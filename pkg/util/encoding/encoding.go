@@ -23,6 +23,21 @@ func DecodeUint64(b []byte) (rest []byte, v uint64, err error) {
 	return b[8:], binary.BigEndian.Uint64(b[:8]), nil
 }
 
+// Uvarint is a plain (non-order-preserving) varint, for value encodings
+// where compactness matters and ordering does not.
+
+func EncodeUvarint(b []byte, v uint64) []byte {
+	return binary.AppendUvarint(b, v)
+}
+
+func DecodeUvarint(b []byte) (rest []byte, v uint64, err error) {
+	v, n := binary.Uvarint(b)
+	if n <= 0 {
+		return nil, 0, fmt.Errorf("decode uvarint: malformed input")
+	}
+	return b[n:], v, nil
+}
+
 // Int64 flips the sign bit so negative values sort before positive ones.
 
 func EncodeInt64(b []byte, v int64) []byte {

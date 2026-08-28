@@ -43,14 +43,19 @@ refreshes on miss; there is no descriptor versioning/leasing in v1
 (concurrent `CREATE TABLE` + use from other gateways is best-effort — schema
 changes beyond CREATE/DROP are out of scope).
 
-## Row encoding
+## Row encoding (v2)
 
-- **Key**: `/t/<tableID>/` + order-preserving encoding of the primary key
-  column values (`pkg/util/encoding`), so PK order = key order and range
-  scans work naturally.
-- **Value**: JSON object `{ "<colID>": value }` of the non-PK columns.
-  NULL = absent entry. (JSON keeps the prototype debuggable; a binary row
-  format is future work and invisible to clients.)
+- **Key**: `/t/<tableID>/<indexID>/` + order-preserving encoding of the
+  index column values (`pkg/util/encoding`), so index order = key order and
+  range scans work naturally. Primary rows are **index 1**; the layout
+  reserves the space secondary indexes live in.
+- **Value**: one version byte, then for each non-NULL non-PK column in
+  ascending column-ID order: the column ID (uvarint), a type tag, and the
+  type's payload (int/float: 8 bytes; string: length-prefixed; bool: 1
+  byte). NULL = absent. Payloads are self-describing, so a decoder skips
+  column IDs its descriptor does not know — which is exactly what makes
+  lazy `DROP COLUMN` and nullable `ADD COLUMN` free. Binary encode is
+  ~3× faster than the JSON encoding it replaced (see rowenc benchmarks).
 
 ## Execution
 

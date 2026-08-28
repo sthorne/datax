@@ -247,8 +247,20 @@ func TableDataPrefix(tableID uint64) Key {
 	return Key(encoding.EncodeUint64(TablePrefix.Clone(), tableID))
 }
 
-// TableDataSpan covers all rows of a table.
+// TableDataSpan covers all rows of a table (every index).
 func TableDataSpan(tableID uint64) (Key, Key) {
 	p := TableDataPrefix(tableID)
+	return p, p.PrefixEnd()
+}
+
+// TableIndexPrefix is the prefix of one index of a table:
+// /t/<tableID>/<indexID>/. Primary rows are index 1 (see pkg/sql/rowenc).
+func TableIndexPrefix(tableID, indexID uint64) Key {
+	return Key(encoding.EncodeUint64(TableDataPrefix(tableID), indexID))
+}
+
+// TableIndexSpan covers all entries of one index of a table.
+func TableIndexSpan(tableID, indexID uint64) (Key, Key) {
+	p := TableIndexPrefix(tableID, indexID)
 	return p, p.PrefixEnd()
 }

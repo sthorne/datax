@@ -212,7 +212,7 @@ func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalo
 		return []fetchedRow{{key: key, row: row}}, nil
 	}
 
-	start, end := keys.TableDataSpan(desc.ID)
+	start, end := rowenc.PrimarySpan(desc.ID)
 	kvs, err := txn.Scan(ctx, start, end, 0)
 	if err != nil {
 		return nil, err
