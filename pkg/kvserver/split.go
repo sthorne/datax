@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
 
@@ -115,9 +116,37 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 	if !ok {
 		return
 	}
-	if _, err := r.store.startReplica(trig.Right, rep.ReplicaID, true /* bootstrap */); err != nil {
+	// bootstrap=false: every replica of the RHS starts it the same way,
+	// deriving the voter set from the descriptor (like a restart) instead
+	// of replaying StartNode's conf-change entries — which would also block
+	// the immediate campaign below.
+	rhs, err := r.store.startReplica(trig.Right, rep.ReplicaID, false)
+	if err != nil {
 		log.Errorf("%s: starting RHS replica after split: %v", trig.Right.RangeID, err)
 		return
+	}
+	// The LHS leader campaigns for the RHS immediately: without this the
+	// RHS sits leaderless for an election timeout, and the eventual
+	// leader's timestamp-cache bump would spuriously restart transactions
+	// that began in that window. The first attempts can fail while peers
+	// have not applied the split yet (their replicas don't exist to vote),
+	// so retry briefly.
+	if r.isLeader() {
+		_ = r.store.cfg.Stopper.RunWorker(func(ctx context.Context) {
+			for i := 0; i < 20; i++ {
+				if rhs.hasLeader() {
+					return
+				}
+				if err := rhs.node.Campaign(ctx); err != nil {
+					log.Debugf("%s: campaign after split: %v", trig.Right.RangeID, err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+		})
 	}
 	log.Infof("split %s at %s → %s [%s, %s)", r.rangeID, trig.Left.EndKey, trig.Right.RangeID, trig.Right.StartKey, trig.Right.EndKey)
 }

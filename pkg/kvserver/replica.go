@@ -62,6 +62,7 @@ type Replica struct {
 		sync.Mutex
 		desc         kvpb.RangeDescriptor
 		appliedIndex uint64
+		term         uint64 // highest raft term observed
 		leader       uint64 // last known raft leader (replica ID); 0 unknown
 		proposals    map[string]chan proposalResult
 		readWaits    map[string]chan uint64
@@ -106,6 +107,9 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs}
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
+	if hs, _, err := rs.InitialState(); err == nil {
+		r.mu.term = hs.Term
+	}
 	r.mu.proposals = make(map[string]chan proposalResult)
 	r.mu.readWaits = make(map[string]chan uint64)
 
@@ -136,6 +140,13 @@ func (r *Replica) Desc() kvpb.RangeDescriptor {
 
 // IsLeader reports whether this replica believes it is the Raft leader.
 func (r *Replica) IsLeader() bool { return r.isLeader() }
+
+// hasLeader reports whether the replica knows any current leader.
+func (r *Replica) hasLeader() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.leader != 0
+}
 
 func (r *Replica) isLeader() bool {
 	r.mu.Lock()
@@ -187,6 +198,10 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 	// 1. Track leadership changes.
 	if rd.SoftState != nil {
 		r.mu.Lock()
+		if rd.HardState.Term > r.mu.term {
+			r.mu.term = rd.HardState.Term
+		}
+		term := r.mu.term
 		prevLeader := r.mu.leader
 		r.mu.leader = rd.SoftState.Lead
 		becameLeader := rd.SoftState.RaftState == raft.StateLeader && prevLeader != uint64(r.replicaID)
@@ -199,10 +214,12 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 			}
 		}
 		r.mu.Unlock()
-		if becameLeader {
+		if becameLeader && term > 1 {
 			// A new leader cannot know what reads the old leader served:
-			// conservatively push all future writes above now.
-			r.tsCache.Bump(r.store.cfg.Clock.Now())
+			// conservatively push all future writes above now. A term-1
+			// leader is the range's first ever — no prior reads exist, so
+			// fresh ranges (splits, bootstrap) skip the bump.
+			r.tsCache.Bump(r.store.cfg.Clock.Now(), uuid.Nil)
 		}
 		for _, ch := range pending {
 			ch <- proposalResult{err: &kvpb.Error{
@@ -411,7 +428,7 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		defer r.latch.RUnlock()
 		// Bump the cache BEFORE evaluating: a write checked after this
 		// point can no longer slip beneath us.
-		r.tsCache.Bump(readTimestamp(ba))
+		r.tsCache.Bump(readTimestamp(ba), batchTxnID(ba))
 		if err := r.linearizableReadIndex(ctx); err != nil {
 			return nil, err
 		}
@@ -420,11 +437,11 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 
 	r.latch.Lock()
 	defer r.latch.Unlock()
-	// No MVCC write may slip beneath a timestamp already served to readers.
-	// Transaction-record-only batches (EndTxn, pushes, resolves) write no
-	// MVCC versions and are exempt.
+	// No MVCC write may slip beneath a timestamp already served to readers
+	// of another transaction. Transaction-record-only batches (EndTxn,
+	// pushes, resolves) write no MVCC versions and are exempt.
 	if ba.HasMVCCWrites() {
-		if low := r.tsCache.Get(); writeTimestamp(ba).LessEq(low) {
+		if ok, low := r.tsCache.AllowsWrite(writeTimestamp(ba), batchTxnID(ba)); !ok {
 			e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
 			e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
 			return nil, e
@@ -464,6 +481,13 @@ func (r *Replica) checkKeyBounds(ba *kvpb.BatchRequest) *kvpb.Error {
 		}
 	}
 	return nil
+}
+
+func batchTxnID(ba *kvpb.BatchRequest) uuid.UUID {
+	if ba.Header.Txn != nil {
+		return ba.Header.Txn.ID
+	}
+	return uuid.Nil
 }
 
 func readTimestamp(ba *kvpb.BatchRequest) hlc.Timestamp {
