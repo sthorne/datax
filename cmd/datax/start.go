@@ -14,17 +14,18 @@ import (
 )
 
 type serverFlags struct {
-	fs        *flag.FlagSet
-	dir       string
-	listen    string
-	pgListen  string
-	join      string
-	locality  string
-	maxOffset time.Duration
-	advertise string
-	certsDir  string
-	rootPw    string
-	verbose   bool
+	fs         *flag.FlagSet
+	dir        string
+	listen     string
+	pgListen   string
+	join       string
+	locality   string
+	maxOffset  time.Duration
+	advertise  string
+	certsDir   string
+	rootPw     string
+	httpListen string
+	verbose    bool
 }
 
 func newServerFlags(name string) *serverFlags {
@@ -38,6 +39,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.advertise, "advertise", "", "address other nodes should use to reach this node (default: resolved listen address)")
 	f.fs.StringVar(&f.certsDir, "certs-dir", "", "certificate directory; enables mutual internode TLS and SQL TLS+SCRAM (empty = insecure)")
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
+	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -59,6 +61,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		AdvertiseAddr: f.advertise,
 		CertsDir:      f.certsDir,
 		RootPassword:  f.rootPw,
+		HTTPListen:    f.httpListen,
 	}, nil
 }
 

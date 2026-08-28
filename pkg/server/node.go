@@ -68,12 +68,16 @@ type Config struct {
 	// RootPassword, in secure mode, seeds the root user's credential at
 	// startup if no verifier exists yet.
 	RootPassword string
+	// HTTPListen serves /metrics (Prometheus) and /status (JSON); empty
+	// disables.
+	HTTPListen string
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
 	Engine          *storage.Engine
 	Listener        net.Listener
 	PGListener      net.Listener
+	HTTPListener    net.Listener
 	Clock           *hlc.Clock
 	StaticBootstrap *StaticBootstrap
 	AdvertiseAddr   string
@@ -106,6 +110,7 @@ type Node struct {
 	joinRange1 kvpb.RangeDescriptor
 
 	pgServer *pgwire.Server // set when PGListen/PGListener is configured
+	httpAddr string         // set when HTTPListen/HTTPListener is configured
 }
 
 // Start boots the node and returns once it is serving.
@@ -299,6 +304,9 @@ func (n *Node) start() error {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
+	if err := n.startHTTP(); err != nil {
+		return err
+	}
 	return n.startSQL()
 }
 
@@ -355,6 +363,9 @@ func (n *Node) SQLAddr() string {
 	}
 	return n.pgServer.Addr()
 }
+
+// HTTPAddr is the observability listener address ("" when disabled).
+func (n *Node) HTTPAddr() string            { return n.httpAddr }
 func (n *Node) DB() *kvclient.DB            { return n.db }
 func (n *Node) Store() *kvserver.Store      { return n.store }
 func (n *Node) Clock() *hlc.Clock           { return n.clock }

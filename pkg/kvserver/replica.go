@@ -192,6 +192,13 @@ func (r *Replica) SizeBytes() int64 {
 	return r.mu.sizeBytes
 }
 
+// AppliedIndex returns the highest applied raft log index.
+func (r *Replica) AppliedIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.appliedIndex
+}
+
 // IsLeader reports whether this replica believes it is the Raft leader.
 func (r *Replica) IsLeader() bool { return r.isLeader() }
 

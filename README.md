@@ -10,10 +10,12 @@ It speaks the **PostgreSQL wire protocol**, so any Postgres client or driver
 works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 `database/sql`.
 
-> **Status: early prototype.** The core is real — MVCC storage, Raft-replicated
-> ranges, serializable distributed transactions, rack-aware placement, and a
-> minimal SQL surface — but this is not production software. See
-> [Limitations](#limitations).
+> **Status: prototype (v2).** The core is real — MVCC storage with garbage
+> collection, Raft-replicated ranges with log truncation and size-based
+> auto-splitting, serializable distributed transactions with read refresh,
+> rack-aware placement with dead-node repair, secondary indexes, TLS +
+> SCRAM authentication, and Prometheus metrics — but this is not production
+> software. See [Limitations](#limitations).
 
 ## Architecture at a glance
 
@@ -46,8 +48,14 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 - **Placement**: nodes declare a locality (`--locality=region=r1,rack=a`);
   the allocator maximizes diversity across failure domains, so losing a rack
   never loses more than one replica of a range.
-- **SQL**: a deliberately small subset (CREATE/DROP TABLE, INSERT, SELECT,
-  UPDATE, DELETE, transactions) served over the Postgres wire protocol.
+- **SQL**: a deliberately small subset (DDL incl. secondary indexes and
+  ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
+  transactions, EXPLAIN) served over the Postgres wire protocol, with TLS +
+  SCRAM-SHA-256 authentication in secure mode.
+- **Operations**: leader-driven housekeeping per range — MVCC garbage
+  collection, raft log truncation, size-based splitting — plus dead-node
+  repair, `datax bench`, and `/metrics` + `/status` observability endpoints
+  (`--http-listen`).
 
 Design documents live in [`docs/`](docs/):
 [architecture](docs/architecture.md) ·
@@ -86,7 +94,11 @@ datax start --dir data3 --listen :26259 --pg-listen :26435 --join 127.0.0.1:2625
 ```
 
 Once three nodes are up, every range is automatically replicated 3× with one
-replica per rack.
+replica per rack. Add `--certs-dir` (after `datax cert create-ca` /
+`create-node`) for mutual internode TLS and SQL TLS + SCRAM, and
+`--http-listen :8080` for Prometheus `/metrics` and JSON `/status`.
+Benchmark with `datax bench kv|bank`; on the in-process demo the kv
+workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
 ## Limitations
 
@@ -100,7 +112,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | joins, GROUP BY, subqueries, most types |
 | Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
-| Ops | observability UI, metrics endpoints; roles/privileges; a restarted node must keep its address (no address-change story) |
+| Ops | observability UI; roles/privileges; a restarted node must keep its address (no address-change story) |
 
 ## License
 

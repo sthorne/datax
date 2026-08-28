@@ -9,6 +9,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -158,6 +159,7 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp) error {
 		if _, kerr := r.Execute(ctx, ba); kerr != nil {
 			return kerr
 		}
+		metrics.GCRuns.Inc()
 		log.Debugf("%s: gc reclaimed %d versions, %d txn records (threshold %s)",
 			r.rangeID, len(chunkV), len(chunkR), threshold)
 	}

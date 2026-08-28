@@ -50,12 +50,15 @@ moves no data**.
 
 ## Life of a read
 
-Reads are served by the Raft **leader** of each range (v1 simplification:
-leaseholder = leader) using Raft **ReadIndex** to stay linearizable across
-leadership changes: the leader confirms its leadership with a quorum
-heartbeat, waits until its applied index reaches the confirmed commit index,
-then reads from local Pebble at the transaction's timestamp — no log entry
-needed.
+Reads are served by the Raft **leader** of each range (leaseholder =
+leader) using Raft **ReadIndex** to stay linearizable across leadership
+changes: the leader confirms its leadership — by default from its
+CheckQuorum **lease** with a wall-clock backstop, or with a quorum round
+trip when lease reads are disabled (see
+[replication & placement](replication-and-placement.md)) — waits until its
+applied index reaches the confirmed commit index, then reads from local
+Pebble at the transaction's timestamp — no log entry needed. Concurrent
+readers coalesce their confirmations.
 
 ## Correctness invariants
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -236,9 +237,11 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 			newTS := kerr.RetryTimestamp(t.db.clock.Now())
 			if refreshes < maxRefreshesPerOp && t.maybeRefresh(ctx, newTS) {
 				refreshes++
+				metrics.TxnRefreshes.Inc()
 				ba.Header.Txn = t.proto() // re-stamp with refreshed timestamps
 				continue
 			}
+			metrics.TxnRetries.Inc()
 			return nil, &RetryableError{Cause: kerr}
 		default:
 			return nil, kerr
@@ -353,6 +356,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 		return err
 	}
 	t.markFinished()
+	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
 	return nil
 }
@@ -373,6 +377,7 @@ func (t *Txn) Rollback(ctx context.Context) error {
 	}
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
 	ba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
+	metrics.TxnAborts.Inc()
 	if _, kerr := t.db.Send(ctx, ba); kerr != nil && kerr.TxnAborted == nil {
 		log.Debugf("rollback of %s: %v", txn.ID, kerr)
 	}

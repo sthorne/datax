@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -45,6 +46,8 @@ func (s *Store) RunAutoSplitOnce(ctx context.Context) {
 		log.Infof("%s: size %d bytes exceeds %d; auto-splitting at %s", r.rangeID, size, threshold, splitKey)
 		if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
 			log.Warnf("%s: auto-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
+		} else {
+			metrics.AutoSplits.Inc()
 		}
 		return true
 	})

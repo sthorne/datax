@@ -7,6 +7,7 @@ import (
 	"go.etcd.io/raft/v3"
 
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -97,6 +98,7 @@ func (r *Replica) maybeTruncateLog(ctx context.Context) error {
 	if _, kerr := r.Execute(ctx, ba); kerr != nil {
 		return kerr
 	}
+	metrics.LogTruncations.Inc()
 	log.Debugf("%s: log truncated through index %d", r.rangeID, target)
 	return nil
 }

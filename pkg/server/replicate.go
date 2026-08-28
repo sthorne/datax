@@ -6,6 +6,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/placement"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -192,6 +193,7 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 			log.Warnf("repairing %s: removing dead replica on n%d: %v", desc.RangeID, deadNode, err)
 			continue
 		}
+		metrics.DeadNodeRepairs.Inc()
 		rangeCount[target]++
 	}
 }

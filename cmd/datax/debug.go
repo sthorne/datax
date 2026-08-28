@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -14,11 +18,36 @@ import (
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
+// runDebugStatus fetches a node's /status document from its observability
+// endpoint (--http-listen).
+func runDebugStatus(args []string) error {
+	fs := flag.NewFlagSet("debug status", flag.ContinueOnError)
+	url := fs.String("url", "http://127.0.0.1:8080/status", "a node's /status URL")
+	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	if *insecureTLS {
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	resp, err := client.Get(*url)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
+}
+
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance> [flags]")
+		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
+	if sub == "status" {
+		return runDebugStatus(rest)
+	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
 	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
