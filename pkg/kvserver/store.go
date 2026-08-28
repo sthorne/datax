@@ -33,6 +33,14 @@ type StoreConfig struct {
 	SnapshotSender   SnapshotSender
 	Stopper          *stop.Stopper
 	RaftTickInterval time.Duration
+	TestingKnobs     TestingKnobs
+}
+
+// TestingKnobs are test-only hooks; all nil in production.
+type TestingKnobs struct {
+	// AfterLatch runs after a batch acquires its latches, before it is
+	// evaluated — lets tests hold a latch open deliberately.
+	AfterLatch func(ba *kvpb.BatchRequest)
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

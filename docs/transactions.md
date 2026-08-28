@@ -81,6 +81,25 @@ at the higher timestamp ("read refresh"). Instead:
 This is strictly correct, just slower under contention. Read refresh is the
 first planned post-v1 improvement.
 
+### Span latches
+
+Each range's leader serializes overlapping requests with per-span latches
+(v2; v1 used one range-wide lock). The invariants:
+
+- **L1** — any two operations with overlapping key spans, at least one of
+  which writes, are fully serialized from timestamp-cache check to apply
+  visibility (a write holds its exclusive latches until it has applied).
+- **L2** — a read bumps the timestamp cache *before* evaluating, while
+  holding its shared latches.
+
+Together these give the write-beneath-read guarantee per key: an
+overlapping write either applied before the read evaluated, or its
+timestamp-cache check observed the read's bump and pushed it above the
+read. Disjoint operations need no ordering — a write cannot invalidate a
+read it does not overlap — so they run in parallel. Transaction-record
+operations latch under their **anchor key** (the record's addressed key),
+and splits take a whole-range exclusive latch.
+
 ### Timestamp cache
 
 Per range, leader-side. v1 keeps a single **high-water mark**: the maximum

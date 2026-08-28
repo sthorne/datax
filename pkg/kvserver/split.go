@@ -63,14 +63,17 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	}
 	trig := &splitTrigger{Left: left, Right: right}
 
-	// Serialize against writes: nothing may be in flight through the old
-	// bounds while the split lands.
-	r.latch.Lock()
+	// Serialize against everything: nothing may be in flight through the
+	// old bounds while the split lands.
+	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
+	if gerr != nil {
+		return nil, kvpb.NewError(gerr)
+	}
 	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig); kerr != nil {
-		r.latch.Unlock()
+		guard.Release()
 		return nil, kerr
 	}
-	r.latch.Unlock()
+	guard.Release()
 
 	// Repair the addressing records (one batch, both on the meta range, so
 	// the update is atomic). Done outside the latch: if the split was on

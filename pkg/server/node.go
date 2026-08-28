@@ -44,6 +44,7 @@ type Config struct {
 	UpreplicationInterval time.Duration
 
 	// Test hooks.
+	TestingKnobs    kvserver.TestingKnobs
 	Engine          *storage.Engine
 	Listener        net.Listener
 	PGListener      net.Listener
@@ -182,6 +183,7 @@ func (n *Node) start() error {
 		Transport:      n.trans,
 		SnapshotSender: n.trans,
 		Stopper:        n.stopper,
+		TestingKnobs:   n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()

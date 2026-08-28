@@ -56,12 +56,13 @@ type Replica struct {
 	// docs/transactions.md).
 	tsCache tsCache
 
-	// latch serializes MVCC-write batches against reads: a write holds it
-	// exclusively from its timestamp-cache check until it is applied, so a
-	// read (shared holder) can never evaluate concurrently with a write
-	// that already passed the check but is not yet visible. v1 keeps this
-	// range-coarse; per-key latches are future work.
-	latch sync.RWMutex
+	// latches serialize overlapping requests: a write holds exclusive
+	// latches on its spans from its timestamp-cache check until it is
+	// applied, so an overlapping read (shared holder) can never evaluate
+	// concurrently with a write that already passed the check but is not
+	// yet visible. Disjoint requests run in parallel. See latch.go for the
+	// L1/L2 invariants.
+	latches *latchManager
 
 	mu struct {
 		sync.Mutex
@@ -109,7 +110,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	if err != nil {
 		return nil, err
 	}
-	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs}
+	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager()}
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
 	if hs, _, err := rs.InitialState(); err == nil {
@@ -443,11 +444,22 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
 	}
+	spans, mode, serr := latchSpans(ba)
+	if serr != nil {
+		return nil, kvpb.NewError(serr)
+	}
+	guard, gerr := r.latches.Acquire(ctx, spans, mode)
+	if gerr != nil {
+		return nil, kvpb.NewError(gerr)
+	}
+	defer guard.Release()
+	if k := r.store.cfg.TestingKnobs.AfterLatch; k != nil {
+		k(ba)
+	}
+
 	if ba.IsReadOnly() {
-		r.latch.RLock()
-		defer r.latch.RUnlock()
-		// Bump the cache BEFORE evaluating: a write checked after this
-		// point can no longer slip beneath us.
+		// Bump the cache BEFORE evaluating (invariant L2): an overlapping
+		// write checked after this point can no longer slip beneath us.
 		r.tsCache.Bump(readTimestamp(ba), batchTxnID(ba))
 		if err := r.linearizableReadIndex(ctx); err != nil {
 			return nil, err
@@ -455,8 +467,6 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return r.evalReadOnly(ba)
 	}
 
-	r.latch.Lock()
-	defer r.latch.Unlock()
 	// No MVCC write may slip beneath a timestamp already served to readers
 	// of another transaction. Transaction-record-only batches (EndTxn,
 	// pushes, resolves) write no MVCC versions and are exempt.
