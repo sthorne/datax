@@ -33,7 +33,10 @@ type StoreConfig struct {
 	SnapshotSender   SnapshotSender
 	Stopper          *stop.Stopper
 	RaftTickInterval time.Duration
-	TestingKnobs     TestingKnobs
+	// DisableLeaseReads reverts ReadIndex to full quorum round trips
+	// (raft's ReadOnlySafe) instead of leader leases.
+	DisableLeaseReads bool
+	TestingKnobs      TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.

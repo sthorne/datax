@@ -64,6 +64,10 @@ type Replica struct {
 	// L1/L2 invariants.
 	latches *latchManager
 
+	// leaseReads is whether ReadIndex runs lease-based (no quorum round
+	// trip per read); fixed at replica creation.
+	leaseReads bool
+
 	mu struct {
 		sync.Mutex
 		desc         kvpb.RangeDescriptor
@@ -75,7 +79,19 @@ type Replica struct {
 		readWaits    map[string]chan uint64
 		appliedWaits []appliedWait
 		destroyed    bool
+		// lastFollowerResp records when each peer last answered this
+		// replica (heartbeat/append responses) — the lease backstop's input.
+		lastFollowerResp map[uint64]time.Time
+		// ReadIndex coalescing: waiters register here; one goroutine drains
+		// rounds while riInFlight.
+		riPending  []chan readIndexResult
+		riInFlight bool
 	}
+}
+
+type readIndexResult struct {
+	idx uint64
+	err *kvpb.Error
 }
 
 type appliedWait struct {
@@ -83,10 +99,15 @@ type appliedWait struct {
 	ch  chan struct{}
 }
 
-func raftConfig(id uint64, applied uint64, st raft.Storage) *raft.Config {
-	return &raft.Config{
+// raftElectionTicks is the raft election timeout in ticks; with the tick
+// interval it bounds how long a partitioned leader can outlive its lease
+// (see leaseContactFresh).
+const raftElectionTicks = 10
+
+func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *raft.Config {
+	cfg := &raft.Config{
 		ID:                        id,
-		ElectionTick:              10,
+		ElectionTick:              raftElectionTicks,
 		HeartbeatTick:             3,
 		Storage:                   st,
 		Applied:                   applied,
@@ -97,6 +118,14 @@ func raftConfig(id uint64, applied uint64, st raft.Storage) *raft.Config {
 		DisableProposalForwarding: true, // the leader owns the timestamp cache
 		Logger:                    &raftLogger{},
 	}
+	if leaseReads {
+		// Lease-based reads answer ReadIndex from the leader's CheckQuorum
+		// lease instead of a quorum round trip. Safe with CheckQuorum +
+		// PreVote (both set above) plus the wall-clock backstop in
+		// leaseContactFresh; see docs/replication-and-placement.md.
+		cfg.ReadOnlyOption = raft.ReadOnlyLeaseBased
+	}
+	return cfg
 }
 
 // newReplica loads or creates the replica and starts its Raft group.
@@ -111,7 +140,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	if err != nil {
 		return nil, err
 	}
-	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager()}
+	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager(), leaseReads: !s.cfg.DisableLeaseReads}
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
 	r.mu.gcThreshold = st.GCThreshold
@@ -120,8 +149,9 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	}
 	r.mu.proposals = make(map[string]chan proposalResult)
 	r.mu.readWaits = make(map[string]chan uint64)
+	r.mu.lastFollowerResp = make(map[uint64]time.Time)
 
-	cfg := raftConfig(uint64(replicaID), st.AppliedIndex, rs)
+	cfg := raftConfig(uint64(replicaID), st.AppliedIndex, rs, r.leaseReads)
 	if bootstrap {
 		peers := make([]raft.Peer, 0, len(desc.Replicas))
 		for _, rep := range desc.Replicas {
@@ -325,7 +355,46 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 
 // stepRaftMessage feeds an incoming message into the Raft state machine.
 func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
+	switch m.Type {
+	case raftpb.MsgHeartbeatResp, raftpb.MsgAppResp:
+		// Follower contact, timestamped for the lease-read backstop.
+		r.mu.Lock()
+		r.mu.lastFollowerResp[m.From] = time.Now()
+		r.mu.Unlock()
+	}
 	return r.node.Step(ctx, m)
+}
+
+// leaseContactFresh is the wall-clock backstop for lease-based reads: serve
+// only while a majority (self included) has answered within
+// electionTimeout − MaxOffset. A follower that answered at time T cannot
+// vote for a new leader before T + electionTimeout (measured on its own
+// tick clock), so within the window no new leader can exist and CheckQuorum
+// guarantees this one still holds its lease. MaxOffset absorbs modest
+// tick-rate skew between nodes; pathological scheduling skew beyond that is
+// the residual (documented) risk, and the cost of a false negative is only
+// a NotLeader retry.
+func (r *Replica) leaseContactFresh() bool {
+	desc := r.Desc()
+	n := len(desc.Replicas)
+	if n <= 1 {
+		return true
+	}
+	window := time.Duration(raftElectionTicks)*r.store.cfg.RaftTickInterval - r.store.cfg.Clock.MaxOffset()
+	if window <= 0 {
+		return false // MaxOffset swamps the election timeout: never lease-read
+	}
+	needed := (n/2 + 1) - 1 // majority minus this replica itself
+	now := time.Now()
+	fresh := 0
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ts := range r.mu.lastFollowerResp {
+		if now.Sub(ts) <= window {
+			fresh++
+		}
+	}
+	return fresh >= needed
 }
 
 // propose submits a write batch through Raft and waits for its application.
@@ -370,10 +439,62 @@ func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *
 	}
 }
 
-// linearizableReadIndex runs the ReadIndex protocol: confirm leadership with
-// a quorum, then wait until the applied state includes everything committed
-// as of that confirmation.
+// linearizableReadIndex runs the ReadIndex protocol: confirm leadership
+// (quorum round trip, or the leader's lease when lease reads are on), then
+// wait until the applied state includes everything committed as of that
+// confirmation. Concurrent readers coalesce: waiters that arrive while a
+// confirmation is in flight share the NEXT one — registered before it is
+// issued, so its index still covers everything committed before they
+// arrived.
 func (r *Replica) linearizableReadIndex(ctx context.Context) *kvpb.Error {
+	mine := make(chan readIndexResult, 1)
+	r.mu.Lock()
+	r.mu.riPending = append(r.mu.riPending, mine)
+	spawn := !r.mu.riInFlight
+	if spawn {
+		r.mu.riInFlight = true
+	}
+	r.mu.Unlock()
+	if spawn {
+		go r.readIndexLoop()
+	}
+	select {
+	case <-ctx.Done():
+		return kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
+	case res := <-mine:
+		if res.err != nil {
+			return res.err
+		}
+		return r.waitApplied(ctx, res.idx)
+	}
+}
+
+// readIndexLoop drains rounds of coalesced ReadIndex confirmations until no
+// waiters remain.
+func (r *Replica) readIndexLoop() {
+	for {
+		r.mu.Lock()
+		cohort := r.mu.riPending
+		r.mu.riPending = nil
+		if len(cohort) == 0 {
+			r.mu.riInFlight = false
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+		idx, kerr := r.issueReadIndex()
+		for _, ch := range cohort {
+			ch <- readIndexResult{idx: idx, err: kerr}
+		}
+	}
+}
+
+// issueReadIndex performs one ReadIndex round trip on behalf of a cohort.
+// It runs under the store's lifetime (not any single caller's context) with
+// a bounded timeout; a timeout surfaces to the cohort as a retryable error.
+func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
+	ctx, cancel := context.WithTimeout(r.store.cfg.Stopper.Ctx(), 3*time.Second)
+	defer cancel()
 	rctx := uuid.NewString()
 	ch := make(chan uint64, 1)
 	r.mu.Lock()
@@ -386,13 +507,13 @@ func (r *Replica) linearizableReadIndex(ctx context.Context) *kvpb.Error {
 	}()
 
 	if err := r.node.ReadIndex(ctx, []byte(rctx)); err != nil {
-		return kvpb.NewError(err)
+		return 0, kvpb.NewError(err)
 	}
 	select {
 	case <-ctx.Done():
-		return kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
+		return 0, kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
 	case idx := <-ch:
-		return r.waitApplied(ctx, idx)
+		return idx, nil
 	}
 }
 
@@ -478,6 +599,12 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		// Bump the cache BEFORE evaluating (invariant L2): an overlapping
 		// write checked after this point can no longer slip beneath us.
 		r.tsCache.Bump(readTimestamp(ba), batchTxnID(ba))
+		if r.leaseReads && !r.leaseContactFresh() {
+			// Lease reads skip the quorum round trip, so refuse to serve on
+			// a possibly-expired lease; the client retries and either we
+			// re-establish contact or a real new leader answers.
+			return nil, r.notLeaderError()
+		}
 		if err := r.linearizableReadIndex(ctx); err != nil {
 			return nil, err
 		}

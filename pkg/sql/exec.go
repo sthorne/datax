@@ -116,6 +116,8 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		}
 	}
 	count := 0
+	var wb kvclient.WriteBatch
+	inserted := map[string]bool{} // duplicates within this statement
 	for _, exprRow := range t.Rows {
 		if len(exprRow) != len(target) {
 			return nil, newErrf(CodeSyntaxError, "INSERT has %d values but %d target columns", len(exprRow), len(target))
@@ -146,6 +148,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		if verr != nil {
 			return nil, verr
 		}
+		if inserted[string(key)] {
+			return nil, newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", t.Table)
+		}
 		if existing, err := txn.Get(ctx, key); err != nil {
 			return nil, err
 		} else if existing != nil {
@@ -155,10 +160,14 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		if verr2 != nil {
 			return nil, verr2
 		}
-		if err := txn.Put(ctx, key, value); err != nil {
-			return nil, err
-		}
+		// Writes are buffered and flushed once below: one routed batch (one
+		// Raft proposal per touched range) per statement.
+		wb.Put(key, value)
+		inserted[string(key)] = true
 		count++
+	}
+	if err := txn.RunBatch(ctx, &wb); err != nil {
+		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("INSERT 0 %d", count)}, nil
 }
@@ -366,6 +375,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
+	var wb kvclient.WriteBatch
 	for _, fr := range rows {
 		for _, set := range t.Set {
 			col, _ := desc.Col(set.Column)
@@ -386,9 +396,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		if verr != nil {
 			return nil, verr
 		}
-		if err := txn.Put(ctx, fr.key, value); err != nil {
-			return nil, err
-		}
+		wb.Put(fr.key, value)
+	}
+	if err := txn.RunBatch(ctx, &wb); err != nil {
+		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("UPDATE %d", len(rows))}, nil
 }
@@ -402,10 +413,12 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
+	var wb kvclient.WriteBatch
 	for _, fr := range rows {
-		if err := txn.Delete(ctx, fr.key); err != nil {
-			return nil, err
-		}
+		wb.Delete(fr.key)
+	}
+	if err := txn.RunBatch(ctx, &wb); err != nil {
+		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("DELETE %d", len(rows))}, nil
 }

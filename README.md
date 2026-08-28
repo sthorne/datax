@@ -96,7 +96,7 @@ This is a prototype. Out of scope so far, deliberately:
 |---|---|
 | Ranges | automatic split/merge (splits are manual: `datax debug split`) |
 | Placement | automatic load rebalancing; node decommission |
-| Reads | leaseholder/follower reads (reads go through the Raft leader via ReadIndex) |
+| Reads | follower reads (reads are leader-only: lease-based ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | secondary indexes, joins, aggregates, ORDER BY, ALTER, most types |
 | Wire | TLS, SCRAM auth (trust auth only), binary extended-protocol parameters |

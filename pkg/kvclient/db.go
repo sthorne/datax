@@ -131,7 +131,21 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 			}
 			j++
 		}
-		br, regroup, kerr := db.sendPartial(ctx, &header, ba.Requests[i:j], desc)
+		// The transaction record must be created on the anchor key's range,
+		// atomically with a write there: scope the creation flag to the one
+		// group that actually writes the anchor key.
+		gh := header
+		if gh.CreateTxnRecord && gh.Txn != nil {
+			gh.CreateTxnRecord = false
+			for _, u := range ba.Requests[i:j] {
+				if keys.Key(gh.Txn.Key).Equal(u.GetInner().Header().Key) {
+					gh.CreateTxnRecord = true
+					break
+				}
+			}
+		}
+		br, regroup, kerr := db.sendPartial(ctx, &gh, ba.Requests[i:j], desc)
+		header.Timestamp = gh.Timestamp
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)

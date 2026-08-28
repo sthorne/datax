@@ -105,6 +105,31 @@ descriptor + applied index) over gRPC **before** the ConfChange commits
 snapshot through Raft. Configuration changes happen one replica at a time (no
 joint consensus in v1).
 
+## Lease-based reads
+
+Reads are leader-only and linearizable. v1 confirmed leadership with a full
+quorum round trip per read (raft's `ReadOnlySafe` ReadIndex); v2 defaults to
+**lease-based** ReadIndex (`ReadOnlyLeaseBased`): the leader answers from
+its CheckQuorum lease, eliminating the per-read network round trip. The
+read-your-writes property is unchanged — every read still waits until the
+applied index reaches the confirmed commit index — and concurrent readers
+**coalesce**: waiters arriving while a confirmation is in flight share the
+next one (registered before it is issued, so its index covers everything
+committed before they arrived).
+
+The correctness argument: with CheckQuorum, a leader steps down when it
+loses contact with a majority for an election timeout, and PreVote keeps
+disruptive candidates from starting elections while a live leader exists.
+On top of that sits a **wall-clock backstop**: the leader serves lease
+reads only while a majority (itself included) has answered within
+`electionTimeout − MaxOffset`. A follower that answered at time T cannot
+vote for a new leader before T + electionTimeout on its own tick clock, so
+within that window no new leader can exist; `MaxOffset` absorbs modest
+tick-rate skew. Pathological scheduler skew beyond that is the residual
+risk, stated honestly — and the failure mode of a false backstop negative
+is only a NotLeader retry. `--disable-lease-reads`-style configuration
+(`DisableLeaseReads`) restores the v1 quorum path.
+
 ## Raft log truncation
 
 The log is bounded by leader-driven, **replicated** `TruncateLog` commands
