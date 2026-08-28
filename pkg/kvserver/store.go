@@ -30,6 +30,7 @@ type StoreConfig struct {
 	Engine           *storage.Engine
 	Clock            *hlc.Clock
 	Transport        RaftTransport
+	SnapshotSender   SnapshotSender
 	Stopper          *stop.Stopper
 	RaftTickInterval time.Duration
 }

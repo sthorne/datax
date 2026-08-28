@@ -14,6 +14,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -22,8 +23,8 @@ import (
 // PayloadHandler serves a JSON request payload and returns a JSON response.
 type PayloadHandler func(ctx context.Context, data []byte) ([]byte, error)
 
-// SnapshotHandler consumes an incoming range snapshot stream (Phase 7).
-type SnapshotHandler func(header []byte, kvs func() ([]rpcpb.SnapshotKV, error)) error
+// SnapshotHandler consumes an incoming range snapshot stream.
+type SnapshotHandler func(header []byte, kvs func() ([]kvserver.SnapshotKV, error)) error
 
 // ServerHandlers are the node-side callbacks the transport dispatches into.
 type ServerHandlers struct {
@@ -32,6 +33,8 @@ type ServerHandlers struct {
 	Admin    PayloadHandler
 	Raft     func(ctx context.Context, rangeID base.RangeID, m raftpb.Message)
 	Snapshot SnapshotHandler
+	// NodeInfo learns a peer's address from its Raft envelopes.
+	NodeInfo func(id base.NodeID, addr string)
 }
 
 // Server implements rpcpb.InternodeServer.
@@ -70,6 +73,9 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 			return err
 		}
 		s.updateClock(env.Now)
+		if s.handlers.NodeInfo != nil && env.FromNode != 0 && env.FromAddr != "" {
+			s.handlers.NodeInfo(base.NodeID(env.FromNode), env.FromAddr)
+		}
 		var m raftpb.Message
 		if err := m.Unmarshal(env.Message); err != nil {
 			log.Warnf("dropping undecodable raft message: %v", err)
@@ -110,7 +116,7 @@ func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
 		return err
 	}
 	s.updateClock(first.Now)
-	next := func() ([]rpcpb.SnapshotKV, error) {
+	next := func() ([]kvserver.SnapshotKV, error) {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
 			return nil, nil
@@ -119,9 +125,9 @@ func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
 			return nil, err
 		}
 		s.updateClock(chunk.Now)
-		out := make([]rpcpb.SnapshotKV, len(chunk.Kvs))
+		out := make([]kvserver.SnapshotKV, len(chunk.Kvs))
 		for i, kv := range chunk.Kvs {
-			out[i] = rpcpb.SnapshotKV{Key: kv.Key, Value: kv.Value}
+			out[i] = kvserver.SnapshotKV{Key: kv.Key, Value: kv.Value}
 		}
 		return out, nil
 	}

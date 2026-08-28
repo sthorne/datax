@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -36,6 +37,10 @@ type proposalResult struct {
 	resp *kvpb.BatchResponse
 	err  *kvpb.Error
 }
+
+// errReplicaRemoved signals that this replica was removed from its range by
+// an applied ConfChange and must shut down.
+var errReplicaRemoved = errors.New("replica removed from range")
 
 // Replica is one replica of a range: a member of the range's Raft group,
 // applying its log to the shared store engine.
@@ -184,7 +189,14 @@ func (r *Replica) raftLoop(ctx context.Context) {
 		case <-ticker.C:
 			r.node.Tick()
 		case rd := <-r.node.Ready():
-			if err := r.handleReady(ctx, rd); err != nil {
+			err := r.handleReady(ctx, rd)
+			if err == errReplicaRemoved {
+				log.Infof("%s/%d: removed from range; shutting replica down", r.rangeID, r.replicaID)
+				r.node.Stop()
+				r.store.removeReplica(r.rangeID)
+				return
+			}
+			if err != nil {
 				log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
 				r.node.Stop()
 				return
@@ -291,7 +303,8 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 			}
 		}
 		if target == 0 {
-			continue // unknown recipient (stale message); drop
+			log.Debugf("%s: dropping %s to unknown replica %d (desc replicas %v)", r.rangeID, m.Type, m.To, desc.Replicas)
+			continue
 		}
 		if err := r.store.cfg.Transport.SendRaftMessage(ctx, target, r.rangeID, m); err != nil {
 			// Raft tolerates message loss; report unreachability so it backs off.
@@ -419,6 +432,13 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			return nil, err
 		}
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminSplit: resp}}}, nil
+	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminChangeReplicas != nil {
+		resp, err := r.adminChangeReplicas(ctx, ba.Requests[0].AdminChangeReplicas)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminChangeReplicas: resp}}}, nil
 	}
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err

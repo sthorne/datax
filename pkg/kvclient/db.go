@@ -34,7 +34,14 @@ type DB struct {
 	clock      *hlc.Clock
 	cache      *rangeCache
 	metaLookup bool
+	// nodeLister enumerates known cluster nodes (the registry): the routing
+	// fallback when a cached descriptor's replicas are unreachable (e.g. a
+	// stale pre-upreplication descriptor whose only replica died).
+	nodeLister func() []base.NodeID
 }
+
+// SetNodeLister wires the cluster-node enumeration used as routing fallback.
+func (db *DB) SetNodeLister(f func() []base.NodeID) { db.nodeLister = f }
 
 type localSender struct {
 	store LocalStore
@@ -330,6 +337,17 @@ func (db *DB) replicaOrder(desc kvpb.RangeDescriptor) []base.NodeID {
 	for _, r := range desc.Replicas {
 		add(r.NodeID)
 	}
+	// Fallback: the descriptor may be stale (membership changed since it
+	// was cached). Any node hosting a replica will serve or redirect;
+	// nodes without one answer RangeNotFound and we move on.
+	if db.local != nil {
+		add(db.local.store.NodeID())
+	}
+	if db.nodeLister != nil {
+		for _, id := range db.nodeLister() {
+			add(id)
+		}
+	}
 	return order
 }
 
@@ -386,6 +404,21 @@ func (db *DB) Increment(ctx context.Context, key keys.Key, by int64) (int64, err
 		return 0, kerr
 	}
 	return br.Responses[0].Increment.NewValue, nil
+}
+
+// AdminChangeReplicas adds and/or removes a replica of the range covering
+// key.
+func (db *DB) AdminChangeReplicas(ctx context.Context, key keys.Key, add, remove base.NodeID) (*kvpb.AdminChangeReplicasResponse, error) {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminChangeReplicasRequest{RequestHeader: kvpb.RequestHeader{Key: key}, AddNode: add, RemoveNode: remove})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	resp := br.Responses[0].AdminChangeReplicas
+	db.cache.Evict(resp.Desc.RangeID)
+	db.cache.Insert(resp.Desc)
+	return resp, nil
 }
 
 // AdminSplit splits the range containing key at key.

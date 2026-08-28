@@ -12,6 +12,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -28,6 +29,10 @@ type Transport struct {
 	clock    *hlc.Clock
 	stopper  *stop.Stopper
 	resolver Resolver
+
+	localMu   sync.Mutex
+	localNode base.NodeID
+	localAddr string
 
 	mu struct {
 		sync.Mutex
@@ -46,6 +51,20 @@ func NewTransport(clock *hlc.Clock, stopper *stop.Stopper, resolver Resolver) *T
 	t.mu.conns = make(map[base.NodeID]*conn)
 	t.mu.raftQ = make(map[base.NodeID]chan *rpcpb.RaftEnvelope)
 	return t
+}
+
+// SetLocalInfo records this node's identity, piggybacked on outgoing Raft
+// envelopes so peers learn our address from Raft traffic itself.
+func (t *Transport) SetLocalInfo(id base.NodeID, addr string) {
+	t.localMu.Lock()
+	t.localNode, t.localAddr = id, addr
+	t.localMu.Unlock()
+}
+
+func (t *Transport) localInfo() (base.NodeID, string) {
+	t.localMu.Lock()
+	defer t.localMu.Unlock()
+	return t.localNode, t.localAddr
 }
 
 func (t *Transport) now() *rpcpb.Hlc {
@@ -92,10 +111,13 @@ func (t *Transport) SendRaftMessage(ctx context.Context, to base.NodeID, rangeID
 	if err != nil {
 		return err
 	}
+	localNode, localAddr := t.localInfo()
 	env := &rpcpb.RaftEnvelope{
 		RangeId:     int64(rangeID),
 		ToReplica:   m.To,
 		FromReplica: m.From,
+		FromNode:    int32(localNode),
+		FromAddr:    localAddr,
 		Now:         t.now(),
 		Message:     raw,
 	}
@@ -138,6 +160,7 @@ func (t *Transport) raftWorker(ctx context.Context, to base.NodeID, q <-chan *rp
 					stream, err = rpcpb.NewInternodeClient(cc).RaftMessages(ctx)
 				}
 				if err != nil {
+					log.Debugf("transport: raft dial/stream to n%d failed: %v", to, err)
 					stream = nil
 					if attempt >= 1 {
 						break // drop this message; raft will retry
@@ -151,6 +174,7 @@ func (t *Transport) raftWorker(ctx context.Context, to base.NodeID, q <-chan *rp
 				}
 			}
 			if err := stream.Send(env); err != nil {
+				log.Debugf("transport: raft stream send to n%d failed: %v", to, err)
 				stream = nil
 				continue // redial once, then drop
 			}
@@ -177,6 +201,40 @@ func (t *Transport) SendBatch(ctx context.Context, to base.NodeID, ba *kvpb.Batc
 	t.updateClock(out.Now)
 	br, kerr, err := UnmarshalBatchResult(out.Json)
 	return br, kerr, err
+}
+
+// SendSnapshot streams a range snapshot to another node. next returns
+// key/value chunks and an empty slice at end of stream.
+func (t *Transport) SendSnapshot(ctx context.Context, to base.NodeID, header []byte, next func() ([]kvserver.SnapshotKV, error)) error {
+	cc, err := t.Dial(to)
+	if err != nil {
+		return err
+	}
+	stream, err := rpcpb.NewInternodeClient(cc).Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if err := stream.Send(&rpcpb.SnapshotChunk{HeaderJson: header, Now: t.now()}); err != nil {
+		return err
+	}
+	for {
+		kvs, err := next()
+		if err != nil {
+			return err
+		}
+		if len(kvs) == 0 {
+			break
+		}
+		chunk := &rpcpb.SnapshotChunk{Now: t.now()}
+		for _, kv := range kvs {
+			chunk.Kvs = append(chunk.Kvs, &rpcpb.SnapshotKV{Key: kv.Key, Value: kv.Value})
+		}
+		if err := stream.Send(chunk); err != nil {
+			return err
+		}
+	}
+	_, err = stream.CloseAndRecv()
+	return err
 }
 
 // Call performs a unary JSON RPC (join/admin) against an address.

@@ -22,9 +22,18 @@ type replicaState struct {
 	TruncatedTerm  uint64 `json:"truncated_term,omitempty"`
 }
 
+// getter is the read capability shared by Engine, Batch, and Snapshot.
+type getter interface {
+	Get(key []byte) ([]byte, error)
+}
+
 func loadReplicaState(eng *storage.Engine, rangeID base.RangeID) (replicaState, error) {
+	return loadReplicaStateFrom(eng, rangeID)
+}
+
+func loadReplicaStateFrom(r getter, rangeID base.RangeID) (replicaState, error) {
 	var st replicaState
-	raw, err := eng.Get(keys.RaftAppliedStateKey(rangeID))
+	raw, err := r.Get(keys.RaftAppliedStateKey(rangeID))
 	if err != nil {
 		return st, err
 	}

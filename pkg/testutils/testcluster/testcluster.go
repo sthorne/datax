@@ -3,6 +3,7 @@
 package testcluster
 
 import (
+	"encoding/json"
 	"net"
 	"testing"
 	"time"
@@ -55,9 +56,10 @@ func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
 			t.Fatal(err)
 		}
 		n, err := server.Start(server.Config{
-			Listener:   listeners[i],
-			PGListener: pglis,
-			Locality:   locality(t, localities, i),
+			Listener:              listeners[i],
+			PGListener:            pglis,
+			Locality:              locality(t, localities, i),
+			UpreplicationInterval: time.Second,
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID,
 				NodeID:    nodeIDs[i],
@@ -105,10 +107,11 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 		tc.T.Fatal(err)
 	}
 	n, err := server.Start(server.Config{
-		Listener:   lis,
-		PGListener: pglis,
-		Join:       tc.Nodes[0].Addr(),
-		Locality:   loc,
+		Listener:              lis,
+		PGListener:            pglis,
+		Join:                  tc.Nodes[0].Addr(),
+		Locality:              loc,
+		UpreplicationInterval: time.Second,
 	})
 	if err != nil {
 		tc.T.Fatalf("joining node: %v", err)
@@ -170,3 +173,6 @@ func (tc *TestCluster) StopAll() {
 		tc.StopNode(i)
 	}
 }
+
+// jsonUnmarshal avoids importing encoding/json in every test file.
+func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }

@@ -144,6 +144,21 @@ func (r *Registry) Upsert(nd kvpb.NodeDescriptor) {
 	}
 }
 
+// UpsertAddress records a peer's address learned from Raft traffic without
+// clobbering locality/liveness from real registry rows.
+func (r *Registry) UpsertAddress(id base.NodeID, addr string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.nodes[id]; ok {
+		if cur.Address != addr {
+			cur.Address = addr
+			r.nodes[id] = cur
+		}
+		return
+	}
+	r.nodes[id] = kvpb.NodeDescriptor{NodeID: id, Address: addr}
+}
+
 func (r *Registry) Get(id base.NodeID) (kvpb.NodeDescriptor, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

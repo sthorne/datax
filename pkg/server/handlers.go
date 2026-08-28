@@ -97,6 +97,9 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 					n.registry.Upsert(other)
 				}
 			}
+			log.Debugf("n%s registry scan: %d rows, %d known nodes", n.ident.NodeID, len(rows), len(n.registry.All()))
+		} else {
+			log.Debugf("n%s registry scan failed: %v", n.ident.NodeID, err)
 		}
 		cancel()
 	}

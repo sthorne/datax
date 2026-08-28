@@ -84,18 +84,27 @@ type AdminSplitRequest struct {
 	RequestHeader // Key = split key
 }
 
+// AdminChangeReplicasRequest adds and/or removes one replica of the range
+// covering Key. Adds are preceded by a snapshot preseed of the target.
+type AdminChangeReplicasRequest struct {
+	RequestHeader
+	AddNode    base.NodeID `json:"add_node,omitempty"`
+	RemoveNode base.NodeID `json:"remove_node,omitempty"`
+}
+
 // RequestUnion holds exactly one request.
 type RequestUnion struct {
-	Get           *GetRequest           `json:"get,omitempty"`
-	Put           *PutRequest           `json:"put,omitempty"`
-	Delete        *DeleteRequest        `json:"delete,omitempty"`
-	Increment     *IncrementRequest     `json:"increment,omitempty"`
-	Scan          *ScanRequest          `json:"scan,omitempty"`
-	EndTxn        *EndTxnRequest        `json:"end_txn,omitempty"`
-	HeartbeatTxn  *HeartbeatTxnRequest  `json:"heartbeat_txn,omitempty"`
-	PushTxn       *PushTxnRequest       `json:"push_txn,omitempty"`
-	ResolveIntent *ResolveIntentRequest `json:"resolve_intent,omitempty"`
-	AdminSplit    *AdminSplitRequest    `json:"admin_split,omitempty"`
+	Get                 *GetRequest                 `json:"get,omitempty"`
+	Put                 *PutRequest                 `json:"put,omitempty"`
+	Delete              *DeleteRequest              `json:"delete,omitempty"`
+	Increment           *IncrementRequest           `json:"increment,omitempty"`
+	Scan                *ScanRequest                `json:"scan,omitempty"`
+	EndTxn              *EndTxnRequest              `json:"end_txn,omitempty"`
+	HeartbeatTxn        *HeartbeatTxnRequest        `json:"heartbeat_txn,omitempty"`
+	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
+	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
+	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
+	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -121,6 +130,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.ResolveIntent
 	case u.AdminSplit != nil:
 		return u.AdminSplit
+	case u.AdminChangeReplicas != nil:
+		return u.AdminChangeReplicas
 	}
 	return nil
 }
@@ -134,38 +145,41 @@ type Request interface {
 	IsReadOnly() bool
 }
 
-func (h *GetRequest) Header() RequestHeader           { return h.RequestHeader }
-func (h *PutRequest) Header() RequestHeader           { return h.RequestHeader }
-func (h *DeleteRequest) Header() RequestHeader        { return h.RequestHeader }
-func (h *IncrementRequest) Header() RequestHeader     { return h.RequestHeader }
-func (h *ScanRequest) Header() RequestHeader          { return h.RequestHeader }
-func (h *EndTxnRequest) Header() RequestHeader        { return h.RequestHeader }
-func (h *HeartbeatTxnRequest) Header() RequestHeader  { return h.RequestHeader }
-func (h *PushTxnRequest) Header() RequestHeader       { return h.RequestHeader }
-func (h *ResolveIntentRequest) Header() RequestHeader { return h.RequestHeader }
-func (h *AdminSplitRequest) Header() RequestHeader    { return h.RequestHeader }
+func (h *GetRequest) Header() RequestHeader                 { return h.RequestHeader }
+func (h *PutRequest) Header() RequestHeader                 { return h.RequestHeader }
+func (h *DeleteRequest) Header() RequestHeader              { return h.RequestHeader }
+func (h *IncrementRequest) Header() RequestHeader           { return h.RequestHeader }
+func (h *ScanRequest) Header() RequestHeader                { return h.RequestHeader }
+func (h *EndTxnRequest) Header() RequestHeader              { return h.RequestHeader }
+func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHeader }
+func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
+func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
+func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
+func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
 
-func (*GetRequest) Method() string           { return "Get" }
-func (*PutRequest) Method() string           { return "Put" }
-func (*DeleteRequest) Method() string        { return "Delete" }
-func (*IncrementRequest) Method() string     { return "Increment" }
-func (*ScanRequest) Method() string          { return "Scan" }
-func (*EndTxnRequest) Method() string        { return "EndTxn" }
-func (*HeartbeatTxnRequest) Method() string  { return "HeartbeatTxn" }
-func (*PushTxnRequest) Method() string       { return "PushTxn" }
-func (*ResolveIntentRequest) Method() string { return "ResolveIntent" }
-func (*AdminSplitRequest) Method() string    { return "AdminSplit" }
+func (*GetRequest) Method() string                 { return "Get" }
+func (*PutRequest) Method() string                 { return "Put" }
+func (*DeleteRequest) Method() string              { return "Delete" }
+func (*IncrementRequest) Method() string           { return "Increment" }
+func (*ScanRequest) Method() string                { return "Scan" }
+func (*EndTxnRequest) Method() string              { return "EndTxn" }
+func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
+func (*PushTxnRequest) Method() string             { return "PushTxn" }
+func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
+func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
+func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
 
-func (*GetRequest) IsReadOnly() bool           { return true }
-func (*PutRequest) IsReadOnly() bool           { return false }
-func (*DeleteRequest) IsReadOnly() bool        { return false }
-func (*IncrementRequest) IsReadOnly() bool     { return false }
-func (*ScanRequest) IsReadOnly() bool          { return true }
-func (*EndTxnRequest) IsReadOnly() bool        { return false }
-func (*HeartbeatTxnRequest) IsReadOnly() bool  { return false }
-func (*PushTxnRequest) IsReadOnly() bool       { return false }
-func (*ResolveIntentRequest) IsReadOnly() bool { return false }
-func (*AdminSplitRequest) IsReadOnly() bool    { return false }
+func (*GetRequest) IsReadOnly() bool                 { return true }
+func (*PutRequest) IsReadOnly() bool                 { return false }
+func (*DeleteRequest) IsReadOnly() bool              { return false }
+func (*IncrementRequest) IsReadOnly() bool           { return false }
+func (*ScanRequest) IsReadOnly() bool                { return true }
+func (*EndTxnRequest) IsReadOnly() bool              { return false }
+func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
+func (*PushTxnRequest) IsReadOnly() bool             { return false }
+func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
+func (*AdminSplitRequest) IsReadOnly() bool          { return false }
+func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
 
 // Response types.
 
@@ -212,18 +226,23 @@ type AdminSplitResponse struct {
 	Right RangeDescriptor `json:"right"`
 }
 
+type AdminChangeReplicasResponse struct {
+	Desc RangeDescriptor `json:"desc"`
+}
+
 // ResponseUnion holds exactly one response.
 type ResponseUnion struct {
-	Get           *GetResponse           `json:"get,omitempty"`
-	Put           *PutResponse           `json:"put,omitempty"`
-	Delete        *DeleteResponse        `json:"delete,omitempty"`
-	Increment     *IncrementResponse     `json:"increment,omitempty"`
-	Scan          *ScanResponse          `json:"scan,omitempty"`
-	EndTxn        *EndTxnResponse        `json:"end_txn,omitempty"`
-	HeartbeatTxn  *HeartbeatTxnResponse  `json:"heartbeat_txn,omitempty"`
-	PushTxn       *PushTxnResponse       `json:"push_txn,omitempty"`
-	ResolveIntent *ResolveIntentResponse `json:"resolve_intent,omitempty"`
-	AdminSplit    *AdminSplitResponse    `json:"admin_split,omitempty"`
+	Get                 *GetResponse                 `json:"get,omitempty"`
+	Put                 *PutResponse                 `json:"put,omitempty"`
+	Delete              *DeleteResponse              `json:"delete,omitempty"`
+	Increment           *IncrementResponse           `json:"increment,omitempty"`
+	Scan                *ScanResponse                `json:"scan,omitempty"`
+	EndTxn              *EndTxnResponse              `json:"end_txn,omitempty"`
+	HeartbeatTxn        *HeartbeatTxnResponse        `json:"heartbeat_txn,omitempty"`
+	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
+	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
+	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
+	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -298,6 +317,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.ResolveIntent = t
 	case *AdminSplitRequest:
 		u.AdminSplit = t
+	case *AdminChangeReplicasRequest:
+		u.AdminChangeReplicas = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

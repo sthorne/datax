@@ -81,13 +81,17 @@ func (x *Hlc) GetLogical() int32 {
 }
 
 type RaftEnvelope struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RangeId       int64                  `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
-	ToReplica     uint64                 `protobuf:"varint,2,opt,name=to_replica,json=toReplica,proto3" json:"to_replica,omitempty"`
-	FromReplica   uint64                 `protobuf:"varint,3,opt,name=from_replica,json=fromReplica,proto3" json:"from_replica,omitempty"`
-	FromNode      int32                  `protobuf:"varint,4,opt,name=from_node,json=fromNode,proto3" json:"from_node,omitempty"`
-	Message       []byte                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"` // marshaled raftpb.Message
-	Now           *Hlc                   `protobuf:"bytes,6,opt,name=now,proto3" json:"now,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	RangeId     int64                  `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
+	ToReplica   uint64                 `protobuf:"varint,2,opt,name=to_replica,json=toReplica,proto3" json:"to_replica,omitempty"`
+	FromReplica uint64                 `protobuf:"varint,3,opt,name=from_replica,json=fromReplica,proto3" json:"from_replica,omitempty"`
+	FromNode    int32                  `protobuf:"varint,4,opt,name=from_node,json=fromNode,proto3" json:"from_node,omitempty"`
+	Message     []byte                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"` // marshaled raftpb.Message
+	Now         *Hlc                   `protobuf:"bytes,6,opt,name=now,proto3" json:"now,omitempty"`
+	// The sender's RPC address: receivers learn peer addresses from Raft
+	// traffic itself, so elections never depend on reading the (possibly
+	// leaderless) registry range.
+	FromAddr      string `protobuf:"bytes,7,opt,name=from_addr,json=fromAddr,proto3" json:"from_addr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -162,6 +166,13 @@ func (x *RaftEnvelope) GetNow() *Hlc {
 		return x.Now
 	}
 	return nil
+}
+
+func (x *RaftEnvelope) GetFromAddr() string {
+	if x != nil {
+		return x.FromAddr
+	}
+	return ""
 }
 
 type RaftAck struct {
@@ -409,7 +420,7 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\x18datax/v1/transport.proto\x12\bdatax.v1\"<\n" +
 	"\x03Hlc\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
-	"\alogical\x18\x02 \x01(\x05R\alogical\"\xc3\x01\n" +
+	"\alogical\x18\x02 \x01(\x05R\alogical\"\xe0\x01\n" +
 	"\fRaftEnvelope\x12\x19\n" +
 	"\brange_id\x18\x01 \x01(\x03R\arangeId\x12\x1d\n" +
 	"\n" +
@@ -417,7 +428,8 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\ffrom_replica\x18\x03 \x01(\x04R\vfromReplica\x12\x1b\n" +
 	"\tfrom_node\x18\x04 \x01(\x05R\bfromNode\x12\x18\n" +
 	"\amessage\x18\x05 \x01(\fR\amessage\x12\x1f\n" +
-	"\x03now\x18\x06 \x01(\v2\r.datax.v1.HlcR\x03now\"\t\n" +
+	"\x03now\x18\x06 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1b\n" +
+	"\tfrom_addr\x18\a \x01(\tR\bfromAddr\"\t\n" +
 	"\aRaftAck\">\n" +
 	"\aPayload\x12\x12\n" +
 	"\x04json\x18\x01 \x01(\fR\x04json\x12\x1f\n" +

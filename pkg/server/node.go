@@ -39,6 +39,9 @@ type Config struct {
 	BootstrapSelf bool
 	Locality      base.Locality
 	MaxOffset     time.Duration
+	// UpreplicationInterval is how often the repair loop scans for
+	// under-replicated ranges (default 3s).
+	UpreplicationInterval time.Duration
 
 	// Test hooks.
 	Engine          *storage.Engine
@@ -163,22 +166,34 @@ func (n *Node) start() error {
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
-		NodeID:    n.ident.NodeID,
-		StoreID:   n.ident.StoreID,
-		Engine:    n.engine,
-		Clock:     n.clock,
-		Transport: n.trans,
-		Stopper:   n.stopper,
+		NodeID:         n.ident.NodeID,
+		StoreID:        n.ident.StoreID,
+		Engine:         n.engine,
+		Clock:          n.clock,
+		Transport:      n.trans,
+		SnapshotSender: n.trans,
+		Stopper:        n.stopper,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
+	n.db.SetNodeLister(func() []base.NodeID {
+		nodes := n.registry.All()
+		ids := make([]base.NodeID, len(nodes))
+		for i, nd := range nodes {
+			ids[i] = nd.NodeID
+		}
+		return ids
+	})
 	n.store.SetSender(n.db)
 
+	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
 	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
-		Batch: n.handleBatch,
-		Join:  n.handleJoin,
-		Admin: n.handleAdmin,
-		Raft:  n.store.HandleRaftMessage,
+		Batch:    n.handleBatch,
+		Join:     n.handleJoin,
+		Admin:    n.handleAdmin,
+		Raft:     n.store.HandleRaftMessage,
+		Snapshot: n.store.ApplySnapshotStream,
+		NodeInfo: n.registry.UpsertAddress,
 	})
 	// Not a stopper worker: Serve exits when the closer calls Stop, and
 	// closers run after workers — a worker here would deadlock shutdown.
@@ -213,6 +228,9 @@ func (n *Node) start() error {
 	})
 
 	if err := n.stopper.RunWorker(n.heartbeatLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.upreplicationLoop); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)

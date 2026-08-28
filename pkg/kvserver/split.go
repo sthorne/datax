@@ -152,7 +152,7 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 }
 
 func (r *Replica) applySnapshot(snap raftpb.Snapshot) error {
-	return fmt.Errorf("incoming raft snapshots not implemented yet")
+	// Replicas are seeded out of band (preseed + ConfChange, see
+	// replicate.go), so raft-internal snapshots never fire in v1.
+	return fmt.Errorf("unexpected raft-internal snapshot")
 }
-
-func (r *Replica) maybeCompleteConfChange(cc raftpb.ConfChange) {}

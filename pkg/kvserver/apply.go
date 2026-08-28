@@ -39,11 +39,44 @@ func (r *Replica) applyEntry(ent raftpb.Entry) error {
 		}
 		state := r.node.ApplyConfChange(cc)
 		r.rs.setConfStateRaw(*state)
-		if err := r.persistAppliedIndex(ent.Index); err != nil {
+
+		// Membership-change conf changes carry the new descriptor; adopt it
+		// atomically with the applied index. (Bootstrap conf changes from
+		// StartNode carry no context.)
+		var newDesc *kvpb.RangeDescriptor
+		if len(cc.Context) > 0 {
+			var ccCtx confChangeContext
+			if err := json.Unmarshal(cc.Context, &ccCtx); err != nil {
+				return fmt.Errorf("corrupt conf change context: %w", err)
+			}
+			newDesc = &ccCtx.Desc
+		}
+		b := r.store.cfg.Engine.NewBatch()
+		if newDesc != nil {
+			if err := PutRangeDescriptor(b, *newDesc); err != nil {
+				_ = b.Close()
+				return err
+			}
+		}
+		if err := r.stageAppliedIndex(b, ent.Index); err != nil {
+			_ = b.Close()
 			return err
 		}
+		if err := b.Commit(false); err != nil {
+			return err
+		}
+		if newDesc != nil {
+			r.mu.Lock()
+			r.mu.desc = *newDesc
+			r.mu.Unlock()
+		}
 		r.setApplied(ent.Index)
-		r.maybeCompleteConfChange(cc)
+
+		if cc.Type == raftpb.ConfChangeRemoveNode && newDesc != nil {
+			if _, stillMember := newDesc.GetReplica(r.store.cfg.NodeID); !stillMember {
+				return errReplicaRemoved
+			}
+		}
 		return nil
 
 	case raftpb.EntryNormal:

@@ -97,6 +97,41 @@ func (e *Engine) NewBatch() *Batch {
 	return &Batch{b: e.db.NewIndexedBatch()}
 }
 
+// NewSnapshot returns a consistent point-in-time read view. Range snapshots
+// are captured through one of these so the applied index and the data it
+// covers are mutually consistent.
+func (e *Engine) NewSnapshot() *Snapshot {
+	return &Snapshot{s: e.db.NewSnapshot()}
+}
+
+// Snapshot is a consistent read view of the engine.
+type Snapshot struct {
+	s *pebble.Snapshot
+}
+
+func (s *Snapshot) Get(key []byte) ([]byte, error) {
+	v, closer, err := s.s.Get(key)
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := append([]byte(nil), v...)
+	_ = closer.Close()
+	return out, nil
+}
+
+func (s *Snapshot) NewIter(lower, upper []byte) Iterator {
+	it, err := s.s.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return &errIter{err: err}
+	}
+	return &pebbleIter{it: it}
+}
+
+func (s *Snapshot) Close() error { return s.s.Close() }
+
 // Batch is an atomic, indexed write batch.
 type Batch struct {
 	b *pebble.Batch

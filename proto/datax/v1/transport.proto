@@ -41,6 +41,10 @@ message RaftEnvelope {
   int32 from_node = 4;
   bytes message = 5; // marshaled raftpb.Message
   Hlc now = 6;
+  // The sender's RPC address: receivers learn peer addresses from Raft
+  // traffic itself, so elections never depend on reading the (possibly
+  // leaderless) registry range.
+  string from_addr = 7;
 }
 
 message RaftAck {}
