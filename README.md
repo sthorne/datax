@@ -94,7 +94,6 @@ This is a prototype. Out of scope so far, deliberately:
 
 | Area | Not yet implemented |
 |---|---|
-| Storage | raft log truncation (logs accumulate until v2.4) |
 | Ranges | automatic split/merge (splits are manual: `datax debug split`) |
 | Placement | automatic rebalancing and dead-node repair; node decommission |
 | Reads | leaseholder/follower reads (reads go through the Raft leader via ReadIndex) |

@@ -61,9 +61,10 @@ const gcChunkSize = 1000
 
 // StartHousekeeping starts the store's background maintenance loop. Each
 // tick, for every range this store leads, garbage older than gcTTL is
-// collected. Non-positive values disable the loop.
+// collected (gcTTL <= 0 disables GC) and the Raft log is truncated when
+// enough of it is reclaimable. A non-positive interval disables the loop.
 func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
-	if gcTTL <= 0 || gcInterval <= 0 {
+	if gcInterval <= 0 {
 		return nil
 	}
 	return s.cfg.Stopper.RunWorker(func(ctx context.Context) {
@@ -74,7 +75,10 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				s.RunGCOnce(ctx, gcTTL)
+				if gcTTL > 0 {
+					s.RunGCOnce(ctx, gcTTL)
+				}
+				s.RunLogTruncationOnce(ctx)
 			}
 		}
 	})

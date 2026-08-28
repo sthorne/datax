@@ -111,6 +111,19 @@ type GCRequest struct {
 	TxnRecordKeys []keys.Key    `json:"txn_record_keys,omitempty"`
 }
 
+// TruncateLogRequest discards the range's Raft log at or below Index
+// (whose term is Term). Proposed by the leader's housekeeping loop with
+// Index <= min(every voter's durably-appended Match, the leader's applied
+// index) minus a safety floor — so no live voter can ever need a truncated
+// entry, across elections included. Replicated: each replica deletes its own
+// (unreplicated) log prefix when the command applies, at which point it has
+// durably applied everything at or below Index.
+type TruncateLogRequest struct {
+	RequestHeader        // Key = range start key
+	Index         uint64 `json:"index"`
+	Term          uint64 `json:"term"`
+}
+
 // AdminSplitRequest splits the range containing SplitKey at SplitKey.
 type AdminSplitRequest struct {
 	RequestHeader // Key = split key
@@ -137,6 +150,7 @@ type RequestUnion struct {
 	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
 	Refresh             *RefreshRequest             `json:"refresh,omitempty"`
 	GC                  *GCRequest                  `json:"gc,omitempty"`
+	TruncateLog         *TruncateLogRequest         `json:"truncate_log,omitempty"`
 	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
 }
@@ -166,6 +180,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Refresh
 	case u.GC != nil:
 		return u.GC
+	case u.TruncateLog != nil:
+		return u.TruncateLog
 	case u.AdminSplit != nil:
 		return u.AdminSplit
 	case u.AdminChangeReplicas != nil:
@@ -194,6 +210,7 @@ func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHe
 func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
 func (h *RefreshRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *GCRequest) Header() RequestHeader                  { return h.RequestHeader }
+func (h *TruncateLogRequest) Header() RequestHeader         { return h.RequestHeader }
 func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
 
@@ -208,6 +225,7 @@ func (*PushTxnRequest) Method() string             { return "PushTxn" }
 func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
 func (*RefreshRequest) Method() string             { return "Refresh" }
 func (*GCRequest) Method() string                  { return "GC" }
+func (*TruncateLogRequest) Method() string         { return "TruncateLog" }
 func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
 func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
 
@@ -222,6 +240,7 @@ func (*PushTxnRequest) IsReadOnly() bool             { return false }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
 func (*RefreshRequest) IsReadOnly() bool             { return true }
 func (*GCRequest) IsReadOnly() bool                  { return false }
+func (*TruncateLogRequest) IsReadOnly() bool         { return false }
 func (*AdminSplitRequest) IsReadOnly() bool          { return false }
 func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
 
@@ -274,6 +293,8 @@ type RefreshResponse struct{}
 
 type GCResponse struct{}
 
+type TruncateLogResponse struct{}
+
 type AdminChangeReplicasResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
@@ -291,6 +312,7 @@ type ResponseUnion struct {
 	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
 	Refresh             *RefreshResponse             `json:"refresh,omitempty"`
 	GC                  *GCResponse                  `json:"gc,omitempty"`
+	TruncateLog         *TruncateLogResponse         `json:"truncate_log,omitempty"`
 	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
 }
@@ -369,6 +391,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Refresh = t
 	case *GCRequest:
 		u.GC = t
+	case *TruncateLogRequest:
+		u.TruncateLog = t
 	case *AdminSplitRequest:
 		u.AdminSplit = t
 	case *AdminChangeReplicasRequest:

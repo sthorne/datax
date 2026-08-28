@@ -15,6 +15,7 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/storage"
 )
 
 // TestCluster is a set of in-process nodes sharing one cluster.
@@ -75,6 +76,57 @@ func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
 	}
 	t.Cleanup(tc.StopAll)
 	return tc
+}
+
+// StartWithEngines brings up numNodes static-membership nodes over injected
+// in-memory engines, so tests can inspect raw storage. The background
+// housekeeping loop is disabled; tests drive GC/truncation explicitly.
+func StartWithEngines(t *testing.T, numNodes int) (*TestCluster, []*storage.Engine) {
+	t.Helper()
+	clusterID := uuid.New()
+	engines := make([]*storage.Engine, numNodes)
+	listeners := make([]net.Listener, numNodes)
+	nodeIDs := make([]base.NodeID, numNodes)
+	var nodeDescs []kvpb.NodeDescriptor
+	for i := 0; i < numNodes; i++ {
+		eng, err := storage.Open("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		engines[i] = eng
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = lis
+		nodeIDs[i] = base.NodeID(i + 1)
+		nodeDescs = append(nodeDescs, kvpb.NodeDescriptor{
+			NodeID: nodeIDs[i], Address: lis.Addr().String(), LivenessTime: time.Now().UnixNano(),
+		})
+	}
+	range1 := cluster.Range1Descriptor(nodeIDs)
+	tc := &TestCluster{T: t}
+	t.Cleanup(func() {
+		for _, eng := range engines {
+			_ = eng.Close()
+		}
+	})
+	for i := 0; i < numNodes; i++ {
+		n, err := server.Start(server.Config{
+			Listener:   listeners[i],
+			Engine:     engines[i],
+			GCInterval: -1, // no background housekeeping
+			StaticBootstrap: &server.StaticBootstrap{
+				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
+			},
+		})
+		if err != nil {
+			t.Fatalf("starting node %d: %v", i+1, err)
+		}
+		tc.Nodes = append(tc.Nodes, n)
+	}
+	t.Cleanup(tc.StopAll)
+	return tc, engines
 }
 
 func locality(t *testing.T, localities []string, i int) base.Locality {

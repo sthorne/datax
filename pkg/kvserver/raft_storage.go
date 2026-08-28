@@ -20,8 +20,8 @@ import (
 // raftStorage implements raft.Storage on top of the store's Pebble engine,
 // reading the per-replica unreplicated keys (HardState, log entries).
 //
-// Log truncation is not implemented in v1: FirstIndex is always 1 and the
-// log grows until the range is snapshotted away or the process is rebuilt.
+// The log is truncated by replicated TruncateLog commands (see truncate.go);
+// FirstIndex is the truncation point plus one.
 type raftStorage struct {
 	eng     *storage.Engine
 	rangeID base.RangeID
@@ -236,6 +236,32 @@ func (rs *raftStorage) append(b *storage.Batch, ents []raftpb.Entry) error {
 	}
 	rs.mu.Lock()
 	rs.mu.lastIndex = newLast
+	rs.mu.Unlock()
+	return nil
+}
+
+// stageTruncate stages deletion of all log entries at or below index into b
+// and adopts the new truncated state (index, term). Idempotent: replayed or
+// stale truncations are no-ops. Called from the apply path only, so raft is
+// not concurrently reading the storage (Ready handling is single-threaded).
+func (rs *raftStorage) stageTruncate(b *storage.Batch, index, term uint64) error {
+	rs.mu.Lock()
+	old := rs.mu.truncated.index
+	last := rs.mu.lastIndex
+	rs.mu.Unlock()
+	if index <= old {
+		return nil
+	}
+	if index > last {
+		return fmt.Errorf("truncating to %d beyond last index %d", index, last)
+	}
+	for i := old + 1; i <= index; i++ {
+		if err := b.Delete(keys.RaftLogKey(rs.rangeID, i)); err != nil {
+			return err
+		}
+	}
+	rs.mu.Lock()
+	rs.mu.truncated.index, rs.mu.truncated.term = index, term
 	rs.mu.Unlock()
 	return nil
 }

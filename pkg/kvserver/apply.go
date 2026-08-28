@@ -286,6 +286,15 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				}
 			}
 			ru.GC = &kvpb.GCResponse{}
+		case *kvpb.TruncateLogRequest:
+			// Applying this entry means everything at or below it — Index
+			// included — is durably applied here, so the local log prefix is
+			// no longer needed. The new truncated state is persisted by
+			// stageAppliedIndex in this same batch.
+			if err := r.rs.stageTruncate(b, req.Index, req.Term); err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.TruncateLog = &kvpb.TruncateLogResponse{}
 		default:
 			return nil, kvpb.NewErrorf("unsupported request in write batch: %T", ba.Requests[i].GetInner())
 		}

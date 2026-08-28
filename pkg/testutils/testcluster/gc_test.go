@@ -259,52 +259,8 @@ func TestGCTxnRecordsAndResurrectionGuard(t *testing.T) {
 // replica's raw engine content over the data span converges to the same
 // bytes with old versions gone — the replicated-GC divergence tripwire.
 func TestGCReplicaConsistency(t *testing.T) {
-	const numNodes = 3
-	clusterID := uuid.New()
-	engines := make([]*storage.Engine, numNodes)
-	listeners := make([]net.Listener, numNodes)
-	nodeIDs := make([]base.NodeID, numNodes)
-	var nodeDescs []kvpb.NodeDescriptor
-	for i := 0; i < numNodes; i++ {
-		eng, err := storage.Open("")
-		if err != nil {
-			t.Fatal(err)
-		}
-		engines[i] = eng
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		listeners[i] = lis
-		nodeIDs[i] = base.NodeID(i + 1)
-		nodeDescs = append(nodeDescs, kvpb.NodeDescriptor{
-			NodeID: nodeIDs[i], Address: lis.Addr().String(), LivenessTime: time.Now().UnixNano(),
-		})
-	}
-	range1 := cluster.Range1Descriptor(nodeIDs)
-	nodes := make([]*server.Node, numNodes)
-	for i := 0; i < numNodes; i++ {
-		n, err := server.Start(server.Config{
-			Listener: listeners[i],
-			Engine:   engines[i],
-			GCTTL:    -1,
-			StaticBootstrap: &server.StaticBootstrap{
-				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
-			},
-		})
-		if err != nil {
-			t.Fatalf("starting node %d: %v", i+1, err)
-		}
-		nodes[i] = n
-	}
-	t.Cleanup(func() {
-		for _, n := range nodes {
-			n.Stop()
-		}
-		for _, eng := range engines {
-			_ = eng.Close()
-		}
-	})
+	tc, engines := StartWithEngines(t, 3)
+	nodes := tc.Nodes
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -333,8 +289,8 @@ func TestGCReplicaConsistency(t *testing.T) {
 	spanHi := storage.EncodeMVCCKey(prefix.PrefixEnd(), hlc.Timestamp{})
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		sums := make([][32]byte, numNodes)
-		counts := make([]int, numNodes)
+		sums := make([][32]byte, len(engines))
+		counts := make([]int, len(engines))
 		for i, eng := range engines {
 			h := sha256.New()
 			it := eng.NewIter(spanLo, spanHi)

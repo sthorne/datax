@@ -89,6 +89,29 @@ descriptor + applied index) over gRPC **before** the ConfChange commits
 snapshot through Raft. Configuration changes happen one replica at a time (no
 joint consensus in v1).
 
+## Raft log truncation
+
+The log is bounded by leader-driven, **replicated** `TruncateLog` commands
+(v2). Each housekeeping tick the leader computes
+
+```
+truncIdx = min(every voter's Match, leader's applied index) − floor (64)
+```
+
+and proposes a truncation when at least 256 entries would be reclaimed.
+`Match` is what a voter has *durably appended*, so the invariant is: **no
+live voter ever needs a truncated entry** — including across elections,
+since any electable peer's log already covers the truncated prefix. Each
+replica deletes its own (unreplicated) log prefix when the command applies,
+at which point it has durably applied everything at or below the index;
+`TruncatedIndex/Term` persist atomically with the applied index, so
+restarts resume from the truncation point.
+
+A dead voter's `Match` freezes and **pins truncation** — deliberate, since
+datax has no raft-internal snapshot delivery: the log must stay sufficient
+to catch up any configured voter. Dead-node repair (removing the dead
+replica) is what unpins it.
+
 ## Rack-aware placement
 
 Nodes declare an ordered locality at startup:
