@@ -97,9 +97,11 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 					n.registry.Upsert(other)
 				}
 			}
-			log.Debugf("n%s registry scan: %d rows, %d known nodes", n.ident.NodeID, len(rows), len(n.registry.All()))
+			if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
+				log.Debugf("persisting registry: %v", err)
+			}
 		} else {
-			log.Debugf("n%s registry scan failed: %v", n.ident.NodeID, err)
+			log.Debugf("%s registry scan failed: %v", n.ident.NodeID, err)
 		}
 		cancel()
 	}

@@ -39,6 +39,22 @@ because range membership of a key is logical. The `/meta/` addressing records
 are then updated transactionally. Automatic split-by-size and merges are
 future work.
 
+## Peer discovery
+
+Range addressing lives in the KV layer, but node *addresses* deliberately do
+not depend on it — two mechanisms break what would otherwise be a
+circularity (an election needs peer addresses; addresses in a registry
+range; the registry range needs an election):
+
+- **Address piggybacking**: every Raft envelope carries the sender's node
+  ID and RPC address; receivers learn peers from Raft traffic itself.
+- **Persisted registry**: each node saves its last known node registry to a
+  local store key and reloads it at startup, so a fully restarted cluster
+  can re-form with no leader anywhere and no `--join` flags.
+
+The registry rows in range 1 (with localities and liveness) remain the
+authority for the allocator; these mechanisms only guarantee reachability.
+
 ## Membership and bootstrap
 
 No gossip protocol in v1; membership is join-based:

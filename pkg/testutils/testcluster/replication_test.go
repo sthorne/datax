@@ -124,3 +124,50 @@ func TestRestartRecovery(t *testing.T) {
 		t.Fatalf("lost write across restart: got %q", v)
 	}
 }
+
+// TestFullClusterRestart: every node of a 3-node on-disk cluster is stopped,
+// then all restart. Peer addresses come back from the persisted registry
+// (no range has a leader to serve them), Raft logs replay, and data
+// survives.
+func TestFullClusterRestart(t *testing.T) {
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	tc := &TestCluster{T: t}
+	n1 := startDiskNode(t, dirs[0], true, "")
+	tc.Nodes = append(tc.Nodes, n1)
+	n2 := startDiskNode(t, dirs[1], false, n1.Addr())
+	n3 := startDiskNode(t, dirs[2], false, n1.Addr())
+	tc.Nodes = append(tc.Nodes, n2, n3)
+	defer tc.StopAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := tc.waitForReplication(ctx, 3, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := n1.DB().Put(ctx, testKey("survives"), []byte("restart")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Stop everything; the cluster is fully dark.
+	addrs := []string{n1.Addr(), n2.Addr(), n3.Addr()}
+	for i := range tc.Nodes {
+		tc.StopNode(i)
+	}
+	_ = addrs
+
+	// Restart all three (no --join: initialized stores rely on the
+	// persisted registry to find each other).
+	for i := range dirs {
+		tc.Nodes = append(tc.Nodes, startDiskNode(t, dirs[i], false, ""))
+	}
+	v, err := tc.Nodes[3].DB().Get(ctx, testKey("survives"))
+	if err != nil {
+		t.Fatalf("get after full restart: %v", err)
+	}
+	if string(v) != "restart" {
+		t.Fatalf("got %q", v)
+	}
+	if err := tc.Nodes[4].DB().Put(ctx, testKey("post-restart"), []byte("ok")); err != nil {
+		t.Fatalf("write after full restart: %v", err)
+	}
+}

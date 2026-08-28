@@ -134,6 +134,15 @@ func (n *Node) start() error {
 	switch {
 	case initialized:
 		n.ident = ident
+		// A restarting node must reach its peers before any range can
+		// elect a leader: reload the last known registry.
+		if nodes, err := cluster.LoadPersistedRegistry(n.engine); err == nil {
+			for _, nd := range nodes {
+				if nd.NodeID != n.ident.NodeID {
+					n.registry.Upsert(nd)
+				}
+			}
+		}
 	case n.cfg.BootstrapSelf:
 		id := cluster.StoreIdent{ClusterID: uuid.New(), NodeID: 1, StoreID: 1}
 		desc := cluster.Range1Descriptor([]base.NodeID{1})
@@ -226,6 +235,9 @@ func (n *Node) start() error {
 		NodeID: n.ident.NodeID, Address: n.addr, Locality: n.cfg.Locality,
 		LivenessTime: n.clock.Now().WallTime,
 	})
+	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
+		log.Warnf("persisting registry: %v", err)
+	}
 
 	if err := n.stopper.RunWorker(n.heartbeatLoop); err != nil {
 		return err

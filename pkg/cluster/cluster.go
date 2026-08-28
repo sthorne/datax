@@ -110,6 +110,30 @@ func Range1Descriptor(nodeIDs []base.NodeID) kvpb.RangeDescriptor {
 	return desc
 }
 
+// PersistRegistry saves the node registry to a local store key, letting a
+// restarted node reach its peers before any range has a leader (the
+// bootstrap of the bootstrap).
+func PersistRegistry(eng *storage.Engine, nodes []kvpb.NodeDescriptor) error {
+	raw, err := json.Marshal(nodes)
+	if err != nil {
+		return err
+	}
+	return eng.Put(keys.StoreRegistryKey(), raw)
+}
+
+// LoadPersistedRegistry reads the registry saved by PersistRegistry.
+func LoadPersistedRegistry(eng *storage.Engine) ([]kvpb.NodeDescriptor, error) {
+	raw, err := eng.Get(keys.StoreRegistryKey())
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	var nodes []kvpb.NodeDescriptor
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		return nil, fmt.Errorf("corrupt persisted registry: %w", err)
+	}
+	return nodes, nil
+}
+
 // JoinRequest is sent by a new node to any existing node.
 type JoinRequest struct {
 	Address  string        `json:"address"`

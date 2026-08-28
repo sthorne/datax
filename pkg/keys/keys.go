@@ -88,6 +88,12 @@ func StoreIdentKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-ident")...)
 }
 
+// StoreRegistryKey holds this store's last known node registry (JSON), so a
+// restarted node can reach its peers before any range has a leader.
+func StoreRegistryKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-registry")...)
+}
+
 // ---------------------------------------------------------------------------
 // Replica-local, unreplicated Raft state, per range.
 

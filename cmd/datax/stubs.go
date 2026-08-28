@@ -1,9 +1,0 @@
-package main
-
-import "errors"
-
-// Placeholder implementations, replaced as the corresponding subsystems land.
-
-var errNotImplemented = errors.New("not implemented yet")
-
-func runDemo(args []string) error { return errNotImplemented }

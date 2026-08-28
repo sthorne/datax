@@ -101,7 +101,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Transactions | read refresh, parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | secondary indexes, joins, aggregates, ORDER BY, ALTER, most types |
 | Wire | TLS, SCRAM auth (trust auth only), binary extended-protocol parameters |
-| Ops | observability UI, metrics endpoints |
+| Ops | observability UI, metrics endpoints; a restarted node must keep its address (no address-change story) |
 
 ## License
 

@@ -5,6 +5,7 @@ package testcluster
 import (
 	"encoding/json"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,12 +142,14 @@ func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
 }
 
 // startDiskNode starts a node backed by an on-disk store (restart tests).
+// A restarted node must come back on its previous address — peers find it
+// through the persisted registry — so the listener address is reused via
+// the store directory name mapping kept by the caller (here: we bind :0 the
+// first time and the SAME port after, since datax has no address-change
+// story in v1).
 func startDiskNode(t *testing.T, dir string, bootstrap bool, join string) *server.Node {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	lis := listenerForDir(t, dir)
 	n, err := server.Start(server.Config{
 		Dir:           dir,
 		Listener:      lis,
@@ -157,6 +160,22 @@ func startDiskNode(t *testing.T, dir string, bootstrap bool, join string) *serve
 		t.Fatalf("starting disk node: %v", err)
 	}
 	return n
+}
+
+var diskAddrs sync.Map // dir -> address, so restarts reuse their port
+
+func listenerForDir(t *testing.T, dir string) net.Listener {
+	t.Helper()
+	addr := "127.0.0.1:0"
+	if prev, ok := diskAddrs.Load(dir); ok {
+		addr = prev.(string)
+	}
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskAddrs.Store(dir, lis.Addr().String())
+	return lis
 }
 
 // StopNode stops one node (simulating a crash) and forgets it.
