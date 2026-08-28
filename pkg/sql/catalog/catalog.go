@@ -26,13 +26,52 @@ type Column struct {
 	NotNull bool         `json:"not_null,omitempty"`
 }
 
-// TableDescriptor describes a table. Rows are stored at
-// /t/<ID>/<encoded primary key> (see pkg/sql/rowenc).
+// IndexDescriptor describes a secondary index. Entries live at
+// /t/<tableID>/<ID>/ (see pkg/sql/rowenc): non-unique keys append the
+// primary key columns after the indexed ones; unique keys carry the encoded
+// primary key as the entry's value.
+type IndexDescriptor struct {
+	ID        uint64     `json:"id"`
+	Name      string     `json:"name"`
+	Unique    bool       `json:"unique,omitempty"`
+	ColumnIDs []ColumnID `json:"column_ids"`
+}
+
+// TableDescriptor describes a table. Primary rows are stored at
+// /t/<ID>/1/<encoded primary key> (see pkg/sql/rowenc).
 type TableDescriptor struct {
 	ID         uint64     `json:"id"`
 	Name       string     `json:"name"`
 	Columns    []Column   `json:"columns"`
 	PrimaryKey []ColumnID `json:"primary_key"`
+	// Indexes are the table's secondary indexes. NextIndexID is the next
+	// index ID to allocate (primary rows are index 1; secondaries start at
+	// 2; IDs are never reused).
+	Indexes     []IndexDescriptor `json:"indexes,omitempty"`
+	NextIndexID uint64            `json:"next_index_id,omitempty"`
+}
+
+// Index returns the secondary index with the given name.
+func (d *TableDescriptor) Index(name string) (IndexDescriptor, bool) {
+	for _, idx := range d.Indexes {
+		if idx.Name == name {
+			return idx, true
+		}
+	}
+	return IndexDescriptor{}, false
+}
+
+// Clone deep-copies the descriptor (mutate copies, never cached ones).
+func (d *TableDescriptor) Clone() *TableDescriptor {
+	out := *d
+	out.Columns = append([]Column(nil), d.Columns...)
+	out.PrimaryKey = append([]ColumnID(nil), d.PrimaryKey...)
+	out.Indexes = make([]IndexDescriptor, len(d.Indexes))
+	for i, idx := range d.Indexes {
+		out.Indexes[i] = idx
+		out.Indexes[i].ColumnIDs = append([]ColumnID(nil), idx.ColumnIDs...)
+	}
+	return &out
 }
 
 // Col returns the column with the given name.
@@ -161,6 +200,20 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 		return err
 	}
 	if err := txn.Put(ctx, keys.NamespaceKey(d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+		return err
+	}
+	a.Invalidate(d.Name)
+	return nil
+}
+
+// Update rewrites an existing table's descriptor within txn (DDL like
+// CREATE INDEX / ALTER TABLE).
+func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	if err := txn.Put(ctx, keys.TableDescKey(d.ID), raw); err != nil {
 		return err
 	}
 	a.Invalidate(d.Name)

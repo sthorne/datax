@@ -191,6 +191,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		return cols, nil
 
+	case *parser.Explain:
+		return []ResultColumn{{Name: "plan", Type: types.String}}, nil
+
 	case *parser.ShowTables:
 		return []ResultColumn{{Name: "table_name", Type: types.String}}, nil
 

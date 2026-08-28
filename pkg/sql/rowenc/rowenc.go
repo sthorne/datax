@@ -252,3 +252,107 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// Secondary index entries.
+
+// EncodeIndexPrefix builds an index key prefix from the leading index
+// column values (fewer datums than index columns = a scan prefix).
+func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, vals []types.Datum) (keys.Key, error) {
+	if len(vals) > len(idx.ColumnIDs) {
+		return nil, fmt.Errorf("index %q has %d columns, got %d values", idx.Name, len(idx.ColumnIDs), len(vals))
+	}
+	k := keys.TableIndexPrefix(desc.ID, idx.ID)
+	for i, d := range vals {
+		col, ok := desc.ColByID(idx.ColumnIDs[i])
+		if !ok {
+			return nil, fmt.Errorf("index %q references unknown column %d", idx.Name, idx.ColumnIDs[i])
+		}
+		if d.Null {
+			return nil, fmt.Errorf("cannot encode NULL in an index key")
+		}
+		var err error
+		k, err = appendDatum(k, col.Type, d)
+		if err != nil {
+			return nil, fmt.Errorf("column %q: %w", col.Name, err)
+		}
+	}
+	return k, nil
+}
+
+// nonUniqueIndexValue marks a non-unique index entry present (values must be
+// non-empty: an empty MVCC read is indistinguishable from absence).
+var nonUniqueIndexValue = []byte{0}
+
+// EncodeIndexEntry builds the index KV pair for a full row. skip=true when
+// an indexed column is NULL: the row simply has no entry in that index
+// (SQL equality never matches NULL, so equality lookups stay correct;
+// unique indexes reject NULLs at the executor instead).
+func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
+	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
+	for _, colID := range idx.ColumnIDs {
+		d, ok := row[colID]
+		if !ok || d.Null {
+			return nil, nil, true, nil
+		}
+		vals = append(vals, d)
+	}
+	k, err := EncodeIndexPrefix(desc, idx, vals)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	// Encoded PK column values (without any prefix).
+	var pkEnc keys.Key
+	for _, colID := range desc.PrimaryKey {
+		col, _ := desc.ColByID(colID)
+		pkEnc, err = appendDatum(pkEnc, col.Type, row[colID])
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("pk column %q: %w", col.Name, err)
+		}
+	}
+	if idx.Unique {
+		return k, pkEnc, false, nil
+	}
+	return append(k, pkEnc...), nonUniqueIndexValue, false, nil
+}
+
+// IndexEntryPrimaryKey recovers the primary row key from an index entry.
+func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key, value []byte) (keys.Key, error) {
+	if idx.Unique {
+		return append(PrimaryKeyPrefix(desc.ID), value...), nil
+	}
+	prefix := keys.TableIndexPrefix(desc.ID, idx.ID)
+	if !bytes.HasPrefix(key, prefix) {
+		return nil, fmt.Errorf("key not in index %q", idx.Name)
+	}
+	rest := []byte(key[len(prefix):])
+	for _, colID := range idx.ColumnIDs {
+		col, ok := desc.ColByID(colID)
+		if !ok {
+			return nil, fmt.Errorf("index %q references unknown column %d", idx.Name, colID)
+		}
+		var err error
+		rest, err = skipDatum(rest, col.Type)
+		if err != nil {
+			return nil, fmt.Errorf("index %q entry: %w", idx.Name, err)
+		}
+	}
+	return append(PrimaryKeyPrefix(desc.ID), rest...), nil
+}
+
+func skipDatum(b []byte, fam types.Family) ([]byte, error) {
+	var err error
+	switch fam {
+	case types.Int:
+		b, _, err = encoding.DecodeInt64(b)
+	case types.Float:
+		b, _, err = encoding.DecodeFloat64(b)
+	case types.String:
+		b, _, err = encoding.DecodeString(b)
+	case types.Bool:
+		b, _, err = encoding.DecodeBool(b)
+	default:
+		err = fmt.Errorf("unskippable type %s", fam)
+	}
+	return b, err
+}

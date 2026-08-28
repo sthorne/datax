@@ -39,6 +39,20 @@ type CreateTable struct {
 	PrimaryKey  []string // table-level constraint (column names)
 }
 
+// CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
+type CreateIndex struct {
+	Unique  bool
+	Name    string
+	Table   string
+	Columns []string
+}
+
+// Explain wraps a statement whose access plan should be described instead
+// of executed.
+type Explain struct {
+	Stmt Statement
+}
+
 type DropTable struct {
 	Name     string
 	IfExists bool
@@ -87,6 +101,8 @@ type ShowTables struct{}
 type SetVar struct{ Name string }
 
 func (*CreateTable) stmt() {}
+func (*CreateIndex) stmt() {}
+func (*Explain) stmt()     {}
 func (*DropTable) stmt()   {}
 func (*Insert) stmt()      {}
 func (*Select) stmt()      {}

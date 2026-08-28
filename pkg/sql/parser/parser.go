@@ -103,7 +103,17 @@ func (p *parser) parseStatement() (Statement, error) {
 	}
 	switch t.text {
 	case "CREATE":
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
+			return p.parseCreateIndex()
+		}
 		return p.parseCreateTable()
+	case "EXPLAIN":
+		p.i++
+		inner, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		return &Explain{Stmt: inner}, nil
 	case "DROP":
 		return p.parseDropTable()
 	case "INSERT":
@@ -275,6 +285,47 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			return def, nil
 		}
 	}
+}
+
+func (p *parser) parseCreateIndex() (Statement, error) {
+	p.i++ // CREATE
+	ci := &CreateIndex{}
+	if p.consumeKeyword("UNIQUE") {
+		ci.Unique = true
+	}
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	ci.Name = name
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	ci.Table = table
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	for {
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ci.Columns = append(ci.Columns, col)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return ci, nil
 }
 
 func (p *parser) parseDropTable() (Statement, error) {

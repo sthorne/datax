@@ -25,9 +25,11 @@ SHOW TABLES
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
 
-Not in v1: secondary indexes, joins, aggregates, GROUP BY, ORDER BY,
-subqueries, ALTER, constraints beyond PRIMARY KEY / NOT NULL, sequences,
-DEFAULT.
+v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)` and
+`EXPLAIN SELECT ...` (one-line access plan).
+
+Still out of scope: joins, aggregates, GROUP BY, ORDER BY, subqueries,
+ALTER, constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
 
 ## Catalog
 
@@ -57,14 +59,41 @@ changes beyond CREATE/DROP are out of scope).
   lazy `DROP COLUMN` and nullable `ADD COLUMN` free. Binary encode is
   ~3× faster than the JSON encoding it replaced (see rowenc benchmarks).
 
+## Secondary indexes (v2)
+
+`CREATE [UNIQUE] INDEX name ON table (cols)` adds an index with its own
+key space (`/t/<tableID>/<indexID>/`):
+
+- **Non-unique**: key = indexed columns + primary key columns, value = a
+  one-byte marker. A row with NULL in any indexed column has **no entry**
+  (SQL equality never matches NULL, so equality lookups stay correct; such
+  rows are found by full scans).
+- **Unique**: key = indexed columns only, value = the encoded primary key.
+  NULLs in unique-indexed columns are **rejected** (a deliberate divergence
+  from PostgreSQL's multiple-NULLs-allowed behavior).
+
+Maintenance happens inside the writing transaction — index entries ride the
+same write batch as the row, so they commit or roll back atomically, and
+uniqueness checks read through the transaction: two racing inserts of the
+same value collide on the index key's intent, so at most one commits.
+`CREATE INDEX` backfills existing rows in its own transaction (offline —
+concurrent writers from other gateways holding the old descriptor would
+miss the index; there are no descriptor leases).
+
 ## Execution
 
-There is no optimizer. The executor pattern-matches:
+There is no cost model. The executor ranks access paths:
 
-- WHERE fully constrains the PK by equality → point `Get`.
-- Otherwise → `Scan` of the table's key span with in-memory filtering.
-- UPDATE / DELETE: read the matching rows, then write inside the same
-  transaction.
+1. WHERE pins every PK column by equality → primary point `Get`.
+2. Every column of a unique index pinned → unique-index point lookup.
+3. A non-empty leading prefix of some index pinned → index prefix scan +
+   primary-key joins (longest prefix wins).
+4. Otherwise → full `Scan` of the primary rows with in-memory filtering.
+
+UPDATE and DELETE read the matching rows through the same path ranking,
+then write inside the same transaction. `EXPLAIN SELECT ...` prints the
+chosen path as a single row — the one-line plan is what the tests assert
+index selection with.
 
 Every statement runs in a transaction: implicit (auto-commit, with
 transparent server-side retry on serialization conflicts) or the session's

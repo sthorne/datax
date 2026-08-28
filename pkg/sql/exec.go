@@ -19,6 +19,10 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 	switch t := stmt.(type) {
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
+	case *parser.CreateIndex:
+		return s.execCreateIndex(ctx, txn, t)
+	case *parser.Explain:
+		return s.execExplain(ctx, txn, t, params)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -163,6 +167,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		// Writes are buffered and flushed once below: one routed batch (one
 		// Raft proposal per touched range) per statement.
 		wb.Put(key, value)
+		if err := addIndexEntries(ctx, txn, desc, row, &wb, inserted); err != nil {
+			return nil, err
+		}
 		inserted[string(key)] = true
 		count++
 	}
@@ -188,28 +195,80 @@ type fetchedRow struct {
 }
 
 func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
-	// Point lookup when every PK column has an equality constraint (and
-	// remaining conjuncts filter afterwards).
-	if pkVals, ok, err := pkPointValues(desc, where, params); err != nil {
+	plan, err := pickPlan(desc, where, params)
+	if err != nil {
 		return nil, err
-	} else if ok {
-		key, err := rowenc.EncodePK(desc, pkVals)
+	}
+	switch plan.kind {
+	case planPKPoint:
+		key, err := rowenc.EncodePK(desc, plan.pkVals)
 		if err != nil {
 			return nil, err
 		}
-		raw, err := txn.Get(ctx, key)
-		if err != nil || raw == nil {
-			return nil, err
-		}
-		row, err := decodeFullRow(desc, key, raw)
+		return s.fetchByPrimaryKey(ctx, txn, desc, key, where, params)
+
+	case planUniquePoint:
+		key, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
 			return nil, err
 		}
-		match, err := matchesWhere(where, desc, row, params)
-		if err != nil || !match {
+		pkEnc, err := txn.Get(ctx, key)
+		if err != nil || pkEnc == nil {
 			return nil, err
 		}
-		return []fetchedRow{{key: key, row: row}}, nil
+		pk := append(rowenc.PrimaryKeyPrefix(desc.ID), pkEnc...)
+		rows, err := s.fetchByPrimaryKey(ctx, txn, desc, pk, where, params)
+		if err != nil {
+			return nil, err
+		}
+		if rows == nil {
+			// The entry and the row commit atomically; a dangling entry is
+			// corruption, not an empty result — unless the row was filtered.
+			if raw, gerr := txn.Get(ctx, pk); gerr == nil && raw == nil {
+				return nil, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
+			}
+		}
+		return rows, nil
+
+	case planIndexScan:
+		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
+		if err != nil {
+			return nil, err
+		}
+		kvs, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
+		if err != nil {
+			return nil, err
+		}
+		var out []fetchedRow
+		for _, kv := range kvs {
+			pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
+			if err != nil {
+				return nil, newErrf(CodeInternal, "%v", err)
+			}
+			raw, err := txn.Get(ctx, pk)
+			if err != nil {
+				return nil, err
+			}
+			if raw == nil {
+				return nil, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
+			}
+			row, err := decodeFullRow(desc, pk, raw)
+			if err != nil {
+				return nil, err
+			}
+			match, err := matchesWhere(where, desc, row, params)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+			out = append(out, fetchedRow{key: pk, row: row})
+			if limit > 0 && int64(len(out)) == limit {
+				break
+			}
+		}
+		return out, nil
 	}
 
 	start, end := rowenc.PrimarySpan(desc.ID)
@@ -376,7 +435,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		return nil, err
 	}
 	var wb kvclient.WriteBatch
+	seen := map[string]bool{}
 	for _, fr := range rows {
+		oldRow := copyRow(fr.row)
 		for _, set := range t.Set {
 			col, _ := desc.Col(set.Column)
 			d, err := evalExpr(set.Value, desc, fr.row, params)
@@ -397,6 +458,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			return nil, verr
 		}
 		wb.Put(fr.key, value)
+		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen); err != nil {
+			return nil, err
+		}
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
@@ -416,11 +480,112 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	var wb kvclient.WriteBatch
 	for _, fr := range rows {
 		wb.Delete(fr.key)
+		if err := dropIndexEntries(desc, fr.row, &wb); err != nil {
+			return nil, err
+		}
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("DELETE %d", len(rows))}, nil
+}
+
+// execCreateIndex adds a secondary index and backfills it from the
+// table's current rows, all in one transaction. The backfill is offline:
+// writers from other gateways that still hold the old descriptor are not
+// blocked and will miss the index (documented limitation — no descriptor
+// leases).
+func (s *Session) execCreateIndex(ctx context.Context, txn *kvclient.Txn, t *parser.CreateIndex) (*Result, error) {
+	shared, err := s.cat.Lookup(ctx, txn, t.Table)
+	if err != nil {
+		return nil, err
+	}
+	desc := shared.Clone()
+	if t.Name == "primary" {
+		return nil, newErrf(CodeSyntaxError, "index name %q is reserved", t.Name)
+	}
+	if _, exists := desc.Index(t.Name); exists {
+		return nil, newErrf(CodeSyntaxError, "index %q already exists", t.Name)
+	}
+	var colIDs []catalog.ColumnID
+	seenCol := map[catalog.ColumnID]bool{}
+	for _, name := range t.Columns {
+		col, ok := desc.Col(name)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+		}
+		if seenCol[col.ID] {
+			return nil, newErrf(CodeSyntaxError, "duplicate column %q in index", name)
+		}
+		seenCol[col.ID] = true
+		colIDs = append(colIDs, col.ID)
+	}
+	if desc.NextIndexID < rowenc.PrimaryIndexID+1 {
+		desc.NextIndexID = rowenc.PrimaryIndexID + 1
+	}
+	idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: t.Name, Unique: t.Unique, ColumnIDs: colIDs}
+	desc.NextIndexID++
+	desc.Indexes = append(desc.Indexes, idx)
+
+	// Backfill from the rows visible to this transaction.
+	start, end := rowenc.PrimarySpan(desc.ID)
+	kvs, err := txn.Scan(ctx, start, end, 0)
+	if err != nil {
+		return nil, err
+	}
+	var wb kvclient.WriteBatch
+	seen := map[string]bool{}
+	for _, kv := range kvs {
+		row, err := decodeFullRow(desc, kv.Key, kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		key, val, skip, err := rowenc.EncodeIndexEntry(desc, &idx, row)
+		if err != nil {
+			return nil, newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+		}
+		if skip {
+			if idx.Unique {
+				return nil, newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
+			}
+			continue
+		}
+		if idx.Unique {
+			if seen[string(key)] {
+				return nil, newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
+			}
+			seen[string(key)] = true
+		}
+		wb.Put(key, val)
+	}
+	if err := txn.RunBatch(ctx, &wb); err != nil {
+		return nil, err
+	}
+	if err := s.cat.Update(ctx, txn, desc); err != nil {
+		return nil, err
+	}
+	return &Result{Tag: "CREATE INDEX"}, nil
+}
+
+// execExplain describes the access plan of a SELECT without executing it.
+func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.Explain, params []types.Datum) (*Result, error) {
+	sel, ok := t.Stmt.(*parser.Select)
+	if !ok || sel.Table == "" {
+		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
+	}
+	desc, err := s.cat.Lookup(ctx, txn, sel.Table)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := pickPlan(desc, sel.Where, params)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{
+		Columns: []ResultColumn{{Name: "plan", Type: types.String}},
+		Rows:    [][]types.Datum{{types.NewString(plan.String())}},
+		Tag:     "EXPLAIN",
+	}, nil
 }
 
 func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn) (*Result, error) {
