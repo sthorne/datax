@@ -47,6 +47,7 @@ type snapshotHeader struct {
 	ReplicaID    base.ReplicaID       `json:"replica_id"`
 	AppliedIndex uint64               `json:"applied_index"`
 	Term         uint64               `json:"term"`
+	GCThreshold  hlc.Timestamp        `json:"gc_threshold,omitempty"`
 }
 
 // adminChangeReplicas executes an AdminChangeReplicasRequest on the leader.
@@ -163,6 +164,7 @@ func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDes
 		ReplicaID:    newReplicaID,
 		AppliedIndex: st.AppliedIndex,
 		Term:         term,
+		GCThreshold:  st.GCThreshold,
 	})
 	if err != nil {
 		return err
@@ -248,6 +250,7 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 		AppliedIndex:   h.AppliedIndex,
 		TruncatedIndex: h.AppliedIndex,
 		TruncatedTerm:  h.Term,
+		GCThreshold:    h.GCThreshold,
 	}); err != nil {
 		_ = b.Close()
 		return err
@@ -267,18 +270,24 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 	return nil
 }
 
-// removeReplica destroys a replica that was removed from its range.
-func (s *Store) removeReplica(rangeID base.RangeID) {
+// removeReplica destroys a replica that was removed from its range,
+// wiping its replicated data (the store no longer serves this span — any
+// sibling replicas on this store cover disjoint spans), its transaction
+// records, and its unreplicated Raft state. A tombstone prevents revival
+// via LoadReplicas.
+func (s *Store) removeReplica(rangeID base.RangeID, desc kvpb.RangeDescriptor) {
 	s.mu.Lock()
 	delete(s.mu.replicas, rangeID)
 	s.mu.Unlock()
-	// v1 leaves the replica's data on disk (space reclamation is a GC
-	// concern); a tombstone prevents accidental revival via LoadReplicas.
 	b := s.cfg.Engine.NewBatch()
+	_ = b.DeleteRange(storage.EncodeMVCCKey(desc.StartKey, hlc.Timestamp{}), storage.EncodeMVCCKey(desc.EndKey, hlc.Timestamp{}))
+	loL, hiL := keys.RangeLocalAddressedSpan(desc.StartKey, desc.EndKey)
+	_ = b.DeleteRange(loL, hiL)
+	pre := keys.RangeUnreplicatedPrefix(rangeID)
+	_ = b.DeleteRange(pre, pre.PrefixEnd())
 	_ = b.Put(keys.RangeTombstoneKey(rangeID), []byte("removed"))
-	_ = b.Delete(keys.RangeDescriptorKey(rangeID))
 	if err := b.Commit(true); err != nil {
-		log.Warnf("%s: writing removal tombstone: %v", rangeID, err)
+		log.Warnf("%s: removing replica state: %v", rangeID, err)
 	}
-	log.Infof("%s: replica removed from this store", rangeID)
+	log.Infof("%s: replica and its data removed from this store", rangeID)
 }

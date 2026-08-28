@@ -90,6 +90,27 @@ type RefreshRequest struct {
 	FromTS hlc.Timestamp `json:"from_ts"`
 }
 
+// GCVersion names one MVCC version to reclaim.
+type GCVersion struct {
+	Key keys.Key      `json:"key"`
+	TS  hlc.Timestamp `json:"ts"`
+}
+
+// GCRequest reclaims garbage below Threshold: the listed MVCC versions
+// (enumerated by the leader from a consistent snapshot — all superseded
+// below the threshold, hence immutable) and finalized transaction records
+// (raw storage keys). Applying it also raises the range's replicated GC
+// threshold, below which reads are rejected. Replicated so replicas stay
+// byte-identical and the threshold survives leadership changes and
+// snapshots. Spans the whole range (Key/EndKey = range bounds) so its
+// exclusive latch serializes it against readers.
+type GCRequest struct {
+	RequestHeader
+	Threshold     hlc.Timestamp `json:"threshold"`
+	Versions      []GCVersion   `json:"versions,omitempty"`
+	TxnRecordKeys []keys.Key    `json:"txn_record_keys,omitempty"`
+}
+
 // AdminSplitRequest splits the range containing SplitKey at SplitKey.
 type AdminSplitRequest struct {
 	RequestHeader // Key = split key
@@ -115,6 +136,7 @@ type RequestUnion struct {
 	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
 	Refresh             *RefreshRequest             `json:"refresh,omitempty"`
+	GC                  *GCRequest                  `json:"gc,omitempty"`
 	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
 }
@@ -142,6 +164,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.ResolveIntent
 	case u.Refresh != nil:
 		return u.Refresh
+	case u.GC != nil:
+		return u.GC
 	case u.AdminSplit != nil:
 		return u.AdminSplit
 	case u.AdminChangeReplicas != nil:
@@ -169,6 +193,7 @@ func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHe
 func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
 func (h *RefreshRequest) Header() RequestHeader             { return h.RequestHeader }
+func (h *GCRequest) Header() RequestHeader                  { return h.RequestHeader }
 func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
 
@@ -182,6 +207,7 @@ func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
 func (*PushTxnRequest) Method() string             { return "PushTxn" }
 func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
 func (*RefreshRequest) Method() string             { return "Refresh" }
+func (*GCRequest) Method() string                  { return "GC" }
 func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
 func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
 
@@ -195,6 +221,7 @@ func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (*PushTxnRequest) IsReadOnly() bool             { return false }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
 func (*RefreshRequest) IsReadOnly() bool             { return true }
+func (*GCRequest) IsReadOnly() bool                  { return false }
 func (*AdminSplitRequest) IsReadOnly() bool          { return false }
 func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
 
@@ -245,6 +272,8 @@ type AdminSplitResponse struct {
 
 type RefreshResponse struct{}
 
+type GCResponse struct{}
+
 type AdminChangeReplicasResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
@@ -261,6 +290,7 @@ type ResponseUnion struct {
 	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
 	Refresh             *RefreshResponse             `json:"refresh,omitempty"`
+	GC                  *GCResponse                  `json:"gc,omitempty"`
 	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
 }
@@ -337,6 +367,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.ResolveIntent = t
 	case *RefreshRequest:
 		u.Refresh = t
+	case *GCRequest:
+		u.GC = t
 	case *AdminSplitRequest:
 		u.AdminSplit = t
 	case *AdminChangeReplicasRequest:

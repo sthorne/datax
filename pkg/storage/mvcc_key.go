@@ -79,6 +79,13 @@ func encodeMVCCValue(data []byte, tombstone bool) []byte {
 	return out
 }
 
+// IsTombstoneValue reports whether a raw MVCC value is a deletion
+// tombstone (used by GC's garbage enumeration).
+func IsTombstoneValue(raw []byte) (bool, error) {
+	_, tomb, err := decodeMVCCValue(raw)
+	return tomb, err
+}
+
 func decodeMVCCValue(raw []byte) (data []byte, tombstone bool, err error) {
 	if len(raw) == 0 {
 		return nil, false, fmt.Errorf("malformed MVCC value: empty")

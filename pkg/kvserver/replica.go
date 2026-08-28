@@ -68,8 +68,9 @@ type Replica struct {
 		sync.Mutex
 		desc         kvpb.RangeDescriptor
 		appliedIndex uint64
-		term         uint64 // highest raft term observed
-		leader       uint64 // last known raft leader (replica ID); 0 unknown
+		gcThreshold  hlc.Timestamp // replicated; raised by applied GC commands
+		term         uint64        // highest raft term observed
+		leader       uint64        // last known raft leader (replica ID); 0 unknown
 		proposals    map[string]chan proposalResult
 		readWaits    map[string]chan uint64
 		appliedWaits []appliedWait
@@ -113,6 +114,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager()}
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
+	r.mu.gcThreshold = st.GCThreshold
 	if hs, _, err := rs.InitialState(); err == nil {
 		r.mu.term = hs.Term
 	}
@@ -142,6 +144,13 @@ func (r *Replica) Desc() kvpb.RangeDescriptor {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mu.desc
+}
+
+// GCThreshold returns the range's replicated GC threshold.
+func (r *Replica) GCThreshold() hlc.Timestamp {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.gcThreshold
 }
 
 // IsLeader reports whether this replica believes it is the Raft leader.
@@ -194,7 +203,7 @@ func (r *Replica) raftLoop(ctx context.Context) {
 			if err == errReplicaRemoved {
 				log.Infof("%s/%d: removed from range; shutting replica down", r.rangeID, r.replicaID)
 				r.node.Stop()
-				r.store.removeReplica(r.rangeID)
+				r.store.removeReplica(r.rangeID, r.Desc())
 				return
 			}
 			if err != nil {
@@ -456,6 +465,14 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if k := r.store.cfg.TestingKnobs.AfterLatch; k != nil {
 		k(ba)
 	}
+	// Reads at or below the GC threshold could miss reclaimed versions:
+	// reject them outright (non-retryable — the data is gone). GC commands
+	// themselves are exempt.
+	if !isGCBatch(ba) {
+		if thr := r.GCThreshold(); !thr.IsEmpty() && readTimestamp(ba).LessEq(thr) {
+			return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, readTimestamp(ba), thr)
+		}
+	}
 
 	if ba.IsReadOnly() {
 		// Bump the cache BEFORE evaluating (invariant L2): an overlapping
@@ -511,6 +528,15 @@ func (r *Replica) checkKeyBounds(ba *kvpb.BatchRequest) *kvpb.Error {
 		}
 	}
 	return nil
+}
+
+func isGCBatch(ba *kvpb.BatchRequest) bool {
+	for _, u := range ba.Requests {
+		if u.GC != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func batchTxnID(ba *kvpb.BatchRequest) uuid.UUID {

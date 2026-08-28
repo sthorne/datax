@@ -3,6 +3,7 @@ package kvserver
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/sthorne/datax/pkg/util/hlc"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
@@ -20,6 +21,10 @@ type replicaState struct {
 	// already includes (non-zero only for snapshot-seeded replicas).
 	TruncatedIndex uint64 `json:"truncated_index,omitempty"`
 	TruncatedTerm  uint64 `json:"truncated_term,omitempty"`
+	// GCThreshold: reads at or below this timestamp are rejected; versions
+	// beneath it may have been reclaimed. Replicated state, raised only by
+	// applied GC commands.
+	GCThreshold hlc.Timestamp `json:"gc_threshold,omitempty"`
 }
 
 // getter is the read capability shared by Engine, Batch, and Snapshot.

@@ -42,6 +42,11 @@ type Config struct {
 	// UpreplicationInterval is how often the repair loop scans for
 	// under-replicated ranges (default 3s).
 	UpreplicationInterval time.Duration
+	// GCTTL is how long MVCC history is retained before garbage collection
+	// (default 25h; negative disables GC).
+	GCTTL time.Duration
+	// GCInterval is how often the GC loop scans led ranges (default 60s).
+	GCInterval time.Duration
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -245,6 +250,17 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.upreplicationLoop); err != nil {
+		return err
+	}
+	gcTTL := n.cfg.GCTTL
+	if gcTTL == 0 {
+		gcTTL = base.DefaultGCTTL
+	}
+	gcInterval := n.cfg.GCInterval
+	if gcInterval == 0 {
+		gcInterval = base.DefaultGCInterval
+	}
+	if err := n.store.StartHousekeeping(gcTTL, gcInterval); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)

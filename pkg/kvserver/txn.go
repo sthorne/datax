@@ -18,8 +18,8 @@ const TxnExpiration = 5 * time.Second
 
 // Transaction records are replicated, non-MVCC keys in the range-local
 // addressed keyspace (see pkg/keys): created with the transaction's first
-// write, flipped exactly once to COMMITTED or ABORTED, and — v1 — never
-// deleted (record GC is out of scope, like MVCC GC).
+// write, flipped exactly once to COMMITTED or ABORTED, and reclaimed by GC
+// once finalized and TTL-old (see gc.go).
 
 func txnRecordKey(txn *enginepb.TxnMeta) keys.Key {
 	return keys.TransactionKey(txn.Key, txn.ID)
@@ -51,6 +51,20 @@ func putTxnRecord(w storage.Writer, key keys.Key, txn *kvpb.Transaction) error {
 func (r *Replica) createTxnRecord(b *storage.Batch, txn *kvpb.Transaction) *kvpb.Error {
 	if txn == nil {
 		return kvpb.NewErrorf("CreateTxnRecord without a transaction")
+	}
+	// Resurrection guard: once records below the GC threshold are
+	// reclaimed, a zombie coordinator's first write must not recreate its
+	// record as PENDING (it may have been aborted before the GC). Any
+	// transaction born at or below the threshold is TTL-old — vastly beyond
+	// TxnExpiration — so no live transaction trips this. Deterministic:
+	// the threshold is replicated state.
+	r.mu.Lock()
+	thr := r.mu.gcThreshold
+	r.mu.Unlock()
+	if !thr.IsEmpty() && txn.MinTimestamp.LessEq(thr) {
+		e := kvpb.NewErrorf("transaction %s predates the GC threshold %s", txn.ID, thr)
+		e.TxnAborted = &kvpb.TxnAbortedError{}
+		return e
 	}
 	key := txnRecordKey(&txn.TxnMeta)
 	existing, err := loadTxnRecord(b, key)

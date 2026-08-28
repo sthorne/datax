@@ -122,6 +122,13 @@ func RaftAppliedStateKey(rangeID base.RangeID) Key { return makeRangeLocalKey(ra
 // RangeDescriptorKey stores this replica's copy of the range descriptor.
 func RangeDescriptorKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "desc") }
 
+// RangeUnreplicatedPrefix is the prefix of ALL of a range's replica-local
+// unreplicated keys (Raft state, applied state, descriptor copy) — used to
+// wipe a removed replica.
+func RangeUnreplicatedPrefix(rangeID base.RangeID) Key {
+	return makeRangeLocalKey(rangeID, "")
+}
+
 // RangeTombstoneKey marks a removed replica so it cannot be revived by stale
 // Raft messages.
 func RangeTombstoneKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "tomb") }

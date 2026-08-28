@@ -144,6 +144,49 @@ Reads below a committed value's timestamp never block (MVCC). v1 pushes on
 *any* foreign intent found on a read path, even one above the read timestamp —
 reading around newer intents is easy future work.
 
+## Garbage collection
+
+Old MVCC versions and finalized transaction records are reclaimed by a
+leader-driven, **replicated** GC (v2). Each store's housekeeping loop
+periodically computes `threshold = now − GCTTL` (default 25h) and, for every
+range it leads, enumerates garbage from one consistent engine snapshot:
+
+- per user key, the newest version at or below the threshold is the
+  **survivor** — exactly what a read just above the threshold observes;
+  every older version is garbage, and the survivor itself is too if it is a
+  deletion tombstone;
+- keys holding an unresolved intent are skipped entirely (their history is
+  in flux);
+- finalized (committed/aborted) transaction records whose timestamps are
+  TTL-old are garbage, unless the range still holds an intent of that
+  transaction.
+
+The leader proposes a `GCRequest` naming the exact keys to delete plus the
+new threshold. Replication is what makes this safe and simple: every
+replica deletes the same bytes (cross-replica checksum equality is asserted
+in tests), the threshold is replicated state that survives crashes,
+leadership changes, and preseed snapshots, and the command's whole-range
+exclusive latch serializes it against reads (invariant L1). Enumerating
+from a snapshot cannot race concurrent writes: committed versions are
+immutable, live transactions write far above the threshold, and intent
+resolution only touches keys the enumeration skipped.
+
+Correctness rules enforced around the threshold:
+
+- **Reads at or below the threshold are rejected**, non-retryably — the
+  versions they would need may be gone. Live transactions never trip this
+  (TTL ≫ transaction lifetime, and refresh/uncertainty only move `readTS`
+  forward).
+- **Resurrection guard**: `createTxnRecord` rejects any transaction whose
+  `MinTimestamp` is at or below the threshold, so a zombie coordinator
+  cannot recreate a reclaimed record as PENDING after having possibly been
+  aborted. Deterministic, because the threshold is replicated.
+- Residual hazard (documented, accepted): an intent of a *committed*
+  transaction that sits unresolved on a range other than the record's for a
+  full TTL can be wrongly aborted after the record is reclaimed. The
+  coordinator resolves intents synchronously at commit, so this requires a
+  crash followed by a TTL of nothing touching the key.
+
 ## Invariants (asserted in tests)
 
 1. An intent is never resolved except per its record's state.
@@ -151,9 +194,10 @@ reading around newer intents is easy future work.
 3. At commit, `writeTS == readTS` (retry-only serializability).
 4. The uncertainty interval is enforced on every read of non-local data.
 5. A transaction's reads observe its own latest writes.
+6. After GC, replicas of a range remain byte-identical, and no read ever
+   observes a state that GC'd versions could have distinguished.
 
-## Known gaps (deliberate, v1)
+## Known gaps (deliberate)
 
-MVCC garbage collection; read refresh; parallel commits; savepoints;
-interval-based timestamp cache; deadlock detection; reading below foreign
-intents' timestamps.
+Parallel commits; savepoints; interval-based timestamp cache; deadlock
+detection; reading below foreign intents' timestamps.

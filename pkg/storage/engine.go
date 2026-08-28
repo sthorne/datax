@@ -161,6 +161,9 @@ func (b *Batch) NewIter(lower, upper []byte) Iterator {
 func (b *Batch) Put(key, value []byte) error { return b.b.Set(key, value, nil) }
 func (b *Batch) Delete(key []byte) error     { return b.b.Delete(key, nil) }
 
+// DeleteRange deletes every key in [start, end).
+func (b *Batch) DeleteRange(start, end []byte) error { return b.b.DeleteRange(start, end, nil) }
+
 // Commit applies the batch. sync=true forces an fsync before returning —
 // required for Raft state (HardState, log entries) and applied state.
 func (b *Batch) Commit(sync bool) error {

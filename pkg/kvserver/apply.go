@@ -124,10 +124,14 @@ func (r *Replica) persistAppliedIndex(idx uint64) error {
 
 func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	tr := r.rs.truncatedState()
+	r.mu.Lock()
+	thr := r.mu.gcThreshold
+	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
 		AppliedIndex:   idx,
 		TruncatedIndex: tr.Index,
 		TruncatedTerm:  tr.Term,
+		GCThreshold:    thr,
 	})
 }
 
@@ -144,6 +148,23 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 	if aerr != nil {
 		_ = b.Close()
 		b = eng.NewBatch()
+	}
+	if aerr == nil {
+		// A GC command raises the replicated threshold atomically with its
+		// deletions (stageAppliedIndex persists it below).
+		var newThr hlc.Timestamp
+		for _, u := range cmd.Batch.Requests {
+			if u.GC != nil {
+				newThr = newThr.Forward(u.GC.Threshold)
+			}
+		}
+		if !newThr.IsEmpty() {
+			r.mu.Lock()
+			if r.mu.gcThreshold.Less(newThr) {
+				r.mu.gcThreshold = newThr
+			}
+			r.mu.Unlock()
+		}
 	}
 	if aerr == nil && cmd.Split != nil {
 		if err := r.stageSplit(b, cmd.Split); err != nil {
@@ -250,6 +271,21 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				return nil, kvpb.NewError(err)
 			}
 			ru.ResolveIntent = &kvpb.ResolveIntentResponse{}
+		case *kvpb.GCRequest:
+			// Delete exactly the versions the leader enumerated (all
+			// superseded below the threshold, hence immutable) and the
+			// finalized transaction records.
+			for _, v := range req.Versions {
+				if err := b.Delete(storage.EncodeMVCCKey(v.Key, v.TS)); err != nil {
+					return nil, kvpb.NewError(err)
+				}
+			}
+			for _, k := range req.TxnRecordKeys {
+				if err := b.Delete(k); err != nil {
+					return nil, kvpb.NewError(err)
+				}
+			}
+			ru.GC = &kvpb.GCResponse{}
 		default:
 			return nil, kvpb.NewErrorf("unsupported request in write batch: %T", ba.Requests[i].GetInner())
 		}
