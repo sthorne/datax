@@ -166,24 +166,24 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			return cols, nil
 		}
-		var proj []projCol
-		lookup := func(ctx context.Context, txn *kvclient.Txn) error {
-			desc, err := s.cat.Lookup(ctx, txn, t.Table)
-			if err != nil {
-				return err
-			}
-			var perr error
-			proj, perr = resolveProjection(desc, t.Exprs)
-			return perr
-		}
-		var err error
-		if s.state == StateOpen {
-			err = lookup(ctx, s.txn)
-		} else {
-			err = s.db.RunTxn(ctx, "plan", lookup)
-		}
+		desc, err := s.lookupForPlan(ctx, t.Table)
 		if err != nil {
 			return nil, ToSQLError(err)
+		}
+		if hasAggregates(t.Exprs) {
+			specs, aerr := resolveAggregates(desc, t.Exprs)
+			if aerr != nil {
+				return nil, ToSQLError(aerr)
+			}
+			cols := make([]ResultColumn, len(specs))
+			for i, sp := range specs {
+				cols[i] = ResultColumn{Name: sp.name, Type: sp.resultType()}
+			}
+			return cols, nil
+		}
+		proj, perr := resolveProjection(desc, t.Exprs)
+		if perr != nil {
+			return nil, ToSQLError(perr)
 		}
 		cols := make([]ResultColumn, len(proj))
 		for i, p := range proj {

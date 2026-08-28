@@ -49,6 +49,9 @@ type TableDescriptor struct {
 	// 2; IDs are never reused).
 	Indexes     []IndexDescriptor `json:"indexes,omitempty"`
 	NextIndexID uint64            `json:"next_index_id,omitempty"`
+	// NextColumnID is the next column ID to allocate; never reused, so a
+	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
+	NextColumnID ColumnID `json:"next_column_id,omitempty"`
 }
 
 // Index returns the secondary index with the given name.

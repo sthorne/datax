@@ -23,6 +23,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execCreateIndex(ctx, txn, t)
 	case *parser.Explain:
 		return s.execExplain(ctx, txn, t, params)
+	case *parser.AlterTable:
+		return s.execAlterTable(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -78,6 +80,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			}
 		}
 	}
+	desc.NextColumnID = catalog.ColumnID(len(desc.Columns) + 1)
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		var ex *catalog.ErrTableExists
 		if t.IfNotExists {
@@ -194,11 +197,16 @@ type fetchedRow struct {
 	row map[catalog.ColumnID]types.Datum
 }
 
-func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, accessPlan, error) {
 	plan, err := pickPlan(desc, where, params)
 	if err != nil {
-		return nil, err
+		return nil, plan, err
 	}
+	rows, err := s.executePlan(ctx, txn, desc, plan, where, params, limit)
+	return rows, plan, err
+}
+
+func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
 	switch plan.kind {
 	case planPKPoint:
 		key, err := rowenc.EncodePK(desc, plan.pkVals)
@@ -380,14 +388,39 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
+	if hasAggregates(t.Exprs) {
+		return s.execAggSelect(ctx, txn, desc, t, params)
+	}
 	proj, perr := resolveProjection(desc, t.Exprs)
 	if perr != nil {
 		return nil, perr
 	}
 
-	rows, err := s.fetchRows(ctx, txn, desc, t.Where, params, t.Limit)
+	// With ORDER BY the limit applies only after sorting (unless the access
+	// path already delivers the requested order).
+	fetchLimit := t.Limit
+	needSort := false
+	if len(t.OrderBy) > 0 {
+		plan, err := pickPlan(desc, t.Where, params)
+		if err != nil {
+			return nil, err
+		}
+		needSort = !orderSatisfiedByPlan(desc, plan, t.OrderBy)
+		if needSort {
+			fetchLimit = 0
+		}
+	}
+	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, fetchLimit)
 	if err != nil {
 		return nil, err
+	}
+	if needSort {
+		if err := sortRows(desc, rows, t.OrderBy); err != nil {
+			return nil, err
+		}
+		if t.Limit > 0 && int64(len(rows)) > t.Limit {
+			rows = rows[:t.Limit]
+		}
 	}
 	res := &Result{}
 	for _, p := range proj {
@@ -430,7 +463,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			return nil, newErrf(CodeFeatureNotSupported, "updating primary key column %q is not supported", set.Column)
 		}
 	}
-	rows, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
+	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -473,7 +506,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
+	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -567,6 +600,70 @@ func (s *Session) execCreateIndex(ctx context.Context, txn *kvclient.Txn, t *par
 	return &Result{Tag: "CREATE INDEX"}, nil
 }
 
+// execAlterTable adds or drops a column. Adds are nullable-only (existing
+// rows simply decode the new column as NULL); drops are lazy (the bytes
+// stay in old row values and are skipped on decode) and refused for
+// primary-key or indexed columns. Column IDs are never reused, so a
+// drop-then-re-add cannot resurrect old values.
+func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *parser.AlterTable) (*Result, error) {
+	shared, err := s.cat.Lookup(ctx, txn, t.Table)
+	if err != nil {
+		return nil, err
+	}
+	desc := shared.Clone()
+	if desc.NextColumnID == 0 {
+		var max catalog.ColumnID
+		for _, c := range desc.Columns {
+			if c.ID > max {
+				max = c.ID
+			}
+		}
+		desc.NextColumnID = max + 1
+	}
+	switch {
+	case t.AddCol != nil:
+		def := t.AddCol
+		if def.NotNull || def.PrimaryKey {
+			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN supports nullable columns only")
+		}
+		if _, exists := desc.Col(def.Name); exists {
+			return nil, newErrf(CodeSyntaxError, "column %q already exists", def.Name)
+		}
+		desc.Columns = append(desc.Columns, catalog.Column{
+			ID: desc.NextColumnID, Name: def.Name, Type: def.Type,
+		})
+		desc.NextColumnID++
+	case t.DropCol != "":
+		col, ok := desc.Col(t.DropCol)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropCol)
+		}
+		if desc.IsPKCol(col.ID) {
+			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
+		}
+		for _, idx := range desc.Indexes {
+			for _, id := range idx.ColumnIDs {
+				if id == col.ID {
+					return nil, newErrf(CodeFeatureNotSupported, "cannot drop column %q: used by index %q", t.DropCol, idx.Name)
+				}
+			}
+		}
+		kept := desc.Columns[:0]
+		for _, c := range desc.Columns {
+			if c.ID != col.ID {
+				kept = append(kept, c)
+			}
+		}
+		desc.Columns = kept
+	default:
+		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires ADD or DROP COLUMN")
+	}
+	if err := s.cat.Update(ctx, txn, desc); err != nil {
+		return nil, err
+	}
+	return &Result{Tag: "ALTER TABLE"}, nil
+}
+
 // execExplain describes the access plan of a SELECT without executing it.
 func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.Explain, params []types.Datum) (*Result, error) {
 	sel, ok := t.Stmt.(*parser.Select)
@@ -581,9 +678,17 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if err != nil {
 		return nil, err
 	}
+	text := plan.String()
+	if len(sel.OrderBy) > 0 && !hasAggregates(sel.Exprs) {
+		if orderSatisfiedByPlan(desc, plan, sel.OrderBy) {
+			text += "; order satisfied by access path"
+		} else {
+			text += "; in-memory sort"
+		}
+	}
 	return &Result{
 		Columns: []ResultColumn{{Name: "plan", Type: types.String}},
-		Rows:    [][]types.Datum{{types.NewString(plan.String())}},
+		Rows:    [][]types.Datum{{types.NewString(text)}},
 		Tag:     "EXPLAIN",
 	}, nil
 }

@@ -68,13 +68,25 @@ type SelectExpr struct {
 	Star  bool
 	Expr  Expr
 	Alias string
+	// Agg is an aggregate call (COUNT/SUM/AVG/MIN/MAX, upper-cased).
+	// AggStar marks COUNT(*); otherwise AggCol names the argument column.
+	Agg     string
+	AggStar bool
+	AggCol  string
+}
+
+// OrderCol is one ORDER BY term.
+type OrderCol struct {
+	Column string
+	Desc   bool
 }
 
 type Select struct {
-	Exprs []SelectExpr
-	Table string // empty for FROM-less selects
-	Where []Comparison
-	Limit int64 // -1 = none
+	Exprs   []SelectExpr
+	Table   string // empty for FROM-less selects
+	Where   []Comparison
+	OrderBy []OrderCol
+	Limit   int64 // -1 = none
 }
 
 type Update struct {
@@ -84,6 +96,13 @@ type Update struct {
 		Value  Expr
 	}
 	Where []Comparison
+}
+
+// AlterTable is ALTER TABLE t ADD [COLUMN] def | DROP [COLUMN] name.
+type AlterTable struct {
+	Table   string
+	AddCol  *ColumnDef // set for ADD COLUMN
+	DropCol string     // set for DROP COLUMN
 }
 
 type Delete struct {
@@ -108,6 +127,7 @@ func (*Insert) stmt()      {}
 func (*Select) stmt()      {}
 func (*Update) stmt()      {}
 func (*Delete) stmt()      {}
+func (*AlterTable) stmt()  {}
 func (*Begin) stmt()       {}
 func (*Commit) stmt()      {}
 func (*Rollback) stmt()    {}

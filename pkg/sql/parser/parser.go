@@ -124,6 +124,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseUpdate()
 	case "DELETE":
 		return p.parseDelete()
+	case "ALTER":
+		return p.parseAlterTable()
 	case "BEGIN":
 		p.i++
 		p.consumeKeyword("TRANSACTION")
@@ -409,6 +411,17 @@ func (p *parser) parseSelect() (Statement, error) {
 	for {
 		if p.consumeOp("*") {
 			sel.Exprs = append(sel.Exprs, SelectExpr{Star: true})
+		} else if se, ok, err := p.parseAggExpr(); err != nil {
+			return nil, err
+		} else if ok {
+			if p.consumeKeyword("AS") {
+				alias, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				se.Alias = alias
+			}
+			sel.Exprs = append(sel.Exprs, se)
 		} else {
 			e, err := p.parseValueOrColumnExpr()
 			if err != nil {
@@ -440,6 +453,27 @@ func (p *parser) parseSelect() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.consumeKeyword("ORDER") {
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			oc := OrderCol{Column: col}
+			if p.consumeKeyword("DESC") {
+				oc.Desc = true
+			} else {
+				p.consumeKeyword("ASC")
+			}
+			sel.OrderBy = append(sel.OrderBy, oc)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
 	if p.consumeKeyword("LIMIT") {
 		t := p.peek()
 		if t.kind != tkNumber {
@@ -453,6 +487,69 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.Limit = v
 	}
 	return sel, nil
+}
+
+var aggNames = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+
+// parseAggExpr parses COUNT(*) / COUNT(col) / SUM(col) / AVG(col) /
+// MIN(col) / MAX(col) when the next tokens form one; ok=false otherwise.
+func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
+	t := p.peek()
+	if t.kind != tkIdent || !aggNames[t.text] {
+		return SelectExpr{}, false, nil
+	}
+	if nxt := p.toks[p.i+1]; nxt.kind != tkOp || nxt.text != "(" {
+		return SelectExpr{}, false, nil
+	}
+	p.i += 2 // name (
+	se := SelectExpr{Agg: strings.ToUpper(t.text)}
+	if p.consumeOp("*") {
+		if se.Agg != "COUNT" {
+			return se, false, p.errf("%s(*) is not supported", se.Agg)
+		}
+		se.AggStar = true
+	} else {
+		col, err := p.expectIdent()
+		if err != nil {
+			return se, false, err
+		}
+		se.AggCol = col
+	}
+	if err := p.expectOp(")"); err != nil {
+		return se, false, err
+	}
+	return se, true, nil
+}
+
+func (p *parser) parseAlterTable() (Statement, error) {
+	p.i++ // ALTER
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	at := &AlterTable{Table: name}
+	switch {
+	case p.consumeKeyword("ADD"):
+		p.consumeKeyword("COLUMN")
+		def, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		at.AddCol = &def
+	case p.consumeKeyword("DROP"):
+		p.consumeKeyword("COLUMN")
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		at.DropCol = col
+	default:
+		return nil, p.errf("expected ADD or DROP, found %q", p.peek().text)
+	}
+	return at, nil
 }
 
 func (p *parser) parseUpdate() (Statement, error) {

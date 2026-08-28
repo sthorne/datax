@@ -98,7 +98,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Placement | automatic load rebalancing; node decommission |
 | Reads | follower reads (reads are leader-only: lease-based ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
-| SQL | joins, aggregates, ORDER BY, ALTER, GROUP BY, most types |
+| SQL | joins, GROUP BY, subqueries, most types |
 | Wire | TLS, SCRAM auth (trust auth only), binary extended-protocol parameters |
 | Ops | observability UI, metrics endpoints; a restarted node must keep its address (no address-change story) |
 

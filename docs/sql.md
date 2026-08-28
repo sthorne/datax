@@ -10,7 +10,8 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
-SELECT * | col, ...  FROM t [WHERE conjunction] [LIMIT n]
+SELECT * | col, ... | aggregates  FROM t [WHERE conjunction]
+    [ORDER BY col [ASC|DESC], ...] [LIMIT n]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]
@@ -25,11 +26,20 @@ SHOW TABLES
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
 
-v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)` and
-`EXPLAIN SELECT ...` (one-line access plan).
+v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
+`EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,
+skipped when the access path already delivers the order; PG-default NULL
+ordering), aggregates `COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX` (whole-table,
+no GROUP BY, no mixing with plain columns), and
+`ALTER TABLE t ADD COLUMN c TYPE` (nullable-only) / `DROP COLUMN c`
+(lazy: old bytes are skipped on decode; PK/indexed columns refused;
+column IDs are never reused, so re-adding a name cannot resurrect old
+values). Caveat: with no descriptor leases, a concurrent gateway holding
+the old descriptor writes rows without the new column — indistinguishable
+from NULL, which is exactly why only nullable adds exist.
 
-Still out of scope: joins, aggregates, GROUP BY, ORDER BY, subqueries,
-ALTER, constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
+Still out of scope: joins, GROUP BY/HAVING, subqueries, DISTINCT,
+constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
 
 ## Catalog
 
