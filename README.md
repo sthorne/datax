@@ -95,7 +95,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Area | Not yet implemented |
 |---|---|
 | Ranges | automatic split/merge (splits are manual: `datax debug split`) |
-| Placement | automatic rebalancing and dead-node repair; node decommission |
+| Placement | automatic load rebalancing; node decommission |
 | Reads | leaseholder/follower reads (reads go through the Raft leader via ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | secondary indexes, joins, aggregates, ORDER BY, ALTER, most types |

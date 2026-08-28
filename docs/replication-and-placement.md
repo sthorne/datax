@@ -77,9 +77,25 @@ enough live distinct nodes exist, gets a replica added via the allocator +
 Raft ConfChange. So a cluster grows organically: node 1 alone runs everything
 at RF=1; as nodes 2 and 3 join, every range is raised to RF=3.
 
-**Known gaps (v1)**: no node removal/decommission; no failure-driven repair
-(a dead node's replicas stay dead until it returns); losing quorum on range 1
-bricks cluster metadata. These are stated limitations, not accidents.
+## Dead-node repair
+
+The same loop repairs replicas stranded on dead nodes (v2). A node whose
+registry heartbeat is staler than `DeadNodeThreshold` (default 30s) is dead;
+the threshold deliberately exceeds the allocator's liveness grace (15s), so
+a briefly-restarting node causes zero replica churn. For each affected
+range the repair is **add-then-remove** — an allocator-picked (diversity-
+valid) live target is added first, so membership never dips below its
+starting size mid-repair — with at most one repair per range per tick.
+Two guards make it idle safely instead of flailing:
+
+- **quorum guard**: if the range's live replicas are not a strict majority,
+  no ConfChange could commit anyway — skip and warn;
+- **no-spare guard**: if no live node without a replica exists, skip.
+
+Repairing a dead voter away is also what un-pins Raft log truncation.
+
+**Known gaps**: no node decommission UX; losing quorum on range 1 bricks
+cluster metadata. These are stated limitations, not accidents.
 
 ## Adding a replica: snapshots
 

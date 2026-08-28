@@ -47,6 +47,12 @@ type Config struct {
 	GCTTL time.Duration
 	// GCInterval is how often the GC loop scans led ranges (default 60s).
 	GCInterval time.Duration
+	// LivenessGrace is how stale a node's heartbeat may be before the
+	// allocator stops treating it as live (default 15s).
+	LivenessGrace time.Duration
+	// DeadNodeThreshold is how stale a node's heartbeat must be before its
+	// replicas are repaired away (default 30s; must exceed LivenessGrace).
+	DeadNodeThreshold time.Duration
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
