@@ -6,8 +6,6 @@ import "errors"
 
 var errNotImplemented = errors.New("not implemented yet")
 
-func runInit(args []string) error  { return errNotImplemented }
-func runStart(args []string) error { return errNotImplemented }
 func runDemo(args []string) error  { return errNotImplemented }
 func runSQL(args []string) error   { return errNotImplemented }
 func runDebug(args []string) error { return errNotImplemented }

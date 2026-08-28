@@ -1,0 +1,273 @@
+// Package server wires a datax node together: engine, clock, transport,
+// store, cluster membership, KV client, and (later phases) SQL + pgwire.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/cluster"
+	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/kvserver"
+	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/util/stop"
+)
+
+// Config configures a node.
+type Config struct {
+	// Dir is the data directory ("" = in-memory, for tests/demo).
+	Dir string
+	// Listen is the internode RPC address (host:port).
+	Listen string
+	// PGListen is the SQL (PostgreSQL protocol) address; empty disables.
+	PGListen string
+	// Join is an existing node's RPC address; empty with BootstrapSelf set
+	// starts a new cluster.
+	Join          string
+	BootstrapSelf bool
+	Locality      base.Locality
+	MaxOffset     time.Duration
+
+	// Test hooks.
+	Engine          *storage.Engine
+	Listener        net.Listener
+	Clock           *hlc.Clock
+	StaticBootstrap *StaticBootstrap
+	AdvertiseAddr   string
+}
+
+// StaticBootstrap seeds a multi-node cluster with pre-agreed membership
+// (testcluster): every seed node boots the same range-1 descriptor.
+type StaticBootstrap struct {
+	ClusterID uuid.UUID
+	NodeID    base.NodeID
+	Range1    kvpb.RangeDescriptor
+	Nodes     []kvpb.NodeDescriptor
+}
+
+// Node is a running datax node.
+type Node struct {
+	cfg      Config
+	stopper  *stop.Stopper
+	clock    *hlc.Clock
+	engine   *storage.Engine
+	registry *cluster.Registry
+	trans    *rpc.Transport
+	store    *kvserver.Store
+	db       *kvclient.DB
+	ident    cluster.StoreIdent
+	addr     string
+	// joinRange1 carries the routing bootstrap from a join response until
+	// the DB exists to seed.
+	joinRange1 kvpb.RangeDescriptor
+
+	sqlServer sqlServer // set when PGListen is configured (Phase 6)
+}
+
+// sqlServer is implemented by pkg/server's pgwire glue in Phase 6.
+type sqlServer interface{ Close() }
+
+// Start boots the node and returns once it is serving.
+func Start(cfg Config) (*Node, error) {
+	n := &Node{cfg: cfg, stopper: stop.NewStopper()}
+	if err := n.start(); err != nil {
+		n.stopper.Stop()
+		return nil, err
+	}
+	return n, nil
+}
+
+func (n *Node) start() error {
+	if n.cfg.MaxOffset == 0 {
+		n.cfg.MaxOffset = base.DefaultMaxClockOffset
+	}
+	n.clock = n.cfg.Clock
+	if n.clock == nil {
+		n.clock = hlc.NewClock(nil, n.cfg.MaxOffset)
+	}
+
+	var err error
+	n.engine = n.cfg.Engine
+	if n.engine == nil {
+		n.engine, err = storage.Open(n.cfg.Dir)
+		if err != nil {
+			return err
+		}
+		n.stopper.AddCloser(func() { _ = n.engine.Close() })
+	}
+
+	lis := n.cfg.Listener
+	if lis == nil {
+		lis, err = net.Listen("tcp", n.cfg.Listen)
+		if err != nil {
+			return err
+		}
+	}
+	n.addr = n.cfg.AdvertiseAddr
+	if n.addr == "" {
+		n.addr = lis.Addr().String()
+	}
+
+	n.registry = cluster.NewRegistry()
+	n.trans = rpc.NewTransport(n.clock, n.stopper, n.registry.Resolve)
+	n.stopper.AddCloser(n.trans.Close)
+
+	// Identity: read from disk, or establish via bootstrap/join.
+	ident, initialized, err := cluster.ReadStoreIdent(n.engine)
+	if err != nil {
+		return err
+	}
+	var freshRange1 *kvpb.RangeDescriptor
+	switch {
+	case initialized:
+		n.ident = ident
+	case n.cfg.BootstrapSelf:
+		id := cluster.StoreIdent{ClusterID: uuid.New(), NodeID: 1, StoreID: 1}
+		desc := cluster.Range1Descriptor([]base.NodeID{1})
+		if err := cluster.BootstrapEngine(n.engine, id, desc, 1); err != nil {
+			return err
+		}
+		n.ident = id
+		freshRange1 = &desc
+		log.Infof("bootstrapped new cluster %s as %s", id.ClusterID, id.NodeID)
+	case n.cfg.StaticBootstrap != nil:
+		sb := n.cfg.StaticBootstrap
+		id := cluster.StoreIdent{ClusterID: sb.ClusterID, NodeID: sb.NodeID, StoreID: base.StoreID(sb.NodeID)}
+		if err := cluster.BootstrapEngine(n.engine, id, sb.Range1, len(sb.Range1.Replicas)); err != nil {
+			return err
+		}
+		n.ident = id
+		desc := sb.Range1
+		freshRange1 = &desc
+		for _, nd := range sb.Nodes {
+			n.registry.Upsert(nd)
+		}
+	case n.cfg.Join != "":
+		if err := n.join(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("store is uninitialized: start with --join or use 'datax init'")
+	}
+
+	// Serve RPC before starting replicas so peers can reach us as soon as
+	// raft groups spin up.
+	n.store = kvserver.NewStore(kvserver.StoreConfig{
+		NodeID:    n.ident.NodeID,
+		StoreID:   n.ident.StoreID,
+		Engine:    n.engine,
+		Clock:     n.clock,
+		Transport: n.trans,
+		Stopper:   n.stopper,
+	})
+	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
+
+	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
+		Batch: n.handleBatch,
+		Join:  n.handleJoin,
+		Admin: n.handleAdmin,
+		Raft:  n.store.HandleRaftMessage,
+	})
+	// Not a stopper worker: Serve exits when the closer calls Stop, and
+	// closers run after workers — a worker here would deadlock shutdown.
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Debugf("grpc server stopped: %v", err)
+		}
+	}()
+	n.stopper.AddCloser(grpcServer.Stop)
+
+	// Bring up replicas: restart from disk, or create the fresh range 1.
+	if err := n.store.LoadReplicas(); err != nil {
+		return err
+	}
+	if freshRange1 != nil {
+		if _, err := n.store.CreateReplica(*freshRange1, true /* bootstrap */); err != nil {
+			return err
+		}
+	}
+	if desc, ok, err := loadLocalRange1(n.engine); err != nil {
+		return err
+	} else if ok {
+		n.db.SeedDescriptor(desc)
+	}
+	if n.joinRange1.RangeID != 0 {
+		n.db.SeedDescriptor(n.joinRange1)
+	}
+
+	n.registry.Upsert(kvpb.NodeDescriptor{
+		NodeID: n.ident.NodeID, Address: n.addr, Locality: n.cfg.Locality,
+		LivenessTime: n.clock.Now().WallTime,
+	})
+
+	if err := n.stopper.RunWorker(n.heartbeatLoop); err != nil {
+		return err
+	}
+	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
+	return n.startSQL()
+}
+
+func loadLocalRange1(eng *storage.Engine) (kvpb.RangeDescriptor, bool, error) {
+	var desc kvpb.RangeDescriptor
+	raw, err := eng.Get(keys.RangeDescriptorKey(1))
+	if err != nil || raw == nil {
+		return desc, false, err
+	}
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return desc, false, err
+	}
+	return desc, true, nil
+}
+
+// join contacts an existing node to obtain identity and routing bootstrap.
+func (n *Node) join() error {
+	req := cluster.JoinRequest{Address: n.addr, Locality: n.cfg.Locality}
+	var resp cluster.JoinResponse
+	ctx, cancel := context.WithTimeout(n.stopper.Ctx(), 30*time.Second)
+	defer cancel()
+	if err := n.trans.Call(ctx, n.cfg.Join, "join", req, &resp); err != nil {
+		return fmt.Errorf("joining via %s: %w", n.cfg.Join, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("join rejected: %s", resp.Error)
+	}
+	n.ident = cluster.StoreIdent{ClusterID: resp.ClusterID, NodeID: resp.NodeID, StoreID: base.StoreID(resp.NodeID)}
+	if err := cluster.WriteStoreIdent(n.engine, n.ident); err != nil {
+		return err
+	}
+	for _, nd := range resp.Nodes {
+		n.registry.Upsert(nd)
+	}
+	// Persist range 1's descriptor? No — we hold no replica of it. Seed the
+	// routing cache only, after the DB exists (start() does it via
+	// SeedDescriptor below).
+	n.joinRange1 = resp.Range1
+	log.Infof("joined cluster %s as %s", resp.ClusterID, resp.NodeID)
+	return nil
+}
+
+// Stop shuts the node down gracefully.
+func (n *Node) Stop() { n.stopper.Stop() }
+
+// Accessors used by tests, the CLI, and later phases.
+func (n *Node) NodeID() base.NodeID { return n.ident.NodeID }
+func (n *Node) Addr() string        { return n.addr }
+
+// SQLAddr is the SQL listener address (real listener from Phase 6 on).
+func (n *Node) SQLAddr() string             { return n.cfg.PGListen }
+func (n *Node) DB() *kvclient.DB            { return n.db }
+func (n *Node) Store() *kvserver.Store      { return n.store }
+func (n *Node) Clock() *hlc.Clock           { return n.clock }
+func (n *Node) Stopper() *stop.Stopper      { return n.stopper }
+func (n *Node) Registry() *cluster.Registry { return n.registry }

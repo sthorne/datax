@@ -1,0 +1,152 @@
+// Package rpc implements the internode transport: a gRPC service carrying
+// Raft messages (streamed), KV batches, join and admin calls. Every message
+// carries an HLC reading; receivers ratchet their clocks, and a clock beyond
+// the configured max offset is fatal (see docs/transactions.md).
+package rpc
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+
+	"go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/grpc"
+
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/rpc/rpcpb"
+	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/util/log"
+)
+
+// PayloadHandler serves a JSON request payload and returns a JSON response.
+type PayloadHandler func(ctx context.Context, data []byte) ([]byte, error)
+
+// SnapshotHandler consumes an incoming range snapshot stream (Phase 7).
+type SnapshotHandler func(header []byte, kvs func() ([]rpcpb.SnapshotKV, error)) error
+
+// ServerHandlers are the node-side callbacks the transport dispatches into.
+type ServerHandlers struct {
+	Batch    PayloadHandler
+	Join     PayloadHandler
+	Admin    PayloadHandler
+	Raft     func(ctx context.Context, rangeID base.RangeID, m raftpb.Message)
+	Snapshot SnapshotHandler
+}
+
+// Server implements rpcpb.InternodeServer.
+type Server struct {
+	rpcpb.UnimplementedInternodeServer
+	clock    *hlc.Clock
+	handlers ServerHandlers
+}
+
+// NewServer returns a gRPC server with the Internode service registered.
+func NewServer(clock *hlc.Clock, handlers ServerHandlers) *grpc.Server {
+	gs := grpc.NewServer()
+	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers})
+	return gs
+}
+
+func (s *Server) updateClock(now *rpcpb.Hlc) {
+	if now == nil {
+		return
+	}
+	ts := hlc.Timestamp{WallTime: now.WallTime, Logical: now.Logical}
+	if err := s.clock.Update(ts); err != nil {
+		// A clock this far off undermines the uncertainty guarantee;
+		// continuing risks serving inconsistent reads.
+		log.Fatalf("clock synchronization violated: %v", err)
+	}
+}
+
+func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
+	for {
+		env, err := stream.Recv()
+		if err == io.EOF {
+			return stream.SendAndClose(&rpcpb.RaftAck{})
+		}
+		if err != nil {
+			return err
+		}
+		s.updateClock(env.Now)
+		var m raftpb.Message
+		if err := m.Unmarshal(env.Message); err != nil {
+			log.Warnf("dropping undecodable raft message: %v", err)
+			continue
+		}
+		s.handlers.Raft(stream.Context(), base.RangeID(env.RangeId), m)
+	}
+}
+
+func (s *Server) payload(ctx context.Context, h PayloadHandler, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	s.updateClock(in.Now)
+	out, err := h(ctx, in.Json)
+	if err != nil {
+		return nil, err
+	}
+	now := s.clock.Now()
+	return &rpcpb.Payload{Json: out, Now: &rpcpb.Hlc{WallTime: now.WallTime, Logical: now.Logical}}, nil
+}
+
+func (s *Server) Batch(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	return s.payload(ctx, s.handlers.Batch, in)
+}
+
+func (s *Server) Join(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	return s.payload(ctx, s.handlers.Join, in)
+}
+
+func (s *Server) Admin(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	return s.payload(ctx, s.handlers.Admin, in)
+}
+
+func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
+	if s.handlers.Snapshot == nil {
+		return io.EOF
+	}
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	s.updateClock(first.Now)
+	next := func() ([]rpcpb.SnapshotKV, error) {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.updateClock(chunk.Now)
+		out := make([]rpcpb.SnapshotKV, len(chunk.Kvs))
+		for i, kv := range chunk.Kvs {
+			out[i] = rpcpb.SnapshotKV{Key: kv.Key, Value: kv.Value}
+		}
+		return out, nil
+	}
+	if err := s.handlers.Snapshot(first.HeaderJson, next); err != nil {
+		return err
+	}
+	return stream.SendAndClose(&rpcpb.SnapshotAck{})
+}
+
+// batchRPCEnvelope is the JSON body of Batch calls: response or wire error.
+type batchRPCEnvelope struct {
+	Response *kvpb.BatchResponse `json:"response,omitempty"`
+	Error    *kvpb.Error         `json:"error,omitempty"`
+}
+
+// MarshalBatchResult encodes a KV execution outcome for the wire.
+func MarshalBatchResult(br *kvpb.BatchResponse, kerr *kvpb.Error) ([]byte, error) {
+	return json.Marshal(batchRPCEnvelope{Response: br, Error: kerr})
+}
+
+// UnmarshalBatchResult decodes a KV execution outcome.
+func UnmarshalBatchResult(data []byte) (*kvpb.BatchResponse, *kvpb.Error, error) {
+	var env batchRPCEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, nil, err
+	}
+	return env.Response, env.Error, nil
+}

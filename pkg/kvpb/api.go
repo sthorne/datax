@@ -1,0 +1,310 @@
+package kvpb
+
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/storage/enginepb"
+	"github.com/sthorne/datax/pkg/util/hlc"
+)
+
+// RequestHeader is common to all requests: the key (span) it operates on.
+type RequestHeader struct {
+	Key    keys.Key `json:"key"`
+	EndKey keys.Key `json:"end_key,omitempty"` // only for ranged requests
+}
+
+// GetRequest reads a key.
+type GetRequest struct {
+	RequestHeader
+}
+
+// PutRequest writes a value.
+type PutRequest struct {
+	RequestHeader
+	Value []byte `json:"value"`
+}
+
+// DeleteRequest deletes a key (writes a tombstone).
+type DeleteRequest struct {
+	RequestHeader
+}
+
+// IncrementRequest atomically adds By to the varint-encoded value at Key,
+// returning the new value. Evaluated under Raft, so it is atomic without a
+// transaction. Used for ID allocation.
+type IncrementRequest struct {
+	RequestHeader
+	By int64 `json:"by"`
+}
+
+// ScanRequest returns keys in [Key, EndKey).
+type ScanRequest struct {
+	RequestHeader
+	MaxRows int64 `json:"max_rows,omitempty"`
+}
+
+// EndTxnRequest commits or aborts the transaction: the atomic flip of the
+// transaction record. Routed to the transaction's anchor range.
+type EndTxnRequest struct {
+	RequestHeader      // Key = the transaction's anchor key
+	Commit        bool `json:"commit"`
+}
+
+// HeartbeatTxnRequest refreshes the transaction record's liveness.
+type HeartbeatTxnRequest struct {
+	RequestHeader               // Key = anchor key
+	Now           hlc.Timestamp `json:"now"`
+}
+
+// PushTxnRequest asks the pushee's record range to resolve a conflict.
+type PushTxnRequest struct {
+	RequestHeader                  // Key = pushee's anchor key
+	PusherTxn     *Transaction     `json:"pusher_txn,omitempty"` // nil for non-txn pushers
+	PusheeTxn     enginepb.TxnMeta `json:"pushee_txn"`
+	// PushAbort: abort the pushee outright (write-write conflict); otherwise
+	// the push only succeeds if the pushee is already finalized or expired.
+	PushAbort bool          `json:"push_abort"`
+	Now       hlc.Timestamp `json:"now"`
+}
+
+// ResolveIntentRequest resolves an intent according to its transaction's
+// final status.
+type ResolveIntentRequest struct {
+	RequestHeader
+	TxnID    uuid.UUID          `json:"txn_id"`
+	Status   enginepb.TxnStatus `json:"status"`
+	CommitTS hlc.Timestamp      `json:"commit_ts"`
+}
+
+// AdminSplitRequest splits the range containing SplitKey at SplitKey.
+type AdminSplitRequest struct {
+	RequestHeader // Key = split key
+}
+
+// RequestUnion holds exactly one request.
+type RequestUnion struct {
+	Get           *GetRequest           `json:"get,omitempty"`
+	Put           *PutRequest           `json:"put,omitempty"`
+	Delete        *DeleteRequest        `json:"delete,omitempty"`
+	Increment     *IncrementRequest     `json:"increment,omitempty"`
+	Scan          *ScanRequest          `json:"scan,omitempty"`
+	EndTxn        *EndTxnRequest        `json:"end_txn,omitempty"`
+	HeartbeatTxn  *HeartbeatTxnRequest  `json:"heartbeat_txn,omitempty"`
+	PushTxn       *PushTxnRequest       `json:"push_txn,omitempty"`
+	ResolveIntent *ResolveIntentRequest `json:"resolve_intent,omitempty"`
+	AdminSplit    *AdminSplitRequest    `json:"admin_split,omitempty"`
+}
+
+// GetInner returns the wrapped request.
+func (u RequestUnion) GetInner() Request {
+	switch {
+	case u.Get != nil:
+		return u.Get
+	case u.Put != nil:
+		return u.Put
+	case u.Delete != nil:
+		return u.Delete
+	case u.Increment != nil:
+		return u.Increment
+	case u.Scan != nil:
+		return u.Scan
+	case u.EndTxn != nil:
+		return u.EndTxn
+	case u.HeartbeatTxn != nil:
+		return u.HeartbeatTxn
+	case u.PushTxn != nil:
+		return u.PushTxn
+	case u.ResolveIntent != nil:
+		return u.ResolveIntent
+	case u.AdminSplit != nil:
+		return u.AdminSplit
+	}
+	return nil
+}
+
+// Request is implemented by all request types.
+type Request interface {
+	Header() RequestHeader
+	Method() string
+	// IsReadOnly requests can be served without a Raft proposal (via
+	// ReadIndex on the leader).
+	IsReadOnly() bool
+}
+
+func (h *GetRequest) Header() RequestHeader           { return h.RequestHeader }
+func (h *PutRequest) Header() RequestHeader           { return h.RequestHeader }
+func (h *DeleteRequest) Header() RequestHeader        { return h.RequestHeader }
+func (h *IncrementRequest) Header() RequestHeader     { return h.RequestHeader }
+func (h *ScanRequest) Header() RequestHeader          { return h.RequestHeader }
+func (h *EndTxnRequest) Header() RequestHeader        { return h.RequestHeader }
+func (h *HeartbeatTxnRequest) Header() RequestHeader  { return h.RequestHeader }
+func (h *PushTxnRequest) Header() RequestHeader       { return h.RequestHeader }
+func (h *ResolveIntentRequest) Header() RequestHeader { return h.RequestHeader }
+func (h *AdminSplitRequest) Header() RequestHeader    { return h.RequestHeader }
+
+func (*GetRequest) Method() string           { return "Get" }
+func (*PutRequest) Method() string           { return "Put" }
+func (*DeleteRequest) Method() string        { return "Delete" }
+func (*IncrementRequest) Method() string     { return "Increment" }
+func (*ScanRequest) Method() string          { return "Scan" }
+func (*EndTxnRequest) Method() string        { return "EndTxn" }
+func (*HeartbeatTxnRequest) Method() string  { return "HeartbeatTxn" }
+func (*PushTxnRequest) Method() string       { return "PushTxn" }
+func (*ResolveIntentRequest) Method() string { return "ResolveIntent" }
+func (*AdminSplitRequest) Method() string    { return "AdminSplit" }
+
+func (*GetRequest) IsReadOnly() bool           { return true }
+func (*PutRequest) IsReadOnly() bool           { return false }
+func (*DeleteRequest) IsReadOnly() bool        { return false }
+func (*IncrementRequest) IsReadOnly() bool     { return false }
+func (*ScanRequest) IsReadOnly() bool          { return true }
+func (*EndTxnRequest) IsReadOnly() bool        { return false }
+func (*HeartbeatTxnRequest) IsReadOnly() bool  { return false }
+func (*PushTxnRequest) IsReadOnly() bool       { return false }
+func (*ResolveIntentRequest) IsReadOnly() bool { return false }
+func (*AdminSplitRequest) IsReadOnly() bool    { return false }
+
+// Response types.
+
+type GetResponse struct {
+	Value []byte `json:"value,omitempty"` // nil = not found
+}
+
+type PutResponse struct{}
+
+type DeleteResponse struct{}
+
+type IncrementResponse struct {
+	NewValue int64 `json:"new_value"`
+}
+
+type ScanResponse struct {
+	Rows   []KeyValue `json:"rows,omitempty"`
+	Resume keys.Key   `json:"resume,omitempty"`
+}
+
+type EndTxnResponse struct {
+	// CommitTimestamp is the timestamp the transaction committed at.
+	CommitTimestamp hlc.Timestamp `json:"commit_ts"`
+}
+
+type HeartbeatTxnResponse struct {
+	// Status reflects the record after the heartbeat; ABORTED tells the
+	// coordinator it has been pushed away.
+	Status enginepb.TxnStatus `json:"status"`
+}
+
+type PushTxnResponse struct {
+	// Status of the pushee after the push: COMMITTED or ABORTED mean the
+	// pusher may resolve the intent it found; PENDING means the pushee is
+	// alive and the pusher must wait.
+	Status   enginepb.TxnStatus `json:"status"`
+	CommitTS hlc.Timestamp      `json:"commit_ts"`
+}
+
+type ResolveIntentResponse struct{}
+
+type AdminSplitResponse struct {
+	Left  RangeDescriptor `json:"left"`
+	Right RangeDescriptor `json:"right"`
+}
+
+// ResponseUnion holds exactly one response.
+type ResponseUnion struct {
+	Get           *GetResponse           `json:"get,omitempty"`
+	Put           *PutResponse           `json:"put,omitempty"`
+	Delete        *DeleteResponse        `json:"delete,omitempty"`
+	Increment     *IncrementResponse     `json:"increment,omitempty"`
+	Scan          *ScanResponse          `json:"scan,omitempty"`
+	EndTxn        *EndTxnResponse        `json:"end_txn,omitempty"`
+	HeartbeatTxn  *HeartbeatTxnResponse  `json:"heartbeat_txn,omitempty"`
+	PushTxn       *PushTxnResponse       `json:"push_txn,omitempty"`
+	ResolveIntent *ResolveIntentResponse `json:"resolve_intent,omitempty"`
+	AdminSplit    *AdminSplitResponse    `json:"admin_split,omitempty"`
+}
+
+// BatchHeader carries batch-wide state.
+type BatchHeader struct {
+	// Timestamp is the read/write timestamp for non-transactional batches;
+	// transactional batches use the transaction's timestamps.
+	Timestamp hlc.Timestamp `json:"timestamp"`
+	Txn       *Transaction  `json:"txn,omitempty"`
+	// RangeID the sender believes owns the batch's span (0 = let the server
+	// route by key, single-range only).
+	RangeID base.RangeID `json:"range_id,omitempty"`
+	// CreateTxnRecord: this batch contains the transaction's first write on
+	// its anchor range; the server creates the transaction record
+	// atomically with the writes.
+	CreateTxnRecord bool `json:"create_txn_record,omitempty"`
+}
+
+// BatchRequest is the unit of KV RPC.
+type BatchRequest struct {
+	Header   BatchHeader    `json:"header"`
+	Requests []RequestUnion `json:"requests"`
+}
+
+// IsReadOnly reports whether every request in the batch is read-only.
+func (b *BatchRequest) IsReadOnly() bool {
+	for _, u := range b.Requests {
+		r := u.GetInner()
+		if r == nil || !r.IsReadOnly() {
+			return false
+		}
+	}
+	return true
+}
+
+// HasMVCCWrites reports whether the batch writes MVCC versions (Put, Delete,
+// Increment) — the writes the timestamp cache must gate. Transaction-record
+// operations write no versions and are exempt.
+func (b *BatchRequest) HasMVCCWrites() bool {
+	for _, u := range b.Requests {
+		switch u.GetInner().(type) {
+		case *PutRequest, *DeleteRequest, *IncrementRequest:
+			return true
+		}
+	}
+	return false
+}
+
+// Add appends a request to the batch.
+func (b *BatchRequest) Add(r Request) {
+	var u RequestUnion
+	switch t := r.(type) {
+	case *GetRequest:
+		u.Get = t
+	case *PutRequest:
+		u.Put = t
+	case *DeleteRequest:
+		u.Delete = t
+	case *IncrementRequest:
+		u.Increment = t
+	case *ScanRequest:
+		u.Scan = t
+	case *EndTxnRequest:
+		u.EndTxn = t
+	case *HeartbeatTxnRequest:
+		u.HeartbeatTxn = t
+	case *PushTxnRequest:
+		u.PushTxn = t
+	case *ResolveIntentRequest:
+		u.ResolveIntent = t
+	case *AdminSplitRequest:
+		u.AdminSplit = t
+	default:
+		panic(fmt.Sprintf("unknown request type %T", r))
+	}
+	b.Requests = append(b.Requests, u)
+}
+
+// BatchResponse mirrors BatchRequest.
+type BatchResponse struct {
+	// Txn echoes the (possibly updated) transaction state.
+	Txn       *Transaction    `json:"txn,omitempty"`
+	Timestamp hlc.Timestamp   `json:"timestamp"`
+	Responses []ResponseUnion `json:"responses"`
+}
