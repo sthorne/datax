@@ -25,6 +25,11 @@ type replicaState struct {
 	// beneath it may have been reclaimed. Replicated state, raised only by
 	// applied GC commands.
 	GCThreshold hlc.Timestamp `json:"gc_threshold,omitempty"`
+	// SizeBytes approximates the range's replicated MVCC data size. Staged
+	// deterministically at apply (every replica computes the same value
+	// from the same commands), recomputed exactly at splits, and reduced by
+	// GC. Drives size-based auto-splits.
+	SizeBytes int64 `json:"size_bytes,omitempty"`
 }
 
 // getter is the read capability shared by Engine, Batch, and Snapshot.

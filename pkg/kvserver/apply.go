@@ -126,12 +126,14 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	tr := r.rs.truncatedState()
 	r.mu.Lock()
 	thr := r.mu.gcThreshold
+	size := r.mu.sizeBytes
 	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
 		AppliedIndex:   idx,
 		TruncatedIndex: tr.Index,
 		TruncatedTerm:  tr.Term,
 		GCThreshold:    thr,
+		SizeBytes:      size,
 	})
 }
 
@@ -162,6 +164,16 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 			r.mu.Lock()
 			if r.mu.gcThreshold.Less(newThr) {
 				r.mu.gcThreshold = newThr
+			}
+			r.mu.Unlock()
+		}
+		// Size accounting: a pure function of the command, so every replica
+		// stays in agreement (stageAppliedIndex persists it below).
+		if delta := commandSizeDelta(&cmd.Batch); delta != 0 {
+			r.mu.Lock()
+			r.mu.sizeBytes += delta
+			if r.mu.sizeBytes < 0 {
+				r.mu.sizeBytes = 0
 			}
 			r.mu.Unlock()
 		}
@@ -358,4 +370,32 @@ func scanResponse(res storage.ScanResult) *kvpb.ScanResponse {
 		out.Rows = append(out.Rows, kvpb.KeyValue{Key: kv.Key, Value: kv.Value})
 	}
 	return out
+}
+
+// mvccVersionOverhead approximates the engine-key overhead of one MVCC
+// version beyond the user key and value: escaping terminator plus the
+// 12-byte timestamp suffix.
+const mvccVersionOverhead = 16
+
+// commandSizeDelta is the replicated size-accounting rule: an
+// approximation, but a deterministic one — every replica computes the same
+// value for the same command. Splits recompute exact sizes; GC subtracts
+// the exact bytes its enumerating leader measured.
+func commandSizeDelta(ba *kvpb.BatchRequest) int64 {
+	var delta int64
+	for _, u := range ba.Requests {
+		switch req := u.GetInner().(type) {
+		case *kvpb.PutRequest:
+			delta += int64(len(req.Key)+len(req.Value)) + mvccVersionOverhead
+		case *kvpb.DeleteRequest:
+			delta += int64(len(req.Key)) + mvccVersionOverhead // tombstones occupy space until GC
+		case *kvpb.IncrementRequest:
+			delta += int64(len(req.Key)) + mvccVersionOverhead + 8
+		case *kvpb.GCRequest:
+			for _, v := range req.Versions {
+				delta -= v.Bytes
+			}
+		}
+	}
+	return delta
 }

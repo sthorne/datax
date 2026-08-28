@@ -106,7 +106,41 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	if err := PutRangeDescriptor(b, trig.Left); err != nil {
 		return err
 	}
-	return PutRangeDescriptor(b, trig.Right)
+	if err := PutRangeDescriptor(b, trig.Right); err != nil {
+		return err
+	}
+	// Recompute each side's exact data size from the staged state (the
+	// batch view is identical on every replica, so the result is
+	// deterministic), and seed the RHS's replicated state: it inherits the
+	// GC threshold — its keyspace was subject to the LHS's GC.
+	leftSize, err := spanSizeBytes(b, trig.Left.StartKey, trig.Left.EndKey)
+	if err != nil {
+		return err
+	}
+	rightSize, err := spanSizeBytes(b, trig.Right.StartKey, trig.Right.EndKey)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	thr := r.mu.gcThreshold
+	r.mu.sizeBytes = leftSize
+	r.mu.Unlock()
+	return putReplicaState(b, trig.Right.RangeID, replicaState{
+		GCThreshold: thr,
+		SizeBytes:   rightSize,
+	})
+}
+
+// spanSizeBytes sums the stored MVCC bytes of [start, end) as seen by r.
+func spanSizeBytes(r storage.Reader, start, end keys.Key) (int64, error) {
+	lower := storage.EncodeMVCCKey(start, hlc.Timestamp{})
+	upper := storage.EncodeMVCCKey(end, hlc.Timestamp{})
+	it := r.NewIter(lower, upper)
+	var size int64
+	for ok := it.SeekGE(lower); ok; ok = it.Next() {
+		size += int64(len(it.Key()) + len(it.Value()))
+	}
+	return size, it.Close()
 }
 
 func (r *Replica) finishSplit(trig *splitTrigger) {

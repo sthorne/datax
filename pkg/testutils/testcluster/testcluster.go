@@ -81,7 +81,7 @@ func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
 // StartWithEngines brings up numNodes static-membership nodes over injected
 // in-memory engines, so tests can inspect raw storage. The background
 // housekeeping loop is disabled; tests drive GC/truncation explicitly.
-func StartWithEngines(t *testing.T, numNodes int) (*TestCluster, []*storage.Engine) {
+func StartWithEngines(t *testing.T, numNodes int, opts ...func(*server.Config)) (*TestCluster, []*storage.Engine) {
 	t.Helper()
 	clusterID := uuid.New()
 	engines := make([]*storage.Engine, numNodes)
@@ -112,14 +112,18 @@ func StartWithEngines(t *testing.T, numNodes int) (*TestCluster, []*storage.Engi
 		}
 	})
 	for i := 0; i < numNodes; i++ {
-		n, err := server.Start(server.Config{
+		cfg := server.Config{
 			Listener:   listeners[i],
 			Engine:     engines[i],
 			GCInterval: -1, // no background housekeeping
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
 			},
-		})
+		}
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		n, err := server.Start(cfg)
 		if err != nil {
 			t.Fatalf("starting node %d: %v", i+1, err)
 		}

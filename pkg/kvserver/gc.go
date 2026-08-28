@@ -79,6 +79,7 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 					s.RunGCOnce(ctx, gcTTL)
 				}
 				s.RunLogTruncationOnce(ctx)
+				s.RunAutoSplitOnce(ctx)
 			}
 		}
 	})
@@ -203,8 +204,9 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 				break // next user key; outer loop re-examines this position
 			}
 			if cvts.LessEq(threshold) {
+				stored := int64(len(it.Key()) + len(it.Value()))
 				if survivorSeen {
-					out = append(out, kvpb.GCVersion{Key: cur, TS: cvts})
+					out = append(out, kvpb.GCVersion{Key: cur, TS: cvts, Bytes: stored})
 				} else {
 					survivorSeen = true
 					tomb, err := storage.IsTombstoneValue(it.Value())
@@ -212,7 +214,7 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 						return nil, nil, err
 					}
 					if tomb {
-						out = append(out, kvpb.GCVersion{Key: cur, TS: cvts})
+						out = append(out, kvpb.GCVersion{Key: cur, TS: cvts, Bytes: stored})
 					}
 				}
 			}

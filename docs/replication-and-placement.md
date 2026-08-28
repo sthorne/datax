@@ -32,12 +32,12 @@ transport.
 [architecture.md](architecture.md)). v1 has no separate lease mechanism:
 leaseholder = Raft leader.
 
-**Splits** are manual in v1 (`datax debug split <key>`): the split is proposed
-as a replicated command; at apply time each replica atomically writes both
-descriptors and creates the right-hand side's Raft state. No data moves,
-because range membership of a key is logical. The `/meta/` addressing records
-are then updated transactionally. Automatic split-by-size and merges are
-future work.
+**Splits** happen automatically by size (v2; see below) or manually
+(`datax debug split <key>`): the split is proposed as a replicated command;
+at apply time each replica atomically writes both descriptors and creates
+the right-hand side's Raft state. No data moves, because range membership
+of a key is logical. The `/meta/` addressing records are then updated
+transactionally. Range merges are future work.
 
 ## Peer discovery
 
@@ -152,6 +152,21 @@ A dead voter's `Match` freezes and **pins truncation** — deliberate, since
 datax has no raft-internal snapshot delivery: the log must stay sufficient
 to catch up any configured voter. Dead-node repair (removing the dead
 replica) is what unpins it.
+
+## Size-based auto-splitting
+
+Each range's approximate data size is **replicated state**
+(`replicaState.SizeBytes`): every applied write adds a deterministic
+per-command estimate, GC subtracts the exact bytes its enumerating leader
+measured (carried in the GC command), and a split recomputes both sides
+exactly from the staged state — so replicas always agree on the number.
+When a led range exceeds `SplitSizeThreshold` (default 64 MiB) the
+housekeeping loop splits it at the byte-midpoint clamped to a user-key
+boundary, through the ordinary replicated split. A range mid-membership-
+change fails the admin op safely and retries next tick. Splits also seed
+the right-hand side's replicated state — including the **GC threshold it
+inherits** from the left-hand side, since its keyspace was subject to the
+same GC.
 
 ## Rack-aware placement
 

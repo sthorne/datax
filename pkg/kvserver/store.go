@@ -36,7 +36,10 @@ type StoreConfig struct {
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
-	TestingKnobs      TestingKnobs
+	// SplitSizeThreshold is the range size that triggers an automatic split
+	// (default 64 MiB; negative disables auto-splitting).
+	SplitSizeThreshold int64
+	TestingKnobs       TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.
@@ -82,6 +85,9 @@ func (s *Store) getSender() Sender {
 func NewStore(cfg StoreConfig) *Store {
 	if cfg.RaftTickInterval == 0 {
 		cfg.RaftTickInterval = 100 * time.Millisecond
+	}
+	if cfg.SplitSizeThreshold == 0 {
+		cfg.SplitSizeThreshold = 64 << 20
 	}
 	s := &Store{cfg: cfg}
 	s.mu.replicas = make(map[base.RangeID]*Replica)

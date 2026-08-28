@@ -48,6 +48,7 @@ type snapshotHeader struct {
 	AppliedIndex uint64               `json:"applied_index"`
 	Term         uint64               `json:"term"`
 	GCThreshold  hlc.Timestamp        `json:"gc_threshold,omitempty"`
+	SizeBytes    int64                `json:"size_bytes,omitempty"`
 }
 
 // adminChangeReplicas executes an AdminChangeReplicasRequest on the leader.
@@ -165,6 +166,7 @@ func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDes
 		AppliedIndex: st.AppliedIndex,
 		Term:         term,
 		GCThreshold:  st.GCThreshold,
+		SizeBytes:    st.SizeBytes,
 	})
 	if err != nil {
 		return err
@@ -251,6 +253,7 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 		TruncatedIndex: h.AppliedIndex,
 		TruncatedTerm:  h.Term,
 		GCThreshold:    h.GCThreshold,
+		SizeBytes:      h.SizeBytes,
 	}); err != nil {
 		_ = b.Close()
 		return err

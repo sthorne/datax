@@ -94,7 +94,7 @@ This is a prototype. Out of scope so far, deliberately:
 
 | Area | Not yet implemented |
 |---|---|
-| Ranges | automatic split/merge (splits are manual: `datax debug split`) |
+| Ranges | range merges (splits are automatic by size, or manual via `datax debug split`) |
 | Placement | automatic load rebalancing; node decommission |
 | Reads | follower reads (reads are leader-only: lease-based ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |

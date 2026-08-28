@@ -73,6 +73,7 @@ type Replica struct {
 		desc         kvpb.RangeDescriptor
 		appliedIndex uint64
 		gcThreshold  hlc.Timestamp // replicated; raised by applied GC commands
+		sizeBytes    int64         // replicated approximate MVCC data size
 		term         uint64        // highest raft term observed
 		leader       uint64        // last known raft leader (replica ID); 0 unknown
 		proposals    map[string]chan proposalResult
@@ -144,6 +145,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
 	r.mu.gcThreshold = st.GCThreshold
+	r.mu.sizeBytes = st.SizeBytes
 	if hs, _, err := rs.InitialState(); err == nil {
 		r.mu.term = hs.Term
 	}
@@ -181,6 +183,13 @@ func (r *Replica) GCThreshold() hlc.Timestamp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mu.gcThreshold
+}
+
+// SizeBytes returns the range's replicated approximate data size.
+func (r *Replica) SizeBytes() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.sizeBytes
 }
 
 // IsLeader reports whether this replica believes it is the Raft leader.

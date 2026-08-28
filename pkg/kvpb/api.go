@@ -90,10 +90,13 @@ type RefreshRequest struct {
 	FromTS hlc.Timestamp `json:"from_ts"`
 }
 
-// GCVersion names one MVCC version to reclaim.
+// GCVersion names one MVCC version to reclaim. Bytes is its stored size
+// (engine key + value), filled by the enumerating leader so every replica
+// subtracts the same amount from the range's size accounting.
 type GCVersion struct {
-	Key keys.Key      `json:"key"`
-	TS  hlc.Timestamp `json:"ts"`
+	Key   keys.Key      `json:"key"`
+	TS    hlc.Timestamp `json:"ts"`
+	Bytes int64         `json:"bytes,omitempty"`
 }
 
 // GCRequest reclaims garbage below Threshold: the listed MVCC versions

@@ -56,6 +56,9 @@ type Config struct {
 	// DisableLeaseReads makes every read confirm leadership with a quorum
 	// round trip (v1 behavior) instead of the leader's lease.
 	DisableLeaseReads bool
+	// SplitSizeThreshold is the range size that triggers an automatic split
+	// (default 64 MiB; negative disables).
+	SplitSizeThreshold int64
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -190,15 +193,16 @@ func (n *Node) start() error {
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
-		NodeID:            n.ident.NodeID,
-		StoreID:           n.ident.StoreID,
-		Engine:            n.engine,
-		Clock:             n.clock,
-		Transport:         n.trans,
-		SnapshotSender:    n.trans,
-		Stopper:           n.stopper,
-		DisableLeaseReads: n.cfg.DisableLeaseReads,
-		TestingKnobs:      n.cfg.TestingKnobs,
+		NodeID:             n.ident.NodeID,
+		StoreID:            n.ident.StoreID,
+		Engine:             n.engine,
+		Clock:              n.clock,
+		Transport:          n.trans,
+		SnapshotSender:     n.trans,
+		Stopper:            n.stopper,
+		DisableLeaseReads:  n.cfg.DisableLeaseReads,
+		SplitSizeThreshold: n.cfg.SplitSizeThreshold,
+		TestingKnobs:       n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
