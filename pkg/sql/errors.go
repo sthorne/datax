@@ -26,6 +26,8 @@ const (
 	CodeNoActiveTransaction  = "25P01"
 	CodeInternal             = "XX000"
 	CodeInvalidParameter     = "08P01"
+	CodeUndefinedObject      = "42704"
+	CodeDuplicateObject      = "42710"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.

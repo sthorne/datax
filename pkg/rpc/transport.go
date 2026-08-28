@@ -2,12 +2,14 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"sync"
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -29,6 +31,7 @@ type Transport struct {
 	clock    *hlc.Clock
 	stopper  *stop.Stopper
 	resolver Resolver
+	tlsCfg   *tls.Config // nil = cleartext
 
 	localMu   sync.Mutex
 	localNode base.NodeID
@@ -52,6 +55,10 @@ func NewTransport(clock *hlc.Clock, stopper *stop.Stopper, resolver Resolver) *T
 	t.mu.raftQ = make(map[base.NodeID]chan *rpcpb.RaftEnvelope)
 	return t
 }
+
+// SetTLS installs the client TLS configuration used for all outbound
+// connections (call before any dialing; nil keeps cleartext).
+func (t *Transport) SetTLS(cfg *tls.Config) { t.tlsCfg = cfg }
 
 // SetLocalInfo records this node's identity, piggybacked on outgoing Raft
 // envelopes so peers learn our address from Raft traffic itself.
@@ -88,7 +95,7 @@ func (t *Transport) Dial(nodeID base.NodeID) (*grpc.ClientConn, error) {
 		_ = c.cc.Close()
 		delete(t.mu.conns, nodeID)
 	}
-	cc, err := DialAddr(addr)
+	cc, err := DialAddr(addr, t.tlsCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +104,11 @@ func (t *Transport) Dial(nodeID base.NodeID) (*grpc.ClientConn, error) {
 }
 
 // DialAddr opens a raw connection to an address (used for joins, before the
-// registry knows any node IDs).
-func DialAddr(addr string) (*grpc.ClientConn, error) {
+// registry knows any node IDs). tlsCfg nil dials cleartext.
+func DialAddr(addr string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
+	if tlsCfg != nil {
+		return grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	}
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
@@ -239,7 +249,7 @@ func (t *Transport) SendSnapshot(ctx context.Context, to base.NodeID, header []b
 
 // Call performs a unary JSON RPC (join/admin) against an address.
 func (t *Transport) Call(ctx context.Context, addr string, method string, req, resp any) error {
-	cc, err := DialAddr(addr)
+	cc, err := DialAddr(addr, t.tlsCfg)
 	if err != nil {
 		return err
 	}

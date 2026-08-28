@@ -114,12 +114,21 @@ explicit `BEGIN ... COMMIT`.
 `pkg/pgwire` implements the PostgreSQL v3 protocol on
 [`pgproto3`](https://github.com/jackc/pgx/tree/master/pgproto3):
 
-- **Startup**: `SSLRequest` answered with `N` (no TLS in v1); **trust
-  authentication** (any user, no password — SCRAM is future work);
-  `ParameterStatus` for `server_version` (reports a PG-13-compatible version
-  string), `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`,
-  `standard_conforming_strings=on`, `TimeZone=UTC`; then `BackendKeyData` and
-  `ReadyForQuery`.
+- **Startup**: in secure mode (`--certs-dir`), `SSLRequest` is answered
+  with `S`, the connection upgrades to TLS, and the client authenticates
+  with **SCRAM-SHA-256** (RFC 5802/7677, hand-implemented server-side with
+  stdlib crypto; verifiers — never plaintext — live at
+  `/system/users/<name>`; unknown users and wrong passwords fail with one
+  uniform `28P01`, and a full dummy exchange runs for unknown users so the
+  flow leaks nothing). Cleartext startup is refused in secure mode. In
+  insecure mode `SSLRequest` gets `N` and authentication is trust.
+  `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
+  `--root-password` seeds root's at startup. No roles or privileges
+  (documented limitation): any authenticated user can do anything.
+  Then `ParameterStatus` for `server_version` (reports a PG-13-compatible
+  version string), `client_encoding=UTF8`, `DateStyle=ISO`,
+  `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;
+  then `BackendKeyData` and `ReadyForQuery`.
 - **Simple query** (`Q`): multi-statement strings split on `;`, each executed;
   results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).

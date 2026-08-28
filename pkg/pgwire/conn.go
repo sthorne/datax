@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -66,6 +67,8 @@ type conn struct {
 	backend *pgproto3.Backend
 	nc      net.Conn
 	session *sql.Session
+	opts    ServerOptions
+	tlsDone bool
 
 	stmts   map[string]*prepared
 	portals map[string]*portal
@@ -74,11 +77,12 @@ type conn struct {
 	skipToSync bool
 }
 
-func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor) *conn {
+func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	return &conn{
 		backend: pgproto3.NewBackend(nc, nc),
 		nc:      nc,
 		session: sql.NewSession(db, cat),
+		opts:    opts,
 		stmts:   make(map[string]*prepared),
 		portals: make(map[string]*portal),
 	}
@@ -154,14 +158,42 @@ func (c *conn) handleStartup() error {
 		if err != nil {
 			return err
 		}
-		switch msg.(type) {
-		case *pgproto3.SSLRequest, *pgproto3.GSSEncRequest:
-			// No TLS/GSS in v1: reply 'N', client continues in cleartext.
+		switch m := msg.(type) {
+		case *pgproto3.SSLRequest:
+			if c.opts.TLS != nil {
+				if _, err := c.nc.Write([]byte{'S'}); err != nil {
+					return err
+				}
+				tc := tls.Server(c.nc, c.opts.TLS)
+				if err := tc.Handshake(); err != nil {
+					return err
+				}
+				c.nc = tc
+				c.backend = pgproto3.NewBackend(tc, tc)
+				c.tlsDone = true
+				continue
+			}
+			// Insecure mode: reply 'N', client continues in cleartext.
+			if _, err := c.nc.Write([]byte{'N'}); err != nil {
+				return err
+			}
+		case *pgproto3.GSSEncRequest:
 			if _, err := c.nc.Write([]byte{'N'}); err != nil {
 				return err
 			}
 		case *pgproto3.StartupMessage:
-			c.backend.Send(&pgproto3.AuthenticationOk{}) // trust auth
+			if c.opts.TLS != nil && !c.tlsDone {
+				c.sendError(&sql.Error{Code: "28000", Msg: "connection requires TLS"})
+				_ = c.backend.Flush()
+				return fmt.Errorf("cleartext startup refused in secure mode")
+			}
+			if c.opts.Auth != nil {
+				if err := c.authenticateSCRAM(m.Parameters["user"]); err != nil {
+					return err
+				}
+			} else {
+				c.backend.Send(&pgproto3.AuthenticationOk{}) // trust auth
+			}
 			for _, kv := range [][2]string{
 				{"server_version", "13.0 datax"},
 				{"server_encoding", "UTF8"},

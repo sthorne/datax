@@ -106,6 +106,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
+			return p.parseUserStmt(false)
+		}
 		return p.parseCreateTable()
 	case "EXPLAIN":
 		p.i++
@@ -115,6 +118,14 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &Explain{Stmt: inner}, nil
 	case "DROP":
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
+			p.i += 2 // DROP USER
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &DropUser{Name: name}, nil
+		}
 		return p.parseDropTable()
 	case "INSERT":
 		return p.parseInsert()
@@ -125,6 +136,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DELETE":
 		return p.parseDelete()
 	case "ALTER":
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
+			return p.parseUserStmt(true)
+		}
 		return p.parseAlterTable()
 	case "BEGIN":
 		p.i++
@@ -519,6 +533,24 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		return se, false, err
 	}
 	return se, true, nil
+}
+
+// parseUserStmt parses CREATE USER / ALTER USER name PASSWORD 'pw'.
+func (p *parser) parseUserStmt(alter bool) (Statement, error) {
+	p.i += 2 // CREATE|ALTER USER
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("PASSWORD"); err != nil {
+		return nil, err
+	}
+	t := p.peek()
+	if t.kind != tkString {
+		return nil, p.errf("expected password string, found %q", t.text)
+	}
+	p.i++
+	return &CreateUser{Name: name, Password: t.text, Alter: alter}, nil
 }
 
 func (p *parser) parseAlterTable() (Statement, error) {

@@ -6,11 +6,13 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -45,8 +47,14 @@ type Server struct {
 }
 
 // NewServer returns a gRPC server with the Internode service registered.
-func NewServer(clock *hlc.Clock, handlers ServerHandlers) *grpc.Server {
-	gs := grpc.NewServer()
+// A non-nil tlsCfg enables mutual TLS (the config must require and verify
+// client certificates); nil serves cleartext.
+func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *grpc.Server {
+	var opts []grpc.ServerOption
+	if tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	gs := grpc.NewServer(opts...)
 	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers})
 	return gs
 }

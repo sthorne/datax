@@ -22,6 +22,8 @@ type serverFlags struct {
 	locality  string
 	maxOffset time.Duration
 	advertise string
+	certsDir  string
+	rootPw    string
 	verbose   bool
 }
 
@@ -34,6 +36,8 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.locality, "locality", "", "ordered failure-domain tiers, e.g. region=r1,rack=a")
 	f.fs.DurationVar(&f.maxOffset, "max-offset", base.DefaultMaxClockOffset, "maximum tolerated clock offset between nodes")
 	f.fs.StringVar(&f.advertise, "advertise", "", "address other nodes should use to reach this node (default: resolved listen address)")
+	f.fs.StringVar(&f.certsDir, "certs-dir", "", "certificate directory; enables mutual internode TLS and SQL TLS+SCRAM (empty = insecure)")
+	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -53,6 +57,8 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		Locality:      loc,
 		MaxOffset:     f.maxOffset,
 		AdvertiseAddr: f.advertise,
+		CertsDir:      f.certsDir,
+		RootPassword:  f.rootPw,
 	}, nil
 }
 
@@ -64,7 +70,11 @@ func runServer(cfg server.Config) error {
 	fmt.Printf("datax node %s ready\n", n.NodeID())
 	fmt.Printf("  internode RPC: %s\n", n.Addr())
 	if cfg.PGListen != "" {
-		fmt.Printf("  SQL clients:   postgres://root@%s/datax?sslmode=disable\n", n.SQLAddr())
+		mode := "sslmode=disable"
+		if cfg.CertsDir != "" {
+			mode = "sslmode=verify-ca"
+		}
+		fmt.Printf("  SQL clients:   postgres://root@%s/datax?%s\n", n.SQLAddr(), mode)
 	}
 
 	ch := make(chan os.Signal, 1)

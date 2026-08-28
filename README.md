@@ -99,8 +99,8 @@ This is a prototype. Out of scope so far, deliberately:
 | Reads | follower reads (reads are leader-only: lease-based ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | joins, GROUP BY, subqueries, most types |
-| Wire | TLS, SCRAM auth (trust auth only), binary extended-protocol parameters |
-| Ops | observability UI, metrics endpoints; a restarted node must keep its address (no address-change story) |
+| Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
+| Ops | observability UI, metrics endpoints; roles/privileges; a restarted node must keep its address (no address-change story) |
 
 ## License
 

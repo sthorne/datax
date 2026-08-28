@@ -221,6 +221,13 @@ func RangeIDGenKey() Key { return systemKey("idgen", "range") }
 // DescIDGenKey is the counter for allocating SQL descriptor (table) IDs.
 func DescIDGenKey() Key { return systemKey("idgen", "desc") }
 
+// UserKey holds a SQL user's SCRAM verifier (JSON; never a plaintext
+// password).
+func UserKey(name string) Key {
+	k := systemKey("users")
+	return Key(encoding.EncodeString(k, name))
+}
+
 // TableDescKey holds the JSON table descriptor for a table ID.
 func TableDescKey(tableID uint64) Key {
 	k := systemKey("desc")

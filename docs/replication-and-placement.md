@@ -105,6 +105,16 @@ descriptor + applied index) over gRPC **before** the ConfChange commits
 snapshot through Raft. Configuration changes happen one replica at a time (no
 joint consensus in v1).
 
+## Internode security
+
+With `--certs-dir` set, all internode gRPC runs over **mutual TLS**: every
+node presents its node certificate and requires a CA-signed client
+certificate from callers, so an attacker on the network can neither read
+nor join the cluster's replication traffic. `datax cert
+create-ca|create-node|create-client` generates the material with standard
+library crypto (ECDSA P-256). Insecure mode (no certs dir) keeps v1's
+cleartext behavior for development.
+
 ## Lease-based reads
 
 Reads are leader-only and linearizable. v1 confirmed leadership with a full

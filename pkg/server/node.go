@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -59,6 +61,13 @@ type Config struct {
 	// SplitSizeThreshold is the range size that triggers an automatic split
 	// (default 64 MiB; negative disables).
 	SplitSizeThreshold int64
+	// CertsDir enables secure mode: mutual TLS between nodes, TLS +
+	// SCRAM-SHA-256 authentication on the SQL listener. Empty = insecure
+	// (cleartext, trust auth).
+	CertsDir string
+	// RootPassword, in secure mode, seeds the root user's credential at
+	// startup if no verifier exists yet.
+	RootPassword string
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -82,6 +91,7 @@ type StaticBootstrap struct {
 // Node is a running datax node.
 type Node struct {
 	cfg      Config
+	tlsCfgs  *security.TLSConfigs // nil in insecure mode
 	stopper  *stop.Stopper
 	clock    *hlc.Clock
 	engine   *storage.Engine
@@ -142,6 +152,13 @@ func (n *Node) start() error {
 	n.registry = cluster.NewRegistry()
 	n.trans = rpc.NewTransport(n.clock, n.stopper, n.registry.Resolve)
 	n.stopper.AddCloser(n.trans.Close)
+	if n.cfg.CertsDir != "" {
+		n.tlsCfgs, err = security.LoadNodeTLS(n.cfg.CertsDir)
+		if err != nil {
+			return fmt.Errorf("loading TLS certificates: %w", err)
+		}
+		n.trans.SetTLS(n.tlsCfgs.Client)
+	}
 
 	// Identity: read from disk, or establish via bootstrap/join.
 	ident, initialized, err := cluster.ReadStoreIdent(n.engine)
@@ -217,6 +234,10 @@ func (n *Node) start() error {
 	n.store.SetSender(n.db)
 
 	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
+	var serverTLS *tls.Config
+	if n.tlsCfgs != nil {
+		serverTLS = n.tlsCfgs.Server
+	}
 	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
 		Batch:    n.handleBatch,
 		Join:     n.handleJoin,
@@ -224,7 +245,7 @@ func (n *Node) start() error {
 		Raft:     n.store.HandleRaftMessage,
 		Snapshot: n.store.ApplySnapshotStream,
 		NodeInfo: n.registry.UpsertAddress,
-	})
+	}, serverTLS)
 	// Not a stopper worker: Serve exits when the closer calls Stop, and
 	// closers run after workers — a worker here would deadlock shutdown.
 	go func() {

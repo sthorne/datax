@@ -25,6 +25,10 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execExplain(ctx, txn, t, params)
 	case *parser.AlterTable:
 		return s.execAlterTable(ctx, txn, t)
+	case *parser.CreateUser:
+		return s.execCreateUser(ctx, txn, t)
+	case *parser.DropUser:
+		return s.execDropUser(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:

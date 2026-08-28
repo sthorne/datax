@@ -110,6 +110,18 @@ type Delete struct {
 	Where []Comparison
 }
 
+// CreateUser is CREATE USER / ALTER USER ... PASSWORD 'pw'.
+type CreateUser struct {
+	Name     string
+	Password string
+	Alter    bool // ALTER USER: the user must already exist
+}
+
+// DropUser is DROP USER name.
+type DropUser struct {
+	Name string
+}
+
 type Begin struct{}
 type Commit struct{}
 type Rollback struct{}
@@ -128,6 +140,8 @@ func (*Select) stmt()      {}
 func (*Update) stmt()      {}
 func (*Delete) stmt()      {}
 func (*AlterTable) stmt()  {}
+func (*CreateUser) stmt()  {}
+func (*DropUser) stmt()    {}
 func (*Begin) stmt()       {}
 func (*Commit) stmt()      {}
 func (*Rollback) stmt()    {}
