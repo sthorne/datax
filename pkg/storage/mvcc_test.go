@@ -368,3 +368,54 @@ func TestMVCCTxnDeleteOwnWrite(t *testing.T) {
 		t.Fatalf("after commit of delete: got %q", v)
 	}
 }
+
+func TestMVCCCheckForWrites(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "a", ts(10, 0), "v10", nil)
+	mustPut(t, eng, "b", ts(20, 0), "v20", nil)
+	mustDelete(t, eng, "c", ts(25, 0), nil)
+
+	own := newTxn(ts(30, 0))
+	mustPut(t, eng, "d", own.WriteTimestamp, "own-intent", own)
+
+	check := func(start, end string, from, to hlc.Timestamp) error {
+		return MVCCCheckForWrites(eng, keys.Key(start), keys.Key(end), from, to, own.ID)
+	}
+
+	// No writes in (10, 15]: refresh safe.
+	if err := check("a", "b", ts(10, 0), ts(15, 0)); err != nil {
+		t.Fatalf("clean window: %v", err)
+	}
+	// b@20 falls in (15, 25]: refresh fails.
+	if err := check("a", "z", ts(15, 0), ts(25, 0)); err == nil {
+		t.Fatal("missed committed write in window")
+	}
+	// Boundary: from is exclusive — a@10 not in (10, 30]... but b@20 is.
+	if err := check("a", "b", ts(9, 0), ts(30, 0)); err == nil {
+		t.Fatal("missed write at from boundary+")
+	}
+	// to is inclusive: b@20 in (19, 20].
+	if err := check("b", "c", ts(19, 0), ts(20, 0)); err == nil {
+		t.Fatal("missed write at to boundary")
+	}
+	// Tombstones count as writes: c@25 in (24, 26].
+	if err := check("c", "d", ts(24, 0), ts(26, 0)); err == nil {
+		t.Fatal("missed tombstone in window")
+	}
+	// Own intent and provisional value are ignored.
+	if err := check("d", "e", ts(29, 0), ts(31, 0)); err != nil {
+		t.Fatalf("own intent should not fail refresh: %v", err)
+	}
+	// Foreign intent fails refresh.
+	other := newTxn(ts(40, 0))
+	mustPut(t, eng, "e", other.WriteTimestamp, "foreign", other)
+	if err := check("e", "f", ts(39, 0), ts(41, 0)); err == nil {
+		t.Fatal("missed foreign intent")
+	}
+	var wie *WriteIntentError
+	if err := check("e", "f", ts(1, 0), ts(2, 0)); !errors.As(err, &wie) {
+		// A foreign intent fails refresh regardless of window (it could
+		// commit anywhere).
+		t.Fatalf("foreign intent outside window: got %v", err)
+	}
+}

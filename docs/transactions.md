@@ -60,26 +60,42 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
 
-## Serializability: retry-only
+## Serializability: refresh, then retry
 
-All reads happen at the txn's `readTS`. All writes must also commit at
-`readTS`. Events that force the write timestamp above `readTS`:
+All reads happen at the txn's `readTS`, and the commit condition — enforced
+in exactly one place, the transaction record flip — is that `writeTS`
+still equals `readTS`. Events that force the write timestamp above
+`readTS`:
 
-- the range's **timestamp cache** shows a later read of a key we want to write
-  (write after read),
+- the range's **timestamp cache** shows a later read overlapping a key we
+  want to write (write after read),
 - `WriteTooOld`: a committed version exists above our write timestamp,
 - an uncertainty restart.
 
-v1 does **not** track read spans, so it cannot prove reads would be unchanged
-at the higher timestamp ("read refresh"). Instead:
+The coordinator tracks every span the transaction has read (up to a cap;
+beyond it refresh is disabled). On any of the conflicts above it attempts a
+**read refresh**: for each read span it sends a `Refresh` request verifying
+no other transaction wrote into the span within `(readTS, newTS]` — any
+committed version there, or any foreign intent (which could commit inside
+the window), fails the refresh. Refresh runs on the ordinary read path, so
+it holds shared latches and **bumps the timestamp cache to the new read
+timestamp before evaluating** — after a success, no write can land beneath
+the new `readTS` on that span without being pushed above it. On success the
+transaction adopts `readTS = writeTS = newTS` and re-issues the conflicting
+operation; the commit condition then holds again without a restart.
 
-- If the transaction is an implicit single statement (auto-commit) the server
-  retries it transparently at a new timestamp with bumped priority.
-- Otherwise the client gets PostgreSQL error **`40001 serialization_failure`**
-  — the standard signal that well-behaved PG/CRDB applications already retry.
+Only when refresh fails (a read was actually invalidated) does the conflict
+surface:
 
-This is strictly correct, just slower under contention. Read refresh is the
-first planned post-v1 improvement.
+- an implicit single statement (auto-commit) is retried transparently at a
+  new timestamp with bumped priority;
+- an explicit transaction gets PostgreSQL error **`40001
+  serialization_failure`** — the standard signal that well-behaved PG/CRDB
+  applications already retry.
+
+Intents laid at the pre-refresh write timestamp are fine: resolution moves
+provisional versions to the final commit timestamp, and moving a write's
+timestamp up never violates the write-beneath-read rule.
 
 ### Span latches
 

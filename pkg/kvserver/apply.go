@@ -284,6 +284,21 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 				return nil, kvpb.NewError(err)
 			}
 			ru.Scan = scanResponse(res)
+		case *kvpb.RefreshRequest:
+			if ba.Header.Txn == nil {
+				return nil, kvpb.NewErrorf("Refresh without a transaction")
+			}
+			end := req.EndKey
+			if len(end) == 0 {
+				end = req.Key.Next()
+			}
+			// ts here is the transaction's NEW read timestamp; the read path
+			// has already bumped the timestamp cache to it (invariant L2),
+			// so a success cannot be invalidated by a later write.
+			if err := storage.MVCCCheckForWrites(eng, req.Key, end, req.FromTS, ts, ba.Header.Txn.ID); err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.Refresh = &kvpb.RefreshResponse{}
 		default:
 			return nil, kvpb.NewErrorf("non-read request in read-only batch: %T", ba.Requests[i].GetInner())
 		}

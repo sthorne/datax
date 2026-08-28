@@ -46,8 +46,36 @@ type Txn struct {
 		writes   map[string]struct{} // keys with intents (across epochs)
 		anchored bool                // transaction record created
 		finished bool
+		// readSpans are the spans this transaction has observed; refresh
+		// verifies them when moving the read timestamp forward.
+		readSpans []readSpan
+		// refreshUnusable: too many spans (or tracking disabled) — fall
+		// back to v1's restart behavior.
+		refreshUnusable bool
 	}
 	heartbeatCancel context.CancelFunc
+}
+
+type readSpan struct {
+	start, end keys.Key // end nil = point read
+}
+
+// maxReadSpans bounds refresh bookkeeping; beyond it, conflicts surface as
+// restarts (v1 behavior).
+const maxReadSpans = 512
+
+func (t *Txn) recordRead(start, end keys.Key) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mu.refreshUnusable {
+		return
+	}
+	if len(t.mu.readSpans) >= maxReadSpans {
+		t.mu.refreshUnusable = true
+		t.mu.readSpans = nil
+		return
+	}
+	t.mu.readSpans = append(t.mu.readSpans, readSpan{start: start.Clone(), end: end.Clone()})
 }
 
 // NewTxn begins a transaction at the current clock reading.
@@ -79,6 +107,7 @@ func (t *Txn) Get(ctx context.Context, key keys.Key) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.recordRead(key, nil)
 	return br.Responses[0].Get.Value, nil
 }
 
@@ -90,7 +119,13 @@ func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 	if err != nil {
 		return nil, err
 	}
-	return br.Responses[0].Scan.Rows, nil
+	resp := br.Responses[0].Scan
+	observedEnd := end
+	if len(resp.Resume) > 0 {
+		observedEnd = resp.Resume // only [start, resume) was observed
+	}
+	t.recordRead(start, observedEnd)
+	return resp.Rows, nil
 }
 
 // Put writes key = value as a write intent.
@@ -162,9 +197,11 @@ func (t *Txn) recordWrite(key keys.Key) {
 
 // send executes a batch, handling conflicts: intents are pushed (and
 // resolved when their transaction is finalized or expired); live conflicts
-// are waited out briefly; timestamp conflicts surface as RetryableError.
+// are waited out briefly; timestamp conflicts trigger a read refresh and,
+// only if that fails, surface as RetryableError.
 func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*kvpb.BatchResponse, error) {
 	waited := time.Duration(0)
+	refreshes := 0
 	for {
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr == nil {
@@ -192,11 +229,64 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 			t.markFinished()
 			return nil, &RetryableError{Cause: kerr}
 		case kerr.IsRetryableTxnError():
+			// Timestamp conflict (WriteTooOld / tsCache push / uncertainty
+			// / commit equality): try to move the read timestamp forward by
+			// proving our read spans saw no writes in the window, instead
+			// of restarting.
+			newTS := kerr.RetryTimestamp(t.db.clock.Now())
+			if refreshes < maxRefreshesPerOp && t.maybeRefresh(ctx, newTS) {
+				refreshes++
+				ba.Header.Txn = t.proto() // re-stamp with refreshed timestamps
+				continue
+			}
 			return nil, &RetryableError{Cause: kerr}
 		default:
 			return nil, kerr
 		}
 	}
+}
+
+// maxRefreshesPerOp bounds refresh loops under pathological contention.
+const maxRefreshesPerOp = 10
+
+// maybeRefresh verifies every tracked read span saw no foreign write in
+// (readTS, newTS] and, on success, advances the transaction's read and
+// write timestamps to newTS. See docs/transactions.md.
+func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
+	t.mu.Lock()
+	if t.mu.refreshUnusable {
+		t.mu.Unlock()
+		return false
+	}
+	oldRead := t.mu.txn.ReadTimestamp
+	spans := append([]readSpan(nil), t.mu.readSpans...)
+	provisional := t.mu.txn
+	t.mu.Unlock()
+
+	if newTS.LessEq(oldRead) {
+		return true // nothing to move
+	}
+	provisional.ReadTimestamp = newTS
+	provisional.WriteTimestamp = newTS
+	for _, sp := range spans {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: provisional.Clone()}}
+		ba.Add(&kvpb.RefreshRequest{
+			RequestHeader: kvpb.RequestHeader{Key: sp.start, EndKey: sp.end},
+			FromTS:        oldRead,
+		})
+		if _, kerr := t.db.Send(ctx, ba); kerr != nil {
+			log.Debugf("txn %s refresh to %s failed: %v", provisional.ID, newTS, kerr)
+			return false
+		}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.mu.txn.ReadTimestamp.Equal(oldRead) {
+		return false // concurrent change; be conservative
+	}
+	t.mu.txn.ReadTimestamp = newTS
+	t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(newTS)
+	return true
 }
 
 // pushIntents pushes the owners of conflicting intents. Returns true if

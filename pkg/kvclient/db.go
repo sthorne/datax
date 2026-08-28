@@ -99,6 +99,14 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 			i++
 			continue
 		}
+		if ref := ba.Requests[i].Refresh; ref != nil && len(ref.EndKey) > 0 {
+			if kerr := db.sendRefresh(ctx, header, ref); kerr != nil {
+				return nil, kerr
+			}
+			out.Responses = append(out.Responses, kvpb.ResponseUnion{Refresh: &kvpb.RefreshResponse{}})
+			i++
+			continue
+		}
 
 		addr, err := keys.Addr(ba.Requests[i].GetInner().Header().Key)
 		if err != nil {
@@ -242,6 +250,36 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		cur = end
 	}
 	return out, nil
+}
+
+// sendRefresh executes a ranged refresh, split across range boundaries
+// (each subspan check is independent; all must pass).
+func (db *DB) sendRefresh(ctx context.Context, header kvpb.BatchHeader, req *kvpb.RefreshRequest) *kvpb.Error {
+	cur := req.Key.Clone()
+	regroups := 0
+	for cur.Less(req.EndKey) {
+		desc, kerr := db.descForKey(ctx, cur)
+		if kerr != nil {
+			return kerr
+		}
+		end := req.EndKey
+		if desc.EndKey.Less(end) {
+			end = desc.EndKey
+		}
+		sub := &kvpb.RefreshRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, FromTS: req.FromTS}
+		_, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Refresh: sub}}, desc)
+		if regroup {
+			if regroups++; regroups > maxRoutingRetries {
+				return kvpb.NewErrorf("refresh routing did not converge: %v", kerr)
+			}
+			continue
+		}
+		if kerr != nil {
+			return kerr
+		}
+		cur = end
+	}
+	return nil
 }
 
 // sendPartial sends one single-range sub-batch, handling timestamp-refresh

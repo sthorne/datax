@@ -79,6 +79,17 @@ type ResolveIntentRequest struct {
 	CommitTS hlc.Timestamp      `json:"commit_ts"`
 }
 
+// RefreshRequest verifies that no other transaction wrote into [Key,
+// EndKey) (EndKey empty = the single key) within (FromTS, the request
+// transaction's ReadTimestamp]. Sent by the coordinator to move a
+// transaction's read timestamp forward without restarting; read-only, so it
+// takes shared latches and bumps the timestamp cache to the NEW read
+// timestamp before evaluating — after success no write can slip beneath it.
+type RefreshRequest struct {
+	RequestHeader
+	FromTS hlc.Timestamp `json:"from_ts"`
+}
+
 // AdminSplitRequest splits the range containing SplitKey at SplitKey.
 type AdminSplitRequest struct {
 	RequestHeader // Key = split key
@@ -103,6 +114,7 @@ type RequestUnion struct {
 	HeartbeatTxn        *HeartbeatTxnRequest        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
+	Refresh             *RefreshRequest             `json:"refresh,omitempty"`
 	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
 }
@@ -128,6 +140,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.PushTxn
 	case u.ResolveIntent != nil:
 		return u.ResolveIntent
+	case u.Refresh != nil:
+		return u.Refresh
 	case u.AdminSplit != nil:
 		return u.AdminSplit
 	case u.AdminChangeReplicas != nil:
@@ -154,6 +168,7 @@ func (h *EndTxnRequest) Header() RequestHeader              { return h.RequestHe
 func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHeader }
 func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
+func (h *RefreshRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
 
@@ -166,6 +181,7 @@ func (*EndTxnRequest) Method() string              { return "EndTxn" }
 func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
 func (*PushTxnRequest) Method() string             { return "PushTxn" }
 func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
+func (*RefreshRequest) Method() string             { return "Refresh" }
 func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
 func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
 
@@ -178,6 +194,7 @@ func (*EndTxnRequest) IsReadOnly() bool              { return false }
 func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (*PushTxnRequest) IsReadOnly() bool             { return false }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
+func (*RefreshRequest) IsReadOnly() bool             { return true }
 func (*AdminSplitRequest) IsReadOnly() bool          { return false }
 func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
 
@@ -226,6 +243,8 @@ type AdminSplitResponse struct {
 	Right RangeDescriptor `json:"right"`
 }
 
+type RefreshResponse struct{}
+
 type AdminChangeReplicasResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
@@ -241,6 +260,7 @@ type ResponseUnion struct {
 	HeartbeatTxn        *HeartbeatTxnResponse        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
+	Refresh             *RefreshResponse             `json:"refresh,omitempty"`
 	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
 }
@@ -315,6 +335,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.PushTxn = t
 	case *ResolveIntentRequest:
 		u.ResolveIntent = t
+	case *RefreshRequest:
+		u.Refresh = t
 	case *AdminSplitRequest:
 		u.AdminSplit = t
 	case *AdminChangeReplicasRequest:

@@ -374,6 +374,65 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 	return res, nil
 }
 
+// MVCCCheckForWrites reports whether [start, end) contains any write that a
+// transaction refreshing its read timestamp from fromTS to toTS would have
+// missed: a committed version with timestamp in (fromTS, toTS], or any
+// intent from another transaction (which could commit inside the window).
+// The transaction's own intents and provisional versions are ignored.
+// Returns nil when the refresh is safe.
+func MVCCCheckForWrites(r Reader, start, end keys.Key, fromTS, toTS hlc.Timestamp, ownTxn uuid.UUID) error {
+	lower := EncodeMVCCKey(start, hlc.Timestamp{})
+	upper := EncodeMVCCKey(end, hlc.Timestamp{})
+	it := r.NewIter(lower, upper)
+	defer func() { _ = it.Close() }()
+
+	ok := it.SeekGE(lower)
+	for ok {
+		userKey, vts, err := DecodeMVCCKey(it.Key())
+		if err != nil {
+			return err
+		}
+		cur := keys.Key(userKey).Clone()
+		var skipAt hlc.Timestamp
+		if vts.IsEmpty() {
+			meta, err := decodeMeta(it.Value())
+			if err != nil {
+				return err
+			}
+			if meta.Txn.ID != ownTxn {
+				return &WriteIntentError{Intents: []Intent{{Key: cur, Txn: meta.Txn}}}
+			}
+			skipAt = meta.Timestamp
+			ok = it.Next()
+			if !ok {
+				break
+			}
+		}
+		// Newest version at or below toTS; skipping our own provisional one.
+		ok = it.SeekGE(EncodeMVCCKey(cur, toTS))
+		for ok {
+			k, cvts, err := DecodeMVCCKey(it.Key())
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(k, cur) {
+				break
+			}
+			if !skipAt.IsEmpty() && cvts.Equal(skipAt) {
+				ok = it.Next()
+				continue
+			}
+			if fromTS.Less(cvts) {
+				return fmt.Errorf("refresh of [%s, %s) failed: write on %s at %s within (%s, %s]",
+					start, end, cur, cvts, fromTS, toTS)
+			}
+			break
+		}
+		ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
+	}
+	return nil
+}
+
 // MVCCResolveIntent resolves the intent on key owned by transaction txnID
 // according to the transaction's final status. Idempotent: resolving an
 // already-resolved (or never-written) intent is a no-op.
