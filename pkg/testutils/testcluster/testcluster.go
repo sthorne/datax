@@ -50,9 +50,14 @@ func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
 
 	tc := &TestCluster{T: t}
 	for i := 0; i < numNodes; i++ {
+		pglis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
 		n, err := server.Start(server.Config{
-			Listener: listeners[i],
-			Locality: locality(t, localities, i),
+			Listener:   listeners[i],
+			PGListener: pglis,
+			Locality:   locality(t, localities, i),
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID,
 				NodeID:    nodeIDs[i],
@@ -95,10 +100,15 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 	if err != nil {
 		tc.T.Fatal(err)
 	}
+	pglis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tc.T.Fatal(err)
+	}
 	n, err := server.Start(server.Config{
-		Listener: lis,
-		Join:     tc.Nodes[0].Addr(),
-		Locality: loc,
+		Listener:   lis,
+		PGListener: pglis,
+		Join:       tc.Nodes[0].Addr(),
+		Locality:   loc,
 	})
 	if err != nil {
 		tc.T.Fatalf("joining node: %v", err)

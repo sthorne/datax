@@ -17,6 +17,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
+	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -42,6 +43,7 @@ type Config struct {
 	// Test hooks.
 	Engine          *storage.Engine
 	Listener        net.Listener
+	PGListener      net.Listener
 	Clock           *hlc.Clock
 	StaticBootstrap *StaticBootstrap
 	AdvertiseAddr   string
@@ -72,11 +74,8 @@ type Node struct {
 	// the DB exists to seed.
 	joinRange1 kvpb.RangeDescriptor
 
-	sqlServer sqlServer // set when PGListen is configured (Phase 6)
+	pgServer *pgwire.Server // set when PGListen/PGListener is configured
 }
-
-// sqlServer is implemented by pkg/server's pgwire glue in Phase 6.
-type sqlServer interface{ Close() }
 
 // Start boots the node and returns once it is serving.
 func Start(cfg Config) (*Node, error) {
@@ -267,7 +266,12 @@ func (n *Node) NodeID() base.NodeID { return n.ident.NodeID }
 func (n *Node) Addr() string        { return n.addr }
 
 // SQLAddr is the SQL listener address (real listener from Phase 6 on).
-func (n *Node) SQLAddr() string             { return n.cfg.PGListen }
+func (n *Node) SQLAddr() string {
+	if n.pgServer == nil {
+		return ""
+	}
+	return n.pgServer.Addr()
+}
 func (n *Node) DB() *kvclient.DB            { return n.db }
 func (n *Node) Store() *kvserver.Store      { return n.store }
 func (n *Node) Clock() *hlc.Clock           { return n.clock }

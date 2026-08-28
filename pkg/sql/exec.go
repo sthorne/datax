@@ -312,38 +312,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
-	// Resolve projection.
-	type outCol struct {
-		col  catalog.Column
-		expr *parser.Expr
-		name string
-	}
-	var proj []outCol
-	for _, se := range t.Exprs {
-		if se.Star {
-			for _, c := range desc.Columns {
-				proj = append(proj, outCol{col: c, name: c.Name})
-			}
-			continue
-		}
-		if se.Expr.Column != "" && se.Expr.BinOp == "" {
-			c, ok := desc.Col(se.Expr.Column)
-			if !ok {
-				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", se.Expr.Column)
-			}
-			name := se.Alias
-			if name == "" {
-				name = c.Name
-			}
-			proj = append(proj, outCol{col: c, name: name})
-			continue
-		}
-		e := se.Expr
-		name := se.Alias
-		if name == "" {
-			name = "?column?"
-		}
-		proj = append(proj, outCol{expr: &e, name: name, col: catalog.Column{Type: types.String}})
+	proj, perr := resolveProjection(desc, t.Exprs)
+	if perr != nil {
+		return nil, perr
 	}
 
 	rows, err := s.fetchRows(ctx, txn, desc, t.Where, params, t.Limit)
