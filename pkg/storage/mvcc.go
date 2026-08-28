@@ -22,6 +22,10 @@ type MVCCGetOptions struct {
 	// (readTS, UncertaintyLimit] — the caller cannot know whether such a
 	// write causally preceded it, given bounded clock skew.
 	UncertaintyLimit hlc.Timestamp
+	// Inconsistent reads never block on (or report) intents: they read the
+	// newest committed version beneath any intent. Used for meta/gossip
+	// scans where staleness is fine but stalls are not.
+	Inconsistent bool
 }
 
 // mvccKeyBounds returns engine-key bounds covering exactly the metadata and
@@ -62,13 +66,17 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 		if err != nil {
 			return nil, err
 		}
-		if opts.Txn == nil || meta.Txn.ID != opts.Txn.ID {
+		switch {
+		case opts.Txn != nil && meta.Txn.ID == opts.Txn.ID:
+			if meta.Txn.Epoch == opts.Txn.Epoch {
+				readAt = meta.Timestamp
+			} else {
+				skipAt = meta.Timestamp
+			}
+		case opts.Inconsistent:
+			skipAt = meta.Timestamp // read beneath the intent
+		default:
 			return nil, &WriteIntentError{Intents: []Intent{{Key: key.Clone(), Txn: meta.Txn}}}
-		}
-		if meta.Txn.Epoch == opts.Txn.Epoch {
-			readAt = meta.Timestamp
-		} else {
-			skipAt = meta.Timestamp
 		}
 	}
 
@@ -251,18 +259,22 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 			if err != nil {
 				return ScanResult{}, err
 			}
-			if opts.Txn == nil || meta.Txn.ID != opts.Txn.ID {
+			switch {
+			case opts.Txn != nil && meta.Txn.ID == opts.Txn.ID:
+				if meta.Txn.Epoch == opts.Txn.Epoch {
+					readAt = meta.Timestamp
+				} else {
+					skipAt = meta.Timestamp
+				}
+			case opts.Inconsistent:
+				skipAt = meta.Timestamp // read beneath the intent
+			default:
 				intents = append(intents, Intent{Key: cur, Txn: meta.Txn})
 				if len(intents) >= maxIntentsPerError {
 					return ScanResult{}, &WriteIntentError{Intents: intents}
 				}
 				ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
 				continue
-			}
-			if meta.Txn.Epoch == opts.Txn.Epoch {
-				readAt = meta.Timestamp
-			} else {
-				skipAt = meta.Timestamp
 			}
 			ok = it.Next()
 			if !ok {

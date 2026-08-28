@@ -290,7 +290,12 @@ func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 
 // propose submits a write batch through Raft and waits for its application.
 func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba}
+	return r.proposeCmd(ctx, ba, nil)
+}
+
+// proposeCmd submits a write batch, optionally carrying a split trigger.
+func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger) (*kvpb.BatchResponse, *kvpb.Error) {
+	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split}
 	data, err := json.Marshal(&cmd)
 	if err != nil {
 		return nil, kvpb.NewError(err)
@@ -390,6 +395,13 @@ func (r *Replica) setApplied(idx uint64) {
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if !r.isLeader() {
 		return nil, r.notLeaderError()
+	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminSplit != nil {
+		resp, err := r.adminSplit(ctx, ba.Requests[0].AdminSplit.Key)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminSplit: resp}}}, nil
 	}
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err

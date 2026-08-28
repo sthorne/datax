@@ -229,7 +229,7 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 // ReadIndex dance made it linearizable).
 func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	br := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
-	opts := storage.MVCCGetOptions{}
+	opts := storage.MVCCGetOptions{Inconsistent: ba.Header.ReadInconsistent}
 	ts := readTimestamp(ba)
 	if ba.Header.Txn != nil {
 		opts.Txn = &ba.Header.Txn.TxnMeta

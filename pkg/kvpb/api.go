@@ -239,6 +239,9 @@ type BatchHeader struct {
 	// its anchor range; the server creates the transaction record
 	// atomically with the writes.
 	CreateTxnRecord bool `json:"create_txn_record,omitempty"`
+	// ReadInconsistent makes reads ignore intents (reading the newest
+	// committed version beneath them). Meta/registry scans only.
+	ReadInconsistent bool `json:"read_inconsistent,omitempty"`
 }
 
 // BatchRequest is the unit of KV RPC.

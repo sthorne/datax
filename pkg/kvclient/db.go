@@ -1,10 +1,12 @@
 // Package kvclient is the KV client layer: DB routes batches to the right
-// range replicas (the "DistSender" role) and — Phase 4 — Txn coordinates
-// distributed transactions.
+// range replicas (the "DistSender" role) and Txn coordinates distributed
+// transactions.
 package kvclient
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -23,19 +25,27 @@ type LocalStore interface {
 }
 
 // DB routes KV batches to range replicas: local fast path when this node
-// holds a replica, otherwise RPC. It retries around leadership changes and
-// stale routing.
+// holds a replica, otherwise RPC. It splits batches across ranges, stitches
+// multi-range scans, refreshes routing from /meta records, and retries
+// around leadership changes.
 type DB struct {
-	local     LocalStore // may be nil
-	transport *rpc.Transport
-	clock     *hlc.Clock
-	cache     *rangeCache
-	// lookupRange, when set (Phase 3), refreshes descriptors from /meta.
-	lookupRange func(ctx context.Context, key keys.Key) (kvpb.RangeDescriptor, error)
+	local      *localSender
+	transport  *rpc.Transport
+	clock      *hlc.Clock
+	cache      *rangeCache
+	metaLookup bool
+}
+
+type localSender struct {
+	store LocalStore
 }
 
 func NewDB(local LocalStore, transport *rpc.Transport, clock *hlc.Clock) *DB {
-	return &DB{local: local, transport: transport, clock: clock, cache: newRangeCache()}
+	db := &DB{transport: transport, clock: clock, cache: newRangeCache()}
+	if local != nil {
+		db.local = &localSender{store: local}
+	}
+	return db
 }
 
 // SeedDescriptor primes the range cache (bootstrap: range 1 from init/join).
@@ -46,66 +56,216 @@ func (db *DB) CachedDescriptor(key keys.Key) (kvpb.RangeDescriptor, bool) {
 	return db.cache.Lookup(key)
 }
 
+// EnableMetaLookup turns on routing refresh from /meta records (requires a
+// seeded descriptor covering the meta span).
+func (db *DB) EnableMetaLookup() { db.metaLookup = true }
+
 // Clock exposes the node clock (transaction timestamps come from it).
 func (db *DB) Clock() *hlc.Clock { return db.clock }
 
 const (
 	perAttemptTimeout = 3 * time.Second
 	retryBackoff      = 50 * time.Millisecond
+	maxRoutingRetries = 30
 )
 
-// Send routes and executes a batch. All requests in the batch must address
-// a single range (multi-range batches are split by the caller — Phase 3
-// adds automatic splitting for scans/transactions).
+// Send routes and executes a batch. Requests are grouped by range and the
+// groups execute in order; scans spanning ranges are stitched together.
+// Note that a non-transactional batch that crosses ranges is NOT atomic —
+// atomicity across ranges is the transaction layer's job.
 func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, kvpb.NewErrorf("empty batch")
 	}
-	addr, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
-	if err != nil {
-		return nil, kvpb.NewError(err)
-	}
-	for {
-		desc, ok := db.cache.Lookup(addr)
-		if !ok {
-			if db.lookupRange == nil {
-				return nil, kvpb.NewErrorf("no descriptor for key %s and no range lookup configured", addr)
+	out := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
+	header := ba.Header
+
+	i := 0
+	regroups := 0
+	for i < len(ba.Requests) {
+		if scan := ba.Requests[i].Scan; scan != nil {
+			resp, kerr := db.sendScan(ctx, header, scan)
+			if kerr != nil {
+				return nil, kerr
 			}
-			d, err := db.lookupRange(ctx, addr)
+			out.Responses = append(out.Responses, kvpb.ResponseUnion{Scan: resp})
+			i++
+			continue
+		}
+
+		addr, err := keys.Addr(ba.Requests[i].GetInner().Header().Key)
+		if err != nil {
+			return nil, kvpb.NewError(err)
+		}
+		desc, kerr := db.descForKey(ctx, addr)
+		if kerr != nil {
+			return nil, kerr
+		}
+		// Extend the group with consecutive point requests on the same range.
+		j := i + 1
+		for j < len(ba.Requests) {
+			if ba.Requests[j].Scan != nil {
+				break
+			}
+			a, err := keys.Addr(ba.Requests[j].GetInner().Header().Key)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
-			db.cache.Insert(d)
-			desc = d
+			if !desc.ContainsKey(a) {
+				break
+			}
+			j++
 		}
-		br, kerr := db.sendToRange(ctx, ba, desc)
-		if kerr != nil && ba.Header.Txn == nil && kerr.IsRetryableTxnError() {
+		br, regroup, kerr := db.sendPartial(ctx, &header, ba.Requests[i:j], desc)
+		if regroup {
+			if regroups++; regroups > maxRoutingRetries {
+				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
+			}
+			continue // descriptors refreshed; re-group from request i
+		}
+		if kerr != nil {
+			return nil, kerr
+		}
+		out.Responses = append(out.Responses, br.Responses...)
+		if br.Txn != nil {
+			out.Txn = br.Txn
+		}
+		i = j
+	}
+	out.Timestamp = header.Timestamp
+	return out, nil
+}
+
+// descForKey resolves the descriptor covering an addressed key, consulting
+// /meta on cache miss.
+func (db *DB) descForKey(ctx context.Context, addr keys.Key) (kvpb.RangeDescriptor, *kvpb.Error) {
+	if d, ok := db.cache.Lookup(addr); ok {
+		return d, nil
+	}
+	if !db.metaLookup {
+		return kvpb.RangeDescriptor{}, kvpb.NewErrorf("no descriptor for key %s and meta lookup disabled", addr)
+	}
+	d, err := db.lookupMeta(ctx, addr)
+	if err != nil {
+		return kvpb.RangeDescriptor{}, kvpb.NewError(err)
+	}
+	db.cache.Insert(d)
+	return d, nil
+}
+
+// lookupMeta scans /meta for the first record whose range ends beyond key.
+// The scan is inconsistent (never blocks on intents) and itself routed via
+// the cache — the bootstrap invariant is that a descriptor covering the
+// meta span is always seeded.
+func (db *DB) lookupMeta(ctx context.Context, key keys.Key) (kvpb.RangeDescriptor, error) {
+	start := keys.Key(keys.RangeMetaKey(key)).Next()
+	_, metaEnd := keys.MetaSpan()
+	header := kvpb.BatchHeader{Timestamp: db.clock.Now(), ReadInconsistent: true}
+	scan := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: metaEnd}, MaxRows: 1}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		desc, ok := db.cache.Lookup(start)
+		if !ok {
+			return kvpb.RangeDescriptor{}, fmt.Errorf("no routing descriptor for the meta span; cluster bootstrap incomplete")
+		}
+		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Scan: scan}}, desc)
+		if regroup {
+			continue
+		}
+		if kerr != nil {
+			return kvpb.RangeDescriptor{}, kerr
+		}
+		rows := br.Responses[0].Scan.Rows
+		if len(rows) == 0 {
+			return kvpb.RangeDescriptor{}, fmt.Errorf("no meta record covering key %s", key)
+		}
+		var d kvpb.RangeDescriptor
+		if err := json.Unmarshal(rows[0].Value, &d); err != nil {
+			return kvpb.RangeDescriptor{}, fmt.Errorf("corrupt meta record: %w", err)
+		}
+		if !d.ContainsKey(key) {
+			return kvpb.RangeDescriptor{}, fmt.Errorf("meta record %s does not cover key %s (stale addressing)", &d, key)
+		}
+		return d, nil
+	}
+	return kvpb.RangeDescriptor{}, fmt.Errorf("meta lookup for %s did not converge", key)
+}
+
+// sendScan executes a scan, stitching across range boundaries.
+func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.ScanRequest) (*kvpb.ScanResponse, *kvpb.Error) {
+	out := &kvpb.ScanResponse{}
+	cur := req.Key.Clone()
+	remaining := req.MaxRows
+	regroups := 0
+	for cur.Less(req.EndKey) {
+		desc, kerr := db.descForKey(ctx, cur)
+		if kerr != nil {
+			return nil, kerr
+		}
+		end := req.EndKey
+		if desc.EndKey.Less(end) {
+			end = desc.EndKey
+		}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining}
+		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Scan: sub}}, desc)
+		if regroup {
+			if regroups++; regroups > maxRoutingRetries {
+				return nil, kvpb.NewErrorf("scan routing did not converge: %v", kerr)
+			}
+			continue
+		}
+		if kerr != nil {
+			return nil, kerr
+		}
+		sr := br.Responses[0].Scan
+		out.Rows = append(out.Rows, sr.Rows...)
+		if len(sr.Resume) > 0 {
+			out.Resume = sr.Resume
+			return out, nil
+		}
+		if req.MaxRows > 0 {
+			remaining -= int64(len(sr.Rows))
+			if remaining <= 0 {
+				if end.Less(req.EndKey) {
+					out.Resume = end
+				}
+				return out, nil
+			}
+		}
+		cur = end
+	}
+	return out, nil
+}
+
+// sendPartial sends one single-range sub-batch, handling timestamp-refresh
+// retries (non-transactional writes) inline and reporting stale routing to
+// the caller (regroup=true after refreshing the cache).
+func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []kvpb.RequestUnion, desc kvpb.RangeDescriptor) (br *kvpb.BatchResponse, regroup bool, kerr *kvpb.Error) {
+	for {
+		ba := &kvpb.BatchRequest{Header: *header, Requests: reqs}
+		br, kerr = db.sendToRange(ctx, ba, desc)
+		if kerr == nil {
+			return br, false, nil
+		}
+		if header.Txn == nil && kerr.IsRetryableTxnError() {
 			// Non-transactional batches have no reads to protect: refresh
-			// the timestamp (above the server's floor) and try again.
-			ts := db.clock.Now().Forward(kerr.RetryTimestamp(ba.Header.Timestamp))
-			ba.Header.Timestamp = ts
+			// the timestamp above the server's floor and try again.
+			header.Timestamp = db.clock.Now().Forward(kerr.RetryTimestamp(header.Timestamp))
 			select {
 			case <-ctx.Done():
-				return nil, kerr
+				return nil, false, kerr
 			default:
 				continue
 			}
 		}
-		if kerr != nil && (kerr.RangeKeyMismatch != nil || kerr.RangeNotFound != nil) {
+		if kerr.RangeKeyMismatch != nil || kerr.RangeNotFound != nil {
 			db.cache.Evict(desc.RangeID)
 			if kerr.RangeKeyMismatch != nil {
 				db.cache.Insert(kerr.RangeKeyMismatch.ActualDescriptors...)
 			}
-			if db.lookupRange != nil {
-				select {
-				case <-ctx.Done():
-					return nil, kvpb.NewError(ctx.Err())
-				default:
-					continue // re-route with fresh descriptor
-				}
-			}
+			return nil, true, kerr
 		}
-		return br, kerr
+		return nil, false, kerr
 	}
 }
 
@@ -136,11 +296,8 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				lastErr = kerr
 				continue
 			}
-			if kerr.RangeNotFound != nil {
-				lastErr = kerr
-				continue
-			}
-			// Definitive KV-level answer (including txn conflicts): return.
+			// Definitive KV-level answer (including txn conflicts and
+			// routing corrections): return to caller.
 			return br, kerr
 		}
 		select {
@@ -166,8 +323,8 @@ func (db *DB) replicaOrder(desc kvpb.RangeDescriptor) []base.NodeID {
 	}
 	add(db.cache.Hint(desc.RangeID))
 	if db.local != nil {
-		if _, ok := desc.GetReplica(db.local.NodeID()); ok {
-			add(db.local.NodeID())
+		if _, ok := desc.GetReplica(db.local.store.NodeID()); ok {
+			add(db.local.store.NodeID())
 		}
 	}
 	for _, r := range desc.Replicas {
@@ -179,8 +336,8 @@ func (db *DB) replicaOrder(desc kvpb.RangeDescriptor) []base.NodeID {
 func (db *DB) sendToReplica(ctx context.Context, ba *kvpb.BatchRequest, target base.NodeID) (*kvpb.BatchResponse, *kvpb.Error, error) {
 	actx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
 	defer cancel()
-	if db.local != nil && target == db.local.NodeID() {
-		br, kerr := db.local.ExecuteBatch(actx, ba)
+	if db.local != nil && target == db.local.store.NodeID() {
+		br, kerr := db.local.store.ExecuteBatch(actx, ba)
 		return br, kerr, nil
 	}
 	return db.transport.SendBatch(actx, target, ba)
@@ -229,6 +386,20 @@ func (db *DB) Increment(ctx context.Context, key keys.Key, by int64) (int64, err
 		return 0, kerr
 	}
 	return br.Responses[0].Increment.NewValue, nil
+}
+
+// AdminSplit splits the range containing key at key.
+func (db *DB) AdminSplit(ctx context.Context, key keys.Key) (*kvpb.AdminSplitResponse, error) {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	resp := br.Responses[0].AdminSplit
+	db.cache.Evict(resp.Left.RangeID)
+	db.cache.Insert(resp.Left, resp.Right)
+	return resp, nil
 }
 
 // ParseCounter decodes a counter value written by Increment.

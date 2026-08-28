@@ -172,6 +172,8 @@ func (n *Node) start() error {
 		Stopper:   n.stopper,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
+	n.db.EnableMetaLookup()
+	n.store.SetSender(n.db)
 
 	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
 		Batch: n.handleBatch,

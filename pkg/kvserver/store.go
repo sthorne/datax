@@ -34,14 +34,37 @@ type StoreConfig struct {
 	RaftTickInterval time.Duration
 }
 
+// Sender executes routed KV batches (implemented by kvclient.DB). The store
+// needs one for admin operations that touch other ranges (ID allocation,
+// meta record updates).
+type Sender interface {
+	Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
+}
+
 // Store owns all replicas hosted by this node's engine.
 type Store struct {
 	cfg StoreConfig
+
+	senderMu sync.Mutex
+	sender   Sender
 
 	mu struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
 	}
+}
+
+// SetSender injects the routed KV client (once, at node startup).
+func (s *Store) SetSender(sender Sender) {
+	s.senderMu.Lock()
+	s.sender = sender
+	s.senderMu.Unlock()
+}
+
+func (s *Store) getSender() Sender {
+	s.senderMu.Lock()
+	defer s.senderMu.Unlock()
+	return s.sender
 }
 
 func NewStore(cfg StoreConfig) *Store {
@@ -179,7 +202,19 @@ func (s *Store) replicaForKey(k keys.Key) (*Replica, bool) {
 }
 
 // ExecuteBatch routes a batch to the right local replica and executes it.
+// After a split, a client's routing may be stale; if another local replica
+// covers the key, reroute to it transparently, and always decorate
+// RangeKeyMismatch errors with the fresh local descriptors so clients can
+// repair their caches.
 func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	if len(ba.Requests) == 0 {
+		return nil, kvpb.NewErrorf("empty batch")
+	}
+	addr, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
+	if err != nil {
+		return nil, kvpb.NewError(err)
+	}
+
 	var r *Replica
 	if ba.Header.RangeID != 0 {
 		var ok bool
@@ -189,23 +224,37 @@ func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.
 			e.RangeNotFound = &kvpb.RangeNotFoundError{RangeID: ba.Header.RangeID}
 			return nil, e
 		}
-	} else {
-		if len(ba.Requests) == 0 {
-			return nil, kvpb.NewErrorf("empty batch")
-		}
-		addr, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
-		if err != nil {
-			return nil, kvpb.NewError(err)
-		}
-		var ok bool
-		r, ok = s.replicaForKey(addr)
-		if !ok {
-			e := kvpb.NewErrorf("no replica for key %s on node %s", addr, s.cfg.NodeID)
-			e.RangeNotFound = &kvpb.RangeNotFoundError{}
-			return nil, e
-		}
 	}
-	return r.Execute(ctx, ba)
+	for attempt := 0; ; attempt++ {
+		if r == nil || !containsKey(r.Desc(), addr) {
+			r2, ok := s.replicaForKey(addr)
+			if !ok || (r != nil && r2 == r) || attempt >= 2 {
+				e := kvpb.NewErrorf("no replica covering key %s on node %s", addr, s.cfg.NodeID)
+				e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: addr, ActualDescriptors: s.localDescriptors()}
+				return nil, e
+			}
+			r = r2
+			ba.Header.RangeID = r.Desc().RangeID
+		}
+		br, kerr := r.Execute(ctx, ba)
+		if kerr != nil && kerr.RangeKeyMismatch != nil {
+			kerr.RangeKeyMismatch.ActualDescriptors = s.localDescriptors()
+			if attempt < 2 {
+				r = nil // re-route: our own replica map may have fresher bounds
+				continue
+			}
+		}
+		return br, kerr
+	}
+}
+
+func (s *Store) localDescriptors() []kvpb.RangeDescriptor {
+	var out []kvpb.RangeDescriptor
+	s.VisitReplicas(func(r *Replica) bool {
+		out = append(out, r.Desc())
+		return true
+	})
+	return out
 }
 
 // HandleRaftMessage delivers an incoming Raft message to its replica.
@@ -221,3 +270,5 @@ func (s *Store) HandleRaftMessage(ctx context.Context, rangeID base.RangeID, m r
 		log.Warnf("%s: raft step failed: %v", rangeID, err)
 	}
 }
+
+func containsKey(d kvpb.RangeDescriptor, k keys.Key) bool { return d.ContainsKey(k) }
