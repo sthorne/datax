@@ -101,14 +101,14 @@ func (s *Store) NodeID() base.NodeID   { return s.cfg.NodeID }
 func (s *Store) StoreID() base.StoreID { return s.cfg.StoreID }
 func (s *Store) Clock() *hlc.Clock     { return s.cfg.Clock }
 
-// LoadReplicas restarts the Raft groups for every replica found on disk
-// (called once at node startup).
-func (s *Store) LoadReplicas() error {
+// LoadLocalRangeDescriptors scans a store for every persisted range
+// descriptor. Exported for offline recovery tooling as well as startup.
+func LoadLocalRangeDescriptors(eng *storage.Engine) ([]kvpb.RangeDescriptor, error) {
 	// Every replica persists its descriptor at a well-known local key;
 	// scan the replica-local keyspace for them.
 	lower := keys.Key{0x01, 'u', 'r'}
 	upper := lower.PrefixEnd()
-	it := s.cfg.Engine.NewIter(lower, upper)
+	it := eng.NewIter(lower, upper)
 	var rangeIDs []base.RangeID
 	suffix := []byte("desc")
 	for ok := it.SeekGE(lower); ok; ok = it.Next() {
@@ -126,25 +126,38 @@ func (s *Store) LoadReplicas() error {
 		rangeIDs = append(rangeIDs, base.RangeID(rid))
 	}
 	if err := it.Close(); err != nil {
+		return nil, err
+	}
+	var out []kvpb.RangeDescriptor
+	for _, rid := range rangeIDs {
+		desc, ok, err := loadRangeDescriptor(eng, rid)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, desc)
+		}
+	}
+	return out, nil
+}
+
+// LoadReplicas restarts the Raft groups for every replica found on disk
+// (called once at node startup).
+func (s *Store) LoadReplicas() error {
+	descs, err := LoadLocalRangeDescriptors(s.cfg.Engine)
+	if err != nil {
 		return err
 	}
-	for _, rid := range rangeIDs {
-		desc, ok, err := loadRangeDescriptor(s.cfg.Engine, rid)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
+	for _, desc := range descs {
 		rep, ok := desc.GetReplica(s.cfg.NodeID)
 		if !ok {
-			log.Warnf("%s: descriptor on disk but this node is not a member; skipping", rid)
+			log.Warnf("%s: descriptor on disk but this node is not a member; skipping", desc.RangeID)
 			continue
 		}
 		if _, err := s.startReplica(desc, rep.ReplicaID, false /* bootstrap */); err != nil {
 			return err
 		}
-		log.Infof("%s: restarted replica %d [%s, %s)", rid, rep.ReplicaID, desc.StartKey, desc.EndKey)
+		log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
 	}
 	return nil
 }

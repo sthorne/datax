@@ -94,8 +94,29 @@ Two guards make it idle safely instead of flailing:
 
 Repairing a dead voter away is also what un-pins Raft log truncation.
 
-**Known gaps**: no node decommission UX; losing quorum on range 1 bricks
-cluster metadata. These are stated limitations, not accidents.
+**Known gaps**: no node decommission UX (a stated limitation, not an
+accident).
+
+## Quorum-loss recovery (unsafe)
+
+Losing a range's quorum — worst of all range 1's, which carries `/meta`
+addressing, descriptors, and users — normally leaves it permanently
+unavailable. Two tools turn that into a recoverable incident:
+
+- **Metadata export**: every disk-backed node writes
+  `<dir>/metadata-backup.json` on each heartbeat — decoded `/meta` records,
+  table descriptors, the namespace, user credential verifiers, and the node
+  registry — atomically (tmp+rename). `datax debug metadata --dir` prints
+  it, online or offline.
+- **`datax debug unsafe-recover --dir <dir> [--range N] --yes`**: with the
+  node STOPPED, rewrites its range descriptors to single-replica
+  membership (its own replica, generation bumped). On restart each
+  recovered range derives a single-voter ConfState from its descriptor,
+  elects itself, and serves; upreplication restores RF as fresh nodes
+  join. This **discards the removed replicas' votes and any writes only
+  they acknowledged** — run it on exactly one survivor per range, and
+  never restart the removed peers with their old data (wipe and rejoin
+  fresh).
 
 ## Adding a replica: snapshots
 

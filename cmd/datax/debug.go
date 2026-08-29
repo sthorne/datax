@@ -9,14 +9,75 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
+
+// runDebugMetadata prints the node's periodic metadata export (written to
+// the data directory every heartbeat; the recovery artifact for a cluster
+// whose metadata range lost quorum).
+func runDebugMetadata(args []string) error {
+	fs := flag.NewFlagSet("debug metadata", flag.ContinueOnError)
+	dir := fs.String("dir", "", "data directory of a (stopped or running) node")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("metadata requires --dir")
+	}
+	raw, err := os.ReadFile(filepath.Join(*dir, server.MetadataBackupFile))
+	if err != nil {
+		return fmt.Errorf("no metadata backup found: %w", err)
+	}
+	_, err = os.Stdout.Write(raw)
+	return err
+}
+
+// runDebugUnsafeRecover rewrites a STOPPED store's range descriptors to
+// single-replica membership so ranges that lost quorum serve again.
+func runDebugUnsafeRecover(args []string) error {
+	fs := flag.NewFlagSet("debug unsafe-recover", flag.ContinueOnError)
+	dir := fs.String("dir", "", "data directory of the STOPPED surviving node")
+	rangeID := fs.Int64("range", 0, "recover only this range (default: every range on the store)")
+	yes := fs.Bool("yes", false, "confirm: I understand this discards the other replicas")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" {
+		return fmt.Errorf("unsafe-recover requires --dir")
+	}
+	if !*yes {
+		return fmt.Errorf(`unsafe-recover rewrites range membership to THIS NODE ALONE.
+
+It discards the other replicas' votes and any writes only they had
+acknowledged. Run it on exactly ONE survivor per range, with the node
+STOPPED — and never restart the removed peers with their old data: wipe
+them and rejoin fresh. Replication is restored by upreplication once new
+nodes join.
+
+Re-run with --yes to proceed`)
+	}
+	descs, err := server.UnsafeRecover(*dir, base.RangeID(*rangeID))
+	if err != nil {
+		return err
+	}
+	if len(descs) == 0 {
+		fmt.Println("nothing to recover (no multi-replica ranges on this store)")
+		return nil
+	}
+	for _, d := range descs {
+		fmt.Printf("recovered %s [%s, %s) to single-replica membership\n", d.RangeID, d.StartKey, d.EndKey)
+	}
+	fmt.Println("restart the node to serve; join fresh nodes to restore replication")
+	return nil
+}
 
 // runDebugStatus fetches a node's /status document from its observability
 // endpoint (--http-listen).
@@ -42,11 +103,16 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|status|metadata|unsafe-recover> [flags]")
 	}
 	sub, rest := args[0], args[1:]
-	if sub == "status" {
+	switch sub {
+	case "status":
 		return runDebugStatus(rest)
+	case "metadata":
+		return runDebugMetadata(rest)
+	case "unsafe-recover":
+		return runDebugUnsafeRecover(rest)
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")

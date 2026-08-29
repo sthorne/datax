@@ -100,6 +100,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 				log.Debugf("persisting registry: %v", err)
 			}
+			n.exportMetadata(hctx)
 		} else {
 			log.Debugf("%s registry scan failed: %v", n.ident.NodeID, err)
 		}

@@ -246,6 +246,18 @@ func NamespaceKey(name string) Key {
 	return Key(encoding.EncodeString(k, name))
 }
 
+// NamespaceSpan covers all table-name mappings.
+func NamespaceSpan() (Key, Key) {
+	p := systemKey("ns")
+	return p, p.PrefixEnd()
+}
+
+// UserSpan covers all SQL user credential records.
+func UserSpan() (Key, Key) {
+	p := systemKey("users")
+	return p, p.PrefixEnd()
+}
+
 // ---------------------------------------------------------------------------
 // Table data keys.
 
