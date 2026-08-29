@@ -33,6 +33,8 @@ message Transaction {
   Hlc read_timestamp = 4;
   Hlc last_heartbeat = 5;
   repeated bytes intent_keys = 6;
+  bytes waiting_for = 7; // 16-byte UUID; deadlock-detection wait edge
+  bytes waiting_for_key = 8;
 }
 
 message ReplicaDescriptor {
@@ -101,6 +103,8 @@ message EndTxnRequest {
 message HeartbeatTxnRequest {
   RequestHeader header = 1;
   Hlc now = 2;
+  bytes waiting_for = 3;
+  bytes waiting_for_key = 4;
 }
 
 message PushTxnRequest {
@@ -109,6 +113,8 @@ message PushTxnRequest {
   TxnMeta pushee_txn = 3;
   bool push_abort = 4;
   Hlc now = 5;
+  bool query_only = 6;
+  bool force_abort = 7;
 }
 
 message ResolveIntentRequest {
@@ -240,6 +246,9 @@ message HeartbeatTxnResponse {
 message PushTxnResponse {
   int32 status = 1;
   Hlc commit_ts = 2;
+  bytes waiting_for = 3;
+  bytes waiting_for_key = 4;
+  int32 priority = 5;
 }
 
 message ResolveIntentResponse {}

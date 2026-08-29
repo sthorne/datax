@@ -70,10 +70,14 @@ type EndTxnRequest struct {
 	IntentKeys []keys.Key `json:"intent_keys,omitempty"`
 }
 
-// HeartbeatTxnRequest refreshes the transaction record's liveness.
+// HeartbeatTxnRequest refreshes the transaction record's liveness and
+// publishes the coordinator's current wait edge (WaitingFor, uuid.Nil =
+// not waiting) for deadlock detection.
 type HeartbeatTxnRequest struct {
 	RequestHeader               // Key = anchor key
 	Now           hlc.Timestamp `json:"now"`
+	WaitingFor    uuid.UUID     `json:"waiting_for,omitempty"`
+	WaitingForKey keys.Key      `json:"waiting_for_key,omitempty"`
 }
 
 // PushTxnRequest asks the pushee's record range to resolve a conflict.
@@ -85,6 +89,14 @@ type PushTxnRequest struct {
 	// the push only succeeds if the pushee is already finalized or expired.
 	PushAbort bool          `json:"push_abort"`
 	Now       hlc.Timestamp `json:"now"`
+	// QueryOnly reads the record without any state change (no expiry
+	// poisoning, no abort), reporting status, priority, and the pushee's
+	// advertised wait edge — the deadlock detector's chain walk. Served on
+	// the read path.
+	QueryOnly bool `json:"query_only,omitempty"`
+	// ForceAbort aborts a PENDING pushee regardless of priority: sent only
+	// at a detected deadlock cycle's chosen victim.
+	ForceAbort bool `json:"force_abort,omitempty"`
 }
 
 // ResolveIntentRequest resolves an intent according to its transaction's
@@ -303,7 +315,7 @@ func (*IncrementRequest) IsReadOnly() bool           { return false }
 func (r *ScanRequest) IsReadOnly() bool              { return !r.ForUpdate }
 func (*EndTxnRequest) IsReadOnly() bool              { return false }
 func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
-func (*PushTxnRequest) IsReadOnly() bool             { return false }
+func (r *PushTxnRequest) IsReadOnly() bool           { return r.QueryOnly }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
 func (*RefreshRequest) IsReadOnly() bool             { return true }
 func (*GCRequest) IsReadOnly() bool                  { return false }
@@ -351,6 +363,10 @@ type PushTxnResponse struct {
 	// alive and the pusher must wait.
 	Status   enginepb.TxnStatus `json:"status"`
 	CommitTS hlc.Timestamp      `json:"commit_ts"`
+	// Chain-walk fields, populated for QueryOnly pushes on a live record.
+	WaitingFor    uuid.UUID `json:"waiting_for,omitempty"`
+	WaitingForKey keys.Key  `json:"waiting_for_key,omitempty"`
+	Priority      int32     `json:"priority,omitempty"`
 }
 
 type ResolveIntentResponse struct{}

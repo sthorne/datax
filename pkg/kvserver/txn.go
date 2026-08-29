@@ -161,6 +161,10 @@ func (r *Replica) evalHeartbeatTxn(b *storage.Batch, txn *kvpb.Transaction, req 
 	}
 	if rec.Status == enginepb.PENDING {
 		rec.LastHeartbeat = rec.LastHeartbeat.Forward(req.Now)
+		// Publish the coordinator's current wait edge (uuid.Nil clears it)
+		// for the deadlock detector's chain walk.
+		rec.WaitingFor = req.WaitingFor
+		rec.WaitingForKey = req.WaitingForKey
 		if err := putTxnRecord(b, key, rec); err != nil {
 			return nil, kvpb.NewError(err)
 		}
@@ -209,6 +213,15 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 		return &kvpb.PushTxnResponse{Status: enginepb.ABORTED}, nil
 	}
 
+	// A detected deadlock cycle's chosen victim is aborted regardless of
+	// priority — the detector already picked deterministically.
+	if req.ForceAbort {
+		rec.Status = enginepb.ABORTED
+		if err := putTxnRecord(b, key, rec); err != nil {
+			return nil, kvpb.NewError(err)
+		}
+		return &kvpb.PushTxnResponse{Status: enginepb.ABORTED}, nil
+	}
 	var pusherPriority int32 = 1 << 30 // non-transactional pushers win
 	if req.PusherTxn != nil {
 		pusherPriority = req.PusherTxn.Priority

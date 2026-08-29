@@ -105,6 +105,8 @@ func txnToProto(t *Transaction) *rpcpb.Transaction {
 		Status:        int32(t.Status),
 		ReadTimestamp: tsToProto(t.ReadTimestamp),
 		LastHeartbeat: tsToProto(t.LastHeartbeat),
+		WaitingFor:    uuidToProto(t.WaitingFor),
+		WaitingForKey: t.WaitingForKey,
 	}
 	for _, k := range t.IntentKeys {
 		pb.IntentKeys = append(pb.IntentKeys, k)
@@ -120,12 +122,18 @@ func txnFromProto(p *rpcpb.Transaction) (*Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
+	waitingFor, err := uuidFromProto(p.WaitingFor)
+	if err != nil {
+		return nil, err
+	}
 	t := &Transaction{
 		TxnMeta:       meta,
 		Name:          p.Name,
 		Status:        enginepb.TxnStatus(p.Status),
 		ReadTimestamp: tsFromProto(p.ReadTimestamp),
 		LastHeartbeat: tsFromProto(p.LastHeartbeat),
+		WaitingFor:    waitingFor,
+		WaitingForKey: p.WaitingForKey,
 	}
 	for _, k := range p.IntentKeys {
 		t.IntentKeys = append(t.IntentKeys, keys.Key(k))
@@ -206,14 +214,21 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		}
 		out.Value = &rpcpb.RequestUnion_EndTxn{EndTxn: pb}
 	case *HeartbeatTxnRequest:
-		out.Value = &rpcpb.RequestUnion_HeartbeatTxn{HeartbeatTxn: &rpcpb.HeartbeatTxnRequest{Header: reqHeaderToProto(r.RequestHeader), Now: tsToProto(r.Now)}}
+		out.Value = &rpcpb.RequestUnion_HeartbeatTxn{HeartbeatTxn: &rpcpb.HeartbeatTxnRequest{
+			Header:        reqHeaderToProto(r.RequestHeader),
+			Now:           tsToProto(r.Now),
+			WaitingFor:    uuidToProto(r.WaitingFor),
+			WaitingForKey: r.WaitingForKey,
+		}}
 	case *PushTxnRequest:
 		out.Value = &rpcpb.RequestUnion_PushTxn{PushTxn: &rpcpb.PushTxnRequest{
-			Header:    reqHeaderToProto(r.RequestHeader),
-			PusherTxn: txnToProto(r.PusherTxn),
-			PusheeTxn: txnMetaToProto(r.PusheeTxn),
-			PushAbort: r.PushAbort,
-			Now:       tsToProto(r.Now),
+			Header:     reqHeaderToProto(r.RequestHeader),
+			PusherTxn:  txnToProto(r.PusherTxn),
+			PusheeTxn:  txnMetaToProto(r.PusheeTxn),
+			PushAbort:  r.PushAbort,
+			Now:        tsToProto(r.Now),
+			QueryOnly:  r.QueryOnly,
+			ForceAbort: r.ForceAbort,
 		}}
 	case *ResolveIntentRequest:
 		out.Value = &rpcpb.RequestUnion_ResolveIntent{ResolveIntent: &rpcpb.ResolveIntentRequest{
@@ -277,7 +292,16 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		}
 		u.EndTxn = r
 	case *rpcpb.RequestUnion_HeartbeatTxn:
-		u.HeartbeatTxn = &HeartbeatTxnRequest{RequestHeader: reqHeaderFromProto(v.HeartbeatTxn.Header), Now: tsFromProto(v.HeartbeatTxn.Now)}
+		waitingFor, err := uuidFromProto(v.HeartbeatTxn.WaitingFor)
+		if err != nil {
+			return u, err
+		}
+		u.HeartbeatTxn = &HeartbeatTxnRequest{
+			RequestHeader: reqHeaderFromProto(v.HeartbeatTxn.Header),
+			Now:           tsFromProto(v.HeartbeatTxn.Now),
+			WaitingFor:    waitingFor,
+			WaitingForKey: v.HeartbeatTxn.WaitingForKey,
+		}
 	case *rpcpb.RequestUnion_PushTxn:
 		pusher, err := txnFromProto(v.PushTxn.PusherTxn)
 		if err != nil {
@@ -293,6 +317,8 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 			PusheeTxn:     pushee,
 			PushAbort:     v.PushTxn.PushAbort,
 			Now:           tsFromProto(v.PushTxn.Now),
+			QueryOnly:     v.PushTxn.QueryOnly,
+			ForceAbort:    v.PushTxn.ForceAbort,
 		}
 	case *rpcpb.RequestUnion_ResolveIntent:
 		id, err := uuidFromProto(v.ResolveIntent.TxnId)
@@ -418,7 +444,13 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	case u.HeartbeatTxn != nil:
 		out.Value = &rpcpb.ResponseUnion_HeartbeatTxn{HeartbeatTxn: &rpcpb.HeartbeatTxnResponse{Status: int32(u.HeartbeatTxn.Status)}}
 	case u.PushTxn != nil:
-		out.Value = &rpcpb.ResponseUnion_PushTxn{PushTxn: &rpcpb.PushTxnResponse{Status: int32(u.PushTxn.Status), CommitTs: tsToProto(u.PushTxn.CommitTS)}}
+		out.Value = &rpcpb.ResponseUnion_PushTxn{PushTxn: &rpcpb.PushTxnResponse{
+			Status:        int32(u.PushTxn.Status),
+			CommitTs:      tsToProto(u.PushTxn.CommitTS),
+			WaitingFor:    uuidToProto(u.PushTxn.WaitingFor),
+			WaitingForKey: u.PushTxn.WaitingForKey,
+			Priority:      u.PushTxn.Priority,
+		}}
 	case u.ResolveIntent != nil:
 		out.Value = &rpcpb.ResponseUnion_ResolveIntent{ResolveIntent: &rpcpb.ResolveIntentResponse{}}
 	case u.Refresh != nil:
@@ -473,7 +505,17 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 	case *rpcpb.ResponseUnion_HeartbeatTxn:
 		u.HeartbeatTxn = &HeartbeatTxnResponse{Status: enginepb.TxnStatus(v.HeartbeatTxn.Status)}
 	case *rpcpb.ResponseUnion_PushTxn:
-		u.PushTxn = &PushTxnResponse{Status: enginepb.TxnStatus(v.PushTxn.Status), CommitTS: tsFromProto(v.PushTxn.CommitTs)}
+		waitingFor, err := uuidFromProto(v.PushTxn.WaitingFor)
+		if err != nil {
+			return u, err
+		}
+		u.PushTxn = &PushTxnResponse{
+			Status:        enginepb.TxnStatus(v.PushTxn.Status),
+			CommitTS:      tsFromProto(v.PushTxn.CommitTs),
+			WaitingFor:    waitingFor,
+			WaitingForKey: v.PushTxn.WaitingForKey,
+			Priority:      v.PushTxn.Priority,
+		}
 	case *rpcpb.ResponseUnion_ResolveIntent:
 		u.ResolveIntent = &ResolveIntentResponse{}
 	case *rpcpb.ResponseUnion_Refresh:

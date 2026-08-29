@@ -1,12 +1,15 @@
 package kvclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -57,6 +60,12 @@ type Txn struct {
 		// refreshUnusable: too many spans (or tracking disabled) — fall
 		// back to v1's restart behavior.
 		refreshUnusable bool
+		// waitingFor/waitingForKey: the transaction this one is currently
+		// blocked on in a push loop (Nil = none). Published on the record
+		// (immediately on change, and with every heartbeat) so pushers can
+		// walk wait chains and detect deadlock cycles.
+		waitingFor    uuid.UUID
+		waitingForKey keys.Key
 	}
 	heartbeatCancel context.CancelFunc
 }
@@ -104,6 +113,16 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 	return t
 }
 
+// TestingSetPriority overrides the transaction's conflict priority.
+// Deadlock tests use equal priorities so priority-based aborts (which
+// require a strictly greater pusher) cannot fire and cycle detection is
+// provably the mechanism that resolves the deadlock.
+func (t *Txn) TestingSetPriority(p int32) {
+	t.mu.Lock()
+	t.mu.txn.Priority = p
+	t.mu.Unlock()
+}
+
 // proto returns a snapshot of the transaction state.
 func (t *Txn) proto() *kvpb.Transaction {
 	t.mu.Lock()
@@ -113,8 +132,12 @@ func (t *Txn) proto() *kvpb.Transaction {
 }
 
 // conflictBudget bounds how long an operation waits on a live conflicting
-// transaction before surfacing a retryable error to the client.
-const conflictBudget = 2 * time.Second
+// transaction before surfacing a retryable error to the client. With
+// deadlock detection (cycles are found and broken in a few poll rounds),
+// this is a generous backstop rather than the deadlock breaker it was in
+// v1, so waiters queueing behind a slow-but-live lock holder are no longer
+// aborted after 2s.
+const conflictBudget = 10 * time.Second
 
 // Get reads a key at the transaction's read timestamp (seeing the
 // transaction's own writes).
@@ -280,6 +303,7 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 	for {
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr == nil {
+			t.publishWait(ctx, nil) // no longer blocked, if we were
 			if br.Txn != nil {
 				// The server may push a write's timestamp above its
 				// timestamp cache instead of rejecting it; adopt the pushed
@@ -292,18 +316,28 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 		}
 		switch {
 		case kerr.WriteIntent != nil:
-			resolvedAll, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite)
+			resolvedAll, pending, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite)
 			if err != nil {
+				t.publishWait(ctx, nil)
 				return nil, err
 			}
 			if resolvedAll {
+				t.publishWait(ctx, nil)
 				continue
 			}
+			// We are blocked on a live transaction: publish the wait edge
+			// and walk the chain for a cycle before backing off.
+			t.publishWait(ctx, &pending.Txn)
+			if derr := t.detectDeadlock(ctx, pending); derr != nil {
+				return nil, derr // self chosen as deadlock victim
+			}
 			if waited >= conflictBudget {
+				t.publishWait(ctx, nil)
 				return nil, &RetryableError{Cause: kerr}
 			}
 			select {
 			case <-ctx.Done():
+				t.publishWait(ctx, nil)
 				return nil, ctx.Err()
 			case <-time.After(100 * time.Millisecond):
 				waited += 100 * time.Millisecond
@@ -374,11 +408,150 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	return true
 }
 
+// publishWait records the transaction this one is blocked on (nil = no
+// longer blocked) and publishes the edge on the transaction record with an
+// immediate heartbeat, so pushers walking wait chains see it without
+// waiting for the periodic beat. Best-effort: the periodic heartbeat
+// re-publishes every second regardless.
+func (t *Txn) publishWait(ctx context.Context, pushee *enginepb.TxnMeta) {
+	var id uuid.UUID
+	var key keys.Key
+	if pushee != nil {
+		id = pushee.ID
+		key = keys.Key(pushee.Key).Clone()
+	}
+	t.mu.Lock()
+	changed := t.mu.waitingFor != id
+	t.mu.waitingFor, t.mu.waitingForKey = id, key
+	anchored := t.mu.anchored
+	txn := t.mu.txn
+	t.mu.Unlock()
+	if !changed || !anchored {
+		// Unanchored transactions hold no intents, so nothing can wait on
+		// them and they can never be part of a cycle — no edge to publish.
+		return
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	ba.Add(&kvpb.HeartbeatTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+		Now:           t.db.clock.Now(),
+		WaitingFor:    id,
+		WaitingForKey: key,
+	})
+	hctx, cancel := context.WithTimeout(ctx, time.Second)
+	if _, kerr := t.db.Send(hctx, ba); kerr != nil {
+		log.Debugf("txn %s wait-edge publish: %v", txn.ID, kerr)
+	}
+	cancel()
+}
+
+// maxDeadlockChain bounds the wait-chain walk.
+const maxDeadlockChain = 8
+
+// detectDeadlock walks the advertised wait chain starting at the pushee
+// this transaction is blocked on. If the chain leads back to this
+// transaction, a deadlock cycle exists: the member with the lowest
+// priority (transaction ID as tie-break) is chosen deterministically by
+// every walker and force-aborted. Returns a RetryableError when this
+// transaction itself is the victim; nil otherwise (including when a
+// victim elsewhere in the cycle was aborted — the caller keeps polling
+// and observes the chain unblock).
+//
+// Wait edges are advisory and may be stale, so a detected "cycle" can be
+// a phantom; the cost of acting on one is a single spurious retryable
+// abort, never an anomaly.
+func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error {
+	type member struct {
+		id       uuid.UUID
+		key      keys.Key
+		priority int32
+	}
+	self := t.proto()
+	cur := member{id: pending.Txn.ID, key: keys.Key(pending.Txn.Key).Clone()}
+	var chain []member
+	cycle := false
+	for hop := 0; hop < maxDeadlockChain; hop++ {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+		ba.Add(&kvpb.PushTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: cur.key.Clone()},
+			PusheeTxn:     enginepb.TxnMeta{ID: cur.id, Key: cur.key},
+			QueryOnly:     true,
+			Now:           t.db.clock.Now(),
+		})
+		br, kerr := t.db.Send(ctx, ba)
+		if kerr != nil {
+			return nil // walk is best-effort
+		}
+		resp := br.Responses[0].PushTxn
+		if resp.Status != enginepb.PENDING {
+			return nil // chain broken: someone finished
+		}
+		cur.priority = resp.Priority
+		chain = append(chain, cur)
+		if resp.WaitingFor == uuid.Nil {
+			return nil // head of the chain is running, not waiting
+		}
+		if resp.WaitingFor == self.ID {
+			cycle = true
+			break
+		}
+		cur = member{id: resp.WaitingFor, key: keys.Key(resp.WaitingForKey).Clone()}
+	}
+	if !cycle {
+		return nil
+	}
+
+	victim := member{id: self.ID, key: keys.Key(self.Key), priority: self.Priority}
+	for _, m := range chain {
+		if m.priority < victim.priority ||
+			(m.priority == victim.priority && bytes.Compare(m.id[:], victim.id[:]) < 0) {
+			victim = m
+		}
+	}
+	metrics.DeadlockAborts.Inc()
+	if victim.id == self.ID {
+		// We are the victim. Abort our own record NOW — the cycle is only
+		// broken once our partners' next poll sees ABORTED and resolves our
+		// intents; leaving the record to expire would stall them for the
+		// whole expiration window.
+		log.Debugf("txn %s: deadlock cycle of %d, self is victim", self.ID, len(chain)+1)
+		aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+		aba.Add(&kvpb.PushTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: keys.Key(self.Key).Clone()},
+			PusheeTxn:     self.TxnMeta,
+			ForceAbort:    true,
+			Now:           t.db.clock.Now(),
+		})
+		if _, kerr := t.db.Send(ctx, aba); kerr != nil {
+			log.Debugf("txn %s: self-abort as deadlock victim: %v", self.ID, kerr)
+		}
+		t.markFinished()
+		e := kvpb.NewErrorf("deadlock detected: transaction %s chosen as victim", self.ID)
+		e.TxnAborted = &kvpb.TxnAbortedError{}
+		return &RetryableError{Cause: e}
+	}
+	log.Debugf("txn %s: deadlock cycle of %d, aborting victim %s", self.ID, len(chain)+1, victim.id)
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+	ba.Add(&kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: victim.key.Clone()},
+		PusherTxn:     self,
+		PusheeTxn:     enginepb.TxnMeta{ID: victim.id, Key: victim.key},
+		ForceAbort:    true,
+		Now:           t.db.clock.Now(),
+	})
+	if _, kerr := t.db.Send(ctx, ba); kerr != nil {
+		log.Debugf("txn %s: aborting deadlock victim %s: %v", self.ID, victim.id, kerr)
+	}
+	return nil
+}
+
 // pushIntents pushes the owners of conflicting intents. Returns true if
 // every intent was resolved (the pushees were finalized, expired, or
-// aborted by priority) and the operation can be retried immediately.
-func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbort bool) (bool, error) {
+// aborted by priority) and the operation can be retried immediately;
+// otherwise pending names one still-live blocker.
+func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbort bool) (bool, *storage.Intent, error) {
 	all := true
+	var pending *storage.Intent
 	for _, intent := range intents {
 		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
 		ba.Add(&kvpb.PushTxnRequest{
@@ -390,7 +563,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 		})
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr != nil {
-			return false, kerr
+			return false, nil, kerr
 		}
 		push := br.Responses[0].PushTxn
 		switch push.Status {
@@ -403,13 +576,17 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				CommitTS:      push.CommitTS,
 			})
 			if _, kerr := t.db.Send(ctx, rba); kerr != nil {
-				return false, kerr
+				return false, nil, kerr
 			}
 		default:
 			all = false // pushee alive; caller waits
+			if pending == nil {
+				p := intent
+				pending = &p
+			}
 		}
 	}
-	return all, nil
+	return all, pending, nil
 }
 
 // Commit atomically commits the transaction: one replicated flip of its
@@ -580,10 +757,15 @@ func (t *Txn) startHeartbeat() {
 			case <-ticker.C:
 			}
 			txn := t.proto()
+			t.mu.Lock()
+			waitingFor, waitingForKey := t.mu.waitingFor, t.mu.waitingForKey
+			t.mu.Unlock()
 			ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn}}
 			ba.Add(&kvpb.HeartbeatTxnRequest{
 				RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
 				Now:           t.db.clock.Now(),
+				WaitingFor:    waitingFor,
+				WaitingForKey: waitingForKey,
 			})
 			hctx, hcancel := context.WithTimeout(ctx, 3*time.Second)
 			br, kerr := t.db.Send(hctx, ba)

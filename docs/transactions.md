@@ -174,8 +174,21 @@ pushee's anchor range:
   - otherwise poll with backoff up to ~2s, then surface `40001` to the client.
 
 Priorities are random at birth and bumped on retries, so starvation is
-unlikely; the timeout crudely breaks deadlocks. A real deadlock detector is
-out of scope for v1.
+unlikely. Genuine deadlocks are broken by **distributed detection over
+advertised wait edges**: a coordinator blocked in a push loop publishes
+"waiting for X" on its own transaction record (immediately on change, and
+with every heartbeat), and each blocked pusher periodically walks the
+chain with query-only pushes — reads of the records along the way. A walk
+that arrives back at the walker has found a cycle; every walker picks the
+same victim deterministically (lowest priority, transaction ID as
+tie-break) and force-aborts it — a self-chosen victim aborts its own
+record at once so its partners unblock on their next poll. Wait edges are
+advisory and may be stale, so a phantom cycle costs at worst one spurious
+retryable abort, never an anomaly. Constructed 2- and 3-cycles resolve in
+a few poll rounds (hundreds of milliseconds). With detection in place the
+conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
+waiters queueing behind a slow-but-live lock holder are no longer aborted
+by the clock.
 
 Reads below a committed value's timestamp never block (MVCC). A foreign
 intent strictly above both the read timestamp and the uncertainty limit is
@@ -243,4 +256,4 @@ Correctness rules enforced around the threshold:
 
 ## Known gaps (deliberate)
 
-Parallel commits; savepoints; deadlock detection.
+Parallel commits; savepoints.

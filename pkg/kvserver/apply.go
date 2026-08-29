@@ -430,6 +430,26 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 				return nil, kvpb.NewError(err)
 			}
 			ru.Refresh = &kvpb.RefreshResponse{}
+		case *kvpb.PushTxnRequest:
+			// Query-only pushes read the record with no state change — the
+			// deadlock detector's chain walk. Mutating pushes go through
+			// the write path.
+			if !req.QueryOnly {
+				return nil, kvpb.NewErrorf("non-query PushTxn in read-only batch")
+			}
+			rec, err := loadTxnRecord(eng, txnRecordKey(&req.PusheeTxn))
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			resp := &kvpb.PushTxnResponse{Status: enginepb.PENDING}
+			if rec != nil {
+				resp.Status = rec.Status
+				resp.CommitTS = rec.WriteTimestamp
+				resp.WaitingFor = rec.WaitingFor
+				resp.WaitingForKey = rec.WaitingForKey
+				resp.Priority = rec.Priority
+			}
+			ru.PushTxn = resp
 		default:
 			return nil, kvpb.NewErrorf("non-read request in read-only batch: %T", ba.Requests[i].GetInner())
 		}

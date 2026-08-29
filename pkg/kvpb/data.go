@@ -83,6 +83,14 @@ type Transaction struct {
 	// IntentKeys is the committed transaction's write set, recorded at
 	// commit so GC resolves every intent before reclaiming the record.
 	IntentKeys []keys.Key `json:"intent_keys,omitempty"`
+	// WaitingFor advertises the transaction this one is currently blocked
+	// on (uuid.Nil = not waiting), with WaitingForKey the blocker's anchor
+	// key so its record can be found. Published by the coordinator while
+	// it waits in a push loop; pushers walk these edges to detect
+	// deadlock cycles. Advisory and possibly stale — used only to pick an
+	// abort victim, never for correctness of data.
+	WaitingFor    uuid.UUID `json:"waiting_for,omitempty"`
+	WaitingForKey keys.Key  `json:"waiting_for_key,omitempty"`
 }
 
 // NewTransaction creates a transaction starting at now.

@@ -123,6 +123,8 @@ type Transaction struct {
 	ReadTimestamp *Hlc                   `protobuf:"bytes,4,opt,name=read_timestamp,json=readTimestamp,proto3" json:"read_timestamp,omitempty"`
 	LastHeartbeat *Hlc                   `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat,omitempty"`
 	IntentKeys    [][]byte               `protobuf:"bytes,6,rep,name=intent_keys,json=intentKeys,proto3" json:"intent_keys,omitempty"`
+	WaitingFor    []byte                 `protobuf:"bytes,7,opt,name=waiting_for,json=waitingFor,proto3" json:"waiting_for,omitempty"` // 16-byte UUID; deadlock-detection wait edge
+	WaitingForKey []byte                 `protobuf:"bytes,8,opt,name=waiting_for_key,json=waitingForKey,proto3" json:"waiting_for_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -195,6 +197,20 @@ func (x *Transaction) GetLastHeartbeat() *Hlc {
 func (x *Transaction) GetIntentKeys() [][]byte {
 	if x != nil {
 		return x.IntentKeys
+	}
+	return nil
+}
+
+func (x *Transaction) GetWaitingFor() []byte {
+	if x != nil {
+		return x.WaitingFor
+	}
+	return nil
+}
+
+func (x *Transaction) GetWaitingForKey() []byte {
+	if x != nil {
+		return x.WaitingForKey
 	}
 	return nil
 }
@@ -823,6 +839,8 @@ type HeartbeatTxnRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
 	Now           *Hlc                   `protobuf:"bytes,2,opt,name=now,proto3" json:"now,omitempty"`
+	WaitingFor    []byte                 `protobuf:"bytes,3,opt,name=waiting_for,json=waitingFor,proto3" json:"waiting_for,omitempty"`
+	WaitingForKey []byte                 `protobuf:"bytes,4,opt,name=waiting_for_key,json=waitingForKey,proto3" json:"waiting_for_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -871,6 +889,20 @@ func (x *HeartbeatTxnRequest) GetNow() *Hlc {
 	return nil
 }
 
+func (x *HeartbeatTxnRequest) GetWaitingFor() []byte {
+	if x != nil {
+		return x.WaitingFor
+	}
+	return nil
+}
+
+func (x *HeartbeatTxnRequest) GetWaitingForKey() []byte {
+	if x != nil {
+		return x.WaitingForKey
+	}
+	return nil
+}
+
 type PushTxnRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
@@ -878,6 +910,8 @@ type PushTxnRequest struct {
 	PusheeTxn     *TxnMeta               `protobuf:"bytes,3,opt,name=pushee_txn,json=pusheeTxn,proto3" json:"pushee_txn,omitempty"`
 	PushAbort     bool                   `protobuf:"varint,4,opt,name=push_abort,json=pushAbort,proto3" json:"push_abort,omitempty"`
 	Now           *Hlc                   `protobuf:"bytes,5,opt,name=now,proto3" json:"now,omitempty"`
+	QueryOnly     bool                   `protobuf:"varint,6,opt,name=query_only,json=queryOnly,proto3" json:"query_only,omitempty"`
+	ForceAbort    bool                   `protobuf:"varint,7,opt,name=force_abort,json=forceAbort,proto3" json:"force_abort,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -945,6 +979,20 @@ func (x *PushTxnRequest) GetNow() *Hlc {
 		return x.Now
 	}
 	return nil
+}
+
+func (x *PushTxnRequest) GetQueryOnly() bool {
+	if x != nil {
+		return x.QueryOnly
+	}
+	return false
+}
+
+func (x *PushTxnRequest) GetForceAbort() bool {
+	if x != nil {
+		return x.ForceAbort
+	}
+	return false
 }
 
 type ResolveIntentRequest struct {
@@ -2339,6 +2387,9 @@ type PushTxnResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        int32                  `protobuf:"varint,1,opt,name=status,proto3" json:"status,omitempty"`
 	CommitTs      *Hlc                   `protobuf:"bytes,2,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
+	WaitingFor    []byte                 `protobuf:"bytes,3,opt,name=waiting_for,json=waitingFor,proto3" json:"waiting_for,omitempty"`
+	WaitingForKey []byte                 `protobuf:"bytes,4,opt,name=waiting_for_key,json=waitingForKey,proto3" json:"waiting_for_key,omitempty"`
+	Priority      int32                  `protobuf:"varint,5,opt,name=priority,proto3" json:"priority,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2385,6 +2436,27 @@ func (x *PushTxnResponse) GetCommitTs() *Hlc {
 		return x.CommitTs
 	}
 	return nil
+}
+
+func (x *PushTxnResponse) GetWaitingFor() []byte {
+	if x != nil {
+		return x.WaitingFor
+	}
+	return nil
+}
+
+func (x *PushTxnResponse) GetWaitingForKey() []byte {
+	if x != nil {
+		return x.WaitingForKey
+	}
+	return nil
+}
+
+func (x *PushTxnResponse) GetPriority() int32 {
+	if x != nil {
+		return x.Priority
+	}
+	return 0
 }
 
 type ResolveIntentResponse struct {
@@ -4050,7 +4122,7 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x05epoch\x18\x03 \x01(\x05R\x05epoch\x126\n" +
 	"\x0fwrite_timestamp\x18\x04 \x01(\v2\r.datax.v1.HlcR\x0ewriteTimestamp\x122\n" +
 	"\rmin_timestamp\x18\x05 \x01(\v2\r.datax.v1.HlcR\fminTimestamp\x12\x1a\n" +
-	"\bpriority\x18\x06 \x01(\x05R\bpriority\"\xed\x01\n" +
+	"\bpriority\x18\x06 \x01(\x05R\bpriority\"\xb6\x02\n" +
 	"\vTransaction\x12%\n" +
 	"\x04meta\x18\x01 \x01(\v2\x11.datax.v1.TxnMetaR\x04meta\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x16\n" +
@@ -4058,7 +4130,10 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x0eread_timestamp\x18\x04 \x01(\v2\r.datax.v1.HlcR\rreadTimestamp\x124\n" +
 	"\x0elast_heartbeat\x18\x05 \x01(\v2\r.datax.v1.HlcR\rlastHeartbeat\x12\x1f\n" +
 	"\vintent_keys\x18\x06 \x03(\fR\n" +
-	"intentKeys\"f\n" +
+	"intentKeys\x12\x1f\n" +
+	"\vwaiting_for\x18\a \x01(\fR\n" +
+	"waitingFor\x12&\n" +
+	"\x0fwaiting_for_key\x18\b \x01(\fR\rwaitingForKey\"f\n" +
 	"\x11ReplicaDescriptor\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x03R\x06nodeId\x12\x19\n" +
 	"\bstore_id\x18\x02 \x01(\x03R\astoreId\x12\x1d\n" +
@@ -4105,10 +4180,13 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x16\n" +
 	"\x06commit\x18\x02 \x01(\bR\x06commit\x12\x1f\n" +
 	"\vintent_keys\x18\x03 \x03(\fR\n" +
-	"intentKeys\"g\n" +
+	"intentKeys\"\xb0\x01\n" +
 	"\x13HeartbeatTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1f\n" +
-	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\"\xe9\x01\n" +
+	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1f\n" +
+	"\vwaiting_for\x18\x03 \x01(\fR\n" +
+	"waitingFor\x12&\n" +
+	"\x0fwaiting_for_key\x18\x04 \x01(\fR\rwaitingForKey\"\xa9\x02\n" +
 	"\x0ePushTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x124\n" +
 	"\n" +
@@ -4117,7 +4195,11 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"pushee_txn\x18\x03 \x01(\v2\x11.datax.v1.TxnMetaR\tpusheeTxn\x12\x1d\n" +
 	"\n" +
 	"push_abort\x18\x04 \x01(\bR\tpushAbort\x12\x1f\n" +
-	"\x03now\x18\x05 \x01(\v2\r.datax.v1.HlcR\x03now\"\xa2\x01\n" +
+	"\x03now\x18\x05 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1d\n" +
+	"\n" +
+	"query_only\x18\x06 \x01(\bR\tqueryOnly\x12\x1f\n" +
+	"\vforce_abort\x18\a \x01(\bR\n" +
+	"forceAbort\"\xa2\x01\n" +
 	"\x14ResolveIntentRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x15\n" +
 	"\x06txn_id\x18\x02 \x01(\fR\x05txnId\x12\x16\n" +
@@ -4205,10 +4287,14 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x0eEndTxnResponse\x128\n" +
 	"\x10commit_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0fcommitTimestamp\".\n" +
 	"\x14HeartbeatTxnResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\x05R\x06status\"U\n" +
+	"\x06status\x18\x01 \x01(\x05R\x06status\"\xba\x01\n" +
 	"\x0fPushTxnResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\x05R\x06status\x12*\n" +
-	"\tcommit_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\bcommitTs\"\x17\n" +
+	"\tcommit_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\bcommitTs\x12\x1f\n" +
+	"\vwaiting_for\x18\x03 \x01(\fR\n" +
+	"waitingFor\x12&\n" +
+	"\x0fwaiting_for_key\x18\x04 \x01(\fR\rwaitingForKey\x12\x1a\n" +
+	"\bpriority\x18\x05 \x01(\x05R\bpriority\"\x17\n" +
 	"\x15ResolveIntentResponse\"\x11\n" +
 	"\x0fRefreshResponse\"\f\n" +
 	"\n" +
