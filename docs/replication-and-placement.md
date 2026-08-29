@@ -68,13 +68,29 @@ circularity (an election needs peer addresses; addresses in a registry
 range; the registry range needs an election):
 
 - **Address piggybacking**: every Raft envelope carries the sender's node
-  ID and RPC address; receivers learn peers from Raft traffic itself.
+  ID and RPC address; receivers learn peers from Raft traffic itself. An
+  address learned this way also counts as a liveness observation — live
+  traffic is stronger evidence than any registry row, so a stale row can
+  never clobber it.
 - **Persisted registry**: each node saves its last known node registry to a
   local store key and reloads it at startup, so a fully restarted cluster
   can re-form with no leader anywhere and no `--join` flags.
+- **Re-announce**: an already-initialized node may come back on a
+  *different* address (rescheduling, port churn). At startup it re-sends
+  the join RPC — with its node ID, so no new ID is allocated — to its
+  configured `--join` target and every persisted-registry peer. Receivers
+  adopt the address into their in-memory registries with **no KV writes**,
+  so this works while quorum is still down, and the response carries every
+  fresh address the receiver has already learned from other announcers.
+  A whole cluster restarted on all-new addresses therefore re-forms as
+  long as nodes share a reachable announce target (the usual static
+  `--join` config); from there, piggybacking and registry rows converge
+  the rest.
 
 The registry rows in range 1 (with localities and liveness) remain the
 authority for the allocator; these mechanisms only guarantee reachability.
+A restarted node publishes its row (with its current address) on its first
+heartbeat, immediately at startup rather than a tick later.
 
 ## Membership and bootstrap
 

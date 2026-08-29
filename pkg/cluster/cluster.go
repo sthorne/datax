@@ -134,10 +134,16 @@ func LoadPersistedRegistry(eng *storage.Engine) ([]kvpb.NodeDescriptor, error) {
 	return nodes, nil
 }
 
-// JoinRequest is sent by a new node to any existing node.
+// JoinRequest is sent by a new node to any existing node. A request with
+// NodeID set is a RE-ANNOUNCE from an already-initialized node whose
+// address may have changed: no ID is allocated, the receiver just adopts
+// the address into its registry and returns the current node list.
 type JoinRequest struct {
 	Address  string        `json:"address"`
 	Locality base.Locality `json:"locality"`
+	// NodeID + ClusterID identify a re-announcing node.
+	NodeID    base.NodeID `json:"node_id,omitempty"`
+	ClusterID uuid.UUID   `json:"cluster_id,omitempty"`
 }
 
 // JoinResponse tells the joiner who it is and how to route.
@@ -154,33 +160,53 @@ type JoinResponse struct {
 type Registry struct {
 	mu    sync.Mutex
 	nodes map[base.NodeID]kvpb.NodeDescriptor
+	now   func() int64 // wall clock for piggybacked-address liveness; may be nil
 }
 
 func NewRegistry() *Registry {
 	return &Registry{nodes: make(map[base.NodeID]kvpb.NodeDescriptor)}
 }
 
+// SetClock installs the wall-clock source used to stamp liveness on
+// addresses learned from live traffic (UpsertAddress).
+func (r *Registry) SetClock(now func() int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.now = now
+}
+
+// Upsert keeps the freshest descriptor per node. Strictly-newer wins: an
+// equal-liveness row must NOT clobber the in-memory entry, because a peer
+// address learned from live Raft traffic (UpsertAddress) may be newer than
+// the row a stale scan carries even at the same liveness reading.
 func (r *Registry) Upsert(nd kvpb.NodeDescriptor) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cur, ok := r.nodes[nd.NodeID]; !ok || cur.LivenessTime <= nd.LivenessTime {
+	if cur, ok := r.nodes[nd.NodeID]; !ok || cur.LivenessTime < nd.LivenessTime {
 		r.nodes[nd.NodeID] = nd
 	}
 }
 
 // UpsertAddress records a peer's address learned from Raft traffic without
-// clobbering locality/liveness from real registry rows.
+// clobbering locality/draining from real registry rows. A changed address
+// also bumps the entry's liveness to now: live traffic is stronger evidence
+// than any row, and the bump keeps a stale row (old address, old liveness)
+// from clobbering the fresh address on the next registry scan.
 func (r *Registry) UpsertAddress(id base.NodeID, addr string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cur, ok := r.nodes[id]; ok {
-		if cur.Address != addr {
-			cur.Address = addr
-			r.nodes[id] = cur
-		}
+	cur, ok := r.nodes[id]
+	if ok && cur.Address == addr {
 		return
 	}
-	r.nodes[id] = kvpb.NodeDescriptor{NodeID: id, Address: addr}
+	cur.NodeID = id
+	cur.Address = addr
+	if r.now != nil {
+		if t := r.now(); cur.LivenessTime < t {
+			cur.LivenessTime = t
+		}
+	}
+	r.nodes[id] = cur
 }
 
 func (r *Registry) Get(id base.NodeID) (kvpb.NodeDescriptor, bool) {

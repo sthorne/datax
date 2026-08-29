@@ -112,7 +112,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |
 | SQL | joins, GROUP BY, subqueries, most types |
 | Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
-| Ops | observability UI; roles/privileges; a restarted node must keep its address (no address-change story) |
+| Ops | observability UI; roles/privileges |
 
 ## License
 

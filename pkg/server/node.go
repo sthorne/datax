@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -174,6 +175,7 @@ func (n *Node) start() error {
 	}
 
 	n.registry = cluster.NewRegistry()
+	n.registry.SetClock(func() int64 { return n.clock.Now().WallTime })
 	n.trans = rpc.NewTransport(n.clock, n.stopper, n.registry.Resolve)
 	n.stopper.AddCloser(n.trans.Close)
 	if n.cfg.CertsDir != "" {
@@ -280,6 +282,16 @@ func (n *Node) start() error {
 	}()
 	n.stopper.AddCloser(grpcServer.Stop)
 
+	if initialized {
+		// A restarted node may be back on a different address. Announce it
+		// to every peer we can reach — the configured join target plus the
+		// persisted registry — BEFORE raft groups spin up, so peers stop
+		// dialing the old address and their responses can find us. Purely
+		// best-effort: peers that moved too are healed by piggybacked
+		// addresses on raft envelopes once any link forms.
+		n.reannounce()
+	}
+
 	// Bring up replicas: restart from disk, or create the fresh range 1.
 	if err := n.store.LoadReplicas(); err != nil {
 		return err
@@ -340,6 +352,68 @@ func loadLocalRange1(eng *storage.Engine) (kvpb.RangeDescriptor, bool, error) {
 		return desc, false, err
 	}
 	return desc, true, nil
+}
+
+// reannounce advertises this (already-initialized) node's identity and
+// current address to the configured join target and every persisted-registry
+// peer, in parallel, best-effort. Successful responses carry the fresh node
+// list the peer holds — including addresses of other nodes that also moved
+// — which is what re-forms a cluster restarted entirely on new addresses.
+func (n *Node) reannounce() {
+	targets := make(map[string]struct{})
+	if n.cfg.Join != "" {
+		targets[n.cfg.Join] = struct{}{}
+	}
+	for _, nd := range n.registry.All() {
+		if nd.NodeID != n.ident.NodeID && nd.Address != "" && nd.Address != n.addr {
+			targets[nd.Address] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	req := cluster.JoinRequest{
+		Address:   n.addr,
+		Locality:  n.cfg.Locality,
+		NodeID:    n.ident.NodeID,
+		ClusterID: n.ident.ClusterID,
+	}
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex // guards n.joinRange1 across the announce goroutines
+	)
+	for addr := range targets {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(n.stopper.Ctx(), 3*time.Second)
+			defer cancel()
+			var resp cluster.JoinResponse
+			if err := n.trans.Call(ctx, addr, "join", req, &resp); err != nil {
+				log.Debugf("re-announce to %s failed: %v", addr, err)
+				return
+			}
+			if resp.Error != "" {
+				log.Warnf("re-announce to %s rejected: %s", addr, resp.Error)
+				return
+			}
+			for _, nd := range resp.Nodes {
+				if nd.NodeID != n.ident.NodeID {
+					n.registry.Upsert(nd)
+				}
+			}
+			mu.Lock()
+			if resp.Range1.RangeID != 0 && n.joinRange1.RangeID == 0 {
+				n.joinRange1 = resp.Range1
+			}
+			mu.Unlock()
+			log.Infof("re-announced %s at %s via %s", n.ident.NodeID, n.addr, addr)
+		}(addr)
+	}
+	wg.Wait()
+	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
+		log.Debugf("persisting registry: %v", err)
+	}
 }
 
 // join contacts an existing node to obtain identity and routing bootstrap.

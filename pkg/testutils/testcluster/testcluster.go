@@ -205,11 +205,10 @@ func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
 }
 
 // startDiskNode starts a node backed by an on-disk store (restart tests).
-// A restarted node must come back on its previous address — peers find it
-// through the persisted registry — so the listener address is reused via
-// the store directory name mapping kept by the caller (here: we bind :0 the
-// first time and the SAME port after, since datax has no address-change
-// story in v1).
+// The listener address is pinned per store directory: these tests exercise
+// the same-address restart path, where peers find a returning node purely
+// through their persisted registries with no re-announce involved. The
+// changed-address path is covered by RestartNodeNewPort and address_test.go.
 func startDiskNode(t *testing.T, dir string, bootstrap bool, join string) *server.Node {
 	t.Helper()
 	lis := listenerForDir(t, dir)
@@ -264,6 +263,36 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 	if err != nil {
 		tc.T.Fatalf("restarting node %d: %v", i+1, err)
 	}
+	tc.Nodes[i] = n
+	return n
+}
+
+// RestartNodeNewPort restarts a stopped StartWithEngines node on a FRESH
+// port (an address change: rescheduling, port churn). join is the announce
+// target for the restarted node ("" = rely on its persisted registry).
+func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join string, opts ...func(*server.Config)) *server.Node {
+	tc.T.Helper()
+	if tc.Nodes[i] != nil {
+		tc.T.Fatalf("node %d is still running", i+1)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tc.T.Fatal(err)
+	}
+	cfg := server.Config{
+		Listener:   lis,
+		Engine:     eng,
+		Join:       join,
+		GCInterval: -1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		tc.T.Fatalf("restarting node %d on new port: %v", i+1, err)
+	}
+	tc.addrs[i] = lis.Addr().String()
 	tc.Nodes[i] = n
 	return n
 }

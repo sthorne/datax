@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/sthorne/datax/pkg/cluster"
@@ -34,6 +35,9 @@ func (n *Node) handleJoin(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 func (n *Node) serveJoin(ctx context.Context, req cluster.JoinRequest) cluster.JoinResponse {
+	if req.NodeID != 0 {
+		return n.serveReannounce(req)
+	}
 	newID, err := n.db.Increment(ctx, keys.NodeIDGenKey(), 1)
 	if err != nil {
 		return cluster.JoinResponse{Error: err.Error()}
@@ -67,16 +71,51 @@ func (n *Node) serveJoin(ctx context.Context, req cluster.JoinRequest) cluster.J
 	return resp
 }
 
+// serveReannounce handles a join request from an already-initialized node
+// (re)advertising its address after a restart. It deliberately performs no
+// KV writes — only the in-memory registry is updated — so it works while
+// quorum is still down (the whole-cluster-restart-on-new-addresses case);
+// durable registry rows follow from the announcer's own heartbeat once
+// range 1 has a leader again. The response's node list gives the announcer
+// every fresh address this node has already learned from other announcers.
+func (n *Node) serveReannounce(req cluster.JoinRequest) cluster.JoinResponse {
+	if req.ClusterID != n.ident.ClusterID {
+		return cluster.JoinResponse{Error: fmt.Sprintf(
+			"re-announce from node %s of cluster %s, but this is cluster %s",
+			req.NodeID, req.ClusterID, n.ident.ClusterID)}
+	}
+	n.registry.UpsertAddress(req.NodeID, req.Address)
+	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
+		log.Debugf("persisting registry: %v", err)
+	}
+	resp := cluster.JoinResponse{
+		ClusterID: n.ident.ClusterID,
+		NodeID:    req.NodeID,
+		Nodes:     n.registry.All(),
+	}
+	if r1, ok := n.store.GetReplica(1); ok {
+		resp.Range1 = r1.Desc()
+	} else if desc, ok := n.db.CachedDescriptor(keys.MinKey); ok {
+		resp.Range1 = desc
+	}
+	log.Infof("node %s re-announced at %s", req.NodeID, req.Address)
+	return resp
+}
+
 // heartbeatLoop periodically writes this node's liveness into the registry
-// keys (range 1) and refreshes the in-memory registry from them.
+// keys (range 1) and refreshes the in-memory registry from them. The first
+// beat runs immediately: a restarted node (possibly on a new address) must
+// publish its row as soon as quorum allows, not a tick later.
 func (n *Node) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 		hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		// Adopt a Draining flag someone else wrote into our row (a
