@@ -181,11 +181,13 @@ Correctness rules enforced around the threshold:
   `MinTimestamp` is at or below the threshold, so a zombie coordinator
   cannot recreate a reclaimed record as PENDING after having possibly been
   aborted. Deterministic, because the threshold is replicated.
-- Residual hazard (documented, accepted): an intent of a *committed*
-  transaction that sits unresolved on a range other than the record's for a
-  full TTL can be wrongly aborted after the record is reclaimed. The
-  coordinator resolves intents synchronously at commit, so this requires a
-  crash followed by a TTL of nothing touching the key.
+- **Committed records are proof, and proof is kept until spent**: a commit
+  stores the transaction's write set on its record, and GC resolves every
+  one of those intents — wherever their ranges live — before reclaiming a
+  COMMITTED record. An intent orphaned by a coordinator crash therefore
+  always resolves as committed, never as expired-and-aborted. (ABORTED
+  records stay collectible outright: a pusher finding a record-less
+  TTL-old intent aborts it, which is the correct outcome either way.)
 
 ## Invariants (asserted in tests)
 

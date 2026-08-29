@@ -51,6 +51,12 @@ type ScanRequest struct {
 type EndTxnRequest struct {
 	RequestHeader      // Key = the transaction's anchor key
 	Commit        bool `json:"commit"`
+	// IntentKeys is the transaction's write set (commit only). It is stored
+	// on the finalized record so GC can prove every intent was resolved
+	// before reclaiming the record — without it, an intent orphaned by a
+	// crashed coordinator would be judged expired and wrongly aborted after
+	// the record is gone.
+	IntentKeys []keys.Key `json:"intent_keys,omitempty"`
 }
 
 // HeartbeatTxnRequest refreshes the transaction record's liveness.

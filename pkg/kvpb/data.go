@@ -74,6 +74,9 @@ type Transaction struct {
 	ReadTimestamp hlc.Timestamp `json:"read_ts"`
 	// LastHeartbeat is used to detect abandoned transactions.
 	LastHeartbeat hlc.Timestamp `json:"last_heartbeat"`
+	// IntentKeys is the committed transaction's write set, recorded at
+	// commit so GC resolves every intent before reclaiming the record.
+	IntentKeys []keys.Key `json:"intent_keys,omitempty"`
 }
 
 // NewTransaction creates a transaction starting at now.

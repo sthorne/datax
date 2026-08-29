@@ -348,8 +348,18 @@ func (t *Txn) Commit(ctx context.Context) error {
 		t.markFinished()
 		return nil
 	}
+	t.mu.Lock()
+	intentKeys := make([]keys.Key, 0, len(t.mu.writes))
+	for k := range t.mu.writes {
+		intentKeys = append(intentKeys, keys.Key(k).Clone())
+	}
+	t.mu.Unlock()
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
-	ba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: true})
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+		Commit:        true,
+		IntentKeys:    intentKeys,
+	})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
 		t.markFinished()

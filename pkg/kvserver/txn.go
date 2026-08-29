@@ -131,6 +131,9 @@ func (r *Replica) evalEndTxn(b *storage.Batch, txn *kvpb.Transaction, req *kvpb.
 	final := txn.Clone()
 	if req.Commit {
 		final.Status = enginepb.COMMITTED
+		// The write set travels on the record so GC can resolve any intents
+		// a crashed coordinator left behind before reclaiming the record.
+		final.IntentKeys = req.IntentKeys
 	} else {
 		final.Status = enginepb.ABORTED
 	}

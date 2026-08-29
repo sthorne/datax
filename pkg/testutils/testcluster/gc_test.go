@@ -314,3 +314,78 @@ func TestGCReplicaConsistency(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestGCResolvesOrphanedCommittedIntents: a coordinator that crashes after
+// the commit flip but before resolving its intents must NOT lose the
+// committed writes when GC later reclaims the record. GC resolves the
+// record's write set (across ranges) before collecting it. Regression test
+// for issue #16.
+func TestGCResolvesOrphanedCommittedIntents(t *testing.T) {
+	tc, engines := StartWithEngines(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	db := tc.Nodes[0].DB()
+
+	prefix := keys.TableDataPrefix(780)
+	if _, err := db.AdminSplit(ctx, append(prefix.Clone(), 'm')); err != nil {
+		t.Fatal(err)
+	}
+	kLeft := append(prefix.Clone(), "a-left"...)
+	kRight := append(prefix.Clone(), "z-right"...)
+
+	// Drive the transaction manually so we can crash it at the worst moment:
+	// intents on two ranges, record committed, nothing resolved.
+	txn := kvpb.NewTransaction("orphan", 0, tc.Nodes[0].Clock().Now())
+	txn.Key = kLeft
+	send := func(ba *kvpb.BatchRequest) {
+		t.Helper()
+		if _, kerr := db.Send(ctx, ba); kerr != nil {
+			t.Fatal(kerr)
+		}
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn, CreateTxnRecord: true}}
+	ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: kLeft}, Value: []byte("left")})
+	send(ba)
+	ba = &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn}}
+	ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: kRight}, Value: []byte("right")})
+	send(ba)
+	ba = &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn}}
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: kLeft},
+		Commit:        true,
+		IntentKeys:    []keys.Key{kLeft.Clone(), kRight.Clone()},
+	})
+	send(ba)
+	// "Crash": no resolution, no heartbeats. Both intents are orphaned.
+
+	// Age past the TTL and run GC everywhere (each range's leader acts).
+	time.Sleep(500 * time.Millisecond)
+	for round := 0; round < 2; round++ {
+		for _, n := range tc.Nodes {
+			n.Store().RunGCOnce(ctx, 200*time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The committed writes survive — without pre-collection resolution the
+	// next reader would push, find no record, and wrongly abort the intents.
+	if v, err := db.Get(ctx, kLeft); err != nil || string(v) != "left" {
+		t.Fatalf("committed write on the anchor range lost: %q, %v", v, err)
+	}
+	if v, err := db.Get(ctx, kRight); err != nil || string(v) != "right" {
+		t.Fatalf("committed write on the other range lost: %q, %v", v, err)
+	}
+	// The intents were resolved (no metadata left on any replica) and the
+	// record was reclaimed.
+	for i, eng := range engines {
+		if metas, _ := mvccEntryCounts(t, eng, kLeft); metas != 0 {
+			t.Fatalf("node %d: intent metadata survives on kLeft", i+1)
+		}
+		if metas, _ := mvccEntryCounts(t, eng, kRight); metas != 0 {
+			t.Fatalf("node %d: intent metadata survives on kRight", i+1)
+		}
+	}
+	if c := txnRecordsAnchoredAt(t, engines[0], kLeft); c != 0 {
+		t.Fatalf("committed record not reclaimed: %d records", c)
+	}
+}

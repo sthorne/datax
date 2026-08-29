@@ -45,16 +45,18 @@ import (
 // keys the enumeration skipped.
 //
 // Transaction records: a finalized (committed or aborted) record whose
-// timestamps are TTL-old is deleted, unless this range still holds an
-// intent of that transaction (the enumeration pass sees every intent, so
-// this check is free). A pusher that later finds a record-less intent from
-// a TTL-old transaction judges it expired and aborts it — correct for
-// aborted transactions, and for committed ones the coordinator resolves
-// intents promptly after commit; an intent orphaned for a whole TTL on a
-// range OTHER than the record's is the residual (documented) hazard.
-// createTxnRecord's resurrection guard rejects transactions born at or
-// below the threshold, so a zombie coordinator cannot recreate a reclaimed
-// record.
+// timestamps are TTL-old is reclaimed — but a COMMITTED record is proof of
+// its intents' fate, so it may only be deleted once every intent it wrote
+// is resolved. Committed records carry the transaction's write set
+// (Transaction.IntentKeys, recorded at commit); before collecting one, the
+// leader resolves those keys through the routed sender — wherever their
+// ranges live — and collects the record only when every resolve succeeded
+// (resolution is idempotent, so racing the coordinator's own cleanup is
+// harmless). ABORTED records are collectible outright: a pusher that later
+// finds a record-less TTL-old intent aborts it, which is the correct
+// outcome. createTxnRecord's resurrection guard rejects transactions born
+// at or below the threshold, so a zombie coordinator cannot recreate a
+// reclaimed record.
 
 // gcChunkSize bounds how many items (versions + record keys) one replicated
 // GC command carries, keeping raft entries reasonably sized.
@@ -117,15 +119,26 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp) error {
 
 	snap := r.store.cfg.Engine.NewSnapshot()
 	versions, liveIntentTxns, err := enumerateGarbageVersions(snap, desc, threshold)
-	var records []keys.Key
+	var recordWork []gcTxnRecord
 	if err == nil {
-		records, err = enumerateGarbageTxnRecords(snap, desc, threshold, liveIntentTxns)
+		recordWork, err = enumerateGarbageTxnRecords(snap, desc, threshold, liveIntentTxns)
 	}
 	if cerr := snap.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		return err
+	}
+
+	// A committed record is only reclaimable once every intent it wrote is
+	// resolved; resolve first (idempotent), and keep the record for a later
+	// pass if resolution cannot be completed now.
+	var records []keys.Key
+	for _, tr := range recordWork {
+		if len(tr.resolve) > 0 && !r.resolveRecordIntents(ctx, tr) {
+			continue
+		}
+		records = append(records, tr.key)
 	}
 	if len(versions) == 0 && len(records) == 0 {
 		// Nothing to reclaim; leave the threshold where it is (raising it
@@ -235,16 +248,27 @@ func intentTxnID(raw []byte) (uuid.UUID, error) {
 	return meta.Txn.ID, nil
 }
 
+// gcTxnRecord is one reclaimable transaction record; resolve lists the
+// committed write set that must be resolved before the record may go.
+type gcTxnRecord struct {
+	key      keys.Key
+	resolve  []keys.Key
+	txnID    uuid.UUID
+	commitTS hlc.Timestamp
+}
+
 // enumerateGarbageTxnRecords scans the range's transaction records and
-// returns the storage keys of finalized, TTL-old records — except those of
-// transactions that still hold an intent in this range (resolution of those
-// intents may yet consult the record via a push).
-func enumerateGarbageTxnRecords(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp, liveIntentTxns map[uuid.UUID]struct{}) ([]keys.Key, error) {
+// returns the finalized, TTL-old ones. Committed records carry their write
+// set for pre-collection resolution; records without one (aborted, or from
+// transactions still holding an in-range intent) follow the conservative
+// rules: aborted records are collectible outright, and records of
+// transactions with a live in-range intent wait for lazy resolution.
+func enumerateGarbageTxnRecords(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp, liveIntentTxns map[uuid.UUID]struct{}) ([]gcTxnRecord, error) {
 	lo, hi := keys.RangeLocalAddressedSpan(desc.StartKey, desc.EndKey)
 	it := snap.NewIter(lo, hi)
 	defer func() { _ = it.Close() }()
 
-	var out []keys.Key
+	var out []gcTxnRecord
 	for ok := it.SeekGE(lo); ok; ok = it.Next() {
 		var txn kvpb.Transaction
 		if err := json.Unmarshal(it.Value(), &txn); err != nil {
@@ -254,12 +278,46 @@ func enumerateGarbageTxnRecords(snap *storage.Snapshot, desc kvpb.RangeDescripto
 		if txn.Status == enginepb.PENDING {
 			continue // live (or expired-but-unpushed): not ours to reclaim
 		}
-		if _, held := liveIntentTxns[txn.ID]; held {
+		if !txn.WriteTimestamp.LessEq(threshold) || !txn.LastHeartbeat.LessEq(threshold) {
 			continue
 		}
-		if txn.WriteTimestamp.LessEq(threshold) && txn.LastHeartbeat.LessEq(threshold) {
-			out = append(out, keys.Key(it.Key()).Clone())
+		tr := gcTxnRecord{key: keys.Key(it.Key()).Clone(), txnID: txn.ID, commitTS: txn.WriteTimestamp}
+		if txn.Status == enginepb.COMMITTED && len(txn.IntentKeys) > 0 {
+			tr.resolve = txn.IntentKeys
+		} else if _, held := liveIntentTxns[txn.ID]; held {
+			// No recorded write set but an intent survives in this range:
+			// leave the record for lazy resolution to consume first.
+			continue
 		}
+		out = append(out, tr)
 	}
 	return out, nil
+}
+
+// resolveRecordIntents resolves a committed transaction's recorded write
+// set through the routed sender (the keys may live on other ranges).
+// Returns false when resolution could not be completed — the record then
+// simply waits for a later GC pass.
+func (r *Replica) resolveRecordIntents(ctx context.Context, tr gcTxnRecord) bool {
+	sender := r.store.getSender()
+	if sender == nil {
+		return false
+	}
+	const chunk = 100
+	for i := 0; i < len(tr.resolve); i += chunk {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: r.store.cfg.Clock.Now()}}
+		for _, k := range tr.resolve[i:min(i+chunk, len(tr.resolve))] {
+			ba.Add(&kvpb.ResolveIntentRequest{
+				RequestHeader: kvpb.RequestHeader{Key: k},
+				TxnID:         tr.txnID,
+				Status:        enginepb.COMMITTED,
+				CommitTS:      tr.commitTS,
+			})
+		}
+		if _, kerr := sender.Send(ctx, ba); kerr != nil {
+			log.Warnf("%s: resolving intents of committed txn %s before record GC: %v", r.rangeID, tr.txnID, kerr)
+			return false
+		}
+	}
+	return true
 }
