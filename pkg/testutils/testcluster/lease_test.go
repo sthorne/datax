@@ -3,6 +3,7 @@ package testcluster
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -131,5 +133,110 @@ func TestLeaseReadFailover(t *testing.T) {
 	v, err := tc.Nodes[survivor].DB().Get(ctx, k)
 	if err != nil || string(v) != "after" {
 		t.Fatalf("read after failover: %q, %v", v, err)
+	}
+}
+
+// TestLeaseBackstopRefusesStaleContact: once follower contact is
+// invalidated (as a detected stall would), the leader refuses lease reads
+// with NotLeader instead of serving on a possibly-expired lease — and
+// recovers as soon as followers answer again. Regression test for issue
+// #17.
+func TestLeaseBackstopRefusesStaleContact(t *testing.T) {
+	tc := startCluster3(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	k := append(keys.TableDataPrefix(743), "k"...)
+	if err := tc.Nodes[0].DB().Put(ctx, k, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	leader := tc.LeaderIndex(1)
+	rep, _ := tc.Nodes[leader].Store().GetReplica(1)
+
+	// Expiring contact and reading immediately must yield NotLeader (a
+	// heartbeat response can occasionally sneak into the microseconds
+	// between the two calls, so accept any refusal across attempts).
+	sawRefusal := false
+	for i := 0; i < 20 && !sawRefusal; i++ {
+		rep.TestingExpireLeaseContact()
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: tc.Nodes[leader].Clock().Now()}}
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}})
+		_, kerr := rep.Execute(ctx, ba)
+		if kerr != nil && kerr.NotLeader != nil {
+			sawRefusal = true
+		}
+	}
+	if !sawRefusal {
+		t.Fatal("stale-contact lease read was never refused")
+	}
+
+	// The refusal is transient: heartbeat responses restore contact and a
+	// routed read succeeds.
+	if v, err := tc.Nodes[leader].DB().Get(ctx, k); err != nil || string(v) != "v" {
+		t.Fatalf("read after contact recovery: %q, %v", v, err)
+	}
+}
+
+// TestLeaseBackstopPostEvalCheck: contact expiring DURING evaluation (a
+// stall mid-read) is caught by the re-check before results are returned.
+func TestLeaseBackstopPostEvalCheck(t *testing.T) {
+	var expire atomic.Bool
+	var target atomic.Pointer[kvserver.Replica]
+	marker := append(keys.TableDataPrefix(744), "marker"...)
+	knobs := kvserver.TestingKnobs{
+		BeforeReadReturn: func(ba *kvpb.BatchRequest) {
+			if !expire.Load() || len(ba.Requests) != 1 {
+				return
+			}
+			if get := ba.Requests[0].Get; get != nil && get.Key.Equal(marker) {
+				if r := target.Load(); r != nil {
+					r.TestingExpireLeaseContact()
+				}
+			}
+		},
+	}
+	tc, _ := StartWithEngines(t, 3, func(c *server.Config) { c.TestingKnobs = knobs })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := tc.Nodes[0].DB().Put(ctx, marker, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	leader := tc.LeaderIndex(1)
+	rep, _ := tc.Nodes[leader].Store().GetReplica(1)
+	target.Store(rep)
+	expire.Store(true)
+
+	// The pre-eval check passes (contact is fresh), the knob expires it
+	// after evaluation, and the post-eval re-check must refuse.
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: tc.Nodes[leader].Clock().Now()}}
+	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: marker}})
+	_, kerr := rep.Execute(ctx, ba)
+	if kerr == nil || kerr.NotLeader == nil {
+		t.Fatalf("mid-read stall not caught by the post-eval check: %v", kerr)
+	}
+	expire.Store(false)
+	if v, err := tc.Nodes[leader].DB().Get(ctx, marker); err != nil || string(v) != "v" {
+		t.Fatalf("read after recovery: %q, %v", v, err)
+	}
+}
+
+// TestLeaseBackstopSingleNodeExempt: a single-replica range is its own
+// quorum; expired contact must not refuse its reads.
+func TestLeaseBackstopSingleNodeExempt(t *testing.T) {
+	n, _ := startGCNode(t) // single node, lease reads on by default
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	k := append(keys.TableDataPrefix(745), "k"...)
+	if err := n.DB().Put(ctx, k, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := n.Store().GetReplica(1)
+	rep.TestingExpireLeaseContact()
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: n.Clock().Now()}}
+	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}})
+	if _, kerr := rep.Execute(ctx, ba); kerr != nil {
+		t.Fatalf("single-node read refused: %v", kerr)
 	}
 }

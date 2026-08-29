@@ -47,6 +47,9 @@ type TestingKnobs struct {
 	// AfterLatch runs after a batch acquires its latches, before it is
 	// evaluated — lets tests hold a latch open deliberately.
 	AfterLatch func(ba *kvpb.BatchRequest)
+	// BeforeReadReturn runs after a read-only batch evaluates, before the
+	// final lease re-check — lets tests expire lease contact mid-read.
+	BeforeReadReturn func(ba *kvpb.BatchRequest)
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

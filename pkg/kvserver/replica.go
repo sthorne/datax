@@ -83,6 +83,14 @@ type Replica struct {
 		// lastFollowerResp records when each peer last answered this
 		// replica (heartbeat/append responses) — the lease backstop's input.
 		lastFollowerResp map[uint64]time.Time
+		// lastTickAt / contactFloor implement stall detection: when the raft
+		// ticker observes a gap far beyond its interval, the process (or at
+		// least this replica's loop) was stalled — GC pause, VM freeze — and
+		// follower contact from before the stall can no longer prove a live
+		// lease. contactFloor is raised to the wake time; only responses
+		// AFTER it count toward leaseContactFresh.
+		lastTickAt   time.Time
+		contactFloor time.Time
 		// ReadIndex coalescing: waiters register here; one goroutine drains
 		// rounds while riInFlight.
 		riPending  []chan readIndexResult
@@ -243,6 +251,7 @@ func (r *Replica) raftLoop(ctx context.Context) {
 			r.node.Stop()
 			return
 		case <-ticker.C:
+			r.noteTick()
 			r.node.Tick()
 		case rd := <-r.node.Ready():
 			err := r.handleReady(ctx, rd)
@@ -381,15 +390,41 @@ func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 	return r.node.Step(ctx, m)
 }
 
+// noteTick runs on every raft ticker fire and detects stalls: a gap far
+// beyond the tick interval means this process slept (GC pause, cgroup
+// throttling, VM freeze). Pre-sleep follower contact then proves nothing —
+// an election may have completed while we were out — so the contact floor
+// is raised to the wake time and lease reads are refused until a majority
+// answers again.
+func (r *Replica) noteTick() {
+	now := time.Now()
+	stallBound := time.Duration(raftElectionTicks) * r.store.cfg.RaftTickInterval / 2
+	r.mu.Lock()
+	if !r.mu.lastTickAt.IsZero() && now.Sub(r.mu.lastTickAt) > stallBound {
+		r.mu.contactFloor = now
+	}
+	r.mu.lastTickAt = now
+	r.mu.Unlock()
+}
+
+// TestingExpireLeaseContact invalidates all follower contact, as a detected
+// stall would — the next lease read is refused until a majority answers
+// again. Test hook.
+func (r *Replica) TestingExpireLeaseContact() {
+	r.mu.Lock()
+	r.mu.contactFloor = time.Now()
+	r.mu.Unlock()
+}
+
 // leaseContactFresh is the wall-clock backstop for lease-based reads: serve
 // only while a majority (self included) has answered within
-// electionTimeout − MaxOffset. A follower that answered at time T cannot
-// vote for a new leader before T + electionTimeout (measured on its own
-// tick clock), so within the window no new leader can exist and CheckQuorum
-// guarantees this one still holds its lease. MaxOffset absorbs modest
-// tick-rate skew between nodes; pathological scheduling skew beyond that is
-// the residual (documented) risk, and the cost of a false negative is only
-// a NotLeader retry.
+// electionTimeout − MaxOffset, and after any detected stall. A follower
+// that answered at time T cannot vote for a new leader before
+// T + electionTimeout (measured on its own tick clock), so within the
+// window no new leader can exist and CheckQuorum guarantees this one still
+// holds its lease. MaxOffset absorbs modest tick-rate skew between nodes;
+// the stall detector (noteTick) covers this process sleeping outright; the
+// cost of any false negative is only a NotLeader retry.
 func (r *Replica) leaseContactFresh() bool {
 	desc := r.Desc()
 	n := len(desc.Replicas)
@@ -406,7 +441,7 @@ func (r *Replica) leaseContactFresh() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, ts := range r.mu.lastFollowerResp {
-		if now.Sub(ts) <= window {
+		if now.Sub(ts) <= window && ts.After(r.mu.contactFloor) {
 			fresh++
 		}
 	}
@@ -624,7 +659,19 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		if err := r.linearizableReadIndex(ctx); err != nil {
 			return nil, err
 		}
-		return r.evalReadOnly(ba)
+		br, rerr := r.evalReadOnly(ba)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if k := r.store.cfg.TestingKnobs.BeforeReadReturn; k != nil {
+			k(ba)
+		}
+		// Re-check the lease immediately before returning: a stall during
+		// evaluation must not let pre-stall contact vouch for this result.
+		if r.leaseReads && !r.leaseContactFresh() {
+			return nil, r.notLeaderError()
+		}
+		return br, nil
 	}
 
 	// No MVCC write may slip beneath a timestamp already served to readers

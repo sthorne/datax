@@ -135,10 +135,18 @@ reads only while a majority (itself included) has answered within
 `electionTimeout − MaxOffset`. A follower that answered at time T cannot
 vote for a new leader before T + electionTimeout on its own tick clock, so
 within that window no new leader can exist; `MaxOffset` absorbs modest
-tick-rate skew. Pathological scheduler skew beyond that is the residual
-risk, stated honestly — and the failure mode of a false backstop negative
-is only a NotLeader retry. `--disable-lease-reads`-style configuration
-(`DisableLeaseReads`) restores the v1 quorum path.
+tick-rate skew.
+
+Two hardenings close the sleeping-leader gap (a GC pause, cgroup
+throttling, or VM freeze that stops the whole process): a **stall
+detector** — the raft ticker notes when a gap far exceeds its interval and
+invalidates all pre-stall follower contact, so a leader that just woke
+cannot serve until a majority answers *again* — and a **post-evaluation
+re-check** of the backstop immediately before read results are returned,
+so a stall during evaluation cannot let pre-stall contact vouch for the
+result. The failure mode of any false negative is only a NotLeader retry.
+`--disable-lease-reads`-style configuration (`DisableLeaseReads`) restores
+the v1 quorum path.
 
 ## Raft log truncation
 
