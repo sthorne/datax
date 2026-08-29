@@ -118,20 +118,31 @@ and splits take a whole-range exclusive latch.
 
 ### Timestamp cache
 
-Per range, leader-side. v1 keeps a single **high-water mark**: the maximum
-read timestamp served. It is bumped on every read, and to `now()` when a
-replica acquires leadership (a new leader cannot know what the old one
-served). A transactional write at or below the mark is **pushed, not
-rejected**: its intents simply land above the cache, the response carries
-the forwarded write timestamp, and the coordinator settles up at commit —
+Per range, leader-side, and **interval-based** (v2; v1 kept a single
+high-water mark that made every read push every writer on the range). Each
+read records its key spans and timestamp; a write consults only entries
+that **overlap** its own spans, so disjoint readers and writers never
+interact. Structure: a range-wide **floor** timestamp plus two bounded
+generations of span entries. Bumps append to the current generation; when
+it fills, the older generation folds into the floor (the max of its
+timestamps — conservative, never incorrect) and rotation continues. Memory
+stays bounded per range, recent reads keep full span precision, and old
+reads age into range-wide coverage. The floor is also set directly by
+whole-range events: leadership acquisition (a new leader cannot know what
+the old one served) and, span-scoped to the absorbed keys, range merges.
+Entries carry the reader's transaction ID: a transaction writing at
+exactly the timestamp of its *own* read is allowed (read-then-write is the
+normal pattern); anyone else at or below an overlapping entry is not.
+
+A transactional write that fails the check is **pushed, not rejected**:
+its intents simply land above the cache, the response carries the
+forwarded write timestamp, and the coordinator settles up at commit —
 refresh the reads, then the EndTxn (which writes no MVCC versions and is
 exempt from the check) flips the record at the pushed timestamp. Rejecting
-instead would let a steady reader starve every writer on the range: the
+instead would let a steady reader starve every writer of a hot key: the
 coordinator's refresh round trip always loses the race against the next
 read's bump. Non-transactional writes, which have no reads to protect, are
-still bounced with a retry timestamp and simply resent above it. Coarse —
-any read pushes all writers on the range — but small and correct. An
-interval cache is future work.
+still bounced with a retry timestamp and simply resent above it.
 
 ## Conflicts and pushes
 
@@ -209,5 +220,5 @@ Correctness rules enforced around the threshold:
 
 ## Known gaps (deliberate)
 
-Parallel commits; savepoints; interval-based timestamp cache; deadlock
-detection; reading below foreign intents' timestamps.
+Parallel commits; savepoints; deadlock detection; reading below foreign
+intents' timestamps.

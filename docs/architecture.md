@@ -69,8 +69,8 @@ These are the load-bearing rules; tests assert them.
    the applied index are written in one atomic batch, so crash-recovery replay
    is idempotent.
 2. **Linearizable reads**: only via ReadIndex on the leader. On leadership
-   acquisition the timestamp cache low-water mark is bumped to `now()`, because
-   a new leader cannot know what reads the old leader served.
+   acquisition the timestamp cache floor is bumped to `now()`, because a new
+   leader cannot know what reads the old leader served.
 3. **Clocks**: every RPC carries an HLC timestamp; receivers ratchet their
    clock. A remote clock further than `--max-offset` ahead is a fatal error.
    Reads treat values in `(readTS, readTS+maxOffset]` as uncertain and restart.

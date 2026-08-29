@@ -330,9 +330,11 @@ func (r *Replica) finishMerge(trig *mergeTrigger) {
 	r.rs.setConfState(trig.Merged)
 	// The RHS leader's timestamp cache died with its group. The driver led
 	// both sides on this clock, so now() bounds every read the RHS ever
-	// served; on other replicas the bump is harmless, and a later LHS
-	// leader gets the standard new-leader bump anyway.
-	r.tsCache.Bump(r.store.cfg.Clock.Now(), uuid.Nil)
+	// served; the bump covers only the absorbed span — the LHS's own reads
+	// are already tracked. On other replicas it is harmless, and a later
+	// LHS leader gets the standard new-leader bump anyway.
+	r.tsCache.Bump([]latchSpan{{Start: trig.Right.StartKey, End: trig.Right.EndKey}},
+		r.store.cfg.Clock.Now(), uuid.Nil)
 	log.Infof("merge applied: %s absorbed %s → [%s, %s)", r.rangeID, trig.Right.RangeID, trig.Merged.StartKey, trig.Merged.EndKey)
 }
 

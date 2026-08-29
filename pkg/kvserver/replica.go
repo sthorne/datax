@@ -359,7 +359,7 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 			// conservatively push all future writes above now. A term-1
 			// leader is the range's first ever — no prior reads exist, so
 			// fresh ranges (splits, bootstrap) skip the bump.
-			r.tsCache.Bump(r.store.cfg.Clock.Now(), uuid.Nil)
+			r.tsCache.Bump([]latchSpan{wholeRangeSpan}, r.store.cfg.Clock.Now(), uuid.Nil)
 		}
 		for _, ch := range pending {
 			ch <- proposalResult{err: &kvpb.Error{
@@ -743,8 +743,10 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 
 	if ba.IsReadOnly() {
 		// Bump the cache BEFORE evaluating (invariant L2): an overlapping
-		// write checked after this point can no longer slip beneath us.
-		r.tsCache.Bump(readTimestamp(ba), batchTxnID(ba))
+		// write checked after this point can no longer slip beneath us. The
+		// bump covers exactly the batch's spans (the same ones latched), so
+		// disjoint writers stay unaffected.
+		r.tsCache.Bump(spans, readTimestamp(ba), batchTxnID(ba))
 		if r.leaseReads && !r.leaseContactFresh() {
 			// Lease reads skip the quorum round trip, so refuse to serve on
 			// a possibly-expired lease; the client retries and either we
@@ -780,7 +782,7 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// starve every writer on the range: by the time the coordinator's
 	// refresh round trip lands, the cache has moved again.
 	if ba.HasMVCCWrites() {
-		if ok, low := r.tsCache.AllowsWrite(writeTimestamp(ba), batchTxnID(ba)); !ok {
+		if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
 			if ba.Header.Txn == nil {
 				e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
 				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
@@ -838,6 +840,34 @@ func isGCBatch(ba *kvpb.BatchRequest) bool {
 		}
 	}
 	return false
+}
+
+// mvccWriteSpans returns the spans of the batch's MVCC-writing requests
+// (Put/Delete/Increment) — the ones the timestamp cache gates. A mixed
+// batch's reads are deliberately excluded: only what the batch WRITES can
+// violate a served read.
+func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
+	spans := make([]latchSpan, 0, len(ba.Requests))
+	for _, u := range ba.Requests {
+		switch u.GetInner().(type) {
+		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest:
+		default:
+			continue
+		}
+		h := u.GetInner().Header()
+		start, err := addrOf(h.Key)
+		if err != nil {
+			continue // unaddressable keys are caught by checkKeyBounds
+		}
+		sp := latchSpan{Start: start}
+		if len(h.EndKey) > 0 {
+			if end, err := addrOf(h.EndKey); err == nil {
+				sp.End = end
+			}
+		}
+		spans = append(spans, sp)
+	}
+	return spans
 }
 
 func batchTxnID(ba *kvpb.BatchRequest) uuid.UUID {
