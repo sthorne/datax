@@ -24,6 +24,7 @@ const (
 	CodeInFailedTransaction  = "25P02"
 	CodeActiveTransaction    = "25001"
 	CodeNoActiveTransaction  = "25P01"
+	CodeInvalidSavepoint     = "3B001"
 	CodeInternal             = "XX000"
 	CodeInvalidParameter     = "08P01"
 	CodeUndefinedObject      = "42704"

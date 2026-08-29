@@ -242,13 +242,13 @@ func (n *Node) start() error {
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
-		NodeID:             n.ident.NodeID,
-		StoreID:            n.ident.StoreID,
-		Engine:             n.engine,
-		Clock:              n.clock,
-		Transport:          n.trans,
-		SnapshotSender:     n.trans,
-		Stopper:            n.stopper,
+		NodeID:                  n.ident.NodeID,
+		StoreID:                 n.ident.StoreID,
+		Engine:                  n.engine,
+		Clock:                   n.clock,
+		Transport:               n.trans,
+		SnapshotSender:          n.trans,
+		Stopper:                 n.stopper,
 		DisableLeaseReads:       n.cfg.DisableLeaseReads,
 		SplitSizeThreshold:      n.cfg.SplitSizeThreshold,
 		MergeSizeThreshold:      n.cfg.MergeSizeThreshold,

@@ -44,6 +44,9 @@ func (t *Txn) RunBatch(ctx context.Context, b *WriteBatch) error {
 		return nil
 	}
 	t.mu.Lock()
+	// One sequence for the whole batch: a savepoint cannot be established
+	// mid-statement, so a statement's writes roll back as a unit.
+	t.mu.txn.Sequence++
 	createRecord := false
 	if !t.mu.anchored {
 		if len(t.mu.txn.Key) == 0 {

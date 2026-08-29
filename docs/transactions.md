@@ -162,6 +162,25 @@ intent commits as a version carrying the same bytes, invisible to
 readers' results. On the bank workload (100 hot accounts, 8 workers) this
 raises committed throughput ~4× and roughly halves 40001s.
 
+### Savepoints
+
+`SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name`
+implement partial rollback with PostgreSQL semantics, including escaping
+the in-failed-transaction state (`25P02`) — the recipe driver retry loops
+and ORMs rely on. Every write carries a **sequence number** (one per
+statement), and each intent keeps the transaction's own superseded
+provisional values for its key in an **intent history**. A savepoint
+captures the current sequence plus the coordinator's write-set and
+read-span positions; `ROLLBACK TO` sends a replicated rollback per
+written key that **physically restores** each intent to its newest state
+at or below the savepoint's sequence (or removes it when the key was
+first written after the savepoint). Because the engine state after the
+rollback simply *is* the savepoint state, reads need no sequence
+awareness and commit resolves the restored values like any others. A
+transaction whose coordinator was already aborted (a serialization
+failure) cannot be rescued by savepoint rollback — the 40001 stands, as
+in CockroachDB.
+
 ## Conflicts and pushes
 
 Encountering someone else's intent triggers `PushTxn(pusher, pushee)` at the
@@ -256,4 +275,4 @@ Correctness rules enforced around the threshold:
 
 ## Known gaps (deliberate)
 
-Parallel commits; savepoints.
+Parallel commits.

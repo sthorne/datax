@@ -50,6 +50,18 @@ type TxnMeta struct {
 	// Priority breaks conflicts: a pusher with higher priority may abort a
 	// pending transaction.
 	Priority int32 `json:"priority"`
+	// Sequence orders the transaction's own writes (bumped by the
+	// coordinator before each write). Savepoint rollback restores every
+	// intent to its newest state at or below the savepoint's sequence.
+	Sequence int32 `json:"seq,omitempty"`
+}
+
+// IntentValue is one superseded provisional value of the SAME transaction,
+// kept in the intent's history so a savepoint rollback can restore it.
+type IntentValue struct {
+	Sequence  int32  `json:"seq"`
+	Value     []byte `json:"value,omitempty"`
+	Tombstone bool   `json:"tombstone,omitempty"`
 }
 
 // MVCCMetadata is the value stored at an intent's metadata key.
@@ -58,4 +70,8 @@ type MVCCMetadata struct {
 	// Timestamp is the timestamp of the provisional value this intent
 	// protects (== Txn.WriteTimestamp at the time the intent was written).
 	Timestamp hlc.Timestamp `json:"ts"`
+	// History holds the transaction's own SUPERSEDED provisional values for
+	// this key, oldest first (same epoch only; a new epoch clears it).
+	// Consulted exclusively by savepoint rollback.
+	History []IntentValue `json:"history,omitempty"`
 }

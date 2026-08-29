@@ -187,6 +187,7 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 	if err != nil {
 		return err
 	}
+	var history []enginepb.IntentValue
 	if rawMeta != nil {
 		meta, err := decodeMeta(rawMeta)
 		if err != nil {
@@ -196,8 +197,24 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 			return &WriteIntentError{Intents: []Intent{{Key: key.Clone(), Txn: meta.Txn}}}
 		}
 		// Rewrite our own intent (same epoch: later statement overwrote the
-		// key; older epoch: retry rewriting its footprint). Drop the old
-		// provisional version, then fall through to write the new one.
+		// key; older epoch: retry rewriting its footprint). Same-epoch
+		// rewrites preserve the superseded provisional value in the intent
+		// history so a savepoint rollback can restore it; a new epoch
+		// starts fresh.
+		if meta.Txn.Epoch == txn.Epoch {
+			raw, err := b.Get(EncodeMVCCKey(key, meta.Timestamp))
+			if err != nil {
+				return err
+			}
+			if raw != nil {
+				val, tomb, err := decodeMVCCValue(raw)
+				if err != nil {
+					return err
+				}
+				history = append(append([]enginepb.IntentValue(nil), meta.History...),
+					enginepb.IntentValue{Sequence: meta.Txn.Sequence, Value: val, Tombstone: tomb})
+			}
+		}
 		if err := b.Delete(EncodeMVCCKey(key, meta.Timestamp)); err != nil {
 			return err
 		}
@@ -228,12 +245,61 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 
 	if txn != nil {
 		ts = txn.WriteTimestamp
-		meta := enginepb.MVCCMetadata{Txn: *txn, Timestamp: ts}
+		meta := enginepb.MVCCMetadata{Txn: *txn, Timestamp: ts, History: history}
 		if err := b.Put(metaKey, encodeMeta(meta)); err != nil {
 			return err
 		}
 	}
 	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
+}
+
+// MVCCRollbackIntent rolls the transaction's intent on key back to its
+// newest state at or below seq — the savepoint-rollback primitive. The
+// intent history holds the superseded provisional values; the newest
+// entry at or below seq is physically restored, or the intent is removed
+// entirely when the key was first written after the savepoint. Idempotent,
+// and a no-op on another transaction's intent or one already at or below
+// seq — so a rollback may be sent for every key the transaction ever
+// wrote.
+func MVCCRollbackIntent(b *Batch, key keys.Key, txnID uuid.UUID, seq int32) error {
+	metaKey, _ := mvccKeyBounds(key)
+	rawMeta, err := b.Get(metaKey)
+	if err != nil {
+		return err
+	}
+	if rawMeta == nil {
+		return nil
+	}
+	meta, err := decodeMeta(rawMeta)
+	if err != nil {
+		return err
+	}
+	if meta.Txn.ID != txnID || meta.Txn.Sequence <= seq {
+		return nil
+	}
+	if err := b.Delete(EncodeMVCCKey(key, meta.Timestamp)); err != nil {
+		return err
+	}
+	// History is append-ordered, so sequences ascend: the newest entry at
+	// or below seq is the state to restore.
+	idx := -1
+	for i := len(meta.History) - 1; i >= 0; i-- {
+		if meta.History[i].Sequence <= seq {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// First write to this key came after the savepoint: no intent left.
+		return b.Delete(metaKey)
+	}
+	ent := meta.History[idx]
+	meta.History = meta.History[:idx]
+	meta.Txn.Sequence = ent.Sequence
+	if err := b.Put(metaKey, encodeMeta(meta)); err != nil {
+		return err
+	}
+	return b.Put(EncodeMVCCKey(key, meta.Timestamp), encodeMVCCValue(ent.Value, ent.Tombstone))
 }
 
 // MVCCLock lays a LOCKING intent on key for txn, pinning the state the

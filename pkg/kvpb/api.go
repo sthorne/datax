@@ -108,6 +108,16 @@ type ResolveIntentRequest struct {
 	CommitTS hlc.Timestamp      `json:"commit_ts"`
 }
 
+// RollbackIntentRequest rolls the transaction's intent on Key back to its
+// newest state at or below Sequence — one key of a savepoint rollback.
+// No-op on other transactions' intents and on state at or below Sequence,
+// so the coordinator may send one for every key it ever wrote.
+type RollbackIntentRequest struct {
+	RequestHeader
+	TxnID    uuid.UUID `json:"txn_id"`
+	Sequence int32     `json:"sequence"`
+}
+
 // RefreshRequest verifies that no other transaction wrote into [Key,
 // EndKey) (EndKey empty = the single key) within (FromTS, the request
 // transaction's ReadTimestamp]. Sent by the coordinator to move a
@@ -207,6 +217,7 @@ type RequestUnion struct {
 	HeartbeatTxn        *HeartbeatTxnRequest        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
+	RollbackIntent      *RollbackIntentRequest      `json:"rollback_intent,omitempty"`
 	Refresh             *RefreshRequest             `json:"refresh,omitempty"`
 	GC                  *GCRequest                  `json:"gc,omitempty"`
 	TruncateLog         *TruncateLogRequest         `json:"truncate_log,omitempty"`
@@ -239,6 +250,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.PushTxn
 	case u.ResolveIntent != nil:
 		return u.ResolveIntent
+	case u.RollbackIntent != nil:
+		return u.RollbackIntent
 	case u.Refresh != nil:
 		return u.Refresh
 	case u.GC != nil:
@@ -279,6 +292,7 @@ func (h *EndTxnRequest) Header() RequestHeader              { return h.RequestHe
 func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHeader }
 func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
+func (h *RollbackIntentRequest) Header() RequestHeader      { return h.RequestHeader }
 func (h *RefreshRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *GCRequest) Header() RequestHeader                  { return h.RequestHeader }
 func (h *TruncateLogRequest) Header() RequestHeader         { return h.RequestHeader }
@@ -298,6 +312,7 @@ func (*EndTxnRequest) Method() string              { return "EndTxn" }
 func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
 func (*PushTxnRequest) Method() string             { return "PushTxn" }
 func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
+func (*RollbackIntentRequest) Method() string      { return "RollbackIntent" }
 func (*RefreshRequest) Method() string             { return "Refresh" }
 func (*GCRequest) Method() string                  { return "GC" }
 func (*TruncateLogRequest) Method() string         { return "TruncateLog" }
@@ -317,6 +332,7 @@ func (*EndTxnRequest) IsReadOnly() bool              { return false }
 func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (r *PushTxnRequest) IsReadOnly() bool           { return r.QueryOnly }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
+func (*RollbackIntentRequest) IsReadOnly() bool      { return false }
 func (*RefreshRequest) IsReadOnly() bool             { return true }
 func (*GCRequest) IsReadOnly() bool                  { return false }
 func (*TruncateLogRequest) IsReadOnly() bool         { return false }
@@ -371,6 +387,8 @@ type PushTxnResponse struct {
 
 type ResolveIntentResponse struct{}
 
+type RollbackIntentResponse struct{}
+
 type AdminSplitResponse struct {
 	Left  RangeDescriptor `json:"left"`
 	Right RangeDescriptor `json:"right"`
@@ -409,6 +427,7 @@ type ResponseUnion struct {
 	HeartbeatTxn        *HeartbeatTxnResponse        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
+	RollbackIntent      *RollbackIntentResponse      `json:"rollback_intent,omitempty"`
 	Refresh             *RefreshResponse             `json:"refresh,omitempty"`
 	GC                  *GCResponse                  `json:"gc,omitempty"`
 	TruncateLog         *TruncateLogResponse         `json:"truncate_log,omitempty"`
@@ -505,6 +524,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.PushTxn = t
 	case *ResolveIntentRequest:
 		u.ResolveIntent = t
+	case *RollbackIntentRequest:
+		u.RollbackIntent = t
 	case *RefreshRequest:
 		u.Refresh = t
 	case *GCRequest:

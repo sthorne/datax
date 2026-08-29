@@ -74,6 +74,7 @@ func txnMetaToProto(m enginepb.TxnMeta) *rpcpb.TxnMeta {
 		WriteTimestamp: tsToProto(m.WriteTimestamp),
 		MinTimestamp:   tsToProto(m.MinTimestamp),
 		Priority:       m.Priority,
+		Sequence:       m.Sequence,
 	}
 }
 
@@ -92,6 +93,7 @@ func txnMetaFromProto(p *rpcpb.TxnMeta) (enginepb.TxnMeta, error) {
 		WriteTimestamp: tsFromProto(p.WriteTimestamp),
 		MinTimestamp:   tsFromProto(p.MinTimestamp),
 		Priority:       p.Priority,
+		Sequence:       p.Sequence,
 	}, nil
 }
 
@@ -237,6 +239,12 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 			Status:   int32(r.Status),
 			CommitTs: tsToProto(r.CommitTS),
 		}}
+	case *RollbackIntentRequest:
+		out.Value = &rpcpb.RequestUnion_RollbackIntent{RollbackIntent: &rpcpb.RollbackIntentRequest{
+			Header:   reqHeaderToProto(r.RequestHeader),
+			TxnId:    uuidToProto(r.TxnID),
+			Sequence: r.Sequence,
+		}}
 	case *RefreshRequest:
 		out.Value = &rpcpb.RequestUnion_Refresh{Refresh: &rpcpb.RefreshRequest{Header: reqHeaderToProto(r.RequestHeader), FromTs: tsToProto(r.FromTS)}}
 	case *GCRequest:
@@ -330,6 +338,16 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 			TxnID:         id,
 			Status:        enginepb.TxnStatus(v.ResolveIntent.Status),
 			CommitTS:      tsFromProto(v.ResolveIntent.CommitTs),
+		}
+	case *rpcpb.RequestUnion_RollbackIntent:
+		id, err := uuidFromProto(v.RollbackIntent.TxnId)
+		if err != nil {
+			return u, err
+		}
+		u.RollbackIntent = &RollbackIntentRequest{
+			RequestHeader: reqHeaderFromProto(v.RollbackIntent.Header),
+			TxnID:         id,
+			Sequence:      v.RollbackIntent.Sequence,
 		}
 	case *rpcpb.RequestUnion_Refresh:
 		u.Refresh = &RefreshRequest{RequestHeader: reqHeaderFromProto(v.Refresh.Header), FromTS: tsFromProto(v.Refresh.FromTs)}
@@ -453,6 +471,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		}}
 	case u.ResolveIntent != nil:
 		out.Value = &rpcpb.ResponseUnion_ResolveIntent{ResolveIntent: &rpcpb.ResolveIntentResponse{}}
+	case u.RollbackIntent != nil:
+		out.Value = &rpcpb.ResponseUnion_RollbackIntent{RollbackIntent: &rpcpb.RollbackIntentResponse{}}
 	case u.Refresh != nil:
 		out.Value = &rpcpb.ResponseUnion_Refresh{Refresh: &rpcpb.RefreshResponse{}}
 	case u.GC != nil:
@@ -518,6 +538,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		}
 	case *rpcpb.ResponseUnion_ResolveIntent:
 		u.ResolveIntent = &ResolveIntentResponse{}
+	case *rpcpb.ResponseUnion_RollbackIntent:
+		u.RollbackIntent = &RollbackIntentResponse{}
 	case *rpcpb.ResponseUnion_Refresh:
 		u.Refresh = &RefreshResponse{}
 	case *rpcpb.ResponseUnion_Gc:

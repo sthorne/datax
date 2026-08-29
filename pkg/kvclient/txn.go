@@ -60,6 +60,10 @@ type Txn struct {
 		// refreshUnusable: too many spans (or tracking disabled) — fall
 		// back to v1's restart behavior.
 		refreshUnusable bool
+		// savepoints by name; spOrder hands out creation order so RELEASE
+		// and ROLLBACK TO can discard later savepoints (PG semantics).
+		savepoints map[string]*savepoint
+		spOrder    int
 		// waitingFor/waitingForKey: the transaction this one is currently
 		// blocked on in a push loop (Nil = none). Published on the record
 		// (immediately on change, and with every heartbeat) so pushers can
@@ -121,6 +125,119 @@ func (t *Txn) TestingSetPriority(p int32) {
 	t.mu.Lock()
 	t.mu.txn.Priority = p
 	t.mu.Unlock()
+}
+
+// savepoint captures a sequence point of the transaction: everything
+// needed to roll its state back to this moment.
+type savepoint struct {
+	order           int
+	seq             int32
+	writes          map[string]struct{}
+	readSpans       int
+	refreshUnusable bool
+}
+
+// Savepoint establishes (or moves) a named savepoint at the transaction's
+// current state.
+func (t *Txn) Savepoint(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mu.finished {
+		return fmt.Errorf("transaction already finished")
+	}
+	if t.mu.savepoints == nil {
+		t.mu.savepoints = make(map[string]*savepoint)
+	}
+	writes := make(map[string]struct{}, len(t.mu.writes))
+	for k := range t.mu.writes {
+		writes[k] = struct{}{}
+	}
+	t.mu.spOrder++
+	t.mu.savepoints[name] = &savepoint{
+		order:           t.mu.spOrder,
+		seq:             t.mu.txn.Sequence,
+		writes:          writes,
+		readSpans:       len(t.mu.readSpans),
+		refreshUnusable: t.mu.refreshUnusable,
+	}
+	return nil
+}
+
+// ReleaseSavepoint destroys the named savepoint and every savepoint
+// established after it (PG semantics). The transaction's effects are kept.
+func (t *Txn) ReleaseSavepoint(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	sp, ok := t.mu.savepoints[name]
+	if !ok {
+		return fmt.Errorf("savepoint %q does not exist", name)
+	}
+	for n, other := range t.mu.savepoints {
+		if other.order >= sp.order {
+			delete(t.mu.savepoints, n)
+		}
+	}
+	return nil
+}
+
+// RollbackToSavepoint rolls the transaction back to the named savepoint:
+// every intent laid after it is physically restored to its state at the
+// savepoint (or removed), read-span tracking is truncated, and savepoints
+// established after it are destroyed. The savepoint itself survives and
+// can be rolled back to again.
+func (t *Txn) RollbackToSavepoint(ctx context.Context, name string) error {
+	t.mu.Lock()
+	if t.mu.finished {
+		t.mu.Unlock()
+		return fmt.Errorf("transaction already finished")
+	}
+	sp, ok := t.mu.savepoints[name]
+	if !ok {
+		t.mu.Unlock()
+		return fmt.Errorf("savepoint %q does not exist", name)
+	}
+	txn := t.mu.txn
+	writeKeys := make([]keys.Key, 0, len(t.mu.writes))
+	for k := range t.mu.writes {
+		writeKeys = append(writeKeys, keys.Key(k).Clone())
+	}
+	t.mu.Unlock()
+
+	// Physically restore every intent to its newest state at or below the
+	// savepoint's sequence. Idempotent per key (no-op for keys untouched
+	// since the savepoint), so the whole write set is sent; one batch, the
+	// DistSender groups per range.
+	if len(writeKeys) > 0 {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+		for _, k := range writeKeys {
+			ba.Add(&kvpb.RollbackIntentRequest{
+				RequestHeader: kvpb.RequestHeader{Key: k},
+				TxnID:         txn.ID,
+				Sequence:      sp.seq,
+			})
+		}
+		if _, kerr := t.db.Send(ctx, ba); kerr != nil {
+			return fmt.Errorf("rolling back to savepoint %q: %w", name, kerr)
+		}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	restored := make(map[string]struct{}, len(sp.writes))
+	for k := range sp.writes {
+		restored[k] = struct{}{}
+	}
+	t.mu.writes = restored
+	if len(t.mu.readSpans) > sp.readSpans {
+		t.mu.readSpans = t.mu.readSpans[:sp.readSpans]
+	}
+	t.mu.refreshUnusable = sp.refreshUnusable
+	for n, other := range t.mu.savepoints {
+		if other.order > sp.order {
+			delete(t.mu.savepoints, n)
+		}
+	}
+	return nil
 }
 
 // proto returns a snapshot of the transaction state.
@@ -255,6 +372,7 @@ func (t *Txn) write(ctx context.Context, req kvpb.Request) error {
 // is created on the range of that key, atomically with the write itself.
 func (t *Txn) prepareWrite(req kvpb.Request) (*kvpb.BatchRequest, keys.Key) {
 	t.mu.Lock()
+	t.mu.txn.Sequence++ // orders own writes; savepoint rollback keys off it
 	key := req.Header().Key
 	createRecord := false
 	if !t.mu.anchored {

@@ -133,25 +133,34 @@ type DropUser struct {
 type Begin struct{}
 type Commit struct{}
 type Rollback struct{}
+
+// Savepoint / ReleaseSavepoint / RollbackToSavepoint are the SQL savepoint
+// statements (PG semantics; see docs/transactions.md).
+type Savepoint struct{ Name string }
+type ReleaseSavepoint struct{ Name string }
+type RollbackToSavepoint struct{ Name string }
 type ShowTables struct{}
 
 // SetVar is `SET name = value` / `SET SESSION ...`: parsed and ignored
 // (clients send these at startup).
 type SetVar struct{ Name string }
 
-func (*CreateTable) stmt() {}
-func (*CreateIndex) stmt() {}
-func (*Explain) stmt()     {}
-func (*DropTable) stmt()   {}
-func (*Insert) stmt()      {}
-func (*Select) stmt()      {}
-func (*Update) stmt()      {}
-func (*Delete) stmt()      {}
-func (*AlterTable) stmt()  {}
-func (*CreateUser) stmt()  {}
-func (*DropUser) stmt()    {}
-func (*Begin) stmt()       {}
-func (*Commit) stmt()      {}
-func (*Rollback) stmt()    {}
-func (*ShowTables) stmt()  {}
-func (*SetVar) stmt()      {}
+func (*CreateTable) stmt()         {}
+func (*CreateIndex) stmt()         {}
+func (*Explain) stmt()             {}
+func (*DropTable) stmt()           {}
+func (*Insert) stmt()              {}
+func (*Select) stmt()              {}
+func (*Update) stmt()              {}
+func (*Delete) stmt()              {}
+func (*AlterTable) stmt()          {}
+func (*CreateUser) stmt()          {}
+func (*DropUser) stmt()            {}
+func (*Begin) stmt()               {}
+func (*Commit) stmt()              {}
+func (*Savepoint) stmt()           {}
+func (*ReleaseSavepoint) stmt()    {}
+func (*RollbackToSavepoint) stmt() {}
+func (*Rollback) stmt()            {}
+func (*ShowTables) stmt()          {}
+func (*SetVar) stmt()              {}

@@ -24,6 +24,7 @@ message TxnMeta {
   Hlc write_timestamp = 4;
   Hlc min_timestamp = 5;
   int32 priority = 6;
+  int32 sequence = 7; // orders the txn's own writes (savepoints)
 }
 
 message Transaction {
@@ -124,6 +125,12 @@ message ResolveIntentRequest {
   Hlc commit_ts = 4;
 }
 
+message RollbackIntentRequest {
+  RequestHeader header = 1;
+  bytes txn_id = 2;
+  int32 sequence = 3;
+}
+
 message RefreshRequest {
   RequestHeader header = 1;
   Hlc from_ts = 2;
@@ -188,6 +195,7 @@ message RequestUnion {
     PushTxnRequest push_txn = 8;
     ResolveIntentRequest resolve_intent = 9;
     RefreshRequest refresh = 10;
+    RollbackIntentRequest rollback_intent = 19;
     GcRequest gc = 11;
     TruncateLogRequest truncate_log = 12;
     AdminSplitRequest admin_split = 13;
@@ -255,6 +263,8 @@ message ResolveIntentResponse {}
 
 message RefreshResponse {}
 
+message RollbackIntentResponse {}
+
 message GcResponse {}
 
 message TruncateLogResponse {}
@@ -292,6 +302,7 @@ message ResponseUnion {
     PushTxnResponse push_txn = 8;
     ResolveIntentResponse resolve_intent = 9;
     RefreshResponse refresh = 10;
+    RollbackIntentResponse rollback_intent = 19;
     GcResponse gc = 11;
     TruncateLogResponse truncate_log = 12;
     AdminSplitResponse admin_split = 13;

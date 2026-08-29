@@ -94,12 +94,15 @@ func (s *Session) Close(ctx context.Context) {
 // Execute runs one parsed statement with the given parameter values.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
 	// A failed transaction accepts only ROLLBACK (or COMMIT, which also
-	// rolls back, per PostgreSQL semantics).
+	// rolls back) — and ROLLBACK TO SAVEPOINT, which escapes the failed
+	// state by restoring the savepoint (PostgreSQL semantics).
 	if s.state == StateFailed {
-		switch stmt.(type) {
+		switch t := stmt.(type) {
 		case *parser.Rollback, *parser.Commit:
 			s.rollback(ctx)
 			return &Result{Tag: "ROLLBACK"}, nil
+		case *parser.RollbackToSavepoint:
+			return s.execRollbackToSavepoint(ctx, t.Name)
 		default:
 			return nil, newErrf(CodeInFailedTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
@@ -139,6 +142,30 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	case *parser.Rollback:
 		s.rollback(ctx)
 		return &Result{Tag: "ROLLBACK"}, nil
+
+	case *parser.Savepoint:
+		if s.state != StateOpen {
+			return nil, newErrf(CodeNoActiveTransaction, "SAVEPOINT can only be used in transaction blocks")
+		}
+		if err := s.txn.Savepoint(t.Name); err != nil {
+			return nil, ToSQLError(err)
+		}
+		return &Result{Tag: "SAVEPOINT"}, nil
+
+	case *parser.ReleaseSavepoint:
+		if s.state != StateOpen {
+			return nil, newErrf(CodeNoActiveTransaction, "RELEASE SAVEPOINT can only be used in transaction blocks")
+		}
+		if err := s.txn.ReleaseSavepoint(t.Name); err != nil {
+			return nil, newErrf(CodeInvalidSavepoint, "%v", err)
+		}
+		return &Result{Tag: "RELEASE"}, nil
+
+	case *parser.RollbackToSavepoint:
+		if s.state != StateOpen {
+			return nil, newErrf(CodeNoActiveTransaction, "ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
+		}
+		return s.execRollbackToSavepoint(ctx, t.Name)
 
 	case *parser.SetVar:
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
@@ -338,4 +365,23 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		}
 	}
 	return true, nil
+}
+
+// execRollbackToSavepoint restores the named savepoint, escaping the
+// in-failed-transaction state (25P02) per PostgreSQL semantics. A
+// transaction whose coordinator already finished (aborted by a conflict)
+// cannot be rescued — the retryable error stands.
+func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Result, *Error) {
+	if s.txn == nil {
+		return nil, newErrf(CodeNoActiveTransaction, "ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
+	}
+	if err := s.txn.RollbackToSavepoint(ctx, name); err != nil {
+		if kvclient.IsRetryable(err) {
+			s.state = StateFailed
+			return nil, ToSQLError(err)
+		}
+		return nil, newErrf(CodeInvalidSavepoint, "%v", err)
+	}
+	s.state = StateOpen
+	return &Result{Tag: "ROLLBACK"}, nil
 }

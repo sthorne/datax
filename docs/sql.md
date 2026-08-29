@@ -16,6 +16,7 @@ SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
+SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
 SHOW TABLES
 ```
 

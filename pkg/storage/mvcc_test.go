@@ -590,3 +590,96 @@ func TestMVCCLockAbsentKey(t *testing.T) {
 		t.Fatalf("committed gap lock produced a value: %q", v)
 	}
 }
+
+// TestMVCCRollbackIntent: the savepoint-rollback primitive restores an
+// intent to its newest state at or below a sequence, or removes it when
+// the key was first written after the savepoint.
+func TestMVCCRollbackIntent(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "k", ts(5, 0), "committed", nil)
+
+	txn := newTxn(ts(10, 0))
+	txn.Sequence = 1
+	mustPut(t, eng, "k", txn.WriteTimestamp, "v1", txn)
+	txn.Sequence = 2
+	mustPut(t, eng, "k", txn.WriteTimestamp, "v2", txn)
+	txn.Sequence = 3
+	mustDelete(t, eng, "k", txn.WriteTimestamp, txn)
+
+	get := func(want string) {
+		t.Helper()
+		v := mustGet(t, eng, "k", ts(10, 0), MVCCGetOptions{Txn: txn})
+		if want == "" {
+			if v != nil {
+				t.Fatalf("own read: got %q, want deleted", v)
+			}
+			return
+		}
+		if string(v) != want {
+			t.Fatalf("own read: got %q, want %q", v, want)
+		}
+	}
+	get("") // tombstone at seq 3
+
+	rollback := func(seq int32) {
+		t.Helper()
+		b := eng.NewBatch()
+		if err := MVCCRollbackIntent(b, keys.Key("k"), txn.ID, seq); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Commit(false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rollback(2)
+	get("v2")
+	rollback(2) // idempotent
+	get("v2")
+	rollback(1)
+	get("v1")
+	// Rollback below the first write removes the intent entirely; the
+	// committed value shows through.
+	rollback(0)
+	if v := mustGet(t, eng, "k", ts(20, 0), MVCCGetOptions{}); string(v) != "committed" {
+		t.Fatalf("after full rollback: got %q", v)
+	}
+
+	// A foreign transaction's rollback request is a no-op.
+	txn2 := newTxn(ts(30, 0))
+	txn2.Sequence = 1
+	mustPut(t, eng, "k", txn2.WriteTimestamp, "other", txn2)
+	b := eng.NewBatch()
+	if err := MVCCRollbackIntent(b, keys.Key("k"), txn.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(false); err != nil {
+		t.Fatal(err)
+	}
+	if v := mustGet(t, eng, "k", ts(30, 0), MVCCGetOptions{Txn: txn2}); string(v) != "other" {
+		t.Fatalf("foreign rollback touched the intent: %q", v)
+	}
+}
+
+// TestMVCCRollbackThenCommit: a key rewritten after a savepoint, rolled
+// back, then committed resolves to the RESTORED value.
+func TestMVCCRollbackThenCommit(t *testing.T) {
+	eng := openTestEngine(t)
+	txn := newTxn(ts(10, 0))
+	txn.Sequence = 1
+	mustPut(t, eng, "k", txn.WriteTimestamp, "keep", txn)
+	txn.Sequence = 2
+	mustPut(t, eng, "k", txn.WriteTimestamp, "discard", txn)
+
+	b := eng.NewBatch()
+	if err := MVCCRollbackIntent(b, keys.Key("k"), txn.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(false); err != nil {
+		t.Fatal(err)
+	}
+	resolve(t, eng, "k", txn, enginepb.COMMITTED, ts(12, 0))
+	if v := mustGet(t, eng, "k", ts(20, 0), MVCCGetOptions{}); string(v) != "keep" {
+		t.Fatalf("committed value after rollback: got %q, want keep", v)
+	}
+}

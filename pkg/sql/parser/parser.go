@@ -52,6 +52,16 @@ func (p *parser) errf(format string, args ...any) error {
 	return &SyntaxError{Msg: fmt.Sprintf(format, args...), Pos: p.peek().pos}
 }
 
+// consumeIdentWord consumes the next token when it is the given
+// (lower-cased) identifier — for words that are not reserved keywords.
+func (p *parser) consumeIdentWord(word string) bool {
+	if t := p.peek(); t.kind == tkIdent && t.text == word {
+		p.i++
+		return true
+	}
+	return false
+}
+
 func (p *parser) consumeKeyword(kw string) bool {
 	if t := p.peek(); t.kind == tkKeyword && t.text == kw {
 		p.i++
@@ -157,7 +167,31 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "ROLLBACK", "ABORT":
 		p.i++
 		p.consumeKeyword("TRANSACTION")
+		// ROLLBACK TO [SAVEPOINT] name
+		if p.consumeKeyword("TO") {
+			p.consumeIdentWord("savepoint")
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &RollbackToSavepoint{Name: name}, nil
+		}
 		return &Rollback{}, nil
+	case "savepoint": // not a reserved word; lexes as an identifier
+		p.i++
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Savepoint{Name: name}, nil
+	case "release": // not a reserved word; lexes as an identifier
+		p.i++
+		p.consumeIdentWord("savepoint")
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &ReleaseSavepoint{Name: name}, nil
 	case "SHOW":
 		p.i++
 		if p.consumeKeyword("TABLES") {
