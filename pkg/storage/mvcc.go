@@ -28,6 +28,23 @@ type MVCCGetOptions struct {
 	Inconsistent bool
 }
 
+// intentAboveRead reports whether a foreign intent at intentTS is strictly
+// above everything a read at ts can observe — above the read timestamp AND
+// above the uncertainty limit. Such an intent cannot change the read's
+// answer however it resolves: resolution only moves a write's timestamp
+// FORWARD (a commit timestamp is never below the intent's provisional
+// timestamp), so the eventual committed version stays invisible too, and
+// the read may simply look beneath the intent. An intent inside the
+// uncertainty window (ts, limit] is NOT skippable — like a committed
+// version there, it may causally precede the read.
+func intentAboveRead(intentTS, ts, uncertaintyLimit hlc.Timestamp) bool {
+	limit := ts
+	if limit.Less(uncertaintyLimit) {
+		limit = uncertaintyLimit
+	}
+	return limit.Less(intentTS)
+}
+
 // mvccKeyBounds returns engine-key bounds covering exactly the metadata and
 // versions of user key k.
 func mvccKeyBounds(k keys.Key) (lower, upper []byte) {
@@ -75,6 +92,12 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 			}
 		case opts.Inconsistent:
 			skipAt = meta.Timestamp // read beneath the intent
+		case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
+			// A foreign intent strictly above everything this read can
+			// observe cannot affect its answer no matter how it resolves
+			// (resolution only moves timestamps forward): read beneath it
+			// instead of pushing its transaction.
+			skipAt = meta.Timestamp
 		default:
 			return nil, &WriteIntentError{Intents: []Intent{{Key: key.Clone(), Txn: meta.Txn}}}
 		}
@@ -268,6 +291,10 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 				}
 			case opts.Inconsistent:
 				skipAt = meta.Timestamp // read beneath the intent
+			case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
+				// Foreign intent strictly above everything observable: read
+				// beneath it (see MVCCGet).
+				skipAt = meta.Timestamp
 			default:
 				intents = append(intents, Intent{Key: cur, Txn: meta.Txn})
 				if len(intents) >= maxIntentsPerError {

@@ -146,8 +146,9 @@ func TestMVCCIntentVisibility(t *testing.T) {
 		t.Fatalf("own read: got %q", v)
 	}
 
-	// Other readers hit a WriteIntentError, even below the intent timestamp
-	// (v1 pushes on any intent).
+	// A reader ABOVE the intent hits a WriteIntentError (the intent may
+	// commit beneath it); readers below newer intents are exercised in
+	// TestMVCCReadBelowNewerIntent.
 	_, err := MVCCGet(eng, keys.Key("k"), ts(20, 0), MVCCGetOptions{})
 	var wie *WriteIntentError
 	if !errors.As(err, &wie) {
@@ -417,5 +418,89 @@ func TestMVCCCheckForWrites(t *testing.T) {
 		// A foreign intent fails refresh regardless of window (it could
 		// commit anywhere).
 		t.Fatalf("foreign intent outside window: got %v", err)
+	}
+}
+
+// TestMVCCReadBelowNewerIntent: a foreign intent strictly above both the
+// read timestamp and the uncertainty limit is read beneath, not pushed —
+// the committed value below is the correct answer however the intent
+// resolves (issue #14). Intents at/below the read timestamp, or inside
+// the uncertainty window, still push.
+func TestMVCCReadBelowNewerIntent(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "k", ts(5, 0), "old", nil)
+	writer := newTxn(ts(100, 0))
+	mustPut(t, eng, "k", writer.WriteTimestamp, "provisional", writer)
+
+	// Below the intent, outside any uncertainty window: served.
+	if v := mustGet(t, eng, "k", ts(50, 0), MVCCGetOptions{}); string(v) != "old" {
+		t.Fatalf("read below newer intent: got %q, want old", v)
+	}
+	// Uncertainty limit still below the intent: served.
+	if v := mustGet(t, eng, "k", ts(50, 0), MVCCGetOptions{UncertaintyLimit: ts(90, 0)}); string(v) != "old" {
+		t.Fatalf("read with low uncertainty limit: got %q, want old", v)
+	}
+
+	var wie *WriteIntentError
+	// AT the intent timestamp: not strictly above — push.
+	if _, err := MVCCGet(eng, keys.Key("k"), ts(100, 0), MVCCGetOptions{}); !errors.As(err, &wie) {
+		t.Fatalf("read at intent timestamp: expected WriteIntentError, got %v", err)
+	}
+	// Above the intent: push.
+	if _, err := MVCCGet(eng, keys.Key("k"), ts(150, 0), MVCCGetOptions{}); !errors.As(err, &wie) {
+		t.Fatalf("read above intent: expected WriteIntentError, got %v", err)
+	}
+	// Intent inside the uncertainty window (50, 120]: push, like an
+	// uncertain committed version would restart.
+	if _, err := MVCCGet(eng, keys.Key("k"), ts(50, 0), MVCCGetOptions{UncertaintyLimit: ts(120, 0)}); !errors.As(err, &wie) {
+		t.Fatalf("intent in uncertainty window: expected WriteIntentError, got %v", err)
+	}
+
+	// A DIFFERENT transaction reading below also skips it.
+	reader := newTxn(ts(40, 0))
+	if v := mustGet(t, eng, "k", ts(40, 0), MVCCGetOptions{Txn: reader, UncertaintyLimit: ts(60, 0)}); string(v) != "old" {
+		t.Fatalf("txn read below newer intent: got %q, want old", v)
+	}
+
+	// After the writer commits (forwarded to 110), the old value is still
+	// the answer below, and the new one above.
+	resolve(t, eng, "k", writer, enginepb.COMMITTED, ts(110, 0))
+	if v := mustGet(t, eng, "k", ts(50, 0), MVCCGetOptions{}); string(v) != "old" {
+		t.Fatalf("post-commit read below: got %q, want old", v)
+	}
+	if v := mustGet(t, eng, "k", ts(120, 0), MVCCGetOptions{}); string(v) != "provisional" {
+		t.Fatalf("post-commit read above: got %q, want provisional", v)
+	}
+}
+
+// TestMVCCScanBelowNewerIntents: the scan variant — keys with newer
+// foreign intents contribute their committed-below values instead of
+// aggregating into a WriteIntentError; a single at-or-below intent still
+// fails the whole scan.
+func TestMVCCScanBelowNewerIntents(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "a", ts(5, 0), "a5", nil)
+	mustPut(t, eng, "b", ts(5, 0), "b5", nil)
+	mustPut(t, eng, "c", ts(5, 0), "c5", nil)
+	w1 := newTxn(ts(100, 0))
+	mustPut(t, eng, "b", w1.WriteTimestamp, "b-prov", w1)
+
+	res, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(50, 0), 0, MVCCGetOptions{})
+	if err != nil {
+		t.Fatalf("scan below newer intent: %v", err)
+	}
+	if len(res.KVs) != 3 || string(res.KVs[1].Value) != "b5" {
+		t.Fatalf("scan rows = %v", res.KVs)
+	}
+
+	// An intent at or below the scan timestamp still fails the scan.
+	w2 := newTxn(ts(30, 0))
+	mustPut(t, eng, "c", w2.WriteTimestamp, "c-prov", w2)
+	var wie *WriteIntentError
+	if _, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(50, 0), 0, MVCCGetOptions{}); !errors.As(err, &wie) {
+		t.Fatalf("expected WriteIntentError, got %v", err)
+	}
+	if len(wie.Intents) != 1 || wie.Intents[0].Txn.ID != w2.ID {
+		t.Fatalf("wrong intents reported: %+v", wie.Intents)
 	}
 }

@@ -159,9 +159,14 @@ Priorities are random at birth and bumped on retries, so starvation is
 unlikely; the timeout crudely breaks deadlocks. A real deadlock detector is
 out of scope for v1.
 
-Reads below a committed value's timestamp never block (MVCC). v1 pushes on
-*any* foreign intent found on a read path, even one above the read timestamp —
-reading around newer intents is easy future work.
+Reads below a committed value's timestamp never block (MVCC). A foreign
+intent strictly above both the read timestamp and the uncertainty limit is
+**read beneath**, not pushed: resolution only moves a write's timestamp
+forward, so however the intent resolves, its version stays invisible to
+the read and the committed value below is the correct answer. Only intents
+at or below the read timestamp — or inside the uncertainty window, where
+like a committed version they might causally precede the read — trigger a
+push.
 
 ## Garbage collection
 
@@ -220,5 +225,4 @@ Correctness rules enforced around the threshold:
 
 ## Known gaps (deliberate)
 
-Parallel commits; savepoints; deadlock detection; reading below foreign
-intents' timestamps.
+Parallel commits; savepoints; deadlock detection.
