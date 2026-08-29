@@ -84,7 +84,7 @@ func RemoveTarget(existing []kvpb.NodeDescriptor) (base.NodeID, bool) {
 				remaining = append(remaining, nd)
 			}
 		}
-		score := setDiversity(remaining)
+		score := SetDiversity(remaining)
 		if score > bestRemaining {
 			bestRemaining = score
 			bestID = id
@@ -93,7 +93,9 @@ func RemoveTarget(existing []kvpb.NodeDescriptor) (base.NodeID, bool) {
 	return bestID, true
 }
 
-func setDiversity(set []kvpb.NodeDescriptor) float64 {
+// SetDiversity is the pairwise locality diversity of a replica set — the
+// quantity placement maximizes.
+func SetDiversity(set []kvpb.NodeDescriptor) float64 {
 	var sum float64
 	for i := range set {
 		for j := i + 1; j < len(set); j++ {
@@ -101,4 +103,22 @@ func setDiversity(set []kvpb.NodeDescriptor) float64 {
 		}
 	}
 	return sum
+}
+
+// RebalanceKeepsDiversity reports whether replacing the replica on `remove`
+// with one on `add` leaves the set at least as diverse as before. Load
+// rebalancing uses it as a non-regression filter: a move driven by range
+// counts must never trade away failure-domain spread.
+func RebalanceKeepsDiversity(existing []kvpb.NodeDescriptor, remove base.NodeID, add kvpb.NodeDescriptor) bool {
+	after := make([]kvpb.NodeDescriptor, 0, len(existing))
+	for _, nd := range existing {
+		if nd.NodeID != remove {
+			after = append(after, nd)
+		}
+	}
+	if len(after) == len(existing) {
+		return false // remove is not in the set
+	}
+	after = append(after, add)
+	return SetDiversity(after) >= SetDiversity(existing)
 }

@@ -16,6 +16,13 @@ type rangeCache struct {
 	mu    sync.Mutex
 	descs []kvpb.RangeDescriptor // sorted by EndKey
 	hints map[base.RangeID]base.NodeID
+	// lastMeta is the last known descriptor covering the meta span — the
+	// bootstrap invariant. Evict may drop the meta range's entry (e.g. a
+	// RangeNotFound from a node that just shed its replica carries no fresh
+	// descriptors), but meta lookups must never lose all routing: Lookup
+	// falls back to this possibly-stale copy, and the replica fan-out plus
+	// mismatch corrections converge it.
+	lastMeta *kvpb.RangeDescriptor
 }
 
 func newRangeCache() *rangeCache {
@@ -31,6 +38,9 @@ func (c *rangeCache) Lookup(key keys.Key) (kvpb.RangeDescriptor, bool) {
 	})
 	if i < len(c.descs) && c.descs[i].ContainsKey(key) {
 		return c.descs[i], true
+	}
+	if c.lastMeta != nil && c.lastMeta.ContainsKey(key) {
+		return *c.lastMeta, true
 	}
 	return kvpb.RangeDescriptor{}, false
 }
@@ -57,6 +67,11 @@ func (c *rangeCache) Insert(descs ...kvpb.RangeDescriptor) {
 		c.descs = filtered
 		if d.RangeID != 0 {
 			c.descs = append(c.descs, d)
+		}
+		if metaStart, _ := keys.MetaSpan(); d.ContainsKey(metaStart) &&
+			(c.lastMeta == nil || d.Generation >= c.lastMeta.Generation) {
+			held := d
+			c.lastMeta = &held
 		}
 	}
 	sort.Slice(c.descs, func(i, j int) bool {

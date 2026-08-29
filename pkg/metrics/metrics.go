@@ -48,4 +48,7 @@ var (
 	LeaseTransfers = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_lease_transfers_total", Help: "Completed range leadership (lease) transfers.",
 	})
+	Rebalances = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_rebalances_total", Help: "Replicas moved by automatic load rebalancing.",
+	})
 )

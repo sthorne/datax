@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -52,7 +53,10 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	}
 }
 
-// listRanges reads all range descriptors from the /meta records.
+// listRanges reads all range descriptors from the /meta records. The
+// inconsistent scan can briefly surface two records for one range (a split
+// or merge whose meta repair has not landed), so duplicates are collapsed
+// to the highest generation.
 func (n *Node) listRanges(ctx context.Context) ([]kvpb.RangeDescriptor, error) {
 	start, end := keys.MetaSpan()
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: n.clock.Now(), ReadInconsistent: true}}
@@ -61,12 +65,23 @@ func (n *Node) listRanges(ctx context.Context) ([]kvpb.RangeDescriptor, error) {
 	if kerr != nil {
 		return nil, kerr
 	}
-	var out []kvpb.RangeDescriptor
+	byID := map[base.RangeID]kvpb.RangeDescriptor{}
+	var order []base.RangeID
 	for _, kv := range br.Responses[0].Scan.Rows {
 		var d kvpb.RangeDescriptor
-		if err := json.Unmarshal(kv.Value, &d); err == nil {
-			out = append(out, d)
+		if err := json.Unmarshal(kv.Value, &d); err != nil {
+			continue
 		}
+		if cur, ok := byID[d.RangeID]; !ok {
+			byID[d.RangeID] = d
+			order = append(order, d.RangeID)
+		} else if d.Generation > cur.Generation {
+			byID[d.RangeID] = d
+		}
+	}
+	out := make([]kvpb.RangeDescriptor, 0, len(order))
+	for _, id := range order {
+		out = append(out, byID[id])
 	}
 	return out, nil
 }

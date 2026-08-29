@@ -74,6 +74,11 @@ type Config struct {
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
+	// RebalanceThreshold is the range-count spread (most- minus least-loaded
+	// live node) at which the allocator moves one replica per tick toward
+	// balance (0 = default 2, the minimum with hysteresis; negative
+	// disables automatic rebalancing).
+	RebalanceThreshold int
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs

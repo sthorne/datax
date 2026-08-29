@@ -245,7 +245,18 @@ timeout aborts with a retryable error. Transferring the lease first is how a
 replica is moved *off* the range's own leader — `debug rebalance` does the
 add → transfer → remove sequence automatically when the source leads.
 
-**Rebalance** is manual: `datax debug rebalance --range N --to nodeX
-[--from nodeY]` performs add-then-remove (with a lease transfer in between
-when the source is the leader). There is no automatic rebalancing loop
-(only the RF-repair upreplication loop above).
+**Rebalancing** is automatic: the allocator (the range-1 leader's loop, the
+same one that upreplicates and repairs) watches per-node range counts across
+live nodes — empty spares included — and when the spread between the most-
+and least-loaded node reaches the rebalance threshold (default 2), it moves
+one replica per tick from a fullest node to the emptiest via the same
+add → transfer-if-leading → remove sequence. A threshold of 2 is the
+hysteresis: one move narrows the spread by 2, so a cluster balanced to a
+spread of ≤ 1 never moves anything and oscillation is impossible. Moves are
+diversity-non-regressing — a move that would lower a range's
+failure-domain spread is skipped even when counts favor it, so
+one-replica-per-rack placement always survives balancing. The pass stands
+down entirely while any node is dead (repair has priority), and a range
+left over-replicated by an interrupted move is trimmed back first.
+`datax debug rebalance --range N --to nodeX [--from nodeY]` remains for
+manual moves; `Config.RebalanceThreshold` < 0 disables the automatic pass.

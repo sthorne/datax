@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -59,6 +61,7 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 		wctx, cancel := context.WithTimeout(ctx, interval*4)
 		n.upreplicateOnce(wctx)
 		n.repairDeadOnce(wctx)
+		n.rebalanceOnce(wctx)
 		cancel()
 	}
 }
@@ -196,4 +199,154 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 		metrics.DeadNodeRepairs.Inc()
 		rangeCount[target]++
 	}
+}
+
+// defaultRebalanceThreshold is the range-count spread that triggers a
+// rebalance move. 2 is the minimum with hysteresis: one move narrows the
+// spread by 2, so a cluster balanced to a spread of 1 never moves anything
+// and oscillation is impossible.
+const defaultRebalanceThreshold = 2
+
+func (n *Node) rebalanceThreshold() int {
+	if n.cfg.RebalanceThreshold != 0 {
+		return n.cfg.RebalanceThreshold
+	}
+	return defaultRebalanceThreshold
+}
+
+// rebalanceOnce evens out range counts across live nodes: when the spread
+// between the most- and least-loaded node reaches the threshold, move one
+// replica (per tick, total) from the fullest node to the emptiest, never
+// trading away failure-domain diversity. Skipped entirely while any node is
+// dead — repair has priority, and rebalancing against a shrinking live set
+// only causes churn.
+func (n *Node) rebalanceOnce(ctx context.Context) {
+	threshold := n.rebalanceThreshold()
+	if threshold < 0 {
+		return
+	}
+	now := n.clock.Now().WallTime
+	live := map[base.NodeID]kvpb.NodeDescriptor{}
+	for _, nd := range n.registry.All() {
+		switch {
+		case nd.NodeID == n.ident.NodeID:
+			live[nd.NodeID] = nd
+		case now-nd.LivenessTime > int64(n.deadNodeThreshold()):
+			return // dead node present: leave the field to repair
+		case now-nd.LivenessTime < int64(n.livenessGrace()):
+			live[nd.NodeID] = nd
+		}
+	}
+	if len(live) < 2 {
+		return
+	}
+	descs, err := n.listRanges(ctx)
+	if err != nil {
+		log.Debugf("rebalance: listing ranges: %v", err)
+		return
+	}
+	sort.Slice(descs, func(i, j int) bool { return descs[i].RangeID < descs[j].RangeID })
+
+	// A range left over-replicated by a crashed add-then-remove is repaired
+	// first (one per tick), before load is considered.
+	for _, desc := range descs {
+		if len(desc.Replicas) <= base.DefaultReplicationFactor || !allReplicasLive(desc, live) {
+			continue
+		}
+		var existing []kvpb.NodeDescriptor
+		for _, r := range desc.Replicas {
+			existing = append(existing, live[r.NodeID])
+		}
+		from, ok := placement.RemoveTarget(existing)
+		if !ok {
+			continue
+		}
+		log.Infof("removing surplus replica of %s from n%d", desc.RangeID, from)
+		if err := n.removeReplicaFrom(ctx, desc, from); err != nil {
+			log.Warnf("removing surplus replica of %s from n%d: %v", desc.RangeID, from, err)
+		}
+		return
+	}
+
+	// Spread check across every live node, spares included.
+	rangeCount := map[base.NodeID]int{}
+	for id := range live {
+		rangeCount[id] = 0
+	}
+	for _, d := range descs {
+		for _, r := range d.Replicas {
+			if _, ok := live[r.NodeID]; ok {
+				rangeCount[r.NodeID]++
+			}
+		}
+	}
+	var max, dst base.NodeID
+	for id, c := range rangeCount {
+		if max == 0 || c > rangeCount[max] || (c == rangeCount[max] && id < max) {
+			max = id
+		}
+		if dst == 0 || c < rangeCount[dst] || (c == rangeCount[dst] && id < dst) {
+			dst = id
+		}
+	}
+	if rangeCount[max]-rangeCount[dst] < threshold {
+		return
+	}
+
+	// Any node at the maximum count may donate — if the fullest node's
+	// replicas are all diversity-pinned, an equally full peer can still move.
+	for _, desc := range descs {
+		if len(desc.Replicas) < base.DefaultReplicationFactor || !allReplicasLive(desc, live) {
+			continue
+		}
+		if _, onDst := desc.GetReplica(dst); onDst {
+			continue
+		}
+		var existing []kvpb.NodeDescriptor
+		for _, r := range desc.Replicas {
+			existing = append(existing, live[r.NodeID])
+		}
+		for _, r := range desc.Replicas {
+			src := r.NodeID
+			if rangeCount[src] != rangeCount[max] || src == dst {
+				continue
+			}
+			if !placement.RebalanceKeepsDiversity(existing, src, live[dst]) {
+				continue
+			}
+			log.Infof("rebalancing %s: n%d (%d ranges) -> n%d (%d ranges)", desc.RangeID, src, rangeCount[src], dst, rangeCount[dst])
+			if _, err := n.moveReplica(ctx, desc, dst, src); err != nil {
+				log.Warnf("rebalancing %s: %v", desc.RangeID, err)
+				return
+			}
+			metrics.Rebalances.Inc()
+			return // one move per tick
+		}
+	}
+}
+
+func allReplicasLive(desc kvpb.RangeDescriptor, live map[base.NodeID]kvpb.NodeDescriptor) bool {
+	for _, r := range desc.Replicas {
+		if _, ok := live[r.NodeID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// removeReplicaFrom removes one replica, transferring leadership to another
+// member first when the source leads the range.
+func (n *Node) removeReplicaFrom(ctx context.Context, desc kvpb.RangeDescriptor, from base.NodeID) error {
+	_, err := n.db.AdminChangeReplicas(ctx, desc.StartKey, 0, from)
+	if err != nil && strings.Contains(err.Error(), "refusing to remove the leader's own replica") {
+		for _, r := range desc.Replicas {
+			if r.NodeID != from {
+				if terr := n.db.AdminTransferLease(ctx, desc.StartKey, r.NodeID); terr == nil {
+					break
+				}
+			}
+		}
+		_, err = n.db.AdminChangeReplicas(ctx, desc.StartKey, 0, from)
+	}
+	return err
 }

@@ -84,3 +84,27 @@ func TestRemoveTargetKeepsDiversity(t *testing.T) {
 		t.Fatalf("got n%d", id)
 	}
 }
+
+func TestRebalanceKeepsDiversity(t *testing.T) {
+	existing := []kvpb.NodeDescriptor{
+		nd(t, 1, "region=r1,rack=a", 0).Node,
+		nd(t, 2, "region=r1,rack=b", 0).Node,
+		nd(t, 3, "region=r1,rack=c", 0).Node,
+	}
+	// Same-rack swap keeps diversity; cross-rack duplication loses it.
+	if !RebalanceKeepsDiversity(existing, 2, nd(t, 4, "region=r1,rack=b", 0).Node) {
+		t.Fatal("same-rack replacement rejected")
+	}
+	if RebalanceKeepsDiversity(existing, 1, nd(t, 4, "region=r1,rack=b", 0).Node) {
+		t.Fatal("rack-duplicating move accepted")
+	}
+	// remove not in the set: never a valid move.
+	if RebalanceKeepsDiversity(existing, 9, nd(t, 4, "region=r1,rack=d", 0).Node) {
+		t.Fatal("move from a non-member accepted")
+	}
+	// No localities anywhere: every swap is diversity-neutral.
+	plain := []kvpb.NodeDescriptor{nd(t, 1, "", 0).Node, nd(t, 2, "", 0).Node}
+	if !RebalanceKeepsDiversity(plain, 1, nd(t, 3, "", 0).Node) {
+		t.Fatal("locality-free swap rejected")
+	}
+}

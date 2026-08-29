@@ -152,6 +152,21 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
 			}
+			// A few immediate retries absorb simple staleness; after that,
+			// back off briefly — mid-flight replica moves and meta repairs
+			// need real time to land, and spinning burns the retry budget
+			// in microseconds.
+			if regroups > 3 {
+				delay := time.Duration(regroups) * 10 * time.Millisecond
+				if delay > 200*time.Millisecond {
+					delay = 200 * time.Millisecond
+				}
+				select {
+				case <-ctx.Done():
+					return nil, kvpb.NewError(ctx.Err())
+				case <-time.After(delay):
+				}
+			}
 			continue // descriptors refreshed; re-group from request i
 		}
 		if kerr != nil {
@@ -357,9 +372,23 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				lastErr = kerr
 				continue
 			}
+			if kerr.RangeNotFound != nil {
+				// This node shed its replica (a stale descriptor or hint
+				// pointed at it); another target may still hold one — the
+				// fallback order ends with every known node.
+				db.cache.SetHint(desc.RangeID, 0)
+				lastErr = kerr
+				continue
+			}
 			// Definitive KV-level answer (including txn conflicts and
 			// routing corrections): return to caller.
 			return br, kerr
+		}
+		// A full pass finding no replica anywhere means the descriptor
+		// itself is stale (the range moved or was reshaped): surface the
+		// RangeNotFound so the caller evicts and re-resolves via meta.
+		if lastErr != nil && lastErr.RangeNotFound != nil {
+			return nil, lastErr
 		}
 		select {
 		case <-ctx.Done():
