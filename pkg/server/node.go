@@ -75,6 +75,10 @@ type Config struct {
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
+	// MergeSizeThreshold: a range and its right neighbor both below it (and
+	// colocated) merge automatically (0 = a quarter of SplitSizeThreshold;
+	// negative disables).
+	MergeSizeThreshold int64
 	// RebalanceThreshold is the range-count spread (most- minus least-loaded
 	// live node) at which the allocator moves one replica per tick toward
 	// balance (0 = default 2, the minimum with hysteresis; negative
@@ -239,6 +243,7 @@ func (n *Node) start() error {
 		Stopper:            n.stopper,
 		DisableLeaseReads:  n.cfg.DisableLeaseReads,
 		SplitSizeThreshold: n.cfg.SplitSizeThreshold,
+		MergeSizeThreshold: n.cfg.MergeSizeThreshold,
 		TestingKnobs:       n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)

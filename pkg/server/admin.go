@@ -51,6 +51,20 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	case "decommission":
 		return n.serveDecommission(ctx, req)
 
+	case "merge":
+		if req.RangeID == 0 {
+			return cluster.AdminResponse{Error: "merge requires --range"}
+		}
+		desc, err := n.findRange(ctx, req.RangeID)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		mr, err := n.db.AdminMerge(ctx, desc.StartKey)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Ranges: []kvpb.RangeDescriptor{mr.Desc}}
+
 	default:
 		return cluster.AdminResponse{Error: "unknown admin op " + req.Op}
 	}

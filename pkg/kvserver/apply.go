@@ -131,6 +131,8 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	r.mu.Lock()
 	thr := r.mu.gcThreshold
 	size := r.mu.sizeBytes
+	frozen := r.mu.frozen
+	mergedInto := r.mu.mergedInto
 	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
 		AppliedIndex:   idx,
@@ -138,6 +140,8 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 		TruncatedTerm:  tr.Term,
 		GCThreshold:    thr,
 		SizeBytes:      size,
+		Frozen:         frozen,
+		MergedInto:     mergedInto,
 	})
 }
 
@@ -190,6 +194,14 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 			aerr = kvpb.NewError(err)
 		}
 	}
+	if aerr == nil && cmd.Merge != nil {
+		if err := r.stageMerge(b, cmd.Merge); err != nil {
+			log.Warnf("%s: merge application refused: %v", r.rangeID, err)
+			_ = b.Close()
+			b = eng.NewBatch()
+			aerr = kvpb.NewError(err)
+		}
+	}
 	if err := r.stageAppliedIndex(b, idx); err != nil {
 		_ = b.Close()
 		return nil, kvpb.NewError(err)
@@ -201,6 +213,9 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 	r.setApplied(idx)
 	if aerr == nil && cmd.Split != nil {
 		r.finishSplit(cmd.Split)
+	}
+	if aerr == nil && cmd.Merge != nil {
+		r.finishMerge(cmd.Merge)
 	}
 	return resp, aerr
 }
@@ -311,6 +326,20 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				return nil, kvpb.NewError(err)
 			}
 			ru.TruncateLog = &kvpb.TruncateLogResponse{}
+		case *kvpb.SubsumeRequest:
+			// Freeze for a merge; persisted by stageAppliedIndex in this
+			// same batch, so every future leader and restart honors it.
+			r.mu.Lock()
+			r.mu.frozen = true
+			r.mu.mergedInto = req.MergeInto
+			r.mu.Unlock()
+			ru.Subsume = &kvpb.SubsumeResponse{}
+		case *kvpb.UnfreezeRequest:
+			r.mu.Lock()
+			r.mu.frozen = false
+			r.mu.mergedInto = 0
+			r.mu.Unlock()
+			ru.Unfreeze = &kvpb.UnfreezeResponse{}
 		default:
 			return nil, kvpb.NewErrorf("unsupported request in write batch: %T", ba.Requests[i].GetInner())
 		}

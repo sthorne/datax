@@ -30,6 +30,11 @@ type replicaState struct {
 	// from the same commands), recomputed exactly at splits, and reduced by
 	// GC. Drives size-based auto-splits.
 	SizeBytes int64 `json:"size_bytes,omitempty"`
+	// Frozen: a Subsume command applied — the range refuses all traffic
+	// until it is absorbed by MergedInto (or unfrozen). Replicated so every
+	// future leader and every restart honors the freeze.
+	Frozen     bool         `json:"frozen,omitempty"`
+	MergedInto base.RangeID `json:"merged_into,omitempty"`
 }
 
 // getter is the read capability shared by Engine, Batch, and Snapshot.

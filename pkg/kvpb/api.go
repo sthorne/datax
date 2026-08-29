@@ -154,6 +154,25 @@ type AdminTransferLeaseRequest struct {
 	Target        base.NodeID `json:"target"`
 }
 
+// SubsumeRequest freezes the range for a merge into MergeInto: applied on
+// every replica, persisted in replicaState, and from then on the range
+// refuses all traffic until it is absorbed (or unfrozen).
+type SubsumeRequest struct {
+	RequestHeader              // Key = start key, EndKey = end key
+	MergeInto     base.RangeID `json:"merge_into"`
+}
+
+// UnfreezeRequest clears a Subsume freeze (the merge was abandoned).
+type UnfreezeRequest struct {
+	RequestHeader // Key = start key, EndKey = end key
+}
+
+// AdminMergeRequest merges the range containing Key with its right
+// neighbor. Driven by the node leading both sides.
+type AdminMergeRequest struct {
+	RequestHeader // Key = any key in the left-hand range
+}
+
 // RequestUnion holds exactly one request.
 type RequestUnion struct {
 	Get                 *GetRequest                 `json:"get,omitempty"`
@@ -171,6 +190,9 @@ type RequestUnion struct {
 	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
 	AdminTransferLease  *AdminTransferLeaseRequest  `json:"admin_transfer_lease,omitempty"`
+	AdminMerge          *AdminMergeRequest          `json:"admin_merge,omitempty"`
+	Subsume             *SubsumeRequest             `json:"subsume,omitempty"`
+	Unfreeze            *UnfreezeRequest            `json:"unfreeze,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -206,6 +228,12 @@ func (u RequestUnion) GetInner() Request {
 		return u.AdminChangeReplicas
 	case u.AdminTransferLease != nil:
 		return u.AdminTransferLease
+	case u.AdminMerge != nil:
+		return u.AdminMerge
+	case u.Subsume != nil:
+		return u.Subsume
+	case u.Unfreeze != nil:
+		return u.Unfreeze
 	}
 	return nil
 }
@@ -234,6 +262,9 @@ func (h *TruncateLogRequest) Header() RequestHeader         { return h.RequestHe
 func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
 func (h *AdminTransferLeaseRequest) Header() RequestHeader  { return h.RequestHeader }
+func (h *AdminMergeRequest) Header() RequestHeader          { return h.RequestHeader }
+func (h *SubsumeRequest) Header() RequestHeader             { return h.RequestHeader }
+func (h *UnfreezeRequest) Header() RequestHeader            { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -250,6 +281,9 @@ func (*TruncateLogRequest) Method() string         { return "TruncateLog" }
 func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
 func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
 func (*AdminTransferLeaseRequest) Method() string  { return "AdminTransferLease" }
+func (*AdminMergeRequest) Method() string          { return "AdminMerge" }
+func (*SubsumeRequest) Method() string             { return "Subsume" }
+func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
 
 func (*GetRequest) IsReadOnly() bool                 { return true }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -266,6 +300,9 @@ func (*TruncateLogRequest) IsReadOnly() bool         { return false }
 func (*AdminSplitRequest) IsReadOnly() bool          { return false }
 func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
 func (*AdminTransferLeaseRequest) IsReadOnly() bool  { return false }
+func (*AdminMergeRequest) IsReadOnly() bool          { return false }
+func (*SubsumeRequest) IsReadOnly() bool             { return false }
+func (*UnfreezeRequest) IsReadOnly() bool            { return false }
 
 // Response types.
 
@@ -326,6 +363,14 @@ type AdminTransferLeaseResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
 
+type AdminMergeResponse struct {
+	Desc RangeDescriptor `json:"desc"`
+}
+
+type SubsumeResponse struct{}
+
+type UnfreezeResponse struct{}
+
 // ResponseUnion holds exactly one response.
 type ResponseUnion struct {
 	Get                 *GetResponse                 `json:"get,omitempty"`
@@ -343,6 +388,9 @@ type ResponseUnion struct {
 	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
 	AdminTransferLease  *AdminTransferLeaseResponse  `json:"admin_transfer_lease,omitempty"`
+	AdminMerge          *AdminMergeResponse          `json:"admin_merge,omitempty"`
+	Subsume             *SubsumeResponse             `json:"subsume,omitempty"`
+	Unfreeze            *UnfreezeResponse            `json:"unfreeze,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -427,6 +475,12 @@ func (b *BatchRequest) Add(r Request) {
 		u.AdminChangeReplicas = t
 	case *AdminTransferLeaseRequest:
 		u.AdminTransferLease = t
+	case *AdminMergeRequest:
+		u.AdminMerge = t
+	case *SubsumeRequest:
+		u.Subsume = t
+	case *UnfreezeRequest:
+		u.Unfreeze = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

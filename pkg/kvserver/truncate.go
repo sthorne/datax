@@ -49,7 +49,7 @@ func (s *Store) RunLogTruncationOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return false
 		}
-		if !r.IsLeader() {
+		if !r.IsLeader() || r.isFrozen() {
 			return true
 		}
 		if err := r.maybeTruncateLog(ctx); err != nil {

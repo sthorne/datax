@@ -542,6 +542,20 @@ func (db *DB) AdminTransferLease(ctx context.Context, key keys.Key, target base.
 	return nil
 }
 
+// AdminMerge merges the range containing key with its right neighbor.
+func (db *DB) AdminMerge(ctx context.Context, key keys.Key) (*kvpb.AdminMergeResponse, error) {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminMergeRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	resp := br.Responses[0].AdminMerge
+	db.cache.Evict(resp.Desc.RangeID)
+	db.cache.Insert(resp.Desc)
+	return resp, nil
+}
+
 // AdminSplit splits the range containing key at key.
 func (db *DB) AdminSplit(ctx context.Context, key keys.Key) (*kvpb.AdminSplitResponse, error) {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}

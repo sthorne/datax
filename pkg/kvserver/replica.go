@@ -25,6 +25,7 @@ type raftCommand struct {
 	ID    string            `json:"id"`
 	Batch kvpb.BatchRequest `json:"batch"`
 	Split *splitTrigger     `json:"split,omitempty"`
+	Merge *mergeTrigger     `json:"merge,omitempty"`
 }
 
 // splitTrigger is carried by the replicated split command (Phase 3).
@@ -108,7 +109,17 @@ type Replica struct {
 		// pendingInstall is a staged incoming snapshot awaiting raft's
 		// restore (committed by applySnapshot). See catchup.go.
 		pendingInstall *pendingSnapshot
+		// frozen: a Subsume applied — the range refuses traffic pending a
+		// merge into mergedInto (see merge.go). Mirrors replicaState.
+		frozen     bool
+		mergedInto base.RangeID
 	}
+
+	// quiesceCh asks the raft loop to exit without destroying data (a
+	// merge absorbed this range); stoppedCh closes when the loop is gone.
+	quiesceCh   chan struct{}
+	quiesceOnce sync.Once
+	stoppedCh   chan struct{}
 }
 
 type readIndexResult struct {
@@ -175,6 +186,10 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.readWaits = make(map[string]chan uint64)
 	r.mu.lastFollowerResp = make(map[uint64]time.Time)
 	r.mu.snapInFlight = make(map[uint64]uint64)
+	r.mu.frozen = st.Frozen
+	r.mu.mergedInto = st.MergedInto
+	r.quiesceCh = make(chan struct{})
+	r.stoppedCh = make(chan struct{})
 
 	cfg := raftConfig(uint64(replicaID), st.AppliedIndex, rs, r.leaseReads)
 	if bootstrap {
@@ -250,6 +265,33 @@ func (r *Replica) leaderHint() base.NodeID {
 	return 0
 }
 
+// isFrozen reports whether a Subsume has frozen this range for a merge.
+func (r *Replica) isFrozen() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.frozen
+}
+
+// checkFrozen refuses traffic on a frozen range. Subsume (idempotent
+// re-drive) and Unfreeze (abandonment) are the only requests allowed
+// through. The error carries a RangeKeyMismatch so clients re-resolve
+// routing — once the merge lands, the merged range's descriptor answers.
+func (r *Replica) checkFrozen(ba *kvpb.BatchRequest) *kvpb.Error {
+	if !r.isFrozen() {
+		return nil
+	}
+	for _, u := range ba.Requests {
+		switch u.GetInner().(type) {
+		case *kvpb.SubsumeRequest, *kvpb.UnfreezeRequest:
+			return nil
+		}
+	}
+	addr, _ := addrOf(ba.Requests[0].GetInner().Header().Key)
+	e := kvpb.NewErrorf("%s: range is frozen for a merge", r.rangeID)
+	e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: addr}
+	return e
+}
+
 func (r *Replica) notLeaderError() *kvpb.Error {
 	e := kvpb.NewErrorf("%s: replica %d is not the leader", r.rangeID, r.replicaID)
 	e.NotLeader = &kvpb.NotLeaderError{RangeID: r.rangeID, LeaderHint: r.leaderHint()}
@@ -258,11 +300,17 @@ func (r *Replica) notLeaderError() *kvpb.Error {
 
 // raftLoop is the replica's Ready-processing goroutine.
 func (r *Replica) raftLoop(ctx context.Context) {
+	defer close(r.stoppedCh)
 	ticker := time.NewTicker(r.store.cfg.RaftTickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			r.node.Stop()
+			return
+		case <-r.quiesceCh:
+			// A merge absorbed this range: stop the group, keep the data
+			// (which now belongs to the merged range).
 			r.node.Stop()
 			return
 		case <-ticker.C:
@@ -474,12 +522,13 @@ func (r *Replica) leaseContactFresh() bool {
 
 // propose submits a write batch through Raft and waits for its application.
 func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-	return r.proposeCmd(ctx, ba, nil)
+	return r.proposeCmd(ctx, ba, nil, nil)
 }
 
-// proposeCmd submits a write batch, optionally carrying a split trigger.
-func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger) (*kvpb.BatchResponse, *kvpb.Error) {
-	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split}
+// proposeCmd submits a write batch, optionally carrying a split or merge
+// trigger.
+func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger, merge *mergeTrigger) (*kvpb.BatchResponse, *kvpb.Error) {
+	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split, Merge: merge}
 	data, err := json.Marshal(&cmd)
 	if err != nil {
 		return nil, kvpb.NewError(err)
@@ -654,6 +703,13 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		}
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminTransferLease: resp}}}, nil
 	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminMerge != nil {
+		resp, err := r.adminMerge(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminMerge: resp}}}, nil
+	}
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
 	}
@@ -666,6 +722,13 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return nil, kvpb.NewError(gerr)
 	}
 	defer guard.Release()
+	// The frozen check sits AFTER latch acquisition: the Subsume command
+	// holds a whole-range exclusive latch until it applies, so a request
+	// that was in flight when the freeze landed waits it out here and then
+	// observes the flag — nothing slips between flag-set and latch-release.
+	if err := r.checkFrozen(ba); err != nil {
+		return nil, err
+	}
 	if k := r.store.cfg.TestingKnobs.AfterLatch; k != nil {
 		k(ba)
 	}

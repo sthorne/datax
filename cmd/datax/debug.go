@@ -103,7 +103,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -147,6 +147,11 @@ func runDebug(args []string) error {
 		req.RangeID = base.RangeID(*rangeID)
 		req.ToNode = base.NodeID(*toNode)
 		req.FromNode = base.NodeID(*fromNode)
+	case "merge":
+		if *rangeID == 0 {
+			return fmt.Errorf("merge requires --range (the left-hand range)")
+		}
+		req.RangeID = base.RangeID(*rangeID)
 	case "decommission":
 		if *nodeID == 0 {
 			return fmt.Errorf("decommission requires --node")
@@ -203,6 +208,10 @@ func runDebug(args []string) error {
 		fmt.Println("rebalance done")
 	case "transfer-lease":
 		fmt.Println("lease transferred")
+	case "merge":
+		if len(resp.Ranges) == 1 {
+			fmt.Printf("merged: %s\n", &resp.Ranges[0])
+		}
 	case "decommission":
 		switch {
 		case *cancelDrain:

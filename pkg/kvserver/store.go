@@ -36,6 +36,10 @@ type StoreConfig struct {
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
+	// MergeSizeThreshold: a range and its right neighbor both below it (and
+	// colocated) are merged by the housekeeping loop. 0 = a quarter of
+	// SplitSizeThreshold; negative disables merging.
+	MergeSizeThreshold int64
 	// SplitSizeThreshold is the range size that triggers an automatic split
 	// (default 64 MiB; negative disables auto-splitting).
 	SplitSizeThreshold int64

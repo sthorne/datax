@@ -37,7 +37,28 @@ leaseholder = Raft leader.
 at apply time each replica atomically writes both descriptors and creates
 the right-hand side's Raft state. No data moves, because range membership
 of a key is logical. The `/meta/` addressing records are then updated
-transactionally. Range merges are future work.
+transactionally.
+
+**Merges** are the inverse: when a range and its right neighbor are both
+below the merge threshold (default: a quarter of the split threshold) and
+have identical replica sets, the housekeeping pass on the node leading the
+left-hand side pulls the right-hand side's leadership to itself and merges
+in two replicated phases. First a **Subsume** command freezes the RHS —
+every replica persists the flag, and the range refuses all traffic from
+then on (serving is leader-only, and every future leader or restart
+reloads the flag), which also pins its membership. Then a **merge trigger**
+on the LHS: at apply, each replica waits for its local RHS replica to
+reach the subsume index (the RHS's final command, so engines are
+identical), quiesces the RHS group *keeping its data*, and atomically
+widens the LHS descriptor, absorbing the RHS's size and GC threshold.
+Transaction records are addressed keys and follow their anchors with no
+rewriting; the surviving leader bumps its timestamp cache over the
+absorbed span so nothing can write beneath a read the RHS served. `/meta`
+shrinks in one atomic batch (the merged record overwrites the RHS's — same
+end key — and the old LHS record is deleted); a failed cleanup is benign
+and re-repaired. An interrupted merge is re-driven (or unfrozen, if
+membership diverged) by the same pass; `datax debug merge --range N`
+drives one by hand.
 
 ## Peer discovery
 

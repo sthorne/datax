@@ -83,6 +83,7 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 				}
 				s.RunLogTruncationOnce(ctx)
 				s.RunAutoSplitOnce(ctx)
+				s.RunRangeMergeOnce(ctx)
 			}
 		}
 	})
@@ -100,7 +101,7 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 		if ctx.Err() != nil {
 			return false
 		}
-		if !r.IsLeader() {
+		if !r.IsLeader() || r.isFrozen() {
 			return true
 		}
 		if err := r.runGC(ctx, threshold); err != nil {

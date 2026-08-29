@@ -53,8 +53,8 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   transactions, EXPLAIN) served over the Postgres wire protocol, with TLS +
   SCRAM-SHA-256 authentication in secure mode.
 - **Operations**: leader-driven housekeeping per range — MVCC garbage
-  collection, raft log truncation, size-based splitting — plus dead-node
-  repair, `datax bench`, and `/metrics` + `/status` observability endpoints
+  collection, raft log truncation, size-based splitting and merging —
+  plus dead-node repair, load rebalancing, decommission, `datax bench`, and `/metrics` + `/status` observability endpoints
   (`--http-listen`).
 
 Design documents live in [`docs/`](docs/):
@@ -106,7 +106,7 @@ This is a prototype. Out of scope so far, deliberately:
 
 | Area | Not yet implemented |
 |---|---|
-| Ranges | range merges (splits are automatic by size, or manual via `datax debug split`) |
+| Ranges | load-based split/merge heuristics (splits and merges are automatic by size, or manual via `datax debug split`/`merge`) |
 | Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
 | Reads | follower reads (reads are leader-only: lease-based ReadIndex) |
 | Transactions | parallel commits, savepoints, deadlock *detection* (timeout-based abort only) |

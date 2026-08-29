@@ -23,6 +23,9 @@ import (
 
 // adminSplit executes an AdminSplitRequest on the leader.
 func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.AdminSplitResponse, *kvpb.Error) {
+	if r.isFrozen() {
+		return nil, kvpb.NewErrorf("%s: cannot split: range is frozen for a merge", r.rangeID)
+	}
 	desc := r.Desc()
 	if splitKey.Equal(desc.StartKey) {
 		return nil, kvpb.NewErrorf("%s: split key %s is already a range boundary", r.rangeID, splitKey)
@@ -66,7 +69,7 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig); kerr != nil {
+	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig, nil); kerr != nil {
 		guard.Release()
 		return nil, kerr
 	}

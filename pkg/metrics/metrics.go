@@ -57,4 +57,7 @@ var (
 	CatchupSnapshots = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_catchup_snapshots_total", Help: "Raft catch-up snapshots streamed to lagging followers.",
 	})
+	RangeMerges = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_merges_total", Help: "Adjacent underfull ranges merged.",
+	})
 )

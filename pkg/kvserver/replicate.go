@@ -57,6 +57,9 @@ func (r *Replica) adminChangeReplicas(ctx context.Context, req *kvpb.AdminChange
 	if sender == nil {
 		return nil, kvpb.NewErrorf("store has no client; cannot change replicas")
 	}
+	if r.isFrozen() {
+		return nil, kvpb.NewErrorf("%s: cannot change replicas: range is frozen for a merge", r.rangeID)
+	}
 	desc := r.Desc()
 
 	if req.AddNode != 0 {

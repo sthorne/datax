@@ -27,7 +27,7 @@ func (s *Store) RunAutoSplitOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return false
 		}
-		if !r.IsLeader() {
+		if !r.IsLeader() || r.isFrozen() {
 			return true
 		}
 		size := r.SizeBytes()
