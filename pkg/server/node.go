@@ -85,6 +85,12 @@ type Config struct {
 	// balance (0 = default 2, the minimum with hysteresis; negative
 	// disables automatic rebalancing).
 	RebalanceThreshold int
+	// ClosedTimestampLag is how far behind now() published closed
+	// timestamps sit — the follower-read staleness floor (0 = default 3s;
+	// negative disables closed timestamps and follower reads).
+	// ClosedTimestampInterval is the publication cadence (0 = default 1s).
+	ClosedTimestampLag      time.Duration
+	ClosedTimestampInterval time.Duration
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -243,10 +249,12 @@ func (n *Node) start() error {
 		Transport:          n.trans,
 		SnapshotSender:     n.trans,
 		Stopper:            n.stopper,
-		DisableLeaseReads:  n.cfg.DisableLeaseReads,
-		SplitSizeThreshold: n.cfg.SplitSizeThreshold,
-		MergeSizeThreshold: n.cfg.MergeSizeThreshold,
-		TestingKnobs:       n.cfg.TestingKnobs,
+		DisableLeaseReads:       n.cfg.DisableLeaseReads,
+		SplitSizeThreshold:      n.cfg.SplitSizeThreshold,
+		MergeSizeThreshold:      n.cfg.MergeSizeThreshold,
+		ClosedTimestampLag:      n.cfg.ClosedTimestampLag,
+		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
+		TestingKnobs:            n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
@@ -333,6 +341,9 @@ func (n *Node) start() error {
 		gcInterval = base.DefaultGCInterval
 	}
 	if err := n.store.StartHousekeeping(gcTTL, gcInterval); err != nil {
+		return err
+	}
+	if err := n.store.StartClosedTimestamps(); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)

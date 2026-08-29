@@ -461,6 +461,25 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, err
 		}
 		sel.Table = name
+		// AS OF SYSTEM TIME <literal>. SYSTEM and TIME are not reserved
+		// words — they lex as (lower-cased) identifiers.
+		if p.consumeKeyword("AS") {
+			for _, word := range []string{"of", "system", "time"} {
+				if t := p.peek(); t.kind == tkIdent && t.text == word {
+					p.i++
+				} else {
+					return nil, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
+				}
+			}
+			t := p.peek()
+			switch t.kind {
+			case tkString, tkNumber:
+				sel.AsOf = t.text
+				p.i++
+			default:
+				return nil, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
+			}
+		}
 	}
 	var err error
 	sel.Where, err = p.parseOptWhere()

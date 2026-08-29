@@ -10,7 +10,7 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
-SELECT * | col, ... | aggregates  FROM t [WHERE conjunction]
+SELECT * | col, ... | aggregates  FROM t [AS OF SYSTEM TIME 't'] [WHERE conjunction]
     [ORDER BY col [ASC|DESC], ...] [LIMIT n]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
@@ -37,6 +37,16 @@ column IDs are never reused, so re-adding a name cannot resurrect old
 values). Descriptor leases (below) drain schema changes across gateways:
 by the time a DDL statement returns, every live gateway plans against the
 new descriptor version.
+
+`SELECT ... FROM t AS OF SYSTEM TIME 't'` pins the read to a fixed past
+timestamp — a negative duration (`'-5s'`), an RFC 3339 timestamp, or Unix
+nanoseconds — and runs it in its own read-only historical transaction
+(refused inside an explicit transaction block). Reads old enough to be
+covered by the range's closed timestamp are served by the gateway's LOCAL
+replica without contacting the leader — follower reads (see
+docs/replication-and-placement.md); more recent ones fall back to leaders.
+The usable window is bounded by the closed-timestamp lag (default 3s)
+on the recent side and the GC TTL (default 25h) on the old side.
 
 Still out of scope: joins, GROUP BY/HAVING, subqueries, DISTINCT,
 constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.

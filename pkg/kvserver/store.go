@@ -43,7 +43,13 @@ type StoreConfig struct {
 	// SplitSizeThreshold is the range size that triggers an automatic split
 	// (default 64 MiB; negative disables auto-splitting).
 	SplitSizeThreshold int64
-	TestingKnobs       TestingKnobs
+	// ClosedTimestampLag is how far behind now() each published closed
+	// timestamp sits (0 = default 3s; negative disables publication and
+	// with it follower reads). ClosedTimestampInterval is the publication
+	// cadence (0 = default 1s).
+	ClosedTimestampLag      time.Duration
+	ClosedTimestampInterval time.Duration
+	TestingKnobs            TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.

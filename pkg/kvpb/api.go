@@ -409,6 +409,12 @@ type BatchHeader struct {
 	// ReadInconsistent makes reads ignore intents (reading the newest
 	// committed version beneath them). Meta/registry scans only.
 	ReadInconsistent bool `json:"read_inconsistent,omitempty"`
+	// StaleRead marks a read-only batch at a FIXED past timestamp that a
+	// follower replica may serve locally when the timestamp is at or below
+	// its closed timestamp. Historical reads need no uncertainty interval:
+	// the closed timestamp proves nothing new can commit at or below the
+	// read timestamp anywhere.
+	StaleRead bool `json:"stale_read,omitempty"`
 }
 
 // BatchRequest is the unit of KV RPC.

@@ -87,6 +87,11 @@ type Select struct {
 	Where   []Comparison
 	OrderBy []OrderCol
 	Limit   int64 // -1 = none
+	// AsOf is the AS OF SYSTEM TIME operand ("" = none): a string literal
+	// holding a negative duration ('-5s'), an RFC 3339 timestamp, or a
+	// Unix-nanoseconds integer. The read runs at that fixed timestamp and
+	// may be served by follower replicas.
+	AsOf string
 }
 
 type Update struct {

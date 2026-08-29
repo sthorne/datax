@@ -246,6 +246,39 @@ result. The failure mode of any false negative is only a NotLeader retry.
 `--disable-lease-reads`-style configuration (`DisableLeaseReads`) restores
 the v1 quorum path.
 
+## Follower reads (closed timestamps)
+
+Followers hold full copies of every range; closed timestamps let them
+serve reads. The leader periodically (default every 1s) publishes "no
+write at or below T will ever commit on this range", with T lagging now by
+a few seconds (default 3s). The publication rides the **raft log itself**
+as a tiny replicated command, which buys two properties for free:
+
+- **Catch-up is log order**: by the time a replica applies the closed-ts
+  command, every write below T has applied too — no applied-index
+  bookkeeping, no side channel.
+- **It survives leader failure**: the closed timestamp is replicated state
+  (persisted in the replica state), so a follower keeps serving reads
+  below T with the leader gone or an election in flight.
+
+Publication is made safe by the same machinery ordinary reads use: the
+leader takes a whole-range **shared latch** (draining in-flight writes,
+whose exclusive latches are held until they apply — invariant L1), bumps
+the timestamp-cache floor to T (every later write is forwarded above it),
+releases, and proposes. A split hands the parent's closed timestamp to the
+new right-hand range so nothing can write beneath reads the parent already
+served on that span.
+
+A follower serves a read-only batch pinned at a fixed timestamp exactly
+when that timestamp is at or below its closed timestamp; anything else —
+including any unresolved intent it encounters (only the leader can push) —
+redirects to the leader as always. Pinned historical reads need no
+uncertainty interval: nothing can commit at or below the read timestamp
+anywhere. The staleness window is bounded below by the publication lag and
+above by the GC TTL (reads at or below the GC threshold are rejected).
+Clients opt in per statement with `AS OF SYSTEM TIME` (see docs/sql.md);
+the gateway then prefers its local replica.
+
 ## Raft log truncation
 
 The log is bounded by leader-driven, **replicated** `TruncateLog` commands

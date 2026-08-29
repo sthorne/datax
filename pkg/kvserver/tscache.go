@@ -32,7 +32,10 @@ import (
 // normal transactional pattern); the floor carries no attribution, so
 // writes at the floor are conservatively rejected.
 //
-// It is only consulted on the leader (Execute is leader-only).
+// It is only consulted on the leader (writes and current reads are
+// leader-only; follower reads at or below the closed timestamp need no
+// bump — the closed timestamp already keeps every future write above
+// them, see closedts.go).
 type tsCache struct {
 	mu    sync.Mutex
 	floor hlc.Timestamp

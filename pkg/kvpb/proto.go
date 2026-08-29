@@ -352,6 +352,7 @@ func BatchRequestToProto(b *BatchRequest) *rpcpb.BatchRequest {
 			RangeId:          int64(b.Header.RangeID),
 			CreateTxnRecord:  b.Header.CreateTxnRecord,
 			ReadInconsistent: b.Header.ReadInconsistent,
+			StaleRead:        b.Header.StaleRead,
 		},
 	}
 	for _, u := range b.Requests {
@@ -380,6 +381,7 @@ func BatchRequestFromProto(pb *rpcpb.BatchRequest) (*BatchRequest, error) {
 			RangeID:          base.RangeID(h.RangeId),
 			CreateTxnRecord:  h.CreateTxnRecord,
 			ReadInconsistent: h.ReadInconsistent,
+			StaleRead:        h.StaleRead,
 		}
 	}
 	for _, pu := range pb.Requests {

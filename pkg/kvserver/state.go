@@ -35,6 +35,11 @@ type replicaState struct {
 	// future leader and every restart honors the freeze.
 	Frozen     bool         `json:"frozen,omitempty"`
 	MergedInto base.RangeID `json:"merged_into,omitempty"`
+	// ClosedTS: no write at or below this timestamp will ever commit on
+	// this range. Replicated (raised by applied closed-timestamp commands;
+	// log order guarantees every earlier write applied first), so any
+	// replica may serve reads at or below it locally — follower reads.
+	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
 }
 
 // getter is the read capability shared by Engine, Batch, and Snapshot.

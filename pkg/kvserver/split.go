@@ -61,7 +61,9 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 		NextReplicaID: desc.NextReplicaID,
 		Generation:    desc.Generation + 1,
 	}
-	trig := &splitTrigger{Left: left, Right: right}
+	// The RHS inherits the parent's closed timestamp: reads served at or
+	// below it covered the RHS span, so no post-split write may land there.
+	trig := &splitTrigger{Left: left, Right: right, ClosedTS: r.ClosedTimestamp()}
 
 	// Serialize against everything: nothing may be in flight through the
 	// old bounds while the split lands.
@@ -69,7 +71,7 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig, nil); kerr != nil {
+	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig, nil, hlc.Timestamp{}); kerr != nil {
 		guard.Release()
 		return nil, kerr
 	}
@@ -128,6 +130,11 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	return putReplicaState(b, trig.Right.RangeID, replicaState{
 		GCThreshold: thr,
 		SizeBytes:   rightSize,
+		// The parent's closed timestamp covered the RHS span; carrying it
+		// over keeps every future RHS leader (newReplica seeds its
+		// timestamp cache floor from it) from admitting writes beneath
+		// reads the parent already served there.
+		ClosedTS: trig.ClosedTS,
 	})
 }
 

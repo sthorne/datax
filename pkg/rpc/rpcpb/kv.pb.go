@@ -1880,8 +1880,11 @@ type BatchHeader struct {
 	RangeId          int64                  `protobuf:"varint,3,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
 	CreateTxnRecord  bool                   `protobuf:"varint,4,opt,name=create_txn_record,json=createTxnRecord,proto3" json:"create_txn_record,omitempty"`
 	ReadInconsistent bool                   `protobuf:"varint,5,opt,name=read_inconsistent,json=readInconsistent,proto3" json:"read_inconsistent,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// stale_read marks a read-only batch a follower may serve at its closed
+	// timestamp (readTS <= closedTS); see follower reads in the docs.
+	StaleRead     bool `protobuf:"varint,6,opt,name=stale_read,json=staleRead,proto3" json:"stale_read,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BatchHeader) Reset() {
@@ -1945,6 +1948,13 @@ func (x *BatchHeader) GetCreateTxnRecord() bool {
 func (x *BatchHeader) GetReadInconsistent() bool {
 	if x != nil {
 		return x.ReadInconsistent
+	}
+	return false
+}
+
+func (x *BatchHeader) GetStaleRead() bool {
+	if x != nil {
+		return x.StaleRead
 	}
 	return false
 }
@@ -3787,11 +3797,16 @@ func (x *BatchEnvelope) GetError() *Error {
 // RaftCommand is the raft log entry payload (entries are prefixed with a
 // one-byte format version; see pkg/kvserver's proposeCmd/applyEntry).
 type RaftCommand struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Batch         *BatchRequest          `protobuf:"bytes,2,opt,name=batch,proto3" json:"batch,omitempty"`
-	Split         *SplitTrigger          `protobuf:"bytes,3,opt,name=split,proto3" json:"split,omitempty"`
-	Merge         *MergeTrigger          `protobuf:"bytes,4,opt,name=merge,proto3" json:"merge,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Batch *BatchRequest          `protobuf:"bytes,2,opt,name=batch,proto3" json:"batch,omitempty"`
+	Split *SplitTrigger          `protobuf:"bytes,3,opt,name=split,proto3" json:"split,omitempty"`
+	Merge *MergeTrigger          `protobuf:"bytes,4,opt,name=merge,proto3" json:"merge,omitempty"`
+	// closed_ts publishes "no more writes at or below this timestamp" for
+	// the range. Log order makes the applied-index condition automatic: by
+	// the time a replica applies this command, every write below the
+	// timestamp has applied too.
+	ClosedTs      *Hlc `protobuf:"bytes,5,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3854,10 +3869,21 @@ func (x *RaftCommand) GetMerge() *MergeTrigger {
 	return nil
 }
 
+func (x *RaftCommand) GetClosedTs() *Hlc {
+	if x != nil {
+		return x.ClosedTs
+	}
+	return nil
+}
+
 type SplitTrigger struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Left          *RangeDescriptor       `protobuf:"bytes,1,opt,name=left,proto3" json:"left,omitempty"`
-	Right         *RangeDescriptor       `protobuf:"bytes,2,opt,name=right,proto3" json:"right,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Left  *RangeDescriptor       `protobuf:"bytes,1,opt,name=left,proto3" json:"left,omitempty"`
+	Right *RangeDescriptor       `protobuf:"bytes,2,opt,name=right,proto3" json:"right,omitempty"`
+	// closed_ts carries the parent's closed timestamp into the new RHS, so
+	// no post-split write can land beneath a follower read the parent
+	// already served on the RHS span.
+	ClosedTs      *Hlc `protobuf:"bytes,3,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3902,6 +3928,13 @@ func (x *SplitTrigger) GetLeft() *RangeDescriptor {
 func (x *SplitTrigger) GetRight() *RangeDescriptor {
 	if x != nil {
 		return x.Right
+	}
+	return nil
+}
+
+func (x *SplitTrigger) GetClosedTs() *Hlc {
+	if x != nil {
+		return x.ClosedTs
 	}
 	return nil
 }
@@ -4127,13 +4160,15 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"adminMerge\x124\n" +
 	"\asubsume\x18\x11 \x01(\v2\x18.datax.v1.SubsumeRequestH\x00R\asubsume\x127\n" +
 	"\bunfreeze\x18\x12 \x01(\v2\x19.datax.v1.UnfreezeRequestH\x00R\bunfreezeB\a\n" +
-	"\x05value\"\xd7\x01\n" +
+	"\x05value\"\xf6\x01\n" +
 	"\vBatchHeader\x12+\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\ttimestamp\x12'\n" +
 	"\x03txn\x18\x02 \x01(\v2\x15.datax.v1.TransactionR\x03txn\x12\x19\n" +
 	"\brange_id\x18\x03 \x01(\x03R\arangeId\x12*\n" +
 	"\x11create_txn_record\x18\x04 \x01(\bR\x0fcreateTxnRecord\x12+\n" +
-	"\x11read_inconsistent\x18\x05 \x01(\bR\x10readInconsistent\"q\n" +
+	"\x11read_inconsistent\x18\x05 \x01(\bR\x10readInconsistent\x12\x1d\n" +
+	"\n" +
+	"stale_read\x18\x06 \x01(\bR\tstaleRead\"q\n" +
 	"\fBatchRequest\x12-\n" +
 	"\x06header\x18\x01 \x01(\v2\x15.datax.v1.BatchHeaderR\x06header\x122\n" +
 	"\brequests\x18\x02 \x03(\v2\x16.datax.v1.RequestUnionR\brequests\"9\n" +
@@ -4237,15 +4272,17 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\tambiguous\x18\v \x01(\v2\x1e.datax.v1.AmbiguousResultErrorR\tambiguous\"k\n" +
 	"\rBatchEnvelope\x123\n" +
 	"\bresponse\x18\x01 \x01(\v2\x17.datax.v1.BatchResponseR\bresponse\x12%\n" +
-	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xa7\x01\n" +
+	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xd3\x01\n" +
 	"\vRaftCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x05batch\x18\x02 \x01(\v2\x16.datax.v1.BatchRequestR\x05batch\x12,\n" +
 	"\x05split\x18\x03 \x01(\v2\x16.datax.v1.SplitTriggerR\x05split\x12,\n" +
-	"\x05merge\x18\x04 \x01(\v2\x16.datax.v1.MergeTriggerR\x05merge\"n\n" +
+	"\x05merge\x18\x04 \x01(\v2\x16.datax.v1.MergeTriggerR\x05merge\x12*\n" +
+	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\"\x9a\x01\n" +
 	"\fSplitTrigger\x12-\n" +
 	"\x04left\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04left\x12/\n" +
-	"\x05right\x18\x02 \x01(\v2\x19.datax.v1.RangeDescriptorR\x05right\"\xb8\x02\n" +
+	"\x05right\x18\x02 \x01(\v2\x19.datax.v1.RangeDescriptorR\x05right\x12*\n" +
+	"\tclosed_ts\x18\x03 \x01(\v2\r.datax.v1.HlcR\bclosedTs\"\xb8\x02\n" +
 	"\fMergeTrigger\x12-\n" +
 	"\x04left\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04left\x12/\n" +
 	"\x05right\x18\x02 \x01(\v2\x19.datax.v1.RangeDescriptorR\x05right\x121\n" +
@@ -4442,17 +4479,19 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	28,  // 104: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
 	62,  // 105: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
 	63,  // 106: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
-	3,   // 107: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 108: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
-	3,   // 109: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 110: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
-	3,   // 111: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
-	64,  // 112: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
-	113, // [113:113] is the sub-list for method output_type
-	113, // [113:113] is the sub-list for method input_type
-	113, // [113:113] is the sub-list for extension type_name
-	113, // [113:113] is the sub-list for extension extendee
-	0,   // [0:113] is the sub-list for field type_name
+	64,  // 107: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
+	3,   // 108: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 109: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
+	64,  // 110: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
+	3,   // 111: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 112: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
+	3,   // 113: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
+	64,  // 114: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
+	115, // [115:115] is the sub-list for method output_type
+	115, // [115:115] is the sub-list for method input_type
+	115, // [115:115] is the sub-list for extension type_name
+	115, // [115:115] is the sub-list for extension extendee
+	0,   // [0:115] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_kv_proto_init() }

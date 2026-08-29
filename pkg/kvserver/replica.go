@@ -25,12 +25,21 @@ type raftCommand struct {
 	Batch kvpb.BatchRequest `json:"batch"`
 	Split *splitTrigger     `json:"split,omitempty"`
 	Merge *mergeTrigger     `json:"merge,omitempty"`
+	// ClosedTS publishes "no write at or below this timestamp will ever
+	// commit on this range". Riding the log makes the applied-index
+	// condition automatic: applying this command implies every earlier
+	// write applied.
+	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
 }
 
 // splitTrigger is carried by the replicated split command (Phase 3).
 type splitTrigger struct {
 	Left  kvpb.RangeDescriptor `json:"left"`
 	Right kvpb.RangeDescriptor `json:"right"`
+	// ClosedTS hands the parent's closed timestamp to the new RHS: reads
+	// the parent served at or below it covered the RHS span too, so no
+	// post-split RHS write may land beneath it.
+	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
 }
 
 type proposalResult struct {
@@ -112,6 +121,10 @@ type Replica struct {
 		// merge into mergedInto (see merge.go). Mirrors replicaState.
 		frozen     bool
 		mergedInto base.RangeID
+		// closedTS mirrors replicaState.ClosedTS: the range's replicated
+		// closed timestamp, below which this replica may serve reads
+		// locally without being the leader.
+		closedTS hlc.Timestamp
 	}
 
 	// quiesceCh asks the raft loop to exit without destroying data (a
@@ -187,6 +200,14 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.snapInFlight = make(map[uint64]uint64)
 	r.mu.frozen = st.Frozen
 	r.mu.mergedInto = st.MergedInto
+	r.mu.closedTS = st.ClosedTS
+	if !st.ClosedTS.IsEmpty() {
+		// The closed timestamp is a promise about the whole range; the
+		// timestamp cache floor must enforce it on whichever replica leads
+		// — including a fresh post-split RHS leader (term 1, which skips
+		// the new-leader bump) and a restarted one.
+		r.tsCache.Bump([]latchSpan{wholeRangeSpan}, st.ClosedTS, uuid.Nil)
+	}
 	r.quiesceCh = make(chan struct{})
 	r.stoppedCh = make(chan struct{})
 
@@ -220,6 +241,15 @@ func (r *Replica) GCThreshold() hlc.Timestamp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mu.gcThreshold
+}
+
+// ClosedTimestamp returns the range's replicated closed timestamp: no
+// write at or below it will ever commit, so reads there are servable by
+// any replica.
+func (r *Replica) ClosedTimestamp() hlc.Timestamp {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.closedTS
 }
 
 // SizeBytes returns the range's replicated approximate data size.
@@ -521,13 +551,13 @@ func (r *Replica) leaseContactFresh() bool {
 
 // propose submits a write batch through Raft and waits for its application.
 func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-	return r.proposeCmd(ctx, ba, nil, nil)
+	return r.proposeCmd(ctx, ba, nil, nil, hlc.Timestamp{})
 }
 
 // proposeCmd submits a write batch, optionally carrying a split or merge
-// trigger.
-func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger, merge *mergeTrigger) (*kvpb.BatchResponse, *kvpb.Error) {
-	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split, Merge: merge}
+// trigger or a closed-timestamp publication.
+func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger, merge *mergeTrigger, closedTS hlc.Timestamp) (*kvpb.BatchResponse, *kvpb.Error) {
+	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split, Merge: merge, ClosedTS: closedTS}
 	data, err := encodeRaftCommand(&cmd)
 	if err != nil {
 		return nil, kvpb.NewError(err)
@@ -675,10 +705,15 @@ func (r *Replica) setApplied(idx uint64) {
 	r.mu.Unlock()
 }
 
-// Execute serves a batch against this replica. Reads and writes are both
-// leader-only in v1 (the leader owns the timestamp cache).
+// Execute serves a batch against this replica. Reads and writes go to the
+// leader (which owns the timestamp cache); the one exception is a stale
+// read at or below the range's closed timestamp, which any replica serves
+// locally (see executeStaleRead).
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if !r.isLeader() {
+		if ba.Header.StaleRead && ba.IsReadOnly() {
+			return r.executeStaleRead(ba)
+		}
 		return nil, r.notLeaderError()
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminSplit != nil {

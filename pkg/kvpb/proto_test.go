@@ -57,6 +57,7 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 		Txn:             testTxn(),
 		RangeID:         4,
 		CreateTxnRecord: true,
+		StaleRead:       true,
 	}}
 	ba.Add(&GetRequest{RequestHeader: h("g")})
 	ba.Add(&PutRequest{RequestHeader: h("p"), Value: []byte("v")})

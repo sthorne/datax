@@ -22,9 +22,10 @@ func testRaftCmd() *raftCommand {
 		}
 	}
 	return &raftCommand{
-		ID:    "cmd-1",
-		Batch: ba,
-		Split: &splitTrigger{Left: desc(4), Right: desc(5)},
+		ID:       "cmd-1",
+		Batch:    ba,
+		ClosedTS: hlc.Timestamp{WallTime: 40},
+		Split:    &splitTrigger{Left: desc(4), Right: desc(5), ClosedTS: hlc.Timestamp{WallTime: 39}},
 		Merge: &mergeTrigger{
 			Left: desc(6), Right: desc(7), Merged: desc(8),
 			RightAppliedIndex: 99, RightSizeBytes: 1234,

@@ -357,14 +357,18 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 			}
 			return nil, kvpb.NewError(err)
 		}
-		for _, target := range db.replicaOrder(desc) {
+		for _, target := range db.replicaOrder(desc, ba.Header.StaleRead) {
 			br, kerr, err := db.sendToReplica(ctx, ba, target)
 			if err != nil {
 				lastErr = kvpb.NewErrorf("n%d unreachable: %v", target, err)
 				continue
 			}
 			if kerr == nil {
-				db.cache.SetHint(desc.RangeID, target)
+				if !ba.Header.StaleRead {
+					// A follower serving a stale read is not the leader;
+					// pinning the hint to it would misroute writes.
+					db.cache.SetHint(desc.RangeID, target)
+				}
 				return br, nil
 			}
 			if kerr.NotLeader != nil {
@@ -401,14 +405,22 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 	}
 }
 
-// replicaOrder yields target nodes: leader hint, then local, then the rest.
-func (db *DB) replicaOrder(desc kvpb.RangeDescriptor) []base.NodeID {
+// replicaOrder yields target nodes: leader hint, then local, then the
+// rest. A stale read prefers the LOCAL replica over the leader hint — any
+// replica whose closed timestamp covers it can serve, and local is the
+// whole point of follower reads.
+func (db *DB) replicaOrder(desc kvpb.RangeDescriptor, staleOK bool) []base.NodeID {
 	var order []base.NodeID
 	seen := map[base.NodeID]bool{}
 	add := func(n base.NodeID) {
 		if n != 0 && !seen[n] {
 			seen[n] = true
 			order = append(order, n)
+		}
+	}
+	if staleOK && db.local != nil {
+		if _, ok := desc.GetReplica(db.local.store.NodeID()); ok {
+			add(db.local.store.NodeID())
 		}
 	}
 	add(db.cache.Hint(desc.RangeID))

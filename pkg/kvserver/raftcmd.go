@@ -40,10 +40,12 @@ func encodeRaftCommand(cmd *raftCommand) ([]byte, error) {
 		Id:    cmd.ID,
 		Batch: kvpb.BatchRequestToProto(&cmd.Batch),
 	}
+	pb.ClosedTs = tsToProto(cmd.ClosedTS)
 	if cmd.Split != nil {
 		pb.Split = &rpcpb.SplitTrigger{
-			Left:  kvpb.RangeDescriptorToProto(cmd.Split.Left),
-			Right: kvpb.RangeDescriptorToProto(cmd.Split.Right),
+			Left:     kvpb.RangeDescriptorToProto(cmd.Split.Left),
+			Right:    kvpb.RangeDescriptorToProto(cmd.Split.Right),
+			ClosedTs: tsToProto(cmd.Split.ClosedTS),
 		}
 	}
 	if cmd.Merge != nil {
@@ -90,11 +92,12 @@ func decodeRaftCommand(data []byte) (*raftCommand, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := &raftCommand{ID: pb.Id, Batch: *batch}
+	cmd := &raftCommand{ID: pb.Id, Batch: *batch, ClosedTS: tsFromProto(pb.ClosedTs)}
 	if pb.Split != nil {
 		cmd.Split = &splitTrigger{
-			Left:  kvpb.RangeDescriptorFromProto(pb.Split.Left),
-			Right: kvpb.RangeDescriptorFromProto(pb.Split.Right),
+			Left:     kvpb.RangeDescriptorFromProto(pb.Split.Left),
+			Right:    kvpb.RangeDescriptorFromProto(pb.Split.Right),
+			ClosedTS: tsFromProto(pb.Split.ClosedTs),
 		}
 	}
 	if pb.Merge != nil {

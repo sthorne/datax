@@ -2,12 +2,42 @@ package sql
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/hlc"
 )
+
+// resolveAsOf turns an AS OF SYSTEM TIME operand into a fixed timestamp:
+// a negative duration ('-5s', relative to now), an RFC 3339 timestamp
+// ('2026-08-29T12:00:00Z'), or a Unix-nanoseconds integer.
+func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
+	if nanos, err := strconv.ParseInt(operand, 10, 64); err == nil {
+		if nanos <= 0 || nanos >= now.WallTime {
+			return hlc.Timestamp{}, fmt.Errorf("timestamp %d is not in the past", nanos)
+		}
+		return hlc.Timestamp{WallTime: nanos}, nil
+	}
+	if d, err := time.ParseDuration(operand); err == nil {
+		if d >= 0 {
+			return hlc.Timestamp{}, fmt.Errorf("duration %q must be negative (a time in the past)", operand)
+		}
+		return now.AddNanos(d.Nanoseconds()), nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
+		ts := hlc.Timestamp{WallTime: t.UnixNano()}
+		if !ts.Less(now) {
+			return hlc.Timestamp{}, fmt.Errorf("timestamp %q is not in the past", operand)
+		}
+		return ts, nil
+	}
+	return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration, RFC 3339 timestamp, or Unix nanoseconds", operand)
+}
 
 // ResultColumn describes one output column.
 type ResultColumn struct {
@@ -133,6 +163,26 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
 		}
 		return s.execCreateIndexOnline(ctx, ci)
+	}
+
+	// AS OF SYSTEM TIME pins a SELECT to a fixed past timestamp: it runs
+	// in its own read-only historical transaction (servable by follower
+	// replicas), so it cannot join an explicit transaction's timestamp.
+	if sel, ok := stmt.(*parser.Select); ok && sel.AsOf != "" {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "AS OF SYSTEM TIME cannot run inside a transaction block")
+		}
+		ts, err := resolveAsOf(sel.AsOf, s.db.Clock().Now())
+		if err != nil {
+			return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
+		}
+		txn := s.db.NewHistoricalTxn("sql-asof", ts)
+		res, serr := s.execSelect(ctx, txn, sel, params)
+		_ = txn.Commit(ctx) // read-only: releases nothing, marks finished
+		if serr != nil {
+			return nil, ToSQLError(serr)
+		}
+		return res, nil
 	}
 
 	if s.state == StateOpen {

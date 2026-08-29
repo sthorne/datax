@@ -217,7 +217,7 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, nil, trig); kerr != nil {
+	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, nil, trig, hlc.Timestamp{}); kerr != nil {
 		guard.Release()
 		return nil, kerr
 	}

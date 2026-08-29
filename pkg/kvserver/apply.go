@@ -133,6 +133,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	size := r.mu.sizeBytes
 	frozen := r.mu.frozen
 	mergedInto := r.mu.mergedInto
+	closedTS := r.mu.closedTS
 	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
 		AppliedIndex:   idx,
@@ -142,6 +143,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 		SizeBytes:      size,
 		Frozen:         frozen,
 		MergedInto:     mergedInto,
+		ClosedTS:       closedTS,
 	})
 }
 
@@ -172,6 +174,17 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 			r.mu.Lock()
 			if r.mu.gcThreshold.Less(newThr) {
 				r.mu.gcThreshold = newThr
+			}
+			r.mu.Unlock()
+		}
+		// A closed-timestamp publication: by log order, every write at or
+		// below it has already applied on this replica — from here on,
+		// reads at or below it are servable locally (stageAppliedIndex
+		// persists it below).
+		if !cmd.ClosedTS.IsEmpty() {
+			r.mu.Lock()
+			if r.mu.closedTS.Less(cmd.ClosedTS) {
+				r.mu.closedTS = cmd.ClosedTS
 			}
 			r.mu.Unlock()
 		}
@@ -357,6 +370,12 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 	if ba.Header.Txn != nil {
 		opts.Txn = &ba.Header.Txn.TxnMeta
 		opts.UncertaintyLimit = ba.Header.Txn.ReadTimestamp.AddNanos(int64(r.store.cfg.Clock.MaxOffset()))
+	}
+	if ba.Header.StaleRead {
+		// A stale read is pinned to a fixed past timestamp; the closed
+		// timestamp proves nothing can commit at or below it anywhere, so
+		// there is no uncertainty window to restart over.
+		opts.UncertaintyLimit = ts
 	}
 	eng := r.store.cfg.Engine
 	for i := range ba.Requests {

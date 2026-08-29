@@ -60,4 +60,7 @@ var (
 	RangeMerges = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_range_merges_total", Help: "Adjacent underfull ranges merged.",
 	})
+	FollowerReads = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_follower_reads_total", Help: "Stale reads served by non-leader replicas at their closed timestamp.",
+	})
 )

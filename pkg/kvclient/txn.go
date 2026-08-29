@@ -40,6 +40,10 @@ func IsRetryable(err error) bool {
 // drives conflict pushes. See docs/transactions.md.
 type Txn struct {
 	db *DB
+	// historical: a read-only transaction pinned at a fixed past
+	// timestamp. Its reads carry the StaleRead flag, so followers whose
+	// closed timestamp covers it serve them locally; writes are refused.
+	historical bool
 
 	mu struct {
 		sync.Mutex
@@ -83,6 +87,19 @@ func (t *Txn) recordRead(start, end keys.Key) {
 func (db *DB) NewTxn(name string) *Txn {
 	t := &Txn{db: db}
 	t.mu.txn = *kvpb.NewTransaction(name, rand.Int31n(1<<20), db.clock.Now())
+	t.mu.writes = make(map[string]struct{})
+	return t
+}
+
+// NewHistoricalTxn begins a READ-ONLY transaction pinned at ts: every read
+// observes exactly the data committed at or below ts, is servable by
+// follower replicas whose closed timestamp covers ts, and needs no
+// uncertainty restarts. Writes are refused. The timestamp must be above
+// the GC threshold (within the GC TTL) and, for follower serving, at or
+// below the closed timestamp — more recent reads fall back to leaders.
+func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
+	t := &Txn{db: db, historical: true}
+	t.mu.txn = *kvpb.NewTransaction(name, 0, ts)
 	t.mu.writes = make(map[string]struct{})
 	return t
 }
@@ -151,6 +168,9 @@ func (t *Txn) Increment(ctx context.Context, key keys.Key, by int64) (int64, err
 }
 
 func (t *Txn) write(ctx context.Context, req kvpb.Request) error {
+	if t.historical {
+		return fmt.Errorf("cannot write in a read-only historical transaction")
+	}
 	ba, key := t.prepareWrite(req)
 	if _, err := t.send(ctx, ba, true); err != nil {
 		return err
@@ -201,6 +221,11 @@ func (t *Txn) recordWrite(key keys.Key) {
 // are waited out briefly; timestamp conflicts trigger a read refresh and,
 // only if that fails, surface as RetryableError.
 func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*kvpb.BatchResponse, error) {
+	if t.historical {
+		// Pinned-timestamp reads are follower-servable and need no
+		// uncertainty interval.
+		ba.Header.StaleRead = true
+	}
 	waited := time.Duration(0)
 	refreshes := 0
 	for {

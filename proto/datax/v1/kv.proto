@@ -197,6 +197,9 @@ message BatchHeader {
   int64 range_id = 3;
   bool create_txn_record = 4;
   bool read_inconsistent = 5;
+  // stale_read marks a read-only batch a follower may serve at its closed
+  // timestamp (readTS <= closedTS); see follower reads in the docs.
+  bool stale_read = 6;
 }
 
 message BatchRequest {
@@ -364,11 +367,20 @@ message RaftCommand {
   BatchRequest batch = 2;
   SplitTrigger split = 3;
   MergeTrigger merge = 4;
+  // closed_ts publishes "no more writes at or below this timestamp" for
+  // the range. Log order makes the applied-index condition automatic: by
+  // the time a replica applies this command, every write below the
+  // timestamp has applied too.
+  Hlc closed_ts = 5;
 }
 
 message SplitTrigger {
   RangeDescriptor left = 1;
   RangeDescriptor right = 2;
+  // closed_ts carries the parent's closed timestamp into the new RHS, so
+  // no post-split write can land beneath a follower read the parent
+  // already served on the RHS span.
+  Hlc closed_ts = 3;
 }
 
 message MergeTrigger {
