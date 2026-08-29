@@ -68,6 +68,11 @@ type Replica struct {
 	// trip per read); fixed at replica creation.
 	leaseReads bool
 
+	// applyMu serializes state-machine replacement (an incoming catch-up
+	// snapshot install) against ordinary entry application. Held by
+	// applyEntry and by Store.installSnapshot's commit-and-swap.
+	applyMu sync.Mutex
+
 	mu struct {
 		sync.Mutex
 		desc         kvpb.RangeDescriptor
@@ -95,6 +100,14 @@ type Replica struct {
 		// rounds while riInFlight.
 		riPending  []chan readIndexResult
 		riInFlight bool
+		// snapInFlight tracks outgoing snapshot streams by target replica
+		// ID → the applied index registered at start. Log truncation never
+		// advances past the minimum, so a follower being caught up can
+		// still receive the entries after its snapshot.
+		snapInFlight map[uint64]uint64
+		// pendingInstall is a staged incoming snapshot awaiting raft's
+		// restore (committed by applySnapshot). See catchup.go.
+		pendingInstall *pendingSnapshot
 	}
 }
 
@@ -150,6 +163,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 		return nil, err
 	}
 	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager(), leaseReads: !s.cfg.DisableLeaseReads}
+	rs.setApplied(st.AppliedIndex)
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
 	r.mu.gcThreshold = st.GCThreshold
@@ -160,6 +174,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.proposals = make(map[string]chan proposalResult)
 	r.mu.readWaits = make(map[string]chan uint64)
 	r.mu.lastFollowerResp = make(map[uint64]time.Time)
+	r.mu.snapInFlight = make(map[uint64]uint64)
 
 	cfg := raftConfig(uint64(replicaID), st.AppliedIndex, rs, r.leaseReads)
 	if bootstrap {
@@ -306,8 +321,16 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 		}
 	}
 
-	// 2. Persist HardState and new entries — synced, BEFORE sending any
-	// messages (the Raft durability contract).
+	// 2. Acknowledge the snapshot (state already installed out of band),
+	// then persist HardState and new entries — synced, BEFORE sending any
+	// messages (the Raft durability contract). Snapshot first: entries in
+	// the same Ready follow the snapshot's index, and Advance() expects the
+	// storage to already report the post-snapshot positions.
+	if !raft.IsEmptySnap(rd.Snapshot) {
+		if err := r.applySnapshot(rd.Snapshot); err != nil {
+			return err
+		}
+	}
 	if !raft.IsEmptyHardState(rd.HardState) || len(rd.Entries) > 0 {
 		b := r.store.cfg.Engine.NewBatch()
 		if !raft.IsEmptyHardState(rd.HardState) {
@@ -321,12 +344,6 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 			return err
 		}
 		if err := b.Commit(true); err != nil {
-			return err
-		}
-	}
-
-	if !raft.IsEmptySnap(rd.Snapshot) {
-		if err := r.applySnapshot(rd.Snapshot); err != nil {
 			return err
 		}
 	}
@@ -369,6 +386,13 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 		}
 		if target == 0 {
 			log.Debugf("%s: dropping %s to unknown replica %d (desc replicas %v)", r.rangeID, m.Type, m.To, desc.Replicas)
+			continue
+		}
+		if m.Type == raftpb.MsgSnap {
+			// Snapshot data never rides inside raft messages (the transport
+			// caps message size and drops under pressure): stream it out of
+			// band, then forward a metadata-only MsgSnap. See catchup.go.
+			r.startCatchupSnapshot(target, m)
 			continue
 		}
 		if err := r.store.cfg.Transport.SendRaftMessage(ctx, target, r.rangeID, m); err != nil {
@@ -588,6 +612,7 @@ func (r *Replica) waitApplied(ctx context.Context, idx uint64) *kvpb.Error {
 // setApplied advances the applied index and wakes satisfied waiters.
 // Called from the apply path only.
 func (r *Replica) setApplied(idx uint64) {
+	r.rs.setApplied(idx)
 	r.mu.Lock()
 	r.mu.appliedIndex = idx
 	var remaining []appliedWait

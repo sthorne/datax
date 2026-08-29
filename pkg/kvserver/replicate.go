@@ -140,36 +140,55 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 const snapshotChunkSize = 256
 
 // sendSnapshotTo captures a consistent snapshot of the range and streams it
-// to the target node.
+// to the target node (the preseed path for new replicas).
 func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID) error {
+	_, err := r.streamSnapshot(ctx, target, newDesc, newReplicaID)
+	return err
+}
+
+// streamSnapshot captures a consistent engine snapshot of the range and
+// streams its content (transaction records + MVCC data) to the target,
+// returning the header it sent. While the stream is in flight, the
+// replica's log truncation holds back so the receiver can still be caught
+// up from the applied index the stream carries.
+func (r *Replica) streamSnapshot(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID) (snapshotHeader, error) {
 	sender := r.store.cfg.SnapshotSender
 	if sender == nil {
-		return fmt.Errorf("no snapshot sender configured")
+		return snapshotHeader{}, fmt.Errorf("no snapshot sender configured")
 	}
 	snap := r.store.cfg.Engine.NewSnapshot()
 	defer func() { _ = snap.Close() }()
 
 	st, err := loadReplicaStateFrom(snap, r.rangeID)
 	if err != nil {
-		return err
+		return snapshotHeader{}, err
 	}
+	r.mu.Lock()
+	r.mu.snapInFlight[uint64(newReplicaID)] = st.AppliedIndex
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.mu.snapInFlight, uint64(newReplicaID))
+		r.mu.Unlock()
+	}()
 	var term uint64
 	if st.AppliedIndex > 0 {
 		term, err = r.rs.Term(st.AppliedIndex)
 		if err != nil {
-			return fmt.Errorf("term of applied index %d: %w", st.AppliedIndex, err)
+			return snapshotHeader{}, fmt.Errorf("term of applied index %d: %w", st.AppliedIndex, err)
 		}
 	}
-	header, err := json.Marshal(snapshotHeader{
+	h := snapshotHeader{
 		Desc:         newDesc,
 		ReplicaID:    newReplicaID,
 		AppliedIndex: st.AppliedIndex,
 		Term:         term,
 		GCThreshold:  st.GCThreshold,
 		SizeBytes:    st.SizeBytes,
-	})
+	}
+	header, err := json.Marshal(h)
 	if err != nil {
-		return err
+		return snapshotHeader{}, err
 	}
 
 	// The range's replicated content: its MVCC data span and its
@@ -216,18 +235,24 @@ func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDes
 		}
 		return out, nil
 	}
-	return sender.SendSnapshot(ctx, target, header, next)
+	if err := sender.SendSnapshot(ctx, target, header, next); err != nil {
+		return snapshotHeader{}, err
+	}
+	return h, nil
 }
 
-// ApplySnapshotStream is the receiving side: it materializes a new replica
-// from a snapshot stream. next returns nil when the stream ends.
+// ApplySnapshotStream is the receiving side of a snapshot stream: it
+// materializes a NEW replica (the preseed path), or replaces an EXISTING
+// replica's state machine (a raft catch-up snapshot for a follower that
+// fell behind the leader's truncated log). next returns nil when the
+// stream ends.
 func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, error)) error {
 	var h snapshotHeader
 	if err := json.Unmarshal(header, &h); err != nil {
 		return fmt.Errorf("corrupt snapshot header: %w", err)
 	}
-	if _, ok := s.GetReplica(h.Desc.RangeID); ok {
-		return fmt.Errorf("%s: replica already exists on n%d", h.Desc.RangeID, s.cfg.NodeID)
+	if r, ok := s.GetReplica(h.Desc.RangeID); ok {
+		return s.installSnapshot(r, h, next)
 	}
 	b := s.cfg.Engine.NewBatch()
 	count := 0

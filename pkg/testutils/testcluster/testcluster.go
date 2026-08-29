@@ -22,6 +22,10 @@ import (
 type TestCluster struct {
 	T     *testing.T
 	Nodes []*server.Node
+	// addrs records each node's RPC address so RestartNode can re-listen on
+	// it (peers find a restarted node through their persisted registries,
+	// which hold the old address). Filled by StartWithEngines.
+	addrs []string
 }
 
 // Start brings up numNodes nodes with static pre-agreed membership: every
@@ -106,6 +110,9 @@ func StartWithEngines(t *testing.T, numNodes int, opts ...func(*server.Config)) 
 	}
 	range1 := cluster.Range1Descriptor(nodeIDs)
 	tc := &TestCluster{T: t}
+	for _, lis := range listeners {
+		tc.addrs = append(tc.addrs, lis.Addr().String())
+	}
 	t.Cleanup(func() {
 		for _, eng := range engines {
 			_ = eng.Close()
@@ -232,6 +239,33 @@ func listenerForDir(t *testing.T, dir string) net.Listener {
 	}
 	diskAddrs.Store(dir, lis.Addr().String())
 	return lis
+}
+
+// RestartNode restarts a stopped StartWithEngines node on its retained
+// engine and original address (a crash-and-return, not a wipe).
+func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*server.Config)) *server.Node {
+	tc.T.Helper()
+	if tc.Nodes[i] != nil {
+		tc.T.Fatalf("node %d is still running", i+1)
+	}
+	lis, err := net.Listen("tcp", tc.addrs[i])
+	if err != nil {
+		tc.T.Fatalf("re-listening on %s: %v", tc.addrs[i], err)
+	}
+	cfg := server.Config{
+		Listener:   lis,
+		Engine:     eng,
+		GCInterval: -1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		tc.T.Fatalf("restarting node %d: %v", i+1, err)
+	}
+	tc.Nodes[i] = n
+	return n
 }
 
 // StopNode stops one node (simulating a crash) and forgets it.

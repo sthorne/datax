@@ -31,9 +31,9 @@ type raftStorage struct {
 		lastIndex uint64
 		// confState is derived from the current range descriptor.
 		confState raftpb.ConfState
-		// snapshot, when non-nil, is a pending outgoing snapshot prepared by
-		// the replica (Phase 7); raft picks it up via Snapshot().
-		snapshot *raftpb.Snapshot
+		// applied mirrors the replica's applied index; Snapshot() reports
+		// the state machine at this position.
+		applied uint64
 		// truncated tracks the (index, term) the log logically starts after.
 		// Non-zero only for replicas seeded from a snapshot.
 		truncated struct{ index, term uint64 }
@@ -195,16 +195,40 @@ func (rs *raftStorage) FirstIndex() (uint64, error) {
 	return rs.mu.truncated.index + 1, nil
 }
 
-// Snapshot implements raft.Storage. Outgoing snapshots are prepared
-// explicitly by the replica (Phase 7 preseed); raft-triggered snapshots are
-// reported unavailable, which makes raft retry later.
+// setApplied mirrors the replica's applied index for Snapshot().
+func (rs *raftStorage) setApplied(idx uint64) {
+	rs.mu.Lock()
+	if idx > rs.mu.applied {
+		rs.mu.applied = idx
+	}
+	rs.mu.Unlock()
+}
+
+// Snapshot implements raft.Storage. The returned snapshot is METADATA ONLY
+// — index, term, and voter set at the applied position. The actual state
+// machine bytes never ride inside raft messages: when raft asks the leader
+// to snapshot a follower, the replica intercepts the resulting MsgSnap and
+// streams the data out of band (the same path that preseeds new replicas),
+// then forwards a matching metadata-only MsgSnap. See sendRaftMessages.
+//
+// Only raft-error returns are legal here: etcd-raft treats any other error
+// from a snapshot request as fatal (panic), and ErrSnapshotTemporarilyUnavailable
+// simply makes it retry later.
 func (rs *raftStorage) Snapshot() (raftpb.Snapshot, error) {
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if rs.mu.snapshot != nil {
-		return *rs.mu.snapshot, nil
+	applied := rs.mu.applied
+	cs := rs.mu.confState
+	rs.mu.Unlock()
+	if applied == 0 || len(cs.Voters) == 0 {
+		return raftpb.Snapshot{}, raft.ErrSnapshotTemporarilyUnavailable
 	}
-	return raftpb.Snapshot{}, raft.ErrSnapshotTemporarilyUnavailable
+	term, err := rs.Term(applied)
+	if err != nil {
+		return raftpb.Snapshot{}, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	return raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{
+		Index: applied, Term: term, ConfState: cs,
+	}}, nil
 }
 
 // append persists new log entries (and prunes any conflicting suffix) into
@@ -275,13 +299,15 @@ func (rs *raftStorage) setHardState(b *storage.Batch, hs raftpb.HardState) error
 }
 
 // applyIncomingSnapshot resets log bookkeeping after the state machine was
-// replaced by a snapshot at (index, term).
+// replaced by a snapshot at (index, term). Callers wipe the on-disk log, so
+// the log becomes logically empty starting after index.
 func (rs *raftStorage) applyIncomingSnapshot(index, term uint64) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.mu.truncated.index, rs.mu.truncated.term = index, term
-	if rs.mu.lastIndex < index {
-		rs.mu.lastIndex = index
+	rs.mu.lastIndex = index
+	if rs.mu.applied < index {
+		rs.mu.applied = index
 	}
 }
 

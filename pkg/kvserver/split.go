@@ -3,10 +3,7 @@ package kvserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
-
-	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
@@ -186,10 +183,4 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 		})
 	}
 	log.Infof("split %s at %s → %s [%s, %s)", r.rangeID, trig.Left.EndKey, trig.Right.RangeID, trig.Right.StartKey, trig.Right.EndKey)
-}
-
-func (r *Replica) applySnapshot(snap raftpb.Snapshot) error {
-	// Replicas are seeded out of band (preseed + ConfChange, see
-	// replicate.go), so raft-internal snapshots never fire in v1.
-	return fmt.Errorf("unexpected raft-internal snapshot")
 }

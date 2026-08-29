@@ -92,7 +92,8 @@ Two guards make it idle safely instead of flailing:
   no ConfChange could commit anyway — skip and warn;
 - **no-spare guard**: if no live node without a replica exists, skip.
 
-Repairing a dead voter away is also what un-pins Raft log truncation.
+A dead voter no longer pins Raft log truncation (returning voters are
+caught up by snapshot), so repair is purely about restoring redundancy.
 
 ## Node decommission
 
@@ -138,13 +139,32 @@ unavailable. Two tools turn that into a recoverable incident:
   never restart the removed peers with their old data (wipe and rejoin
   fresh).
 
-## Adding a replica: snapshots
+## Snapshots: preseed and raft catch-up
 
 A new replica is seeded by streaming a snapshot (the range's data span +
 descriptor + applied index) over gRPC **before** the ConfChange commits
 ("preseed"), avoiding the stall where a new member can't vote until it gets a
 snapshot through Raft. Configuration changes happen one replica at a time (no
 joint consensus in v1).
+
+The same stream also serves **raft catch-up snapshots**: when a follower
+needs entries the leader has truncated, raft requests a snapshot — the
+storage answers with metadata only (index, term, voters) — and the replica
+intercepts the resulting MsgSnap. Snapshot bytes never ride inside raft
+messages (the transport caps message sizes and sheds under pressure):
+the leader streams the state machine out of band, the receiver **stages**
+the install as an uncommitted batch, and only when the forwarded
+metadata-only MsgSnap comes back through raft's own restore flow does the
+replica commit the staged batch and swap its in-memory state — mutating
+raft's storage underneath a live node is a protocol violation. The leader
+then reports the outcome to raft (retry on failure) and, while any stream
+is in flight, log truncation holds at the streamed index so the receiver
+can be served the entries after its install.
+
+One sharp edge: a replica whose range **bounds** changed while it was away
+(it missed a split) cannot be caught up by snapshot — its stale span may
+overlap sibling replicas on the same store. Such a replica is refused and
+repaired by removal and re-add, the same remedy as a dead node.
 
 ## Internode security
 
@@ -195,22 +215,22 @@ The log is bounded by leader-driven, **replicated** `TruncateLog` commands
 (v2). Each housekeeping tick the leader computes
 
 ```
-truncIdx = min(every voter's Match, leader's applied index) − floor (64)
+truncIdx = leader's applied index − floor (64)
 ```
 
-and proposes a truncation when at least 256 entries would be reclaimed.
-`Match` is what a voter has *durably appended*, so the invariant is: **no
-live voter ever needs a truncated entry** — including across elections,
-since any electable peer's log already covers the truncated prefix. Each
-replica deletes its own (unreplicated) log prefix when the command applies,
-at which point it has durably applied everything at or below the index;
+clamped to the index of any in-flight snapshot stream, and proposes a
+truncation when at least 256 entries would be reclaimed. Each replica
+deletes its own (unreplicated) log prefix when the command applies, at
+which point it has durably applied everything at or below the index;
 `TruncatedIndex/Term` persist atomically with the applied index, so
 restarts resume from the truncation point.
 
-A dead voter's `Match` freezes and **pins truncation** — deliberate, since
-datax has no raft-internal snapshot delivery: the log must stay sufficient
-to catch up any configured voter. Dead-node repair (removing the dead
-replica) is what unpins it.
+A dead or lagging voter no longer pins the log: a voter that needs a
+truncated entry is caught up by a raft snapshot instead (see the snapshot
+section above), so the log stops growing during an outage and a returning
+voter recovers via one snapshot stream plus the retained tail. The floor
+bounds how often a barely-behind follower needs a snapshot rather than a
+plain append.
 
 ## Size-based auto-splitting
 

@@ -94,10 +94,10 @@ func TestLogTruncation(t *testing.T) {
 	}
 }
 
-// TestLogTruncationPinnedByDeadVoter: a stopped voter's frozen Match pins
-// truncation — the log must stay sufficient to catch it up (datax has no
-// raft-internal snapshot delivery).
-func TestLogTruncationPinnedByDeadVoter(t *testing.T) {
+// TestLogTruncationAdvancesPastDeadVoter: a stopped voter no longer pins
+// truncation — the log tracks the leader's applied index, and a returning
+// voter is caught up by a raft snapshot instead (see the catch-up tests).
+func TestLogTruncationAdvancesPastDeadVoter(t *testing.T) {
 	tc, _ := StartWithEngines(t, 3)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -110,12 +110,17 @@ func TestLogTruncationPinnedByDeadVoter(t *testing.T) {
 
 	fillLog(ctx, t, tc.Nodes[leader], 721, 400)
 	store := tc.Nodes[leader].Store()
-	store.RunLogTruncationOnce(ctx)
-	store.RunLogTruncationOnce(ctx)
-
 	rep, _ := store.GetReplica(1)
-	if idx := rep.TruncatedIndex(); idx != 0 {
-		t.Fatalf("truncation advanced to %d despite a dead voter pinning the log", idx)
+	deadline := time.Now().Add(15 * time.Second)
+	for rep.TruncatedIndex() == 0 {
+		store.RunLogTruncationOnce(ctx)
+		if time.Now().After(deadline) {
+			t.Fatal("truncation never advanced past the dead voter")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if idx := rep.TruncatedIndex(); idx < 256 {
+		t.Fatalf("truncated only through %d; want >= 256", idx)
 	}
 }
 

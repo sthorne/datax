@@ -54,4 +54,7 @@ var (
 	DecommissionMoves = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_decommission_replicas_moved_total", Help: "Replicas drained off decommissioning nodes.",
 	})
+	CatchupSnapshots = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_catchup_snapshots_total", Help: "Raft catch-up snapshots streamed to lagging followers.",
+	})
 )

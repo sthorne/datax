@@ -22,8 +22,12 @@ func addrOf(k keys.Key) (keys.Key, error) { return keys.Addr(k) }
 
 // applyEntry applies one committed Raft entry. Application is idempotent:
 // entries at or below the persisted applied index are skipped, which makes
-// crash-recovery replay safe.
+// crash-recovery replay safe — and also lets a catch-up snapshot install
+// (which raises the applied index under applyMu) turn any entries it
+// superseded into no-ops.
 func (r *Replica) applyEntry(ent raftpb.Entry) error {
+	r.applyMu.Lock()
+	defer r.applyMu.Unlock()
 	r.mu.Lock()
 	applied := r.mu.appliedIndex
 	r.mu.Unlock()
