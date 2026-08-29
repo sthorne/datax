@@ -19,8 +19,6 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 	switch t := stmt.(type) {
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
-	case *parser.CreateIndex:
-		return s.execCreateIndex(ctx, txn, t)
 	case *parser.Explain:
 		return s.execExplain(ctx, txn, t, params)
 	case *parser.AlterTable:
@@ -525,83 +523,6 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("DELETE %d", len(rows))}, nil
-}
-
-// execCreateIndex adds a secondary index and backfills it from the
-// table's current rows, all in one transaction. The backfill is offline:
-// writers from other gateways that still hold the old descriptor are not
-// blocked and will miss the index (documented limitation — no descriptor
-// leases).
-func (s *Session) execCreateIndex(ctx context.Context, txn *kvclient.Txn, t *parser.CreateIndex) (*Result, error) {
-	shared, err := s.cat.Lookup(ctx, txn, t.Table)
-	if err != nil {
-		return nil, err
-	}
-	desc := shared.Clone()
-	if t.Name == "primary" {
-		return nil, newErrf(CodeSyntaxError, "index name %q is reserved", t.Name)
-	}
-	if _, exists := desc.Index(t.Name); exists {
-		return nil, newErrf(CodeSyntaxError, "index %q already exists", t.Name)
-	}
-	var colIDs []catalog.ColumnID
-	seenCol := map[catalog.ColumnID]bool{}
-	for _, name := range t.Columns {
-		col, ok := desc.Col(name)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
-		}
-		if seenCol[col.ID] {
-			return nil, newErrf(CodeSyntaxError, "duplicate column %q in index", name)
-		}
-		seenCol[col.ID] = true
-		colIDs = append(colIDs, col.ID)
-	}
-	if desc.NextIndexID < rowenc.PrimaryIndexID+1 {
-		desc.NextIndexID = rowenc.PrimaryIndexID + 1
-	}
-	idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: t.Name, Unique: t.Unique, ColumnIDs: colIDs}
-	desc.NextIndexID++
-	desc.Indexes = append(desc.Indexes, idx)
-
-	// Backfill from the rows visible to this transaction.
-	start, end := rowenc.PrimarySpan(desc.ID)
-	kvs, err := txn.Scan(ctx, start, end, 0)
-	if err != nil {
-		return nil, err
-	}
-	var wb kvclient.WriteBatch
-	seen := map[string]bool{}
-	for _, kv := range kvs {
-		row, err := decodeFullRow(desc, kv.Key, kv.Value)
-		if err != nil {
-			return nil, err
-		}
-		key, val, skip, err := rowenc.EncodeIndexEntry(desc, &idx, row)
-		if err != nil {
-			return nil, newErrf(CodeInternal, "index %q: %v", idx.Name, err)
-		}
-		if skip {
-			if idx.Unique {
-				return nil, newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
-			}
-			continue
-		}
-		if idx.Unique {
-			if seen[string(key)] {
-				return nil, newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
-			}
-			seen[string(key)] = true
-		}
-		wb.Put(key, val)
-	}
-	if err := txn.RunBatch(ctx, &wb); err != nil {
-		return nil, err
-	}
-	if err := s.cat.Update(ctx, txn, desc); err != nil {
-		return nil, err
-	}
-	return &Result{Tag: "CREATE INDEX"}, nil
 }
 
 // execAlterTable adds or drops a column. Adds are nullable-only (existing

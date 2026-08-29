@@ -71,6 +71,9 @@ type Config struct {
 	// HTTPListen serves /metrics (Prometheus) and /status (JSON); empty
 	// disables.
 	HTTPListen string
+	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
+	// 10s; negative disables leasing, restoring pre-lease cache semantics).
+	DescLeaseTTL time.Duration
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs

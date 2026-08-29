@@ -428,6 +428,16 @@ func (db *DB) Get(ctx context.Context, key keys.Key) ([]byte, error) {
 	return br.Responses[0].Get.Value, nil
 }
 
+func (db *DB) Delete(ctx context.Context, key keys.Key) error {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.DeleteRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	_, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return kerr
+	}
+	return nil
+}
+
 func (db *DB) Put(ctx context.Context, key keys.Key, value []byte) error {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
 	ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: key}, Value: value})

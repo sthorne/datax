@@ -246,6 +246,21 @@ func NamespaceKey(name string) Key {
 	return Key(encoding.EncodeString(k, name))
 }
 
+// DescLeaseKey holds one gateway's lease on a table descriptor: proof that
+// the gateway may be using the descriptor at the recorded version until the
+// recorded expiration. DDL drains against these.
+func DescLeaseKey(descID uint64, gateway uuid.UUID) Key {
+	k := systemKey("lease")
+	k = Key(encoding.EncodeUint64(k, descID))
+	return append(k, gateway[:]...)
+}
+
+// DescLeaseSpan covers all gateways' leases on one descriptor.
+func DescLeaseSpan(descID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("lease"), descID))
+	return p, p.PrefixEnd()
+}
+
 // NamespaceSpan covers all table-name mappings.
 func NamespaceSpan() (Key, Key) {
 	p := systemKey("ns")

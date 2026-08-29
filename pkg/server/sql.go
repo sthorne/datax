@@ -28,6 +28,12 @@ func (n *Node) startSQL() error {
 			return err
 		}
 	}
+	cat := catalog.NewAccessor()
+	if n.cfg.DescLeaseTTL >= 0 {
+		if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
+			return err
+		}
+	}
 	var opts pgwire.ServerOptions
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
@@ -38,7 +44,7 @@ func (n *Node) startSQL() error {
 			}
 		}
 	}
-	n.pgServer = pgwire.Serve(lis, n.db, catalog.NewAccessor(), n.stopper, opts)
+	n.pgServer = pgwire.Serve(lis, n.db, cat, n.stopper, opts)
 	log.Infof("node %s serving SQL at %s", n.ident.NodeID, n.pgServer.Addr())
 	return nil
 }

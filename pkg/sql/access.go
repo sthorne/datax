@@ -89,6 +89,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
+		if !idx.Public() {
+			continue // write-only: maintained, but not readable yet
+		}
 		if idx.Unique && len(pinned(idx)) == len(idx.ColumnIDs) {
 			return accessPlan{kind: planUniquePoint, idx: idx, idxVals: pinned(idx)}, nil
 		}
@@ -97,6 +100,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	var bestVals []types.Datum
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
+		if !idx.Public() {
+			continue
+		}
 		if vals := pinned(idx); len(vals) > len(bestVals) {
 			best, bestVals = idx, vals
 		}

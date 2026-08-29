@@ -34,9 +34,9 @@ no GROUP BY, no mixing with plain columns), and
 `ALTER TABLE t ADD COLUMN c TYPE` (nullable-only) / `DROP COLUMN c`
 (lazy: old bytes are skipped on decode; PK/indexed columns refused;
 column IDs are never reused, so re-adding a name cannot resurrect old
-values). Caveat: with no descriptor leases, a concurrent gateway holding
-the old descriptor writes rows without the new column — indistinguishable
-from NULL, which is exactly why only nullable adds exist.
+values). Descriptor leases (below) drain schema changes across gateways:
+by the time a DDL statement returns, every live gateway plans against the
+new descriptor version.
 
 Still out of scope: joins, GROUP BY/HAVING, subqueries, DISTINCT,
 constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
@@ -50,10 +50,27 @@ Table descriptors are JSON documents stored in system keys (range 1):
 - `/system/ns/<name>` → tableID (namespace index)
 - `/system/idgen` → next descriptor ID (incremented transactionally)
 
-DDL runs inside a normal transaction. Each gateway caches descriptors and
-refreshes on miss; there is no descriptor versioning/leasing in v1
-(concurrent `CREATE TABLE` + use from other gateways is best-effort — schema
-changes beyond CREATE/DROP are out of scope).
+DDL runs inside a normal transaction. Each gateway caches descriptors;
+descriptor **versions and leases** make that cache safe across gateways:
+
+- Every descriptor carries a `Version`, bumped by each change.
+- A gateway that caches a descriptor writes a lease record at
+  `/system/lease/<descID>/<gatewayUUID>` — `{version, expiration}` — and
+  may serve from its cache only while the lease is unexpired (TTL 10s by
+  default, configurable in the server config). A background
+  loop renews leases at TTL/3 by re-reading the descriptor, which is also
+  how a gateway adopts new versions.
+- After a DDL statement's transaction commits, the issuing session
+  **drains**: it waits until every live (unexpired) lease on the descriptor
+  is at the new version or later. Expired leases cannot be used, so a
+  crashed or partitioned gateway delays the drain by at most one TTL
+  (hard cap 2×TTL). When the statement returns, no gateway is still
+  planning against the old schema.
+
+Remaining gap: a transaction that issued its `BEGIN` before the drain, on
+another gateway, keeps the descriptor version it started with until it
+commits. Statement-sized windows are closed; long-lived explicit
+transactions are not (tracked in issue #22).
 
 ## Row encoding (v2)
 
@@ -86,9 +103,27 @@ Maintenance happens inside the writing transaction — index entries ride the
 same write batch as the row, so they commit or roll back atomically, and
 uniqueness checks read through the transaction: two racing inserts of the
 same value collide on the index key's intent, so at most one commits.
-`CREATE INDEX` backfills existing rows in its own transaction (offline —
-concurrent writers from other gateways holding the old descriptor would
-miss the index; there are no descriptor leases).
+`CREATE INDEX` builds **online**, like PostgreSQL's
+`CREATE INDEX CONCURRENTLY` (and, like it, refuses to run inside an
+explicit transaction block — code 25001):
+
+1. Publish the index in the **write-only** state and drain the descriptor
+   lease: every gateway now maintains the index on writes, but the planner
+   ignores it.
+2. Backfill from a full table scan in its own transaction. Rows committed
+   before the backfill's snapshot are written by the backfill; rows after
+   are maintained by their writers (guaranteed by step 1's drain), so the
+   union is complete. The backfill transaction deliberately touches only
+   row and index data — the descriptor flip to **public** is a separate
+   small transaction, so a stream of concurrent writes cannot starve the
+   backfill's commit. Unique violations (including a NULL in a
+   unique-indexed column) abort the build and remove the write-only index
+   again.
+3. Drain once more, so every gateway plans with the public index.
+
+Left for later (issue #22): bounded/batched backfill for very large tables
+(today's backfill is one scan in one transaction) and a delete-only state
+for online index drops.
 
 ## Execution
 

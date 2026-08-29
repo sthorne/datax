@@ -40,6 +40,9 @@ type Session struct {
 
 	txn   *kvclient.Txn
 	state TxnState
+	// pendingDDL names tables changed inside the open explicit transaction;
+	// lease adoption for them is drained at COMMIT.
+	pendingDDL []string
 }
 
 // NewSession creates a session. The catalog accessor is shared per node.
@@ -89,8 +92,17 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		err := s.txn.Commit(ctx)
 		s.txn = nil
 		s.state = StateIdle
+		pending := s.pendingDDL
+		s.pendingDDL = nil
 		if err != nil {
 			return nil, ToSQLError(err)
+		}
+		// Schema changes are visible everywhere once COMMIT returns: drain
+		// lease adoption for every table this transaction altered.
+		for _, name := range pending {
+			if derr := s.cat.FinishDDL(ctx, name); derr != nil {
+				return nil, ToSQLError(derr)
+			}
 		}
 		return &Result{Tag: "COMMIT"}, nil
 
@@ -112,12 +124,26 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 // executeData runs a data statement in the session transaction (explicit)
 // or an auto-retrying implicit one.
 func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+	// CREATE INDEX is a multi-transaction state machine (publish
+	// write-only → drain → backfill+publish → drain), so — like
+	// PostgreSQL's CREATE INDEX CONCURRENTLY — it cannot run inside an
+	// explicit transaction block.
+	if ci, ok := stmt.(*parser.CreateIndex); ok {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
+		}
+		return s.execCreateIndexOnline(ctx, ci)
+	}
+
 	if s.state == StateOpen {
 		res, err := s.execStmt(ctx, s.txn, stmt, params)
 		if err != nil {
 			// Any error fails the explicit transaction (PG semantics).
 			s.state = StateFailed
 			return nil, ToSQLError(err)
+		}
+		if name := ddlTableName(stmt); name != "" {
+			s.pendingDDL = append(s.pendingDDL, name)
 		}
 		return res, nil
 	}
@@ -130,6 +156,11 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
+	if name := ddlTableName(stmt); name != "" {
+		if derr := s.cat.FinishDDL(ctx, name); derr != nil {
+			return nil, ToSQLError(derr)
+		}
+	}
 	return res, nil
 }
 
@@ -138,6 +169,7 @@ func (s *Session) rollback(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
+	s.pendingDDL = nil
 	s.state = StateIdle
 }
 

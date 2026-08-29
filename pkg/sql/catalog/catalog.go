@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
 // ColumnID identifies a column within a table (stable across renames —
@@ -35,6 +39,21 @@ type IndexDescriptor struct {
 	Name      string     `json:"name"`
 	Unique    bool       `json:"unique,omitempty"`
 	ColumnIDs []ColumnID `json:"column_ids"`
+	// State is the index's lifecycle state: "" or "public" = readable;
+	// "write-only" = maintained by writers but invisible to the planner
+	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
+	State string `json:"state,omitempty"`
+}
+
+// Index lifecycle states.
+const (
+	IndexStatePublic    = "public"
+	IndexStateWriteOnly = "write-only"
+)
+
+// Public reports whether the index may serve reads.
+func (idx *IndexDescriptor) Public() bool {
+	return idx.State == "" || idx.State == IndexStatePublic
 }
 
 // TableDescriptor describes a table. Primary rows are stored at
@@ -52,6 +71,9 @@ type TableDescriptor struct {
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
+	// Version increments on every descriptor change; gateway leases record
+	// which version they may be using (see leasing in this package).
+	Version uint64 `json:"version,omitempty"`
 }
 
 // Index returns the secondary index with the given name.
@@ -118,31 +140,59 @@ type ErrTableExists struct{ Name string }
 func (e *ErrTableExists) Error() string { return fmt.Sprintf("table %q already exists", e.Name) }
 
 // Accessor reads and writes descriptors through transactions, with a
-// per-gateway cache (invalidated on miss and on DDL; no leases in v1 —
-// concurrent DDL from other gateways is best-effort, see docs/sql.md).
+// per-gateway cache. With leasing enabled (StartLeasing; wired for real
+// gateways, optional in tests), each cached descriptor is covered by a
+// lease record at its version: cached entries expire with the lease, a
+// background loop renews them (adopting new versions), and DDL drains
+// against every gateway's lease before completing — see lease.go.
 type Accessor struct {
 	mu    sync.Mutex
-	cache map[string]*TableDescriptor
+	cache map[string]*cachedDesc
+
+	// Leasing state; zero when disabled (bare accessors behave as a plain
+	// cache that never expires, today's pre-lease semantics).
+	leasing bool
+	db      *kvclient.DB
+	clock   *hlc.Clock
+	gateway uuid.UUID
+	ttl     time.Duration
+}
+
+type cachedDesc struct {
+	desc *TableDescriptor
+	// expireAt bounds cache use to the lease's lifetime (zero = forever,
+	// leasing disabled).
+	expireAt time.Time
 }
 
 func NewAccessor() *Accessor {
-	return &Accessor{cache: make(map[string]*TableDescriptor)}
+	return &Accessor{cache: make(map[string]*cachedDesc)}
 }
 
-// Lookup resolves a table by name within txn, using the cache first.
+// Lookup resolves a table by name within txn, using the cache while its
+// lease (if any) is live.
 func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
 	a.mu.Lock()
-	if d, ok := a.cache[name]; ok {
+	if c, ok := a.cache[name]; ok && (c.expireAt.IsZero() || time.Now().Before(c.expireAt)) {
 		a.mu.Unlock()
-		return d, nil
+		return c.desc, nil
 	}
 	a.mu.Unlock()
 	d, err := lookupUncached(ctx, txn, name)
 	if err != nil {
 		return nil, err
 	}
+	entry := &cachedDesc{desc: d}
+	if a.leasing {
+		if err := a.writeLease(ctx, d); err != nil {
+			// Without a lease the cache may not be trusted beyond this
+			// statement; return the descriptor uncached.
+			return d, nil
+		}
+		entry.expireAt = time.Now().Add(a.ttl)
+	}
 	a.mu.Lock()
-	a.cache[name] = d
+	a.cache[name] = entry
 	a.mu.Unlock()
 	return d, nil
 }
@@ -195,6 +245,7 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 		return err
 	}
 	d.ID = uint64(id)
+	d.Version = 1
 	raw, err := json.Marshal(d)
 	if err != nil {
 		return err
@@ -210,8 +261,9 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 }
 
 // Update rewrites an existing table's descriptor within txn (DDL like
-// CREATE INDEX / ALTER TABLE).
+// CREATE INDEX / ALTER TABLE), bumping its version.
 func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+	d.Version++
 	raw, err := json.Marshal(d)
 	if err != nil {
 		return err
