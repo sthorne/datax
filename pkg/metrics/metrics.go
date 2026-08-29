@@ -51,4 +51,7 @@ var (
 	Rebalances = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_rebalances_total", Help: "Replicas moved by automatic load rebalancing.",
 	})
+	DecommissionMoves = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_decommission_replicas_moved_total", Help: "Replicas drained off decommissioning nodes.",
+	})
 )

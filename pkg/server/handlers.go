@@ -79,11 +79,21 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		// Adopt a Draining flag someone else wrote into our row (a
+		// decommission can be initiated from any node) before overwriting
+		// it; once adopted, this node re-asserts it on every beat.
+		if cur, err := n.db.Get(hctx, keys.NodeRegistryKey(n.ident.NodeID)); err == nil && cur != nil {
+			var prev kvpb.NodeDescriptor
+			if json.Unmarshal(cur, &prev) == nil && prev.Draining {
+				n.draining.Store(true)
+			}
+		}
 		nd := kvpb.NodeDescriptor{
 			NodeID:       n.ident.NodeID,
 			Address:      n.addr,
 			Locality:     n.cfg.Locality,
 			LivenessTime: n.clock.Now().WallTime,
+			Draining:     n.draining.Load(),
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {

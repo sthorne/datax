@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -119,6 +120,12 @@ type Node struct {
 
 	pgServer *pgwire.Server // set when PGListen/PGListener is configured
 	httpAddr string         // set when HTTPListen/HTTPListener is configured
+
+	// draining mirrors this node's registry Draining flag. The heartbeat
+	// loop adopts it from the node's own registry row (a decommission may
+	// be initiated from any node) and re-asserts it on every beat, so the
+	// flag survives both heartbeat overwrites and restarts.
+	draining atomic.Bool
 }
 
 // Start boots the node and returns once it is serving.

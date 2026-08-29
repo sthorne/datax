@@ -48,6 +48,9 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	case "transfer-lease":
 		return n.serveTransferLease(ctx, req)
 
+	case "decommission":
+		return n.serveDecommission(ctx, req)
+
 	default:
 		return cluster.AdminResponse{Error: "unknown admin op " + req.Op}
 	}

@@ -103,7 +103,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|transfer-lease|status|metadata|unsafe-recover> [flags]")
+		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -121,6 +121,9 @@ func runDebug(args []string) error {
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
 	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
+	nodeID := fs.Int64("node", 0, "decommission: node ID to drain")
+	cancelDrain := fs.Bool("cancel", false, "decommission: stop draining the node instead")
+	wait := fs.Bool("wait", false, "decommission: block until the node holds no replicas")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -144,6 +147,12 @@ func runDebug(args []string) error {
 		req.RangeID = base.RangeID(*rangeID)
 		req.ToNode = base.NodeID(*toNode)
 		req.FromNode = base.NodeID(*fromNode)
+	case "decommission":
+		if *nodeID == 0 {
+			return fmt.Errorf("decommission requires --node")
+		}
+		req.NodeID = base.NodeID(*nodeID)
+		req.Cancel = *cancelDrain
 	case "ranges", "nodes":
 	default:
 		return fmt.Errorf("unknown debug subcommand %q", sub)
@@ -159,6 +168,21 @@ func runDebug(args []string) error {
 	if resp.Error != "" {
 		return fmt.Errorf("%s", resp.Error)
 	}
+	if sub == "decommission" && *wait && !*cancelDrain {
+		for resp.RemainingReplicas > 0 {
+			fmt.Printf("node n%d draining: %d replicas remaining\n", *nodeID, resp.RemainingReplicas)
+			time.Sleep(2 * time.Second)
+			wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := trans.Call(wctx, *addr, "admin", req, &resp)
+			wcancel()
+			if err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return fmt.Errorf("%s", resp.Error)
+			}
+		}
+	}
 	switch sub {
 	case "split":
 		fmt.Printf("split done:\n  left:  %s\n  right: %s\n", resp.Left, resp.Right)
@@ -169,12 +193,25 @@ func runDebug(args []string) error {
 	case "nodes":
 		for _, nd := range resp.Nodes {
 			age := time.Duration(time.Now().UnixNano()-nd.LivenessTime) * time.Nanosecond
-			fmt.Printf("%s  %s  locality=%s  last-heartbeat=%s ago\n", nd.NodeID, nd.Address, nd.Locality, age.Round(time.Second))
+			state := ""
+			if nd.Draining {
+				state = "  DRAINING"
+			}
+			fmt.Printf("%s  %s  locality=%s  last-heartbeat=%s ago%s\n", nd.NodeID, nd.Address, nd.Locality, age.Round(time.Second), state)
 		}
 	case "rebalance":
 		fmt.Println("rebalance done")
 	case "transfer-lease":
 		fmt.Println("lease transferred")
+	case "decommission":
+		switch {
+		case *cancelDrain:
+			fmt.Printf("node n%d no longer draining\n", *nodeID)
+		case resp.RemainingReplicas == 0:
+			fmt.Printf("node n%d drained; safe to stop\n", *nodeID)
+		default:
+			fmt.Printf("node n%d draining: %d replicas remaining (re-run or use --wait to follow)\n", *nodeID, resp.RemainingReplicas)
+		}
 	}
 	return nil
 }

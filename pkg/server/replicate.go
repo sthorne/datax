@@ -61,6 +61,7 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 		wctx, cancel := context.WithTimeout(ctx, interval*4)
 		n.upreplicateOnce(wctx)
 		n.repairDeadOnce(wctx)
+		n.drainOnce(wctx)
 		n.rebalanceOnce(wctx)
 		cancel()
 	}
@@ -101,6 +102,9 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 		}
 		var candidates []placement.Candidate
 		for _, nd := range liveNodes {
+			if nd.Draining {
+				continue // never place new replicas on a draining node
+			}
 			if _, holds := desc.GetReplica(nd.NodeID); !holds {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
 			}
@@ -179,6 +183,9 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 		}
 		var candidates []placement.Candidate
 		for _, nd := range live {
+			if nd.Draining {
+				continue // never place new replicas on a draining node
+			}
 			if _, holds := desc.GetReplica(nd.NodeID); !holds {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
 			}
@@ -229,6 +236,10 @@ func (n *Node) rebalanceOnce(ctx context.Context) {
 	live := map[base.NodeID]kvpb.NodeDescriptor{}
 	for _, nd := range n.registry.All() {
 		switch {
+		case nd.Draining:
+			// Draining nodes are drainOnce's concern: not a destination, and
+			// ranges touching them are skipped here (allReplicasLive fails).
+			continue
 		case nd.NodeID == n.ident.NodeID:
 			live[nd.NodeID] = nd
 		case now-nd.LivenessTime > int64(n.deadNodeThreshold()):

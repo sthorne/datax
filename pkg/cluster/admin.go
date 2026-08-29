@@ -7,7 +7,8 @@ import (
 
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
 type AdminRequest struct {
-	// Op: "split", "ranges", "nodes", "rebalance", "transfer-lease".
+	// Op: "split", "ranges", "nodes", "rebalance", "transfer-lease",
+	// "decommission".
 	Op string `json:"op"`
 	// Key for split (raw key bytes).
 	Key []byte `json:"key,omitempty"`
@@ -15,6 +16,9 @@ type AdminRequest struct {
 	RangeID  base.RangeID `json:"range_id,omitempty"`
 	ToNode   base.NodeID  `json:"to_node,omitempty"`
 	FromNode base.NodeID  `json:"from_node,omitempty"`
+	// NodeID and Cancel for decommission.
+	NodeID base.NodeID `json:"node_id,omitempty"`
+	Cancel bool        `json:"cancel,omitempty"`
 }
 
 // AdminResponse is the JSON reply.
@@ -24,4 +28,7 @@ type AdminResponse struct {
 	Nodes  []kvpb.NodeDescriptor  `json:"nodes,omitempty"`
 	Left   *kvpb.RangeDescriptor  `json:"left,omitempty"`
 	Right  *kvpb.RangeDescriptor  `json:"right,omitempty"`
+	// Decommission progress.
+	Draining          bool `json:"draining,omitempty"`
+	RemainingReplicas int  `json:"remaining_replicas,omitempty"`
 }

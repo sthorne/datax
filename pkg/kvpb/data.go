@@ -61,6 +61,10 @@ type NodeDescriptor struct {
 	Locality base.Locality `json:"locality"`
 	// LivenessTime is the HLC wall time of the node's last heartbeat.
 	LivenessTime int64 `json:"liveness_time"`
+	// Draining marks a node being decommissioned: the allocator moves its
+	// replicas away and never places new ones on it. The node itself
+	// adopts and re-asserts the flag through its heartbeats.
+	Draining bool `json:"draining,omitempty"`
 }
 
 // Transaction is the full transaction state, as tracked by the coordinator

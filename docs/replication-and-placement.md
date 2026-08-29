@@ -94,8 +94,28 @@ Two guards make it idle safely instead of flailing:
 
 Repairing a dead voter away is also what un-pins Raft log truncation.
 
-**Known gaps**: no node decommission UX (a stated limitation, not an
-accident).
+## Node decommission
+
+`datax debug decommission --node N [--wait]` retires a node gracefully:
+instead of killing it and waiting for dead-node repair (which loses
+redundancy for the repair window), the node is marked **draining** and the
+allocator proactively moves its replicas away — one per tick, via the same
+add → transfer-lease-if-leading → remove sequence as rebalancing — while
+the node is still alive to serve and vote. Draining nodes never receive new
+replicas (from upreplication, repair, or rebalancing), still count as live
+voters for quorum math, and a drain that would leave a range without a
+diversity-valid target stalls safely (the replica stays; the range never
+drops below its replication factor) until a node joins. Once the count
+reaches zero — `--wait` follows it — the process can be stopped with zero
+repair churn. `--cancel` un-drains.
+
+The draining flag lives in the node's own registry row. Since a node
+overwrites its whole row on every heartbeat, the decommission op is
+forwarded to the target node itself, which holds the flag in-process and
+re-asserts it on every beat (surviving restarts by re-adopting it from its
+row); only an unreachable node's row is written directly, and it adopts the
+flag if it ever comes back. A draining node that dies anyway is finished by
+ordinary dead-node repair.
 
 ## Quorum-loss recovery (unsafe)
 
