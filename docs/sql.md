@@ -11,7 +11,7 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
 SELECT * | col, ... | aggregates  FROM t [AS OF SYSTEM TIME 't'] [WHERE conjunction]
-    [ORDER BY col [ASC|DESC], ...] [LIMIT n]
+    [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]

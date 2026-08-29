@@ -391,6 +391,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return nil, err
 	}
 	if hasAggregates(t.Exprs) {
+		if t.ForUpdate {
+			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with aggregate functions")
+		}
 		return s.execAggSelect(ctx, txn, desc, t, params)
 	}
 	proj, perr := resolveProjection(desc, t.Exprs)
@@ -415,6 +418,17 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, fetchLimit)
 	if err != nil {
 		return nil, err
+	}
+	if t.ForUpdate {
+		// Lock each selected row: the locking read re-verifies the row at
+		// the transaction's read timestamp server-side (any newer committed
+		// version surfaces as a retryable conflict), so the fetch-then-lock
+		// gap cannot admit a stale read.
+		for _, fr := range rows {
+			if _, lerr := txn.GetForUpdate(ctx, fr.key); lerr != nil {
+				return nil, lerr
+			}
+		}
 	}
 	if needSort {
 		if err := sortRows(desc, rows, t.OrderBy); err != nil {

@@ -190,7 +190,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	out := &rpcpb.RequestUnion{}
 	switch r := u.GetInner().(type) {
 	case *GetRequest:
-		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate}}
 	case *PutRequest:
 		out.Value = &rpcpb.RequestUnion_Put{Put: &rpcpb.PutRequest{Header: reqHeaderToProto(r.RequestHeader), Value: r.Value}}
 	case *DeleteRequest:
@@ -198,7 +198,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *IncrementRequest:
 		out.Value = &rpcpb.RequestUnion_Increment{Increment: &rpcpb.IncrementRequest{Header: reqHeaderToProto(r.RequestHeader), By: r.By}}
 	case *ScanRequest:
-		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows}}
+		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate}}
 	case *EndTxnRequest:
 		pb := &rpcpb.EndTxnRequest{Header: reqHeaderToProto(r.RequestHeader), Commit: r.Commit}
 		for _, k := range r.IntentKeys {
@@ -261,7 +261,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	var u RequestUnion
 	switch v := p.Value.(type) {
 	case *rpcpb.RequestUnion_Get:
-		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header)}
+		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate}
 	case *rpcpb.RequestUnion_Put:
 		u.Put = &PutRequest{RequestHeader: reqHeaderFromProto(v.Put.Header), Value: v.Put.Value}
 	case *rpcpb.RequestUnion_Delete:
@@ -269,7 +269,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Increment:
 		u.Increment = &IncrementRequest{RequestHeader: reqHeaderFromProto(v.Increment.Header), By: v.Increment.By}
 	case *rpcpb.RequestUnion_Scan:
-		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows}
+		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate}
 	case *rpcpb.RequestUnion_EndTxn:
 		r := &EndTxnRequest{RequestHeader: reqHeaderFromProto(v.EndTxn.Header), Commit: v.EndTxn.Commit}
 		for _, k := range v.EndTxn.IntentKeys {

@@ -252,8 +252,17 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		if desc.EndKey.Less(end) {
 			end = desc.EndKey
 		}
-		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining}
-		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Scan: sub}}, desc)
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining, ForUpdate: req.ForUpdate}
+		// The transaction record is created on the anchor key's range only:
+		// scope the flag to the one segment covering it (locking scans may
+		// be a transaction's first, anchoring operation).
+		gh := header
+		if gh.CreateTxnRecord && gh.Txn != nil {
+			a := keys.Key(gh.Txn.Key)
+			gh.CreateTxnRecord = cur.Compare(a) <= 0 && a.Less(end)
+		}
+		br, regroup, kerr := db.sendPartial(ctx, &gh, []kvpb.RequestUnion{{Scan: sub}}, desc)
+		header.Timestamp = gh.Timestamp
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("scan routing did not converge: %v", kerr)

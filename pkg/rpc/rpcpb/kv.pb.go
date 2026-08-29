@@ -502,6 +502,7 @@ func (x *RequestHeader) GetEndKey() []byte {
 type GetRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	ForUpdate     bool                   `protobuf:"varint,2,opt,name=for_update,json=forUpdate,proto3" json:"for_update,omitempty"` // locking read (see pkg/kvpb)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -541,6 +542,13 @@ func (x *GetRequest) GetHeader() *RequestHeader {
 		return x.Header
 	}
 	return nil
+}
+
+func (x *GetRequest) GetForUpdate() bool {
+	if x != nil {
+		return x.ForUpdate
+	}
+	return false
 }
 
 type PutRequest struct {
@@ -695,6 +703,7 @@ type ScanRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
 	MaxRows       int64                  `protobuf:"varint,2,opt,name=max_rows,json=maxRows,proto3" json:"max_rows,omitempty"`
+	ForUpdate     bool                   `protobuf:"varint,3,opt,name=for_update,json=forUpdate,proto3" json:"for_update,omitempty"` // locking scan (see pkg/kvpb)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -741,6 +750,13 @@ func (x *ScanRequest) GetMaxRows() int64 {
 		return x.MaxRows
 	}
 	return 0
+}
+
+func (x *ScanRequest) GetForUpdate() bool {
+	if x != nil {
+		return x.ForUpdate
+	}
+	return false
 }
 
 type EndTxnRequest struct {
@@ -4065,10 +4081,12 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x03txn\x18\x02 \x01(\v2\x11.datax.v1.TxnMetaR\x03txn\":\n" +
 	"\rRequestHeader\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x17\n" +
-	"\aend_key\x18\x02 \x01(\fR\x06endKey\"=\n" +
+	"\aend_key\x18\x02 \x01(\fR\x06endKey\"\\\n" +
 	"\n" +
 	"GetRequest\x12/\n" +
-	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"S\n" +
+	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1d\n" +
+	"\n" +
+	"for_update\x18\x02 \x01(\bR\tforUpdate\"S\n" +
 	"\n" +
 	"PutRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x14\n" +
@@ -4077,10 +4095,12 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"S\n" +
 	"\x10IncrementRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x0e\n" +
-	"\x02by\x18\x02 \x01(\x03R\x02by\"Y\n" +
+	"\x02by\x18\x02 \x01(\x03R\x02by\"x\n" +
 	"\vScanRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x19\n" +
-	"\bmax_rows\x18\x02 \x01(\x03R\amaxRows\"y\n" +
+	"\bmax_rows\x18\x02 \x01(\x03R\amaxRows\x12\x1d\n" +
+	"\n" +
+	"for_update\x18\x03 \x01(\bR\tforUpdate\"y\n" +
 	"\rEndTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x16\n" +
 	"\x06commit\x18\x02 \x01(\bR\x06commit\x12\x1f\n" +

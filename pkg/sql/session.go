@@ -172,6 +172,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "AS OF SYSTEM TIME cannot run inside a transaction block")
 		}
+		if sel.ForUpdate {
+			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with AS OF SYSTEM TIME")
+		}
 		ts, err := resolveAsOf(sel.AsOf, s.db.Clock().Now())
 		if err != nil {
 			return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)

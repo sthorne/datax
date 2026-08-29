@@ -23,6 +23,7 @@ func runBench(args []string) error {
 	duration := fs.Duration("duration", 10*time.Second, "how long to run")
 	readPct := fs.Int("read-pct", 95, "kv workload: percentage of reads")
 	preload := fs.Int("preload", 1000, "rows (kv) or accounts (bank) to preload")
+	forUpdate := fs.Bool("for-update", false, "bank workload: read balances with SELECT ... FOR UPDATE")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: datax bench <kv|bank> [flags]\n\n")
 		fs.PrintDefaults()
@@ -126,7 +127,7 @@ func runBench(args []string) error {
 						_, err = conn.Exec(ctx, fmt.Sprintf("UPDATE bench_kv SET v = 'u%d' WHERE k = %d", rng.Int63(), rng.Intn(*preload)))
 					}
 				case "bank":
-					err = bankTransfer(ctx, conn, rng, *preload)
+					err = bankTransfer(ctx, conn, rng, *preload, *forUpdate)
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
@@ -161,10 +162,18 @@ func runBench(args []string) error {
 
 // bankTransfer moves a random amount between two random accounts in one
 // serializable transaction (the classic consistency workload).
-func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, accounts int) error {
+func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, accounts int, forUpdate bool) error {
 	a, b := rng.Intn(accounts), rng.Intn(accounts)
 	if a == b {
 		b = (b + 1) % accounts
+	}
+	// Locking the two rows in a fixed order avoids trivial 2-row deadlocks.
+	if forUpdate && b < a {
+		a, b = b, a
+	}
+	suffix := ""
+	if forUpdate {
+		suffix = " FOR UPDATE"
 	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
@@ -172,10 +181,10 @@ func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, accounts 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var balA, balB int64
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d", a)).Scan(&balA); err != nil {
+	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d%s", a, suffix)).Scan(&balA); err != nil {
 		return err
 	}
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d", b)).Scan(&balB); err != nil {
+	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d%s", b, suffix)).Scan(&balB); err != nil {
 		return err
 	}
 	amount := int64(rng.Intn(10) + 1)

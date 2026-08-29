@@ -16,9 +16,16 @@ type RequestHeader struct {
 	EndKey keys.Key `json:"end_key,omitempty"` // only for ranged requests
 }
 
-// GetRequest reads a key.
+// GetRequest reads a key. With ForUpdate set (transactional batches only)
+// it is a LOCKING read: evaluated on the write path, it re-reads the key at
+// the transaction's read timestamp and lays a write intent pinning the
+// observed state — the current value for an existing row, a tombstone for
+// an absent one — so no other transaction can change the key until this
+// one finishes. A committed version above the read timestamp fails the
+// lock with WriteTooOld (the snapshot is stale), exactly like a write.
 type GetRequest struct {
 	RequestHeader
+	ForUpdate bool `json:"for_update,omitempty"`
 }
 
 // PutRequest writes a value.
@@ -40,10 +47,14 @@ type IncrementRequest struct {
 	By int64 `json:"by"`
 }
 
-// ScanRequest returns keys in [Key, EndKey).
+// ScanRequest returns keys in [Key, EndKey). With ForUpdate set
+// (transactional batches only) it is a LOCKING scan: each returned row
+// gets a write intent pinning its observed value (see GetRequest); absent
+// keys in the span are not locked.
 type ScanRequest struct {
 	RequestHeader
-	MaxRows int64 `json:"max_rows,omitempty"`
+	MaxRows   int64 `json:"max_rows,omitempty"`
+	ForUpdate bool  `json:"for_update,omitempty"`
 }
 
 // EndTxnRequest commits or aborts the transaction: the atomic flip of the
@@ -285,11 +296,11 @@ func (*AdminMergeRequest) Method() string          { return "AdminMerge" }
 func (*SubsumeRequest) Method() string             { return "Subsume" }
 func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
 
-func (*GetRequest) IsReadOnly() bool                 { return true }
+func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
 func (*DeleteRequest) IsReadOnly() bool              { return false }
 func (*IncrementRequest) IsReadOnly() bool           { return false }
-func (*ScanRequest) IsReadOnly() bool                { return true }
+func (r *ScanRequest) IsReadOnly() bool              { return !r.ForUpdate }
 func (*EndTxnRequest) IsReadOnly() bool              { return false }
 func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (*PushTxnRequest) IsReadOnly() bool             { return false }
@@ -435,13 +446,22 @@ func (b *BatchRequest) IsReadOnly() bool {
 }
 
 // HasMVCCWrites reports whether the batch writes MVCC versions (Put, Delete,
-// Increment) — the writes the timestamp cache must gate. Transaction-record
-// operations write no versions and are exempt.
+// Increment, and locking reads, whose intents commit as versions) — the
+// writes the timestamp cache must gate. Transaction-record operations write
+// no versions and are exempt.
 func (b *BatchRequest) HasMVCCWrites() bool {
 	for _, u := range b.Requests {
-		switch u.GetInner().(type) {
+		switch r := u.GetInner().(type) {
 		case *PutRequest, *DeleteRequest, *IncrementRequest:
 			return true
+		case *GetRequest:
+			if r.ForUpdate {
+				return true
+			}
+		case *ScanRequest:
+			if r.ForUpdate {
+				return true
+			}
 		}
 	}
 	return false

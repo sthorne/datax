@@ -519,6 +519,17 @@ func (p *parser) parseSelect() (Statement, error) {
 		}
 		sel.Limit = v
 	}
+	// FOR UPDATE (FOR is not a reserved word — it lexes as an identifier).
+	if t := p.peek(); t.kind == tkIdent && t.text == "for" {
+		p.i++
+		if err := p.expectKeyword("UPDATE"); err != nil {
+			return nil, err
+		}
+		if sel.Table == "" {
+			return nil, p.errf("FOR UPDATE requires a FROM clause")
+		}
+		sel.ForUpdate = true
+	}
 	return sel, nil
 }
 

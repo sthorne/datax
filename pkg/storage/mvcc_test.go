@@ -504,3 +504,89 @@ func TestMVCCScanBelowNewerIntents(t *testing.T) {
 		t.Fatalf("wrong intents reported: %+v", wie.Intents)
 	}
 }
+
+// TestMVCCLock: a locking read pins the observed state with an intent —
+// blocking other writers — and commits as a same-value version.
+func TestMVCCLock(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "k", ts(10, 0), "v", nil)
+
+	locker := newTxn(ts(50, 0))
+	b := eng.NewBatch()
+	if err := MVCCLock(b, keys.Key("k"), ts(50, 0), []byte("v"), locker); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	if err := b.Commit(false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another writer conflicts with the lock like any intent.
+	other := newTxn(ts(60, 0))
+	b = eng.NewBatch()
+	var wie *WriteIntentError
+	if err := MVCCPut(b, keys.Key("k"), other.WriteTimestamp, []byte("x"), other); !errors.As(err, &wie) {
+		t.Fatalf("write against lock: expected WriteIntentError, got %v", err)
+	}
+	_ = b.Close()
+
+	// Commit (possibly forwarded): the pinned value persists; readers on
+	// both sides of the commit timestamp see "v".
+	resolve(t, eng, "k", locker, enginepb.COMMITTED, ts(55, 0))
+	if v := mustGet(t, eng, "k", ts(40, 0), MVCCGetOptions{}); string(v) != "v" {
+		t.Fatalf("below commit: got %q", v)
+	}
+	if v := mustGet(t, eng, "k", ts(60, 0), MVCCGetOptions{}); string(v) != "v" {
+		t.Fatalf("above commit: got %q", v)
+	}
+}
+
+// TestMVCCLockStaleSnapshot: a version above the locker's read timestamp
+// fails the lock (the snapshot is stale); one exactly AT the read
+// timestamp was observed and is lockable.
+func TestMVCCLockStaleSnapshot(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "k", ts(50, 0), "newer", nil)
+
+	stale := newTxn(ts(60, 0))
+	b := eng.NewBatch()
+	var wto *WriteTooOldError
+	if err := MVCCLock(b, keys.Key("k"), ts(40, 0), nil, stale); !errors.As(err, &wto) {
+		t.Fatalf("stale lock: expected WriteTooOldError, got %v", err)
+	}
+	_ = b.Close()
+
+	exact := newTxn(ts(60, 0))
+	b = eng.NewBatch()
+	if err := MVCCLock(b, keys.Key("k"), ts(50, 0), []byte("newer"), exact); err != nil {
+		t.Fatalf("lock at observed version's timestamp: %v", err)
+	}
+	_ = b.Close()
+}
+
+// TestMVCCLockAbsentKey: an absent key is pinned with a tombstone intent
+// — a later INSERT by someone else conflicts — and aborting removes every
+// trace, while committing leaves only an invisible tombstone.
+func TestMVCCLockAbsentKey(t *testing.T) {
+	eng := openTestEngine(t)
+	locker := newTxn(ts(10, 0))
+	b := eng.NewBatch()
+	if err := MVCCLock(b, keys.Key("gap"), ts(10, 0), nil, locker); err != nil {
+		t.Fatalf("lock absent: %v", err)
+	}
+	if err := b.Commit(false); err != nil {
+		t.Fatal(err)
+	}
+
+	inserter := newTxn(ts(20, 0))
+	b = eng.NewBatch()
+	var wie *WriteIntentError
+	if err := MVCCPut(b, keys.Key("gap"), inserter.WriteTimestamp, []byte("x"), inserter); !errors.As(err, &wie) {
+		t.Fatalf("insert against gap lock: expected WriteIntentError, got %v", err)
+	}
+	_ = b.Close()
+
+	resolve(t, eng, "gap", locker, enginepb.COMMITTED, ts(15, 0))
+	if v := mustGet(t, eng, "gap", ts(30, 0), MVCCGetOptions{}); v != nil {
+		t.Fatalf("committed gap lock produced a value: %q", v)
+	}
+}

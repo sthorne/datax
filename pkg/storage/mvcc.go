@@ -236,6 +236,24 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
 }
 
+// MVCCLock lays a LOCKING intent on key for txn, pinning the state the
+// transaction observed at readTS: value is the visible value at readTS
+// (nil = absent or deleted, pinned as a tombstone). The intent serializes
+// all other writers behind the transaction exactly like a real write, and
+// commits as a version carrying the same bytes — invisible to readers'
+// results. Fails with WriteTooOldError if any committed version exists
+// ABOVE readTS (the caller's snapshot is stale; a version exactly at
+// readTS was observed and is lockable), and with WriteIntentError on a
+// foreign intent.
+func MVCCLock(b *Batch, key keys.Key, readTS hlc.Timestamp, value []byte, txn *enginepb.TxnMeta) error {
+	if txn == nil {
+		return fmt.Errorf("MVCCLock requires a transaction")
+	}
+	// readTS.Next() makes mvccWrite's conflict check reject versions
+	// strictly above readTS while admitting one exactly at it.
+	return mvccWrite(b, key, readTS.Next(), value, value == nil, txn)
+}
+
 // KeyValue is one row of a scan result.
 type KeyValue struct {
 	Key   keys.Key

@@ -877,14 +877,23 @@ func isGCBatch(ba *kvpb.BatchRequest) bool {
 }
 
 // mvccWriteSpans returns the spans of the batch's MVCC-writing requests
-// (Put/Delete/Increment) — the ones the timestamp cache gates. A mixed
-// batch's reads are deliberately excluded: only what the batch WRITES can
-// violate a served read.
+// (Put/Delete/Increment, plus locking reads whose intents commit as
+// versions) — the ones the timestamp cache gates. A mixed batch's plain
+// reads are deliberately excluded: only what the batch WRITES can violate
+// a served read.
 func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 	spans := make([]latchSpan, 0, len(ba.Requests))
 	for _, u := range ba.Requests {
-		switch u.GetInner().(type) {
+		switch r := u.GetInner().(type) {
 		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest:
+		case *kvpb.GetRequest:
+			if !r.ForUpdate {
+				continue
+			}
+		case *kvpb.ScanRequest:
+			if !r.ForUpdate {
+				continue
+			}
 		default:
 			continue
 		}

@@ -144,6 +144,24 @@ coordinator's refresh round trip always loses the race against the next
 read's bump. Non-transactional writes, which have no reads to protect, are
 still bounced with a retry timestamp and simply resent above it.
 
+### Locking reads (SELECT FOR UPDATE)
+
+The symmetric read-modify-write pattern — two transactions read the same
+rows, then each invalidates the other's reads on write — is a doomed race
+under plain reads: refresh cannot help (the read spans really were
+overwritten), so both restart, repeatedly. `SELECT ... FOR UPDATE` breaks
+it by serializing upfront: the row fetch is followed by a **locking read**
+per selected row, a Get evaluated on the WRITE path that atomically
+re-verifies the row at the transaction's read timestamp (any newer
+committed version surfaces as a retryable conflict — the fetch-then-lock
+gap cannot admit a stale read) and lays a write intent pinning the
+observed state — the current value for an existing row, a tombstone for an
+absent one. The second transaction's lock then queues behind the intent
+via the ordinary push machinery instead of racing to a restart. The
+intent commits as a version carrying the same bytes, invisible to
+readers' results. On the bank workload (100 hot accounts, 8 workers) this
+raises committed throughput ~4× and roughly halves 40001s.
+
 ## Conflicts and pushes
 
 Encountering someone else's intent triggers `PushTxn(pusher, pushee)` at the

@@ -285,11 +285,33 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
+			if req.ForUpdate {
+				// Locking read: pin the observed state with an intent. The
+				// lock's stale-snapshot check (any version above readTS →
+				// WriteTooOld) subsumes uncertainty, and a foreign intent —
+				// even one the read looked beneath — conflicts here.
+				if txnMeta == nil {
+					return nil, kvpb.NewErrorf("locking read outside a transaction")
+				}
+				if err := storage.MVCCLock(b, req.Key, readTimestamp(ba), val, txnMeta); err != nil {
+					return nil, kvpb.NewError(err)
+				}
+			}
 			ru.Get = &kvpb.GetResponse{Value: val}
 		case *kvpb.ScanRequest:
 			res, err := storage.MVCCScan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
 				return nil, kvpb.NewError(err)
+			}
+			if req.ForUpdate {
+				if txnMeta == nil {
+					return nil, kvpb.NewErrorf("locking scan outside a transaction")
+				}
+				for _, kv := range res.KVs {
+					if err := storage.MVCCLock(b, kv.Key, readTimestamp(ba), kv.Value, txnMeta); err != nil {
+						return nil, kvpb.NewError(err)
+					}
+				}
 			}
 			ru.Scan = scanResponse(res)
 		case *kvpb.EndTxnRequest:

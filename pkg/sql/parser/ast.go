@@ -92,6 +92,9 @@ type Select struct {
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and
 	// may be served by follower replicas.
 	AsOf string
+	// ForUpdate locks the selected rows (write intents) for the enclosing
+	// transaction, serializing read-modify-write against other writers.
+	ForUpdate bool
 }
 
 type Update struct {

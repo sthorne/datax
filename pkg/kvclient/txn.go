@@ -146,6 +146,55 @@ func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 	return resp.Rows, nil
 }
 
+// GetForUpdate reads key at the transaction's read timestamp AND locks it:
+// the server atomically lays a write intent pinning the observed state
+// (value or absence), so no other transaction can change the key until
+// this one finishes. Serializes read-modify-write upfront — the SELECT FOR
+// UPDATE primitive.
+func (t *Txn) GetForUpdate(ctx context.Context, key keys.Key) ([]byte, error) {
+	if t.historical {
+		return nil, fmt.Errorf("cannot lock in a read-only historical transaction")
+	}
+	ba, k := t.prepareWrite(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: key.Clone()}, ForUpdate: true})
+	br, err := t.send(ctx, ba, true)
+	if err != nil {
+		return nil, err
+	}
+	t.recordRead(key, nil)
+	// The lock is an intent on the key (absent rows are pinned with a
+	// tombstone intent), so it must be resolved at commit/abort.
+	t.recordWrite(k)
+	return br.Responses[0].Get.Value, nil
+}
+
+// ScanForUpdate reads [start, end) at the transaction's read timestamp and
+// locks every returned row (absent keys in the span are not locked; the
+// recorded read span still protects the gap via refresh).
+func (t *Txn) ScanForUpdate(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.KeyValue, error) {
+	if t.historical {
+		return nil, fmt.Errorf("cannot lock in a read-only historical transaction")
+	}
+	ba, k := t.prepareWrite(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start.Clone(), EndKey: end.Clone()}, ForUpdate: true, MaxRows: max})
+	br, err := t.send(ctx, ba, true)
+	if err != nil {
+		return nil, err
+	}
+	resp := br.Responses[0].Scan
+	observedEnd := end
+	if len(resp.Resume) > 0 {
+		observedEnd = resp.Resume
+	}
+	t.recordRead(start, observedEnd)
+	// Anchor bookkeeping: the scan's start key was the prepareWrite anchor
+	// candidate; record it (resolution of a key with no intent is a no-op)
+	// so the record is heartbeat-kept even when the scan locked nothing.
+	t.recordWrite(k)
+	for _, kv := range resp.Rows {
+		t.recordWrite(kv.Key)
+	}
+	return resp.Rows, nil
+}
+
 // Put writes key = value as a write intent.
 func (t *Txn) Put(ctx context.Context, key keys.Key, value []byte) error {
 	return t.write(ctx, &kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: key.Clone()}, Value: value})
