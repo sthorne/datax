@@ -342,6 +342,12 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				return nil, kvpb.NewError(err)
 			}
 			ru.RollbackIntent = &kvpb.RollbackIntentResponse{}
+		case *kvpb.RecoverTxnRequest:
+			resp, rerr := r.evalRecoverTxn(b, req)
+			if rerr != nil {
+				return nil, rerr
+			}
+			ru.RecoverTxn = resp
 		case *kvpb.GCRequest:
 			// Delete exactly the versions the leader enumerated (all
 			// superseded below the threshold, hence immutable) and the

@@ -108,11 +108,16 @@ func (r *Replica) evalEndTxn(b *storage.Batch, txn *kvpb.Transaction, req *kvpb.
 			return nil, e
 		case enginepb.COMMITTED:
 			if req.Commit && rec.Epoch == txn.Epoch {
-				// Idempotent commit retry.
+				// Idempotent commit retry (or the explicit finalize of a
+				// parallel commit that status recovery already finalized).
 				return &kvpb.EndTxnResponse{CommitTimestamp: rec.WriteTimestamp}, nil
 			}
 			return nil, kvpb.NewErrorf("transaction %s already committed", txn.ID)
 		}
+		// PENDING and STAGING both accept the flip: a STAGING record is
+		// re-staged (the coordinator retried at a higher timestamp),
+		// finalized to COMMITTED (in-flight writes proven applied), or
+		// aborted (the parallel commit failed).
 		if rec.Epoch > txn.Epoch {
 			return nil, kvpb.NewErrorf("transaction %s: record at newer epoch %d than request %d", txn.ID, rec.Epoch, txn.Epoch)
 		}
@@ -130,12 +135,23 @@ func (r *Replica) evalEndTxn(b *storage.Batch, txn *kvpb.Transaction, req *kvpb.
 	}
 	final := txn.Clone()
 	if req.Commit {
-		final.Status = enginepb.COMMITTED
+		if len(req.InFlight) > 0 {
+			// Parallel commit: the record STAGES with the writes pipelined
+			// alongside it. The transaction is implicitly committed once
+			// all of them are present at or below the staged timestamp;
+			// recovery (or the coordinator's explicit finalize) settles it.
+			final.Status = enginepb.STAGING
+			final.InFlightKeys = req.InFlight
+		} else {
+			final.Status = enginepb.COMMITTED
+			final.InFlightKeys = nil
+		}
 		// The write set travels on the record so GC can resolve any intents
 		// a crashed coordinator left behind before reclaiming the record.
 		final.IntentKeys = req.IntentKeys
 	} else {
 		final.Status = enginepb.ABORTED
+		final.InFlightKeys = nil
 	}
 	if err := putTxnRecord(b, key, final); err != nil {
 		return nil, kvpb.NewError(err)
@@ -203,6 +219,17 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 		return &kvpb.PushTxnResponse{Status: enginepb.COMMITTED, CommitTS: rec.WriteTimestamp}, nil
 	case enginepb.ABORTED:
 		return &kvpb.PushTxnResponse{Status: enginepb.ABORTED}, nil
+	case enginepb.STAGING:
+		// A parallel commit is in flight: past the point where pushes,
+		// priority aborts, or expiry may decide its fate — the pusher must
+		// run status recovery against the staged write set (even for an
+		// expired record: an implicitly committed transaction must never
+		// be aborted).
+		return &kvpb.PushTxnResponse{
+			Status:       enginepb.STAGING,
+			CommitTS:     rec.WriteTimestamp,
+			InFlightKeys: rec.InFlightKeys,
+		}, nil
 	}
 
 	if expired(req.Now, rec.LastHeartbeat) {
@@ -234,6 +261,36 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 		return &kvpb.PushTxnResponse{Status: enginepb.ABORTED}, nil
 	}
 	return &kvpb.PushTxnResponse{Status: enginepb.PENDING}, nil
+}
+
+// evalRecoverTxn finalizes a STAGING record after status recovery: the
+// recoverer verified every staged in-flight write (present at or below
+// the staged timestamp -> commit; any missing AND prevented from ever
+// landing -> abort). Idempotent: a record no longer STAGING is reported
+// as is; a missing record is reported ABORTED (already recovered and
+// GC'd, or never staged — either way not committed).
+func (r *Replica) evalRecoverTxn(b *storage.Batch, req *kvpb.RecoverTxnRequest) (*kvpb.RecoverTxnResponse, *kvpb.Error) {
+	key := keys.TransactionKey(req.Key, req.TxnID)
+	rec, err := loadTxnRecord(b, key)
+	if err != nil {
+		return nil, kvpb.NewError(err)
+	}
+	if rec == nil {
+		return &kvpb.RecoverTxnResponse{Status: enginepb.ABORTED}, nil
+	}
+	if rec.Status != enginepb.STAGING {
+		return &kvpb.RecoverTxnResponse{Status: rec.Status}, nil
+	}
+	if req.Commit {
+		rec.Status = enginepb.COMMITTED
+	} else {
+		rec.Status = enginepb.ABORTED
+	}
+	rec.InFlightKeys = nil
+	if err := putTxnRecord(b, key, rec); err != nil {
+		return nil, kvpb.NewError(err)
+	}
+	return &kvpb.RecoverTxnResponse{Status: rec.Status}, nil
 }
 
 func expired(now, last hlc.Timestamp) bool {

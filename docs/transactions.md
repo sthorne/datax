@@ -181,6 +181,37 @@ transaction whose coordinator was already aborted (a serialization
 failure) cannot be rescued by savepoint rollback — the 40001 stands, as
 in CockroachDB.
 
+### Parallel commits
+
+Commit latency was two sequential consensus rounds: lay the final
+intents, then flip the record. Pipelined transactions (the auto-retrying
+implicit path uses this; explicit BEGIN blocks commit classically) defer
+each statement's write batch — any operation needing read-your-writes
+flushes it transparently — and Commit then sends the deferred batch and
+an EndTxn IN PARALLEL. The EndTxn carries the batch's keys as an
+**in-flight write set** and lands the record in a third state, `STAGING`:
+the transaction is **implicitly committed** the moment every in-flight
+write has applied at or below the staged timestamp. The coordinator
+returns to the client after that one round and finalizes (STAGING →
+COMMITTED, then intent resolution) asynchronously. If anything forwarded
+the writes above the staged timestamp, the commit settles classically —
+refresh, then a finalizing EndTxn — and on failure the record is
+explicitly aborted so recovery agrees with the reported error.
+
+A pusher that finds a `STAGING` record runs **status recovery** instead
+of aborting it (expiry included — an implicitly committed transaction
+must never be aborted): it probes each staged in-flight key with a
+**prevention read** at the staged timestamp. The ordinary read path bumps
+the timestamp cache before evaluating (invariant L2), so a write found
+missing can never land at or below the staged timestamp afterwards — the
+verdict is stable. All present → a replicated `RecoverTxn` finalizes the
+record COMMITTED; any missing → ABORTED. Recovery and the coordinator's
+own finalize are idempotent and commute. GC never reclaims `STAGING`
+records.
+
+On the write-only kv workload (implicit UPDATEs), the shorter
+intent-hold window roughly triples committed throughput.
+
 ## Conflicts and pushes
 
 Encountering someone else's intent triggers `PushTxn(pusher, pushee)` at the
@@ -275,4 +306,6 @@ Correctness rules enforced around the threshold:
 
 ## Known gaps (deliberate)
 
-Parallel commits.
+Write pipelining WITHIN a transaction (async consensus for every
+statement, not just the final batch); ranged (non-point) requests in
+deferred batches.

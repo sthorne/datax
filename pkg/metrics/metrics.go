@@ -66,4 +66,10 @@ var (
 	DeadlockAborts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_deadlock_aborts_total", Help: "Transactions aborted as chosen victims of detected deadlock cycles.",
 	})
+	ParallelCommits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_parallel_commits_total", Help: "Transactions committed via the pipelined (STAGING) fast path.",
+	})
+	TxnRecoveries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_txn_recoveries_total", Help: "Status recoveries run against STAGING transaction records.",
+	})
 )

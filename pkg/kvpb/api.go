@@ -68,6 +68,13 @@ type EndTxnRequest struct {
 	// crashed coordinator would be judged expired and wrongly aborted after
 	// the record is gone.
 	IntentKeys []keys.Key `json:"intent_keys,omitempty"`
+	// InFlight names writes pipelined IN PARALLEL with this commit — not
+	// yet proven applied. Non-empty InFlight stages the record (STAGING)
+	// instead of committing it: the transaction is then implicitly
+	// committed once every in-flight write has applied at or below the
+	// staged timestamp, and explicitly finalized by a second EndTxn (or by
+	// status recovery, if the coordinator dies first).
+	InFlight []keys.Key `json:"in_flight,omitempty"`
 }
 
 // HeartbeatTxnRequest refreshes the transaction record's liveness and
@@ -218,6 +225,7 @@ type RequestUnion struct {
 	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentRequest       `json:"resolve_intent,omitempty"`
 	RollbackIntent      *RollbackIntentRequest      `json:"rollback_intent,omitempty"`
+	RecoverTxn          *RecoverTxnRequest          `json:"recover_txn,omitempty"`
 	Refresh             *RefreshRequest             `json:"refresh,omitempty"`
 	GC                  *GCRequest                  `json:"gc,omitempty"`
 	TruncateLog         *TruncateLogRequest         `json:"truncate_log,omitempty"`
@@ -252,6 +260,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.ResolveIntent
 	case u.RollbackIntent != nil:
 		return u.RollbackIntent
+	case u.RecoverTxn != nil:
+		return u.RecoverTxn
 	case u.Refresh != nil:
 		return u.Refresh
 	case u.GC != nil:
@@ -293,6 +303,7 @@ func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHe
 func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *ResolveIntentRequest) Header() RequestHeader       { return h.RequestHeader }
 func (h *RollbackIntentRequest) Header() RequestHeader      { return h.RequestHeader }
+func (h *RecoverTxnRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *RefreshRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *GCRequest) Header() RequestHeader                  { return h.RequestHeader }
 func (h *TruncateLogRequest) Header() RequestHeader         { return h.RequestHeader }
@@ -313,6 +324,7 @@ func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
 func (*PushTxnRequest) Method() string             { return "PushTxn" }
 func (*ResolveIntentRequest) Method() string       { return "ResolveIntent" }
 func (*RollbackIntentRequest) Method() string      { return "RollbackIntent" }
+func (*RecoverTxnRequest) Method() string          { return "RecoverTxn" }
 func (*RefreshRequest) Method() string             { return "Refresh" }
 func (*GCRequest) Method() string                  { return "GC" }
 func (*TruncateLogRequest) Method() string         { return "TruncateLog" }
@@ -333,6 +345,7 @@ func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (r *PushTxnRequest) IsReadOnly() bool           { return r.QueryOnly }
 func (*ResolveIntentRequest) IsReadOnly() bool       { return false }
 func (*RollbackIntentRequest) IsReadOnly() bool      { return false }
+func (*RecoverTxnRequest) IsReadOnly() bool          { return false }
 func (*RefreshRequest) IsReadOnly() bool             { return true }
 func (*GCRequest) IsReadOnly() bool                  { return false }
 func (*TruncateLogRequest) IsReadOnly() bool         { return false }
@@ -383,6 +396,23 @@ type PushTxnResponse struct {
 	WaitingFor    uuid.UUID `json:"waiting_for,omitempty"`
 	WaitingForKey keys.Key  `json:"waiting_for_key,omitempty"`
 	Priority      int32     `json:"priority,omitempty"`
+	// InFlightKeys, when Status is STAGING, is the staged write set the
+	// pusher needs to run status recovery.
+	InFlightKeys []keys.Key `json:"in_flight_keys,omitempty"`
+}
+
+// RecoverTxnRequest finalizes a STAGING transaction record after status
+// recovery: Commit reports whether every staged in-flight write was found
+// present (at or below the staged timestamp). Idempotent: a record no
+// longer STAGING is left as is. Routed to the record's anchor range.
+type RecoverTxnRequest struct {
+	RequestHeader           // Key = the transaction's anchor key
+	TxnID         uuid.UUID `json:"txn_id"`
+	Commit        bool      `json:"commit"`
+}
+
+type RecoverTxnResponse struct {
+	Status enginepb.TxnStatus `json:"status"`
 }
 
 type ResolveIntentResponse struct{}
@@ -428,6 +458,7 @@ type ResponseUnion struct {
 	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
 	ResolveIntent       *ResolveIntentResponse       `json:"resolve_intent,omitempty"`
 	RollbackIntent      *RollbackIntentResponse      `json:"rollback_intent,omitempty"`
+	RecoverTxn          *RecoverTxnResponse          `json:"recover_txn,omitempty"`
 	Refresh             *RefreshResponse             `json:"refresh,omitempty"`
 	GC                  *GCResponse                  `json:"gc,omitempty"`
 	TruncateLog         *TruncateLogResponse         `json:"truncate_log,omitempty"`
@@ -526,6 +557,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.ResolveIntent = t
 	case *RollbackIntentRequest:
 		u.RollbackIntent = t
+	case *RecoverTxnRequest:
+		u.RecoverTxn = t
 	case *RefreshRequest:
 		u.Refresh = t
 	case *GCRequest:

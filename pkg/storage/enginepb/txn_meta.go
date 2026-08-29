@@ -15,6 +15,11 @@ const (
 	PENDING TxnStatus = iota
 	COMMITTED
 	ABORTED
+	// STAGING: a parallel commit is in flight — the record names the
+	// writes that were pipelined with it. The transaction is implicitly
+	// committed iff every one of them is present at or below the record's
+	// timestamp; status recovery decides (see docs/transactions.md).
+	STAGING
 )
 
 func (s TxnStatus) String() string {
@@ -25,6 +30,8 @@ func (s TxnStatus) String() string {
 		return "COMMITTED"
 	case ABORTED:
 		return "ABORTED"
+	case STAGING:
+		return "STAGING"
 	default:
 		return "UNKNOWN"
 	}

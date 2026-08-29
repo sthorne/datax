@@ -36,6 +36,7 @@ message Transaction {
   repeated bytes intent_keys = 6;
   bytes waiting_for = 7; // 16-byte UUID; deadlock-detection wait edge
   bytes waiting_for_key = 8;
+  repeated bytes in_flight_keys = 9; // STAGING records: staged write set
 }
 
 message ReplicaDescriptor {
@@ -99,6 +100,7 @@ message EndTxnRequest {
   RequestHeader header = 1;
   bool commit = 2;
   repeated bytes intent_keys = 3;
+  repeated bytes in_flight = 4; // parallel commit: stages the record
 }
 
 message HeartbeatTxnRequest {
@@ -196,6 +198,7 @@ message RequestUnion {
     ResolveIntentRequest resolve_intent = 9;
     RefreshRequest refresh = 10;
     RollbackIntentRequest rollback_intent = 19;
+    RecoverTxnRequest recover_txn = 20;
     GcRequest gc = 11;
     TruncateLogRequest truncate_log = 12;
     AdminSplitRequest admin_split = 13;
@@ -257,6 +260,17 @@ message PushTxnResponse {
   bytes waiting_for = 3;
   bytes waiting_for_key = 4;
   int32 priority = 5;
+  repeated bytes in_flight_keys = 6; // STAGING: recovery input
+}
+
+message RecoverTxnRequest {
+  RequestHeader header = 1;
+  bytes txn_id = 2;
+  bool commit = 3;
+}
+
+message RecoverTxnResponse {
+  int32 status = 1;
 }
 
 message ResolveIntentResponse {}
@@ -303,6 +317,7 @@ message ResponseUnion {
     ResolveIntentResponse resolve_intent = 9;
     RefreshResponse refresh = 10;
     RollbackIntentResponse rollback_intent = 19;
+    RecoverTxnResponse recover_txn = 20;
     GcResponse gc = 11;
     TruncateLogResponse truncate_log = 12;
     AdminSplitResponse admin_split = 13;

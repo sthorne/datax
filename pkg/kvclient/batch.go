@@ -43,6 +43,24 @@ func (t *Txn) RunBatch(ctx context.Context, b *WriteBatch) error {
 	if b.Len() == 0 {
 		return nil
 	}
+	if t.pipelining {
+		// Defer the flush: Commit will send it in parallel with a staged
+		// EndTxn (parallel commit). Reads and point writes flush first, so
+		// read-your-writes is preserved.
+		t.mu.Lock()
+		if t.mu.deferred == nil {
+			t.mu.deferred = &WriteBatch{}
+		}
+		t.mu.deferred.reqs = append(t.mu.deferred.reqs, b.reqs...)
+		t.mu.deferred.kys = append(t.mu.deferred.kys, b.kys...)
+		t.mu.Unlock()
+		return nil
+	}
+	return t.runBatchNow(ctx, b)
+}
+
+// runBatchNow is the classic synchronous flush.
+func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 	t.mu.Lock()
 	// One sequence for the whole batch: a savepoint cannot be established
 	// mid-statement, so a statement's writes roll back as a unit.

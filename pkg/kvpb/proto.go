@@ -64,6 +64,28 @@ func uuidFromProto(b []byte) (uuid.UUID, error) {
 	return uuid.FromBytes(b)
 }
 
+func keysToProto(ks []keys.Key) [][]byte {
+	if len(ks) == 0 {
+		return nil
+	}
+	out := make([][]byte, len(ks))
+	for i, k := range ks {
+		out[i] = k
+	}
+	return out
+}
+
+func keysFromProto(bs [][]byte) []keys.Key {
+	if len(bs) == 0 {
+		return nil
+	}
+	out := make([]keys.Key, len(bs))
+	for i, b := range bs {
+		out[i] = keys.Key(b)
+	}
+	return out
+}
+
 // ---- transactions ----
 
 func txnMetaToProto(m enginepb.TxnMeta) *rpcpb.TxnMeta {
@@ -113,6 +135,9 @@ func txnToProto(t *Transaction) *rpcpb.Transaction {
 	for _, k := range t.IntentKeys {
 		pb.IntentKeys = append(pb.IntentKeys, k)
 	}
+	for _, k := range t.InFlightKeys {
+		pb.InFlightKeys = append(pb.InFlightKeys, k)
+	}
 	return pb
 }
 
@@ -139,6 +164,9 @@ func txnFromProto(p *rpcpb.Transaction) (*Transaction, error) {
 	}
 	for _, k := range p.IntentKeys {
 		t.IntentKeys = append(t.IntentKeys, keys.Key(k))
+	}
+	for _, k := range p.InFlightKeys {
+		t.InFlightKeys = append(t.InFlightKeys, keys.Key(k))
 	}
 	return t, nil
 }
@@ -214,6 +242,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		for _, k := range r.IntentKeys {
 			pb.IntentKeys = append(pb.IntentKeys, k)
 		}
+		for _, k := range r.InFlight {
+			pb.InFlight = append(pb.InFlight, k)
+		}
 		out.Value = &rpcpb.RequestUnion_EndTxn{EndTxn: pb}
 	case *HeartbeatTxnRequest:
 		out.Value = &rpcpb.RequestUnion_HeartbeatTxn{HeartbeatTxn: &rpcpb.HeartbeatTxnRequest{
@@ -244,6 +275,12 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 			Header:   reqHeaderToProto(r.RequestHeader),
 			TxnId:    uuidToProto(r.TxnID),
 			Sequence: r.Sequence,
+		}}
+	case *RecoverTxnRequest:
+		out.Value = &rpcpb.RequestUnion_RecoverTxn{RecoverTxn: &rpcpb.RecoverTxnRequest{
+			Header: reqHeaderToProto(r.RequestHeader),
+			TxnId:  uuidToProto(r.TxnID),
+			Commit: r.Commit,
 		}}
 	case *RefreshRequest:
 		out.Value = &rpcpb.RequestUnion_Refresh{Refresh: &rpcpb.RefreshRequest{Header: reqHeaderToProto(r.RequestHeader), FromTs: tsToProto(r.FromTS)}}
@@ -298,6 +335,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		for _, k := range v.EndTxn.IntentKeys {
 			r.IntentKeys = append(r.IntentKeys, keys.Key(k))
 		}
+		for _, k := range v.EndTxn.InFlight {
+			r.InFlight = append(r.InFlight, keys.Key(k))
+		}
 		u.EndTxn = r
 	case *rpcpb.RequestUnion_HeartbeatTxn:
 		waitingFor, err := uuidFromProto(v.HeartbeatTxn.WaitingFor)
@@ -348,6 +388,16 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 			RequestHeader: reqHeaderFromProto(v.RollbackIntent.Header),
 			TxnID:         id,
 			Sequence:      v.RollbackIntent.Sequence,
+		}
+	case *rpcpb.RequestUnion_RecoverTxn:
+		id, err := uuidFromProto(v.RecoverTxn.TxnId)
+		if err != nil {
+			return u, err
+		}
+		u.RecoverTxn = &RecoverTxnRequest{
+			RequestHeader: reqHeaderFromProto(v.RecoverTxn.Header),
+			TxnID:         id,
+			Commit:        v.RecoverTxn.Commit,
 		}
 	case *rpcpb.RequestUnion_Refresh:
 		u.Refresh = &RefreshRequest{RequestHeader: reqHeaderFromProto(v.Refresh.Header), FromTS: tsFromProto(v.Refresh.FromTs)}
@@ -468,11 +518,14 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 			WaitingFor:    uuidToProto(u.PushTxn.WaitingFor),
 			WaitingForKey: u.PushTxn.WaitingForKey,
 			Priority:      u.PushTxn.Priority,
+			InFlightKeys:  keysToProto(u.PushTxn.InFlightKeys),
 		}}
 	case u.ResolveIntent != nil:
 		out.Value = &rpcpb.ResponseUnion_ResolveIntent{ResolveIntent: &rpcpb.ResolveIntentResponse{}}
 	case u.RollbackIntent != nil:
 		out.Value = &rpcpb.ResponseUnion_RollbackIntent{RollbackIntent: &rpcpb.RollbackIntentResponse{}}
+	case u.RecoverTxn != nil:
+		out.Value = &rpcpb.ResponseUnion_RecoverTxn{RecoverTxn: &rpcpb.RecoverTxnResponse{Status: int32(u.RecoverTxn.Status)}}
 	case u.Refresh != nil:
 		out.Value = &rpcpb.ResponseUnion_Refresh{Refresh: &rpcpb.RefreshResponse{}}
 	case u.GC != nil:
@@ -535,11 +588,14 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			WaitingFor:    waitingFor,
 			WaitingForKey: v.PushTxn.WaitingForKey,
 			Priority:      v.PushTxn.Priority,
+			InFlightKeys:  keysFromProto(v.PushTxn.InFlightKeys),
 		}
 	case *rpcpb.ResponseUnion_ResolveIntent:
 		u.ResolveIntent = &ResolveIntentResponse{}
 	case *rpcpb.ResponseUnion_RollbackIntent:
 		u.RollbackIntent = &RollbackIntentResponse{}
+	case *rpcpb.ResponseUnion_RecoverTxn:
+		u.RecoverTxn = &RecoverTxnResponse{Status: enginepb.TxnStatus(v.RecoverTxn.Status)}
 	case *rpcpb.ResponseUnion_Refresh:
 		u.Refresh = &RefreshResponse{}
 	case *rpcpb.ResponseUnion_Gc:

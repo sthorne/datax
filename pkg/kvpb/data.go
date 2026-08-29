@@ -91,6 +91,10 @@ type Transaction struct {
 	// abort victim, never for correctness of data.
 	WaitingFor    uuid.UUID `json:"waiting_for,omitempty"`
 	WaitingForKey keys.Key  `json:"waiting_for_key,omitempty"`
+	// InFlightKeys, on a STAGING record, names the writes pipelined with
+	// the parallel commit: the transaction is implicitly committed iff all
+	// of them are present at or below the record's timestamp.
+	InFlightKeys []keys.Key `json:"in_flight_keys,omitempty"`
 }
 
 // NewTransaction creates a transaction starting at now.

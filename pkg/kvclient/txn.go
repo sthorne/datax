@@ -47,6 +47,11 @@ type Txn struct {
 	// timestamp. Its reads carry the StaleRead flag, so followers whose
 	// closed timestamp covers it serve them locally; writes are refused.
 	historical bool
+	// pipelining defers RunBatch flushes so Commit can run them IN
+	// PARALLEL with a staged EndTxn — the parallel-commit fast path that
+	// saves one consensus round. Any operation needing read-your-writes
+	// flushes the deferred batch first, so semantics never change.
+	pipelining bool
 
 	mu struct {
 		sync.Mutex
@@ -60,6 +65,9 @@ type Txn struct {
 		// refreshUnusable: too many spans (or tracking disabled) — fall
 		// back to v1's restart behavior.
 		refreshUnusable bool
+		// deferred is the pipelined write batch awaiting Commit (see
+		// pipelining above).
+		deferred *WriteBatch
 		// savepoints by name; spOrder hands out creation order so RELEASE
 		// and ROLLBACK TO can discard later savepoints (PG semantics).
 		savepoints map[string]*savepoint
@@ -125,6 +133,24 @@ func (t *Txn) TestingSetPriority(p int32) {
 	t.mu.Lock()
 	t.mu.txn.Priority = p
 	t.mu.Unlock()
+}
+
+// EnablePipelining defers write batches to Commit, which then stages the
+// transaction record in parallel with them (parallel commit). Reads and
+// point writes transparently flush first, preserving read-your-writes.
+func (t *Txn) EnablePipelining() { t.pipelining = true }
+
+// flushDeferred sends any pipelined write batch now — called by every
+// operation that must observe (or order after) those writes.
+func (t *Txn) flushDeferred(ctx context.Context) error {
+	t.mu.Lock()
+	wb := t.mu.deferred
+	t.mu.deferred = nil
+	t.mu.Unlock()
+	if wb == nil || wb.Len() == 0 {
+		return nil
+	}
+	return t.runBatchNow(ctx, wb)
 }
 
 // savepoint captures a sequence point of the transaction: everything
@@ -197,6 +223,16 @@ func (t *Txn) RollbackToSavepoint(ctx context.Context, name string) error {
 		return fmt.Errorf("savepoint %q does not exist", name)
 	}
 	txn := t.mu.txn
+	if t.mu.deferred != nil {
+		// Deferred writes were never sent: rolling back before the flush
+		// simply discards the portion after the savepoint... simplest and
+		// correct: flush first, then roll back through the normal path.
+		t.mu.Unlock()
+		if err := t.flushDeferred(ctx); err != nil {
+			return err
+		}
+		return t.RollbackToSavepoint(ctx, name)
+	}
 	writeKeys := make([]keys.Key, 0, len(t.mu.writes))
 	for k := range t.mu.writes {
 		writeKeys = append(writeKeys, keys.Key(k).Clone())
@@ -259,6 +295,9 @@ const conflictBudget = 10 * time.Second
 // Get reads a key at the transaction's read timestamp (seeing the
 // transaction's own writes).
 func (t *Txn) Get(ctx context.Context, key keys.Key) ([]byte, error) {
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
 	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
 	br, err := t.send(ctx, ba, false)
@@ -271,6 +310,9 @@ func (t *Txn) Get(ctx context.Context, key keys.Key) ([]byte, error) {
 
 // Scan reads [start, end) at the transaction's read timestamp.
 func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.KeyValue, error) {
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
 	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max})
 	br, err := t.send(ctx, ba, false)
@@ -295,6 +337,9 @@ func (t *Txn) GetForUpdate(ctx context.Context, key keys.Key) ([]byte, error) {
 	if t.historical {
 		return nil, fmt.Errorf("cannot lock in a read-only historical transaction")
 	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
 	ba, k := t.prepareWrite(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: key.Clone()}, ForUpdate: true})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
@@ -313,6 +358,9 @@ func (t *Txn) GetForUpdate(ctx context.Context, key keys.Key) ([]byte, error) {
 func (t *Txn) ScanForUpdate(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.KeyValue, error) {
 	if t.historical {
 		return nil, fmt.Errorf("cannot lock in a read-only historical transaction")
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
 	}
 	ba, k := t.prepareWrite(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start.Clone(), EndKey: end.Clone()}, ForUpdate: true, MaxRows: max})
 	br, err := t.send(ctx, ba, true)
@@ -359,6 +407,9 @@ func (t *Txn) Increment(ctx context.Context, key keys.Key, by int64) (int64, err
 func (t *Txn) write(ctx context.Context, req kvpb.Request) error {
 	if t.historical {
 		return fmt.Errorf("cannot write in a read-only historical transaction")
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return err
 	}
 	ba, key := t.prepareWrite(req)
 	if _, err := t.send(ctx, ba, true); err != nil {
@@ -684,6 +735,16 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 			return false, nil, kerr
 		}
 		push := br.Responses[0].PushTxn
+		if push.Status == enginepb.STAGING {
+			// A parallel commit in flight: run status recovery, then let
+			// the next push observe the finalized record.
+			t.recoverStagedTxn(ctx, intent.Txn, push)
+			br, kerr = t.db.Send(ctx, ba)
+			if kerr != nil {
+				return false, nil, kerr
+			}
+			push = br.Responses[0].PushTxn
+		}
 		switch push.Status {
 		case enginepb.COMMITTED, enginepb.ABORTED:
 			rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
@@ -716,6 +777,13 @@ func (t *Txn) Commit(ctx context.Context) error {
 		t.mu.Unlock()
 		return fmt.Errorf("transaction already finished")
 	}
+	wb := t.mu.deferred
+	t.mu.deferred = nil
+	t.mu.Unlock()
+	if wb != nil && wb.Len() > 0 {
+		return t.parallelCommit(ctx, wb)
+	}
+	t.mu.Lock()
 	anchored := t.mu.anchored
 	txn := t.mu.txn
 	t.mu.Unlock()
@@ -746,6 +814,189 @@ func (t *Txn) Commit(ctx context.Context) error {
 	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
 	return nil
+}
+
+// parallelCommit is the pipelined commit fast path: the deferred write
+// batch and a STAGING EndTxn are sent IN PARALLEL — one consensus round of
+// client-visible latency instead of two. The transaction is implicitly
+// committed the moment both succeed at the staged timestamp; an explicit
+// finalize (and intent resolution) then runs asynchronously. If anything
+// forwarded the writes above the staged timestamp, the commit condition is
+// settled the classic way: refresh, then a finalizing EndTxn. On failure
+// the staged record is explicitly aborted so status recovery agrees with
+// the error we return.
+func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
+	t.mu.Lock()
+	t.mu.txn.Sequence++
+	if len(t.mu.txn.Key) == 0 {
+		t.mu.txn.Key = wb.kys[0].Clone()
+	}
+	createRecord := !t.mu.anchored
+	txn := t.mu.txn
+	intentKeys := make([]keys.Key, 0, len(t.mu.writes)+len(wb.kys))
+	for k := range t.mu.writes {
+		intentKeys = append(intentKeys, keys.Key(k).Clone())
+	}
+	t.mu.Unlock()
+	inFlight := make([]keys.Key, 0, len(wb.kys))
+	for _, k := range wb.kys {
+		inFlight = append(inFlight, k.Clone())
+		intentKeys = append(intentKeys, k.Clone())
+	}
+	// Track the batch's keys now so any failure path's cleanup resolves
+	// them (recordWrite also anchors and starts the heartbeat).
+	for _, k := range wb.kys {
+		t.recordWrite(k)
+	}
+
+	wbBA := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}, Requests: wb.reqs}
+	etBA := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone(), CreateTxnRecord: createRecord}}
+	etBA.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+		Commit:        true,
+		IntentKeys:    intentKeys,
+		InFlight:      inFlight,
+	})
+
+	var (
+		wg           sync.WaitGroup
+		wbBR, etBR   *kvpb.BatchResponse
+		wbErr, etErr error
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); wbBR, wbErr = t.send(ctx, wbBA, true) }()
+	go func() { defer wg.Done(); etBR, etErr = t.send(ctx, etBA, true) }()
+	wg.Wait()
+
+	if wbErr != nil || etErr != nil {
+		// Make the record's fate explicit before surfacing the error: a
+		// dangling STAGING record with all writes present would otherwise
+		// be RECOVERED AS COMMITTED, contradicting the error we return.
+		aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
+		aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
+		if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
+			log.Debugf("aborting failed parallel commit of %s: %v", txn.ID, kerr)
+		}
+		t.markFinished()
+		t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+		if wbErr != nil {
+			return wbErr
+		}
+		return etErr
+	}
+
+	stagedTS := etBR.Responses[0].EndTxn.CommitTimestamp
+	writesTS := stagedTS
+	if wbBR.Txn != nil {
+		writesTS = writesTS.Forward(wbBR.Txn.WriteTimestamp)
+	}
+	if stagedTS.Less(writesTS) {
+		// The writes were forwarded above the staged timestamp: the staged
+		// commit condition does not hold. Settle classically: refresh the
+		// reads to the writes' timestamp, then finalize at it.
+		if !t.maybeRefresh(ctx, writesTS) {
+			aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
+			aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
+			if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
+				log.Debugf("aborting unrefreshable parallel commit of %s: %v", txn.ID, kerr)
+			}
+			t.markFinished()
+			t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+			e := kvpb.NewErrorf("parallel commit of %s forwarded to %s and refresh failed", txn.ID, writesTS)
+			e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: writesTS}
+			metrics.TxnRetries.Inc()
+			return &RetryableError{Cause: e}
+		}
+		fba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
+		fba.Add(&kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+			Commit:        true,
+			IntentKeys:    intentKeys,
+		})
+		fbr, err := t.send(ctx, fba, true)
+		if err != nil {
+			t.markFinished()
+			return err
+		}
+		t.markFinished()
+		metrics.TxnCommits.Inc()
+		t.resolveAll(enginepb.COMMITTED, fbr.Responses[0].EndTxn.CommitTimestamp)
+		return nil
+	}
+
+	// Implicitly committed: every pipelined write applied at or below the
+	// staged timestamp. Return to the client now; finalize asynchronously
+	// (a reader tripping over an intent first runs status recovery, which
+	// reaches the same verdict).
+	t.markFinished()
+	metrics.TxnCommits.Inc()
+	metrics.ParallelCommits.Inc()
+	go func() {
+		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		fba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}}
+		fba.Add(&kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+			Commit:        true,
+			IntentKeys:    intentKeys,
+		})
+		if _, kerr := t.db.Send(fctx, fba); kerr != nil {
+			log.Debugf("finalizing parallel commit of %s: %v (recovery will cover)", txn.ID, kerr)
+			return
+		}
+		t.resolveAll(enginepb.COMMITTED, stagedTS)
+	}()
+	return nil
+}
+
+// recoverStagedTxn runs status recovery against a STAGING record: verify
+// each staged in-flight write with a PREVENTION READ at the staged
+// timestamp — the ordinary read path bumps the timestamp cache first
+// (invariant L2), so a write found missing can never land at or below the
+// staged timestamp afterwards — then finalize the record accordingly.
+func (t *Txn) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, push *kvpb.PushTxnResponse) {
+	stagedTS := push.CommitTS
+	committed := true
+	for _, k := range push.InFlightKeys {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: stagedTS}}
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}})
+		_, kerr := t.db.Send(ctx, ba)
+		if kerr == nil {
+			// No intent of the staged transaction at or below stagedTS —
+			// and the read's timestamp-cache bump now PREVENTS one forever.
+			committed = false
+			break
+		}
+		if kerr.WriteIntent != nil {
+			present := false
+			for _, in := range kerr.WriteIntent.Intents {
+				if in.Txn.ID == pushee.ID {
+					present = true
+				}
+			}
+			if present {
+				continue
+			}
+			// A different transaction's intent: ours is not there, and the
+			// bump (taken before evaluation) prevents it.
+			committed = false
+			break
+		}
+		// Transport or routing trouble: recovery is best-effort; the next
+		// push retries it.
+		log.Debugf("recovering staged txn %s: probing %s: %v", pushee.ID, k, kerr)
+		return
+	}
+	metrics.TxnRecoveries.Inc()
+	rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+	rba.Add(&kvpb.RecoverTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keys.Key(pushee.Key).Clone()},
+		TxnID:         pushee.ID,
+		Commit:        committed,
+	})
+	if _, kerr := t.db.Send(ctx, rba); kerr != nil {
+		log.Debugf("recovering staged txn %s: %v", pushee.ID, kerr)
+	}
 }
 
 // Rollback aborts the transaction and cleans its intents (best effort).
@@ -905,6 +1156,7 @@ func (t *Txn) startHeartbeat() {
 // SQL transactions instead surface RetryableError to the client as 40001.
 func (db *DB) RunTxn(ctx context.Context, name string, fn func(ctx context.Context, txn *Txn) error) error {
 	txn := db.NewTxn(name)
+	txn.EnablePipelining()
 	for attempt := 0; ; attempt++ {
 		err := fn(ctx, txn)
 		if err == nil {
@@ -919,6 +1171,7 @@ func (db *DB) RunTxn(ctx context.Context, name string, fn func(ctx context.Conte
 		}
 		_ = txn.Rollback(ctx)
 		next := db.NewTxn(name)
+		next.EnablePipelining()
 		next.mu.Lock()
 		pri := txn.proto().Priority + 1 // push harder each retry
 		next.mu.txn.Priority = pri

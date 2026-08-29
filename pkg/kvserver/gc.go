@@ -276,8 +276,10 @@ func enumerateGarbageTxnRecords(snap *storage.Snapshot, desc kvpb.RangeDescripto
 			// Not a transaction record; leave unknown range-local keys alone.
 			continue
 		}
-		if txn.Status == enginepb.PENDING {
-			continue // live (or expired-but-unpushed): not ours to reclaim
+		if txn.Status == enginepb.PENDING || txn.Status == enginepb.STAGING {
+			// Live, expired-but-unpushed, or awaiting status recovery
+			// (a STAGING record may be implicitly committed): not ours.
+			continue
 		}
 		if !txn.WriteTimestamp.LessEq(threshold) || !txn.LastHeartbeat.LessEq(threshold) {
 			continue
