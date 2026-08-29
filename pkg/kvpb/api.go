@@ -146,6 +146,14 @@ type AdminChangeReplicasRequest struct {
 	RemoveNode base.NodeID `json:"remove_node,omitempty"`
 }
 
+// AdminTransferLeaseRequest moves the range's raft leadership (and with it
+// the lease, since leaseholder = leader) to Target, which must already hold
+// a replica.
+type AdminTransferLeaseRequest struct {
+	RequestHeader             // Key = any key in the range
+	Target        base.NodeID `json:"target"`
+}
+
 // RequestUnion holds exactly one request.
 type RequestUnion struct {
 	Get                 *GetRequest                 `json:"get,omitempty"`
@@ -162,6 +170,7 @@ type RequestUnion struct {
 	TruncateLog         *TruncateLogRequest         `json:"truncate_log,omitempty"`
 	AdminSplit          *AdminSplitRequest          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasRequest `json:"admin_change_replicas,omitempty"`
+	AdminTransferLease  *AdminTransferLeaseRequest  `json:"admin_transfer_lease,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -195,6 +204,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.AdminSplit
 	case u.AdminChangeReplicas != nil:
 		return u.AdminChangeReplicas
+	case u.AdminTransferLease != nil:
+		return u.AdminTransferLease
 	}
 	return nil
 }
@@ -222,6 +233,7 @@ func (h *GCRequest) Header() RequestHeader                  { return h.RequestHe
 func (h *TruncateLogRequest) Header() RequestHeader         { return h.RequestHeader }
 func (h *AdminSplitRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminChangeReplicasRequest) Header() RequestHeader { return h.RequestHeader }
+func (h *AdminTransferLeaseRequest) Header() RequestHeader  { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -237,6 +249,7 @@ func (*GCRequest) Method() string                  { return "GC" }
 func (*TruncateLogRequest) Method() string         { return "TruncateLog" }
 func (*AdminSplitRequest) Method() string          { return "AdminSplit" }
 func (*AdminChangeReplicasRequest) Method() string { return "AdminChangeReplicas" }
+func (*AdminTransferLeaseRequest) Method() string  { return "AdminTransferLease" }
 
 func (*GetRequest) IsReadOnly() bool                 { return true }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -252,6 +265,7 @@ func (*GCRequest) IsReadOnly() bool                  { return false }
 func (*TruncateLogRequest) IsReadOnly() bool         { return false }
 func (*AdminSplitRequest) IsReadOnly() bool          { return false }
 func (*AdminChangeReplicasRequest) IsReadOnly() bool { return false }
+func (*AdminTransferLeaseRequest) IsReadOnly() bool  { return false }
 
 // Response types.
 
@@ -308,6 +322,10 @@ type AdminChangeReplicasResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
 
+type AdminTransferLeaseResponse struct {
+	Desc RangeDescriptor `json:"desc"`
+}
+
 // ResponseUnion holds exactly one response.
 type ResponseUnion struct {
 	Get                 *GetResponse                 `json:"get,omitempty"`
@@ -324,6 +342,7 @@ type ResponseUnion struct {
 	TruncateLog         *TruncateLogResponse         `json:"truncate_log,omitempty"`
 	AdminSplit          *AdminSplitResponse          `json:"admin_split,omitempty"`
 	AdminChangeReplicas *AdminChangeReplicasResponse `json:"admin_change_replicas,omitempty"`
+	AdminTransferLease  *AdminTransferLeaseResponse  `json:"admin_transfer_lease,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -406,6 +425,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.AdminSplit = t
 	case *AdminChangeReplicasRequest:
 		u.AdminChangeReplicas = t
+	case *AdminTransferLeaseRequest:
+		u.AdminTransferLease = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

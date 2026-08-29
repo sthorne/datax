@@ -45,4 +45,7 @@ var (
 	DeadNodeRepairs = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_dead_node_repairs_total", Help: "Replicas rebuilt away from dead nodes.",
 	})
+	LeaseTransfers = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_lease_transfers_total", Help: "Completed range leadership (lease) transfers.",
+	})
 )

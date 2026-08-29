@@ -103,7 +103,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|status|metadata|unsafe-recover> [flags]")
+		return fmt.Errorf("usage: datax debug <split|ranges|nodes|rebalance|transfer-lease|status|metadata|unsafe-recover> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -118,8 +118,8 @@ func runDebug(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
 	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
 	rawKey := fs.String("key", "", "split: raw split key (hex)")
-	rangeID := fs.Int64("range", 0, "rebalance: range ID")
-	toNode := fs.Int64("to", 0, "rebalance: destination node ID")
+	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
+	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -140,7 +140,7 @@ func runDebug(args []string) error {
 		default:
 			return fmt.Errorf("split requires --table or --key")
 		}
-	case "rebalance":
+	case "rebalance", "transfer-lease":
 		req.RangeID = base.RangeID(*rangeID)
 		req.ToNode = base.NodeID(*toNode)
 		req.FromNode = base.NodeID(*fromNode)
@@ -173,6 +173,8 @@ func runDebug(args []string) error {
 		}
 	case "rebalance":
 		fmt.Println("rebalance done")
+	case "transfer-lease":
+		fmt.Println("lease transferred")
 	}
 	return nil
 }

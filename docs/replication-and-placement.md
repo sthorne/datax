@@ -232,8 +232,20 @@ replica per rack, so a rack failure costs at most one replica of any range —
 quorum survives.
 
 Zone/lease *preferences* (pinning leaseholders near clients) are parsed and
-stored but not yet acted on in v1.
+stored but not yet acted on automatically.
+
+**Lease transfer** is `datax debug transfer-lease --range N --to nodeX`.
+Leaseholder = raft leader in datax, so the transfer is raft's
+`TransferLeadership`: the leader stops proposing, catches the transferee up,
+and tells it to campaign. The new leader's timestamp-cache bump (any
+leadership change) preserves read-your-writes across the hand-off, at the
+cost of possibly restarting transactions in flight at that moment. A
+transfer to a lagging replica that cannot complete within an election
+timeout aborts with a retryable error. Transferring the lease first is how a
+replica is moved *off* the range's own leader — `debug rebalance` does the
+add → transfer → remove sequence automatically when the source leads.
 
 **Rebalance** is manual: `datax debug rebalance --range N --to nodeX
-[--from nodeY]` performs add-then-remove. There is no automatic rebalancing
-loop (only the RF-repair upreplication loop above).
+[--from nodeY]` performs add-then-remove (with a lease transfer in between
+when the source is the leader). There is no automatic rebalancing loop
+(only the RF-repair upreplication loop above).

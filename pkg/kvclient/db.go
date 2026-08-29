@@ -485,6 +485,20 @@ func (db *DB) AdminChangeReplicas(ctx context.Context, key keys.Key, add, remove
 	return resp, nil
 }
 
+// AdminTransferLease moves leadership (and with it the lease) of the range
+// covering key to target, which must already hold a replica.
+func (db *DB) AdminTransferLease(ctx context.Context, key keys.Key, target base.NodeID) error {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminTransferLeaseRequest{RequestHeader: kvpb.RequestHeader{Key: key}, Target: target})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return kerr
+	}
+	// Route follow-up traffic straight at the new leader.
+	db.cache.SetHint(br.Responses[0].AdminTransferLease.Desc.RangeID, target)
+	return nil
+}
+
 // AdminSplit splits the range containing key at key.
 func (db *DB) AdminSplit(ctx context.Context, key keys.Key) (*kvpb.AdminSplitResponse, error) {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}

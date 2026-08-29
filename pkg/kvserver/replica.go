@@ -622,6 +622,13 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		}
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminChangeReplicas: resp}}}, nil
 	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminTransferLease != nil {
+		resp, err := r.adminTransferLease(ctx, ba.Requests[0].AdminTransferLease)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminTransferLease: resp}}}, nil
+	}
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
 	}
