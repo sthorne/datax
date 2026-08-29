@@ -212,9 +212,13 @@ func (*RaftAck) Descriptor() ([]byte, []int) {
 }
 
 type Payload struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Json          []byte                 `protobuf:"bytes,1,opt,name=json,proto3" json:"json,omitempty"`
-	Now           *Hlc                   `protobuf:"bytes,2,opt,name=now,proto3" json:"now,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Json  []byte                 `protobuf:"bytes,1,opt,name=json,proto3" json:"json,omitempty"`
+	Now   *Hlc                   `protobuf:"bytes,2,opt,name=now,proto3" json:"now,omitempty"`
+	// proto carries a binary body on hot paths (Batch: BatchRequest out,
+	// BatchEnvelope back — see kv.proto). Exactly one of json/proto is set;
+	// receivers dispatch on which. Cold paths (join/admin) stay JSON.
+	Proto         []byte `protobuf:"bytes,3,opt,name=proto,proto3" json:"proto,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -259,6 +263,13 @@ func (x *Payload) GetJson() []byte {
 func (x *Payload) GetNow() *Hlc {
 	if x != nil {
 		return x.Now
+	}
+	return nil
+}
+
+func (x *Payload) GetProto() []byte {
+	if x != nil {
+		return x.Proto
 	}
 	return nil
 }
@@ -430,10 +441,11 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\amessage\x18\x05 \x01(\fR\amessage\x12\x1f\n" +
 	"\x03now\x18\x06 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1b\n" +
 	"\tfrom_addr\x18\a \x01(\tR\bfromAddr\"\t\n" +
-	"\aRaftAck\">\n" +
+	"\aRaftAck\"T\n" +
 	"\aPayload\x12\x12\n" +
 	"\x04json\x18\x01 \x01(\fR\x04json\x12\x1f\n" +
-	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\"y\n" +
+	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x14\n" +
+	"\x05proto\x18\x03 \x01(\fR\x05proto\"y\n" +
 	"\rSnapshotChunk\x12\x1f\n" +
 	"\vheader_json\x18\x01 \x01(\fR\n" +
 	"headerJson\x12&\n" +

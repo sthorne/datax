@@ -9,18 +9,13 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
-	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
-// handleBatch serves incoming KV batches against the local store.
-func (n *Node) handleBatch(ctx context.Context, data []byte) ([]byte, error) {
-	var ba kvpb.BatchRequest
-	if err := json.Unmarshal(data, &ba); err != nil {
-		return nil, err
-	}
-	br, kerr := n.store.ExecuteBatch(ctx, &ba)
-	return rpc.MarshalBatchResult(br, kerr)
+// handleBatch serves incoming KV batches against the local store. Wire
+// encoding is the rpc layer's concern.
+func (n *Node) handleBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	return n.store.ExecuteBatch(ctx, ba)
 }
 
 // handleJoin admits a new node: allocates a node ID through the replicated

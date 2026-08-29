@@ -30,7 +30,9 @@ type SnapshotHandler func(header []byte, kvs func() ([]kvserver.SnapshotKV, erro
 
 // ServerHandlers are the node-side callbacks the transport dispatches into.
 type ServerHandlers struct {
-	Batch    PayloadHandler
+	// Batch executes a KV batch. Wire encoding (proto on the hot path,
+	// JSON from older senders) is the rpc layer's concern, not the node's.
+	Batch    func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
 	Join     PayloadHandler
 	Admin    PayloadHandler
 	Raft     func(ctx context.Context, rangeID base.RangeID, m raftpb.Message)
@@ -103,8 +105,37 @@ func (s *Server) payload(ctx context.Context, h PayloadHandler, in *rpcpb.Payloa
 	return &rpcpb.Payload{Json: out, Now: &rpcpb.Hlc{WallTime: now.WallTime, Logical: now.Logical}}, nil
 }
 
+// Batch decodes a KV batch (proto on the hot path; JSON accepted from
+// older senders) and replies in the encoding the request used, so a mixed
+// pair degrades to JSON instead of failing.
 func (s *Server) Batch(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
-	return s.payload(ctx, s.handlers.Batch, in)
+	s.updateClock(in.Now)
+	var (
+		ba  *kvpb.BatchRequest
+		err error
+	)
+	useProto := len(in.Proto) > 0
+	if useProto {
+		ba, err = kvpb.UnmarshalBatchRequest(in.Proto)
+	} else {
+		ba = &kvpb.BatchRequest{}
+		err = json.Unmarshal(in.Json, ba)
+	}
+	if err != nil {
+		return nil, err
+	}
+	br, kerr := s.handlers.Batch(ctx, ba)
+	now := s.clock.Now()
+	out := &rpcpb.Payload{Now: &rpcpb.Hlc{WallTime: now.WallTime, Logical: now.Logical}}
+	if useProto {
+		out.Proto, err = kvpb.MarshalBatchEnvelope(br, kerr)
+	} else {
+		out.Json, err = MarshalBatchResult(br, kerr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Server) Join(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {

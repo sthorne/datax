@@ -200,15 +200,19 @@ func (t *Transport) SendBatch(ctx context.Context, to base.NodeID, ba *kvpb.Batc
 	if err != nil {
 		return nil, nil, err
 	}
-	data, err := json.Marshal(ba)
+	data, err := kvpb.MarshalBatchRequest(ba)
 	if err != nil {
 		return nil, nil, err
 	}
-	out, err := rpcpb.NewInternodeClient(cc).Batch(ctx, &rpcpb.Payload{Json: data, Now: t.now()})
+	out, err := rpcpb.NewInternodeClient(cc).Batch(ctx, &rpcpb.Payload{Proto: data, Now: t.now()})
 	if err != nil {
 		return nil, nil, err
 	}
 	t.updateClock(out.Now)
+	if len(out.Proto) > 0 {
+		return kvpb.UnmarshalBatchEnvelope(out.Proto)
+	}
+	// An older server replies in JSON.
 	br, kerr, err := UnmarshalBatchResult(out.Json)
 	return br, kerr, err
 }

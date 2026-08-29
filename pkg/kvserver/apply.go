@@ -92,11 +92,11 @@ func (r *Replica) applyEntry(ent raftpb.Entry) error {
 			r.setApplied(ent.Index)
 			return nil
 		}
-		var cmd raftCommand
-		if err := json.Unmarshal(ent.Data, &cmd); err != nil {
+		cmd, err := decodeRaftCommand(ent.Data)
+		if err != nil {
 			return fmt.Errorf("corrupt raft command at index %d: %w", ent.Index, err)
 		}
-		resp, aerr := r.applyCommand(&cmd, ent.Index)
+		resp, aerr := r.applyCommand(cmd, ent.Index)
 
 		// Deliver the outcome to a local waiter, if this replica proposed it.
 		r.mu.Lock()

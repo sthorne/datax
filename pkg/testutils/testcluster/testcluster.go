@@ -20,7 +20,7 @@ import (
 
 // TestCluster is a set of in-process nodes sharing one cluster.
 type TestCluster struct {
-	T     *testing.T
+	T     testing.TB
 	Nodes []*server.Node
 	// addrs records each node's RPC address so RestartNode can re-listen on
 	// it (peers find a restarted node through their persisted registries,
@@ -31,7 +31,7 @@ type TestCluster struct {
 // Start brings up numNodes nodes with static pre-agreed membership: every
 // node holds a replica of range 1 from the start. localities[i] (optional)
 // is parsed as a locality string for node i+1.
-func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
+func Start(t testing.TB, numNodes int, localities ...string) *TestCluster {
 	t.Helper()
 	clusterID := uuid.New()
 
@@ -85,7 +85,7 @@ func Start(t *testing.T, numNodes int, localities ...string) *TestCluster {
 // StartWithEngines brings up numNodes static-membership nodes over injected
 // in-memory engines, so tests can inspect raw storage. The background
 // housekeeping loop is disabled; tests drive GC/truncation explicitly.
-func StartWithEngines(t *testing.T, numNodes int, opts ...func(*server.Config)) (*TestCluster, []*storage.Engine) {
+func StartWithEngines(t testing.TB, numNodes int, opts ...func(*server.Config)) (*TestCluster, []*storage.Engine) {
 	t.Helper()
 	clusterID := uuid.New()
 	engines := make([]*storage.Engine, numNodes)
@@ -140,7 +140,7 @@ func StartWithEngines(t *testing.T, numNodes int, opts ...func(*server.Config)) 
 	return tc, engines
 }
 
-func locality(t *testing.T, localities []string, i int) base.Locality {
+func locality(t testing.TB, localities []string, i int) base.Locality {
 	if i >= len(localities) || localities[i] == "" {
 		return base.Locality{}
 	}
@@ -209,7 +209,7 @@ func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
 // the same-address restart path, where peers find a returning node purely
 // through their persisted registries with no re-announce involved. The
 // changed-address path is covered by RestartNodeNewPort and address_test.go.
-func startDiskNode(t *testing.T, dir string, bootstrap bool, join string) *server.Node {
+func startDiskNode(t testing.TB, dir string, bootstrap bool, join string) *server.Node {
 	t.Helper()
 	lis := listenerForDir(t, dir)
 	n, err := server.Start(server.Config{
@@ -226,7 +226,7 @@ func startDiskNode(t *testing.T, dir string, bootstrap bool, join string) *serve
 
 var diskAddrs sync.Map // dir -> address, so restarts reuse their port
 
-func listenerForDir(t *testing.T, dir string) net.Listener {
+func listenerForDir(t testing.TB, dir string) net.Listener {
 	t.Helper()
 	addr := "127.0.0.1:0"
 	if prev, ok := diskAddrs.Load(dir); ok {

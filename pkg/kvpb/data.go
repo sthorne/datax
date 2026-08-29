@@ -1,7 +1,9 @@
 // Package kvpb defines datax's KV API: the batch request/response types
 // exchanged between the KV client (DistSender/TxnCoordinator) and the range
 // replicas, plus the shared cluster data types (descriptors, transactions).
-// Serialization is JSON carried inside gRPC envelopes.
+// Hot-path serialization (the Batch RPC body and the raft command payload)
+// is protobuf via the converters in proto.go; cold paths (join, admin,
+// descriptors at rest, registry rows) stay JSON for debuggability.
 package kvpb
 
 import (

@@ -52,6 +52,10 @@ message RaftAck {}
 message Payload {
   bytes json = 1;
   Hlc now = 2;
+  // proto carries a binary body on hot paths (Batch: BatchRequest out,
+  // BatchEnvelope back — see kv.proto). Exactly one of json/proto is set;
+  // receivers dispatch on which. Cold paths (join/admin) stay JSON.
+  bytes proto = 3;
 }
 
 message SnapshotChunk {

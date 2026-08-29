@@ -2,7 +2,6 @@ package kvserver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -529,7 +528,7 @@ func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 // trigger.
 func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger, merge *mergeTrigger) (*kvpb.BatchResponse, *kvpb.Error) {
 	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split, Merge: merge}
-	data, err := json.Marshal(&cmd)
+	data, err := encodeRaftCommand(&cmd)
 	if err != nil {
 		return nil, kvpb.NewError(err)
 	}
