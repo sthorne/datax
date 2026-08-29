@@ -683,15 +683,31 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 
 	// No MVCC write may slip beneath a timestamp already served to readers
 	// of another transaction. Transaction-record-only batches (EndTxn,
-	// pushes, resolves) write no MVCC versions and are exempt.
+	// pushes, resolves) write no MVCC versions and are exempt. A
+	// transactional write is not rejected but PUSHED: its provisional
+	// intents simply land above the cache, the response echoes the
+	// forwarded transaction, and the coordinator settles up at commit
+	// (refresh, then the EndTxn — itself exempt here — flips the record at
+	// the pushed timestamp). Rejecting instead would let a steady reader
+	// starve every writer on the range: by the time the coordinator's
+	// refresh round trip lands, the cache has moved again.
 	if ba.HasMVCCWrites() {
 		if ok, low := r.tsCache.AllowsWrite(writeTimestamp(ba), batchTxnID(ba)); !ok {
-			e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
-			e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
-			return nil, e
+			if ba.Header.Txn == nil {
+				e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
+				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
+				return nil, e
+			}
+			pushed := *ba.Header.Txn
+			pushed.WriteTimestamp = pushed.WriteTimestamp.Forward(low.Next())
+			ba.Header.Txn = &pushed
 		}
 	}
-	return r.propose(ctx, ba)
+	br, kerr := r.propose(ctx, ba)
+	if kerr == nil && ba.Header.Txn != nil {
+		br.Txn = ba.Header.Txn
+	}
+	return br, kerr
 }
 
 // checkKeyBounds verifies every request key is addressed to this range.

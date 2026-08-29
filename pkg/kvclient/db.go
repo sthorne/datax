@@ -487,6 +487,20 @@ func (db *DB) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 	return br.Responses[0].Scan.Rows, nil
 }
 
+// ScanAt reads [start, end) inconsistently at a FIXED timestamp: intents
+// are ignored and the result set is exactly the rows committed at or below
+// ts, however long the scan takes. Used where a stable snapshot matters
+// more than recency (the index backfill's planning sweep).
+func (db *DB) ScanAt(ctx context.Context, start, end keys.Key, max int64, ts hlc.Timestamp) ([]kvpb.KeyValue, error) {
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: ts, ReadInconsistent: true}}
+	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	return br.Responses[0].Scan.Rows, nil
+}
+
 // Increment atomically adds by to the counter at key, returning the new
 // value.
 func (db *DB) Increment(ctx context.Context, key keys.Key, by int64) (int64, error) {

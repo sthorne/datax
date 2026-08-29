@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -15,16 +16,24 @@ import (
 //  1. Publish the index in the write-only state and drain: once every
 //     gateway's descriptor lease has adopted it, all new writes maintain
 //     the index (the planner still ignores it).
-//  2. Backfill from a full scan in its own transaction — every row that
-//     committed before the backfill's snapshot is written by the backfill,
-//     every row after it is maintained by its writer, so the union is
-//     complete — then flip the index public in the same transaction.
-//  3. Drain again so every gateway can plan with it.
+//  2. Backfill in bounded chunks planned against a frozen snapshot — see
+//     backfillIndex. One whole-table transaction would restart forever
+//     under concurrent writes (its refresh span is the whole table) and
+//     its single giant raft entry would stall the range; a naive resume
+//     cursor would chase a growing table's tail forever.
+//  3. Flip the index public in its own small transaction (the descriptor
+//     key is read constantly by lease renewals, so no data-carrying
+//     transaction may write it), then drain again so every gateway plans
+//     with it.
 //
-// Remaining gap (issue #22): a transaction that BEGAN before step 1's
-// drain, on another gateway, still writes with the descriptor it started
-// with; statement-sized windows are closed, long-lived explicit
-// transactions are not. Bounded, batched backfill is also future work.
+// Remaining gap: a transaction that BEGAN before step 1's drain, on
+// another gateway, still writes with the descriptor it started with;
+// statement-sized windows are closed, long-lived explicit transactions are
+// not (documented in docs/sql.md).
+
+// backfillChunkSize bounds each backfill chunk: rows scanned, KV batch
+// size, raft entry size, and refresh-span width per transaction.
+const backfillChunkSize = 64
 
 // execCreateIndexOnline runs the state machine. The session has already
 // rejected explicit-transaction contexts.
@@ -75,65 +84,10 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		return nil, ToSQLError(err)
 	}
 
-	// Step 2: backfill in its own transaction that touches ONLY row and
-	// index data — never the descriptor. The descriptor key lives on range 1
-	// and is read constantly (lease renewals), so a transaction writing it
-	// is pushed and must refresh; refreshing a full-table read span fails
-	// against any concurrent write, and the backfill would livelock. Left
-	// alone, the backfill commits at its original timestamp: rows committed
-	// before it are in its scan, rows after are maintained by their writers
-	// (the drain above guarantees that), so the union is complete. A
-	// concurrent update to a scanned row collides on the entry key
-	// (WriteTooOld), forcing the refresh-and-retry that re-reads it.
-	backfillErr := s.db.RunTxn(ctx, "create-index-backfill", func(ctx context.Context, txn *kvclient.Txn) error {
-		shared, err := s.cat.Lookup(ctx, txn, t.Table)
-		if err != nil {
-			return err
-		}
-		desc := shared
-		var idx *catalog.IndexDescriptor
-		for i := range desc.Indexes {
-			if desc.Indexes[i].ID == indexID {
-				idx = &desc.Indexes[i]
-			}
-		}
-		if idx == nil {
-			return newErrf(CodeInternal, "index %q vanished during backfill", t.Name)
-		}
-		start, end := rowenc.PrimarySpan(desc.ID)
-		kvs, err := txn.Scan(ctx, start, end, 0)
-		if err != nil {
-			return err
-		}
-		var wb kvclient.WriteBatch
-		seen := map[string]bool{}
-		for _, kv := range kvs {
-			row, err := decodeFullRow(desc, kv.Key, kv.Value)
-			if err != nil {
-				return err
-			}
-			key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
-			if err != nil {
-				return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
-			}
-			if skip {
-				if idx.Unique {
-					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
-				}
-				continue
-			}
-			if idx.Unique {
-				if seen[string(key)] {
-					return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
-				}
-				seen[string(key)] = true
-			}
-			wb.Put(key, val)
-		}
-		return txn.RunBatch(ctx, &wb)
-	})
-	// Flip public in a separate small transaction (see above for why the
-	// backfill cannot carry the descriptor write itself).
+	// Step 2: chunked backfill (see the file comment for the liveness and
+	// correctness argument).
+	backfillErr := s.backfillIndex(ctx, t.Table, indexID)
+	// Step 3: flip public in its own small transaction.
 	if backfillErr == nil {
 		backfillErr = s.db.RunTxn(ctx, "create-index-public", func(ctx context.Context, txn *kvclient.Txn) error {
 			shared, err := s.cat.Lookup(ctx, txn, t.Table)
@@ -152,13 +106,17 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	}
 	if backfillErr != nil {
 		// Abandon: remove the write-only index so writers stop maintaining
-		// it, then surface the original failure.
+		// it, wipe any entries committed chunks left behind (best effort —
+		// index IDs are never reused, so leftovers are unreachable, just
+		// wasted space), then surface the original failure.
+		var tableID uint64
 		_ = s.db.RunTxn(ctx, "create-index-abandon", func(ctx context.Context, txn *kvclient.Txn) error {
 			shared, err := s.cat.Lookup(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
 			desc := shared.Clone()
+			tableID = desc.ID
 			kept := desc.Indexes[:0]
 			for _, ix := range desc.Indexes {
 				if ix.ID != indexID {
@@ -169,6 +127,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			return s.cat.Update(ctx, txn, desc)
 		})
 		_ = s.cat.FinishDDL(ctx, t.Table)
+		if tableID != 0 {
+			s.wipeIndexEntries(ctx, tableID, indexID)
+		}
 		return nil, ToSQLError(backfillErr)
 	}
 
@@ -177,6 +138,130 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "CREATE INDEX"}, nil
+}
+
+// backfillIndex fills the index from the table's rows as of a fixed
+// boundary timestamp, one bounded chunk per transaction.
+//
+// The planning sweep scans row KEYS inconsistently AT the boundary, so its
+// row set is frozen — concurrent writers cannot extend it, and the sweep
+// terminates no matter how fast the table grows (rows committed after the
+// boundary were written by post-drain writers that maintain the index
+// themselves). Each planned chunk then re-reads its own narrow key span in
+// a serializable transaction and writes the entries: a concurrent delete
+// or update inside the chunk invalidates its read and forces a rescan, so
+// entries are always derived from rows that exist at the chunk's commit —
+// no resurrection of concurrently deleted rows. Refresh spans stay one
+// chunk wide, so writes elsewhere in the table never restart a chunk.
+func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint64) error {
+	boundary := s.db.Clock().Now()
+
+	var tableID uint64
+	if err := s.db.RunTxn(ctx, "create-index-plan", func(ctx context.Context, txn *kvclient.Txn) error {
+		desc, err := s.cat.Lookup(ctx, txn, table)
+		if err != nil {
+			return err
+		}
+		tableID = desc.ID
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	cursor, end := rowenc.PrimarySpan(tableID)
+	for {
+		plan, err := s.db.ScanAt(ctx, cursor, end, backfillChunkSize, boundary)
+		if err != nil {
+			return err
+		}
+		if len(plan) == 0 {
+			return nil
+		}
+		chunkEnd := plan[len(plan)-1].Key.Next()
+		if err := s.backfillChunk(ctx, table, indexID, cursor, chunkEnd); err != nil {
+			return err
+		}
+		cursor = chunkEnd
+	}
+}
+
+// backfillChunk writes the index entries for the rows currently in
+// [start, end) in one serializable transaction.
+func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint64, start, end keys.Key) error {
+	return s.db.RunTxn(ctx, "create-index-backfill", func(ctx context.Context, txn *kvclient.Txn) error {
+		desc, err := s.cat.Lookup(ctx, txn, table)
+		if err != nil {
+			return err
+		}
+		var idx *catalog.IndexDescriptor
+		for i := range desc.Indexes {
+			if desc.Indexes[i].ID == indexID {
+				idx = &desc.Indexes[i]
+			}
+		}
+		if idx == nil {
+			return newErrf(CodeInternal, "index vanished during backfill")
+		}
+		kvs, err := txn.Scan(ctx, start, end, 0)
+		if err != nil {
+			return err
+		}
+		var wb kvclient.WriteBatch
+		seen := map[string]string{}
+		for _, kv := range kvs {
+			row, err := decodeFullRow(desc, kv.Key, kv.Value)
+			if err != nil {
+				return err
+			}
+			key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+			if err != nil {
+				return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+			}
+			if skip {
+				if idx.Unique {
+					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
+				}
+				continue
+			}
+			if idx.Unique {
+				// Duplicates within the chunk, then against entries earlier
+				// chunks (or concurrent writers) committed: a unique entry's
+				// value is the encoded primary key, so an existing entry
+				// with a different value is another row with the same
+				// indexed values.
+				if prev, dup := seen[string(key)]; dup && prev != string(val) {
+					return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
+				}
+				seen[string(key)] = string(val)
+				existing, err := txn.Get(ctx, key)
+				if err != nil {
+					return err
+				}
+				if existing != nil && string(existing) != string(val) {
+					return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
+				}
+			}
+			wb.Put(key, val)
+		}
+		return txn.RunBatch(ctx, &wb)
+	})
+}
+
+// wipeIndexEntries best-effort deletes an abandoned index's entries.
+func (s *Session) wipeIndexEntries(ctx context.Context, tableID, indexID uint64) {
+	lo, hi := keys.TableIndexSpan(tableID, indexID)
+	for {
+		kvs, err := s.db.Scan(ctx, lo, hi, backfillChunkSize)
+		if err != nil || len(kvs) == 0 {
+			return
+		}
+		for _, kv := range kvs {
+			if err := s.db.Delete(ctx, kv.Key); err != nil {
+				return
+			}
+		}
+		lo = kvs[len(kvs)-1].Key.Next()
+	}
 }
 
 // ddlTableName names the table a committed DDL statement changed (empty

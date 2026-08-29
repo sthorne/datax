@@ -206,6 +206,14 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 	for {
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr == nil {
+			if br.Txn != nil {
+				// The server may push a write's timestamp above its
+				// timestamp cache instead of rejecting it; adopt the pushed
+				// timestamp so commit knows to refresh.
+				t.mu.Lock()
+				t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(br.Txn.WriteTimestamp)
+				t.mu.Unlock()
+			}
 			return br, nil
 		}
 		switch {

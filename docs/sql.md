@@ -121,9 +121,20 @@ explicit transaction block — code 25001):
    again.
 3. Drain once more, so every gateway plans with the public index.
 
-Left for later (issue #22): bounded/batched backfill for very large tables
-(today's backfill is one scan in one transaction) and a delete-only state
-for online index drops.
+The backfill is **bounded and snapshot-planned**: a planning sweep reads
+row keys inconsistently at a fixed boundary timestamp (so its row set is
+frozen — concurrent writers cannot extend it and the sweep terminates no
+matter how fast the table grows; rows committed after the boundary are
+maintained by their post-drain writers), and each planned chunk then
+re-reads its own narrow key span in a serializable transaction and writes
+the entries. A concurrent delete or update inside a chunk invalidates its
+read and forces a rescan, so entries always reflect rows that exist at the
+chunk's commit; writes elsewhere in the table never restart a chunk.
+Memory, transaction size, and raft entry size stay bounded regardless of
+table size.
+
+Left for later: a delete-only state for online index drops, and the
+long-lived-transaction descriptor pinning noted under Catalog.
 
 ## Execution
 

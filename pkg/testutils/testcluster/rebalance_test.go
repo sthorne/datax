@@ -131,10 +131,19 @@ func TestAutoRebalance(t *testing.T) {
 		}
 	}
 
+	// Converged = balanced AND every range back at exactly RF replicas (an
+	// interrupted move can transiently leave one at four, which the trim
+	// pass fixes with a generation bump of its own).
 	deadline := time.Now().Add(90 * time.Second)
 	for {
 		counts, descs, err := tc.rangeCounts(ctx)
-		if err == nil && len(descs) == 6 && spread(counts) <= 1 {
+		settled := err == nil && len(descs) == 6 && spread(counts) <= 1
+		for _, d := range descs {
+			if len(d.Replicas) != 3 {
+				settled = false
+			}
+		}
+		if settled {
 			break
 		}
 		if time.Now().After(deadline) {

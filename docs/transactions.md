@@ -119,11 +119,19 @@ and splits take a whole-range exclusive latch.
 ### Timestamp cache
 
 Per range, leader-side. v1 keeps a single **high-water mark**: the maximum
-read timestamp served. Writers at or below it get pushed above (→ retry). It
-is bumped on every read, and to `now()` when a replica acquires leadership
-(a new leader cannot know what the old one served). Coarse — any read pushes
-all writers on the range — but small and correct. An interval cache is future
-work.
+read timestamp served. It is bumped on every read, and to `now()` when a
+replica acquires leadership (a new leader cannot know what the old one
+served). A transactional write at or below the mark is **pushed, not
+rejected**: its intents simply land above the cache, the response carries
+the forwarded write timestamp, and the coordinator settles up at commit —
+refresh the reads, then the EndTxn (which writes no MVCC versions and is
+exempt from the check) flips the record at the pushed timestamp. Rejecting
+instead would let a steady reader starve every writer on the range: the
+coordinator's refresh round trip always loses the race against the next
+read's bump. Non-transactional writes, which have no reads to protect, are
+still bounced with a retry timestamp and simply resent above it. Coarse —
+any read pushes all writers on the range — but small and correct. An
+interval cache is future work.
 
 ## Conflicts and pushes
 
