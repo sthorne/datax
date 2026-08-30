@@ -11,6 +11,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/server/ui"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -93,6 +94,21 @@ func (n *Node) startHTTP() error {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(n.statusSummary())
 	})
+	mux.HandleFunc("/api/cluster", n.serveClusterAPI)
+	// The dashboard, exact path only — anything else 404s rather than
+	// serving the page for every typo. Self-contained and read-only.
+	page, uerr := ui.FS.ReadFile("index.html")
+	if uerr != nil {
+		return uerr
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/" {
+			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(page)
+	})
 
 	srv := &http.Server{Handler: mux}
 	if n.tlsCfgs != nil {
@@ -110,7 +126,7 @@ func (n *Node) startHTTP() error {
 		}()
 	}
 	n.stopper.AddCloser(func() { _ = srv.Close() })
-	log.Infof("node %s serving /metrics and /status at %s", n.ident.NodeID, n.httpAddr)
+	log.Infof("node %s serving the dashboard, /metrics, /status and /api/cluster at %s", n.ident.NodeID, n.httpAddr)
 	return nil
 }
 

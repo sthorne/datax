@@ -55,8 +55,10 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   secure mode.
 - **Operations**: leader-driven housekeeping per range — MVCC garbage
   collection, raft log truncation, size-based splitting and merging —
-  plus dead-node repair, load rebalancing, decommission, `datax bench`, and `/metrics` + `/status` observability endpoints
-  (`--http-listen`).
+  plus dead-node repair, load rebalancing, decommission, `datax bench`, and
+  a built-in observability dashboard with `/metrics` + `/status` + `/api/cluster`
+  endpoints (`--http-listen`; the dashboard at `/` is read-only, self-contained,
+  and — like the endpoints it reads — unauthenticated).
 
 Design documents live in [`docs/`](docs/):
 [architecture](docs/architecture.md) ·
@@ -100,7 +102,8 @@ datax start --dir data3 --listen :26259 --pg-listen :26435 --join 127.0.0.1:2625
 Once three nodes are up, every range is automatically replicated 3× with one
 replica per rack. Add `--certs-dir` (after `datax cert create-ca` /
 `create-node`) for mutual internode TLS and SQL TLS + SCRAM, and
-`--http-listen :8080` for Prometheus `/metrics` and JSON `/status`.
+`--http-listen :8080` for the observability dashboard (Prometheus `/metrics`, JSON `/status` and
+`/api/cluster`, and a self-contained web UI at `/`).
 Benchmark with `datax bench kv|bank`; on the in-process demo the kv
 workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
@@ -110,12 +113,12 @@ This is a prototype. Out of scope so far, deliberately:
 
 | Area | Not yet implemented |
 |---|---|
-| Ranges | load-based split/merge heuristics (splits and merges are automatic by size, or manual via `datax debug split`/`merge`) |
+| Ranges | load stats are per-leader only (a leadership transfer resets the QPS view; splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
 | SQL | correlated subqueries, 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
 | Wire | COPY protocol; portal suspension (partial result fetches) |
-| Ops | observability UI |
+| Ops | auth on the observability endpoints (dashboard and JSON are read-only but unauthenticated); per-node drill-down across peers (the dashboard's range detail is the serving node's own) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
 | Time series | changing `shards` after CREATE; order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |

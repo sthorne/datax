@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>datax</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --panel: #ffffff; --border: #e4e3df;
+    --text: #0b0b0b; --text-2: #52514e; --text-3: #8a897f;
+    --series-1: #2a78d6; --series-2: #eb6834;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19; --panel: #232322; --border: #3a3936;
+      --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
+      --series-1: #3987e5; --series-2: #d95926;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+  header .sub { color: var(--text-2); font-size: 13px; }
+  header .stale { color: var(--critical); font-size: 13px; margin-left: auto; display: none; }
+  main { padding: 16px 20px 40px; max-width: 1200px; margin: 0 auto; }
+  section { margin-top: 22px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 8px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .tile {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px 8px;
+  }
+  .tile .label { font-size: 12px; color: var(--text-2); }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
+  .tile polyline { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
+  .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 12px; white-space: nowrap; }
+  th { font-size: 12px; color: var(--text-2); font-weight: 500; border-bottom: 1px solid var(--border); }
+  tbody tr + tr td { border-top: 1px solid var(--border); }
+  td.num, th.num { text-align: right; }
+  td.key { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2); max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  .st { display: inline-flex; align-items: center; gap: 6px; }
+  .st .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .st.live .dot { background: var(--good); }
+  .st.down .dot { background: var(--critical); }
+  .st.draining .dot { background: var(--warning); }
+  .err {
+    display: none; margin-top: 10px; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--serious); color: var(--text); background: var(--panel); font-size: 13px;
+  }
+  .muted { color: var(--text-3); }
+</style>
+</head>
+<body>
+<header>
+  <h1>datax</h1>
+  <span class="sub" id="hdr-node">connecting…</span>
+  <span class="stale" id="hdr-stale">● stale — last update failed</span>
+</header>
+<main>
+  <div class="err" id="cluster-err"></div>
+
+  <section>
+    <h2>Cluster</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section>
+    <h2>Nodes</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th><th class="num">heartbeat</th></tr></thead>
+      <tbody id="nodes"></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Ranges (local replicas, this node)</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th></tr></thead>
+      <tbody id="ranges"></tbody>
+    </table></div>
+    <p class="muted" id="cluster-range-note"></p>
+  </section>
+
+  <section>
+    <h2>Storage health</h2>
+    <div class="tiles" id="storage"></div>
+  </section>
+</main>
+<script>
+"use strict";
+// Read-only dashboard: polls /api/cluster every 3s and renders in place.
+// Sparkline history lives only in this tab.
+const HISTORY = 40;
+const hist = {}; // name -> number[]
+function pushHist(name, v) {
+  const h = hist[name] || (hist[name] = []);
+  h.push(v);
+  if (h.length > HISTORY) h.shift();
+  return h;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+function fmtBytes(b) {
+  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(1) + " GiB";
+  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + " MiB";
+  if (b >= 1 << 10) return (b / (1 << 10)).toFixed(1) + " KiB";
+  return b + " B";
+}
+function fmtAgo(ms) {
+  if (ms < 1500) return "now";
+  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
+  return Math.round(ms / 60000) + "m ago";
+}
+function spark(h) {
+  if (h.length < 2) return "";
+  const max = Math.max(...h, 1e-9), w = 100, ht = 26;
+  const pts = h.map((v, i) =>
+    (i * w / (h.length - 1)).toFixed(1) + "," + (ht - 2 - v / max * (ht - 4)).toFixed(1)
+  ).join(" ");
+  return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="recent trend"><polyline points="${pts}"/></svg>`;
+}
+function tile(label, value, histName, histVal) {
+  let sp = "";
+  if (histName !== undefined) sp = spark(pushHist(histName, histVal));
+  return `<div class="tile"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div>${sp}</div>`;
+}
+function statusCell(n) {
+  if (!n.live) return `<span class="st down"><span class="dot"></span>down</span>`;
+  if (n.draining) return `<span class="st draining"><span class="dot"></span>draining</span>`;
+  return `<span class="st live"><span class="dot"></span>live</span>`;
+}
+function render(d) {
+  document.getElementById("hdr-node").textContent =
+    "node n" + d.node_id + " · " + (d.local.address || "");
+  const liveCount = (d.nodes || []).filter(n => n.live).length;
+  const totalQPS = (d.local.ranges || []).reduce((s, r) => s + (r.qps || 0), 0);
+  const totalBytes = (d.local.ranges || []).reduce((s, r) => s + (r.size_bytes || 0), 0);
+  document.getElementById("tiles").innerHTML =
+    tile("live nodes", liveCount + " / " + (d.nodes || []).length) +
+    tile("cluster ranges", (d.ranges || []).length || (d.local.ranges || []).length) +
+    tile("this node leads", d.local.leader_of) +
+    tile("this node QPS", Math.round(totalQPS), "qps", totalQPS) +
+    tile("this node data", fmtBytes(totalBytes), "bytes", totalBytes);
+
+  document.getElementById("nodes").innerHTML = (d.nodes || []).map(n => `<tr>
+    <td>n${n.node_id}</td>
+    <td>${statusCell(n)}</td>
+    <td class="key">${esc(n.address)}</td>
+    <td>${esc(n.locality || "—")}</td>
+    <td class="num">${fmtAgo(n.heartbeat_ago_ms)}</td>
+  </tr>`).join("");
+
+  const local = (d.local.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
+  document.getElementById("ranges").innerHTML = local.map(r => `<tr>
+    <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
+    <td class="key">${esc(r.start_key)} → ${esc(r.end_key)}</td>
+    <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
+    <td>${r.leader ? "this node" : ""}</td>
+    <td class="num">${fmtBytes(r.size_bytes)}</td>
+    <td class="num">${r.qps ? r.qps.toFixed(0) : "0"}</td>
+    <td class="num">${r.applied_index}</td>
+  </tr>`).join("");
+  const clusterN = (d.ranges || []).length;
+  document.getElementById("cluster-range-note").textContent = clusterN
+    ? "cluster-wide: " + clusterN + " ranges (★ = led by this node; qps is the leader's local rate)"
+    : "";
+
+  const s = d.storage || {};
+  document.getElementById("storage").innerHTML =
+    tile("L0 files", s.L0Files ?? 0) +
+    tile("L0 sublevels", s.L0Sublevels ?? 0) +
+    tile("compaction debt", fmtBytes(s.CompactionDebtBytes || 0), "debt", s.CompactionDebtBytes || 0) +
+    tile("memtables", (s.MemtableCount ?? 0) + " (" + fmtBytes(s.MemtableBytes || 0) + ")") +
+    tile("write stalls", s.WriteStalls ?? 0) +
+    tile("disk slow events", s.DiskSlowEvents ?? 0);
+
+  const errBox = document.getElementById("cluster-err");
+  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
+  else errBox.style.display = "none";
+}
+async function poll() {
+  try {
+    const resp = await fetch("/api/cluster", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    render(await resp.json());
+    document.getElementById("hdr-stale").style.display = "none";
+  } catch (err) {
+    document.getElementById("hdr-stale").style.display = "inline";
+  }
+}
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>
