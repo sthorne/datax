@@ -441,11 +441,17 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
-	if hasAggregates(t.Exprs) {
+	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 		if t.ForUpdate {
-			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with aggregate functions")
+			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with GROUP BY or aggregate functions")
 		}
-		return s.execAggSelect(ctx, txn, desc, t, params)
+		return s.execGroupedSelect(ctx, txn, desc, t, params)
+	}
+	if len(t.Having) > 0 {
+		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")
+	}
+	if t.Distinct && t.ForUpdate {
+		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with DISTINCT")
 	}
 	proj, perr := resolveProjection(desc, t.Exprs)
 	if perr != nil {
@@ -453,8 +459,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 
 	// With ORDER BY the limit applies only after sorting (unless the access
-	// path already delivers the requested order).
+	// path already delivers the requested order); with DISTINCT only after
+	// deduplication.
 	fetchLimit := t.Limit
+	if t.Distinct {
+		fetchLimit = 0
+	}
 	needSort := false
 	if len(t.OrderBy) > 0 {
 		plan, err := pickPlan(desc, t.Where, params)
@@ -485,7 +495,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		if err := sortRows(desc, rows, t.OrderBy); err != nil {
 			return nil, err
 		}
-		if t.Limit > 0 && int64(len(rows)) > t.Limit {
+		if !t.Distinct && t.Limit > 0 && int64(len(rows)) > t.Limit {
 			rows = rows[:t.Limit]
 		}
 	}
@@ -511,6 +521,14 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			out[i] = d
 		}
 		res.Rows = append(res.Rows, out)
+	}
+	if t.Distinct {
+		// Degenerate grouping over the projection: keep first occurrences
+		// (rows are already in the requested order), then apply the limit.
+		res.Rows = dedupeRows(res.Rows)
+		if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
+			res.Rows = res.Rows[:t.Limit]
+		}
 	}
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
@@ -669,14 +687,15 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		return nil, err
 	}
 	text := plan.String()
-	if len(sel.OrderBy) > 0 && !hasAggregates(sel.Exprs) {
+	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
+	if len(sel.OrderBy) > 0 && !grouped {
 		if orderSatisfiedByPlan(desc, plan, sel.OrderBy) {
 			text += "; order satisfied by access path"
 		} else {
 			text += "; in-memory sort"
 		}
 	}
-	if sel.Limit > 0 && !hasAggregates(sel.Exprs) && len(plan.residual) == 0 &&
+	if sel.Limit > 0 && !grouped && len(plan.residual) == 0 &&
 		(len(sel.OrderBy) == 0 || orderSatisfiedByPlan(desc, plan, sel.OrderBy)) {
 		switch plan.kind {
 		case planFullScan, planPKScan, planIndexScan:

@@ -170,14 +170,14 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
-		if hasAggregates(t.Exprs) {
-			specs, aerr := resolveAggregates(desc, t.Exprs)
+		if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
+			gq, aerr := resolveGrouped(desc, t)
 			if aerr != nil {
 				return nil, ToSQLError(aerr)
 			}
-			cols := make([]ResultColumn, len(specs))
-			for i, sp := range specs {
-				cols[i] = ResultColumn{Name: sp.name, Type: sp.resultType()}
+			cols := make([]ResultColumn, len(gq.outs))
+			for i, oc := range gq.outs {
+				cols[i] = ResultColumn{Name: oc.name, Type: oc.typ}
 			}
 			return cols, nil
 		}

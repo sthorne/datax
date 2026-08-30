@@ -456,6 +456,10 @@ func (p *parser) parseInsert() (Statement, error) {
 func (p *parser) parseSelect() (Statement, error) {
 	p.i++ // SELECT
 	sel := &Select{Limit: -1}
+	// DISTINCT is not a reserved word — it lexes as an identifier.
+	if p.consumeIdentWord("distinct") {
+		sel.Distinct = true
+	}
 	for {
 		if p.consumeOp("*") {
 			sel.Exprs = append(sel.Exprs, SelectExpr{Star: true})
@@ -520,6 +524,28 @@ func (p *parser) parseSelect() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	// GROUP and HAVING are not reserved words — they lex as identifiers.
+	if p.consumeIdentWord("group") {
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			sel.GroupBy = append(sel.GroupBy, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
+	if p.consumeIdentWord("having") {
+		sel.Having, err = p.parseHaving()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if p.consumeKeyword("ORDER") {
 		if err := p.expectKeyword("BY"); err != nil {
 			return nil, err
@@ -565,6 +591,41 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.ForUpdate = true
 	}
 	return sel, nil
+}
+
+// parseHaving parses the HAVING conjunction: each conjunct compares an
+// aggregate call or a column/output name against a literal or parameter.
+func (p *parser) parseHaving() ([]HavingCond, error) {
+	var out []HavingCond
+	for {
+		var hc HavingCond
+		if se, ok, err := p.parseAggExpr(); err != nil {
+			return nil, err
+		} else if ok {
+			hc.Agg = &se
+		} else {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			hc.Column = col
+		}
+		t := p.peek()
+		if t.kind != tkOp || !isCmpOp(t.text) {
+			return nil, p.errf("expected comparison operator, found %q", t.text)
+		}
+		p.i++
+		val, err := p.parseValueExpr()
+		if err != nil {
+			return nil, err
+		}
+		hc.Op, hc.Value = t.text, val
+		out = append(out, hc)
+		if !p.consumeKeyword("AND") {
+			break
+		}
+	}
+	return out, nil
 }
 
 var aggNames = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}

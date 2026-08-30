@@ -10,7 +10,8 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
-SELECT * | col, ... | aggregates  FROM t [AS OF SYSTEM TIME 't'] [WHERE conjunction]
+SELECT [DISTINCT] * | col, ... | aggregates  FROM t [AS OF SYSTEM TIME 't']
+    [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
     [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
@@ -31,8 +32,8 @@ SHOW TABLES
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,
 skipped when the access path already delivers the order; PG-default NULL
-ordering), aggregates `COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX` (whole-table,
-no GROUP BY, no mixing with plain columns), and
+ordering), aggregates `COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX`
+(whole-table or per group), and
 `ALTER TABLE t ADD COLUMN c TYPE` (nullable-only) / `DROP COLUMN c`
 (lazy: old bytes are skipped on decode; PK/indexed columns refused;
 column IDs are never reused, so re-adding a name cannot resurrect old
@@ -50,7 +51,7 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: joins, GROUP BY/HAVING, subqueries, DISTINCT,
+Still out of scope: joins, subqueries,
 constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
 
 ## Catalog
@@ -175,6 +176,16 @@ so the planner only uses one when the schema (`NOT NULL`) or the WHERE
 clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
 match — and `col IS NULL` therefore always reads the primary rows. Unique
 indexes reject NULLs at write time and are always complete.
+
+Grouping is post-fetch and never changes the access path: `GROUP BY`
+hash-groups the fetched rows on the group columns' datums (NULL keys form
+one group, per SQL) with streaming per-group aggregate state, and every
+non-aggregate output must appear in GROUP BY (else `42803`). `HAVING`
+conjuncts — aggregate calls, group columns, or output names — filter after
+aggregation; `DISTINCT` is a degenerate grouping over the projection. On a
+grouped or DISTINCT select, ORDER BY sorts the output rows by
+result-column name and LIMIT applies last, so limit pushdown never applies
+there.
 
 UPDATE and DELETE read the matching rows through the same path ranking,
 then write inside the same transaction. `EXPLAIN SELECT ...` prints the

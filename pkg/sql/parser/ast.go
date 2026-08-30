@@ -81,12 +81,24 @@ type OrderCol struct {
 	Desc   bool
 }
 
+// HavingCond is one HAVING conjunct: an aggregate call (HAVING COUNT(*) > 5)
+// or a group-column/output name (HAVING city != 'x') compared to a value.
+type HavingCond struct {
+	Agg    *SelectExpr // aggregate form; nil for the column form
+	Column string
+	Op     string
+	Value  Expr
+}
+
 type Select struct {
-	Exprs   []SelectExpr
-	Table   string // empty for FROM-less selects
-	Where   []Comparison
-	OrderBy []OrderCol
-	Limit   int64 // -1 = none
+	Distinct bool
+	Exprs    []SelectExpr
+	Table    string // empty for FROM-less selects
+	Where    []Comparison
+	GroupBy  []string
+	Having   []HavingCond
+	OrderBy  []OrderCol
+	Limit    int64 // -1 = none
 	// AsOf is the AS OF SYSTEM TIME operand ("" = none): a string literal
 	// holding a negative duration ('-5s'), an RFC 3339 timestamp, or a
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and

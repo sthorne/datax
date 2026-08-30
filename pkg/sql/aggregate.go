@@ -2,6 +2,9 @@ package sql
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -30,31 +33,29 @@ type aggSpec struct {
 	name string
 }
 
-// resolveAggregates validates and resolves an all-aggregate SELECT list
-// (mixing aggregates with plain columns is not supported without GROUP BY).
-func resolveAggregates(desc *catalog.TableDescriptor, exprs []parser.SelectExpr) ([]aggSpec, error) {
-	var specs []aggSpec
-	for _, se := range exprs {
-		if se.Agg == "" {
-			return nil, newErrf(CodeFeatureNotSupported, "cannot mix aggregates with plain columns (no GROUP BY)")
-		}
-		sp := aggSpec{fn: se.Agg, star: se.AggStar, name: se.Alias}
-		if sp.name == "" {
-			sp.name = strings.ToLower(se.Agg)
-		}
-		if !se.AggStar {
-			col, ok := desc.Col(se.AggCol)
-			if !ok {
-				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", se.AggCol)
-			}
-			if (se.Agg == "SUM" || se.Agg == "AVG") && col.Type != types.Int && col.Type != types.Float {
-				return nil, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, col.Type)
-			}
-			sp.col = col
-		}
-		specs = append(specs, sp)
+// resolveAggSpec validates and resolves one aggregate select item.
+func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpec, error) {
+	sp := aggSpec{fn: se.Agg, star: se.AggStar, name: se.Alias}
+	if sp.name == "" {
+		sp.name = strings.ToLower(se.Agg)
 	}
-	return specs, nil
+	if !se.AggStar {
+		col, ok := desc.Col(se.AggCol)
+		if !ok {
+			return sp, newErrf(CodeUndefinedColumn, "column %q does not exist", se.AggCol)
+		}
+		if (se.Agg == "SUM" || se.Agg == "AVG") && col.Type != types.Int && col.Type != types.Float {
+			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, col.Type)
+		}
+		sp.col = col
+	}
+	return sp, nil
+}
+
+// sameSpec reports whether two aggregate computations are identical (so a
+// HAVING aggregate can reuse a projected one's state).
+func sameSpec(a, b aggSpec) bool {
+	return a.fn == b.fn && a.star == b.star && a.col.ID == b.col.ID
 }
 
 func (sp aggSpec) resultType() types.Family {
@@ -67,11 +68,240 @@ func (sp aggSpec) resultType() types.Family {
 	return sp.col.Type
 }
 
-func (s *Session) execAggSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
-	if len(t.OrderBy) > 0 {
-		return nil, newErrf(CodeFeatureNotSupported, "ORDER BY with aggregates is not supported")
+// aggState is the streaming accumulator for one group's aggregates.
+type aggState struct {
+	counts []int64
+	sumI   []int64
+	sumF   []float64
+	best   []types.Datum // MIN/MAX candidate; zero = none yet
+	seen   []bool
+}
+
+func newAggState(n int) *aggState {
+	return &aggState{
+		counts: make([]int64, n),
+		sumI:   make([]int64, n),
+		sumF:   make([]float64, n),
+		best:   make([]types.Datum, n),
+		seen:   make([]bool, n),
 	}
-	specs, err := resolveAggregates(desc, t.Exprs)
+}
+
+func (st *aggState) accumulate(specs []aggSpec, row map[catalog.ColumnID]types.Datum) error {
+	for i, sp := range specs {
+		if sp.star {
+			st.counts[i]++
+			continue
+		}
+		d, ok := row[sp.col.ID]
+		if !ok || d.Null {
+			continue
+		}
+		d, cerr := d.Coerce(sp.col.Type)
+		if cerr != nil {
+			return newErrf(CodeInternal, "column %q: %v", sp.col.Name, cerr)
+		}
+		st.counts[i]++
+		switch sp.fn {
+		case "SUM", "AVG":
+			if sp.col.Type == types.Int {
+				st.sumI[i] += d.I
+			} else {
+				st.sumF[i] += d.F
+			}
+		case "MIN", "MAX":
+			if !st.seen[i] {
+				st.best[i], st.seen[i] = d, true
+				continue
+			}
+			c, err := d.Compare(st.best[i])
+			if err != nil {
+				return newErrf(CodeInternal, "%v", err)
+			}
+			if (sp.fn == "MIN" && c < 0) || (sp.fn == "MAX" && c > 0) {
+				st.best[i] = d
+			}
+		}
+	}
+	return nil
+}
+
+func (st *aggState) finish(specs []aggSpec) []types.Datum {
+	out := make([]types.Datum, len(specs))
+	for i, sp := range specs {
+		switch sp.fn {
+		case "COUNT":
+			out[i] = types.NewInt(st.counts[i])
+		case "SUM":
+			if st.counts[i] == 0 {
+				out[i] = types.DNull
+			} else if sp.col.Type == types.Int {
+				out[i] = types.NewInt(st.sumI[i])
+			} else {
+				out[i] = types.NewFloat(st.sumF[i])
+			}
+		case "AVG":
+			if st.counts[i] == 0 {
+				out[i] = types.DNull
+			} else {
+				total := st.sumF[i]
+				if sp.col.Type == types.Int {
+					total = float64(st.sumI[i])
+				}
+				out[i] = types.NewFloat(total / float64(st.counts[i]))
+			}
+		case "MIN", "MAX":
+			if !st.seen[i] {
+				out[i] = types.DNull
+			} else {
+				out[i] = st.best[i]
+			}
+		}
+	}
+	return out
+}
+
+// groupedOut is one output column of a grouped SELECT: either a group key
+// position or an aggregate spec position.
+type groupedOut struct {
+	name     string
+	typ      types.Family
+	groupPos int // ≥0 → group key position; else -1
+	aggPos   int // ≥0 → aggregate spec position; else -1
+}
+
+// havingRef is one resolved HAVING conjunct.
+type havingRef struct {
+	op       string
+	value    parser.Expr
+	groupPos int
+	aggPos   int
+}
+
+// groupedQuery is the resolved shape of a grouped/aggregate SELECT.
+type groupedQuery struct {
+	groupCols []catalog.Column
+	specs     []aggSpec // projected aggregates first, then HAVING-only ones
+	outs      []groupedOut
+	having    []havingRef
+}
+
+// resolveGrouped resolves the select list, GROUP BY, and HAVING of a
+// grouped/aggregate SELECT (standard rule: every non-aggregate output must
+// appear in GROUP BY).
+func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQuery, error) {
+	gq := &groupedQuery{}
+	groupIdx := map[string]int{} // column name → group key position
+	for _, name := range t.GroupBy {
+		col, ok := desc.Col(name)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+		}
+		if _, dup := groupIdx[name]; !dup {
+			groupIdx[name] = len(gq.groupCols)
+			gq.groupCols = append(gq.groupCols, col)
+		}
+	}
+
+	for _, se := range t.Exprs {
+		switch {
+		case se.Star:
+			return nil, newErrf(CodeGrouping, "SELECT * is not allowed with GROUP BY or aggregates")
+		case se.Agg != "":
+			sp, err := resolveAggSpec(desc, se)
+			if err != nil {
+				return nil, err
+			}
+			gq.outs = append(gq.outs, groupedOut{name: sp.name, typ: sp.resultType(), groupPos: -1, aggPos: len(gq.specs)})
+			gq.specs = append(gq.specs, sp)
+		default:
+			if se.Expr.Column == "" || se.Expr.BinOp != "" {
+				return nil, newErrf(CodeFeatureNotSupported, "grouped SELECT items must be plain columns or aggregates")
+			}
+			pos, ok := groupIdx[se.Expr.Column]
+			if !ok {
+				return nil, newErrf(CodeGrouping, "column %q must appear in the GROUP BY clause or be used in an aggregate function", se.Expr.Column)
+			}
+			name := se.Alias
+			if name == "" {
+				name = se.Expr.Column
+			}
+			col, _ := desc.Col(se.Expr.Column)
+			gq.outs = append(gq.outs, groupedOut{name: name, typ: col.Type, groupPos: pos, aggPos: -1})
+		}
+	}
+
+	for _, hc := range t.Having {
+		ref := havingRef{op: hc.Op, value: hc.Value, groupPos: -1, aggPos: -1}
+		if hc.Agg != nil {
+			sp, err := resolveAggSpec(desc, *hc.Agg)
+			if err != nil {
+				return nil, err
+			}
+			for i := range gq.specs {
+				if sameSpec(gq.specs[i], sp) {
+					ref.aggPos = i
+					break
+				}
+			}
+			if ref.aggPos < 0 {
+				ref.aggPos = len(gq.specs)
+				gq.specs = append(gq.specs, sp) // computed, not projected
+			}
+		} else if pos, ok := groupIdx[hc.Column]; ok {
+			ref.groupPos = pos
+		} else {
+			// An output name (alias or default aggregate name).
+			for _, oc := range gq.outs {
+				if oc.name == hc.Column {
+					ref.groupPos, ref.aggPos = oc.groupPos, oc.aggPos
+					break
+				}
+			}
+			if ref.groupPos < 0 && ref.aggPos < 0 {
+				return nil, newErrf(CodeGrouping, "column %q must appear in the GROUP BY clause or be used in an aggregate function", hc.Column)
+			}
+		}
+		gq.having = append(gq.having, ref)
+	}
+	return gq, nil
+}
+
+// encodeGroupKey builds a collision-free hash key from group datums. NULLs
+// are their own value, so NULL keys group together (SQL semantics).
+func encodeGroupKey(ds []types.Datum) string {
+	var b []byte
+	for _, d := range ds {
+		switch {
+		case d.Null:
+			b = append(b, 'n')
+		case d.Fam == types.Int:
+			b = append(b, 'i')
+			b = binary.BigEndian.AppendUint64(b, uint64(d.I))
+		case d.Fam == types.Float:
+			b = append(b, 'f')
+			b = binary.BigEndian.AppendUint64(b, math.Float64bits(d.F))
+		case d.Fam == types.Bool:
+			if d.B {
+				b = append(b, 'b', 1)
+			} else {
+				b = append(b, 'b', 0)
+			}
+		default:
+			b = append(b, 's')
+			b = binary.AppendUvarint(b, uint64(len(d.S)))
+			b = append(b, d.S...)
+		}
+	}
+	return string(b)
+}
+
+// execGroupedSelect executes a SELECT with aggregates and/or GROUP BY:
+// hash-group over the fetched rows on the group columns' datums, streaming
+// aggregate state per group, HAVING post-aggregation, then ORDER BY/LIMIT
+// over the output rows.
+func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
+	gq, err := resolveGrouped(desc, t)
 	if err != nil {
 		return nil, err
 	}
@@ -80,85 +310,192 @@ func (s *Session) execAggSelect(ctx context.Context, txn *kvclient.Txn, desc *ca
 		return nil, err
 	}
 
-	// Streaming state per aggregate.
-	counts := make([]int64, len(specs))
-	sumI := make([]int64, len(specs))
-	sumF := make([]float64, len(specs))
-	best := make([]types.Datum, len(specs)) // MIN/MAX candidate; zero = none yet
-	seen := make([]bool, len(specs))
+	type aggGroup struct {
+		key []types.Datum
+		st  *aggState
+	}
+	groups := map[string]*aggGroup{}
+	var order []string // first-seen group order
 	for _, fr := range rows {
-		for i, sp := range specs {
-			if sp.star {
-				counts[i]++
-				continue
+		key := make([]types.Datum, len(gq.groupCols))
+		for i, col := range gq.groupCols {
+			d, ok := fr.row[col.ID]
+			if !ok {
+				d = types.DNull
 			}
-			d, ok := fr.row[sp.col.ID]
-			if !ok || d.Null {
-				continue
-			}
-			d, cerr := d.Coerce(sp.col.Type)
-			if cerr != nil {
-				return nil, newErrf(CodeInternal, "column %q: %v", sp.col.Name, cerr)
-			}
-			counts[i]++
-			switch sp.fn {
-			case "SUM", "AVG":
-				if sp.col.Type == types.Int {
-					sumI[i] += d.I
-				} else {
-					sumF[i] += d.F
-				}
-			case "MIN", "MAX":
-				if !seen[i] {
-					best[i], seen[i] = d, true
-					continue
-				}
-				c, err := d.Compare(best[i])
-				if err != nil {
-					return nil, newErrf(CodeInternal, "%v", err)
-				}
-				if (sp.fn == "MIN" && c < 0) || (sp.fn == "MAX" && c > 0) {
-					best[i] = d
-				}
-			}
+			key[i] = d
 		}
+		k := encodeGroupKey(key)
+		g, ok := groups[k]
+		if !ok {
+			g = &aggGroup{key: key, st: newAggState(len(gq.specs))}
+			groups[k] = g
+			order = append(order, k)
+		}
+		if err := g.st.accumulate(gq.specs, fr.row); err != nil {
+			return nil, err
+		}
+	}
+	// Without GROUP BY, aggregates over zero rows still produce one row.
+	if len(gq.groupCols) == 0 && len(order) == 0 {
+		k := encodeGroupKey(nil)
+		groups[k] = &aggGroup{st: newAggState(len(gq.specs))}
+		order = append(order, k)
 	}
 
-	res := &Result{Tag: "SELECT 1"}
-	out := make([]types.Datum, len(specs))
-	for i, sp := range specs {
-		res.Columns = append(res.Columns, ResultColumn{Name: sp.name, Type: sp.resultType()})
-		switch sp.fn {
-		case "COUNT":
-			out[i] = types.NewInt(counts[i])
-		case "SUM":
-			if counts[i] == 0 {
-				out[i] = types.DNull
-			} else if sp.col.Type == types.Int {
-				out[i] = types.NewInt(sumI[i])
+	res := &Result{}
+	for _, oc := range gq.outs {
+		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ})
+	}
+	for _, k := range order {
+		g := groups[k]
+		aggVals := g.st.finish(gq.specs)
+		keep := true
+		for _, ref := range gq.having {
+			var lhs types.Datum
+			if ref.aggPos >= 0 {
+				lhs = aggVals[ref.aggPos]
 			} else {
-				out[i] = types.NewFloat(sumF[i])
+				lhs = g.key[ref.groupPos]
 			}
-		case "AVG":
-			if counts[i] == 0 {
-				out[i] = types.DNull
-			} else {
-				total := sumF[i]
-				if sp.col.Type == types.Int {
-					total = float64(sumI[i])
-				}
-				out[i] = types.NewFloat(total / float64(counts[i]))
+			match, err := compareDatum(lhs, ref.op, ref.value, params)
+			if err != nil {
+				return nil, err
 			}
-		case "MIN", "MAX":
-			if !seen[i] {
-				out[i] = types.DNull
-			} else {
-				out[i] = best[i]
+			if !match {
+				keep = false
+				break
 			}
 		}
+		if !keep {
+			continue
+		}
+		out := make([]types.Datum, len(gq.outs))
+		for i, oc := range gq.outs {
+			if oc.groupPos >= 0 {
+				out[i] = g.key[oc.groupPos]
+			} else {
+				out[i] = aggVals[oc.aggPos]
+			}
+		}
+		res.Rows = append(res.Rows, out)
 	}
-	res.Rows = [][]types.Datum{out}
+
+	if t.Distinct {
+		res.Rows = dedupeRows(res.Rows)
+	}
+	if len(t.OrderBy) > 0 {
+		if err := sortResultRows(res.Columns, res.Rows, t.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
+		res.Rows = res.Rows[:t.Limit]
+	}
+	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
+}
+
+// compareDatum mirrors matchesWhere's comparison semantics for one value:
+// NULLs never match, the RHS coerces to the LHS's family.
+func compareDatum(lhs types.Datum, op string, value parser.Expr, params []types.Datum) (bool, error) {
+	rhs, err := evalExpr(value, nil, nil, params)
+	if err != nil {
+		return false, err
+	}
+	if lhs.Null || rhs.Null {
+		return false, nil
+	}
+	rhs, cerr := rhs.Coerce(lhs.Fam)
+	if cerr != nil {
+		return false, newErrf(CodeInternal, "HAVING: %v", cerr)
+	}
+	c, err := lhs.Compare(rhs)
+	if err != nil {
+		return false, nil
+	}
+	switch op {
+	case "=":
+		return c == 0, nil
+	case "!=":
+		return c != 0, nil
+	case "<":
+		return c < 0, nil
+	case "<=":
+		return c <= 0, nil
+	case ">":
+		return c > 0, nil
+	case ">=":
+		return c >= 0, nil
+	}
+	return false, nil
+}
+
+// dedupeRows removes duplicate output rows, keeping first occurrences in
+// order (SELECT DISTINCT).
+func dedupeRows(rows [][]types.Datum) [][]types.Datum {
+	seen := map[string]bool{}
+	out := rows[:0]
+	for _, r := range rows {
+		k := encodeGroupKey(r)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// sortResultRows sorts output rows by result-column names (grouped and
+// DISTINCT selects order by what they produce, not by table columns). NULL
+// ordering matches sortRows: NULLS LAST ascending, NULLS FIRST descending.
+func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.OrderCol) error {
+	idx := make([]int, len(order))
+	for i, oc := range order {
+		found := -1
+		for j, c := range cols {
+			if c.Name == oc.Column {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			return newErrf(CodeUndefinedColumn, "ORDER BY column %q is not in the select list", oc.Column)
+		}
+		idx[i] = found
+	}
+	var sortErr error
+	sort.SliceStable(rows, func(a, b int) bool {
+		for i, oc := range order {
+			da, db := rows[a][idx[i]], rows[b][idx[i]]
+			if da.Null || db.Null {
+				if da.Null == db.Null {
+					continue
+				}
+				return db.Null != oc.Desc
+			}
+			c, err := da.Compare(db)
+			if err != nil {
+				if sortErr == nil {
+					sortErr = err
+				}
+				return false
+			}
+			if c == 0 {
+				continue
+			}
+			if oc.Desc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return false
+	})
+	if sortErr != nil {
+		return newErrf(CodeInternal, "ORDER BY: %v", sortErr)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
