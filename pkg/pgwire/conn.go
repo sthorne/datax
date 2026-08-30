@@ -217,6 +217,9 @@ func (c *conn) handleStartup() error {
 			} else {
 				c.backend.Send(&pgproto3.AuthenticationOk{}) // trust auth
 			}
+			// Privileges are enforced against this identity. In trust mode
+			// it is client-claimed (nothing verified it) — documented.
+			c.session.SetUser(m.Parameters["user"])
 			for _, kv := range [][2]string{
 				{"server_version", "13.0 datax"},
 				{"server_encoding", "UTF8"},

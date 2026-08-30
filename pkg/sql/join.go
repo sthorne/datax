@@ -285,6 +285,9 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, outerDe
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkTablePriv(ctx, txn, innerDesc, "SELECT"); err != nil {
+		return nil, err
+	}
 	outer, inner, err := makeJoinSides(outerDesc, innerDesc, t)
 	if err != nil {
 		return nil, err

@@ -79,6 +79,10 @@ type TableDescriptor struct {
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
+	// Privileges maps a user name to its granted per-table privileges
+	// (SELECT/INSERT/UPDATE/DELETE, upper-cased; ALL is stored expanded).
+	// root and admin-role members bypass the map entirely.
+	Privileges map[string][]string `json:"privileges,omitempty"`
 	// Version increments on every descriptor change; gateway leases record
 	// which version they may be using (see leasing in this package).
 	Version uint64 `json:"version,omitempty"`
@@ -103,6 +107,12 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	for i, idx := range d.Indexes {
 		out.Indexes[i] = idx
 		out.Indexes[i].ColumnIDs = append([]ColumnID(nil), idx.ColumnIDs...)
+	}
+	if d.Privileges != nil {
+		out.Privileges = make(map[string][]string, len(d.Privileges))
+		for u, ps := range d.Privileges {
+			out.Privileges[u] = append([]string(nil), ps...)
+		}
 	}
 	return &out
 }

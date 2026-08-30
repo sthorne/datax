@@ -259,8 +259,17 @@ explicit `BEGIN ... COMMIT`.
   flow leaks nothing). Cleartext startup is refused in secure mode. In
   insecure mode `SSLRequest` gets `N` and authentication is trust.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
-  `--root-password` seeds root's at startup. No roles or privileges
-  (documented limitation): any authenticated user can do anything.
+  `--root-password` seeds root's at startup. Authorization: `root` is
+  all-powerful; members of the **admin role** (`GRANT ADMIN TO user`,
+  `REVOKE ADMIN FROM user`; root is implicitly a member) may run DDL,
+  manage users, and grant; everyone else needs per-table privileges —
+  `GRANT SELECT, INSERT, UPDATE, DELETE | ALL ON t TO user` /
+  `REVOKE ... ON t FROM user`, enforced at execution with `42501`
+  (joins and subqueries check every table they touch). Grants ride the
+  table descriptor, so they propagate through the same version leases
+  as schema changes: by the time GRANT returns, every gateway enforces
+  it. In insecure (trust) mode the username is client-claimed, so
+  enforcement there is advisory — anyone can claim `root`.
   Then `ParameterStatus` for `server_version` (reports a PG-13-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

@@ -11,10 +11,10 @@ import (
 )
 
 // SQL users. Only SCRAM verifiers are ever stored (never plaintext), at
-// /system/users/<name>. There are no roles or privileges (documented
-// limitation): any authenticated user can do anything, including managing
-// users. Insecure clusters use trust auth and these statements simply
-// manage credentials that nothing checks.
+// /system/users/<name>. User management requires the admin role (see
+// privileges.go); per-table access is governed by GRANT/REVOKE. Insecure
+// clusters use trust auth: these statements manage credentials that
+// nothing checks, and the enforced identity is client-claimed.
 
 func (s *Session) execCreateUser(ctx context.Context, txn *kvclient.Txn, t *parser.CreateUser) (*Result, error) {
 	key := keys.UserKey(t.Name)

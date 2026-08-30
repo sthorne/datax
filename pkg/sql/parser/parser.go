@@ -212,6 +212,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &RollbackToSavepoint{Name: name}, nil
 		}
 		return &Rollback{}, nil
+	case "grant", "revoke": // not reserved words; they lex as identifiers
+		return p.parseGrantRevoke(t.text == "revoke")
 	case "savepoint": // not a reserved word; lexes as an identifier
 		p.i++
 		name, err := p.expectIdent()
@@ -818,6 +820,66 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		return se, false, err
 	}
 	return se, true, nil
+}
+
+// parseGrantRevoke parses GRANT/REVOKE ADMIN and per-table privileges.
+func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
+	p.i++ // grant | revoke
+	gr := &GrantRevoke{Revoke: revoke}
+	linkKw := "TO"
+	if revoke {
+		linkKw = "FROM"
+	}
+
+	if p.consumeIdentWord("admin") {
+		gr.Admin = true
+		if err := p.expectKeyword(linkKw); err != nil {
+			return nil, err
+		}
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		gr.User = name
+		return gr, nil
+	}
+
+	for {
+		t := p.peek()
+		var priv string
+		switch {
+		case t.kind == tkKeyword && (t.text == "SELECT" || t.text == "INSERT" || t.text == "UPDATE" || t.text == "DELETE"):
+			priv = t.text
+			p.i++
+		case t.kind == tkIdent && t.text == "all":
+			priv = "ALL"
+			p.i++
+		default:
+			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, ALL), found %q", t.text)
+		}
+		gr.Privileges = append(gr.Privileges, priv)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	p.consumeKeyword("TABLE")
+	table, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	gr.Table = table
+	if err := p.expectKeyword(linkKw); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	gr.User = name
+	return gr, nil
 }
 
 // parseUserStmt parses CREATE USER / ALTER USER name PASSWORD 'pw'.

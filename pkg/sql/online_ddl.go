@@ -274,6 +274,10 @@ func ddlTableName(stmt parser.Statement) string {
 		return t.Table
 	case *parser.DropTable:
 		return t.Name
+	case *parser.GrantRevoke:
+		// Table grants ride the descriptor: drain leases like any DDL so
+		// every gateway enforces the new privileges once the grant returns.
+		return t.Table
 	}
 	return ""
 }

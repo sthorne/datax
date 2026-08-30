@@ -134,7 +134,8 @@ func TestSecureClusterEndToEnd(t *testing.T) {
 		t.Fatalf("unknown user: %v", err)
 	}
 
-	// User management via SQL.
+	// User management via SQL. Authenticating is not authorization: alice
+	// needs a grant before she can read the table.
 	if _, err := conn.Exec(ctx, `CREATE USER alice PASSWORD 'wonderland'`); err != nil {
 		t.Fatal(err)
 	}
@@ -142,8 +143,14 @@ func TestSecureClusterEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alice cannot log in: %v", err)
 	}
+	if err := aliceConn.QueryRow(ctx, `SELECT v FROM secrets WHERE id = 1`).Scan(&v); err == nil || !strings.Contains(err.Error(), "42501") {
+		t.Fatalf("ungranted read succeeded or failed oddly: %q, %v", v, err)
+	}
+	if _, err := conn.Exec(ctx, `GRANT SELECT ON secrets TO alice`); err != nil {
+		t.Fatal(err)
+	}
 	if err := aliceConn.QueryRow(ctx, `SELECT v FROM secrets WHERE id = 1`).Scan(&v); err != nil || v != "classified" {
-		t.Fatalf("alice's query: %q, %v", v, err)
+		t.Fatalf("alice's granted query: %q, %v", v, err)
 	}
 	_ = aliceConn.Close(ctx)
 

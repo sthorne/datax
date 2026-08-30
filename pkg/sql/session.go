@@ -67,6 +67,10 @@ const (
 type Session struct {
 	db  *kvclient.DB
 	cat *catalog.Accessor
+	// user is the authenticated SQL user ("root" for internal sessions).
+	// In insecure/trust mode it is the client-claimed name: privileges are
+	// enforced against it, but nothing verified the identity.
+	user string
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -75,10 +79,30 @@ type Session struct {
 	pendingDDL []string
 }
 
-// NewSession creates a session. The catalog accessor is shared per node.
+// NewSession creates a root session (internal components, tests, tools).
+// The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat}
+	return &Session{db: db, cat: cat, user: "root"}
 }
+
+// NewSessionForUser creates a session for an authenticated user.
+func NewSessionForUser(db *kvclient.DB, cat *catalog.Accessor, user string) *Session {
+	if user == "" {
+		user = "root"
+	}
+	return &Session{db: db, cat: cat, user: user}
+}
+
+// SetUser rebinds the session's user (pgwire sets it after startup).
+func (s *Session) SetUser(user string) {
+	if user == "" {
+		user = "root"
+	}
+	s.user = user
+}
+
+// User returns the session's SQL user.
+func (s *Session) User() string { return s.user }
 
 func (s *Session) State() TxnState { return s.state }
 
@@ -188,6 +212,16 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	if ci, ok := stmt.(*parser.CreateIndex); ok {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
+		}
+		var aerr error
+		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			aerr = s.checkAdmin(ctx, txn)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if aerr != nil {
+			return nil, ToSQLError(aerr)
 		}
 		return s.execCreateIndexOnline(ctx, ci)
 	}

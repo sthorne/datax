@@ -228,6 +228,13 @@ func UserKey(name string) Key {
 	return Key(encoding.EncodeString(k, name))
 }
 
+// AdminUserKey marks a SQL user as a member of the admin role (root is
+// implicitly a member and has no row).
+func AdminUserKey(name string) Key {
+	k := systemKey("admins")
+	return Key(encoding.EncodeString(k, name))
+}
+
 // TableDescKey holds the JSON table descriptor for a table ID.
 func TableDescKey(tableID uint64) Key {
 	k := systemKey("desc")

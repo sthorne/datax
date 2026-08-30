@@ -17,7 +17,14 @@ import (
 // execStmt executes one data statement within txn. It is safe to re-run on
 // transaction retry (all state flows through txn).
 func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.Statement, params []types.Datum) (*Result, error) {
+	if requiresAdmin(stmt) {
+		if err := s.checkAdmin(ctx, txn); err != nil {
+			return nil, err
+		}
+	}
 	switch t := stmt.(type) {
+	case *parser.GrantRevoke:
+		return s.execGrantRevoke(ctx, txn, t)
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
 	case *parser.Explain:
@@ -122,6 +129,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	}
 	desc, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 		return nil, err
 	}
 	// Resolve target columns.
@@ -464,6 +474,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+		return nil, err
+	}
 	if t.Join != nil {
 		return s.execJoinSelect(ctx, txn, desc, t, params)
 	}
@@ -569,6 +582,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
+		return nil, err
+	}
 	for _, set := range t.Set {
 		col, ok := desc.Col(set.Column)
 		if !ok {
@@ -623,6 +639,9 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	}
 	desc, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkTablePriv(ctx, txn, desc, "DELETE"); err != nil {
 		return nil, err
 	}
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)

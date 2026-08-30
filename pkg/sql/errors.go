@@ -28,6 +28,7 @@ const (
 	CodeGrouping             = "42803"
 	CodeAmbiguousColumn      = "42702"
 	CodeCardinality          = "21000"
+	CodeInsufficientPriv     = "42501"
 	CodeInternal             = "XX000"
 	CodeInvalidParameter     = "08P01"
 	CodeUndefinedObject      = "42704"

@@ -173,6 +173,17 @@ type DropUser struct {
 	Name string
 }
 
+// GrantRevoke is GRANT/REVOKE: either the admin role
+// (GRANT ADMIN TO user / REVOKE ADMIN FROM user) or per-table privileges
+// (GRANT SELECT, INSERT ON t TO user / REVOKE ALL ON t FROM user).
+type GrantRevoke struct {
+	Revoke     bool
+	Admin      bool     // admin-role form; Privileges/Table empty
+	Privileges []string // upper-cased: SELECT INSERT UPDATE DELETE ALL
+	Table      string
+	User       string
+}
+
 type Begin struct{}
 type Commit struct{}
 type Rollback struct{}
@@ -199,6 +210,7 @@ func (*Delete) stmt()              {}
 func (*AlterTable) stmt()          {}
 func (*CreateUser) stmt()          {}
 func (*DropUser) stmt()            {}
+func (*GrantRevoke) stmt()         {}
 func (*Begin) stmt()               {}
 func (*Commit) stmt()              {}
 func (*Savepoint) stmt()           {}
