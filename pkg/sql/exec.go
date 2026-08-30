@@ -588,11 +588,14 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		}
 		d, err := evalExpr(cmp.Value, nil, nil, params)
 		if err != nil {
-			return nil, false, err
+			continue // row-dependent value (column RHS): not a point bound
 		}
 		d, cerr := d.Coerce(col.Type)
 		if cerr != nil {
 			return nil, false, nil // un-coercible: cannot match anything via point path; fall to scan
+		}
+		if d.Null {
+			continue // = NULL never matches; the scan+filter path returns nothing
 		}
 		byCol[col.ID] = d
 	}
@@ -636,6 +639,24 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	// Correlated conjuncts leave the WHERE clause before eager subquery
+	// resolution and access planning ever see them; they come back as a
+	// per-row filter after the fetch. Only the plain single-table path
+	// supports them.
+	var corr []correlatedConjunct
+	if t.Table != "" && t.Join == nil && t.Derived == nil {
+		if cdesc, derr := s.cat.Lookup(ctx, txn, t.Table); derr == nil {
+			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, t.Where, cdesc, t.Alias)
+			if serr != nil {
+				return nil, serr
+			}
+			if len(cc) > 0 {
+				c := *t
+				c.Where = plannable
+				t, corr = &c, cc
+			}
+		}
+	}
 	t, err := s.resolveSelectSubs(ctx, txn, t, params)
 	if err != nil {
 		return nil, err
@@ -685,7 +706,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		if t.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with GROUP BY or aggregate functions")
 		}
-		return s.execGroupedSelect(ctx, txn, desc, t, params)
+		return s.execGroupedSelect(ctx, txn, desc, t, params, corr)
 	}
 	if len(t.Having) > 0 {
 		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")
@@ -702,7 +723,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// path already delivers the requested order); with DISTINCT only after
 	// deduplication.
 	fetchLimit := t.Limit
-	if t.Distinct {
+	if t.Distinct || len(corr) > 0 {
+		// A correlated filter runs after the fetch, so the fetch itself
+		// must not stop early; the limit re-applies to the survivors.
 		fetchLimit = 0
 	}
 	needSort := false
@@ -719,6 +742,23 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, fetchLimit)
 	if err != nil {
 		return nil, err
+	}
+	if len(corr) > 0 {
+		memo := corrMemo{}
+		kept := rows[:0]
+		for _, fr := range rows {
+			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if match {
+				kept = append(kept, fr)
+			}
+		}
+		rows = kept
+		if !needSort && !t.Distinct && t.Limit > 0 && int64(len(rows)) > t.Limit {
+			rows = rows[:t.Limit]
+		}
 	}
 	if t.ForUpdate {
 		// Lock each selected row: the locking read re-verifies the row at
@@ -775,7 +815,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 }
 
 func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update, params []types.Datum) (*Result, error) {
-	t, err := s.resolveUpdateSubs(ctx, txn, t, params)
+	corr, t2, err := s.splitCorrelatedUpdate(ctx, txn, t)
+	if err != nil {
+		return nil, err
+	}
+	t = t2
+	t, err = s.resolveUpdateSubs(ctx, txn, t, params)
 	if err != nil {
 		return nil, err
 	}
@@ -798,6 +843,20 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
+	}
+	if len(corr) > 0 {
+		memo := corrMemo{}
+		kept := rows[:0]
+		for _, fr := range rows {
+			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if match {
+				kept = append(kept, fr)
+			}
+		}
+		rows = kept
 	}
 	var wb kvclient.WriteBatch
 	seen := map[string]bool{}
@@ -834,7 +893,12 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 }
 
 func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*Result, error) {
-	t, err := s.resolveDeleteSubs(ctx, txn, t, params)
+	corr, t2, err := s.splitCorrelatedDelete(ctx, txn, t)
+	if err != nil {
+		return nil, err
+	}
+	t = t2
+	t, err = s.resolveDeleteSubs(ctx, txn, t, params)
 	if err != nil {
 		return nil, err
 	}
@@ -848,6 +912,20 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
+	}
+	if len(corr) > 0 {
+		memo := corrMemo{}
+		kept := rows[:0]
+		for _, fr := range rows {
+			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if match {
+				kept = append(kept, fr)
+			}
+		}
+		rows = kept
 	}
 	var wb kvclient.WriteBatch
 	for _, fr := range rows {
@@ -946,6 +1024,22 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
 	}
+	// Correlated conjuncts are stripped exactly as execution strips them,
+	// so the plan below describes the plannable remainder.
+	var corr []correlatedConjunct
+	if sel.Table != "" && sel.Join == nil && sel.Derived == nil {
+		if cdesc, derr := s.cat.Lookup(ctx, txn, sel.Table); derr == nil {
+			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Alias)
+			if serr != nil {
+				return nil, serr
+			}
+			if len(cc) > 0 {
+				c := *sel
+				c.Where = plannable
+				sel, corr = &c, cc
+			}
+		}
+	}
 	// Subqueries are evaluated (in this transaction) so the plan reflects
 	// the spliced values, exactly as execution will see them.
 	sel, err := s.resolveSelectSubs(ctx, txn, sel, params)
@@ -979,6 +1073,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		return nil, err
 	}
 	text := plan.String()
+	if len(corr) > 0 {
+		text += fmt.Sprintf("; correlated filter: nested loop over %d conjunct(s) (O(outer rows x inner query), memoized per correlation key)", len(corr))
+	}
 	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
 	if len(sel.OrderBy) > 0 && !grouped {
 		if orderSatisfiedByPlan(desc, plan, sel.OrderBy) {

@@ -37,9 +37,9 @@ SHOW TABLES
   omit the column store the default; an explicit NULL stays NULL.
 - WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
   plus `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, and
-  `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, or an
-  uncorrelated scalar subquery `(SELECT ...)` — also usable in INSERT
-  values and UPDATE SET.
+  `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, a
+  column reference, or a scalar subquery `(SELECT ...)` (correlated in
+  WHERE; uncorrelated ones also work in INSERT values and UPDATE SET).
 - Every table must declare a `PRIMARY KEY`.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
@@ -70,7 +70,7 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: correlated subqueries, multi-way (3+ table) joins,
+Still out of scope: multi-level correlated subqueries, multi-way (3+ table) joins,
 aggregates/GROUP BY over joins,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 DECIMAL and JSONB column types, DEFAULT expressions beyond constants.
@@ -212,20 +212,34 @@ qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
 inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
 primary key join`.
 
-Subqueries are uncorrelated only and evaluate eagerly, inside the same
-transaction, before the outer statement plans: a scalar subquery splices
-in as a literal (zero rows = NULL; two rows = `21000`), `[NOT] IN
-(SELECT ...)` becomes a value list with SQL three-valued semantics
-(`NOT IN` over a NULL-bearing set is never true), and `[NOT] EXISTS`
-collapses to a constant conjunct. Because splicing happens before
-planning, `WHERE k = (SELECT MAX(k) ...)` plans as a point lookup. A
-derived table — `FROM (SELECT ...) AS alias` — materializes the inner
-result in memory and runs the outer pipeline (WHERE, grouping,
-ORDER BY, DISTINCT, LIMIT) over it, which is how you filter on an
-aggregate output. A column inside a subquery that does not resolve in
-the subquery's own scope is reported as an unsupported correlated
-reference (`0A000`). The parsed statement is never mutated, so prepared
-statements re-evaluate their subqueries on every execution.
+Uncorrelated subqueries evaluate eagerly, inside the same transaction,
+before the outer statement plans: a scalar subquery splices in as a
+literal (zero rows = NULL; two rows = `21000`), `[NOT] IN (SELECT ...)`
+becomes a value list with SQL three-valued semantics (`NOT IN` over a
+NULL-bearing set is never true), and `[NOT] EXISTS` collapses to a
+constant conjunct. Because splicing happens before planning,
+`WHERE k = (SELECT MAX(k) ...)` plans as a point lookup. A derived
+table — `FROM (SELECT ...) AS alias` — materializes the inner result in
+memory and runs the outer pipeline (WHERE, grouping, ORDER BY, DISTINCT,
+LIMIT) over it, which is how you filter on an aggregate output.
+
+**Correlated** subqueries — an inner reference to the outer row, like
+`WHERE salary = (SELECT MAX(salary) FROM emp WHERE dept_id = e.dept_id)`
+— are supported in the WHERE clause of single-table SELECT (plain or
+aggregated), UPDATE, and DELETE, as scalar comparisons, `[NOT] IN`, and
+`[NOT] EXISTS`, one correlation level deep, over plain single-table
+inner selects. Names resolve inner-scope-first (an inner column shadows
+an outer one; qualify with the outer alias to force the outer scope).
+Execution is a nested loop: the correlated conjunct leaves the planned
+WHERE clause and re-runs the inner query per fetched outer row with the
+outer values spliced in, memoized per distinct correlation key —
+`EXPLAIN` says so (`correlated filter: nested loop ...`), and the cost
+is honestly O(outer rows × inner query). A name resolving in neither
+scope is a plain `42703` (not the old blanket "correlated" error); a
+correlated reference in GROUP BY / ORDER BY / aggregate arguments, in a
+join or derived-table outer, or reaching more than one level up is
+rejected with a clear error. The parsed statement is never mutated, so
+prepared statements re-evaluate their subqueries on every execution.
 
 Grouping is post-fetch and never changes the access path: `GROUP BY`
 hash-groups the fetched rows on the group columns' datums (NULL keys form

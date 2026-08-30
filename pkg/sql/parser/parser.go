@@ -1108,7 +1108,10 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 			return nil, p.errf("expected comparison operator, found %q", t.text)
 		}
 		p.i++
-		val, err := p.parseValueExpr()
+		// The right side may itself be a column reference (a = b, or a
+		// correlated outer.col inside a subquery); row-dependent values
+		// are excluded from access planning and checked by the filter.
+		val, err := p.parseValueOrColumnExpr()
 		if err != nil {
 			return nil, err
 		}

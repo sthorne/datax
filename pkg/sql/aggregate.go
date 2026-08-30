@@ -300,10 +300,26 @@ func encodeGroupKey(ds []types.Datum) string {
 // hash-group over the fetched rows on the group columns' datums, streaming
 // aggregate state per group, HAVING post-aggregation, then ORDER BY/LIMIT
 // over the output rows.
-func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
+func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum, corr []correlatedConjunct) (*Result, error) {
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
+	}
+	if len(corr) > 0 {
+		// Correlated conjuncts filter the input rows before grouping —
+		// COUNT(*) WHERE EXISTS (...) counts the survivors.
+		memo := corrMemo{}
+		kept := rows[:0]
+		for _, fr := range rows {
+			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if match {
+				kept = append(kept, fr)
+			}
+		}
+		rows = kept
 	}
 	return s.execGroupedOver(desc, rows, t, params)
 }

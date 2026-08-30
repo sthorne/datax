@@ -190,12 +190,13 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 		pc := planConj{cmp: cmp, col: col}
 		switch cmp.Op {
 		case "=", "<", "<=", ">", ">=":
-			d, err := evalExpr(cmp.Value, nil, nil, params)
-			if err != nil {
-				return accessPlan{}, err
-			}
-			if d, cerr := d.Coerce(col.Type); cerr == nil && !d.Null {
-				pc.d, pc.usable = d, true
+			// A value that cannot be evaluated without a row (a column
+			// reference on the right-hand side) is simply unusable for
+			// bounds; the post-fetch filter evaluates it per row.
+			if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil {
+				if d, cerr := d.Coerce(col.Type); cerr == nil && !d.Null {
+					pc.d, pc.usable = d, true
+				}
 			}
 		}
 		conjs[i] = pc

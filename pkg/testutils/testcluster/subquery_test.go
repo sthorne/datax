@@ -154,11 +154,11 @@ func TestSubqueriesOverPgwire(t *testing.T) {
 	} else if !errors.As(err, &pgErr) || pgErr.Code != "42601" {
 		t.Fatalf("multi-column IN error: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `SELECT id FROM depts WHERE EXISTS (SELECT 1 FROM emp WHERE region = 'west')`); err == nil {
-		t.Fatal("correlated subquery accepted")
-	} else if !errors.As(err, &pgErr) || pgErr.Code != "0A000" {
-		t.Fatalf("correlated error: %v", err)
-	}
+	// Correlated EXISTS works now (full matrix in TestCorrelatedSubqueries):
+	// 'region' resolves in the OUTER scope, so each 'west' dept probes the
+	// non-empty emp table.
+	eq(names(`SELECT region FROM depts WHERE EXISTS (SELECT 1 FROM emp WHERE region = 'west') ORDER BY id`),
+		[]string{"west", "west"})
 	if _, err := conn.Exec(ctx, `SELECT * FROM (SELECT id FROM emp)`); err == nil {
 		t.Fatal("FROM subquery without alias accepted")
 	} else if !errors.As(err, &pgErr) || pgErr.Code != "42601" {
