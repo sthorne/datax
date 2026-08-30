@@ -49,7 +49,19 @@ type StoreConfig struct {
 	// cadence (0 = default 1s).
 	ClosedTimestampLag      time.Duration
 	ClosedTimestampInterval time.Duration
-	TestingKnobs            TestingKnobs
+	// RetentionOverride, when set, maps a key span to a GC TTL override
+	// (per-table retention for timeseries tables). Called per replica from
+	// the housekeeping loop with the range's [start, end); returning
+	// ok=true replaces the store-wide TTL for that range with ttl.
+	// expire=true additionally switches that range's GC to row expiry:
+	// every version at or below the threshold is collected, INCLUDING the
+	// newest one — rows older than the retention disappear. The provider
+	// must only set expire for a range that lies entirely inside one
+	// retention table's span, and must never return a TTL shorter than
+	// the default for a span that also holds non-retention data (never
+	// delete early from a mixed range).
+	RetentionOverride func(start, end keys.Key) (ttl time.Duration, expire, ok bool)
+	TestingKnobs      TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.

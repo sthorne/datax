@@ -257,6 +257,11 @@ func (n *Node) start() error {
 
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
+	defaultGCTTL := n.cfg.GCTTL
+	if defaultGCTTL == 0 {
+		defaultGCTTL = base.DefaultGCTTL
+	}
+	retention := &retentionProvider{node: n, defaultTTL: defaultGCTTL}
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
 		NodeID:                  n.ident.NodeID,
 		StoreID:                 n.ident.StoreID,
@@ -270,6 +275,7 @@ func (n *Node) start() error {
 		MergeSizeThreshold:      n.cfg.MergeSizeThreshold,
 		ClosedTimestampLag:      n.cfg.ClosedTimestampLag,
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
+		RetentionOverride:       retention.override,
 		TestingKnobs:            n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)

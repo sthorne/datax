@@ -142,10 +142,10 @@ func resolveJoinProjection(outer, inner joinSide, exprs []parser.SelectExpr) ([]
 	for _, se := range exprs {
 		switch {
 		case se.Star:
-			for _, c := range outer.desc.Columns {
+			for _, c := range outer.desc.VisibleColumns() {
 				proj = append(proj, joinProj{name: c.Name, ref: joinRef{col: c}})
 			}
-			for _, c := range inner.desc.Columns {
+			for _, c := range inner.desc.VisibleColumns() {
 				proj = append(proj, joinProj{name: c.Name, ref: joinRef{inner: true, col: c}})
 			}
 		case se.Agg != "":

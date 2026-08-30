@@ -40,6 +40,12 @@ type accessPlan struct {
 	// executor always re-filters with the full WHERE clause (belt and
 	// braces); residual only gates LIMIT pushdown into the KV scan.
 	residual []parser.Comparison
+
+	// fanBuckets (sharded timeseries planPKScan only): the scan runs once
+	// per shard bucket — the pinned prefix and range bounds constrain the
+	// LOGICAL primary key (PrimaryKey[1:]), and the executor prepends each
+	// bucket value in turn. Fanned results are not in logical PK order.
+	fanBuckets int32
 }
 
 type planKind int
@@ -100,7 +106,11 @@ func (p accessPlan) String() string {
 	case planUniquePoint:
 		return fmt.Sprintf("point lookup via unique index %q", p.idx.Name)
 	case planPKScan:
-		return fmt.Sprintf("range scan of primary key (%s)", p.boundsString())
+		out := fmt.Sprintf("range scan of primary key (%s)", p.boundsString())
+		if p.fanBuckets > 0 {
+			out += fmt.Sprintf(" (fan-out over %d shard buckets)", p.fanBuckets)
+		}
+		return out
 	case planIndexScan:
 		if p.hasBounds() {
 			return fmt.Sprintf("scan of index %q (%s) + primary key join", p.idx.Name, p.boundsString())
@@ -295,7 +305,14 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 		return cand
 	}
 
-	best := buildCandidate(nil, desc.PrimaryKey) // ties prefer the primary key (no join)
+	// Sharded timeseries tables plan against the LOGICAL primary key — the
+	// hidden _shard column leads the real key but no query pins it; the
+	// executor fans the resulting scan out across the buckets.
+	pkCols := desc.PrimaryKey
+	if desc.ShardBuckets > 0 && len(pkCols) > 1 {
+		pkCols = pkCols[1:]
+	}
+	best := buildCandidate(nil, pkCols) // ties prefer the primary key (no join)
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		if !idx.Public() {
@@ -337,6 +354,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	}
 	if best.idx == nil {
 		plan.kind = planPKScan
+		if desc.ShardBuckets > 0 {
+			plan.fanBuckets = desc.ShardBuckets
+		}
 	} else {
 		plan.kind = planIndexScan
 	}

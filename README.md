@@ -64,7 +64,8 @@ Design documents live in [`docs/`](docs/):
 [replication & placement](docs/replication-and-placement.md) ·
 [sql](docs/sql.md) ·
 [storage profiles](docs/storage-profiles.md) ·
-[encryption](docs/encryption.md)
+[encryption](docs/encryption.md) ·
+[time-series tables](docs/timeseries.md)
 
 ## Quickstart
 
@@ -116,6 +117,8 @@ This is a prototype. Out of scope so far, deliberately:
 | Wire | COPY protocol; portal suspension (partial result fetches) |
 | Ops | observability UI |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
+| Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
+| Time series | changing `shards` after CREATE; order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
 
 ## License
 

@@ -8,6 +8,7 @@ transactions — all over the standard PostgreSQL wire protocol.
 
 ```
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
+    [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
 SELECT [DISTINCT] * | col, ... | aggregates

@@ -46,6 +46,10 @@ type CreateTable struct {
 	IfNotExists bool
 	Columns     []ColumnDef
 	PrimaryKey  []string // table-level constraint (column names)
+	// Options is the trailing WITH (name = value, ...) list, lowercased
+	// names mapping to raw literal text (e.g. timeseries=true,
+	// retention='7d', shards=8). Nil when no WITH clause was given.
+	Options map[string]string
 }
 
 // CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).

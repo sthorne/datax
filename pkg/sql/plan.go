@@ -20,7 +20,7 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 	var proj []projCol
 	for _, se := range exprs {
 		if se.Star {
-			for _, c := range desc.Columns {
+			for _, c := range desc.VisibleColumns() {
 				proj = append(proj, projCol{col: c, name: c.Name})
 			}
 			continue
@@ -95,7 +95,7 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
-		target := desc.Columns
+		target := desc.VisibleColumns()
 		if len(t.Columns) > 0 {
 			target = nil
 			for _, name := range t.Columns {

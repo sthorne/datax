@@ -105,6 +105,17 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 		if !redrive && (lhs.SizeBytes() >= threshold || rhs.SizeBytes() >= threshold) {
 			return true
 		}
+		// Never merge ranges with differing retention policies: the merged
+		// range GCs at one TTL and adopts the max of both GC thresholds, so
+		// absorbing a short-retention neighbor could instantly put the
+		// long-retention side's recent history below the threshold.
+		if !redrive && s.cfg.RetentionOverride != nil {
+			lt, lexp, lok := s.cfg.RetentionOverride(desc.StartKey, desc.EndKey)
+			rt, rexp, rok := s.cfg.RetentionOverride(rhsDesc.StartKey, rhsDesc.EndKey)
+			if lok != rok || lt != rt || lexp != rexp {
+				return true
+			}
+		}
 		if !rhs.isLeader() {
 			// Pull the RHS's leadership to this node, then merge on a later
 			// pass. TransferLeadership is forwarded to the current leader.

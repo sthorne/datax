@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -12,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // execStmt executes one data statement within txn. It is safe to re-run on
@@ -85,6 +87,22 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if len(pkNames) == 0 {
 		return nil, newErrf(CodeFeatureNotSupported, "table %q must declare a PRIMARY KEY", t.Name)
 	}
+	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
+		return nil, err
+	}
+	if desc.ShardBuckets > 0 {
+		// The hidden bucket column leads the primary key; the executor
+		// fills it from the logical PK on every insert.
+		shard := catalog.Column{
+			ID:      catalog.ColumnID(len(desc.Columns) + 1),
+			Name:    rowenc.ShardColumnName,
+			Type:    types.Int,
+			NotNull: true,
+			Hidden:  true,
+		}
+		desc.Columns = append(desc.Columns, shard)
+		pkNames = append([]string{rowenc.ShardColumnName}, pkNames...)
+	}
 	for _, name := range pkNames {
 		col, ok := desc.Col(name)
 		if !ok {
@@ -108,7 +126,116 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 		return nil, err
 	}
+	s.presplitTimeseries(ctx, desc)
 	return &Result{Tag: "CREATE TABLE"}, nil
+}
+
+// applyTableOptions validates the WITH (...) options and stamps the
+// timeseries fields onto desc (before the hidden shard column is added).
+func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string, pkNames []string) error {
+	if len(options) == 0 {
+		return nil
+	}
+	for name := range options {
+		switch name {
+		case "timeseries", "retention", "shards":
+		default:
+			return newErrf(CodeSyntaxError, "unknown table option %q", name)
+		}
+	}
+	switch options["timeseries"] {
+	case "true":
+	case "", "false":
+		return newErrf(CodeSyntaxError, "table options require timeseries=true")
+	default:
+		return newErrf(CodeSyntaxError, "timeseries must be true or false")
+	}
+	desc.Timeseries = true
+
+	// The timestamp must close the (logical) primary key so each series'
+	// rows are stored in time order and retention trims a key suffix.
+	last, ok := desc.Col(pkNames[len(pkNames)-1])
+	if !ok || last.Type != types.Timestamp {
+		return newErrf(CodeFeatureNotSupported, "a timeseries table's last primary key column must be TIMESTAMPTZ")
+	}
+
+	if v, ok := options["retention"]; ok {
+		secs, err := parseRetention(v)
+		if err != nil {
+			return newErrf(CodeSyntaxError, "retention: %v", err)
+		}
+		desc.RetentionSeconds = secs
+	}
+	if v, ok := options["shards"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 2 || n > 256 {
+			return newErrf(CodeSyntaxError, "shards must be an integer in [2, 256]")
+		}
+		if _, exists := desc.Col(rowenc.ShardColumnName); exists {
+			return newErrf(CodeSyntaxError, "column name %q is reserved for sharded timeseries tables", rowenc.ShardColumnName)
+		}
+		desc.ShardBuckets = int32(n)
+	}
+	return nil
+}
+
+// parseRetention parses a duration like 90d, 36h, 30m, or 45s into
+// seconds.
+func parseRetention(s string) (int64, error) {
+	if len(s) < 2 {
+		return 0, fmt.Errorf("want <number><d|h|m|s>, got %q", s)
+	}
+	n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("want a positive number before the unit in %q", s)
+	}
+	var mult int64
+	switch s[len(s)-1] {
+	case 'd':
+		mult = 24 * 3600
+	case 'h':
+		mult = 3600
+	case 'm':
+		mult = 60
+	case 's':
+		mult = 1
+	default:
+		return 0, fmt.Errorf("unit must be d, h, m, or s in %q", s)
+	}
+	if n > (1<<62)/mult {
+		return 0, fmt.Errorf("retention %q overflows", s)
+	}
+	return n * mult, nil
+}
+
+// presplitTimeseries pre-carves a fresh timeseries table's key space:
+// splits at the table's span boundaries (so ranges rarely straddle the
+// table edge — the common case for per-table retention GC is then "range
+// fully inside the table") and, for sharded tables, at each bucket
+// prefix, so ingest parallelizes across ranges immediately instead of
+// after autosplit catches up. Best-effort: splits are non-transactional
+// and outlive an aborted enclosing txn, which is harmless — an aborted
+// CREATE leaves empty ranges that the size-based merger re-absorbs.
+func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDescriptor) {
+	if !desc.Timeseries || desc.ID == 0 {
+		return
+	}
+	splitAt := []keys.Key{
+		keys.TableDataPrefix(desc.ID),
+		keys.TableDataPrefix(desc.ID).PrefixEnd(),
+	}
+	for b := int32(1); b < desc.ShardBuckets; b++ {
+		k, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefix(desc.ID), types.Int, types.NewInt(int64(b)))
+		if err != nil {
+			return
+		}
+		splitAt = append(splitAt, k)
+	}
+	for _, k := range splitAt {
+		if _, err := s.db.AdminSplit(ctx, k); err != nil {
+			log.Debugf("timeseries pre-split at %s: %v", k, err)
+		}
+	}
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
@@ -134,15 +261,20 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 		return nil, err
 	}
-	// Resolve target columns.
+	// Resolve target columns. Hidden columns (the _shard bucket) are never
+	// insert targets: implicitly they are skipped, explicitly they error —
+	// the executor computes them.
 	var target []catalog.Column
 	if len(t.Columns) == 0 {
-		target = desc.Columns
+		target = desc.VisibleColumns()
 	} else {
 		for _, name := range t.Columns {
 			col, ok := desc.Col(name)
 			if !ok {
 				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+			}
+			if col.Hidden {
+				return nil, newErrf(CodeSyntaxError, "column %q is system-managed and cannot be inserted", name)
 			}
 			target = append(target, col)
 		}
@@ -169,6 +301,21 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		for _, col := range desc.Columns {
 			d, ok := row[col.ID]
 			if !ok {
+				if col.Hidden && col.Name == rowenc.ShardColumnName && desc.ShardBuckets > 0 {
+					// The shard bucket hashes the logical PK. It is the last
+					// column in desc.Columns, so every logical PK datum is
+					// already filled (and NOT-NULL-checked) by this point.
+					logical := make([]types.Datum, len(desc.PrimaryKey)-1)
+					for i, id := range desc.PrimaryKey[1:] {
+						logical[i] = row[id]
+					}
+					sd, serr := rowenc.ShardBucket(desc, logical)
+					if serr != nil {
+						return nil, serr
+					}
+					row[col.ID] = sd
+					continue
+				}
 				// An omitted column takes its DEFAULT (NULL when none).
 				d = types.DNull
 				if col.Default != nil {
@@ -324,25 +471,65 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		return out, nil
 
 	case planPKScan:
-		prefix := rowenc.PrimaryKeyPrefix(desc.ID)
-		for i, d := range plan.idxVals {
-			col, _ := desc.ColByID(desc.PrimaryKey[i])
-			var err error
-			prefix, err = rowenc.AppendKeyDatum(prefix, col.Type, d)
-			if err != nil {
-				return nil, newErrf(CodeInternal, "pk bound: %v", err)
+		// The plan's pinned prefix and bounds constrain the logical PK; on
+		// a sharded table (fanBuckets > 0) that is PrimaryKey[1:], and the
+		// scan runs once per bucket with the bucket value prepended.
+		pkCols := desc.PrimaryKey
+		if plan.fanBuckets > 0 {
+			pkCols = pkCols[1:]
+		}
+		buildSpan := func(prefix keys.Key) (keys.Key, keys.Key, error) {
+			for i, d := range plan.idxVals {
+				col, _ := desc.ColByID(pkCols[i])
+				var err error
+				prefix, err = rowenc.AppendKeyDatum(prefix, col.Type, d)
+				if err != nil {
+					return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
+				}
 			}
+			var fam types.Family
+			if plan.hasBounds() {
+				col, _ := desc.ColByID(pkCols[len(plan.idxVals)])
+				fam = col.Type
+			}
+			start, end, err := plan.spanBounds(prefix, fam)
+			if err != nil {
+				return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
+			}
+			return start, end, nil
 		}
-		var fam types.Family
-		if plan.hasBounds() {
-			col, _ := desc.ColByID(desc.PrimaryKey[len(plan.idxVals)])
-			fam = col.Type
+		if plan.fanBuckets == 0 {
+			start, end, err := buildSpan(rowenc.PrimaryKeyPrefix(desc.ID))
+			if err != nil {
+				return nil, err
+			}
+			return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 		}
-		start, end, err := plan.spanBounds(prefix, fam)
-		if err != nil {
-			return nil, newErrf(CodeInternal, "pk bound: %v", err)
+		var out []fetchedRow
+		for b := int32(0); b < plan.fanBuckets; b++ {
+			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefix(desc.ID), types.Int, types.NewInt(int64(b)))
+			if err != nil {
+				return nil, newErrf(CodeInternal, "shard bound: %v", err)
+			}
+			start, end, err := buildSpan(bp)
+			if err != nil {
+				return nil, err
+			}
+			// The limit is only an upper bound per span (each span alone
+			// cannot yield more result rows than the global limit); the
+			// global limit re-applies to the concatenation below — and the
+			// caller re-applies it after sorting when there is an ORDER BY,
+			// in which case it passes limit 0 here.
+			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rows...)
 		}
-		return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+		if limit > 0 && int64(len(out)) > limit {
+			out = out[:limit]
+		}
+		return out, nil
 	}
 
 	start, end := rowenc.PrimarySpan(desc.ID)
@@ -396,7 +583,7 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		if !ok {
 			return nil, false, newErrf(CodeUndefinedColumn, "column %q does not exist", cmp.Column)
 		}
-		if !desc.IsPKCol(col.ID) {
+		if !desc.IsPKCol(col.ID) || col.Hidden {
 			continue
 		}
 		d, err := evalExpr(cmp.Value, nil, nil, params)
@@ -409,12 +596,26 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		}
 		byCol[col.ID] = d
 	}
-	if len(byCol) != len(desc.PrimaryKey) {
+	// Sharded timeseries: the query pins the LOGICAL primary key; the
+	// hidden leading _shard value is recomputed from it, so a fully-pinned
+	// lookup stays a single point read.
+	pkCols := desc.PrimaryKey
+	if desc.ShardBuckets > 0 && len(pkCols) > 1 {
+		pkCols = pkCols[1:]
+	}
+	if len(byCol) != len(pkCols) {
 		return nil, false, nil
 	}
-	out := make([]types.Datum, len(desc.PrimaryKey))
-	for i, id := range desc.PrimaryKey {
+	out := make([]types.Datum, len(pkCols))
+	for i, id := range pkCols {
 		out[i] = byCol[id]
+	}
+	if desc.ShardBuckets > 0 {
+		bucket, err := rowenc.ShardBucket(desc, out)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append([]types.Datum{bucket}, out...)
 	}
 	return out, true, nil
 }

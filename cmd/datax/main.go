@@ -54,7 +54,7 @@ Usage:
                                        start a node, joining an existing cluster
   datax demo   [--nodes N]             run an in-process demo cluster across racks
   datax sql    --url <postgres-url>    interactive SQL shell
-  datax bench  <kv|bank|ingest> [flags]  benchmark a running cluster over pgwire
+  datax bench  <kv|bank|ingest|timeseries> [flags]  benchmark a running cluster over pgwire
   datax cert   <create-ca|create-node|create-client>
                                        manage TLS certificates (secure mode)
   datax debug  <subcommand>            cluster inspection and admin commands

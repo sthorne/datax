@@ -36,6 +36,10 @@ type Column struct {
 	// NULL marker when the column is NULL, so NULL and "predates the
 	// column" stay distinguishable.
 	FillDefault bool `json:"fill_default,omitempty"`
+	// Hidden marks a system-managed column (the _shard bucket of a
+	// sharded timeseries table): invisible to SELECT *, not an INSERT
+	// target, and filled by the executor.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // IndexDescriptor describes a secondary index. Entries live at
@@ -86,6 +90,31 @@ type TableDescriptor struct {
 	// Version increments on every descriptor change; gateway leases record
 	// which version they may be using (see leasing in this package).
 	Version uint64 `json:"version,omitempty"`
+	// Timeseries marks a table created WITH (timeseries=true): its last
+	// primary-key column is a TIMESTAMPTZ, it may carry a retention TTL,
+	// and it may be sharded across buckets by a hidden leading PK column.
+	Timeseries bool `json:"timeseries,omitempty"`
+	// RetentionSeconds (timeseries only): rows older than this are
+	// eligible for GC — reads below the cutoff fail like any read below
+	// the GC threshold. 0 = keep forever (default GC policy applies).
+	RetentionSeconds int64 `json:"retention_seconds,omitempty"`
+	// ShardBuckets (timeseries only): when > 0, a hidden _shard column
+	// (fnv32a of the logical PK encoding, mod this) leads the primary
+	// key, spreading a monotone timestamp tail across ShardBuckets
+	// ranges. Immutable after creation — it defines the key layout.
+	ShardBuckets int32 `json:"shard_buckets,omitempty"`
+}
+
+// VisibleColumns returns the columns SELECT * expands to and INSERT
+// implicitly targets — every column except Hidden ones.
+func (d *TableDescriptor) VisibleColumns() []Column {
+	out := make([]Column, 0, len(d.Columns))
+	for _, c := range d.Columns {
+		if !c.Hidden {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Index returns the secondary index with the given name.

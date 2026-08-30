@@ -318,6 +318,46 @@ func (p *parser) parseCreateTable() (Statement, error) {
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
 	}
+	// Trailing storage options: WITH (name = value, ...). WITH is not a
+	// keyword (that would collide with TIMESTAMP WITH TIME ZONE), so it
+	// arrives as a plain identifier here.
+	if p.consumeIdentWord("with") {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		ct.Options = map[string]string{}
+		for {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("="); err != nil {
+				return nil, err
+			}
+			v := p.peek()
+			val := v.text
+			switch v.kind {
+			case tkString, tkNumber:
+				p.i++
+			case tkIdent, tkKeyword:
+				// Bare words (true, false) compare case-insensitively.
+				p.i++
+				val = strings.ToLower(val)
+			default:
+				return nil, p.errf("expected a value for option %q, found %q", name, v.text)
+			}
+			if _, dup := ct.Options[name]; dup {
+				return nil, p.errf("duplicate option %q", name)
+			}
+			ct.Options[name] = val
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
 	return ct, nil
 }
 

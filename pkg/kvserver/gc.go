@@ -78,7 +78,10 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if gcTTL > 0 {
+				// With a RetentionOverride, GC must run even when the
+				// store-wide TTL disables it — retention tables still age
+				// out (RunGCOnce skips replicas whose effective TTL is 0).
+				if gcTTL > 0 || s.cfg.RetentionOverride != nil {
 					s.RunGCOnce(ctx, gcTTL)
 				}
 				s.RunLogTruncationOnce(ctx)
@@ -90,13 +93,11 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 }
 
 // RunGCOnce runs one GC pass over every range this store currently leads,
-// collecting garbage older than ttl. Exported for tests (time-compressed
-// TTLs) and future debug tooling.
+// collecting garbage older than ttl — or than the range's
+// RetentionOverride TTL when one applies. Exported for tests
+// (time-compressed TTLs) and future debug tooling.
 func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
-	threshold := s.cfg.Clock.Now().AddNanos(-ttl.Nanoseconds())
-	if threshold.WallTime <= 0 {
-		return
-	}
+	now := s.cfg.Clock.Now()
 	s.VisitReplicas(func(r *Replica) bool {
 		if ctx.Err() != nil {
 			return false
@@ -104,7 +105,21 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 		if !r.IsLeader() || r.isFrozen() {
 			return true
 		}
-		if err := r.runGC(ctx, threshold); err != nil {
+		effective, expire := ttl, false
+		if s.cfg.RetentionOverride != nil {
+			desc := r.Desc()
+			if t, exp, ok := s.cfg.RetentionOverride(desc.StartKey, desc.EndKey); ok {
+				effective, expire = t, exp
+			}
+		}
+		if effective <= 0 {
+			return true // GC disabled for this range
+		}
+		threshold := now.AddNanos(-effective.Nanoseconds())
+		if threshold.WallTime <= 0 {
+			return true
+		}
+		if err := r.runGC(ctx, threshold, expire); err != nil {
 			log.Warnf("%s: gc at threshold %s: %v", r.rangeID, threshold, err)
 		}
 		return true
@@ -112,14 +127,16 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 }
 
 // runGC enumerates and collects this range's garbage below threshold.
-func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp) error {
+// expire (retention ranges) collects EVERY version at or below the
+// threshold, survivors included — the rows are past their retention.
+func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire bool) error {
 	if threshold.LessEq(r.GCThreshold()) {
 		return nil
 	}
 	desc := r.Desc()
 
 	snap := r.store.cfg.Engine.NewSnapshot()
-	versions, liveIntentTxns, err := enumerateGarbageVersions(snap, desc, threshold)
+	versions, liveIntentTxns, err := enumerateGarbageVersions(snap, desc, threshold, expire)
 	var recordWork []gcTxnRecord
 	if err == nil {
 		recordWork, err = enumerateGarbageTxnRecords(snap, desc, threshold, liveIntentTxns)
@@ -183,7 +200,7 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp) error {
 // enumerateGarbageVersions scans the range's MVCC span in one consistent
 // snapshot and returns the versions that are garbage at threshold, plus the
 // set of transactions that still hold an intent somewhere in the range.
-func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp) ([]kvpb.GCVersion, map[uuid.UUID]struct{}, error) {
+func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp, expire bool) ([]kvpb.GCVersion, map[uuid.UUID]struct{}, error) {
 	lower := storage.EncodeMVCCKey(desc.StartKey, hlc.Timestamp{})
 	upper := storage.EncodeMVCCKey(desc.EndKey, hlc.Timestamp{})
 	it := snap.NewIter(lower, upper)
@@ -221,7 +238,10 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 			}
 			if cvts.LessEq(threshold) {
 				stored := int64(len(it.Key()) + len(it.Value()))
-				if survivorSeen {
+				if survivorSeen || expire {
+					// expire (retention ranges): the survivor goes too —
+					// rows at or below the threshold are past retention,
+					// and reads at or below it are rejected outright.
 					out = append(out, kvpb.GCVersion{Key: cur, TS: cvts, Bytes: stored})
 				} else {
 					survivorSeen = true
