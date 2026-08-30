@@ -370,3 +370,31 @@ down entirely while any node is dead (repair has priority), and a range
 left over-replicated by an interrupted move is trimmed back first.
 `datax debug rebalance --range N --to nodeX [--from nodeY]` remains for
 manual moves; `Config.RebalanceThreshold` < 0 disables the automatic pass.
+
+**Load- and byte-weighted balancing** runs behind the count pass, at most
+ONE balancing op per tick across all three passes (acting on statistics a
+just-performed move already invalidated only causes churn). Every node
+advertises load aggregates through its registry heartbeat — total
+leader QPS over *mature* trackers, leader count, total replica bytes, and
+its top-8 hot and big ranges (`kvpb.NodeDescriptor`, from
+`Store.LoadSummary`). Two passes act on them:
+
+- **Lease shedding**: a node whose leader QPS exceeds the live-set mean
+  by the shed factor (default 1.5×, with a 100 QPS absolute spread floor
+  so idle clusters never shuffle) transfers the lease of an advertised
+  hot range to the coolest live node already holding a replica —
+  membership unchanged, no data moves, no diversity question. A transfer
+  must *shrink* the imbalance: handing the hot lease to a node that
+  would end up hotter than the source is refused, which is what stops a
+  single dominant range from ping-ponging.
+- **Byte rebalancing**: when counts are level but the replica-byte
+  spread exceeds the threshold (default 64 MiB, with a 20%-of-mean
+  floor), the biggest advertised range moves off the fullest node to the
+  emptiest, diversity-gated like every replica move.
+
+QPS is leader-local and resets to zero for a full measurement window
+after every transfer, so both passes stamp a per-range cooldown (default
+60s, deliberately longer than the maturity window) before acting — the
+anti-oscillation story, on top of the projection check and the absolute
+floors. `--lease-shed-factor` and `--rebalance-bytes-threshold` tune the
+triggers (negative bytes threshold disables byte moves).

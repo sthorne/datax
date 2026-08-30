@@ -24,6 +24,11 @@ type ClusterNode struct {
 	Live     bool  `json:"live"`
 	AgoMs    int64 `json:"heartbeat_ago_ms"`
 	Draining bool  `json:"draining,omitempty"`
+	// Load aggregates from the node's own heartbeat (leader-local QPS;
+	// see kvpb.NodeDescriptor).
+	LeaderQPS    float64 `json:"leader_qps,omitempty"`
+	LeaderCount  int     `json:"leader_count,omitempty"`
+	ReplicaBytes int64   `json:"replica_bytes,omitempty"`
 }
 
 // ClusterRange is one cluster-wide range descriptor (from /meta — every
@@ -59,12 +64,15 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 	grace := n.livenessGrace().Nanoseconds()
 	for _, nd := range n.registry.All() {
 		doc.Nodes = append(doc.Nodes, ClusterNode{
-			NodeID:   int(nd.NodeID),
-			Address:  nd.Address,
-			Locality: nd.Locality.String(),
-			Live:     now-nd.LivenessTime <= grace,
-			AgoMs:    (now - nd.LivenessTime) / int64(time.Millisecond),
-			Draining: nd.Draining,
+			NodeID:       int(nd.NodeID),
+			Address:      nd.Address,
+			Locality:     nd.Locality.String(),
+			Live:         now-nd.LivenessTime <= grace,
+			AgoMs:        (now - nd.LivenessTime) / int64(time.Millisecond),
+			Draining:     nd.Draining,
+			LeaderQPS:    nd.LeaderQPS,
+			LeaderCount:  nd.LeaderCount,
+			ReplicaBytes: nd.ReplicaBytes,
 		})
 	}
 	if descs, err := n.listRanges(req.Context()); err != nil {

@@ -29,6 +29,8 @@ type serverFlags struct {
 	profile    string
 	encKeyPath string
 	loadSplit  float64
+	shedFactor float64
+	bytesThr   int64
 	verbose    bool
 }
 
@@ -47,6 +49,8 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext)")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
+	f.fs.Float64Var(&f.shedFactor, "lease-shed-factor", 0, "leader-QPS multiple of the cluster mean at which a node sheds hot leases (0 = default 1.5)")
+	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -62,9 +66,11 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
-		StorageProfile:     prof,
-		EncKeyPath:         f.encKeyPath,
-		LoadSplitThreshold: f.loadSplit,
+		StorageProfile:          prof,
+		EncKeyPath:              f.encKeyPath,
+		LoadSplitThreshold:      f.loadSplit,
+		LeaseShedFactor:         f.shedFactor,
+		RebalanceBytesThreshold: f.bytesThr,
 		Dir:                f.dir,
 		Listen:             f.listen,
 		PGListen:           f.pgListen,

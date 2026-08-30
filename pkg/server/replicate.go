@@ -62,7 +62,14 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 		n.upreplicateOnce(wctx)
 		n.repairDeadOnce(wctx)
 		n.drainOnce(wctx)
-		n.rebalanceOnce(wctx)
+		// The balancing passes run in strict priority and perform at most
+		// ONE op per tick between them: acting on load statistics that a
+		// just-performed move has already invalidated only causes churn.
+		if !n.rebalanceOnce(wctx) {
+			if !n.shedLeaseOnce(wctx) {
+				n.rebalanceBytesOnce(wctx)
+			}
+		}
 		cancel()
 	}
 }
@@ -226,35 +233,21 @@ func (n *Node) rebalanceThreshold() int {
 // replica (per tick, total) from the fullest node to the emptiest, never
 // trading away failure-domain diversity. Skipped entirely while any node is
 // dead — repair has priority, and rebalancing against a shrinking live set
-// only causes churn.
-func (n *Node) rebalanceOnce(ctx context.Context) {
+// only causes churn. Reports whether it performed (or attempted) an op, so
+// the lower-priority load passes can hold off this tick.
+func (n *Node) rebalanceOnce(ctx context.Context) bool {
 	threshold := n.rebalanceThreshold()
 	if threshold < 0 {
-		return
+		return false
 	}
-	now := n.clock.Now().WallTime
-	live := map[base.NodeID]kvpb.NodeDescriptor{}
-	for _, nd := range n.registry.All() {
-		switch {
-		case nd.Draining:
-			// Draining nodes are drainOnce's concern: not a destination, and
-			// ranges touching them are skipped here (allReplicasLive fails).
-			continue
-		case nd.NodeID == n.ident.NodeID:
-			live[nd.NodeID] = nd
-		case now-nd.LivenessTime > int64(n.deadNodeThreshold()):
-			return // dead node present: leave the field to repair
-		case now-nd.LivenessTime < int64(n.livenessGrace()):
-			live[nd.NodeID] = nd
-		}
-	}
-	if len(live) < 2 {
-		return
+	live, ok := n.balanceLiveSet()
+	if !ok || len(live) < 2 {
+		return false
 	}
 	descs, err := n.listRanges(ctx)
 	if err != nil {
 		log.Debugf("rebalance: listing ranges: %v", err)
-		return
+		return false
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].RangeID < descs[j].RangeID })
 
@@ -276,7 +269,7 @@ func (n *Node) rebalanceOnce(ctx context.Context) {
 		if err := n.removeReplicaFrom(ctx, desc, from); err != nil {
 			log.Warnf("removing surplus replica of %s from n%d: %v", desc.RangeID, from, err)
 		}
-		return
+		return true
 	}
 
 	// Spread check across every live node, spares included.
@@ -301,7 +294,7 @@ func (n *Node) rebalanceOnce(ctx context.Context) {
 		}
 	}
 	if rangeCount[max]-rangeCount[dst] < threshold {
-		return
+		return false
 	}
 
 	// Any node at the maximum count may donate — if the fullest node's
@@ -328,12 +321,13 @@ func (n *Node) rebalanceOnce(ctx context.Context) {
 			log.Infof("rebalancing %s: n%d (%d ranges) -> n%d (%d ranges)", desc.RangeID, src, rangeCount[src], dst, rangeCount[dst])
 			if _, err := n.moveReplica(ctx, desc, dst, src); err != nil {
 				log.Warnf("rebalancing %s: %v", desc.RangeID, err)
-				return
+				return true // attempted: don't stack another op this tick
 			}
 			metrics.Rebalances.Inc()
-			return // one move per tick
+			return true // one move per tick
 		}
 	}
+	return false
 }
 
 func allReplicasLive(desc kvpb.RangeDescriptor, live map[base.NodeID]kvpb.NodeDescriptor) bool {

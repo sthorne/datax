@@ -122,12 +122,18 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 				n.draining.Store(true)
 			}
 		}
+		load := n.store.LoadSummary(loadAdvertiseTopK)
 		nd := kvpb.NodeDescriptor{
 			NodeID:       n.ident.NodeID,
 			Address:      n.addr,
 			Locality:     n.cfg.Locality,
 			LivenessTime: n.clock.Now().WallTime,
 			Draining:     n.draining.Load(),
+			LeaderQPS:    load.LeaderQPS,
+			LeaderCount:  load.LeaderCount,
+			ReplicaBytes: load.ReplicaBytes,
+			HotRanges:    load.HotRanges,
+			BigRanges:    load.BigRanges,
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {

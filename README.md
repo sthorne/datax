@@ -118,7 +118,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Area | Not yet implemented |
 |---|---|
 | Ranges | load stats are per-leader only (a leadership transfer resets the QPS view; splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
-| Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
+| Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements; count rebalancing, lease shedding, byte moves and decommission are all automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
 | SQL | multi-level correlated subqueries (one level is in, as an O(outer×inner) memoized nested loop), 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
 | Wire | COPY protocol; portal suspension (partial result fetches) |

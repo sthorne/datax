@@ -67,6 +67,33 @@ type NodeDescriptor struct {
 	// replicas away and never places new ones on it. The node itself
 	// adopts and re-asserts the flag through its heartbeats.
 	Draining bool `json:"draining,omitempty"`
+
+	// Load aggregates, refreshed on every heartbeat so the allocator (the
+	// range-1 leader) can weigh load it cannot observe locally. QPS is
+	// leader-local and resets on leadership changes, so these are
+	// best-effort signals gated by thresholds, never exact accounting.
+	//
+	// LeaderQPS sums the measured request rate over this node's MATURE
+	// leaseholder replicas (immature trackers — mid-window after a
+	// transfer — contribute nothing rather than a misleading zero-ish
+	// partial rate).
+	LeaderQPS float64 `json:"leader_qps,omitempty"`
+	// LeaderCount is how many ranges this node currently leads.
+	LeaderCount int `json:"leader_count,omitempty"`
+	// ReplicaBytes sums SizeBytes over all replicas this node hosts.
+	ReplicaBytes int64 `json:"replica_bytes,omitempty"`
+	// HotRanges are the node's heaviest mature leaseholders by QPS, and
+	// BigRanges its largest replicas by bytes (top-K each) — the concrete
+	// candidates a lease-shedding or byte-rebalancing pass acts on.
+	HotRanges []HotRange `json:"hot_ranges,omitempty"`
+	BigRanges []HotRange `json:"big_ranges,omitempty"`
+}
+
+// HotRange is one entry of a node's advertised hot/big range lists.
+type HotRange struct {
+	RangeID base.RangeID `json:"range_id"`
+	QPS     float64      `json:"qps,omitempty"`
+	Bytes   int64        `json:"bytes,omitempty"`
 }
 
 // Transaction is the full transaction state, as tracked by the coordinator

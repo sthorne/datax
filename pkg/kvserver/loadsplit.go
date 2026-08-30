@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"time"
 
@@ -231,4 +232,45 @@ func (s *Store) effectiveQPS(r *Replica) (float64, bool) {
 		}
 	}
 	return r.load.qps()
+}
+
+// NodeLoad aggregates the store's replica load for the registry heartbeat
+// (kvpb.NodeDescriptor's load fields).
+type NodeLoad struct {
+	LeaderQPS    float64
+	LeaderCount  int
+	ReplicaBytes int64
+	HotRanges    []kvpb.HotRange // top-K mature leaseholders by QPS
+	BigRanges    []kvpb.HotRange // top-K replicas by size
+}
+
+// LoadSummary walks the store's replicas and aggregates what the
+// allocator needs to weigh this node's load: total mature-leaseholder
+// QPS, leader count, total replica bytes, and the top-K hot and big
+// ranges. Immature QPS trackers (mid-window after a leadership change)
+// are excluded entirely — a misleading partial rate is worse than none.
+func (s *Store) LoadSummary(k int) NodeLoad {
+	var out NodeLoad
+	s.VisitReplicas(func(r *Replica) bool {
+		size := r.SizeBytes()
+		out.ReplicaBytes += size
+		out.BigRanges = append(out.BigRanges, kvpb.HotRange{RangeID: r.rangeID, Bytes: size})
+		if r.IsLeader() {
+			out.LeaderCount++
+			if q, ok := s.effectiveQPS(r); ok {
+				out.LeaderQPS += q
+				out.HotRanges = append(out.HotRanges, kvpb.HotRange{RangeID: r.rangeID, QPS: q, Bytes: size})
+			}
+		}
+		return true
+	})
+	sort.Slice(out.HotRanges, func(i, j int) bool { return out.HotRanges[i].QPS > out.HotRanges[j].QPS })
+	sort.Slice(out.BigRanges, func(i, j int) bool { return out.BigRanges[i].Bytes > out.BigRanges[j].Bytes })
+	if len(out.HotRanges) > k {
+		out.HotRanges = out.HotRanges[:k]
+	}
+	if len(out.BigRanges) > k {
+		out.BigRanges = out.BigRanges[:k]
+	}
+	return out
 }

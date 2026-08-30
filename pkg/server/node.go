@@ -96,6 +96,22 @@ type Config struct {
 	// housekeeping loop splits a range by load (0 = default; negative
 	// disables).
 	LoadSplitThreshold float64
+	// LeaseShedFactor: a node whose aggregate leader QPS exceeds the
+	// live-set mean by this factor sheds one hot lease per tick (0 =
+	// default 1.5). LeaseShedMinQPS is the absolute spread floor below
+	// which shedding never fires (0 = default 100) — idle clusters must
+	// not shuffle leases over noise.
+	LeaseShedFactor float64
+	LeaseShedMinQPS float64
+	// RebalanceBytesThreshold is the replica-byte spread (fullest minus
+	// emptiest live node, with a 20%-of-mean floor) at which one replica
+	// of a large range moves per tick (0 = default 64 MiB; negative
+	// disables byte-weighted moves).
+	RebalanceBytesThreshold int64
+	// LoadCooldown is the per-range hold-off between load-driven ops (0 =
+	// default 60s; it must exceed the QPS maturity window, or the shed
+	// pass acts on the post-transfer blind spot and ping-pongs).
+	LoadCooldown time.Duration
 	// StorageProfile selects the engine's Pebble tuning ("" = balanced).
 	StorageProfile storage.Profile
 	// EncKeyPath is a file holding the 32-byte store encryption key (raw or
@@ -151,6 +167,11 @@ type Node struct {
 	// be initiated from any node) and re-asserts it on every beat, so the
 	// flag survives both heartbeat overwrites and restarts.
 	draining atomic.Bool
+
+	// loadCooldown stamps the last load-driven op (lease shed / byte move)
+	// per range while this node acts as the allocator; see loadOpAllowed.
+	loadCooldownMu sync.Mutex
+	loadCooldown   map[base.RangeID]time.Time
 }
 
 // Start boots the node and returns once it is serving.
