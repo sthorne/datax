@@ -25,6 +25,7 @@ func runDemo(args []string) error {
 	nodes := fs.Int("nodes", 3, "number of nodes (1-9)")
 	basePG := fs.Int("pg-port", 26433, "first SQL port (node i listens on port+i-1)")
 	baseRPC := fs.Int("rpc-port", 26257, "first internode RPC port")
+	baseHTTP := fs.Int("http-port", 0, "first observability HTTP port (0 = disabled; node i listens on port+i-1)")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -51,6 +52,9 @@ func runDemo(args []string) error {
 			Locality:              loc,
 			UpreplicationInterval: time.Second,
 		}
+		if *baseHTTP > 0 {
+			cfg.HTTPListen = fmt.Sprintf("127.0.0.1:%d", *baseHTTP+i)
+		}
 		if i == 0 {
 			cfg.BootstrapSelf = true
 		} else {
@@ -75,6 +79,10 @@ func runDemo(args []string) error {
 	fmt.Printf("  psql \"postgres://root@%s/datax?sslmode=disable\"\n", started[0].SQLAddr())
 	fmt.Printf("  datax sql --url \"postgres://root@%s/datax?sslmode=disable\"\n", started[0].SQLAddr())
 	fmt.Println()
+	if *baseHTTP > 0 {
+		fmt.Printf("Dashboard: http://127.0.0.1:%d/\n", *baseHTTP)
+		fmt.Println()
+	}
 	fmt.Println("Try:")
 	fmt.Println("  CREATE TABLE accounts (id INT8 PRIMARY KEY, balance INT8);")
 	fmt.Println("  INSERT INTO accounts VALUES (1, 100), (2, 100);")

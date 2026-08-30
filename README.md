@@ -74,7 +74,8 @@ Design documents live in [`docs/`](docs/):
 ```sh
 go build -o datax ./cmd/datax
 
-# One process, three in-memory nodes across racks a/b/c:
+# One process, three in-memory nodes across racks a/b/c
+# (-http-port 8080 also serves the observability dashboard per node):
 ./datax demo
 
 # ... in another terminal:
