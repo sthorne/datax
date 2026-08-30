@@ -49,6 +49,14 @@ type StoreConfig struct {
 	// cadence (0 = default 1s).
 	ClosedTimestampLag      time.Duration
 	ClosedTimestampInterval time.Duration
+	// LoadSplitThreshold is the sustained per-range QPS above which the
+	// housekeeping loop splits a range by load (0 = default 500; negative
+	// disables load-based splitting). LoadSettleWindow is how long a
+	// fresh load-split half is protected from re-merging and how long a
+	// rate must be observed before it is trusted (0 = twice the rate
+	// window).
+	LoadSplitThreshold float64
+	LoadSettleWindow   time.Duration
 	// RetentionOverride, when set, maps a key span to a GC TTL override
 	// (per-table retention for timeseries tables). Called per replica from
 	// the housekeeping loop with the range's [start, end); returning
@@ -75,6 +83,12 @@ type TestingKnobs struct {
 	// OverrideOverloaded replaces the engine's backpressure signal — lets
 	// tests trip the write-shedding gate without an overloaded Pebble.
 	OverrideOverloaded func() (bool, string)
+	// LoadNowNanos replaces the load-tracking clock, so tests advance
+	// rate windows without sleeping.
+	LoadNowNanos func() int64
+	// OverrideReplicaQPS injects a per-range request rate (trusted as
+	// mature) — lets tests drive load splits without real traffic.
+	OverrideReplicaQPS func(base.RangeID) (float64, bool)
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

@@ -79,6 +79,10 @@ type Replica struct {
 	// trip per read); fixed at replica creation.
 	leaseReads bool
 
+	// load is the leader-local, unreplicated request-rate tracker feeding
+	// load-based splitting (see loadsplit.go). It has its own mutex.
+	load replicaLoad
+
 	// applyMu serializes state-machine replacement (an incoming catch-up
 	// snapshot install) against ordinary entry application. Held by
 	// applyEntry and by Store.installSnapshot's commit-and-swap.
@@ -188,6 +192,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 		return nil, err
 	}
 	r := &Replica{store: s, rangeID: desc.RangeID, replicaID: replicaID, rs: rs, latches: newLatchManager(), leaseReads: !s.cfg.DisableLeaseReads}
+	r.load.init(s.loadNow)
 	rs.setApplied(st.AppliedIndex)
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
@@ -752,6 +757,12 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	spans, mode, serr := latchSpans(ba)
 	if serr != nil {
 		return nil, kvpb.NewError(serr)
+	}
+	// Load tracking: one count per batch, keyed by its first span. Admin
+	// ops never reach here and non-leaders bailed above, so this measures
+	// exactly the leader's served traffic.
+	if len(spans) > 0 {
+		r.load.record(spans[0].Start)
 	}
 	guard, gerr := r.latches.Acquire(ctx, spans, mode)
 	if gerr != nil {

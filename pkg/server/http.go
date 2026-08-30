@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"math"
 	"net"
 	"net/http"
 
@@ -123,7 +124,9 @@ type RangeStatus struct {
 	AppliedIndex   uint64 `json:"applied_index"`
 	TruncatedIndex uint64 `json:"truncated_index"`
 	SizeBytes      int64  `json:"size_bytes"`
-	GCThreshold    string `json:"gc_threshold,omitempty"`
+	// QPS is the leader-local measured request rate (~0 on followers).
+	QPS         float64 `json:"qps"`
+	GCThreshold string  `json:"gc_threshold,omitempty"`
 }
 
 // NodeStatus is the /status document.
@@ -149,6 +152,7 @@ func (n *Node) rangeStatuses() []RangeStatus {
 			AppliedIndex:   r.AppliedIndex(),
 			TruncatedIndex: r.TruncatedIndex(),
 			SizeBytes:      r.SizeBytes(),
+			QPS:            math.Round(r.QPS()*10) / 10,
 		}
 		if thr := r.GCThreshold(); !thr.IsEmpty() {
 			rs.GCThreshold = thr.String()

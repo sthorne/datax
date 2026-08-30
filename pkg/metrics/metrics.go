@@ -42,6 +42,9 @@ var (
 	AutoSplits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auto_splits_total", Help: "Size-triggered range splits performed.",
 	})
+	LoadSplits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_load_splits_total", Help: "Load-triggered range splits performed.",
+	})
 	DeadNodeRepairs = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_dead_node_repairs_total", Help: "Replicas rebuilt away from dead nodes.",
 	})

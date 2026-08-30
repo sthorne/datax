@@ -105,6 +105,30 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 		if !redrive && (lhs.SizeBytes() >= threshold || rhs.SizeBytes() >= threshold) {
 			return true
 		}
+		// Never undo a load split: skip merging while the pair is hot
+		// (combined rate above a quarter of the split threshold) or while
+		// either half was load-split within the settle window — fresh
+		// trackers read ~0 QPS and would otherwise green-light an
+		// immediate re-merge. Interrupted merges (redrive) always finish.
+		if lt := s.loadSplitThreshold(); !redrive && lt > 0 {
+			// Only mature (or test-injected) rates count: an immature
+			// tracker's partial window would misread a bulk load as
+			// sustained heat and wedge merging.
+			var combined float64
+			if lq, ok := s.effectiveQPS(lhs); ok {
+				combined += lq
+			}
+			if rq, ok := s.effectiveQPS(rhs); ok {
+				combined += rq
+			}
+			if combined > lt/4 {
+				return true
+			}
+			settle := s.loadSettleWindow()
+			if lhs.load.recentLoadSplit(settle) || rhs.load.recentLoadSplit(settle) {
+				return true
+			}
+		}
 		// Never merge ranges with differing retention policies: the merged
 		// range GCs at one TTL and adopts the max of both GC thresholds, so
 		// absorbing a short-retention neighbor could instantly put the

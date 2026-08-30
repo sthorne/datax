@@ -17,10 +17,12 @@ import (
 // change fails the admin op safely and is retried next tick.
 
 // RunAutoSplitOnce splits every led range whose size exceeds the store's
-// threshold. Exported for tests and debug tooling.
+// threshold, or whose sustained request rate exceeds the load threshold.
+// Exported for tests and debug tooling.
 func (s *Store) RunAutoSplitOnce(ctx context.Context) {
-	threshold := s.cfg.SplitSizeThreshold
-	if threshold <= 0 {
+	sizeThreshold := s.cfg.SplitSizeThreshold
+	loadThreshold := s.loadSplitThreshold()
+	if sizeThreshold <= 0 && loadThreshold <= 0 {
 		return
 	}
 	s.VisitReplicas(func(r *Replica) bool {
@@ -30,27 +32,67 @@ func (s *Store) RunAutoSplitOnce(ctx context.Context) {
 		if !r.IsLeader() || r.isFrozen() {
 			return true
 		}
-		size := r.SizeBytes()
-		if size <= threshold {
+		if size := r.SizeBytes(); sizeThreshold > 0 && size > sizeThreshold {
+			desc := r.Desc()
+			splitKey, err := findSplitMidpoint(s.cfg.Engine, desc.StartKey, desc.EndKey)
+			if err != nil {
+				log.Warnf("%s: finding split point: %v", r.rangeID, err)
+				return true
+			}
+			if splitKey == nil {
+				return true // all bytes under one user key: nothing to split
+			}
+			log.Infof("%s: size %d bytes exceeds %d; auto-splitting at %s", r.rangeID, size, sizeThreshold, splitKey)
+			if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
+				log.Warnf("%s: auto-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
+			} else {
+				metrics.AutoSplits.Inc()
+				r.load.resetForSplit(false)
+			}
 			return true
 		}
-		desc := r.Desc()
-		splitKey, err := findSplitMidpoint(s.cfg.Engine, desc.StartKey, desc.EndKey)
-		if err != nil {
-			log.Warnf("%s: finding split point: %v", r.rangeID, err)
-			return true
-		}
-		if splitKey == nil {
-			return true // all bytes under one user key: nothing to split
-		}
-		log.Infof("%s: size %d bytes exceeds %d; auto-splitting at %s", r.rangeID, size, threshold, splitKey)
-		if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
-			log.Warnf("%s: auto-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
-		} else {
-			metrics.AutoSplits.Inc()
+		if loadThreshold > 0 {
+			s.maybeLoadSplit(ctx, r, loadThreshold)
 		}
 		return true
 	})
+}
+
+// maybeLoadSplit splits r when its request rate has been sustained above
+// threshold: the tracker must be mature (a full window observed, or a
+// testing override) and not freshly reset by a recent load split.
+func (s *Store) maybeLoadSplit(ctx context.Context, r *Replica, threshold float64) {
+	qps, trusted := s.effectiveQPS(r)
+	if !trusted || qps <= threshold || r.load.recentLoadSplit(s.loadSettleWindow()) {
+		return
+	}
+	desc := r.Desc()
+	splitKey := r.load.chooseSplitKey(desc)
+	if splitKey == nil {
+		// No sample balances the traffic (or none survived clamping):
+		// fall back to the byte midpoint. A single hot KEY stays unsplit —
+		// findSplitMidpoint returns nil for a one-key range, and splitting
+		// elsewhere would not move any of its load.
+		var err error
+		splitKey, err = findSplitMidpoint(s.cfg.Engine, desc.StartKey, desc.EndKey)
+		if err != nil || splitKey == nil {
+			return
+		}
+	}
+	log.Infof("%s: %.0f qps exceeds %.0f; load-splitting at %s", r.rangeID, qps, threshold, splitKey)
+	if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
+		log.Warnf("%s: load-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
+		return
+	}
+	metrics.LoadSplits.Inc()
+	// Both halves start over: the LHS's window and samples described a
+	// span that no longer exists, and the RHS is brand new. The stamp is
+	// what keeps the merge pass from immediately undoing this split while
+	// the fresh trackers still read ~0 QPS.
+	r.load.resetForSplit(true)
+	if rhs := s.replicaStartingAt(splitKey); rhs != nil {
+		rhs.load.resetForSplit(true)
+	}
 }
 
 // findSplitMidpoint returns the first user-key boundary at or past half the

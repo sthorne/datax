@@ -92,6 +92,10 @@ type Config struct {
 	// ClosedTimestampInterval is the publication cadence (0 = default 1s).
 	ClosedTimestampLag      time.Duration
 	ClosedTimestampInterval time.Duration
+	// LoadSplitThreshold is the sustained per-range QPS above which the
+	// housekeeping loop splits a range by load (0 = default; negative
+	// disables).
+	LoadSplitThreshold float64
 	// StorageProfile selects the engine's Pebble tuning ("" = balanced).
 	StorageProfile storage.Profile
 	// EncKeyPath is a file holding the 32-byte store encryption key (raw or
@@ -275,6 +279,7 @@ func (n *Node) start() error {
 		MergeSizeThreshold:      n.cfg.MergeSizeThreshold,
 		ClosedTimestampLag:      n.cfg.ClosedTimestampLag,
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
+		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
 		TestingKnobs:            n.cfg.TestingKnobs,
 	})
