@@ -71,7 +71,8 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: multi-level correlated subqueries,
+Still out of scope: correlated subqueries nested past 4 levels or over
+join/derived-table shapes,
 join reordering (join order = syntactic order) and joins beyond 8 tables,
 expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
@@ -236,23 +237,25 @@ table — `FROM (SELECT ...) AS alias` — materializes the inner result in
 memory and runs the outer pipeline (WHERE, grouping, ORDER BY, DISTINCT,
 LIMIT) over it, which is how you filter on an aggregate output.
 
-**Correlated** subqueries — an inner reference to the outer row, like
+**Correlated** subqueries — an inner reference to an enclosing row, like
 `WHERE salary = (SELECT MAX(salary) FROM emp WHERE dept_id = e.dept_id)`
 — are supported in the WHERE clause of single-table SELECT (plain or
 aggregated), UPDATE, and DELETE, as scalar comparisons, `[NOT] IN`, and
-`[NOT] EXISTS`, one correlation level deep, over plain single-table
-inner selects. Names resolve inner-scope-first (an inner column shadows
-an outer one; qualify with the outer alias to force the outer scope).
-Execution is a nested loop: the correlated conjunct leaves the planned
-WHERE clause and re-runs the inner query per fetched outer row with the
-outer values spliced in, memoized per distinct correlation key —
-`EXPLAIN` says so (`correlated filter: nested loop ...`), and the cost
-is honestly O(outer rows × inner query). A name resolving in neither
-scope is a plain `42703` (not the old blanket "correlated" error); a
-correlated reference in GROUP BY / ORDER BY / aggregate arguments, in a
-join or derived-table outer, or reaching more than one level up is
-rejected with a clear error. The parsed statement is never mutated, so
-prepared statements re-evaluate their subqueries on every execution.
+`[NOT] EXISTS`, over plain single-table inner selects, nesting up to
+**four** subquery levels deep. A reference may reach ANY enclosing
+scope, not just the nearest: names resolve nearest-scope-first (a nearer
+column shadows a farther one; qualify with an enclosing alias to pin a
+scope). Execution is a nested loop composing one level at a time: each
+statement binds only ITS row into the subquery tree (references to
+intermediate levels stay symbolic) and the substituted subquery
+re-enters the same machinery when it runs, memoized per distinct
+correlation key at every level — `EXPLAIN` says so (`correlated filter:
+nested loop ...`), and the cost is honestly the product of the level row
+counts. A name resolving in no scope is a plain `42703`; a correlated
+reference in GROUP BY / ORDER BY / aggregate arguments, in a join or
+derived-table outer, or nesting past the depth cap is rejected with a
+clear error. The parsed statement is never mutated, so prepared
+statements re-evaluate their subqueries on every execution.
 
 Grouping is post-fetch and never changes the access path: `GROUP BY`
 hash-groups the fetched rows on the group columns' datums (NULL keys form

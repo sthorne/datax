@@ -120,7 +120,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Ranges | load stats are per-leader only (a leadership transfer resets the QPS view; splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements; count rebalancing, lease shedding, byte moves and decommission are all automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
-| SQL | multi-level correlated subqueries (one level is in, as an O(outer×inner) memoized nested loop), join reordering (join order = syntactic order, ≤ 8 tables, nested loop), DECIMAL/JSONB types |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), join reordering (join order = syntactic order, ≤ 8 tables, nested loop), DECIMAL/JSONB types |
 | Wire | COPY protocol; portal suspension (partial result fetches) |
 | Ops | per-node drill-down across peers (the dashboard's range detail is the serving node's own); per-endpoint authorization (secure-mode HTTP auth accepts any valid user — everything served is read-only) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |

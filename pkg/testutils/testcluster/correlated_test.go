@@ -106,13 +106,10 @@ func TestCorrelatedSubqueries(t *testing.T) {
 	if _, serr := trySQL(ctx, s, `SELECT id FROM depts WHERE EXISTS (SELECT 1 FROM emp WHERE bogus.x = 5)`); serr == nil || serr.Code != sql.CodeUndefinedTable {
 		t.Fatalf("unknown qualifier: %+v", serr)
 	}
-	// Depth-2 correlation: the innermost reference to the outermost scope
-	// is out of reach (one correlation level), reported as a missing FROM
-	// entry with the scoping rule spelled out.
-	if _, serr := trySQL(ctx, s, `SELECT id FROM depts WHERE EXISTS (SELECT 1 FROM emp WHERE EXISTS (SELECT 1 FROM emp WHERE dept_id = depts.id))`); serr == nil ||
-		serr.Code != sql.CodeUndefinedTable || !strings.Contains(serr.Msg, "immediately enclosing") {
-		t.Fatalf("two-level correlation: %+v", serr)
-	}
+	// Depth-2 correlation now works: the innermost reference reaches the
+	// outermost scope (multi-level tests live in TestMultiLevelCorrelated).
+	eq(col(`SELECT id FROM depts WHERE EXISTS (SELECT 1 FROM emp e WHERE EXISTS (SELECT 1 FROM emp WHERE dept_id = depts.id)) ORDER BY id`),
+		[]string{"1", "2", "3"})
 	// A bare outer column in a position that cannot carry correlation
 	// (GROUP BY) is rejected up front.
 	if _, serr := trySQL(ctx, s, `SELECT id FROM depts d WHERE EXISTS (SELECT 1 FROM emp GROUP BY region)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {

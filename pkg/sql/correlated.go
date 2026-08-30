@@ -11,75 +11,90 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
-// Correlated subqueries (v1 scope: scalar / [NOT] IN / [NOT] EXISTS in
-// the WHERE clause of a single-table SELECT, UPDATE, or DELETE, one
-// correlation level, plain single-table inner selects).
+// Correlated subqueries (scalar / [NOT] IN / [NOT] EXISTS in the WHERE
+// clause of a single-table SELECT, UPDATE, or DELETE; plain single-table
+// inner selects; up to maxCorrDepth nesting levels).
 //
-// Correlation is detected STRUCTURALLY — every name in the inner select
-// is resolved against the inner scope first, then the outer (PG scoping:
-// an inner column shadows an outer one) — replacing the old trick of
-// sniffing CodeUndefinedColumn out of the inner execution, which also
-// misreported genuine typos as "correlated". A name resolving in neither
-// scope is now a proper 42703.
+// Correlation is detected STRUCTURALLY — every name in a subquery resolves
+// against its own scope first, then each enclosing scope nearest-first (PG
+// scoping: a nearer column shadows a farther one). A name resolving
+// nowhere is a proper 42703.
 //
-// Execution is a nested loop: correlated conjuncts are stripped from the
-// WHERE clause before access planning (the planner must never see them —
-// it evaluates bound values without a row), the outer rows are fetched
-// with the remaining conjuncts, and each fetched row then evaluates its
-// correlated conjuncts by cloning the inner select with the outer
-// references spliced in as literals (the parsed AST is never mutated) and
-// running it through the ordinary subquery machinery. O(outer × inner),
+// Execution is a nested loop, one level at a time: correlated conjuncts
+// are stripped from the WHERE clause before access planning, the outer
+// rows are fetched with the remaining conjuncts, and each fetched row
+// evaluates its correlated conjuncts by cloning the subquery TREE with
+// every reference to THIS query's row spliced in as a literal (the parsed
+// AST is never mutated) and running it through the ordinary machinery.
+// References to intermediate levels stay symbolic in the clone: when the
+// substituted subquery executes, its own splitCorrelatedWhere re-detects
+// them as ordinary one-level correlation — multi-level correlation is the
+// single-level machinery composing with itself. O(∏ level row counts),
 // stated in EXPLAIN; a per-statement memo keyed by the substituted values
-// makes repeated correlation keys cheap.
+// makes repeated correlation keys cheap at every level.
 
-// corrScope is the two-scope name-resolution context.
+// maxCorrDepth caps subquery nesting below a correlated statement: each
+// level multiplies the work of the one above.
+const maxCorrDepth = 4
+
+// scopeLevel is one query's name-resolution scope.
+type scopeLevel struct {
+	desc  *catalog.TableDescriptor
+	alias string // alias if given, else the table name
+}
+
+func (sl scopeLevel) matches(q string) bool {
+	return q == sl.alias || q == sl.desc.Name
+}
+
+// corrScope is a subquery's resolution context: its own scope plus every
+// enclosing scope, nearest first.
 type corrScope struct {
-	outerDesc  *catalog.TableDescriptor
-	outerAlias string // alias if given, else the table name
-	innerDesc  *catalog.TableDescriptor
-	innerAlias string
+	inner  scopeLevel
+	outers []scopeLevel // [0] = immediately enclosing
 }
 
-func (sc *corrScope) matchesOuter(q string) bool {
-	return q == sc.outerAlias || q == sc.outerDesc.Name
-}
-
-func (sc *corrScope) matchesInner(q string) bool {
-	return q == sc.innerAlias || q == sc.innerDesc.Name
-}
-
-// classify resolves one name: inner=false means a correlated (outer)
-// reference. Inner wins for bare names present in both scopes.
-func (sc *corrScope) classify(name string) (inner bool, err error) {
+// classify resolves one name to a level: 0 is the subquery's own scope,
+// k >= 1 is outers[k-1]. Nearer scopes shadow farther ones.
+func (sc *corrScope) classify(name string) (int, error) {
 	q, col := splitQualified(name)
 	if q != "" {
-		switch {
-		case sc.matchesInner(q):
-			if _, ok := sc.innerDesc.Col(col); !ok {
-				return false, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+		if sc.inner.matches(q) {
+			if _, ok := sc.inner.desc.Col(col); !ok {
+				return 0, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 			}
-			return true, nil
-		case sc.matchesOuter(q):
-			if _, ok := sc.outerDesc.Col(col); !ok {
-				return false, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
-			}
-			return false, nil
+			return 0, nil
 		}
-		return false, newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q (a correlated reference may only reach the immediately enclosing query)", q)
+		for i, sl := range sc.outers {
+			if !sl.matches(q) {
+				continue
+			}
+			if _, ok := sl.desc.Col(col); !ok {
+				return 0, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+			}
+			return i + 1, nil
+		}
+		return 0, newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
 	}
-	if _, ok := sc.innerDesc.Col(name); ok {
-		return true, nil
+	if _, ok := sc.inner.desc.Col(name); ok {
+		return 0, nil
 	}
-	if _, ok := sc.outerDesc.Col(name); ok {
-		return false, nil
+	for i, sl := range sc.outers {
+		if _, ok := sl.desc.Col(name); ok {
+			return i + 1, nil
+		}
 	}
-	return false, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	return 0, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 }
 
-// outerDatum evaluates a correlated reference against an outer row.
-func (sc *corrScope) outerDatum(name string, row map[catalog.ColumnID]types.Datum) types.Datum {
+// bindLevel is the classify index of the scope currently being bound (the
+// statement whose row is in hand): the outermost scope this node knows.
+func (sc *corrScope) bindLevel() int { return len(sc.outers) }
+
+// bindDatum evaluates a bind-level reference against the bound row.
+func (sc *corrScope) bindDatum(name string, row map[catalog.ColumnID]types.Datum) types.Datum {
 	_, colName := splitQualified(name)
-	col, _ := sc.outerDesc.Col(colName)
+	col, _ := sc.outers[len(sc.outers)-1].desc.Col(colName)
 	d, ok := row[col.ID]
 	if !ok {
 		d = types.DNull
@@ -87,13 +102,22 @@ func (sc *corrScope) outerDatum(name string, row map[catalog.ColumnID]types.Datu
 	return d
 }
 
-// correlatedConjunct is one WHERE conjunct whose subquery references the
-// outer row; it is evaluated per fetched row instead of being planned.
+// scopeNode is the analysis result for one subquery: its scope, plus a
+// child node per nested subquery (keyed by AST pointer — stable for the
+// statement execution the split belongs to).
+type scopeNode struct {
+	scope    corrScope
+	children map[*parser.Select]*scopeNode
+}
+
+// correlatedConjunct is one WHERE conjunct whose subquery tree references
+// the current statement's row; it is evaluated per fetched row instead of
+// being planned.
 type correlatedConjunct struct {
-	cmp   parser.Comparison
-	scope corrScope
-	refs  []string // correlated names, deduplicated, in first-seen order (the memo key)
-	idx   int
+	cmp  parser.Comparison
+	node *scopeNode // analysis tree of the conjunct's subquery
+	refs []string   // bind-level names, deduplicated, first-seen order (the memo key)
+	idx  int
 }
 
 // exprColumns walks a value-expression chain's column references.
@@ -109,19 +133,25 @@ func exprColumns(e parser.Expr, visit func(string)) {
 	}
 }
 
-// innerSubShape reports whether the inner select is a shape correlation
-// detection covers: a plain single-table select with no nested
-// subqueries of its own (one correlation level).
+// exprSubs walks a value-expression chain's subqueries.
+func exprSubs(e parser.Expr, visit func(*parser.Select)) {
+	for cur := &e; cur != nil; cur = cur.Right {
+		if cur.Sub != nil {
+			visit(cur.Sub)
+		}
+	}
+}
+
+// innerSubShape reports whether a subquery is a shape correlation
+// detection covers: a plain single-table select whose own nested
+// subqueries (WHERE positions only) are recursively covered too.
 func innerSubShape(sub *parser.Select) bool {
 	if sub.Table == "" || len(sub.Joins) > 0 || sub.Derived != nil {
 		return false
 	}
 	for _, cmp := range sub.Where {
-		if cmp.Sub != nil || exprHasSub(cmp.Value) {
-			return false
-		}
-		for _, ve := range cmp.Values {
-			if exprHasSub(ve) {
+		for _, nested := range conjunctSubs(cmp) {
+			if !innerSubShape(nested) {
 				return false
 			}
 		}
@@ -139,11 +169,16 @@ func innerSubShape(sub *parser.Select) bool {
 	return true
 }
 
-// analyzeSub classifies every name of a covered-shape inner select,
-// returning the correlated ones (nil = uncorrelated). Positions that
-// cannot carry an outer reference (GROUP BY, ORDER BY, aggregate
-// arguments, HAVING left-hand sides) reject with a clear error.
-func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, outerDesc *catalog.TableDescriptor, outerAlias string) ([]string, *corrScope, error) {
+// analyzeSub classifies every name of a covered-shape subquery (and,
+// recursively, its nested subqueries), returning the names that resolve
+// to the OUTERMOST scope — the statement being bound — and the scope
+// tree. Positions that cannot carry an outer reference (GROUP BY, ORDER
+// BY, aggregate arguments, HAVING left-hand sides) reject with a clear
+// error at every level.
+func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, outers []scopeLevel) ([]string, *scopeNode, error) {
+	if len(outers) > maxCorrDepth {
+		return nil, nil, newErrf(CodeFeatureNotSupported, "correlated subqueries nest deeper than %d levels", maxCorrDepth)
+	}
 	innerDesc, err := s.cat.Lookup(ctx, txn, sub.Table)
 	if err != nil {
 		return nil, nil, err
@@ -152,7 +187,11 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	if innerAlias == "" {
 		innerAlias = sub.Table
 	}
-	scope := &corrScope{outerDesc: outerDesc, outerAlias: outerAlias, innerDesc: innerDesc, innerAlias: innerAlias}
+	node := &scopeNode{scope: corrScope{
+		inner:  scopeLevel{desc: innerDesc, alias: innerAlias},
+		outers: outers,
+	}}
+	bind := node.scope.bindLevel()
 
 	var refs []string
 	seen := map[string]bool{}
@@ -161,19 +200,21 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		if firstErr != nil {
 			return
 		}
-		inner, err := scope.classify(name)
+		level, err := node.scope.classify(name)
 		if err != nil {
 			firstErr = err
 			return
 		}
-		if inner {
+		if level == 0 {
 			return
 		}
 		if !allowedOuter {
 			firstErr = newErrf(CodeFeatureNotSupported, "correlated reference %q is not supported in %s", name, position)
 			return
 		}
-		if !seen[name] {
+		// Only bind-level refs bubble up; intermediate levels are the
+		// intermediate statements' business when they execute.
+		if level == bind && !seen[name] {
 			seen[name] = true
 			refs = append(refs, name)
 		}
@@ -186,6 +227,29 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		exprColumns(cmp.Value, func(n string) { record(n, true, "WHERE") })
 		for _, ve := range cmp.Values {
 			exprColumns(ve, func(n string) { record(n, true, "WHERE") })
+		}
+		// Nested subqueries extend the scope stack by this level.
+		for _, nested := range conjunctSubs(cmp) {
+			if firstErr != nil {
+				break
+			}
+			nrefs, nnode, nerr := s.analyzeSub(ctx, txn, nested,
+				append([]scopeLevel{node.scope.inner}, outers...))
+			if nerr != nil {
+				return nil, nil, nerr
+			}
+			if node.children == nil {
+				node.children = map[*parser.Select]*scopeNode{}
+			}
+			node.children[nested] = nnode
+			// A nested bind-level ref is, in this node's coordinates, still
+			// a bind-level ref: the stack grew by one at the near end.
+			for _, n := range nrefs {
+				if !seen[n] {
+					seen[n] = true
+					refs = append(refs, n)
+				}
+			}
 		}
 	}
 	for _, se := range sub.Exprs {
@@ -209,11 +273,11 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	if firstErr != nil {
 		return nil, nil, firstErr
 	}
-	return refs, scope, nil
+	return refs, node, nil
 }
 
 // conjunctSubs collects the subqueries a conjunct carries (cmp.Sub plus
-// any inside the value expression chain).
+// any inside the value expression chains).
 func conjunctSubs(cmp parser.Comparison) []*parser.Select {
 	var subs []*parser.Select
 	if cmp.Sub != nil {
@@ -242,24 +306,25 @@ func (s *Session) splitCorrelatedWhere(ctx context.Context, txn *kvclient.Txn, w
 	if outerAlias == "" {
 		outerAlias = outerDesc.Name
 	}
+	outer := scopeLevel{desc: outerDesc, alias: outerAlias}
 	for _, cmp := range where {
 		subs := conjunctSubs(cmp)
 		correlated := false
 		if len(subs) > 0 {
 			var refs []string
-			var scope *corrScope
+			var node *scopeNode
 			covered := 0
 			for _, sub := range subs {
 				if !innerSubShape(sub) {
 					continue // uncovered shape: leave to the eager path (and its conservative error)
 				}
 				covered++
-				r, sc, aerr := s.analyzeSub(ctx, txn, sub, outerDesc, outerAlias)
+				r, n, aerr := s.analyzeSub(ctx, txn, sub, []scopeLevel{outer})
 				if aerr != nil {
 					return nil, nil, aerr
 				}
 				if len(r) > 0 {
-					refs, scope = r, sc
+					refs, node = r, n
 				}
 			}
 			if len(refs) > 0 {
@@ -275,7 +340,7 @@ func (s *Session) splitCorrelatedWhere(ctx context.Context, txn *kvclient.Txn, w
 				if cmp.Sub == nil && cmp.Value.Sub == nil {
 					return nil, nil, newErrf(CodeFeatureNotSupported, "a correlated scalar subquery must be the comparison's right-hand side")
 				}
-				corr = append(corr, correlatedConjunct{cmp: cmp, scope: *scope, refs: refs, idx: len(corr)})
+				corr = append(corr, correlatedConjunct{cmp: cmp, node: node, refs: refs, idx: len(corr)})
 				correlated = true
 			}
 		}
@@ -338,58 +403,109 @@ func mirrorOp(op string) string {
 	return op // = and != are symmetric
 }
 
-// substituteExpr replaces correlated column references in a value chain
-// with literals from the outer row.
-func substituteExpr(e parser.Expr, sc *corrScope, row map[catalog.ColumnID]types.Datum) parser.Expr {
+// substituteExpr replaces bind-level column references in a value chain
+// with literals from the bound row, and rewrites nested subqueries
+// through their scope nodes.
+func substituteExpr(e parser.Expr, node *scopeNode, row map[catalog.ColumnID]types.Datum, params []types.Datum) (parser.Expr, error) {
 	out := e
 	if out.Column != "" {
-		if inner, _ := sc.classify(out.Column); !inner {
-			d := sc.outerDatum(out.Column, row)
+		switch level, _ := node.scope.classify(out.Column); level {
+		case node.scope.bindLevel():
+			d := node.scope.bindDatum(out.Column, row)
 			out.Column, out.Lit = "", &d
+		case 0:
+			// The clone executes as a plain single-table select, whose
+			// resolver knows bare names only: strip the sub's own alias.
+			_, bare := splitQualified(out.Column)
+			out.Column = bare
+		}
+	}
+	if out.Sub != nil {
+		if child := node.children[out.Sub]; child != nil {
+			sub, err := substituteSub(out.Sub, child, row, params)
+			if err != nil {
+				return out, err
+			}
+			out.Sub = sub
 		}
 	}
 	if out.Right != nil {
-		r := substituteExpr(*out.Right, sc, row)
+		r, err := substituteExpr(*out.Right, node, row, params)
+		if err != nil {
+			return out, err
+		}
 		out.Right = &r
 	}
-	return out
+	return out, nil
 }
 
-// substituteSub clones the inner select with every correlated reference
-// replaced by the outer row's value. The source AST is never modified.
-func substituteSub(sub *parser.Select, sc *corrScope, row map[catalog.ColumnID]types.Datum, params []types.Datum) (*parser.Select, error) {
+// substituteSub clones the subquery tree with every BIND-LEVEL reference
+// replaced by the bound row's value. References to intermediate enclosing
+// levels stay symbolic — the substituted select re-enters the correlation
+// machinery when it executes, one level at a time. The source AST is
+// never modified.
+func substituteSub(sub *parser.Select, node *scopeNode, row map[catalog.ColumnID]types.Datum, params []types.Datum) (*parser.Select, error) {
+	bind := node.scope.bindLevel()
 	c := *sub
 	c.Where = append([]parser.Comparison(nil), sub.Where...)
 	for i := range c.Where {
 		cmp := &c.Where[i]
-		cmp.Value = substituteExpr(cmp.Value, sc, row)
+		var err error
+		cmp.Value, err = substituteExpr(cmp.Value, node, row, params)
+		if err != nil {
+			return nil, err
+		}
 		if len(cmp.Values) > 0 {
 			cmp.Values = append([]parser.Expr(nil), cmp.Values...)
 			for j := range cmp.Values {
-				cmp.Values[j] = substituteExpr(cmp.Values[j], sc, row)
+				if cmp.Values[j], err = substituteExpr(cmp.Values[j], node, row, params); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if cmp.Sub != nil {
+			if child := node.children[cmp.Sub]; child != nil {
+				nsub, err := substituteSub(cmp.Sub, child, row, params)
+				if err != nil {
+					return nil, err
+				}
+				cmp.Sub = nsub
 			}
 		}
 		if cmp.Column == "" {
 			continue
 		}
-		inner, err := sc.classify(cmp.Column)
+		level, err := node.scope.classify(cmp.Column)
 		if err != nil {
 			return nil, err
 		}
-		if inner {
+		if level == 0 {
+			// Own scope: strip the alias qualifier for the plain
+			// single-table resolver the clone will execute under.
+			_, bare := splitQualified(cmp.Column)
+			cmp.Column = bare
 			continue
 		}
-		// The conjunct's LEFT side is the outer reference (outer.x op rhs).
-		lhs := sc.outerDatum(cmp.Column, row)
+		if level != bind {
+			continue // intermediate level: stays symbolic
+		}
+		// The conjunct's LEFT side is a bind-level reference (outer.x op rhs).
+		lhs := node.scope.bindDatum(cmp.Column, row)
 		switch cmp.Op {
 		case "IS NULL", "IS NOT NULL":
 			truth := lhs.Null == (cmp.Op == "IS NULL")
 			*cmp = parser.Comparison{Op: constOp(truth)}
 		case "=", "!=", "<", "<=", ">", ">=":
 			if rhsCol := cmp.Value.Column; rhsCol != "" && cmp.Value.BinOp == "" {
-				// outer.x op inner_col  →  inner_col mirror(op) <literal>
+				// outer.x op other_col  →  other_col mirror(op) <literal>
 				*cmp = parser.Comparison{Column: rhsCol, Op: mirrorOp(cmp.Op), Value: parser.Expr{Lit: &lhs}}
 				break
+			}
+			if cmp.Value.Sub != nil {
+				// outer.x op (SELECT ...): keep as a comparison against the
+				// (possibly still correlated) subquery with the literal on
+				// the left folded to the right via the mirror.
+				return nil, newErrf(CodeFeatureNotSupported, "a correlated reference cannot compare against another subquery")
 			}
 			// Fully-substituted right side: the conjunct is a constant.
 			rhs, err := evalExpr(cmp.Value, nil, nil, params)
@@ -409,12 +525,18 @@ func substituteSub(sub *parser.Select, sc *corrScope, row map[catalog.ColumnID]t
 	// arguments).
 	c.Exprs = append([]parser.SelectExpr(nil), sub.Exprs...)
 	for i := range c.Exprs {
-		c.Exprs[i].Expr = substituteExpr(c.Exprs[i].Expr, sc, row)
+		var err error
+		if c.Exprs[i].Expr, err = substituteExpr(c.Exprs[i].Expr, node, row, params); err != nil {
+			return nil, err
+		}
 	}
 	if len(sub.Having) > 0 {
 		c.Having = append([]parser.HavingCond(nil), sub.Having...)
 		for i := range c.Having {
-			c.Having[i].Value = substituteExpr(c.Having[i].Value, sc, row)
+			var err error
+			if c.Having[i].Value, err = substituteExpr(c.Having[i].Value, node, row, params); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &c, nil
@@ -456,7 +578,8 @@ func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
 
 // corrMemo caches inner-query results per statement, keyed by conjunct
 // and the substituted outer values — repeated correlation keys run the
-// inner query once.
+// inner query once. Each nesting level's statement execution carries its
+// own memo.
 type corrMemo map[string]memoEntry
 
 type memoEntry struct {
@@ -469,7 +592,7 @@ func (cc *correlatedConjunct) memoKey(row map[catalog.ColumnID]types.Datum) stri
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d", cc.idx)
 	for _, name := range cc.refs {
-		d := cc.scope.outerDatum(name, row)
+		d := cc.node.scope.bindDatum(name, row)
 		fmt.Fprintf(&b, "|%t,%d,%d,%g,%q,%t", d.Null, d.Fam, d.I, d.F, d.S, d.B)
 	}
 	return b.String()
@@ -498,7 +621,7 @@ func (s *Session) evalCorrelatedOne(ctx context.Context, txn *kvclient.Txn, cc *
 	switch cc.cmp.Op {
 	case "EXISTS", "NOT EXISTS":
 		if !cached {
-			probe, err := substituteSub(cc.cmp.Sub, &cc.scope, row, params)
+			probe, err := substituteSub(cc.cmp.Sub, cc.node, row, params)
 			if err != nil {
 				return false, err
 			}
@@ -517,7 +640,7 @@ func (s *Session) evalCorrelatedOne(ctx context.Context, txn *kvclient.Txn, cc *
 
 	case "IN", "NOT IN":
 		if !cached {
-			sub, err := substituteSub(cc.cmp.Sub, &cc.scope, row, params)
+			sub, err := substituteSub(cc.cmp.Sub, cc.node, row, params)
 			if err != nil {
 				return false, err
 			}
@@ -541,7 +664,7 @@ func (s *Session) evalCorrelatedOne(ctx context.Context, txn *kvclient.Txn, cc *
 
 	default: // scalar comparison: col op (SELECT ...) [+ tail]
 		if !cached {
-			sub, err := substituteSub(cc.cmp.Value.Sub, &cc.scope, row, params)
+			sub, err := substituteSub(cc.cmp.Value.Sub, cc.node, row, params)
 			if err != nil {
 				return false, err
 			}
