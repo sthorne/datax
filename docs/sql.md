@@ -10,7 +10,9 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
-SELECT [DISTINCT] * | col, ... | aggregates  FROM t [AS OF SYSTEM TIME 't']
+SELECT [DISTINCT] * | col, ... | aggregates  FROM t [[AS] alias]
+    [[INNER | LEFT [OUTER]] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...]]
+    [AS OF SYSTEM TIME 't']
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
     [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
@@ -51,7 +53,8 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: joins, subqueries,
+Still out of scope: subqueries, multi-way (3+ table) joins,
+aggregates/GROUP BY over joins,
 constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
 
 ## Catalog
@@ -176,6 +179,20 @@ so the planner only uses one when the schema (`NOT NULL`) or the WHERE
 clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
 match — and `col IS NULL` therefore always reads the primary rows. Unique
 indexes reject NULLs at write time and are always complete.
+
+Two-table joins (INNER and LEFT OUTER) are nested loops: the outer side
+is fetched through the ranking above using the WHERE conjuncts that
+reference only the outer table, and for each outer row the ON equalities
+become synthetic equality predicates on the inner table — so a join key
+that hits the inner primary key or an index turns into a point/index
+lookup per outer row. The full WHERE clause re-evaluates on every joined
+row, which is what makes it filter after NULL extension on a LEFT JOIN
+(`WHERE inner.col IS NULL` is the anti-join). Column references may be
+qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
+(`42702`). `EXPLAIN` prints both paths:
+`nested loop left join; outer (c): range scan of primary key (id > 1);
+inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
+primary key join`.
 
 Grouping is post-fetch and never changes the access path: `GROUP BY`
 hash-groups the fetched rows on the group columns' datums (NULL keys form

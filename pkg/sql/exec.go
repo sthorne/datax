@@ -441,6 +441,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
+	if t.Join != nil {
+		return s.execJoinSelect(ctx, txn, desc, t, params)
+	}
 	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 		if t.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with GROUP BY or aggregate functions")
@@ -681,6 +684,17 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	desc, err := s.cat.Lookup(ctx, txn, sel.Table)
 	if err != nil {
 		return nil, err
+	}
+	if sel.Join != nil {
+		text, jerr := s.explainJoin(ctx, txn, desc, sel, params)
+		if jerr != nil {
+			return nil, jerr
+		}
+		return &Result{
+			Columns: []ResultColumn{{Name: "plan", Type: types.String}},
+			Rows:    [][]types.Datum{{types.NewString(text)}},
+			Tag:     "EXPLAIN",
+		}, nil
 	}
 	plan, err := pickPlan(desc, sel.Where, params)
 	if err != nil {

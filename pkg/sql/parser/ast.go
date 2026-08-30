@@ -90,10 +90,31 @@ type HavingCond struct {
 	Value  Expr
 }
 
+// ColumnRef is a possibly-qualified column reference (t.c or c).
+type ColumnRef struct {
+	Table  string // alias or table name; "" = unqualified
+	Column string
+}
+
+// JoinCond is one ON conjunct: an equality between two column references.
+type JoinCond struct {
+	L, R ColumnRef
+}
+
+// JoinClause is [INNER | LEFT [OUTER]] JOIN table [AS] alias ON conds.
+type JoinClause struct {
+	Left  bool // LEFT OUTER; false = inner
+	Table string
+	Alias string
+	On    []JoinCond
+}
+
 type Select struct {
 	Distinct bool
 	Exprs    []SelectExpr
 	Table    string // empty for FROM-less selects
+	Alias    string // optional alias for Table
+	Join     *JoinClause
 	Where    []Comparison
 	GroupBy  []string
 	Having   []HavingCond

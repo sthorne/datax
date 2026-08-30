@@ -52,6 +52,41 @@ func (p *parser) errf(format string, args ...any) error {
 	return &SyntaxError{Msg: fmt.Sprintf(format, args...), Pos: p.peek().pos}
 }
 
+// parseColumnRef parses ident['.' ident] into a ColumnRef.
+func (p *parser) parseColumnRef() (ColumnRef, error) {
+	name, err := p.expectIdent()
+	if err != nil {
+		return ColumnRef{}, err
+	}
+	if p.consumeOp(".") {
+		col, err := p.expectIdent()
+		if err != nil {
+			return ColumnRef{}, err
+		}
+		return ColumnRef{Table: name, Column: col}, nil
+	}
+	return ColumnRef{Column: name}, nil
+}
+
+// String renders the reference back to its source form ("t.c" or "c") —
+// the single-string form carried by Expr.Column and friends.
+func (r ColumnRef) String() string {
+	if r.Table != "" {
+		return r.Table + "." + r.Column
+	}
+	return r.Column
+}
+
+// expectColumnName parses a possibly-qualified column name into its
+// single-string form.
+func (p *parser) expectColumnName() (string, error) {
+	ref, err := p.parseColumnRef()
+	if err != nil {
+		return "", err
+	}
+	return ref.String(), nil
+}
+
 // consumeIdentWord consumes the next token when it is the given
 // (lower-cased) identifier — for words that are not reserved keywords.
 func (p *parser) consumeIdentWord(word string) bool {
@@ -499,8 +534,56 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, err
 		}
 		sel.Table = name
-		// AS OF SYSTEM TIME <literal>. SYSTEM and TIME are not reserved
-		// words — they lex as (lower-cased) identifiers.
+		sel.Alias = p.parseOptTableAlias(true)
+		// JOIN / INNER JOIN / LEFT [OUTER] JOIN — none are reserved words.
+		var left bool
+		join := false
+		switch {
+		case p.consumeIdentWord("join"):
+			join = true
+		case p.consumeIdentWord("inner"):
+			if !p.consumeIdentWord("join") {
+				return nil, p.errf("expected JOIN after INNER, found %q", p.peek().text)
+			}
+			join = true
+		case p.consumeIdentWord("left"):
+			p.consumeIdentWord("outer")
+			if !p.consumeIdentWord("join") {
+				return nil, p.errf("expected JOIN after LEFT [OUTER], found %q", p.peek().text)
+			}
+			join, left = true, true
+		}
+		if join {
+			jt, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			jc := &JoinClause{Left: left, Table: jt}
+			jc.Alias = p.parseOptTableAlias(false)
+			if err := p.expectKeyword("ON"); err != nil {
+				return nil, err
+			}
+			for {
+				l, err := p.parseColumnRef()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp("="); err != nil {
+					return nil, err
+				}
+				r, err := p.parseColumnRef()
+				if err != nil {
+					return nil, err
+				}
+				jc.On = append(jc.On, JoinCond{L: l, R: r})
+				if !p.consumeKeyword("AND") {
+					break
+				}
+			}
+			sel.Join = jc
+		}
+		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
+		// untouched; SYSTEM and TIME lex as identifiers).
 		if p.consumeKeyword("AS") {
 			for _, word := range []string{"of", "system", "time"} {
 				if t := p.peek(); t.kind == tkIdent && t.text == word {
@@ -551,7 +634,7 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, err
 		}
 		for {
-			col, err := p.expectIdent()
+			col, err := p.expectColumnName()
 			if err != nil {
 				return nil, err
 			}
@@ -591,6 +674,50 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.ForUpdate = true
 	}
 	return sel, nil
+}
+
+// tableClauseWords are non-reserved identifier words that begin a clause
+// after a table name — never a bare table alias.
+var tableClauseWords = map[string]bool{
+	"join": true, "inner": true, "left": true, "group": true, "having": true, "for": true,
+}
+
+// peekIdentSeq reports whether the next tokens are exactly this sequence of
+// (lower-cased) identifiers.
+func (p *parser) peekIdentSeq(words ...string) bool {
+	for j, w := range words {
+		if p.i+j >= len(p.toks) {
+			return false
+		}
+		if t := p.toks[p.i+j]; t.kind != tkIdent || t.text != w {
+			return false
+		}
+	}
+	return true
+}
+
+// parseOptTableAlias consumes an optional [AS] alias after a table name.
+// In the outer-table position (allowAsOf) an AS followed by the
+// of/system/time identifier sequence is AS OF SYSTEM TIME, not an alias,
+// and is left for the caller.
+func (p *parser) parseOptTableAlias(allowAsOf bool) string {
+	if p.consumeKeyword("AS") {
+		if allowAsOf && p.peekIdentSeq("of", "system", "time") {
+			p.i-- // give AS back: it introduces AS OF SYSTEM TIME
+			return ""
+		}
+		if t := p.peek(); t.kind == tkIdent {
+			p.i++
+			return t.text
+		}
+		p.i-- // AS not followed by an alias: leave it for the caller
+		return ""
+	}
+	if t := p.peek(); t.kind == tkIdent && !tableClauseWords[t.text] {
+		p.i++
+		return t.text
+	}
+	return ""
 }
 
 // parseHaving parses the HAVING conjunction: each conjunct compares an
@@ -771,7 +898,7 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 	}
 	var out []Comparison
 	for {
-		col, err := p.expectIdent()
+		col, err := p.expectColumnName()
 		if err != nil {
 			return nil, err
 		}
@@ -898,7 +1025,15 @@ func (p *parser) parseValueOrColumnExpr() (Expr, error) {
 	t := p.peek()
 	if t.kind == tkIdent {
 		p.i++
-		e := Expr{Column: t.text}
+		name := t.text
+		if p.consumeOp(".") {
+			col, err := p.expectIdent()
+			if err != nil {
+				return Expr{}, err
+			}
+			name += "." + col
+		}
+		e := Expr{Column: name}
 		if op := p.peek(); op.kind == tkOp && (op.text == "+" || op.text == "-") {
 			p.i++
 			rhs, err := p.parseValueExpr()

@@ -120,6 +120,18 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				return nil, ToSQLError(err)
 			}
 			fromWhere(desc, t.Where)
+			if t.Join != nil {
+				// Qualified references resolve against either join side.
+				if innerDesc, err := s.lookupForPlan(ctx, t.Join.Table); err == nil {
+					if outer, inner, jerr := makeJoinSides(desc, innerDesc, t); jerr == nil {
+						for _, cmp := range t.Where {
+							if ref, rerr := resolveJoinRef(outer, inner, cmp.Column); rerr == nil {
+								assign(cmp.Value, ref.col.Type)
+							}
+						}
+					}
+				}
+			}
 		}
 	case *parser.Update:
 		desc, err := s.lookupForPlan(ctx, t.Table)
@@ -169,6 +181,25 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		desc, err := s.lookupForPlan(ctx, t.Table)
 		if err != nil {
 			return nil, ToSQLError(err)
+		}
+		if t.Join != nil {
+			innerDesc, err := s.lookupForPlan(ctx, t.Join.Table)
+			if err != nil {
+				return nil, ToSQLError(err)
+			}
+			outer, inner, jerr := makeJoinSides(desc, innerDesc, t)
+			if jerr != nil {
+				return nil, ToSQLError(jerr)
+			}
+			proj, perr := resolveJoinProjection(outer, inner, t.Exprs)
+			if perr != nil {
+				return nil, ToSQLError(perr)
+			}
+			cols := make([]ResultColumn, len(proj))
+			for i, p := range proj {
+				cols[i] = ResultColumn{Name: p.name, Type: p.ref.col.Type}
+			}
+			return cols, nil
 		}
 		if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 			gq, aerr := resolveGrouped(desc, t)
