@@ -50,9 +50,11 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   never loses more than one replica of a range.
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes and
   ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
-  transactions, joins, GROUP BY, subqueries, EXPLAIN) served over the
-  Postgres wire protocol, with TLS + SCRAM-SHA-256 authentication in
-  secure mode.
+  transactions, joins up to 8 tables, GROUP BY — including over joins,
+  correlated subqueries to 4 levels, EXPLAIN) over ten column types
+  including exact DECIMAL and JSONB with `->`/`->>` extraction, served
+  over the Postgres wire protocol with TLS + SCRAM-SHA-256
+  authentication in secure mode.
 - **Operations**: leader-driven housekeeping per range — MVCC garbage
   collection, raft log truncation, size-based splitting and merging —
   plus dead-node repair, load rebalancing, decommission, `datax bench`, and
