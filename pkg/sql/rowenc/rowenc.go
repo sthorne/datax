@@ -33,10 +33,18 @@ const valueVersion byte = 1
 // Column payload tags. Each payload is self-describing so unknown columns
 // can be skipped.
 const (
-	tagInt    byte = 1 // 8-byte big-endian two's complement
-	tagFloat  byte = 2 // 8-byte big-endian IEEE-754 bits
-	tagString byte = 3 // uvarint length + bytes
-	tagBool   byte = 4 // 1 byte (0/1)
+	tagInt       byte = 1 // 8-byte big-endian two's complement
+	tagFloat     byte = 2 // 8-byte big-endian IEEE-754 bits
+	tagString    byte = 3 // uvarint length + bytes
+	tagBool      byte = 4 // 1 byte (0/1)
+	tagTimestamp byte = 5 // 8-byte big-endian Unix nanoseconds
+	tagDate      byte = 6 // 8-byte big-endian Unix days
+	tagBytes     byte = 7 // uvarint length + raw bytes
+	tagUUID      byte = 8 // 16 raw bytes
+	// tagNull marks an explicit NULL (no payload). Only written for
+	// fill-on-read (ALTER-added DEFAULT) columns, where a missing column
+	// means "row predates the column" rather than NULL.
+	tagNull byte = 9
 )
 
 // PrimaryKeyPrefix is the key prefix of a table's primary rows.
@@ -85,11 +93,11 @@ func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) 
 		return nil, err
 	}
 	switch fam {
-	case types.Int:
+	case types.Int, types.Timestamp, types.Date:
 		return keys.Key(encoding.EncodeInt64(k, d.I)), nil
 	case types.Float:
 		return keys.Key(encoding.EncodeFloat64(k, d.F)), nil
-	case types.String:
+	case types.String, types.Bytes, types.Uuid:
 		return keys.Key(encoding.EncodeString(k, d.S)), nil
 	case types.Bool:
 		return keys.Key(encoding.EncodeBool(k, d.B)), nil
@@ -110,18 +118,18 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 		var err error
 		var d types.Datum
 		switch col.Type {
-		case types.Int:
+		case types.Int, types.Timestamp, types.Date:
 			var v int64
 			rest, v, err = encoding.DecodeInt64(rest)
-			d = types.NewInt(v)
+			d = types.Datum{Fam: col.Type, I: v}
 		case types.Float:
 			var v float64
 			rest, v, err = encoding.DecodeFloat64(rest)
 			d = types.NewFloat(v)
-		case types.String:
+		case types.String, types.Bytes, types.Uuid:
 			var v string
 			rest, v, err = encoding.DecodeString(rest)
-			d = types.NewString(v)
+			d = types.Datum{Fam: col.Type, S: v}
 		case types.Bool:
 			var v bool
 			rest, v, err = encoding.DecodeBool(rest)
@@ -143,8 +151,15 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) ([]byte, error) {
 	ids := make([]catalog.ColumnID, 0, len(row))
 	for colID, d := range row {
-		if desc.IsPKCol(colID) || d.Null {
+		if desc.IsPKCol(colID) {
 			continue
+		}
+		if d.Null {
+			// NULLs are normally omitted — except for fill-on-read columns,
+			// where absence means "predates the column" (= default).
+			if col, ok := desc.ColByID(colID); !ok || !col.FillDefault {
+				continue
+			}
 		}
 		ids = append(ids, colID)
 	}
@@ -156,21 +171,42 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		if !ok {
 			return nil, fmt.Errorf("unknown column id %d", colID)
 		}
+		if row[colID].Null {
+			out = encoding.EncodeUvarint(out, uint64(colID))
+			out = append(out, tagNull)
+			continue
+		}
 		d, err := row[colID].Coerce(col.Type)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)
 		}
 		out = encoding.EncodeUvarint(out, uint64(colID))
 		switch col.Type {
-		case types.Int:
-			out = append(out, tagInt)
+		case types.Int, types.Timestamp, types.Date:
+			tag := tagInt
+			if col.Type == types.Timestamp {
+				tag = tagTimestamp
+			} else if col.Type == types.Date {
+				tag = tagDate
+			}
+			out = append(out, tag)
 			out = binary.BigEndian.AppendUint64(out, uint64(d.I))
 		case types.Float:
 			out = append(out, tagFloat)
 			out = binary.BigEndian.AppendUint64(out, math.Float64bits(d.F))
-		case types.String:
-			out = append(out, tagString)
+		case types.String, types.Bytes:
+			tag := tagString
+			if col.Type == types.Bytes {
+				tag = tagBytes
+			}
+			out = append(out, tag)
 			out = encoding.EncodeUvarint(out, uint64(len(d.S)))
+			out = append(out, d.S...)
+		case types.Uuid:
+			if len(d.S) != 16 {
+				return nil, fmt.Errorf("column %q: UUID must be 16 bytes", col.Name)
+			}
+			out = append(out, tagUUID)
 			out = append(out, d.S...)
 		case types.Bool:
 			out = append(out, tagBool)
@@ -215,14 +251,24 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 		col, known := desc.ColByID(colID)
 
 		switch tag {
-		case tagInt:
+		case tagNull:
+			if known {
+				out[colID] = types.DNull
+			}
+		case tagInt, tagTimestamp, tagDate:
 			if len(rest) < 8 {
 				return nil, fmt.Errorf("corrupt row value: short int payload")
 			}
 			v := int64(binary.BigEndian.Uint64(rest[:8]))
 			rest = rest[8:]
-			if known && col.Type == types.Int {
-				out[colID] = types.NewInt(v)
+			want := types.Int
+			if tag == tagTimestamp {
+				want = types.Timestamp
+			} else if tag == tagDate {
+				want = types.Date
+			}
+			if known && col.Type == want {
+				out[colID] = types.Datum{Fam: want, I: v}
 			}
 		case tagFloat:
 			if len(rest) < 8 {
@@ -233,7 +279,7 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if known && col.Type == types.Float {
 				out[colID] = types.NewFloat(v)
 			}
-		case tagString:
+		case tagString, tagBytes:
 			var n uint64
 			var err error
 			rest, n, err = encoding.DecodeUvarint(rest)
@@ -242,8 +288,21 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			}
 			v := string(rest[:n])
 			rest = rest[n:]
-			if known && col.Type == types.String {
-				out[colID] = types.NewString(v)
+			want := types.String
+			if tag == tagBytes {
+				want = types.Bytes
+			}
+			if known && col.Type == want {
+				out[colID] = types.Datum{Fam: want, S: v}
+			}
+		case tagUUID:
+			if len(rest) < 16 {
+				return nil, fmt.Errorf("corrupt row value: short uuid payload")
+			}
+			v := string(rest[:16])
+			rest = rest[16:]
+			if known && col.Type == types.Uuid {
+				out[colID] = types.Datum{Fam: types.Uuid, S: v}
 			}
 		case tagBool:
 			if len(rest) < 1 {
@@ -256,6 +315,17 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			}
 		default:
 			return nil, fmt.Errorf("corrupt row value: unknown tag 0x%02x for column %d", tag, id)
+		}
+	}
+	// Fill-on-read: a fill-default column absent from the value predates
+	// the column's ADD — it reads as the default. (Explicit NULLs were
+	// stored as tagNull above and are present in out.)
+	for _, col := range desc.Columns {
+		if !col.FillDefault || col.Default == nil {
+			continue
+		}
+		if _, ok := out[col.ID]; !ok {
+			out[col.ID] = *col.Default
 		}
 	}
 	return out, nil
@@ -351,11 +421,11 @@ func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescr
 func skipDatum(b []byte, fam types.Family) ([]byte, error) {
 	var err error
 	switch fam {
-	case types.Int:
+	case types.Int, types.Timestamp, types.Date:
 		b, _, err = encoding.DecodeInt64(b)
 	case types.Float:
 		b, _, err = encoding.DecodeFloat64(b)
-	case types.String:
+	case types.String, types.Bytes, types.Uuid:
 		b, _, err = encoding.DecodeString(b)
 	case types.Bool:
 		b, _, err = encoding.DecodeBool(b)

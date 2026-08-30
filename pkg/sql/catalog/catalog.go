@@ -28,6 +28,14 @@ type Column struct {
 	Name    string       `json:"name"`
 	Type    types.Family `json:"type"`
 	NotNull bool         `json:"not_null,omitempty"`
+	// Default is the value INSERT uses when the column is omitted.
+	Default *types.Datum `json:"default,omitempty"`
+	// FillDefault marks a column added by ALTER TABLE ... DEFAULT: rows
+	// written before the ADD lack the column entirely and decode as the
+	// default (fill-on-read). Rows written afterwards store an explicit
+	// NULL marker when the column is NULL, so NULL and "predates the
+	// column" stay distinguishable.
+	FillDefault bool `json:"fill_default,omitempty"`
 }
 
 // IndexDescriptor describes a secondary index. Entries live at

@@ -25,7 +25,15 @@ SHOW TABLES
 ```
 
 - Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
-  `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN).
+  `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
+  (alias TIMESTAMP [WITH TIME ZONE]; UTC nanoseconds internally,
+  microsecond precision on the binary wire), `DATE`, `BYTES` (alias
+  BYTEA; `\x` hex text format), `UUID`. String literals coerce into the
+  new types (`WHERE at >= '2026-08-30 02:00:00Z'` becomes a key bound),
+  and all are usable in primary keys and indexes via the
+  order-preserving encodings. DECIMAL and JSONB remain out of scope.
+- Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
+  omit the column store the default; an explicit NULL stays NULL.
 - WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
   plus `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, and
   `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, or an
@@ -40,10 +48,14 @@ v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 skipped when the access path already delivers the order; PG-default NULL
 ordering), aggregates `COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX`
 (whole-table or per group), and
-`ALTER TABLE t ADD COLUMN c TYPE` (nullable-only) / `DROP COLUMN c`
-(lazy: old bytes are skipped on decode; PK/indexed columns refused;
-column IDs are never reused, so re-adding a name cannot resurrect old
-values). Descriptor leases (below) drain schema changes across gateways:
+`ALTER TABLE t ADD COLUMN c TYPE [DEFAULT lit [NOT NULL]]` / `DROP
+COLUMN c` (lazy: old bytes are skipped on decode; PK/indexed columns
+refused; column IDs are never reused, so re-adding a name cannot
+resurrect old values). An ADD with a DEFAULT is fill-on-read: rows
+written before the ADD lack the column on disk and decode as the
+default, while rows written afterwards store an explicit NULL marker
+when NULL — so NULL and "predates the column" stay distinguishable and
+no backfill is needed. `NOT NULL` on ADD requires a DEFAULT. Descriptor leases (below) drain schema changes across gateways:
 by the time a DDL statement returns, every live gateway plans against the
 new descriptor version.
 
@@ -59,7 +71,8 @@ on the recent side and the GC TTL (default 25h) on the old side.
 
 Still out of scope: correlated subqueries, multi-way (3+ table) joins,
 aggregates/GROUP BY over joins,
-constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
+constraints beyond PRIMARY KEY / NOT NULL, sequences,
+DECIMAL and JSONB column types, DEFAULT expressions beyond constants.
 
 ## Catalog
 

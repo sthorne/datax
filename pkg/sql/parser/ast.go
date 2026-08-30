@@ -37,6 +37,8 @@ type ColumnDef struct {
 	Type       types.Family
 	NotNull    bool
 	PrimaryKey bool // column-level PRIMARY KEY shorthand
+	// Default is the DEFAULT literal (constants only; no expressions).
+	Default *types.Datum
 }
 
 type CreateTable struct {

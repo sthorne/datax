@@ -110,7 +110,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Ranges | load-based split/merge heuristics (splits and merges are automatic by size, or manual via `datax debug split`/`merge`) |
 | Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
-| SQL | correlated subqueries, 3+-table joins, aggregates over joins, most types |
+| SQL | correlated subqueries, 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
 | Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
 | Ops | observability UI; roles/privileges |
 

@@ -338,6 +338,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.i++
 		}
 	}
+	// TIMESTAMP WITH[OUT] TIME ZONE: absorb the trailing words.
+	if strings.EqualFold(typeName, "timestamp") {
+		if p.peekIdentSeq("with", "time", "zone") || p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
 	// VARCHAR(n) etc.: absorb the length.
 	if p.consumeOp("(") {
 		if p.peek().kind == tkNumber {
@@ -366,6 +372,16 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 			def.PrimaryKey = true
 			def.NotNull = true
+		case p.consumeIdentWord("default"):
+			// Constant defaults only ("default" is not a reserved word).
+			e, err := p.parseValueExpr()
+			if err != nil {
+				return def, err
+			}
+			if e.Lit == nil {
+				return def, p.errf("DEFAULT must be a constant literal")
+			}
+			def.Default = e.Lit
 		default:
 			return def, nil
 		}

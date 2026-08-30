@@ -54,9 +54,17 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			return nil, newErrf(CodeSyntaxError, "duplicate column %q", cd.Name)
 		}
 		seen[cd.Name] = true
-		desc.Columns = append(desc.Columns, catalog.Column{
+		col := catalog.Column{
 			ID: catalog.ColumnID(i + 1), Name: cd.Name, Type: cd.Type, NotNull: cd.NotNull,
-		})
+		}
+		if cd.Default != nil && !cd.Default.Null {
+			d, cerr := cd.Default.Coerce(cd.Type)
+			if cerr != nil {
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr)
+			}
+			col.Default = &d
+		}
+		desc.Columns = append(desc.Columns, col)
 		if cd.PrimaryKey {
 			colPK = append(colPK, cd.Name)
 		}
@@ -151,7 +159,11 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		for _, col := range desc.Columns {
 			d, ok := row[col.ID]
 			if !ok {
+				// An omitted column takes its DEFAULT (NULL when none).
 				d = types.DNull
+				if col.Default != nil {
+					d = *col.Default
+				}
 				row[col.ID] = d
 			}
 			if d.Null && col.NotNull {
@@ -653,15 +665,29 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	switch {
 	case t.AddCol != nil:
 		def := t.AddCol
-		if def.NotNull || def.PrimaryKey {
-			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN supports nullable columns only")
+		if def.PrimaryKey {
+			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot add a primary key column")
+		}
+		if def.NotNull && (def.Default == nil || def.Default.Null) {
+			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN ... NOT NULL requires a DEFAULT (existing rows need a value)")
 		}
 		if _, exists := desc.Col(def.Name); exists {
 			return nil, newErrf(CodeSyntaxError, "column %q already exists", def.Name)
 		}
-		desc.Columns = append(desc.Columns, catalog.Column{
-			ID: desc.NextColumnID, Name: def.Name, Type: def.Type,
-		})
+		col := catalog.Column{
+			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
+		}
+		if def.Default != nil && !def.Default.Null {
+			d, cerr := def.Default.Coerce(def.Type)
+			if cerr != nil {
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr)
+			}
+			// Fill-on-read: rows written before this ADD lack the column and
+			// decode as the default; NULLs written afterwards are stored
+			// explicitly so they stay NULL.
+			col.Default, col.FillDefault = &d, true
+		}
+		desc.Columns = append(desc.Columns, col)
 		desc.NextColumnID++
 	case t.DropCol != "":
 		col, ok := desc.Col(t.DropCol)

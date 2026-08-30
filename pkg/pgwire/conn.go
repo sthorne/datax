@@ -19,10 +19,21 @@ import (
 
 // PostgreSQL type OIDs for datax's SQL types.
 const (
-	oidBool   = 16
-	oidInt8   = 20
-	oidText   = 25
-	oidFloat8 = 701
+	oidBool        = 16
+	oidBytea       = 17
+	oidInt8        = 20
+	oidText        = 25
+	oidFloat8      = 701
+	oidDate        = 1082
+	oidTimestamptz = 1184
+	oidUUID        = 2950
+)
+
+// pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
+// binary-format epoch (2000-01-01).
+const (
+	pgEpochOffsetMicros = int64(946684800) * 1e6
+	pgEpochOffsetDays   = int64(10957)
 )
 
 func typeOID(f types.Family) uint32 {
@@ -33,6 +44,14 @@ func typeOID(f types.Family) uint32 {
 		return oidFloat8
 	case types.Bool:
 		return oidBool
+	case types.Timestamp:
+		return oidTimestamptz
+	case types.Date:
+		return oidDate
+	case types.Bytes:
+		return oidBytea
+	case types.Uuid:
+		return oidUUID
 	default:
 		return oidText
 	}
@@ -40,10 +59,14 @@ func typeOID(f types.Family) uint32 {
 
 func typeSize(f types.Family) int16 {
 	switch f {
-	case types.Int, types.Float:
+	case types.Int, types.Float, types.Timestamp:
 		return 8
 	case types.Bool:
 		return 1
+	case types.Date:
+		return 4
+	case types.Uuid:
+		return 16
 	default:
 		return -1
 	}
@@ -308,6 +331,14 @@ func encodeDatum(d types.Datum, format int16) []byte {
 			return []byte{1}
 		}
 		return []byte{0}
+	case types.Timestamp:
+		// Binary timestamptz: microseconds since 2000-01-01.
+		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000-pgEpochOffsetMicros))
+	case types.Date:
+		// Binary date: days since 2000-01-01, int32.
+		return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I-pgEpochOffsetDays)))
+	case types.Bytes, types.Uuid:
+		return []byte(d.S)
 	default:
 		return []byte(d.Text())
 	}
@@ -339,6 +370,26 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.NewBool(raw[0] != 0), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary bool length %d", len(raw))
+	case types.Timestamp:
+		if len(raw) == 8 {
+			micros := int64(binary.BigEndian.Uint64(raw)) + pgEpochOffsetMicros
+			return types.NewTimestamp(micros * 1000), nil
+		}
+		return types.Datum{}, fmt.Errorf("bad binary timestamptz length %d", len(raw))
+	case types.Date:
+		if len(raw) == 4 {
+			return types.NewDate(int64(int32(binary.BigEndian.Uint32(raw))) + pgEpochOffsetDays), nil
+		}
+		return types.Datum{}, fmt.Errorf("bad binary date length %d", len(raw))
+	case types.Bytes:
+		return types.NewBytes(raw), nil
+	case types.Uuid:
+		if len(raw) == 16 {
+			var u [16]byte
+			copy(u[:], raw)
+			return types.NewUUID(u), nil
+		}
+		return types.Datum{}, fmt.Errorf("bad binary uuid length %d", len(raw))
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}
