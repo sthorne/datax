@@ -177,7 +177,7 @@ func orderSatisfiedByPlan(desc *catalog.TableDescriptor, plan accessPlan, order 
 	}
 	var natural []catalog.ColumnID
 	switch plan.kind {
-	case planFullScan, planPKPoint:
+	case planFullScan, planPKPoint, planPKScan:
 		natural = desc.PrimaryKey
 	case planUniquePoint:
 		return true // at most one row

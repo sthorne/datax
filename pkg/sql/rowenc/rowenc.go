@@ -71,6 +71,14 @@ func EncodePK(desc *catalog.TableDescriptor, pkVals []types.Datum) (keys.Key, er
 	return k, nil
 }
 
+// AppendKeyDatum appends the order-preserving key encoding of d (coerced to
+// fam) to k. It is how the planner turns a range predicate's bound value
+// into a scan bound: the encoding is self-delimiting, so PrefixEnd on the
+// result steps past exactly the keys carrying that column value.
+func AppendKeyDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) {
+	return appendDatum(k, fam, d)
+}
+
 func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) {
 	d, err := d.Coerce(fam)
 	if err != nil {

@@ -22,7 +22,8 @@ SHOW TABLES
 
 - Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
   `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN).
-- WHERE: conjunctions (`AND`) of `col op literal`, ops `= != < <= > >=`.
+- WHERE: conjunctions (`AND`) of `col op literal`, ops `= != < <= > >=`,
+  plus `col IS [NOT] NULL`.
 - Every table must declare a `PRIMARY KEY`.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
@@ -153,14 +154,32 @@ There is no cost model. The executor ranks access paths:
 
 1. WHERE pins every PK column by equality → primary point `Get`.
 2. Every column of a unique index pinned → unique-index point lookup.
-3. A non-empty leading prefix of some index pinned → index prefix scan +
-   primary-key joins (longest prefix wins).
+3. The best constrained scan of the primary key or an index: equality
+   conjuncts pin a leading column prefix, and range conjuncts
+   (`> >= < <=`) on the **next** key column become order-preserving scan
+   bounds (`WHERE a = 1 AND b > 5 AND b <= 9` scans exactly the matching
+   key span). Paths score 2 per pinned column plus 1 for a range; ties
+   prefer the primary key (no index join).
 4. Otherwise → full `Scan` of the primary rows with in-memory filtering.
+
+Conjuncts a path cannot absorb (`!=`, `IS [NOT] NULL`, columns outside
+the key prefix) stay as a **residual filter**: the executor re-checks the
+complete WHERE clause against every fetched row regardless of path, so
+plan bounds only ever narrow the scan. `LIMIT` is pushed into the KV scan
+exactly when the residual is empty (every scanned row is a result row)
+and any ORDER BY is already satisfied by the access path; scanned-row
+counts are observable via `datax_sql_rows_scanned_total`.
+
+A non-unique index has no entry for rows with NULL in any indexed column,
+so the planner only uses one when the schema (`NOT NULL`) or the WHERE
+clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
+match — and `col IS NULL` therefore always reads the primary rows. Unique
+indexes reject NULLs at write time and are always complete.
 
 UPDATE and DELETE read the matching rows through the same path ranking,
 then write inside the same transaction. `EXPLAIN SELECT ...` prints the
-chosen path as a single row — the one-line plan is what the tests assert
-index selection with.
+chosen path as a single row — bounds, order and limit-pushdown included —
+which is what the tests assert plan selection with.
 
 Every statement runs in a transaction: implicit (auto-commit, with
 transparent server-side retry on serialization conflicts) or the session's

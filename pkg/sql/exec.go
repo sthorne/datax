@@ -7,6 +7,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
@@ -245,10 +246,26 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if err != nil {
 			return nil, err
 		}
-		kvs, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
+		var fam types.Family
+		if plan.hasBounds() {
+			col, _ := desc.ColByID(plan.idx.ColumnIDs[len(plan.idxVals)])
+			fam = col.Type
+		}
+		start, end, err := plan.spanBounds(prefix, fam)
 		if err != nil {
 			return nil, err
 		}
+		// Index entries are 1:1 with rows, so with no residual filter every
+		// scanned entry yields a result row: the limit pushes into the scan.
+		var scanLimit int64
+		if len(plan.residual) == 0 {
+			scanLimit = limit
+		}
+		kvs, err := txn.Scan(ctx, start, end, scanLimit)
+		if err != nil {
+			return nil, err
+		}
+		metrics.SQLRowsScanned.Add(float64(len(kvs)))
 		var out []fetchedRow
 		for _, kv := range kvs {
 			pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
@@ -279,13 +296,47 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			}
 		}
 		return out, nil
+
+	case planPKScan:
+		prefix := rowenc.PrimaryKeyPrefix(desc.ID)
+		for i, d := range plan.idxVals {
+			col, _ := desc.ColByID(desc.PrimaryKey[i])
+			var err error
+			prefix, err = rowenc.AppendKeyDatum(prefix, col.Type, d)
+			if err != nil {
+				return nil, newErrf(CodeInternal, "pk bound: %v", err)
+			}
+		}
+		var fam types.Family
+		if plan.hasBounds() {
+			col, _ := desc.ColByID(desc.PrimaryKey[len(plan.idxVals)])
+			fam = col.Type
+		}
+		start, end, err := plan.spanBounds(prefix, fam)
+		if err != nil {
+			return nil, newErrf(CodeInternal, "pk bound: %v", err)
+		}
+		return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 	}
 
 	start, end := rowenc.PrimarySpan(desc.ID)
-	kvs, err := txn.Scan(ctx, start, end, 0)
+	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+}
+
+// scanPrimarySpan scans [start, end) of the primary index, filters with the
+// full WHERE clause, and stops at limit. The limit is pushed into the KV
+// scan itself when the plan has no residual filter (every scanned row is a
+// result row).
+func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, start, end keys.Key, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	var scanLimit int64
+	if len(plan.residual) == 0 {
+		scanLimit = limit
+	}
+	kvs, err := txn.Scan(ctx, start, end, scanLimit)
 	if err != nil {
 		return nil, err
 	}
+	metrics.SQLRowsScanned.Add(float64(len(kvs)))
 	var out []fetchedRow
 	for _, kv := range kvs {
 		row, err := decodeFullRow(desc, kv.Key, kv.Value)
@@ -623,6 +674,13 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			text += "; order satisfied by access path"
 		} else {
 			text += "; in-memory sort"
+		}
+	}
+	if sel.Limit > 0 && !hasAggregates(sel.Exprs) && len(plan.residual) == 0 &&
+		(len(sel.OrderBy) == 0 || orderSatisfiedByPlan(desc, plan, sel.OrderBy)) {
+		switch plan.kind {
+		case planFullScan, planPKScan, planIndexScan:
+			text += "; limit pushed into scan"
 		}
 	}
 	return &Result{

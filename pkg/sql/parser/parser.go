@@ -714,6 +714,21 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 		if err != nil {
 			return nil, err
 		}
+		// col IS [NOT] NULL ("is" is not a reserved keyword).
+		if p.consumeIdentWord("is") {
+			op := "IS NULL"
+			if p.consumeKeyword("NOT") {
+				op = "IS NOT NULL"
+			}
+			if err := p.expectKeyword("NULL"); err != nil {
+				return nil, err
+			}
+			out = append(out, Comparison{Column: col, Op: op})
+			if !p.consumeKeyword("AND") {
+				break
+			}
+			continue
+		}
 		t := p.peek()
 		if t.kind != tkOp || !isCmpOp(t.text) {
 			return nil, p.errf("expected comparison operator, found %q", t.text)

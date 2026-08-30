@@ -72,4 +72,7 @@ var (
 	TxnRecoveries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_recoveries_total", Help: "Status recoveries run against STAGING transaction records.",
 	})
+	SQLRowsScanned = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_rows_scanned_total", Help: "KV pairs fetched by SQL table and index scans (before filtering).",
+	})
 )

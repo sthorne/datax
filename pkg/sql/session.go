@@ -330,6 +330,12 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if !ok {
 			lhs = types.DNull
 		}
+		if cmp.Op == "IS NULL" || cmp.Op == "IS NOT NULL" {
+			if lhs.Null != (cmp.Op == "IS NULL") {
+				return false, nil
+			}
+			continue
+		}
 		rhs, err := evalExpr(cmp.Value, desc, row, params)
 		if err != nil {
 			return false, err
