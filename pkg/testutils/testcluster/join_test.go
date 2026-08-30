@@ -216,8 +216,9 @@ func TestJoinSession(t *testing.T) {
 	if _, serr := trySQL(ctx, s, `SELECT c.name FROM customers c JOIN orders o ON c.id = o.customer_id FOR UPDATE`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
 		t.Fatalf("join FOR UPDATE: %v", serr)
 	}
-	if _, serr := trySQL(ctx, s, `SELECT COUNT(*) FROM customers c JOIN orders o ON c.id = o.customer_id`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
-		t.Fatalf("join aggregate: %v", serr)
+	res = execSQL(t, ctx, s, `SELECT COUNT(*) FROM customers c JOIN orders o ON c.id = o.customer_id`)
+	if len(res.Rows) != 1 || res.Rows[0][0].I != 3 {
+		t.Fatalf("join aggregate: %+v", res.Rows)
 	}
 	if _, serr := trySQL(ctx, s, `SELECT c.name FROM customers c JOIN orders o ON c.id = o.id AND o.total = o.total`); serr == nil {
 		t.Fatal("same-side ON condition accepted")

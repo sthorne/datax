@@ -120,14 +120,12 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				return nil, ToSQLError(err)
 			}
 			fromWhere(desc, t.Where)
-			if t.Join != nil {
-				// Qualified references resolve against either join side.
-				if innerDesc, err := s.lookupForPlan(ctx, t.Join.Table); err == nil {
-					if outer, inner, jerr := makeJoinSides(desc, innerDesc, t); jerr == nil {
-						for _, cmp := range t.Where {
-							if ref, rerr := resolveJoinRef(outer, inner, cmp.Column); rerr == nil {
-								assign(cmp.Value, ref.col.Type)
-							}
+			if len(t.Joins) > 0 {
+				// Qualified references resolve against any join side.
+				if sides, jerr := s.planJoinSides(ctx, desc, t); jerr == nil {
+					for _, cmp := range t.Where {
+						if ref, rerr := resolveJoinRef(sides, cmp.Column); rerr == nil {
+							assign(cmp.Value, ref.col.Type)
 						}
 					}
 				}
@@ -215,16 +213,27 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
-		if t.Join != nil {
-			innerDesc, err := s.lookupForPlan(ctx, t.Join.Table)
-			if err != nil {
-				return nil, ToSQLError(err)
-			}
-			outer, inner, jerr := makeJoinSides(desc, innerDesc, t)
+		if len(t.Joins) > 0 {
+			sides, jerr := s.planJoinSides(ctx, desc, t)
 			if jerr != nil {
 				return nil, ToSQLError(jerr)
 			}
-			proj, perr := resolveJoinProjection(outer, inner, t.Exprs)
+			if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
+				jdesc, _, sel, gerr := groupedJoinQuery(sides, t)
+				if gerr != nil {
+					return nil, ToSQLError(gerr)
+				}
+				gq, aerr := resolveGrouped(jdesc, sel)
+				if aerr != nil {
+					return nil, ToSQLError(aerr)
+				}
+				cols := make([]ResultColumn, len(gq.outs))
+				for i, oc := range gq.outs {
+					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ}
+				}
+				return cols, nil
+			}
+			proj, perr := resolveJoinProjection(sides, t.Exprs)
 			if perr != nil {
 				return nil, ToSQLError(perr)
 			}
@@ -270,4 +279,18 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	default:
 		return nil, nil
 	}
+}
+
+// planJoinSides builds the join sides for planning (Describe/parameter
+// inference) without privilege checks — mirrors resolveJoinQuery's shape.
+func (s *Session) planJoinSides(ctx context.Context, baseDesc *catalog.TableDescriptor, t *parser.Select) ([]joinSide, error) {
+	inner := make([]*catalog.TableDescriptor, len(t.Joins))
+	for i := range t.Joins {
+		d, err := s.lookupForPlan(ctx, t.Joins[i].Table)
+		if err != nil {
+			return nil, err
+		}
+		inner[i] = d
+	}
+	return makeJoinSides(baseDesc, inner, t)
 }

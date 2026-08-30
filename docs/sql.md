@@ -71,8 +71,9 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: multi-level correlated subqueries, multi-way (3+ table) joins,
-aggregates/GROUP BY over joins,
+Still out of scope: multi-level correlated subqueries,
+join reordering (join order = syntactic order) and joins beyond 8 tables,
+expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 DECIMAL and JSONB column types, DEFAULT expressions beyond constants.
 
@@ -199,19 +200,30 @@ clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
 match — and `col IS NULL` therefore always reads the primary rows. Unique
 indexes reject NULLs at write time and are always complete.
 
-Two-table joins (INNER and LEFT OUTER) are nested loops: the outer side
-is fetched through the ranking above using the WHERE conjuncts that
-reference only the outer table, and for each outer row the ON equalities
-become synthetic equality predicates on the inner table — so a join key
-that hits the inner primary key or an index turns into a point/index
-lookup per outer row. The full WHERE clause re-evaluates on every joined
-row, which is what makes it filter after NULL extension on a LEFT JOIN
-(`WHERE inner.col IS NULL` is the anti-join). Column references may be
+Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops
+executed **in syntactic order** — there is no join reordering, so the
+FROM/JOIN order you write is the plan you get. The base (first) table is
+fetched through the ranking above using the WHERE conjuncts that
+reference only it; for each partial row, the next JOIN's ON equalities
+become synthetic equality predicates on that table — so a join key that
+hits its primary key or an index turns into a point/index lookup per
+row. Each ON conjunct must equate a column of the table being joined
+with a column of any *earlier* table (skip-level equalities are fine).
+The full WHERE clause evaluates on complete rows only, which is what
+makes it filter after NULL extension on a LEFT JOIN
+(`WHERE inner.col IS NULL` is the anti-join) — WHERE conjuncts are never
+pushed into a LEFT-joined side's scan. Column references may be
 qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
-(`42702`). `EXPLAIN` prints both paths:
+(`42702`). `EXPLAIN` prints one path per level:
 `nested loop left join; outer (c): range scan of primary key (id > 1);
 inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
-primary key join`.
+primary key join; then inner (i) per row: point lookup on primary key`.
+
+Aggregates and GROUP BY compose with joins: the joined rows run through
+the grouped executor, with `GROUP BY c.name`, `SUM(o.total)`, HAVING and
+DISTINCT all accepting qualified references. ORDER BY on a grouped join
+orders by *result* column name (the same rule single-table GROUP BY
+follows). Plain (non-grouped) join select lists remain columns or `*`.
 
 Uncorrelated subqueries evaluate eagerly, inside the same transaction,
 before the outer statement plans: a scalar subquery splices in as a

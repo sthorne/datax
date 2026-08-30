@@ -113,7 +113,7 @@ func exprColumns(e parser.Expr, visit func(string)) {
 // detection covers: a plain single-table select with no nested
 // subqueries of its own (one correlation level).
 func innerSubShape(sub *parser.Select) bool {
-	if sub.Table == "" || sub.Join != nil || sub.Derived != nil {
+	if sub.Table == "" || len(sub.Joins) > 0 || sub.Derived != nil {
 		return false
 	}
 	for _, cmp := range sub.Where {

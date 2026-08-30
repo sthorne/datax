@@ -128,7 +128,9 @@ type Select struct {
 	Table    string  // empty for FROM-less and derived-table selects
 	Alias    string  // optional alias for Table (or the derived table's alias)
 	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
-	Join     *JoinClause
+	// Joins are the JOIN clauses in syntactic order; execution joins
+	// left-deep in exactly this order.
+	Joins []JoinClause
 	Where    []Comparison
 	GroupBy  []string
 	Having   []HavingCond

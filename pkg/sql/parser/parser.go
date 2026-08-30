@@ -8,6 +8,10 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
+// maxJoinTables caps a SELECT's FROM+JOIN table count: the executor is a
+// left-deep nested loop, and every joined table multiplies its work.
+const maxJoinTables = 8
+
 // SyntaxError carries a position for client-friendly messages.
 type SyntaxError struct {
 	Msg string
@@ -615,30 +619,37 @@ func (p *parser) parseSelect() (Statement, error) {
 		}
 		sel.Table = name
 		sel.Alias = p.parseOptTableAlias(true)
-		// JOIN / INNER JOIN / LEFT [OUTER] JOIN — none are reserved words.
-		var left bool
-		join := false
-		switch {
-		case p.consumeIdentWord("join"):
-			join = true
-		case p.consumeIdentWord("inner"):
-			if !p.consumeIdentWord("join") {
-				return nil, p.errf("expected JOIN after INNER, found %q", p.peek().text)
+		// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
+		// words. Joins execute left-deep in syntactic order.
+		for {
+			var left bool
+			join := false
+			switch {
+			case p.consumeIdentWord("join"):
+				join = true
+			case p.consumeIdentWord("inner"):
+				if !p.consumeIdentWord("join") {
+					return nil, p.errf("expected JOIN after INNER, found %q", p.peek().text)
+				}
+				join = true
+			case p.consumeIdentWord("left"):
+				p.consumeIdentWord("outer")
+				if !p.consumeIdentWord("join") {
+					return nil, p.errf("expected JOIN after LEFT [OUTER], found %q", p.peek().text)
+				}
+				join, left = true, true
 			}
-			join = true
-		case p.consumeIdentWord("left"):
-			p.consumeIdentWord("outer")
-			if !p.consumeIdentWord("join") {
-				return nil, p.errf("expected JOIN after LEFT [OUTER], found %q", p.peek().text)
+			if !join {
+				break
 			}
-			join, left = true, true
-		}
-		if join {
+			if len(sel.Joins) >= maxJoinTables-1 {
+				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
+			}
 			jt, err := p.expectIdent()
 			if err != nil {
 				return nil, err
 			}
-			jc := &JoinClause{Left: left, Table: jt}
+			jc := JoinClause{Left: left, Table: jt}
 			jc.Alias = p.parseOptTableAlias(false)
 			if err := p.expectKeyword("ON"); err != nil {
 				return nil, err
@@ -660,7 +671,7 @@ func (p *parser) parseSelect() (Statement, error) {
 					break
 				}
 			}
-			sel.Join = jc
+			sel.Joins = append(sel.Joins, jc)
 		}
 		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
 		// untouched; SYSTEM and TIME lex as identifiers).
@@ -699,11 +710,12 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, err
 		}
 		for {
-			col, err := p.expectIdent()
+			// Possibly qualified: GROUP BY c.name over a join.
+			ref, err := p.parseColumnRef()
 			if err != nil {
 				return nil, err
 			}
-			sel.GroupBy = append(sel.GroupBy, col)
+			sel.GroupBy = append(sel.GroupBy, ref.String())
 			if !p.consumeOp(",") {
 				break
 			}
@@ -861,11 +873,12 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		}
 		se.AggStar = true
 	} else {
-		col, err := p.expectIdent()
+		// Possibly qualified: SUM(o.total) over a join.
+		ref, err := p.parseColumnRef()
 		if err != nil {
 			return se, false, err
 		}
-		se.AggCol = col
+		se.AggCol = ref.String()
 	}
 	if err := p.expectOp(")"); err != nil {
 		return se, false, err

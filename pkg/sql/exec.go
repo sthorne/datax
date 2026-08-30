@@ -651,7 +651,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// per-row filter after the fetch. Only the plain single-table path
 	// supports them.
 	var corr []correlatedConjunct
-	if t.Table != "" && t.Join == nil && t.Derived == nil {
+	if t.Table != "" && len(t.Joins) == 0 && t.Derived == nil {
 		if cdesc, derr := s.cat.Lookup(ctx, txn, t.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, t.Where, cdesc, t.Alias)
 			if serr != nil {
@@ -706,7 +706,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 		return nil, err
 	}
-	if t.Join != nil {
+	if len(t.Joins) > 0 {
 		return s.execJoinSelect(ctx, txn, desc, t, params)
 	}
 	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
@@ -1049,7 +1049,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	// Correlated conjuncts are stripped exactly as execution strips them,
 	// so the plan below describes the plannable remainder.
 	var corr []correlatedConjunct
-	if sel.Table != "" && sel.Join == nil && sel.Derived == nil {
+	if sel.Table != "" && len(sel.Joins) == 0 && sel.Derived == nil {
 		if cdesc, derr := s.cat.Lookup(ctx, txn, sel.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Alias)
 			if serr != nil {
@@ -1079,7 +1079,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if err != nil {
 		return nil, err
 	}
-	if sel.Join != nil {
+	if len(sel.Joins) > 0 {
 		text, jerr := s.explainJoin(ctx, txn, desc, sel, params)
 		if jerr != nil {
 			return nil, jerr
