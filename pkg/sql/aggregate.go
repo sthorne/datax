@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
 // Aggregates (COUNT/SUM/AVG/MIN/MAX, no GROUP BY) and ORDER BY.
@@ -44,8 +45,11 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 		if !ok {
 			return sp, newErrf(CodeUndefinedColumn, "column %q does not exist", se.AggCol)
 		}
-		if (se.Agg == "SUM" || se.Agg == "AVG") && col.Type != types.Int && col.Type != types.Float {
+		if (se.Agg == "SUM" || se.Agg == "AVG") && col.Type != types.Int && col.Type != types.Float && col.Type != types.Decimal {
 			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, col.Type)
+		}
+		if (se.Agg == "MIN" || se.Agg == "MAX") && col.Type == types.Jsonb {
+			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported (JSONB has no order)", se.Agg, col.Type)
 		}
 		sp.col = col
 	}
@@ -63,6 +67,9 @@ func (sp aggSpec) resultType() types.Family {
 	case "COUNT":
 		return types.Int
 	case "AVG":
+		if sp.col.Type == types.Decimal {
+			return types.Decimal // exact, quantized to 6 fractional digits
+		}
 		return types.Float
 	}
 	return sp.col.Type
@@ -73,6 +80,7 @@ type aggState struct {
 	counts []int64
 	sumI   []int64
 	sumF   []float64
+	sumD   []decimal.Dec // exact register for DECIMAL SUM/AVG
 	best   []types.Datum // MIN/MAX candidate; zero = none yet
 	seen   []bool
 }
@@ -82,6 +90,7 @@ func newAggState(n int) *aggState {
 		counts: make([]int64, n),
 		sumI:   make([]int64, n),
 		sumF:   make([]float64, n),
+		sumD:   make([]decimal.Dec, n),
 		best:   make([]types.Datum, n),
 		seen:   make([]bool, n),
 	}
@@ -104,9 +113,16 @@ func (st *aggState) accumulate(specs []aggSpec, row map[catalog.ColumnID]types.D
 		st.counts[i]++
 		switch sp.fn {
 		case "SUM", "AVG":
-			if sp.col.Type == types.Int {
+			switch sp.col.Type {
+			case types.Int:
 				st.sumI[i] += d.I
-			} else {
+			case types.Decimal:
+				v, err := d.DecimalVal()
+				if err != nil {
+					return newErrf(CodeInternal, "column %q: %v", sp.col.Name, err)
+				}
+				st.sumD[i] = decimal.Add(st.sumD[i], v)
+			default:
 				st.sumF[i] += d.F
 			}
 		case "MIN", "MAX":
@@ -133,17 +149,28 @@ func (st *aggState) finish(specs []aggSpec) []types.Datum {
 		case "COUNT":
 			out[i] = types.NewInt(st.counts[i])
 		case "SUM":
-			if st.counts[i] == 0 {
+			switch {
+			case st.counts[i] == 0:
 				out[i] = types.DNull
-			} else if sp.col.Type == types.Int {
+			case sp.col.Type == types.Int:
 				out[i] = types.NewInt(st.sumI[i])
-			} else {
+			case sp.col.Type == types.Decimal:
+				out[i] = types.NewDecimal(st.sumD[i].String())
+			default:
 				out[i] = types.NewFloat(st.sumF[i])
 			}
 		case "AVG":
-			if st.counts[i] == 0 {
+			switch {
+			case st.counts[i] == 0:
 				out[i] = types.DNull
-			} else {
+			case sp.col.Type == types.Decimal:
+				q, err := decimal.DivQuantize(st.sumD[i], decimal.FromInt(st.counts[i]), 6)
+				if err != nil {
+					out[i] = types.DNull
+				} else {
+					out[i] = types.NewDecimal(q.String())
+				}
+			default:
 				total := st.sumF[i]
 				if sp.col.Type == types.Int {
 					total = float64(st.sumI[i])
@@ -215,7 +242,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 			gq.outs = append(gq.outs, groupedOut{name: sp.name, typ: sp.resultType(), groupPos: -1, aggPos: len(gq.specs)})
 			gq.specs = append(gq.specs, sp)
 		default:
-			if se.Expr.Column == "" || se.Expr.BinOp != "" {
+			if se.Expr.Column == "" || se.Expr.BinOp != "" || len(se.Expr.Path) > 0 {
 				return nil, newErrf(CodeFeatureNotSupported, "grouped SELECT items must be plain columns or aggregates")
 			}
 			pos, ok := groupIdx[se.Expr.Column]

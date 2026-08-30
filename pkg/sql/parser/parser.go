@@ -401,10 +401,18 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.i += 3
 		}
 	}
-	// VARCHAR(n) etc.: absorb the length.
+	// VARCHAR(n) / DECIMAL(p[,s]) etc.: absorb the typmod. Precision and
+	// scale are accepted and IGNORED — storage is arbitrary-precision
+	// (documented; enforcement is a possible follow-up).
 	if p.consumeOp("(") {
 		if p.peek().kind == tkNumber {
 			p.i++
+			if p.consumeOp(",") {
+				if p.peek().kind != tkNumber {
+					return def, p.errf("expected scale after ',' in type modifier")
+				}
+				p.i++
+			}
 		}
 		if err := p.expectOp(")"); err != nil {
 			return def, err
@@ -1077,6 +1085,10 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 		if err != nil {
 			return nil, err
 		}
+		path, err := p.parsePathSteps()
+		if err != nil {
+			return nil, err
+		}
 		// col IS [NOT] NULL ("is" is not a reserved keyword).
 		if p.consumeIdentWord("is") {
 			op := "IS NULL"
@@ -1086,7 +1098,7 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 			if err := p.expectKeyword("NULL"); err != nil {
 				return nil, err
 			}
-			out = append(out, Comparison{Column: col, Op: op})
+			out = append(out, Comparison{Column: col, Path: path, Op: op})
 			if !p.consumeKeyword("AND") {
 				break
 			}
@@ -1101,7 +1113,7 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 			notIn = true
 		}
 		if notIn || p.consumeIdentWord("in") {
-			cmp := Comparison{Column: col, Op: "IN"}
+			cmp := Comparison{Column: col, Path: path, Op: "IN"}
 			if notIn {
 				cmp.Op = "NOT IN"
 			}
@@ -1145,7 +1157,7 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Comparison{Column: col, Op: t.text, Value: val})
+		out = append(out, Comparison{Column: col, Path: path, Op: t.text, Value: val})
 		if !p.consumeKeyword("AND") {
 			break
 		}
@@ -1227,14 +1239,18 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	case tkNumber:
 		p.i++
 		if strings.ContainsAny(t.text, ".eE") {
-			f, err := strconv.ParseFloat(t.text, 64)
+			// Non-integer numeric literals are exact DECIMALs (PostgreSQL
+			// semantics): 0.1 must survive to a DECIMAL column unrounded.
+			// Float columns coerce Decimal→Float on demand (lossy is fine
+			// in that direction).
+			txt := t.text
+			if neg {
+				txt = "-" + txt
+			}
+			d, err := types.ParseDecimal(txt)
 			if err != nil {
 				return e, p.errf("invalid number %q", t.text)
 			}
-			if neg {
-				f = -f
-			}
-			d := types.NewFloat(f)
 			e.Lit = &d
 		} else {
 			i, err := strconv.ParseInt(t.text, 10, 64)
@@ -1290,6 +1306,29 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	return e, nil
 }
 
+// parsePathSteps parses a chained ->/->> JSONB extraction after a column
+// reference. Keys are string literals; ->> renders text and is therefore
+// terminal — jsonb -> 'a' ->> 'b' is fine, ->> 'a' -> 'b' is not.
+func (p *parser) parsePathSteps() ([]PathStep, error) {
+	var steps []PathStep
+	for {
+		t := p.peek()
+		if t.kind != tkOp || (t.text != "->" && t.text != "->>") {
+			return steps, nil
+		}
+		if len(steps) > 0 && steps[len(steps)-1].Text {
+			return nil, p.errf("cannot apply %s after ->> (->> yields text, not jsonb)", t.text)
+		}
+		p.i++
+		key := p.peek()
+		if key.kind != tkString {
+			return nil, p.errf("expected string key after %s, found %q", t.text, key.text)
+		}
+		p.i++
+		steps = append(steps, PathStep{Key: key.text, Text: t.text == "->>"})
+	}
+}
+
 // parseValueOrColumnExpr additionally allows column references and
 // col ± value (for SET balance = balance - 10 and SELECT col).
 func (p *parser) parseValueOrColumnExpr() (Expr, error) {
@@ -1305,6 +1344,11 @@ func (p *parser) parseValueOrColumnExpr() (Expr, error) {
 			name += "." + col
 		}
 		e := Expr{Column: name}
+		path, err := p.parsePathSteps()
+		if err != nil {
+			return Expr{}, err
+		}
+		e.Path = path
 		if op := p.peek(); op.kind == tkOp && (op.text == "+" || op.text == "-") {
 			p.i++
 			rhs, err := p.parseValueExpr()

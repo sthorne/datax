@@ -165,6 +165,9 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 		case se.Agg != "":
 			return nil, newErrf(CodeInternal, "aggregate reached the join projection")
 		case se.Expr.Column != "" && se.Expr.BinOp == "":
+			if len(se.Expr.Path) > 0 {
+				return nil, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
+			}
 			ref, err := resolveJoinRef(sides, se.Expr.Column)
 			if err != nil {
 				return nil, err
@@ -192,6 +195,9 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cmp.Op == "FALSE" {
 			return false, nil
 		}
+		if len(cmp.Path) > 0 {
+			return false, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
+		}
 		ref, err := resolveJoinRef(sides, cmp.Column)
 		if err != nil {
 			return false, err
@@ -204,7 +210,7 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			continue
 		}
 		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
-			match, err := matchesIn(cmp, ref.col, lhs, nil, nil, params)
+			match, err := matchesIn(cmp, ref.col.Type, lhs, nil, nil, params)
 			if err != nil || !match {
 				return false, err
 			}
@@ -258,6 +264,9 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 	for _, cmp := range where {
 		if cmp.Column == "" {
 			continue // constant conjuncts stay in the post-join filter
+		}
+		if len(cmp.Path) > 0 {
+			return nil, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
 		}
 		ref, err := resolveJoinRef(sides, cmp.Column)
 		if err != nil {

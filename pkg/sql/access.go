@@ -188,6 +188,13 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 			return accessPlan{}, newErrf(CodeUndefinedColumn, "column %q does not exist", cmp.Column)
 		}
 		pc := planConj{cmp: cmp, col: col}
+		if len(cmp.Path) > 0 {
+			// A ->/->> conjunct constrains the extracted value, not the
+			// column itself: never usable for key bounds (and never proof
+			// the column matches anything) — post-fetch filter only.
+			conjs[i] = pc
+			continue
+		}
 		switch cmp.Op {
 		case "=", "<", "<=", ">", ">=":
 			// A value that cannot be evaluated without a row (a column

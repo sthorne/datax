@@ -108,6 +108,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		if !ok {
 			return nil, newErrf(CodeUndefinedColumn, "primary key column %q does not exist", name)
 		}
+		if !types.IsIndexable(col.Type) {
+			return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be part of a primary key (no ordered key encoding)", name, col.Type)
+		}
 		desc.PrimaryKey = append(desc.PrimaryKey, col.ID)
 		// PK columns are implicitly NOT NULL.
 		for i := range desc.Columns {
@@ -583,7 +586,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum) ([]types.Datum, bool, error) {
 	byCol := map[catalog.ColumnID]types.Datum{}
 	for _, cmp := range where {
-		if cmp.Op != "=" {
+		if cmp.Op != "=" || len(cmp.Path) > 0 {
 			continue
 		}
 		col, ok := desc.Col(cmp.Column)

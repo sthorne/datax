@@ -34,6 +34,18 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 			if name == "" {
 				name = c.Name
 			}
+			if len(se.Expr.Path) > 0 {
+				// col -> 'k' / ->> 'k': a computed column typed by the chain.
+				if c.Type != types.Jsonb {
+					return nil, newErrf(CodeFeatureNotSupported, "cannot extract path from type %s (-> and ->> require jsonb)", c.Type)
+				}
+				e := se.Expr
+				if se.Alias == "" {
+					name = "?column?"
+				}
+				proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: pathResultType(se.Expr.Path)}})
+				continue
+			}
 			proj = append(proj, projCol{col: c, name: name})
 			continue
 		}
@@ -85,7 +97,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 	fromWhere := func(desc *catalog.TableDescriptor, where []parser.Comparison) {
 		for _, cmp := range where {
 			if col, ok := desc.Col(cmp.Column); ok {
-				assign(cmp.Value, col.Type)
+				typ := col.Type
+				if len(cmp.Path) > 0 {
+					typ = pathResultType(cmp.Path)
+				}
+				assign(cmp.Value, typ)
 			}
 		}
 	}

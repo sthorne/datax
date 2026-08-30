@@ -8,6 +8,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 // Online CREATE INDEX (three steps, driven by the session outside any
@@ -58,6 +59,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			col, ok := desc.Col(name)
 			if !ok {
 				return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+			}
+			if !types.IsIndexable(col.Type) {
+				return newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
 			}
 			if seenCol[col.ID] {
 				return newErrf(CodeSyntaxError, "duplicate column %q in index", name)

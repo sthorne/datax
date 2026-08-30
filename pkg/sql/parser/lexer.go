@@ -120,13 +120,19 @@ func lex(src string) ([]token, error) {
 			}
 			l.toks = append(l.toks, token{kind: tkParam, text: l.src[numStart:l.pos], pos: start})
 		default:
-			// Multi-char operators first.
+			// Multi-char operators first (longest match: ->> before ->,
+			// which the comment case above already can't shadow).
+			if l.pos+3 <= len(l.src) && l.src[l.pos:l.pos+3] == "->>" {
+				l.toks = append(l.toks, token{kind: tkOp, text: "->>", pos: start})
+				l.pos += 3
+				continue
+			}
 			two := ""
 			if l.pos+1 < len(l.src) {
 				two = l.src[l.pos : l.pos+2]
 			}
 			switch two {
-			case "!=", "<>", "<=", ">=", "::":
+			case "!=", "<>", "<=", ">=", "::", "->":
 				op := two
 				if op == "<>" {
 					op = "!="

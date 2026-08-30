@@ -30,10 +30,28 @@ SHOW TABLES
   `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
   (alias TIMESTAMP [WITH TIME ZONE]; UTC nanoseconds internally,
   microsecond precision on the binary wire), `DATE`, `BYTES` (alias
-  BYTEA; `\x` hex text format), `UUID`. String literals coerce into the
+  BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases NUMERIC, DEC),
+  `JSONB` (alias JSON). String literals coerce into the
   new types (`WHERE at >= '2026-08-30 02:00:00Z'` becomes a key bound),
-  and all are usable in primary keys and indexes via the
-  order-preserving encodings. DECIMAL and JSONB remain out of scope.
+  and all but JSONB are usable in primary keys and indexes via
+  order-preserving encodings (JSONB has no ordering and refuses with
+  `0A000`).
+- DECIMAL is exact arbitrary-precision arithmetic (`math/big` coefficient
+  × 10^exp). Non-integer numeric literals are DECIMAL, as in PostgreSQL —
+  `0.1` survives to a DECIMAL column unrounded, and `SUM`/`AVG` over
+  DECIMAL stay exact where float64 breaks (`AVG` quantizes to 6 fractional
+  digits, round-half-even). Int operands mix exactly; a FLOAT8 operand
+  demotes the expression to float. `DECIMAL(p,s)` is accepted and IGNORED
+  (no precision/scale enforcement yet). Float→Decimal coercion is
+  rejected — cast through text if you really mean it.
+- JSONB stores normalized text (sorted object keys, compact, duplicate
+  keys last-wins). Numbers pass through `json.Number`, so integer
+  fidelity is preserved on ingest; equality compares normalized text, and
+  ordering comparisons are refused. Extraction: `col -> 'key'` (jsonb)
+  and `col ->> 'key'` (text, terminal only), chainable
+  (`j -> 'a' ->> 'b'`); missing keys and non-objects yield NULL.
+  Single-table queries only — path operators in join queries refuse with
+  `0A000` — and path conjuncts never become index bounds.
 - Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
   omit the column store the default; an explicit NULL stays NULL.
 - WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
@@ -76,7 +94,9 @@ join/derived-table shapes,
 join reordering (join order = syntactic order) and joins beyond 8 tables,
 expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
-DECIMAL and JSONB column types, DEFAULT expressions beyond constants.
+DECIMAL precision/scale enforcement (typmod parsed and ignored),
+JSONB indexing and containment (`@>`), path operators in join queries,
+DEFAULT expressions beyond constants.
 
 ## Catalog
 
@@ -323,8 +343,9 @@ explicit `BEGIN ... COMMIT`.
 - **Extended protocol**: minimal but real, because pgx's default mode prepares
   statements: `Parse` / `Bind` / `Describe` / `Execute` / `Sync` / `Close`.
   Parameters and results in both text and binary formats for every column
-  type (int8, float8, bool, text, timestamptz, date, bytea, uuid). No
-  portal suspension.
+  type (int8, float8, bool, text, timestamptz, date, bytea, uuid,
+  numeric as PostgreSQL's base-10000 digit groups, jsonb with the
+  version-1 byte). No portal suspension.
 - **Transaction status is load-bearing**: `ReadyForQuery` carries `I` (idle),
   `T` (in transaction), or `E` (failed transaction — everything except
   `ROLLBACK` is rejected with `25P02`).

@@ -10,6 +10,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -353,6 +354,13 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 	default:
 		return types.Datum{}, newErrf(CodeInternal, "empty expression")
 	}
+	if len(e.Path) > 0 {
+		var err error
+		base, err = applyPath(base, e.Path)
+		if err != nil {
+			return types.Datum{}, err
+		}
+	}
 	if e.BinOp == "" {
 		return base, nil
 	}
@@ -373,6 +381,36 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 			return types.NewInt(l.I + r.I), nil
 		case "-":
 			return types.NewInt(l.I - r.I), nil
+		}
+	}
+	// Exact decimal arithmetic when either side is DECIMAL and the other
+	// lifts exactly (DECIMAL or INT). A FLOAT operand falls through to
+	// float arithmetic — mixing binary rounding in and calling the result
+	// exact would be a lie.
+	if (l.Fam == types.Decimal || r.Fam == types.Decimal) &&
+		(l.Fam == types.Decimal || l.Fam == types.Int) &&
+		(r.Fam == types.Decimal || r.Fam == types.Int) {
+		ld, err := l.Coerce(types.Decimal)
+		if err != nil {
+			return types.Datum{}, newErrf(CodeInternal, "%v", err)
+		}
+		rd, err := r.Coerce(types.Decimal)
+		if err != nil {
+			return types.Datum{}, newErrf(CodeInternal, "%v", err)
+		}
+		lv, err := ld.DecimalVal()
+		if err != nil {
+			return types.Datum{}, newErrf(CodeInternal, "%v", err)
+		}
+		rv, err := rd.DecimalVal()
+		if err != nil {
+			return types.Datum{}, newErrf(CodeInternal, "%v", err)
+		}
+		switch op {
+		case "+":
+			return types.NewDecimal(decimal.Add(lv, rv).String()), nil
+		case "-":
+			return types.NewDecimal(decimal.Sub(lv, rv).String()), nil
 		}
 	}
 	lf, err := l.Coerce(types.Float)
@@ -410,6 +448,16 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if !ok {
 			lhs = types.DNull
 		}
+		// A ->/->> path replaces the column value and its comparison type.
+		cmpType := col.Type
+		if len(cmp.Path) > 0 {
+			var perr error
+			lhs, perr = applyPath(lhs, cmp.Path)
+			if perr != nil {
+				return false, perr
+			}
+			cmpType = pathResultType(cmp.Path)
+		}
 		if cmp.Op == "IS NULL" || cmp.Op == "IS NOT NULL" {
 			if lhs.Null != (cmp.Op == "IS NULL") {
 				return false, nil
@@ -417,7 +465,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			continue
 		}
 		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
-			match, err := matchesIn(cmp, col, lhs, desc, row, params)
+			match, err := matchesIn(cmp, cmpType, lhs, desc, row, params)
 			if err != nil || !match {
 				return false, err
 			}
@@ -430,7 +478,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if lhs.Null || rhs.Null {
 			return false, nil // NULL comparisons never match
 		}
-		rhs, err = rhs.Coerce(col.Type)
+		rhs, err = rhs.Coerce(cmpType)
 		if err != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, err)
 		}
@@ -464,7 +512,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 // semantics collapsed to WHERE's boolean: a NULL left-hand side never
 // matches; a NULL element can never prove NOT IN (x NOT IN (..., NULL) is
 // UNKNOWN unless x matches a non-NULL element).
-func matchesIn(cmp parser.Comparison, col catalog.Column, lhs types.Datum, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
+func matchesIn(cmp parser.Comparison, cmpType types.Family, lhs types.Datum, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
 	if lhs.Null {
 		return false, nil
 	}
@@ -478,7 +526,7 @@ func matchesIn(cmp parser.Comparison, col catalog.Column, lhs types.Datum, desc 
 			hasNull = true
 			continue
 		}
-		d, cerr := d.Coerce(col.Type)
+		d, cerr := d.Coerce(cmpType)
 		if cerr != nil {
 			return false, newErrf(CodeInternal, "IN %s: %v", cmp.Column, cerr)
 		}

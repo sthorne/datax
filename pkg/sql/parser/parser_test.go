@@ -164,3 +164,61 @@ func TestJoinChains(t *testing.T) {
 		t.Fatalf("cap: %v", err)
 	}
 }
+
+// TestJSONBPathParsing: ->/->> chains attach to column references in the
+// SELECT list and WHERE conjuncts; ->> is terminal (it yields text).
+func TestJSONBPathParsing(t *testing.T) {
+	sel := parseOne(t, `SELECT j -> 'a', j -> 'a' ->> 'b' AS x FROM t WHERE j ->> 'k' = 'v' AND j -> 'n' IS NULL`).(*Select)
+	if len(sel.Exprs) != 2 {
+		t.Fatalf("exprs: %+v", sel.Exprs)
+	}
+	p0 := sel.Exprs[0].Expr.Path
+	if sel.Exprs[0].Expr.Column != "j" || len(p0) != 1 || p0[0] != (PathStep{Key: "a"}) {
+		t.Fatalf("expr 0: %+v", sel.Exprs[0].Expr)
+	}
+	p1 := sel.Exprs[1].Expr.Path
+	if len(p1) != 2 || p1[0] != (PathStep{Key: "a"}) || p1[1] != (PathStep{Key: "b", Text: true}) {
+		t.Fatalf("expr 1: %+v", sel.Exprs[1].Expr)
+	}
+	if sel.Exprs[1].Alias != "x" {
+		t.Fatalf("alias: %+v", sel.Exprs[1])
+	}
+	if len(sel.Where) != 2 {
+		t.Fatalf("where: %+v", sel.Where)
+	}
+	w0 := sel.Where[0]
+	if w0.Column != "j" || len(w0.Path) != 1 || !w0.Path[0].Text || w0.Path[0].Key != "k" || w0.Op != "=" {
+		t.Fatalf("where 0: %+v", w0)
+	}
+	w1 := sel.Where[1]
+	if w1.Op != "IS NULL" || len(w1.Path) != 1 || w1.Path[0] != (PathStep{Key: "n"}) {
+		t.Fatalf("where 1: %+v", w1)
+	}
+
+	for _, bad := range []string{
+		`SELECT j ->> 'a' -> 'b' FROM t`, // ->> yields text: not chainable
+		`SELECT j -> 5 FROM t`,           // keys are string literals
+		`SELECT j -> col FROM t`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
+
+// TestDecimalLiterals: non-integer numeric literals parse as exact DECIMAL
+// datums (PostgreSQL semantics), not binary floats.
+func TestDecimalLiterals(t *testing.T) {
+	sel := parseOne(t, `SELECT 0.1, -1.5e2, 2.50 FROM t`).(*Select)
+	want := []string{"0.1", "-150", "2.5"}
+	for i, w := range want {
+		lit := sel.Exprs[i].Expr.Lit
+		if lit == nil || lit.Fam != types.Decimal || lit.S != w {
+			t.Fatalf("expr %d: %+v, want canonical %q", i, lit, w)
+		}
+	}
+	ins := parseOne(t, `INSERT INTO t VALUES (0.30000000000000004)`).(*Insert)
+	if lit := ins.Rows[0][0].Lit; lit.S != "0.30000000000000004" {
+		t.Fatalf("precision lost: %+v", lit)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
@@ -44,7 +45,9 @@ const (
 	// tagNull marks an explicit NULL (no payload). Only written for
 	// fill-on-read (ALTER-added DEFAULT) columns, where a missing column
 	// means "row predates the column" rather than NULL.
-	tagNull byte = 9
+	tagNull    byte = 9
+	tagDecimal byte = 10 // uvarint length + canonical decimal string
+	tagJsonb   byte = 11 // uvarint length + normalized JSON text
 )
 
 // PrimaryKeyPrefix is the key prefix of a table's ORIGINAL primary rows
@@ -121,6 +124,12 @@ func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) 
 		return keys.Key(encoding.EncodeString(k, d.S)), nil
 	case types.Bool:
 		return keys.Key(encoding.EncodeBool(k, d.B)), nil
+	case types.Decimal:
+		v, err := d.DecimalVal()
+		if err != nil {
+			return nil, err
+		}
+		return keys.Key(encoding.EncodeDecimal(k, v)), nil
 	}
 	return nil, fmt.Errorf("unencodable type %s", fam)
 }
@@ -154,6 +163,10 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 			var v bool
 			rest, v, err = encoding.DecodeBool(rest)
 			d = types.NewBool(v)
+		case types.Decimal:
+			var v decimal.Dec
+			rest, v, err = encoding.DecodeDecimal(rest)
+			d = types.NewDecimal(v.String())
 		default:
 			err = fmt.Errorf("undecodable type %s", col.Type)
 		}
@@ -214,10 +227,15 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		case types.Float:
 			out = append(out, tagFloat)
 			out = binary.BigEndian.AppendUint64(out, math.Float64bits(d.F))
-		case types.String, types.Bytes:
+		case types.String, types.Bytes, types.Decimal, types.Jsonb:
 			tag := tagString
-			if col.Type == types.Bytes {
+			switch col.Type {
+			case types.Bytes:
 				tag = tagBytes
+			case types.Decimal:
+				tag = tagDecimal
+			case types.Jsonb:
+				tag = tagJsonb
 			}
 			out = append(out, tag)
 			out = encoding.EncodeUvarint(out, uint64(len(d.S)))
@@ -299,7 +317,7 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if known && col.Type == types.Float {
 				out[colID] = types.NewFloat(v)
 			}
-		case tagString, tagBytes:
+		case tagString, tagBytes, tagDecimal, tagJsonb:
 			var n uint64
 			var err error
 			rest, n, err = encoding.DecodeUvarint(rest)
@@ -309,8 +327,13 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			v := string(rest[:n])
 			rest = rest[n:]
 			want := types.String
-			if tag == tagBytes {
+			switch tag {
+			case tagBytes:
 				want = types.Bytes
+			case tagDecimal:
+				want = types.Decimal
+			case tagJsonb:
+				want = types.Jsonb
 			}
 			if known && col.Type == want {
 				out[colID] = types.Datum{Fam: want, S: v}
@@ -449,6 +472,8 @@ func skipDatum(b []byte, fam types.Family) ([]byte, error) {
 		b, _, err = encoding.DecodeString(b)
 	case types.Bool:
 		b, _, err = encoding.DecodeBool(b)
+	case types.Decimal:
+		b, _, err = encoding.DecodeDecimal(b)
 	default:
 		err = fmt.Errorf("unskippable type %s", fam)
 	}

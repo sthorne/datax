@@ -3,10 +3,14 @@ package types
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
 // Family is a column type.
@@ -22,7 +26,12 @@ const (
 	Date             // DATE: days since the Unix epoch (in I)
 	Bytes            // BYTES/BYTEA: raw bytes (in S)
 	Uuid             // UUID: 16 raw bytes (in S)
+	Decimal          // DECIMAL/NUMERIC: canonical decimal string (in S)
+	Jsonb            // JSONB: normalized compact JSON text (in S)
 )
+
+// The Family values above are ON-DISK FORMAT (JSON-serialized in table
+// descriptors): append only, never renumber.
 
 func (f Family) String() string {
 	switch f {
@@ -42,6 +51,10 @@ func (f Family) String() string {
 		return "BYTES"
 	case Uuid:
 		return "UUID"
+	case Decimal:
+		return "DECIMAL"
+	case Jsonb:
+		return "JSONB"
 	}
 	return "UNKNOWN"
 }
@@ -65,6 +78,10 @@ func ParseType(name string) (Family, error) {
 		return Bytes, nil
 	case "UUID":
 		return Uuid, nil
+	case "DECIMAL", "NUMERIC", "DEC":
+		return Decimal, nil
+	case "JSONB", "JSON":
+		return Jsonb, nil
 	}
 	return Unknown, fmt.Errorf("unsupported type %q", name)
 }
@@ -97,6 +114,15 @@ func NewBytes(v []byte) Datum { return Datum{Fam: Bytes, S: string(v)} }
 
 // NewUUID holds the 16 raw bytes of a UUID (stored in S).
 func NewUUID(v [16]byte) Datum { return Datum{Fam: Uuid, S: string(v[:])} }
+
+// NewDecimal holds a decimal's CANONICAL string form (callers must
+// canonicalize via ParseDecimal/decimal.Dec.String — grouping, memo keys,
+// and equality compare the text).
+func NewDecimal(canonical string) Datum { return Datum{Fam: Decimal, S: canonical} }
+
+// NewJsonb holds NORMALIZED compact JSON text (callers must normalize via
+// ParseJSONB — sorted object keys, no insignificant whitespace).
+func NewJsonb(normalized string) Datum { return Datum{Fam: Jsonb, S: normalized} }
 
 // timestampFormats are the accepted TIMESTAMPTZ input layouts (a bare
 // timestamp is UTC).
@@ -156,6 +182,48 @@ func ParseUUID(s string) ([16]byte, error) {
 	return out, nil
 }
 
+// ParseDecimal parses and canonicalizes a decimal literal.
+func ParseDecimal(s string) (Datum, error) {
+	d, err := decimal.Parse(s)
+	if err != nil {
+		return Datum{}, fmt.Errorf("could not parse %q as DECIMAL", s)
+	}
+	return NewDecimal(d.String()), nil
+}
+
+// ParseJSONB parses and normalizes a JSON document: objects re-marshal
+// with sorted keys (duplicate keys: last wins), whitespace is dropped,
+// and HTML characters are NOT escaped. Numbers round-trip through
+// float64 — very large integers lose precision (documented).
+func ParseJSONB(s string) (Datum, error) {
+	var v any
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return Datum{}, fmt.Errorf("could not parse value as JSONB: %v", err)
+	}
+	// Trailing garbage after the document is an error.
+	if dec.More() {
+		return Datum{}, fmt.Errorf("could not parse value as JSONB: trailing content")
+	}
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return Datum{}, fmt.Errorf("could not normalize JSONB: %v", err)
+	}
+	return NewJsonb(strings.TrimSuffix(b.String(), "\n")), nil
+}
+
+// IsIndexable reports whether the family has an order-preserving key
+// encoding (usable in primary keys and indexes).
+func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown }
+
+// DecimalVal parses the canonical form back out of a Decimal datum.
+func (d Datum) DecimalVal() (decimal.Dec, error) {
+	return decimal.Parse(d.S)
+}
+
 // Coerce converts d to the target family (e.g. an int literal into a FLOAT8
 // column), or errors when the conversion is lossy/invalid.
 func (d Datum) Coerce(target Family) (Datum, error) {
@@ -212,6 +280,20 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 			return Datum{}, err
 		}
 		return NewUUID(u), nil
+	case d.Fam == String && target == Decimal:
+		return ParseDecimal(d.S)
+	case d.Fam == Int && target == Decimal:
+		return NewDecimal(decimal.FromInt(d.I).String()), nil
+	case d.Fam == Decimal && target == Float:
+		// Lossy narrowing is allowed on demand (the reverse is not:
+		// Float→Decimal would launder binary rounding into "exact").
+		v, err := d.DecimalVal()
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewFloat(v.Float64()), nil
+	case d.Fam == String && target == Jsonb:
+		return ParseJSONB(d.S)
 	}
 	return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 }
@@ -228,6 +310,22 @@ func (d Datum) Compare(o Datum) (int, error) {
 	if d.Fam == Float && o.Fam == Int {
 		return cmpFloat(d.F, float64(o.I)), nil
 	}
+	// Decimal cross-compares exactly with Int, and with Float by lifting
+	// the float through its shortest decimal rendering.
+	if d.Fam == Decimal || o.Fam == Decimal {
+		if (d.Fam == Decimal || d.Fam == Int || d.Fam == Float) &&
+			(o.Fam == Decimal || o.Fam == Int || o.Fam == Float) {
+			dv, err := d.liftDecimal()
+			if err != nil {
+				return 0, err
+			}
+			ov, err := o.liftDecimal()
+			if err != nil {
+				return 0, err
+			}
+			return decimal.Cmp(dv, ov), nil
+		}
+	}
 	if d.Fam != o.Fam {
 		return 0, fmt.Errorf("cannot compare %s with %s", d.Fam, o.Fam)
 	}
@@ -240,8 +338,33 @@ func (d Datum) Compare(o Datum) (int, error) {
 		return strings.Compare(d.S, o.S), nil
 	case Bool:
 		return cmpBool(d.B, o.B), nil
+	case Decimal:
+		return 0, fmt.Errorf("unreachable") // handled above
+	case Jsonb:
+		// Equality by canonical text; no defined ordering.
+		if d.S == o.S {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("JSONB values have no order")
 	}
 	return 0, fmt.Errorf("cannot compare %s values", d.Fam)
+}
+
+// liftDecimal lifts a numeric datum to decimal (float via its shortest
+// decimal rendering; NaN/Inf reject).
+func (d Datum) liftDecimal() (decimal.Dec, error) {
+	switch d.Fam {
+	case Decimal:
+		return d.DecimalVal()
+	case Int:
+		return decimal.FromInt(d.I), nil
+	case Float:
+		if math.IsNaN(d.F) || math.IsInf(d.F, 0) {
+			return decimal.Dec{}, fmt.Errorf("cannot compare DECIMAL with non-finite FLOAT8")
+		}
+		return decimal.Parse(strconv.FormatFloat(d.F, 'g', -1, 64))
+	}
+	return decimal.Dec{}, fmt.Errorf("cannot lift %s to DECIMAL", d.Fam)
 }
 
 func cmpInt(a, b int64) int {
@@ -305,6 +428,8 @@ func (d Datum) Text() string {
 		}
 		h := hex.EncodeToString(b)
 		return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+	case Decimal, Jsonb:
+		return d.S // canonical/normalized text IS the wire text
 	}
 	return ""
 }

@@ -7,12 +7,22 @@ import "github.com/sthorne/datax/pkg/sql/types"
 // Statement is any parsed SQL statement.
 type Statement interface{ stmt() }
 
+// PathStep is one JSONB path operator applied to a column reference:
+// -> 'key' (Text=false, result stays jsonb) or ->> 'key' (Text=true,
+// result rendered as text; terminal only).
+type PathStep struct {
+	Key  string `json:"key"`
+	Text bool   `json:"text,omitempty"`
+}
+
 // Expr is a scalar expression: a literal, a parameter ($N), a column
 // reference, or column ± literal/param (for UPDATE ... SET x = x + 1).
 type Expr struct {
 	Lit    *types.Datum `json:"lit,omitempty"`
 	Param  int          `json:"param,omitempty"` // 1-based; 0 = none
 	Column string       `json:"column,omitempty"`
+	// Path is the ->/->> chain applied to Column (JSONB extraction).
+	Path []PathStep `json:"path,omitempty"`
 	// Sub is a scalar subquery: (SELECT ...) used as a value. Uncorrelated
 	// only — the executor evaluates it once and splices the result.
 	Sub *Select `json:"sub,omitempty"`
@@ -25,11 +35,12 @@ type Expr struct {
 // col [NOT] IN (list | subquery), or [NOT] EXISTS (subquery). The executor
 // rewrites evaluated EXISTS conjuncts to the constant ops TRUE/FALSE.
 type Comparison struct {
-	Column string  // lower-cased; empty for [NOT] EXISTS and TRUE/FALSE
-	Op     string  // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE
-	Value  Expr    // scalar ops: literal, param, or scalar subquery
-	Values []Expr  // [NOT] IN: the value list (spliced from Sub when a subquery)
-	Sub    *Select // [NOT] IN / [NOT] EXISTS subquery
+	Column string     // lower-cased; empty for [NOT] EXISTS and TRUE/FALSE
+	Path   []PathStep // ->/->> chain applied to Column (JSONB extraction)
+	Op     string     // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE
+	Value  Expr       // scalar ops: literal, param, or scalar subquery
+	Values []Expr     // [NOT] IN: the value list (spliced from Sub when a subquery)
+	Sub    *Select    // [NOT] IN / [NOT] EXISTS subquery
 }
 
 type ColumnDef struct {
@@ -130,12 +141,12 @@ type Select struct {
 	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
 	// Joins are the JOIN clauses in syntactic order; execution joins
 	// left-deep in exactly this order.
-	Joins []JoinClause
-	Where    []Comparison
-	GroupBy  []string
-	Having   []HavingCond
-	OrderBy  []OrderCol
-	Limit    int64 // -1 = none
+	Joins   []JoinClause
+	Where   []Comparison
+	GroupBy []string
+	Having  []HavingCond
+	OrderBy []OrderCol
+	Limit   int64 // -1 = none
 	// AsOf is the AS OF SYSTEM TIME operand ("" = none): a string literal
 	// holding a negative duration ('-5s'), an RFC 3339 timestamp, or a
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and

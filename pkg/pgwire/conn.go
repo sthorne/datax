@@ -27,6 +27,8 @@ const (
 	oidDate        = 1082
 	oidTimestamptz = 1184
 	oidUUID        = 2950
+	oidNumeric     = 1700
+	oidJsonb       = 3802
 )
 
 // pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
@@ -52,6 +54,10 @@ func typeOID(f types.Family) uint32 {
 		return oidBytea
 	case types.Uuid:
 		return oidUUID
+	case types.Decimal:
+		return oidNumeric
+	case types.Jsonb:
+		return oidJsonb
 	default:
 		return oidText
 	}
@@ -347,6 +353,16 @@ func encodeDatum(d types.Datum, format int16) []byte {
 		return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I-pgEpochOffsetDays)))
 	case types.Bytes, types.Uuid:
 		return []byte(d.S)
+	case types.Decimal:
+		// Real base-10000 NUMERIC: a text fallthrough under OID 1700 would
+		// corrupt clients that requested binary.
+		if enc, err := encodePGNumeric(d.S); err == nil {
+			return enc
+		}
+		return []byte(d.Text())
+	case types.Jsonb:
+		// Binary jsonb: version byte 1 + the UTF-8 text.
+		return append([]byte{1}, d.S...)
 	default:
 		return []byte(d.Text())
 	}
@@ -398,6 +414,17 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.NewUUID(u), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary uuid length %d", len(raw))
+	case types.Decimal:
+		text, err := decodePGNumeric(raw)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		return types.ParseDecimal(text)
+	case types.Jsonb:
+		if len(raw) < 1 || raw[0] != 1 {
+			return types.Datum{}, fmt.Errorf("bad binary jsonb version")
+		}
+		return types.ParseJSONB(string(raw[1:]))
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}
