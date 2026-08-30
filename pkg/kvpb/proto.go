@@ -704,6 +704,9 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 	if e.Ambiguous != nil {
 		pb.Ambiguous = &rpcpb.AmbiguousResultError{}
 	}
+	if e.StorageOverloaded != nil {
+		pb.StorageOverloaded = &rpcpb.StorageOverloadedError{}
+	}
 	return pb
 }
 
@@ -754,6 +757,9 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 	}
 	if pb.Ambiguous != nil {
 		e.Ambiguous = &AmbiguousResultError{}
+	}
+	if pb.StorageOverloaded != nil {
+		e.StorageOverloaded = &StorageOverloadedError{}
 	}
 	return e, nil
 }

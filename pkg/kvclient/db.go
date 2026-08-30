@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
@@ -354,11 +355,23 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 	}
 }
 
+// overloadBackoff is the jittered exponential delay before retrying a
+// write the leader shed under storage backpressure: 10ms doubling to a 1s
+// cap, ±50% jitter.
+func overloadBackoff(n int) time.Duration {
+	d := 10 * time.Millisecond << uint(min(n, 7)) // 10ms .. 1.28s
+	if d > time.Second {
+		d = time.Second
+	}
+	return d/2 + time.Duration(rand.Int64N(int64(d)))
+}
+
 // sendToRange tries the range's replicas — leader hint first, local replica
 // next — retrying around NotLeader and transport errors until ctx expires.
 func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (*kvpb.BatchResponse, *kvpb.Error) {
 	ba.Header.RangeID = desc.RangeID
 	var lastErr *kvpb.Error
+	overloads := 0
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -379,6 +392,21 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 					db.cache.SetHint(desc.RangeID, target)
 				}
 				return br, nil
+			}
+			if kerr.StorageOverloaded != nil {
+				// The leader shed the write under engine backpressure before
+				// proposing anything, so resending the identical batch is
+				// safe — but retry with jittered exponential backoff: a hot
+				// retry loop is exactly the load an overloaded store cannot
+				// absorb.
+				lastErr = kerr
+				select {
+				case <-ctx.Done():
+					return nil, kerr
+				case <-time.After(overloadBackoff(overloads)):
+				}
+				overloads++
+				break // restart from the leader hint
 			}
 			if kerr.NotLeader != nil {
 				db.cache.SetHint(desc.RangeID, kerr.NotLeader.LeaderHint)

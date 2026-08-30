@@ -10,6 +10,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -25,6 +26,7 @@ type serverFlags struct {
 	certsDir   string
 	rootPw     string
 	httpListen string
+	profile    string
 	verbose    bool
 }
 
@@ -40,6 +42,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.certsDir, "certs-dir", "", "certificate directory; enables mutual internode TLS and SQL TLS+SCRAM (empty = insecure)")
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
+	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -49,19 +52,24 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	if err != nil {
 		return server.Config{}, err
 	}
+	prof, err := storage.ParseProfile(f.profile)
+	if err != nil {
+		return server.Config{}, err
+	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
-		Dir:           f.dir,
-		Listen:        f.listen,
-		PGListen:      f.pgListen,
-		Join:          f.join,
-		BootstrapSelf: bootstrap,
-		Locality:      loc,
-		MaxOffset:     f.maxOffset,
-		AdvertiseAddr: f.advertise,
-		CertsDir:      f.certsDir,
-		RootPassword:  f.rootPw,
-		HTTPListen:    f.httpListen,
+		StorageProfile: prof,
+		Dir:            f.dir,
+		Listen:         f.listen,
+		PGListen:       f.pgListen,
+		Join:           f.join,
+		BootstrapSelf:  bootstrap,
+		Locality:       loc,
+		MaxOffset:      f.maxOffset,
+		AdvertiseAddr:  f.advertise,
+		CertsDir:       f.certsDir,
+		RootPassword:   f.rootPw,
+		HTTPListen:     f.httpListen,
 	}, nil
 }
 

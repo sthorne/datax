@@ -12,7 +12,9 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -805,6 +807,30 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return br, nil
 	}
 
+	// Backpressure: shed table-data writes with a retryable error while the
+	// engine is overloaded, well before Pebble's own hard write stall would
+	// freeze raft appends and heartbeats for every range on this store.
+	// Only user table data (0x04-prefixed) is gated — /system and /meta
+	// writes (liveness heartbeats, descriptor updates, range metadata) must
+	// keep flowing exactly when the store is struggling, and GC batches are
+	// what dig it out. EndTxn/pushes/resolves write no MVCC versions and
+	// are exempt via HasMVCCWrites, so intent cleanup is never blocked.
+	if ba.HasMVCCWrites() && !isGCBatch(ba) && batchIsTableData(ba) {
+		over, why := false, ""
+		if k := r.store.cfg.TestingKnobs.OverrideOverloaded; k != nil {
+			over, why = k()
+		} else if eng := r.store.cfg.Engine; eng != nil {
+			over, why = eng.Overloaded()
+		}
+		if over {
+			metrics.StorageBackpressure.Inc()
+			e := kvpb.NewErrorf("%s: storage overloaded, write shed: %s", r.rangeID, why)
+			e.StorageOverloaded = &kvpb.StorageOverloadedError{}
+			e.TxnRetry = &kvpb.TxnRetryError{}
+			return nil, e
+		}
+	}
+
 	// No MVCC write may slip beneath a timestamp already served to readers
 	// of another transaction. Transaction-record-only batches (EndTxn,
 	// pushes, resolves) write no MVCC versions and are exempt. A
@@ -865,6 +891,21 @@ func (r *Replica) checkKeyBounds(ba *kvpb.BatchRequest) *kvpb.Error {
 		}
 	}
 	return nil
+}
+
+// batchIsTableData reports whether the batch's first MVCC-writing request
+// targets user table data (the 0x04 table prefix) — the only writes the
+// backpressure gate may shed.
+func batchIsTableData(ba *kvpb.BatchRequest) bool {
+	for _, u := range ba.Requests {
+		req := u.GetInner()
+		if req == nil || req.IsReadOnly() {
+			continue
+		}
+		k := req.Header().Key
+		return len(k) > 0 && k[0] == keys.TablePrefix[0]
+	}
+	return false
 }
 
 func isGCBatch(ba *kvpb.BatchRequest) bool {

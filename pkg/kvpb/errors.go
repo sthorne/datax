@@ -25,6 +25,9 @@ type Error struct {
 	TxnRetry         *TxnRetryError         `json:"txn_retry,omitempty"`
 	TxnNotFound      *TxnNotFoundError      `json:"txn_not_found,omitempty"`
 	Ambiguous        *AmbiguousResultError  `json:"ambiguous,omitempty"`
+	// StorageOverloaded accompanies TxnRetry when the leader's engine shed
+	// the write under backpressure: retry, but with backoff.
+	StorageOverloaded *StorageOverloadedError `json:"storage_overloaded,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -82,6 +85,11 @@ type TxnNotFoundError struct{}
 // AmbiguousResultError: the outcome of a proposal is unknown (leadership
 // changed while it was in flight). Idempotent operations may retry.
 type AmbiguousResultError struct{}
+
+// StorageOverloadedError: the leader's engine crossed its backpressure
+// thresholds and the write was shed before proposal. Retryable — but
+// clients back off instead of retrying hot.
+type StorageOverloadedError struct{}
 
 // NewError builds a wire error from any error, preserving known typed
 // details (including storage-layer errors).

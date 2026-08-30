@@ -60,6 +60,9 @@ type TestingKnobs struct {
 	// BeforeReadReturn runs after a read-only batch evaluates, before the
 	// final lease re-check — lets tests expire lease contact mid-read.
 	BeforeReadReturn func(ba *kvpb.BatchRequest)
+	// OverrideOverloaded replaces the engine's backpressure signal — lets
+	// tests trip the write-shedding gate without an overloaded Pebble.
+	OverrideOverloaded func() (bool, string)
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

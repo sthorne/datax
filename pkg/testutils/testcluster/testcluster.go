@@ -93,7 +93,7 @@ func StartWithEngines(t testing.TB, numNodes int, opts ...func(*server.Config)) 
 	nodeIDs := make([]base.NodeID, numNodes)
 	var nodeDescs []kvpb.NodeDescriptor
 	for i := 0; i < numNodes; i++ {
-		eng, err := storage.Open("")
+		eng, err := storage.Open("", storage.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}

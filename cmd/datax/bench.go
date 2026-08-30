@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -24,20 +26,27 @@ func runBench(args []string) error {
 	readPct := fs.Int("read-pct", 95, "kv workload: percentage of reads")
 	preload := fs.Int("preload", 1000, "rows (kv) or accounts (bank) to preload")
 	forUpdate := fs.Bool("for-update", false, "bank workload: read balances with SELECT ... FOR UPDATE")
+	batch := fs.Int("batch", 100, "ingest workload: rows per INSERT batch")
+	payloadBytes := fs.Int("payload-bytes", 256, "ingest workload: value size per row")
+	rate := fs.Int("rate", 0, "ingest workload: target rows/s across all workers (0 = unthrottled)")
+	reportInterval := fs.Duration("report-interval", 5*time.Second, "ingest workload: throughput-over-time reporting cadence")
+	metricsURL := fs.String("metrics-url", "", "ingest workload: node /metrics URL; reports write-stall and backpressure deltas")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: datax bench <kv|bank> [flags]\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: datax bench <kv|bank|ingest> [flags]\n\n")
+		fmt.Fprintf(fs.Output(), "ingest writes batches of RANDOM keys to stress the LSM write path;\n")
+		fmt.Fprintf(fs.Output(), "monotonic (time-ordered) key tails are the timeseries workload's domain.\n\n")
 		fs.PrintDefaults()
 	}
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return fmt.Errorf("bench requires a workload: kv or bank")
+		return fmt.Errorf("bench requires a workload: kv, bank, or ingest")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if workload != "kv" && workload != "bank" {
-		return fmt.Errorf("unknown workload %q (want kv or bank)", workload)
+	if workload != "kv" && workload != "bank" && workload != "ingest" {
+		return fmt.Errorf("unknown workload %q (want kv, bank, or ingest)", workload)
 	}
 
 	ctx := context.Background()
@@ -69,6 +78,10 @@ func runBench(args []string) error {
 				return err
 			}
 		}
+	case "ingest":
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_ingest (k INT PRIMARY KEY, pad TEXT)"); err != nil {
+			return err
+		}
 	case "bank":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_bank (id INT PRIMARY KEY, balance INT)"); err != nil {
 			return err
@@ -90,22 +103,89 @@ func runBench(args []string) error {
 	var latMu sync.Mutex
 	var lats []time.Duration
 
+	// Ingest extras: per-interval throughput/latency reporting, a shared
+	// pacer for --rate, and storage-health counter deltas from /metrics.
+	var intervalOps atomic.Int64
+	var intervalLatMu sync.Mutex
+	var intervalLats []time.Duration
+	stopReport := make(chan struct{})
+	var pace func()
+	if workload == "ingest" && *rate > 0 {
+		var paceMu sync.Mutex
+		next := time.Now()
+		per := time.Duration(float64(*batch) / float64(*rate) * float64(time.Second))
+		pace = func() {
+			paceMu.Lock()
+			n := next
+			next = next.Add(per)
+			paceMu.Unlock()
+			if d := time.Until(n); d > 0 {
+				time.Sleep(d)
+			}
+		}
+	}
+
 	recordLatency := func(d time.Duration) {
 		latMu.Lock()
 		if len(lats) < 200000 {
 			lats = append(lats, d)
 		}
 		latMu.Unlock()
+		if workload == "ingest" {
+			intervalOps.Add(1)
+			intervalLatMu.Lock()
+			if len(intervalLats) < 100000 {
+				intervalLats = append(intervalLats, d)
+			}
+			intervalLatMu.Unlock()
+		}
+	}
+
+	var before map[string]float64
+	if workload == "ingest" && *metricsURL != "" {
+		before = scrapeCounters(*metricsURL)
 	}
 
 	deadline := time.Now().Add(*duration)
 	var wg sync.WaitGroup
 	fmt.Printf("running %s: %d workers for %s...\n", workload, *concurrency, *duration)
+	if workload == "ingest" {
+		started := time.Now()
+		go func() {
+			t := time.NewTicker(*reportInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-stopReport:
+					return
+				case <-t.C:
+					n := intervalOps.Swap(0)
+					intervalLatMu.Lock()
+					sample := intervalLats
+					intervalLats = nil
+					intervalLatMu.Unlock()
+					p99 := time.Duration(0)
+					if len(sample) > 0 {
+						sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
+						p99 = sample[int(float64(len(sample)-1)*0.99)]
+					}
+					fmt.Printf("  t=%4.0fs  %9.0f rows/s  batch p99 %s\n",
+						time.Since(started).Seconds(),
+						float64(n*int64(*batch))/reportInterval.Seconds(),
+						p99.Round(time.Microsecond))
+				}
+			}
+		}()
+	}
 	for w := 0; w < *concurrency; w++ {
 		wg.Add(1)
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
+			// Ingest payload: per-worker random hex, reused across rows.
+			padRaw := make([]byte, (*payloadBytes+1)/2)
+			rng.Read(padRaw)
+			pad := fmt.Sprintf("%x", padRaw)[:*payloadBytes]
 			conn, err := connect()
 			if err != nil {
 				errs.Add(1)
@@ -128,6 +208,19 @@ func runBench(args []string) error {
 					}
 				case "bank":
 					err = bankTransfer(ctx, conn, rng, *preload, *forUpdate)
+				case "ingest":
+					if pace != nil {
+						pace()
+					}
+					var sb strings.Builder
+					sb.WriteString("INSERT INTO bench_ingest (k, pad) VALUES ")
+					for j := 0; j < *batch; j++ {
+						if j > 0 {
+							sb.WriteByte(',')
+						}
+						fmt.Fprintf(&sb, "(%d, '%s')", rng.Int63(), pad)
+					}
+					_, err = conn.Exec(ctx, sb.String())
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
@@ -143,12 +236,23 @@ func runBench(args []string) error {
 		}(int64(w) + time.Now().UnixNano())
 	}
 	wg.Wait()
+	close(stopReport)
 
 	total := ops.Load()
 	fmt.Printf("\n%s results:\n", workload)
 	fmt.Printf("  ops:        %d (%.1f/s)\n", total, float64(total)/duration.Seconds())
+	if workload == "ingest" {
+		fmt.Printf("  rows:       %d (%.0f/s)\n", total*int64(*batch), float64(total*int64(*batch))/duration.Seconds())
+	}
 	fmt.Printf("  40001s:     %d\n", retries.Load())
 	fmt.Printf("  errors:     %d\n", errs.Load())
+	if before != nil {
+		after := scrapeCounters(*metricsURL)
+		fmt.Printf("  hard write stalls: %+.0f (must be 0 at the target rate)\n",
+			after["datax_storage_write_stalls_total"]-before["datax_storage_write_stalls_total"])
+		fmt.Printf("  backpressured writes: %+.0f\n",
+			after["datax_storage_backpressure_total"]-before["datax_storage_backpressure_total"])
+	}
 	latMu.Lock()
 	defer latMu.Unlock()
 	if len(lats) > 0 {
@@ -158,6 +262,34 @@ func runBench(args []string) error {
 			pct(0.50).Round(time.Microsecond), pct(0.95).Round(time.Microsecond), pct(0.99).Round(time.Microsecond))
 	}
 	return nil
+}
+
+// scrapeCounters fetches a Prometheus /metrics page and returns the plain
+// (unlabeled) series it can parse; failures return an empty map.
+func scrapeCounters(url string) map[string]float64 {
+	out := map[string]float64{}
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Printf("  (metrics scrape failed: %v)\n", err)
+		return out
+	}
+	defer func() { _ = resp.Body.Close() }()
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, val, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		var f float64
+		if _, err := fmt.Sscanf(val, "%g", &f); err == nil {
+			out[name] = f
+		}
+	}
+	return out
 }
 
 // bankTransfer moves a random amount between two random accounts in one

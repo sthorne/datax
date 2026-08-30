@@ -36,13 +36,28 @@ type Iterator interface {
 
 // Engine is a Pebble store.
 type Engine struct {
-	db *pebble.DB
+	db     *pebble.DB
+	health health
 }
 
-// Open opens (creating if needed) a Pebble store in dir. If dir is empty an
+// Open opens (creating if needed) a Pebble store in dir with the given
+// options (zero value = balanced profile, plaintext). If dir is empty an
 // in-memory store is used (tests, demo mode).
-func Open(dir string) (*Engine, error) {
+func Open(dir string, o Options) (*Engine, error) {
+	e := &Engine{}
 	opts := &pebble.Options{}
+	e.health.gate = o.Profile.apply(opts)
+	opts.EventListener = &pebble.EventListener{
+		WriteStallBegin: func(info pebble.WriteStallBeginInfo) {
+			e.health.stalls.Add(1)
+			e.health.inStall.Store(true)
+		},
+		WriteStallEnd: func() { e.health.inStall.Store(false) },
+		DiskSlow:      func(pebble.DiskSlowInfo) { e.health.diskSlow.Add(1) },
+		BackgroundError: func(err error) {
+			e.health.bgErrors.Add(1)
+		},
+	}
 	if dir == "" {
 		opts.FS = vfs.NewMem()
 		dir = "in-mem"
@@ -51,7 +66,8 @@ func Open(dir string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{db: db}, nil
+	e.db = db
+	return e, nil
 }
 
 func (e *Engine) Close() error { return e.db.Close() }

@@ -60,6 +60,28 @@ func (n *Node) startHTTP() error {
 			return float64(total)
 		}),
 	)
+	if eng := n.engine; eng != nil {
+		nodeReg.MustRegister(
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_l0_files", Help: "Pebble L0 sstable count.",
+			}, func() float64 { return float64(eng.StorageMetrics().L0Files) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_l0_sublevels", Help: "Pebble L0 sublevel count (read amplification of L0).",
+			}, func() float64 { return float64(eng.StorageMetrics().L0Sublevels) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_compaction_debt_bytes", Help: "Estimated bytes of pending compaction work.",
+			}, func() float64 { return float64(eng.StorageMetrics().CompactionDebtBytes) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_memtable_count", Help: "Memtables held (mutable + queued for flush).",
+			}, func() float64 { return float64(eng.StorageMetrics().MemtableCount) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_write_stalls_total", Help: "Pebble hard write-stall events on this store.",
+			}, func() float64 { return float64(eng.StorageMetrics().WriteStalls) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_disk_slow_total", Help: "Slow-disk events reported by Pebble.",
+			}, func() float64 { return float64(eng.StorageMetrics().DiskSlowEvents) }),
+		)
+	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()

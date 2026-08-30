@@ -26,7 +26,7 @@ import (
 // drive GC explicitly via RunGCOnce).
 func startGCNode(t *testing.T) (*server.Node, *storage.Engine) {
 	t.Helper()
-	eng, err := storage.Open("")
+	eng, err := storage.Open("", storage.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

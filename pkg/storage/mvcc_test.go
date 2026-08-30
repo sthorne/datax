@@ -13,7 +13,7 @@ import (
 
 func openTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	eng, err := Open("") // in-memory
+	eng, err := Open("", Options{}) // in-memory
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -375,6 +375,10 @@ message TxnNotFoundError {}
 
 message AmbiguousResultError {}
 
+// StorageOverloadedError: the leader's engine crossed its backpressure
+// thresholds; the write was shed and should be retried with backoff.
+message StorageOverloadedError {}
+
 message Error {
   string message = 1;
   NotLeaderError not_leader = 2;
@@ -387,6 +391,7 @@ message Error {
   TxnRetryError txn_retry = 9;
   TxnNotFoundError txn_not_found = 10;
   AmbiguousResultError ambiguous = 11;
+  StorageOverloadedError storage_overloaded = 12;
 }
 
 // BatchEnvelope is the Batch RPC's response body: outcome or wire error.

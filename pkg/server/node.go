@@ -91,6 +91,8 @@ type Config struct {
 	// ClosedTimestampInterval is the publication cadence (0 = default 1s).
 	ClosedTimestampLag      time.Duration
 	ClosedTimestampInterval time.Duration
+	// StorageProfile selects the engine's Pebble tuning ("" = balanced).
+	StorageProfile storage.Profile
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -161,7 +163,7 @@ func (n *Node) start() error {
 	var err error
 	n.engine = n.cfg.Engine
 	if n.engine == nil {
-		n.engine, err = storage.Open(n.cfg.Dir)
+		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile})
 		if err != nil {
 			return err
 		}

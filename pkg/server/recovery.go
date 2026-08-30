@@ -110,7 +110,7 @@ func (n *Node) exportMetadata(ctx context.Context) {
 // them and rejoin fresh. Replication is restored by upreplication once new
 // nodes join.
 func UnsafeRecover(dir string, rangeID base.RangeID) ([]kvpb.RangeDescriptor, error) {
-	eng, err := storage.Open(dir)
+	eng, err := storage.Open(dir, storage.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("opening store (is the node stopped?): %w", err)
 	}
