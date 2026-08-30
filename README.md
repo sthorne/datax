@@ -57,8 +57,11 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   collection, raft log truncation, size-based splitting and merging —
   plus dead-node repair, load rebalancing, decommission, `datax bench`, and
   a built-in observability dashboard with `/metrics` + `/status` + `/api/cluster`
-  endpoints (`--http-listen`; the dashboard at `/` is read-only, self-contained,
-  and — like the endpoints it reads — unauthenticated).
+  endpoints (`--http-listen`; the dashboard at `/` is read-only and
+  self-contained; in secure mode every endpoint requires HTTP Basic
+  credentials of any database user — Prometheus `basic_auth` — or a
+  CA-verified client certificate, and in insecure mode stays open like
+  pgwire trust auth).
 
 Design documents live in [`docs/`](docs/):
 [architecture](docs/architecture.md) ·
@@ -119,7 +122,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
 | SQL | multi-level correlated subqueries (one level is in, as an O(outer×inner) memoized nested loop), 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
 | Wire | COPY protocol; portal suspension (partial result fetches) |
-| Ops | auth on the observability endpoints (dashboard and JSON are read-only but unauthenticated); per-node drill-down across peers (the dashboard's range detail is the serving node's own) |
+| Ops | per-node drill-down across peers (the dashboard's range detail is the serving node's own); per-endpoint authorization (secure-mode HTTP auth accepts any valid user — everything served is read-only) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
 | Time series | re-sharding tables that carry secondary indexes, and historical reads below a re-shard (v1 guards); order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |

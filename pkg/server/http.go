@@ -11,6 +11,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server/ui"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -110,7 +111,7 @@ func (n *Node) startHTTP() error {
 		_, _ = w.Write(page)
 	})
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: n.httpAuth(mux)}
 	if n.tlsCfgs != nil {
 		srv.TLSConfig = n.tlsCfgs.PGServer.Clone()
 		go func() {
@@ -128,6 +129,46 @@ func (n *Node) startHTTP() error {
 	n.stopper.AddCloser(func() { _ = srv.Close() })
 	log.Infof("node %s serving the dashboard, /metrics, /status and /api/cluster at %s", n.ident.NodeID, n.httpAddr)
 	return nil
+}
+
+// httpAuth wraps the WHOLE mux — a route added later is secure by default.
+// In secure mode every request must present either HTTP Basic credentials
+// matching a stored user's SCRAM verifier, or a CA-verified client
+// certificate whose CommonName is the user (the same two doors pgwire
+// offers). Any valid user suffices: every endpoint is read-only. Insecure
+// mode passes everything through, matching pgwire's trust semantics.
+func (n *Node) httpAuth(next http.Handler) http.Handler {
+	if n.tlsCfgs == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// A CA-verified client certificate authenticates by CommonName.
+		// The TLS config uses VerifyClientCertIfGiven, so VerifiedChains —
+		// not the mere presence of TLS state — is the test.
+		if req.TLS != nil && len(req.TLS.VerifiedChains) > 0 &&
+			len(req.TLS.VerifiedChains[0]) > 0 &&
+			req.TLS.VerifiedChains[0][0].Subject.CommonName != "" {
+			next.ServeHTTP(w, req)
+			return
+		}
+		user, pass, ok := req.BasicAuth()
+		if ok {
+			ctx := req.Context()
+			verifier, err := n.lookupVerifier(ctx, user)
+			if err != nil || verifier == nil {
+				// Unknown user (or lookup failure): burn the same work as a
+				// real check so the response timing does not reveal whether
+				// the user exists.
+				verifier = security.DummyVerifier()
+			}
+			if security.VerifyPassword(verifier, pass) {
+				next.ServeHTTP(w, req)
+				return
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="datax"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	})
 }
 
 // RangeStatus is one replica's view in /status.

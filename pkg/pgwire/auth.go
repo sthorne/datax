@@ -15,13 +15,7 @@ import (
 // dummyVerifier stands in for missing users so the SCRAM exchange runs to
 // completion identically whether or not the user exists — the client learns
 // only "password authentication failed".
-var dummyVerifier = func() *security.ScramVerifier {
-	v, err := security.MakeScramVerifier("this-password-can-never-verify")
-	if err != nil {
-		panic(err)
-	}
-	return v
-}()
+var dummyVerifier = security.DummyVerifier()
 
 // clientCertUser returns the CommonName of a CA-verified client
 // certificate on the TLS session, or "" when none was presented (or it

@@ -20,8 +20,9 @@ import (
 )
 
 // startSecureCluster starts a 3-node cluster with mutual internode TLS and
-// SQL TLS + SCRAM, seeding root's password on node 1.
-func startSecureCluster(t *testing.T, rootPassword string) (*TestCluster, string) {
+// SQL TLS + SCRAM, seeding root's password on node 1. Optional hooks tweak
+// each node's config before start (i is the zero-based node index).
+func startSecureCluster(t *testing.T, rootPassword string, hooks ...func(i int, cfg *server.Config)) (*TestCluster, string) {
 	t.Helper()
 	certsDir := t.TempDir()
 	if err := security.CreateCA(certsDir); err != nil {
@@ -65,6 +66,9 @@ func startSecureCluster(t *testing.T, rootPassword string) (*TestCluster, string
 		}
 		if i == 0 {
 			cfg.RootPassword = rootPassword
+		}
+		for _, hook := range hooks {
+			hook(i, &cfg)
 		}
 		n, err := server.Start(cfg)
 		if err != nil {

@@ -203,3 +203,45 @@ func TestScramChannelAttrVerified(t *testing.T) {
 		t.Fatalf("gs2/c= mismatch accepted: %v", err)
 	}
 }
+
+// TestVerifyPassword: the non-interactive plaintext check agrees with the
+// stored verifier — correct password passes, wrong/empty fail, non-ASCII
+// passwords match via SASLprep normalization, and the dummy verifier
+// matches nothing (not even the phrase it was derived from).
+func TestVerifyPassword(t *testing.T) {
+	v, err := MakeScramVerifier("pencil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyPassword(v, "pencil") {
+		t.Fatal("correct password rejected")
+	}
+	// (No "pencil\x00" case: PBKDF2 keys HMAC with the password and HMAC
+	// zero-pads short keys, so trailing NULs are equivalent by
+	// construction — PostgreSQL shares the property.)
+	for _, bad := range []string{"Pencil", "pencil ", "", "encil"} {
+		if VerifyPassword(v, bad) {
+			t.Fatalf("wrong password %q accepted", bad)
+		}
+	}
+	if VerifyPassword(nil, "pencil") {
+		t.Fatal("nil verifier accepted a password")
+	}
+
+	// SASLprep: a password stored with a non-breaking space verifies from
+	// the plain-space form (both normalize to the same string).
+	nb, err := MakeScramVerifier("pass word")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyPassword(nb, "pass word") {
+		t.Fatal("SASLprep-equivalent password rejected")
+	}
+
+	d := DummyVerifier()
+	for _, pw := range []string{"this-password-can-never-verify", "", "x"} {
+		if VerifyPassword(d, pw) {
+			t.Fatalf("dummy verifier accepted %q", pw)
+		}
+	}
+}

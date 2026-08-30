@@ -98,6 +98,40 @@ func makeVerifier(password string, salt []byte, iterations int) (*ScramVerifier,
 	}, nil
 }
 
+// VerifyPassword reports whether password matches the stored verifier, by
+// re-deriving the verifier from the stored salt and iteration count and
+// comparing stored keys in constant time. This is the non-interactive
+// check for callers that receive a plaintext password directly (HTTP Basic
+// auth); the SCRAM conversation below never needs the plaintext.
+func VerifyPassword(v *ScramVerifier, password string) bool {
+	if v == nil {
+		return false
+	}
+	derived, err := makeVerifier(SASLprep(password), v.Salt, v.Iterations)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(derived.StoredKey, v.StoredKey)
+}
+
+// DummyVerifier returns a shared verifier that no password can match
+// (derived once from an unusable password, then its stored key is
+// clobbered). Authentication paths run it for unknown users so the work
+// performed — and therefore the timing and the error — is identical
+// whether or not the user exists.
+func DummyVerifier() *ScramVerifier { return dummyVerifier }
+
+var dummyVerifier = func() *ScramVerifier {
+	v, err := MakeScramVerifier("this-password-can-never-verify")
+	if err != nil {
+		panic(err)
+	}
+	// Clobber the keys so not even the phrase above verifies.
+	v.StoredKey = make([]byte, len(v.StoredKey))
+	v.ServerKey = make([]byte, len(v.ServerKey))
+	return v
+}()
+
 // MarshalVerifier / UnmarshalVerifier are the storage encoding.
 func MarshalVerifier(v *ScramVerifier) ([]byte, error) { return json.Marshal(v) }
 
