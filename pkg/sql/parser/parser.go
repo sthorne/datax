@@ -529,6 +529,17 @@ func (p *parser) parseSelect() (Statement, error) {
 		}
 	}
 	if p.consumeKeyword("FROM") {
+		// FROM (SELECT ...) AS alias — a derived table.
+		if sub, ok, err := p.parseSubquery(); err != nil {
+			return nil, err
+		} else if ok {
+			sel.Derived = sub
+			sel.Alias = p.parseOptTableAlias(false)
+			if sel.Alias == "" {
+				return nil, p.errf("subquery in FROM must have an alias")
+			}
+			return p.finishSelect(sel)
+		}
 		name, err := p.expectIdent()
 		if err != nil {
 			return nil, err
@@ -602,6 +613,12 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 		}
 	}
+	return p.finishSelect(sel)
+}
+
+// finishSelect parses the clauses shared by table and derived-table
+// selects: WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, FOR UPDATE.
+func (p *parser) finishSelect(sel *Select) (Statement, error) {
 	var err error
 	sel.Where, err = p.parseOptWhere()
 	if err != nil {
@@ -898,6 +915,16 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 	}
 	var out []Comparison
 	for {
+		// [NOT] EXISTS (SELECT ...) — no left-hand column.
+		if cmp, ok, err := p.parseExistsCond(); err != nil {
+			return nil, err
+		} else if ok {
+			out = append(out, cmp)
+			if !p.consumeKeyword("AND") {
+				break
+			}
+			continue
+		}
 		col, err := p.expectColumnName()
 		if err != nil {
 			return nil, err
@@ -912,6 +939,47 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 				return nil, err
 			}
 			out = append(out, Comparison{Column: col, Op: op})
+			if !p.consumeKeyword("AND") {
+				break
+			}
+			continue
+		}
+		// col [NOT] IN (value, ... | SELECT ...) ("in" is an identifier).
+		notIn := false
+		if p.consumeKeyword("NOT") {
+			if !p.consumeIdentWord("in") {
+				return nil, p.errf("expected IN after NOT, found %q", p.peek().text)
+			}
+			notIn = true
+		}
+		if notIn || p.consumeIdentWord("in") {
+			cmp := Comparison{Column: col, Op: "IN"}
+			if notIn {
+				cmp.Op = "NOT IN"
+			}
+			if sub, ok, err := p.parseSubquery(); err != nil {
+				return nil, err
+			} else if ok {
+				cmp.Sub = sub
+			} else {
+				if err := p.expectOp("("); err != nil {
+					return nil, err
+				}
+				for {
+					v, err := p.parseValueExpr()
+					if err != nil {
+						return nil, err
+					}
+					cmp.Values = append(cmp.Values, v)
+					if !p.consumeOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+			}
+			out = append(out, cmp)
 			if !p.consumeKeyword("AND") {
 				break
 			}
@@ -934,6 +1002,32 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 	return out, nil
 }
 
+// parseExistsCond parses [NOT] EXISTS (SELECT ...) when present.
+func (p *parser) parseExistsCond() (Comparison, bool, error) {
+	not := false
+	switch {
+	case p.consumeKeyword("EXISTS"):
+	case p.peek().kind == tkKeyword && p.peek().text == "NOT" &&
+		p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkKeyword && p.toks[p.i+1].text == "EXISTS":
+		p.i += 2
+		not = true
+	default:
+		return Comparison{}, false, nil
+	}
+	sub, ok, err := p.parseSubquery()
+	if err != nil {
+		return Comparison{}, false, err
+	}
+	if !ok {
+		return Comparison{}, false, p.errf("expected (SELECT ...) after EXISTS, found %q", p.peek().text)
+	}
+	cmp := Comparison{Op: "EXISTS", Sub: sub}
+	if not {
+		cmp.Op = "NOT EXISTS"
+	}
+	return cmp, true, nil
+}
+
 func isCmpOp(op string) bool {
 	switch op {
 	case "=", "!=", "<", "<=", ">", ">=":
@@ -942,8 +1036,34 @@ func isCmpOp(op string) bool {
 	return false
 }
 
-// parseValueExpr parses a literal or parameter (with optional leading -).
+// parseSubquery parses (SELECT ...) when the next tokens open one;
+// ok=false otherwise.
+func (p *parser) parseSubquery() (*Select, bool, error) {
+	if t := p.peek(); t.kind != tkOp || t.text != "(" {
+		return nil, false, nil
+	}
+	if nxt := p.toks[p.i+1]; nxt.kind != tkKeyword || nxt.text != "SELECT" {
+		return nil, false, nil
+	}
+	p.i++ // (
+	stmt, err := p.parseSelect()
+	if err != nil {
+		return nil, false, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, false, err
+	}
+	return stmt.(*Select), true, nil
+}
+
+// parseValueExpr parses a literal, parameter, or scalar subquery (with
+// optional leading - on numbers).
 func (p *parser) parseValueExpr() (Expr, error) {
+	if sub, ok, err := p.parseSubquery(); err != nil {
+		return Expr{}, err
+	} else if ok {
+		return Expr{Sub: sub}, nil
+	}
 	t := p.peek()
 	neg := false
 	if t.kind == tkOp && t.text == "-" {

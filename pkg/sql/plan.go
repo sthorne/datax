@@ -160,6 +160,34 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
 	switch t := stmt.(type) {
 	case *parser.Select:
+		if t.Derived != nil {
+			innerCols, err := s.PlanColumns(ctx, t.Derived)
+			if err != nil {
+				return nil, err
+			}
+			desc := derivedDesc(t.Alias, innerCols)
+			td := derivedSelect(t)
+			if hasAggregates(td.Exprs) || len(td.GroupBy) > 0 {
+				gq, aerr := resolveGrouped(desc, td)
+				if aerr != nil {
+					return nil, ToSQLError(aerr)
+				}
+				cols := make([]ResultColumn, len(gq.outs))
+				for i, oc := range gq.outs {
+					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ}
+				}
+				return cols, nil
+			}
+			proj, perr := resolveProjection(desc, td.Exprs)
+			if perr != nil {
+				return nil, ToSQLError(perr)
+			}
+			cols := make([]ResultColumn, len(proj))
+			for i, p := range proj {
+				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type}
+			}
+			return cols, nil
+		}
 		if t.Table == "" {
 			var cols []ResultColumn
 			for _, se := range t.Exprs {
@@ -173,6 +201,11 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 				fam := types.String
 				if se.Expr.Lit != nil && !se.Expr.Lit.Null {
 					fam = se.Expr.Lit.Fam
+				}
+				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
+					if sc, serr := s.PlanColumns(ctx, se.Expr.Sub); serr == nil && len(sc) == 1 {
+						fam = sc[0].Type
+					}
 				}
 				cols = append(cols, ResultColumn{Name: name, Type: fam})
 			}

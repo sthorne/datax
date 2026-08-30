@@ -27,6 +27,7 @@ const (
 	CodeInvalidSavepoint     = "3B001"
 	CodeGrouping             = "42803"
 	CodeAmbiguousColumn      = "42702"
+	CodeCardinality          = "21000"
 	CodeInternal             = "XX000"
 	CodeInvalidParameter     = "08P01"
 	CodeUndefinedObject      = "42704"

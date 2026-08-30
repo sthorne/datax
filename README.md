@@ -50,8 +50,9 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   never loses more than one replica of a range.
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes and
   ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
-  transactions, EXPLAIN) served over the Postgres wire protocol, with TLS +
-  SCRAM-SHA-256 authentication in secure mode.
+  transactions, joins, GROUP BY, subqueries, EXPLAIN) served over the
+  Postgres wire protocol, with TLS + SCRAM-SHA-256 authentication in
+  secure mode.
 - **Operations**: leader-driven housekeeping per range — MVCC garbage
   collection, raft log truncation, size-based splitting and merging —
   plus dead-node repair, load rebalancing, decommission, `datax bench`, and `/metrics` + `/status` observability endpoints
@@ -109,7 +110,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Ranges | load-based split/merge heuristics (splits and merges are automatic by size, or manual via `datax debug split`/`merge`) |
 | Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
-| SQL | subqueries, 3+-table joins, aggregates over joins, most types |
+| SQL | correlated subqueries, 3+-table joins, aggregates over joins, most types |
 | Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
 | Ops | observability UI; roles/privileges |
 

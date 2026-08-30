@@ -172,6 +172,12 @@ func resolveJoinProjection(outer, inner joinSide, exprs []parser.SelectExpr) ([]
 // the LEFT JOIN's NULL extension).
 func evalJoinWhere(outer, inner joinSide, where []parser.Comparison, jr joinedRow, params []types.Datum) (bool, error) {
 	for _, cmp := range where {
+		if cmp.Op == "TRUE" {
+			continue
+		}
+		if cmp.Op == "FALSE" {
+			return false, nil
+		}
 		ref, err := resolveJoinRef(outer, inner, cmp.Column)
 		if err != nil {
 			return false, err
@@ -180,6 +186,13 @@ func evalJoinWhere(outer, inner joinSide, where []parser.Comparison, jr joinedRo
 		if cmp.Op == "IS NULL" || cmp.Op == "IS NOT NULL" {
 			if lhs.Null != (cmp.Op == "IS NULL") {
 				return false, nil
+			}
+			continue
+		}
+		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
+			match, err := matchesIn(cmp, ref.col, lhs, nil, nil, params)
+			if err != nil || !match {
+				return false, err
 			}
 			continue
 		}
@@ -228,6 +241,9 @@ func evalJoinWhere(outer, inner joinSide, where []parser.Comparison, jr joinedRo
 func outerOnlyWhere(outer, inner joinSide, where []parser.Comparison) ([]parser.Comparison, error) {
 	var out []parser.Comparison
 	for _, cmp := range where {
+		if cmp.Column == "" {
+			continue // constant conjuncts stay in the post-join filter
+		}
 		ref, err := resolveJoinRef(outer, inner, cmp.Column)
 		if err != nil {
 			return nil, err

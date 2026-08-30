@@ -170,6 +170,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	// unusable for bounds and left to the post-fetch filter.
 	conjs := make([]planConj, len(where))
 	for i, cmp := range where {
+		if cmp.Column == "" {
+			continue // constant conjuncts (TRUE/FALSE) bind no column
+		}
 		col, ok := desc.Col(cmp.Column)
 		if !ok {
 			return accessPlan{}, newErrf(CodeUndefinedColumn, "column %q does not exist", cmp.Column)

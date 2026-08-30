@@ -13,16 +13,23 @@ type Expr struct {
 	Lit    *types.Datum `json:"lit,omitempty"`
 	Param  int          `json:"param,omitempty"` // 1-based; 0 = none
 	Column string       `json:"column,omitempty"`
+	// Sub is a scalar subquery: (SELECT ...) used as a value. Uncorrelated
+	// only — the executor evaluates it once and splices the result.
+	Sub *Select `json:"sub,omitempty"`
 	// Binary op: Column/Lit/Param on the left, operator, right operand.
 	BinOp string `json:"bin_op,omitempty"` // "+", "-"
 	Right *Expr  `json:"right,omitempty"`
 }
 
-// Comparison is one WHERE conjunct: col op value.
+// Comparison is one WHERE conjunct: col op value, col IS [NOT] NULL,
+// col [NOT] IN (list | subquery), or [NOT] EXISTS (subquery). The executor
+// rewrites evaluated EXISTS conjuncts to the constant ops TRUE/FALSE.
 type Comparison struct {
-	Column string // lower-cased
-	Op     string // = != < <= > >=
-	Value  Expr   // literal or param
+	Column string  // lower-cased; empty for [NOT] EXISTS and TRUE/FALSE
+	Op     string  // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE
+	Value  Expr    // scalar ops: literal, param, or scalar subquery
+	Values []Expr  // [NOT] IN: the value list (spliced from Sub when a subquery)
+	Sub    *Select // [NOT] IN / [NOT] EXISTS subquery
 }
 
 type ColumnDef struct {
@@ -112,8 +119,9 @@ type JoinClause struct {
 type Select struct {
 	Distinct bool
 	Exprs    []SelectExpr
-	Table    string // empty for FROM-less selects
-	Alias    string // optional alias for Table
+	Table    string  // empty for FROM-less and derived-table selects
+	Alias    string  // optional alias for Table (or the derived table's alias)
+	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
 	Join     *JoinClause
 	Where    []Comparison
 	GroupBy  []string

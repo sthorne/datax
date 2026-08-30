@@ -277,6 +277,9 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 			d = types.DNull
 		}
 		base = d
+	case e.Sub != nil:
+		// Scalar subqueries are evaluated and spliced before execution.
+		return types.Datum{}, newErrf(CodeInternal, "unresolved scalar subquery")
 	default:
 		return types.Datum{}, newErrf(CodeInternal, "empty expression")
 	}
@@ -322,6 +325,13 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 // matchesWhere evaluates the conjunction against a full row.
 func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
 	for _, cmp := range where {
+		// Constant conjuncts (evaluated EXISTS subqueries) bind no column.
+		if cmp.Op == "TRUE" {
+			continue
+		}
+		if cmp.Op == "FALSE" {
+			return false, nil
+		}
 		col, ok := desc.Col(cmp.Column)
 		if !ok {
 			return false, newErrf(CodeUndefinedColumn, "column %q does not exist", cmp.Column)
@@ -333,6 +343,13 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if cmp.Op == "IS NULL" || cmp.Op == "IS NOT NULL" {
 			if lhs.Null != (cmp.Op == "IS NULL") {
 				return false, nil
+			}
+			continue
+		}
+		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
+			match, err := matchesIn(cmp, col, lhs, desc, row, params)
+			if err != nil || !match {
+				return false, err
 			}
 			continue
 		}
@@ -371,6 +388,39 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		}
 	}
 	return true, nil
+}
+
+// matchesIn evaluates col [NOT] IN (values) with SQL three-valued
+// semantics collapsed to WHERE's boolean: a NULL left-hand side never
+// matches; a NULL element can never prove NOT IN (x NOT IN (..., NULL) is
+// UNKNOWN unless x matches a non-NULL element).
+func matchesIn(cmp parser.Comparison, col catalog.Column, lhs types.Datum, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
+	if lhs.Null {
+		return false, nil
+	}
+	matched, hasNull := false, false
+	for _, ve := range cmp.Values {
+		d, err := evalExpr(ve, desc, row, params)
+		if err != nil {
+			return false, err
+		}
+		if d.Null {
+			hasNull = true
+			continue
+		}
+		d, cerr := d.Coerce(col.Type)
+		if cerr != nil {
+			return false, newErrf(CodeInternal, "IN %s: %v", cmp.Column, cerr)
+		}
+		if c, err := lhs.Compare(d); err == nil && c == 0 {
+			matched = true
+			break
+		}
+	}
+	if cmp.Op == "IN" {
+		return matched, nil
+	}
+	return !matched && !hasNull, nil
 }
 
 // execRollbackToSavepoint restores the named savepoint, escaping the

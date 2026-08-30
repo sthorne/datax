@@ -301,11 +301,17 @@ func encodeGroupKey(ds []types.Datum) string {
 // aggregate state per group, HAVING post-aggregation, then ORDER BY/LIMIT
 // over the output rows.
 func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
-	gq, err := resolveGrouped(desc, t)
+	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
 	}
-	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
+	return s.execGroupedOver(desc, rows, t, params)
+}
+
+// execGroupedOver runs the grouping/aggregation pipeline over already
+// fetched (or materialized) rows.
+func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedRow, t *parser.Select, params []types.Datum) (*Result, error) {
+	gq, err := resolveGrouped(desc, t)
 	if err != nil {
 		return nil, err
 	}

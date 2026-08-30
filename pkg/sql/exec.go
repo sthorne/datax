@@ -108,6 +108,10 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 }
 
 func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.Insert, params []types.Datum) (*Result, error) {
+	t, err := s.resolveInsertSubs(ctx, txn, t, params)
+	if err != nil {
+		return nil, err
+	}
 	desc, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
@@ -409,6 +413,13 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	t, err := s.resolveSelectSubs(ctx, txn, t, params)
+	if err != nil {
+		return nil, err
+	}
+	if t.Derived != nil {
+		return s.execDerivedSelect(ctx, txn, t, params)
+	}
 	if t.Table == "" {
 		// FROM-less SELECT: one row of evaluated expressions.
 		res := &Result{}
@@ -538,6 +549,10 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 }
 
 func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update, params []types.Datum) (*Result, error) {
+	t, err := s.resolveUpdateSubs(ctx, txn, t, params)
+	if err != nil {
+		return nil, err
+	}
 	desc, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
@@ -590,6 +605,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 }
 
 func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*Result, error) {
+	t, err := s.resolveDeleteSubs(ctx, txn, t, params)
+	if err != nil {
+		return nil, err
+	}
 	desc, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
@@ -678,8 +697,21 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 // execExplain describes the access plan of a SELECT without executing it.
 func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.Explain, params []types.Datum) (*Result, error) {
 	sel, ok := t.Stmt.(*parser.Select)
-	if !ok || sel.Table == "" {
+	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
+	}
+	// Subqueries are evaluated (in this transaction) so the plan reflects
+	// the spliced values, exactly as execution will see them.
+	sel, err := s.resolveSelectSubs(ctx, txn, sel, params)
+	if err != nil {
+		return nil, err
+	}
+	if sel.Derived != nil {
+		return &Result{
+			Columns: []ResultColumn{{Name: "plan", Type: types.String}},
+			Rows:    [][]types.Datum{{types.NewString(fmt.Sprintf("materialized subquery (derived table %q)", sel.Alias))}},
+			Tag:     "EXPLAIN",
+		}, nil
 	}
 	desc, err := s.cat.Lookup(ctx, txn, sel.Table)
 	if err != nil {

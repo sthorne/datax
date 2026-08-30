@@ -10,7 +10,8 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
-SELECT [DISTINCT] * | col, ... | aggregates  FROM t [[AS] alias]
+SELECT [DISTINCT] * | col, ... | aggregates
+    FROM t [[AS] alias] | (SELECT ...) [AS] alias
     [[INNER | LEFT [OUTER]] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...]]
     [AS OF SYSTEM TIME 't']
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
@@ -25,8 +26,11 @@ SHOW TABLES
 
 - Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
   `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN).
-- WHERE: conjunctions (`AND`) of `col op literal`, ops `= != < <= > >=`,
-  plus `col IS [NOT] NULL`.
+- WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
+  plus `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, and
+  `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, or an
+  uncorrelated scalar subquery `(SELECT ...)` — also usable in INSERT
+  values and UPDATE SET.
 - Every table must declare a `PRIMARY KEY`.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
@@ -53,7 +57,7 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: subqueries, multi-way (3+ table) joins,
+Still out of scope: correlated subqueries, multi-way (3+ table) joins,
 aggregates/GROUP BY over joins,
 constraints beyond PRIMARY KEY / NOT NULL, sequences, DEFAULT.
 
@@ -193,6 +197,21 @@ qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
 `nested loop left join; outer (c): range scan of primary key (id > 1);
 inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
 primary key join`.
+
+Subqueries are uncorrelated only and evaluate eagerly, inside the same
+transaction, before the outer statement plans: a scalar subquery splices
+in as a literal (zero rows = NULL; two rows = `21000`), `[NOT] IN
+(SELECT ...)` becomes a value list with SQL three-valued semantics
+(`NOT IN` over a NULL-bearing set is never true), and `[NOT] EXISTS`
+collapses to a constant conjunct. Because splicing happens before
+planning, `WHERE k = (SELECT MAX(k) ...)` plans as a point lookup. A
+derived table — `FROM (SELECT ...) AS alias` — materializes the inner
+result in memory and runs the outer pipeline (WHERE, grouping,
+ORDER BY, DISTINCT, LIMIT) over it, which is how you filter on an
+aggregate output. A column inside a subquery that does not resolve in
+the subquery's own scope is reported as an unsupported correlated
+reference (`0A000`). The parsed statement is never mutated, so prepared
+statements re-evaluate their subqueries on every execution.
 
 Grouping is post-fetch and never changes the access path: `GROUP BY`
 hash-groups the fetched rows on the group columns' datums (NULL keys form
