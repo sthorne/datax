@@ -4,8 +4,12 @@
 package storage
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
+
+	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
 // Reader provides read access to an engine or batch.
@@ -58,16 +62,66 @@ func Open(dir string, o Options) (*Engine, error) {
 			e.health.bgErrors.Add(1)
 		},
 	}
+	base := vfs.Default
 	if dir == "" {
-		opts.FS = vfs.NewMem()
+		base = vfs.NewMem()
 		dir = "in-mem"
 	}
+	fs, err := maybeEncrypt(base, dir, o.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	opts.FS = fs
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, err
 	}
 	e.db = db
 	return e, nil
+}
+
+// maybeEncrypt validates the store's encryption state against the provided
+// key and returns the FS Pebble should use. The matrix:
+//
+//   - registry + correct key  -> encrypting FS (a fresh data key is minted)
+//   - registry + wrong key    -> error (GCM authentication failure)
+//   - registry + no key       -> error: key required
+//   - no registry + key, but the store already has files -> error: refusing
+//     to encrypt an existing plaintext store (there is no silent conversion;
+//     the ciphertext-looking sstables would just be unreadable garbage)
+//   - no registry + key + empty dir -> initialize encryption
+//   - no key, no registry     -> plaintext, exactly as before
+func maybeEncrypt(base vfs.FS, dir string, key []byte) (vfs.FS, error) {
+	encrypted := enc.RegistryExists(base, dir)
+	if key == nil {
+		if encrypted {
+			return nil, fmt.Errorf("store in %s is encrypted; --enc-key is required", dir)
+		}
+		return base, nil
+	}
+	if !encrypted && storeHasFiles(base, dir) {
+		return nil, fmt.Errorf("store in %s exists unencrypted; refusing to open it with an encryption key (encrypting in place is not supported)", dir)
+	}
+	keys, err := enc.LoadOrInitRegistry(base, dir, key)
+	if err != nil {
+		return nil, err
+	}
+	return enc.NewFS(base, keys), nil
+}
+
+// storeHasFiles reports whether dir already holds a Pebble store (CURRENT /
+// MANIFEST present).
+func storeHasFiles(base vfs.FS, dir string) bool {
+	names, err := base.List(dir)
+	if err != nil {
+		return false
+	}
+	for _, n := range names {
+		if n == "CURRENT" || len(n) >= 8 && n[:8] == "MANIFEST" {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) Close() error { return e.db.Close() }

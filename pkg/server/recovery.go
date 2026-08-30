@@ -14,6 +14,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -26,6 +27,10 @@ import (
 
 // MetadataBackupFile is the export's filename inside the data directory.
 const MetadataBackupFile = "metadata-backup.json"
+
+// MetadataBackupMagic prefixes the sealed (AES-GCM under the store key)
+// form of the backup, written when the store is encrypted.
+const MetadataBackupMagic = "DXMB1"
 
 // MetadataBackup is the periodically exported cluster metadata snapshot.
 type MetadataBackup struct {
@@ -88,6 +93,14 @@ func (n *Node) exportMetadata(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// On an encrypted store the backup holds the same data the sstables do
+	// (descriptors, user verifiers) — seal it with the store key.
+	if n.encKey != nil {
+		if raw, err = enc.Seal(MetadataBackupMagic, n.encKey, raw); err != nil {
+			log.Debugf("metadata export: sealing: %v", err)
+			return
+		}
+	}
 	tmp := filepath.Join(n.cfg.Dir, MetadataBackupFile+".tmp")
 	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
@@ -109,8 +122,9 @@ func (n *Node) exportMetadata(ctx context.Context) {
 // stopped, and never restart the removed peers with their old data — wipe
 // them and rejoin fresh. Replication is restored by upreplication once new
 // nodes join.
-func UnsafeRecover(dir string, rangeID base.RangeID) ([]kvpb.RangeDescriptor, error) {
-	eng, err := storage.Open(dir, storage.Options{})
+// encKey is the store encryption key (nil for a plaintext store).
+func UnsafeRecover(dir string, rangeID base.RangeID, encKey []byte) ([]kvpb.RangeDescriptor, error) {
+	eng, err := storage.Open(dir, storage.Options{EncryptionKey: encKey})
 	if err != nil {
 		return nil, fmt.Errorf("opening store (is the node stopped?): %w", err)
 	}

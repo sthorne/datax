@@ -24,6 +24,7 @@ import (
 	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
@@ -93,6 +94,9 @@ type Config struct {
 	ClosedTimestampInterval time.Duration
 	// StorageProfile selects the engine's Pebble tuning ("" = balanced).
 	StorageProfile storage.Profile
+	// EncKeyPath is a file holding the 32-byte store encryption key (raw or
+	// hex); empty = plaintext storage.
+	EncKeyPath string
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -134,6 +138,10 @@ type Node struct {
 	pgServer *pgwire.Server // set when PGListen/PGListener is configured
 	httpAddr string         // set when HTTPListen/HTTPListener is configured
 
+	// encKey is the loaded store encryption key; non-nil means the store is
+	// encrypted and node-written artifacts (metadata backup) are sealed too.
+	encKey []byte
+
 	// draining mirrors this node's registry Draining flag. The heartbeat
 	// loop adopts it from the node's own registry row (a decommission may
 	// be initiated from any node) and re-asserts it on every beat, so the
@@ -161,9 +169,15 @@ func (n *Node) start() error {
 	}
 
 	var err error
+	if n.cfg.EncKeyPath != "" {
+		n.encKey, err = enc.LoadKeyFile(n.cfg.EncKeyPath)
+		if err != nil {
+			return fmt.Errorf("loading encryption key: %w", err)
+		}
+	}
 	n.engine = n.cfg.Engine
 	if n.engine == nil {
-		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile})
+		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey})
 		if err != nil {
 			return err
 		}

@@ -27,6 +27,7 @@ type serverFlags struct {
 	rootPw     string
 	httpListen string
 	profile    string
+	encKeyPath string
 	verbose    bool
 }
 
@@ -43,6 +44,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
 	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
+	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -59,6 +61,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	log.SetVerbose(f.verbose)
 	return server.Config{
 		StorageProfile: prof,
+		EncKeyPath:     f.encKeyPath,
 		Dir:            f.dir,
 		Listen:         f.listen,
 		PGListen:       f.pgListen,

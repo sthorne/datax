@@ -62,7 +62,9 @@ Design documents live in [`docs/`](docs/):
 [architecture](docs/architecture.md) ·
 [transactions](docs/transactions.md) ·
 [replication & placement](docs/replication-and-placement.md) ·
-[sql](docs/sql.md)
+[sql](docs/sql.md) ·
+[storage profiles](docs/storage-profiles.md) ·
+[encryption](docs/encryption.md)
 
 ## Quickstart
 
@@ -113,6 +115,7 @@ This is a prototype. Out of scope so far, deliberately:
 | SQL | correlated subqueries, 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
 | Wire | COPY protocol; portal suspension (partial result fetches) |
 | Ops | observability UI |
+| Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 
 ## License
 

@@ -62,7 +62,7 @@ func TestUnsafeRecoverQuorumLoss(t *testing.T) {
 	}
 
 	// Recover every range on the survivor to solo membership.
-	recovered, err := server.UnsafeRecover(dirs[0], 0)
+	recovered, err := server.UnsafeRecover(dirs[0], 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

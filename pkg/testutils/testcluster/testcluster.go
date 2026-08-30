@@ -87,13 +87,20 @@ func Start(t testing.TB, numNodes int, localities ...string) *TestCluster {
 // housekeeping loop is disabled; tests drive GC/truncation explicitly.
 func StartWithEngines(t testing.TB, numNodes int, opts ...func(*server.Config)) (*TestCluster, []*storage.Engine) {
 	t.Helper()
+	return StartWithEngineOptions(t, numNodes, storage.Options{}, opts...)
+}
+
+// StartWithEngineOptions is StartWithEngines with explicit storage options
+// for the injected in-memory engines (profile, encryption).
+func StartWithEngineOptions(t testing.TB, numNodes int, storageOpts storage.Options, opts ...func(*server.Config)) (*TestCluster, []*storage.Engine) {
+	t.Helper()
 	clusterID := uuid.New()
 	engines := make([]*storage.Engine, numNodes)
 	listeners := make([]net.Listener, numNodes)
 	nodeIDs := make([]base.NodeID, numNodes)
 	var nodeDescs []kvpb.NodeDescriptor
 	for i := 0; i < numNodes; i++ {
-		eng, err := storage.Open("", storage.Options{})
+		eng, err := storage.Open("", storageOpts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,15 +216,19 @@ func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
 // the same-address restart path, where peers find a returning node purely
 // through their persisted registries with no re-announce involved. The
 // changed-address path is covered by RestartNodeNewPort and address_test.go.
-func startDiskNode(t testing.TB, dir string, bootstrap bool, join string) *server.Node {
+func startDiskNode(t testing.TB, dir string, bootstrap bool, join string, opts ...func(*server.Config)) *server.Node {
 	t.Helper()
 	lis := listenerForDir(t, dir)
-	n, err := server.Start(server.Config{
+	cfg := server.Config{
 		Dir:           dir,
 		Listener:      lis,
 		BootstrapSelf: bootstrap,
 		Join:          join,
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
 	if err != nil {
 		t.Fatalf("starting disk node: %v", err)
 	}

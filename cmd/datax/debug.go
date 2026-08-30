@@ -12,13 +12,24 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cockroachdb/pebble/vfs"
+
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
+
+// loadOptionalKey resolves an --enc-key flag value (empty = no key).
+func loadOptionalKey(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return enc.LoadKeyFile(path)
+}
 
 // runDebugMetadata prints the node's periodic metadata export (written to
 // the data directory every heartbeat; the recovery artifact for a cluster
@@ -26,6 +37,7 @@ import (
 func runDebugMetadata(args []string) error {
 	fs := flag.NewFlagSet("debug metadata", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of a (stopped or running) node")
+	keyPath := fs.String("enc-key", "", "store encryption key file (for an encrypted store's sealed backup)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -36,8 +48,68 @@ func runDebugMetadata(args []string) error {
 	if err != nil {
 		return fmt.Errorf("no metadata backup found: %w", err)
 	}
+	if len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
+		key, err := loadOptionalKey(*keyPath)
+		if err != nil {
+			return err
+		}
+		if key == nil {
+			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key is required")
+		}
+		if raw, err = enc.Unseal(server.MetadataBackupMagic, key, raw); err != nil {
+			return err
+		}
+	}
 	_, err = os.Stdout.Write(raw)
 	return err
+}
+
+// runDebugRotateEncKey reseals a STOPPED encrypted store's key registry
+// (and sealed metadata backup) under a new store key. Data keys — and so
+// the file contents — are untouched; only the wrapping changes.
+func runDebugRotateEncKey(args []string) error {
+	fs := flag.NewFlagSet("debug rotate-enc-key", flag.ContinueOnError)
+	dir := fs.String("dir", "", "data directory of the STOPPED node")
+	oldPath := fs.String("old-key", "", "current store encryption key file")
+	newPath := fs.String("new-key", "", "new store encryption key file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" || *oldPath == "" || *newPath == "" {
+		return fmt.Errorf("rotate-enc-key requires --dir, --old-key, and --new-key (stop the node first: a running node keeps sealing with the key it loaded at startup)")
+	}
+	oldKey, err := enc.LoadKeyFile(*oldPath)
+	if err != nil {
+		return err
+	}
+	newKey, err := enc.LoadKeyFile(*newPath)
+	if err != nil {
+		return err
+	}
+	if err := enc.RotateStoreKey(vfs.Default, *dir, oldKey, newKey); err != nil {
+		return err
+	}
+	// Reseal the metadata backup too, so one key opens everything.
+	bakPath := filepath.Join(*dir, server.MetadataBackupFile)
+	if raw, err := os.ReadFile(bakPath); err == nil &&
+		len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
+		plain, err := enc.Unseal(server.MetadataBackupMagic, oldKey, raw)
+		if err != nil {
+			return fmt.Errorf("resealing metadata backup: %w", err)
+		}
+		sealed, err := enc.Seal(server.MetadataBackupMagic, newKey, plain)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(bakPath+".tmp", sealed, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(bakPath+".tmp", bakPath); err != nil {
+			return err
+		}
+	}
+	fmt.Println("store key rotated; restart the node with the new key")
+	return nil
 }
 
 // runDebugUnsafeRecover rewrites a STOPPED store's range descriptors to
@@ -46,6 +118,7 @@ func runDebugUnsafeRecover(args []string) error {
 	fs := flag.NewFlagSet("debug unsafe-recover", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of the STOPPED surviving node")
 	rangeID := fs.Int64("range", 0, "recover only this range (default: every range on the store)")
+	keyPath := fs.String("enc-key", "", "store encryption key file (required for an encrypted store)")
 	yes := fs.Bool("yes", false, "confirm: I understand this discards the other replicas")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -64,7 +137,11 @@ nodes join.
 
 Re-run with --yes to proceed`)
 	}
-	descs, err := server.UnsafeRecover(*dir, base.RangeID(*rangeID))
+	key, err := loadOptionalKey(*keyPath)
+	if err != nil {
+		return err
+	}
+	descs, err := server.UnsafeRecover(*dir, base.RangeID(*rangeID), key)
 	if err != nil {
 		return err
 	}
@@ -103,7 +180,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover|rotate-enc-key> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -113,6 +190,8 @@ func runDebug(args []string) error {
 		return runDebugMetadata(rest)
 	case "unsafe-recover":
 		return runDebugUnsafeRecover(rest)
+	case "rotate-enc-key":
+		return runDebugRotateEncKey(rest)
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
