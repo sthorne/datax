@@ -156,8 +156,10 @@ type TLSConfigs struct {
 	Server *tls.Config
 	// Client authenticates this node to its peers.
 	Client *tls.Config
-	// PGServer serves SQL clients: server-authenticated TLS (clients verify
-	// the CA; user authentication is SCRAM, not certificates).
+	// PGServer serves SQL clients: server-authenticated TLS (clients
+	// verify the CA). User authentication is SCRAM, or a CA-signed client
+	// certificate whose CommonName is the SQL user (optional — hence
+	// VerifyClientCertIfGiven).
 	PGServer *tls.Config
 }
 
@@ -189,6 +191,8 @@ func LoadNodeTLS(certsDir string) (*TLSConfigs, error) {
 		},
 		PGServer: &tls.Config{
 			Certificates: []tls.Certificate{pair},
+			ClientCAs:    pool,
+			ClientAuth:   tls.VerifyClientCertIfGiven,
 			MinVersion:   tls.VersionTLS12,
 		},
 	}, nil

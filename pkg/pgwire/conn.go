@@ -211,7 +211,12 @@ func (c *conn) handleStartup() error {
 				return fmt.Errorf("cleartext startup refused in secure mode")
 			}
 			if c.opts.Auth != nil {
-				if err := c.authenticateSCRAM(m.Parameters["user"]); err != nil {
+				// A CA-verified client certificate whose CommonName matches
+				// the startup user authenticates without a password.
+				user := m.Parameters["user"]
+				if user != "" && c.clientCertUser() == user {
+					c.backend.Send(&pgproto3.AuthenticationOk{})
+				} else if err := c.authenticateSCRAM(user); err != nil {
 					return err
 				}
 			} else {

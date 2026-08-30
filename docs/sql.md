@@ -252,11 +252,23 @@ explicit `BEGIN ... COMMIT`.
 
 - **Startup**: in secure mode (`--certs-dir`), `SSLRequest` is answered
   with `S`, the connection upgrades to TLS, and the client authenticates
-  with **SCRAM-SHA-256** (RFC 5802/7677, hand-implemented server-side with
-  stdlib crypto; verifiers — never plaintext — live at
-  `/system/users/<name>`; unknown users and wrong passwords fail with one
-  uniform `28P01`, and a full dummy exchange runs for unknown users so the
-  flow leaks nothing). Cleartext startup is refused in secure mode. In
+  with **SCRAM-SHA-256** or **SCRAM-SHA-256-PLUS** (RFC 5802/7677/5929,
+  hand-implemented server-side with stdlib crypto). The `-PLUS` mechanism
+  binds the exchange to the TLS session via `tls-server-end-point` —
+  relaying through a MitM with a different certificate fails the proof —
+  and a client that supports binding but claims the server does not
+  (gs2 flag `y`) is rejected as a downgrade. Passwords are
+  SASLprep-normalized (PRECIS OpaqueString — the same profile pgx applies
+  client-side; non-UTF-8 or prohibited input falls back to exact bytes),
+  so non-ASCII passwords interoperate with spec-compliant clients.
+  Alternatively, a CA-signed **client certificate** whose CommonName is
+  the SQL user authenticates with no password at all
+  (`datax cert create-client --user alice`, then `sslcert`/`sslkey`);
+  a CN mismatch falls back to SCRAM. Verifiers — never plaintext — live
+  at `/system/users/<name>`; unknown users and wrong passwords fail with
+  one uniform `28P01`, and a full dummy exchange runs for unknown users
+  so the flow leaks nothing. Cleartext startup is refused in secure
+  mode. In
   insecure mode `SSLRequest` gets `N` and authentication is trust.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is
@@ -279,8 +291,9 @@ explicit `BEGIN ... COMMIT`.
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).
 - **Extended protocol**: minimal but real, because pgx's default mode prepares
   statements: `Parse` / `Bind` / `Describe` / `Execute` / `Sync` / `Close`.
-  Text-format parameters only; binary parameters are rejected with a clear
-  error. No portal suspension.
+  Parameters and results in both text and binary formats for every column
+  type (int8, float8, bool, text, timestamptz, date, bytea, uuid). No
+  portal suspension.
 - **Transaction status is load-bearing**: `ReadyForQuery` carries `I` (idle),
   `T` (in transaction), or `E` (failed transaction — everything except
   `ROLLBACK` is rejected with `25P02`).

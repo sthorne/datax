@@ -111,7 +111,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Placement | byte- or load-weighted balancing (range-count rebalancing and node decommission are automatic) |
 | Reads | bounded-staleness follower reads (exact-timestamp `AS OF SYSTEM TIME` follower reads are in; current reads are leader-only: lease-based ReadIndex) |
 | SQL | correlated subqueries, 3+-table joins, aggregates over joins, DECIMAL/JSONB types |
-| Wire | binary extended-protocol parameters; client-cert SQL auth, SCRAM-PLUS/SASLprep |
+| Wire | COPY protocol; portal suspension (partial result fetches) |
 | Ops | observability UI |
 
 ## License
