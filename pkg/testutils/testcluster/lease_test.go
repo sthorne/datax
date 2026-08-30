@@ -208,12 +208,19 @@ func TestLeaseBackstopPostEvalCheck(t *testing.T) {
 	expire.Store(true)
 
 	// The pre-eval check passes (contact is fresh), the knob expires it
-	// after evaluation, and the post-eval re-check must refuse.
-	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: tc.Nodes[leader].Clock().Now()}}
-	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: marker}})
-	_, kerr := rep.Execute(ctx, ba)
-	if kerr == nil || kerr.NotLeader == nil {
-		t.Fatalf("mid-read stall not caught by the post-eval check: %v", kerr)
+	// after evaluation, and the post-eval re-check must refuse. A raft
+	// heartbeat response landing in the tiny knob→re-check window refreshes
+	// contact and legitimately lets the read through, so retry the scenario
+	// until the stall lands inside the window.
+	caught := false
+	for attempt := 0; attempt < 10 && !caught; attempt++ {
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: tc.Nodes[leader].Clock().Now()}}
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: marker}})
+		_, kerr := rep.Execute(ctx, ba)
+		caught = kerr != nil && kerr.NotLeader != nil
+	}
+	if !caught {
+		t.Fatal("mid-read stall never caught by the post-eval check")
 	}
 	expire.Store(false)
 	if v, err := tc.Nodes[leader].DB().Get(ctx, marker); err != nil || string(v) != "v" {
