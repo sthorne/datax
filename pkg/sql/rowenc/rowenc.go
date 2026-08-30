@@ -47,23 +47,43 @@ const (
 	tagNull byte = 9
 )
 
-// PrimaryKeyPrefix is the key prefix of a table's primary rows.
+// PrimaryKeyPrefix is the key prefix of a table's ORIGINAL primary rows
+// (index 1). Prefer PrimaryKeyPrefixFor: a re-sharded table's live
+// primary index is a later ID.
 func PrimaryKeyPrefix(tableID uint64) keys.Key {
 	return keys.TableIndexPrefix(tableID, PrimaryIndexID)
 }
 
-// PrimarySpan covers a table's primary rows.
+// PrimaryKeyPrefixFor is the key prefix of the table's LIVE primary rows.
+func PrimaryKeyPrefixFor(desc *catalog.TableDescriptor) keys.Key {
+	return keys.TableIndexPrefix(desc.ID, desc.LivePrimaryIndex())
+}
+
+// PrimarySpan covers a table's original (index 1) primary rows; prefer
+// PrimarySpanFor.
 func PrimarySpan(tableID uint64) (keys.Key, keys.Key) {
 	return keys.TableIndexSpan(tableID, PrimaryIndexID)
 }
 
+// PrimarySpanFor covers the table's live primary rows.
+func PrimarySpanFor(desc *catalog.TableDescriptor) (keys.Key, keys.Key) {
+	return keys.TableIndexSpan(desc.ID, desc.LivePrimaryIndex())
+}
+
 // EncodePK builds the row key for the given primary key values (one datum
-// per PK column, coerced and non-null).
+// per PK column, coerced and non-null) at the table's live primary index.
 func EncodePK(desc *catalog.TableDescriptor, pkVals []types.Datum) (keys.Key, error) {
+	return EncodePKAt(desc, desc.LivePrimaryIndex(), pkVals)
+}
+
+// EncodePKAt is EncodePK at an explicit index ID — the re-shard backfill
+// and dual-write build the NEW layout's keys with it while the live index
+// still points at the old one.
+func EncodePKAt(desc *catalog.TableDescriptor, indexID uint64, pkVals []types.Datum) (keys.Key, error) {
 	if len(pkVals) != len(desc.PrimaryKey) {
 		return nil, fmt.Errorf("expected %d primary key values, got %d", len(desc.PrimaryKey), len(pkVals))
 	}
-	k := PrimaryKeyPrefix(desc.ID)
+	k := keys.TableIndexPrefix(desc.ID, indexID)
 	for i, colID := range desc.PrimaryKey {
 		col, _ := desc.ColByID(colID)
 		d := pkVals[i]
@@ -107,7 +127,7 @@ func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) 
 
 // DecodePK decodes the PK datums from a primary row key.
 func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error) {
-	prefix := PrimaryKeyPrefix(desc.ID)
+	prefix := PrimaryKeyPrefixFor(desc)
 	if !bytes.HasPrefix(key, prefix) {
 		return nil, fmt.Errorf("key not in table %d's primary index", desc.ID)
 	}
@@ -397,7 +417,7 @@ func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescripto
 // IndexEntryPrimaryKey recovers the primary row key from an index entry.
 func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key, value []byte) (keys.Key, error) {
 	if idx.Unique {
-		return append(PrimaryKeyPrefix(desc.ID), value...), nil
+		return append(PrimaryKeyPrefixFor(desc), value...), nil
 	}
 	prefix := keys.TableIndexPrefix(desc.ID, idx.ID)
 	if !bytes.HasPrefix(key, prefix) {
@@ -415,7 +435,7 @@ func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescr
 			return nil, fmt.Errorf("index %q entry: %w", idx.Name, err)
 		}
 	}
-	return append(PrimaryKeyPrefix(desc.ID), rest...), nil
+	return append(PrimaryKeyPrefixFor(desc), rest...), nil
 }
 
 func skipDatum(b []byte, fam types.Family) ([]byte, error) {

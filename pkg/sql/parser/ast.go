@@ -158,6 +158,9 @@ type AlterTable struct {
 	Table   string
 	AddCol  *ColumnDef // set for ADD COLUMN
 	DropCol string     // set for DROP COLUMN
+	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
+	// shards = N, the online re-shard.
+	SetOptions map[string]string
 }
 
 type Delete struct {

@@ -12,6 +12,8 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
 // TestParallelCommitFastPath: a pipelined transaction commits via the
@@ -172,4 +174,96 @@ func TestStagingRecoveryAborts(t *testing.T) {
 	if v, err := reader2.Get(ctx, k1); err != nil || v != nil {
 		t.Fatalf("aborted staged write resurfaced: %q, %v", v, err)
 	}
+}
+
+// TestMultiRangePushCommitsAbovePushedWrite: a transaction's write batch
+// spans two ranges, and a read bumps only the FIRST range's timestamp
+// cache above the transaction's timestamp — so only that sub-batch's
+// write is pushed. The batch response must report the MAXIMUM write
+// timestamp across sub-batches: if the un-pushed second group's response
+// overwrote it, the parallel commit would stage, commit, and resolve at
+// the original timestamp, physically moving the pushed intent's version
+// back DOWN beneath the timestamp already served to the reader — a
+// serializability violation (regression: the re-shard dual-write phantom).
+func TestMultiRangePushCommitsAbovePushedWrite(t *testing.T) {
+	n, eng := startGCNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db := n.DB()
+	prefix := keys.TableDataPrefix(933)
+	k1 := append(prefix.Clone(), "a"...)
+	k2 := append(prefix.Clone(), "m"...)
+	if _, err := db.AdminSplit(ctx, k2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(ctx, append(prefix.Clone(), "a-warm"...), []byte("w")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(ctx, append(prefix.Clone(), "m-warm"...), []byte("w")); err != nil {
+		t.Fatal(err)
+	}
+
+	var scanTS hlc.Timestamp
+	err := db.RunTxn(ctx, "mr-push", func(ctx context.Context, txn *kvclient.Txn) error {
+		var wb kvclient.WriteBatch
+		wb.Put(k1, []byte("v1"))
+		wb.Put(k2, []byte("v2"))
+		if err := txn.RunBatch(ctx, &wb); err != nil { // deferred: no intents yet
+			return err
+		}
+		// Bump k1's range's timestamp cache above the transaction's
+		// timestamp; k2's range stays untouched. At commit, the k1 write is
+		// pushed and the k2 write is not.
+		scanTS = db.Clock().Now()
+		_, err := db.Scan(ctx, k1, k1.Next(), 0)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both committed versions must land at ONE timestamp, above the served
+	// read. Wait out intent resolution first (the buggy path finalized
+	// asynchronously).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		m1, _ := mvccEntryCounts(t, eng, k1)
+		m2, _ := mvccEntryCounts(t, eng, k2)
+		if m1 == 0 && m2 == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("intents not resolved: %d/%d metas remain", m1, m2)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	ts1 := newestVersionTS(t, eng, k1)
+	ts2 := newestVersionTS(t, eng, k2)
+	if !ts1.Equal(ts2) {
+		t.Fatalf("atomic commit split across timestamps: k1 at %s, k2 at %s", ts1, ts2)
+	}
+	if !scanTS.Less(ts1) {
+		t.Fatalf("commit at %s did not clear the served read at %s (write slid beneath a reader)", ts1, scanTS)
+	}
+}
+
+// newestVersionTS returns the timestamp of the newest committed version of
+// user key k, by raw engine iteration.
+func newestVersionTS(t *testing.T, eng *storage.Engine, k keys.Key) hlc.Timestamp {
+	t.Helper()
+	lower := storage.EncodeMVCCKey(k, hlc.Timestamp{})
+	upper := storage.EncodeMVCCKey(k.Next(), hlc.Timestamp{})
+	it := eng.NewIter(lower, upper)
+	defer func() { _ = it.Close() }()
+	for ok := it.SeekGE(lower); ok; ok = it.Next() {
+		_, ts, err := storage.DecodeMVCCKey(it.Key())
+		if err != nil {
+			t.Fatalf("decoding %x: %v", it.Key(), err)
+		}
+		if !ts.IsEmpty() {
+			return ts // versions sort newest-first
+		}
+	}
+	t.Fatalf("no committed version of %x", k)
+	return hlc.Timestamp{}
 }

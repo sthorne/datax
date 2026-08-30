@@ -26,7 +26,15 @@ const ShardColumnName = "_shard"
 // encoding as hash input is also what lets the planner recompute the
 // bucket for a fully-pinned point lookup.
 func ShardBucket(desc *catalog.TableDescriptor, logicalPK []types.Datum) (types.Datum, error) {
-	if desc.ShardBuckets <= 0 || len(desc.PrimaryKey) < 2 {
+	return ShardBucketAt(desc, logicalPK, desc.ShardBuckets)
+}
+
+// ShardBucketAt computes the bucket for an explicit bucket count — the
+// re-shard path hashes the same frozen encoding mod the NEW count. The
+// hash and its input never vary; only the mod does, and only together
+// with a full rewrite of the table.
+func ShardBucketAt(desc *catalog.TableDescriptor, logicalPK []types.Datum, buckets int32) (types.Datum, error) {
+	if buckets <= 0 || len(desc.PrimaryKey) < 2 {
 		return types.Datum{}, fmt.Errorf("table %q is not shard-bucketed", desc.Name)
 	}
 	logical := desc.PrimaryKey[1:] // [0] is the hidden _shard column
@@ -47,5 +55,5 @@ func ShardBucket(desc *catalog.TableDescriptor, logicalPK []types.Datum) (types.
 		buf = enc
 		_, _ = h.Write(buf)
 	}
-	return types.NewInt(int64(h.Sum32() % uint32(desc.ShardBuckets))), nil
+	return types.NewInt(int64(h.Sum32() % uint32(buckets))), nil
 }

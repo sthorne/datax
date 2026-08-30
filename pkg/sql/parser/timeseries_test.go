@@ -42,3 +42,26 @@ func TestCreateTableWithOptions(t *testing.T) {
 		}
 	}
 }
+
+// TestAlterTableSetOptions: the ALTER TABLE ... SET (name = value) form
+// parses (sharing the CREATE TABLE option-list grammar) and plain
+// ADD/DROP COLUMN is untouched.
+func TestAlterTableSetOptions(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE m SET (shards = 8)`).(*AlterTable)
+	if at.Table != "m" || at.SetOptions["shards"] != "8" || at.AddCol != nil || at.DropCol != "" {
+		t.Fatalf("SET form: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE m ADD COLUMN c INT`).(*AlterTable)
+	if at.AddCol == nil || at.SetOptions != nil {
+		t.Fatalf("ADD form: %+v", at)
+	}
+	for _, bad := range []string{
+		`ALTER TABLE m SET shards = 8`,
+		`ALTER TABLE m SET (shards)`,
+		`ALTER TABLE m SET (shards = 8, shards = 9)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}

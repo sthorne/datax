@@ -144,6 +144,15 @@ coordinator's refresh round trip always loses the race against the next
 read's bump. Non-transactional writes, which have no reads to protect, are
 still bounced with a retry timestamp and simply resent above it.
 
+Because a multi-range batch executes as per-range sub-batches, any ONE of
+which may be pushed by its own range's cache, the router merges the
+forwarded timestamps: the batch response reports the MAXIMUM write
+timestamp across sub-batches. Overwriting with the last sub-batch's
+response would let an earlier push vanish — the commit would then flip
+(and resolution would re-timestamp the pushed intent DOWN to) a timestamp
+already served to a reader, silently un-happening a read. The
+`TestMultiRangePushCommitsAbovePushedWrite` regression pins this.
+
 ### Locking reads (SELECT FOR UPDATE)
 
 The symmetric read-modify-write pattern — two transactions read the same

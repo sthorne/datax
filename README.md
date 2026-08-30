@@ -121,7 +121,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Ops | auth on the observability endpoints (dashboard and JSON are read-only but unauthenticated); per-node drill-down across peers (the dashboard's range detail is the serving node's own) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
-| Time series | changing `shards` after CREATE; order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
+| Time series | re-sharding tables that carry secondary indexes, and historical reads below a re-shard (v1 guards); order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
 
 ## License
 

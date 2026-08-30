@@ -19,7 +19,8 @@ must be `TIMESTAMPTZ`):
 - `retention = '<N><d|h|m|s>'` — rows older than this are expired by the
   GC housekeeping pass, with zero SQL DELETEs.
 - `shards = N` (2–256) — spread the write hot tail over N key prefixes.
-  Immutable after creation: it defines the key layout.
+  Changeable later with the online re-shard (`ALTER TABLE ... SET
+  (shards = M)`, below).
 
 Pair a timeseries node with `--storage-profile ingest`
 (docs/storage-profiles.md) for sustained append throughput.
@@ -99,9 +100,45 @@ Benchmark with `datax bench timeseries [--shards N --series M]` — it
 appends monotone per-series timestamps (deliberately the worst case for
 an unsharded PK) and then times windowed reads.
 
+## Re-sharding
+
+`ALTER TABLE t SET (shards = M)` changes the bucket count **online**, on
+the same state machine as online CREATE INDEX. Primary rows live at an
+index ID; the new layout is built at a freshly allocated ID (IDs are
+never reused, so the keyspaces cannot collide):
+
+1. A `Reshard` marker publishes + lease-drains — every gateway then
+   dual-writes both layouts.
+2. The new layout's bucket prefixes are pre-split.
+3. A frozen-timestamp sweep re-keys the old rows in parallel chunked
+   transactions (recompute the bucket mod M, re-encode at the new
+   index; value bytes copy verbatim — values hold only non-PK columns).
+   Concurrent dual-writes are idempotent against it; concurrent deletes
+   invalidate the chunk's read and force a rescan.
+4. One transaction swaps `ShardBuckets` + the live primary index,
+   clears the marker, and stamps `ReshardedAt`; after the drain, reads,
+   writes, and the planner's fan-out all follow the new layout.
+5. The old layout is wiped (batched, intent-aware; emptied ranges merge
+   away).
+
+Measured (single node, ingest profile): idle backfill ~8,800 rows/s
+(260k rows in 30s); under a live 4,000 rows/s ingest the re-shard of a
+growing 120k→400k-row table took ~129s with foreground throughput
+dipping to ~2,200 rows/s (dual-write amplification) and recovering to
+full speed on the new buckets the moment the swap landed — writes never
+stopped. Recorded runs live in issue #33.
+
+v1 scope: already-sharded timeseries tables only (the PK column list
+must stay identical so both layouts decode during dual-write); tables
+with secondary indexes are rejected (their entries embed the bucket
+value — drop and recreate them around the re-shard); `AS OF SYSTEM
+TIME` below the swap is refused (the new layout's rows carry
+backfill-time MVCC timestamps); a handful of old-layout keys from
+statements in flight at the swap can survive the wipe as unreachable
+garbage.
+
 ## Limitations
 
-- `shards` is fixed at CREATE (re-sharding = new table + copy).
 - Fan-out disables order pushdown: `ORDER BY ts` on a sharded table
   always sorts in memory (bounded windows keep that cheap).
 - Retention expiry is range-granular and best-effort in timing (one

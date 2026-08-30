@@ -225,7 +225,7 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 		keys.TableDataPrefix(desc.ID).PrefixEnd(),
 	}
 	for b := int32(1); b < desc.ShardBuckets; b++ {
-		k, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefix(desc.ID), types.Int, types.NewInt(int64(b)))
+		k, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefixFor(desc), types.Int, types.NewInt(int64(b)))
 		if err != nil {
 			return
 		}
@@ -346,6 +346,13 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		// Writes are buffered and flushed once below: one routed batch (one
 		// Raft proposal per touched range) per statement.
 		wb.Put(key, value)
+		if desc.Reshard != nil {
+			shadow, serr := reshardShadowKey(desc, row)
+			if serr != nil {
+				return nil, serr
+			}
+			wb.Put(shadow, value)
+		}
 		if err := addIndexEntries(ctx, txn, desc, row, &wb, inserted); err != nil {
 			return nil, err
 		}
@@ -400,7 +407,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if err != nil || pkEnc == nil {
 			return nil, err
 		}
-		pk := append(rowenc.PrimaryKeyPrefix(desc.ID), pkEnc...)
+		pk := append(rowenc.PrimaryKeyPrefixFor(desc), pkEnc...)
 		rows, err := s.fetchByPrimaryKey(ctx, txn, desc, pk, where, params)
 		if err != nil {
 			return nil, err
@@ -499,7 +506,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			return start, end, nil
 		}
 		if plan.fanBuckets == 0 {
-			start, end, err := buildSpan(rowenc.PrimaryKeyPrefix(desc.ID))
+			start, end, err := buildSpan(rowenc.PrimaryKeyPrefixFor(desc))
 			if err != nil {
 				return nil, err
 			}
@@ -507,7 +514,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		var out []fetchedRow
 		for b := int32(0); b < plan.fanBuckets; b++ {
-			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefix(desc.ID), types.Int, types.NewInt(int64(b)))
+			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefixFor(desc), types.Int, types.NewInt(int64(b)))
 			if err != nil {
 				return nil, newErrf(CodeInternal, "shard bound: %v", err)
 			}
@@ -532,7 +539,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		return out, nil
 	}
 
-	start, end := rowenc.PrimarySpan(desc.ID)
+	start, end := rowenc.PrimarySpanFor(desc)
 	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 }
 
@@ -882,6 +889,14 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			return nil, verr
 		}
 		wb.Put(fr.key, value)
+		if desc.Reshard != nil {
+			// PK updates are unsupported, so the shadow key is stable.
+			shadow, serr := reshardShadowKey(desc, fr.row)
+			if serr != nil {
+				return nil, serr
+			}
+			wb.Put(shadow, value)
+		}
 		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen); err != nil {
 			return nil, err
 		}
@@ -930,6 +945,13 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	var wb kvclient.WriteBatch
 	for _, fr := range rows {
 		wb.Delete(fr.key)
+		if desc.Reshard != nil {
+			shadow, serr := reshardShadowKey(desc, fr.row)
+			if serr != nil {
+				return nil, serr
+			}
+			wb.Delete(shadow)
+		}
 		if err := dropIndexEntries(desc, fr.row, &wb); err != nil {
 			return nil, err
 		}

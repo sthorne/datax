@@ -156,19 +156,17 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint64) error {
 	boundary := s.db.Clock().Now()
 
-	var tableID uint64
+	var cursor, end keys.Key
 	if err := s.db.RunTxn(ctx, "create-index-plan", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, err := s.cat.Lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}
-		tableID = desc.ID
+		cursor, end = rowenc.PrimarySpanFor(desc)
 		return nil
 	}); err != nil {
 		return err
 	}
-
-	cursor, end := rowenc.PrimarySpan(tableID)
 	for {
 		plan, err := s.db.ScanAt(ctx, cursor, end, backfillChunkSize, boundary)
 		if err != nil {
@@ -247,20 +245,50 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 	})
 }
 
-// wipeIndexEntries best-effort deletes an abandoned index's entries.
+// wipeIndexEntries best-effort deletes an abandoned (or superseded)
+// index's entries in batched, transactional chunks — a re-shard's old
+// layout can hold hundreds of thousands of keys (per-key deletes would
+// take minutes), and scanning inside the txn resolves any straggler
+// dual-write intents instead of aborting on them. It sweeps in passes
+// until a pass finds nothing (a statement in flight during an earlier
+// pass may have committed behind the cursor); leftovers are unreachable
+// garbage either way.
 func (s *Session) wipeIndexEntries(ctx context.Context, tableID, indexID uint64) {
-	lo, hi := keys.TableIndexSpan(tableID, indexID)
-	for {
-		kvs, err := s.db.Scan(ctx, lo, hi, backfillChunkSize)
-		if err != nil || len(kvs) == 0 {
-			return
-		}
-		for _, kv := range kvs {
-			if err := s.db.Delete(ctx, kv.Key); err != nil {
+	const wipeChunk = 1024
+	for pass := 0; pass < 5; pass++ {
+		lo, hi := keys.TableIndexSpan(tableID, indexID)
+		deleted := 0
+		for {
+			var n int
+			var last keys.Key
+			err := s.db.RunTxn(ctx, "wipe-index", func(ctx context.Context, txn *kvclient.Txn) error {
+				kvs, err := txn.Scan(ctx, lo, hi, wipeChunk)
+				if err != nil {
+					return err
+				}
+				n = len(kvs)
+				if n == 0 {
+					return nil
+				}
+				last = kvs[n-1].Key.Clone()
+				var wb kvclient.WriteBatch
+				for _, kv := range kvs {
+					wb.Delete(kv.Key)
+				}
+				return txn.RunBatch(ctx, &wb)
+			})
+			if err != nil {
 				return
 			}
+			if n == 0 {
+				break
+			}
+			deleted += n
+			lo = last.Next()
 		}
-		lo = kvs[len(kvs)-1].Key.Next()
+		if deleted == 0 {
+			return
+		}
 	}
 }
 

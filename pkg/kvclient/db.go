@@ -175,7 +175,22 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 		}
 		out.Responses = append(out.Responses, br.Responses...)
 		if br.Txn != nil {
-			out.Txn = br.Txn
+			// Merge, never overwrite: a multi-range batch executes as
+			// per-range sub-batches, and any ONE of them may have had its
+			// write timestamp pushed by that range's timestamp cache. The
+			// batch response must report the MAXIMUM write timestamp across
+			// all sub-batches — taking the last group's verbatim would let
+			// an earlier group's push vanish, and a parallel commit would
+			// then stage, commit, and resolve intents BELOW a timestamp
+			// already served to a reader (a serializability violation: the
+			// pushed intent's version is moved back down beneath the read).
+			if out.Txn == nil {
+				out.Txn = br.Txn
+			} else if out.Txn.WriteTimestamp.Less(br.Txn.WriteTimestamp) {
+				merged := *out.Txn
+				merged.WriteTimestamp = br.Txn.WriteTimestamp
+				out.Txn = &merged
+			}
 		}
 		i = j
 	}

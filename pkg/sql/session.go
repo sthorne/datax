@@ -209,6 +209,25 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// write-only → drain → backfill+publish → drain), so — like
 	// PostgreSQL's CREATE INDEX CONCURRENTLY — it cannot run inside an
 	// explicit transaction block.
+	// ALTER TABLE ... SET (shards = N) is the online re-shard: the same
+	// multi-transaction state-machine shape, with the same restrictions.
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
+		}
+		var aerr error
+		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			aerr = s.checkAdmin(ctx, txn)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if aerr != nil {
+			return nil, ToSQLError(aerr)
+		}
+		return s.execReshardOnline(ctx, at)
+	}
+
 	if ci, ok := stmt.(*parser.CreateIndex); ok {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
@@ -239,6 +258,23 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		ts, err := resolveAsOf(sel.AsOf, s.db.Clock().Now())
 		if err != nil {
 			return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
+		}
+		// A re-shard rewrites the table at a new primary index whose rows
+		// carry backfill-time MVCC timestamps: a historical read below the
+		// swap would silently miss rows, so it is refused. The CURRENT
+		// descriptor carries the stamp — the historical one predates it.
+		if sel.Table != "" {
+			var resharded int64
+			_ = s.db.RunTxn(ctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
+				if desc, derr := s.cat.Lookup(ctx, gtxn, sel.Table); derr == nil {
+					resharded = desc.ReshardedAt
+				}
+				return nil
+			})
+			if resharded > 0 && ts.WallTime < resharded {
+				return nil, newErrf(CodeFeatureNotSupported,
+					"historical read predates the re-shard of table %q; AS OF SYSTEM TIME must be at or after it", sel.Table)
+			}
 		}
 		txn := s.db.NewHistoricalTxn("sql-asof", ts)
 		res, serr := s.execSelect(ctx, txn, sel, params)

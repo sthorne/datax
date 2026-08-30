@@ -101,8 +101,36 @@ type TableDescriptor struct {
 	// ShardBuckets (timeseries only): when > 0, a hidden _shard column
 	// (fnv32a of the logical PK encoding, mod this) leads the primary
 	// key, spreading a monotone timestamp tail across ShardBuckets
-	// ranges. Immutable after creation — it defines the key layout.
+	// ranges. It defines the key layout: changing it requires rewriting
+	// every row (ALTER TABLE ... SET (shards = N), the online re-shard).
 	ShardBuckets int32 `json:"shard_buckets,omitempty"`
+	// PrimaryIndex is the index ID primary rows live at; 0 means the
+	// original rowenc.PrimaryIndexID (1) — the zero value keeps every
+	// pre-existing descriptor valid. A re-shard rewrites the table at a
+	// fresh index ID and swaps this atomically with ShardBuckets.
+	PrimaryIndex uint64 `json:"primary_index,omitempty"`
+	// Reshard, when non-nil, marks an in-flight re-shard: every writer
+	// dual-writes rows to NewIndexID with the bucket recomputed mod
+	// NewBuckets while the backfill copies history.
+	Reshard *ReshardState `json:"reshard,omitempty"`
+	// ReshardedAt is the HLC wall time of the last completed re-shard
+	// swap; historical reads below it are rejected (the new layout only
+	// fully describes the table from the swap onward).
+	ReshardedAt int64 `json:"resharded_at,omitempty"`
+}
+
+// ReshardState is the descriptor marker for an in-flight re-shard.
+type ReshardState struct {
+	NewIndexID uint64 `json:"new_index_id"`
+	NewBuckets int32  `json:"new_buckets"`
+}
+
+// LivePrimaryIndex is the index ID primary rows are read and written at.
+func (d *TableDescriptor) LivePrimaryIndex() uint64 {
+	if d.PrimaryIndex != 0 {
+		return d.PrimaryIndex
+	}
+	return 1 // rowenc.PrimaryIndexID; literal to avoid an import cycle
 }
 
 // VisibleColumns returns the columns SELECT * expands to and INSERT
@@ -142,6 +170,10 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		for u, ps := range d.Privileges {
 			out.Privileges[u] = append([]string(nil), ps...)
 		}
+	}
+	if d.Reshard != nil {
+		rs := *d.Reshard
+		out.Reshard = &rs
 	}
 	return &out
 }
