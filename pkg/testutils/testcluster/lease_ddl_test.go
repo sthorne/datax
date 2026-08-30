@@ -151,8 +151,13 @@ func TestOnlineCreateIndexUnderConcurrentWrites(t *testing.T) {
 	}
 
 	// Exactly one index entry per row: nothing missed during the build.
+	// Read through a transaction: the writer's last commit may still be
+	// resolving its intents asynchronously (parallel commits finalize after
+	// control returns), and only the transactional read path pushes them.
 	lo, hi := keys.TableIndexSpan(desc.ID, idx.ID)
-	entries, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+	reader := tc.Nodes[0].DB().NewTxn("index-count")
+	entries, err := reader.Scan(ctx, lo, hi, 0)
+	_ = reader.Rollback(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
