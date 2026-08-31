@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -89,6 +90,22 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 		return nil, kvpb.NewErrorf("empty batch")
 	}
 	defer func(start time.Time) { metrics.KVBatchLatency.Observe(time.Since(start).Seconds()) }(time.Now())
+
+	// Transactional batches of point requests spanning several ranges fan
+	// out concurrently — one range's consensus round no longer waits for
+	// another's. Everything else (non-transactional batches, whose
+	// per-group timestamp ratchet is observable ordering, and ranged
+	// requests) keeps the sequential path below.
+	if ba.Header.Txn != nil && len(ba.Requests) > 1 && batchIsPointRequests(ba) {
+		groups, kerr := db.partitionByRange(ctx, ba.Requests, nil)
+		if kerr != nil {
+			return nil, kerr
+		}
+		if len(groups) > 1 {
+			return db.sendParallel(ctx, ba, groups)
+		}
+	}
+
 	out := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
 	header := ba.Header
 
@@ -206,6 +223,241 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 		i = j
 	}
 	out.Timestamp = header.Timestamp
+	return out, nil
+}
+
+// batchIsPointRequests reports whether every request in the batch is a
+// point request — the shape the parallel fan-out handles. Ranged requests
+// (Scan, Export, span Refresh) have their own multi-range stitching.
+func batchIsPointRequests(ba *kvpb.BatchRequest) bool {
+	for i := range ba.Requests {
+		if ba.Requests[i].Scan != nil || ba.Requests[i].Export != nil {
+			return false
+		}
+		if ref := ba.Requests[i].Refresh; ref != nil && len(ref.EndKey) > 0 {
+			return false
+		}
+		if ba.Requests[i].GetInner() == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// rangeGroup is one range's share of a partitioned batch, with the
+// original request positions for response reassembly.
+type rangeGroup struct {
+	desc    kvpb.RangeDescriptor
+	indices []int
+	reqs    []kvpb.RequestUnion
+}
+
+// partitionByRange groups point requests by the range covering them — a
+// true partition, unlike the sequential path's contiguous runs, so a batch
+// whose keys interleave across ranges (a SQL INSERT's rows and index
+// entries) still yields one sub-batch per range. indices maps reqs back to
+// original batch positions (nil = identity).
+func (db *DB) partitionByRange(ctx context.Context, reqs []kvpb.RequestUnion, indices []int) ([]rangeGroup, *kvpb.Error) {
+	var groups []rangeGroup
+	byRange := map[base.RangeID]int{}
+	for n := range reqs {
+		addr, err := keys.Addr(reqs[n].GetInner().Header().Key)
+		if err != nil {
+			return nil, kvpb.NewError(err)
+		}
+		desc, kerr := db.descForKey(ctx, addr)
+		if kerr != nil {
+			return nil, kerr
+		}
+		idx := n
+		if indices != nil {
+			idx = indices[n]
+		}
+		if gi, ok := byRange[desc.RangeID]; ok {
+			groups[gi].reqs = append(groups[gi].reqs, reqs[n])
+			groups[gi].indices = append(groups[gi].indices, idx)
+		} else {
+			byRange[desc.RangeID] = len(groups)
+			groups = append(groups, rangeGroup{
+				desc:    desc,
+				indices: []int{idx},
+				reqs:    []kvpb.RequestUnion{reqs[n]},
+			})
+		}
+	}
+	return groups, nil
+}
+
+// maxParallelSubBatches caps how many per-range sub-batches of one batch
+// are in flight at once.
+const maxParallelSubBatches = 8
+
+// sendParallel executes a transactional point-request batch as per-range
+// sub-batches fanned out concurrently. Ordering constraints preserved:
+//
+//   - Anchor-first: when the batch creates the transaction record, the
+//     sub-batch writing the anchor key completes BEFORE any sibling is
+//     sent, so no intent is ever observable before the record exists (a
+//     pusher finding such an intent judges expiry from MinTimestamp and
+//     can poison the record ABORTED).
+//   - The response's transaction reports the MAXIMUM write timestamp
+//     across sub-batches (same merge as the sequential path — see the
+//     comment there); the merge is mutex-guarded here.
+//   - Responses are placed positionally via the partition's index map.
+//
+// Sub-batches that need re-routing (splits, moved replicas) are
+// re-partitioned into the next wave under the batch-wide retry budget.
+func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []rangeGroup) (*kvpb.BatchResponse, *kvpb.Error) {
+	header := ba.Header
+	out := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
+	out.Responses = make([]kvpb.ResponseUnion, len(ba.Requests))
+
+	var txnMu sync.Mutex
+	mergeTxn := func(br *kvpb.BatchResponse) {
+		if br.Txn == nil {
+			return
+		}
+		txnMu.Lock()
+		defer txnMu.Unlock()
+		if out.Txn == nil {
+			out.Txn = br.Txn
+		} else if out.Txn.WriteTimestamp.Less(br.Txn.WriteTimestamp) {
+			merged := *out.Txn
+			merged.WriteTimestamp = br.Txn.WriteTimestamp
+			out.Txn = &merged
+		}
+	}
+
+	// sendGroup executes one sub-batch and, on success, places its
+	// responses. The CreateTxnRecord flag is scoped to the group writing
+	// the anchor key, exactly as on the sequential path.
+	sendGroup := func(g rangeGroup) (regroup bool, kerr *kvpb.Error) {
+		gh := header
+		if gh.CreateTxnRecord && gh.Txn != nil {
+			gh.CreateTxnRecord = false
+			for i := range g.reqs {
+				if keys.Key(gh.Txn.Key).Equal(g.reqs[i].GetInner().Header().Key) {
+					gh.CreateTxnRecord = true
+					break
+				}
+			}
+		}
+		br, regroup, kerr := db.sendPartial(ctx, &gh, g.reqs, g.desc)
+		if regroup || kerr != nil {
+			return regroup, kerr
+		}
+		for k := range g.reqs {
+			out.Responses[g.indices[k]] = br.Responses[k]
+		}
+		mergeTxn(br)
+		return false, nil
+	}
+
+	anchorGroup := func(groups []rangeGroup) int {
+		if !header.CreateTxnRecord || header.Txn == nil {
+			return -1
+		}
+		for i := range groups {
+			for j := range groups[i].reqs {
+				if keys.Key(header.Txn.Key).Equal(groups[i].reqs[j].GetInner().Header().Key) {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+
+	regroups := 0
+	regroupWait := func(kerr *kvpb.Error) *kvpb.Error {
+		if regroups++; regroups > maxRoutingRetries {
+			return kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
+		}
+		if regroups > 3 {
+			delay := time.Duration(regroups) * 10 * time.Millisecond
+			if delay > 200*time.Millisecond {
+				delay = 200 * time.Millisecond
+			}
+			select {
+			case <-ctx.Done():
+				return kvpb.NewError(ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+		return nil
+	}
+	repartition := func(gs []rangeGroup) ([]rangeGroup, *kvpb.Error) {
+		var reqs []kvpb.RequestUnion
+		var idxs []int
+		for _, g := range gs {
+			reqs = append(reqs, g.reqs...)
+			idxs = append(idxs, g.indices...)
+		}
+		return db.partitionByRange(ctx, reqs, idxs)
+	}
+
+	for len(groups) > 0 {
+		// Anchor-first when >1 group remains and the record is not yet
+		// created.
+		if ai := anchorGroup(groups); ai >= 0 && len(groups) > 1 {
+			regroup, kerr := sendGroup(groups[ai])
+			if regroup {
+				if werr := regroupWait(kerr); werr != nil {
+					return nil, werr
+				}
+				var perr *kvpb.Error
+				if groups, perr = repartition(groups); perr != nil {
+					return nil, perr
+				}
+				continue
+			}
+			if kerr != nil {
+				return nil, kerr
+			}
+			groups = append(groups[:ai:ai], groups[ai+1:]...)
+			header.CreateTxnRecord = false // record exists; siblings never create
+		}
+
+		var (
+			wg       sync.WaitGroup
+			resMu    sync.Mutex
+			retry    []rangeGroup
+			firstErr *kvpb.Error
+			lastRe   *kvpb.Error
+		)
+		sem := make(chan struct{}, maxParallelSubBatches)
+		for _, g := range groups {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(g rangeGroup) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				regroup, kerr := sendGroup(g)
+				resMu.Lock()
+				defer resMu.Unlock()
+				switch {
+				case regroup:
+					retry = append(retry, g)
+					lastRe = kerr
+				case kerr != nil && firstErr == nil:
+					firstErr = kerr
+				}
+			}(g)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		if len(retry) == 0 {
+			break
+		}
+		if werr := regroupWait(lastRe); werr != nil {
+			return nil, werr
+		}
+		var perr *kvpb.Error
+		if groups, perr = repartition(retry); perr != nil {
+			return nil, perr
+		}
+	}
 	return out, nil
 }
 

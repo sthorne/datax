@@ -537,6 +537,13 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 // maxRefreshesPerOp bounds refresh loops under pathological contention.
 const maxRefreshesPerOp = 10
 
+// txnPoisonGuardAge is how old a transaction may be before parallelCommit
+// stops racing its write batch against the record-creating staged EndTxn.
+// Half of kvserver.TxnExpiration (5s — keep in sync): beyond it, a pusher
+// finding an intent before the record exists could judge the transaction
+// expired from MinTimestamp and poison the record ABORTED mid-commit.
+const txnPoisonGuardAge = 2500 * time.Millisecond
+
 // maybeRefresh verifies every tracked read span saw no foreign write in
 // (readTS, newTS] and, on success, advances the transaction's read and
 // write timestamps to newTS. See docs/transactions.md.
@@ -859,14 +866,28 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 	})
 
 	var (
-		wg           sync.WaitGroup
 		wbBR, etBR   *kvpb.BatchResponse
 		wbErr, etErr error
 	)
-	wg.Add(2)
-	go func() { defer wg.Done(); wbBR, wbErr = t.send(ctx, wbBA, true) }()
-	go func() { defer wg.Done(); etBR, etErr = t.send(ctx, etBA, true) }()
-	wg.Wait()
+	if t.db.clock.Now().WallTime-txn.MinTimestamp.WallTime > int64(txnPoisonGuardAge) {
+		// Poison guard: a pusher that finds one of the write batch's
+		// intents BEFORE the staged record exists judges expiry from
+		// MinTimestamp (kvserver's rec==nil push path) and would abort the
+		// record out from under a transaction older than TxnExpiration.
+		// For a transaction old enough to be at risk, forfeit the
+		// parallelism: create the staged record first, then send the
+		// writes.
+		etBR, etErr = t.send(ctx, etBA, true)
+		if etErr == nil {
+			wbBR, wbErr = t.send(ctx, wbBA, true)
+		}
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); wbBR, wbErr = t.send(ctx, wbBA, true) }()
+		go func() { defer wg.Done(); etBR, etErr = t.send(ctx, etBA, true) }()
+		wg.Wait()
+	}
 
 	if wbErr != nil || etErr != nil {
 		// Make the record's fate explicit before surfacing the error: a

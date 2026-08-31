@@ -201,9 +201,13 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 		return nil, kvpb.NewError(err)
 	}
 	if rec == nil {
-		// No record. Either the pushee never managed to create one, or the
-		// intent predates it (cannot happen: the record is created with the
-		// first write). Judge expiry from the transaction's birth.
+		// No record. Either the pushee never managed to create one, or its
+		// record creation is still in flight — a parallel or one-phase
+		// commit races the write batch against the record-creating EndTxn,
+		// so an intent CAN be observable before the record exists. Judge
+		// expiry from the transaction's birth; the coordinator's poison
+		// guard (kvclient's txnPoisonGuardAge) keeps transactions old
+		// enough to be judged expired here from entering that race.
 		if expired(req.Now, req.PusheeTxn.MinTimestamp) {
 			poisoned := &kvpb.Transaction{TxnMeta: req.PusheeTxn, Status: enginepb.ABORTED}
 			if err := putTxnRecord(b, key, poisoned); err != nil {
