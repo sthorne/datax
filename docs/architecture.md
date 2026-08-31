@@ -40,13 +40,20 @@ moves no data**.
    primary key 1, reads the current row, and issues a `Put` through the
    session's transaction.
 3. `kvclient`'s **TxnCoordinator** stamps the request with the transaction's
-   metadata; the **DistSender** looks up which range owns the key (range cache,
-   backed by `/meta/`) and sends a `BatchRequest` to a replica of that range.
+   metadata; the **DistSender** looks up which range owns each key (range
+   cache, backed by `/meta/`) and sends a `BatchRequest` to a replica of
+   that range — a batch spanning several ranges partitions into per-range
+   sub-batches sent **in parallel** (the record-creating one first).
 4. `kvserver` on the Raft leader checks the timestamp cache, then proposes the
    write to the range's Raft group. Once a quorum has appended it, each replica
    **applies** it: an MVCC *write intent* lands in Pebble.
 5. At `COMMIT`, the coordinator flips the transaction record to COMMITTED — a
    single Raft write — then asynchronously resolves intents to plain values.
+   Fast paths skip stages of this: an implicit transaction stages its
+   record in parallel with its writes (**parallel commit**), and one whose
+   whole write set fits a single range commits in **one Raft proposal**
+   with no record or intents at all (**one-phase commit**) — see
+   [transactions](transactions.md).
 
 ## Life of a read
 
