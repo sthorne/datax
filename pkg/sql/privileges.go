@@ -1,0 +1,145 @@
+package sql
+
+import (
+	"context"
+
+	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/parser"
+)
+
+// Authorization. root is all-powerful; members of the admin role
+// (GRANT ADMIN TO user; root implicitly a member) may run DDL and manage
+// users and grants; everyone else needs per-table privileges. In insecure
+// (trust) mode the username is client-claimed, so enforcement is advisory
+// there — documented in docs/sql.md.
+
+// tablePrivs are the grantable per-table privileges.
+var tablePrivs = map[string]bool{"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true}
+
+// requiresAdmin reports whether a statement is restricted to the admin
+// role (DDL, user management, grants).
+func requiresAdmin(stmt parser.Statement) bool {
+	switch stmt.(type) {
+	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable,
+		*parser.CreateIndex, *parser.CreateUser, *parser.DropUser, *parser.GrantRevoke:
+		return true
+	}
+	return false
+}
+
+// isAdmin reports whether the session's user is root or an admin-role
+// member.
+func (s *Session) isAdmin(ctx context.Context, txn *kvclient.Txn) (bool, error) {
+	if s.user == "root" {
+		return true, nil
+	}
+	v, err := txn.Get(ctx, keys.AdminUserKey(s.user))
+	if err != nil {
+		return false, err
+	}
+	return v != nil, nil
+}
+
+// checkAdmin returns 42501 unless the user is root or an admin.
+func (s *Session) checkAdmin(ctx context.Context, txn *kvclient.Txn) error {
+	ok, err := s.isAdmin(ctx, txn)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return newErrf(CodeInsufficientPriv, "permission denied: %q is not an admin", s.user)
+	}
+	return nil
+}
+
+// checkTablePriv returns 42501 unless the user holds priv on the table
+// (or is root/admin).
+func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) error {
+	if s.user == "root" {
+		return nil
+	}
+	for _, p := range desc.Privileges[s.user] {
+		if p == priv {
+			return nil
+		}
+	}
+	ok, err := s.isAdmin(ctx, txn)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return newErrf(CodeInsufficientPriv, "permission denied for table %q (%s as user %q)", desc.Name, priv, s.user)
+	}
+	return nil
+}
+
+// execGrantRevoke applies a GRANT/REVOKE (the admin gate has already run).
+func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *parser.GrantRevoke) (*Result, error) {
+	tag := "GRANT"
+	if t.Revoke {
+		tag = "REVOKE"
+	}
+
+	if t.Admin {
+		if t.User == "root" {
+			return nil, newErrf(CodeFeatureNotSupported, "root's admin membership is implicit and cannot be changed")
+		}
+		key := keys.AdminUserKey(t.User)
+		if t.Revoke {
+			if err := txn.Delete(ctx, key); err != nil {
+				return nil, err
+			}
+		} else if err := txn.Put(ctx, key, []byte("1")); err != nil {
+			return nil, err
+		}
+		return &Result{Tag: tag}, nil
+	}
+
+	// Expand and validate the privilege list.
+	set := map[string]bool{}
+	for _, p := range t.Privileges {
+		if p == "ALL" {
+			for tp := range tablePrivs {
+				set[tp] = true
+			}
+			continue
+		}
+		if !tablePrivs[p] {
+			return nil, newErrf(CodeSyntaxError, "unknown privilege %q", p)
+		}
+		set[p] = true
+	}
+
+	shared, err := s.cat.Lookup(ctx, txn, t.Table)
+	if err != nil {
+		return nil, err
+	}
+	desc := shared.Clone()
+	if desc.Privileges == nil {
+		desc.Privileges = map[string][]string{}
+	}
+	cur := map[string]bool{}
+	for _, p := range desc.Privileges[t.User] {
+		cur[p] = true
+	}
+	for p := range set {
+		cur[p] = !t.Revoke
+	}
+	var next []string
+	for _, p := range []string{"SELECT", "INSERT", "UPDATE", "DELETE"} { // stable order
+		if cur[p] {
+			next = append(next, p)
+		}
+	}
+	if len(next) == 0 {
+		delete(desc.Privileges, t.User)
+	} else {
+		desc.Privileges[t.User] = next
+	}
+	if err := s.cat.Update(ctx, txn, desc); err != nil {
+		return nil, err
+	}
+	return &Result{Tag: tag}, nil
+}

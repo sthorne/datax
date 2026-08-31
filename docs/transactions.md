@@ -60,35 +60,166 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
 
-## Serializability: retry-only
+## Serializability: refresh, then retry
 
-All reads happen at the txn's `readTS`. All writes must also commit at
-`readTS`. Events that force the write timestamp above `readTS`:
+All reads happen at the txn's `readTS`, and the commit condition — enforced
+in exactly one place, the transaction record flip — is that `writeTS`
+still equals `readTS`. Events that force the write timestamp above
+`readTS`:
 
-- the range's **timestamp cache** shows a later read of a key we want to write
-  (write after read),
+- the range's **timestamp cache** shows a later read overlapping a key we
+  want to write (write after read),
 - `WriteTooOld`: a committed version exists above our write timestamp,
 - an uncertainty restart.
 
-v1 does **not** track read spans, so it cannot prove reads would be unchanged
-at the higher timestamp ("read refresh"). Instead:
+The coordinator tracks every span the transaction has read (up to a cap;
+beyond it refresh is disabled). On any of the conflicts above it attempts a
+**read refresh**: for each read span it sends a `Refresh` request verifying
+no other transaction wrote into the span within `(readTS, newTS]` — any
+committed version there, or any foreign intent (which could commit inside
+the window), fails the refresh. Refresh runs on the ordinary read path, so
+it holds shared latches and **bumps the timestamp cache to the new read
+timestamp before evaluating** — after a success, no write can land beneath
+the new `readTS` on that span without being pushed above it. On success the
+transaction adopts `readTS = writeTS = newTS` and re-issues the conflicting
+operation; the commit condition then holds again without a restart.
 
-- If the transaction is an implicit single statement (auto-commit) the server
-  retries it transparently at a new timestamp with bumped priority.
-- Otherwise the client gets PostgreSQL error **`40001 serialization_failure`**
-  — the standard signal that well-behaved PG/CRDB applications already retry.
+Only when refresh fails (a read was actually invalidated) does the conflict
+surface:
 
-This is strictly correct, just slower under contention. Read refresh is the
-first planned post-v1 improvement.
+- an implicit single statement (auto-commit) is retried transparently at a
+  new timestamp with bumped priority;
+- an explicit transaction gets PostgreSQL error **`40001
+  serialization_failure`** — the standard signal that well-behaved PG/CRDB
+  applications already retry.
+
+Intents laid at the pre-refresh write timestamp are fine: resolution moves
+provisional versions to the final commit timestamp, and moving a write's
+timestamp up never violates the write-beneath-read rule.
+
+### Span latches
+
+Each range's leader serializes overlapping requests with per-span latches
+(v2; v1 used one range-wide lock). The invariants:
+
+- **L1** — any two operations with overlapping key spans, at least one of
+  which writes, are fully serialized from timestamp-cache check to apply
+  visibility (a write holds its exclusive latches until it has applied).
+- **L2** — a read bumps the timestamp cache *before* evaluating, while
+  holding its shared latches.
+
+Together these give the write-beneath-read guarantee per key: an
+overlapping write either applied before the read evaluated, or its
+timestamp-cache check observed the read's bump and pushed it above the
+read. Disjoint operations need no ordering — a write cannot invalidate a
+read it does not overlap — so they run in parallel. Transaction-record
+operations latch under their **anchor key** (the record's addressed key),
+and splits take a whole-range exclusive latch.
 
 ### Timestamp cache
 
-Per range, leader-side. v1 keeps a single **high-water mark**: the maximum
-read timestamp served. Writers at or below it get pushed above (→ retry). It
-is bumped on every read, and to `now()` when a replica acquires leadership
-(a new leader cannot know what the old one served). Coarse — any read pushes
-all writers on the range — but small and correct. An interval cache is future
-work.
+Per range, leader-side, and **interval-based** (v2; v1 kept a single
+high-water mark that made every read push every writer on the range). Each
+read records its key spans and timestamp; a write consults only entries
+that **overlap** its own spans, so disjoint readers and writers never
+interact. Structure: a range-wide **floor** timestamp plus two bounded
+generations of span entries. Bumps append to the current generation; when
+it fills, the older generation folds into the floor (the max of its
+timestamps — conservative, never incorrect) and rotation continues. Memory
+stays bounded per range, recent reads keep full span precision, and old
+reads age into range-wide coverage. The floor is also set directly by
+whole-range events: leadership acquisition (a new leader cannot know what
+the old one served) and, span-scoped to the absorbed keys, range merges.
+Entries carry the reader's transaction ID: a transaction writing at
+exactly the timestamp of its *own* read is allowed (read-then-write is the
+normal pattern); anyone else at or below an overlapping entry is not.
+
+A transactional write that fails the check is **pushed, not rejected**:
+its intents simply land above the cache, the response carries the
+forwarded write timestamp, and the coordinator settles up at commit —
+refresh the reads, then the EndTxn (which writes no MVCC versions and is
+exempt from the check) flips the record at the pushed timestamp. Rejecting
+instead would let a steady reader starve every writer of a hot key: the
+coordinator's refresh round trip always loses the race against the next
+read's bump. Non-transactional writes, which have no reads to protect, are
+still bounced with a retry timestamp and simply resent above it.
+
+Because a multi-range batch executes as per-range sub-batches, any ONE of
+which may be pushed by its own range's cache, the router merges the
+forwarded timestamps: the batch response reports the MAXIMUM write
+timestamp across sub-batches. Overwriting with the last sub-batch's
+response would let an earlier push vanish — the commit would then flip
+(and resolution would re-timestamp the pushed intent DOWN to) a timestamp
+already served to a reader, silently un-happening a read. The
+`TestMultiRangePushCommitsAbovePushedWrite` regression pins this.
+
+### Locking reads (SELECT FOR UPDATE)
+
+The symmetric read-modify-write pattern — two transactions read the same
+rows, then each invalidates the other's reads on write — is a doomed race
+under plain reads: refresh cannot help (the read spans really were
+overwritten), so both restart, repeatedly. `SELECT ... FOR UPDATE` breaks
+it by serializing upfront: the row fetch is followed by a **locking read**
+per selected row, a Get evaluated on the WRITE path that atomically
+re-verifies the row at the transaction's read timestamp (any newer
+committed version surfaces as a retryable conflict — the fetch-then-lock
+gap cannot admit a stale read) and lays a write intent pinning the
+observed state — the current value for an existing row, a tombstone for an
+absent one. The second transaction's lock then queues behind the intent
+via the ordinary push machinery instead of racing to a restart. The
+intent commits as a version carrying the same bytes, invisible to
+readers' results. On the bank workload (100 hot accounts, 8 workers) this
+raises committed throughput ~4× and roughly halves 40001s.
+
+### Savepoints
+
+`SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name`
+implement partial rollback with PostgreSQL semantics, including escaping
+the in-failed-transaction state (`25P02`) — the recipe driver retry loops
+and ORMs rely on. Every write carries a **sequence number** (one per
+statement), and each intent keeps the transaction's own superseded
+provisional values for its key in an **intent history**. A savepoint
+captures the current sequence plus the coordinator's write-set and
+read-span positions; `ROLLBACK TO` sends a replicated rollback per
+written key that **physically restores** each intent to its newest state
+at or below the savepoint's sequence (or removes it when the key was
+first written after the savepoint). Because the engine state after the
+rollback simply *is* the savepoint state, reads need no sequence
+awareness and commit resolves the restored values like any others. A
+transaction whose coordinator was already aborted (a serialization
+failure) cannot be rescued by savepoint rollback — the 40001 stands, as
+in CockroachDB.
+
+### Parallel commits
+
+Commit latency was two sequential consensus rounds: lay the final
+intents, then flip the record. Pipelined transactions (the auto-retrying
+implicit path uses this; explicit BEGIN blocks commit classically) defer
+each statement's write batch — any operation needing read-your-writes
+flushes it transparently — and Commit then sends the deferred batch and
+an EndTxn IN PARALLEL. The EndTxn carries the batch's keys as an
+**in-flight write set** and lands the record in a third state, `STAGING`:
+the transaction is **implicitly committed** the moment every in-flight
+write has applied at or below the staged timestamp. The coordinator
+returns to the client after that one round and finalizes (STAGING →
+COMMITTED, then intent resolution) asynchronously. If anything forwarded
+the writes above the staged timestamp, the commit settles classically —
+refresh, then a finalizing EndTxn — and on failure the record is
+explicitly aborted so recovery agrees with the reported error.
+
+A pusher that finds a `STAGING` record runs **status recovery** instead
+of aborting it (expiry included — an implicitly committed transaction
+must never be aborted): it probes each staged in-flight key with a
+**prevention read** at the staged timestamp. The ordinary read path bumps
+the timestamp cache before evaluating (invariant L2), so a write found
+missing can never land at or below the staged timestamp afterwards — the
+verdict is stable. All present → a replicated `RecoverTxn` finalizes the
+record COMMITTED; any missing → ABORTED. Recovery and the coordinator's
+own finalize are idempotent and commute. GC never reclaims `STAGING`
+records.
+
+On the write-only kv workload (implicit UPDATEs), the shorter
+intent-hold window roughly triples committed throughput.
 
 ## Conflicts and pushes
 
@@ -102,12 +233,75 @@ pushee's anchor range:
   - otherwise poll with backoff up to ~2s, then surface `40001` to the client.
 
 Priorities are random at birth and bumped on retries, so starvation is
-unlikely; the timeout crudely breaks deadlocks. A real deadlock detector is
-out of scope for v1.
+unlikely. Genuine deadlocks are broken by **distributed detection over
+advertised wait edges**: a coordinator blocked in a push loop publishes
+"waiting for X" on its own transaction record (immediately on change, and
+with every heartbeat), and each blocked pusher periodically walks the
+chain with query-only pushes — reads of the records along the way. A walk
+that arrives back at the walker has found a cycle; every walker picks the
+same victim deterministically (lowest priority, transaction ID as
+tie-break) and force-aborts it — a self-chosen victim aborts its own
+record at once so its partners unblock on their next poll. Wait edges are
+advisory and may be stale, so a phantom cycle costs at worst one spurious
+retryable abort, never an anomaly. Constructed 2- and 3-cycles resolve in
+a few poll rounds (hundreds of milliseconds). With detection in place the
+conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
+waiters queueing behind a slow-but-live lock holder are no longer aborted
+by the clock.
 
-Reads below a committed value's timestamp never block (MVCC). v1 pushes on
-*any* foreign intent found on a read path, even one above the read timestamp —
-reading around newer intents is easy future work.
+Reads below a committed value's timestamp never block (MVCC). A foreign
+intent strictly above both the read timestamp and the uncertainty limit is
+**read beneath**, not pushed: resolution only moves a write's timestamp
+forward, so however the intent resolves, its version stays invisible to
+the read and the committed value below is the correct answer. Only intents
+at or below the read timestamp — or inside the uncertainty window, where
+like a committed version they might causally precede the read — trigger a
+push.
+
+## Garbage collection
+
+Old MVCC versions and finalized transaction records are reclaimed by a
+leader-driven, **replicated** GC (v2). Each store's housekeeping loop
+periodically computes `threshold = now − GCTTL` (default 25h) and, for every
+range it leads, enumerates garbage from one consistent engine snapshot:
+
+- per user key, the newest version at or below the threshold is the
+  **survivor** — exactly what a read just above the threshold observes;
+  every older version is garbage, and the survivor itself is too if it is a
+  deletion tombstone;
+- keys holding an unresolved intent are skipped entirely (their history is
+  in flux);
+- finalized (committed/aborted) transaction records whose timestamps are
+  TTL-old are garbage, unless the range still holds an intent of that
+  transaction.
+
+The leader proposes a `GCRequest` naming the exact keys to delete plus the
+new threshold. Replication is what makes this safe and simple: every
+replica deletes the same bytes (cross-replica checksum equality is asserted
+in tests), the threshold is replicated state that survives crashes,
+leadership changes, and preseed snapshots, and the command's whole-range
+exclusive latch serializes it against reads (invariant L1). Enumerating
+from a snapshot cannot race concurrent writes: committed versions are
+immutable, live transactions write far above the threshold, and intent
+resolution only touches keys the enumeration skipped.
+
+Correctness rules enforced around the threshold:
+
+- **Reads at or below the threshold are rejected**, non-retryably — the
+  versions they would need may be gone. Live transactions never trip this
+  (TTL ≫ transaction lifetime, and refresh/uncertainty only move `readTS`
+  forward).
+- **Resurrection guard**: `createTxnRecord` rejects any transaction whose
+  `MinTimestamp` is at or below the threshold, so a zombie coordinator
+  cannot recreate a reclaimed record as PENDING after having possibly been
+  aborted. Deterministic, because the threshold is replicated.
+- **Committed records are proof, and proof is kept until spent**: a commit
+  stores the transaction's write set on its record, and GC resolves every
+  one of those intents — wherever their ranges live — before reclaiming a
+  COMMITTED record. An intent orphaned by a coordinator crash therefore
+  always resolves as committed, never as expired-and-aborted. (ABORTED
+  records stay collectible outright: a pusher finding a record-less
+  TTL-old intent aborts it, which is the correct outcome either way.)
 
 ## Invariants (asserted in tests)
 
@@ -116,9 +310,11 @@ reading around newer intents is easy future work.
 3. At commit, `writeTS == readTS` (retry-only serializability).
 4. The uncertainty interval is enforced on every read of non-local data.
 5. A transaction's reads observe its own latest writes.
+6. After GC, replicas of a range remain byte-identical, and no read ever
+   observes a state that GC'd versions could have distinguished.
 
-## Known gaps (deliberate, v1)
+## Known gaps (deliberate)
 
-MVCC garbage collection; read refresh; parallel commits; savepoints;
-interval-based timestamp cache; deadlock detection; reading below foreign
-intents' timestamps.
+Write pipelining WITHIN a transaction (async consensus for every
+statement, not just the final batch); ranged (non-point) requests in
+deferred batches.

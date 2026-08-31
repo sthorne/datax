@@ -36,6 +36,13 @@ const DefaultReplicationFactor = 3
 // DefaultMaxClockOffset bounds tolerated physical clock skew between nodes.
 const DefaultMaxClockOffset = 500 * time.Millisecond
 
+// DefaultGCTTL is how long MVCC history is retained before garbage
+// collection reclaims it.
+const DefaultGCTTL = 25 * time.Hour
+
+// DefaultGCInterval is how often each store's GC loop scans its led ranges.
+const DefaultGCInterval = 60 * time.Second
+
 // Tier is one element of a node's ordered locality, e.g. region=us-east.
 type Tier struct {
 	Key   string `json:"key"`

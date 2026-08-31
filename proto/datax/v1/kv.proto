@@ -1,0 +1,435 @@
+// Binary (protobuf) encodings for the HOT KV paths: the batch RPC bodies
+// exchanged between gateways and range leaders, and the raft log's command
+// payload (see issue #8). Cold paths — join, admin, status, snapshots,
+// confchange context, replica state, MVCC intent metadata — stay JSON for
+// debuggability; profiles put them in the noise.
+//
+// These messages mirror the hand-written Go types in pkg/kvpb (and the
+// kvserver raftCommand); the Go types remain the in-memory API, converted
+// at the wire/log boundary by pkg/kvpb/proto.go and pkg/kvserver.
+syntax = "proto3";
+
+package datax.v1;
+
+option go_package = "github.com/sthorne/datax/pkg/rpc/rpcpb";
+
+import "datax/v1/transport.proto";
+
+// ---- shared data types ----
+
+message TxnMeta {
+  bytes id = 1; // 16-byte UUID
+  bytes key = 2; // anchor key
+  int32 epoch = 3;
+  Hlc write_timestamp = 4;
+  Hlc min_timestamp = 5;
+  int32 priority = 6;
+  int32 sequence = 7; // orders the txn's own writes (savepoints)
+}
+
+message Transaction {
+  TxnMeta meta = 1;
+  string name = 2;
+  int32 status = 3; // enginepb.TxnStatus
+  Hlc read_timestamp = 4;
+  Hlc last_heartbeat = 5;
+  repeated bytes intent_keys = 6;
+  bytes waiting_for = 7; // 16-byte UUID; deadlock-detection wait edge
+  bytes waiting_for_key = 8;
+  repeated bytes in_flight_keys = 9; // STAGING records: staged write set
+}
+
+message ReplicaDescriptor {
+  int64 node_id = 1;
+  int64 store_id = 2;
+  int64 replica_id = 3;
+}
+
+message RangeDescriptor {
+  int64 range_id = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated ReplicaDescriptor replicas = 4;
+  int64 next_replica_id = 5;
+  int64 generation = 6;
+}
+
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message Intent {
+  bytes key = 1;
+  TxnMeta txn = 2;
+}
+
+// ---- requests ----
+
+message RequestHeader {
+  bytes key = 1;
+  bytes end_key = 2;
+}
+
+message GetRequest {
+  RequestHeader header = 1;
+  bool for_update = 2; // locking read (see pkg/kvpb)
+}
+
+message PutRequest {
+  RequestHeader header = 1;
+  bytes value = 2;
+}
+
+message DeleteRequest {
+  RequestHeader header = 1;
+}
+
+message IncrementRequest {
+  RequestHeader header = 1;
+  int64 by = 2;
+}
+
+message ScanRequest {
+  RequestHeader header = 1;
+  int64 max_rows = 2;
+  bool for_update = 3; // locking scan (see pkg/kvpb)
+}
+
+message EndTxnRequest {
+  RequestHeader header = 1;
+  bool commit = 2;
+  repeated bytes intent_keys = 3;
+  repeated bytes in_flight = 4; // parallel commit: stages the record
+}
+
+message HeartbeatTxnRequest {
+  RequestHeader header = 1;
+  Hlc now = 2;
+  bytes waiting_for = 3;
+  bytes waiting_for_key = 4;
+}
+
+message PushTxnRequest {
+  RequestHeader header = 1;
+  Transaction pusher_txn = 2;
+  TxnMeta pushee_txn = 3;
+  bool push_abort = 4;
+  Hlc now = 5;
+  bool query_only = 6;
+  bool force_abort = 7;
+}
+
+message ResolveIntentRequest {
+  RequestHeader header = 1;
+  bytes txn_id = 2;
+  int32 status = 3;
+  Hlc commit_ts = 4;
+}
+
+message RollbackIntentRequest {
+  RequestHeader header = 1;
+  bytes txn_id = 2;
+  int32 sequence = 3;
+}
+
+message RefreshRequest {
+  RequestHeader header = 1;
+  Hlc from_ts = 2;
+}
+
+message GcVersion {
+  bytes key = 1;
+  Hlc ts = 2;
+  int64 bytes_size = 3;
+}
+
+message GcRequest {
+  RequestHeader header = 1;
+  Hlc threshold = 2;
+  repeated GcVersion versions = 3;
+  repeated bytes txn_record_keys = 4;
+}
+
+message TruncateLogRequest {
+  RequestHeader header = 1;
+  uint64 index = 2;
+  uint64 term = 3;
+}
+
+message AdminSplitRequest {
+  RequestHeader header = 1;
+}
+
+message AdminChangeReplicasRequest {
+  RequestHeader header = 1;
+  int64 add_node = 2;
+  int64 remove_node = 3;
+}
+
+message AdminTransferLeaseRequest {
+  RequestHeader header = 1;
+  int64 target = 2;
+}
+
+message AdminMergeRequest {
+  RequestHeader header = 1;
+}
+
+message SubsumeRequest {
+  RequestHeader header = 1;
+  int64 merge_into = 2;
+}
+
+message UnfreezeRequest {
+  RequestHeader header = 1;
+}
+
+message RequestUnion {
+  oneof value {
+    GetRequest get = 1;
+    PutRequest put = 2;
+    DeleteRequest delete = 3;
+    IncrementRequest increment = 4;
+    ScanRequest scan = 5;
+    EndTxnRequest end_txn = 6;
+    HeartbeatTxnRequest heartbeat_txn = 7;
+    PushTxnRequest push_txn = 8;
+    ResolveIntentRequest resolve_intent = 9;
+    RefreshRequest refresh = 10;
+    RollbackIntentRequest rollback_intent = 19;
+    RecoverTxnRequest recover_txn = 20;
+    GcRequest gc = 11;
+    TruncateLogRequest truncate_log = 12;
+    AdminSplitRequest admin_split = 13;
+    AdminChangeReplicasRequest admin_change_replicas = 14;
+    AdminTransferLeaseRequest admin_transfer_lease = 15;
+    AdminMergeRequest admin_merge = 16;
+    SubsumeRequest subsume = 17;
+    UnfreezeRequest unfreeze = 18;
+  }
+}
+
+message BatchHeader {
+  Hlc timestamp = 1;
+  Transaction txn = 2;
+  int64 range_id = 3;
+  bool create_txn_record = 4;
+  bool read_inconsistent = 5;
+  // stale_read marks a read-only batch a follower may serve at its closed
+  // timestamp (readTS <= closedTS); see follower reads in the docs.
+  bool stale_read = 6;
+}
+
+message BatchRequest {
+  BatchHeader header = 1;
+  repeated RequestUnion requests = 2;
+}
+
+// ---- responses ----
+
+message GetResponse {
+  bytes value = 1;
+  bool found = 2; // distinguishes empty value from not-found
+}
+
+message PutResponse {}
+
+message DeleteResponse {}
+
+message IncrementResponse {
+  int64 new_value = 1;
+}
+
+message ScanResponse {
+  repeated KeyValue rows = 1;
+  bytes resume = 2;
+}
+
+message EndTxnResponse {
+  Hlc commit_timestamp = 1;
+}
+
+message HeartbeatTxnResponse {
+  int32 status = 1;
+}
+
+message PushTxnResponse {
+  int32 status = 1;
+  Hlc commit_ts = 2;
+  bytes waiting_for = 3;
+  bytes waiting_for_key = 4;
+  int32 priority = 5;
+  repeated bytes in_flight_keys = 6; // STAGING: recovery input
+}
+
+message RecoverTxnRequest {
+  RequestHeader header = 1;
+  bytes txn_id = 2;
+  bool commit = 3;
+}
+
+message RecoverTxnResponse {
+  int32 status = 1;
+}
+
+message ResolveIntentResponse {}
+
+message RefreshResponse {}
+
+message RollbackIntentResponse {}
+
+message GcResponse {}
+
+message TruncateLogResponse {}
+
+message AdminSplitResponse {
+  RangeDescriptor left = 1;
+  RangeDescriptor right = 2;
+}
+
+message AdminChangeReplicasResponse {
+  RangeDescriptor desc = 1;
+}
+
+message AdminTransferLeaseResponse {
+  RangeDescriptor desc = 1;
+}
+
+message AdminMergeResponse {
+  RangeDescriptor desc = 1;
+}
+
+message SubsumeResponse {}
+
+message UnfreezeResponse {}
+
+message ResponseUnion {
+  oneof value {
+    GetResponse get = 1;
+    PutResponse put = 2;
+    DeleteResponse delete = 3;
+    IncrementResponse increment = 4;
+    ScanResponse scan = 5;
+    EndTxnResponse end_txn = 6;
+    HeartbeatTxnResponse heartbeat_txn = 7;
+    PushTxnResponse push_txn = 8;
+    ResolveIntentResponse resolve_intent = 9;
+    RefreshResponse refresh = 10;
+    RollbackIntentResponse rollback_intent = 19;
+    RecoverTxnResponse recover_txn = 20;
+    GcResponse gc = 11;
+    TruncateLogResponse truncate_log = 12;
+    AdminSplitResponse admin_split = 13;
+    AdminChangeReplicasResponse admin_change_replicas = 14;
+    AdminTransferLeaseResponse admin_transfer_lease = 15;
+    AdminMergeResponse admin_merge = 16;
+    SubsumeResponse subsume = 17;
+    UnfreezeResponse unfreeze = 18;
+  }
+}
+
+message BatchResponse {
+  Transaction txn = 1;
+  Hlc timestamp = 2;
+  repeated ResponseUnion responses = 3;
+}
+
+// ---- errors ----
+
+message NotLeaderError {
+  int64 range_id = 1;
+  int64 leader_hint = 2;
+}
+
+message RangeNotFoundError {
+  int64 range_id = 1;
+}
+
+message RangeKeyMismatchError {
+  bytes request_key = 1;
+  repeated RangeDescriptor actual_descriptors = 2;
+}
+
+message WriteIntentError {
+  repeated Intent intents = 1;
+}
+
+message WriteTooOldError {
+  Hlc timestamp = 1;
+  Hlc actual_timestamp = 2;
+}
+
+message UncertaintyError {
+  Hlc read_timestamp = 1;
+  Hlc existing_timestamp = 2;
+}
+
+message TxnAbortedError {}
+
+message TxnRetryError {
+  Hlc retry_timestamp = 1;
+}
+
+message TxnNotFoundError {}
+
+message AmbiguousResultError {}
+
+// StorageOverloadedError: the leader's engine crossed its backpressure
+// thresholds; the write was shed and should be retried with backoff.
+message StorageOverloadedError {}
+
+message Error {
+  string message = 1;
+  NotLeaderError not_leader = 2;
+  RangeNotFoundError range_not_found = 3;
+  RangeKeyMismatchError range_key_mismatch = 4;
+  WriteIntentError write_intent = 5;
+  WriteTooOldError write_too_old = 6;
+  UncertaintyError uncertainty = 7;
+  TxnAbortedError txn_aborted = 8;
+  TxnRetryError txn_retry = 9;
+  TxnNotFoundError txn_not_found = 10;
+  AmbiguousResultError ambiguous = 11;
+  StorageOverloadedError storage_overloaded = 12;
+}
+
+// BatchEnvelope is the Batch RPC's response body: outcome or wire error.
+message BatchEnvelope {
+  BatchResponse response = 1;
+  Error error = 2;
+}
+
+// ---- raft log ----
+
+// RaftCommand is the raft log entry payload (entries are prefixed with a
+// one-byte format version; see pkg/kvserver's proposeCmd/applyEntry).
+message RaftCommand {
+  string id = 1;
+  BatchRequest batch = 2;
+  SplitTrigger split = 3;
+  MergeTrigger merge = 4;
+  // closed_ts publishes "no more writes at or below this timestamp" for
+  // the range. Log order makes the applied-index condition automatic: by
+  // the time a replica applies this command, every write below the
+  // timestamp has applied too.
+  Hlc closed_ts = 5;
+}
+
+message SplitTrigger {
+  RangeDescriptor left = 1;
+  RangeDescriptor right = 2;
+  // closed_ts carries the parent's closed timestamp into the new RHS, so
+  // no post-split write can land beneath a follower read the parent
+  // already served on the RHS span.
+  Hlc closed_ts = 3;
+}
+
+message MergeTrigger {
+  RangeDescriptor left = 1;
+  RangeDescriptor right = 2;
+  RangeDescriptor merged = 3;
+  uint64 right_applied_index = 4;
+  int64 right_size_bytes = 5;
+  Hlc right_gc_threshold = 6;
+}

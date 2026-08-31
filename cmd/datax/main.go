@@ -26,6 +26,10 @@ func main() {
 		err = runDemo(os.Args[2:])
 	case "sql":
 		err = runSQL(os.Args[2:])
+	case "bench":
+		err = runBench(os.Args[2:])
+	case "cert":
+		err = runCert(os.Args[2:])
 	case "debug":
 		err = runDebug(os.Args[2:])
 	case "help", "--help", "-h":
@@ -50,6 +54,9 @@ Usage:
                                        start a node, joining an existing cluster
   datax demo   [--nodes N]             run an in-process demo cluster across racks
   datax sql    --url <postgres-url>    interactive SQL shell
+  datax bench  <kv|bank|ingest|timeseries> [flags]  benchmark a running cluster over pgwire
+  datax cert   <create-ca|create-node|create-client>
+                                       manage TLS certificates (secure mode)
   datax debug  <subcommand>            cluster inspection and admin commands
   datax version                        print version
 

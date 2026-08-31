@@ -50,12 +50,15 @@ moves no data**.
 
 ## Life of a read
 
-Reads are served by the Raft **leader** of each range (v1 simplification:
-leaseholder = leader) using Raft **ReadIndex** to stay linearizable across
-leadership changes: the leader confirms its leadership with a quorum
-heartbeat, waits until its applied index reaches the confirmed commit index,
-then reads from local Pebble at the transaction's timestamp — no log entry
-needed.
+Reads are served by the Raft **leader** of each range (leaseholder =
+leader) using Raft **ReadIndex** to stay linearizable across leadership
+changes: the leader confirms its leadership — by default from its
+CheckQuorum **lease** with a wall-clock backstop, or with a quorum round
+trip when lease reads are disabled (see
+[replication & placement](replication-and-placement.md)) — waits until its
+applied index reaches the confirmed commit index, then reads from local
+Pebble at the transaction's timestamp — no log entry needed. Concurrent
+readers coalesce their confirmations.
 
 ## Correctness invariants
 
@@ -66,8 +69,11 @@ These are the load-bearing rules; tests assert them.
    the applied index are written in one atomic batch, so crash-recovery replay
    is idempotent.
 2. **Linearizable reads**: only via ReadIndex on the leader. On leadership
-   acquisition the timestamp cache low-water mark is bumped to `now()`, because
-   a new leader cannot know what reads the old leader served.
+   acquisition the timestamp cache floor is bumped to `now()`, because a new
+   leader cannot know what reads the old leader served. The one non-leader
+   read path is a **follower read**: a read pinned to a fixed timestamp at
+   or below the range's replicated closed timestamp (`AS OF SYSTEM TIME`),
+   which is linearizable *at that timestamp* by construction.
 3. **Clocks**: every RPC carries an HLC timestamp; receivers ratchet their
    clock. A remote clock further than `--max-offset` ahead is a fatal error.
    Reads treat values in `(readTS, readTS+maxOffset]` as uncertain and restart.

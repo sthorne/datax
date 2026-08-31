@@ -1,0 +1,74 @@
+// The datax internode transport: Raft messages, KV batches, cluster
+// membership, and admin operations. Payload bodies for KV/join/admin are
+// JSON-encoded Go types from pkg/kvpb and pkg/cluster (see those packages);
+// Raft messages are raftpb.Message bytes, opaque to the transport.
+syntax = "proto3";
+
+package datax.v1;
+
+option go_package = "github.com/sthorne/datax/pkg/rpc/rpcpb";
+
+service Internode {
+  // RaftMessages is a long-lived, unidirectional stream of Raft messages
+  // from one node to another (one stream per node pair, sender-initiated).
+  rpc RaftMessages(stream RaftEnvelope) returns (RaftAck);
+
+  // Batch executes a KV batch (JSON kvpb.BatchRequest / BatchResponse).
+  rpc Batch(Payload) returns (Payload);
+
+  // Join adds a node to the cluster (JSON cluster.JoinRequest / JoinResponse).
+  rpc Join(Payload) returns (Payload);
+
+  // Admin executes cluster admin operations (JSON cluster.AdminRequest /
+  // AdminResponse): split, rebalance, list ranges/nodes.
+  rpc Admin(Payload) returns (Payload);
+
+  // Snapshot streams a range snapshot to seed a new replica.
+  rpc Snapshot(stream SnapshotChunk) returns (SnapshotAck);
+}
+
+// Hlc carries an HLC reading; every message type embeds one so receivers can
+// ratchet their clocks (see docs/transactions.md).
+message Hlc {
+  int64 wall_time = 1;
+  int32 logical = 2;
+}
+
+message RaftEnvelope {
+  int64 range_id = 1;
+  uint64 to_replica = 2;
+  uint64 from_replica = 3;
+  int32 from_node = 4;
+  bytes message = 5; // marshaled raftpb.Message
+  Hlc now = 6;
+  // The sender's RPC address: receivers learn peer addresses from Raft
+  // traffic itself, so elections never depend on reading the (possibly
+  // leaderless) registry range.
+  string from_addr = 7;
+}
+
+message RaftAck {}
+
+message Payload {
+  bytes json = 1;
+  Hlc now = 2;
+  // proto carries a binary body on hot paths (Batch: BatchRequest out,
+  // BatchEnvelope back — see kv.proto). Exactly one of json/proto is set;
+  // receivers dispatch on which. Cold paths (join/admin) stay JSON.
+  bytes proto = 3;
+}
+
+message SnapshotChunk {
+  // First chunk carries the JSON header (range descriptor, applied index);
+  // subsequent chunks carry raw key/value data.
+  bytes header_json = 1;
+  repeated SnapshotKV kvs = 2;
+  Hlc now = 3;
+}
+
+message SnapshotKV {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message SnapshotAck {}

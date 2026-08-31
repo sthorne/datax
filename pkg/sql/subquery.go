@@ -1,0 +1,441 @@
+package sql
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/types"
+)
+
+// Uncorrelated subqueries: the inner SELECT is evaluated first, within the
+// same transaction, and its result is spliced in as a literal (scalar), a
+// value list ([NOT] IN), or a constant conjunct ([NOT] EXISTS). The parsed
+// AST is never mutated — resolution builds modified copies — so a prepared
+// statement re-evaluates its subqueries on every execution.
+
+// execSubSelect executes a subquery. A column that fails to resolve inside
+// the subquery's own scope is (almost always) a correlated reference,
+// which is not supported.
+func (s *Session) execSubSelect(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, params []types.Datum) (*Result, error) {
+	res, err := s.execSelect(ctx, txn, sub, params)
+	if err != nil {
+		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedColumn {
+			return nil, newErrf(CodeFeatureNotSupported, "correlated subqueries are not supported (%s)", serr.Msg)
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
+// execScalarSub evaluates (SELECT ...) used as a value: exactly one output
+// column; zero rows is NULL; more than one row is an error.
+func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, params []types.Datum) (types.Datum, error) {
+	res, err := s.execSubSelect(ctx, txn, sub, params)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	if len(res.Columns) != 1 {
+		return types.Datum{}, newErrf(CodeSyntaxError, "subquery must return only one column")
+	}
+	switch len(res.Rows) {
+	case 0:
+		return types.DNull, nil
+	case 1:
+		return res.Rows[0][0], nil
+	}
+	return types.Datum{}, newErrf(CodeCardinality, "more than one row returned by a subquery used as an expression")
+}
+
+// resolveValueExpr splices scalar subqueries inside a value expression.
+func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (parser.Expr, error) {
+	if e.Sub != nil {
+		d, err := s.execScalarSub(ctx, txn, e.Sub, params)
+		if err != nil {
+			return e, err
+		}
+		out := e
+		out.Sub, out.Lit = nil, &d
+		if out.Right != nil {
+			r, err := s.resolveValueExpr(ctx, txn, *out.Right, params)
+			if err != nil {
+				return e, err
+			}
+			out.Right = &r
+		}
+		return out, nil
+	}
+	if e.Right != nil {
+		r, err := s.resolveValueExpr(ctx, txn, *e.Right, params)
+		if err != nil {
+			return e, err
+		}
+		out := e
+		out.Right = &r
+		return out, nil
+	}
+	return e, nil
+}
+
+func exprHasSub(e parser.Expr) bool {
+	for {
+		if e.Sub != nil {
+			return true
+		}
+		if e.Right == nil {
+			return false
+		}
+		e = *e.Right
+	}
+}
+
+// resolveWhereSubs evaluates every subquery in a WHERE conjunction,
+// returning a spliced copy (or the original slice when nothing changed).
+func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, params []types.Datum) ([]parser.Comparison, error) {
+	changed := false
+	for _, cmp := range where {
+		if cmp.Sub != nil || exprHasSub(cmp.Value) {
+			changed = true
+			break
+		}
+		for _, ve := range cmp.Values {
+			if exprHasSub(ve) {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		return where, nil
+	}
+	out := make([]parser.Comparison, len(where))
+	copy(out, where)
+	for i := range out {
+		cmp := &out[i]
+		if exprHasSub(cmp.Value) {
+			v, err := s.resolveValueExpr(ctx, txn, cmp.Value, params)
+			if err != nil {
+				return nil, err
+			}
+			cmp.Value = v
+		}
+		switch cmp.Op {
+		case "IN", "NOT IN":
+			for j, ve := range cmp.Values {
+				if !exprHasSub(ve) {
+					continue
+				}
+				if &cmp.Values[0] == &where[i].Values[0] {
+					cmp.Values = append([]parser.Expr(nil), where[i].Values...)
+				}
+				v, err := s.resolveValueExpr(ctx, txn, ve, params)
+				if err != nil {
+					return nil, err
+				}
+				cmp.Values[j] = v
+			}
+			if cmp.Sub != nil {
+				res, err := s.execSubSelect(ctx, txn, cmp.Sub, params)
+				if err != nil {
+					return nil, err
+				}
+				if len(res.Columns) != 1 {
+					return nil, newErrf(CodeSyntaxError, "subquery must return only one column")
+				}
+				vals := make([]parser.Expr, len(res.Rows))
+				for j, r := range res.Rows {
+					d := r[0]
+					vals[j] = parser.Expr{Lit: &d}
+				}
+				cmp.Values, cmp.Sub = vals, nil
+			}
+		case "EXISTS", "NOT EXISTS":
+			probe := *cmp.Sub
+			probe.Limit = 1
+			res, err := s.execSubSelect(ctx, txn, &probe, params)
+			if err != nil {
+				return nil, err
+			}
+			exists := len(res.Rows) > 0
+			if cmp.Op == "NOT EXISTS" {
+				exists = !exists
+			}
+			op := "FALSE"
+			if exists {
+				op = "TRUE"
+			}
+			*cmp = parser.Comparison{Op: op}
+		}
+	}
+	return out, nil
+}
+
+// resolveSelectSubs evaluates the uncorrelated subqueries of a SELECT
+// (select list, WHERE, HAVING values) into a spliced copy. The derived
+// table (FROM subquery) is left alone — execDerivedSelect materializes it.
+func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*parser.Select, error) {
+	out := t
+	cloned := func() *parser.Select {
+		if out == t {
+			c := *t
+			out = &c
+		}
+		return out
+	}
+
+	where, err := s.resolveWhereSubs(ctx, txn, t.Where, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(where) > 0 && &where[0] != &t.Where[0] {
+		cloned().Where = where
+	}
+
+	for i, se := range t.Exprs {
+		if !exprHasSub(se.Expr) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, se.Expr, params)
+		if err != nil {
+			return nil, err
+		}
+		c := cloned()
+		if &c.Exprs[0] == &t.Exprs[0] {
+			c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+		}
+		c.Exprs[i].Expr = v
+	}
+
+	for i, hc := range t.Having {
+		if !exprHasSub(hc.Value) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, hc.Value, params)
+		if err != nil {
+			return nil, err
+		}
+		c := cloned()
+		if &c.Having[0] == &t.Having[0] {
+			c.Having = append([]parser.HavingCond(nil), t.Having...)
+		}
+		c.Having[i].Value = v
+	}
+	return out, nil
+}
+
+// resolveUpdateSubs evaluates subqueries in an UPDATE's SET values and
+// WHERE clause into a spliced copy.
+func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Update, params []types.Datum) (*parser.Update, error) {
+	out := t
+	where, err := s.resolveWhereSubs(ctx, txn, t.Where, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(where) > 0 && &where[0] != &t.Where[0] {
+		c := *t
+		c.Where = where
+		out = &c
+	}
+	for i, set := range t.Set {
+		if !exprHasSub(set.Value) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, set.Value, params)
+		if err != nil {
+			return nil, err
+		}
+		if out == t {
+			c := *t
+			out = &c
+		}
+		if &out.Set[0] == &t.Set[0] {
+			out.Set = append([]struct {
+				Column string
+				Value  parser.Expr
+			}(nil), t.Set...)
+		}
+		out.Set[i].Value = v
+	}
+	return out, nil
+}
+
+// resolveDeleteSubs evaluates subqueries in a DELETE's WHERE clause.
+func (s *Session) resolveDeleteSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*parser.Delete, error) {
+	where, err := s.resolveWhereSubs(ctx, txn, t.Where, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(where) > 0 && &where[0] != &t.Where[0] {
+		c := *t
+		c.Where = where
+		return &c, nil
+	}
+	return t, nil
+}
+
+// resolveInsertSubs evaluates scalar subqueries in INSERT values.
+func (s *Session) resolveInsertSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Insert, params []types.Datum) (*parser.Insert, error) {
+	out := t
+	for ri, row := range t.Rows {
+		for ci, e := range row {
+			if !exprHasSub(e) {
+				continue
+			}
+			v, err := s.resolveValueExpr(ctx, txn, e, params)
+			if err != nil {
+				return nil, err
+			}
+			if out == t {
+				c := *t
+				c.Rows = make([][]parser.Expr, len(t.Rows))
+				copy(c.Rows, t.Rows)
+				out = &c
+			}
+			if &out.Rows[ri][0] == &t.Rows[ri][0] {
+				out.Rows[ri] = append([]parser.Expr(nil), t.Rows[ri]...)
+			}
+			out.Rows[ri][ci] = v
+		}
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Derived tables: FROM (SELECT ...) AS alias.
+
+// stripAliasQualifier rewrites "alias.c" to "c" for the derived table's
+// alias in a possibly-qualified column name.
+func stripAliasQualifier(name, alias string) string {
+	if q, col := splitQualified(name); q == alias {
+		return col
+	}
+	return name
+}
+
+// derivedSelect returns a copy of the outer select with the derived
+// table's alias stripped from every column reference, so the synthetic
+// descriptor's bare column names resolve.
+func derivedSelect(t *parser.Select) *parser.Select {
+	c := *t
+	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+	for i := range c.Exprs {
+		if c.Exprs[i].Expr.Column != "" {
+			c.Exprs[i].Expr.Column = stripAliasQualifier(c.Exprs[i].Expr.Column, t.Alias)
+		}
+		if c.Exprs[i].AggCol != "" {
+			c.Exprs[i].AggCol = stripAliasQualifier(c.Exprs[i].AggCol, t.Alias)
+		}
+	}
+	c.Where = append([]parser.Comparison(nil), t.Where...)
+	for i := range c.Where {
+		c.Where[i].Column = stripAliasQualifier(c.Where[i].Column, t.Alias)
+	}
+	c.GroupBy = append([]string(nil), t.GroupBy...)
+	for i := range c.GroupBy {
+		c.GroupBy[i] = stripAliasQualifier(c.GroupBy[i], t.Alias)
+	}
+	c.Having = append([]parser.HavingCond(nil), t.Having...)
+	for i := range c.Having {
+		if c.Having[i].Column != "" {
+			c.Having[i].Column = stripAliasQualifier(c.Having[i].Column, t.Alias)
+		}
+	}
+	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
+	for i := range c.OrderBy {
+		c.OrderBy[i].Column = stripAliasQualifier(c.OrderBy[i].Column, t.Alias)
+	}
+	return &c
+}
+
+// derivedDesc builds the synthetic single-table descriptor for a
+// materialized subquery result.
+func derivedDesc(alias string, cols []ResultColumn) *catalog.TableDescriptor {
+	desc := &catalog.TableDescriptor{Name: alias}
+	for i, rc := range cols {
+		desc.Columns = append(desc.Columns, catalog.Column{
+			ID: catalog.ColumnID(i + 1), Name: strings.ToLower(rc.Name), Type: rc.Type,
+		})
+	}
+	return desc
+}
+
+// execDerivedSelect materializes the FROM subquery and runs the outer
+// select's pipeline (WHERE filter, grouping or projection, ORDER BY,
+// DISTINCT, LIMIT) over the in-memory rows.
+func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	if t.ForUpdate {
+		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed on a subquery")
+	}
+	inner, err := s.execSubSelect(ctx, txn, t.Derived, params)
+	if err != nil {
+		return nil, err
+	}
+	desc := derivedDesc(t.Alias, inner.Columns)
+	t = derivedSelect(t)
+
+	rows := make([]fetchedRow, 0, len(inner.Rows))
+	for _, r := range inner.Rows {
+		row := make(map[catalog.ColumnID]types.Datum, len(r))
+		for i, d := range r {
+			row[catalog.ColumnID(i+1)] = d
+		}
+		match, err := matchesWhere(t.Where, desc, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			rows = append(rows, fetchedRow{row: row})
+		}
+	}
+
+	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
+		return s.execGroupedOver(desc, rows, t, params)
+	}
+	if len(t.Having) > 0 {
+		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")
+	}
+
+	if len(t.OrderBy) > 0 {
+		if err := sortRows(desc, rows, t.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	proj, perr := resolveProjection(desc, t.Exprs)
+	if perr != nil {
+		return nil, perr
+	}
+	res := &Result{}
+	for _, p := range proj {
+		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type})
+	}
+	for _, fr := range rows {
+		out := make([]types.Datum, len(proj))
+		for i, p := range proj {
+			if p.expr != nil {
+				d, err := evalExpr(*p.expr, desc, fr.row, params)
+				if err != nil {
+					return nil, err
+				}
+				out[i] = d
+				continue
+			}
+			d, ok := fr.row[p.col.ID]
+			if !ok {
+				d = types.DNull
+			}
+			out[i] = d
+		}
+		res.Rows = append(res.Rows, out)
+	}
+	if t.Distinct {
+		res.Rows = dedupeRows(res.Rows)
+	}
+	if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
+		res.Rows = res.Rows[:t.Limit]
+	}
+	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
+	return res, nil
+}
