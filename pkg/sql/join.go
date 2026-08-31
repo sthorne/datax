@@ -195,6 +195,12 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cmp.Op == "FALSE" {
 			return false, nil
 		}
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// Containment is single-table only. This must stay an explicit
+			// refusal: the trailing operator switch would silently drop
+			// every row otherwise.
+			return false, newErrf(CodeFeatureNotSupported, "JSONB containment @> is not supported in join queries")
+		}
 		if len(cmp.Path) > 0 {
 			return false, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
 		}
@@ -284,6 +290,11 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 	for _, cmp := range where {
 		if cmp.Column == "" {
 			continue // constant conjuncts stay in the post-join filter
+		}
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// Refused before the base scan (so EXPLAIN errors too), and
+			// never pushed — see evalJoinWhere.
+			return nil, newErrf(CodeFeatureNotSupported, "JSONB containment @> is not supported in join queries")
 		}
 		if len(cmp.Path) > 0 {
 			return nil, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")

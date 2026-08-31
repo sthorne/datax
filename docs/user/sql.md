@@ -39,6 +39,12 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
   JSONB cannot be a primary key or indexed, and `->`/`->>` work in
   single-table queries only.
+- Containment: `j @> '{"tags":["go"]}'` — PostgreSQL semantics (objects
+  contain recursively, arrays contain each right element somewhere, a
+  top-level array contains a matching scalar), numbers compared
+  numerically (`1` contains `1.0`). Works in WHERE — including `NOT`,
+  `OR`, a `->` path on the left, and the WHERE of grouped queries — but
+  is single-table only and always a filter (no index acceleration).
 - Every type except JSONB can appear in primary keys and indexes.
 
 ## DDL
@@ -74,7 +80,7 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 
 - **WHERE** supports full boolean logic: `AND`, `OR`, `NOT`, and
   parentheses over conditions of the form `expr op value`
-  (`= != < <= > >=`), `col IS [NOT] NULL`,
+  (`= != < <= > >=`, jsonb `j @> '...'`), `col IS [NOT] NULL`,
   `col [NOT] IN (list | SELECT ...)`, `[NOT] EXISTS (SELECT ...)`,
   `j ->> 'k' op value`. The left side may be a computed expression
   (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a literal,

@@ -199,8 +199,8 @@ func ParseDecimal(s string) (Datum, error) {
 
 // ParseJSONB parses and normalizes a JSON document: objects re-marshal
 // with sorted keys (duplicate keys: last wins), whitespace is dropped,
-// and HTML characters are NOT escaped. Numbers round-trip through
-// float64 — very large integers lose precision (documented).
+// and HTML characters are NOT escaped. Numbers decode as json.Number, so
+// they keep their exact ingest text — integers beyond float64 survive.
 func ParseJSONB(s string) (Datum, error) {
 	var v any
 	dec := json.NewDecoder(strings.NewReader(s))

@@ -68,10 +68,24 @@ SHOW TABLES
   (`j -> 'a' ->> 'b'`); missing keys and non-objects yield NULL.
   Single-table queries only — path operators in join queries refuse with
   `0A000` — and path conjuncts never become index bounds.
+- JSONB containment `@>` (and its NOT-elimination twin `NOT @>`): decoded
+  with `json.Number` and walked structurally — objects contain
+  recursively, arrays contain each right element via SOME left element,
+  a top-level array contains a matching scalar (top level only), scalars
+  compare by value with numbers compared NUMERICALLY through the decimal
+  package (`1` contains `1.0`; integers beyond float64 keep fidelity —
+  note the deliberate asymmetry with jsonb `=`, which stays normalized-
+  text comparison). Accepted only as a plain-column conjunct (optional
+  `->` path on the left, which must still produce jsonb); not in HAVING
+  or after a computed left-hand side; refused in join queries with
+  `0A000` (both in the filter and before base-scan pushdown — an
+  unhandled op there would silently drop rows). Never an index bound —
+  always a post-fetch filter; inverted indexes are out of scope.
 - Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
   omit the column store the default; an explicit NULL stays NULL.
-- WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
-  plus `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, and
+- WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`
+  (plus jsonb `@>` on jsonb columns), `col IS [NOT] NULL`,
+  `col [NOT] IN (list | SELECT ...)`, and
   `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, a
   column reference, or a scalar subquery `(SELECT ...)` (correlated in
   WHERE; uncorrelated ones also work in INSERT values and UPDATE SET).
@@ -111,7 +125,9 @@ join reordering (join order = syntactic order) and joins beyond 8 tables,
 expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
-JSONB indexing and containment (`@>`), path operators in join queries,
+JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
+`<@` and the `?`/`?|`/`?&` existence operators,
+path operators in join queries,
 DEFAULT expressions beyond constants.
 
 ## Catalog

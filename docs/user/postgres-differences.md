@@ -36,10 +36,13 @@ syntax error or `0A000` feature not supported):
   canonical form (no declared scale), as in PostgreSQL.
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
-- **JSONB**: only `->` and `->>` (single-table queries), equality
-  comparison, and `IS [NOT] NULL`. No containment `@>` (planned, #40), no
-  indexing on JSONB columns, no ordering comparisons. Numbers inside JSONB
-  keep exact textual fidelity rather than PostgreSQL's numeric parsing.
+- **JSONB**: `->`/`->>` extraction and containment `@>` (single-table
+  queries only), equality comparison, and `IS [NOT] NULL`. No indexing on
+  JSONB columns (`@>` always filters — no inverted indexes), no ordering
+  comparisons, no `<@`/`?`/`?|`/`?&`. `@>` is not accepted in `HAVING` or
+  after a computed left-hand side. One asymmetry to know: `@>` compares
+  numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
+  normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
   indexable `AND` condition alongside on large tables. Subqueries cannot

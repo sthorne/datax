@@ -460,3 +460,51 @@ func TestDecimalTypmod(t *testing.T) {
 		}
 	}
 }
+
+func TestJSONBContainmentParsing(t *testing.T) {
+	// Plain form, with and without a leading path.
+	stmts, err := Parse(`SELECT * FROM t WHERE j @> '{"a":1}'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "@>" || w[0].Column != "j" {
+		t.Fatalf("got %+v", w)
+	}
+	stmts, err = Parse(`SELECT * FROM t WHERE j -> 'a' @> '[1]'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "@>" || len(w[0].Path) != 1 {
+		t.Fatalf("pathed: %+v", w)
+	}
+	// NOT lowers to the negated op (and back under double negation).
+	stmts, err = Parse(`SELECT * FROM t WHERE NOT (j @> '{"a":1}')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "NOT @>" {
+		t.Fatalf("negated: %+v", w)
+	}
+	// Inside OR with De Morgan round-trip.
+	stmts, err = Parse(`SELECT * FROM t WHERE NOT (j @> '{"a":1}' OR x = 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 2 || w[0].Op != "NOT @>" || w[1].Op != "!=" {
+		t.Fatalf("de morgan: %+v", w)
+	}
+	// Rejected surfaces: computed LHS, HAVING, bare @.
+	for _, src := range []string{
+		`SELECT * FROM t WHERE x + 1 @> '1'`,
+		`SELECT a FROM t GROUP BY a HAVING count(*) @> '1'`,
+		`SELECT * FROM t WHERE j @ '1'`,
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Fatalf("%s: accepted", src)
+		}
+	}
+}

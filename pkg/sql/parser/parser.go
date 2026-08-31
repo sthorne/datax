@@ -1371,7 +1371,10 @@ func (p *parser) parseConjunct() (Comparison, error) {
 		return cmp, nil
 	}
 	t := p.peek()
-	if t.kind != tkOp || !isCmpOp(t.text) {
+	// JSONB containment: accepted only in this plain-column form (an
+	// optional path on the left is fine — it must still produce jsonb).
+	// HAVING and computed left-hand sides deliberately do not take @>.
+	if t.kind != tkOp || (!isCmpOp(t.text) && t.text != "@>") {
 		return Comparison{}, p.errf("expected comparison operator, found %q", t.text)
 	}
 	p.i++
@@ -1517,6 +1520,7 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"IN": "NOT IN", "NOT IN": "IN",
 		"EXISTS": "NOT EXISTS", "NOT EXISTS": "EXISTS",
 		"TRUE": "FALSE", "FALSE": "TRUE",
+		"@>": "NOT @>", "NOT @>": "@>",
 	}
 	if c.Op == "OR" {
 		// NOT over a lowered OR: De Morgan by hand — negate every inner

@@ -663,6 +663,32 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			}
 			continue
 		}
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// JSONB containment. The left side (post-path) must be jsonb —
+			// a terminal ->> produces text and is refused.
+			if cmpType != types.Jsonb {
+				return false, newErrf(CodeFeatureNotSupported, "@> requires jsonb operands (%s is %s)", cmp.Column, cmpType)
+			}
+			rhs, err := evalExpr(cmp.Value, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if lhs.Null || rhs.Null {
+				return false, nil // NULL operands: UNKNOWN either way
+			}
+			rhs, err = rhs.Coerce(types.Jsonb)
+			if err != nil {
+				return false, newErrf(CodeInvalidTextRepresentation, "WHERE %s @>: %v", cmp.Column, err)
+			}
+			ok, cerr := jsonbContains(lhs, rhs)
+			if cerr != nil {
+				return false, cerr
+			}
+			if ok != (cmp.Op == "@>") {
+				return false, nil
+			}
+			continue
+		}
 		rhs, err := evalExpr(cmp.Value, desc, row, params)
 		if err != nil {
 			return false, err
