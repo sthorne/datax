@@ -41,7 +41,7 @@ func chaosWorkers(tc *TestCluster, stop *atomic.Bool, wg *sync.WaitGroup, gatewa
 		go func(w, g int) {
 			defer wg.Done()
 			for i := 0; !stop.Load(); i++ {
-				n := tc.Nodes[g]
+				n := tc.Node(g)
 				if n == nil {
 					continue // node is down in this scenario
 				}

@@ -26,6 +26,26 @@ type TestCluster struct {
 	// it (peers find a restarted node through their persisted registries,
 	// which hold the old address). Filled by StartWithEngines.
 	addrs []string
+	// nodesMu orders Nodes slot writes (StopNode/Restart*) against
+	// concurrent readers using Node(i) — workloads that keep running while
+	// the test restarts nodes.
+	nodesMu sync.RWMutex
+}
+
+// Node returns tc.Nodes[i] under the lock that StopNode and the Restart
+// helpers hold while writing the slot — the race-free accessor for
+// workload goroutines running across a restart. May return nil (node
+// currently down).
+func (tc *TestCluster) Node(i int) *server.Node {
+	tc.nodesMu.RLock()
+	defer tc.nodesMu.RUnlock()
+	return tc.Nodes[i]
+}
+
+func (tc *TestCluster) setNode(i int, n *server.Node) {
+	tc.nodesMu.Lock()
+	tc.Nodes[i] = n
+	tc.nodesMu.Unlock()
 }
 
 // Start brings up numNodes nodes with static pre-agreed membership: every
@@ -242,7 +262,7 @@ func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*
 		_ = lis.Close()
 		return nil, err
 	}
-	tc.Nodes[i] = n
+	tc.setNode(i, n)
 	return n, nil
 }
 
@@ -329,7 +349,7 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 	if err != nil {
 		tc.T.Fatalf("restarting node %d: %v", i+1, err)
 	}
-	tc.Nodes[i] = n
+	tc.setNode(i, n)
 	return n
 }
 
@@ -359,15 +379,15 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 		tc.T.Fatalf("restarting node %d on new port: %v", i+1, err)
 	}
 	tc.addrs[i] = lis.Addr().String()
-	tc.Nodes[i] = n
+	tc.setNode(i, n)
 	return n
 }
 
 // StopNode stops one node (simulating a crash) and forgets it.
 func (tc *TestCluster) StopNode(i int) {
-	if tc.Nodes[i] != nil {
-		tc.Nodes[i].Stop()
-		tc.Nodes[i] = nil
+	if n := tc.Node(i); n != nil {
+		n.Stop()
+		tc.setNode(i, nil)
 	}
 }
 
