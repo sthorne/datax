@@ -252,6 +252,14 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 	}
 	ts := writeTimestamp(ba)
 
+	// One-phase commit: the whole transaction in one proposal — writes land
+	// as committed values, no record, no intents. Detected from batch
+	// content (never the header's CreateTxnRecord, which stays set for old
+	// servers' classic evaluation).
+	if is1PC(ba) {
+		return r.evalOnePhase(b, ba)
+	}
+
 	if ba.Header.CreateTxnRecord {
 		if err := r.createTxnRecord(b, ba.Header.Txn); err != nil {
 			return nil, err

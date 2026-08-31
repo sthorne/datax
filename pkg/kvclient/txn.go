@@ -788,6 +788,9 @@ func (t *Txn) Commit(ctx context.Context) error {
 	t.mu.deferred = nil
 	t.mu.Unlock()
 	if wb != nil && wb.Len() > 0 {
+		if handled, err := t.commit1PC(ctx, wb); handled {
+			return err
+		}
 		return t.parallelCommit(ctx, wb)
 	}
 	t.mu.Lock()
@@ -821,6 +824,149 @@ func (t *Txn) Commit(ctx context.Context) error {
 	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
 	return nil
+}
+
+// commit1PC attempts the one-phase fast path: when the deferred write
+// batch is provably the transaction's ENTIRE write set (unanchored, no
+// tracked writes) and every key — anchor included — maps to one range by
+// WARM-CACHE lookup, the writes and a committing EndTxn{All} go out as a
+// single BatchRequest evaluated in one raft proposal, writing committed
+// values directly: no record, no intents, nothing to resolve. Returns
+// handled=false (nothing applied) when ineligible or when routing shifted
+// under the pinned descriptor — the caller falls back to parallelCommit.
+// The batch keeps CreateTxnRecord so an old server that drops the unknown
+// All field evaluates record + intents + commit classically in the same
+// proposal — correct, just unoptimized — revealed by the missing OnePhase
+// in its response.
+func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
+	t.mu.Lock()
+	if t.mu.anchored || len(t.mu.writes) != 0 {
+		t.mu.Unlock()
+		return false, nil
+	}
+	t.mu.Unlock()
+	anchor := wb.kys[0]
+	desc, ok := t.db.cache.Lookup(anchor)
+	if !ok {
+		return false, nil // cold cache: no lookup RPCs on this path
+	}
+	for _, k := range wb.kys {
+		if !desc.ContainsKey(k) {
+			return false, nil
+		}
+	}
+
+	t.mu.Lock()
+	t.mu.txn.Sequence++
+	if len(t.mu.txn.Key) == 0 {
+		t.mu.txn.Key = anchor.Clone()
+	}
+	txn := t.mu.txn
+	t.mu.Unlock()
+
+	intentKeys := make([]keys.Key, 0, len(wb.kys))
+	for _, k := range wb.kys {
+		intentKeys = append(intentKeys, k.Clone())
+	}
+	reqs := make([]kvpb.RequestUnion, 0, len(wb.reqs)+1)
+	reqs = append(reqs, wb.reqs...)
+	ba := &kvpb.BatchRequest{
+		Header:   kvpb.BatchHeader{Txn: txn.Clone(), CreateTxnRecord: true},
+		Requests: reqs,
+	}
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
+		Commit:        true,
+		All:           true,
+		IntentKeys:    intentKeys,
+	})
+
+	br, sent, err := t.sendSingleRange(ctx, ba, desc)
+	if !sent {
+		return false, nil // routing changed; nothing applied — classic path
+	}
+	if err != nil {
+		t.markFinished()
+		return true, err
+	}
+	et := br.Responses[len(br.Responses)-1].EndTxn
+	if !et.OnePhase {
+		// An old server evaluated the batch classically (record + intents
+		// + committed EndTxn, one atomic proposal): track the writes so
+		// they can be resolved at the commit timestamp.
+		for _, k := range wb.kys {
+			t.recordWrite(k)
+		}
+	}
+	t.markFinished()
+	metrics.TxnCommits.Inc()
+	if et.OnePhase {
+		metrics.OnePhaseCommits.Inc()
+		return true, nil
+	}
+	t.resolveAll(enginepb.COMMITTED, et.CommitTimestamp)
+	return true, nil
+}
+
+// sendSingleRange executes ba against one pinned range with send's
+// conflict handling (pushes, refreshes) but never through DB.Send — a
+// one-phase batch must not be split by routing, or an EndTxn{All} could
+// travel without its writes. sent=false (nothing applied) reports that
+// the range's bounds changed under us.
+func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (_ *kvpb.BatchResponse, sent bool, _ error) {
+	waited := time.Duration(0)
+	refreshes := 0
+	for {
+		gh := ba.Header
+		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
+		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)
+		if regroup {
+			return nil, false, nil
+		}
+		if kerr == nil {
+			if br.Txn != nil {
+				t.mu.Lock()
+				t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(br.Txn.WriteTimestamp)
+				t.mu.Unlock()
+			}
+			return br, true, nil
+		}
+		switch {
+		case kerr.WriteIntent != nil:
+			resolvedAll, pending, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, true)
+			if err != nil {
+				return nil, true, err
+			}
+			if resolvedAll {
+				continue
+			}
+			if derr := t.detectDeadlock(ctx, pending); derr != nil {
+				return nil, true, derr
+			}
+			if waited >= conflictBudget {
+				return nil, true, &RetryableError{Cause: kerr}
+			}
+			select {
+			case <-ctx.Done():
+				return nil, true, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+				waited += 100 * time.Millisecond
+			}
+		case kerr.TxnAborted != nil:
+			return nil, true, &RetryableError{Cause: kerr}
+		case kerr.IsRetryableTxnError():
+			newTS := kerr.RetryTimestamp(t.db.clock.Now())
+			if refreshes < maxRefreshesPerOp && t.maybeRefresh(ctx, newTS) {
+				refreshes++
+				metrics.TxnRefreshes.Inc()
+				continue
+			}
+			metrics.TxnRetries.Inc()
+			return nil, true, &RetryableError{Cause: kerr}
+		default:
+			return nil, true, kerr
+		}
+	}
 }
 
 // parallelCommit is the pipelined commit fast path: the deferred write

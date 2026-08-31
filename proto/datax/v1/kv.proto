@@ -101,6 +101,9 @@ message EndTxnRequest {
   bool commit = 2;
   repeated bytes intent_keys = 3;
   repeated bytes in_flight = 4; // parallel commit: stages the record
+  // all: this batch is the transaction's ENTIRE write set — the one-phase
+  // commit hint. An old server ignores it and evaluates classically.
+  bool all = 5;
 }
 
 message HeartbeatTxnRequest {
@@ -266,6 +269,9 @@ message ScanResponse {
 
 message EndTxnResponse {
   Hlc commit_timestamp = 1;
+  // one_phase: the batch committed via the one-phase fast path — values
+  // written committed, no record, nothing to resolve.
+  bool one_phase = 2;
 }
 
 message HeartbeatTxnResponse {

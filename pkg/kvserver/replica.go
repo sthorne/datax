@@ -914,7 +914,28 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// starve every writer on the range: by the time the coordinator's
 	// refresh round trip lands, the cache has moved again.
 	if ba.HasMVCCWrites() {
-		if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
+		if is1PC(ba) {
+			// A one-phase commit is never pushed in place: its EndTxn
+			// evaluates in the same proposal, and the commit-equality
+			// invariant (read ts == write ts) must hold at apply. Reject
+			// pre-propose with a retryable error instead; the client's
+			// refresh loop re-stamps and resends. This is the only extra
+			// cost of 1PC, and only when the batch would actually be
+			// pushed.
+			txn := ba.Header.Txn
+			if !txn.ReadTimestamp.Equal(txn.WriteTimestamp) {
+				e := kvpb.NewErrorf("%s: one-phase commit of %s arrived with diverged timestamps (read %s, write %s)",
+					r.rangeID, txn.ID, txn.ReadTimestamp, txn.WriteTimestamp)
+				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: txn.WriteTimestamp}
+				return nil, e
+			}
+			if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
+				e := kvpb.NewErrorf("%s: one-phase commit of %s at %s below timestamp cache %s",
+					r.rangeID, txn.ID, writeTimestamp(ba), low)
+				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
+				return nil, e
+			}
+		} else if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
 			if ba.Header.Txn == nil {
 				e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
 				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
@@ -1024,6 +1045,29 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 		spans = append(spans, sp)
 	}
 	return spans
+}
+
+// is1PC reports whether the batch is one-phase-commit shaped: bound to a
+// transaction, its last request a committing EndTxn with All set (the
+// client's "this is the entire transaction" declaration), and every other
+// request a plain Put or Delete. Deterministic from batch content alone,
+// so the leader's pre-propose gate and every replica's apply agree.
+func is1PC(ba *kvpb.BatchRequest) bool {
+	if ba.Header.Txn == nil || len(ba.Requests) < 2 {
+		return false
+	}
+	last := ba.Requests[len(ba.Requests)-1].EndTxn
+	if last == nil || !last.Commit || !last.All {
+		return false
+	}
+	for i := 0; i < len(ba.Requests)-1; i++ {
+		switch ba.Requests[i].GetInner().(type) {
+		case *kvpb.PutRequest, *kvpb.DeleteRequest:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func batchTxnID(ba *kvpb.BatchRequest) uuid.UUID {

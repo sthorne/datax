@@ -204,6 +204,13 @@ datax bench timeseries --series 1000 --shards 8
 monotone timestamps — the hot-tail shape — and is the honest way to compare
 `--shards` settings.
 
+Two counters show which commit fast path your workload rides:
+`datax_one_phase_commits_total` (single-range implicit transactions — one
+raft proposal, the cheapest commit) and `datax_parallel_commits_total`
+(multi-range pipelined commits). A write-heavy workload where neither
+moves is paying the classic two-round commit — usually explicit
+`BEGIN` blocks.
+
 ## Capacity planning
 
 Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):

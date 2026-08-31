@@ -180,6 +180,54 @@ func MVCCDelete(b *Batch, key keys.Key, ts hlc.Timestamp, txn *enginepb.TxnMeta)
 	return mvccWrite(b, key, ts, nil, true, txn)
 }
 
+// MVCCPutCommitted writes a bare committed version at exactly ts, with the
+// TRANSACTIONAL conflict rules — any intent is a WriteIntentError, a
+// version at or above ts is a WriteTooOldError — but no intent metadata.
+// The one-phase-commit primitive: never the nil-txn timestamp ratchet
+// (which would commit at a timestamp the client never agreed to).
+func MVCCPutCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte) error {
+	return mvccWriteCommitted(b, key, ts, value, false)
+}
+
+// MVCCDeleteCommitted is MVCCPutCommitted's tombstone counterpart.
+func MVCCDeleteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp) error {
+	return mvccWriteCommitted(b, key, ts, nil, true)
+}
+
+func mvccWriteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone bool) error {
+	metaKey, upper := mvccKeyBounds(key)
+	rawMeta, err := b.Get(metaKey)
+	if err != nil {
+		return err
+	}
+	if rawMeta != nil {
+		meta, err := decodeMeta(rawMeta)
+		if err != nil {
+			return err
+		}
+		// Any intent conflicts — a one-phase transaction has no prior
+		// writes of its own, so ownership is irrelevant here.
+		return &WriteIntentError{Intents: []Intent{{Key: key.Clone(), Txn: meta.Txn}}}
+	}
+	it := b.NewIter(metaKey, upper)
+	firstVersion := append(append([]byte(nil), metaKey...), 0x00)
+	if it.SeekGE(firstVersion) {
+		_, vts, err := DecodeMVCCKey(it.Key())
+		if cerr := it.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+		if ts.LessEq(vts) {
+			return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
+		}
+	} else if err := it.Close(); err != nil {
+		return err
+	}
+	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
+}
+
 func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone bool, txn *enginepb.TxnMeta) error {
 	metaKey, upper := mvccKeyBounds(key)
 

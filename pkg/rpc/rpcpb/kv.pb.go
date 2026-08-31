@@ -792,11 +792,14 @@ func (x *ScanRequest) GetForUpdate() bool {
 }
 
 type EndTxnRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
-	Commit        bool                   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
-	IntentKeys    [][]byte               `protobuf:"bytes,3,rep,name=intent_keys,json=intentKeys,proto3" json:"intent_keys,omitempty"`
-	InFlight      [][]byte               `protobuf:"bytes,4,rep,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"` // parallel commit: stages the record
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Header     *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	Commit     bool                   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
+	IntentKeys [][]byte               `protobuf:"bytes,3,rep,name=intent_keys,json=intentKeys,proto3" json:"intent_keys,omitempty"`
+	InFlight   [][]byte               `protobuf:"bytes,4,rep,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"` // parallel commit: stages the record
+	// all: this batch is the transaction's ENTIRE write set — the one-phase
+	// commit hint. An old server ignores it and evaluates classically.
+	All           bool `protobuf:"varint,5,opt,name=all,proto3" json:"all,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -857,6 +860,13 @@ func (x *EndTxnRequest) GetInFlight() [][]byte {
 		return x.InFlight
 	}
 	return nil
+}
+
+func (x *EndTxnRequest) GetAll() bool {
+	if x != nil {
+		return x.All
+	}
+	return false
 }
 
 type HeartbeatTxnRequest struct {
@@ -2602,8 +2612,11 @@ func (x *ScanResponse) GetResume() []byte {
 type EndTxnResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	CommitTimestamp *Hlc                   `protobuf:"bytes,1,opt,name=commit_timestamp,json=commitTimestamp,proto3" json:"commit_timestamp,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// one_phase: the batch committed via the one-phase fast path — values
+	// written committed, no record, nothing to resolve.
+	OnePhase      bool `protobuf:"varint,2,opt,name=one_phase,json=onePhase,proto3" json:"one_phase,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EndTxnResponse) Reset() {
@@ -2641,6 +2654,13 @@ func (x *EndTxnResponse) GetCommitTimestamp() *Hlc {
 		return x.CommitTimestamp
 	}
 	return nil
+}
+
+func (x *EndTxnResponse) GetOnePhase() bool {
+	if x != nil {
+		return x.OnePhase
+	}
+	return false
 }
 
 type HeartbeatTxnResponse struct {
@@ -4841,13 +4861,14 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x19\n" +
 	"\bmax_rows\x18\x02 \x01(\x03R\amaxRows\x12\x1d\n" +
 	"\n" +
-	"for_update\x18\x03 \x01(\bR\tforUpdate\"\x96\x01\n" +
+	"for_update\x18\x03 \x01(\bR\tforUpdate\"\xa8\x01\n" +
 	"\rEndTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x16\n" +
 	"\x06commit\x18\x02 \x01(\bR\x06commit\x12\x1f\n" +
 	"\vintent_keys\x18\x03 \x03(\fR\n" +
 	"intentKeys\x12\x1b\n" +
-	"\tin_flight\x18\x04 \x03(\fR\binFlight\"\xb0\x01\n" +
+	"\tin_flight\x18\x04 \x03(\fR\binFlight\x12\x10\n" +
+	"\x03all\x18\x05 \x01(\bR\x03all\"\xb0\x01\n" +
 	"\x13HeartbeatTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1f\n" +
 	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1f\n" +
@@ -4971,9 +4992,10 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\tnew_value\x18\x01 \x01(\x03R\bnewValue\"N\n" +
 	"\fScanResponse\x12&\n" +
 	"\x04rows\x18\x01 \x03(\v2\x12.datax.v1.KeyValueR\x04rows\x12\x16\n" +
-	"\x06resume\x18\x02 \x01(\fR\x06resume\"J\n" +
+	"\x06resume\x18\x02 \x01(\fR\x06resume\"g\n" +
 	"\x0eEndTxnResponse\x128\n" +
-	"\x10commit_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0fcommitTimestamp\".\n" +
+	"\x10commit_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0fcommitTimestamp\x12\x1b\n" +
+	"\tone_phase\x18\x02 \x01(\bR\bonePhase\".\n" +
 	"\x14HeartbeatTxnResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\x05R\x06status\"\xe0\x01\n" +
 	"\x0fPushTxnResponse\x12\x16\n" +

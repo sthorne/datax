@@ -84,6 +84,9 @@ var (
 	ParallelCommits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_parallel_commits_total", Help: "Transactions committed via the pipelined (STAGING) fast path.",
 	})
+	OnePhaseCommits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_one_phase_commits_total", Help: "Transactions committed via the single-proposal one-phase fast path (no record, no intents).",
+	})
 	TxnRecoveries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_recoveries_total", Help: "Status recoveries run against STAGING transaction records.",
 	})

@@ -95,6 +95,12 @@ func (r *Replica) evalEndTxn(b *storage.Batch, txn *kvpb.Transaction, req *kvpb.
 	if txn == nil {
 		return nil, kvpb.NewErrorf("EndTxn without a transaction")
 	}
+	if req.All {
+		// Defense in depth: an All EndTxn only evaluates inside a
+		// 1PC-shaped batch (evalOnePhase); reaching here means the batch
+		// was malformed — e.g. a stale-cache split scattered it.
+		return nil, kvpb.NewErrorf("EndTxn.All in a batch that is not one-phase-commit shaped")
+	}
 	key := txnRecordKey(&txn.TxnMeta)
 	rec, err := loadTxnRecord(b, key)
 	if err != nil {
@@ -157,6 +163,61 @@ func (r *Replica) evalEndTxn(b *storage.Batch, txn *kvpb.Transaction, req *kvpb.
 		return nil, kvpb.NewError(err)
 	}
 	return &kvpb.EndTxnResponse{CommitTimestamp: final.WriteTimestamp}, nil
+}
+
+// evalOnePhase evaluates a one-phase-commit batch: every write lands as a
+// committed version at the transaction's timestamp, no record and no
+// intents are created, and the EndTxn is answered inline with OnePhase
+// set. An eval error discards the entire engine batch (applyCommand
+// commits only on success), so a failed or abandoned 1PC leaves zero
+// state — nothing to recover, by construction.
+func (r *Replica) evalOnePhase(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	txn := ba.Header.Txn
+	// The commit-equality invariant, re-checked at apply: the leader gate
+	// rejects pushed 1PC batches pre-propose and the header travels inside
+	// the raft command, so this is deterministic across replicas.
+	if !txn.ReadTimestamp.Equal(txn.WriteTimestamp) {
+		e := kvpb.NewErrorf("transaction %s cannot commit in one phase: write timestamp %s diverged from read timestamp %s",
+			txn.ID, txn.WriteTimestamp, txn.ReadTimestamp)
+		e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: txn.WriteTimestamp}
+		return nil, e
+	}
+	// Defensive: a pusher may have poisoned a record for this transaction
+	// (rec==nil expiry path). Never commit over an ABORTED record.
+	rec, err := loadTxnRecord(b, txnRecordKey(&txn.TxnMeta))
+	if err != nil {
+		return nil, kvpb.NewError(err)
+	}
+	if rec != nil && rec.Status == enginepb.ABORTED {
+		e := kvpb.NewErrorf("transaction %s aborted before its one-phase commit", txn.ID)
+		e.TxnAborted = &kvpb.TxnAbortedError{}
+		return nil, e
+	}
+	ts := txn.WriteTimestamp
+	br := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
+	for i := range ba.Requests {
+		var ru kvpb.ResponseUnion
+		switch req := ba.Requests[i].GetInner().(type) {
+		case *kvpb.PutRequest:
+			if err := storage.MVCCPutCommitted(b, req.Key, ts, req.Value); err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.Put = &kvpb.PutResponse{}
+		case *kvpb.DeleteRequest:
+			if err := storage.MVCCDeleteCommitted(b, req.Key, ts); err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.Delete = &kvpb.DeleteResponse{}
+		case *kvpb.EndTxnRequest:
+			ru.EndTxn = &kvpb.EndTxnResponse{CommitTimestamp: ts, OnePhase: true}
+		default:
+			// is1PC admitted the batch; anything else is a programming
+			// error, surfaced deterministically.
+			return nil, kvpb.NewErrorf("unsupported request in one-phase batch: %T", ba.Requests[i].GetInner())
+		}
+		br.Responses = append(br.Responses, ru)
+	}
+	return br, nil
 }
 
 // evalHeartbeatTxn refreshes the record's liveness, telling the coordinator

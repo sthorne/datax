@@ -89,6 +89,14 @@ type EndTxnRequest struct {
 	// staged timestamp, and explicitly finalized by a second EndTxn (or by
 	// status recovery, if the coordinator dies first).
 	InFlight []keys.Key `json:"in_flight,omitempty"`
+	// All marks this batch as the transaction's ENTIRE write set — the
+	// one-phase-commit hint. A server that recognizes it (and finds the
+	// batch 1PC-shaped: this EndTxn last, only writes before it) evaluates
+	// the writes as committed values in one proposal, creating no record
+	// and no intents, and answers OnePhase. An old server drops the field
+	// and evaluates record + intents + commit classically — correct, just
+	// unoptimized — which the missing OnePhase in its response reveals.
+	All bool `json:"all,omitempty"`
 }
 
 // HeartbeatTxnRequest refreshes the transaction record's liveness and
@@ -412,6 +420,9 @@ type ExportResponse struct {
 type EndTxnResponse struct {
 	// CommitTimestamp is the timestamp the transaction committed at.
 	CommitTimestamp hlc.Timestamp `json:"commit_ts"`
+	// OnePhase reports that the batch committed via the one-phase fast
+	// path: values written committed, no record, nothing to resolve.
+	OnePhase bool `json:"one_phase,omitempty"`
 }
 
 type HeartbeatTxnResponse struct {

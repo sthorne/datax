@@ -221,6 +221,43 @@ records.
 On the write-only kv workload (implicit UPDATEs), the shorter
 intent-hold window roughly triples committed throughput.
 
+Two ordering rules keep the parallelism sound. The record-creating
+(anchor) sub-batch of a multi-range write completes before any sibling
+sub-batch is sent, so no intent is ever observable before the record
+exists — a pusher finding such an intent judges expiry from the
+transaction's birth (`MinTimestamp`) and could poison the record ABORTED.
+For the same reason, a transaction already older than half the expiry
+window (2.5s) forfeits the commit-time parallelism and creates its staged
+record before sending the write batch.
+
+### One-phase commits
+
+When a pipelined transaction's **entire** write set — provably so: never
+anchored, nothing flushed early — lands on **one range** (by warm-cache
+routing only), Commit skips the parallel-commit protocol entirely: the
+writes and a committing `EndTxn` marked `All` go out as one BatchRequest,
+and the server evaluates the whole transaction in a **single raft
+proposal**, writing committed values directly — no transaction record, no
+intents, nothing to finalize or resolve. A failed or abandoned attempt
+discards the entire engine batch, so there is no state to recover, by
+construction. This is the common case for a single-statement INSERT or
+UPDATE on an unsplit (or single-range) table, and it halves the measured
+single-row commit latency again on top of parallel commits.
+
+The fast path never bends serializability: a one-phase batch is **never
+pushed in place**. If the timestamp cache would forward it (or its read
+and write timestamps already diverged — the uniqueness-probe-then-write
+shape), the server rejects it pre-proposal with a retryable error and the
+client's ordinary refresh loop validates its read spans and resends. At
+apply, the writes use the transactional conflict rules (foreign intent →
+push, newer version → write-too-old), never the non-transactional
+timestamp bump. Ineligible or unlucky commits — multi-range write sets, a
+cold routing cache, a split racing the send — fall back to the parallel
+commit unchanged, with nothing applied. Old servers that predate the
+`All` flag simply evaluate the batch classically (record + intents +
+commit, still one atomic proposal); the response tells the client to
+resolve as usual, so mixed-version clusters need no gating.
+
 ## Conflicts and pushes
 
 Encountering someone else's intent triggers `PushTxn(pusher, pushee)` at the
