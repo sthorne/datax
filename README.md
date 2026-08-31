@@ -44,7 +44,10 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   (multi-raft). Writes commit only once a quorum has them on disk.
 - **Transactions**: CockroachDB-style — write intents plus a transaction
   record whose single atomic flip commits the whole transaction, no matter how
-  many ranges it touched. Serializable isolation.
+  many ranges it touched. Serializable isolation. Multi-range writes fan
+  out to their ranges in parallel; a single-range implicit transaction
+  commits in **one raft proposal** (one-phase commit — no record, no
+  intents).
 - **Placement**: nodes declare a locality (`--locality=region=r1,rack=a`);
   the allocator maximizes diversity across failure domains, so losing a rack
   never loses more than one replica of a range.
@@ -59,7 +62,8 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   collection, raft log truncation, size-based splitting and merging —
   plus dead-node repair, load rebalancing, decommission,
   consistent cluster backup/restore (full + incremental, `datax backup` /
-  `datax restore`), `datax bench`, and
+  `datax restore`), rolling upgrades with an explicit finalize
+  (`datax debug upgrade`), `datax bench`, and
   a built-in observability dashboard with `/metrics` + `/status` + `/api/cluster`
   endpoints (`--http-listen`; the dashboard at `/` is read-only and
   self-contained; in secure mode every endpoint requires HTTP Basic
@@ -131,6 +135,7 @@ This is a prototype. Out of scope so far, deliberately:
 | SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), join reordering (join order = syntactic order, ≤ 8 tables, nested loop), DECIMAL precision/scale enforcement (typmod parsed and ignored), JSONB indexing/containment (`->`/`->>` extraction is in, single-table queries only) |
 | Wire | COPY protocol; cursor-style streaming (suspended portals serve materialized results — a fetch limit bounds wire traffic per round trip, not server memory) |
 | Ops | per-node drill-down across peers (the dashboard's range detail is the serving node's own); per-endpoint authorization (secure-mode HTTP auth accepts any valid user — everything served is read-only) |
+| Upgrades | skipping versions (adjacent-version rolls only) or auto-finalize (the version bump is a deliberate `datax debug upgrade`; before it, binaries roll back freely — after it, never) |
 | Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
