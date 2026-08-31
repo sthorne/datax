@@ -67,9 +67,10 @@ func TestDecimalJSONBOverPgwire(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
-	// DECIMAL(10,2): precision/scale accepted (and ignored — see docs).
+	// Bare DECIMAL: unconstrained, values survive with full fidelity.
+	// (DECIMAL(p,s) rescaling/enforcement is TestDecimalTypmodOverPgwire.)
 	if _, err := conn.Exec(ctx, `CREATE TABLE items (
-		id INT8 PRIMARY KEY, price DECIMAL(10,2), attrs JSONB
+		id INT8 PRIMARY KEY, price DECIMAL, attrs JSONB
 	)`); err != nil {
 		t.Fatalf("create: %v", err)
 	}

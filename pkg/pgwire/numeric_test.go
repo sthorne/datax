@@ -41,6 +41,13 @@ func TestPGNumericGoldenVectors(t *testing.T) {
 		{"99999999", golden(2, 1, false, 0, 9999, 9999)},
 		// 0.00012 = 0001|2000 in base-10000 starting at 10000^-1.
 		{"-0.00012", golden(2, -1, true, 5, 1, 2000)},
+		// DECIMAL(p,s) fixed-scale rendering: padded text carries its
+		// declared scale as dscale; all-zero fraction groups are trimmed
+		// from the digits but survive in dscale.
+		{"1.00", golden(1, 0, false, 2, 1)},
+		{"9.90", golden(2, 0, false, 2, 9, 9000)},
+		{"0.10", golden(1, -1, false, 2, 1000)},
+		{"-2.50", golden(2, 0, true, 2, 2, 5000)},
 	}
 	for _, tc := range cases {
 		in := tc.text

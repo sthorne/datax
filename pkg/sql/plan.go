@@ -209,7 +209,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type}
+				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
 			}
 			return cols, nil
 		}
@@ -266,7 +266,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.ref.col.Type}
+				cols[i] = ResultColumn{Name: p.name, Type: p.ref.col.Type, Typmod: colTypmod(p.ref.col)}
 			}
 			return cols, nil
 		}
@@ -287,7 +287,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		cols := make([]ResultColumn, len(proj))
 		for i, p := range proj {
-			cols[i] = ResultColumn{Name: p.name, Type: p.col.Type}
+			cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
 		}
 		return cols, nil
 

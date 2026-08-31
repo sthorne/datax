@@ -70,6 +70,11 @@ type ColumnDef struct {
 	PrimaryKey bool // column-level PRIMARY KEY shorthand
 	// Default is the DEFAULT literal (constants only; no expressions).
 	Default *types.Datum
+	// Precision/Scale carry a DECIMAL(p,s) typmod (0 precision = bare
+	// DECIMAL, unconstrained). Typmods on other types are still accepted
+	// and ignored (documented).
+	Precision int32
+	Scale     int32
 }
 
 type CreateTable struct {

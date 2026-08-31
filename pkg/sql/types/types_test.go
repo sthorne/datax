@@ -106,3 +106,30 @@ func TestNewTypeCoerceCompare(t *testing.T) {
 		t.Fatalf("uuid compare: %d, %v", c, err)
 	}
 }
+
+func TestDecimalDscaleText(t *testing.T) {
+	for _, c := range []struct {
+		s      string
+		dscale int32
+		want   string
+	}{
+		{"9.9", 2, "9.90"},
+		{"1", 2, "1.00"},
+		{"0", 2, "0.00"},
+		{"-2.5", 2, "-2.50"},
+		{"1.25", 2, "1.25"},
+		{"42", 0, "42"},
+		{"0.1", 4, "0.1000"},
+	} {
+		d := NewDecimal(c.s)
+		d.Dscale = c.dscale
+		if got := d.Text(); got != c.want {
+			t.Fatalf("Text(%q, dscale %d) = %q, want %q", c.s, c.dscale, got, c.want)
+		}
+		// Dscale never changes identity.
+		plain := NewDecimal(c.s)
+		if cmp, err := d.Compare(plain); err != nil || cmp != 0 {
+			t.Fatalf("Compare(%q dscale=%d, plain) = %d, %v", c.s, c.dscale, cmp, err)
+		}
+	}
+}

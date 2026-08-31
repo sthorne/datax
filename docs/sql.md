@@ -42,9 +42,24 @@ SHOW TABLES
   `0.1` survives to a DECIMAL column unrounded, and `SUM`/`AVG` over
   DECIMAL stay exact where float64 breaks (`AVG` quantizes to 6 fractional
   digits, round-half-even). Int operands mix exactly; a FLOAT8 operand
-  demotes the expression to float. `DECIMAL(p,s)` is accepted and IGNORED
-  (no precision/scale enforcement yet). Float→Decimal coercion is
-  rejected — cast through text if you really mean it.
+  demotes the expression to float. Float→Decimal coercion is rejected —
+  cast through text if you really mean it.
+- `DECIMAL(p,s)` is enforced at the two row-completion choke points every
+  write funnels through (insert-row build — INSERT, COPY, defaults — and
+  the UPDATE SET loop): values quantize to scale `s` round-half-even,
+  then overflow past `p−s` integer digits is SQLSTATE `22003` (checked
+  after rounding, so `9.999` into `DECIMAL(3,2)` rounds to `10.00` and
+  then overflows — PostgreSQL order). Quantization happens before key
+  encoding, so DECIMAL primary keys and index entries store the rounded
+  value (two inserts that round together are a `23505`). Storage keeps
+  the canonical trailing-zero-stripped text — equality, grouping, and
+  memo identity are untouched — while the datum carries the declared
+  scale as a display-only field: `Text()` pads to it (`9.90`), and the
+  binary NUMERIC encoder derives its `dscale` from that padded render.
+  RowDescription reports the typmod (`(p<<16)|(s+4)`) for enforced
+  columns. Precision/scale live on the column descriptor as append-only
+  `omitempty` JSON fields (zero = bare DECIMAL, the pre-existing
+  meaning), so old descriptors and rolling upgrades are unaffected.
 - JSONB stores normalized text (sorted object keys, compact, duplicate
   keys last-wins). Numbers pass through `json.Number`, so integer
   fidelity is preserved on ingest; equality compares normalized text, and
@@ -95,7 +110,7 @@ join/derived-table shapes,
 join reordering (join order = syntactic order) and joins beyond 8 tables,
 expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
-DECIMAL precision/scale enforcement (typmod parsed and ignored),
+typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing and containment (`@>`), path operators in join queries,
 DEFAULT expressions beyond constants.
 

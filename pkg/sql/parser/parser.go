@@ -403,28 +403,53 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.i += 3
 		}
 	}
-	// VARCHAR(n) / DECIMAL(p[,s]) etc.: absorb the typmod. Precision and
-	// scale are accepted and IGNORED — storage is arbitrary-precision
-	// (documented; enforcement is a possible follow-up).
+	fam, err := types.ParseType(typeName)
+	if err != nil {
+		return def, p.errf("%v", err)
+	}
+	def.Type = fam
+	// VARCHAR(n) / DECIMAL(p[,s]) etc.: for DECIMAL the typmod is captured
+	// and ENFORCED (precision/scale on the column descriptor); for every
+	// other type it is accepted and ignored — storage is arbitrary-length
+	// (documented).
 	if p.consumeOp("(") {
+		var mods []string
 		if p.peek().kind == tkNumber {
+			mods = append(mods, p.peek().text)
 			p.i++
 			if p.consumeOp(",") {
 				if p.peek().kind != tkNumber {
 					return def, p.errf("expected scale after ',' in type modifier")
 				}
+				mods = append(mods, p.peek().text)
 				p.i++
 			}
 		}
 		if err := p.expectOp(")"); err != nil {
 			return def, err
 		}
+		if fam == types.Decimal && len(mods) > 0 {
+			prec, perr := strconv.ParseInt(mods[0], 10, 32)
+			if perr != nil {
+				return def, p.errf("DECIMAL precision %q must be an integer", mods[0])
+			}
+			var scale int64
+			if len(mods) > 1 {
+				var serr error
+				scale, serr = strconv.ParseInt(mods[1], 10, 32)
+				if serr != nil {
+					return def, p.errf("DECIMAL scale %q must be an integer", mods[1])
+				}
+			}
+			if prec < 1 || prec > 1000 {
+				return def, p.errf("DECIMAL precision %d must be between 1 and 1000", prec)
+			}
+			if scale < 0 || scale > prec {
+				return def, p.errf("DECIMAL scale %d must be between 0 and the precision %d", scale, prec)
+			}
+			def.Precision, def.Scale = int32(prec), int32(scale)
+		}
 	}
-	fam, err := types.ParseType(typeName)
-	if err != nil {
-		return def, p.errf("%v", err)
-	}
-	def.Type = fam
 	for {
 		switch {
 		case p.consumeKeyword("NOT"):

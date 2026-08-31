@@ -453,7 +453,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.ref.col.Type})
+		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.ref.col.Type, Typmod: colTypmod(p.ref.col)})
 	}
 	for _, jr := range joined {
 		out := make([]types.Datum, len(proj))

@@ -28,8 +28,12 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
-- **`DECIMAL(p,s)` typmod is ignored** (enforcement is planned, #39).
-  `DECIMAL` itself is exact.
+- **`DECIMAL(p,s)` is enforced** (rescale to `s` half-even, `22003` on
+  overflow, fixed-scale rendering), with small deviations: an invalid
+  typmod (`DECIMAL(0)`, scale > precision) is a syntax error `42601`
+  rather than PostgreSQL's `22023`; `VARCHAR(n)` and other typmods are
+  still accepted and ignored; expression/aggregate results render in
+  canonical form (no declared scale), as in PostgreSQL.
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
 - **JSONB**: only `->` and `->>` (single-table queries), equality

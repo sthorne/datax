@@ -68,6 +68,16 @@ func resolveMaxStaleness(operand string, now, localClosed hlc.Timestamp) (hlc.Ti
 type ResultColumn struct {
 	Name string
 	Type types.Family
+	// Typmod is PostgreSQL's atttypmod for the column (0 = none, emitted
+	// as -1 on the wire). Set only when a real DECIMAL(p,s) column backs
+	// the output: ((p<<16) | (s+4)).
+	Typmod int32
+}
+
+// DecimalTypmod encodes a DECIMAL(p,s) declaration as PostgreSQL's
+// atttypmod.
+func DecimalTypmod(precision, scale int32) int32 {
+	return precision<<16 | (scale + 4)
 }
 
 // Result is the outcome of one statement.

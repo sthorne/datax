@@ -69,11 +69,16 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		seen[cd.Name] = true
 		col := catalog.Column{
 			ID: catalog.ColumnID(i + 1), Name: cd.Name, Type: cd.Type, NotNull: cd.NotNull,
+			Precision: cd.Precision, Scale: cd.Scale,
 		}
 		if cd.Default != nil && !cd.Default.Null {
 			d, cerr := cd.Default.Coerce(cd.Type)
 			if cerr != nil {
 				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr)
+			}
+			d, terr := enforceTypmod(col, d)
+			if terr != nil {
+				return nil, terr
 			}
 			col.Default = &d
 		}
@@ -287,7 +292,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			}
 			d, cerr := d.Coerce(target[i].Type)
 			if cerr != nil {
-				return nil, newErrf(CodeInternal, "column %q: %v", target[i].Name, cerr)
+				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", target[i].Name, cerr)
 			}
 			vals[i] = d
 		}
@@ -360,6 +365,16 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 		}
 		if d.Null && col.NotNull {
 			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+		}
+		// DECIMAL(p,s): quantize/validate before the key encoding below —
+		// PK columns precede the (last-positioned) hidden shard column, so
+		// the shard hash and pkKey both see the stored form.
+		if col.Precision > 0 {
+			ed, eerr := enforceTypmod(col, row[col.ID])
+			if eerr != nil {
+				return nil, nil, eerr
+			}
+			row[col.ID] = ed
 		}
 	}
 	key, verr := pkKey(desc, row)
@@ -688,6 +703,19 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 	for i, id := range desc.PrimaryKey {
 		row[id] = pkVals[i]
 	}
+	// Stamp DECIMAL(p,s) columns with their declared display scale so
+	// projections render fixed-scale ("9.90"). After the PK overwrite, so
+	// key-decoded PK decimals are stamped too. Display-only: canonical
+	// text in S stays the comparison/storage identity.
+	for i := range desc.Columns {
+		col := &desc.Columns[i]
+		if col.Precision > 0 && col.Type == types.Decimal {
+			if d, ok := row[col.ID]; ok && !d.Null {
+				d.Dscale = col.Scale
+				row[col.ID] = d
+			}
+		}
+	}
 	return row, nil
 }
 
@@ -834,7 +862,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type})
+		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
 	}
 	for _, fr := range rows {
 		out := make([]types.Datum, len(proj))
@@ -923,10 +951,14 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			}
 			d, cerr := d.Coerce(col.Type)
 			if cerr != nil {
-				return nil, newErrf(CodeInternal, "column %q: %v", col.Name, cerr)
+				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
 			}
 			if d.Null && col.NotNull {
 				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+			}
+			d, cerr2 := enforceTypmod(col, d)
+			if cerr2 != nil {
+				return nil, cerr2
 			}
 			fr.row[col.ID] = d
 		}
@@ -1042,11 +1074,16 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		col := catalog.Column{
 			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
+			Precision: def.Precision, Scale: def.Scale,
 		}
 		if def.Default != nil && !def.Default.Null {
 			d, cerr := def.Default.Coerce(def.Type)
 			if cerr != nil {
 				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr)
+			}
+			d, terr := enforceTypmod(col, d)
+			if terr != nil {
+				return nil, terr
 			}
 			// Fill-on-read: rows written before this ADD lack the column and
 			// decode as the default; NULLs written afterwards are stored

@@ -10,7 +10,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 |---|---|---|
 | `INT8` | `INT`, `INTEGER`, `BIGINT` | 64-bit |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
-| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is accepted but **not enforced** |
+| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
 | `TEXT` | `STRING`, `VARCHAR` | |
 | `BOOL` | `BOOLEAN` | |
 | `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire |
@@ -28,6 +28,12 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   operand demotes the expression to float. `AVG(DECIMAL)` rounds to 6
   fractional digits (half-even). Float values never implicitly convert
   *to* DECIMAL.
+- `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
+  in both wire formats, `COPY`, and `DEFAULT` values — including primary
+  key and indexed columns (two values that round to the same stored
+  number collide as duplicates). Expression and aggregate *results* are
+  plain DECIMALs and render canonically (`SUM` of `9.90`s can print
+  `19.8`), like PostgreSQL's rule that expressions lose the typmod.
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
