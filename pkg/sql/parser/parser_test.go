@@ -222,3 +222,100 @@ func TestDecimalLiterals(t *testing.T) {
 		t.Fatalf("precision lost: %+v", lit)
 	}
 }
+
+// TestBooleanWhere: OR/AND/NOT with parentheses lower to the executor's
+// conjunction form — De Morgan eliminates NOT, single-column equality ORs
+// rewrite to IN, and subqueries inside OR are rejected.
+func TestBooleanWhere(t *testing.T) {
+	// AND of a leaf and an OR group.
+	sel := parseOne(t, `SELECT id FROM t WHERE a = 1 AND (b = 2 OR c > 3)`).(*Select)
+	if len(sel.Where) != 2 || sel.Where[0].Column != "a" {
+		t.Fatalf("where: %+v", sel.Where)
+	}
+	or := sel.Where[1]
+	if or.Op != "OR" || len(or.Or) != 2 || or.Or[0][0].Column != "b" || or.Or[1][0].Op != ">" {
+		t.Fatalf("or: %+v", or)
+	}
+
+	// Precedence: AND binds tighter than OR.
+	sel = parseOne(t, `SELECT id FROM t WHERE a = 1 OR b = 2 AND c = 3`).(*Select)
+	if len(sel.Where) != 1 || sel.Where[0].Op != "OR" {
+		t.Fatalf("where: %+v", sel.Where)
+	}
+	if d := sel.Where[0].Or; len(d) != 2 || len(d[0]) != 1 || len(d[1]) != 2 {
+		t.Fatalf("or shape: %+v", d)
+	}
+
+	// NOT elimination: De Morgan + operator negation.
+	sel = parseOne(t, `SELECT id FROM t WHERE NOT (a = 1 AND b IS NULL)`).(*Select)
+	or = sel.Where[0]
+	if or.Op != "OR" || or.Or[0][0].Op != "!=" || or.Or[1][0].Op != "IS NOT NULL" {
+		t.Fatalf("negated: %+v", or)
+	}
+	sel = parseOne(t, `SELECT id FROM t WHERE NOT a < 5`).(*Select)
+	if sel.Where[0].Op != ">=" {
+		t.Fatalf("negated leaf: %+v", sel.Where[0])
+	}
+
+	// Single-column equality OR rewrites to IN.
+	sel = parseOne(t, `SELECT id FROM t WHERE a = 1 OR a = 2 OR a = $1`).(*Select)
+	w := sel.Where[0]
+	if w.Op != "IN" || w.Column != "a" || len(w.Values) != 3 || w.Values[2].Param != 1 {
+		t.Fatalf("IN rewrite: %+v", w)
+	}
+	if CountParams(sel) != 1 {
+		t.Fatalf("params through IN rewrite: %d", CountParams(sel))
+	}
+
+	// Mixed columns stay an OR; subqueries inside OR are rejected.
+	sel = parseOne(t, `SELECT id FROM t WHERE a = 1 OR b = 2`).(*Select)
+	if sel.Where[0].Op != "OR" {
+		t.Fatalf("mixed: %+v", sel.Where[0])
+	}
+	if _, err := Parse(`SELECT id FROM t WHERE a = 1 OR b IN (SELECT x FROM u)`); err == nil {
+		t.Fatal("subquery inside OR accepted")
+	}
+	// NOT IN and NOT EXISTS still parse as leaves.
+	sel = parseOne(t, `SELECT id FROM t WHERE a NOT IN (1, 2) AND NOT EXISTS (SELECT 1 FROM u)`).(*Select)
+	if sel.Where[0].Op != "NOT IN" || sel.Where[1].Op != "NOT EXISTS" {
+		t.Fatalf("legacy NOTs: %+v", sel.Where)
+	}
+}
+
+// TestArithmeticAndFunctions: precedence-correct * and /, parenthesized
+// grouping, and builtin calls.
+func TestArithmeticAndFunctions(t *testing.T) {
+	sel := parseOne(t, `SELECT a + b * 2, (a + b) * 2, lower(name), coalesce(x, y, 0), now() FROM t`).(*Select)
+	e := sel.Exprs[0].Expr // a + (b * 2): flat node a, +, Right = {b * 2}
+	if e.Column != "a" || e.BinOp != "+" || e.Right.Column != "b" || e.Right.BinOp != "*" {
+		t.Fatalf("precedence: %+v", e)
+	}
+	e = sel.Exprs[1].Expr // (a + b) * 2: Left = {a + b}, *, 2
+	if e.Left == nil || e.Left.BinOp != "+" || e.BinOp != "*" || e.Right.Lit == nil {
+		t.Fatalf("grouping: %+v", e)
+	}
+	if f := sel.Exprs[2].Expr; f.Func != "lower" || len(f.Args) != 1 || f.Args[0].Column != "name" {
+		t.Fatalf("lower: %+v", f)
+	}
+	if f := sel.Exprs[3].Expr; f.Func != "coalesce" || len(f.Args) != 3 {
+		t.Fatalf("coalesce: %+v", f)
+	}
+	if f := sel.Exprs[4].Expr; f.Func != "now" || len(f.Args) != 0 {
+		t.Fatalf("now: %+v", f)
+	}
+	// Left associativity: a - b - c = (a - b) - c.
+	sel = parseOne(t, `SELECT a - b - c FROM t`).(*Select)
+	e = sel.Exprs[0].Expr
+	if e.Left == nil || e.Left.Column != "a" || e.Left.BinOp != "-" || e.Right.Column != "c" {
+		t.Fatalf("associativity: %+v", e)
+	}
+	for _, bad := range []string{
+		`SELECT length() FROM t`,
+		`SELECT now(1) FROM t`,
+		`SELECT coalesce() FROM t`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}

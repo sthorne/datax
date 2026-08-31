@@ -66,11 +66,23 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   [ORDER BY col [ASC|DESC], ...] [LIMIT n];
 ```
 
-- **WHERE** is a conjunction (`AND` only — no `OR`, no parentheses) of:
-  `col op value` (`= != < <= > >=`), `col IS [NOT] NULL`,
+- **WHERE** supports full boolean logic: `AND`, `OR`, `NOT`, and
+  parentheses over conditions of the form `expr op value`
+  (`= != < <= > >=`), `col IS [NOT] NULL`,
   `col [NOT] IN (list | SELECT ...)`, `[NOT] EXISTS (SELECT ...)`,
-  `j ->> 'k' op value`. A value may be a literal, parameter, column, or
-  scalar `(SELECT ...)`.
+  `j ->> 'k' op value`. The left side may be a computed expression
+  (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a literal,
+  parameter, column, or scalar `(SELECT ...)`. Restrictions: subqueries
+  cannot appear inside `OR`, and computed left-hand sides work in
+  single-table queries only. `OR` conditions filter fetched rows — they
+  never become index bounds, so pair them with an indexable `AND`
+  condition on large tables.
+- **Expressions**: arithmetic `+ - * /` with standard precedence and
+  parentheses (exact on DECIMAL/INT8; integer division truncates;
+  division by zero is SQLSTATE `22012`), and the functions `now()`,
+  `coalesce(...)`, `length(s)`, `lower(s)`, `upper(s)`, `abs(n)` — in
+  SELECT lists, WHERE, INSERT VALUES, and UPDATE SET. Computed SELECT
+  outputs describe as text on the wire.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   whole-table or per `GROUP BY` group, including over joins. `HAVING`
   filters on aggregates or group columns. `DISTINCT` is supported.

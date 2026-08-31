@@ -11,10 +11,9 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| `OR` in WHERE (and parenthesized boolean logic) | run two queries and merge client-side, or use `IN` for same-column alternatives |
 | `OFFSET` | paginate by key: `WHERE id > $last ORDER BY id LIMIT n` (faster anyway) |
 | `RETURNING` | `SELECT` after the write, in the same transaction |
-| Expressions in SELECT beyond `col ± value` (no `col * 2`, no function calls, no `now()`) | compute client-side; timestamps come from the client |
+| Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`; `CASE` expressions | compute client-side |
 | `UNION` / `INTERSECT` / `EXCEPT` | merge client-side |
 | `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
 | Sequences / `SERIAL` / `DEFAULT` expressions | generate ids client-side (UUIDs distribute writes better than sequences here anyway) |
@@ -37,6 +36,11 @@ syntax error or `0A000` feature not supported):
   comparison, and `IS [NOT] NULL`. No containment `@>` (planned, #40), no
   indexing on JSONB columns, no ordering comparisons. Numbers inside JSONB
   keep exact textual fidelity rather than PostgreSQL's numeric parsing.
+- **`OR` is supported with full boolean grouping**, but `OR` conditions
+  never become index bounds (they filter fetched rows) — keep an
+  indexable `AND` condition alongside on large tables. Subqueries cannot
+  appear inside `OR`, and computed left-hand sides (`qty * 2 > 10`) work
+  in single-table queries only.
 - **Join order is execution order** — there is no cost-based reordering.
   Write the most selective table first. `ON` clauses must be equalities
   against earlier tables.

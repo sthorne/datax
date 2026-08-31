@@ -16,7 +16,10 @@ type PathStep struct {
 }
 
 // Expr is a scalar expression: a literal, a parameter ($N), a column
-// reference, or column ± literal/param (for UPDATE ... SET x = x + 1).
+// reference, a function call, or arithmetic over those. A single binary
+// op keeps the flat historical shape (Column/Lit/Param on the node
+// itself, operator, Right); chained or parenthesized arithmetic nests
+// through Left.
 type Expr struct {
 	Lit    *types.Datum `json:"lit,omitempty"`
 	Param  int          `json:"param,omitempty"` // 1-based; 0 = none
@@ -26,8 +29,14 @@ type Expr struct {
 	// Sub is a scalar subquery: (SELECT ...) used as a value. Uncorrelated
 	// only — the executor evaluates it once and splices the result.
 	Sub *Select `json:"sub,omitempty"`
-	// Binary op: Column/Lit/Param on the left, operator, right operand.
-	BinOp string `json:"bin_op,omitempty"` // "+", "-"
+	// Func is a builtin call (lower-cased): coalesce, length, lower,
+	// upper, abs, now. Args are its arguments.
+	Func string `json:"func,omitempty"`
+	Args []Expr `json:"args,omitempty"`
+	// Binary op: "+", "-", "*", "/". The left operand is Left when set,
+	// else this node's own Column/Lit/Param/Func.
+	BinOp string `json:"bin_op,omitempty"`
+	Left  *Expr  `json:"left,omitempty"`
 	Right *Expr  `json:"right,omitempty"`
 }
 
@@ -35,12 +44,23 @@ type Expr struct {
 // col [NOT] IN (list | subquery), or [NOT] EXISTS (subquery). The executor
 // rewrites evaluated EXISTS conjuncts to the constant ops TRUE/FALSE.
 type Comparison struct {
-	Column string     // lower-cased; empty for [NOT] EXISTS and TRUE/FALSE
+	Column string     // lower-cased; empty for [NOT] EXISTS, TRUE/FALSE, and OR
 	Path   []PathStep // ->/->> chain applied to Column (JSONB extraction)
-	Op     string     // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE
+	Op     string     // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE | OR
 	Value  Expr       // scalar ops: literal, param, or scalar subquery
 	Values []Expr     // [NOT] IN: the value list (spliced from Sub when a subquery)
 	Sub    *Select    // [NOT] IN / [NOT] EXISTS subquery
+	// Expr, when set, is a computed left-hand side (qty * 2 > 10,
+	// lower(name) = 'x'); Column/Path are empty then. Computed LHS
+	// conjuncts are never usable for key bounds and are v1-restricted to
+	// single-table queries.
+	Expr *Expr `json:"expr,omitempty"`
+	// Or (Op "OR") is a disjunction of conjunctions: the conjunct is true
+	// when ANY inner []Comparison is entirely true. NOT was eliminated at
+	// parse time (De Morgan + operator negation — sound under SQL
+	// three-valued logic because WHERE keeps only TRUE), and subqueries
+	// are rejected inside OR (documented v1 restriction).
+	Or [][]Comparison `json:"or,omitempty"`
 }
 
 type ColumnDef struct {

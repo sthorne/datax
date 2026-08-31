@@ -3,7 +3,9 @@ package sql
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -328,6 +330,18 @@ func (s *Session) rollback(ctx context.Context) {
 func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
 	var base types.Datum
 	switch {
+	case e.Left != nil:
+		d, err := evalExpr(*e.Left, desc, row, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		base = d
+	case e.Func != "":
+		d, err := evalFunc(e, desc, row, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		base = d
 	case e.Lit != nil:
 		base = *e.Lit
 	case e.Param > 0:
@@ -381,6 +395,14 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 			return types.NewInt(l.I + r.I), nil
 		case "-":
 			return types.NewInt(l.I - r.I), nil
+		case "*":
+			return types.NewInt(l.I * r.I), nil
+		case "/":
+			// Integer division truncates (PostgreSQL semantics).
+			if r.I == 0 {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+			}
+			return types.NewInt(l.I / r.I), nil
 		}
 	}
 	// Exact decimal arithmetic when either side is DECIMAL and the other
@@ -411,6 +433,14 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 			return types.NewDecimal(decimal.Add(lv, rv).String()), nil
 		case "-":
 			return types.NewDecimal(decimal.Sub(lv, rv).String()), nil
+		case "*":
+			return types.NewDecimal(decimal.Mul(lv, rv).String()), nil
+		case "/":
+			q, err := decimal.DivQuantize(lv, rv, 6)
+			if err != nil {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+			}
+			return types.NewDecimal(q.String()), nil
 		}
 	}
 	lf, err := l.Coerce(types.Float)
@@ -426,8 +456,83 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 		return types.NewFloat(lf.F + rf.F), nil
 	case "-":
 		return types.NewFloat(lf.F - rf.F), nil
+	case "*":
+		return types.NewFloat(lf.F * rf.F), nil
+	case "/":
+		if rf.F == 0 {
+			return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+		}
+		return types.NewFloat(lf.F / rf.F), nil
 	}
 	return types.Datum{}, newErrf(CodeFeatureNotSupported, "unsupported operator %q", op)
+}
+
+// evalFunc evaluates a builtin scalar call ("now" never reaches here —
+// the session splices it before execution).
+func evalFunc(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+	args := make([]types.Datum, len(e.Args))
+	for i, a := range e.Args {
+		d, err := evalExpr(a, desc, row, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		args[i] = d
+	}
+	switch e.Func {
+	case "coalesce":
+		for _, d := range args {
+			if !d.Null {
+				return d, nil
+			}
+		}
+		return types.DNull, nil
+	case "length":
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		if args[0].Fam != types.String {
+			return types.Datum{}, newErrf(CodeFeatureNotSupported, "length() requires a text argument, got %s", args[0].Fam)
+		}
+		return types.NewInt(int64(len([]rune(args[0].S)))), nil
+	case "lower", "upper":
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		if args[0].Fam != types.String {
+			return types.Datum{}, newErrf(CodeFeatureNotSupported, "%s() requires a text argument, got %s", e.Func, args[0].Fam)
+		}
+		if e.Func == "lower" {
+			return types.NewString(strings.ToLower(args[0].S)), nil
+		}
+		return types.NewString(strings.ToUpper(args[0].S)), nil
+	case "abs":
+		d := args[0]
+		if d.Null {
+			return types.DNull, nil
+		}
+		switch d.Fam {
+		case types.Int:
+			if d.I < 0 {
+				return types.NewInt(-d.I), nil
+			}
+			return d, nil
+		case types.Float:
+			return types.NewFloat(math.Abs(d.F)), nil
+		case types.Decimal:
+			v, err := d.DecimalVal()
+			if err != nil {
+				return types.Datum{}, newErrf(CodeInternal, "%v", err)
+			}
+			if v.Sign() < 0 {
+				return types.NewDecimal(decimal.Neg(v).String()), nil
+			}
+			return d, nil
+		}
+		return types.Datum{}, newErrf(CodeFeatureNotSupported, "abs() requires a numeric argument, got %s", d.Fam)
+	case "now":
+		return types.Datum{}, newErrf(CodeInternal, "now() was not resolved before execution")
+	}
+	return types.Datum{}, newErrf(CodeFeatureNotSupported, "unknown function %q", e.Func)
 }
 
 // matchesWhere evaluates the conjunction against a full row.
@@ -439,6 +544,46 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		}
 		if cmp.Op == "FALSE" {
 			return false, nil
+		}
+		if cmp.Expr != nil {
+			// Computed left-hand side: evaluate both sides and compare raw
+			// (Compare lifts numerics; no column type to coerce toward).
+			lhs, err := evalExpr(*cmp.Expr, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			rhs, err := evalExpr(cmp.Value, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if lhs.Null || rhs.Null {
+				return false, nil
+			}
+			c, err := lhs.Compare(rhs)
+			if err != nil {
+				return false, nil
+			}
+			if !cmpHolds(cmp.Op, c) {
+				return false, nil
+			}
+			continue
+		}
+		if cmp.Op == "OR" {
+			matched := false
+			for _, disjunct := range cmp.Or {
+				ok, err := matchesWhere(disjunct, desc, row, params)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false, nil
+			}
+			continue
 		}
 		col, ok := desc.Col(cmp.Column)
 		if !ok {
@@ -486,26 +631,30 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if err != nil {
 			return false, nil
 		}
-		ok = false
-		switch cmp.Op {
-		case "=":
-			ok = c == 0
-		case "!=":
-			ok = c != 0
-		case "<":
-			ok = c < 0
-		case "<=":
-			ok = c <= 0
-		case ">":
-			ok = c > 0
-		case ">=":
-			ok = c >= 0
-		}
-		if !ok {
+		if !cmpHolds(cmp.Op, c) {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// cmpHolds applies a comparison operator to a Compare result.
+func cmpHolds(op string, c int) bool {
+	switch op {
+	case "=":
+		return c == 0
+	case "!=":
+		return c != 0
+	case "<":
+		return c < 0
+	case "<=":
+		return c <= 0
+	case ">":
+		return c > 0
+	case ">=":
+		return c >= 0
+	}
+	return false
 }
 
 // matchesIn evaluates col [NOT] IN (values) with SQL three-valued

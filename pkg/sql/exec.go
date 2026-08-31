@@ -586,7 +586,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum) ([]types.Datum, bool, error) {
 	byCol := map[catalog.ColumnID]types.Datum{}
 	for _, cmp := range where {
-		if cmp.Op != "=" || len(cmp.Path) > 0 {
+		if cmp.Op != "=" || len(cmp.Path) > 0 || cmp.Column == "" {
 			continue
 		}
 		col, ok := desc.Col(cmp.Column)
