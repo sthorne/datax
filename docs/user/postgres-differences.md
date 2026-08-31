@@ -68,7 +68,9 @@ syntax error or `0A000` feature not supported):
 
 - pgx (native and `database/sql`), lib/pq, and psql work, in both simple
   and extended protocol modes, text and binary formats.
-- Prepared statements work; portal suspension (fetching partial results)
-  does not — drivers that set a row fetch limit should disable it.
+- Prepared statements and portal suspension both work — JDBC-style fetch
+  sizes are fine. The full result is materialized server-side at the
+  first Execute and served in fetch-size chunks, so a fetch limit bounds
+  wire traffic per round trip, not server memory.
 - `sslmode=verify-full` works in secure mode with the datax CA
   ([Security](security.md)); `sslmode=disable` in insecure mode.

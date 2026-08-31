@@ -90,6 +90,15 @@ type portal struct {
 	stmt       *prepared
 	params     []types.Datum
 	resFormats []int16 // normalized per result column (0 text, 1 binary)
+	// Suspension state (row-limited Execute): the statement runs once on
+	// the first Execute and the materialized result is then served across
+	// Executes — up to MaxRows rows each, PortalSuspended in between,
+	// CommandComplete when exhausted. PostgreSQL portal semantics: a
+	// portal executes its statement once; re-running requires a re-Bind
+	// (which replaces this struct and resets the state).
+	res    *sql.Result
+	offset int
+	done   bool
 }
 
 type conn struct {
@@ -131,6 +140,9 @@ func (c *conn) run(ctx context.Context) error {
 		case *pgproto3.Query:
 			c.skipToSync = false
 			c.handleSimpleQuery(ctx, m.String)
+			if c.session.State() != sql.StateOpen {
+				c.reapPortals() // a simple-query COMMIT/ROLLBACK ends them
+			}
 			c.sendReady()
 			if err := c.backend.Flush(); err != nil {
 				return err
@@ -164,6 +176,12 @@ func (c *conn) run(ctx context.Context) error {
 			}
 		case *pgproto3.Sync:
 			c.skipToSync = false
+			// Portals do not survive the implicit transaction: outside an
+			// explicit BEGIN, Sync ends the cycle and reaps them (inside
+			// one they live until the transaction ends).
+			if c.session.State() != sql.StateOpen {
+				c.reapPortals()
+			}
 			c.sendReady()
 			if err := c.backend.Flush(); err != nil {
 				return err
@@ -313,8 +331,21 @@ func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
 }
 
 // sendDataRows emits rows; formats is per-column (nil = all text).
+// reapPortals destroys every portal (end of implicit cycle or of the
+// enclosing transaction).
+func (c *conn) reapPortals() {
+	for name := range c.portals {
+		delete(c.portals, name)
+	}
+}
+
 func (c *conn) sendDataRows(res *sql.Result, formats []int16) {
-	for _, row := range res.Rows {
+	c.sendDataRowRange(res, formats, 0, len(res.Rows))
+}
+
+// sendDataRowRange sends rows [from, to) of a materialized result.
+func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) {
+	for _, row := range res.Rows[from:to] {
 		dr := &pgproto3.DataRow{Values: make([][]byte, len(row))}
 		for i, d := range row {
 			format := int16(0)
@@ -572,13 +603,36 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		c.backend.Send(&pgproto3.EmptyQueryResponse{})
 		return
 	}
-	res, serr := c.session.Execute(ctx, pt.stmt.stmt, pt.params)
-	if serr != nil {
-		c.extError(serr)
+	if pt.done {
+		// A completed portal stays completed: further Executes return no
+		// rows (re-running requires a re-Bind).
+		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
 		return
 	}
-	if res.Columns != nil {
-		c.sendDataRows(res, pt.resFormats)
+	if pt.res == nil {
+		res, serr := c.session.Execute(ctx, pt.stmt.stmt, pt.params)
+		if serr != nil {
+			c.extError(serr)
+			return
+		}
+		pt.res = res
 	}
-	c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(res.Tag)})
+	if pt.res.Columns == nil {
+		// Row-less statements complete in one Execute regardless of limit.
+		pt.done = true
+		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+		return
+	}
+	end := len(pt.res.Rows)
+	if m.MaxRows > 0 && pt.offset+int(m.MaxRows) < end {
+		end = pt.offset + int(m.MaxRows)
+	}
+	c.sendDataRowRange(pt.res, pt.resFormats, pt.offset, end)
+	pt.offset = end
+	if pt.offset < len(pt.res.Rows) {
+		c.backend.Send(&pgproto3.PortalSuspended{})
+		return
+	}
+	pt.done = true
+	c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
 }
