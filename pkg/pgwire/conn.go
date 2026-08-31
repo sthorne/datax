@@ -192,6 +192,11 @@ func (c *conn) run(ctx context.Context) error {
 			}
 		case *pgproto3.Terminate:
 			return nil
+		case *pgproto3.CopyData, *pgproto3.CopyDone, *pgproto3.CopyFail:
+			// Copy sub-protocol messages outside copy mode are silently
+			// discarded (PostgreSQL behavior). This also drains a client
+			// that streamed CopyData optimistically before seeing the
+			// ErrorResponse for a COPY that failed to start (pgx does).
 		default:
 			c.sendError(&sql.Error{Code: sql.CodeFeatureNotSupported, Msg: fmt.Sprintf("unsupported message %T", msg)})
 			c.skipToSync = true
@@ -302,7 +307,19 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 		c.backend.Send(&pgproto3.EmptyQueryResponse{})
 		return
 	}
-	for _, stmt := range stmts {
+	for i, stmt := range stmts {
+		if cf, ok := stmt.(*parser.CopyFrom); ok {
+			// COPY takes over the message stream, so it may only end a
+			// simple query — running statements after copy mode would need
+			// a continuation machine no client exercises.
+			if i != len(stmts)-1 {
+				c.sendError(&sql.Error{Code: sql.CodeFeatureNotSupported,
+					Msg: "COPY FROM STDIN must be the last statement of a simple query"})
+				return
+			}
+			c.handleCopyIn(ctx, cf)
+			return
+		}
 		res, serr := c.session.Execute(ctx, stmt, nil)
 		if serr != nil {
 			c.sendError(serr)
@@ -476,6 +493,15 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 	switch len(stmts) {
 	case 0:
 	case 1:
+		if _, ok := stmts[0].(*parser.CopyFrom); ok {
+			// pgx's CopyFrom sends the COPY statement itself via a simple
+			// Query; only its preliminary column-discovery SELECT arrives
+			// here. Copy mode inside the extended protocol is undefined
+			// territory no client needs.
+			c.extError(&sql.Error{Code: sql.CodeFeatureNotSupported,
+				Msg: "COPY FROM STDIN is only supported in the simple query protocol"})
+			return
+		}
 		p.stmt = stmts[0]
 		p.nParams = parser.CountParams(stmts[0])
 		cols, serr := c.session.PlanColumns(ctx, stmts[0])

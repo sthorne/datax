@@ -108,6 +108,35 @@ type Insert struct {
 	Rows    [][]Expr
 }
 
+// CopyFormat selects the data encoding of a COPY FROM STDIN stream.
+type CopyFormat int
+
+const (
+	CopyFormatText CopyFormat = iota
+	CopyFormatCSV
+	CopyFormatBinary
+)
+
+func (f CopyFormat) String() string {
+	switch f {
+	case CopyFormatCSV:
+		return "csv"
+	case CopyFormatBinary:
+		return "binary"
+	default:
+		return "text"
+	}
+}
+
+// CopyFrom is COPY table [(cols)] FROM STDIN [format clause]. The data
+// itself travels out of band (pgwire copy-in sub-protocol), so this
+// statement only names the target and the encoding.
+type CopyFrom struct {
+	Table   string
+	Columns []string // empty = all visible columns in order
+	Format  CopyFormat
+}
+
 type SelectExpr struct {
 	Star  bool
 	Expr  Expr
@@ -172,6 +201,13 @@ type Select struct {
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and
 	// may be served by follower replicas.
 	AsOf string
+	// AsOfMaxStaleness is the AS OF SYSTEM TIME with_max_staleness('10s')
+	// operand ("" = none): a POSITIVE duration string. The gateway picks
+	// one statement timestamp — the freshest its local replicas can serve
+	// from their closed timestamps, never older than now minus the bound —
+	// and ranges that cannot serve it locally fall back to their leader.
+	// Mutually exclusive with AsOf by construction.
+	AsOfMaxStaleness string
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool
@@ -244,6 +280,7 @@ func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}
 func (*Insert) stmt()              {}
+func (*CopyFrom) stmt()            {}
 func (*Select) stmt()              {}
 func (*Update) stmt()              {}
 func (*Delete) stmt()              {}

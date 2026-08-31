@@ -78,6 +78,9 @@ var (
 	FollowerReads = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_follower_reads_total", Help: "Stale reads served by non-leader replicas at their closed timestamp.",
 	})
+	FollowerReadFallbacks = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_follower_read_fallbacks_total", Help: "Stale-read sub-batches the gateway could not serve from its local replica (none held, or its closed timestamp lagged) and sent to the leader instead.",
+	})
 	DeadlockAborts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_deadlock_aborts_total", Help: "Transactions aborted as chosen victims of detected deadlock cycles.",
 	})

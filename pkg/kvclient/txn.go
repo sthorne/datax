@@ -308,6 +308,33 @@ func (t *Txn) Get(ctx context.Context, key keys.Key) ([]byte, error) {
 	return br.Responses[0].Get.Value, nil
 }
 
+// GetBatch reads many keys in ONE routed batch — the per-range sub-batches
+// fan out in parallel — returning values positionally (nil = absent).
+// Vastly cheaper than N sequential Gets when the keys are known up front
+// (COPY's per-chunk uniqueness probes).
+func (t *Txn) GetBatch(ctx context.Context, ks []keys.Key) ([][]byte, error) {
+	if len(ks) == 0 {
+		return nil, nil
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
+	for _, k := range ks {
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}})
+	}
+	br, err := t.send(ctx, ba, false)
+	if err != nil {
+		return nil, err
+	}
+	vals := make([][]byte, len(ks))
+	for i, k := range ks {
+		t.recordRead(k, nil)
+		vals[i] = br.Responses[i].Get.Value
+	}
+	return vals, nil
+}
+
 // Scan reads [start, end) at the transaction's read timestamp.
 func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.KeyValue, error) {
 	if err := t.flushDeferred(ctx); err != nil {

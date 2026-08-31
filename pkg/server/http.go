@@ -184,6 +184,10 @@ type RangeStatus struct {
 	// QPS is the leader-local measured request rate (~0 on followers).
 	QPS         float64 `json:"qps"`
 	GCThreshold string  `json:"gc_threshold,omitempty"`
+	// ClosedTimestamp is this replica's applied closed timestamp — the
+	// newest fixed timestamp it can serve follower reads at. Empty until
+	// the first publication applies.
+	ClosedTimestamp string `json:"closed_timestamp,omitempty"`
 }
 
 // NodeStatus is the /status document.
@@ -213,6 +217,9 @@ func (n *Node) rangeStatuses() []RangeStatus {
 		}
 		if thr := r.GCThreshold(); !thr.IsEmpty() {
 			rs.GCThreshold = thr.String()
+		}
+		if ct := r.ClosedTimestamp(); !ct.IsEmpty() {
+			rs.ClosedTimestamp = ct.String()
 		}
 		for _, rep := range desc.Replicas {
 			rs.Replicas = append(rs.Replicas, int(rep.NodeID))

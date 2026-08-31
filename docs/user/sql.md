@@ -119,6 +119,27 @@ DELETE FROM t WHERE a = 1;
 Batching inserts matters enormously for throughput — a 100-row `INSERT` is
 one replication round; 100 single-row statements are 100.
 
+### Bulk loading with COPY
+
+```sql
+COPY t (a, b) FROM STDIN;                  -- text format (psql \copy sends this)
+COPY t FROM STDIN WITH (FORMAT csv);
+```
+
+```sh
+psql "$URL" -c "\copy t FROM data.csv WITH (FORMAT csv)"
+```
+
+pgx's `CopyFrom` (binary format) works too and is the fastest loader.
+COPY runs through the same pipeline as `INSERT` — defaults, `NOT NULL`,
+unique checks, and secondary indexes all apply — but commits in **chunks**
+of 128 rows / 1 MiB as data streams in. That makes huge loads safe
+(bounded memory, bounded transactions), at a price worth knowing: a
+mid-load failure keeps the chunks already committed (the error reports
+the failing row and the committed count), and COPY cannot run inside
+`BEGIN`. Only the `FORMAT text|csv|binary` option is supported; `COPY TO`
+is not.
+
 ## Transactions and retries
 
 ```sql
@@ -163,12 +184,29 @@ Deadlocks are detected and broken automatically (one victim gets `40001`).
 ```sql
 SELECT COUNT(*) FROM users AS OF SYSTEM TIME '-5s';
 SELECT ... AS OF SYSTEM TIME '2026-08-30T10:00:00Z';
+SELECT ... AS OF SYSTEM TIME with_max_staleness('10s');
 ```
 
-Pins the read to a fixed past timestamp; reads older than the closed
-timestamp lag (~3s) are served by the **local** replica without contacting
-the leader — cheap read scaling for dashboards and reports. Bounded by the
-GC window (25h) on the old side. Not allowed inside `BEGIN`.
+The first two pin the read to a fixed past timestamp; reads older than the
+closed timestamp lag (~3s) are served by the **local** replica without
+contacting the leader — cheap read scaling for dashboards and reports.
+
+`with_max_staleness('10s')` inverts the guess: instead of picking a
+staleness and hoping it is old enough, you state the staleness you can
+*tolerate*, and the gateway reads at **the freshest timestamp its own
+replicas can serve** — never staler than the bound. Data the gateway holds
+locally is answered without touching leaders (it keeps working even if
+they are unreachable); ranges it cannot serve within the bound fall back
+to their leaders transparently. One timestamp covers the whole statement,
+so multi-range results stay consistent. Watch
+`datax_follower_reads_total` (served locally) vs
+`datax_follower_read_fallbacks_total` (sent to a leader) to see whether
+your bound is doing its job.
+
+All forms: bounded by the GC window (25h) on the old side; not allowed
+inside `BEGIN`; a freshly written row may be invisible until the closed
+timestamp passes its write (~the lag) — that is the staleness you signed
+up for.
 
 ## Timeseries tables
 

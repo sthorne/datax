@@ -17,7 +17,7 @@ syntax error or `0A000` feature not supported):
 | `UNION` / `INTERSECT` / `EXCEPT` | merge client-side |
 | `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
 | Sequences / `SERIAL` / `DEFAULT` expressions | generate ids client-side (UUIDs distribute writes better than sequences here anyway) |
-| `COPY` | multi-row `INSERT` batches (100–1000 rows per statement) — COPY is planned (#42) |
+| `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Multiple databases / schemas | one namespace; the URL's database name is accepted and ignored |
 | Views, triggers, stored procedures, `LISTEN/NOTIFY` | — |
 
@@ -44,6 +44,11 @@ syntax error or `0A000` feature not supported):
 - **Join order is execution order** — there is no cost-based reordering.
   Write the most selective table first. `ON` clauses must be equalities
   against earlier tables.
+- **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
+  1 MiB) as the stream arrives, so a failure partway leaves the earlier
+  chunks committed — the error names the failing row and how many rows
+  were already committed. For the same reason COPY is refused inside
+  `BEGIN` (SQLSTATE `25001`) and only the `FORMAT` option is accepted.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
   inside a transaction block.
@@ -54,7 +59,9 @@ syntax error or `0A000` feature not supported):
 - **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
   `EXPLAIN ANALYZE`.
 - **`AS OF SYSTEM TIME`** exists (CockroachDB syntax, not PostgreSQL) —
-  cheap historical/follower reads.
+  cheap historical/follower reads, including bounded staleness:
+  `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
+  the local replicas can serve within the bound.
 - **`SET x = y`** is parsed and ignored (drivers send these at startup);
   `server_version` reports a PostgreSQL-13-compatible string.
 

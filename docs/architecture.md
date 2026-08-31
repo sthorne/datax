@@ -79,8 +79,10 @@ These are the load-bearing rules; tests assert them.
    acquisition the timestamp cache floor is bumped to `now()`, because a new
    leader cannot know what reads the old leader served. The one non-leader
    read path is a **follower read**: a read pinned to a fixed timestamp at
-   or below the range's replicated closed timestamp (`AS OF SYSTEM TIME`),
-   which is linearizable *at that timestamp* by construction.
+   or below the range's replicated closed timestamp (`AS OF SYSTEM TIME`,
+   whose `with_max_staleness` form picks that timestamp from the gateway's
+   own closed timestamps), which is linearizable *at that timestamp* by
+   construction.
 3. **Clocks**: every RPC carries an HLC timestamp; receivers ratchet their
    clock. A remote clock further than `--max-offset` ahead is a fatal error.
    Reads treat values in `(readTS, readTS+maxOffset]` as uncertain and restart.

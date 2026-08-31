@@ -12,10 +12,11 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
+COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 SELECT [DISTINCT] * | col, ... | aggregates
     FROM t [[AS] alias] | (SELECT ...) [AS] alias
     [[INNER | LEFT [OUTER]] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...]]
-    [AS OF SYSTEM TIME 't']
+    [AS OF SYSTEM TIME 't' | AS OF SYSTEM TIME with_max_staleness('d')]
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
     [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
@@ -351,6 +352,28 @@ explicit `BEGIN ... COMMIT`.
   outside one) — JDBC fetch-size loops work. The statement runs once at
   the first Execute and the result is served from the materialized rows
   (streaming resumption from KV is a possible later optimization).
+- **Copy-in sub-protocol**: `COPY t [(cols)] FROM STDIN [WITH (FORMAT
+  text|csv|binary)]` (also pgx's pre-9.0 trailing `BINARY` spelling) is
+  accepted in the simple protocol, as the last statement of the query.
+  The server answers `CopyInResponse` and consumes `CopyData` messages as
+  one byte stream — clients cut them with no row alignment, so rows,
+  fields, and escape sequences may straddle messages. Text format
+  implements the PG escape rules (`\N` null, `\t` `\n` … `\\`, octal,
+  hex, the `\.` terminator); CSV distinguishes unquoted-empty (NULL) from
+  `""` (empty string), which is why the parser is hand-rolled and
+  streaming; binary is the `PGCOPY` header + per-field lengths, decoded
+  with the same per-type routines as binary parameters (a missing `-1`
+  trailer is tolerated — pgx omits it). Rows execute through the shared
+  INSERT pipeline (defaults, shard bucket, NOT NULL, uniqueness, index
+  entries) and commit in chunks of 128 rows / 1 MiB, one implicit
+  transaction per chunk whose write batch is rebuilt on every retry
+  attempt (the uniqueness reads must re-execute in the fresh
+  transaction). A failure reports the row number and the rows already
+  committed; `CopyFail` aborts with `57014`; stray copy messages outside
+  copy mode are silently discarded (PG behavior — and what keeps an
+  optimistically-streaming pgx from desyncing after a refused COPY).
+  COPY inside `BEGIN` is refused (`25001`), like the other
+  chunked-commit statements.
 - **Transaction status is load-bearing**: `ReadyForQuery` carries `I` (idle),
   `T` (in transaction), or `E` (failed transaction — everything except
   `ROLLBACK` is rejected with `25P02`).
