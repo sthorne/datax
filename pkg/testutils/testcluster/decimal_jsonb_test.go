@@ -266,12 +266,15 @@ func TestDecimalKeysAndJSONBGuards(t *testing.T) {
 		t.Fatalf("path IS NULL: %+v", res.Rows)
 	}
 
-	// Paths demand jsonb, and stay out of join queries (documented v1 cut).
+	// Paths demand jsonb; join queries now evaluate them (issue #41 —
+	// the dedicated join_expr_path suite covers the full surface).
 	if _, serr := trySQL(ctx, s, `SELECT id ->> 'k' FROM docs`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
 		t.Fatalf("path on int: %+v", serr)
 	}
-	if _, serr := trySQL(ctx, s, `SELECT d.id FROM docs AS d JOIN tx AS x ON x.id = d.id WHERE d.j ->> 'k' = 'v'`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
+	if res, serr := trySQL(ctx, s, `SELECT d.id FROM docs AS d JOIN tx AS x ON x.id = d.id WHERE d.j ->> 's' = 'txt'`); serr != nil {
 		t.Fatalf("path in join: %+v", serr)
+	} else if len(res.Rows) != 1 || res.Rows[0][0].I != 1 {
+		t.Fatalf("path in join rows: %+v", res.Rows)
 	}
 
 	// Exact decimal arithmetic in expressions: 0.1 + 0.2 = 0.3.

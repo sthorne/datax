@@ -374,17 +374,55 @@ func (s *Session) rollback(ctx context.Context) {
 }
 
 // evalExpr evaluates an expression given an optional row context.
+// exprEnv resolves column references during expression evaluation: a
+// single table's descriptor+row, or a joined row with side-qualified
+// names. Everything else about evaluation (literals, params, functions,
+// paths, arithmetic) is environment-independent.
+type exprEnv interface {
+	col(name string) (types.Datum, error)
+}
+
+// tableEnv is the single-table environment: descriptor + row map. A nil
+// descriptor or row means column references are simply not available
+// (constant-only contexts like access planning).
+type tableEnv struct {
+	desc *catalog.TableDescriptor
+	row  map[catalog.ColumnID]types.Datum
+}
+
+func (t tableEnv) col(name string) (types.Datum, error) {
+	if t.desc == nil || t.row == nil {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q is not available in this context", name)
+	}
+	col, ok := t.desc.Col(name)
+	if !ok {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	}
+	d, ok := t.row[col.ID]
+	if !ok {
+		d = types.DNull
+	}
+	return d, nil
+}
+
+// evalExpr evaluates an expression against a single table's row — the
+// historical signature, kept for its many call sites; join evaluation
+// passes a joinEnv to evalExprEnv directly.
 func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+	return evalExprEnv(e, tableEnv{desc: desc, row: row}, params)
+}
+
+func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
 	var base types.Datum
 	switch {
 	case e.Left != nil:
-		d, err := evalExpr(*e.Left, desc, row, params)
+		d, err := evalExprEnv(*e.Left, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
 		base = d
 	case e.Func != "":
-		d, err := evalFunc(e, desc, row, params)
+		d, err := evalFunc(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -397,16 +435,9 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 		}
 		base = params[e.Param-1]
 	case e.Column != "":
-		if desc == nil || row == nil {
-			return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q is not available in this context", e.Column)
-		}
-		col, ok := desc.Col(e.Column)
-		if !ok {
-			return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", e.Column)
-		}
-		d, ok := row[col.ID]
-		if !ok {
-			d = types.DNull
+		d, err := env.col(e.Column)
+		if err != nil {
+			return types.Datum{}, err
 		}
 		base = d
 	case e.Sub != nil:
@@ -425,7 +456,7 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 	if e.BinOp == "" {
 		return base, nil
 	}
-	rhs, err := evalExpr(*e.Right, desc, row, params)
+	rhs, err := evalExprEnv(*e.Right, env, params)
 	if err != nil {
 		return types.Datum{}, err
 	}
@@ -516,10 +547,10 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 
 // evalFunc evaluates a builtin scalar call ("now" never reaches here —
 // the session splices it before execution).
-func evalFunc(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
 	args := make([]types.Datum, len(e.Args))
 	for i, a := range e.Args {
-		d, err := evalExpr(a, desc, row, params)
+		d, err := evalExprEnv(a, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}

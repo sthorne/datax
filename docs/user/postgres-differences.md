@@ -36,8 +36,9 @@ syntax error or `0A000` feature not supported):
   canonical form (no declared scale), as in PostgreSQL.
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
-- **JSONB**: `->`/`->>` extraction and containment `@>` (single-table
-  queries only), equality comparison, and `IS [NOT] NULL`. No indexing on
+- **JSONB**: `->`/`->>` extraction (single-table queries and joins;
+  grouped SELECT lists refuse), containment `@>` (single-table only),
+  equality comparison, and `IS [NOT] NULL`. No indexing on
   JSONB columns (`@>` always filters — no inverted indexes), no ordering
   comparisons, no `<@`/`?`/`?|`/`?&`. `@>` is not accepted in `HAVING` or
   after a computed left-hand side. One asymmetry to know: `@>` compares
@@ -46,8 +47,8 @@ syntax error or `0A000` feature not supported):
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
   indexable `AND` condition alongside on large tables. Subqueries cannot
-  appear inside `OR`, and computed left-hand sides (`qty * 2 > 10`) work
-  in single-table queries only.
+  appear inside `OR`. Computed left-hand sides (`qty * 2 > 10`) work in
+  single-table queries and joins.
 - **Join order is execution order** — there is no cost-based reordering.
   Write the most selective table first. `ON` clauses must be equalities
   against earlier tables.

@@ -66,8 +66,9 @@ SHOW TABLES
   ordering comparisons are refused. Extraction: `col -> 'key'` (jsonb)
   and `col ->> 'key'` (text, terminal only), chainable
   (`j -> 'a' ->> 'b'`); missing keys and non-objects yield NULL.
-  Single-table queries only — path operators in join queries refuse with
-  `0A000` — and path conjuncts never become index bounds.
+  Path operators work in single-table queries and joins (select lists
+  and WHERE, evaluated on the joined row; grouped SELECT lists refuse
+  with `0A000`), and path conjuncts never become index bounds.
 - JSONB containment `@>` (and its NOT-elimination twin `NOT @>`): decoded
   with `json.Number` and walked structurally — objects contain
   recursively, arrays contain each right element via SOME left element,
@@ -122,12 +123,11 @@ on the recent side and the GC TTL (default 25h) on the old side.
 Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 join reordering (join order = syntactic order) and joins beyond 8 tables,
-expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
 `<@` and the `?`/`?|`/`?&` existence operators,
-path operators in join queries,
+path operators and expressions in GROUPED join select lists,
 DEFAULT expressions beyond constants.
 
 ## Catalog
@@ -276,7 +276,24 @@ Aggregates and GROUP BY compose with joins: the joined rows run through
 the grouped executor, with `GROUP BY c.name`, `SUM(o.total)`, HAVING and
 DISTINCT all accepting qualified references. ORDER BY on a grouped join
 orders by *result* column name (the same rule single-table GROUP BY
-follows). Plain (non-grouped) join select lists remain columns or `*`.
+follows).
+
+Plain (non-grouped) join select lists and WHERE conjuncts evaluate full
+expressions and `->`/`->>` paths against the joined row: expression
+evaluation is environment-abstracted (`exprEnv` — a column-lookup seam
+with a single-table and a join implementation), so the join side reuses
+the same literal/parameter/function/path/arithmetic machinery with
+side-resolved column references. A NULL-extended LEFT side yields NULL
+for its columns, which flows through paths and arithmetic as SQL NULL —
+and path conjuncts apply before the IS NULL arm, so
+`left.j ->> 'k' IS NULL` keeps NULL-extended rows. Computed select items
+render as TEXT (the single-table rule); path items type by their chain.
+Path and computed conjuncts are never pushed into the base scan (the
+post-join filter re-evaluates the full WHERE — pushing would only be an
+optimization, and for paths never a bound anyway). Remaining narrow
+spots, all explicit `0A000`s: grouped join SELECT lists take plain
+columns and aggregates only; `@>` stays single-table; join ORDER BY
+sorts by side columns, not computed aliases.
 
 Uncorrelated subqueries evaluate eagerly, inside the same transaction,
 before the outer statement plans: a scalar subquery splices in as a
