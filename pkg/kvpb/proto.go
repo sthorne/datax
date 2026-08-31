@@ -237,6 +237,8 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		out.Value = &rpcpb.RequestUnion_Increment{Increment: &rpcpb.IncrementRequest{Header: reqHeaderToProto(r.RequestHeader), By: r.By}}
 	case *ScanRequest:
 		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate}}
+	case *ExportRequest:
+		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords}}
 	case *EndTxnRequest:
 		pb := &rpcpb.EndTxnRequest{Header: reqHeaderToProto(r.RequestHeader), Commit: r.Commit}
 		for _, k := range r.IntentKeys {
@@ -330,6 +332,8 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		u.Increment = &IncrementRequest{RequestHeader: reqHeaderFromProto(v.Increment.Header), By: v.Increment.By}
 	case *rpcpb.RequestUnion_Scan:
 		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate}
+	case *rpcpb.RequestUnion_Export:
+		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords}
 	case *rpcpb.RequestUnion_EndTxn:
 		r := &EndTxnRequest{RequestHeader: reqHeaderFromProto(v.EndTxn.Header), Commit: v.EndTxn.Commit}
 		for _, k := range v.EndTxn.IntentKeys {
@@ -507,6 +511,12 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 			pb.Rows = append(pb.Rows, &rpcpb.KeyValue{Key: kv.Key, Value: kv.Value})
 		}
 		out.Value = &rpcpb.ResponseUnion_Scan{Scan: pb}
+	case u.Export != nil:
+		pb := &rpcpb.ExportResponse{Resume: u.Export.Resume}
+		for _, rec := range u.Export.Records {
+			pb.Records = append(pb.Records, &rpcpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+		}
+		out.Value = &rpcpb.ResponseUnion_Export{Export: pb}
 	case u.EndTxn != nil:
 		out.Value = &rpcpb.ResponseUnion_EndTxn{EndTxn: &rpcpb.EndTxnResponse{CommitTimestamp: tsToProto(u.EndTxn.CommitTimestamp)}}
 	case u.HeartbeatTxn != nil:
@@ -573,6 +583,12 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			r.Rows = append(r.Rows, KeyValue{Key: kv.Key, Value: kv.Value})
 		}
 		u.Scan = r
+	case *rpcpb.ResponseUnion_Export:
+		r := &ExportResponse{Resume: v.Export.Resume}
+		for _, rec := range v.Export.Records {
+			r.Records = append(r.Records, ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+		}
+		u.Export = r
 	case *rpcpb.ResponseUnion_EndTxn:
 		u.EndTxn = &EndTxnResponse{CommitTimestamp: tsFromProto(v.EndTxn.CommitTimestamp)}
 	case *rpcpb.ResponseUnion_HeartbeatTxn:

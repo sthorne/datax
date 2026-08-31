@@ -62,6 +62,50 @@ Splits and merges also happen automatically (by size: 64 MiB; by load:
 sustained 500 QPS); the manual commands are for pre-splitting before a bulk
 load and for tests.
 
+## Backup and restore
+
+`datax backup` asks a node to write a **consistent** backup of the whole
+cluster — every table (data and indexes, raw), descriptors with their
+grants, and users — captured at a single timestamp, correct even under
+concurrent write load:
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31
+datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
+              --base /backups/2026-08-31          # incremental since the base
+```
+
+- Paths are on the **serving node's** filesystem (a mounted shared
+  filesystem makes them portable).
+- A backup directory holds a `BACKUP.json` manifest plus one data file per
+  table; the manifest is written last, so its presence marks the backup
+  complete. The summary prints per-table record counts and SHA-256
+  checksums over the live data.
+- Incrementals capture only keys changed since the base — deletions
+  included — and must chain within the MVCC GC window (25h by default): an
+  older base is refused with "incremental base too old". Take a fresh full
+  backup at least daily.
+- On an encrypted store, backup files are written in plaintext; the
+  command refuses unless you pass `--allow-plaintext`. Protect the backup
+  location accordingly.
+
+`datax restore` applies a chain (full first, then incrementals in order)
+into an **empty** cluster — it refuses if any table exists:
+
+```sh
+datax restore --addr 10.0.1.1:26257 --src /backups/2026-08-31,/backups/2026-08-31-noon
+```
+
+Table IDs are preserved, so secondary indexes and timeseries shard layouts
+restore as-is with no backfill; the descriptor ID generator is bumped past
+every restored ID. Users, admin-role markers, and per-table grants come
+from the backup — after a restore, **credentials are the source cluster's**.
+The restore summary re-exports every table and prints fresh checksums:
+compare them against the backup's to verify the restore byte-for-byte.
+
+MVCC history is not preserved (rows are rewritten at restore time), so
+`AS OF SYSTEM TIME` cannot see below the restore.
+
 ## Decommissioning a node
 
 ```sh

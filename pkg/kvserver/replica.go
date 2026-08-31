@@ -787,6 +787,16 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, readTimestamp(ba), thr)
 		}
 	}
+	// An incremental export whose window opens below the GC threshold could
+	// miss deletions whose tombstones GC has already reclaimed: refuse it
+	// (non-retryable — the history is gone, the base backup is too old).
+	for _, u := range ba.Requests {
+		if exp := u.Export; exp != nil && !exp.StartTS.IsEmpty() {
+			if thr := r.GCThreshold(); !thr.IsEmpty() && exp.StartTS.Less(thr) {
+				return nil, kvpb.NewErrorf("%s: export start timestamp %s is below the GC threshold %s (incremental base too old)", r.rangeID, exp.StartTS, thr)
+			}
+		}
+	}
 
 	if ba.IsReadOnly() {
 		// Bump the cache BEFORE evaluating (invariant L2): an overlapping

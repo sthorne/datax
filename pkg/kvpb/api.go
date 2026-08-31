@@ -57,6 +57,20 @@ type ScanRequest struct {
 	ForUpdate bool  `json:"for_update,omitempty"`
 }
 
+// ExportRequest returns, for every key in [Key, EndKey) that changed in
+// (StartTS, batch timestamp], the newest version at or below the batch
+// timestamp — deletions included, as tombstone records. StartTS zero
+// exports everything live at the batch timestamp (a full backup); non-zero
+// exports the delta since a prior export at StartTS (an incremental).
+// Evaluated as a consistent read: intents at or below the batch timestamp
+// conflict, exactly like a Scan — an inconsistent read would silently miss
+// a transaction committing just below the export timestamp.
+type ExportRequest struct {
+	RequestHeader
+	StartTS    hlc.Timestamp `json:"start_ts,omitempty"`
+	MaxRecords int64         `json:"max_records,omitempty"`
+}
+
 // EndTxnRequest commits or aborts the transaction: the atomic flip of the
 // transaction record. Routed to the transaction's anchor range.
 type EndTxnRequest struct {
@@ -220,6 +234,7 @@ type RequestUnion struct {
 	Delete              *DeleteRequest              `json:"delete,omitempty"`
 	Increment           *IncrementRequest           `json:"increment,omitempty"`
 	Scan                *ScanRequest                `json:"scan,omitempty"`
+	Export              *ExportRequest              `json:"export,omitempty"`
 	EndTxn              *EndTxnRequest              `json:"end_txn,omitempty"`
 	HeartbeatTxn        *HeartbeatTxnRequest        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnRequest             `json:"push_txn,omitempty"`
@@ -250,6 +265,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Increment
 	case u.Scan != nil:
 		return u.Scan
+	case u.Export != nil:
+		return u.Export
 	case u.EndTxn != nil:
 		return u.EndTxn
 	case u.HeartbeatTxn != nil:
@@ -298,6 +315,7 @@ func (h *PutRequest) Header() RequestHeader                 { return h.RequestHe
 func (h *DeleteRequest) Header() RequestHeader              { return h.RequestHeader }
 func (h *IncrementRequest) Header() RequestHeader           { return h.RequestHeader }
 func (h *ScanRequest) Header() RequestHeader                { return h.RequestHeader }
+func (h *ExportRequest) Header() RequestHeader              { return h.RequestHeader }
 func (h *EndTxnRequest) Header() RequestHeader              { return h.RequestHeader }
 func (h *HeartbeatTxnRequest) Header() RequestHeader        { return h.RequestHeader }
 func (h *PushTxnRequest) Header() RequestHeader             { return h.RequestHeader }
@@ -319,6 +337,7 @@ func (*PutRequest) Method() string                 { return "Put" }
 func (*DeleteRequest) Method() string              { return "Delete" }
 func (*IncrementRequest) Method() string           { return "Increment" }
 func (*ScanRequest) Method() string                { return "Scan" }
+func (*ExportRequest) Method() string              { return "Export" }
 func (*EndTxnRequest) Method() string              { return "EndTxn" }
 func (*HeartbeatTxnRequest) Method() string        { return "HeartbeatTxn" }
 func (*PushTxnRequest) Method() string             { return "PushTxn" }
@@ -340,6 +359,7 @@ func (*PutRequest) IsReadOnly() bool                 { return false }
 func (*DeleteRequest) IsReadOnly() bool              { return false }
 func (*IncrementRequest) IsReadOnly() bool           { return false }
 func (r *ScanRequest) IsReadOnly() bool              { return !r.ForUpdate }
+func (*ExportRequest) IsReadOnly() bool              { return true }
 func (*EndTxnRequest) IsReadOnly() bool              { return false }
 func (*HeartbeatTxnRequest) IsReadOnly() bool        { return false }
 func (r *PushTxnRequest) IsReadOnly() bool           { return r.QueryOnly }
@@ -373,6 +393,20 @@ type IncrementResponse struct {
 type ScanResponse struct {
 	Rows   []KeyValue `json:"rows,omitempty"`
 	Resume keys.Key   `json:"resume,omitempty"`
+}
+
+// ExportRecord is one exported key: its newest visible value at the export
+// timestamp, or a tombstone marker when the change in the window was a
+// deletion.
+type ExportRecord struct {
+	Key     keys.Key `json:"key"`
+	Value   []byte   `json:"value,omitempty"`
+	Deleted bool     `json:"deleted,omitempty"`
+}
+
+type ExportResponse struct {
+	Records []ExportRecord `json:"records,omitempty"`
+	Resume  keys.Key       `json:"resume,omitempty"`
 }
 
 type EndTxnResponse struct {
@@ -453,6 +487,7 @@ type ResponseUnion struct {
 	Delete              *DeleteResponse              `json:"delete,omitempty"`
 	Increment           *IncrementResponse           `json:"increment,omitempty"`
 	Scan                *ScanResponse                `json:"scan,omitempty"`
+	Export              *ExportResponse              `json:"export,omitempty"`
 	EndTxn              *EndTxnResponse              `json:"end_txn,omitempty"`
 	HeartbeatTxn        *HeartbeatTxnResponse        `json:"heartbeat_txn,omitempty"`
 	PushTxn             *PushTxnResponse             `json:"push_txn,omitempty"`
@@ -547,6 +582,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Increment = t
 	case *ScanRequest:
 		u.Scan = t
+	case *ExportRequest:
+		u.Export = t
 	case *EndTxnRequest:
 		u.EndTxn = t
 	case *HeartbeatTxnRequest:

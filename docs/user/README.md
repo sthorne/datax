@@ -10,7 +10,7 @@ it works inside, the design docs live one level up in [`docs/`](../).
 | [Security](security.md) | Certificates, secure vs insecure mode, users, `GRANT`/`REVOKE`, Prometheus auth |
 | [SQL reference](sql.md) | Every supported statement with examples, the type table, transactions and the retry loop, timeseries tables |
 | [Differences from PostgreSQL](postgres-differences.md) | What's missing, what behaves differently, and workarounds |
-| [Operations](operations.md) | The dashboard, metrics and alerting, `datax debug`, decommission, capacity planning |
+| [Operations](operations.md) | The dashboard, metrics and alerting, backup/restore, `datax debug`, decommission, capacity planning |
 
 All examples in these pages were run against a live cluster before being
 written down. Prompt conventions: `$` is your shell, `datax>` is

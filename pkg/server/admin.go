@@ -51,6 +51,23 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	case "decommission":
 		return n.serveDecommission(ctx, req)
 
+	case "backup":
+		if req.Path == "" {
+			return cluster.AdminResponse{Error: "backup requires a destination path"}
+		}
+		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
+	case "restore":
+		sum, err := n.RunRestore(ctx, req.Paths)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
 	case "merge":
 		if req.RangeID == 0 {
 			return cluster.AdminResponse{Error: "merge requires --range"}

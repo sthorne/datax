@@ -280,6 +280,12 @@ func UserSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// AdminUserSpan covers all admin-role membership markers.
+func AdminUserSpan() (Key, Key) {
+	p := systemKey("admins")
+	return p, p.PrefixEnd()
+}
+
 // ---------------------------------------------------------------------------
 // Table data keys.
 

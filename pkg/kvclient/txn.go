@@ -738,7 +738,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 		if push.Status == enginepb.STAGING {
 			// A parallel commit in flight: run status recovery, then let
 			// the next push observe the finalized record.
-			t.recoverStagedTxn(ctx, intent.Txn, push)
+			t.db.recoverStagedTxn(ctx, intent.Txn, push)
 			br, kerr = t.db.Send(ctx, ba)
 			if kerr != nil {
 				return false, nil, kerr
@@ -954,13 +954,13 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 // timestamp — the ordinary read path bumps the timestamp cache first
 // (invariant L2), so a write found missing can never land at or below the
 // staged timestamp afterwards — then finalize the record accordingly.
-func (t *Txn) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, push *kvpb.PushTxnResponse) {
+func (db *DB) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, push *kvpb.PushTxnResponse) {
 	stagedTS := push.CommitTS
 	committed := true
 	for _, k := range push.InFlightKeys {
 		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: stagedTS}}
 		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}})
-		_, kerr := t.db.Send(ctx, ba)
+		_, kerr := db.Send(ctx, ba)
 		if kerr == nil {
 			// No intent of the staged transaction at or below stagedTS —
 			// and the read's timestamp-cache bump now PREVENTS one forever.
@@ -988,13 +988,13 @@ func (t *Txn) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, pus
 		return
 	}
 	metrics.TxnRecoveries.Inc()
-	rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+	rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
 	rba.Add(&kvpb.RecoverTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(pushee.Key).Clone()},
 		TxnID:         pushee.ID,
 		Commit:        committed,
 	})
-	if _, kerr := t.db.Send(ctx, rba); kerr != nil {
+	if _, kerr := db.Send(ctx, rba); kerr != nil {
 		log.Debugf("recovering staged txn %s: %v", pushee.ID, kerr)
 	}
 }
