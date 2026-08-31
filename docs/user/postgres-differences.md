@@ -59,7 +59,9 @@ syntax error or `0A000` feature not supported):
 - **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
   `EXPLAIN ANALYZE`.
 - **`AS OF SYSTEM TIME`** exists (CockroachDB syntax, not PostgreSQL) —
-  cheap historical/follower reads.
+  cheap historical/follower reads, including bounded staleness:
+  `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
+  the local replicas can serve within the bound.
 - **`SET x = y`** is parsed and ignored (drivers send these at startup);
   `server_version` reports a PostgreSQL-13-compatible string.
 

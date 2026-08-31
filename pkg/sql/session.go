@@ -42,6 +42,28 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 	return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration, RFC 3339 timestamp, or Unix nanoseconds", operand)
 }
 
+// resolveMaxStaleness turns a with_max_staleness operand into the
+// statement timestamp: the freshest the local store can serve
+// (localClosed), but never older than now minus the bound. A local store
+// that has closed past now-bound simply gives a fresher read; one
+// lagging past the bound (or absent — a pure gateway) yields
+// now-bound, and ranges that cannot serve it locally fall back to their
+// leaders through ordinary stale-read routing.
+func resolveMaxStaleness(operand string, now, localClosed hlc.Timestamp) (hlc.Timestamp, error) {
+	d, err := time.ParseDuration(operand)
+	if err != nil {
+		return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration", operand)
+	}
+	if d <= 0 {
+		return hlc.Timestamp{}, fmt.Errorf("max staleness %q must be a positive duration", operand)
+	}
+	ts := now.AddNanos(-d.Nanoseconds())
+	if ts.Less(localClosed) {
+		ts = localClosed
+	}
+	return ts, nil
+}
+
 // ResultColumn describes one output column.
 type ResultColumn struct {
 	Name string
@@ -251,29 +273,44 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// AS OF SYSTEM TIME pins a SELECT to a fixed past timestamp: it runs
 	// in its own read-only historical transaction (servable by follower
 	// replicas), so it cannot join an explicit transaction's timestamp.
-	if sel, ok := stmt.(*parser.Select); ok && sel.AsOf != "" {
+	if sel, ok := stmt.(*parser.Select); ok && (sel.AsOf != "" || sel.AsOfMaxStaleness != "") {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "AS OF SYSTEM TIME cannot run inside a transaction block")
 		}
 		if sel.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with AS OF SYSTEM TIME")
 		}
-		ts, err := resolveAsOf(sel.AsOf, s.db.Clock().Now())
-		if err != nil {
-			return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
+		var ts hlc.Timestamp
+		if sel.AsOfMaxStaleness != "" {
+			var err error
+			ts, err = resolveMaxStaleness(sel.AsOfMaxStaleness, s.db.Clock().Now(), s.db.LocalClosedTimestamp())
+			if err != nil {
+				return nil, newErrf(CodeInvalidParameterValue, "with_max_staleness: %v", err)
+			}
+		} else {
+			var err error
+			ts, err = resolveAsOf(sel.AsOf, s.db.Clock().Now())
+			if err != nil {
+				return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
+			}
 		}
 		// A re-shard rewrites the table at a new primary index whose rows
 		// carry backfill-time MVCC timestamps: a historical read below the
 		// swap would silently miss rows, so it is refused. The CURRENT
 		// descriptor carries the stamp — the historical one predates it.
+		// Best-effort with a short timeout: it is a CURRENT-time read, and
+		// a partitioned leader must not hang a bounded-staleness read whose
+		// whole point is serving locally.
 		if sel.Table != "" {
 			var resharded int64
-			_ = s.db.RunTxn(ctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
+			gctx, gcancel := context.WithTimeout(ctx, 2*time.Second)
+			_ = s.db.RunTxn(gctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
 				if desc, derr := s.cat.Lookup(ctx, gtxn, sel.Table); derr == nil {
 					resharded = desc.ReshardedAt
 				}
 				return nil
 			})
+			gcancel()
 			if resharded > 0 && ts.WallTime < resharded {
 				return nil, newErrf(CodeFeatureNotSupported,
 					"historical read predates the re-shard of table %q; AS OF SYSTEM TIME must be at or after it", sel.Table)

@@ -786,13 +786,31 @@ func (p *parser) parseSelect() (Statement, error) {
 					return nil, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
 				}
 			}
-			t := p.peek()
-			switch t.kind {
-			case tkString, tkNumber:
-				sel.AsOf = t.text
+			// with_max_staleness('10s') asks for the freshest timestamp
+			// the local store can serve within the bound (bounded
+			// staleness); a bare literal pins an exact timestamp.
+			if p.consumeIdentWord("with_max_staleness") {
+				if err := p.expectOp("("); err != nil {
+					return nil, err
+				}
+				t := p.peek()
+				if t.kind != tkString {
+					return nil, p.errf("with_max_staleness expects a duration string, found %q", t.text)
+				}
+				sel.AsOfMaxStaleness = t.text
 				p.i++
-			default:
-				return nil, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+			} else {
+				t := p.peek()
+				switch t.kind {
+				case tkString, tkNumber:
+					sel.AsOf = t.text
+					p.i++
+				default:
+					return nil, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
+				}
 			}
 		}
 	}

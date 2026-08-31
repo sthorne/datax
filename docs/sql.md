@@ -16,7 +16,7 @@ COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protoco
 SELECT [DISTINCT] * | col, ... | aggregates
     FROM t [[AS] alias] | (SELECT ...) [AS] alias
     [[INNER | LEFT [OUTER]] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...]]
-    [AS OF SYSTEM TIME 't']
+    [AS OF SYSTEM TIME 't' | AS OF SYSTEM TIME with_max_staleness('d')]
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
     [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)

@@ -252,6 +252,24 @@ func (s *Store) GetReplica(rangeID base.RangeID) (*Replica, bool) {
 	return r, ok
 }
 
+// MinClosedTimestamp is the oldest closed timestamp across this store's
+// replicas that have published one — the freshest timestamp EVERY such
+// local replica can serve a stale read at. Replicas with no closed
+// timestamp yet are skipped: they can serve nothing locally at any
+// timestamp, so counting them as zero would pin bounded-staleness reads
+// to their staleness bound without making those ranges servable. Zero
+// when no replica qualifies.
+func (s *Store) MinClosedTimestamp() hlc.Timestamp {
+	var min hlc.Timestamp
+	s.VisitReplicas(func(r *Replica) bool {
+		if ct := r.ClosedTimestamp(); !ct.IsEmpty() && (min.IsEmpty() || ct.Less(min)) {
+			min = ct
+		}
+		return true
+	})
+	return min
+}
+
 // VisitReplicas calls f for each replica until it returns false.
 func (s *Store) VisitReplicas(f func(*Replica) bool) {
 	s.mu.Lock()

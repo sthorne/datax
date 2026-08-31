@@ -371,3 +371,32 @@ func TestCopyFrom(t *testing.T) {
 		}
 	}
 }
+
+func TestAsOfMaxStaleness(t *testing.T) {
+	stmts, err := Parse("SELECT * FROM t AS OF SYSTEM TIME with_max_staleness('10s')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := stmts[0].(*Select)
+	if sel.AsOfMaxStaleness != "10s" || sel.AsOf != "" {
+		t.Fatalf("parsed %+v", sel)
+	}
+	// The exact form still works.
+	stmts, err = Parse("SELECT * FROM t AS OF SYSTEM TIME '-5s'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel := stmts[0].(*Select); sel.AsOf != "-5s" || sel.AsOfMaxStaleness != "" {
+		t.Fatalf("exact form: %+v", sel)
+	}
+	for _, bad := range []string{
+		"SELECT * FROM t AS OF SYSTEM TIME with_max_staleness('10s'",
+		"SELECT * FROM t AS OF SYSTEM TIME with_max_staleness(10)",
+		"SELECT * FROM t AS OF SYSTEM TIME with_max_staleness()",
+		"SELECT * FROM t AS OF SYSTEM TIME with_max_staleness",
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%q parsed", bad)
+		}
+	}
+}

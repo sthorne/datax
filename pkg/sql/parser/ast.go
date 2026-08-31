@@ -201,6 +201,13 @@ type Select struct {
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and
 	// may be served by follower replicas.
 	AsOf string
+	// AsOfMaxStaleness is the AS OF SYSTEM TIME with_max_staleness('10s')
+	// operand ("" = none): a POSITIVE duration string. The gateway picks
+	// one statement timestamp — the freshest its local replicas can serve
+	// from their closed timestamps, never older than now minus the bound —
+	// and ranges that cannot serve it locally fall back to their leader.
+	// Mutually exclusive with AsOf by construction.
+	AsOfMaxStaleness string
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool

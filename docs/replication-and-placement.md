@@ -279,6 +279,44 @@ above by the GC TTL (reads at or below the GC threshold are rejected).
 Clients opt in per statement with `AS OF SYSTEM TIME` (see docs/sql.md);
 the gateway then prefers its local replica.
 
+**Bounded staleness** (`AS OF SYSTEM TIME with_max_staleness('10s')`)
+turns the choice around: instead of the client naming a timestamp and
+hoping followers have closed past it, the client names the staleness it
+tolerates and the gateway picks the freshest timestamp its own replicas
+can serve. The gateway computes
+
+```
+ts = max(now − bound, min over local replicas of ClosedTimestamp)
+```
+
+taking the minimum over the store's replicas that have a **non-empty**
+closed timestamp — a replica that has never applied a closed-ts command
+can't serve any follower read, so letting it pin `ts` to zero would make
+every read maximally stale for nothing; those ranges simply fall back. A
+gateway with no replicas at all reads at `now − bound`. The result is one
+fixed timestamp for the whole statement (multi-range results stay
+transactionally consistent — same MVCC snapshot everywhere), never staler
+than the bound, and as fresh as local serving allows: when the local
+replicas have closed past `now − bound`, the read is exactly a
+`now − bound` read; when they lag less than the bound, the read tracks
+their edge and is served entirely locally, leaders unreachable or not.
+
+Per range, serving is all-or-nothing at that timestamp: a range whose
+local replica has closed past `ts` is served locally; one that hasn't —
+or that the gateway holds no replica of — goes to its leader through the
+ordinary NotLeader retry path.
+
+Two counters tell the story. `datax_follower_reads_total` (server-side)
+counts reads a replica served **as a follower**. Its counterpart
+`datax_follower_read_fallbacks_total` (gateway-side) counts ranges a
+stale read could *not* serve locally — no local replica, or a local
+replica that answered NotLeader. The two are asymmetric on purpose: a
+stale read served by a local replica that happens to be the **leader**
+increments neither (it was served locally, but not as a follower, and it
+wasn't a fallback). A rising fallback rate means the bound is tighter
+than the local closed-timestamp lag, or the gateway's store simply
+doesn't hold the ranges being read.
+
 ## Raft log truncation
 
 The log is bounded by leader-driven, **replicated** `TruncateLog` commands

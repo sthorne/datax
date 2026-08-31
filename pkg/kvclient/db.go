@@ -29,6 +29,27 @@ type LocalStore interface {
 	ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
 }
 
+// ClosedTimestampSource is optionally implemented by a LocalStore
+// (kvserver.Store does): the oldest closed timestamp across its local
+// replicas — what bounded-staleness reads use to pick the freshest
+// locally-servable statement timestamp.
+type ClosedTimestampSource interface {
+	MinClosedTimestamp() hlc.Timestamp
+}
+
+// LocalClosedTimestamp reports the local store's MinClosedTimestamp, or
+// zero when there is no local store (a pure gateway) or it does not
+// publish closed timestamps.
+func (db *DB) LocalClosedTimestamp() hlc.Timestamp {
+	if db.local == nil {
+		return hlc.Timestamp{}
+	}
+	if src, ok := db.local.store.(ClosedTimestampSource); ok {
+		return src.MinClosedTimestamp()
+	}
+	return hlc.Timestamp{}
+}
+
 // DB routes KV batches to range replicas: local fast path when this node
 // holds a replica, otherwise RPC. It splits batches across ranges, stitches
 // multi-range scans, refreshes routing from /meta records, and retries
@@ -695,6 +716,18 @@ func overloadBackoff(n int) time.Duration {
 // next — retrying around NotLeader and transport errors until ctx expires.
 func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (*kvpb.BatchResponse, *kvpb.Error) {
 	ba.Header.RangeID = desc.RangeID
+	// Follower-read fallback accounting: a stale read the gateway cannot
+	// serve from its own replica goes to the leader instead. Counted at
+	// most once per sub-batch — either the gateway holds no replica of
+	// this range at all, or its replica answers NotLeader (closed
+	// timestamp too old, or an intent).
+	fallbackCounted := false
+	if ba.Header.StaleRead && db.local != nil {
+		if _, ok := desc.GetReplica(db.local.store.NodeID()); !ok {
+			metrics.FollowerReadFallbacks.Inc()
+			fallbackCounted = true
+		}
+	}
 	var lastErr *kvpb.Error
 	overloads := 0
 	for attempt := 0; ; attempt++ {
@@ -734,6 +767,11 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				break // restart from the leader hint
 			}
 			if kerr.NotLeader != nil {
+				if ba.Header.StaleRead && !fallbackCounted && db.local != nil && target == db.local.store.NodeID() {
+					// The local replica could not serve the stale read.
+					metrics.FollowerReadFallbacks.Inc()
+					fallbackCounted = true
+				}
 				db.cache.SetHint(desc.RangeID, kerr.NotLeader.LeaderHint)
 				lastErr = kerr
 				continue
