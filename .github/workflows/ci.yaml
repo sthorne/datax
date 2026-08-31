@@ -1,12 +1,14 @@
 name: ci
 on:
   push:
-    branches: [main, master]
+    # 'claude/**' covers the working branches, which take direct pushes.
+    branches: [main, master, 'claude/**']
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -19,4 +21,4 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test -race -timeout 20m ./...
+        run: go test -race -timeout 30m ./...

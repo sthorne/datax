@@ -1,0 +1,68 @@
+name: build
+# On-demand binary builds: Actions tab -> "build" -> "Run workflow"
+# (pick any branch), or via the API/workflow-dispatch endpoint. Each run
+# fast-verifies the tree (gofmt/vet/build — the full race suite is ci's
+# job), then cross-compiles the datax binary for every supported platform
+# and uploads each as a downloadable artifact on the run page.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so git describe can reach tags once they exist.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l -s .)
+          if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: version
+        id: version
+        # Tag-relative when tags exist, short SHA until then.
+        run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64, ext: .exe }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build binary
+        env:
+          CGO_ENABLED: "0" # pure Go (Pebble included): cross-compiles everywhere
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "datax${{ matrix.ext }}" ./cmd/datax
+      - uses: actions/upload-artifact@v4
+        with:
+          name: datax-${{ needs.verify.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: datax${{ matrix.ext }}
+          retention-days: 30
+          if-no-files-found: error
