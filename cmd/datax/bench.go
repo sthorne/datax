@@ -34,7 +34,7 @@ func runBench(args []string) error {
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: datax bench <kv|bank|ingest|timeseries> [flags]\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: datax bench <kv|bank|ingest|ingest-copy|timeseries> [flags]\n\n")
 		fmt.Fprintf(fs.Output(), "ingest writes batches of RANDOM keys to stress the LSM write path;\n")
 		fmt.Fprintf(fs.Output(), "timeseries appends per-series MONOTONE timestamps — the hot-tail shape\n")
 		fmt.Fprintf(fs.Output(), "that shard buckets exist to spread — then times windowed reads.\n\n")

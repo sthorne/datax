@@ -304,7 +304,13 @@ their edge and is served entirely locally, leaders unreachable or not.
 Per range, serving is all-or-nothing at that timestamp: a range whose
 local replica has closed past `ts` is served locally; one that hasn't —
 or that the gateway holds no replica of — goes to its leader through the
-ordinary NotLeader retry path.
+ordinary NotLeader retry path. Whether the gateway holds a replica is
+answered by the **store**, not the routing cache: a node that joined an
+existing cluster cached the pre-upreplication descriptor at join, and
+nothing refreshes a descriptor that keeps routing to the leader
+successfully — trusting it would hide the local replica forever (and did,
+before the store became the authority; the store's descriptor also
+repairs the cache when consulted).
 
 Two counters tell the story. `datax_follower_reads_total` (server-side)
 counts reads a replica served **as a follower**. Its counterpart

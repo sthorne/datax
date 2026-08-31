@@ -11,8 +11,9 @@ serves, on that address:
   drill-down yet, so check each node's dashboard for its ranges.
 - **`/metrics`** — Prometheus text format.
 - **`/status`** — JSON: this node's identity, locality, and every range it
-  holds (leader, applied index, size, QPS). `datax debug status --url ...`
-  pretty-prints it.
+  holds (leader, applied index, size, QPS, closed timestamp — the newest
+  fixed timestamp the replica can serve follower reads at).
+  `datax debug status --url ...` pretty-prints it.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
   liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges).
 
@@ -37,8 +38,10 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 
 Also useful: `datax_kv_batch_latency_seconds` (histogram — p99 of the
-replication path), `datax_follower_reads_total` (are your `AS OF` reads
-actually staying local), `datax_parallel_commits_total`,
+replication path), `datax_follower_reads_total` vs
+`datax_follower_read_fallbacks_total` (are your `AS OF` /
+`with_max_staleness` reads actually staying local, or falling back to
+leaders), `datax_parallel_commits_total`,
 `datax_sql_rows_scanned_total` (a jump usually means a query lost its
 index), `datax_auto_splits_total` / `datax_load_splits_total` /
 `datax_range_merges_total`, `datax_gc_runs_total`.

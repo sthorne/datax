@@ -283,3 +283,65 @@ func TestBoundedStalenessSQLSurface(t *testing.T) {
 	}
 	execSQL(t, ctx, s, "ROLLBACK")
 }
+
+// TestBoundedStalenessStaleCachedDescriptor: a gateway whose routing
+// cache holds a descriptor that omits its own replica must still notice
+// it holds one — the store, not the cache, is the authority on local
+// membership. The production vector is the join-time seed: a node that
+// joins an existing cluster caches the pre-upreplication descriptor, and
+// nothing refreshes a descriptor that keeps routing to the leader
+// successfully (only a split or a routing error would). Regression: on
+// such a gateway every bounded read fell back to the leader forever —
+// counted as fallbacks with zero local serves. The test forces the
+// equivalent cache state directly (the cache's freshness guard means a
+// same-shape seed needs a newer generation), then asserts the read is
+// served locally and not miscounted.
+func TestBoundedStalenessStaleCachedDescriptor(t *testing.T) {
+	tc, _ := StartWithEngines(t, 3, fastClosedTS)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	s0 := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	execSQL(t, ctx, s0, "CREATE TABLE sc (id INT8 PRIMARY KEY, v TEXT)")
+	execSQL(t, ctx, s0, "INSERT INTO sc VALUES (1, 'x')")
+	writeTS := tc.Nodes[0].Clock().Now()
+
+	leader := tc.LeaderIndex(1)
+	gateway := (leader + 1) % 3
+	waitAllClosed(t, tc.Nodes[gateway], writeTS)
+
+	// Poison the gateway's cache: the current descriptor with every
+	// replica but the leader's stripped, so the cache claims the gateway
+	// holds nothing.
+	cur, ok := tc.Nodes[gateway].Store().LocalDescriptor(1)
+	if !ok {
+		t.Fatal("gateway holds no replica of range 1")
+	}
+	poisoned := cur
+	poisoned.Replicas = nil
+	leaderNode := tc.Nodes[leader].Store().NodeID()
+	for _, r := range cur.Replicas {
+		if r.NodeID == leaderNode {
+			poisoned.Replicas = append(poisoned.Replicas, r)
+		}
+	}
+	poisoned.Generation = cur.Generation + 1
+	tc.Nodes[gateway].DB().SeedDescriptor(poisoned)
+
+	beforeLocal := testutil.ToFloat64(metrics.FollowerReads)
+	beforeFB := testutil.ToFloat64(metrics.FollowerReadFallbacks)
+	sg := sql.NewSession(tc.Nodes[gateway].DB(), catalog.NewAccessor())
+	res, serr := trySQL(ctx, sg, "SELECT v FROM sc AS OF SYSTEM TIME with_max_staleness('10s') WHERE id = 1")
+	if serr != nil {
+		t.Fatalf("bounded read: [%s] %s", serr.Code, serr.Msg)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].S != "x" {
+		t.Fatalf("bounded read rows: %+v", res.Rows)
+	}
+	if after := testutil.ToFloat64(metrics.FollowerReads); after <= beforeLocal {
+		t.Fatalf("read was not served locally (%v -> %v)", beforeLocal, after)
+	}
+	if after := testutil.ToFloat64(metrics.FollowerReadFallbacks); after != beforeFB {
+		t.Fatalf("local read miscounted as fallback (%v -> %v)", beforeFB, after)
+	}
+}

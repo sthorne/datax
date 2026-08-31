@@ -270,6 +270,17 @@ func (s *Store) MinClosedTimestamp() hlc.Timestamp {
 	return min
 }
 
+// LocalDescriptor returns the current descriptor of this store's replica
+// of the range, if it holds one — the authoritative local-membership
+// answer for gateway routing (kvclient.LocalRanges).
+func (s *Store) LocalDescriptor(id base.RangeID) (kvpb.RangeDescriptor, bool) {
+	r, ok := s.GetReplica(id)
+	if !ok {
+		return kvpb.RangeDescriptor{}, false
+	}
+	return r.Desc(), true
+}
+
 // VisitReplicas calls f for each replica until it returns false.
 func (s *Store) VisitReplicas(f func(*Replica) bool) {
 	s.mu.Lock()

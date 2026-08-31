@@ -37,6 +37,45 @@ type ClosedTimestampSource interface {
 	MinClosedTimestamp() hlc.Timestamp
 }
 
+// LocalRanges is optionally implemented by a LocalStore (kvserver.Store
+// does): descriptor access for replicas this node actually holds. The
+// store is the authority on local membership — a cached descriptor can
+// predate this node's upreplication into the range (it was seeded at
+// join and nothing refreshes a descriptor that still routes to the
+// leader successfully), silently hiding the local replica.
+type LocalRanges interface {
+	LocalDescriptor(base.RangeID) (kvpb.RangeDescriptor, bool)
+}
+
+// holdsReplica reports whether this node holds a replica of the range,
+// consulting the local store when the (possibly stale) descriptor says
+// no. A store descriptor newer than the routing cache's repairs the
+// cache as a side effect, so later statements route correctly upfront.
+func (db *DB) holdsReplica(desc kvpb.RangeDescriptor) bool {
+	if db.local == nil {
+		return false
+	}
+	self := db.local.store.NodeID()
+	if _, ok := desc.GetReplica(self); ok {
+		return true
+	}
+	lr, ok := db.local.store.(LocalRanges)
+	if !ok {
+		return false
+	}
+	ldesc, ok := lr.LocalDescriptor(desc.RangeID)
+	if !ok {
+		return false
+	}
+	if _, ok := ldesc.GetReplica(self); !ok {
+		return false
+	}
+	if ldesc.Generation > desc.Generation {
+		db.cache.Insert(ldesc)
+	}
+	return true
+}
+
 // LocalClosedTimestamp reports the local store's MinClosedTimestamp, or
 // zero when there is no local store (a pure gateway) or it does not
 // publish closed timestamps.
@@ -722,11 +761,9 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 	// this range at all, or its replica answers NotLeader (closed
 	// timestamp too old, or an intent).
 	fallbackCounted := false
-	if ba.Header.StaleRead && db.local != nil {
-		if _, ok := desc.GetReplica(db.local.store.NodeID()); !ok {
-			metrics.FollowerReadFallbacks.Inc()
-			fallbackCounted = true
-		}
+	if ba.Header.StaleRead && db.local != nil && !db.holdsReplica(desc) {
+		metrics.FollowerReadFallbacks.Inc()
+		fallbackCounted = true
 	}
 	var lastErr *kvpb.Error
 	overloads := 0
@@ -818,16 +855,12 @@ func (db *DB) replicaOrder(desc kvpb.RangeDescriptor, staleOK bool) []base.NodeI
 			order = append(order, n)
 		}
 	}
-	if staleOK && db.local != nil {
-		if _, ok := desc.GetReplica(db.local.store.NodeID()); ok {
-			add(db.local.store.NodeID())
-		}
+	if staleOK && db.holdsReplica(desc) {
+		add(db.local.store.NodeID())
 	}
 	add(db.cache.Hint(desc.RangeID))
-	if db.local != nil {
-		if _, ok := desc.GetReplica(db.local.store.NodeID()); ok {
-			add(db.local.store.NodeID())
-		}
+	if db.holdsReplica(desc) {
+		add(db.local.store.NodeID())
 	}
 	for _, r := range desc.Replicas {
 		add(r.NodeID)
