@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -149,10 +150,30 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 			}
 			target[i] = col
 		}
+		// Probe every row's primary key in ONE batched read (the per-range
+		// sub-batches fan out in parallel) instead of a sequential Get per
+		// row — the difference between a chunk costing one round trip and
+		// costing 128.
+		pkKeys := make([]keys.Key, len(rows))
+		for i, r := range rows {
+			_, key, err := buildInsertRow(desc, target, r.vals)
+			if err != nil {
+				return ci.rowErr(r.ordinal, err)
+			}
+			pkKeys[i] = key
+		}
+		existing, err := txn.GetBatch(ctx, pkKeys)
+		if err != nil {
+			return err
+		}
 		var wb kvclient.WriteBatch
 		inserted := map[string]bool{}
-		for _, r := range rows {
-			if err := insertRow(ctx, txn, desc, target, r.vals, &wb, inserted); err != nil {
+		for i, r := range rows {
+			if existing[i] != nil {
+				return ci.rowErr(r.ordinal, newErrf(CodeUniqueViolation,
+					"duplicate key value violates unique constraint on %q", desc.Name))
+			}
+			if err := insertRow(ctx, txn, desc, target, r.vals, &wb, inserted, true); err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
 		}

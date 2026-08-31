@@ -291,7 +291,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			}
 			vals[i] = d
 		}
-		if err := insertRow(ctx, txn, desc, target, vals, &wb, inserted); err != nil {
+		if err := insertRow(ctx, txn, desc, target, vals, &wb, inserted, false); err != nil {
 			return nil, err
 		}
 		count++
@@ -324,12 +324,11 @@ func resolveInsertTargets(desc *catalog.TableDescriptor, cols []string) ([]catal
 	return target, nil
 }
 
-// insertRow runs the per-row insert pipeline shared by INSERT and COPY on
-// already-coerced datums: defaults, the hidden shard bucket, NOT NULL,
-// primary-key uniqueness (intra-statement map + a committed read), value
-// encoding, the reshard shadow write, and secondary index entries — all
-// buffered into wb. vals must be positionally parallel to target.
-func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) error {
+// buildInsertRow completes a positional value row into the full column
+// map — defaults, the hidden shard bucket, NOT NULL — and returns it with
+// its primary-key encoding. Shared by INSERT's per-row path and COPY's
+// batched-probe path.
+func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum) (map[catalog.ColumnID]types.Datum, keys.Key, error) {
 	row := make(map[catalog.ColumnID]types.Datum, len(desc.Columns))
 	for i := range target {
 		row[target[i].ID] = vals[i]
@@ -347,7 +346,7 @@ func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescri
 				}
 				sd, serr := rowenc.ShardBucket(desc, logical)
 				if serr != nil {
-					return serr
+					return nil, nil, serr
 				}
 				row[col.ID] = sd
 				continue
@@ -360,20 +359,36 @@ func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescri
 			row[col.ID] = d
 		}
 		if d.Null && col.NotNull {
-			return newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
 		}
 	}
 	key, verr := pkKey(desc, row)
 	if verr != nil {
-		return verr
+		return nil, nil, verr
+	}
+	return row, key, nil
+}
+
+// insertRow runs the per-row insert pipeline shared by INSERT and COPY on
+// already-coerced datums: defaults, the hidden shard bucket, NOT NULL,
+// primary-key uniqueness (intra-statement map + a committed read — skipped
+// when the caller already probed the key, pkKnownAbsent), value encoding,
+// the reshard shadow write, and secondary index entries — all buffered
+// into wb. vals must be positionally parallel to target.
+func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool) error {
+	row, key, err := buildInsertRow(desc, target, vals)
+	if err != nil {
+		return err
 	}
 	if inserted[string(key)] {
 		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
 	}
-	if existing, err := txn.Get(ctx, key); err != nil {
-		return err
-	} else if existing != nil {
-		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+	if !pkKnownAbsent {
+		if existing, err := txn.Get(ctx, key); err != nil {
+			return err
+		} else if existing != nil {
+			return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+		}
 	}
 	value, verr2 := rowenc.EncodeValue(desc, row)
 	if verr2 != nil {
