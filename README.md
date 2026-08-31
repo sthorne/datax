@@ -88,6 +88,15 @@ Design documents live in [`docs/`](docs/):
 
 ```sh
 go build -o datax ./cmd/datax
+```
+
+Prebuilt binaries on demand: the **build** GitHub Actions workflow
+(Actions tab → build → Run workflow, any branch) verifies the tree and
+cross-compiles `datax` for linux/darwin/windows on amd64+arm64, attaching
+each as a downloadable artifact stamped with the git version. CI (gofmt,
+vet, the full race suite) runs on every push and pull request.
+
+```sh
 
 # One process, three in-memory nodes across racks a/b/c
 # (-http-port 8080 also serves the observability dashboard per node):
