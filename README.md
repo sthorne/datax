@@ -65,6 +65,10 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   CA-verified client certificate, and in insecure mode stays open like
   pgwire trust auth).
 
+**User documentation** — installing, deploying, securing, and operating a
+cluster, plus the SQL reference and a differences-from-PostgreSQL guide —
+lives in [`docs/user/`](docs/user/).
+
 Design documents live in [`docs/`](docs/):
 [architecture](docs/architecture.md) ·
 [transactions](docs/transactions.md) ·

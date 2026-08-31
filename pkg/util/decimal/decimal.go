@@ -9,6 +9,7 @@ package decimal
 import (
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 )
 
@@ -250,18 +251,14 @@ func DivQuantize(a, b Dec, scale int32) (Dec, error) {
 // FromInt lifts an int64 exactly.
 func FromInt(i int64) Dec { return New(i, 0) }
 
-// Float64 converts lossily (for Decimal→Float coercion).
+// Float64 converts lossily (for Decimal→Float coercion), correctly
+// rounded: parsing the canonical string yields the nearest float64, so
+// Float64(Parse("0.42")) is bit-identical to the float literal 0.42.
+// (Iterating ×10/÷10 instead compounds one ULP of error per step.)
 func (d Dec) Float64() float64 {
-	f, _ := new(big.Float).SetInt(coeffOf(d)).Float64()
-	exp := d.exp
-	for exp > 0 {
-		f *= 10
-		exp--
-	}
-	for exp < 0 {
-		f /= 10
-		exp++
-	}
+	// String() is always a plain, valid decimal, so the only possible
+	// error is ErrRange, which still hands back the correct ±Inf.
+	f, _ := strconv.ParseFloat(d.String(), 64)
 	return f
 }
 

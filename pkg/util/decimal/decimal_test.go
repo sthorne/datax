@@ -3,6 +3,7 @@ package decimal
 import (
 	"math/big"
 	"math/rand/v2"
+	"strconv"
 	"testing"
 )
 
@@ -133,6 +134,28 @@ func TestMantissaRoundTrip(t *testing.T) {
 		}
 		if Cmp(d, back) != 0 || back.String() != d.String() {
 			t.Fatalf("mantissa round-trip %s -> %s", d, back)
+		}
+	}
+}
+
+// TestFloat64CorrectlyRounded: Float64 must match Go's own parse of the
+// same text — one ULP off turns a stored FLOAT8 0.42 into
+// 0.42000000000000004 on read.
+func TestFloat64CorrectlyRounded(t *testing.T) {
+	for _, s := range []string{
+		"0.42", "0.57", "0.1", "0.2", "0.3", "123.456", "-9.99",
+		"1e300", "-1e-300", "2.2250738585072014e-308", "0",
+	} {
+		d, err := Parse(s)
+		if err != nil {
+			t.Fatalf("parse %q: %v", s, err)
+		}
+		want, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			t.Fatalf("reference parse %q: %v", s, err)
+		}
+		if got := d.Float64(); got != want {
+			t.Fatalf("Float64(%q) = %v, want %v", s, got, want)
 		}
 	}
 }

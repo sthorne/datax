@@ -1,0 +1,110 @@
+# Deployment
+
+## Starting a cluster
+
+The first node bootstraps the cluster with `init`; every other node joins it
+with `start --join`:
+
+```sh
+# Node 1 (bootstraps, then serves):
+datax init  --dir /var/lib/datax --listen 10.0.0.1:26257 --pg-listen 10.0.0.1:26433 \
+            --locality region=eu,rack=a --http-listen 10.0.0.1:8080
+
+# Nodes 2..N (any existing node's RPC address works as --join):
+datax start --dir /var/lib/datax --listen 10.0.0.2:26257 --pg-listen 10.0.0.2:26433 \
+            --locality region=eu,rack=b --http-listen 10.0.0.2:8080 \
+            --join 10.0.0.1:26257
+```
+
+`init` and `start` accept the same flags; `init` additionally bootstraps the
+cluster on first run. Defaults: RPC `:26257`, SQL `:26433`. An empty
+`--dir` runs in-memory (data lost on exit) — fine for tests, not for
+deployment. Node identity lives in the data directory, so a node restarted
+with the same `--dir` rejoins as itself even if its address changed
+(`--advertise` controls the address other nodes use to reach it, when the
+listen address isn't routable).
+
+With three or more nodes up, every range is replicated 3×. Until then the
+cluster still works, just under-replicated; ranges up-replicate
+automatically as nodes arrive.
+
+## Localities
+
+`--locality` declares the node's failure-domain tiers, outermost first:
+
+```
+--locality region=eu,rack=a
+```
+
+The allocator maximizes diversity across the **last** tier boundary it can:
+with one replica per rack, losing a rack loses at most one replica of any
+range. Give every node the same tier names in the same order. Leaving
+localities off works, but placement then has no failure domains to spread
+across.
+
+## Clocks
+
+Nodes tolerate at most `--max-offset` (default `500ms`) of clock skew; a
+node that drifts past it shuts down rather than risk consistency. Run NTP
+(or equivalent) on every machine. Transaction timestamps come from hybrid
+logical clocks, so ordinary skew below the limit is handled transparently.
+
+## Storage profiles
+
+`--storage-profile` tunes the storage engine:
+
+| Profile | Use when | Trade-off |
+|---|---|---|
+| `balanced` (default) | mixed read/write workloads | Pebble defaults; write-heavy loads accumulate compaction debt and throughput sags |
+| `ingest` | sustained bulk loading | bigger memtables, earlier/more parallel compaction — measured ~10.2k rows/s steady vs ~8k declining on `balanced` for the batched-ingest benchmark, with better read p99 |
+
+The profile is per-node and can differ across restarts. Watch
+`datax_storage_l0_files` / `datax_storage_compaction_debt_bytes` (see
+[Operations](operations.md)) to tell when `ingest` is warranted. Details in
+[docs/storage-profiles.md](../storage-profiles.md).
+
+## Encryption at rest
+
+Give the node a 32-byte key file (raw or hex) and everything it writes to
+disk is encrypted:
+
+```sh
+head -c 32 /dev/urandom > /etc/datax/store.key
+chmod 600 /etc/datax/store.key
+datax init --dir /var/lib/datax --enc-key /etc/datax/store.key ...
+```
+
+The store key wraps per-file data keys; measured cost is ~13% on a mixed
+workload. To rotate the store key the node must be **stopped**:
+
+```sh
+datax debug rotate-enc-key --dir /var/lib/datax \
+  --old-key /etc/datax/store.key --new-key /etc/datax/store-v2.key
+```
+
+Rotation re-wraps the data keys (fast); old data files are re-encrypted
+only through natural compaction churn. Losing the key file means losing the
+store — back it up separately from the data. Details in
+[docs/encryption.md](../encryption.md).
+
+## Tuning flags (rarely needed)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--load-split-threshold` | 500 | sustained per-range QPS that triggers a load-based split (negative disables) |
+| `--lease-shed-factor` | 1.5 | leader-QPS multiple of the cluster mean at which a node sheds hot leases |
+| `--rebalance-bytes-threshold` | 64 MiB | replica-byte spread that triggers byte-weighted replica moves (negative disables) |
+
+The defaults are right for almost everyone; see
+[docs/replication-and-placement.md](../replication-and-placement.md) before
+touching them.
+
+## Checklist for production-ish deployments
+
+- One `datax` process per machine, `--dir` on its own disk (NVMe strongly
+  preferred — every write commits through an fsync'd raft log).
+- `--locality` set consistently on every node; at least 3 failure domains.
+- NTP running everywhere.
+- [Secure mode](security.md): certs dir + `--root-password` on first init.
+- `--http-listen` set, Prometheus scraping `/metrics` on every node.
+- The key file (if encrypting) backed up somewhere that is not the data disk.
