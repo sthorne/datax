@@ -191,6 +191,61 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 	return n
 }
 
+// AddNodeErr joins a fresh node through node 1 like AddNode, but takes
+// config options and returns the start error instead of failing the test —
+// for tests that expect a join rejection (e.g. version gating).
+func (tc *TestCluster) AddNodeErr(opts ...func(*server.Config)) (*server.Node, error) {
+	tc.T.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tc.T.Fatal(err)
+	}
+	cfg := server.Config{
+		Listener:              lis,
+		Join:                  tc.Nodes[0].Addr(),
+		UpreplicationInterval: time.Second,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
+	tc.Nodes = append(tc.Nodes, n)
+	return n, nil
+}
+
+// RestartNodeErr is RestartNode returning the start error instead of
+// failing the test — for tests that expect a refused restart (e.g. a
+// binary downgrade past a finalized upgrade).
+func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*server.Config)) (*server.Node, error) {
+	tc.T.Helper()
+	if tc.Nodes[i] != nil {
+		tc.T.Fatalf("node %d is still running", i+1)
+	}
+	lis, err := net.Listen("tcp", tc.addrs[i])
+	if err != nil {
+		tc.T.Fatalf("re-listening on %s: %v", tc.addrs[i], err)
+	}
+	cfg := server.Config{
+		Listener:   lis,
+		Engine:     eng,
+		GCInterval: -1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
+	tc.Nodes[i] = n
+	return n, nil
+}
+
 // LeaderIndex returns the index of the node whose replica of rangeID is the
 // Raft leader, waiting up to 15s for one to emerge.
 func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {

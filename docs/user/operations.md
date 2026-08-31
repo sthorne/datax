@@ -117,6 +117,37 @@ compare them against the backup's to verify the restore byte-for-byte.
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.
 
+## Rolling upgrades
+
+A cluster upgrades with no downtime, one node at a time. Each binary has a
+protocol version (shown at startup and in `datax debug nodes`); a cluster
+has a **finalized cluster version** that only moves when you say so.
+Adjacent versions only: upgrade one major version at a time.
+
+```sh
+# For each node, one at a time:
+#   1. stop the node (optionally decommission-drain first for zero blips)
+#   2. restart it on the new binary
+#   3. wait until `datax debug nodes` shows it heartbeating with the new
+#      version and the cluster is healthy
+# Then, once EVERY node runs the new binary:
+datax debug upgrade                # finalize; refuses while old nodes remain
+datax debug nodes                  # shows: cluster version: v2
+```
+
+Rules of the road:
+
+- **Before finalize** you can freely roll a node back to the old binary —
+  mixed-version clusters are supported for the duration of the roll.
+- **After finalize there is no downgrade.** A node restarted on an older
+  binary refuses to start ("downgrading a node after the cluster upgrade
+  was finalized is not supported"); a too-old binary is also refused at
+  join time.
+- Finalize is deliberate, not automatic: verify the upgraded cluster looks
+  healthy first, because finalize is the point of no return.
+- `datax debug upgrade` names any node still on the old binary instead of
+  finalizing — nothing to time or coordinate.
+
 ## Decommissioning a node
 
 ```sh

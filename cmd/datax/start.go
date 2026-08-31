@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/log"
+	pversion "github.com/sthorne/datax/pkg/version"
 )
 
 type serverFlags struct {
@@ -93,7 +94,7 @@ func runServer(cfg server.Config) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("datax node %s ready\n", n.NodeID())
+	fmt.Printf("datax node %s ready (protocol %s)\n", n.NodeID(), pversion.Current)
 	fmt.Printf("  internode RPC: %s\n", n.Addr())
 	if cfg.PGListen != "" {
 		mode := "sslmode=disable"

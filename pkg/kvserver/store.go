@@ -289,6 +289,14 @@ func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.
 	if len(ba.Requests) == 0 {
 		return nil, kvpb.NewErrorf("empty batch")
 	}
+	// A request union with no populated member is what an unknown request
+	// type decodes to under the JSON fallback encoding (a newer peer's
+	// request): degrade to an error, never a nil dereference.
+	for i := range ba.Requests {
+		if ba.Requests[i].GetInner() == nil {
+			return nil, kvpb.NewErrorf("unsupported request at index %d in batch (version skew?)", i)
+		}
+	}
 	addr, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
 	if err != nil {
 		return nil, kvpb.NewError(err)

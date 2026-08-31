@@ -14,6 +14,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // StoreIdent identifies a store: which cluster it belongs to and which
@@ -58,12 +59,13 @@ var bootstrapTimestamp = hlc.Timestamp{WallTime: 1}
 
 // BootstrapEngine seeds a fresh engine with the cluster's initial state:
 // the store ident and — identically on every seed node — the pre-applied
-// state machine of range 1: its /meta addressing record and the ID
-// generation counters. These writes happen BEFORE Raft starts, forming the
-// state at applied index 0; determinism across seed nodes is what makes
-// this sound. The caller then creates the range-1 replica with bootstrap
-// semantics.
-func BootstrapEngine(eng *storage.Engine, ident StoreIdent, range1 kvpb.RangeDescriptor, seedNodes int) error {
+// state machine of range 1: its /meta addressing record, the ID
+// generation counters, and the cluster version. These writes happen BEFORE
+// Raft starts, forming the state at applied index 0; determinism across
+// seed nodes is what makes this sound — which requires every seed node to
+// run the same binary (cv must match). The caller then creates the range-1
+// replica with bootstrap semantics.
+func BootstrapEngine(eng *storage.Engine, ident StoreIdent, range1 kvpb.RangeDescriptor, seedNodes int, cv version.Version) error {
 	if _, ok, err := ReadStoreIdent(eng); err != nil {
 		return err
 	} else if ok {
@@ -86,6 +88,11 @@ func BootstrapEngine(eng *storage.Engine, ident StoreIdent, range1 kvpb.RangeDes
 		return err
 	}
 	if err := storage.MVCCPut(b, keys.RangeIDGenKey(), bootstrapTimestamp, []byte("1"), nil); err != nil {
+		return err
+	}
+	// Cluster version: seeded like the ID counters so a fresh cluster is
+	// born finalized at its binary's version.
+	if err := storage.MVCCPut(b, keys.ClusterVersionKey(), bootstrapTimestamp, []byte(fmt.Sprintf("%d", int(cv))), nil); err != nil {
 		return err
 	}
 	return b.Commit(true)
@@ -144,6 +151,10 @@ type JoinRequest struct {
 	// NodeID + ClusterID identify a re-announcing node.
 	NodeID    base.NodeID `json:"node_id,omitempty"`
 	ClusterID uuid.UUID   `json:"cluster_id,omitempty"`
+	// BinaryVersion/MinSupported advertise the sender's protocol-version
+	// window. Absent (pre-versioning binaries) reads as [1, 1].
+	BinaryVersion int `json:"binary_version,omitempty"`
+	MinSupported  int `json:"min_supported,omitempty"`
 }
 
 // JoinResponse tells the joiner who it is and how to route.

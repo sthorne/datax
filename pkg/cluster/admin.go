@@ -28,6 +28,9 @@ type AdminRequest struct {
 	AllowPlaintext bool     `json:"allow_plaintext,omitempty"`
 	// CheckID identifies a consistency probe for collect-checksum.
 	CheckID string `json:"check_id,omitempty"`
+	// Version is the target for upgrade-cluster (0 = the serving node's
+	// binary version).
+	Version int `json:"version,omitempty"`
 }
 
 // AdminResponse is the JSON reply.
@@ -46,6 +49,9 @@ type AdminResponse struct {
 	// and the applied index it was computed at.
 	Checksum     []byte `json:"checksum,omitempty"`
 	AppliedIndex uint64 `json:"applied_index,omitempty"`
+	// ClusterVersion reports the finalized cluster version (nodes,
+	// upgrade-cluster).
+	ClusterVersion int `json:"cluster_version,omitempty"`
 }
 
 // BackupTableSummary reports one table of a backup or restore.

@@ -3,11 +3,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // handleAdmin serves cluster admin RPCs (datax debug ...).
@@ -40,7 +46,13 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 		return cluster.AdminResponse{Ranges: descs}
 
 	case "nodes":
-		return cluster.AdminResponse{Nodes: n.registry.All()}
+		return cluster.AdminResponse{
+			Nodes:          n.registry.All(),
+			ClusterVersion: int(n.readClusterVersion(ctx)),
+		}
+
+	case "upgrade-cluster":
+		return n.serveUpgradeCluster(ctx, req)
 
 	case "rebalance":
 		return n.serveRebalance(ctx, req)
@@ -95,6 +107,53 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	default:
 		return cluster.AdminResponse{Error: "unknown admin op " + req.Op}
 	}
+}
+
+// serveUpgradeCluster finalizes a cluster upgrade: once every live,
+// non-draining node runs a binary at or above the target version, the
+// replicated cluster version advances to it. The version only ever moves
+// forward; repeating the op is idempotent.
+func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
+	target := version.Version(req.Version)
+	if target == 0 {
+		target = n.binaryVersion()
+	}
+	if target > n.binaryVersion() {
+		return cluster.AdminResponse{Error: fmt.Sprintf(
+			"cannot upgrade to %s: this node's binary supports at most %s", target, n.binaryVersion())}
+	}
+	var stragglers []string
+	for _, nd := range n.liveNodes() {
+		if nd.Draining {
+			continue
+		}
+		bv := version.Version(nd.BinaryVersion)
+		if nd.NodeID == n.ident.NodeID {
+			// Our own registry row may lag a heartbeat; we know our binary.
+			bv = n.binaryVersion()
+		} else if bv == 0 {
+			bv = version.V1
+		}
+		if bv < target {
+			stragglers = append(stragglers, fmt.Sprintf("%s (%s)", nd.NodeID, bv))
+		}
+	}
+	if len(stragglers) > 0 {
+		sort.Strings(stragglers)
+		return cluster.AdminResponse{Error: fmt.Sprintf(
+			"cannot finalize %s: live nodes still run older binaries: %s",
+			target, strings.Join(stragglers, ", "))}
+	}
+	cur := n.readClusterVersion(ctx)
+	if cur >= target {
+		return cluster.AdminResponse{ClusterVersion: int(cur)}
+	}
+	if err := n.db.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target)))); err != nil {
+		return cluster.AdminResponse{Error: err.Error()}
+	}
+	n.mirrorClusterVersion(ctx)
+	log.Infof("cluster version finalized at %s", target)
+	return cluster.AdminResponse{ClusterVersion: int(target)}
 }
 
 // listRanges reads all range descriptors from the /meta records. The

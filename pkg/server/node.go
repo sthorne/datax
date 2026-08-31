@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Config configures a node.
@@ -122,6 +124,10 @@ type Config struct {
 	// EncKeyPath is a file holding the 32-byte store encryption key (raw or
 	// hex); empty = plaintext storage.
 	EncKeyPath string
+	// BinaryVersionOverride makes the node advertise (and gate on) this
+	// protocol version instead of version.Current — used by tests to
+	// simulate mixed-version clusters. 0 = version.Current.
+	BinaryVersionOverride version.Version
 
 	// Test hooks.
 	TestingKnobs    kvserver.TestingKnobs
@@ -166,6 +172,11 @@ type Node struct {
 	// encKey is the loaded store encryption key; non-nil means the store is
 	// encrypted and node-written artifacts (metadata backup) are sealed too.
 	encKey []byte
+
+	// clusterVersion caches the last observed finalized cluster version
+	// (0 reads as v1). Seeded from the store-local mirror at startup and
+	// refreshed by the heartbeat loop from the replicated row.
+	clusterVersion atomic.Int64
 
 	// draining mirrors this node's registry Draining flag. The heartbeat
 	// loop adopts it from the node's own registry row (a decommission may
@@ -247,6 +258,20 @@ func (n *Node) start() error {
 	switch {
 	case initialized:
 		n.ident = ident
+		// Downgrade gate: a store that observed a finalized cluster
+		// version newer than this binary supports must not rejoin — it
+		// would misapply version-gated payloads. Checked store-locally so
+		// it works before quorum.
+		if stored, err := readStoreClusterVersion(n.engine); err != nil {
+			return err
+		} else if stored > n.binaryVersion() {
+			return fmt.Errorf(
+				"store last ran at cluster version %s but this binary supports at most %s: "+
+					"downgrading a node after the cluster upgrade was finalized is not supported",
+				stored, n.binaryVersion())
+		} else if stored != 0 {
+			n.clusterVersion.Store(int64(stored))
+		}
 		// A restarting node must reach its peers before any range can
 		// elect a leader: reload the last known registry.
 		if nodes, err := cluster.LoadPersistedRegistry(n.engine); err == nil {
@@ -259,16 +284,16 @@ func (n *Node) start() error {
 	case n.cfg.BootstrapSelf:
 		id := cluster.StoreIdent{ClusterID: uuid.New(), NodeID: 1, StoreID: 1}
 		desc := cluster.Range1Descriptor([]base.NodeID{1})
-		if err := cluster.BootstrapEngine(n.engine, id, desc, 1); err != nil {
+		if err := cluster.BootstrapEngine(n.engine, id, desc, 1, n.binaryVersion()); err != nil {
 			return err
 		}
 		n.ident = id
 		freshRange1 = &desc
-		log.Infof("bootstrapped new cluster %s as %s", id.ClusterID, id.NodeID)
+		log.Infof("bootstrapped new cluster %s as %s (version %s)", id.ClusterID, id.NodeID, n.binaryVersion())
 	case n.cfg.StaticBootstrap != nil:
 		sb := n.cfg.StaticBootstrap
 		id := cluster.StoreIdent{ClusterID: sb.ClusterID, NodeID: sb.NodeID, StoreID: base.StoreID(sb.NodeID)}
-		if err := cluster.BootstrapEngine(n.engine, id, sb.Range1, len(sb.Range1.Replicas)); err != nil {
+		if err := cluster.BootstrapEngine(n.engine, id, sb.Range1, len(sb.Range1.Replicas), n.binaryVersion()); err != nil {
 			return err
 		}
 		n.ident = id
@@ -438,10 +463,12 @@ func (n *Node) reannounce() {
 		return
 	}
 	req := cluster.JoinRequest{
-		Address:   n.addr,
-		Locality:  n.cfg.Locality,
-		NodeID:    n.ident.NodeID,
-		ClusterID: n.ident.ClusterID,
+		Address:       n.addr,
+		Locality:      n.cfg.Locality,
+		NodeID:        n.ident.NodeID,
+		ClusterID:     n.ident.ClusterID,
+		BinaryVersion: int(n.binaryVersion()),
+		MinSupported:  int(n.minSupportedVersion()),
 	}
 	var (
 		wg sync.WaitGroup
@@ -481,9 +508,46 @@ func (n *Node) reannounce() {
 	}
 }
 
+// binaryVersion is the protocol version this node runs (and advertises):
+// version.Current, unless a test overrides it to simulate skew.
+func (n *Node) binaryVersion() version.Version {
+	if n.cfg.BinaryVersionOverride != 0 {
+		return n.cfg.BinaryVersionOverride
+	}
+	return version.Current
+}
+
+// minSupportedVersion is the oldest cluster version this node can join.
+func (n *Node) minSupportedVersion() version.Version {
+	if bv := n.binaryVersion(); bv < version.MinSupported {
+		// A simulated older binary supports only its own version window.
+		return bv
+	}
+	return version.MinSupported
+}
+
+// readStoreClusterVersion loads the store-local mirror of the last observed
+// cluster version (0 = never recorded, i.e. v1-era store).
+func readStoreClusterVersion(eng *storage.Engine) (version.Version, error) {
+	raw, err := eng.Get(keys.StoreClusterVersionKey())
+	if err != nil || raw == nil {
+		return 0, err
+	}
+	v, err := strconv.Atoi(string(raw))
+	if err != nil {
+		return 0, fmt.Errorf("corrupt store cluster version %q: %w", raw, err)
+	}
+	return version.Version(v), nil
+}
+
 // join contacts an existing node to obtain identity and routing bootstrap.
 func (n *Node) join() error {
-	req := cluster.JoinRequest{Address: n.addr, Locality: n.cfg.Locality}
+	req := cluster.JoinRequest{
+		Address:       n.addr,
+		Locality:      n.cfg.Locality,
+		BinaryVersion: int(n.binaryVersion()),
+		MinSupported:  int(n.minSupportedVersion()),
+	}
 	var resp cluster.JoinResponse
 	ctx, cancel := context.WithTimeout(n.stopper.Ctx(), 30*time.Second)
 	defer cancel()

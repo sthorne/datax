@@ -94,6 +94,14 @@ func StoreRegistryKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-registry")...)
 }
 
+// StoreClusterVersionKey mirrors the last replicated cluster version this
+// store observed (decimal string), refreshed by the heartbeat loop. Read at
+// startup — before quorum — to refuse a binary downgrade past a finalized
+// upgrade.
+func StoreClusterVersionKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-cluster-version")...)
+}
+
 // ---------------------------------------------------------------------------
 // Replica-local, unreplicated Raft state, per range.
 
@@ -199,6 +207,11 @@ func systemKey(parts ...string) Key {
 	}
 	return k
 }
+
+// ClusterVersionKey holds the cluster's finalized protocol version
+// (decimal string, e.g. "2"; missing = version 1). It only moves forward,
+// via the "upgrade-cluster" admin op.
+func ClusterVersionKey() Key { return systemKey("cluster-version") }
 
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {

@@ -16,10 +16,12 @@ func TestKeyspaceOrdering(t *testing.T) {
 		RaftLogKey(base.RangeID(1), 1),
 		RaftLogKey(base.RangeID(1), 2),
 		RaftLogKey(base.RangeID(2), 1),
+		StoreClusterVersionKey(), // "store-cluster-version" < "store-ident"
 		StoreIdentKey(),
 		MinKey,
 		RangeMetaKey(Key("a")),
-		TableDescKey(1), // "desc" < "nodes" within /system
+		ClusterVersionKey(), // "cluster-version" < "desc" < "nodes" within /system
+		TableDescKey(1),
 		NodeRegistryKey(1),
 		TableDataPrefix(1),
 		TableDataPrefix(2),

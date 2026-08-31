@@ -1,0 +1,59 @@
+// Package version defines the cluster protocol version and the
+// compatibility rules that make rolling upgrades safe.
+//
+// The protocol version is a small integer, independent of the CLI's
+// human-readable build string. A binary supports the window
+// [MinSupported, Current]. A cluster persists one "cluster version"
+// (keys.ClusterVersionKey), which only ever moves forward, and only via
+// the operator-triggered "upgrade-cluster" admin op (finalize) once every
+// live node runs a binary whose window contains the target. Nodes gate on
+// it at join time, and a store remembers the last cluster version it
+// observed (keys.StoreClusterVersionKey) so a binary downgrade past a
+// finalized upgrade is refused at startup.
+//
+// Compatibility rules (enforced by golden decode tests across packages):
+//
+//  1. JSON payloads (persisted or on the wire) are additive-only: new
+//     fields must be `omitempty` with safe zero-value semantics; fields
+//     are never renamed, retyped, or reused.
+//  2. Protobuf fields are add-only, with fresh field numbers; numbers are
+//     never reused, and removed fields stay reserved.
+//  3. Format bytes (raft command encoding, rowenc values) may only gain
+//     new values behind a cluster-version gate; decoders accept every old
+//     format forever.
+//  4. A new RequestUnion member, admin op, or trigger may only be SENT
+//     once the cluster version has reached the gate it was introduced
+//     under. Receivers of unknown payloads must degrade to an error,
+//     never crash or silently misapply.
+//  5. Every wire/persisted type carries a golden decode test frozen at
+//     its current encoding, so an accidental breaking change fails CI.
+package version
+
+import "fmt"
+
+// Version is the cluster protocol version.
+type Version int
+
+const (
+	// V1 is every cluster bootstrapped before versioning existed (a
+	// missing cluster-version key reads as V1).
+	V1 Version = 1
+	// V2 introduces cluster versioning itself: the persisted cluster
+	// version, join/restart gating, and version-advertising heartbeats.
+	V2 Version = 2
+
+	// Current is the newest cluster version this binary can run.
+	Current = V2
+	// MinSupported is the oldest cluster version this binary can join.
+	// The support window is adjacent versions only: operators upgrade
+	// one major version at a time.
+	MinSupported = V1
+)
+
+// Supported reports whether this binary can participate in a cluster at
+// version cv.
+func Supported(cv Version) bool {
+	return cv >= MinSupported && cv <= Current
+}
+
+func (v Version) String() string { return fmt.Sprintf("v%d", int(v)) }

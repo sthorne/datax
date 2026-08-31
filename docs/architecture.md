@@ -84,9 +84,30 @@ These are the load-bearing rules; tests assert them.
    still equals its read timestamp; anything that bumps the write timestamp
    forces a retry (see [transactions.md](transactions.md)).
 
+## Versioning and rolling upgrades
+
+Each binary has an integer protocol version with a supported window
+(`pkg/version`: `[MinSupported, Current]`, adjacent versions only). The
+cluster persists one **cluster version** at `/system/cluster-version`,
+seeded at bootstrap and advanced only by the operator-triggered
+`upgrade-cluster` admin op once every live node's heartbeat advertises a
+new-enough binary. Gates: join (a node whose window excludes the cluster
+version is refused), startup (each store mirrors the last observed cluster
+version locally and refuses to start under an older binary — the
+no-downgrade-after-finalize rule, enforceable even with quorum down), and
+re-announce (advisory disjoint-window rejection).
+
+What makes the mixed-version window safe is a set of compatibility rules
+codified in `pkg/version`'s package doc and enforced by golden decode
+tests across packages: JSON payloads grow additively (`omitempty`, safe
+zero values), proto fields are add-only with never-reused numbers, format
+bytes only gain values behind a cluster-version gate and decode forever,
+and unknown payloads degrade to errors, never crashes or silent misapplies.
+
 ## Modules
 
 - `pkg/base` — shared ID types (NodeID, StoreID, RangeID) and configuration.
+- `pkg/version` — the protocol version, support window, and compat rules.
 - `pkg/util/hlc` — hybrid logical clock.
 - `pkg/util/encoding` — order-preserving key encodings.
 - `pkg/util/stop` — goroutine lifecycle / graceful shutdown.

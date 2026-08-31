@@ -180,7 +180,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|status|metadata|unsafe-recover|rotate-enc-key> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|metadata|unsafe-recover|rotate-enc-key> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -198,7 +198,7 @@ func runDebug(args []string) error {
 	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
 	rawKey := fs.String("key", "", "split: raw split key (hex)")
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
-	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID")
+	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID; upgrade: target cluster version")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
 	nodeID := fs.Int64("node", 0, "decommission: node ID to drain")
 	cancelDrain := fs.Bool("cancel", false, "decommission: stop draining the node instead")
@@ -237,6 +237,9 @@ func runDebug(args []string) error {
 		}
 		req.NodeID = base.NodeID(*nodeID)
 		req.Cancel = *cancelDrain
+	case "upgrade":
+		req.Op = "upgrade-cluster"
+		req.Version = int(*toNode)
 	case "ranges", "nodes":
 	default:
 		return fmt.Errorf("unknown debug subcommand %q", sub)
@@ -275,18 +278,27 @@ func runDebug(args []string) error {
 			fmt.Printf("%s\n", &d)
 		}
 	case "nodes":
+		if resp.ClusterVersion != 0 {
+			fmt.Printf("cluster version: v%d\n", resp.ClusterVersion)
+		}
 		for _, nd := range resp.Nodes {
 			age := time.Duration(time.Now().UnixNano()-nd.LivenessTime) * time.Nanosecond
 			state := ""
 			if nd.Draining {
 				state = "  DRAINING"
 			}
-			fmt.Printf("%s  %s  locality=%s  last-heartbeat=%s ago%s\n", nd.NodeID, nd.Address, nd.Locality, age.Round(time.Second), state)
+			bv := nd.BinaryVersion
+			if bv == 0 {
+				bv = 1
+			}
+			fmt.Printf("%s  %s  locality=%s  version=v%d  last-heartbeat=%s ago%s\n", nd.NodeID, nd.Address, nd.Locality, bv, age.Round(time.Second), state)
 		}
 	case "rebalance":
 		fmt.Println("rebalance done")
 	case "transfer-lease":
 		fmt.Println("lease transferred")
+	case "upgrade":
+		fmt.Printf("cluster version finalized at v%d\n", resp.ClusterVersion)
 	case "merge":
 		if len(resp.Ranges) == 1 {
 			fmt.Printf("merged: %s\n", &resp.Ranges[0])
