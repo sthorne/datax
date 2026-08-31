@@ -119,6 +119,27 @@ DELETE FROM t WHERE a = 1;
 Batching inserts matters enormously for throughput — a 100-row `INSERT` is
 one replication round; 100 single-row statements are 100.
 
+### Bulk loading with COPY
+
+```sql
+COPY t (a, b) FROM STDIN;                  -- text format (psql \copy sends this)
+COPY t FROM STDIN WITH (FORMAT csv);
+```
+
+```sh
+psql "$URL" -c "\copy t FROM data.csv WITH (FORMAT csv)"
+```
+
+pgx's `CopyFrom` (binary format) works too and is the fastest loader.
+COPY runs through the same pipeline as `INSERT` — defaults, `NOT NULL`,
+unique checks, and secondary indexes all apply — but commits in **chunks**
+of 128 rows / 1 MiB as data streams in. That makes huge loads safe
+(bounded memory, bounded transactions), at a price worth knowing: a
+mid-load failure keeps the chunks already committed (the error reports
+the failing row and the committed count), and COPY cannot run inside
+`BEGIN`. Only the `FORMAT text|csv|binary` option is supported; `COPY TO`
+is not.
+
 ## Transactions and retries
 
 ```sql

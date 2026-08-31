@@ -216,6 +216,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &RollbackToSavepoint{Name: name}, nil
 		}
 		return &Rollback{}, nil
+	case "copy": // not a reserved word; lexes as an identifier
+		return p.parseCopy()
 	case "grant", "revoke": // not reserved words; they lex as identifiers
 		return p.parseGrantRevoke(t.text == "revoke")
 	case "savepoint": // not a reserved word; lexes as an identifier
@@ -567,6 +569,99 @@ func (p *parser) parseInsert() (Statement, error) {
 		}
 	}
 	return ins, nil
+}
+
+// parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause].
+// Accepted format spellings — all of them appear in the wild:
+//
+//	COPY t FROM STDIN                        -- text (default)
+//	COPY t FROM STDIN [WITH] (FORMAT csv)    -- PostgreSQL 9.0+ option list
+//	COPY t FROM STDIN BINARY                 -- pre-9.0 trailing word (pgx)
+//
+// None of COPY/STDIN/FORMAT/WITH/BINARY are reserved words; they lex as
+// identifiers.
+func (p *parser) parseCopy() (Statement, error) {
+	p.i++ // copy
+	cf := &CopyFrom{Format: CopyFormatText}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	cf.Table = name
+	if p.consumeOp("(") {
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			cf.Columns = append(cf.Columns, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
+	if p.consumeKeyword("TO") {
+		return nil, p.errf("COPY TO is not supported")
+	}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	if !p.consumeIdentWord("stdin") {
+		return nil, p.errf("only COPY ... FROM STDIN is supported, found %q", p.peek().text)
+	}
+	switch {
+	case p.consumeIdentWord("binary"):
+		cf.Format = CopyFormatBinary
+	default:
+		hasWith := p.consumeIdentWord("with")
+		if p.consumeOp("(") {
+			if err := p.parseCopyOptions(cf); err != nil {
+				return nil, err
+			}
+		} else if hasWith {
+			return nil, p.errf("expected ( after WITH, found %q", p.peek().text)
+		}
+	}
+	return cf, nil
+}
+
+// parseCopyOptions parses the body of a COPY option list after its opening
+// paren: option [value] pairs with NO "=" (unlike parseOptionList's
+// name = value shape used by CREATE TABLE ... WITH).
+func (p *parser) parseCopyOptions(cf *CopyFrom) error {
+	for {
+		name, err := p.expectIdent()
+		if err != nil {
+			return err
+		}
+		switch name {
+		case "format":
+			t := p.peek()
+			if t.kind != tkIdent && t.kind != tkString {
+				return p.errf("expected a format name, found %q", t.text)
+			}
+			p.i++
+			switch strings.ToLower(t.text) {
+			case "text":
+				cf.Format = CopyFormatText
+			case "csv":
+				cf.Format = CopyFormatCSV
+			case "binary":
+				cf.Format = CopyFormatBinary
+			default:
+				return p.errf("unknown COPY format %q", t.text)
+			}
+		default:
+			return p.errf("unsupported COPY option %q", name)
+		}
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return p.expectOp(")")
 }
 
 func (p *parser) parseSelect() (Statement, error) {

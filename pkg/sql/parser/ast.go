@@ -108,6 +108,35 @@ type Insert struct {
 	Rows    [][]Expr
 }
 
+// CopyFormat selects the data encoding of a COPY FROM STDIN stream.
+type CopyFormat int
+
+const (
+	CopyFormatText CopyFormat = iota
+	CopyFormatCSV
+	CopyFormatBinary
+)
+
+func (f CopyFormat) String() string {
+	switch f {
+	case CopyFormatCSV:
+		return "csv"
+	case CopyFormatBinary:
+		return "binary"
+	default:
+		return "text"
+	}
+}
+
+// CopyFrom is COPY table [(cols)] FROM STDIN [format clause]. The data
+// itself travels out of band (pgwire copy-in sub-protocol), so this
+// statement only names the target and the encoding.
+type CopyFrom struct {
+	Table   string
+	Columns []string // empty = all visible columns in order
+	Format  CopyFormat
+}
+
 type SelectExpr struct {
 	Star  bool
 	Expr  Expr
@@ -244,6 +273,7 @@ func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}
 func (*Insert) stmt()              {}
+func (*CopyFrom) stmt()            {}
 func (*Select) stmt()              {}
 func (*Update) stmt()              {}
 func (*Delete) stmt()              {}

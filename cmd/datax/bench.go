@@ -42,16 +42,16 @@ func runBench(args []string) error {
 	}
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return fmt.Errorf("bench requires a workload: kv, bank, ingest, or timeseries")
+		return fmt.Errorf("bench requires a workload: kv, bank, ingest, ingest-copy, or timeseries")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	switch workload {
-	case "kv", "bank", "ingest", "timeseries":
+	case "kv", "bank", "ingest", "ingest-copy", "timeseries":
 	default:
-		return fmt.Errorf("unknown workload %q (want kv, bank, ingest, or timeseries)", workload)
+		return fmt.Errorf("unknown workload %q (want kv, bank, ingest, ingest-copy, or timeseries)", workload)
 	}
 	tsTable := "bench_ts"
 	if *shards > 0 {
@@ -60,7 +60,7 @@ func runBench(args []string) error {
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
 	tsBase := time.Now().UTC().Truncate(time.Second)
-	ivalReport := workload == "ingest" || workload == "timeseries"
+	ivalReport := workload == "ingest" || workload == "ingest-copy" || workload == "timeseries"
 
 	ctx := context.Background()
 	connect := func() (*pgx.Conn, error) {
@@ -91,7 +91,7 @@ func runBench(args []string) error {
 				return err
 			}
 		}
-	case "ingest":
+	case "ingest", "ingest-copy":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_ingest (k INT PRIMARY KEY, pad TEXT)"); err != nil {
 			return err
 		}
@@ -249,6 +249,19 @@ func runBench(args []string) error {
 						fmt.Fprintf(&sb, "(%d, '%s')", rng.Int63(), pad)
 					}
 					_, err = conn.Exec(ctx, sb.String())
+				case "ingest-copy":
+					// The same rows through COPY: pgx's CopyFrom takes the
+					// binary copy path regardless of the connection's simple
+					// query mode.
+					if pace != nil {
+						pace()
+					}
+					rows := make([][]any, *batch)
+					for j := range rows {
+						rows[j] = []any{rng.Int63(), pad}
+					}
+					_, err = conn.CopyFrom(ctx, pgx.Identifier{"bench_ingest"},
+						[]string{"k", "pad"}, pgx.CopyFromRows(rows))
 				case "timeseries":
 					if pace != nil {
 						pace()

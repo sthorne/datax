@@ -41,6 +41,10 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
 		return s.execInsert(ctx, txn, t, params)
+	case *parser.CopyFrom:
+		// COPY's data arrives through the pgwire copy-in sub-protocol, so
+		// the statement cannot execute through the ordinary path.
+		return nil, newErrf(CodeFeatureNotSupported, "COPY FROM STDIN can only run over the wire protocol")
 	case *parser.Select:
 		return s.execSelect(ctx, txn, t, params)
 	case *parser.Update:
@@ -264,23 +268,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 		return nil, err
 	}
-	// Resolve target columns. Hidden columns (the _shard bucket) are never
-	// insert targets: implicitly they are skipped, explicitly they error —
-	// the executor computes them.
-	var target []catalog.Column
-	if len(t.Columns) == 0 {
-		target = desc.VisibleColumns()
-	} else {
-		for _, name := range t.Columns {
-			col, ok := desc.Col(name)
-			if !ok {
-				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
-			}
-			if col.Hidden {
-				return nil, newErrf(CodeSyntaxError, "column %q is system-managed and cannot be inserted", name)
-			}
-			target = append(target, col)
-		}
+	target, err := resolveInsertTargets(desc, t.Columns)
+	if err != nil {
+		return nil, err
 	}
 	count := 0
 	var wb kvclient.WriteBatch
@@ -289,7 +279,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		if len(exprRow) != len(target) {
 			return nil, newErrf(CodeSyntaxError, "INSERT has %d values but %d target columns", len(exprRow), len(target))
 		}
-		row := make(map[catalog.ColumnID]types.Datum, len(desc.Columns))
+		vals := make([]types.Datum, len(exprRow))
 		for i, e := range exprRow {
 			d, err := evalExpr(e, nil, nil, params)
 			if err != nil {
@@ -299,73 +289,111 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			if cerr != nil {
 				return nil, newErrf(CodeInternal, "column %q: %v", target[i].Name, cerr)
 			}
-			row[target[i].ID] = d
+			vals[i] = d
 		}
-		for _, col := range desc.Columns {
-			d, ok := row[col.ID]
-			if !ok {
-				if col.Hidden && col.Name == rowenc.ShardColumnName && desc.ShardBuckets > 0 {
-					// The shard bucket hashes the logical PK. It is the last
-					// column in desc.Columns, so every logical PK datum is
-					// already filled (and NOT-NULL-checked) by this point.
-					logical := make([]types.Datum, len(desc.PrimaryKey)-1)
-					for i, id := range desc.PrimaryKey[1:] {
-						logical[i] = row[id]
-					}
-					sd, serr := rowenc.ShardBucket(desc, logical)
-					if serr != nil {
-						return nil, serr
-					}
-					row[col.ID] = sd
-					continue
-				}
-				// An omitted column takes its DEFAULT (NULL when none).
-				d = types.DNull
-				if col.Default != nil {
-					d = *col.Default
-				}
-				row[col.ID] = d
-			}
-			if d.Null && col.NotNull {
-				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
-			}
-		}
-		key, verr := pkKey(desc, row)
-		if verr != nil {
-			return nil, verr
-		}
-		if inserted[string(key)] {
-			return nil, newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", t.Table)
-		}
-		if existing, err := txn.Get(ctx, key); err != nil {
-			return nil, err
-		} else if existing != nil {
-			return nil, newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", t.Table)
-		}
-		value, verr2 := rowenc.EncodeValue(desc, row)
-		if verr2 != nil {
-			return nil, verr2
-		}
-		// Writes are buffered and flushed once below: one routed batch (one
-		// Raft proposal per touched range) per statement.
-		wb.Put(key, value)
-		if desc.Reshard != nil {
-			shadow, serr := reshardShadowKey(desc, row)
-			if serr != nil {
-				return nil, serr
-			}
-			wb.Put(shadow, value)
-		}
-		if err := addIndexEntries(ctx, txn, desc, row, &wb, inserted); err != nil {
+		if err := insertRow(ctx, txn, desc, target, vals, &wb, inserted); err != nil {
 			return nil, err
 		}
-		inserted[string(key)] = true
 		count++
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: fmt.Sprintf("INSERT 0 %d", count)}, nil
+}
+
+// resolveInsertTargets resolves an INSERT/COPY target-column list: empty
+// means every visible column in order. Hidden columns (the _shard bucket)
+// are never targets: implicitly they are skipped, explicitly they error —
+// the executor computes them.
+func resolveInsertTargets(desc *catalog.TableDescriptor, cols []string) ([]catalog.Column, error) {
+	if len(cols) == 0 {
+		return desc.VisibleColumns(), nil
+	}
+	target := make([]catalog.Column, 0, len(cols))
+	for _, name := range cols {
+		col, ok := desc.Col(name)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+		}
+		if col.Hidden {
+			return nil, newErrf(CodeSyntaxError, "column %q is system-managed and cannot be inserted", name)
+		}
+		target = append(target, col)
+	}
+	return target, nil
+}
+
+// insertRow runs the per-row insert pipeline shared by INSERT and COPY on
+// already-coerced datums: defaults, the hidden shard bucket, NOT NULL,
+// primary-key uniqueness (intra-statement map + a committed read), value
+// encoding, the reshard shadow write, and secondary index entries — all
+// buffered into wb. vals must be positionally parallel to target.
+func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) error {
+	row := make(map[catalog.ColumnID]types.Datum, len(desc.Columns))
+	for i := range target {
+		row[target[i].ID] = vals[i]
+	}
+	for _, col := range desc.Columns {
+		d, ok := row[col.ID]
+		if !ok {
+			if col.Hidden && col.Name == rowenc.ShardColumnName && desc.ShardBuckets > 0 {
+				// The shard bucket hashes the logical PK. It is the last
+				// column in desc.Columns, so every logical PK datum is
+				// already filled (and NOT-NULL-checked) by this point.
+				logical := make([]types.Datum, len(desc.PrimaryKey)-1)
+				for i, id := range desc.PrimaryKey[1:] {
+					logical[i] = row[id]
+				}
+				sd, serr := rowenc.ShardBucket(desc, logical)
+				if serr != nil {
+					return serr
+				}
+				row[col.ID] = sd
+				continue
+			}
+			// An omitted column takes its DEFAULT (NULL when none).
+			d = types.DNull
+			if col.Default != nil {
+				d = *col.Default
+			}
+			row[col.ID] = d
+		}
+		if d.Null && col.NotNull {
+			return newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+		}
+	}
+	key, verr := pkKey(desc, row)
+	if verr != nil {
+		return verr
+	}
+	if inserted[string(key)] {
+		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+	}
+	if existing, err := txn.Get(ctx, key); err != nil {
+		return err
+	} else if existing != nil {
+		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+	}
+	value, verr2 := rowenc.EncodeValue(desc, row)
+	if verr2 != nil {
+		return verr2
+	}
+	// Writes are buffered; the caller flushes the batch (one routed batch —
+	// one Raft proposal per touched range — per statement or chunk).
+	wb.Put(key, value)
+	if desc.Reshard != nil {
+		shadow, serr := reshardShadowKey(desc, row)
+		if serr != nil {
+			return serr
+		}
+		wb.Put(shadow, value)
+	}
+	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted); err != nil {
+		return err
+	}
+	inserted[string(key)] = true
+	return nil
 }
 
 func pkKey(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) (keys.Key, error) {

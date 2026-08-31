@@ -319,3 +319,55 @@ func TestArithmeticAndFunctions(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyFrom(t *testing.T) {
+	parse1 := func(t *testing.T, src string) *CopyFrom {
+		t.Helper()
+		stmts, err := Parse(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("%s: %d statements", src, len(stmts))
+		}
+		cf, ok := stmts[0].(*CopyFrom)
+		if !ok {
+			t.Fatalf("%s: got %T", src, stmts[0])
+		}
+		return cf
+	}
+
+	cf := parse1(t, "COPY t FROM STDIN")
+	if cf.Table != "t" || len(cf.Columns) != 0 || cf.Format != CopyFormatText {
+		t.Fatalf("plain: %+v", cf)
+	}
+	cf = parse1(t, "COPY t (a, b) FROM STDIN WITH (FORMAT csv)")
+	if cf.Table != "t" || len(cf.Columns) != 2 || cf.Columns[1] != "b" || cf.Format != CopyFormatCSV {
+		t.Fatalf("with csv: %+v", cf)
+	}
+	cf = parse1(t, "copy t from stdin (format text)")
+	if cf.Format != CopyFormatText {
+		t.Fatalf("bare option list: %+v", cf)
+	}
+	cf = parse1(t, "COPY t FROM STDIN WITH (FORMAT 'binary')")
+	if cf.Format != CopyFormatBinary {
+		t.Fatalf("quoted format: %+v", cf)
+	}
+	// pgx's exact spelling.
+	cf = parse1(t, `copy "t" ( "a", "b" ) from stdin binary;`)
+	if cf.Table != "t" || len(cf.Columns) != 2 || cf.Format != CopyFormatBinary {
+		t.Fatalf("pgx spelling: %+v", cf)
+	}
+
+	for _, bad := range []string{
+		"COPY t TO STDOUT",
+		"COPY t FROM '/tmp/f'",
+		"COPY t FROM STDIN WITH (DELIMITER ',')",
+		"COPY t FROM STDIN WITH (FORMAT nope)",
+		"COPY t FROM STDIN WITH",
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%q parsed", bad)
+		}
+	}
+}

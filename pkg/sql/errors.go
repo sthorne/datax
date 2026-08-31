@@ -34,6 +34,10 @@ const (
 	CodeInvalidParameter     = "08P01"
 	CodeUndefinedObject      = "42704"
 	CodeDuplicateObject      = "42710"
+	// COPY FROM STDIN.
+	CodeInvalidTextRepresentation = "22P02"
+	CodeBadCopyFormat             = "22P04"
+	CodeQueryCanceled             = "57014"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.
