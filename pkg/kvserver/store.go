@@ -109,6 +109,12 @@ type Store struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
 	}
+
+	// consistencyMu round-robins the consistency sweep over led ranges.
+	consistencyMu struct {
+		sync.Mutex
+		cursor uint64
+	}
 }
 
 // SetSender injects the routed KV client (once, at node startup).

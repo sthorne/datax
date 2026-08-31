@@ -68,6 +68,16 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 		}
 		return cluster.AdminResponse{Backup: sum}
 
+	case "collect-checksum":
+		if req.RangeID == 0 || req.CheckID == "" {
+			return cluster.AdminResponse{Error: "collect-checksum requires a range and check ID"}
+		}
+		sum, idx, ok := n.store.LookupChecksum(ctx, req.RangeID, req.CheckID)
+		if !ok {
+			return cluster.AdminResponse{Error: "checksum not available"}
+		}
+		return cluster.AdminResponse{Checksum: sum, AppliedIndex: idx}
+
 	case "merge":
 		if req.RangeID == 0 {
 			return cluster.AdminResponse{Error: "merge requires --range"}

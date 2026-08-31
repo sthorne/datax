@@ -325,3 +325,28 @@ func (tc *TestCluster) StopAll() {
 
 // jsonUnmarshal avoids importing encoding/json in every test file.
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+// Isolate partitions node i away from every other node, both directions —
+// its outbound traffic is vetoed and every peer vetoes traffic to it.
+func (tc *TestCluster) Isolate(i int) {
+	target := base.NodeID(i + 1)
+	for j, n := range tc.Nodes {
+		if n == nil {
+			continue
+		}
+		if j == i {
+			n.InjectRPCDrop(func(base.NodeID) bool { return true })
+		} else {
+			n.InjectRPCDrop(func(to base.NodeID) bool { return to == target })
+		}
+	}
+}
+
+// Heal clears all injected partitions.
+func (tc *TestCluster) Heal() {
+	for _, n := range tc.Nodes {
+		if n != nil {
+			n.InjectRPCDrop(nil)
+		}
+	}
+}

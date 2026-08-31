@@ -26,6 +26,8 @@ type AdminRequest struct {
 	BasePath       string   `json:"base_path,omitempty"`
 	Paths          []string `json:"paths,omitempty"`
 	AllowPlaintext bool     `json:"allow_plaintext,omitempty"`
+	// CheckID identifies a consistency probe for collect-checksum.
+	CheckID string `json:"check_id,omitempty"`
 }
 
 // AdminResponse is the JSON reply.
@@ -40,6 +42,10 @@ type AdminResponse struct {
 	RemainingReplicas int  `json:"remaining_replicas,omitempty"`
 	// Backup/restore summary.
 	Backup *BackupSummary `json:"backup,omitempty"`
+	// Checksum answers collect-checksum: this node's digest for the probe,
+	// and the applied index it was computed at.
+	Checksum     []byte `json:"checksum,omitempty"`
+	AppliedIndex uint64 `json:"applied_index,omitempty"`
 }
 
 // BackupTableSummary reports one table of a backup or restore.

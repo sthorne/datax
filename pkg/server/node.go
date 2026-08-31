@@ -50,6 +50,11 @@ type Config struct {
 	// GCTTL is how long MVCC history is retained before garbage collection
 	// (default 25h; negative disables GC).
 	GCTTL time.Duration
+	// ConsistencyInterval paces the replica consistency sweep: every
+	// interval, one led range's replicas are checksummed and compared.
+	// 0 (the default) disables the sweep — hashing a range reads all of
+	// it, so operators opt in and pick the pace.
+	ConsistencyInterval time.Duration
 	// GCInterval is how often the GC loop scans led ranges (default 60s).
 	GCInterval time.Duration
 	// LivenessGrace is how stale a node's heartbeat may be before the
@@ -394,6 +399,7 @@ func (n *Node) start() error {
 	if err := n.store.StartClosedTimestamps(); err != nil {
 		return err
 	}
+	n.startConsistencyLoop()
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err
@@ -524,3 +530,8 @@ func (n *Node) Store() *kvserver.Store      { return n.store }
 func (n *Node) Clock() *hlc.Clock           { return n.clock }
 func (n *Node) Stopper() *stop.Stopper      { return n.stopper }
 func (n *Node) Registry() *cluster.Registry { return n.registry }
+
+// InjectRPCDrop installs (or clears, with nil) a per-destination veto on
+// this node's outbound RPC traffic — the fault-injection hook partition
+// tests use. Never call in production.
+func (n *Node) InjectRPCDrop(fn func(to base.NodeID) bool) { n.trans.SetTestingDrop(fn) }

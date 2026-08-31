@@ -230,6 +230,16 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 	if aerr == nil && cmd.Merge != nil {
 		r.finishMerge(cmd.Merge)
 	}
+	if cmd.Load != nil {
+		r.mu.Lock()
+		r.mu.loadHandoff = cmd.Load
+		r.mu.Unlock()
+	}
+	if cmd.Checksum != nil {
+		// Post-commit, still under applyMu: the engine snapshot taken here
+		// is exactly this entry's state on every replica.
+		r.startChecksum(cmd.Checksum.ID, idx)
+	}
 	return resp, aerr
 }
 

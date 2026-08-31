@@ -113,7 +113,7 @@ func (r *Replica) publishClosedTimestamp(ctx context.Context, target hlc.Timesta
 	r.tsCache.Bump([]latchSpan{wholeRangeSpan}, target, uuid.Nil)
 	guard.Release()
 	// Step 3: replicate. Log order does the rest.
-	_, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, nil, nil, target)
+	_, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{closedTS: target})
 	if kerr != nil {
 		return kerr
 	}

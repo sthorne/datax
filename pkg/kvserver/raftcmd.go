@@ -41,6 +41,12 @@ func encodeRaftCommand(cmd *raftCommand) ([]byte, error) {
 		Batch: kvpb.BatchRequestToProto(&cmd.Batch),
 	}
 	pb.ClosedTs = tsToProto(cmd.ClosedTS)
+	if cmd.Load != nil {
+		pb.LoadHandoff = &rpcpb.LoadHandoff{Qps: cmd.Load.QPS, AtNanos: cmd.Load.AtNanos}
+	}
+	if cmd.Checksum != nil {
+		pb.Checksum = &rpcpb.ChecksumTrigger{Id: cmd.Checksum.ID}
+	}
 	if cmd.Split != nil {
 		pb.Split = &rpcpb.SplitTrigger{
 			Left:     kvpb.RangeDescriptorToProto(cmd.Split.Left),
@@ -93,6 +99,12 @@ func decodeRaftCommand(data []byte) (*raftCommand, error) {
 		return nil, err
 	}
 	cmd := &raftCommand{ID: pb.Id, Batch: *batch, ClosedTS: tsFromProto(pb.ClosedTs)}
+	if pb.LoadHandoff != nil {
+		cmd.Load = &loadHandoff{QPS: pb.LoadHandoff.Qps, AtNanos: pb.LoadHandoff.AtNanos}
+	}
+	if pb.Checksum != nil {
+		cmd.Checksum = &checksumTrigger{ID: pb.Checksum.Id}
+	}
 	if pb.Split != nil {
 		cmd.Split = &splitTrigger{
 			Left:     kvpb.RangeDescriptorFromProto(pb.Split.Left),

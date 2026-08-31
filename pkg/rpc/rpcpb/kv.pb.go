@@ -4440,7 +4440,15 @@ type RaftCommand struct {
 	// the range. Log order makes the applied-index condition automatic: by
 	// the time a replica applies this command, every write below the
 	// timestamp has applied too.
-	ClosedTs      *Hlc `protobuf:"bytes,5,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
+	ClosedTs *Hlc `protobuf:"bytes,5,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
+	// load_handoff carries the outgoing leaseholder's measured load ahead
+	// of a lease transfer, so the incoming one starts warm instead of
+	// amnesiac.
+	LoadHandoff *LoadHandoff `protobuf:"bytes,6,opt,name=load_handoff,json=loadHandoff,proto3" json:"load_handoff,omitempty"`
+	// checksum asks every replica to checksum the range's replicated state
+	// at this command's applied index (identical by construction across
+	// replicas) — the consistency checker's probe.
+	Checksum      *ChecksumTrigger `protobuf:"bytes,7,opt,name=checksum,proto3" json:"checksum,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4510,6 +4518,116 @@ func (x *RaftCommand) GetClosedTs() *Hlc {
 	return nil
 }
 
+func (x *RaftCommand) GetLoadHandoff() *LoadHandoff {
+	if x != nil {
+		return x.LoadHandoff
+	}
+	return nil
+}
+
+func (x *RaftCommand) GetChecksum() *ChecksumTrigger {
+	if x != nil {
+		return x.Checksum
+	}
+	return nil
+}
+
+type LoadHandoff struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Qps           float64                `protobuf:"fixed64,1,opt,name=qps,proto3" json:"qps,omitempty"`
+	AtNanos       int64                  `protobuf:"varint,2,opt,name=at_nanos,json=atNanos,proto3" json:"at_nanos,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LoadHandoff) Reset() {
+	*x = LoadHandoff{}
+	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LoadHandoff) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LoadHandoff) ProtoMessage() {}
+
+func (x *LoadHandoff) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LoadHandoff.ProtoReflect.Descriptor instead.
+func (*LoadHandoff) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{70}
+}
+
+func (x *LoadHandoff) GetQps() float64 {
+	if x != nil {
+		return x.Qps
+	}
+	return 0
+}
+
+func (x *LoadHandoff) GetAtNanos() int64 {
+	if x != nil {
+		return x.AtNanos
+	}
+	return 0
+}
+
+type ChecksumTrigger struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChecksumTrigger) Reset() {
+	*x = ChecksumTrigger{}
+	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChecksumTrigger) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChecksumTrigger) ProtoMessage() {}
+
+func (x *ChecksumTrigger) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChecksumTrigger.ProtoReflect.Descriptor instead.
+func (*ChecksumTrigger) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{71}
+}
+
+func (x *ChecksumTrigger) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 type SplitTrigger struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Left  *RangeDescriptor       `protobuf:"bytes,1,opt,name=left,proto3" json:"left,omitempty"`
@@ -4524,7 +4642,7 @@ type SplitTrigger struct {
 
 func (x *SplitTrigger) Reset() {
 	*x = SplitTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	mi := &file_datax_v1_kv_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4536,7 +4654,7 @@ func (x *SplitTrigger) String() string {
 func (*SplitTrigger) ProtoMessage() {}
 
 func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	mi := &file_datax_v1_kv_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4549,7 +4667,7 @@ func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitTrigger.ProtoReflect.Descriptor instead.
 func (*SplitTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{70}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *SplitTrigger) GetLeft() *RangeDescriptor {
@@ -4587,7 +4705,7 @@ type MergeTrigger struct {
 
 func (x *MergeTrigger) Reset() {
 	*x = MergeTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	mi := &file_datax_v1_kv_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4599,7 +4717,7 @@ func (x *MergeTrigger) String() string {
 func (*MergeTrigger) ProtoMessage() {}
 
 func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	mi := &file_datax_v1_kv_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4612,7 +4730,7 @@ func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MergeTrigger.ProtoReflect.Descriptor instead.
 func (*MergeTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{71}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *MergeTrigger) GetLeft() *RangeDescriptor {
@@ -4963,13 +5081,20 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x12storage_overloaded\x18\f \x01(\v2 .datax.v1.StorageOverloadedErrorR\x11storageOverloaded\"k\n" +
 	"\rBatchEnvelope\x123\n" +
 	"\bresponse\x18\x01 \x01(\v2\x17.datax.v1.BatchResponseR\bresponse\x12%\n" +
-	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xd3\x01\n" +
+	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xc4\x02\n" +
 	"\vRaftCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x05batch\x18\x02 \x01(\v2\x16.datax.v1.BatchRequestR\x05batch\x12,\n" +
 	"\x05split\x18\x03 \x01(\v2\x16.datax.v1.SplitTriggerR\x05split\x12,\n" +
 	"\x05merge\x18\x04 \x01(\v2\x16.datax.v1.MergeTriggerR\x05merge\x12*\n" +
-	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\"\x9a\x01\n" +
+	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\x128\n" +
+	"\fload_handoff\x18\x06 \x01(\v2\x15.datax.v1.LoadHandoffR\vloadHandoff\x125\n" +
+	"\bchecksum\x18\a \x01(\v2\x19.datax.v1.ChecksumTriggerR\bchecksum\":\n" +
+	"\vLoadHandoff\x12\x10\n" +
+	"\x03qps\x18\x01 \x01(\x01R\x03qps\x12\x19\n" +
+	"\bat_nanos\x18\x02 \x01(\x03R\aatNanos\"!\n" +
+	"\x0fChecksumTrigger\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x9a\x01\n" +
 	"\fSplitTrigger\x12-\n" +
 	"\x04left\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04left\x12/\n" +
 	"\x05right\x18\x02 \x01(\v2\x19.datax.v1.RangeDescriptorR\x05right\x12*\n" +
@@ -4994,7 +5119,7 @@ func file_datax_v1_kv_proto_rawDescGZIP() []byte {
 	return file_datax_v1_kv_proto_rawDescData
 }
 
-var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 72)
+var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 74)
 var file_datax_v1_kv_proto_goTypes = []any{
 	(*TxnMeta)(nil),                     // 0: datax.v1.TxnMeta
 	(*Transaction)(nil),                 // 1: datax.v1.Transaction
@@ -5066,16 +5191,18 @@ var file_datax_v1_kv_proto_goTypes = []any{
 	(*Error)(nil),                       // 67: datax.v1.Error
 	(*BatchEnvelope)(nil),               // 68: datax.v1.BatchEnvelope
 	(*RaftCommand)(nil),                 // 69: datax.v1.RaftCommand
-	(*SplitTrigger)(nil),                // 70: datax.v1.SplitTrigger
-	(*MergeTrigger)(nil),                // 71: datax.v1.MergeTrigger
-	(*Hlc)(nil),                         // 72: datax.v1.Hlc
+	(*LoadHandoff)(nil),                 // 70: datax.v1.LoadHandoff
+	(*ChecksumTrigger)(nil),             // 71: datax.v1.ChecksumTrigger
+	(*SplitTrigger)(nil),                // 72: datax.v1.SplitTrigger
+	(*MergeTrigger)(nil),                // 73: datax.v1.MergeTrigger
+	(*Hlc)(nil),                         // 74: datax.v1.Hlc
 }
 var file_datax_v1_kv_proto_depIdxs = []int32{
-	72,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
-	72,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
+	74,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
+	74,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
 	0,   // 2: datax.v1.Transaction.meta:type_name -> datax.v1.TxnMeta
-	72,  // 3: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
-	72,  // 4: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
+	74,  // 3: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
+	74,  // 4: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
 	2,   // 5: datax.v1.RangeDescriptor.replicas:type_name -> datax.v1.ReplicaDescriptor
 	0,   // 6: datax.v1.Intent.txn:type_name -> datax.v1.TxnMeta
 	6,   // 7: datax.v1.GetRequest.header:type_name -> datax.v1.RequestHeader
@@ -5085,22 +5212,22 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	6,   // 11: datax.v1.ScanRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 12: datax.v1.EndTxnRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 13: datax.v1.HeartbeatTxnRequest.header:type_name -> datax.v1.RequestHeader
-	72,  // 14: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
+	74,  // 14: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
 	6,   // 15: datax.v1.PushTxnRequest.header:type_name -> datax.v1.RequestHeader
 	1,   // 16: datax.v1.PushTxnRequest.pusher_txn:type_name -> datax.v1.Transaction
 	0,   // 17: datax.v1.PushTxnRequest.pushee_txn:type_name -> datax.v1.TxnMeta
-	72,  // 18: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
+	74,  // 18: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
 	6,   // 19: datax.v1.ResolveIntentRequest.header:type_name -> datax.v1.RequestHeader
-	72,  // 20: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
+	74,  // 20: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
 	6,   // 21: datax.v1.RollbackIntentRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 22: datax.v1.RefreshRequest.header:type_name -> datax.v1.RequestHeader
-	72,  // 23: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
+	74,  // 23: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
 	6,   // 24: datax.v1.ExportRequest.header:type_name -> datax.v1.RequestHeader
-	72,  // 25: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
+	74,  // 25: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
 	19,  // 26: datax.v1.ExportResponse.records:type_name -> datax.v1.ExportRecord
-	72,  // 27: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
+	74,  // 27: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
 	6,   // 28: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
-	72,  // 29: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
+	74,  // 29: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
 	21,  // 30: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
 	6,   // 31: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 32: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
@@ -5130,13 +5257,13 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	28,  // 56: datax.v1.RequestUnion.subsume:type_name -> datax.v1.SubsumeRequest
 	29,  // 57: datax.v1.RequestUnion.unfreeze:type_name -> datax.v1.UnfreezeRequest
 	18,  // 58: datax.v1.RequestUnion.export:type_name -> datax.v1.ExportRequest
-	72,  // 59: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
+	74,  // 59: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
 	1,   // 60: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
 	31,  // 61: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
 	30,  // 62: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
 	4,   // 63: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
-	72,  // 64: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
-	72,  // 65: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
+	74,  // 64: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
+	74,  // 65: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
 	6,   // 66: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
 	3,   // 67: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
 	3,   // 68: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
@@ -5165,15 +5292,15 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	53,  // 91: datax.v1.ResponseUnion.unfreeze:type_name -> datax.v1.UnfreezeResponse
 	20,  // 92: datax.v1.ResponseUnion.export:type_name -> datax.v1.ExportResponse
 	1,   // 93: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
-	72,  // 94: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
+	74,  // 94: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
 	54,  // 95: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
 	3,   // 96: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
 	5,   // 97: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
-	72,  // 98: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
-	72,  // 99: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
-	72,  // 100: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
-	72,  // 101: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
-	72,  // 102: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
+	74,  // 98: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
+	74,  // 99: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
+	74,  // 100: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
+	74,  // 101: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
+	74,  // 102: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
 	56,  // 103: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
 	57,  // 104: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
 	58,  // 105: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
@@ -5188,21 +5315,23 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	55,  // 114: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
 	67,  // 115: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
 	32,  // 116: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
-	70,  // 117: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
-	71,  // 118: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
-	72,  // 119: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
-	3,   // 120: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 121: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
-	72,  // 122: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
-	3,   // 123: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 124: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
-	3,   // 125: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
-	72,  // 126: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
-	127, // [127:127] is the sub-list for method output_type
-	127, // [127:127] is the sub-list for method input_type
-	127, // [127:127] is the sub-list for extension type_name
-	127, // [127:127] is the sub-list for extension extendee
-	0,   // [0:127] is the sub-list for field type_name
+	72,  // 117: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
+	73,  // 118: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
+	74,  // 119: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
+	70,  // 120: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
+	71,  // 121: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
+	3,   // 122: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 123: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
+	74,  // 124: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
+	3,   // 125: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 126: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
+	3,   // 127: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
+	74,  // 128: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
+	129, // [129:129] is the sub-list for method output_type
+	129, // [129:129] is the sub-list for method input_type
+	129, // [129:129] is the sub-list for extension type_name
+	129, // [129:129] is the sub-list for extension extendee
+	0,   // [0:129] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_kv_proto_init() }
@@ -5263,7 +5392,7 @@ func file_datax_v1_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_kv_proto_rawDesc), len(file_datax_v1_kv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   72,
+			NumMessages:   74,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

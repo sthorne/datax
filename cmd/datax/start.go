@@ -30,6 +30,7 @@ type serverFlags struct {
 	encKeyPath string
 	loadSplit  float64
 	shedFactor float64
+	consistInt time.Duration
 	bytesThr   int64
 	verbose    bool
 }
@@ -51,6 +52,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.Float64Var(&f.shedFactor, "lease-shed-factor", 0, "leader-QPS multiple of the cluster mean at which a node sheds hot leases (0 = default 1.5)")
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
+	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -70,6 +72,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		EncKeyPath:              f.encKeyPath,
 		LoadSplitThreshold:      f.loadSplit,
 		LeaseShedFactor:         f.shedFactor,
+		ConsistencyInterval:     f.consistInt,
 		RebalanceBytesThreshold: f.bytesThr,
 		Dir:                     f.dir,
 		Listen:                  f.listen,

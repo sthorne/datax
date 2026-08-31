@@ -33,6 +33,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
+| `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 
 Also useful: `datax_kv_batch_latency_seconds` (histogram — p99 of the
@@ -61,6 +62,16 @@ datax debug rebalance --range 5 [--from 1]
 Splits and merges also happen automatically (by size: 64 MiB; by load:
 sustained 500 QPS); the manual commands are for pre-splitting before a bulk
 load and for tests.
+
+## Consistency checking
+
+Start nodes with `--consistency-interval 10m` (off by default) and each
+node periodically checksums one range it leads across all its replicas —
+a background tripwire for silent corruption. A divergence logs every
+replica's digest (`CONSISTENCY FAILURE` in the node log) and increments
+`datax_consistency_failures_total`; alert on it. The check reads the
+whole range, so pick an interval that spreads the IO — at `10m` a node
+leading 100 ranges re-verifies everything roughly every 17 hours.
 
 ## Backup and restore
 

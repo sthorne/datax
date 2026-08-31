@@ -71,7 +71,7 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, trig, nil, hlc.Timestamp{}); kerr != nil {
+	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{split: trig}); kerr != nil {
 		guard.Release()
 		return nil, kerr
 	}

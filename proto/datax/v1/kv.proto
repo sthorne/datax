@@ -433,6 +433,23 @@ message RaftCommand {
   // the time a replica applies this command, every write below the
   // timestamp has applied too.
   Hlc closed_ts = 5;
+  // load_handoff carries the outgoing leaseholder's measured load ahead
+  // of a lease transfer, so the incoming one starts warm instead of
+  // amnesiac.
+  LoadHandoff load_handoff = 6;
+  // checksum asks every replica to checksum the range's replicated state
+  // at this command's applied index (identical by construction across
+  // replicas) — the consistency checker's probe.
+  ChecksumTrigger checksum = 7;
+}
+
+message LoadHandoff {
+  double qps = 1;
+  int64 at_nanos = 2;
+}
+
+message ChecksumTrigger {
+  string id = 1;
 }
 
 message SplitTrigger {
