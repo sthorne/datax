@@ -26,6 +26,7 @@ const (
 	CodeNoActiveTransaction  = "25P01"
 	CodeInvalidSavepoint     = "3B001"
 	CodeGrouping             = "42803"
+	CodeDivisionByZero       = "22012"
 	CodeAmbiguousColumn      = "42702"
 	CodeCardinality          = "21000"
 	CodeInsufficientPriv     = "42501"

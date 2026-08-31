@@ -51,6 +51,12 @@ var (
 	LeaseTransfers = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_lease_transfers_total", Help: "Completed range leadership (lease) transfers.",
 	})
+	ConsistencyChecks = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_consistency_checks_total", Help: "Replica consistency probes proposed.",
+	})
+	ConsistencyFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_consistency_failures_total", Help: "Consistency probes where a replica's checksum diverged — replicated state corruption.",
+	})
 	Rebalances = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_rebalances_total", Help: "Replicas moved by automatic load rebalancing.",
 	})
@@ -77,6 +83,9 @@ var (
 	})
 	ParallelCommits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_parallel_commits_total", Help: "Transactions committed via the pipelined (STAGING) fast path.",
+	})
+	OnePhaseCommits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_one_phase_commits_total", Help: "Transactions committed via the single-proposal one-phase fast path (no record, no intents).",
 	})
 	TxnRecoveries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_recoveries_total", Help: "Status recoveries run against STAGING transaction records.",

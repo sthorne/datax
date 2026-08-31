@@ -198,6 +198,26 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if len(cmp.Path) > 0 {
 			return false, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
 		}
+		if cmp.Expr != nil {
+			return false, newErrf(CodeFeatureNotSupported, "computed expressions on the left of a comparison are not supported in join queries")
+		}
+		if cmp.Op == "OR" {
+			matched := false
+			for _, disjunct := range cmp.Or {
+				ok, err := evalJoinWhere(sides, disjunct, jr, params)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false, nil
+			}
+			continue
+		}
 		ref, err := resolveJoinRef(sides, cmp.Column)
 		if err != nil {
 			return false, err

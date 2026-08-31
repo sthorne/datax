@@ -30,6 +30,10 @@ func main() {
 		err = runBench(os.Args[2:])
 	case "cert":
 		err = runCert(os.Args[2:])
+	case "backup":
+		err = runBackupCmd(os.Args[2:])
+	case "restore":
+		err = runRestoreCmd(os.Args[2:])
 	case "debug":
 		err = runDebug(os.Args[2:])
 	case "help", "--help", "-h":
@@ -57,6 +61,8 @@ Usage:
   datax bench  <kv|bank|ingest|timeseries> [flags]  benchmark a running cluster over pgwire
   datax cert   <create-ca|create-node|create-client>
                                        manage TLS certificates (secure mode)
+  datax backup  --dest <dir>           write a consistent cluster backup (on the serving node)
+  datax restore --src <dir[,dir...]>   restore a backup chain into an empty cluster
   datax debug  <subcommand>            cluster inspection and admin commands
   datax version                        print version
 

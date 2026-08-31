@@ -74,6 +74,20 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 	}
 }
 
+// liveNodes returns the registry entries currently considered live: this
+// node itself, plus every peer whose heartbeat is within the liveness
+// grace window.
+func (n *Node) liveNodes() map[base.NodeID]kvpb.NodeDescriptor {
+	now := n.clock.Now().WallTime
+	live := map[base.NodeID]kvpb.NodeDescriptor{}
+	for _, nd := range n.registry.All() {
+		if nd.NodeID == n.ident.NodeID || now-nd.LivenessTime < int64(n.livenessGrace()) {
+			live[nd.NodeID] = nd
+		}
+	}
+	return live
+}
+
 func (n *Node) upreplicateOnce(ctx context.Context) {
 	descs, err := n.listRanges(ctx)
 	if err != nil {
@@ -81,13 +95,7 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 		return
 	}
 
-	now := n.clock.Now().WallTime
-	liveNodes := map[base.NodeID]kvpb.NodeDescriptor{}
-	for _, nd := range n.registry.All() {
-		if nd.NodeID == n.ident.NodeID || now-nd.LivenessTime < int64(n.livenessGrace()) {
-			liveNodes[nd.NodeID] = nd
-		}
-	}
+	liveNodes := n.liveNodes()
 	rangeCount := map[base.NodeID]int{}
 	for _, d := range descs {
 		for _, r := range d.Replicas {

@@ -83,18 +83,23 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		return nil, nil
 	}
 	fams := make([]types.Family, n)
-	assign := func(e parser.Expr, fam types.Family) {
-		for {
-			if e.Param > 0 && fams[e.Param-1] == types.Unknown {
-				fams[e.Param-1] = fam
-			}
-			if e.Right == nil {
-				return
-			}
-			e = *e.Right
+	var assign func(e parser.Expr, fam types.Family)
+	assign = func(e parser.Expr, fam types.Family) {
+		if e.Param > 0 && fams[e.Param-1] == types.Unknown {
+			fams[e.Param-1] = fam
+		}
+		if e.Left != nil {
+			assign(*e.Left, fam)
+		}
+		if e.Right != nil {
+			assign(*e.Right, fam)
+		}
+		for _, a := range e.Args {
+			assign(a, fam)
 		}
 	}
-	fromWhere := func(desc *catalog.TableDescriptor, where []parser.Comparison) {
+	var fromWhere func(desc *catalog.TableDescriptor, where []parser.Comparison)
+	fromWhere = func(desc *catalog.TableDescriptor, where []parser.Comparison) {
 		for _, cmp := range where {
 			if col, ok := desc.Col(cmp.Column); ok {
 				typ := col.Type
@@ -102,6 +107,12 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 					typ = pathResultType(cmp.Path)
 				}
 				assign(cmp.Value, typ)
+				for _, v := range cmp.Values {
+					assign(v, typ)
+				}
+			}
+			for _, d := range cmp.Or {
+				fromWhere(desc, d)
 			}
 		}
 	}

@@ -32,6 +32,38 @@ type raftCommand struct {
 	// condition automatic: applying this command implies every earlier
 	// write applied.
 	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
+	// Load hands the outgoing leaseholder's measured request rate to the
+	// incoming one ahead of a lease transfer (see adminTransferLease).
+	Load *loadHandoff `json:"load,omitempty"`
+	// Checksum asks every replica to checksum the range's replicated
+	// state at this command's applied index — identical across replicas
+	// by construction, so any divergence is corruption.
+	Checksum *checksumTrigger `json:"checksum,omitempty"`
+}
+
+// loadHandoff carries a leaseholder's measured QPS through the log.
+// Applying it stores the value replica-locally; the replica that next
+// becomes leader seeds its load tracker from it if it is fresh, so
+// rebalancing decisions keep seeing the range's real load across the
+// transfer instead of a zeroed, immature tracker.
+type loadHandoff struct {
+	QPS     float64 `json:"qps"`
+	AtNanos int64   `json:"at_nanos"`
+}
+
+// checksumTrigger identifies one consistency-check computation.
+type checksumTrigger struct {
+	ID string `json:"id"`
+}
+
+// cmdTriggers bundles the optional replicated side effects a proposal may
+// carry alongside (or instead of) its write batch.
+type cmdTriggers struct {
+	split    *splitTrigger
+	merge    *mergeTrigger
+	closedTS hlc.Timestamp
+	load     *loadHandoff
+	checksum *checksumTrigger
 }
 
 // splitTrigger is carried by the replicated split command (Phase 3).
@@ -131,6 +163,11 @@ type Replica struct {
 		// closed timestamp, below which this replica may serve reads
 		// locally without being the leader.
 		closedTS hlc.Timestamp
+		// loadHandoff is the newest applied load handoff (in-memory only —
+		// warmth is best-effort); consumed when this replica becomes leader.
+		loadHandoff *loadHandoff
+		// checksums parks completed consistency-check results by check ID.
+		checksums map[string]checksumResult
 	}
 
 	// quiesceCh asks the raft loop to exit without destroying data (a
@@ -382,6 +419,10 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 		r.mu.leader = rd.SoftState.Lead
 		becameLeader := rd.SoftState.RaftState == raft.StateLeader && prevLeader != uint64(r.replicaID)
 		lostLeadership := prevLeader == uint64(r.replicaID) && rd.SoftState.RaftState != raft.StateLeader
+		var handoff *loadHandoff
+		if becameLeader {
+			handoff, r.mu.loadHandoff = r.mu.loadHandoff, nil
+		}
 		var pending []chan proposalResult
 		if lostLeadership {
 			for id, ch := range r.mu.proposals {
@@ -396,6 +437,11 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 			// leader is the range's first ever — no prior reads exist, so
 			// fresh ranges (splits, bootstrap) skip the bump.
 			r.tsCache.Bump([]latchSpan{wholeRangeSpan}, r.store.cfg.Clock.Now(), uuid.Nil)
+		}
+		if becameLeader && handoff != nil {
+			// A lease transfer handed us the outgoing leader's measured
+			// rate: start warm instead of amnesiac (see loadHandoff).
+			r.load.seed(handoff.QPS, handoff.AtNanos)
 		}
 		for _, ch := range pending {
 			ch <- proposalResult{err: &kvpb.Error{
@@ -558,13 +604,18 @@ func (r *Replica) leaseContactFresh() bool {
 
 // propose submits a write batch through Raft and waits for its application.
 func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-	return r.proposeCmd(ctx, ba, nil, nil, hlc.Timestamp{})
+	return r.proposeCmd(ctx, ba, cmdTriggers{})
 }
 
-// proposeCmd submits a write batch, optionally carrying a split or merge
-// trigger or a closed-timestamp publication.
-func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, split *splitTrigger, merge *mergeTrigger, closedTS hlc.Timestamp) (*kvpb.BatchResponse, *kvpb.Error) {
-	cmd := raftCommand{ID: uuid.NewString(), Batch: *ba, Split: split, Merge: merge, ClosedTS: closedTS}
+// proposeCmd submits a write batch, optionally carrying replicated
+// triggers (split, merge, closed-timestamp publication, load handoff,
+// checksum probe).
+func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cmdTriggers) (*kvpb.BatchResponse, *kvpb.Error) {
+	cmd := raftCommand{
+		ID: uuid.NewString(), Batch: *ba,
+		Split: trig.split, Merge: trig.merge, ClosedTS: trig.closedTS,
+		Load: trig.load, Checksum: trig.checksum,
+	}
 	data, err := encodeRaftCommand(&cmd)
 	if err != nil {
 		return nil, kvpb.NewError(err)
@@ -787,6 +838,16 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, readTimestamp(ba), thr)
 		}
 	}
+	// An incremental export whose window opens below the GC threshold could
+	// miss deletions whose tombstones GC has already reclaimed: refuse it
+	// (non-retryable — the history is gone, the base backup is too old).
+	for _, u := range ba.Requests {
+		if exp := u.Export; exp != nil && !exp.StartTS.IsEmpty() {
+			if thr := r.GCThreshold(); !thr.IsEmpty() && exp.StartTS.Less(thr) {
+				return nil, kvpb.NewErrorf("%s: export start timestamp %s is below the GC threshold %s (incremental base too old)", r.rangeID, exp.StartTS, thr)
+			}
+		}
+	}
 
 	if ba.IsReadOnly() {
 		// Bump the cache BEFORE evaluating (invariant L2): an overlapping
@@ -853,7 +914,28 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// starve every writer on the range: by the time the coordinator's
 	// refresh round trip lands, the cache has moved again.
 	if ba.HasMVCCWrites() {
-		if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
+		if is1PC(ba) {
+			// A one-phase commit is never pushed in place: its EndTxn
+			// evaluates in the same proposal, and the commit-equality
+			// invariant (read ts == write ts) must hold at apply. Reject
+			// pre-propose with a retryable error instead; the client's
+			// refresh loop re-stamps and resends. This is the only extra
+			// cost of 1PC, and only when the batch would actually be
+			// pushed.
+			txn := ba.Header.Txn
+			if !txn.ReadTimestamp.Equal(txn.WriteTimestamp) {
+				e := kvpb.NewErrorf("%s: one-phase commit of %s arrived with diverged timestamps (read %s, write %s)",
+					r.rangeID, txn.ID, txn.ReadTimestamp, txn.WriteTimestamp)
+				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: txn.WriteTimestamp}
+				return nil, e
+			}
+			if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
+				e := kvpb.NewErrorf("%s: one-phase commit of %s at %s below timestamp cache %s",
+					r.rangeID, txn.ID, writeTimestamp(ba), low)
+				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
+				return nil, e
+			}
+		} else if ok, low := r.tsCache.AllowsWrite(mvccWriteSpans(ba), writeTimestamp(ba), batchTxnID(ba)); !ok {
 			if ba.Header.Txn == nil {
 				e := kvpb.NewErrorf("%s: write timestamp %s below timestamp cache %s", r.rangeID, writeTimestamp(ba), low)
 				e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: low.Next()}
@@ -963,6 +1045,29 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 		spans = append(spans, sp)
 	}
 	return spans
+}
+
+// is1PC reports whether the batch is one-phase-commit shaped: bound to a
+// transaction, its last request a committing EndTxn with All set (the
+// client's "this is the entire transaction" declaration), and every other
+// request a plain Put or Delete. Deterministic from batch content alone,
+// so the leader's pre-propose gate and every replica's apply agree.
+func is1PC(ba *kvpb.BatchRequest) bool {
+	if ba.Header.Txn == nil || len(ba.Requests) < 2 {
+		return false
+	}
+	last := ba.Requests[len(ba.Requests)-1].EndTxn
+	if last == nil || !last.Commit || !last.All {
+		return false
+	}
+	for i := 0; i < len(ba.Requests)-1; i++ {
+		switch ba.Requests[i].GetInner().(type) {
+		case *kvpb.PutRequest, *kvpb.DeleteRequest:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func batchTxnID(ba *kvpb.BatchRequest) uuid.UUID {

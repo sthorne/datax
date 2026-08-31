@@ -26,6 +26,26 @@ type TestCluster struct {
 	// it (peers find a restarted node through their persisted registries,
 	// which hold the old address). Filled by StartWithEngines.
 	addrs []string
+	// nodesMu orders Nodes slot writes (StopNode/Restart*) against
+	// concurrent readers using Node(i) — workloads that keep running while
+	// the test restarts nodes.
+	nodesMu sync.RWMutex
+}
+
+// Node returns tc.Nodes[i] under the lock that StopNode and the Restart
+// helpers hold while writing the slot — the race-free accessor for
+// workload goroutines running across a restart. May return nil (node
+// currently down).
+func (tc *TestCluster) Node(i int) *server.Node {
+	tc.nodesMu.RLock()
+	defer tc.nodesMu.RUnlock()
+	return tc.Nodes[i]
+}
+
+func (tc *TestCluster) setNode(i int, n *server.Node) {
+	tc.nodesMu.Lock()
+	tc.Nodes[i] = n
+	tc.nodesMu.Unlock()
 }
 
 // Start brings up numNodes nodes with static pre-agreed membership: every
@@ -191,6 +211,61 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 	return n
 }
 
+// AddNodeErr joins a fresh node through node 1 like AddNode, but takes
+// config options and returns the start error instead of failing the test —
+// for tests that expect a join rejection (e.g. version gating).
+func (tc *TestCluster) AddNodeErr(opts ...func(*server.Config)) (*server.Node, error) {
+	tc.T.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tc.T.Fatal(err)
+	}
+	cfg := server.Config{
+		Listener:              lis,
+		Join:                  tc.Nodes[0].Addr(),
+		UpreplicationInterval: time.Second,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
+	tc.Nodes = append(tc.Nodes, n)
+	return n, nil
+}
+
+// RestartNodeErr is RestartNode returning the start error instead of
+// failing the test — for tests that expect a refused restart (e.g. a
+// binary downgrade past a finalized upgrade).
+func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*server.Config)) (*server.Node, error) {
+	tc.T.Helper()
+	if tc.Nodes[i] != nil {
+		tc.T.Fatalf("node %d is still running", i+1)
+	}
+	lis, err := net.Listen("tcp", tc.addrs[i])
+	if err != nil {
+		tc.T.Fatalf("re-listening on %s: %v", tc.addrs[i], err)
+	}
+	cfg := server.Config{
+		Listener:   lis,
+		Engine:     eng,
+		GCInterval: -1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
+	tc.setNode(i, n)
+	return n, nil
+}
+
 // LeaderIndex returns the index of the node whose replica of rangeID is the
 // Raft leader, waiting up to 15s for one to emerge.
 func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
@@ -274,7 +349,7 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 	if err != nil {
 		tc.T.Fatalf("restarting node %d: %v", i+1, err)
 	}
-	tc.Nodes[i] = n
+	tc.setNode(i, n)
 	return n
 }
 
@@ -304,15 +379,15 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 		tc.T.Fatalf("restarting node %d on new port: %v", i+1, err)
 	}
 	tc.addrs[i] = lis.Addr().String()
-	tc.Nodes[i] = n
+	tc.setNode(i, n)
 	return n
 }
 
 // StopNode stops one node (simulating a crash) and forgets it.
 func (tc *TestCluster) StopNode(i int) {
-	if tc.Nodes[i] != nil {
-		tc.Nodes[i].Stop()
-		tc.Nodes[i] = nil
+	if n := tc.Node(i); n != nil {
+		n.Stop()
+		tc.setNode(i, nil)
 	}
 }
 
@@ -325,3 +400,28 @@ func (tc *TestCluster) StopAll() {
 
 // jsonUnmarshal avoids importing encoding/json in every test file.
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+// Isolate partitions node i away from every other node, both directions —
+// its outbound traffic is vetoed and every peer vetoes traffic to it.
+func (tc *TestCluster) Isolate(i int) {
+	target := base.NodeID(i + 1)
+	for j, n := range tc.Nodes {
+		if n == nil {
+			continue
+		}
+		if j == i {
+			n.InjectRPCDrop(func(base.NodeID) bool { return true })
+		} else {
+			n.InjectRPCDrop(func(to base.NodeID) bool { return to == target })
+		}
+	}
+}
+
+// Heal clears all injected partitions.
+func (tc *TestCluster) Heal() {
+	for _, n := range tc.Nodes {
+		if n != nil {
+			n.InjectRPCDrop(nil)
+		}
+	}
+}

@@ -345,7 +345,12 @@ explicit `BEGIN ... COMMIT`.
   Parameters and results in both text and binary formats for every column
   type (int8, float8, bool, text, timestamptz, date, bytea, uuid,
   numeric as PostgreSQL's base-10000 digit groups, jsonb with the
-  version-1 byte). No portal suspension.
+  version-1 byte). Portal suspension is supported: a row-limited Execute
+  returns up to that many rows and `PortalSuspended`; re-Execute resumes,
+  and portals live to the end of the transaction (destroyed by Sync
+  outside one) — JDBC fetch-size loops work. The statement runs once at
+  the first Execute and the result is served from the materialized rows
+  (streaming resumption from KV is a possible later optimization).
 - **Transaction status is load-bearing**: `ReadyForQuery` carries `I` (idle),
   `T` (in transaction), or `E` (failed transaction — everything except
   `ROLLBACK` is rejected with `25P02`).

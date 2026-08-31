@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -32,6 +34,11 @@ type Transport struct {
 	stopper  *stop.Stopper
 	resolver Resolver
 	tlsCfg   *tls.Config // nil = cleartext
+
+	// testingDrop, when set, vetoes outbound traffic per destination —
+	// the fault-injection hook for partition tests. Never set in
+	// production.
+	testingDrop atomic.Pointer[func(to base.NodeID) bool]
 
 	localMu   sync.Mutex
 	localNode base.NodeID
@@ -112,11 +119,32 @@ func DialAddr(addr string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
+// SetTestingDrop installs (or clears, with nil) a per-destination veto on
+// all outbound traffic — the partition hook for fault-injection tests.
+func (t *Transport) SetTestingDrop(fn func(to base.NodeID) bool) {
+	if fn == nil {
+		t.testingDrop.Store(nil)
+		return
+	}
+	t.testingDrop.Store(&fn)
+}
+
+// dropTo reports whether the partition hook vetoes traffic to a node.
+func (t *Transport) dropTo(to base.NodeID) bool {
+	if fn := t.testingDrop.Load(); fn != nil {
+		return (*fn)(to)
+	}
+	return false
+}
+
 // SendRaftMessage enqueues a Raft message for delivery. Delivery is
 // best-effort (Raft tolerates loss); a full queue drops the message. An
 // error is returned only when the queue worker cannot even be started —
 // callers use it to report unreachability to Raft.
 func (t *Transport) SendRaftMessage(ctx context.Context, to base.NodeID, rangeID base.RangeID, m raftpb.Message) error {
+	if t.dropTo(to) {
+		return nil // injected partition: silently dropped, like a lost packet
+	}
 	raw, err := m.Marshal()
 	if err != nil {
 		return err
@@ -196,6 +224,9 @@ func (t *Transport) raftWorker(ctx context.Context, to base.NodeID, q <-chan *rp
 // SendBatch executes a KV batch on a remote node. The outer error covers
 // transport failure; the kvpb.Error is the KV-level outcome.
 func (t *Transport) SendBatch(ctx context.Context, to base.NodeID, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error, error) {
+	if t.dropTo(to) {
+		return nil, nil, fmt.Errorf("to n%d: injected partition", to)
+	}
 	cc, err := t.Dial(to)
 	if err != nil {
 		return nil, nil, err
@@ -220,6 +251,9 @@ func (t *Transport) SendBatch(ctx context.Context, to base.NodeID, ba *kvpb.Batc
 // SendSnapshot streams a range snapshot to another node. next returns
 // key/value chunks and an empty slice at end of stream.
 func (t *Transport) SendSnapshot(ctx context.Context, to base.NodeID, header []byte, next func() ([]kvserver.SnapshotKV, error)) error {
+	if t.dropTo(to) {
+		return fmt.Errorf("to n%d: injected partition", to)
+	}
 	cc, err := t.Dial(to)
 	if err != nil {
 		return err

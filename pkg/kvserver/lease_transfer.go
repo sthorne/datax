@@ -27,6 +27,16 @@ func (r *Replica) adminTransferLease(ctx context.Context, req *kvpb.AdminTransfe
 		return nil, kvpb.NewErrorf("%s: node %s has no replica to transfer the lease to", r.rangeID, req.Target)
 	}
 
+	// Hand the measured load to the incoming leaseholder first (riding the
+	// log, so it is applied before the target can lead anything new): the
+	// new leader seeds its tracker from it instead of starting amnesiac,
+	// and rebalancing keeps seeing the range's real load across the
+	// transfer. Best-effort — a failed proposal just means a cold start.
+	if q, mature := r.load.qps(); mature && q > 0 {
+		_, _ = r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}},
+			cmdTriggers{load: &loadHandoff{QPS: q, AtNanos: r.store.loadNow()}})
+	}
+
 	r.node.TransferLeadership(ctx, uint64(r.replicaID), uint64(rep.ReplicaID))
 
 	// Raft aborts a transfer that cannot complete within one election

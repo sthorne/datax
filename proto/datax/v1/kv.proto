@@ -101,6 +101,9 @@ message EndTxnRequest {
   bool commit = 2;
   repeated bytes intent_keys = 3;
   repeated bytes in_flight = 4; // parallel commit: stages the record
+  // all: this batch is the transaction's ENTIRE write set — the one-phase
+  // commit hint. An old server ignores it and evaluates classically.
+  bool all = 5;
 }
 
 message HeartbeatTxnRequest {
@@ -136,6 +139,23 @@ message RollbackIntentRequest {
 message RefreshRequest {
   RequestHeader header = 1;
   Hlc from_ts = 2;
+}
+
+message ExportRequest {
+  RequestHeader header = 1;
+  Hlc start_ts = 2; // export keys changed in (start_ts, batch timestamp]
+  int64 max_records = 3;
+}
+
+message ExportRecord {
+  bytes key = 1;
+  bytes value = 2;
+  bool deleted = 3; // tombstone: the key was deleted in the window
+}
+
+message ExportResponse {
+  repeated ExportRecord records = 1;
+  bytes resume = 2;
 }
 
 message GcVersion {
@@ -207,6 +227,7 @@ message RequestUnion {
     AdminMergeRequest admin_merge = 16;
     SubsumeRequest subsume = 17;
     UnfreezeRequest unfreeze = 18;
+    ExportRequest export = 21;
   }
 }
 
@@ -248,6 +269,9 @@ message ScanResponse {
 
 message EndTxnResponse {
   Hlc commit_timestamp = 1;
+  // one_phase: the batch committed via the one-phase fast path — values
+  // written committed, no record, nothing to resolve.
+  bool one_phase = 2;
 }
 
 message HeartbeatTxnResponse {
@@ -326,6 +350,7 @@ message ResponseUnion {
     AdminMergeResponse admin_merge = 16;
     SubsumeResponse subsume = 17;
     UnfreezeResponse unfreeze = 18;
+    ExportResponse export = 21;
   }
 }
 
@@ -414,6 +439,23 @@ message RaftCommand {
   // the time a replica applies this command, every write below the
   // timestamp has applied too.
   Hlc closed_ts = 5;
+  // load_handoff carries the outgoing leaseholder's measured load ahead
+  // of a lease transfer, so the incoming one starts warm instead of
+  // amnesiac.
+  LoadHandoff load_handoff = 6;
+  // checksum asks every replica to checksum the range's replicated state
+  // at this command's applied index (identical by construction across
+  // replicas) — the consistency checker's probe.
+  ChecksumTrigger checksum = 7;
+}
+
+message LoadHandoff {
+  double qps = 1;
+  int64 at_nanos = 2;
+}
+
+message ChecksumTrigger {
+  string id = 1;
 }
 
 message SplitTrigger {

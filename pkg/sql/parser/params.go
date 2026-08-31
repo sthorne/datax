@@ -4,15 +4,34 @@ package parser
 // statement — the number of parameter values a Bind must supply.
 func CountParams(stmt Statement) int {
 	max := 0
-	visit := func(e Expr) {
-		for {
-			if e.Param > max {
-				max = e.Param
+	var visit func(e Expr)
+	visit = func(e Expr) {
+		if e.Param > max {
+			max = e.Param
+		}
+		if e.Left != nil {
+			visit(*e.Left)
+		}
+		if e.Right != nil {
+			visit(*e.Right)
+		}
+		for _, a := range e.Args {
+			visit(a)
+		}
+	}
+	var visitWhere func(where []Comparison)
+	visitWhere = func(where []Comparison) {
+		for _, c := range where {
+			if c.Expr != nil {
+				visit(*c.Expr)
 			}
-			if e.Right == nil {
-				return
+			visit(c.Value)
+			for _, v := range c.Values {
+				visit(v)
 			}
-			e = *e.Right
+			for _, d := range c.Or {
+				visitWhere(d)
+			}
 		}
 	}
 	switch t := stmt.(type) {
@@ -28,20 +47,14 @@ func CountParams(stmt Statement) int {
 				visit(se.Expr)
 			}
 		}
-		for _, c := range t.Where {
-			visit(c.Value)
-		}
+		visitWhere(t.Where)
 	case *Update:
 		for _, set := range t.Set {
 			visit(set.Value)
 		}
-		for _, c := range t.Where {
-			visit(c.Value)
-		}
+		visitWhere(t.Where)
 	case *Delete:
-		for _, c := range t.Where {
-			visit(c.Value)
-		}
+		visitWhere(t.Where)
 	}
 	return max
 }

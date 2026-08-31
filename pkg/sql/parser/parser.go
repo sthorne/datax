@@ -549,7 +549,7 @@ func (p *parser) parseInsert() (Statement, error) {
 		}
 		var row []Expr
 		for {
-			e, err := p.parseValueExpr()
+			e, err := p.parseValueOrColumnExpr()
 			if err != nil {
 				return nil, err
 			}
@@ -848,7 +848,7 @@ func (p *parser) parseHaving() ([]HavingCond, error) {
 			return nil, p.errf("expected comparison operator, found %q", t.text)
 		}
 		p.i++
-		val, err := p.parseValueExpr()
+		val, err := p.parseValueOrColumnExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -1069,100 +1069,350 @@ func (p *parser) parseOptWhere() ([]Comparison, error) {
 	if !p.consumeKeyword("WHERE") {
 		return nil, nil
 	}
-	var out []Comparison
-	for {
-		// [NOT] EXISTS (SELECT ...) — no left-hand column.
-		if cmp, ok, err := p.parseExistsCond(); err != nil {
-			return nil, err
-		} else if ok {
-			out = append(out, cmp)
-			if !p.consumeKeyword("AND") {
-				break
+	n, err := p.parseBoolOr()
+	if err != nil {
+		return nil, err
+	}
+	return lowerBool(n, false)
+}
+
+// boolNode is the parse-time boolean tree; lowerBool flattens it into the
+// executor's conjunction-of-comparisons form, eliminating NOT on the way.
+type boolNode struct {
+	op   string // "and", "or", "not", "leaf"
+	kids []boolNode
+	leaf Comparison
+}
+
+func (p *parser) parseBoolOr() (boolNode, error) {
+	n, err := p.parseBoolAnd()
+	if err != nil {
+		return n, err
+	}
+	if p.peek().kind == tkKeyword && p.peek().text == "OR" {
+		node := boolNode{op: "or", kids: []boolNode{n}}
+		for p.consumeKeyword("OR") {
+			k, err := p.parseBoolAnd()
+			if err != nil {
+				return node, err
 			}
-			continue
+			node.kids = append(node.kids, k)
 		}
-		col, err := p.expectColumnName()
-		if err != nil {
-			return nil, err
-		}
-		path, err := p.parsePathSteps()
-		if err != nil {
-			return nil, err
-		}
-		// col IS [NOT] NULL ("is" is not a reserved keyword).
-		if p.consumeIdentWord("is") {
-			op := "IS NULL"
-			if p.consumeKeyword("NOT") {
-				op = "IS NOT NULL"
+		return node, nil
+	}
+	return n, nil
+}
+
+func (p *parser) parseBoolAnd() (boolNode, error) {
+	n, err := p.parseBoolFactor()
+	if err != nil {
+		return n, err
+	}
+	if p.peek().kind == tkKeyword && p.peek().text == "AND" {
+		node := boolNode{op: "and", kids: []boolNode{n}}
+		for p.consumeKeyword("AND") {
+			k, err := p.parseBoolFactor()
+			if err != nil {
+				return node, err
 			}
-			if err := p.expectKeyword("NULL"); err != nil {
-				return nil, err
-			}
-			out = append(out, Comparison{Column: col, Path: path, Op: op})
-			if !p.consumeKeyword("AND") {
-				break
-			}
-			continue
+			node.kids = append(node.kids, k)
 		}
-		// col [NOT] IN (value, ... | SELECT ...) ("in" is an identifier).
-		notIn := false
-		if p.consumeKeyword("NOT") {
-			if !p.consumeIdentWord("in") {
-				return nil, p.errf("expected IN after NOT, found %q", p.peek().text)
+		return node, nil
+	}
+	return n, nil
+}
+
+func (p *parser) parseBoolFactor() (boolNode, error) {
+	// NOT EXISTS is a leaf (parseExistsCond claims it); any other NOT is
+	// boolean negation.
+	if t := p.peek(); t.kind == tkKeyword && t.text == "NOT" {
+		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "EXISTS") {
+			p.i++
+			k, err := p.parseBoolFactor()
+			if err != nil {
+				return k, err
 			}
-			notIn = true
-		}
-		if notIn || p.consumeIdentWord("in") {
-			cmp := Comparison{Column: col, Path: path, Op: "IN"}
-			if notIn {
-				cmp.Op = "NOT IN"
-			}
-			if sub, ok, err := p.parseSubquery(); err != nil {
-				return nil, err
-			} else if ok {
-				cmp.Sub = sub
-			} else {
-				if err := p.expectOp("("); err != nil {
-					return nil, err
-				}
-				for {
-					v, err := p.parseValueExpr()
-					if err != nil {
-						return nil, err
-					}
-					cmp.Values = append(cmp.Values, v)
-					if !p.consumeOp(",") {
-						break
-					}
-				}
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-			}
-			out = append(out, cmp)
-			if !p.consumeKeyword("AND") {
-				break
-			}
-			continue
-		}
-		t := p.peek()
-		if t.kind != tkOp || !isCmpOp(t.text) {
-			return nil, p.errf("expected comparison operator, found %q", t.text)
-		}
-		p.i++
-		// The right side may itself be a column reference (a = b, or a
-		// correlated outer.col inside a subquery); row-dependent values
-		// are excluded from access planning and checked by the filter.
-		val, err := p.parseValueOrColumnExpr()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Comparison{Column: col, Path: path, Op: t.text, Value: val})
-		if !p.consumeKeyword("AND") {
-			break
+			return boolNode{op: "not", kids: []boolNode{k}}, nil
 		}
 	}
-	return out, nil
+	// Parenthesized boolean group. A leaf conjunct never starts with "(",
+	// so the paren is unambiguous here.
+	if p.peek().kind == tkOp && p.peek().text == "(" {
+		p.i++
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return n, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return n, err
+		}
+		return n, nil
+	}
+	cmp, err := p.parseConjunct()
+	if err != nil {
+		return boolNode{}, err
+	}
+	return boolNode{op: "leaf", leaf: cmp}, nil
+}
+
+// parseConjunct parses one atomic condition: [NOT] EXISTS(...), col IS
+// [NOT] NULL, col [NOT] IN (...), or col op value.
+func (p *parser) parseConjunct() (Comparison, error) {
+	if cmp, ok, err := p.parseExistsCond(); err != nil {
+		return Comparison{}, err
+	} else if ok {
+		return cmp, nil
+	}
+	lhs, err := p.parseAddExpr()
+	if err != nil {
+		return Comparison{}, err
+	}
+	col, path := lhs.Column, lhs.Path
+	computed := lhs.Column == "" || lhs.BinOp != "" || lhs.Func != "" || lhs.Left != nil
+	if computed {
+		// Computed left-hand side: only plain comparisons apply.
+		t := p.peek()
+		if t.kind != tkOp || !isCmpOp(t.text) {
+			return Comparison{}, p.errf("expected comparison operator, found %q", t.text)
+		}
+		p.i++
+		val, err := p.parseValueOrColumnExpr()
+		if err != nil {
+			return Comparison{}, err
+		}
+		return Comparison{Expr: &lhs, Op: t.text, Value: val}, nil
+	}
+	// col IS [NOT] NULL ("is" is not a reserved keyword).
+	if p.consumeIdentWord("is") {
+		op := "IS NULL"
+		if p.consumeKeyword("NOT") {
+			op = "IS NOT NULL"
+		}
+		if err := p.expectKeyword("NULL"); err != nil {
+			return Comparison{}, err
+		}
+		return Comparison{Column: col, Path: path, Op: op}, nil
+	}
+	// col [NOT] IN (value, ... | SELECT ...) ("in" is an identifier).
+	notIn := false
+	if p.peek().kind == tkKeyword && p.peek().text == "NOT" &&
+		p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "in" {
+		p.i++
+		notIn = true
+	}
+	if notIn || p.consumeIdentWord("in") {
+		if notIn {
+			p.i++ // the "in" identifier
+		}
+		cmp := Comparison{Column: col, Path: path, Op: "IN"}
+		if notIn {
+			cmp.Op = "NOT IN"
+		}
+		if sub, ok, err := p.parseSubquery(); err != nil {
+			return Comparison{}, err
+		} else if ok {
+			cmp.Sub = sub
+		} else {
+			if err := p.expectOp("("); err != nil {
+				return Comparison{}, err
+			}
+			for {
+				v, err := p.parseValueExpr()
+				if err != nil {
+					return Comparison{}, err
+				}
+				cmp.Values = append(cmp.Values, v)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return Comparison{}, err
+			}
+		}
+		return cmp, nil
+	}
+	t := p.peek()
+	if t.kind != tkOp || !isCmpOp(t.text) {
+		return Comparison{}, p.errf("expected comparison operator, found %q", t.text)
+	}
+	p.i++
+	// The right side may itself be a column reference (a = b, or a
+	// correlated outer.col inside a subquery); row-dependent values
+	// are excluded from access planning and checked by the filter.
+	val, err := p.parseValueOrColumnExpr()
+	if err != nil {
+		return Comparison{}, err
+	}
+	return Comparison{Column: col, Path: path, Op: t.text, Value: val}, nil
+}
+
+// lowerBool flattens the boolean tree into a conjunction of comparisons.
+// NOT is eliminated by De Morgan plus operator negation — sound under SQL
+// three-valued logic because WHERE keeps exactly the TRUE rows and both a
+// negated UNKNOWN and an UNKNOWN negation stay UNKNOWN. An OR subtree
+// becomes one Op-"OR" comparison holding a disjunction of conjunctions;
+// subqueries inside OR are rejected (v1 — the subquery machinery splices
+// over the flat conjunction only).
+func lowerBool(n boolNode, negated bool) ([]Comparison, error) {
+	switch n.op {
+	case "not":
+		return lowerBool(n.kids[0], !negated)
+	case "and", "or":
+		op := n.op
+		if negated { // De Morgan
+			if op == "and" {
+				op = "or"
+			} else {
+				op = "and"
+			}
+		}
+		if op == "and" {
+			var out []Comparison
+			for _, k := range n.kids {
+				kc, err := lowerBool(k, negated)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, kc...)
+			}
+			return out, nil
+		}
+		var disjuncts [][]Comparison
+		for _, k := range n.kids {
+			kc, err := lowerBool(k, negated)
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range kc {
+				if err := rejectSubInOr(c); err != nil {
+					return nil, err
+				}
+			}
+			disjuncts = append(disjuncts, kc)
+		}
+		if in, ok := orAsIn(disjuncts); ok {
+			return []Comparison{in}, nil
+		}
+		return []Comparison{{Op: "OR", Or: disjuncts}}, nil
+	default: // leaf
+		leaf := n.leaf
+		if negated {
+			neg, err := negateComparison(leaf)
+			if err != nil {
+				return nil, err
+			}
+			leaf = neg
+		}
+		return []Comparison{leaf}, nil
+	}
+}
+
+// rejectSubInOr refuses subqueries anywhere inside an OR group.
+func rejectSubInOr(c Comparison) error {
+	if c.Sub != nil || exprContainsSub(c.Value) || (c.Expr != nil && exprContainsSub(*c.Expr)) {
+		return fmt.Errorf("subqueries are not supported inside OR")
+	}
+	for _, v := range c.Values {
+		if exprContainsSub(v) {
+			return fmt.Errorf("subqueries are not supported inside OR")
+		}
+	}
+	for _, d := range c.Or {
+		for _, inner := range d {
+			if err := rejectSubInOr(inner); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func exprContainsSub(e Expr) bool {
+	if e.Sub != nil {
+		return true
+	}
+	if e.Left != nil && exprContainsSub(*e.Left) {
+		return true
+	}
+	if e.Right != nil && exprContainsSub(*e.Right) {
+		return true
+	}
+	for _, a := range e.Args {
+		if exprContainsSub(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// orAsIn rewrites `a = x OR a = y OR ...` (single-equality disjuncts on
+// one bare column) into `a IN (x, y, ...)`.
+func orAsIn(disjuncts [][]Comparison) (Comparison, bool) {
+	var col string
+	in := Comparison{Op: "IN"}
+	for i, d := range disjuncts {
+		if len(d) != 1 {
+			return Comparison{}, false
+		}
+		c := d[0]
+		if c.Op != "=" || c.Column == "" || len(c.Path) > 0 || len(c.Or) > 0 {
+			return Comparison{}, false
+		}
+		if i == 0 {
+			col = c.Column
+		} else if c.Column != col {
+			return Comparison{}, false
+		}
+		in.Values = append(in.Values, c.Value)
+	}
+	in.Column = col
+	return in, true
+}
+
+// negateComparison negates one atomic condition exactly (three-valued
+// logic: UNKNOWN stays UNKNOWN either way).
+func negateComparison(c Comparison) (Comparison, error) {
+	neg := map[string]string{
+		"=": "!=", "!=": "=", "<": ">=", ">=": "<", ">": "<=", "<=": ">",
+		"IS NULL": "IS NOT NULL", "IS NOT NULL": "IS NULL",
+		"IN": "NOT IN", "NOT IN": "IN",
+		"EXISTS": "NOT EXISTS", "NOT EXISTS": "EXISTS",
+		"TRUE": "FALSE", "FALSE": "TRUE",
+	}
+	if c.Op == "OR" {
+		// NOT over a lowered OR: De Morgan by hand — negate every inner
+		// conjunct and swap the shape (the disjunction of conjunctions
+		// becomes a conjunction of disjunctions, re-lowered as nested ORs).
+		var conj []Comparison
+		for _, d := range c.Or {
+			var alts [][]Comparison
+			for _, inner := range d {
+				n, err := negateComparison(inner)
+				if err != nil {
+					return Comparison{}, err
+				}
+				alts = append(alts, []Comparison{n})
+			}
+			if len(alts) == 1 {
+				conj = append(conj, alts[0][0])
+			} else {
+				conj = append(conj, Comparison{Op: "OR", Or: alts})
+			}
+		}
+		if len(conj) == 1 {
+			return conj[0], nil
+		}
+		// A conjunction can't be one comparison: wrap as a single-disjunct
+		// OR (a disjunction with one conjunction is just that conjunction).
+		return Comparison{Op: "OR", Or: [][]Comparison{conj}}, nil
+	}
+	op, ok := neg[c.Op]
+	if !ok {
+		return Comparison{}, fmt.Errorf("cannot negate %q", c.Op)
+	}
+	c.Op = op
+	return c, nil
 }
 
 // parseExistsCond parses [NOT] EXISTS (SELECT ...) when present.
@@ -1332,8 +1582,119 @@ func (p *parser) parsePathSteps() ([]PathStep, error) {
 // parseValueOrColumnExpr additionally allows column references and
 // col ± value (for SET balance = balance - 10 and SELECT col).
 func (p *parser) parseValueOrColumnExpr() (Expr, error) {
+	return p.parseAddExpr()
+}
+
+// parseAddExpr / parseMulExpr implement left-associative arithmetic with
+// the usual precedence (* / bind tighter than + -). A single binary op
+// keeps the flat historical Expr shape; further chaining nests the
+// accumulated expression through Left.
+func (p *parser) parseAddExpr() (Expr, error) {
+	e, err := p.parseMulExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		op := p.peek()
+		if op.kind != tkOp || (op.text != "+" && op.text != "-") {
+			return e, nil
+		}
+		p.i++
+		rhs, err := p.parseMulExpr()
+		if err != nil {
+			return e, err
+		}
+		e = foldBinOp(e, op.text, rhs)
+	}
+}
+
+func (p *parser) parseMulExpr() (Expr, error) {
+	e, err := p.parsePrimaryExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		op := p.peek()
+		if op.kind != tkOp || (op.text != "*" && op.text != "/") {
+			return e, nil
+		}
+		p.i++
+		rhs, err := p.parsePrimaryExpr()
+		if err != nil {
+			return e, err
+		}
+		e = foldBinOp(e, op.text, rhs)
+	}
+}
+
+// foldBinOp attaches (lhs op rhs), reusing lhs's own node when it carries
+// no operator yet (the flat historical shape) and nesting through Left
+// otherwise (left associativity).
+func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
+	if lhs.BinOp == "" {
+		lhs.BinOp = op
+		lhs.Right = &rhs
+		return lhs
+	}
+	l := lhs
+	return Expr{Left: &l, BinOp: op, Right: &rhs}
+}
+
+// scalarFuncs are the builtin scalar functions ("now" is spliced by the
+// session before execution; the rest evaluate per row).
+var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
+	"now": 0, "length": 1, "lower": 1, "upper": 1, "abs": 1, "coalesce": -1,
+}
+
+// parsePrimaryExpr parses one operand: a parenthesized expression, a
+// builtin call, a possibly-qualified column reference (with an optional
+// ->/->> chain), or a literal/parameter/scalar subquery.
+func (p *parser) parsePrimaryExpr() (Expr, error) {
 	t := p.peek()
+	if t.kind == tkOp && t.text == "(" {
+		// A scalar subquery is "(SELECT"; anything else is grouping.
+		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") {
+			p.i++
+			e, err := p.parseAddExpr()
+			if err != nil {
+				return e, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return e, err
+			}
+			return e, nil
+		}
+		return p.parseValueExpr()
+	}
 	if t.kind == tkIdent {
+		// Builtin call: known name followed by "(".
+		if arity, isFunc := scalarFuncs[t.text]; isFunc &&
+			p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
+			p.i += 2
+			e := Expr{Func: t.text}
+			if !p.consumeOp(")") {
+				for {
+					a, err := p.parseAddExpr()
+					if err != nil {
+						return e, err
+					}
+					e.Args = append(e.Args, a)
+					if !p.consumeOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return e, err
+				}
+			}
+			switch {
+			case arity == -1 && len(e.Args) == 0:
+				return e, p.errf("%s() requires at least one argument", t.text)
+			case arity >= 0 && len(e.Args) != arity:
+				return e, p.errf("%s() takes %d argument(s), got %d", t.text, arity, len(e.Args))
+			}
+			return e, nil
+		}
 		p.i++
 		name := t.text
 		if p.consumeOp(".") {
@@ -1349,15 +1710,6 @@ func (p *parser) parseValueOrColumnExpr() (Expr, error) {
 			return Expr{}, err
 		}
 		e.Path = path
-		if op := p.peek(); op.kind == tkOp && (op.text == "+" || op.text == "-") {
-			p.i++
-			rhs, err := p.parseValueExpr()
-			if err != nil {
-				return e, err
-			}
-			e.BinOp = op.text
-			e.Right = &rhs
-		}
 		return e, nil
 	}
 	return p.parseValueExpr()

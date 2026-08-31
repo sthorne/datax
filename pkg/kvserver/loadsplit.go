@@ -114,6 +114,32 @@ func (l *replicaLoad) record(start keys.Key) {
 	}
 }
 
+// handoffFreshness bounds how old a handed-off rate may be and still seed
+// a new leader's tracker — older than this, the range's load has likely
+// changed and starting cold (immature) is more honest.
+const handoffFreshness = 30 * time.Second
+
+// seed adopts a rate measured by the previous leaseholder, making the
+// tracker immediately mature: the value is real, continuously measured
+// load, not a guess. The rate lands in the PREVIOUS window, so it decays
+// over one window unless this leader's own traffic sustains it. Stale
+// handoffs are ignored.
+func (l *replicaLoad) seed(qps float64, atNanos int64) bool {
+	now := l.nowFn()
+	if now-atNanos > handoffFreshness.Nanoseconds() || qps <= 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.prev = int64(qps * loadRateWindow.Seconds())
+	l.cur = 0
+	l.windowStart = now
+	if l.rotations < 1 {
+		l.rotations = 1
+	}
+	return true
+}
+
 // qps returns the sliding-window request rate and whether the tracker is
 // mature (has observed at least one full window).
 func (l *replicaLoad) qps() (float64, bool) {

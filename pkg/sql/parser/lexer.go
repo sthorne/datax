@@ -28,7 +28,7 @@ var keywords = map[string]bool{
 	"CREATE": true, "TABLE": true, "DROP": true, "IF": true, "NOT": true,
 	"EXISTS": true, "NULL": true, "PRIMARY": true, "KEY": true,
 	"INSERT": true, "INTO": true, "VALUES": true,
-	"SELECT": true, "FROM": true, "WHERE": true, "AND": true, "LIMIT": true, "AS": true,
+	"SELECT": true, "FROM": true, "WHERE": true, "AND": true, "OR": true, "LIMIT": true, "AS": true,
 	"UPDATE": true, "SET": true, "DELETE": true,
 	"BEGIN": true, "START": true, "TRANSACTION": true, "COMMIT": true, "ROLLBACK": true, "ABORT": true, "END": true,
 	"SHOW": true, "TABLES": true, "TRUE": true, "FALSE": true,
@@ -141,7 +141,7 @@ func lex(src string) ([]token, error) {
 				l.pos += 2
 			default:
 				switch c {
-				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '.':
+				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '/', '.':
 					l.toks = append(l.toks, token{kind: tkOp, text: string(c), pos: start})
 					l.pos++
 				default:

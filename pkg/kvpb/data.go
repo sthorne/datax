@@ -67,6 +67,11 @@ type NodeDescriptor struct {
 	// replicas away and never places new ones on it. The node itself
 	// adopts and re-asserts the flag through its heartbeats.
 	Draining bool `json:"draining,omitempty"`
+	// BinaryVersion is the protocol version of the binary the node runs
+	// (see pkg/version), re-asserted on every heartbeat. 0 (absent, or an
+	// entry synthesized from raft traffic before the node's first
+	// heartbeat lands) conservatively reads as version 1.
+	BinaryVersion int `json:"binary_version,omitempty"`
 
 	// Load aggregates, refreshed on every heartbeat so the allocator (the
 	// range-1 leader) can weigh load it cannot observe locally. QPS is

@@ -33,6 +33,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
+| `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 
 Also useful: `datax_kv_batch_latency_seconds` (histogram — p99 of the
@@ -61,6 +62,91 @@ datax debug rebalance --range 5 [--from 1]
 Splits and merges also happen automatically (by size: 64 MiB; by load:
 sustained 500 QPS); the manual commands are for pre-splitting before a bulk
 load and for tests.
+
+## Consistency checking
+
+Start nodes with `--consistency-interval 10m` (off by default) and each
+node periodically checksums one range it leads across all its replicas —
+a background tripwire for silent corruption. A divergence logs every
+replica's digest (`CONSISTENCY FAILURE` in the node log) and increments
+`datax_consistency_failures_total`; alert on it. The check reads the
+whole range, so pick an interval that spreads the IO — at `10m` a node
+leading 100 ranges re-verifies everything roughly every 17 hours.
+
+## Backup and restore
+
+`datax backup` asks a node to write a **consistent** backup of the whole
+cluster — every table (data and indexes, raw), descriptors with their
+grants, and users — captured at a single timestamp, correct even under
+concurrent write load:
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31
+datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
+              --base /backups/2026-08-31          # incremental since the base
+```
+
+- Paths are on the **serving node's** filesystem (a mounted shared
+  filesystem makes them portable).
+- A backup directory holds a `BACKUP.json` manifest plus one data file per
+  table; the manifest is written last, so its presence marks the backup
+  complete. The summary prints per-table record counts and SHA-256
+  checksums over the live data.
+- Incrementals capture only keys changed since the base — deletions
+  included — and must chain within the MVCC GC window (25h by default): an
+  older base is refused with "incremental base too old". Take a fresh full
+  backup at least daily.
+- On an encrypted store, backup files are written in plaintext; the
+  command refuses unless you pass `--allow-plaintext`. Protect the backup
+  location accordingly.
+
+`datax restore` applies a chain (full first, then incrementals in order)
+into an **empty** cluster — it refuses if any table exists:
+
+```sh
+datax restore --addr 10.0.1.1:26257 --src /backups/2026-08-31,/backups/2026-08-31-noon
+```
+
+Table IDs are preserved, so secondary indexes and timeseries shard layouts
+restore as-is with no backfill; the descriptor ID generator is bumped past
+every restored ID. Users, admin-role markers, and per-table grants come
+from the backup — after a restore, **credentials are the source cluster's**.
+The restore summary re-exports every table and prints fresh checksums:
+compare them against the backup's to verify the restore byte-for-byte.
+
+MVCC history is not preserved (rows are rewritten at restore time), so
+`AS OF SYSTEM TIME` cannot see below the restore.
+
+## Rolling upgrades
+
+A cluster upgrades with no downtime, one node at a time. Each binary has a
+protocol version (shown at startup and in `datax debug nodes`); a cluster
+has a **finalized cluster version** that only moves when you say so.
+Adjacent versions only: upgrade one major version at a time.
+
+```sh
+# For each node, one at a time:
+#   1. stop the node (optionally decommission-drain first for zero blips)
+#   2. restart it on the new binary
+#   3. wait until `datax debug nodes` shows it heartbeating with the new
+#      version and the cluster is healthy
+# Then, once EVERY node runs the new binary:
+datax debug upgrade                # finalize; refuses while old nodes remain
+datax debug nodes                  # shows: cluster version: v2
+```
+
+Rules of the road:
+
+- **Before finalize** you can freely roll a node back to the old binary —
+  mixed-version clusters are supported for the duration of the roll.
+- **After finalize there is no downgrade.** A node restarted on an older
+  binary refuses to start ("downgrading a node after the cluster upgrade
+  was finalized is not supported"); a too-old binary is also refused at
+  join time.
+- Finalize is deliberate, not automatic: verify the upgraded cluster looks
+  healthy first, because finalize is the point of no return.
+- `datax debug upgrade` names any node still on the old binary instead of
+  finalizing — nothing to time or coordinate.
 
 ## Decommissioning a node
 
@@ -117,6 +203,13 @@ datax bench timeseries --series 1000 --shards 8
 `ingest` writes random keys (LSM stress); `timeseries` writes per-series
 monotone timestamps — the hot-tail shape — and is the honest way to compare
 `--shards` settings.
+
+Two counters show which commit fast path your workload rides:
+`datax_one_phase_commits_total` (single-range implicit transactions — one
+raft proposal, the cheapest commit) and `datax_parallel_commits_total`
+(multi-range pipelined commits). A write-heavy workload where neither
+moves is paying the classic two-round commit — usually explicit
+`BEGIN` blocks.
 
 ## Capacity planning
 

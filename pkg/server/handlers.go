@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // handleBatch serves incoming KV batches against the local store. Wire
@@ -32,6 +34,22 @@ func (n *Node) handleJoin(ctx context.Context, data []byte) ([]byte, error) {
 func (n *Node) serveJoin(ctx context.Context, req cluster.JoinRequest) cluster.JoinResponse {
 	if req.NodeID != 0 {
 		return n.serveReannounce(req)
+	}
+	// Version gate: the joiner's supported window must contain the
+	// cluster's finalized version. Absent fields are a pre-versioning
+	// binary, i.e. [1, 1].
+	cv := n.readClusterVersion(ctx)
+	jbv, jmin := version.Version(req.BinaryVersion), version.Version(req.MinSupported)
+	if jbv == 0 {
+		jbv = version.V1
+	}
+	if jmin == 0 {
+		jmin = version.V1
+	}
+	if cv > jbv || cv < jmin {
+		return cluster.JoinResponse{Error: fmt.Sprintf(
+			"cluster is at version %s but the joining binary supports [%s, %s]: run a binary that supports %s",
+			cv, jmin, jbv, cv)}
 	}
 	newID, err := n.db.Increment(ctx, keys.NodeIDGenKey(), 1)
 	if err != nil {
@@ -79,6 +97,21 @@ func (n *Node) serveReannounce(req cluster.JoinRequest) cluster.JoinResponse {
 			"re-announce from node %s of cluster %s, but this is cluster %s",
 			req.NodeID, req.ClusterID, n.ident.ClusterID)}
 	}
+	// Advisory version check, deliberately KV-free (this path must work
+	// with quorum down): if the announcer's window and this binary's
+	// window are disjoint, the two binaries cannot serve one cluster.
+	// The startup downgrade gate is the enforcing check.
+	if req.BinaryVersion != 0 {
+		abv, amin := version.Version(req.BinaryVersion), version.Version(req.MinSupported)
+		if amin == 0 {
+			amin = abv
+		}
+		if amin > n.binaryVersion() || abv < n.minSupportedVersion() {
+			return cluster.JoinResponse{Error: fmt.Sprintf(
+				"node %s runs versions [%s, %s] but this node runs [%s, %s]: version windows are disjoint",
+				req.NodeID, amin, abv, n.minSupportedVersion(), n.binaryVersion())}
+		}
+	}
 	n.registry.UpsertAddress(req.NodeID, req.Address)
 	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 		log.Debugf("persisting registry: %v", err)
@@ -124,16 +157,17 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		}
 		load := n.store.LoadSummary(loadAdvertiseTopK)
 		nd := kvpb.NodeDescriptor{
-			NodeID:       n.ident.NodeID,
-			Address:      n.addr,
-			Locality:     n.cfg.Locality,
-			LivenessTime: n.clock.Now().WallTime,
-			Draining:     n.draining.Load(),
-			LeaderQPS:    load.LeaderQPS,
-			LeaderCount:  load.LeaderCount,
-			ReplicaBytes: load.ReplicaBytes,
-			HotRanges:    load.HotRanges,
-			BigRanges:    load.BigRanges,
+			NodeID:        n.ident.NodeID,
+			Address:       n.addr,
+			Locality:      n.cfg.Locality,
+			LivenessTime:  n.clock.Now().WallTime,
+			Draining:      n.draining.Load(),
+			BinaryVersion: int(n.binaryVersion()),
+			LeaderQPS:     load.LeaderQPS,
+			LeaderCount:   load.LeaderCount,
+			ReplicaBytes:  load.ReplicaBytes,
+			HotRanges:     load.HotRanges,
+			BigRanges:     load.BigRanges,
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
@@ -154,6 +188,46 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		} else {
 			log.Debugf("%s registry scan failed: %v", n.ident.NodeID, err)
 		}
+		n.mirrorClusterVersion(hctx)
 		cancel()
 	}
+}
+
+// readClusterVersion returns the cluster's finalized protocol version: the
+// freshest of the replicated row and this node's last observed value (the
+// version only ever moves forward). Missing everywhere = version 1.
+func (n *Node) readClusterVersion(ctx context.Context) version.Version {
+	cv := version.Version(n.clusterVersion.Load())
+	if raw, err := n.db.Get(ctx, keys.ClusterVersionKey()); err == nil && raw != nil {
+		if v, aerr := strconv.Atoi(string(raw)); aerr == nil && version.Version(v) > cv {
+			cv = version.Version(v)
+		}
+	}
+	if cv == 0 {
+		cv = version.V1
+	}
+	return cv
+}
+
+// mirrorClusterVersion refreshes the in-memory cluster version from the
+// replicated row and persists a store-local copy when it advances, so the
+// startup downgrade gate can read it before quorum.
+func (n *Node) mirrorClusterVersion(ctx context.Context) {
+	raw, err := n.db.Get(ctx, keys.ClusterVersionKey())
+	if err != nil || raw == nil {
+		return
+	}
+	v, err := strconv.Atoi(string(raw))
+	if err != nil {
+		log.Warnf("corrupt cluster version row %q: %v", raw, err)
+		return
+	}
+	if int64(v) <= n.clusterVersion.Load() {
+		return
+	}
+	n.clusterVersion.Store(int64(v))
+	if err := n.engine.Put(keys.StoreClusterVersionKey(), raw); err != nil {
+		log.Warnf("persisting store cluster version: %v", err)
+	}
+	log.Infof("cluster version is now %s", version.Version(v))
 }

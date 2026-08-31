@@ -109,6 +109,12 @@ type Store struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
 	}
+
+	// consistencyMu round-robins the consistency sweep over led ranges.
+	consistencyMu struct {
+		sync.Mutex
+		cursor uint64
+	}
 }
 
 // SetSender injects the routed KV client (once, at node startup).
@@ -282,6 +288,14 @@ func (s *Store) replicaForKey(k keys.Key) (*Replica, bool) {
 func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, kvpb.NewErrorf("empty batch")
+	}
+	// A request union with no populated member is what an unknown request
+	// type decodes to under the JSON fallback encoding (a newer peer's
+	// request): degrade to an error, never a nil dereference.
+	for i := range ba.Requests {
+		if ba.Requests[i].GetInner() == nil {
+			return nil, kvpb.NewErrorf("unsupported request at index %d in batch (version skew?)", i)
+		}
 	}
 	addr, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
 	if err != nil {

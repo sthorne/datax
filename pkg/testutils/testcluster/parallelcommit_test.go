@@ -27,6 +27,12 @@ func TestParallelCommitFastPath(t *testing.T) {
 	prefix := keys.TableDataPrefix(930)
 	k1 := append(prefix.Clone(), "a"...)
 	k2 := append(prefix.Clone(), "b"...)
+	// Split between the keys: a single-range write set now takes the
+	// one-phase path (issue #50); the STAGING protocol under test here is
+	// the multi-range commit's.
+	if _, err := db.AdminSplit(ctx, append(prefix.Clone(), "b"...)); err != nil {
+		t.Fatal(err)
+	}
 	// Settle elections: a leadership change bumps the timestamp-cache
 	// floor, which would forward the pipelined writes and (correctly)
 	// push the commit off the fast path.

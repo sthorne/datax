@@ -792,11 +792,14 @@ func (x *ScanRequest) GetForUpdate() bool {
 }
 
 type EndTxnRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
-	Commit        bool                   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
-	IntentKeys    [][]byte               `protobuf:"bytes,3,rep,name=intent_keys,json=intentKeys,proto3" json:"intent_keys,omitempty"`
-	InFlight      [][]byte               `protobuf:"bytes,4,rep,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"` // parallel commit: stages the record
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Header     *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	Commit     bool                   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
+	IntentKeys [][]byte               `protobuf:"bytes,3,rep,name=intent_keys,json=intentKeys,proto3" json:"intent_keys,omitempty"`
+	InFlight   [][]byte               `protobuf:"bytes,4,rep,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"` // parallel commit: stages the record
+	// all: this batch is the transaction's ENTIRE write set — the one-phase
+	// commit hint. An old server ignores it and evaluates classically.
+	All           bool `protobuf:"varint,5,opt,name=all,proto3" json:"all,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -857,6 +860,13 @@ func (x *EndTxnRequest) GetInFlight() [][]byte {
 		return x.InFlight
 	}
 	return nil
+}
+
+func (x *EndTxnRequest) GetAll() bool {
+	if x != nil {
+		return x.All
+	}
+	return false
 }
 
 type HeartbeatTxnRequest struct {
@@ -1199,6 +1209,178 @@ func (x *RefreshRequest) GetFromTs() *Hlc {
 	return nil
 }
 
+type ExportRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	StartTs       *Hlc                   `protobuf:"bytes,2,opt,name=start_ts,json=startTs,proto3" json:"start_ts,omitempty"` // export keys changed in (start_ts, batch timestamp]
+	MaxRecords    int64                  `protobuf:"varint,3,opt,name=max_records,json=maxRecords,proto3" json:"max_records,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportRequest) Reset() {
+	*x = ExportRequest{}
+	mi := &file_datax_v1_kv_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportRequest) ProtoMessage() {}
+
+func (x *ExportRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportRequest.ProtoReflect.Descriptor instead.
+func (*ExportRequest) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ExportRequest) GetHeader() *RequestHeader {
+	if x != nil {
+		return x.Header
+	}
+	return nil
+}
+
+func (x *ExportRequest) GetStartTs() *Hlc {
+	if x != nil {
+		return x.StartTs
+	}
+	return nil
+}
+
+func (x *ExportRequest) GetMaxRecords() int64 {
+	if x != nil {
+		return x.MaxRecords
+	}
+	return 0
+}
+
+type ExportRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Deleted       bool                   `protobuf:"varint,3,opt,name=deleted,proto3" json:"deleted,omitempty"` // tombstone: the key was deleted in the window
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportRecord) Reset() {
+	*x = ExportRecord{}
+	mi := &file_datax_v1_kv_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportRecord) ProtoMessage() {}
+
+func (x *ExportRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportRecord.ProtoReflect.Descriptor instead.
+func (*ExportRecord) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ExportRecord) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *ExportRecord) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *ExportRecord) GetDeleted() bool {
+	if x != nil {
+		return x.Deleted
+	}
+	return false
+}
+
+type ExportResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Records       []*ExportRecord        `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	Resume        []byte                 `protobuf:"bytes,2,opt,name=resume,proto3" json:"resume,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportResponse) Reset() {
+	*x = ExportResponse{}
+	mi := &file_datax_v1_kv_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportResponse) ProtoMessage() {}
+
+func (x *ExportResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportResponse.ProtoReflect.Descriptor instead.
+func (*ExportResponse) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ExportResponse) GetRecords() []*ExportRecord {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+func (x *ExportResponse) GetResume() []byte {
+	if x != nil {
+		return x.Resume
+	}
+	return nil
+}
+
 type GcVersion struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
@@ -1210,7 +1392,7 @@ type GcVersion struct {
 
 func (x *GcVersion) Reset() {
 	*x = GcVersion{}
-	mi := &file_datax_v1_kv_proto_msgTypes[18]
+	mi := &file_datax_v1_kv_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1222,7 +1404,7 @@ func (x *GcVersion) String() string {
 func (*GcVersion) ProtoMessage() {}
 
 func (x *GcVersion) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[18]
+	mi := &file_datax_v1_kv_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1235,7 +1417,7 @@ func (x *GcVersion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GcVersion.ProtoReflect.Descriptor instead.
 func (*GcVersion) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{18}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *GcVersion) GetKey() []byte {
@@ -1271,7 +1453,7 @@ type GcRequest struct {
 
 func (x *GcRequest) Reset() {
 	*x = GcRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[19]
+	mi := &file_datax_v1_kv_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1283,7 +1465,7 @@ func (x *GcRequest) String() string {
 func (*GcRequest) ProtoMessage() {}
 
 func (x *GcRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[19]
+	mi := &file_datax_v1_kv_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1296,7 +1478,7 @@ func (x *GcRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GcRequest.ProtoReflect.Descriptor instead.
 func (*GcRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{19}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *GcRequest) GetHeader() *RequestHeader {
@@ -1338,7 +1520,7 @@ type TruncateLogRequest struct {
 
 func (x *TruncateLogRequest) Reset() {
 	*x = TruncateLogRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[20]
+	mi := &file_datax_v1_kv_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1350,7 +1532,7 @@ func (x *TruncateLogRequest) String() string {
 func (*TruncateLogRequest) ProtoMessage() {}
 
 func (x *TruncateLogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[20]
+	mi := &file_datax_v1_kv_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1363,7 +1545,7 @@ func (x *TruncateLogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TruncateLogRequest.ProtoReflect.Descriptor instead.
 func (*TruncateLogRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{20}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *TruncateLogRequest) GetHeader() *RequestHeader {
@@ -1396,7 +1578,7 @@ type AdminSplitRequest struct {
 
 func (x *AdminSplitRequest) Reset() {
 	*x = AdminSplitRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[21]
+	mi := &file_datax_v1_kv_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1408,7 +1590,7 @@ func (x *AdminSplitRequest) String() string {
 func (*AdminSplitRequest) ProtoMessage() {}
 
 func (x *AdminSplitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[21]
+	mi := &file_datax_v1_kv_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1421,7 +1603,7 @@ func (x *AdminSplitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminSplitRequest.ProtoReflect.Descriptor instead.
 func (*AdminSplitRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{21}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *AdminSplitRequest) GetHeader() *RequestHeader {
@@ -1442,7 +1624,7 @@ type AdminChangeReplicasRequest struct {
 
 func (x *AdminChangeReplicasRequest) Reset() {
 	*x = AdminChangeReplicasRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[22]
+	mi := &file_datax_v1_kv_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1454,7 +1636,7 @@ func (x *AdminChangeReplicasRequest) String() string {
 func (*AdminChangeReplicasRequest) ProtoMessage() {}
 
 func (x *AdminChangeReplicasRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[22]
+	mi := &file_datax_v1_kv_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1467,7 +1649,7 @@ func (x *AdminChangeReplicasRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminChangeReplicasRequest.ProtoReflect.Descriptor instead.
 func (*AdminChangeReplicasRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{22}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *AdminChangeReplicasRequest) GetHeader() *RequestHeader {
@@ -1501,7 +1683,7 @@ type AdminTransferLeaseRequest struct {
 
 func (x *AdminTransferLeaseRequest) Reset() {
 	*x = AdminTransferLeaseRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[23]
+	mi := &file_datax_v1_kv_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1513,7 +1695,7 @@ func (x *AdminTransferLeaseRequest) String() string {
 func (*AdminTransferLeaseRequest) ProtoMessage() {}
 
 func (x *AdminTransferLeaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[23]
+	mi := &file_datax_v1_kv_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1526,7 +1708,7 @@ func (x *AdminTransferLeaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminTransferLeaseRequest.ProtoReflect.Descriptor instead.
 func (*AdminTransferLeaseRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{23}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *AdminTransferLeaseRequest) GetHeader() *RequestHeader {
@@ -1552,7 +1734,7 @@ type AdminMergeRequest struct {
 
 func (x *AdminMergeRequest) Reset() {
 	*x = AdminMergeRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[24]
+	mi := &file_datax_v1_kv_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1564,7 +1746,7 @@ func (x *AdminMergeRequest) String() string {
 func (*AdminMergeRequest) ProtoMessage() {}
 
 func (x *AdminMergeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[24]
+	mi := &file_datax_v1_kv_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1577,7 +1759,7 @@ func (x *AdminMergeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminMergeRequest.ProtoReflect.Descriptor instead.
 func (*AdminMergeRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{24}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *AdminMergeRequest) GetHeader() *RequestHeader {
@@ -1597,7 +1779,7 @@ type SubsumeRequest struct {
 
 func (x *SubsumeRequest) Reset() {
 	*x = SubsumeRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[25]
+	mi := &file_datax_v1_kv_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1609,7 +1791,7 @@ func (x *SubsumeRequest) String() string {
 func (*SubsumeRequest) ProtoMessage() {}
 
 func (x *SubsumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[25]
+	mi := &file_datax_v1_kv_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1622,7 +1804,7 @@ func (x *SubsumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubsumeRequest.ProtoReflect.Descriptor instead.
 func (*SubsumeRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{25}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *SubsumeRequest) GetHeader() *RequestHeader {
@@ -1648,7 +1830,7 @@ type UnfreezeRequest struct {
 
 func (x *UnfreezeRequest) Reset() {
 	*x = UnfreezeRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[26]
+	mi := &file_datax_v1_kv_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1660,7 +1842,7 @@ func (x *UnfreezeRequest) String() string {
 func (*UnfreezeRequest) ProtoMessage() {}
 
 func (x *UnfreezeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[26]
+	mi := &file_datax_v1_kv_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1673,7 +1855,7 @@ func (x *UnfreezeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnfreezeRequest.ProtoReflect.Descriptor instead.
 func (*UnfreezeRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{26}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *UnfreezeRequest) GetHeader() *RequestHeader {
@@ -1707,6 +1889,7 @@ type RequestUnion struct {
 	//	*RequestUnion_AdminMerge
 	//	*RequestUnion_Subsume
 	//	*RequestUnion_Unfreeze
+	//	*RequestUnion_Export
 	Value         isRequestUnion_Value `protobuf_oneof:"value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1714,7 +1897,7 @@ type RequestUnion struct {
 
 func (x *RequestUnion) Reset() {
 	*x = RequestUnion{}
-	mi := &file_datax_v1_kv_proto_msgTypes[27]
+	mi := &file_datax_v1_kv_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1726,7 +1909,7 @@ func (x *RequestUnion) String() string {
 func (*RequestUnion) ProtoMessage() {}
 
 func (x *RequestUnion) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[27]
+	mi := &file_datax_v1_kv_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1739,7 +1922,7 @@ func (x *RequestUnion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestUnion.ProtoReflect.Descriptor instead.
 func (*RequestUnion) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{27}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *RequestUnion) GetValue() isRequestUnion_Value {
@@ -1929,6 +2112,15 @@ func (x *RequestUnion) GetUnfreeze() *UnfreezeRequest {
 	return nil
 }
 
+func (x *RequestUnion) GetExport() *ExportRequest {
+	if x != nil {
+		if x, ok := x.Value.(*RequestUnion_Export); ok {
+			return x.Export
+		}
+	}
+	return nil
+}
+
 type isRequestUnion_Value interface {
 	isRequestUnion_Value()
 }
@@ -2013,6 +2205,10 @@ type RequestUnion_Unfreeze struct {
 	Unfreeze *UnfreezeRequest `protobuf:"bytes,18,opt,name=unfreeze,proto3,oneof"`
 }
 
+type RequestUnion_Export struct {
+	Export *ExportRequest `protobuf:"bytes,21,opt,name=export,proto3,oneof"`
+}
+
 func (*RequestUnion_Get) isRequestUnion_Value() {}
 
 func (*RequestUnion_Put) isRequestUnion_Value() {}
@@ -2053,6 +2249,8 @@ func (*RequestUnion_Subsume) isRequestUnion_Value() {}
 
 func (*RequestUnion_Unfreeze) isRequestUnion_Value() {}
 
+func (*RequestUnion_Export) isRequestUnion_Value() {}
+
 type BatchHeader struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Timestamp        *Hlc                   `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
@@ -2069,7 +2267,7 @@ type BatchHeader struct {
 
 func (x *BatchHeader) Reset() {
 	*x = BatchHeader{}
-	mi := &file_datax_v1_kv_proto_msgTypes[28]
+	mi := &file_datax_v1_kv_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2081,7 +2279,7 @@ func (x *BatchHeader) String() string {
 func (*BatchHeader) ProtoMessage() {}
 
 func (x *BatchHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[28]
+	mi := &file_datax_v1_kv_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2094,7 +2292,7 @@ func (x *BatchHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchHeader.ProtoReflect.Descriptor instead.
 func (*BatchHeader) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{28}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *BatchHeader) GetTimestamp() *Hlc {
@@ -2149,7 +2347,7 @@ type BatchRequest struct {
 
 func (x *BatchRequest) Reset() {
 	*x = BatchRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[29]
+	mi := &file_datax_v1_kv_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2161,7 +2359,7 @@ func (x *BatchRequest) String() string {
 func (*BatchRequest) ProtoMessage() {}
 
 func (x *BatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[29]
+	mi := &file_datax_v1_kv_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2174,7 +2372,7 @@ func (x *BatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchRequest.ProtoReflect.Descriptor instead.
 func (*BatchRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{29}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *BatchRequest) GetHeader() *BatchHeader {
@@ -2201,7 +2399,7 @@ type GetResponse struct {
 
 func (x *GetResponse) Reset() {
 	*x = GetResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[30]
+	mi := &file_datax_v1_kv_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2213,7 +2411,7 @@ func (x *GetResponse) String() string {
 func (*GetResponse) ProtoMessage() {}
 
 func (x *GetResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[30]
+	mi := &file_datax_v1_kv_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2226,7 +2424,7 @@ func (x *GetResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetResponse.ProtoReflect.Descriptor instead.
 func (*GetResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{30}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *GetResponse) GetValue() []byte {
@@ -2251,7 +2449,7 @@ type PutResponse struct {
 
 func (x *PutResponse) Reset() {
 	*x = PutResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[31]
+	mi := &file_datax_v1_kv_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2263,7 +2461,7 @@ func (x *PutResponse) String() string {
 func (*PutResponse) ProtoMessage() {}
 
 func (x *PutResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[31]
+	mi := &file_datax_v1_kv_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2276,7 +2474,7 @@ func (x *PutResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutResponse.ProtoReflect.Descriptor instead.
 func (*PutResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{31}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{34}
 }
 
 type DeleteResponse struct {
@@ -2287,7 +2485,7 @@ type DeleteResponse struct {
 
 func (x *DeleteResponse) Reset() {
 	*x = DeleteResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[32]
+	mi := &file_datax_v1_kv_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2299,7 +2497,7 @@ func (x *DeleteResponse) String() string {
 func (*DeleteResponse) ProtoMessage() {}
 
 func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[32]
+	mi := &file_datax_v1_kv_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2312,7 +2510,7 @@ func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteResponse.ProtoReflect.Descriptor instead.
 func (*DeleteResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{32}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{35}
 }
 
 type IncrementResponse struct {
@@ -2324,7 +2522,7 @@ type IncrementResponse struct {
 
 func (x *IncrementResponse) Reset() {
 	*x = IncrementResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[33]
+	mi := &file_datax_v1_kv_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2336,7 +2534,7 @@ func (x *IncrementResponse) String() string {
 func (*IncrementResponse) ProtoMessage() {}
 
 func (x *IncrementResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[33]
+	mi := &file_datax_v1_kv_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2349,7 +2547,7 @@ func (x *IncrementResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IncrementResponse.ProtoReflect.Descriptor instead.
 func (*IncrementResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{33}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *IncrementResponse) GetNewValue() int64 {
@@ -2369,7 +2567,7 @@ type ScanResponse struct {
 
 func (x *ScanResponse) Reset() {
 	*x = ScanResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[34]
+	mi := &file_datax_v1_kv_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2381,7 +2579,7 @@ func (x *ScanResponse) String() string {
 func (*ScanResponse) ProtoMessage() {}
 
 func (x *ScanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[34]
+	mi := &file_datax_v1_kv_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2394,7 +2592,7 @@ func (x *ScanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanResponse.ProtoReflect.Descriptor instead.
 func (*ScanResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{34}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ScanResponse) GetRows() []*KeyValue {
@@ -2414,13 +2612,16 @@ func (x *ScanResponse) GetResume() []byte {
 type EndTxnResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	CommitTimestamp *Hlc                   `protobuf:"bytes,1,opt,name=commit_timestamp,json=commitTimestamp,proto3" json:"commit_timestamp,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// one_phase: the batch committed via the one-phase fast path — values
+	// written committed, no record, nothing to resolve.
+	OnePhase      bool `protobuf:"varint,2,opt,name=one_phase,json=onePhase,proto3" json:"one_phase,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EndTxnResponse) Reset() {
 	*x = EndTxnResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[35]
+	mi := &file_datax_v1_kv_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2432,7 +2633,7 @@ func (x *EndTxnResponse) String() string {
 func (*EndTxnResponse) ProtoMessage() {}
 
 func (x *EndTxnResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[35]
+	mi := &file_datax_v1_kv_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2445,7 +2646,7 @@ func (x *EndTxnResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndTxnResponse.ProtoReflect.Descriptor instead.
 func (*EndTxnResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{35}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *EndTxnResponse) GetCommitTimestamp() *Hlc {
@@ -2453,6 +2654,13 @@ func (x *EndTxnResponse) GetCommitTimestamp() *Hlc {
 		return x.CommitTimestamp
 	}
 	return nil
+}
+
+func (x *EndTxnResponse) GetOnePhase() bool {
+	if x != nil {
+		return x.OnePhase
+	}
+	return false
 }
 
 type HeartbeatTxnResponse struct {
@@ -2464,7 +2672,7 @@ type HeartbeatTxnResponse struct {
 
 func (x *HeartbeatTxnResponse) Reset() {
 	*x = HeartbeatTxnResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[36]
+	mi := &file_datax_v1_kv_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2476,7 +2684,7 @@ func (x *HeartbeatTxnResponse) String() string {
 func (*HeartbeatTxnResponse) ProtoMessage() {}
 
 func (x *HeartbeatTxnResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[36]
+	mi := &file_datax_v1_kv_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2489,7 +2697,7 @@ func (x *HeartbeatTxnResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatTxnResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatTxnResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{36}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *HeartbeatTxnResponse) GetStatus() int32 {
@@ -2513,7 +2721,7 @@ type PushTxnResponse struct {
 
 func (x *PushTxnResponse) Reset() {
 	*x = PushTxnResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[37]
+	mi := &file_datax_v1_kv_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2525,7 +2733,7 @@ func (x *PushTxnResponse) String() string {
 func (*PushTxnResponse) ProtoMessage() {}
 
 func (x *PushTxnResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[37]
+	mi := &file_datax_v1_kv_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2538,7 +2746,7 @@ func (x *PushTxnResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushTxnResponse.ProtoReflect.Descriptor instead.
 func (*PushTxnResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{37}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *PushTxnResponse) GetStatus() int32 {
@@ -2594,7 +2802,7 @@ type RecoverTxnRequest struct {
 
 func (x *RecoverTxnRequest) Reset() {
 	*x = RecoverTxnRequest{}
-	mi := &file_datax_v1_kv_proto_msgTypes[38]
+	mi := &file_datax_v1_kv_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2606,7 +2814,7 @@ func (x *RecoverTxnRequest) String() string {
 func (*RecoverTxnRequest) ProtoMessage() {}
 
 func (x *RecoverTxnRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[38]
+	mi := &file_datax_v1_kv_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2619,7 +2827,7 @@ func (x *RecoverTxnRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoverTxnRequest.ProtoReflect.Descriptor instead.
 func (*RecoverTxnRequest) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{38}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *RecoverTxnRequest) GetHeader() *RequestHeader {
@@ -2652,7 +2860,7 @@ type RecoverTxnResponse struct {
 
 func (x *RecoverTxnResponse) Reset() {
 	*x = RecoverTxnResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[39]
+	mi := &file_datax_v1_kv_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2664,7 +2872,7 @@ func (x *RecoverTxnResponse) String() string {
 func (*RecoverTxnResponse) ProtoMessage() {}
 
 func (x *RecoverTxnResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[39]
+	mi := &file_datax_v1_kv_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2677,7 +2885,7 @@ func (x *RecoverTxnResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoverTxnResponse.ProtoReflect.Descriptor instead.
 func (*RecoverTxnResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{39}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *RecoverTxnResponse) GetStatus() int32 {
@@ -2695,7 +2903,7 @@ type ResolveIntentResponse struct {
 
 func (x *ResolveIntentResponse) Reset() {
 	*x = ResolveIntentResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[40]
+	mi := &file_datax_v1_kv_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2707,7 +2915,7 @@ func (x *ResolveIntentResponse) String() string {
 func (*ResolveIntentResponse) ProtoMessage() {}
 
 func (x *ResolveIntentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[40]
+	mi := &file_datax_v1_kv_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2720,7 +2928,7 @@ func (x *ResolveIntentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveIntentResponse.ProtoReflect.Descriptor instead.
 func (*ResolveIntentResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{40}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{43}
 }
 
 type RefreshResponse struct {
@@ -2731,7 +2939,7 @@ type RefreshResponse struct {
 
 func (x *RefreshResponse) Reset() {
 	*x = RefreshResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[41]
+	mi := &file_datax_v1_kv_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2743,7 +2951,7 @@ func (x *RefreshResponse) String() string {
 func (*RefreshResponse) ProtoMessage() {}
 
 func (x *RefreshResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[41]
+	mi := &file_datax_v1_kv_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2756,7 +2964,7 @@ func (x *RefreshResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshResponse.ProtoReflect.Descriptor instead.
 func (*RefreshResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{41}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{44}
 }
 
 type RollbackIntentResponse struct {
@@ -2767,7 +2975,7 @@ type RollbackIntentResponse struct {
 
 func (x *RollbackIntentResponse) Reset() {
 	*x = RollbackIntentResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[42]
+	mi := &file_datax_v1_kv_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2779,7 +2987,7 @@ func (x *RollbackIntentResponse) String() string {
 func (*RollbackIntentResponse) ProtoMessage() {}
 
 func (x *RollbackIntentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[42]
+	mi := &file_datax_v1_kv_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2792,7 +3000,7 @@ func (x *RollbackIntentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackIntentResponse.ProtoReflect.Descriptor instead.
 func (*RollbackIntentResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{42}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{45}
 }
 
 type GcResponse struct {
@@ -2803,7 +3011,7 @@ type GcResponse struct {
 
 func (x *GcResponse) Reset() {
 	*x = GcResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[43]
+	mi := &file_datax_v1_kv_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2815,7 +3023,7 @@ func (x *GcResponse) String() string {
 func (*GcResponse) ProtoMessage() {}
 
 func (x *GcResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[43]
+	mi := &file_datax_v1_kv_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2828,7 +3036,7 @@ func (x *GcResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GcResponse.ProtoReflect.Descriptor instead.
 func (*GcResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{43}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{46}
 }
 
 type TruncateLogResponse struct {
@@ -2839,7 +3047,7 @@ type TruncateLogResponse struct {
 
 func (x *TruncateLogResponse) Reset() {
 	*x = TruncateLogResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[44]
+	mi := &file_datax_v1_kv_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2851,7 +3059,7 @@ func (x *TruncateLogResponse) String() string {
 func (*TruncateLogResponse) ProtoMessage() {}
 
 func (x *TruncateLogResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[44]
+	mi := &file_datax_v1_kv_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2864,7 +3072,7 @@ func (x *TruncateLogResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TruncateLogResponse.ProtoReflect.Descriptor instead.
 func (*TruncateLogResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{44}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{47}
 }
 
 type AdminSplitResponse struct {
@@ -2877,7 +3085,7 @@ type AdminSplitResponse struct {
 
 func (x *AdminSplitResponse) Reset() {
 	*x = AdminSplitResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[45]
+	mi := &file_datax_v1_kv_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2889,7 +3097,7 @@ func (x *AdminSplitResponse) String() string {
 func (*AdminSplitResponse) ProtoMessage() {}
 
 func (x *AdminSplitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[45]
+	mi := &file_datax_v1_kv_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2902,7 +3110,7 @@ func (x *AdminSplitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminSplitResponse.ProtoReflect.Descriptor instead.
 func (*AdminSplitResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{45}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *AdminSplitResponse) GetLeft() *RangeDescriptor {
@@ -2928,7 +3136,7 @@ type AdminChangeReplicasResponse struct {
 
 func (x *AdminChangeReplicasResponse) Reset() {
 	*x = AdminChangeReplicasResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[46]
+	mi := &file_datax_v1_kv_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2940,7 +3148,7 @@ func (x *AdminChangeReplicasResponse) String() string {
 func (*AdminChangeReplicasResponse) ProtoMessage() {}
 
 func (x *AdminChangeReplicasResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[46]
+	mi := &file_datax_v1_kv_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2953,7 +3161,7 @@ func (x *AdminChangeReplicasResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminChangeReplicasResponse.ProtoReflect.Descriptor instead.
 func (*AdminChangeReplicasResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{46}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *AdminChangeReplicasResponse) GetDesc() *RangeDescriptor {
@@ -2972,7 +3180,7 @@ type AdminTransferLeaseResponse struct {
 
 func (x *AdminTransferLeaseResponse) Reset() {
 	*x = AdminTransferLeaseResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[47]
+	mi := &file_datax_v1_kv_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2984,7 +3192,7 @@ func (x *AdminTransferLeaseResponse) String() string {
 func (*AdminTransferLeaseResponse) ProtoMessage() {}
 
 func (x *AdminTransferLeaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[47]
+	mi := &file_datax_v1_kv_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2997,7 +3205,7 @@ func (x *AdminTransferLeaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminTransferLeaseResponse.ProtoReflect.Descriptor instead.
 func (*AdminTransferLeaseResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{47}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *AdminTransferLeaseResponse) GetDesc() *RangeDescriptor {
@@ -3016,7 +3224,7 @@ type AdminMergeResponse struct {
 
 func (x *AdminMergeResponse) Reset() {
 	*x = AdminMergeResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[48]
+	mi := &file_datax_v1_kv_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3028,7 +3236,7 @@ func (x *AdminMergeResponse) String() string {
 func (*AdminMergeResponse) ProtoMessage() {}
 
 func (x *AdminMergeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[48]
+	mi := &file_datax_v1_kv_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3041,7 +3249,7 @@ func (x *AdminMergeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdminMergeResponse.ProtoReflect.Descriptor instead.
 func (*AdminMergeResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{48}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *AdminMergeResponse) GetDesc() *RangeDescriptor {
@@ -3059,7 +3267,7 @@ type SubsumeResponse struct {
 
 func (x *SubsumeResponse) Reset() {
 	*x = SubsumeResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[49]
+	mi := &file_datax_v1_kv_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3071,7 +3279,7 @@ func (x *SubsumeResponse) String() string {
 func (*SubsumeResponse) ProtoMessage() {}
 
 func (x *SubsumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[49]
+	mi := &file_datax_v1_kv_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3084,7 +3292,7 @@ func (x *SubsumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubsumeResponse.ProtoReflect.Descriptor instead.
 func (*SubsumeResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{49}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{52}
 }
 
 type UnfreezeResponse struct {
@@ -3095,7 +3303,7 @@ type UnfreezeResponse struct {
 
 func (x *UnfreezeResponse) Reset() {
 	*x = UnfreezeResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[50]
+	mi := &file_datax_v1_kv_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3107,7 +3315,7 @@ func (x *UnfreezeResponse) String() string {
 func (*UnfreezeResponse) ProtoMessage() {}
 
 func (x *UnfreezeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[50]
+	mi := &file_datax_v1_kv_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3120,7 +3328,7 @@ func (x *UnfreezeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnfreezeResponse.ProtoReflect.Descriptor instead.
 func (*UnfreezeResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{50}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{53}
 }
 
 type ResponseUnion struct {
@@ -3147,6 +3355,7 @@ type ResponseUnion struct {
 	//	*ResponseUnion_AdminMerge
 	//	*ResponseUnion_Subsume
 	//	*ResponseUnion_Unfreeze
+	//	*ResponseUnion_Export
 	Value         isResponseUnion_Value `protobuf_oneof:"value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3154,7 +3363,7 @@ type ResponseUnion struct {
 
 func (x *ResponseUnion) Reset() {
 	*x = ResponseUnion{}
-	mi := &file_datax_v1_kv_proto_msgTypes[51]
+	mi := &file_datax_v1_kv_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3166,7 +3375,7 @@ func (x *ResponseUnion) String() string {
 func (*ResponseUnion) ProtoMessage() {}
 
 func (x *ResponseUnion) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[51]
+	mi := &file_datax_v1_kv_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3179,7 +3388,7 @@ func (x *ResponseUnion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResponseUnion.ProtoReflect.Descriptor instead.
 func (*ResponseUnion) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{51}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *ResponseUnion) GetValue() isResponseUnion_Value {
@@ -3369,6 +3578,15 @@ func (x *ResponseUnion) GetUnfreeze() *UnfreezeResponse {
 	return nil
 }
 
+func (x *ResponseUnion) GetExport() *ExportResponse {
+	if x != nil {
+		if x, ok := x.Value.(*ResponseUnion_Export); ok {
+			return x.Export
+		}
+	}
+	return nil
+}
+
 type isResponseUnion_Value interface {
 	isResponseUnion_Value()
 }
@@ -3453,6 +3671,10 @@ type ResponseUnion_Unfreeze struct {
 	Unfreeze *UnfreezeResponse `protobuf:"bytes,18,opt,name=unfreeze,proto3,oneof"`
 }
 
+type ResponseUnion_Export struct {
+	Export *ExportResponse `protobuf:"bytes,21,opt,name=export,proto3,oneof"`
+}
+
 func (*ResponseUnion_Get) isResponseUnion_Value() {}
 
 func (*ResponseUnion_Put) isResponseUnion_Value() {}
@@ -3493,6 +3715,8 @@ func (*ResponseUnion_Subsume) isResponseUnion_Value() {}
 
 func (*ResponseUnion_Unfreeze) isResponseUnion_Value() {}
 
+func (*ResponseUnion_Export) isResponseUnion_Value() {}
+
 type BatchResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Txn           *Transaction           `protobuf:"bytes,1,opt,name=txn,proto3" json:"txn,omitempty"`
@@ -3504,7 +3728,7 @@ type BatchResponse struct {
 
 func (x *BatchResponse) Reset() {
 	*x = BatchResponse{}
-	mi := &file_datax_v1_kv_proto_msgTypes[52]
+	mi := &file_datax_v1_kv_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3516,7 +3740,7 @@ func (x *BatchResponse) String() string {
 func (*BatchResponse) ProtoMessage() {}
 
 func (x *BatchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[52]
+	mi := &file_datax_v1_kv_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3529,7 +3753,7 @@ func (x *BatchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchResponse.ProtoReflect.Descriptor instead.
 func (*BatchResponse) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{52}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *BatchResponse) GetTxn() *Transaction {
@@ -3563,7 +3787,7 @@ type NotLeaderError struct {
 
 func (x *NotLeaderError) Reset() {
 	*x = NotLeaderError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[53]
+	mi := &file_datax_v1_kv_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3575,7 +3799,7 @@ func (x *NotLeaderError) String() string {
 func (*NotLeaderError) ProtoMessage() {}
 
 func (x *NotLeaderError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[53]
+	mi := &file_datax_v1_kv_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3588,7 +3812,7 @@ func (x *NotLeaderError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotLeaderError.ProtoReflect.Descriptor instead.
 func (*NotLeaderError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{53}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *NotLeaderError) GetRangeId() int64 {
@@ -3614,7 +3838,7 @@ type RangeNotFoundError struct {
 
 func (x *RangeNotFoundError) Reset() {
 	*x = RangeNotFoundError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[54]
+	mi := &file_datax_v1_kv_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3626,7 +3850,7 @@ func (x *RangeNotFoundError) String() string {
 func (*RangeNotFoundError) ProtoMessage() {}
 
 func (x *RangeNotFoundError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[54]
+	mi := &file_datax_v1_kv_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3639,7 +3863,7 @@ func (x *RangeNotFoundError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeNotFoundError.ProtoReflect.Descriptor instead.
 func (*RangeNotFoundError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{54}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *RangeNotFoundError) GetRangeId() int64 {
@@ -3659,7 +3883,7 @@ type RangeKeyMismatchError struct {
 
 func (x *RangeKeyMismatchError) Reset() {
 	*x = RangeKeyMismatchError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[55]
+	mi := &file_datax_v1_kv_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3671,7 +3895,7 @@ func (x *RangeKeyMismatchError) String() string {
 func (*RangeKeyMismatchError) ProtoMessage() {}
 
 func (x *RangeKeyMismatchError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[55]
+	mi := &file_datax_v1_kv_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3684,7 +3908,7 @@ func (x *RangeKeyMismatchError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeKeyMismatchError.ProtoReflect.Descriptor instead.
 func (*RangeKeyMismatchError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{55}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *RangeKeyMismatchError) GetRequestKey() []byte {
@@ -3710,7 +3934,7 @@ type WriteIntentError struct {
 
 func (x *WriteIntentError) Reset() {
 	*x = WriteIntentError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[56]
+	mi := &file_datax_v1_kv_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3722,7 +3946,7 @@ func (x *WriteIntentError) String() string {
 func (*WriteIntentError) ProtoMessage() {}
 
 func (x *WriteIntentError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[56]
+	mi := &file_datax_v1_kv_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3735,7 +3959,7 @@ func (x *WriteIntentError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteIntentError.ProtoReflect.Descriptor instead.
 func (*WriteIntentError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{56}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *WriteIntentError) GetIntents() []*Intent {
@@ -3755,7 +3979,7 @@ type WriteTooOldError struct {
 
 func (x *WriteTooOldError) Reset() {
 	*x = WriteTooOldError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[57]
+	mi := &file_datax_v1_kv_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3767,7 +3991,7 @@ func (x *WriteTooOldError) String() string {
 func (*WriteTooOldError) ProtoMessage() {}
 
 func (x *WriteTooOldError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[57]
+	mi := &file_datax_v1_kv_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3780,7 +4004,7 @@ func (x *WriteTooOldError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteTooOldError.ProtoReflect.Descriptor instead.
 func (*WriteTooOldError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{57}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *WriteTooOldError) GetTimestamp() *Hlc {
@@ -3807,7 +4031,7 @@ type UncertaintyError struct {
 
 func (x *UncertaintyError) Reset() {
 	*x = UncertaintyError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[58]
+	mi := &file_datax_v1_kv_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3819,7 +4043,7 @@ func (x *UncertaintyError) String() string {
 func (*UncertaintyError) ProtoMessage() {}
 
 func (x *UncertaintyError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[58]
+	mi := &file_datax_v1_kv_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3832,7 +4056,7 @@ func (x *UncertaintyError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UncertaintyError.ProtoReflect.Descriptor instead.
 func (*UncertaintyError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{58}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *UncertaintyError) GetReadTimestamp() *Hlc {
@@ -3857,7 +4081,7 @@ type TxnAbortedError struct {
 
 func (x *TxnAbortedError) Reset() {
 	*x = TxnAbortedError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[59]
+	mi := &file_datax_v1_kv_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3869,7 +4093,7 @@ func (x *TxnAbortedError) String() string {
 func (*TxnAbortedError) ProtoMessage() {}
 
 func (x *TxnAbortedError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[59]
+	mi := &file_datax_v1_kv_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3882,7 +4106,7 @@ func (x *TxnAbortedError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxnAbortedError.ProtoReflect.Descriptor instead.
 func (*TxnAbortedError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{59}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{62}
 }
 
 type TxnRetryError struct {
@@ -3894,7 +4118,7 @@ type TxnRetryError struct {
 
 func (x *TxnRetryError) Reset() {
 	*x = TxnRetryError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[60]
+	mi := &file_datax_v1_kv_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3906,7 +4130,7 @@ func (x *TxnRetryError) String() string {
 func (*TxnRetryError) ProtoMessage() {}
 
 func (x *TxnRetryError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[60]
+	mi := &file_datax_v1_kv_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3919,7 +4143,7 @@ func (x *TxnRetryError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxnRetryError.ProtoReflect.Descriptor instead.
 func (*TxnRetryError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{60}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *TxnRetryError) GetRetryTimestamp() *Hlc {
@@ -3937,7 +4161,7 @@ type TxnNotFoundError struct {
 
 func (x *TxnNotFoundError) Reset() {
 	*x = TxnNotFoundError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[61]
+	mi := &file_datax_v1_kv_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3949,7 +4173,7 @@ func (x *TxnNotFoundError) String() string {
 func (*TxnNotFoundError) ProtoMessage() {}
 
 func (x *TxnNotFoundError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[61]
+	mi := &file_datax_v1_kv_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3962,7 +4186,7 @@ func (x *TxnNotFoundError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxnNotFoundError.ProtoReflect.Descriptor instead.
 func (*TxnNotFoundError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{61}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{64}
 }
 
 type AmbiguousResultError struct {
@@ -3973,7 +4197,7 @@ type AmbiguousResultError struct {
 
 func (x *AmbiguousResultError) Reset() {
 	*x = AmbiguousResultError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[62]
+	mi := &file_datax_v1_kv_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3985,7 +4209,7 @@ func (x *AmbiguousResultError) String() string {
 func (*AmbiguousResultError) ProtoMessage() {}
 
 func (x *AmbiguousResultError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[62]
+	mi := &file_datax_v1_kv_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3998,7 +4222,7 @@ func (x *AmbiguousResultError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AmbiguousResultError.ProtoReflect.Descriptor instead.
 func (*AmbiguousResultError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{62}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{65}
 }
 
 // StorageOverloadedError: the leader's engine crossed its backpressure
@@ -4011,7 +4235,7 @@ type StorageOverloadedError struct {
 
 func (x *StorageOverloadedError) Reset() {
 	*x = StorageOverloadedError{}
-	mi := &file_datax_v1_kv_proto_msgTypes[63]
+	mi := &file_datax_v1_kv_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4023,7 +4247,7 @@ func (x *StorageOverloadedError) String() string {
 func (*StorageOverloadedError) ProtoMessage() {}
 
 func (x *StorageOverloadedError) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[63]
+	mi := &file_datax_v1_kv_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4036,7 +4260,7 @@ func (x *StorageOverloadedError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageOverloadedError.ProtoReflect.Descriptor instead.
 func (*StorageOverloadedError) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{63}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{66}
 }
 
 type Error struct {
@@ -4059,7 +4283,7 @@ type Error struct {
 
 func (x *Error) Reset() {
 	*x = Error{}
-	mi := &file_datax_v1_kv_proto_msgTypes[64]
+	mi := &file_datax_v1_kv_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4071,7 +4295,7 @@ func (x *Error) String() string {
 func (*Error) ProtoMessage() {}
 
 func (x *Error) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[64]
+	mi := &file_datax_v1_kv_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4084,7 +4308,7 @@ func (x *Error) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Error.ProtoReflect.Descriptor instead.
 func (*Error) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{64}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *Error) GetMessage() string {
@@ -4182,7 +4406,7 @@ type BatchEnvelope struct {
 
 func (x *BatchEnvelope) Reset() {
 	*x = BatchEnvelope{}
-	mi := &file_datax_v1_kv_proto_msgTypes[65]
+	mi := &file_datax_v1_kv_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4194,7 +4418,7 @@ func (x *BatchEnvelope) String() string {
 func (*BatchEnvelope) ProtoMessage() {}
 
 func (x *BatchEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[65]
+	mi := &file_datax_v1_kv_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4207,7 +4431,7 @@ func (x *BatchEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchEnvelope.ProtoReflect.Descriptor instead.
 func (*BatchEnvelope) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{65}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *BatchEnvelope) GetResponse() *BatchResponse {
@@ -4236,14 +4460,22 @@ type RaftCommand struct {
 	// the range. Log order makes the applied-index condition automatic: by
 	// the time a replica applies this command, every write below the
 	// timestamp has applied too.
-	ClosedTs      *Hlc `protobuf:"bytes,5,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
+	ClosedTs *Hlc `protobuf:"bytes,5,opt,name=closed_ts,json=closedTs,proto3" json:"closed_ts,omitempty"`
+	// load_handoff carries the outgoing leaseholder's measured load ahead
+	// of a lease transfer, so the incoming one starts warm instead of
+	// amnesiac.
+	LoadHandoff *LoadHandoff `protobuf:"bytes,6,opt,name=load_handoff,json=loadHandoff,proto3" json:"load_handoff,omitempty"`
+	// checksum asks every replica to checksum the range's replicated state
+	// at this command's applied index (identical by construction across
+	// replicas) — the consistency checker's probe.
+	Checksum      *ChecksumTrigger `protobuf:"bytes,7,opt,name=checksum,proto3" json:"checksum,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RaftCommand) Reset() {
 	*x = RaftCommand{}
-	mi := &file_datax_v1_kv_proto_msgTypes[66]
+	mi := &file_datax_v1_kv_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4255,7 +4487,7 @@ func (x *RaftCommand) String() string {
 func (*RaftCommand) ProtoMessage() {}
 
 func (x *RaftCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[66]
+	mi := &file_datax_v1_kv_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4268,7 +4500,7 @@ func (x *RaftCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftCommand.ProtoReflect.Descriptor instead.
 func (*RaftCommand) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{66}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *RaftCommand) GetId() string {
@@ -4306,6 +4538,116 @@ func (x *RaftCommand) GetClosedTs() *Hlc {
 	return nil
 }
 
+func (x *RaftCommand) GetLoadHandoff() *LoadHandoff {
+	if x != nil {
+		return x.LoadHandoff
+	}
+	return nil
+}
+
+func (x *RaftCommand) GetChecksum() *ChecksumTrigger {
+	if x != nil {
+		return x.Checksum
+	}
+	return nil
+}
+
+type LoadHandoff struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Qps           float64                `protobuf:"fixed64,1,opt,name=qps,proto3" json:"qps,omitempty"`
+	AtNanos       int64                  `protobuf:"varint,2,opt,name=at_nanos,json=atNanos,proto3" json:"at_nanos,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LoadHandoff) Reset() {
+	*x = LoadHandoff{}
+	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LoadHandoff) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LoadHandoff) ProtoMessage() {}
+
+func (x *LoadHandoff) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[70]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LoadHandoff.ProtoReflect.Descriptor instead.
+func (*LoadHandoff) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{70}
+}
+
+func (x *LoadHandoff) GetQps() float64 {
+	if x != nil {
+		return x.Qps
+	}
+	return 0
+}
+
+func (x *LoadHandoff) GetAtNanos() int64 {
+	if x != nil {
+		return x.AtNanos
+	}
+	return 0
+}
+
+type ChecksumTrigger struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChecksumTrigger) Reset() {
+	*x = ChecksumTrigger{}
+	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChecksumTrigger) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChecksumTrigger) ProtoMessage() {}
+
+func (x *ChecksumTrigger) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[71]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChecksumTrigger.ProtoReflect.Descriptor instead.
+func (*ChecksumTrigger) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{71}
+}
+
+func (x *ChecksumTrigger) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 type SplitTrigger struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Left  *RangeDescriptor       `protobuf:"bytes,1,opt,name=left,proto3" json:"left,omitempty"`
@@ -4320,7 +4662,7 @@ type SplitTrigger struct {
 
 func (x *SplitTrigger) Reset() {
 	*x = SplitTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[67]
+	mi := &file_datax_v1_kv_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4332,7 +4674,7 @@ func (x *SplitTrigger) String() string {
 func (*SplitTrigger) ProtoMessage() {}
 
 func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[67]
+	mi := &file_datax_v1_kv_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4345,7 +4687,7 @@ func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitTrigger.ProtoReflect.Descriptor instead.
 func (*SplitTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{67}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *SplitTrigger) GetLeft() *RangeDescriptor {
@@ -4383,7 +4725,7 @@ type MergeTrigger struct {
 
 func (x *MergeTrigger) Reset() {
 	*x = MergeTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[68]
+	mi := &file_datax_v1_kv_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4395,7 +4737,7 @@ func (x *MergeTrigger) String() string {
 func (*MergeTrigger) ProtoMessage() {}
 
 func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[68]
+	mi := &file_datax_v1_kv_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4408,7 +4750,7 @@ func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MergeTrigger.ProtoReflect.Descriptor instead.
 func (*MergeTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{68}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *MergeTrigger) GetLeft() *RangeDescriptor {
@@ -4519,13 +4861,14 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x19\n" +
 	"\bmax_rows\x18\x02 \x01(\x03R\amaxRows\x12\x1d\n" +
 	"\n" +
-	"for_update\x18\x03 \x01(\bR\tforUpdate\"\x96\x01\n" +
+	"for_update\x18\x03 \x01(\bR\tforUpdate\"\xa8\x01\n" +
 	"\rEndTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x16\n" +
 	"\x06commit\x18\x02 \x01(\bR\x06commit\x12\x1f\n" +
 	"\vintent_keys\x18\x03 \x03(\fR\n" +
 	"intentKeys\x12\x1b\n" +
-	"\tin_flight\x18\x04 \x03(\fR\binFlight\"\xb0\x01\n" +
+	"\tin_flight\x18\x04 \x03(\fR\binFlight\x12\x10\n" +
+	"\x03all\x18\x05 \x01(\bR\x03all\"\xb0\x01\n" +
 	"\x13HeartbeatTxnRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1f\n" +
 	"\x03now\x18\x02 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1f\n" +
@@ -4556,7 +4899,19 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\bsequence\x18\x03 \x01(\x05R\bsequence\"i\n" +
 	"\x0eRefreshRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12&\n" +
-	"\afrom_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\x06fromTs\"[\n" +
+	"\afrom_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\x06fromTs\"\x8b\x01\n" +
+	"\rExportRequest\x12/\n" +
+	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12(\n" +
+	"\bstart_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\astartTs\x12\x1f\n" +
+	"\vmax_records\x18\x03 \x01(\x03R\n" +
+	"maxRecords\"P\n" +
+	"\fExportRecord\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x18\n" +
+	"\adeleted\x18\x03 \x01(\bR\adeleted\"Z\n" +
+	"\x0eExportResponse\x120\n" +
+	"\arecords\x18\x01 \x03(\v2\x16.datax.v1.ExportRecordR\arecords\x12\x16\n" +
+	"\x06resume\x18\x02 \x01(\fR\x06resume\"[\n" +
 	"\tGcVersion\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1d\n" +
 	"\x02ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\x02ts\x12\x1d\n" +
@@ -4588,7 +4943,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\n" +
 	"merge_into\x18\x02 \x01(\x03R\tmergeInto\"B\n" +
 	"\x0fUnfreezeRequest\x12/\n" +
-	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"\xd1\t\n" +
+	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"\x84\n" +
+	"\n" +
 	"\fRequestUnion\x12(\n" +
 	"\x03get\x18\x01 \x01(\v2\x14.datax.v1.GetRequestH\x00R\x03get\x12(\n" +
 	"\x03put\x18\x02 \x01(\v2\x14.datax.v1.PutRequestH\x00R\x03put\x121\n" +
@@ -4613,7 +4969,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\vadmin_merge\x18\x10 \x01(\v2\x1b.datax.v1.AdminMergeRequestH\x00R\n" +
 	"adminMerge\x124\n" +
 	"\asubsume\x18\x11 \x01(\v2\x18.datax.v1.SubsumeRequestH\x00R\asubsume\x127\n" +
-	"\bunfreeze\x18\x12 \x01(\v2\x19.datax.v1.UnfreezeRequestH\x00R\bunfreezeB\a\n" +
+	"\bunfreeze\x18\x12 \x01(\v2\x19.datax.v1.UnfreezeRequestH\x00R\bunfreeze\x121\n" +
+	"\x06export\x18\x15 \x01(\v2\x17.datax.v1.ExportRequestH\x00R\x06exportB\a\n" +
 	"\x05value\"\xf6\x01\n" +
 	"\vBatchHeader\x12+\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\ttimestamp\x12'\n" +
@@ -4635,9 +4992,10 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\tnew_value\x18\x01 \x01(\x03R\bnewValue\"N\n" +
 	"\fScanResponse\x12&\n" +
 	"\x04rows\x18\x01 \x03(\v2\x12.datax.v1.KeyValueR\x04rows\x12\x16\n" +
-	"\x06resume\x18\x02 \x01(\fR\x06resume\"J\n" +
+	"\x06resume\x18\x02 \x01(\fR\x06resume\"g\n" +
 	"\x0eEndTxnResponse\x128\n" +
-	"\x10commit_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0fcommitTimestamp\".\n" +
+	"\x10commit_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0fcommitTimestamp\x12\x1b\n" +
+	"\tone_phase\x18\x02 \x01(\bR\bonePhase\".\n" +
 	"\x14HeartbeatTxnResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\x05R\x06status\"\xe0\x01\n" +
 	"\x0fPushTxnResponse\x12\x16\n" +
@@ -4670,7 +5028,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x12AdminMergeResponse\x12-\n" +
 	"\x04desc\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04desc\"\x11\n" +
 	"\x0fSubsumeResponse\"\x12\n" +
-	"\x10UnfreezeResponse\"\xe6\t\n" +
+	"\x10UnfreezeResponse\"\x9a\n" +
+	"\n" +
 	"\rResponseUnion\x12)\n" +
 	"\x03get\x18\x01 \x01(\v2\x15.datax.v1.GetResponseH\x00R\x03get\x12)\n" +
 	"\x03put\x18\x02 \x01(\v2\x15.datax.v1.PutResponseH\x00R\x03put\x122\n" +
@@ -4695,7 +5054,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\vadmin_merge\x18\x10 \x01(\v2\x1c.datax.v1.AdminMergeResponseH\x00R\n" +
 	"adminMerge\x125\n" +
 	"\asubsume\x18\x11 \x01(\v2\x19.datax.v1.SubsumeResponseH\x00R\asubsume\x128\n" +
-	"\bunfreeze\x18\x12 \x01(\v2\x1a.datax.v1.UnfreezeResponseH\x00R\bunfreezeB\a\n" +
+	"\bunfreeze\x18\x12 \x01(\v2\x1a.datax.v1.UnfreezeResponseH\x00R\bunfreeze\x122\n" +
+	"\x06export\x18\x15 \x01(\v2\x18.datax.v1.ExportResponseH\x00R\x06exportB\a\n" +
 	"\x05value\"\x9c\x01\n" +
 	"\rBatchResponse\x12'\n" +
 	"\x03txn\x18\x01 \x01(\v2\x15.datax.v1.TransactionR\x03txn\x12+\n" +
@@ -4743,13 +5103,20 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x12storage_overloaded\x18\f \x01(\v2 .datax.v1.StorageOverloadedErrorR\x11storageOverloaded\"k\n" +
 	"\rBatchEnvelope\x123\n" +
 	"\bresponse\x18\x01 \x01(\v2\x17.datax.v1.BatchResponseR\bresponse\x12%\n" +
-	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xd3\x01\n" +
+	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xc4\x02\n" +
 	"\vRaftCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x05batch\x18\x02 \x01(\v2\x16.datax.v1.BatchRequestR\x05batch\x12,\n" +
 	"\x05split\x18\x03 \x01(\v2\x16.datax.v1.SplitTriggerR\x05split\x12,\n" +
 	"\x05merge\x18\x04 \x01(\v2\x16.datax.v1.MergeTriggerR\x05merge\x12*\n" +
-	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\"\x9a\x01\n" +
+	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\x128\n" +
+	"\fload_handoff\x18\x06 \x01(\v2\x15.datax.v1.LoadHandoffR\vloadHandoff\x125\n" +
+	"\bchecksum\x18\a \x01(\v2\x19.datax.v1.ChecksumTriggerR\bchecksum\":\n" +
+	"\vLoadHandoff\x12\x10\n" +
+	"\x03qps\x18\x01 \x01(\x01R\x03qps\x12\x19\n" +
+	"\bat_nanos\x18\x02 \x01(\x03R\aatNanos\"!\n" +
+	"\x0fChecksumTrigger\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x9a\x01\n" +
 	"\fSplitTrigger\x12-\n" +
 	"\x04left\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04left\x12/\n" +
 	"\x05right\x18\x02 \x01(\v2\x19.datax.v1.RangeDescriptorR\x05right\x12*\n" +
@@ -4774,7 +5141,7 @@ func file_datax_v1_kv_proto_rawDescGZIP() []byte {
 	return file_datax_v1_kv_proto_rawDescData
 }
 
-var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 69)
+var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 74)
 var file_datax_v1_kv_proto_goTypes = []any{
 	(*TxnMeta)(nil),                     // 0: datax.v1.TxnMeta
 	(*Transaction)(nil),                 // 1: datax.v1.Transaction
@@ -4794,65 +5161,70 @@ var file_datax_v1_kv_proto_goTypes = []any{
 	(*ResolveIntentRequest)(nil),        // 15: datax.v1.ResolveIntentRequest
 	(*RollbackIntentRequest)(nil),       // 16: datax.v1.RollbackIntentRequest
 	(*RefreshRequest)(nil),              // 17: datax.v1.RefreshRequest
-	(*GcVersion)(nil),                   // 18: datax.v1.GcVersion
-	(*GcRequest)(nil),                   // 19: datax.v1.GcRequest
-	(*TruncateLogRequest)(nil),          // 20: datax.v1.TruncateLogRequest
-	(*AdminSplitRequest)(nil),           // 21: datax.v1.AdminSplitRequest
-	(*AdminChangeReplicasRequest)(nil),  // 22: datax.v1.AdminChangeReplicasRequest
-	(*AdminTransferLeaseRequest)(nil),   // 23: datax.v1.AdminTransferLeaseRequest
-	(*AdminMergeRequest)(nil),           // 24: datax.v1.AdminMergeRequest
-	(*SubsumeRequest)(nil),              // 25: datax.v1.SubsumeRequest
-	(*UnfreezeRequest)(nil),             // 26: datax.v1.UnfreezeRequest
-	(*RequestUnion)(nil),                // 27: datax.v1.RequestUnion
-	(*BatchHeader)(nil),                 // 28: datax.v1.BatchHeader
-	(*BatchRequest)(nil),                // 29: datax.v1.BatchRequest
-	(*GetResponse)(nil),                 // 30: datax.v1.GetResponse
-	(*PutResponse)(nil),                 // 31: datax.v1.PutResponse
-	(*DeleteResponse)(nil),              // 32: datax.v1.DeleteResponse
-	(*IncrementResponse)(nil),           // 33: datax.v1.IncrementResponse
-	(*ScanResponse)(nil),                // 34: datax.v1.ScanResponse
-	(*EndTxnResponse)(nil),              // 35: datax.v1.EndTxnResponse
-	(*HeartbeatTxnResponse)(nil),        // 36: datax.v1.HeartbeatTxnResponse
-	(*PushTxnResponse)(nil),             // 37: datax.v1.PushTxnResponse
-	(*RecoverTxnRequest)(nil),           // 38: datax.v1.RecoverTxnRequest
-	(*RecoverTxnResponse)(nil),          // 39: datax.v1.RecoverTxnResponse
-	(*ResolveIntentResponse)(nil),       // 40: datax.v1.ResolveIntentResponse
-	(*RefreshResponse)(nil),             // 41: datax.v1.RefreshResponse
-	(*RollbackIntentResponse)(nil),      // 42: datax.v1.RollbackIntentResponse
-	(*GcResponse)(nil),                  // 43: datax.v1.GcResponse
-	(*TruncateLogResponse)(nil),         // 44: datax.v1.TruncateLogResponse
-	(*AdminSplitResponse)(nil),          // 45: datax.v1.AdminSplitResponse
-	(*AdminChangeReplicasResponse)(nil), // 46: datax.v1.AdminChangeReplicasResponse
-	(*AdminTransferLeaseResponse)(nil),  // 47: datax.v1.AdminTransferLeaseResponse
-	(*AdminMergeResponse)(nil),          // 48: datax.v1.AdminMergeResponse
-	(*SubsumeResponse)(nil),             // 49: datax.v1.SubsumeResponse
-	(*UnfreezeResponse)(nil),            // 50: datax.v1.UnfreezeResponse
-	(*ResponseUnion)(nil),               // 51: datax.v1.ResponseUnion
-	(*BatchResponse)(nil),               // 52: datax.v1.BatchResponse
-	(*NotLeaderError)(nil),              // 53: datax.v1.NotLeaderError
-	(*RangeNotFoundError)(nil),          // 54: datax.v1.RangeNotFoundError
-	(*RangeKeyMismatchError)(nil),       // 55: datax.v1.RangeKeyMismatchError
-	(*WriteIntentError)(nil),            // 56: datax.v1.WriteIntentError
-	(*WriteTooOldError)(nil),            // 57: datax.v1.WriteTooOldError
-	(*UncertaintyError)(nil),            // 58: datax.v1.UncertaintyError
-	(*TxnAbortedError)(nil),             // 59: datax.v1.TxnAbortedError
-	(*TxnRetryError)(nil),               // 60: datax.v1.TxnRetryError
-	(*TxnNotFoundError)(nil),            // 61: datax.v1.TxnNotFoundError
-	(*AmbiguousResultError)(nil),        // 62: datax.v1.AmbiguousResultError
-	(*StorageOverloadedError)(nil),      // 63: datax.v1.StorageOverloadedError
-	(*Error)(nil),                       // 64: datax.v1.Error
-	(*BatchEnvelope)(nil),               // 65: datax.v1.BatchEnvelope
-	(*RaftCommand)(nil),                 // 66: datax.v1.RaftCommand
-	(*SplitTrigger)(nil),                // 67: datax.v1.SplitTrigger
-	(*MergeTrigger)(nil),                // 68: datax.v1.MergeTrigger
-	(*Hlc)(nil),                         // 69: datax.v1.Hlc
+	(*ExportRequest)(nil),               // 18: datax.v1.ExportRequest
+	(*ExportRecord)(nil),                // 19: datax.v1.ExportRecord
+	(*ExportResponse)(nil),              // 20: datax.v1.ExportResponse
+	(*GcVersion)(nil),                   // 21: datax.v1.GcVersion
+	(*GcRequest)(nil),                   // 22: datax.v1.GcRequest
+	(*TruncateLogRequest)(nil),          // 23: datax.v1.TruncateLogRequest
+	(*AdminSplitRequest)(nil),           // 24: datax.v1.AdminSplitRequest
+	(*AdminChangeReplicasRequest)(nil),  // 25: datax.v1.AdminChangeReplicasRequest
+	(*AdminTransferLeaseRequest)(nil),   // 26: datax.v1.AdminTransferLeaseRequest
+	(*AdminMergeRequest)(nil),           // 27: datax.v1.AdminMergeRequest
+	(*SubsumeRequest)(nil),              // 28: datax.v1.SubsumeRequest
+	(*UnfreezeRequest)(nil),             // 29: datax.v1.UnfreezeRequest
+	(*RequestUnion)(nil),                // 30: datax.v1.RequestUnion
+	(*BatchHeader)(nil),                 // 31: datax.v1.BatchHeader
+	(*BatchRequest)(nil),                // 32: datax.v1.BatchRequest
+	(*GetResponse)(nil),                 // 33: datax.v1.GetResponse
+	(*PutResponse)(nil),                 // 34: datax.v1.PutResponse
+	(*DeleteResponse)(nil),              // 35: datax.v1.DeleteResponse
+	(*IncrementResponse)(nil),           // 36: datax.v1.IncrementResponse
+	(*ScanResponse)(nil),                // 37: datax.v1.ScanResponse
+	(*EndTxnResponse)(nil),              // 38: datax.v1.EndTxnResponse
+	(*HeartbeatTxnResponse)(nil),        // 39: datax.v1.HeartbeatTxnResponse
+	(*PushTxnResponse)(nil),             // 40: datax.v1.PushTxnResponse
+	(*RecoverTxnRequest)(nil),           // 41: datax.v1.RecoverTxnRequest
+	(*RecoverTxnResponse)(nil),          // 42: datax.v1.RecoverTxnResponse
+	(*ResolveIntentResponse)(nil),       // 43: datax.v1.ResolveIntentResponse
+	(*RefreshResponse)(nil),             // 44: datax.v1.RefreshResponse
+	(*RollbackIntentResponse)(nil),      // 45: datax.v1.RollbackIntentResponse
+	(*GcResponse)(nil),                  // 46: datax.v1.GcResponse
+	(*TruncateLogResponse)(nil),         // 47: datax.v1.TruncateLogResponse
+	(*AdminSplitResponse)(nil),          // 48: datax.v1.AdminSplitResponse
+	(*AdminChangeReplicasResponse)(nil), // 49: datax.v1.AdminChangeReplicasResponse
+	(*AdminTransferLeaseResponse)(nil),  // 50: datax.v1.AdminTransferLeaseResponse
+	(*AdminMergeResponse)(nil),          // 51: datax.v1.AdminMergeResponse
+	(*SubsumeResponse)(nil),             // 52: datax.v1.SubsumeResponse
+	(*UnfreezeResponse)(nil),            // 53: datax.v1.UnfreezeResponse
+	(*ResponseUnion)(nil),               // 54: datax.v1.ResponseUnion
+	(*BatchResponse)(nil),               // 55: datax.v1.BatchResponse
+	(*NotLeaderError)(nil),              // 56: datax.v1.NotLeaderError
+	(*RangeNotFoundError)(nil),          // 57: datax.v1.RangeNotFoundError
+	(*RangeKeyMismatchError)(nil),       // 58: datax.v1.RangeKeyMismatchError
+	(*WriteIntentError)(nil),            // 59: datax.v1.WriteIntentError
+	(*WriteTooOldError)(nil),            // 60: datax.v1.WriteTooOldError
+	(*UncertaintyError)(nil),            // 61: datax.v1.UncertaintyError
+	(*TxnAbortedError)(nil),             // 62: datax.v1.TxnAbortedError
+	(*TxnRetryError)(nil),               // 63: datax.v1.TxnRetryError
+	(*TxnNotFoundError)(nil),            // 64: datax.v1.TxnNotFoundError
+	(*AmbiguousResultError)(nil),        // 65: datax.v1.AmbiguousResultError
+	(*StorageOverloadedError)(nil),      // 66: datax.v1.StorageOverloadedError
+	(*Error)(nil),                       // 67: datax.v1.Error
+	(*BatchEnvelope)(nil),               // 68: datax.v1.BatchEnvelope
+	(*RaftCommand)(nil),                 // 69: datax.v1.RaftCommand
+	(*LoadHandoff)(nil),                 // 70: datax.v1.LoadHandoff
+	(*ChecksumTrigger)(nil),             // 71: datax.v1.ChecksumTrigger
+	(*SplitTrigger)(nil),                // 72: datax.v1.SplitTrigger
+	(*MergeTrigger)(nil),                // 73: datax.v1.MergeTrigger
+	(*Hlc)(nil),                         // 74: datax.v1.Hlc
 }
 var file_datax_v1_kv_proto_depIdxs = []int32{
-	69,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
-	69,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
+	74,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
+	74,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
 	0,   // 2: datax.v1.Transaction.meta:type_name -> datax.v1.TxnMeta
-	69,  // 3: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
-	69,  // 4: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
+	74,  // 3: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
+	74,  // 4: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
 	2,   // 5: datax.v1.RangeDescriptor.replicas:type_name -> datax.v1.ReplicaDescriptor
 	0,   // 6: datax.v1.Intent.txn:type_name -> datax.v1.TxnMeta
 	6,   // 7: datax.v1.GetRequest.header:type_name -> datax.v1.RequestHeader
@@ -4862,119 +5234,126 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	6,   // 11: datax.v1.ScanRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 12: datax.v1.EndTxnRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 13: datax.v1.HeartbeatTxnRequest.header:type_name -> datax.v1.RequestHeader
-	69,  // 14: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
+	74,  // 14: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
 	6,   // 15: datax.v1.PushTxnRequest.header:type_name -> datax.v1.RequestHeader
 	1,   // 16: datax.v1.PushTxnRequest.pusher_txn:type_name -> datax.v1.Transaction
 	0,   // 17: datax.v1.PushTxnRequest.pushee_txn:type_name -> datax.v1.TxnMeta
-	69,  // 18: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
+	74,  // 18: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
 	6,   // 19: datax.v1.ResolveIntentRequest.header:type_name -> datax.v1.RequestHeader
-	69,  // 20: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
+	74,  // 20: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
 	6,   // 21: datax.v1.RollbackIntentRequest.header:type_name -> datax.v1.RequestHeader
 	6,   // 22: datax.v1.RefreshRequest.header:type_name -> datax.v1.RequestHeader
-	69,  // 23: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
-	69,  // 24: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
-	6,   // 25: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
-	69,  // 26: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
-	18,  // 27: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
-	6,   // 28: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 29: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 30: datax.v1.AdminChangeReplicasRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 31: datax.v1.AdminTransferLeaseRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 32: datax.v1.AdminMergeRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 33: datax.v1.SubsumeRequest.header:type_name -> datax.v1.RequestHeader
-	6,   // 34: datax.v1.UnfreezeRequest.header:type_name -> datax.v1.RequestHeader
-	7,   // 35: datax.v1.RequestUnion.get:type_name -> datax.v1.GetRequest
-	8,   // 36: datax.v1.RequestUnion.put:type_name -> datax.v1.PutRequest
-	9,   // 37: datax.v1.RequestUnion.delete:type_name -> datax.v1.DeleteRequest
-	10,  // 38: datax.v1.RequestUnion.increment:type_name -> datax.v1.IncrementRequest
-	11,  // 39: datax.v1.RequestUnion.scan:type_name -> datax.v1.ScanRequest
-	12,  // 40: datax.v1.RequestUnion.end_txn:type_name -> datax.v1.EndTxnRequest
-	13,  // 41: datax.v1.RequestUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnRequest
-	14,  // 42: datax.v1.RequestUnion.push_txn:type_name -> datax.v1.PushTxnRequest
-	15,  // 43: datax.v1.RequestUnion.resolve_intent:type_name -> datax.v1.ResolveIntentRequest
-	17,  // 44: datax.v1.RequestUnion.refresh:type_name -> datax.v1.RefreshRequest
-	16,  // 45: datax.v1.RequestUnion.rollback_intent:type_name -> datax.v1.RollbackIntentRequest
-	38,  // 46: datax.v1.RequestUnion.recover_txn:type_name -> datax.v1.RecoverTxnRequest
-	19,  // 47: datax.v1.RequestUnion.gc:type_name -> datax.v1.GcRequest
-	20,  // 48: datax.v1.RequestUnion.truncate_log:type_name -> datax.v1.TruncateLogRequest
-	21,  // 49: datax.v1.RequestUnion.admin_split:type_name -> datax.v1.AdminSplitRequest
-	22,  // 50: datax.v1.RequestUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasRequest
-	23,  // 51: datax.v1.RequestUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseRequest
-	24,  // 52: datax.v1.RequestUnion.admin_merge:type_name -> datax.v1.AdminMergeRequest
-	25,  // 53: datax.v1.RequestUnion.subsume:type_name -> datax.v1.SubsumeRequest
-	26,  // 54: datax.v1.RequestUnion.unfreeze:type_name -> datax.v1.UnfreezeRequest
-	69,  // 55: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
-	1,   // 56: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
-	28,  // 57: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
-	27,  // 58: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
-	4,   // 59: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
-	69,  // 60: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
-	69,  // 61: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
-	6,   // 62: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
-	3,   // 63: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 64: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
-	3,   // 65: datax.v1.AdminChangeReplicasResponse.desc:type_name -> datax.v1.RangeDescriptor
-	3,   // 66: datax.v1.AdminTransferLeaseResponse.desc:type_name -> datax.v1.RangeDescriptor
-	3,   // 67: datax.v1.AdminMergeResponse.desc:type_name -> datax.v1.RangeDescriptor
-	30,  // 68: datax.v1.ResponseUnion.get:type_name -> datax.v1.GetResponse
-	31,  // 69: datax.v1.ResponseUnion.put:type_name -> datax.v1.PutResponse
-	32,  // 70: datax.v1.ResponseUnion.delete:type_name -> datax.v1.DeleteResponse
-	33,  // 71: datax.v1.ResponseUnion.increment:type_name -> datax.v1.IncrementResponse
-	34,  // 72: datax.v1.ResponseUnion.scan:type_name -> datax.v1.ScanResponse
-	35,  // 73: datax.v1.ResponseUnion.end_txn:type_name -> datax.v1.EndTxnResponse
-	36,  // 74: datax.v1.ResponseUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnResponse
-	37,  // 75: datax.v1.ResponseUnion.push_txn:type_name -> datax.v1.PushTxnResponse
-	40,  // 76: datax.v1.ResponseUnion.resolve_intent:type_name -> datax.v1.ResolveIntentResponse
-	41,  // 77: datax.v1.ResponseUnion.refresh:type_name -> datax.v1.RefreshResponse
-	42,  // 78: datax.v1.ResponseUnion.rollback_intent:type_name -> datax.v1.RollbackIntentResponse
-	39,  // 79: datax.v1.ResponseUnion.recover_txn:type_name -> datax.v1.RecoverTxnResponse
-	43,  // 80: datax.v1.ResponseUnion.gc:type_name -> datax.v1.GcResponse
-	44,  // 81: datax.v1.ResponseUnion.truncate_log:type_name -> datax.v1.TruncateLogResponse
-	45,  // 82: datax.v1.ResponseUnion.admin_split:type_name -> datax.v1.AdminSplitResponse
-	46,  // 83: datax.v1.ResponseUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasResponse
-	47,  // 84: datax.v1.ResponseUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseResponse
-	48,  // 85: datax.v1.ResponseUnion.admin_merge:type_name -> datax.v1.AdminMergeResponse
-	49,  // 86: datax.v1.ResponseUnion.subsume:type_name -> datax.v1.SubsumeResponse
-	50,  // 87: datax.v1.ResponseUnion.unfreeze:type_name -> datax.v1.UnfreezeResponse
-	1,   // 88: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
-	69,  // 89: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
-	51,  // 90: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
-	3,   // 91: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
-	5,   // 92: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
-	69,  // 93: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
-	69,  // 94: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
-	69,  // 95: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
-	69,  // 96: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
-	69,  // 97: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
-	53,  // 98: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
-	54,  // 99: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
-	55,  // 100: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
-	56,  // 101: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
-	57,  // 102: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
-	58,  // 103: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
-	59,  // 104: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
-	60,  // 105: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
-	61,  // 106: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
-	62,  // 107: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
-	63,  // 108: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
-	52,  // 109: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
-	64,  // 110: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
-	29,  // 111: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
-	67,  // 112: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
-	68,  // 113: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
-	69,  // 114: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
-	3,   // 115: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 116: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
-	69,  // 117: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
-	3,   // 118: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
-	3,   // 119: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
-	3,   // 120: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
-	69,  // 121: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
-	122, // [122:122] is the sub-list for method output_type
-	122, // [122:122] is the sub-list for method input_type
-	122, // [122:122] is the sub-list for extension type_name
-	122, // [122:122] is the sub-list for extension extendee
-	0,   // [0:122] is the sub-list for field type_name
+	74,  // 23: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
+	6,   // 24: datax.v1.ExportRequest.header:type_name -> datax.v1.RequestHeader
+	74,  // 25: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
+	19,  // 26: datax.v1.ExportResponse.records:type_name -> datax.v1.ExportRecord
+	74,  // 27: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
+	6,   // 28: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
+	74,  // 29: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
+	21,  // 30: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
+	6,   // 31: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 32: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 33: datax.v1.AdminChangeReplicasRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 34: datax.v1.AdminTransferLeaseRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 35: datax.v1.AdminMergeRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 36: datax.v1.SubsumeRequest.header:type_name -> datax.v1.RequestHeader
+	6,   // 37: datax.v1.UnfreezeRequest.header:type_name -> datax.v1.RequestHeader
+	7,   // 38: datax.v1.RequestUnion.get:type_name -> datax.v1.GetRequest
+	8,   // 39: datax.v1.RequestUnion.put:type_name -> datax.v1.PutRequest
+	9,   // 40: datax.v1.RequestUnion.delete:type_name -> datax.v1.DeleteRequest
+	10,  // 41: datax.v1.RequestUnion.increment:type_name -> datax.v1.IncrementRequest
+	11,  // 42: datax.v1.RequestUnion.scan:type_name -> datax.v1.ScanRequest
+	12,  // 43: datax.v1.RequestUnion.end_txn:type_name -> datax.v1.EndTxnRequest
+	13,  // 44: datax.v1.RequestUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnRequest
+	14,  // 45: datax.v1.RequestUnion.push_txn:type_name -> datax.v1.PushTxnRequest
+	15,  // 46: datax.v1.RequestUnion.resolve_intent:type_name -> datax.v1.ResolveIntentRequest
+	17,  // 47: datax.v1.RequestUnion.refresh:type_name -> datax.v1.RefreshRequest
+	16,  // 48: datax.v1.RequestUnion.rollback_intent:type_name -> datax.v1.RollbackIntentRequest
+	41,  // 49: datax.v1.RequestUnion.recover_txn:type_name -> datax.v1.RecoverTxnRequest
+	22,  // 50: datax.v1.RequestUnion.gc:type_name -> datax.v1.GcRequest
+	23,  // 51: datax.v1.RequestUnion.truncate_log:type_name -> datax.v1.TruncateLogRequest
+	24,  // 52: datax.v1.RequestUnion.admin_split:type_name -> datax.v1.AdminSplitRequest
+	25,  // 53: datax.v1.RequestUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasRequest
+	26,  // 54: datax.v1.RequestUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseRequest
+	27,  // 55: datax.v1.RequestUnion.admin_merge:type_name -> datax.v1.AdminMergeRequest
+	28,  // 56: datax.v1.RequestUnion.subsume:type_name -> datax.v1.SubsumeRequest
+	29,  // 57: datax.v1.RequestUnion.unfreeze:type_name -> datax.v1.UnfreezeRequest
+	18,  // 58: datax.v1.RequestUnion.export:type_name -> datax.v1.ExportRequest
+	74,  // 59: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
+	1,   // 60: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
+	31,  // 61: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
+	30,  // 62: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
+	4,   // 63: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
+	74,  // 64: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
+	74,  // 65: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
+	6,   // 66: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
+	3,   // 67: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 68: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
+	3,   // 69: datax.v1.AdminChangeReplicasResponse.desc:type_name -> datax.v1.RangeDescriptor
+	3,   // 70: datax.v1.AdminTransferLeaseResponse.desc:type_name -> datax.v1.RangeDescriptor
+	3,   // 71: datax.v1.AdminMergeResponse.desc:type_name -> datax.v1.RangeDescriptor
+	33,  // 72: datax.v1.ResponseUnion.get:type_name -> datax.v1.GetResponse
+	34,  // 73: datax.v1.ResponseUnion.put:type_name -> datax.v1.PutResponse
+	35,  // 74: datax.v1.ResponseUnion.delete:type_name -> datax.v1.DeleteResponse
+	36,  // 75: datax.v1.ResponseUnion.increment:type_name -> datax.v1.IncrementResponse
+	37,  // 76: datax.v1.ResponseUnion.scan:type_name -> datax.v1.ScanResponse
+	38,  // 77: datax.v1.ResponseUnion.end_txn:type_name -> datax.v1.EndTxnResponse
+	39,  // 78: datax.v1.ResponseUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnResponse
+	40,  // 79: datax.v1.ResponseUnion.push_txn:type_name -> datax.v1.PushTxnResponse
+	43,  // 80: datax.v1.ResponseUnion.resolve_intent:type_name -> datax.v1.ResolveIntentResponse
+	44,  // 81: datax.v1.ResponseUnion.refresh:type_name -> datax.v1.RefreshResponse
+	45,  // 82: datax.v1.ResponseUnion.rollback_intent:type_name -> datax.v1.RollbackIntentResponse
+	42,  // 83: datax.v1.ResponseUnion.recover_txn:type_name -> datax.v1.RecoverTxnResponse
+	46,  // 84: datax.v1.ResponseUnion.gc:type_name -> datax.v1.GcResponse
+	47,  // 85: datax.v1.ResponseUnion.truncate_log:type_name -> datax.v1.TruncateLogResponse
+	48,  // 86: datax.v1.ResponseUnion.admin_split:type_name -> datax.v1.AdminSplitResponse
+	49,  // 87: datax.v1.ResponseUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasResponse
+	50,  // 88: datax.v1.ResponseUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseResponse
+	51,  // 89: datax.v1.ResponseUnion.admin_merge:type_name -> datax.v1.AdminMergeResponse
+	52,  // 90: datax.v1.ResponseUnion.subsume:type_name -> datax.v1.SubsumeResponse
+	53,  // 91: datax.v1.ResponseUnion.unfreeze:type_name -> datax.v1.UnfreezeResponse
+	20,  // 92: datax.v1.ResponseUnion.export:type_name -> datax.v1.ExportResponse
+	1,   // 93: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
+	74,  // 94: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
+	54,  // 95: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
+	3,   // 96: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
+	5,   // 97: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
+	74,  // 98: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
+	74,  // 99: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
+	74,  // 100: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
+	74,  // 101: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
+	74,  // 102: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
+	56,  // 103: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
+	57,  // 104: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
+	58,  // 105: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
+	59,  // 106: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
+	60,  // 107: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
+	61,  // 108: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
+	62,  // 109: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
+	63,  // 110: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
+	64,  // 111: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
+	65,  // 112: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
+	66,  // 113: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
+	55,  // 114: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
+	67,  // 115: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
+	32,  // 116: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
+	72,  // 117: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
+	73,  // 118: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
+	74,  // 119: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
+	70,  // 120: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
+	71,  // 121: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
+	3,   // 122: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 123: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
+	74,  // 124: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
+	3,   // 125: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
+	3,   // 126: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
+	3,   // 127: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
+	74,  // 128: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
+	129, // [129:129] is the sub-list for method output_type
+	129, // [129:129] is the sub-list for method input_type
+	129, // [129:129] is the sub-list for extension type_name
+	129, // [129:129] is the sub-list for extension extendee
+	0,   // [0:129] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_kv_proto_init() }
@@ -4983,7 +5362,7 @@ func file_datax_v1_kv_proto_init() {
 		return
 	}
 	file_datax_v1_transport_proto_init()
-	file_datax_v1_kv_proto_msgTypes[27].OneofWrappers = []any{
+	file_datax_v1_kv_proto_msgTypes[30].OneofWrappers = []any{
 		(*RequestUnion_Get)(nil),
 		(*RequestUnion_Put)(nil),
 		(*RequestUnion_Delete)(nil),
@@ -5004,8 +5383,9 @@ func file_datax_v1_kv_proto_init() {
 		(*RequestUnion_AdminMerge)(nil),
 		(*RequestUnion_Subsume)(nil),
 		(*RequestUnion_Unfreeze)(nil),
+		(*RequestUnion_Export)(nil),
 	}
-	file_datax_v1_kv_proto_msgTypes[51].OneofWrappers = []any{
+	file_datax_v1_kv_proto_msgTypes[54].OneofWrappers = []any{
 		(*ResponseUnion_Get)(nil),
 		(*ResponseUnion_Put)(nil),
 		(*ResponseUnion_Delete)(nil),
@@ -5026,6 +5406,7 @@ func file_datax_v1_kv_proto_init() {
 		(*ResponseUnion_AdminMerge)(nil),
 		(*ResponseUnion_Subsume)(nil),
 		(*ResponseUnion_Unfreeze)(nil),
+		(*ResponseUnion_Export)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -5033,7 +5414,7 @@ func file_datax_v1_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_kv_proto_rawDesc), len(file_datax_v1_kv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   69,
+			NumMessages:   74,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -392,9 +392,36 @@ its top-8 hot and big ranges (`kvpb.NodeDescriptor`, from
   floor), the biggest advertised range moves off the fullest node to the
   emptiest, diversity-gated like every replica move.
 
-QPS is leader-local and resets to zero for a full measurement window
-after every transfer, so both passes stamp a per-range cooldown (default
-60s, deliberately longer than the maturity window) before acting — the
-anti-oscillation story, on top of the projection check and the absolute
-floors. `--lease-shed-factor` and `--rebalance-bytes-threshold` tune the
-triggers (negative bytes threshold disables byte moves).
+QPS is leader-local, but a lease transfer no longer zeroes the view: the
+outgoing leaseholder proposes a **load handoff** through the raft log
+just before transferring (`raftCommand.Load`), every replica stores it,
+and whichever replica next becomes leader seeds its tracker from it (if
+fresh — 30s) as an immediately *mature* rate that decays over one window
+unless real traffic sustains it. The split-key reservoir still starts
+fresh (samples don't transfer), so both passes keep the per-range
+cooldown (default 60s) — the anti-oscillation story, on top of the
+projection check and the absolute floors. `--lease-shed-factor` and
+`--rebalance-bytes-threshold` tune the triggers (negative bytes
+threshold disables byte moves).
+
+## Replica consistency checking
+
+Replicas of a range are byte-identical by construction: they apply the
+same log prefix, and even GC replicates the exact versions it deletes.
+The consistency checker turns that invariant into a tripwire. The leader
+proposes a checksum trigger through the log (`raftCommand.Checksum`);
+each replica, on applying it, captures an engine snapshot at exactly
+that applied index and SHA-256s the range's replicated content (the
+MVCC data span plus range-local transaction records) asynchronously.
+The proposing node then collects the followers' digests over the admin
+channel and compares: a mismatch is corruption — it logs every
+replica's digest and increments `datax_consistency_failures_total`
+(`datax_consistency_checks_total` counts probes).
+
+The sweep is **off by default** (hashing a range reads all of it);
+`--consistency-interval 10m` probes one led range per node per
+interval, round-robin. A lagging replica that misses the collection
+window is a liveness note, not a failure — the next probe retries it.
+The fault-injection suite (`chaos_test.go`) runs the bank-invariant
+workload through partitions, crashes, and injected storage overload and
+ends every scenario with a consistency probe.

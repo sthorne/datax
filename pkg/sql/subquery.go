@@ -50,46 +50,92 @@ func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, sub *par
 	return types.Datum{}, newErrf(CodeCardinality, "more than one row returned by a subquery used as an expression")
 }
 
-// resolveValueExpr splices scalar subqueries inside a value expression.
+// resolveValueExpr splices the parts of a value expression that must be
+// evaluated once, before row-by-row execution: scalar subqueries and
+// now() (the statement timestamp).
 func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (parser.Expr, error) {
+	out := e
 	if e.Sub != nil {
 		d, err := s.execScalarSub(ctx, txn, e.Sub, params)
 		if err != nil {
 			return e, err
 		}
-		out := e
 		out.Sub, out.Lit = nil, &d
-		if out.Right != nil {
-			r, err := s.resolveValueExpr(ctx, txn, *out.Right, params)
-			if err != nil {
-				return e, err
-			}
-			out.Right = &r
+	}
+	if e.Func == "now" {
+		d := types.NewTimestamp(s.db.Clock().Now().WallTime)
+		out.Func, out.Lit = "", &d
+	}
+	if e.Left != nil {
+		l, err := s.resolveValueExpr(ctx, txn, *e.Left, params)
+		if err != nil {
+			return e, err
 		}
-		return out, nil
+		out.Left = &l
 	}
 	if e.Right != nil {
 		r, err := s.resolveValueExpr(ctx, txn, *e.Right, params)
 		if err != nil {
 			return e, err
 		}
-		out := e
 		out.Right = &r
-		return out, nil
 	}
-	return e, nil
+	if len(e.Args) > 0 {
+		args := make([]parser.Expr, len(e.Args))
+		for i, a := range e.Args {
+			ra, err := s.resolveValueExpr(ctx, txn, a, params)
+			if err != nil {
+				return e, err
+			}
+			args[i] = ra
+		}
+		out.Args = args
+	}
+	return out, nil
 }
 
+// exprHasSub reports whether an expression needs the pre-execution
+// resolve pass: a scalar subquery or a now() call anywhere inside it.
 func exprHasSub(e parser.Expr) bool {
-	for {
-		if e.Sub != nil {
+	if e.Sub != nil || e.Func == "now" {
+		return true
+	}
+	if e.Left != nil && exprHasSub(*e.Left) {
+		return true
+	}
+	if e.Right != nil && exprHasSub(*e.Right) {
+		return true
+	}
+	for _, a := range e.Args {
+		if exprHasSub(a) {
 			return true
 		}
-		if e.Right == nil {
-			return false
-		}
-		e = *e.Right
 	}
+	return false
+}
+
+// cmpNeedsResolve reports whether a conjunct (or, recursively, an OR
+// group) contains anything the pre-execution resolve pass must handle.
+func cmpNeedsResolve(cmp parser.Comparison) bool {
+	if cmp.Sub != nil || exprHasSub(cmp.Value) {
+		return true
+	}
+	if cmp.Expr != nil && exprHasSub(*cmp.Expr) {
+		return true
+	}
+	for _, ve := range cmp.Values {
+		if exprHasSub(ve) {
+			return true
+		}
+	}
+	for _, d := range cmp.Or {
+		for _, inner := range d {
+			if cmpNeedsResolve(inner) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // resolveWhereSubs evaluates every subquery in a WHERE conjunction,
@@ -97,15 +143,9 @@ func exprHasSub(e parser.Expr) bool {
 func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, params []types.Datum) ([]parser.Comparison, error) {
 	changed := false
 	for _, cmp := range where {
-		if cmp.Sub != nil || exprHasSub(cmp.Value) {
+		if cmpNeedsResolve(cmp) {
 			changed = true
 			break
-		}
-		for _, ve := range cmp.Values {
-			if exprHasSub(ve) {
-				changed = true
-				break
-			}
 		}
 	}
 	if !changed {
@@ -115,12 +155,33 @@ func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where
 	copy(out, where)
 	for i := range out {
 		cmp := &out[i]
+		if len(cmp.Or) > 0 {
+			// OR groups hold no subqueries (the parser rejects them), but
+			// may hold now() calls: resolve each disjunct recursively.
+			or := make([][]parser.Comparison, len(cmp.Or))
+			for j, d := range cmp.Or {
+				rd, err := s.resolveWhereSubs(ctx, txn, d, params)
+				if err != nil {
+					return nil, err
+				}
+				or[j] = rd
+			}
+			cmp.Or = or
+			continue
+		}
 		if exprHasSub(cmp.Value) {
 			v, err := s.resolveValueExpr(ctx, txn, cmp.Value, params)
 			if err != nil {
 				return nil, err
 			}
 			cmp.Value = v
+		}
+		if cmp.Expr != nil && exprHasSub(*cmp.Expr) {
+			v, err := s.resolveValueExpr(ctx, txn, *cmp.Expr, params)
+			if err != nil {
+				return nil, err
+			}
+			cmp.Expr = &v
 		}
 		switch cmp.Op {
 		case "IN", "NOT IN":

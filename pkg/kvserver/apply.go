@@ -230,6 +230,16 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 	if aerr == nil && cmd.Merge != nil {
 		r.finishMerge(cmd.Merge)
 	}
+	if cmd.Load != nil {
+		r.mu.Lock()
+		r.mu.loadHandoff = cmd.Load
+		r.mu.Unlock()
+	}
+	if cmd.Checksum != nil {
+		// Post-commit, still under applyMu: the engine snapshot taken here
+		// is exactly this entry's state on every replica.
+		r.startChecksum(cmd.Checksum.ID, idx)
+	}
 	return resp, aerr
 }
 
@@ -241,6 +251,14 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 		txnMeta = &ba.Header.Txn.TxnMeta
 	}
 	ts := writeTimestamp(ba)
+
+	// One-phase commit: the whole transaction in one proposal — writes land
+	// as committed values, no record, no intents. Detected from batch
+	// content (never the header's CreateTxnRecord, which stays set for old
+	// servers' classic evaluation).
+	if is1PC(ba) {
+		return r.evalOnePhase(b, ba)
+	}
 
 	if ba.Header.CreateTxnRecord {
 		if err := r.createTxnRecord(b, ba.Header.Txn); err != nil {
@@ -426,6 +444,16 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 				return nil, kvpb.NewError(err)
 			}
 			ru.Scan = scanResponse(res)
+		case *kvpb.ExportRequest:
+			res, err := storage.MVCCExport(eng, req.Key, req.EndKey, req.StartTS, ts, req.MaxRecords)
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			resp := &kvpb.ExportResponse{Resume: res.Resume}
+			for _, rec := range res.Records {
+				resp.Records = append(resp.Records, kvpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+			}
+			ru.Export = resp
 		case *kvpb.RefreshRequest:
 			if ba.Header.Txn == nil {
 				return nil, kvpb.NewErrorf("Refresh without a transaction")

@@ -99,6 +99,15 @@ The defaults are right for almost everyone; see
 [docs/replication-and-placement.md](../replication-and-placement.md) before
 touching them.
 
+## Upgrading a running cluster
+
+Rolling, no downtime: restart one node at a time on the new binary, wait
+until `datax debug nodes` shows it healthy on the new version, and when
+every node is upgraded, finalize deliberately with `datax debug upgrade`.
+Before finalize you can roll any node back; after it, never. Full
+procedure and rules: [Operations → Rolling
+upgrades](operations.md#rolling-upgrades).
+
 ## Checklist for production-ish deployments
 
 - One `datax` process per machine, `--dir` on its own disk (NVMe strongly
@@ -108,3 +117,6 @@ touching them.
 - [Secure mode](security.md): certs dir + `--root-password` on first init.
 - `--http-listen` set, Prometheus scraping `/metrics` on every node.
 - The key file (if encrypting) backed up somewhere that is not the data disk.
+- Upgrades: same binary version on every node at bootstrap; upgrade
+  rolling, one node at a time, and treat `datax debug upgrade` as the
+  point of no return.

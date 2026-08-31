@@ -40,13 +40,20 @@ moves no data**.
    primary key 1, reads the current row, and issues a `Put` through the
    session's transaction.
 3. `kvclient`'s **TxnCoordinator** stamps the request with the transaction's
-   metadata; the **DistSender** looks up which range owns the key (range cache,
-   backed by `/meta/`) and sends a `BatchRequest` to a replica of that range.
+   metadata; the **DistSender** looks up which range owns each key (range
+   cache, backed by `/meta/`) and sends a `BatchRequest` to a replica of
+   that range — a batch spanning several ranges partitions into per-range
+   sub-batches sent **in parallel** (the record-creating one first).
 4. `kvserver` on the Raft leader checks the timestamp cache, then proposes the
    write to the range's Raft group. Once a quorum has appended it, each replica
    **applies** it: an MVCC *write intent* lands in Pebble.
 5. At `COMMIT`, the coordinator flips the transaction record to COMMITTED — a
    single Raft write — then asynchronously resolves intents to plain values.
+   Fast paths skip stages of this: an implicit transaction stages its
+   record in parallel with its writes (**parallel commit**), and one whose
+   whole write set fits a single range commits in **one Raft proposal**
+   with no record or intents at all (**one-phase commit**) — see
+   [transactions](transactions.md).
 
 ## Life of a read
 
@@ -84,9 +91,30 @@ These are the load-bearing rules; tests assert them.
    still equals its read timestamp; anything that bumps the write timestamp
    forces a retry (see [transactions.md](transactions.md)).
 
+## Versioning and rolling upgrades
+
+Each binary has an integer protocol version with a supported window
+(`pkg/version`: `[MinSupported, Current]`, adjacent versions only). The
+cluster persists one **cluster version** at `/system/cluster-version`,
+seeded at bootstrap and advanced only by the operator-triggered
+`upgrade-cluster` admin op once every live node's heartbeat advertises a
+new-enough binary. Gates: join (a node whose window excludes the cluster
+version is refused), startup (each store mirrors the last observed cluster
+version locally and refuses to start under an older binary — the
+no-downgrade-after-finalize rule, enforceable even with quorum down), and
+re-announce (advisory disjoint-window rejection).
+
+What makes the mixed-version window safe is a set of compatibility rules
+codified in `pkg/version`'s package doc and enforced by golden decode
+tests across packages: JSON payloads grow additively (`omitempty`, safe
+zero values), proto fields are add-only with never-reused numbers, format
+bytes only gain values behind a cluster-version gate and decode forever,
+and unknown payloads degrade to errors, never crashes or silent misapplies.
+
 ## Modules
 
 - `pkg/base` — shared ID types (NodeID, StoreID, RangeID) and configuration.
+- `pkg/version` — the protocol version, support window, and compat rules.
 - `pkg/util/hlc` — hybrid logical clock.
 - `pkg/util/encoding` — order-preserving key encodings.
 - `pkg/util/stop` — goroutine lifecycle / graceful shutdown.
