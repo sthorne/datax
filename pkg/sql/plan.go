@@ -152,7 +152,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				if sides, jerr := s.planJoinSides(ctx, desc, t); jerr == nil {
 					for _, cmp := range t.Where {
 						if ref, rerr := resolveJoinRef(sides, cmp.Column); rerr == nil {
-							assign(cmp.Value, ref.col.Type)
+							typ := ref.col.Type
+							if len(cmp.Path) > 0 {
+								typ = pathResultType(cmp.Path)
+							}
+							assign(cmp.Value, typ)
 						}
 					}
 				}
@@ -209,7 +213,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type}
+				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
 			}
 			return cols, nil
 		}
@@ -266,7 +270,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.ref.col.Type}
+				cols[i] = ResultColumn{Name: p.name, Type: p.typ, Typmod: colTypmod(p.ref.col)}
 			}
 			return cols, nil
 		}
@@ -287,7 +291,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		cols := make([]ResultColumn, len(proj))
 		for i, p := range proj {
-			cols[i] = ResultColumn{Name: p.name, Type: p.col.Type}
+			cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
 		}
 		return cols, nil
 

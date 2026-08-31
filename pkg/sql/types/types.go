@@ -94,6 +94,12 @@ type Datum struct {
 	F    float64 `json:"f,omitempty"`
 	S    string  `json:"s,omitempty"`
 	B    bool    `json:"b,omitempty"`
+	// Dscale is DISPLAY-ONLY: a Decimal datum read from (or written to) a
+	// DECIMAL(p,s) column carries the declared scale so Text() renders
+	// fixed-scale ("9.90", not "9.9"). Identity is untouched: S keeps the
+	// canonical (trailing-zero-stripped) text that equality, grouping, and
+	// storage compare, and Dscale never participates in Compare.
+	Dscale int32 `json:"dscale,omitempty"`
 }
 
 var DNull = Datum{Null: true}
@@ -193,8 +199,8 @@ func ParseDecimal(s string) (Datum, error) {
 
 // ParseJSONB parses and normalizes a JSON document: objects re-marshal
 // with sorted keys (duplicate keys: last wins), whitespace is dropped,
-// and HTML characters are NOT escaped. Numbers round-trip through
-// float64 — very large integers lose precision (documented).
+// and HTML characters are NOT escaped. Numbers decode as json.Number, so
+// they keep their exact ingest text — integers beyond float64 survive.
 func ParseJSONB(s string) (Datum, error) {
 	var v any
 	dec := json.NewDecoder(strings.NewReader(s))
@@ -428,8 +434,29 @@ func (d Datum) Text() string {
 		}
 		h := hex.EncodeToString(b)
 		return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
-	case Decimal, Jsonb:
-		return d.S // canonical/normalized text IS the wire text
+	case Decimal:
+		if d.Dscale > 0 {
+			return padDecimalScale(d.S, d.Dscale)
+		}
+		return d.S // canonical text IS the wire text
+	case Jsonb:
+		return d.S // normalized text IS the wire text
 	}
 	return ""
+}
+
+// padDecimalScale renders canonical decimal text with exactly scale
+// fraction digits (canonical text never has MORE than the declared scale
+// — writes quantize — so this only pads, never truncates).
+func padDecimalScale(s string, scale int32) string {
+	frac := 0
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		frac = len(s) - i - 1
+	} else {
+		s += "."
+	}
+	for ; frac < int(scale); frac++ {
+		s += "0"
+	}
+	return s
 }

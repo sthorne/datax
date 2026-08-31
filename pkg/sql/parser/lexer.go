@@ -132,7 +132,7 @@ func lex(src string) ([]token, error) {
 				two = l.src[l.pos : l.pos+2]
 			}
 			switch two {
-			case "!=", "<>", "<=", ">=", "::", "->":
+			case "!=", "<>", "<=", ">=", "::", "->", "@>":
 				op := two
 				if op == "<>" {
 					op = "!="

@@ -28,19 +28,27 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
-- **`DECIMAL(p,s)` typmod is ignored** (enforcement is planned, #39).
-  `DECIMAL` itself is exact.
+- **`DECIMAL(p,s)` is enforced** (rescale to `s` half-even, `22003` on
+  overflow, fixed-scale rendering), with small deviations: an invalid
+  typmod (`DECIMAL(0)`, scale > precision) is a syntax error `42601`
+  rather than PostgreSQL's `22023`; `VARCHAR(n)` and other typmods are
+  still accepted and ignored; expression/aggregate results render in
+  canonical form (no declared scale), as in PostgreSQL.
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
-- **JSONB**: only `->` and `->>` (single-table queries), equality
-  comparison, and `IS [NOT] NULL`. No containment `@>` (planned, #40), no
-  indexing on JSONB columns, no ordering comparisons. Numbers inside JSONB
-  keep exact textual fidelity rather than PostgreSQL's numeric parsing.
+- **JSONB**: `->`/`->>` extraction (single-table queries and joins;
+  grouped SELECT lists refuse), containment `@>` (single-table only),
+  equality comparison, and `IS [NOT] NULL`. No indexing on
+  JSONB columns (`@>` always filters — no inverted indexes), no ordering
+  comparisons, no `<@`/`?`/`?|`/`?&`. `@>` is not accepted in `HAVING` or
+  after a computed left-hand side. One asymmetry to know: `@>` compares
+  numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
+  normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
   indexable `AND` condition alongside on large tables. Subqueries cannot
-  appear inside `OR`, and computed left-hand sides (`qty * 2 > 10`) work
-  in single-table queries only.
+  appear inside `OR`. Computed left-hand sides (`qty * 2 > 10`) work in
+  single-table queries and joins.
 - **Join order is execution order** — there is no cost-based reordering.
   Write the most selective table first. `ON` clauses must be equalities
   against earlier tables.

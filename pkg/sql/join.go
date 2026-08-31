@@ -142,16 +142,67 @@ func resolveOn(sides []joinSide, k int, conds []parser.JoinCond) ([]onPair, erro
 	return pairs, nil
 }
 
-// joinProj is one output column of a join select.
+// joinEnv resolves side-qualified column references against one joined
+// row — the join-side exprEnv. A NULL-extended LEFT side yields DNull for
+// its columns, which then flows through paths and arithmetic as SQL NULL.
+type joinEnv struct {
+	sides []joinSide
+	jr    joinedRow
+}
+
+func (j joinEnv) col(name string) (types.Datum, error) {
+	ref, err := resolveJoinRef(j.sides, name)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return j.jr.datum(ref), nil
+}
+
+// joinProj is one output column of a join select: a plain column (ref),
+// or a computed expression (expr, typed typ) evaluated per joined row —
+// mirroring the single-table projCol shapes exactly.
 type joinProj struct {
 	name string
 	ref  joinRef
+	expr *parser.Expr
+	typ  types.Family
+}
+
+// walkExprRefs resolves every column reference inside an expression at
+// projection-resolve time, so bad names error before execution (and
+// EXPLAIN/Describe see them without evaluating a row).
+func walkExprRefs(sides []joinSide, e parser.Expr) error {
+	if e.Column != "" {
+		if _, err := resolveJoinRef(sides, e.Column); err != nil {
+			return err
+		}
+	}
+	if e.Left != nil {
+		if err := walkExprRefs(sides, *e.Left); err != nil {
+			return err
+		}
+	}
+	if e.Right != nil {
+		if err := walkExprRefs(sides, *e.Right); err != nil {
+			return err
+		}
+	}
+	for _, a := range e.Args {
+		if err := walkExprRefs(sides, a); err != nil {
+			return err
+		}
+	}
+	if e.Sub != nil {
+		return newErrf(CodeFeatureNotSupported, "subqueries in join SELECT lists are not supported")
+	}
+	return nil
 }
 
 // resolveJoinProjection resolves the select list: * (each side's columns
-// in join order, PostgreSQL order) or plain possibly-qualified column
-// references. Expressions over joins are not supported; aggregates take
-// the grouped path and never reach here.
+// in join order, PostgreSQL order), plain possibly-qualified columns,
+// ->/->> paths on jsonb columns, and computed expressions (rendered as
+// TEXT, the single-table precedent). Aggregates take the grouped path and
+// never reach here.
 func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinProj, error) {
 	var proj []joinProj
 	for _, se := range exprs {
@@ -159,15 +210,12 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 		case se.Star:
 			for i, js := range sides {
 				for _, c := range js.desc.VisibleColumns() {
-					proj = append(proj, joinProj{name: c.Name, ref: joinRef{side: i, col: c}})
+					proj = append(proj, joinProj{name: c.Name, ref: joinRef{side: i, col: c}, typ: c.Type})
 				}
 			}
 		case se.Agg != "":
 			return nil, newErrf(CodeInternal, "aggregate reached the join projection")
 		case se.Expr.Column != "" && se.Expr.BinOp == "":
-			if len(se.Expr.Path) > 0 {
-				return nil, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
-			}
 			ref, err := resolveJoinRef(sides, se.Expr.Column)
 			if err != nil {
 				return nil, err
@@ -176,9 +224,29 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 			if name == "" {
 				name = ref.col.Name
 			}
-			proj = append(proj, joinProj{name: name, ref: ref})
+			if len(se.Expr.Path) > 0 {
+				// col -> 'k' / ->> 'k': a computed column typed by the chain.
+				if ref.col.Type != types.Jsonb {
+					return nil, newErrf(CodeFeatureNotSupported, "cannot extract path from type %s (-> and ->> require jsonb)", ref.col.Type)
+				}
+				e := se.Expr
+				if se.Alias == "" {
+					name = "?column?"
+				}
+				proj = append(proj, joinProj{name: name, expr: &e, typ: pathResultType(se.Expr.Path)})
+				continue
+			}
+			proj = append(proj, joinProj{name: name, ref: ref, typ: ref.col.Type})
 		default:
-			return nil, newErrf(CodeFeatureNotSupported, "join SELECT items must be columns or *")
+			if err := walkExprRefs(sides, se.Expr); err != nil {
+				return nil, err
+			}
+			e := se.Expr
+			name := se.Alias
+			if name == "" {
+				name = "?column?"
+			}
+			proj = append(proj, joinProj{name: name, expr: &e, typ: types.String})
 		}
 	}
 	return proj, nil
@@ -195,11 +263,34 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cmp.Op == "FALSE" {
 			return false, nil
 		}
-		if len(cmp.Path) > 0 {
-			return false, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// Containment is single-table only. This must stay an explicit
+			// refusal: an unhandled operator below would silently drop
+			// every row otherwise.
+			return false, newErrf(CodeFeatureNotSupported, "JSONB containment @> is not supported in join queries")
 		}
 		if cmp.Expr != nil {
-			return false, newErrf(CodeFeatureNotSupported, "computed expressions on the left of a comparison are not supported in join queries")
+			// Computed left-hand side: evaluate both sides against the
+			// joined row and compare raw, mirroring matchesWhere.
+			lhs, err := evalExprEnv(*cmp.Expr, joinEnv{sides, jr}, params)
+			if err != nil {
+				return false, err
+			}
+			rhs, err := evalExprEnv(cmp.Value, joinEnv{sides, jr}, params)
+			if err != nil {
+				return false, err
+			}
+			if lhs.Null || rhs.Null {
+				return false, nil
+			}
+			c, err := lhs.Compare(rhs)
+			if err != nil {
+				return false, nil
+			}
+			if !cmpHolds(cmp.Op, c) {
+				return false, nil
+			}
+			continue
 		}
 		if cmp.Op == "OR" {
 			matched := false
@@ -223,6 +314,18 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			return false, err
 		}
 		lhs := jr.datum(ref)
+		// A ->/->> path replaces the column value and its comparison type
+		// — applied before IS NULL and IN, mirroring matchesWhere, so a
+		// missing key (or a NULL-extended LEFT side) is seen as NULL.
+		cmpType := ref.col.Type
+		if len(cmp.Path) > 0 {
+			var perr error
+			lhs, perr = applyPath(lhs, cmp.Path)
+			if perr != nil {
+				return false, perr
+			}
+			cmpType = pathResultType(cmp.Path)
+		}
 		if cmp.Op == "IS NULL" || cmp.Op == "IS NOT NULL" {
 			if lhs.Null != (cmp.Op == "IS NULL") {
 				return false, nil
@@ -230,20 +333,22 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			continue
 		}
 		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
-			match, err := matchesIn(cmp, ref.col.Type, lhs, nil, nil, params)
+			match, err := matchesIn(cmp, cmpType, lhs, nil, nil, params)
 			if err != nil || !match {
 				return false, err
 			}
 			continue
 		}
-		rhs, err := evalExpr(cmp.Value, nil, nil, params)
+		// The right side may reference joined columns too (a = b across
+		// sides).
+		rhs, err := evalExprEnv(cmp.Value, joinEnv{sides, jr}, params)
 		if err != nil {
 			return false, err
 		}
 		if lhs.Null || rhs.Null {
 			return false, nil
 		}
-		rhs, cerr := rhs.Coerce(ref.col.Type)
+		rhs, cerr := rhs.Coerce(cmpType)
 		if cerr != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, cerr)
 		}
@@ -251,22 +356,7 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if err != nil {
 			return false, nil
 		}
-		ok := false
-		switch cmp.Op {
-		case "=":
-			ok = c == 0
-		case "!=":
-			ok = c != 0
-		case "<":
-			ok = c < 0
-		case "<=":
-			ok = c <= 0
-		case ">":
-			ok = c > 0
-		case ">=":
-			ok = c >= 0
-		}
-		if !ok {
+		if !cmpHolds(cmp.Op, c) {
 			return false, nil
 		}
 	}
@@ -285,8 +375,16 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 		if cmp.Column == "" {
 			continue // constant conjuncts stay in the post-join filter
 		}
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// Refused before the base scan (so EXPLAIN errors too), and
+			// never pushed — see evalJoinWhere.
+			return nil, newErrf(CodeFeatureNotSupported, "JSONB containment @> is not supported in join queries")
+		}
 		if len(cmp.Path) > 0 {
-			return nil, newErrf(CodeFeatureNotSupported, "JSONB path operators are not supported in join queries")
+			// Path conjuncts filter extracted values: never pushed as base
+			// bounds (even for side 0) — the post-join filter re-evaluates
+			// the full WHERE, so this only costs the pushdown.
+			continue
 		}
 		ref, err := resolveJoinRef(sides, cmp.Column)
 		if err != nil {
@@ -453,11 +551,19 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.ref.col.Type})
+		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.typ, Typmod: colTypmod(p.ref.col)})
 	}
 	for _, jr := range joined {
 		out := make([]types.Datum, len(proj))
 		for i, p := range proj {
+			if p.expr != nil {
+				d, err := evalExprEnv(*p.expr, joinEnv{sides, jr}, params)
+				if err != nil {
+					return nil, err
+				}
+				out[i] = d
+				continue
+			}
 			out[i] = jr.datum(p.ref)
 		}
 		res.Rows = append(res.Rows, out)

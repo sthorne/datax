@@ -196,6 +196,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 			continue
 		}
 		switch cmp.Op {
+		// Any other operator — including JSONB containment @>/NOT @> — is
+		// structurally unusable for key bounds and runs as a post-fetch
+		// filter (no inverted indexes).
 		case "=", "<", "<=", ">", ">=":
 			// A value that cannot be evaluated without a row (a column
 			// reference on the right-hand side) is simply unusable for

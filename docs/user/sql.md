@@ -10,7 +10,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 |---|---|---|
 | `INT8` | `INT`, `INTEGER`, `BIGINT` | 64-bit |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
-| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is accepted but **not enforced** |
+| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
 | `TEXT` | `STRING`, `VARCHAR` | |
 | `BOOL` | `BOOLEAN` | |
 | `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire |
@@ -28,11 +28,24 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   operand demotes the expression to float. `AVG(DECIMAL)` rounds to 6
   fractional digits (half-even). Float values never implicitly convert
   *to* DECIMAL.
+- `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
+  in both wire formats, `COPY`, and `DEFAULT` values — including primary
+  key and indexed columns (two values that round to the same stored
+  number collide as duplicates). Expression and aggregate *results* are
+  plain DECIMALs and render canonically (`SUM` of `9.90`s can print
+  `19.8`), like PostgreSQL's rule that expressions lose the typmod.
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
-  JSONB cannot be a primary key or indexed, and `->`/`->>` work in
-  single-table queries only.
+  JSONB cannot be a primary key or indexed. `->`/`->>` work in
+  single-table queries and joins (SELECT lists and WHERE; a LEFT-joined
+  NULL side extracts to NULL) — not in grouped SELECT lists.
+- Containment: `j @> '{"tags":["go"]}'` — PostgreSQL semantics (objects
+  contain recursively, arrays contain each right element somewhere, a
+  top-level array contains a matching scalar), numbers compared
+  numerically (`1` contains `1.0`). Works in WHERE — including `NOT`,
+  `OR`, a `->` path on the left, and the WHERE of grouped queries — but
+  is single-table only and always a filter (no index acceleration).
 - Every type except JSONB can appear in primary keys and indexes.
 
 ## DDL
@@ -68,13 +81,14 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 
 - **WHERE** supports full boolean logic: `AND`, `OR`, `NOT`, and
   parentheses over conditions of the form `expr op value`
-  (`= != < <= > >=`), `col IS [NOT] NULL`,
+  (`= != < <= > >=`, jsonb `j @> '...'`), `col IS [NOT] NULL`,
   `col [NOT] IN (list | SELECT ...)`, `[NOT] EXISTS (SELECT ...)`,
   `j ->> 'k' op value`. The left side may be a computed expression
   (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a literal,
-  parameter, column, or scalar `(SELECT ...)`. Restrictions: subqueries
-  cannot appear inside `OR`, and computed left-hand sides work in
-  single-table queries only. `OR` conditions filter fetched rows — they
+  parameter, column, or scalar `(SELECT ...)`. Computed left-hand sides
+  and `->`/`->>` conjuncts work in joins too (evaluated on the joined
+  row). Restrictions: subqueries cannot appear inside `OR`. `OR`
+  conditions and path/computed conjuncts filter fetched rows — they
   never become index bounds, so pair them with an indexable `AND`
   condition on large tables.
 - **Expressions**: arithmetic `+ - * /` with standard precedence and
@@ -89,7 +103,10 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 - **Joins** execute left-deep in the order written (there is no
   reorderer — put the most selective table first). `ON` must equate a
   column of the newly joined table with one from an earlier table. Join
-  select lists are plain columns or `*`.
+  select lists take columns, `*`, expressions (`o.qty * 2`, rendered as
+  text), and `->`/`->>` paths; under `GROUP BY` they narrow to plain
+  columns and aggregates, and join `ORDER BY` sorts by side columns
+  (not computed aliases).
 - **Subqueries**: uncorrelated scalars anywhere a value goes; derived
   tables `FROM (SELECT ...) AS d`; correlated subqueries in
   `EXISTS`/`IN`/scalar positions up to 4 nesting levels.

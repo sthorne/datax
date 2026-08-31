@@ -336,11 +336,15 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
 	rd := &pgproto3.RowDescription{}
 	for _, col := range cols {
+		typmod := int32(-1)
+		if col.Typmod != 0 {
+			typmod = col.Typmod
+		}
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
 			Name:         []byte(col.Name),
 			DataTypeOID:  typeOID(col.Type),
 			DataTypeSize: typeSize(col.Type),
-			TypeModifier: -1,
+			TypeModifier: typmod,
 			Format:       0,
 		})
 	}
@@ -403,8 +407,9 @@ func encodeDatum(d types.Datum, format int16) []byte {
 		return []byte(d.S)
 	case types.Decimal:
 		// Real base-10000 NUMERIC: a text fallthrough under OID 1700 would
-		// corrupt clients that requested binary.
-		if enc, err := encodePGNumeric(d.S); err == nil {
+		// corrupt clients that requested binary. Text() (not S) so a
+		// DECIMAL(p,s) column's declared scale becomes the wire dscale.
+		if enc, err := encodePGNumeric(d.Text()); err == nil {
 			return enc
 		}
 		return []byte(d.Text())

@@ -470,7 +470,7 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type})
+		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
 	}
 	for _, fr := range rows {
 		out := make([]types.Datum, len(proj))

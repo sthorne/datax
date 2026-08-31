@@ -159,3 +159,45 @@ func TestFloat64CorrectlyRounded(t *testing.T) {
 		}
 	}
 }
+
+func TestQuantize(t *testing.T) {
+	for _, c := range []struct {
+		in    string
+		scale int32
+		want  string
+	}{
+		// Half-even ties.
+		{"0.125", 2, "0.12"},
+		{"0.135", 2, "0.14"},
+		{"1.005", 2, "1"}, // 100|5 → even 100 → canonical "1"
+		{"1.015", 2, "1.02"},
+		{"2.5", 0, "2"},
+		{"3.5", 0, "4"},
+		{"-0.125", 2, "-0.12"},
+		{"-2.5", 0, "-2"},
+		// Plain rounding.
+		{"9.999", 2, "10"},
+		{"1.004", 2, "1"},
+		{"1.006", 2, "1.01"},
+		{"-1.006", 2, "-1.01"},
+		// Already representable: unchanged (canonical form).
+		{"1.5", 2, "1.5"},
+		{"42", 2, "42"},
+		{"0", 4, "0"},
+		// Scale 0 truncates the fraction with rounding.
+		{"123.49", 0, "123"},
+		{"123.51", 0, "124"},
+	} {
+		d, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("parse %q: %v", c.in, err)
+		}
+		q, err := Quantize(d, c.scale)
+		if err != nil {
+			t.Fatalf("Quantize(%q, %d): %v", c.in, c.scale, err)
+		}
+		if got := q.String(); got != c.want {
+			t.Fatalf("Quantize(%q, %d) = %q, want %q", c.in, c.scale, got, c.want)
+		}
+	}
+}

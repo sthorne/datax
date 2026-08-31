@@ -42,21 +42,51 @@ SHOW TABLES
   `0.1` survives to a DECIMAL column unrounded, and `SUM`/`AVG` over
   DECIMAL stay exact where float64 breaks (`AVG` quantizes to 6 fractional
   digits, round-half-even). Int operands mix exactly; a FLOAT8 operand
-  demotes the expression to float. `DECIMAL(p,s)` is accepted and IGNORED
-  (no precision/scale enforcement yet). Float→Decimal coercion is
-  rejected — cast through text if you really mean it.
+  demotes the expression to float. Float→Decimal coercion is rejected —
+  cast through text if you really mean it.
+- `DECIMAL(p,s)` is enforced at the two row-completion choke points every
+  write funnels through (insert-row build — INSERT, COPY, defaults — and
+  the UPDATE SET loop): values quantize to scale `s` round-half-even,
+  then overflow past `p−s` integer digits is SQLSTATE `22003` (checked
+  after rounding, so `9.999` into `DECIMAL(3,2)` rounds to `10.00` and
+  then overflows — PostgreSQL order). Quantization happens before key
+  encoding, so DECIMAL primary keys and index entries store the rounded
+  value (two inserts that round together are a `23505`). Storage keeps
+  the canonical trailing-zero-stripped text — equality, grouping, and
+  memo identity are untouched — while the datum carries the declared
+  scale as a display-only field: `Text()` pads to it (`9.90`), and the
+  binary NUMERIC encoder derives its `dscale` from that padded render.
+  RowDescription reports the typmod (`(p<<16)|(s+4)`) for enforced
+  columns. Precision/scale live on the column descriptor as append-only
+  `omitempty` JSON fields (zero = bare DECIMAL, the pre-existing
+  meaning), so old descriptors and rolling upgrades are unaffected.
 - JSONB stores normalized text (sorted object keys, compact, duplicate
   keys last-wins). Numbers pass through `json.Number`, so integer
   fidelity is preserved on ingest; equality compares normalized text, and
   ordering comparisons are refused. Extraction: `col -> 'key'` (jsonb)
   and `col ->> 'key'` (text, terminal only), chainable
   (`j -> 'a' ->> 'b'`); missing keys and non-objects yield NULL.
-  Single-table queries only — path operators in join queries refuse with
-  `0A000` — and path conjuncts never become index bounds.
+  Path operators work in single-table queries and joins (select lists
+  and WHERE, evaluated on the joined row; grouped SELECT lists refuse
+  with `0A000`), and path conjuncts never become index bounds.
+- JSONB containment `@>` (and its NOT-elimination twin `NOT @>`): decoded
+  with `json.Number` and walked structurally — objects contain
+  recursively, arrays contain each right element via SOME left element,
+  a top-level array contains a matching scalar (top level only), scalars
+  compare by value with numbers compared NUMERICALLY through the decimal
+  package (`1` contains `1.0`; integers beyond float64 keep fidelity —
+  note the deliberate asymmetry with jsonb `=`, which stays normalized-
+  text comparison). Accepted only as a plain-column conjunct (optional
+  `->` path on the left, which must still produce jsonb); not in HAVING
+  or after a computed left-hand side; refused in join queries with
+  `0A000` (both in the filter and before base-scan pushdown — an
+  unhandled op there would silently drop rows). Never an index bound —
+  always a post-fetch filter; inverted indexes are out of scope.
 - Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
   omit the column store the default; an explicit NULL stays NULL.
-- WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`,
-  plus `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, and
+- WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`
+  (plus jsonb `@>` on jsonb columns), `col IS [NOT] NULL`,
+  `col [NOT] IN (list | SELECT ...)`, and
   `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, a
   column reference, or a scalar subquery `(SELECT ...)` (correlated in
   WHERE; uncorrelated ones also work in INSERT values and UPDATE SET).
@@ -93,10 +123,11 @@ on the recent side and the GC TTL (default 25h) on the old side.
 Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 join reordering (join order = syntactic order) and joins beyond 8 tables,
-expressions in join select lists,
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
-DECIMAL precision/scale enforcement (typmod parsed and ignored),
-JSONB indexing and containment (`@>`), path operators in join queries,
+typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
+JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
+`<@` and the `?`/`?|`/`?&` existence operators,
+path operators and expressions in GROUPED join select lists,
 DEFAULT expressions beyond constants.
 
 ## Catalog
@@ -245,7 +276,24 @@ Aggregates and GROUP BY compose with joins: the joined rows run through
 the grouped executor, with `GROUP BY c.name`, `SUM(o.total)`, HAVING and
 DISTINCT all accepting qualified references. ORDER BY on a grouped join
 orders by *result* column name (the same rule single-table GROUP BY
-follows). Plain (non-grouped) join select lists remain columns or `*`.
+follows).
+
+Plain (non-grouped) join select lists and WHERE conjuncts evaluate full
+expressions and `->`/`->>` paths against the joined row: expression
+evaluation is environment-abstracted (`exprEnv` — a column-lookup seam
+with a single-table and a join implementation), so the join side reuses
+the same literal/parameter/function/path/arithmetic machinery with
+side-resolved column references. A NULL-extended LEFT side yields NULL
+for its columns, which flows through paths and arithmetic as SQL NULL —
+and path conjuncts apply before the IS NULL arm, so
+`left.j ->> 'k' IS NULL` keeps NULL-extended rows. Computed select items
+render as TEXT (the single-table rule); path items type by their chain.
+Path and computed conjuncts are never pushed into the base scan (the
+post-join filter re-evaluates the full WHERE — pushing would only be an
+optimization, and for paths never a bound anyway). Remaining narrow
+spots, all explicit `0A000`s: grouped join SELECT lists take plain
+columns and aggregates only; `@>` stays single-table; join ORDER BY
+sorts by side columns, not computed aliases.
 
 Uncorrelated subqueries evaluate eagerly, inside the same transaction,
 before the outer statement plans: a scalar subquery splices in as a

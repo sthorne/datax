@@ -24,10 +24,18 @@ type ColumnID int32
 
 // Column is one column of a table.
 type Column struct {
-	ID      ColumnID     `json:"id"`
-	Name    string       `json:"name"`
-	Type    types.Family `json:"type"`
-	NotNull bool         `json:"not_null,omitempty"`
+	ID   ColumnID     `json:"id"`
+	Name string       `json:"name"`
+	Type types.Family `json:"type"`
+	// Precision/Scale enforce a DECIMAL(p,s) typmod: values are rescaled
+	// to Scale (round-half-even) on write and rejected (22003) when their
+	// integer digits exceed Precision−Scale. Zero Precision = bare
+	// DECIMAL, unconstrained — the safe pre-existing meaning, so old
+	// descriptors keep their behavior (append-only JSON, pkg/version
+	// rule 1).
+	Precision int32 `json:"precision,omitempty"`
+	Scale     int32 `json:"scale,omitempty"`
+	NotNull   bool  `json:"not_null,omitempty"`
 	// Default is the value INSERT uses when the column is omitted.
 	Default *types.Datum `json:"default,omitempty"`
 	// FillDefault marks a column added by ALTER TABLE ... DEFAULT: rows

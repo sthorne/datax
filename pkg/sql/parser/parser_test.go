@@ -400,3 +400,111 @@ func TestAsOfMaxStaleness(t *testing.T) {
 		}
 	}
 }
+
+func TestDecimalTypmod(t *testing.T) {
+	// Captured for DECIMAL and its aliases.
+	for _, src := range []string{
+		"CREATE TABLE t (a DECIMAL(10,2))",
+		"CREATE TABLE t (a NUMERIC(10,2))",
+	} {
+		stmts, err := Parse(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		ct := stmts[0].(*CreateTable)
+		if ct.Columns[0].Precision != 10 || ct.Columns[0].Scale != 2 {
+			t.Fatalf("%s: got (%d,%d)", src, ct.Columns[0].Precision, ct.Columns[0].Scale)
+		}
+	}
+	// Precision without scale: scale 0.
+	stmts, err := Parse("CREATE TABLE t (a DECIMAL(5))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := stmts[0].(*CreateTable).Columns[0]; c.Precision != 5 || c.Scale != 0 {
+		t.Fatalf("DECIMAL(5): got (%d,%d)", c.Precision, c.Scale)
+	}
+	// Bare DECIMAL: unconstrained.
+	stmts, err = Parse("CREATE TABLE t (a DECIMAL)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := stmts[0].(*CreateTable).Columns[0]; c.Precision != 0 || c.Scale != 0 {
+		t.Fatalf("bare DECIMAL: got (%d,%d)", c.Precision, c.Scale)
+	}
+	// ALTER TABLE ADD COLUMN carries it too.
+	stmts, err = Parse("ALTER TABLE t ADD COLUMN d DECIMAL(6,3)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := stmts[0].(*AlterTable).AddCol; c.Precision != 6 || c.Scale != 3 {
+		t.Fatalf("ADD COLUMN: got (%d,%d)", c.Precision, c.Scale)
+	}
+	// VARCHAR(n) still absorbed and ignored.
+	stmts, err = Parse("CREATE TABLE t (a VARCHAR(20))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := stmts[0].(*CreateTable).Columns[0]; c.Precision != 0 {
+		t.Fatalf("VARCHAR: got precision %d", c.Precision)
+	}
+	// Invalid bounds.
+	for _, src := range []string{
+		"CREATE TABLE t (a DECIMAL(0))",
+		"CREATE TABLE t (a DECIMAL(1001))",
+		"CREATE TABLE t (a DECIMAL(5,6))",
+		"CREATE TABLE t (a DECIMAL(1.5))",
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Fatalf("%s: accepted", src)
+		}
+	}
+}
+
+func TestJSONBContainmentParsing(t *testing.T) {
+	// Plain form, with and without a leading path.
+	stmts, err := Parse(`SELECT * FROM t WHERE j @> '{"a":1}'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "@>" || w[0].Column != "j" {
+		t.Fatalf("got %+v", w)
+	}
+	stmts, err = Parse(`SELECT * FROM t WHERE j -> 'a' @> '[1]'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "@>" || len(w[0].Path) != 1 {
+		t.Fatalf("pathed: %+v", w)
+	}
+	// NOT lowers to the negated op (and back under double negation).
+	stmts, err = Parse(`SELECT * FROM t WHERE NOT (j @> '{"a":1}')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 1 || w[0].Op != "NOT @>" {
+		t.Fatalf("negated: %+v", w)
+	}
+	// Inside OR with De Morgan round-trip.
+	stmts, err = Parse(`SELECT * FROM t WHERE NOT (j @> '{"a":1}' OR x = 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = stmts[0].(*Select).Where
+	if len(w) != 2 || w[0].Op != "NOT @>" || w[1].Op != "!=" {
+		t.Fatalf("de morgan: %+v", w)
+	}
+	// Rejected surfaces: computed LHS, HAVING, bare @.
+	for _, src := range []string{
+		`SELECT * FROM t WHERE x + 1 @> '1'`,
+		`SELECT a FROM t GROUP BY a HAVING count(*) @> '1'`,
+		`SELECT * FROM t WHERE j @ '1'`,
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Fatalf("%s: accepted", src)
+		}
+	}
+}

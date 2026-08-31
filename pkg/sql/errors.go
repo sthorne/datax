@@ -35,6 +35,8 @@ const (
 	CodeUndefinedObject       = "42704"
 	CodeDuplicateObject       = "42710"
 	CodeInvalidParameterValue = "22023"
+	// DECIMAL(p,s): integer digits exceed precision−scale.
+	CodeNumericValueOutOfRange = "22003"
 	// COPY FROM STDIN.
 	CodeInvalidTextRepresentation = "22P02"
 	CodeBadCopyFormat             = "22P04"

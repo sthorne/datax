@@ -68,6 +68,16 @@ func resolveMaxStaleness(operand string, now, localClosed hlc.Timestamp) (hlc.Ti
 type ResultColumn struct {
 	Name string
 	Type types.Family
+	// Typmod is PostgreSQL's atttypmod for the column (0 = none, emitted
+	// as -1 on the wire). Set only when a real DECIMAL(p,s) column backs
+	// the output: ((p<<16) | (s+4)).
+	Typmod int32
+}
+
+// DecimalTypmod encodes a DECIMAL(p,s) declaration as PostgreSQL's
+// atttypmod.
+func DecimalTypmod(precision, scale int32) int32 {
+	return precision<<16 | (scale + 4)
 }
 
 // Result is the outcome of one statement.
@@ -364,17 +374,55 @@ func (s *Session) rollback(ctx context.Context) {
 }
 
 // evalExpr evaluates an expression given an optional row context.
+// exprEnv resolves column references during expression evaluation: a
+// single table's descriptor+row, or a joined row with side-qualified
+// names. Everything else about evaluation (literals, params, functions,
+// paths, arithmetic) is environment-independent.
+type exprEnv interface {
+	col(name string) (types.Datum, error)
+}
+
+// tableEnv is the single-table environment: descriptor + row map. A nil
+// descriptor or row means column references are simply not available
+// (constant-only contexts like access planning).
+type tableEnv struct {
+	desc *catalog.TableDescriptor
+	row  map[catalog.ColumnID]types.Datum
+}
+
+func (t tableEnv) col(name string) (types.Datum, error) {
+	if t.desc == nil || t.row == nil {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q is not available in this context", name)
+	}
+	col, ok := t.desc.Col(name)
+	if !ok {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	}
+	d, ok := t.row[col.ID]
+	if !ok {
+		d = types.DNull
+	}
+	return d, nil
+}
+
+// evalExpr evaluates an expression against a single table's row — the
+// historical signature, kept for its many call sites; join evaluation
+// passes a joinEnv to evalExprEnv directly.
 func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+	return evalExprEnv(e, tableEnv{desc: desc, row: row}, params)
+}
+
+func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
 	var base types.Datum
 	switch {
 	case e.Left != nil:
-		d, err := evalExpr(*e.Left, desc, row, params)
+		d, err := evalExprEnv(*e.Left, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
 		base = d
 	case e.Func != "":
-		d, err := evalFunc(e, desc, row, params)
+		d, err := evalFunc(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -387,16 +435,9 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 		}
 		base = params[e.Param-1]
 	case e.Column != "":
-		if desc == nil || row == nil {
-			return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q is not available in this context", e.Column)
-		}
-		col, ok := desc.Col(e.Column)
-		if !ok {
-			return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", e.Column)
-		}
-		d, ok := row[col.ID]
-		if !ok {
-			d = types.DNull
+		d, err := env.col(e.Column)
+		if err != nil {
+			return types.Datum{}, err
 		}
 		base = d
 	case e.Sub != nil:
@@ -415,7 +456,7 @@ func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.Colu
 	if e.BinOp == "" {
 		return base, nil
 	}
-	rhs, err := evalExpr(*e.Right, desc, row, params)
+	rhs, err := evalExprEnv(*e.Right, env, params)
 	if err != nil {
 		return types.Datum{}, err
 	}
@@ -506,10 +547,10 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 
 // evalFunc evaluates a builtin scalar call ("now" never reaches here —
 // the session splices it before execution).
-func evalFunc(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
 	args := make([]types.Datum, len(e.Args))
 	for i, a := range e.Args {
-		d, err := evalExpr(a, desc, row, params)
+		d, err := evalExprEnv(a, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -650,6 +691,32 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			match, err := matchesIn(cmp, cmpType, lhs, desc, row, params)
 			if err != nil || !match {
 				return false, err
+			}
+			continue
+		}
+		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			// JSONB containment. The left side (post-path) must be jsonb —
+			// a terminal ->> produces text and is refused.
+			if cmpType != types.Jsonb {
+				return false, newErrf(CodeFeatureNotSupported, "@> requires jsonb operands (%s is %s)", cmp.Column, cmpType)
+			}
+			rhs, err := evalExpr(cmp.Value, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if lhs.Null || rhs.Null {
+				return false, nil // NULL operands: UNKNOWN either way
+			}
+			rhs, err = rhs.Coerce(types.Jsonb)
+			if err != nil {
+				return false, newErrf(CodeInvalidTextRepresentation, "WHERE %s @>: %v", cmp.Column, err)
+			}
+			ok, cerr := jsonbContains(lhs, rhs)
+			if cerr != nil {
+				return false, cerr
+			}
+			if ok != (cmp.Op == "@>") {
+				return false, nil
 			}
 			continue
 		}

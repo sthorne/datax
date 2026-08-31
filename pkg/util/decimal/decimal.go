@@ -251,6 +251,13 @@ func DivQuantize(a, b Dec, scale int32) (Dec, error) {
 // FromInt lifts an int64 exactly.
 func FromInt(i int64) Dec { return New(i, 0) }
 
+// Quantize returns a rounded half-even to the given decimal scale (digits
+// after the point), then canonicalized — so a value already representable
+// at that scale is unchanged. Used to enforce DECIMAL(p,s) column scale.
+func Quantize(a Dec, scale int32) (Dec, error) {
+	return DivQuantize(a, FromInt(1), scale)
+}
+
 // Float64 converts lossily (for Decimal→Float coercion), correctly
 // rounded: parsing the canonical string yields the nearest float64, so
 // Float64(Parse("0.42")) is bit-identical to the float literal 0.42.
