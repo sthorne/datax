@@ -324,29 +324,26 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 				return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
 			}
 		}
-		// A re-shard rewrites the table at a new primary index whose rows
-		// carry backfill-time MVCC timestamps: a historical read below the
-		// swap would silently miss rows, so it is refused. The CURRENT
-		// descriptor carries the stamp — the historical one predates it.
-		// Best-effort with a short timeout: it is a CURRENT-time read, and
-		// a partitioned leader must not hang a bounded-staleness read whose
-		// whole point is serving locally.
+		// Historical reads plan against the descriptor current AT their
+		// timestamp (the catalog reads it through the historical txn), so
+		// a read below a re-shard routes to the retired pre-swap layout.
+		// The guard refuses only when that layout has already been wiped
+		// by the janitor — its rows are gone, and the read would silently
+		// come back short. Checked per referenced table; best-effort with
+		// a short timeout on the current-descriptor read (a partitioned
+		// leader must not hang a bounded-staleness read whose whole point
+		// is serving locally).
+		txn := s.db.NewHistoricalTxn("sql-asof", ts)
 		if sel.Table != "" {
-			var resharded int64
-			gctx, gcancel := context.WithTimeout(ctx, 2*time.Second)
-			_ = s.db.RunTxn(gctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
-				if desc, derr := s.cat.Lookup(ctx, gtxn, sel.Table); derr == nil {
-					resharded = desc.ReshardedAt
-				}
-				return nil
-			})
-			gcancel()
-			if resharded > 0 && ts.WallTime < resharded {
-				return nil, newErrf(CodeFeatureNotSupported,
-					"historical read predates the re-shard of table %q; AS OF SYSTEM TIME must be at or after it", sel.Table)
+			if serr := s.checkHistoricalLayout(ctx, txn, sel.Table); serr != nil {
+				return nil, serr
 			}
 		}
-		txn := s.db.NewHistoricalTxn("sql-asof", ts)
+		for i := range sel.Joins {
+			if serr := s.checkHistoricalLayout(ctx, txn, sel.Joins[i].Table); serr != nil {
+				return nil, serr
+			}
+		}
 		res, serr := s.execSelect(ctx, txn, sel, params)
 		_ = txn.Commit(ctx) // read-only: releases nothing, marks finished
 		if serr != nil {

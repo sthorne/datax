@@ -125,6 +125,12 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 	return t
 }
 
+// Historical reports whether this is a read-only transaction pinned at a
+// fixed past timestamp (NewHistoricalTxn). Catalog lookups key off it:
+// a historical transaction reads the descriptor version current AT its
+// timestamp, never a cached or leased current one.
+func (t *Txn) Historical() bool { return t.historical }
+
 // TestingSetPriority overrides the transaction's conflict priority.
 // Deadlock tests use equal priorities so priority-based aborts (which
 // require a strictly greater pusher) cannot fire and cycle detection is

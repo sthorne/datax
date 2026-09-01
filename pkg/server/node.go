@@ -102,6 +102,11 @@ type Config struct {
 	// StatsStaleness is the statistics age that triggers a background
 	// re-collection (0 = default 10m).
 	StatsStaleness time.Duration
+	// ReshardRetireFor is how long a completed re-shard's superseded
+	// layout stays on disk serving AS OF SYSTEM TIME below the swap
+	// before the janitor reclaims it (0 = the GC TTL, matching the
+	// deepest admissible historical read).
+	ReshardRetireFor time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -435,6 +440,9 @@ func (n *Node) start() error {
 	}
 	n.startConsistencyLoop()
 	if err := n.stopper.RunWorker(n.statsRefreshLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)

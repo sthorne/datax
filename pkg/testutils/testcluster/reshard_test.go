@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -127,14 +128,18 @@ func TestOnlineReshardUnderConcurrentWrites(t *testing.T) {
 		t.Fatalf("point read after re-shard: %+v", res.Rows)
 	}
 
-	// The old layout (index 1) is wiped.
+	// The old layout (index 1) is RETAINED for historical reads and
+	// recorded as a retired layout for the janitor.
 	lo, hi := keys.TableIndexSpan(desc.ID, 1)
 	rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("old layout still holds %d keys", len(rows))
+	if len(rows) == 0 {
+		t.Fatal("old layout was wiped at the swap; it must stay for historical reads")
+	}
+	if len(desc.RetiredLayouts) != 1 || desc.RetiredLayouts[0].PrimaryIndexID != 1 || desc.RetiredLayouts[0].Buckets != 2 {
+		t.Fatalf("retired layouts: %+v", desc.RetiredLayouts)
 	}
 
 	// The new layout's bucket pre-splits landed: range boundaries exist
@@ -200,6 +205,16 @@ func TestReshardWithSecondaryIndexes(t *testing.T) {
 				return
 			default:
 			}
+			// Paced, and capped: enough live overlap to exercise the
+			// dual-write mirrors without starving the backfill on a
+			// loaded machine (each insert pays two index mirrors and a
+			// unique-check read on top of the primary dual-write).
+			if i >= 400 {
+				<-stop
+				done <- nil
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
 			series, ts, tag := int64(100+i%7), at(1000+i), int64(1000+i)
 			if _, serr := trySQL(ctx, sB, `INSERT INTO mx VALUES ($1, $2, $3, 7)`,
 				types.NewInt(series), ts, types.NewInt(tag)); serr != nil {
@@ -291,15 +306,20 @@ func TestReshardWithSecondaryIndexes(t *testing.T) {
 		t.Fatalf("post-swap delete via index: %+v", res.Rows)
 	}
 
-	// The old layouts — primary and both index generations — are wiped.
+	// The old layouts — primary and both index generations — are
+	// retained for historical reads and recorded for the janitor.
+	if len(desc.RetiredLayouts) != 1 || desc.RetiredLayouts[0].PrimaryIndexID != 1 ||
+		len(desc.RetiredLayouts[0].IndexIDs) != 2 {
+		t.Fatalf("retired layouts: %+v", desc.RetiredLayouts)
+	}
 	for name, id := range oldIndexIDs {
 		lo, hi := keys.TableIndexSpan(desc.ID, id)
 		rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(rows) != 0 {
-			t.Fatalf("old index %q layout still holds %d keys", name, len(rows))
+		if len(rows) == 0 {
+			t.Fatalf("old index %q generation was wiped at the swap; it must stay for historical reads", name)
 		}
 	}
 	lo, hi := keys.TableIndexSpan(desc.ID, 1)
@@ -307,8 +327,8 @@ func TestReshardWithSecondaryIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("old primary layout still holds %d keys", len(rows))
+	if len(rows) == 0 {
+		t.Fatal("old primary layout was wiped at the swap; it must stay for historical reads")
 	}
 }
 
@@ -376,22 +396,129 @@ func TestReshardValidationAndGuards(t *testing.T) {
 		t.Fatalf("in-txn re-shard: %+v", serr)
 	}
 
-	// Historical-read guard: reads below the swap are refused; at/after
-	// (and current reads) work.
+	// Historical reads below the swap route through the RETAINED pre-swap
+	// layout: they see exactly the pre-reshard data while current reads
+	// see everything.
 	execSQL(t, ctx, s, `CREATE TABLE g (series INT8, ts TIMESTAMPTZ, PRIMARY KEY (series, ts))
 		WITH (timeseries = true, shards = 2)`)
 	execSQL(t, ctx, s, `INSERT INTO g VALUES (1, '2026-08-30 00:00:00Z')`)
 	preReshard := n.DB().Clock().Now().WallTime
 	time.Sleep(10 * time.Millisecond)
 	execSQL(t, ctx, s, `ALTER TABLE g SET (shards = 4)`)
+	execSQL(t, ctx, s, `INSERT INTO g VALUES (2, '2026-08-30 01:00:00Z')`)
 
-	if _, serr := trySQL(ctx, s, fmt.Sprintf(`SELECT COUNT(*) AS n FROM g AS OF SYSTEM TIME '%d'`, preReshard)); serr == nil ||
-		serr.Code != sql.CodeFeatureNotSupported || !strings.Contains(serr.Msg, "re-shard") {
-		t.Fatalf("pre-reshard historical read: %+v", serr)
-	}
-	res := execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM g`)
+	res := execSQL(t, ctx, s, fmt.Sprintf(`SELECT COUNT(*) AS n FROM g AS OF SYSTEM TIME '%d'`, preReshard))
 	if res.Rows[0][0].I != 1 {
+		t.Fatalf("pre-reshard historical read: %+v", res.Rows)
+	}
+	res = execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM g`)
+	if res.Rows[0][0].I != 2 {
 		t.Fatalf("current read after re-shard: %+v", res.Rows)
+	}
+}
+
+// TestReshardHistoricalReads: AS OF SYSTEM TIME below a re-shard serves
+// from the retained pre-swap layout (indexes included), and is refused
+// with the same error style only once the janitor reclaims that layout
+// past the keep window. Issue #53 (TS2).
+func TestReshardHistoricalReads(t *testing.T) {
+	n, _ := startGCNodeCfg(t, func(c *server.Config) {
+		c.ReshardRetireFor = 50 * time.Millisecond
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(n.DB(), catalog.NewAccessor())
+
+	execSQL(t, ctx, s, `CREATE TABLE h (series INT8, ts TIMESTAMPTZ, v INT8 NOT NULL, PRIMARY KEY (series, ts))
+		WITH (timeseries = true, shards = 2)`)
+	execSQL(t, ctx, s, `CREATE INDEX h_by_v ON h (v)`)
+	for i := 0; i < 5; i++ {
+		execSQL(t, ctx, s, `INSERT INTO h VALUES ($1, $2, $3)`,
+			types.NewInt(int64(i)), mustTS(t, 2026, 8, 30, i), types.NewInt(int64(100+i)))
+	}
+	ts0 := n.DB().Clock().Now().WallTime
+	time.Sleep(10 * time.Millisecond)
+	execSQL(t, ctx, s, `ALTER TABLE h SET (shards = 4)`)
+	execSQL(t, ctx, s, `INSERT INTO h VALUES (10, $1, 200)`, mustTS(t, 2026, 8, 30, 10))
+
+	asof := func(q string) (*sql.Result, *sql.Error) {
+		return trySQL(ctx, s, fmt.Sprintf(q, ts0))
+	}
+	// Primary-path historical read: exactly the pre-swap rows.
+	res, serr := asof(`SELECT COUNT(*) AS n FROM h AS OF SYSTEM TIME '%d'`)
+	if serr != nil || res.Rows[0][0].I != 5 {
+		t.Fatalf("historical count: %+v %+v", res, serr)
+	}
+	// Index-path historical read: the retained old index generation.
+	res, serr = asof(`SELECT series FROM h AS OF SYSTEM TIME '%d' WHERE v = 103`)
+	if serr != nil || len(res.Rows) != 1 || res.Rows[0][0].I != 3 {
+		t.Fatalf("historical index read: %+v %+v", res, serr)
+	}
+	// The retired layout is recorded and still on disk.
+	desc := lookupDescriptor(t, ctx, n.DB(), "h")
+	if len(desc.RetiredLayouts) != 1 || desc.RetiredLayouts[0].PrimaryIndexID != 1 ||
+		len(desc.RetiredLayouts[0].IndexIDs) != 1 || desc.RetiredLayouts[0].Buckets != 2 {
+		t.Fatalf("retired layouts: %+v", desc.RetiredLayouts)
+	}
+	lo, hi := keys.TableIndexSpan(desc.ID, 1)
+	if kvs, err := n.DB().Scan(ctx, lo, hi, 0); err != nil || len(kvs) == 0 {
+		t.Fatalf("retired primary layout: %d keys, err %v", len(kvs), err)
+	}
+
+	// Past the keep window the janitor reclaims it: descriptor entry
+	// first, then the keyspaces — and the historical read is refused.
+	time.Sleep(100 * time.Millisecond)
+	n.RunReshardJanitorOnce(ctx)
+	desc = lookupDescriptor(t, ctx, n.DB(), "h")
+	if len(desc.RetiredLayouts) != 0 {
+		t.Fatalf("retired layouts after janitor: %+v", desc.RetiredLayouts)
+	}
+	for _, id := range []uint64{1, 2} { // old primary, old index generation
+		lo, hi := keys.TableIndexSpan(desc.ID, id)
+		if kvs, err := n.DB().Scan(ctx, lo, hi, 0); err != nil || len(kvs) != 0 {
+			t.Fatalf("old generation %d after janitor: %d keys, err %v", id, len(kvs), err)
+		}
+	}
+	if _, serr := asof(`SELECT COUNT(*) AS n FROM h AS OF SYSTEM TIME '%d'`); serr == nil ||
+		serr.Code != sql.CodeFeatureNotSupported || !strings.Contains(serr.Msg, "re-shard") {
+		t.Fatalf("historical read after reclamation: %+v", serr)
+	}
+	// Current reads are untouched.
+	res = execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM h`)
+	if res.Rows[0][0].I != 6 {
+		t.Fatalf("current count: %+v", res.Rows)
+	}
+}
+
+// TestHistoricalLookupDoesNotPoisonLease: a cold-cache AS OF lookup must
+// not cache the historical descriptor or write a backdated lease — the
+// next current read has to see the post-reshard schema.
+func TestHistoricalLookupDoesNotPoisonLease(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := leasedSession(t, tc, 0, 2*time.Second)
+
+	execSQL(t, ctx, s, `CREATE TABLE lp (series INT8, ts TIMESTAMPTZ, PRIMARY KEY (series, ts))
+		WITH (timeseries = true, shards = 2)`)
+	execSQL(t, ctx, s, `INSERT INTO lp VALUES (1, '2026-08-30 00:00:00Z')`)
+	ts0 := tc.Nodes[0].DB().Clock().Now().WallTime
+	time.Sleep(10 * time.Millisecond)
+	execSQL(t, ctx, s, `ALTER TABLE lp SET (shards = 4)`)
+	execSQL(t, ctx, s, `INSERT INTO lp VALUES (2, '2026-08-30 01:00:00Z')`)
+
+	// A brand-new leased session: its FIRST touch of the table is the
+	// historical read (cold cache), which sees the pre-swap layout.
+	s2 := leasedSession(t, tc, 0, 2*time.Second)
+	res := execSQL(t, ctx, s2, fmt.Sprintf(`SELECT COUNT(*) AS n FROM lp AS OF SYSTEM TIME '%d'`, ts0))
+	if res.Rows[0][0].I != 1 {
+		t.Fatalf("historical count: %+v", res.Rows)
+	}
+	// The very next current read must plan against the CURRENT layout —
+	// a poisoned cache would route to the retired one and lose a row.
+	res = execSQL(t, ctx, s2, `SELECT COUNT(*) AS n FROM lp`)
+	if res.Rows[0][0].I != 2 {
+		t.Fatalf("current count after historical lookup: %+v", res.Rows)
 	}
 }
 

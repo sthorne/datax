@@ -25,6 +25,12 @@ import (
 // test can inspect raw storage) and the background GC loop disabled (tests
 // drive GC explicitly via RunGCOnce).
 func startGCNode(t *testing.T) (*server.Node, *storage.Engine) {
+	return startGCNodeCfg(t)
+}
+
+// startGCNodeCfg is startGCNode with config overrides applied on top of
+// the fixture defaults.
+func startGCNodeCfg(t *testing.T, opts ...func(*server.Config)) (*server.Node, *storage.Engine) {
 	t.Helper()
 	eng, err := storage.Open("", storage.Options{})
 	if err != nil {
@@ -34,7 +40,7 @@ func startGCNode(t *testing.T) (*server.Node, *storage.Engine) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := server.Start(server.Config{
+	cfg := server.Config{
 		Listener: lis,
 		Engine:   eng,
 		GCTTL:    -1, // disable the background loop
@@ -43,7 +49,11 @@ func startGCNode(t *testing.T) (*server.Node, *storage.Engine) {
 			NodeID:    1,
 			Range1:    cluster.Range1Descriptor([]base.NodeID{1}),
 		},
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	n, err := server.Start(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

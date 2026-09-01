@@ -138,12 +138,24 @@ dipping to ~2,200 rows/s (dual-write amplification) and recovering to
 full speed on the new buckets the moment the swap landed — writes never
 stopped. Recorded runs live in issue #33.
 
+**Historical reads work across the swap.** The superseded layout is not
+wiped at the swap: it is recorded in the descriptor (`RetiredLayouts`)
+and stays on disk. An `AS OF SYSTEM TIME` below the swap reads the
+descriptor as of its own timestamp (descriptors are ordinary MVCC
+values), plans against the pre-swap layout — old bucket count, old
+primary index, old index generations — and returns exactly the data
+committed then. A background janitor (range-1 leader; keep window
+`ReshardRetireFor`, default the GC TTL — the deepest timestamp a
+historical read can use anyway) removes the descriptor entry first and
+then wipes the retired keyspaces; from that point a historical read
+below the swap is refused with a clear error instead of coming back
+short. Historical catalog lookups bypass the gateway's descriptor cache
+and take no lease, so they can never publish a backdated version.
+
 Scope: already-sharded timeseries tables only (the PK column list
-must stay identical so both layouts decode during dual-write); `AS OF
-SYSTEM TIME` below the swap is refused (the new layout's rows carry
-backfill-time MVCC timestamps); a handful of old-layout keys from
-statements in flight at the swap can survive the wipe as unreachable
-garbage.
+must stay identical so both layouts decode during dual-write); a handful
+of old-layout keys from statements in flight at the swap can survive the
+eventual wipe as unreachable garbage.
 
 ## Limitations
 

@@ -33,9 +33,12 @@ import (
 //     chunk's read and forces a rescan; a concurrent insert's dual-write
 //     writes the same bytes to the same key, so overlap is idempotent;
 //  4. swap: ShardBuckets = M, PrimaryIndex = NewIndexID, clear Reshard,
-//     stamp ReshardedAt; drain. Readers, writers, and the planner's
-//     fan-out all key off these together;
-//  5. wipe the old layout (best effort; unreachable either way).
+//     stamp ReshardedAt, record the superseded layout in RetiredLayouts;
+//     drain. Readers, writers, and the planner's fan-out all key off
+//     these together;
+//  5. deferred: retired layouts keep serving AS OF SYSTEM TIME below the
+//     swap (historical descriptor reads route to them) until the
+//     re-shard janitor (pkg/server) wipes them past the GC TTL.
 //
 // Secondary indexes ride the same machinery: their entries embed the
 // _shard value in the primary-key suffix, so each index is rebuilt at a
@@ -48,8 +51,8 @@ import (
 //
 // Scope guards: timeseries and already-sharded only (the PK column
 // list must stay identical so DecodePK serves both layouts during
-// dual-write); historical reads below ReshardedAt are refused (the new
-// layout's rows carry backfill-time MVCC timestamps).
+// dual-write); historical reads below ReshardedAt are refused only once
+// their layout has been wiped.
 
 // reshardShadowKey builds the in-flight re-shard's new-layout key for a
 // complete row; (nil, nil) when no re-shard is pending.
@@ -91,6 +94,43 @@ func reshardShadowRow(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 	return out, nil
 }
 
+// checkHistoricalLayout gates a historical read of one table: the
+// descriptor read through the historical transaction names the layout
+// current AT the read timestamp, and the read may proceed while that
+// layout is the live one or still retained (RetiredLayouts). Once the
+// janitor has wiped it, the read is refused — its rows are gone.
+// Best-effort beyond that: lookup failures fall through to execution
+// (which surfaces missing tables and GC-threshold errors itself), and
+// only sharded timeseries descriptors pay the current-descriptor read.
+func (s *Session) checkHistoricalLayout(ctx context.Context, htxn *kvclient.Txn, table string) *Error {
+	hdesc, err := s.cat.Lookup(ctx, htxn, table)
+	if err != nil || !hdesc.Timeseries || hdesc.ShardBuckets <= 0 {
+		return nil
+	}
+	layout := hdesc.LivePrimaryIndex()
+
+	var cur *catalog.TableDescriptor
+	gctx, gcancel := context.WithTimeout(ctx, 2*time.Second)
+	_ = s.db.RunTxn(gctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
+		cur, _ = s.cat.LookupFresh(ctx, gtxn, table)
+		return nil
+	})
+	gcancel()
+	if cur == nil || cur.ID != hdesc.ID {
+		return nil // guard unavailable (or the name was reused): best-effort
+	}
+	if layout == cur.LivePrimaryIndex() {
+		return nil
+	}
+	for _, rl := range cur.RetiredLayouts {
+		if rl.PrimaryIndexID == layout {
+			return nil // superseded, but still on disk
+		}
+	}
+	return newErrf(CodeFeatureNotSupported,
+		"historical read predates the re-shard of table %q and the old layout has been reclaimed; AS OF SYSTEM TIME must be at or after the re-shard", table)
+}
+
 // execReshardOnline runs the re-shard state machine. The session has
 // already rejected explicit-transaction contexts and checked admin.
 func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
@@ -107,7 +147,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 
 	// Step 1: publish the dual-write marker.
 	var tableID, newIndexID, oldIndexID uint64
-	var oldSecondaryIDs, newSecondaryIDs []uint64
+	var newSecondaryIDs []uint64
 	rerr := s.db.RunTxn(ctx, "reshard-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		shared, err := s.cat.Lookup(ctx, txn, t.Table)
 		if err != nil {
@@ -138,9 +178,8 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 		// Secondary-index entries embed the shard bucket in their
 		// primary-key suffix, so each index is rebuilt at a shadow ID and
 		// adopted at the swap together with the primary layout.
-		oldSecondaryIDs, newSecondaryIDs = nil, nil
-		for i := range desc.Indexes {
-			oldSecondaryIDs = append(oldSecondaryIDs, desc.Indexes[i].ID)
+		newSecondaryIDs = nil
+		for range desc.Indexes {
 			newSecondaryIDs = append(newSecondaryIDs, desc.NextIndexID)
 			desc.NextIndexID++
 		}
@@ -182,13 +221,24 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 			if len(desc.Indexes) != len(desc.Reshard.NewIndexIDs) {
 				return newErrf(CodeInternal, "re-shard shadow index set diverged from the table's indexes")
 			}
+			// The superseded layout stays on disk for historical reads
+			// (AS OF SYSTEM TIME below the swap plans against the
+			// pre-swap descriptor, which routes here); the re-shard
+			// janitor wipes it once RetiredAt ages out of the window.
+			retired := catalog.RetiredLayout{
+				PrimaryIndexID: desc.LivePrimaryIndex(),
+				Buckets:        desc.ShardBuckets,
+				RetiredAt:      s.db.Clock().Now().WallTime,
+			}
 			desc.ShardBuckets = newBuckets
 			desc.PrimaryIndex = newIndexID
 			for i := range desc.Indexes {
+				retired.IndexIDs = append(retired.IndexIDs, desc.Indexes[i].ID)
 				desc.Indexes[i].ID = desc.Reshard.NewIndexIDs[i]
 			}
 			desc.Reshard = nil
-			desc.ReshardedAt = s.db.Clock().Now().WallTime
+			desc.ReshardedAt = retired.RetiredAt
+			desc.RetiredLayouts = append(desc.RetiredLayouts, retired)
 			return s.cat.Update(ctx, txn, desc)
 		})
 	}
@@ -225,13 +275,11 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	// pointed at the old layout for one statement's lifetime.
 	sleepGrace(ctx)
 
-	// Step 5: the old layout — primary rows and every secondary index's
-	// old-ID entries — is unreachable; reclaim it. Emptied ranges get
-	// re-absorbed by the size-based merger.
-	s.wipeIndexEntries(ctx, tableID, oldIndexID)
-	for _, id := range oldSecondaryIDs {
-		s.wipeIndexEntries(ctx, tableID, id)
-	}
+	// Step 5 is deferred: the old layout — primary rows and every
+	// secondary index's old-ID entries — is unreachable by current reads
+	// but still serves AS OF SYSTEM TIME below the swap. The re-shard
+	// janitor reclaims it (RetiredLayouts) once the historical window
+	// lapses.
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
