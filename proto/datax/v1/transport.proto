@@ -45,6 +45,25 @@ message RaftEnvelope {
   // traffic itself, so elections never depend on reading the (possibly
   // leaderless) registry range.
   string from_addr = 7;
+  // The sender's storage-health snapshot, piggybacked so leaders can factor
+  // follower health into their write path with no extra traffic. Old
+  // receivers ignore the field (benign — they just keep leader-only
+  // backpressure).
+  StorageHealth health = 8;
+}
+
+// StorageHealth is a node's storage-health snapshot. `overloaded` is the
+// sender's own soft-gate verdict against its storage profile (the numbers
+// are advisory detail — the receiver never re-judges them, so profiles
+// stay a per-node concern).
+message StorageHealth {
+  bool overloaded = 1;
+  string reason = 2;
+  int64 l0_sublevels = 3;
+  int64 l0_files = 4;
+  int64 compaction_debt_bytes = 5;
+  int64 memtable_bytes = 6;
+  int64 wall_time = 7; // sender wall clock, for staleness checks
 }
 
 message RaftAck {}

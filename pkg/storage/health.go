@@ -34,6 +34,10 @@ type health struct {
 	snapshot  atomic.Pointer[StorageMetrics]
 	refreshed atomic.Int64 // unix nanos of the last snapshot refresh
 	gate      softGate
+	// Compaction-debt gate latch (hysteresis: set at >= debtHigh, cleared
+	// at <= debtLow), updated on snapshot refresh.
+	debtGated       atomic.Bool
+	debtGateEntries atomic.Int64
 }
 
 // StorageMetrics returns the engine's health snapshot, refreshing it from
@@ -63,25 +67,69 @@ func (e *Engine) StorageMetrics() StorageMetrics {
 		BackgroundErrors:    e.health.bgErrors.Load(),
 	}
 	e.health.snapshot.Store(&s)
+	e.updateDebtGate(s.CompactionDebtBytes)
 	return s
 }
+
+// updateDebtGate applies the debt gate's hysteresis to a fresh reading.
+func (e *Engine) updateDebtGate(debt uint64) {
+	g := e.health.gate
+	if g.debtHigh == 0 {
+		return
+	}
+	if e.health.debtGated.Load() {
+		if debt <= g.debtLow {
+			e.health.debtGated.Store(false)
+		}
+	} else if debt >= g.debtHigh {
+		if e.health.debtGated.CompareAndSwap(false, true) {
+			e.health.debtGateEntries.Add(1)
+		}
+	}
+}
+
+// DebtGated reports whether the compaction-debt gate is currently latched.
+func (e *Engine) DebtGated() bool { return e.health.debtGated.Load() }
+
+// DebtGateEntries counts how many times the debt gate has latched.
+func (e *Engine) DebtGateEntries() int64 { return e.health.debtGateEntries.Load() }
+
+// OverloadCause classifies why the engine is overloaded: "engine" for the
+// immediate write-path signals (stall, L0 depth, memtable backlog), "debt"
+// for the latched compaction-debt gate.
+type OverloadCause string
+
+const (
+	CauseEngine OverloadCause = "engine"
+	CauseDebt   OverloadCause = "debt"
+)
 
 // Overloaded reports whether the engine has crossed the profile's soft
 // backpressure thresholds, with a reason naming the tripped signal. It is
 // called on every KV write, so it only ever reads the cached snapshot.
 func (e *Engine) Overloaded() (bool, string) {
+	over, _, why := e.OverloadedCause()
+	return over, why
+}
+
+// OverloadedCause is Overloaded with the tripped signal classified — the
+// immediate engine gates are checked first, the (latched) debt gate last.
+func (e *Engine) OverloadedCause() (bool, OverloadCause, string) {
 	if e.health.inStall.Load() {
-		return true, "pebble write stall in progress"
+		return true, CauseEngine, "pebble write stall in progress"
 	}
 	s := e.StorageMetrics()
 	g := e.health.gate
 	switch {
 	case g.l0Sublevels > 0 && s.L0Sublevels >= g.l0Sublevels:
-		return true, fmt.Sprintf("L0 sublevels %d >= %d", s.L0Sublevels, g.l0Sublevels)
+		return true, CauseEngine, fmt.Sprintf("L0 sublevels %d >= %d", s.L0Sublevels, g.l0Sublevels)
 	case g.l0Files > 0 && s.L0Files >= g.l0Files:
-		return true, fmt.Sprintf("L0 files %d >= %d", s.L0Files, g.l0Files)
+		return true, CauseEngine, fmt.Sprintf("L0 files %d >= %d", s.L0Files, g.l0Files)
 	case g.memtableBytes > 0 && s.MemtableBytes >= g.memtableBytes:
-		return true, fmt.Sprintf("memtable bytes %d >= %d", s.MemtableBytes, g.memtableBytes)
+		return true, CauseEngine, fmt.Sprintf("memtable bytes %d >= %d", s.MemtableBytes, g.memtableBytes)
+	case e.health.debtGated.Load():
+		return true, CauseDebt, fmt.Sprintf("compaction debt %d latched above %d (releases at %d)",
+			s.CompactionDebtBytes, g.debtHigh, g.debtLow)
 	}
-	return false, ""
+	return false, "", ""
 }

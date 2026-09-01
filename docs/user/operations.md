@@ -30,10 +30,11 @@ Full list: scrape `/metrics`. The load-bearing ones:
 
 | Metric | Alert when | Meaning |
 |---|---|---|
-| `datax_storage_backpressure_total` | increasing | writes are being shed; LSM can't keep up — see [Backpressure](#backpressure) |
+| `datax_storage_backpressure_total` | increasing | writes are being shed — `datax_storage_backpressure_cause_total{cause=leader\|debt\|follower}` says which limit; see [Backpressure](#backpressure) |
 | `datax_storage_write_stalls_total` | increasing at all | Pebble hard-stalled writes; you're past backpressure |
 | `datax_storage_l0_sublevels` / `datax_storage_l0_files` | sustained ≥ 10 / ≥ 400 | compaction falling behind |
 | `datax_storage_compaction_debt_bytes` | growing without bound | ingest exceeds compaction budget |
+| `datax_storage_debt_gate` | 1 for long stretches | the compaction-debt gate is latched (writes shed with `cause=debt` until debt halves) |
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
@@ -198,8 +199,24 @@ This can lose recently committed writes on the dead replicas — hence
 When the LSM falls behind (L0 too deep, memtables full), nodes shed
 table-data writes with a retryable storage-overload error rather than
 letting the engine hard-stall; clients see higher latency, not failures
-(the built-in retry loop absorbs it). Sustained backpressure means the disk
-can't take the write rate: switch heavy loaders to the `ingest`
+(the built-in retry loop absorbs it). Three limits feed the same shed
+path, told apart by `datax_storage_backpressure_cause_total`:
+
+- **`cause=leader`** — the leaseholder's own engine crossed its
+  profile's L0/memtable thresholds (or Pebble is mid-stall).
+- **`cause=debt`** — the leaseholder's compaction debt latched above the
+  profile's high water (`datax_storage_debt_gate` = 1); it releases only
+  once debt halves, so sustained ingest cannot outrun compaction
+  indefinitely.
+- **`cause=follower`** — some OTHER member of the range's replica set is
+  overloaded. Nodes piggyback their health verdict on raft traffic, and
+  leaders shed rather than let a sick follower lag raft without bound
+  (unbounded lag ends in catch-up snapshots, or one more failure away
+  from quorum loss). The error names the node; check that node's
+  storage tiles.
+
+Sustained backpressure means a disk can't take the write rate: switch
+heavy loaders to the `ingest`
 [storage profile](deployment.md#storage-profiles), slow the load, or add
 nodes. Retention GC and re-shard backfills compete for the same LSM budget
 — schedule bulk loads away from them.

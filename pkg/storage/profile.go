@@ -55,6 +55,13 @@ type softGate struct {
 	l0Sublevels   int
 	l0Files       int
 	memtableBytes uint64
+	// Compaction-debt gate, with hysteresis: enter above debtHigh, exit
+	// below debtLow (a single threshold would flap on every compaction).
+	// Debt measures scheduled-but-unfinished compaction work, so a
+	// sustained ingest that outruns compaction trips it long before L0
+	// shape does.
+	debtHigh uint64
+	debtLow  uint64
 }
 
 // apply sets the profile's Pebble options and returns its soft gate.
@@ -81,10 +88,14 @@ func (p Profile) apply(opts *pebble.Options) softGate {
 		// the stop threshold allows) means flushing is clearly behind.
 		// (Pebble's MemTable.Count is just len(queue) and idles well above
 		// 1, so bytes — not count — is the backlog signal.)
-		return softGate{l0Sublevels: 20, l0Files: 1500, memtableBytes: 3 * (64 << 20)}
+		// Debt: the ingest profile compacts aggressively, so debt this deep
+		// means ingest has outrun the compaction budget for a while.
+		return softGate{l0Sublevels: 20, l0Files: 1500, memtableBytes: 3 * (64 << 20),
+			debtHigh: 8 << 30, debtLow: 4 << 30}
 	default:
 		// Balanced: leave every Pebble option at its default; no memtable
 		// criterion (tiny default memtables make byte thresholds twitchy).
-		return softGate{l0Sublevels: 10, l0Files: 400}
+		return softGate{l0Sublevels: 10, l0Files: 400,
+			debtHigh: 2 << 30, debtLow: 1 << 30}
 	}
 }

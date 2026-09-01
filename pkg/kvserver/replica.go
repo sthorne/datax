@@ -15,6 +15,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -888,14 +889,37 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// what dig it out. EndTxn/pushes/resolves write no MVCC versions and
 	// are exempt via HasMVCCWrites, so intent cleanup is never blocked.
 	if ba.HasMVCCWrites() && !isGCBatch(ba) && batchIsTableData(ba) {
-		over, why := false, ""
+		over, cause, why := false, "leader", ""
 		if k := r.store.cfg.TestingKnobs.OverrideOverloaded; k != nil {
 			over, why = k()
 		} else if eng := r.store.cfg.Engine; eng != nil {
-			over, why = eng.Overloaded()
+			var c storage.OverloadCause
+			over, c, why = eng.OverloadedCause()
+			if c == storage.CauseDebt {
+				cause = "debt"
+			}
+		}
+		if !over {
+			// Quorum health: an overloaded member ANYWHERE in the replica
+			// set sheds too — a sick follower otherwise lags raft silently
+			// until it needs a catch-up snapshot (or the range quietly
+			// rides one node from quorum loss). Verdicts are piggybacked
+			// on raft traffic; absent/stale ones read as healthy.
+			desc := r.Desc()
+			for _, rep := range desc.Replicas {
+				if rep.NodeID == r.store.cfg.NodeID {
+					continue
+				}
+				if o, fwhy := r.store.NodeOverloaded(rep.NodeID); o {
+					over, cause = true, "follower"
+					why = fmt.Sprintf("follower n%d overloaded: %s", rep.NodeID, fwhy)
+					break
+				}
+			}
 		}
 		if over {
 			metrics.StorageBackpressure.Inc()
+			metrics.StorageBackpressureCause.WithLabelValues(cause).Inc()
 			e := kvpb.NewErrorf("%s: storage overloaded, write shed: %s", r.rangeID, why)
 			e.StorageOverloaded = &kvpb.StorageOverloadedError{}
 			e.TxnRetry = &kvpb.TxnRetryError{}

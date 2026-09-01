@@ -12,12 +12,11 @@
 package rpcpb
 
 import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
-
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -92,7 +91,12 @@ type RaftEnvelope struct {
 	// The sender's RPC address: receivers learn peer addresses from Raft
 	// traffic itself, so elections never depend on reading the (possibly
 	// leaderless) registry range.
-	FromAddr      string `protobuf:"bytes,7,opt,name=from_addr,json=fromAddr,proto3" json:"from_addr,omitempty"`
+	FromAddr string `protobuf:"bytes,7,opt,name=from_addr,json=fromAddr,proto3" json:"from_addr,omitempty"`
+	// The sender's storage-health snapshot, piggybacked so leaders can factor
+	// follower health into their write path with no extra traffic. Old
+	// receivers ignore the field (benign — they just keep leader-only
+	// backpressure).
+	Health        *StorageHealth `protobuf:"bytes,8,opt,name=health,proto3" json:"health,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -176,6 +180,109 @@ func (x *RaftEnvelope) GetFromAddr() string {
 	return ""
 }
 
+func (x *RaftEnvelope) GetHealth() *StorageHealth {
+	if x != nil {
+		return x.Health
+	}
+	return nil
+}
+
+// StorageHealth is a node's storage-health snapshot. `overloaded` is the
+// sender's own soft-gate verdict against its storage profile (the numbers
+// are advisory detail — the receiver never re-judges them, so profiles
+// stay a per-node concern).
+type StorageHealth struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	Overloaded          bool                   `protobuf:"varint,1,opt,name=overloaded,proto3" json:"overloaded,omitempty"`
+	Reason              string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	L0Sublevels         int64                  `protobuf:"varint,3,opt,name=l0_sublevels,json=l0Sublevels,proto3" json:"l0_sublevels,omitempty"`
+	L0Files             int64                  `protobuf:"varint,4,opt,name=l0_files,json=l0Files,proto3" json:"l0_files,omitempty"`
+	CompactionDebtBytes int64                  `protobuf:"varint,5,opt,name=compaction_debt_bytes,json=compactionDebtBytes,proto3" json:"compaction_debt_bytes,omitempty"`
+	MemtableBytes       int64                  `protobuf:"varint,6,opt,name=memtable_bytes,json=memtableBytes,proto3" json:"memtable_bytes,omitempty"`
+	WallTime            int64                  `protobuf:"varint,7,opt,name=wall_time,json=wallTime,proto3" json:"wall_time,omitempty"` // sender wall clock, for staleness checks
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *StorageHealth) Reset() {
+	*x = StorageHealth{}
+	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StorageHealth) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StorageHealth) ProtoMessage() {}
+
+func (x *StorageHealth) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StorageHealth.ProtoReflect.Descriptor instead.
+func (*StorageHealth) Descriptor() ([]byte, []int) {
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *StorageHealth) GetOverloaded() bool {
+	if x != nil {
+		return x.Overloaded
+	}
+	return false
+}
+
+func (x *StorageHealth) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *StorageHealth) GetL0Sublevels() int64 {
+	if x != nil {
+		return x.L0Sublevels
+	}
+	return 0
+}
+
+func (x *StorageHealth) GetL0Files() int64 {
+	if x != nil {
+		return x.L0Files
+	}
+	return 0
+}
+
+func (x *StorageHealth) GetCompactionDebtBytes() int64 {
+	if x != nil {
+		return x.CompactionDebtBytes
+	}
+	return 0
+}
+
+func (x *StorageHealth) GetMemtableBytes() int64 {
+	if x != nil {
+		return x.MemtableBytes
+	}
+	return 0
+}
+
+func (x *StorageHealth) GetWallTime() int64 {
+	if x != nil {
+		return x.WallTime
+	}
+	return 0
+}
+
 type RaftAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -184,7 +291,7 @@ type RaftAck struct {
 
 func (x *RaftAck) Reset() {
 	*x = RaftAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	mi := &file_datax_v1_transport_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -196,7 +303,7 @@ func (x *RaftAck) String() string {
 func (*RaftAck) ProtoMessage() {}
 
 func (x *RaftAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	mi := &file_datax_v1_transport_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -209,7 +316,7 @@ func (x *RaftAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAck.ProtoReflect.Descriptor instead.
 func (*RaftAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{2}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{3}
 }
 
 type Payload struct {
@@ -226,7 +333,7 @@ type Payload struct {
 
 func (x *Payload) Reset() {
 	*x = Payload{}
-	mi := &file_datax_v1_transport_proto_msgTypes[3]
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -238,7 +345,7 @@ func (x *Payload) String() string {
 func (*Payload) ProtoMessage() {}
 
 func (x *Payload) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[3]
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -251,7 +358,7 @@ func (x *Payload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Payload.ProtoReflect.Descriptor instead.
 func (*Payload) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{3}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Payload) GetJson() []byte {
@@ -288,7 +395,7 @@ type SnapshotChunk struct {
 
 func (x *SnapshotChunk) Reset() {
 	*x = SnapshotChunk{}
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -300,7 +407,7 @@ func (x *SnapshotChunk) String() string {
 func (*SnapshotChunk) ProtoMessage() {}
 
 func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -313,7 +420,7 @@ func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
 func (*SnapshotChunk) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *SnapshotChunk) GetHeaderJson() []byte {
@@ -347,7 +454,7 @@ type SnapshotKV struct {
 
 func (x *SnapshotKV) Reset() {
 	*x = SnapshotKV{}
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -359,7 +466,7 @@ func (x *SnapshotKV) String() string {
 func (*SnapshotKV) ProtoMessage() {}
 
 func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -372,7 +479,7 @@ func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotKV.ProtoReflect.Descriptor instead.
 func (*SnapshotKV) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *SnapshotKV) GetKey() []byte {
@@ -397,7 +504,7 @@ type SnapshotAck struct {
 
 func (x *SnapshotAck) Reset() {
 	*x = SnapshotAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -409,7 +516,7 @@ func (x *SnapshotAck) String() string {
 func (*SnapshotAck) ProtoMessage() {}
 
 func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -422,7 +529,7 @@ func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotAck.ProtoReflect.Descriptor instead.
 func (*SnapshotAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{7}
 }
 
 var File_datax_v1_transport_proto protoreflect.FileDescriptor
@@ -432,7 +539,7 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\x18datax/v1/transport.proto\x12\bdatax.v1\"<\n" +
 	"\x03Hlc\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
-	"\alogical\x18\x02 \x01(\x05R\alogical\"\xe0\x01\n" +
+	"\alogical\x18\x02 \x01(\x05R\alogical\"\x91\x02\n" +
 	"\fRaftEnvelope\x12\x19\n" +
 	"\brange_id\x18\x01 \x01(\x03R\arangeId\x12\x1d\n" +
 	"\n" +
@@ -441,7 +548,18 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\tfrom_node\x18\x04 \x01(\x05R\bfromNode\x12\x18\n" +
 	"\amessage\x18\x05 \x01(\fR\amessage\x12\x1f\n" +
 	"\x03now\x18\x06 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1b\n" +
-	"\tfrom_addr\x18\a \x01(\tR\bfromAddr\"\t\n" +
+	"\tfrom_addr\x18\a \x01(\tR\bfromAddr\x12/\n" +
+	"\x06health\x18\b \x01(\v2\x17.datax.v1.StorageHealthR\x06health\"\xfd\x01\n" +
+	"\rStorageHealth\x12\x1e\n" +
+	"\n" +
+	"overloaded\x18\x01 \x01(\bR\n" +
+	"overloaded\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12!\n" +
+	"\fl0_sublevels\x18\x03 \x01(\x03R\vl0Sublevels\x12\x19\n" +
+	"\bl0_files\x18\x04 \x01(\x03R\al0Files\x122\n" +
+	"\x15compaction_debt_bytes\x18\x05 \x01(\x03R\x13compactionDebtBytes\x12%\n" +
+	"\x0ememtable_bytes\x18\x06 \x01(\x03R\rmemtableBytes\x12\x1b\n" +
+	"\twall_time\x18\a \x01(\x03R\bwallTime\"\t\n" +
 	"\aRaftAck\"T\n" +
 	"\aPayload\x12\x12\n" +
 	"\x04json\x18\x01 \x01(\fR\x04json\x12\x1f\n" +
@@ -476,36 +594,38 @@ func file_datax_v1_transport_proto_rawDescGZIP() []byte {
 	return file_datax_v1_transport_proto_rawDescData
 }
 
-var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_datax_v1_transport_proto_goTypes = []any{
 	(*Hlc)(nil),           // 0: datax.v1.Hlc
 	(*RaftEnvelope)(nil),  // 1: datax.v1.RaftEnvelope
-	(*RaftAck)(nil),       // 2: datax.v1.RaftAck
-	(*Payload)(nil),       // 3: datax.v1.Payload
-	(*SnapshotChunk)(nil), // 4: datax.v1.SnapshotChunk
-	(*SnapshotKV)(nil),    // 5: datax.v1.SnapshotKV
-	(*SnapshotAck)(nil),   // 6: datax.v1.SnapshotAck
+	(*StorageHealth)(nil), // 2: datax.v1.StorageHealth
+	(*RaftAck)(nil),       // 3: datax.v1.RaftAck
+	(*Payload)(nil),       // 4: datax.v1.Payload
+	(*SnapshotChunk)(nil), // 5: datax.v1.SnapshotChunk
+	(*SnapshotKV)(nil),    // 6: datax.v1.SnapshotKV
+	(*SnapshotAck)(nil),   // 7: datax.v1.SnapshotAck
 }
 var file_datax_v1_transport_proto_depIdxs = []int32{
-	0, // 0: datax.v1.RaftEnvelope.now:type_name -> datax.v1.Hlc
-	0, // 1: datax.v1.Payload.now:type_name -> datax.v1.Hlc
-	5, // 2: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
-	0, // 3: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
-	1, // 4: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
-	3, // 5: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
-	3, // 6: datax.v1.Internode.Join:input_type -> datax.v1.Payload
-	3, // 7: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
-	4, // 8: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
-	2, // 9: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
-	3, // 10: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
-	3, // 11: datax.v1.Internode.Join:output_type -> datax.v1.Payload
-	3, // 12: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
-	6, // 13: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
-	9, // [9:14] is the sub-list for method output_type
-	4, // [4:9] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	0,  // 0: datax.v1.RaftEnvelope.now:type_name -> datax.v1.Hlc
+	2,  // 1: datax.v1.RaftEnvelope.health:type_name -> datax.v1.StorageHealth
+	0,  // 2: datax.v1.Payload.now:type_name -> datax.v1.Hlc
+	6,  // 3: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
+	0,  // 4: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
+	1,  // 5: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
+	4,  // 6: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
+	4,  // 7: datax.v1.Internode.Join:input_type -> datax.v1.Payload
+	4,  // 8: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
+	5,  // 9: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
+	3,  // 10: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
+	4,  // 11: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
+	4,  // 12: datax.v1.Internode.Join:output_type -> datax.v1.Payload
+	4,  // 13: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
+	7,  // 14: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
+	10, // [10:15] is the sub-list for method output_type
+	5,  // [5:10] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_transport_proto_init() }
@@ -519,7 +639,7 @@ func file_datax_v1_transport_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_transport_proto_rawDesc), len(file_datax_v1_transport_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -84,6 +84,17 @@ func (n *Node) startHTTP() error {
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "datax_storage_disk_slow_total", Help: "Slow-disk events reported by Pebble.",
 			}, func() float64 { return float64(eng.StorageMetrics().DiskSlowEvents) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_debt_gate", Help: "1 while the compaction-debt backpressure gate is latched (hysteresis: enters above the profile's high-water debt, exits below the low).",
+			}, func() float64 {
+				if eng.DebtGated() {
+					return 1
+				}
+				return 0
+			}),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_debt_gate_entered_total", Help: "Times the compaction-debt gate latched.",
+			}, func() float64 { return float64(eng.DebtGateEntries()) }),
 		)
 	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}

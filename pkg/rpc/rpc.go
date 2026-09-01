@@ -40,6 +40,9 @@ type ServerHandlers struct {
 	Snapshot SnapshotHandler
 	// NodeInfo learns a peer's address from its Raft envelopes.
 	NodeInfo func(id base.NodeID, addr string)
+	// NodeHealth learns a peer's storage-health snapshot from its Raft
+	// envelopes (see rpcpb.StorageHealth).
+	NodeHealth func(id base.NodeID, h *rpcpb.StorageHealth)
 }
 
 // Server implements rpcpb.InternodeServer.
@@ -107,6 +110,9 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 		s.updateClock(env.Now)
 		if s.handlers.NodeInfo != nil && env.FromNode != 0 && env.FromAddr != "" {
 			s.handlers.NodeInfo(base.NodeID(env.FromNode), env.FromAddr)
+		}
+		if s.handlers.NodeHealth != nil && env.FromNode != 0 && env.Health != nil {
+			s.handlers.NodeHealth(base.NodeID(env.FromNode), env.Health)
 		}
 		var m raftpb.Message
 		if err := m.Unmarshal(env.Message); err != nil {

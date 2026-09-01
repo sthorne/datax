@@ -44,6 +44,12 @@ type Transport struct {
 	localNode base.NodeID
 	localAddr string
 
+	// healthProv supplies this node's storage-health snapshot, piggybacked
+	// on outgoing raft envelopes (refreshed at most every healthCacheFor).
+	healthProv  atomic.Pointer[func() *rpcpb.StorageHealth]
+	healthCache atomic.Pointer[rpcpb.StorageHealth]
+	healthAt    atomic.Int64
+
 	mu struct {
 		sync.Mutex
 		conns map[base.NodeID]*conn
@@ -66,6 +72,38 @@ func NewTransport(clock *hlc.Clock, stopper *stop.Stopper, resolver Resolver) *T
 // SetTLS installs the client TLS configuration used for all outbound
 // connections (call before any dialing; nil keeps cleartext).
 func (t *Transport) SetTLS(cfg *tls.Config) { t.tlsCfg = cfg }
+
+// healthCacheFor bounds how often the health provider is consulted — raft
+// traffic is per-range and hot, the snapshot is per-node and slow-moving.
+const healthCacheFor = 500 * time.Millisecond
+
+// SetHealthProvider installs the source of this node's storage-health
+// snapshot, attached to every outgoing Raft envelope so peers' leaders can
+// factor this node's health into their write path (nil = no piggyback).
+func (t *Transport) SetHealthProvider(fn func() *rpcpb.StorageHealth) {
+	if fn == nil {
+		t.healthProv.Store(nil)
+		return
+	}
+	t.healthProv.Store(&fn)
+}
+
+func (t *Transport) health() *rpcpb.StorageHealth {
+	p := t.healthProv.Load()
+	if p == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	if h := t.healthCache.Load(); h != nil && now-t.healthAt.Load() < int64(healthCacheFor) {
+		return h
+	}
+	h := (*p)()
+	if h != nil {
+		t.healthCache.Store(h)
+		t.healthAt.Store(now)
+	}
+	return h
+}
 
 // SetLocalInfo records this node's identity, piggybacked on outgoing Raft
 // envelopes so peers learn our address from Raft traffic itself.
@@ -158,6 +196,7 @@ func (t *Transport) SendRaftMessage(ctx context.Context, to base.NodeID, rangeID
 		FromAddr:    localAddr,
 		Now:         t.now(),
 		Message:     raw,
+		Health:      t.health(),
 	}
 	t.mu.Lock()
 	q, ok := t.mu.raftQ[to]

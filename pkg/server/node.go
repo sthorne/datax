@@ -23,6 +23,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
@@ -370,6 +371,30 @@ func (n *Node) start() error {
 	n.store.SetSender(n.db)
 
 	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
+	// Piggyback this node's storage-health verdict on outgoing raft
+	// envelopes, so peers' leaders can factor it into their write path.
+	// The testing knob is consulted first — the advertised verdict must
+	// match the one this node's own gate would apply.
+	n.trans.SetHealthProvider(func() *rpcpb.StorageHealth {
+		var (
+			over bool
+			why  string
+		)
+		if k := n.cfg.TestingKnobs.OverrideOverloaded; k != nil {
+			over, why = k()
+		} else if n.engine != nil {
+			over, _, why = n.engine.OverloadedCause()
+		}
+		h := &rpcpb.StorageHealth{Overloaded: over, Reason: why, WallTime: time.Now().UnixNano()}
+		if n.engine != nil {
+			m := n.engine.StorageMetrics()
+			h.L0Sublevels = int64(m.L0Sublevels)
+			h.L0Files = int64(m.L0Files)
+			h.CompactionDebtBytes = int64(m.CompactionDebtBytes)
+			h.MemtableBytes = int64(m.MemtableBytes)
+		}
+		return h
+	})
 	var serverTLS *tls.Config
 	if n.tlsCfgs != nil {
 		serverTLS = n.tlsCfgs.Server
@@ -381,6 +406,9 @@ func (n *Node) start() error {
 		Raft:     n.store.HandleRaftMessage,
 		Snapshot: n.store.ApplySnapshotStream,
 		NodeInfo: n.registry.UpsertAddress,
+		NodeHealth: func(id base.NodeID, h *rpcpb.StorageHealth) {
+			n.store.UpdateNodeHealth(id, h.Overloaded, h.Reason)
+		},
 	}, serverTLS)
 	// Not a stopper worker: Serve exits when the closer calls Stop, and
 	// closers run after workers — a worker here would deadlock shutdown.
