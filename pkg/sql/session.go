@@ -280,6 +280,26 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.execCreateIndexOnline(ctx, ci)
 	}
 
+	// ANALYZE sweeps tables at a frozen timestamp in paced chunks outside
+	// any transaction, so — like the other multi-transaction statements —
+	// it cannot run inside an explicit transaction block.
+	if an, ok := stmt.(*parser.Analyze); ok {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ANALYZE cannot run inside a transaction block")
+		}
+		var aerr error
+		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			aerr = s.checkAdmin(ctx, txn)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if aerr != nil {
+			return nil, ToSQLError(aerr)
+		}
+		return s.execAnalyze(ctx, an)
+	}
+
 	// AS OF SYSTEM TIME pins a SELECT to a fixed past timestamp: it runs
 	// in its own read-only historical transaction (servable by follower
 	// replicas), so it cannot join an explicit transaction's timestamp.

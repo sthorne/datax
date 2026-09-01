@@ -53,6 +53,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDelete(ctx, txn, t, params)
 	case *parser.ShowTables:
 		return s.execShowTables(ctx, txn)
+	case *parser.ShowStats:
+		return s.execShowStats(ctx, txn, t)
+	case *parser.Analyze:
+		// ANALYZE runs a multi-transaction sweep and is intercepted before
+		// execStmt; reaching here means an unsupported calling context.
+		return nil, newErrf(CodeFeatureNotSupported, "ANALYZE cannot run in this context")
 	default:
 		return nil, newErrf(CodeFeatureNotSupported, "unsupported statement %T", stmt)
 	}
@@ -251,12 +257,20 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
-	if _, err := s.cat.Drop(ctx, txn, t.Name); err != nil {
+	desc, err := s.cat.Drop(ctx, txn, t.Name)
+	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {
 			return &Result{Tag: "DROP TABLE"}, nil
 		}
 		return nil, err
+	}
+	// Statistics die with the table (same DDL txn; the background
+	// sampler's orphan sweep is the backstop for anything missed).
+	if desc != nil {
+		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
+			return nil, err
+		}
 	}
 	return &Result{Tag: "DROP TABLE"}, nil
 }

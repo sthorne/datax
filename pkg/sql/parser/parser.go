@@ -235,10 +235,32 @@ func (p *parser) parseStatement() (Statement, error) {
 			return nil, err
 		}
 		return &ReleaseSavepoint{Name: name}, nil
+	case "analyze": // not a reserved word; lexes as an identifier
+		p.i++
+		a := &Analyze{}
+		if p.peek().kind == tkIdent {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			a.Table = name
+		}
+		return a, nil
 	case "SHOW":
 		p.i++
 		if p.consumeKeyword("TABLES") {
 			return &ShowTables{}, nil
+		}
+		// SHOW STATS FOR <table>: read-only statistics view.
+		if p.consumeIdentWord("stats") {
+			if !p.consumeIdentWord("for") {
+				return nil, p.errf("expected FOR in SHOW STATS FOR <table>")
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &ShowStats{Table: name}, nil
 		}
 		// SHOW <anything else>: tolerated for client compatibility, treated
 		// as an empty result via SetVar semantics.

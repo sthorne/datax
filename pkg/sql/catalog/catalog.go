@@ -243,6 +243,11 @@ type Accessor struct {
 	clock   *hlc.Clock
 	gateway uuid.UUID
 	ttl     time.Duration
+
+	// Statistics cache (stats.go); statsDB nil = stats disabled.
+	statsMu    sync.Mutex
+	statsDB    *kvclient.DB
+	statsCache map[uint64]*cachedStats
 }
 
 type cachedDesc struct {

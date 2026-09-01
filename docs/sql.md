@@ -25,6 +25,8 @@ DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
 SHOW TABLES
+ANALYZE [t]                             -- collect table statistics (admin; not in a txn block)
+SHOW STATS FOR t
 ```
 
 - Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
@@ -90,7 +92,19 @@ SHOW TABLES
   `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, a
   column reference, or a scalar subquery `(SELECT ...)` (correlated in
   WHERE; uncorrelated ones also work in INSERT values and UPDATE SET).
-- Every table must declare a `PRIMARY KEY`.
+- Table statistics: `ANALYZE [t]` sweeps the primary index in 1024-row
+  chunks at a frozen timestamp (the CREATE INDEX backfill pattern — no
+  transaction, no locks, termination independent of concurrent ingest),
+  counting rows exactly and estimating per-column distinct counts with a
+  256-entry KMV (k-minimum-values) sketch over splitmix64-finalized
+  fnv-1a hashes of each datum's canonical form (DECIMAL hashes its
+  canonical text, so display scale never splits a value). The blob
+  persists as append-only JSON at `/system/stats/<tableID>` — a separate
+  key from the lease-hot descriptor — read through a per-gateway 30s
+  stale-serving cache, deleted in the DROP TABLE transaction, and shown
+  by `SHOW STATS FOR t`. Statistics feed the planner (below); their
+  absence means the structural fallback, byte-identical to the
+  pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
 

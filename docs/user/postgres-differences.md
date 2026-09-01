@@ -66,6 +66,10 @@ syntax error or `0A000` feature not supported):
   precision on the wire, nanosecond internally.
 - **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
   `EXPLAIN ANALYZE`.
+- **`ANALYZE`** exists but is admin-only (PostgreSQL allows table
+  owners), takes no column list or options, and stores row counts +
+  distinct estimates only — no histograms, no `pg_statistic`. `SHOW
+  STATS FOR t` is the (non-PostgreSQL) way to inspect them.
 - **`AS OF SYSTEM TIME`** exists (CockroachDB syntax, not PostgreSQL) —
   cheap historical/follower reads, including bounded staleness:
   `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data

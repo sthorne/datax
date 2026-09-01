@@ -96,6 +96,12 @@ var (
 	SQLRowsScanned = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_rows_scanned_total", Help: "KV pairs fetched by SQL table and index scans (before filtering).",
 	})
+	StatsRefreshes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_stats_refreshes_total", Help: "Table statistics collections completed (ANALYZE and the background sampler).",
+	})
+	StatsRowsScanned = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_stats_rows_scanned_total", Help: "Rows swept by statistics collection.",
+	})
 	StorageBackpressure = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_total", Help: "Table-data writes shed with a retryable error while the engine was overloaded.",
 	})

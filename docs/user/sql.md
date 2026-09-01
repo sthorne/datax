@@ -225,6 +225,21 @@ inside `BEGIN`; a freshly written row may be invisible until the closed
 timestamp passes its write (~the lag) — that is the staleness you signed
 up for.
 
+## Table statistics
+
+```sql
+ANALYZE users;      -- collect stats for one table (admin only)
+ANALYZE;            -- all tables
+SHOW STATS FOR users;
+```
+
+`ANALYZE` sweeps the table at a frozen timestamp (safe under concurrent
+writes, no locks) and stores the exact row count plus per-column
+distinct-value and NULL counts — distinct counts are exact up to 256
+values and a sketch estimate (±~10%) beyond. It cannot run inside
+`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
+shows what the planner sees, one row per column.
+
 ## Timeseries tables
 
 Monotonic keys (time!) funnel all inserts into one range. Timeseries

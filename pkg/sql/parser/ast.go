@@ -276,6 +276,14 @@ type ReleaseSavepoint struct{ Name string }
 type RollbackToSavepoint struct{ Name string }
 type ShowTables struct{}
 
+// Analyze collects table statistics (row count, per-column distinct
+// estimates) for one table, or every table when Table is empty. Runs
+// outside any transaction (chunked frozen-timestamp sweep); admin-only.
+type Analyze struct{ Table string }
+
+// ShowStats renders the stored statistics for a table (read-only).
+type ShowStats struct{ Table string }
+
 // SetVar is `SET name = value` / `SET SESSION ...`: parsed and ignored
 // (clients send these at startup).
 type SetVar struct{ Name string }
@@ -300,4 +308,6 @@ func (*ReleaseSavepoint) stmt()    {}
 func (*RollbackToSavepoint) stmt() {}
 func (*Rollback) stmt()            {}
 func (*ShowTables) stmt()          {}
+func (*Analyze) stmt()             {}
+func (*ShowStats) stmt()           {}
 func (*SetVar) stmt()              {}
