@@ -41,13 +41,17 @@ const (
 	// V2 introduces cluster versioning itself: the persisted cluster
 	// version, join/restart gating, and version-advertising heartbeats.
 	V2 Version = 2
+	// V3 introduces reverse scans (ScanRequest.Reverse): a v2 node
+	// ignores the field and runs a forward scan, so reverse scans are
+	// sent only once the cluster has finalized v3 (rule 4).
+	V3 Version = 3
 
 	// Current is the newest cluster version this binary can run.
-	Current = V2
+	Current = V3
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.
-	MinSupported = V1
+	MinSupported = V2
 )
 
 // Supported reports whether this binary can participate in a cluster at

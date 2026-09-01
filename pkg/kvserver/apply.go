@@ -317,7 +317,14 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			ru.Get = &kvpb.GetResponse{Value: val}
 		case *kvpb.ScanRequest:
-			res, err := storage.MVCCScan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta})
+			scan := storage.MVCCScan
+			if req.Reverse {
+				if req.ForUpdate {
+					return nil, kvpb.NewErrorf("reverse locking scans are not supported")
+				}
+				scan = storage.MVCCReverseScan
+			}
+			res, err := scan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
@@ -439,7 +446,11 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 			}
 			ru.Get = &kvpb.GetResponse{Value: val}
 		case *kvpb.ScanRequest:
-			res, err := storage.MVCCScan(eng, req.Key, req.EndKey, ts, req.MaxRows, opts)
+			scan := storage.MVCCScan
+			if req.Reverse {
+				scan = storage.MVCCReverseScan
+			}
+			res, err := scan(eng, req.Key, req.EndKey, ts, req.MaxRows, opts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}

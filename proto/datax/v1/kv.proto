@@ -94,6 +94,11 @@ message ScanRequest {
   RequestHeader header = 1;
   int64 max_rows = 2;
   bool for_update = 3; // locking scan (see pkg/kvpb)
+  // reverse iterates [start, end) from the end backwards, returning rows
+  // newest-key-first. Gated on cluster version v3: a v2 node ignores the
+  // field and would run a forward scan, so senders must not set it until
+  // the upgrade is finalized (pkg/version rule 4).
+  bool reverse = 4;
 }
 
 message EndTxnRequest {

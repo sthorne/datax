@@ -122,15 +122,39 @@ type TableDescriptor struct {
 	// NewBuckets while the backfill copies history.
 	Reshard *ReshardState `json:"reshard,omitempty"`
 	// ReshardedAt is the HLC wall time of the last completed re-shard
-	// swap; historical reads below it are rejected (the new layout only
-	// fully describes the table from the swap onward).
+	// swap. Historical reads below it route through the retired layout
+	// current at their timestamp (the historical descriptor read supplies
+	// it) while that layout is still retained, and are rejected once the
+	// janitor has wiped it.
 	ReshardedAt int64 `json:"resharded_at,omitempty"`
+	// RetiredLayouts records superseded re-shard layouts kept on disk for
+	// historical reads: the pre-swap primary index and secondary-index
+	// generations stay readable until RetiredAt ages past the historical
+	// window (the GC TTL by default), then the re-shard janitor wipes
+	// them and removes the entry.
+	RetiredLayouts []RetiredLayout `json:"retired_layouts,omitempty"`
+}
+
+// RetiredLayout is one superseded re-shard layout awaiting reclamation.
+type RetiredLayout struct {
+	PrimaryIndexID uint64   `json:"primary_index_id"`
+	IndexIDs       []uint64 `json:"index_ids,omitempty"` // secondary-index generations
+	Buckets        int32    `json:"buckets"`
+	RetiredAt      int64    `json:"retired_at"` // wall nanos of the swap
 }
 
 // ReshardState is the descriptor marker for an in-flight re-shard.
 type ReshardState struct {
 	NewIndexID uint64 `json:"new_index_id"`
 	NewBuckets int32  `json:"new_buckets"`
+	// NewIndexIDs are the shadow IDs the table's secondary indexes are
+	// rebuilt at, parallel to Indexes: index entries embed the shard
+	// bucket in their primary-key suffix, so a re-shard rewrites every
+	// entry under a fresh ID and the swap adopts them together with the
+	// primary layout. Empty for tables without secondary indexes (and on
+	// descriptors written before this field existed — such re-shards
+	// carried no indexes by the old guard).
+	NewIndexIDs []uint64 `json:"new_index_ids,omitempty"`
 }
 
 // LivePrimaryIndex is the index ID primary rows are read and written at.
@@ -181,7 +205,15 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	}
 	if d.Reshard != nil {
 		rs := *d.Reshard
+		rs.NewIndexIDs = append([]uint64(nil), d.Reshard.NewIndexIDs...)
 		out.Reshard = &rs
+	}
+	if d.RetiredLayouts != nil {
+		out.RetiredLayouts = make([]RetiredLayout, len(d.RetiredLayouts))
+		for i, rl := range d.RetiredLayouts {
+			out.RetiredLayouts[i] = rl
+			out.RetiredLayouts[i].IndexIDs = append([]uint64(nil), rl.IndexIDs...)
+		}
 	}
 	return &out
 }
@@ -243,6 +275,11 @@ type Accessor struct {
 	clock   *hlc.Clock
 	gateway uuid.UUID
 	ttl     time.Duration
+
+	// Statistics cache (stats.go); statsDB nil = stats disabled.
+	statsMu    sync.Mutex
+	statsDB    *kvclient.DB
+	statsCache map[uint64]*cachedStats
 }
 
 type cachedDesc struct {
@@ -258,7 +295,19 @@ func NewAccessor() *Accessor {
 
 // Lookup resolves a table by name within txn, using the cache while its
 // lease (if any) is live.
+//
+// A HISTORICAL transaction bypasses both: the descriptor key is an
+// ordinary MVCC value, so reading it through the pinned-timestamp txn
+// yields the descriptor version current AT that timestamp — exactly what
+// a historical query must plan against (a re-shard's pre-swap layout
+// included). The cache would serve the CURRENT descriptor instead, and
+// writing a lease for a backdated version would poison the gateway's
+// cache and stall concurrent DDL drains waiting for every live lease to
+// adopt the new version.
 func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
+	if txn != nil && txn.Historical() {
+		return lookupUncached(ctx, txn, name)
+	}
 	a.mu.Lock()
 	if c, ok := a.cache[name]; ok && (c.expireAt.IsZero() || time.Now().Before(c.expireAt)) {
 		a.mu.Unlock()
@@ -282,6 +331,14 @@ func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (
 	a.cache[name] = entry
 	a.mu.Unlock()
 	return d, nil
+}
+
+// LookupFresh resolves a table by name within txn, bypassing the cache
+// and taking no lease: callers that must see the current COMMITTED
+// descriptor (the re-shard historical-read guard) rather than a leased
+// snapshot.
+func (a *Accessor) LookupFresh(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
+	return lookupUncached(ctx, txn, name)
 }
 
 // Invalidate drops a cached entry (after DDL or a stale-descriptor error).

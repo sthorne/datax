@@ -508,3 +508,38 @@ func TestJSONBContainmentParsing(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzeAndShowStats(t *testing.T) {
+	stmts, err := Parse("ANALYZE orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := stmts[0].(*Analyze); a.Table != "orders" {
+		t.Fatalf("got %+v", a)
+	}
+	stmts, err = Parse("analyze")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := stmts[0].(*Analyze); a.Table != "" {
+		t.Fatalf("bare: %+v", a)
+	}
+	stmts, err = Parse(`SHOW STATS FOR "orders"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := stmts[0].(*ShowStats); s.Table != "orders" {
+		t.Fatalf("show stats: %+v", s)
+	}
+	// SHOW <other> keeps its SetVar compatibility fallback.
+	stmts, err = Parse("SHOW server_version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmts[0].(*SetVar); !ok {
+		t.Fatalf("show fallback: %T", stmts[0])
+	}
+	if _, err := Parse("SHOW STATS orders"); err == nil {
+		t.Fatal("missing FOR accepted")
+	}
+}

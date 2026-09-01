@@ -29,6 +29,7 @@ func (n *Node) startSQL() error {
 		}
 	}
 	cat := catalog.NewAccessor()
+	cat.EnableStats(n.db)
 	if n.cfg.DescLeaseTTL >= 0 {
 		if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
 			return err

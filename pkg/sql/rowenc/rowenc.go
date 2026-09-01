@@ -410,6 +410,16 @@ var nonUniqueIndexValue = []byte{0}
 // (SQL equality never matches NULL, so equality lookups stay correct;
 // unique indexes reject NULLs at the executor instead).
 func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
+	return EncodeIndexEntryAt(desc, idx, idx.ID, row)
+}
+
+// EncodeIndexEntryAt is EncodeIndexEntry with the entry's index ID
+// overridden: the re-shard machinery rebuilds every secondary index at a
+// shadow ID (the entry's primary-key suffix embeds the shard bucket, so
+// the two layouts' entries must live in disjoint keyspaces). The row map
+// supplies the suffix, so a shadow row carrying the new bucket value
+// yields the new-layout entry.
+func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
 	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
 	for _, colID := range idx.ColumnIDs {
 		d, ok := row[colID]
@@ -418,7 +428,9 @@ func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescripto
 		}
 		vals = append(vals, d)
 	}
-	k, err := EncodeIndexPrefix(desc, idx, vals)
+	at := *idx
+	at.ID = entryID
+	k, err := EncodeIndexPrefix(desc, &at, vals)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -459,6 +471,28 @@ func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescr
 		}
 	}
 	return append(PrimaryKeyPrefixFor(desc), rest...), nil
+}
+
+// DecodeTrailingTimestamp decodes the LAST primary-key column — a
+// timestamp — from rest, the encoded PK suffix of a row key (the bytes
+// after the table/index prefix), given the PK column families in
+// physical order. Returns UTC nanoseconds. The row-level retention sweep
+// uses it to age rows by their timestamp column without a full decode.
+func DecodeTrailingTimestamp(rest []byte, fams []types.Family) (int64, bool) {
+	if len(fams) == 0 || fams[len(fams)-1] != types.Timestamp {
+		return 0, false
+	}
+	var err error
+	for _, fam := range fams[:len(fams)-1] {
+		if rest, err = skipDatum(rest, fam); err != nil {
+			return 0, false
+		}
+	}
+	tail, nanos, err := encoding.DecodeInt64(rest)
+	if err != nil || len(tail) != 0 {
+		return 0, false
+	}
+	return nanos, true
 }
 
 func skipDatum(b []byte, fam types.Family) ([]byte, error) {

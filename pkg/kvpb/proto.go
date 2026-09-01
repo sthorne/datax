@@ -236,7 +236,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *IncrementRequest:
 		out.Value = &rpcpb.RequestUnion_Increment{Increment: &rpcpb.IncrementRequest{Header: reqHeaderToProto(r.RequestHeader), By: r.By}}
 	case *ScanRequest:
-		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate}}
+		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse}}
 	case *ExportRequest:
 		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords}}
 	case *EndTxnRequest:
@@ -331,7 +331,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Increment:
 		u.Increment = &IncrementRequest{RequestHeader: reqHeaderFromProto(v.Increment.Header), By: v.Increment.By}
 	case *rpcpb.RequestUnion_Scan:
-		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate}
+		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse}
 	case *rpcpb.RequestUnion_Export:
 		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords}
 	case *rpcpb.RequestUnion_EndTxn:

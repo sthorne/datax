@@ -50,9 +50,19 @@ The planner plans against the **logical** primary key:
 - All logical PK columns pinned by `=` → the bucket is recomputed from
   the pinned values and the lookup stays a **single point read**.
 - A pinned prefix or time window → the scan runs once per bucket
-  (`EXPLAIN` shows `(fan-out over N shard buckets)`), results are
-  concatenated, and `LIMIT` re-applies globally. Fanned output is not in
-  logical PK order, so `ORDER BY` always sorts in memory.
+  (`EXPLAIN` shows `(fan-out over N shard buckets)`) and `LIMIT`
+  re-applies globally. Each bucket's scan is in logical-PK order, so an
+  `ORDER BY` on the logical key (equality-pinned columns skipped) is
+  delivered by a **K-way merge** of the per-bucket scans — no in-memory
+  sort — with `LIMIT n` stopping after at most `buckets × n` scanned
+  rows. `ORDER BY ts DESC LIMIT n` (the dashboard query) rides
+  per-bucket **reverse scans** through the same merge: measured 1.23 ms
+  vs 27.9 ms for the full-scan-and-sort it replaces on a 5,000-row
+  series (22×; the gap grows with table size). `EXPLAIN` says
+  `order satisfied by K-way merge across shard buckets [(reverse
+  scans)]`. Reverse scans need cluster version v3; below it (a
+  not-yet-finalized upgrade) descending orders fall back to the
+  in-memory sort.
 
 ## Retention
 
@@ -66,9 +76,22 @@ mean a never-updated row never expires.)
   it are rejected (`AS OF SYSTEM TIME` past the retention fails cleanly
   rather than returning silently-missing rows).
 - A range that only **partially** overlaps a retention table (it also
-  holds other data) never expires rows and is never GC'd earlier than
-  `max(default TTL, every overlapping retention)` — mixed ranges never
-  delete early.
+  holds other data) keeps the conservative whole-range rules — GC'd no
+  earlier than `max(default TTL, every overlapping retention)` — but
+  retention still holds through **row-level expiry**: the sweep decodes
+  each row key's trailing timestamp column, and a version whose row
+  timestamp AND commit timestamp are both past the table's retention is
+  collected individually (survivors included), without touching the
+  range's other tenants or its GC threshold. Normal ingest writes rows
+  at ≈ their timestamp value, so the two conditions move together; a
+  freshly-rewritten old row waits out its write age first. Two caveats:
+  row-level expiry applies only to retention tables **without secondary
+  indexes** (index entries carry no timestamp; expiring rows under them
+  would leave dangling entries), and a historical read of an expired
+  window on a mixed range comes back short without an error (the range's
+  threshold, which rejects such reads on fully-contained ranges, stays
+  at the conservative default). `datax_retention_rows_expired_total`
+  counts the expired versions.
 - The automatic range merger skips merges whose two sides have different
   retention policies, so a long-retention range never absorbs a
   short-retention neighbor's threshold.
@@ -121,6 +144,16 @@ never reused, so the keyspaces cannot collide):
 5. The old layout is wiped (batched, intent-aware; emptied ranges merge
    away).
 
+Secondary indexes ride the same machinery: their entries embed the shard
+bucket in the primary-key suffix they point back with, so each index is
+rebuilt at a freshly allocated shadow ID — dual-writes mirror every
+entry mutation with the bucket recomputed, the backfill emits shadow
+entries from the same decoded rows, and the swap adopts all the shadow
+IDs together with the primary layout (uniqueness stays enforced on the
+live copy throughout). A re-shard and an online CREATE INDEX exclude
+each other: whichever is in flight, the other is refused with SQLSTATE
+`25001`.
+
 Measured (single node, ingest profile): idle backfill ~8,800 rows/s
 (260k rows in 30s); under a live 4,000 rows/s ingest the re-shard of a
 growing 120k→400k-row table took ~129s with foreground throughput
@@ -128,20 +161,29 @@ dipping to ~2,200 rows/s (dual-write amplification) and recovering to
 full speed on the new buckets the moment the swap landed — writes never
 stopped. Recorded runs live in issue #33.
 
-v1 scope: already-sharded timeseries tables only (the PK column list
-must stay identical so both layouts decode during dual-write); tables
-with secondary indexes are rejected (their entries embed the bucket
-value — drop and recreate them around the re-shard); `AS OF SYSTEM
-TIME` below the swap is refused (the new layout's rows carry
-backfill-time MVCC timestamps); a handful of old-layout keys from
-statements in flight at the swap can survive the wipe as unreachable
-garbage.
+**Historical reads work across the swap.** The superseded layout is not
+wiped at the swap: it is recorded in the descriptor (`RetiredLayouts`)
+and stays on disk. An `AS OF SYSTEM TIME` below the swap reads the
+descriptor as of its own timestamp (descriptors are ordinary MVCC
+values), plans against the pre-swap layout — old bucket count, old
+primary index, old index generations — and returns exactly the data
+committed then. A background janitor (range-1 leader; keep window
+`ReshardRetireFor`, default the GC TTL — the deepest timestamp a
+historical read can use anyway) removes the descriptor entry first and
+then wipes the retired keyspaces; from that point a historical read
+below the swap is refused with a clear error instead of coming back
+short. Historical catalog lookups bypass the gateway's descriptor cache
+and take no lease, so they can never publish a backdated version.
+
+Scope: already-sharded timeseries tables only (the PK column list
+must stay identical so both layouts decode during dual-write); a handful
+of old-layout keys from statements in flight at the swap can survive the
+eventual wipe as unreachable garbage.
 
 ## Limitations
 
-- Fan-out disables order pushdown: `ORDER BY ts` on a sharded table
-  always sorts in memory (bounded windows keep that cheap).
-- Retention expiry is range-granular and best-effort in timing (one
-  housekeeping tick, default 30s, plus the ~30s descriptor cache).
+- Retention expiry is best-effort in timing (one housekeeping tick,
+  default 30s, plus the ~30s descriptor cache); on mixed ranges it is
+  row-granular but skips tables with secondary indexes.
 - Secondary indexes on sharded tables are unsharded (their own hot-tail
   characteristics apply).

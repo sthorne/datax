@@ -100,8 +100,11 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   whole-table or per `GROUP BY` group, including over joins. `HAVING`
   filters on aggregates or group columns. `DISTINCT` is supported.
-- **Joins** execute left-deep in the order written (there is no
-  reorderer — put the most selective table first). `ON` must equate a
+- **Joins** execute left-deep in the order written — until
+  [statistics](#table-statistics) exist for every joined table, at which
+  point INNER joins are automatically reordered to drive from the
+  cheapest side (`EXPLAIN` says `join reordered by cost`; LEFT joins and
+  self-joins always keep the written order). `ON` must equate a
   column of the newly joined table with one from an earlier table. Join
   select lists take columns, `*`, expressions (`o.qty * 2`, rendered as
   text), and `->`/`->>` paths; under `GROUP BY` they narrow to plain
@@ -111,7 +114,10 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   tables `FROM (SELECT ...) AS d`; correlated subqueries in
   `EXISTS`/`IN`/scalar positions up to 4 nesting levels.
 - **ORDER BY** result-column names; sorts in memory unless the access path
-  already delivers the order.
+  already delivers the order — ascending along the key, descending via a
+  reverse scan, and on sharded timeseries tables either direction via a
+  K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
+  dashboards stop early instead of scanning everything).
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 
@@ -119,11 +125,15 @@ Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 point lookup on primary key
 scan of index "by_city" (city = 'oslo') + primary key join
 range scan of primary key (series = 'cpu.node1', at >= 2026-08-30 10:00:00+00)
-full table scan
+full table scan [~5000 rows]
 ```
 
 A `full table scan` on a big table is the thing to fix (add an index, or
-constrain the leading PK columns).
+constrain the leading PK columns). When [table statistics](#table-statistics)
+exist, the plan carries a ` [~N rows]` estimate and competing paths are
+ranked by cost rather than structure — in particular, an index on a
+low-selectivity column (few distinct values) correctly loses to the full
+scan it would out-fetch.
 
 ## Writing
 
@@ -225,6 +235,27 @@ inside `BEGIN`; a freshly written row may be invisible until the closed
 timestamp passes its write (~the lag) — that is the staleness you signed
 up for.
 
+## Table statistics
+
+```sql
+ANALYZE users;      -- collect stats for one table (admin only)
+ANALYZE;            -- all tables
+SHOW STATS FOR users;
+```
+
+`ANALYZE` sweeps the table at a frozen timestamp (safe under concurrent
+writes, no locks) and stores the exact row count plus per-column
+distinct-value and NULL counts — distinct counts are exact up to 256
+values and a sketch estimate (±~10%) beyond. It cannot run inside
+`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
+shows what the planner sees, one row per column.
+
+A background sampler also keeps statistics fresh without ANALYZE: every
+minute (configurable) one node re-collects at most one table whose
+statistics are missing or older than 10 minutes, in paced 1024-row
+chunks. Watch `datax_stats_refreshes_total` and
+`datax_stats_rows_scanned_total` for its cost.
+
 ## Timeseries tables
 
 Monotonic keys (time!) funnel all inserts into one range. Timeseries
@@ -245,7 +276,9 @@ CREATE TABLE metrics (
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:
   measured ~2× point-read p50 at `shards=8`, in exchange for ~linear
   insert scaling.
-- Re-shard online: `ALTER TABLE metrics SET (shards = 16);`
+- Re-shard online: `ALTER TABLE metrics SET (shards = 16);` — writes
+  never stop, and secondary indexes on the table are rebuilt and swapped
+  along with the rows.
 
 ## Parameters
 

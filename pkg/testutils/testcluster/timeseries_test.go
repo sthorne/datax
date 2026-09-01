@@ -94,10 +94,10 @@ func TestTimeseriesShardedTable(t *testing.T) {
 		t.Fatalf("window rows: %+v", res.Rows)
 	}
 
-	// Fanned results are not naturally ordered: ORDER BY must sort (and
-	// stay correct).
+	// Each bucket's scan is in logical-PK order, so ORDER BY on the
+	// logical key is satisfied by a K-way merge — no in-memory sort.
 	oq := `SELECT ts FROM metrics WHERE series = 'mem' AND ts >= '2026-08-30 00:00:00Z' ORDER BY ts`
-	if p := explainPlan(t, ctx, s, oq); !strings.Contains(p, "in-memory sort") {
+	if p := explainPlan(t, ctx, s, oq); !strings.Contains(p, "order satisfied by K-way merge across shard buckets") {
 		t.Fatalf("fan+order plan: %q", p)
 	}
 	res = execSQL(t, ctx, s, oq)
@@ -107,6 +107,20 @@ func TestTimeseriesShardedTable(t *testing.T) {
 	for i := 1; i < len(res.Rows); i++ {
 		if res.Rows[i-1][0].I >= res.Rows[i][0].I {
 			t.Fatalf("not sorted at %d: %+v", i, res.Rows)
+		}
+	}
+	// Descending rides reverse scans through the same merge.
+	dq := `SELECT ts FROM metrics WHERE series = 'mem' AND ts >= '2026-08-30 00:00:00Z' ORDER BY ts DESC`
+	if p := explainPlan(t, ctx, s, dq); !strings.Contains(p, "K-way merge across shard buckets (reverse scans)") {
+		t.Fatalf("fan+desc plan: %q", p)
+	}
+	res = execSQL(t, ctx, s, dq)
+	if len(res.Rows) != 8 {
+		t.Fatalf("desc rows: %d", len(res.Rows))
+	}
+	for i := 1; i < len(res.Rows); i++ {
+		if res.Rows[i-1][0].I <= res.Rows[i][0].I {
+			t.Fatalf("not desc-sorted at %d: %+v", i, res.Rows)
 		}
 	}
 

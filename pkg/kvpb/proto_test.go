@@ -64,6 +64,7 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	ba.Add(&DeleteRequest{RequestHeader: h("d")})
 	ba.Add(&IncrementRequest{RequestHeader: h("i"), By: -4})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10})
+	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10, Reverse: true})
 	ba.Add(&EndTxnRequest{RequestHeader: h("e"), Commit: true, IntentKeys: []keys.Key{keys.Key("x")}})
 	ba.Add(&HeartbeatTxnRequest{RequestHeader: h("h"), Now: mkts(60)})
 	ba.Add(&PushTxnRequest{RequestHeader: h("q"), PusherTxn: testTxn(), PusheeTxn: testTxn().TxnMeta, PushAbort: true, Now: mkts(61)})

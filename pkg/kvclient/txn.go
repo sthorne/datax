@@ -125,6 +125,12 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 	return t
 }
 
+// Historical reports whether this is a read-only transaction pinned at a
+// fixed past timestamp (NewHistoricalTxn). Catalog lookups key off it:
+// a historical transaction reads the descriptor version current AT its
+// timestamp, never a cached or leased current one.
+func (t *Txn) Historical() bool { return t.historical }
+
 // TestingSetPriority overrides the transaction's conflict priority.
 // Deadlock tests use equal priorities so priority-based aborts (which
 // require a strictly greater pusher) cannot fire and cycle detection is
@@ -352,6 +358,31 @@ func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 		observedEnd = resp.Resume // only [start, resume) was observed
 	}
 	t.recordRead(start, observedEnd)
+	return resp.Rows, nil
+}
+
+// ReverseScan reads [start, end) BACKWARDS (largest key first) at the
+// transaction's read timestamp. When max stops the scan early, the next
+// page is [start, resume) — resume is the exclusive end. Refresh-wise the
+// observed span is [resume-or-start, end). Callers must consult the DB's
+// version gate before using reverse scans (pkg/version rule 4: a v2 node
+// would silently run a forward scan).
+func (t *Txn) ReverseScan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.KeyValue, error) {
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
+	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max, Reverse: true})
+	br, err := t.send(ctx, ba, false)
+	if err != nil {
+		return nil, err
+	}
+	resp := br.Responses[0].Scan
+	observedStart := start
+	if len(resp.Resume) > 0 {
+		observedStart = resp.Resume // only [resume, end) was observed
+	}
+	t.recordRead(observedStart, end)
 	return resp.Rows, nil
 }
 

@@ -50,11 +50,17 @@ type IncrementRequest struct {
 // ScanRequest returns keys in [Key, EndKey). With ForUpdate set
 // (transactional batches only) it is a LOCKING scan: each returned row
 // gets a write intent pinning its observed value (see GetRequest); absent
-// keys in the span are not locked.
+// keys in the span are not locked. With Reverse set the span is iterated
+// from the end backwards (rows come back largest-key-first, Resume is the
+// exclusive END of the next page); Reverse may only be SENT once the
+// cluster version has reached v3 — an older node ignores the field and
+// runs a forward scan (pkg/version rule 4). Reverse+ForUpdate is not
+// supported.
 type ScanRequest struct {
 	RequestHeader
 	MaxRows   int64 `json:"max_rows,omitempty"`
 	ForUpdate bool  `json:"for_update,omitempty"`
+	Reverse   bool  `json:"reverse,omitempty"`
 }
 
 // ExportRequest returns, for every key in [Key, EndKey) that changed in

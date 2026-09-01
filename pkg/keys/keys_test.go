@@ -87,3 +87,23 @@ func TestPrefixEnd(t *testing.T) {
 		t.Fatal("row outside its table span")
 	}
 }
+
+func TestTableStatsKey(t *testing.T) {
+	k := TableStatsKey(42)
+	id, ok := TableStatsID(k)
+	if !ok || id != 42 {
+		t.Fatalf("round trip: %d, %v", id, ok)
+	}
+	lo, hi := TableStatsSpan()
+	if k.Compare(lo) < 0 || k.Compare(hi) >= 0 {
+		t.Fatalf("key outside span")
+	}
+	// Ordered by table ID within the span.
+	if TableStatsKey(1).Compare(TableStatsKey(2)) >= 0 {
+		t.Fatal("not ordered")
+	}
+	// Foreign keys don't decode.
+	if _, ok := TableStatsID(TableDescKey(42)); ok {
+		t.Fatal("desc key decoded as stats key")
+	}
+}

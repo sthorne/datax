@@ -25,6 +25,8 @@ DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
 SHOW TABLES
+ANALYZE [t]                             -- collect table statistics (admin; not in a txn block)
+SHOW STATS FOR t
 ```
 
 - Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
@@ -90,7 +92,19 @@ SHOW TABLES
   `[NOT] EXISTS (SELECT ...)`. A value is a literal, a parameter, a
   column reference, or a scalar subquery `(SELECT ...)` (correlated in
   WHERE; uncorrelated ones also work in INSERT values and UPDATE SET).
-- Every table must declare a `PRIMARY KEY`.
+- Table statistics: `ANALYZE [t]` sweeps the primary index in 1024-row
+  chunks at a frozen timestamp (the CREATE INDEX backfill pattern — no
+  transaction, no locks, termination independent of concurrent ingest),
+  counting rows exactly and estimating per-column distinct counts with a
+  256-entry KMV (k-minimum-values) sketch over splitmix64-finalized
+  fnv-1a hashes of each datum's canonical form (DECIMAL hashes its
+  canonical text, so display scale never splits a value). The blob
+  persists as append-only JSON at `/system/stats/<tableID>` — a separate
+  key from the lease-hot descriptor — read through a per-gateway 30s
+  stale-serving cache, deleted in the DROP TABLE transaction, and shown
+  by `SHOW STATS FOR t`. Statistics feed the planner (below); their
+  absence means the structural fallback, byte-identical to the
+  pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
 
@@ -122,7 +136,8 @@ on the recent side and the GC TTL (default 25h) on the old side.
 
 Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
-join reordering (join order = syntactic order) and joins beyond 8 tables,
+joins beyond 8 tables (INNER joins are cost-reordered when statistics
+exist; LEFT joins and self-joins keep syntactic order),
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
@@ -227,7 +242,7 @@ long-lived-transaction descriptor pinning noted under Catalog.
 
 ## Execution
 
-There is no cost model. The executor ranks access paths:
+The executor ranks access paths:
 
 1. WHERE pins every PK column by equality → primary point `Get`.
 2. Every column of a unique index pinned → unique-index point lookup.
@@ -235,9 +250,23 @@ There is no cost model. The executor ranks access paths:
    conjuncts pin a leading column prefix, and range conjuncts
    (`> >= < <=`) on the **next** key column become order-preserving scan
    bounds (`WHERE a = 1 AND b > 5 AND b <= 9` scans exactly the matching
-   key span). Paths score 2 per pinned column plus 1 for a range; ties
-   prefer the primary key (no index join).
+   key span). Without statistics, paths score 2 per pinned column plus 1
+   for a range; ties prefer the primary key (no index join).
 4. Otherwise → full `Scan` of the primary rows with in-memory filtering.
+
+With table statistics present (ANALYZE or the background sampler),
+step 3 ranks competing scans by **estimated cost** instead of the
+structural score: estimated rows (row count × 1/distinct per equality,
+×⅓ per range bound, ×⅒ for a column the statistics never saw; naive
+independence, floor of one row), times a ×4 index-join multiplier for
+non-unique indexes (modelling the per-entry primary-key `Get`). The
+cheapest path wins, exact ties keep the primary key, and a constrained
+scan whose cost reaches the full-scan cost loses to the full scan — the
+case the structural planner gets wrong on low-selectivity indexed
+columns. The point-lookup short-circuits (steps 1–2) are unaffected, and
+with no statistics the structural ranking runs byte-identically to the
+pre-statistics planner. `EXPLAIN` appends ` [~N rows]` to a plan whose
+estimate came from statistics.
 
 Conjuncts a path cannot absorb (`!=`, `IS [NOT] NULL`, columns outside
 the key prefix) stay as a **residual filter**: the executor re-checks the
@@ -247,15 +276,25 @@ exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`.
 
+Whether an ORDER BY is satisfied is decided by `orderPlan`: skipping
+columns the plan pins by equality (constants order nothing), the
+remaining terms must follow the path's natural key order — all ascending,
+or all descending via a **reverse scan** (a v3 KV primitive; below
+cluster version v3 descending falls back to the sort). On a sharded
+timeseries fan-out the natural order is the LOGICAL primary key, restored
+by a K-way merge of the per-bucket scans (see docs/timeseries.md); the
+per-bucket scans carry the pushed limit, so `ORDER BY ts DESC LIMIT n`
+reads at most `buckets × n` rows.
+
 A non-unique index has no entry for rows with NULL in any indexed column,
 so the planner only uses one when the schema (`NOT NULL`) or the WHERE
 clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
 match — and `col IS NULL` therefore always reads the primary rows. Unique
 indexes reject NULLs at write time and are always complete.
 
-Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops
-executed **in syntactic order** — there is no join reordering, so the
-FROM/JOIN order you write is the plan you get. The base (first) table is
+Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops.
+Without statistics they execute **in syntactic order** — the FROM/JOIN
+order you write is the plan you get. The base (first) table is
 fetched through the ranking above using the WHERE conjuncts that
 reference only it; for each partial row, the next JOIN's ON equalities
 become synthetic equality predicates on that table — so a join key that
@@ -271,6 +310,25 @@ qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
 `nested loop left join; outer (c): range scan of primary key (id > 1);
 inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
 primary key join; then inner (i) per row: point lookup on primary key`.
+
+With statistics present for **every** joined table, INNER joins are
+cost-reordered: a greedy pass picks the side with the fewest estimated
+rows (after its side-local WHERE conjuncts, using the single-table
+selectivities) to drive the nested loop, then repeatedly adds the
+cheapest side connected to the placed set by an ON equality. The rewrite
+is a pure AST transformation on a clone (prepared statements re-plan
+per execution): `SELECT *` is pre-expanded into qualified references in
+the original side order so output columns never move, and every ON
+conjunct is pooled and re-attached, fully qualified, at the level where
+its later side lands. It declines — keeping byte-identical syntactic
+order — for any LEFT join (NULL-extension is order-sensitive), a derived
+base table, missing statistics, self-joins or any alias/table-name
+shadowing (qualified references bind first-match), or a join graph the
+ON equalities don't connect. `EXPLAIN` appends ` [~N rows]` to each side
+planned with statistics and `; join reordered by cost` when the order
+changed. Measured on a worst-first 3-way join (400×20×5 rows, one
+selective product): 24.1ms/op syntactic vs 5.1ms/op reordered — within
+~3% of the same query hand-ordered (5.2ms/op).
 
 Aggregates and GROUP BY compose with joins: the joined rows run through
 the grouped executor, with `GROUP BY c.name`, `SUM(o.total)`, HAVING and

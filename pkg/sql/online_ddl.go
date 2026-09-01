@@ -47,6 +47,12 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			return err
 		}
 		desc := shared.Clone()
+		if desc.Reshard != nil {
+			// The re-shard allocated shadow IDs for the indexes it saw at
+			// publish time; an index appearing mid-flight would miss the
+			// swap. The two state machines exclude each other.
+			return newErrf(CodeActiveTransaction, "cannot create an index on table %q while a re-shard is in progress", t.Table)
+		}
 		if t.Name == "primary" {
 			return newErrf(CodeSyntaxError, "index name %q is reserved", t.Name)
 		}
@@ -258,6 +264,13 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 // pass may have committed behind the cursor); leftovers are unreachable
 // garbage either way.
 func (s *Session) wipeIndexEntries(ctx context.Context, tableID, indexID uint64) {
+	WipeIndexEntries(ctx, s.db, tableID, indexID)
+}
+
+// WipeIndexEntries is the session-free form of the wipe: the re-shard
+// janitor (pkg/server) reclaims retired layouts once their historical
+// window lapses.
+func WipeIndexEntries(ctx context.Context, db *kvclient.DB, tableID, indexID uint64) {
 	const wipeChunk = 1024
 	for pass := 0; pass < 5; pass++ {
 		lo, hi := keys.TableIndexSpan(tableID, indexID)
@@ -265,7 +278,7 @@ func (s *Session) wipeIndexEntries(ctx context.Context, tableID, indexID uint64)
 		for {
 			var n int
 			var last keys.Key
-			err := s.db.RunTxn(ctx, "wipe-index", func(ctx context.Context, txn *kvclient.Txn) error {
+			err := db.RunTxn(ctx, "wipe-index", func(ctx context.Context, txn *kvclient.Txn) error {
 				kvs, err := txn.Scan(ctx, lo, hi, wipeChunk)
 				if err != nil {
 					return err

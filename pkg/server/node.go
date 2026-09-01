@@ -93,6 +93,20 @@ type Config struct {
 	// balance (0 = default 2, the minimum with hysteresis; negative
 	// disables automatic rebalancing).
 	RebalanceThreshold int
+	// StatsRefreshInterval paces the background statistics sampler: each
+	// tick, the node leading range 1 re-collects statistics for at most
+	// ONE table whose stats are missing or older than StatsStaleness
+	// (0 = default 60s; negative disables the sampler — ANALYZE still
+	// works).
+	StatsRefreshInterval time.Duration
+	// StatsStaleness is the statistics age that triggers a background
+	// re-collection (0 = default 10m).
+	StatsStaleness time.Duration
+	// ReshardRetireFor is how long a completed re-shard's superseded
+	// layout stays on disk serving AS OF SYSTEM TIME below the swap
+	// before the janitor reclaims it (0 = the GC TTL, matching the
+	// deepest admissible historical read).
+	ReshardRetireFor time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -332,10 +346,19 @@ func (n *Node) start() error {
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
 		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
+		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
+	// Version-gated request shapes key off the node's cluster-version
+	// mirror (refreshed by the heartbeat loop and at finalize).
+	n.db.SetVersionGate(func() version.Version {
+		if cv := version.Version(n.clusterVersion.Load()); cv > 0 {
+			return cv
+		}
+		return version.V1 // not yet mirrored: assume the floor
+	})
 	n.db.SetNodeLister(func() []base.NodeID {
 		nodes := n.registry.All()
 		ids := make([]base.NodeID, len(nodes))
@@ -425,6 +448,12 @@ func (n *Node) start() error {
 		return err
 	}
 	n.startConsistencyLoop()
+	if err := n.stopper.RunWorker(n.statsRefreshLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
+		return err
+	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err

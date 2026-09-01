@@ -69,7 +69,19 @@ type StoreConfig struct {
 	// the default for a span that also holds non-retention data (never
 	// delete early from a mixed range).
 	RetentionOverride func(start, end keys.Key) (ttl time.Duration, expire, ok bool)
-	TestingKnobs      TestingKnobs
+	// RowExpiry, when set, provides ROW-LEVEL retention for ranges that
+	// only PARTIALLY overlap retention tables (where RetentionOverride
+	// must keep the conservative max TTL and can never expire whole
+	// ranges). Called with the range's [start, end); when ok, the
+	// returned predicate reports — for a user key and one version's
+	// commit timestamp — that the row is past its table's retention,
+	// keyed on the row's own timestamp column AND the version's write
+	// age. GC then collects such versions (survivors and tombstones
+	// included) WITHOUT ratcheting the range's GC threshold, so the
+	// range's other tenants keep their history. Keys with a live intent
+	// are never offered to the predicate.
+	RowExpiry    func(start, end keys.Key) (func(key keys.Key, vts hlc.Timestamp) bool, bool)
+	TestingKnobs TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.

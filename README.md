@@ -54,7 +54,8 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes and
   ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
   transactions, joins up to 8 tables, GROUP BY — including over joins,
-  correlated subqueries to 4 levels, EXPLAIN) over ten column types
+  correlated subqueries to 4 levels, EXPLAIN, ANALYZE with a cost-based
+  planner over table statistics) over ten column types
   including exact DECIMAL and JSONB with `->`/`->>` extraction, served
   over the Postgres wire protocol with TLS + SCRAM-SHA-256
   authentication in secure mode.
@@ -141,14 +142,14 @@ This is a prototype. Out of scope so far, deliberately:
 | Ranges | load stats are leader-local samples (a lease transfer now hands the measured rate to the new leader, but reservoir split-key samples start fresh; splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements; count rebalancing, lease shedding, byte moves and decommission are all automatic) |
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads require opting in per statement — exact-timestamp `AS OF SYSTEM TIME` and bounded-staleness `with_max_staleness('10s')` are both in |
-| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), join reordering (join order = syntactic order, ≤ 8 tables, nested loop), typmods beyond DECIMAL (`DECIMAL(p,s)` is enforced; `VARCHAR(n)` parsed and ignored), JSONB indexing (`->`/`->>` extraction works in single-table queries and joins, `@>` containment single-table only; `@>` always filters — no inverted indexes) |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), joins beyond 8 tables (nested loop; INNER joins cost-reorder when table statistics exist, LEFT joins keep syntactic order), typmods beyond DECIMAL (`DECIMAL(p,s)` is enforced; `VARCHAR(n)` parsed and ignored), JSONB indexing (`->`/`->>` extraction works in single-table queries and joins, `@>` containment single-table only; `@>` always filters — no inverted indexes) |
 | Wire | COPY TO and COPY options beyond FORMAT (COPY FROM STDIN is in — text/CSV/binary, chunked commits); cursor-style streaming (suspended portals serve materialized results — a fetch limit bounds wire traffic per round trip, not server memory) |
 | Ops | per-node drill-down across peers (the dashboard's range detail is the serving node's own); per-endpoint authorization (secure-mode HTTP auth accepts any valid user — everything served is read-only) |
 | Upgrades | skipping versions (adjacent-version rolls only) or auto-finalize (the version bump is a deliberate `datax debug upgrade`; before it, binaries roll back freely — after it, never) |
 | Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
-| Time series | re-sharding tables that carry secondary indexes, and historical reads below a re-shard (v1 guards); order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
+| Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |
 
 ## License
 

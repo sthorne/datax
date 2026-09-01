@@ -260,6 +260,36 @@ func TableDescSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// TableStatsKey holds the JSON table statistics (row count, per-column
+// distinct estimates) for a table ID. Deliberately a separate key from
+// the descriptor: the descriptor is re-read constantly by lease renewals
+// and every version bump churns gateway leases, while stats writes are
+// routine background traffic. Missing = no statistics (planner falls
+// back to structural ranking).
+func TableStatsKey(tableID uint64) Key {
+	k := systemKey("stats")
+	return Key(encoding.EncodeUint64(k, tableID))
+}
+
+// TableStatsSpan covers all table statistics (orphan sweeps).
+func TableStatsSpan() (Key, Key) {
+	p := systemKey("stats")
+	return p, p.PrefixEnd()
+}
+
+// TableStatsID extracts the table ID a stats key refers to.
+func TableStatsID(k Key) (uint64, bool) {
+	p := systemKey("stats")
+	if len(k) <= len(p) || string(k[:len(p)]) != string(p) {
+		return 0, false
+	}
+	_, id, err := encoding.DecodeUint64(k[len(p):])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
 // NamespaceKey maps a table name to its ID.
 func NamespaceKey(name string) Key {
 	k := systemKey("ns")

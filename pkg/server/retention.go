@@ -7,6 +7,10 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -28,6 +32,10 @@ type retentionProvider struct {
 type retentionSpan struct {
 	start, end keys.Key
 	ttl        time.Duration
+	// Row-level expiry inputs (nil prefixes disables it for this table —
+	// see rowExpiry for the eligibility rules).
+	prefixes []keys.Key     // primary-index prefixes, every retained generation
+	pkFams   []types.Family // PK column families in physical order (last: the timestamp)
 }
 
 const retentionRefreshInterval = 30 * time.Second
@@ -89,17 +97,92 @@ func (p *retentionProvider) get() []retentionSpan {
 	}
 	var spans []retentionSpan
 	for _, kv := range rows {
-		var d struct {
-			ID               uint64 `json:"id"`
-			Timeseries       bool   `json:"timeseries"`
-			RetentionSeconds int64  `json:"retention_seconds"`
-		}
+		var d catalog.TableDescriptor
 		if json.Unmarshal(kv.Value, &d) != nil || !d.Timeseries || d.RetentionSeconds <= 0 || d.ID == 0 {
 			continue
 		}
 		start, end := keys.TableDataSpan(d.ID)
-		spans = append(spans, retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second})
+		rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second}
+		// Row-level expiry eligibility: the timestamp must be decodable
+		// from the key alone (it always is — the last PK column), and the
+		// table must carry no secondary indexes (their entries hold no
+		// timestamp; expiring rows but not entries would leave dangling
+		// entries that index reads treat as corruption). Every retained
+		// primary generation — live, mid-reshard shadow, retired — decodes
+		// with the same column families, so all of them are eligible.
+		if len(d.Indexes) == 0 && len(d.PrimaryKey) > 0 {
+			fams := make([]types.Family, 0, len(d.PrimaryKey))
+			okFams := true
+			for _, colID := range d.PrimaryKey {
+				col, ok := d.ColByID(colID)
+				if !ok {
+					okFams = false
+					break
+				}
+				fams = append(fams, col.Type)
+			}
+			if okFams && fams[len(fams)-1] == types.Timestamp {
+				rs.pkFams = fams
+				rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.LivePrimaryIndex()))
+				if d.Reshard != nil {
+					rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.Reshard.NewIndexID))
+				}
+				for _, rl := range d.RetiredLayouts {
+					rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, rl.PrimaryIndexID))
+				}
+			}
+		}
+		spans = append(spans, rs)
 	}
 	p.spans, p.fetchedAt = spans, time.Now()
 	return p.spans
+}
+
+// rowExpiry implements kvserver.StoreConfig.RowExpiry: row-level
+// retention for ranges that only PARTIALLY overlap retention tables. The
+// predicate ages a version out when BOTH the row's own timestamp column
+// (decoded from its key) and the version's commit timestamp are older
+// than the table's retention — for normal timeseries ingest the two move
+// together; a freshly-rewritten old row waits out its write age, and a
+// backfilled ancient row expires promptly. Keys that match no eligible
+// retention table (foreign tenants of the mixed range, secondary-index
+// entries) are never touched.
+func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.Timestamp) bool, bool) {
+	spans := p.get()
+	var overlapping []retentionSpan
+	for _, ts := range spans {
+		if start.Compare(ts.end) >= 0 || ts.start.Compare(end) >= 0 {
+			continue
+		}
+		if ts.start.Compare(start) <= 0 && end.Compare(ts.end) <= 0 {
+			return nil, false // fully contained: expire-mode GC handles it
+		}
+		if len(ts.prefixes) > 0 {
+			overlapping = append(overlapping, ts)
+		}
+	}
+	if len(overlapping) == 0 {
+		return nil, false
+	}
+	nowNanos := time.Now().UnixNano()
+	return func(key keys.Key, vts hlc.Timestamp) bool {
+		for _, ts := range overlapping {
+			if key.Compare(ts.start) < 0 || key.Compare(ts.end) >= 0 {
+				continue
+			}
+			cutoff := nowNanos - ts.ttl.Nanoseconds()
+			if vts.WallTime > cutoff {
+				return false // written too recently, whatever the row says
+			}
+			for _, prefix := range ts.prefixes {
+				if !key.HasPrefix(prefix) {
+					continue
+				}
+				rowTS, ok := rowenc.DecodeTrailingTimestamp(key[len(prefix):], ts.pkFams)
+				return ok && rowTS <= cutoff
+			}
+			return false // an index entry or unknown generation: keep
+		}
+		return false
+	}, true
 }

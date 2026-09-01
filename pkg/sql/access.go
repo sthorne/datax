@@ -20,10 +20,13 @@ type colBound struct {
 	inclusive bool
 }
 
-// accessPlan is the chosen access path for one table read. There is no
-// cost model: plans are ranked primary-key point > unique-index point >
-// best constrained scan (2 points per equality-pinned column + 1 point for
-// a range on the next column, ties preferring the primary key) > full scan.
+// accessPlan is the chosen access path for one table read. Without
+// statistics, plans are ranked structurally: primary-key point >
+// unique-index point > best constrained scan (2 points per
+// equality-pinned column + 1 point for a range on the next column, ties
+// preferring the primary key) > full scan. With statistics (ANALYZE or
+// the background sampler), competing constrained scans and the full scan
+// are ranked by estimated cost instead — see pickPlanWithStats.
 type accessPlan struct {
 	kind    planKind
 	idx     *catalog.IndexDescriptor
@@ -46,6 +49,21 @@ type accessPlan struct {
 	// LOGICAL primary key (PrimaryKey[1:]), and the executor prepends each
 	// bucket value in turn. Fanned results are not in logical PK order.
 	fanBuckets int32
+
+	// estRows is the statistics-based row estimate for this path (0 = no
+	// statistics were used; the plan came from the structural fallback).
+	// EXPLAIN renders it; execution ignores it.
+	estRows float64
+
+	// Execution-order directives, stamped by execSelect from the ORDER BY
+	// decision (orderPlan) — never set by the planner itself. reverse
+	// runs the scan(s) backwards (all-descending ORDER BY; only stamped
+	// when the cluster-version gate allows reverse scans). mergeFan
+	// (sharded planPKScan only) K-way-merges the per-bucket scans by key,
+	// restoring logical-PK order — and, with a limit, stopping globally
+	// after limit rows instead of concatenating whole buckets.
+	reverse  bool
+	mergeFan bool
 }
 
 type planKind int
@@ -169,6 +187,27 @@ func tightenHi(cur *colBound, nb colBound) *colBound {
 // range conjuncts. The executor re-filters fetched rows with the complete
 // WHERE clause regardless of path, so plan bounds only ever narrow the scan.
 func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
+	return pickPlanWithStats(desc, nil, where, params)
+}
+
+// Cost-model constants (statistics present only). A non-unique index
+// scan pays indexJoinCostMultiplier per estimated row for the per-entry
+// primary-key Get that follows it; equality selectivity comes from the
+// column's distinct count, ranges use a fixed fraction, and a column the
+// statistics never saw gets a conservative guess. All deliberately
+// simple: with NO statistics the structural ranking below runs
+// byte-identically to the pre-statistics planner.
+const (
+	indexJoinCostMultiplier = 4
+	rangeSelectivity        = 1.0 / 3
+	unknownEqSelectivity    = 1.0 / 10
+)
+
+// pickPlanWithStats is pickPlan with optional table statistics: when st
+// is non-nil, competing constrained scans are ranked by estimated cost
+// (estimated rows × per-row cost) instead of the structural score, and a
+// low-selectivity index scan loses to the full scan it would out-fetch.
+func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
 	if pkVals, ok, err := pkPointValues(desc, where, params); err != nil {
 		return accessPlan{}, err
 	} else if ok {
@@ -323,7 +362,48 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	if desc.ShardBuckets > 0 && len(pkCols) > 1 {
 		pkCols = pkCols[1:]
 	}
+	// estRowsFor estimates the rows a candidate's bounds select: table
+	// rows times the selectivity of each consumed conjunct (equalities by
+	// 1/distinct, ranges by a fixed fraction; naive independence).
+	tableRows := float64(1)
+	if st != nil && st.RowCount > 0 {
+		tableRows = float64(st.RowCount)
+	}
+	estRowsFor := func(cand scanCandidate) float64 {
+		rows := tableRows
+		for ci := range cand.consumed {
+			pc := conjs[ci]
+			switch pc.cmp.Op {
+			case "=":
+				sel := unknownEqSelectivity
+				if cs, ok := st.Column(pc.col.ID); ok && cs.Distinct > 0 {
+					sel = 1 / float64(cs.Distinct)
+				}
+				rows *= sel
+			default: // range bounds
+				rows *= rangeSelectivity
+			}
+		}
+		if rows < 1 {
+			rows = 1
+		}
+		return rows
+	}
+	// costFor: estimated rows times the per-row fetch cost — a non-unique
+	// index entry costs an extra primary-key Get per row.
+	costFor := func(cand scanCandidate) float64 {
+		c := estRowsFor(cand)
+		if cand.idx != nil && !cand.idx.Unique {
+			c *= indexJoinCostMultiplier
+		}
+		return c
+	}
+
 	best := buildCandidate(nil, pkCols) // ties prefer the primary key (no join)
+	bestCost := 0.0
+	if st != nil {
+		bestCost = costFor(best)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		if !idx.Public() {
@@ -347,13 +427,32 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 				continue
 			}
 		}
-		if cand := buildCandidate(idx, idx.ColumnIDs); cand.score > best.score {
-			best = cand
+		cand := buildCandidate(idx, idx.ColumnIDs)
+		if st == nil {
+			if cand.score > best.score {
+				best = cand
+			}
+			continue
+		}
+		// Cost-based: strictly cheaper wins; ties keep the earlier choice
+		// (the PK candidate came first — no index→PK join on a tie).
+		if cand.score > 0 && (best.score == 0 || costFor(cand) < bestCost) {
+			best, bestCost = cand, costFor(cand)
 		}
 	}
 
 	if best.score == 0 {
-		return accessPlan{kind: planFullScan, residual: where}, nil
+		plan := accessPlan{kind: planFullScan, residual: where}
+		if st != nil {
+			plan.estRows = tableRows
+		}
+		return plan, nil
+	}
+	// With statistics, a constrained scan that would fetch MORE than the
+	// whole table (a low-selectivity index and its per-row PK joins) loses
+	// to the full scan.
+	if st != nil && bestCost >= tableRows {
+		return accessPlan{kind: planFullScan, residual: where, estRows: tableRows}, nil
 	}
 	plan := accessPlan{
 		idx:      best.idx,
@@ -362,6 +461,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 		lo:       best.lo,
 		hi:       best.hi,
 		rangeCol: best.rangeCol,
+	}
+	if st != nil {
+		plan.estRows = estRowsFor(best)
 	}
 	if best.idx == nil {
 		plan.kind = planPKScan
@@ -431,11 +533,41 @@ func (s *Session) fetchByPrimaryKey(ctx context.Context, txn *kvclient.Txn, desc
 // Index maintenance. All entries ride the statement's WriteBatch, so index
 // and row mutations commit atomically with the transaction.
 
+// reshardMirrorIndex applies the shadow-layout mirror of one index-entry
+// mutation during a re-shard's dual-write window: the same entry encoded
+// at the index's shadow ID from shadowRow (which carries the new bucket
+// in its hidden shard column). shadowRow == nil means no re-shard is
+// pending — a no-op. Mirrors carry no uniqueness checks of their own:
+// they duplicate the live copy, whose checks already ran.
+func reshardMirrorIndex(desc *catalog.TableDescriptor, i int, shadowRow map[catalog.ColumnID]types.Datum, del bool, wb *kvclient.WriteBatch) error {
+	if shadowRow == nil || desc.Reshard == nil || i >= len(desc.Reshard.NewIndexIDs) {
+		return nil
+	}
+	idx := &desc.Indexes[i]
+	key, val, skip, err := rowenc.EncodeIndexEntryAt(desc, idx, desc.Reshard.NewIndexIDs[i], shadowRow)
+	if err != nil {
+		return newErrf(CodeInternal, "re-shard mirror of index %q: %v", idx.Name, err)
+	}
+	if skip {
+		return nil
+	}
+	if del {
+		wb.Delete(key)
+	} else {
+		wb.Put(key, val)
+	}
+	return nil
+}
+
 // addIndexEntries buffers the row's entries in every secondary index.
 // Unique conflicts are detected through the transaction (a racing insert's
 // intent makes the conflict visible); seen catches duplicates within one
 // statement whose writes are still buffered.
 func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+	shadowRow, serr := reshardShadowRow(desc, row)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
@@ -460,12 +592,19 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			seen[string(key)] = true
 		}
 		wb.Put(key, val)
+		if err := reshardMirrorIndex(desc, i, shadowRow, false, wb); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // dropIndexEntries buffers deletion of the row's entries in every index.
 func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch) error {
+	shadowRow, serr := reshardShadowRow(desc, row)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		key, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
@@ -474,6 +613,9 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 		}
 		if !skip {
 			wb.Delete(key)
+			if err := reshardMirrorIndex(desc, i, shadowRow, true, wb); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -483,6 +625,14 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 // whose entry changed between oldRow and newRow (the primary key is
 // immutable under UPDATE, so only indexed-column changes move entries).
 func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+	shadowOld, serr := reshardShadowRow(desc, oldRow)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
+	shadowNew, serr := reshardShadowRow(desc, newRow)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		oldKey, _, oldSkip, err := rowenc.EncodeIndexEntry(desc, idx, oldRow)
@@ -497,10 +647,16 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 			return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
 		}
 		if !oldSkip && !newSkip && bytes.Equal(oldKey, newKey) {
-			continue // entry unchanged
+			// Entry unchanged. The shadow entry is unchanged too: the
+			// indexed columns and the (immutable-under-UPDATE) primary key
+			// are what both keys encode.
+			continue
 		}
 		if !oldSkip {
 			wb.Delete(oldKey)
+			if err := reshardMirrorIndex(desc, i, shadowOld, true, wb); err != nil {
+				return err
+			}
 		}
 		if !newSkip {
 			if idx.Unique {
@@ -515,6 +671,9 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 				seen[string(newKey)] = true
 			}
 			wb.Put(newKey, newVal)
+			if err := reshardMirrorIndex(desc, i, shadowNew, false, wb); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

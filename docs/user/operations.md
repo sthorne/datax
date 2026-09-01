@@ -43,7 +43,11 @@ replication path), `datax_follower_reads_total` vs
 `with_max_staleness` reads actually staying local, or falling back to
 leaders), `datax_parallel_commits_total`,
 `datax_sql_rows_scanned_total` (a jump usually means a query lost its
-index), `datax_auto_splits_total` / `datax_load_splits_total` /
+index), `datax_stats_refreshes_total` / `datax_stats_rows_scanned_total`
+(the table-statistics sampler's pace and cost),
+`datax_retention_rows_expired_total` (row-level retention expiry on
+mixed ranges),
+`datax_auto_splits_total` / `datax_load_splits_total` /
 `datax_range_merges_total`, `datax_gc_runs_total`.
 
 ## Everyday admin: `datax debug`
@@ -135,7 +139,7 @@ Adjacent versions only: upgrade one major version at a time.
 #      version and the cluster is healthy
 # Then, once EVERY node runs the new binary:
 datax debug upgrade                # finalize; refuses while old nodes remain
-datax debug nodes                  # shows: cluster version: v2
+datax debug nodes                  # shows: cluster version: v3
 ```
 
 Rules of the road:

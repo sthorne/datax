@@ -112,6 +112,16 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 				effective, expire = t, exp
 			}
 		}
+		// Row-level retention: a range that only partially overlaps
+		// retention tables keeps the conservative TTL, but individual
+		// rows past their table's retention still expire.
+		var rowExpired func(keys.Key, hlc.Timestamp) bool
+		if !expire && s.cfg.RowExpiry != nil {
+			desc := r.Desc()
+			if pred, ok := s.cfg.RowExpiry(desc.StartKey, desc.EndKey); ok {
+				rowExpired = pred
+			}
+		}
 		if effective <= 0 {
 			return true // GC disabled for this range
 		}
@@ -119,7 +129,7 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 		if threshold.WallTime <= 0 {
 			return true
 		}
-		if err := r.runGC(ctx, threshold, expire); err != nil {
+		if err := r.runGC(ctx, threshold, expire, rowExpired); err != nil {
 			log.Warnf("%s: gc at threshold %s: %v", r.rangeID, threshold, err)
 		}
 		return true
@@ -129,14 +139,17 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 // runGC enumerates and collects this range's garbage below threshold.
 // expire (retention ranges) collects EVERY version at or below the
 // threshold, survivors included — the rows are past their retention.
-func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire bool) error {
+// rowExpired, when non-nil (mixed ranges), additionally collects every
+// version of a row the predicate ages out — above the threshold included
+// — without changing how the threshold ratchets.
+func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire bool, rowExpired func(keys.Key, hlc.Timestamp) bool) error {
 	if threshold.LessEq(r.GCThreshold()) {
 		return nil
 	}
 	desc := r.Desc()
 
 	snap := r.store.cfg.Engine.NewSnapshot()
-	versions, liveIntentTxns, err := enumerateGarbageVersions(snap, desc, threshold, expire)
+	versions, rowExpiredCount, liveIntentTxns, err := enumerateGarbageVersions(snap, desc, threshold, expire, rowExpired)
 	var recordWork []gcTxnRecord
 	if err == nil {
 		recordWork, err = enumerateGarbageTxnRecords(snap, desc, threshold, liveIntentTxns)
@@ -194,25 +207,31 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire boo
 		log.Debugf("%s: gc reclaimed %d versions, %d txn records (threshold %s)",
 			r.rangeID, len(chunkV), len(chunkR), threshold)
 	}
+	if rowExpiredCount > 0 {
+		metrics.RetentionRowsExpired.Add(float64(rowExpiredCount))
+	}
 	return nil
 }
 
 // enumerateGarbageVersions scans the range's MVCC span in one consistent
-// snapshot and returns the versions that are garbage at threshold, plus the
-// set of transactions that still hold an intent somewhere in the range.
-func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp, expire bool) ([]kvpb.GCVersion, map[uuid.UUID]struct{}, error) {
+// snapshot and returns the versions that are garbage at threshold (plus
+// how many of them rowExpired aged out beyond the ordinary rules), plus
+// the set of transactions that still hold an intent somewhere in the
+// range.
+func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor, threshold hlc.Timestamp, expire bool, rowExpired func(keys.Key, hlc.Timestamp) bool) ([]kvpb.GCVersion, int, map[uuid.UUID]struct{}, error) {
 	lower := storage.EncodeMVCCKey(desc.StartKey, hlc.Timestamp{})
 	upper := storage.EncodeMVCCKey(desc.EndKey, hlc.Timestamp{})
 	it := snap.NewIter(lower, upper)
 	defer func() { _ = it.Close() }()
 
 	var out []kvpb.GCVersion
+	rowExpiredCount := 0
 	liveIntentTxns := make(map[uuid.UUID]struct{})
 	ok := it.SeekGE(lower)
 	for ok {
 		userKey, vts, err := storage.DecodeMVCCKey(it.Key())
 		if err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
 		cur := keys.Key(userKey).Clone()
 		if vts.IsEmpty() {
@@ -231,13 +250,24 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 		for ok {
 			k, cvts, err := storage.DecodeMVCCKey(it.Key())
 			if err != nil {
-				return nil, nil, err
+				return nil, 0, nil, err
 			}
 			if !cur.Equal(k) {
 				break // next user key; outer loop re-examines this position
 			}
+			stored := int64(len(it.Key()) + len(it.Value()))
+			if rowExpired != nil && rowExpired(cur, cvts) {
+				// Row-level retention (mixed ranges): the row's own
+				// timestamp column and this version's write age are both
+				// past the table's retention — every such version goes,
+				// survivors and tombstones included, independent of the
+				// range's conservative threshold.
+				out = append(out, kvpb.GCVersion{Key: cur, TS: cvts, Bytes: stored})
+				rowExpiredCount++
+				ok = it.Next()
+				continue
+			}
 			if cvts.LessEq(threshold) {
-				stored := int64(len(it.Key()) + len(it.Value()))
 				if survivorSeen || expire {
 					// expire (retention ranges): the survivor goes too —
 					// rows at or below the threshold are past retention,
@@ -247,7 +277,7 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 					survivorSeen = true
 					tomb, err := storage.IsTombstoneValue(it.Value())
 					if err != nil {
-						return nil, nil, err
+						return nil, 0, nil, err
 					}
 					if tomb {
 						out = append(out, kvpb.GCVersion{Key: cur, TS: cvts, Bytes: stored})
@@ -257,7 +287,7 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 			ok = it.Next()
 		}
 	}
-	return out, liveIntentTxns, nil
+	return out, rowExpiredCount, liveIntentTxns, nil
 }
 
 // intentTxnID extracts the owning transaction's ID from raw intent metadata.

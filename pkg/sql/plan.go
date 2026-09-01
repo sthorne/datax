@@ -301,6 +301,19 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.ShowTables:
 		return []ResultColumn{{Name: "table_name", Type: types.String}}, nil
 
+	case *parser.ShowStats:
+		return []ResultColumn{
+			{Name: "table_name", Type: types.String},
+			{Name: "row_count", Type: types.Int},
+			{Name: "collected_at", Type: types.Timestamp},
+			{Name: "column_name", Type: types.String},
+			{Name: "distinct_count", Type: types.Int},
+			{Name: "null_count", Type: types.Int},
+		}, nil
+
+	case *parser.Analyze:
+		return nil, nil
+
 	case *parser.SetVar:
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
 			return []ResultColumn{{Name: t.Name[5:], Type: types.String}}, nil

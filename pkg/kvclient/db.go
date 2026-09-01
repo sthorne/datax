@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -21,6 +22,7 @@ import (
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // LocalStore is the interface DB uses to short-circuit to the local store.
@@ -103,10 +105,30 @@ type DB struct {
 	// fallback when a cached descriptor's replicas are unreachable (e.g. a
 	// stale pre-upreplication descriptor whose only replica died).
 	nodeLister func() []base.NodeID
+	// versionGate reports the finalized cluster version; version-gated
+	// request shapes (pkg/version rule 4) are sent only when it allows
+	// them. Nil (tests, tools) reads as the binary's own version: a
+	// process without version plumbing never talks to older binaries.
+	versionGate atomic.Pointer[func() version.Version]
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
 func (db *DB) SetNodeLister(f func() []base.NodeID) { db.nodeLister = f }
+
+// SetVersionGate wires the finalized-cluster-version source (the node's
+// mirror) consulted before sending version-gated request shapes.
+func (db *DB) SetVersionGate(f func() version.Version) { db.versionGate.Store(&f) }
+
+// ReverseScansOK reports whether reverse scans may be SENT: they were
+// introduced under cluster version v3, and a v2 node silently runs a
+// forward scan when it sees one (pkg/version rule 4).
+func (db *DB) ReverseScansOK() bool {
+	f := db.versionGate.Load()
+	if f == nil {
+		return true // no gate: single-binary process at the binary's version
+	}
+	return (*f)() >= version.V3
+}
 
 type localSender struct {
 	store LocalStore
@@ -578,6 +600,9 @@ func (db *DB) lookupMeta(ctx context.Context, key keys.Key) (kvpb.RangeDescripto
 
 // sendScan executes a scan, stitching across range boundaries.
 func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.ScanRequest) (*kvpb.ScanResponse, *kvpb.Error) {
+	if req.Reverse {
+		return db.sendReverseScan(ctx, header, req)
+	}
 	out := &kvpb.ScanResponse{}
 	cur := req.Key.Clone()
 	remaining := req.MaxRows
@@ -627,6 +652,73 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 			}
 		}
 		cur = end
+	}
+	return out, nil
+}
+
+// sendReverseScan executes a reverse scan, stitching across range
+// boundaries from the END of the span backwards. The meta index answers
+// "which range contains key K", not "which range precedes K", so each
+// iteration walks the (cached, in-memory) descriptors forward to locate
+// the LAST not-yet-scanned segment and reverse-scans it — O(ranges²)
+// cache lookups, always against fresh descriptors, so splits and merges
+// racing the scan resolve through the ordinary regroup path.
+func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.ScanRequest) (*kvpb.ScanResponse, *kvpb.Error) {
+	out := &kvpb.ScanResponse{}
+	curEnd := req.EndKey.Clone()
+	remaining := req.MaxRows
+	regroups := 0
+	for req.Key.Less(curEnd) {
+		// Locate the last segment of [req.Key, curEnd).
+		var segStart, segEnd keys.Key
+		var desc kvpb.RangeDescriptor
+		s := req.Key.Clone()
+		for s.Less(curEnd) {
+			d, kerr := db.descForKey(ctx, s)
+			if kerr != nil {
+				return nil, kerr
+			}
+			e := curEnd
+			if d.EndKey.Less(e) {
+				e = d.EndKey
+			}
+			segStart, segEnd, desc = s, e, d
+			s = e
+		}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: segStart, EndKey: segEnd}, MaxRows: remaining, Reverse: true}
+		// Anchor scoping, as in the forward path.
+		gh := header
+		if gh.CreateTxnRecord && gh.Txn != nil {
+			a := keys.Key(gh.Txn.Key)
+			gh.CreateTxnRecord = segStart.Compare(a) <= 0 && a.Less(segEnd)
+		}
+		br, regroup, kerr := db.sendPartial(ctx, &gh, []kvpb.RequestUnion{{Scan: sub}}, desc)
+		header.Timestamp = gh.Timestamp
+		if regroup {
+			if regroups++; regroups > maxRoutingRetries {
+				return nil, kvpb.NewErrorf("reverse scan routing did not converge: %v", kerr)
+			}
+			continue
+		}
+		if kerr != nil {
+			return nil, kerr
+		}
+		sr := br.Responses[0].Scan
+		out.Rows = append(out.Rows, sr.Rows...)
+		if len(sr.Resume) > 0 {
+			out.Resume = sr.Resume
+			return out, nil
+		}
+		if req.MaxRows > 0 {
+			remaining -= int64(len(sr.Rows))
+			if remaining <= 0 {
+				if req.Key.Less(segStart) {
+					out.Resume = segStart
+				}
+				return out, nil
+			}
+		}
+		curEnd = segStart
 	}
 	return out, nil
 }
