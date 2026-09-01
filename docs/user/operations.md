@@ -6,9 +6,10 @@ Start nodes with `--http-listen` (or `demo -http-port`) and each node
 serves, on that address:
 
 - **`/`** — a self-contained web UI: node liveness, per-node leader/QPS/byte
-  load, range table with replica placement, storage health. The range
-  detail view shows the serving node's own replicas; there is no cross-node
-  drill-down yet, so check each node's dashboard for its ranges.
+  load, range tables with replica placement, storage health. The cluster
+  ranges table drills down: clicking a range fetches every holding node's
+  view of it (leader, applied index, size, QPS, closed timestamp) over
+  internode RPC, so any node's dashboard can inspect any range.
 - **`/metrics`** — Prometheus text format.
 - **`/status`** — JSON: this node's identity, locality, and every range it
   holds (leader, applied index, size, QPS, closed timestamp — the newest
@@ -16,9 +17,12 @@ serves, on that address:
   `datax debug status --url ...` pretty-prints it.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
   liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges).
+- **`/api/range?id=N`** — JSON: the cross-node drill-down document behind
+  the range detail view. Admin role required in secure mode.
 
 In secure mode all of it requires HTTP Basic credentials of any database
-user, or a client certificate ([Security](security.md)).
+user, or a client certificate; `/api/range` additionally requires the
+admin role ([Security](security.md)).
 
 ## Metrics worth alerting on
 
@@ -53,7 +57,11 @@ mixed ranges),
 ## Everyday admin: `datax debug`
 
 All subcommands talk to a running node (`--addr`, default
-`127.0.0.1:26257`) except where noted.
+`127.0.0.1:26257`) except where noted. Against a **secure** cluster add
+`--certs-dir` (and `--user`, default `root`) to present a client
+certificate; state-changing subcommands require the admin role, and each
+one lands in the node's audit log with the acting principal
+([Security](security.md#admin-rpcs-in-secure-mode)).
 
 ```sh
 datax debug nodes                      # liveness, locality, last heartbeat

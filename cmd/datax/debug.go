@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"time"
 
@@ -18,10 +19,21 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/util/log"
 )
+
+// osUsername names the operating-system user for offline-command audit
+// records ("unknown" when unresolvable).
+func osUsername() string {
+	if u, err := osuser.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "unknown"
+}
 
 // loadOptionalKey resolves an --enc-key flag value (empty = no key).
 func loadOptionalKey(path string) ([]byte, error) {
@@ -145,6 +157,9 @@ Re-run with --yes to proceed`)
 	if err != nil {
 		return err
 	}
+	// Offline command: no cluster principal exists, so the audit record
+	// carries the operating-system user who ran it.
+	log.Audit("unsafe-recover", "dir", *dir, "range", *rangeID, "principal", "os:"+osUsername())
 	if len(descs) == 0 {
 		fmt.Println("nothing to recover (no multi-replica ranges on this store)")
 		return nil
@@ -162,12 +177,22 @@ func runDebugStatus(args []string) error {
 	fs := flag.NewFlagSet("debug status", flag.ContinueOnError)
 	url := fs.String("url", "http://127.0.0.1:8080/status", "a node's /status URL")
 	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification")
+	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
-	if *insecureTLS {
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	tlsCfg := &tls.Config{}
+	if *certsDir != "" {
+		var err error
+		if tlsCfg, err = security.LoadClientTLS(*certsDir, *certUser); err != nil {
+			return err
+		}
+	}
+	tlsCfg.InsecureSkipVerify = *insecureTLS
+	if *certsDir != "" || *insecureTLS {
+		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}
 	resp, err := client.Get(*url)
 	if err != nil {
@@ -195,6 +220,8 @@ func runDebug(args []string) error {
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
+	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); state-changing ops require an admin")
 	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
 	rawKey := fs.String("key", "", "split: raw split key (hex)")
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
@@ -246,6 +273,13 @@ func runDebug(args []string) error {
 	}
 
 	trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
+	if *certsDir != "" {
+		tlsCfg, err := security.LoadClientTLS(*certsDir, *certUser)
+		if err != nil {
+			return err
+		}
+		trans.SetTLS(tlsCfg)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var resp cluster.AdminResponse

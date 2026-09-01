@@ -2,11 +2,13 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // Authorization. root is all-powerful; members of the admin role
@@ -94,6 +96,7 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 		} else if err := txn.Put(ctx, key, []byte("1")); err != nil {
 			return nil, err
 		}
+		log.Audit("privilege-ddl", "stmt", tag, "privileges", "ADMIN", "target", t.User, "principal", s.user)
 		return &Result{Tag: tag}, nil
 	}
 
@@ -141,5 +144,7 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
+	log.Audit("privilege-ddl", "stmt", tag, "privileges", strings.Join(t.Privileges, ","),
+		"table", t.Table, "target", t.User, "principal", s.user)
 	return &Result{Tag: tag}, nil
 }

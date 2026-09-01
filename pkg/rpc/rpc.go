@@ -13,6 +13,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -59,6 +60,27 @@ func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *g
 	gs := grpc.NewServer(opts...)
 	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers})
 	return gs
+}
+
+// PeerCN returns the CommonName of the caller's CA-verified client
+// certificate, or "" on a cleartext (insecure-mode) connection. The
+// internode server requires and verifies client certificates, so in
+// secure mode every call carries exactly one verified identity: "node"
+// for cluster peers, or a SQL username for a client certificate issued
+// by `datax cert create-client`.
+func PeerCN(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.AuthInfo == nil {
+		return ""
+	}
+	ti, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return ""
+	}
+	if len(ti.State.VerifiedChains) == 0 || len(ti.State.VerifiedChains[0]) == 0 {
+		return ""
+	}
+	return ti.State.VerifiedChains[0][0].Subject.CommonName
 }
 
 func (s *Server) updateClock(now *rpcpb.Hlc) {

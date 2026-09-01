@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -146,6 +147,38 @@ func TestHTTPAuthSecure(t *testing.T) {
 		t.Fatal("scraper with wrong password accepted")
 	}
 
+	// The cross-node drill-down is admin-gated: a non-admin gets 403 (not
+	// 401 — they authenticated fine), an admin gets every replica's view.
+	if code, _, _ := authedGet(t, client, base+"/api/range?id=1", "scraper", "metrics-pw"); code != http.StatusForbidden {
+		t.Fatalf("/api/range as non-admin: want 403")
+	}
+	code, body, _ := authedGet(t, client, base+"/api/range?id=1", "root", "topsecret")
+	if code != http.StatusOK {
+		t.Fatalf("/api/range as root: %d, want 200 (%s)", code, body)
+	}
+	var detail server.RangeDetail
+	if err := json.Unmarshal([]byte(body), &detail); err != nil {
+		t.Fatalf("undecodable /api/range body: %v", err)
+	}
+	if detail.RangeID != 1 || len(detail.Replicas) != 3 {
+		t.Fatalf("range detail: id=%d replicas=%d, want 1/3", detail.RangeID, len(detail.Replicas))
+	}
+	leaders := 0
+	for _, rep := range detail.Replicas {
+		if rep.Error != "" {
+			t.Fatalf("replica n%d view errored: %s", rep.NodeID, rep.Error)
+		}
+		if rep.Status == nil {
+			t.Fatalf("replica n%d has no status", rep.NodeID)
+		}
+		if rep.Status.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("range detail shows %d leaders, want exactly 1", leaders)
+	}
+
 	// A CA-verified client certificate authenticates without Basic creds.
 	if err := security.CreateClientCert(certsDir, "root"); err != nil {
 		t.Fatal(err)
@@ -161,7 +194,7 @@ func TestHTTPAuthSecure(t *testing.T) {
 func TestHTTPAuthInsecure(t *testing.T) {
 	tc := startWithHTTP(t, 1)
 	base := "http://" + tc.Nodes[0].HTTPAddr()
-	for _, path := range []string{"/", "/metrics", "/status", "/api/cluster"} {
+	for _, path := range []string{"/", "/metrics", "/status", "/api/cluster", "/api/range?id=1"} {
 		if code, _, _ := httpGet(t, base+path); code != http.StatusOK {
 			t.Fatalf("insecure %s: %d, want 200", path, code)
 		}

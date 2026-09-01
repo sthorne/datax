@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"encoding/json"
+
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 )
@@ -52,6 +54,10 @@ type AdminResponse struct {
 	// ClusterVersion reports the finalized cluster version (nodes,
 	// upgrade-cluster).
 	ClusterVersion int `json:"cluster_version,omitempty"`
+	// Status answers node-status: the serving node's /status document
+	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
+	// this package does not depend on the server package's types.
+	Status json.RawMessage `json:"status,omitempty"`
 }
 
 // BackupTableSummary reports one table of a backup or restore.

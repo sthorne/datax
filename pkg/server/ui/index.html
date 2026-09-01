@@ -61,6 +61,11 @@
     border: 1px solid var(--serious); color: var(--text); background: var(--panel); font-size: 13px;
   }
   .muted { color: var(--text-3); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: color-mix(in srgb, var(--border) 30%, transparent); }
+  td.detail { padding: 0 12px 10px; }
+  td.detail table { margin-top: 4px; }
+  td.detail .note { color: var(--text-3); font-size: 12px; padding: 6px 0; }
 </style>
 </head>
 <body>
@@ -92,6 +97,15 @@
       <tbody id="ranges"></tbody>
     </table></div>
     <p class="muted" id="cluster-range-note"></p>
+  </section>
+
+  <section>
+    <h2>Ranges (cluster)</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
+      <tbody id="cluster-ranges"></tbody>
+    </table></div>
+    <p class="muted">click a range for its per-replica detail from every holding node (admin role)</p>
   </section>
 
   <section>
@@ -178,6 +192,7 @@ function render(d) {
   document.getElementById("cluster-range-note").textContent = clusterN
     ? "cluster-wide: " + clusterN + " ranges (★ = led by this node; qps is the leader's local rate)"
     : "";
+  renderClusterRanges(d.ranges || []);
 
   const s = d.storage || {};
   document.getElementById("storage").innerHTML =
@@ -191,6 +206,69 @@ function render(d) {
   const errBox = document.getElementById("cluster-err");
   if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
   else errBox.style.display = "none";
+}
+// Cross-node drill-down: clicking a cluster range fetches /api/range?id=N
+// (admin role) — every holding node's view of that range over internode
+// RPC. The open detail row survives the 3s re-render (cached HTML) and is
+// refreshed only on click.
+let openRange = null, openDetailHTML = "";
+function detailRow(html) {
+  return `<tr class="detailrow"><td class="detail" colspan="3">${html}</td></tr>`;
+}
+function renderClusterRanges(ranges) {
+  const rows = ranges.slice().sort((a, b) => a.range_id - b.range_id).map(r => {
+    let row = `<tr class="clickable" data-range="${r.range_id}">
+      <td>r${r.range_id}</td>
+      <td class="key">${esc(r.start_key)} → ${esc(r.end_key)}</td>
+      <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
+    </tr>`;
+    if (r.range_id === openRange) row += detailRow(openDetailHTML);
+    return row;
+  }).join("");
+  const tbody = document.getElementById("cluster-ranges");
+  tbody.innerHTML = rows;
+  tbody.querySelectorAll("tr.clickable").forEach(tr => {
+    tr.addEventListener("click", () => toggleRangeDetail(Number(tr.dataset.range)));
+  });
+}
+async function toggleRangeDetail(id) {
+  if (openRange === id) { openRange = null; openDetailHTML = ""; poll(); return; }
+  openRange = id;
+  openDetailHTML = `<div class="note">loading r${id}…</div>`;
+  try {
+    const resp = await fetch("/api/range?id=" + id, { cache: "no-store" });
+    if (resp.status === 403) {
+      openDetailHTML = `<div class="note">admin role required for cross-node drill-down</div>`;
+    } else if (!resp.ok) {
+      openDetailHTML = `<div class="note">error: HTTP ${resp.status}</div>`;
+    } else {
+      const d = await resp.json();
+      openDetailHTML = `<table>
+        <thead><tr><th>node</th><th>status</th><th>locality</th><th>leader</th>
+          <th class="num">applied</th><th class="num">size</th><th class="num">qps</th>
+          <th>closed ts</th></tr></thead>
+        <tbody>` + (d.replicas || []).map(rep => {
+          if (rep.error) return `<tr><td>n${rep.node_id}</td>
+            <td>${statusCell({ live: rep.live })}</td>
+            <td>${esc(rep.locality || "—")}</td>
+            <td colspan="5" class="key">${esc(rep.error)}</td></tr>`;
+          const s = rep.status || {};
+          return `<tr>
+            <td>n${rep.node_id}</td>
+            <td>${statusCell({ live: rep.live })}</td>
+            <td>${esc(rep.locality || "—")}</td>
+            <td>${s.leader ? "★ leader" : ""}</td>
+            <td class="num">${s.applied_index ?? ""}</td>
+            <td class="num">${fmtBytes(s.size_bytes || 0)}</td>
+            <td class="num">${s.qps ? s.qps.toFixed(0) : "0"}</td>
+            <td class="key">${esc(s.closed_timestamp || "—")}</td>
+          </tr>`;
+        }).join("") + `</tbody></table>`;
+    }
+  } catch (err) {
+    openDetailHTML = `<div class="note">error: ${esc(err.message || err)}</div>`;
+  }
+  poll();
 }
 async function poll() {
   try {
