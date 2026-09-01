@@ -45,6 +45,8 @@ leaders), `datax_parallel_commits_total`,
 `datax_sql_rows_scanned_total` (a jump usually means a query lost its
 index), `datax_stats_refreshes_total` / `datax_stats_rows_scanned_total`
 (the table-statistics sampler's pace and cost),
+`datax_retention_rows_expired_total` (row-level retention expiry on
+mixed ranges),
 `datax_auto_splits_total` / `datax_load_splits_total` /
 `datax_range_merges_total`, `datax_gc_runs_total`.
 

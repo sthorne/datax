@@ -346,6 +346,7 @@ func (n *Node) start() error {
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
 		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
+		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)

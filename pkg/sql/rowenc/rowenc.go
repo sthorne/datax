@@ -473,6 +473,28 @@ func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescr
 	return append(PrimaryKeyPrefixFor(desc), rest...), nil
 }
 
+// DecodeTrailingTimestamp decodes the LAST primary-key column — a
+// timestamp — from rest, the encoded PK suffix of a row key (the bytes
+// after the table/index prefix), given the PK column families in
+// physical order. Returns UTC nanoseconds. The row-level retention sweep
+// uses it to age rows by their timestamp column without a full decode.
+func DecodeTrailingTimestamp(rest []byte, fams []types.Family) (int64, bool) {
+	if len(fams) == 0 || fams[len(fams)-1] != types.Timestamp {
+		return 0, false
+	}
+	var err error
+	for _, fam := range fams[:len(fams)-1] {
+		if rest, err = skipDatum(rest, fam); err != nil {
+			return 0, false
+		}
+	}
+	tail, nanos, err := encoding.DecodeInt64(rest)
+	if err != nil || len(tail) != 0 {
+		return 0, false
+	}
+	return nanos, true
+}
+
 func skipDatum(b []byte, fam types.Family) ([]byte, error) {
 	var err error
 	switch fam {
