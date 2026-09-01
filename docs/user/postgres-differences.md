@@ -49,9 +49,12 @@ syntax error or `0A000` feature not supported):
   indexable `AND` condition alongside on large tables. Subqueries cannot
   appear inside `OR`. Computed left-hand sides (`qty * 2 > 10`) work in
   single-table queries and joins.
-- **Join order is execution order** — there is no cost-based reordering.
-  Write the most selective table first. `ON` clauses must be equalities
-  against earlier tables.
+- **Join order is execution order until statistics exist** — with
+  statistics for every joined table (`ANALYZE` or the background
+  sampler), INNER joins are cost-reordered greedily; LEFT joins and
+  self-joins always run in the written order, so put the most selective
+  table first there. `ON` clauses must be equalities against earlier
+  tables.
 - **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
   1 MiB) as the stream arrives, so a failure partway leaves the earlier
   chunks committed — the error names the failing row and how many rows

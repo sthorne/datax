@@ -100,8 +100,11 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   whole-table or per `GROUP BY` group, including over joins. `HAVING`
   filters on aggregates or group columns. `DISTINCT` is supported.
-- **Joins** execute left-deep in the order written (there is no
-  reorderer — put the most selective table first). `ON` must equate a
+- **Joins** execute left-deep in the order written — until
+  [statistics](#table-statistics) exist for every joined table, at which
+  point INNER joins are automatically reordered to drive from the
+  cheapest side (`EXPLAIN` says `join reordered by cost`; LEFT joins and
+  self-joins always keep the written order). `ON` must equate a
   column of the newly joined table with one from an earlier table. Join
   select lists take columns, `*`, expressions (`o.qty * 2`, rendered as
   text), and `->`/`->>` paths; under `GROUP BY` they narrow to plain

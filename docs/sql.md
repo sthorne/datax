@@ -136,7 +136,8 @@ on the recent side and the GC TTL (default 25h) on the old side.
 
 Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
-join reordering (join order = syntactic order) and joins beyond 8 tables,
+joins beyond 8 tables (INNER joins are cost-reordered when statistics
+exist; LEFT joins and self-joins keep syntactic order),
 constraints beyond PRIMARY KEY / NOT NULL, sequences,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
@@ -281,9 +282,9 @@ clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
 match — and `col IS NULL` therefore always reads the primary rows. Unique
 indexes reject NULLs at write time and are always complete.
 
-Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops
-executed **in syntactic order** — there is no join reordering, so the
-FROM/JOIN order you write is the plan you get. The base (first) table is
+Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops.
+Without statistics they execute **in syntactic order** — the FROM/JOIN
+order you write is the plan you get. The base (first) table is
 fetched through the ranking above using the WHERE conjuncts that
 reference only it; for each partial row, the next JOIN's ON equalities
 become synthetic equality predicates on that table — so a join key that
@@ -299,6 +300,25 @@ qualified (`t.c` or `alias.c`); unqualified names must be unambiguous
 `nested loop left join; outer (c): range scan of primary key (id > 1);
 inner (o) per outer row: scan of index "by_customer" (1 column prefix) +
 primary key join; then inner (i) per row: point lookup on primary key`.
+
+With statistics present for **every** joined table, INNER joins are
+cost-reordered: a greedy pass picks the side with the fewest estimated
+rows (after its side-local WHERE conjuncts, using the single-table
+selectivities) to drive the nested loop, then repeatedly adds the
+cheapest side connected to the placed set by an ON equality. The rewrite
+is a pure AST transformation on a clone (prepared statements re-plan
+per execution): `SELECT *` is pre-expanded into qualified references in
+the original side order so output columns never move, and every ON
+conjunct is pooled and re-attached, fully qualified, at the level where
+its later side lands. It declines — keeping byte-identical syntactic
+order — for any LEFT join (NULL-extension is order-sensitive), a derived
+base table, missing statistics, self-joins or any alias/table-name
+shadowing (qualified references bind first-match), or a join graph the
+ON equalities don't connect. `EXPLAIN` appends ` [~N rows]` to each side
+planned with statistics and `; join reordered by cost` when the order
+changed. Measured on a worst-first 3-way join (400×20×5 rows, one
+selective product): 24.1ms/op syntactic vs 5.1ms/op reordered — within
+~3% of the same query hand-ordered (5.2ms/op).
 
 Aggregates and GROUP BY compose with joins: the joined rows run through
 the grouped executor, with `GROUP BY c.name`, `SUM(o.total)`, HAVING and

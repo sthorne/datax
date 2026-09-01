@@ -426,43 +426,84 @@ func makeJoinSides(baseDesc *catalog.TableDescriptor, innerDescs []*catalog.Tabl
 	return sides, nil
 }
 
-// resolveJoinQuery looks up and privilege-checks every joined table and
+// joinQuery is a resolved join: the sides in EXECUTION order, each
+// level's ON pairs, and the Select to execute — the caller's own, or a
+// cost-reordered clone (reordered = true), in which case everything
+// downstream (projection, WHERE, ORDER BY) must read sel, never the
+// original.
+type joinQuery struct {
+	sides     []joinSide
+	ons       [][]onPair
+	sel       *parser.Select
+	reordered bool
+}
+
+// resolveJoinQuery looks up and privilege-checks every joined table,
+// applies cost-based join reordering when statistics allow it, and
 // resolves each level's ON conditions.
-func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select) ([]joinSide, [][]onPair, error) {
+func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select) (*joinQuery, error) {
 	innerDescs := make([]*catalog.TableDescriptor, len(t.Joins))
 	for i := range t.Joins {
 		desc, err := s.cat.Lookup(ctx, txn, t.Joins[i].Table)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		innerDescs[i] = desc
 	}
 	sides, err := makeJoinSides(baseDesc, innerDescs, t)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	ons := make([][]onPair, len(t.Joins))
-	for i := range t.Joins {
-		on, err := resolveOn(sides, i+1, t.Joins[i].On)
-		if err != nil {
-			return nil, nil, err
+	jq := &joinQuery{sides: sides, sel: t}
+	// Reorder only with statistics for EVERY side: their absence keeps
+	// the syntactic order byte-identical to the pre-statistics executor.
+	stats := make([]*catalog.TableStatistics, len(sides))
+	haveAll := true
+	for i, js := range sides {
+		st, ok := s.cat.Stats(ctx, js.desc.ID)
+		if !ok {
+			haveAll = false
+			break
 		}
-		ons[i] = on
+		stats[i] = st
 	}
-	return sides, ons, nil
+	if haveAll {
+		if clone, order, changed, ok := reorderJoins(t, sides, stats); ok && changed {
+			jq.sel, jq.reordered = clone, true
+			permuted := make([]joinSide, len(sides))
+			for p, si := range order {
+				permuted[p] = sides[si]
+			}
+			jq.sides = permuted
+		}
+	}
+	jq.ons = make([][]onPair, len(jq.sel.Joins))
+	for i := range jq.sel.Joins {
+		on, err := resolveOn(jq.sides, i+1, jq.sel.Joins[i].On)
+		if err != nil {
+			return nil, err
+		}
+		jq.ons[i] = on
+	}
+	return jq, nil
 }
 
 func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
 	if t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with joins")
 	}
-	sides, ons, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
+	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
 	if err != nil {
 		return nil, err
 	}
+	// From here on t is the (possibly cost-reordered) clone; sides are in
+	// execution order and the star, if any, was pre-expanded to preserve
+	// the original output column order.
+	sides, ons := jq.sides, jq.ons
+	t = jq.sel
 	grouped := hasAggregates(t.Exprs) || len(t.GroupBy) > 0 || len(t.Having) > 0
 	var proj []joinProj
 	if !grouped {
@@ -649,10 +690,12 @@ func innerPathDesc(plan accessPlan) string {
 // explainJoin renders the join plan: the base access path (with real
 // bounds) and each level's per-row path implied by its ON keys.
 func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (string, error) {
-	sides, ons, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
+	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
 	if err != nil {
 		return "", err
 	}
+	sides, ons := jq.sides, jq.ons
+	t = jq.sel
 	grouped := hasAggregates(t.Exprs) || len(t.GroupBy) > 0 || len(t.Having) > 0
 	if grouped {
 		if _, _, _, err := groupedJoinQuery(sides, t); err != nil {
@@ -665,19 +708,29 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 	if err != nil {
 		return "", err
 	}
-	basePlan, err := pickPlan(sides[0].desc, baseWhere, params)
+	// Statistics are threaded exactly as execution threads them (fetchRows
+	// does the same lookup), so EXPLAIN shows the paths execution takes;
+	// a statistics-based estimate annotates each side that has one.
+	baseStats, _ := s.cat.Stats(ctx, sides[0].desc.ID)
+	basePlan, err := pickPlanWithStats(sides[0].desc, baseStats, baseWhere, params)
 	if err != nil {
 		return "", err
+	}
+	estimate := func(plan accessPlan) string {
+		if plan.estRows > 0 {
+			return fmt.Sprintf(" [~%.0f rows]", plan.estRows)
+		}
+		return ""
 	}
 	kind := "inner"
 	if sides[1].left {
 		kind = "left"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s", kind, sides[0].alias, basePlan.String())
+	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s%s", kind, sides[0].alias, basePlan.String(), estimate(basePlan))
 	for k := 1; k < len(sides); k++ {
 		// Placeholder non-NULL datums of the join-key columns' own types
-		// give pickPlan the same shape the per-row lookups will use.
+		// give the planner the same shape the per-row lookups will use.
 		synth := make([]parser.Comparison, 0, len(ons[k-1]))
 		for _, p := range ons[k-1] {
 			lit := types.Datum{Fam: p.rightCol.Type}
@@ -685,22 +738,26 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 				Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
 			})
 		}
-		plan, err := pickPlan(sides[k].desc, synth, nil)
+		sideStats, _ := s.cat.Stats(ctx, sides[k].desc.ID)
+		plan, err := pickPlanWithStats(sides[k].desc, sideStats, synth, nil)
 		if err != nil {
 			return "", err
 		}
 		if k == 1 {
-			fmt.Fprintf(&b, "; inner (%s) per outer row: %s", sides[k].alias, innerPathDesc(plan))
+			fmt.Fprintf(&b, "; inner (%s) per outer row: %s%s", sides[k].alias, innerPathDesc(plan), estimate(plan))
 			continue
 		}
 		lk := "inner"
 		if sides[k].left {
 			lk = "left"
 		}
-		fmt.Fprintf(&b, "; then %s (%s) per row: %s", lk, sides[k].alias, innerPathDesc(plan))
+		fmt.Fprintf(&b, "; then %s (%s) per row: %s%s", lk, sides[k].alias, innerPathDesc(plan), estimate(plan))
 	}
 	if grouped {
 		b.WriteString("; then group/aggregate over the joined rows")
+	}
+	if jq.reordered {
+		b.WriteString("; join reordered by cost")
 	}
 	return b.String(), nil
 }
