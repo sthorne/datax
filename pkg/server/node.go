@@ -93,6 +93,15 @@ type Config struct {
 	// balance (0 = default 2, the minimum with hysteresis; negative
 	// disables automatic rebalancing).
 	RebalanceThreshold int
+	// StatsRefreshInterval paces the background statistics sampler: each
+	// tick, the node leading range 1 re-collects statistics for at most
+	// ONE table whose stats are missing or older than StatsStaleness
+	// (0 = default 60s; negative disables the sampler — ANALYZE still
+	// works).
+	StatsRefreshInterval time.Duration
+	// StatsStaleness is the statistics age that triggers a background
+	// re-collection (0 = default 10m).
+	StatsStaleness time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -425,6 +434,9 @@ func (n *Node) start() error {
 		return err
 	}
 	n.startConsistencyLoop()
+	if err := n.stopper.RunWorker(n.statsRefreshLoop); err != nil {
+		return err
+	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err

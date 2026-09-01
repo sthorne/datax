@@ -240,6 +240,12 @@ values and a sketch estimate (±~10%) beyond. It cannot run inside
 `BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
 shows what the planner sees, one row per column.
 
+A background sampler also keeps statistics fresh without ANALYZE: every
+minute (configurable) one node re-collects at most one table whose
+statistics are missing or older than 10 minutes, in paced 1024-row
+chunks. Watch `datax_stats_refreshes_total` and
+`datax_stats_rows_scanned_total` for its cost.
+
 ## Timeseries tables
 
 Monotonic keys (time!) funnel all inserts into one range. Timeseries
