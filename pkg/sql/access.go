@@ -523,11 +523,41 @@ func (s *Session) fetchByPrimaryKey(ctx context.Context, txn *kvclient.Txn, desc
 // Index maintenance. All entries ride the statement's WriteBatch, so index
 // and row mutations commit atomically with the transaction.
 
+// reshardMirrorIndex applies the shadow-layout mirror of one index-entry
+// mutation during a re-shard's dual-write window: the same entry encoded
+// at the index's shadow ID from shadowRow (which carries the new bucket
+// in its hidden shard column). shadowRow == nil means no re-shard is
+// pending — a no-op. Mirrors carry no uniqueness checks of their own:
+// they duplicate the live copy, whose checks already ran.
+func reshardMirrorIndex(desc *catalog.TableDescriptor, i int, shadowRow map[catalog.ColumnID]types.Datum, del bool, wb *kvclient.WriteBatch) error {
+	if shadowRow == nil || desc.Reshard == nil || i >= len(desc.Reshard.NewIndexIDs) {
+		return nil
+	}
+	idx := &desc.Indexes[i]
+	key, val, skip, err := rowenc.EncodeIndexEntryAt(desc, idx, desc.Reshard.NewIndexIDs[i], shadowRow)
+	if err != nil {
+		return newErrf(CodeInternal, "re-shard mirror of index %q: %v", idx.Name, err)
+	}
+	if skip {
+		return nil
+	}
+	if del {
+		wb.Delete(key)
+	} else {
+		wb.Put(key, val)
+	}
+	return nil
+}
+
 // addIndexEntries buffers the row's entries in every secondary index.
 // Unique conflicts are detected through the transaction (a racing insert's
 // intent makes the conflict visible); seen catches duplicates within one
 // statement whose writes are still buffered.
 func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+	shadowRow, serr := reshardShadowRow(desc, row)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
@@ -552,12 +582,19 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			seen[string(key)] = true
 		}
 		wb.Put(key, val)
+		if err := reshardMirrorIndex(desc, i, shadowRow, false, wb); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // dropIndexEntries buffers deletion of the row's entries in every index.
 func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch) error {
+	shadowRow, serr := reshardShadowRow(desc, row)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		key, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
@@ -566,6 +603,9 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 		}
 		if !skip {
 			wb.Delete(key)
+			if err := reshardMirrorIndex(desc, i, shadowRow, true, wb); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -575,6 +615,14 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 // whose entry changed between oldRow and newRow (the primary key is
 // immutable under UPDATE, so only indexed-column changes move entries).
 func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+	shadowOld, serr := reshardShadowRow(desc, oldRow)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
+	shadowNew, serr := reshardShadowRow(desc, newRow)
+	if serr != nil {
+		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		oldKey, _, oldSkip, err := rowenc.EncodeIndexEntry(desc, idx, oldRow)
@@ -589,10 +637,16 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 			return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
 		}
 		if !oldSkip && !newSkip && bytes.Equal(oldKey, newKey) {
-			continue // entry unchanged
+			// Entry unchanged. The shadow entry is unchanged too: the
+			// indexed columns and the (immutable-under-UPDATE) primary key
+			// are what both keys encode.
+			continue
 		}
 		if !oldSkip {
 			wb.Delete(oldKey)
+			if err := reshardMirrorIndex(desc, i, shadowOld, true, wb); err != nil {
+				return err
+			}
 		}
 		if !newSkip {
 			if idx.Unique {
@@ -607,6 +661,9 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 				seen[string(newKey)] = true
 			}
 			wb.Put(newKey, newVal)
+			if err := reshardMirrorIndex(desc, i, shadowNew, false, wb); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -121,6 +121,16 @@ never reused, so the keyspaces cannot collide):
 5. The old layout is wiped (batched, intent-aware; emptied ranges merge
    away).
 
+Secondary indexes ride the same machinery: their entries embed the shard
+bucket in the primary-key suffix they point back with, so each index is
+rebuilt at a freshly allocated shadow ID — dual-writes mirror every
+entry mutation with the bucket recomputed, the backfill emits shadow
+entries from the same decoded rows, and the swap adopts all the shadow
+IDs together with the primary layout (uniqueness stays enforced on the
+live copy throughout). A re-shard and an online CREATE INDEX exclude
+each other: whichever is in flight, the other is refused with SQLSTATE
+`25001`.
+
 Measured (single node, ingest profile): idle backfill ~8,800 rows/s
 (260k rows in 30s); under a live 4,000 rows/s ingest the re-shard of a
 growing 120k→400k-row table took ~129s with foreground throughput
@@ -128,11 +138,9 @@ dipping to ~2,200 rows/s (dual-write amplification) and recovering to
 full speed on the new buckets the moment the swap landed — writes never
 stopped. Recorded runs live in issue #33.
 
-v1 scope: already-sharded timeseries tables only (the PK column list
-must stay identical so both layouts decode during dual-write); tables
-with secondary indexes are rejected (their entries embed the bucket
-value — drop and recreate them around the re-shard); `AS OF SYSTEM
-TIME` below the swap is refused (the new layout's rows carry
+Scope: already-sharded timeseries tables only (the PK column list
+must stay identical so both layouts decode during dual-write); `AS OF
+SYSTEM TIME` below the swap is refused (the new layout's rows carry
 backfill-time MVCC timestamps); a handful of old-layout keys from
 statements in flight at the swap can survive the wipe as unreachable
 garbage.

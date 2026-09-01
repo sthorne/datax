@@ -149,7 +149,7 @@ This is a prototype. Out of scope so far, deliberately:
 | Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
 | Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
 | Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
-| Time series | re-sharding tables that carry secondary indexes, and historical reads below a re-shard (v1 guards); order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
+| Time series | historical reads below a re-shard (v1 guard); order pushdown through shard fan-out (ORDER BY sorts in memory); sub-range retention granularity (mixed ranges take the max TTL and never expire rows) |
 
 ## License
 

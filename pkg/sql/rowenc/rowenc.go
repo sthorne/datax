@@ -410,6 +410,16 @@ var nonUniqueIndexValue = []byte{0}
 // (SQL equality never matches NULL, so equality lookups stay correct;
 // unique indexes reject NULLs at the executor instead).
 func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
+	return EncodeIndexEntryAt(desc, idx, idx.ID, row)
+}
+
+// EncodeIndexEntryAt is EncodeIndexEntry with the entry's index ID
+// overridden: the re-shard machinery rebuilds every secondary index at a
+// shadow ID (the entry's primary-key suffix embeds the shard bucket, so
+// the two layouts' entries must live in disjoint keyspaces). The row map
+// supplies the suffix, so a shadow row carrying the new bucket value
+// yields the new-layout entry.
+func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
 	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
 	for _, colID := range idx.ColumnIDs {
 		d, ok := row[colID]
@@ -418,7 +428,9 @@ func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescripto
 		}
 		vals = append(vals, d)
 	}
-	k, err := EncodeIndexPrefix(desc, idx, vals)
+	at := *idx
+	at.ID = entryID
+	k, err := EncodeIndexPrefix(desc, &at, vals)
 	if err != nil {
 		return nil, nil, false, err
 	}

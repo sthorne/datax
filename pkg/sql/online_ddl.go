@@ -47,6 +47,12 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			return err
 		}
 		desc := shared.Clone()
+		if desc.Reshard != nil {
+			// The re-shard allocated shadow IDs for the indexes it saw at
+			// publish time; an index appearing mid-flight would miss the
+			// swap. The two state machines exclude each other.
+			return newErrf(CodeActiveTransaction, "cannot create an index on table %q while a re-shard is in progress", t.Table)
+		}
 		if t.Name == "primary" {
 			return newErrf(CodeSyntaxError, "index name %q is reserved", t.Name)
 		}

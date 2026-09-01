@@ -37,12 +37,19 @@ import (
 //     fan-out all key off these together;
 //  5. wipe the old layout (best effort; unreachable either way).
 //
-// v1 scope guards: timeseries and already-sharded only (the PK column
+// Secondary indexes ride the same machinery: their entries embed the
+// _shard value in the primary-key suffix, so each index is rebuilt at a
+// shadow ID (ReshardState.NewIndexIDs) — dual-writes mirror every entry
+// mutation to the shadow ID with the bucket recomputed, the backfill
+// writes shadow entries from the same decoded rows, and the swap adopts
+// the shadow IDs together with the primary layout. A re-shard and a
+// CREATE INDEX backfill exclude each other (both are refused while the
+// other is in flight).
+//
+// Scope guards: timeseries and already-sharded only (the PK column
 // list must stay identical so DecodePK serves both layouts during
-// dual-write); no secondary indexes (their entries embed the _shard
-// value, so a re-shard would invalidate them all); historical reads
-// below ReshardedAt are refused (the new layout's rows carry
-// backfill-time MVCC timestamps).
+// dual-write); historical reads below ReshardedAt are refused (the new
+// layout's rows carry backfill-time MVCC timestamps).
 
 // reshardShadowKey builds the in-flight re-shard's new-layout key for a
 // complete row; (nil, nil) when no re-shard is pending.
@@ -62,6 +69,28 @@ func reshardShadowKey(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 	return rowenc.EncodePKAt(desc, rs.NewIndexID, append([]types.Datum{bucket}, logical...))
 }
 
+// reshardShadowRow returns a copy of row with the hidden shard column
+// recomputed under the pending re-shard's bucket count — the row an index
+// entry's new-layout primary-key suffix must encode. nil when no re-shard
+// is in flight.
+func reshardShadowRow(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
+	rs := desc.Reshard
+	if rs == nil {
+		return nil, nil
+	}
+	logical := make([]types.Datum, len(desc.PrimaryKey)-1)
+	for i, id := range desc.PrimaryKey[1:] {
+		logical[i] = row[id]
+	}
+	bucket, err := rowenc.ShardBucketAt(desc, logical, rs.NewBuckets)
+	if err != nil {
+		return nil, err
+	}
+	out := copyRow(row)
+	out[desc.PrimaryKey[0]] = bucket
+	return out, nil
+}
+
 // execReshardOnline runs the re-shard state machine. The session has
 // already rejected explicit-transaction contexts and checked admin.
 func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
@@ -78,6 +107,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 
 	// Step 1: publish the dual-write marker.
 	var tableID, newIndexID, oldIndexID uint64
+	var oldSecondaryIDs, newSecondaryIDs []uint64
 	rerr := s.db.RunTxn(ctx, "reshard-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		shared, err := s.cat.Lookup(ctx, txn, t.Table)
 		if err != nil {
@@ -89,10 +119,15 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 			return newErrf(CodeFeatureNotSupported, "re-sharding requires a sharded timeseries table (created WITH (timeseries = true, shards = N))")
 		case newBuckets == desc.ShardBuckets:
 			return newErrf(CodeSyntaxError, "table %q already has %d shards", t.Table, desc.ShardBuckets)
-		case len(desc.Indexes) > 0:
-			return newErrf(CodeFeatureNotSupported, "re-sharding a table with secondary indexes is not supported (their entries embed the shard bucket); drop and recreate them around the re-shard")
 		case desc.Reshard != nil:
 			return newErrf(CodeActiveTransaction, "a re-shard of table %q is already in progress", t.Table)
+		}
+		// A write-only index is mid-backfill: its own state machine races
+		// the shadow-ID adoption. One at a time.
+		for i := range desc.Indexes {
+			if !desc.Indexes[i].Public() {
+				return newErrf(CodeActiveTransaction, "cannot re-shard table %q while index %q is being built", t.Table, desc.Indexes[i].Name)
+			}
 		}
 		if desc.NextIndexID <= desc.LivePrimaryIndex() {
 			desc.NextIndexID = desc.LivePrimaryIndex() + 1
@@ -100,7 +135,16 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 		tableID, oldIndexID = desc.ID, desc.LivePrimaryIndex()
 		newIndexID = desc.NextIndexID
 		desc.NextIndexID++
-		desc.Reshard = &catalog.ReshardState{NewIndexID: newIndexID, NewBuckets: newBuckets}
+		// Secondary-index entries embed the shard bucket in their
+		// primary-key suffix, so each index is rebuilt at a shadow ID and
+		// adopted at the swap together with the primary layout.
+		oldSecondaryIDs, newSecondaryIDs = nil, nil
+		for i := range desc.Indexes {
+			oldSecondaryIDs = append(oldSecondaryIDs, desc.Indexes[i].ID)
+			newSecondaryIDs = append(newSecondaryIDs, desc.NextIndexID)
+			desc.NextIndexID++
+		}
+		desc.Reshard = &catalog.ReshardState{NewIndexID: newIndexID, NewBuckets: newBuckets, NewIndexIDs: newSecondaryIDs}
 		return s.cat.Update(ctx, txn, desc)
 	})
 	if rerr != nil {
@@ -135,8 +179,14 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 			if desc.Reshard == nil || desc.Reshard.NewIndexID != newIndexID {
 				return newErrf(CodeInternal, "re-shard state vanished during backfill")
 			}
+			if len(desc.Indexes) != len(desc.Reshard.NewIndexIDs) {
+				return newErrf(CodeInternal, "re-shard shadow index set diverged from the table's indexes")
+			}
 			desc.ShardBuckets = newBuckets
 			desc.PrimaryIndex = newIndexID
+			for i := range desc.Indexes {
+				desc.Indexes[i].ID = desc.Reshard.NewIndexIDs[i]
+			}
 			desc.Reshard = nil
 			desc.ReshardedAt = s.db.Clock().Now().WallTime
 			return s.cat.Update(ctx, txn, desc)
@@ -163,6 +213,9 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 		})
 		_ = s.cat.FinishDDL(cctx, t.Table)
 		s.wipeIndexEntries(cctx, tableID, newIndexID)
+		for _, id := range newSecondaryIDs {
+			s.wipeIndexEntries(cctx, tableID, id)
+		}
 		return nil, ToSQLError(backfillErr)
 	}
 	if err := s.cat.FinishDDL(ctx, t.Table); err != nil {
@@ -172,9 +225,13 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	// pointed at the old layout for one statement's lifetime.
 	sleepGrace(ctx)
 
-	// Step 5: the old layout is unreachable; reclaim it. Emptied ranges
-	// get re-absorbed by the size-based merger.
+	// Step 5: the old layout — primary rows and every secondary index's
+	// old-ID entries — is unreachable; reclaim it. Emptied ranges get
+	// re-absorbed by the size-based merger.
 	s.wipeIndexEntries(ctx, tableID, oldIndexID)
+	for _, id := range oldSecondaryIDs {
+		s.wipeIndexEntries(ctx, tableID, id)
+	}
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -325,6 +382,28 @@ func (s *Session) reshardChunk(ctx context.Context, table string, start, end key
 			}
 			// Value bytes carry only non-PK columns: verbatim copy.
 			wb.Put(newKey, kv.Value)
+			// Rebuild every secondary index's entry at its shadow ID: the
+			// entry's primary-key suffix embeds the bucket, so it encodes
+			// from the shadow row. Idempotent against dual-writes for the
+			// same reason the primary copy is.
+			if len(desc.Reshard.NewIndexIDs) > 0 {
+				shadowRow, err := reshardShadowRow(desc, row)
+				if err != nil {
+					return err
+				}
+				for i := range desc.Indexes {
+					if i >= len(desc.Reshard.NewIndexIDs) {
+						return newErrf(CodeInternal, "re-shard shadow index set diverged from the table's indexes")
+					}
+					ik, iv, skip, err := rowenc.EncodeIndexEntryAt(desc, &desc.Indexes[i], desc.Reshard.NewIndexIDs[i], shadowRow)
+					if err != nil {
+						return newErrf(CodeInternal, "re-shard index %q: %v", desc.Indexes[i].Name, err)
+					}
+					if !skip {
+						wb.Put(ik, iv)
+					}
+				}
+			}
 		}
 		return txn.RunBatch(ctx, &wb)
 	})

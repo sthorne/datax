@@ -155,6 +155,163 @@ func TestOnlineReshardUnderConcurrentWrites(t *testing.T) {
 	}
 }
 
+// TestReshardWithSecondaryIndexes: ALTER TABLE ... SET (shards = 8) on a
+// table carrying a unique and a non-unique index, under live ingest from
+// another gateway. Index entries embed the shard bucket in their
+// primary-key suffix, so the re-shard rebuilds both indexes at shadow IDs
+// and swaps them with the primary layout. Issue #53 (TS1).
+func TestReshardWithSecondaryIndexes(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	const ttl = 2 * time.Second
+	sA := leasedSession(t, tc, 0, ttl)
+	sB := leasedSession(t, tc, 1, ttl)
+
+	execSQL(t, ctx, sA, `CREATE TABLE mx (series INT8, ts TIMESTAMPTZ, tag INT8 NOT NULL, v INT8 NOT NULL,
+		PRIMARY KEY (series, ts)) WITH (timeseries = true, shards = 2)`)
+	execSQL(t, ctx, sA, `CREATE UNIQUE INDEX by_tag ON mx (tag)`)
+	execSQL(t, ctx, sA, `CREATE INDEX by_v ON mx (v)`)
+	base := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC).UnixNano()
+	at := func(i int) types.Datum { return types.NewTimestamp(base + int64(i)*int64(time.Second)) }
+	for i := 0; i < 50; i++ {
+		execSQL(t, ctx, sA, `INSERT INTO mx VALUES ($1, $2, $3, $4)`,
+			types.NewInt(int64(i%5)), at(i), types.NewInt(int64(i)), types.NewInt(int64(i%5)))
+	}
+	execSQL(t, ctx, sB, `SELECT v FROM mx WHERE series = 0 AND ts = $1`, at(0)) // B leases pre-reshard
+
+	desc := lookupDescriptor(t, ctx, tc.Nodes[0].DB(), "mx")
+	oldIndexIDs := map[string]uint64{}
+	for _, idx := range desc.Indexes {
+		oldIndexIDs[idx.Name] = idx.ID
+	}
+
+	// B ingests through the whole re-shard: inserts with fresh unique
+	// tags, index-moving updates, deletes.
+	var net, updates atomic.Int64
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			series, ts, tag := int64(100+i%7), at(1000+i), int64(1000+i)
+			if _, serr := trySQL(ctx, sB, `INSERT INTO mx VALUES ($1, $2, $3, 7)`,
+				types.NewInt(series), ts, types.NewInt(tag)); serr != nil {
+				done <- fmt.Errorf("concurrent insert %d: [%s] %s", i, serr.Code, serr.Msg)
+				return
+			}
+			net.Add(1)
+			switch i % 10 {
+			case 3: // move the by_v entry
+				if _, serr := trySQL(ctx, sB, `UPDATE mx SET v = 9000 WHERE series = $1 AND ts = $2`,
+					types.NewInt(series), ts); serr != nil {
+					done <- fmt.Errorf("concurrent update %d: [%s] %s", i, serr.Code, serr.Msg)
+					return
+				}
+				updates.Add(1)
+			case 9:
+				dres, serr := trySQL(ctx, sB, `DELETE FROM mx WHERE series = $1 AND ts = $2`,
+					types.NewInt(series), ts)
+				if serr != nil || dres.Tag != "DELETE 1" {
+					done <- fmt.Errorf("concurrent delete %d: %v %v", i, serr, dres)
+					return
+				}
+				net.Add(-1)
+			}
+		}
+	}()
+	for net.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	execSQL(t, ctx, sA, `ALTER TABLE mx SET (shards = 8)`)
+
+	close(stop)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := 50 + int(net.Load())
+
+	// Descriptor: primary swapped AND both indexes moved to shadow IDs.
+	desc = lookupDescriptor(t, ctx, tc.Nodes[0].DB(), "mx")
+	if desc.ShardBuckets != 8 || desc.Reshard != nil || desc.ReshardedAt == 0 {
+		t.Fatalf("descriptor after swap: %+v", desc)
+	}
+	for _, idx := range desc.Indexes {
+		if idx.ID == oldIndexIDs[idx.Name] {
+			t.Fatalf("index %q kept its old ID %d across the re-shard", idx.Name, idx.ID)
+		}
+	}
+
+	// Counts agree between a primary scan and an index-driven scan, on
+	// both gateways.
+	for name, s := range map[string]*sql.Session{"A": sA, "B": sB} {
+		res := execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM mx`)
+		if got := int(res.Rows[0][0].I); got != want {
+			t.Fatalf("gateway %s: %d rows, want %d", name, got, want)
+		}
+		res = execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM mx WHERE v = 9000`)
+		if got := int(res.Rows[0][0].I); got != int(updates.Load()) {
+			t.Fatalf("gateway %s: %d updated rows via by_v, want %d", name, got, updates.Load())
+		}
+	}
+
+	// Unique-index point lookups route through the new layout to the
+	// right primary rows.
+	if p := explainPlan(t, ctx, sA, `SELECT series FROM mx WHERE tag = 7`); p != `point lookup via unique index "by_tag"` {
+		t.Fatalf("unique point plan: %q", p)
+	}
+	for _, tag := range []int64{0, 7, 23, 49} {
+		res := execSQL(t, ctx, sA, `SELECT series, v FROM mx WHERE tag = $1`, types.NewInt(tag))
+		if len(res.Rows) != 1 || res.Rows[0][0].I != tag%5 {
+			t.Fatalf("tag %d lookup: %+v", tag, res.Rows)
+		}
+	}
+
+	// Uniqueness still enforced after the swap.
+	if _, serr := trySQL(ctx, sA, `INSERT INTO mx VALUES (900, $1, 7, 1)`, at(5000)); serr == nil ||
+		serr.Code != sql.CodeUniqueViolation {
+		t.Fatalf("duplicate tag after re-shard: %+v", serr)
+	}
+	// And index maintenance works post-swap: update moves, delete drops.
+	execSQL(t, ctx, sA, `UPDATE mx SET v = 8000 WHERE series = 0 AND ts = $1`, at(0))
+	res := execSQL(t, ctx, sA, `SELECT COUNT(*) AS n FROM mx WHERE v = 8000`)
+	if res.Rows[0][0].I != 1 {
+		t.Fatalf("post-swap update via index: %+v", res.Rows)
+	}
+	execSQL(t, ctx, sA, `DELETE FROM mx WHERE series = 0 AND ts = $1`, at(0))
+	res = execSQL(t, ctx, sA, `SELECT COUNT(*) AS n FROM mx WHERE v = 8000`)
+	if res.Rows[0][0].I != 0 {
+		t.Fatalf("post-swap delete via index: %+v", res.Rows)
+	}
+
+	// The old layouts — primary and both index generations — are wiped.
+	for name, id := range oldIndexIDs {
+		lo, hi := keys.TableIndexSpan(desc.ID, id)
+		rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("old index %q layout still holds %d keys", name, len(rows))
+		}
+	}
+	lo, hi := keys.TableIndexSpan(desc.ID, 1)
+	rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("old primary layout still holds %d keys", len(rows))
+	}
+}
+
 // TestReshardValidationAndGuards: the scope-guard matrix and the
 // historical-read guard.
 func TestReshardValidationAndGuards(t *testing.T) {
@@ -182,11 +339,33 @@ func TestReshardValidationAndGuards(t *testing.T) {
 		}
 	}
 
-	// Secondary indexes block re-sharding.
+	// Secondary indexes no longer block re-sharding — but CREATE INDEX
+	// and a re-shard exclude each other. Hold a re-shard open at the
+	// start of its backfill and try to add an index from another session.
 	execSQL(t, ctx, s, `CREATE INDEX by_v ON sharded (v)`)
-	if _, serr := trySQL(ctx, s, `ALTER TABLE sharded SET (shards = 4)`); serr == nil ||
-		serr.Code != sql.CodeFeatureNotSupported || !strings.Contains(serr.Msg, "secondary indexes") {
-		t.Fatalf("indexed table re-shard: %+v", serr)
+	{
+		hold, release := make(chan struct{}), make(chan struct{})
+		sql.TestingReshardFailBackfill = func() error {
+			close(hold)
+			<-release
+			return nil
+		}
+		reshardDone := make(chan *sql.Error, 1)
+		go func() {
+			s2 := sql.NewSession(n.DB(), catalog.NewAccessor())
+			_, serr := trySQL(ctx, s2, `ALTER TABLE sharded SET (shards = 4)`)
+			reshardDone <- serr
+		}()
+		<-hold
+		if _, serr := trySQL(ctx, s, `CREATE INDEX by_v2 ON sharded (v)`); serr == nil ||
+			serr.Code != sql.CodeActiveTransaction || !strings.Contains(serr.Msg, "re-shard") {
+			t.Fatalf("CREATE INDEX during re-shard: %+v", serr)
+		}
+		close(release)
+		sql.TestingReshardFailBackfill = nil
+		if serr := <-reshardDone; serr != nil {
+			t.Fatalf("held re-shard failed: [%s] %s", serr.Code, serr.Msg)
+		}
 	}
 
 	// Explicit transaction blocks are rejected.

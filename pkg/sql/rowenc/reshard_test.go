@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -76,6 +77,57 @@ func TestPrimaryIndexAware(t *testing.T) {
 	}
 	if !bytes.Equal(pk, newKey) {
 		t.Fatalf("index entry points at %x, live row is %x", pk, newKey)
+	}
+}
+
+// TestEncodeIndexEntryAt: the shadow-ID variant places the entry in the
+// override ID's keyspace, and the entry's primary-key suffix follows the
+// row map — a shadow row carrying a re-shard's new bucket yields an entry
+// that resolves to the new layout's primary key.
+func TestEncodeIndexEntryAt(t *testing.T) {
+	desc := shardedDesc(8)
+	idx := &catalog.IndexDescriptor{ID: 6, Name: "by_series", ColumnIDs: []catalog.ColumnID{1}}
+	desc.Indexes = []catalog.IndexDescriptor{*idx}
+	row := map[catalog.ColumnID]types.Datum{
+		1: types.NewString("cpu"),
+		2: types.NewTimestamp(1_700_000_000_000_000_000),
+		3: types.NewInt(3), // _shard
+	}
+
+	liveKey, _, _, err := EncodeIndexEntry(desc, idx, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	atKey, _, skip, err := EncodeIndexEntryAt(desc, idx, 9, row)
+	if err != nil || skip {
+		t.Fatalf("entry at 9: %v skip=%v", err, skip)
+	}
+	if !bytes.HasPrefix(atKey, keys.TableIndexPrefix(desc.ID, 9)) {
+		t.Fatal("shadow entry not under the override index ID")
+	}
+	if bytes.Equal(liveKey, atKey) {
+		t.Fatal("shadow entry collides with the live entry")
+	}
+	// Same row, same suffix: only the 8-byte index ID differs.
+	livePfx, atPfx := keys.TableIndexPrefix(desc.ID, idx.ID), keys.TableIndexPrefix(desc.ID, 9)
+	if !bytes.Equal(liveKey[len(livePfx):], atKey[len(atPfx):]) {
+		t.Fatal("suffixes differ between live and shadow entries of the same row")
+	}
+
+	// A shadow row with a different bucket changes the embedded suffix,
+	// and a unique entry's value resolves to that bucket's primary key.
+	shadow := map[catalog.ColumnID]types.Datum{1: row[1], 2: row[2], 3: types.NewInt(5)}
+	uidx := &catalog.IndexDescriptor{ID: 7, Name: "u", Unique: true, ColumnIDs: []catalog.ColumnID{1}}
+	_, uval, _, err := EncodeIndexEntryAt(desc, uidx, 10, shadow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPK, err := EncodePK(desc, []types.Datum{shadow[3], shadow[1], shadow[2]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := append(PrimaryKeyPrefixFor(desc), uval...); !bytes.Equal(got, wantPK) {
+		t.Fatalf("unique shadow value resolves to %x, want %x", got, wantPK)
 	}
 }
 

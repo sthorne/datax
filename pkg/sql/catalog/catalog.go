@@ -131,6 +131,14 @@ type TableDescriptor struct {
 type ReshardState struct {
 	NewIndexID uint64 `json:"new_index_id"`
 	NewBuckets int32  `json:"new_buckets"`
+	// NewIndexIDs are the shadow IDs the table's secondary indexes are
+	// rebuilt at, parallel to Indexes: index entries embed the shard
+	// bucket in their primary-key suffix, so a re-shard rewrites every
+	// entry under a fresh ID and the swap adopts them together with the
+	// primary layout. Empty for tables without secondary indexes (and on
+	// descriptors written before this field existed — such re-shards
+	// carried no indexes by the old guard).
+	NewIndexIDs []uint64 `json:"new_index_ids,omitempty"`
 }
 
 // LivePrimaryIndex is the index ID primary rows are read and written at.
@@ -181,6 +189,7 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	}
 	if d.Reshard != nil {
 		rs := *d.Reshard
+		rs.NewIndexIDs = append([]uint64(nil), d.Reshard.NewIndexIDs...)
 		out.Reshard = &rs
 	}
 	return &out

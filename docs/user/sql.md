@@ -273,7 +273,9 @@ CREATE TABLE metrics (
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:
   measured ~2× point-read p50 at `shards=8`, in exchange for ~linear
   insert scaling.
-- Re-shard online: `ALTER TABLE metrics SET (shards = 16);`
+- Re-shard online: `ALTER TABLE metrics SET (shards = 16);` — writes
+  never stop, and secondary indexes on the table are rebuilt and swapped
+  along with the rows.
 
 ## Parameters
 
