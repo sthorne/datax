@@ -137,7 +137,7 @@ Adjacent versions only: upgrade one major version at a time.
 #      version and the cluster is healthy
 # Then, once EVERY node runs the new binary:
 datax debug upgrade                # finalize; refuses while old nodes remain
-datax debug nodes                  # shows: cluster version: v2
+datax debug nodes                  # shows: cluster version: v3
 ```
 
 Rules of the road:

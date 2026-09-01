@@ -113,6 +113,14 @@ zero values), proto fields are add-only with never-reused numbers, format
 bytes only gain values behind a cluster-version gate and decode forever,
 and unknown payloads degrade to errors, never crashes or silent misapplies.
 
+Version-gated request shapes follow rule 4 through a client-side gate:
+`kvclient.DB` holds the node's mirrored cluster version and refuses to
+SEND a gated shape below its introduction version. The first such shape
+is the reverse scan (`ScanRequest.Reverse`, introduced under **v3**): a
+v2 node would silently ignore the field and run a forward scan, so until
+the operator finalizes v3 the SQL layer transparently falls back to the
+pre-v3 plan (an in-memory sort).
+
 ## Modules
 
 - `pkg/base` — shared ID types (NodeID, StoreID, RangeID) and configuration.

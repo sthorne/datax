@@ -72,9 +72,9 @@ func waitForStoreVersionMirror(t *testing.T, eng *storage.Engine, want string) {
 
 func TestRollingUpgradeUnderLoad(t *testing.T) {
 	ctx := context.Background()
-	asV1 := func(c *server.Config) { c.BinaryVersionOverride = version.V1 }
 	asV2 := func(c *server.Config) { c.BinaryVersionOverride = version.V2 }
-	tc, engines := StartWithEngines(t, 3, asV1)
+	asV3 := func(c *server.Config) { c.BinaryVersionOverride = version.V3 }
+	tc, engines := StartWithEngines(t, 3, asV2)
 	tc.LeaderIndex(1)
 	chaosSeedAccounts(t, ctx, tc.Nodes[0].DB())
 
@@ -83,21 +83,21 @@ func TestRollingUpgradeUnderLoad(t *testing.T) {
 	chaosWorkers(tc, &stop, &wg, []int{0, 1, 2})
 	defer func() { stop.Store(true); wg.Wait() }()
 
-	// A v1 cluster cannot finalize v2: the serving binary is too old.
-	resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 2})
-	if !strings.Contains(resp.Error, "supports at most v1") {
-		t.Fatalf("finalize on v1 binary: %q", resp.Error)
+	// A v2 cluster cannot finalize v3: the serving binary is too old.
+	resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 3})
+	if !strings.Contains(resp.Error, "supports at most v2") {
+		t.Fatalf("finalize on v2 binary: %q", resp.Error)
 	}
 
 	// Rolling restart onto the "new binary", one node at a time, under load.
 	for i := 0; i < 3; i++ {
 		tc.StopNode(i)
-		tc.RestartNode(i, engines[i], asV2)
+		tc.RestartNode(i, engines[i], asV3)
 		tc.LeaderIndex(1) // wait for the cluster to be serviceable again
 		if i < 2 {
-			// Mid-upgrade: finalize must fail naming the v1 stragglers.
-			waitForAdvertisedVersion(t, ctx, tc.Nodes[i].Addr(), []base.NodeID{base.NodeID(i + 1)}, 2)
-			resp := adminCall(t, ctx, tc.Nodes[i].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 2})
+			// Mid-upgrade: finalize must fail naming the v2 stragglers.
+			waitForAdvertisedVersion(t, ctx, tc.Nodes[i].Addr(), []base.NodeID{base.NodeID(i + 1)}, 3)
+			resp := adminCall(t, ctx, tc.Nodes[i].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 3})
 			if !strings.Contains(resp.Error, "older binaries") {
 				t.Fatalf("mid-upgrade finalize after node %d: %q", i+1, resp.Error)
 			}
@@ -106,10 +106,10 @@ func TestRollingUpgradeUnderLoad(t *testing.T) {
 
 	// All nodes upgraded (and advertising it): finalize succeeds.
 	ids := []base.NodeID{1, 2, 3}
-	waitForAdvertisedVersion(t, ctx, tc.Nodes[0].Addr(), ids, 2)
+	waitForAdvertisedVersion(t, ctx, tc.Nodes[0].Addr(), ids, 3)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		resp = adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 2})
+		resp = adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 3})
 		if resp.Error == "" {
 			break
 		}
@@ -119,14 +119,14 @@ func TestRollingUpgradeUnderLoad(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if resp.ClusterVersion != 2 {
-		t.Fatalf("finalized version %d, want 2", resp.ClusterVersion)
+	if resp.ClusterVersion != 3 {
+		t.Fatalf("finalized version %d, want 3", resp.ClusterVersion)
 	}
-	if resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "nodes"}); resp.ClusterVersion != 2 {
-		t.Fatalf("nodes op reports cluster version %d, want 2", resp.ClusterVersion)
+	if resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "nodes"}); resp.ClusterVersion != 3 {
+		t.Fatalf("nodes op reports cluster version %d, want 3", resp.ClusterVersion)
 	}
 	// Idempotent.
-	if resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 2}); resp.Error != "" || resp.ClusterVersion != 2 {
+	if resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: 3}); resp.Error != "" || resp.ClusterVersion != 3 {
 		t.Fatalf("re-finalize: %+v", resp)
 	}
 
@@ -135,9 +135,9 @@ func TestRollingUpgradeUnderLoad(t *testing.T) {
 	wg.Wait()
 	chaosVerify(t, ctx, tc)
 
-	// A v1 binary can no longer join the finalized cluster.
-	if _, err := tc.AddNodeErr(asV1); err == nil || !strings.Contains(err.Error(), "join rejected") {
-		t.Fatalf("v1 join into finalized v2 cluster: %v", err)
+	// A v2 binary can no longer join the finalized cluster.
+	if _, err := tc.AddNodeErr(asV2); err == nil || !strings.Contains(err.Error(), "join rejected") {
+		t.Fatalf("v2 join into finalized v3 cluster: %v", err)
 	}
 }
 
@@ -146,13 +146,13 @@ func TestBinaryTooOldRestart(t *testing.T) {
 	tc, engines := StartWithEngines(t, 3)
 	tc.LeaderIndex(1)
 	// The first heartbeat mirrors the replicated version into each store.
-	waitForStoreVersionMirror(t, engines[2], "2")
+	waitForStoreVersionMirror(t, engines[2], "3")
 	tc.StopNode(2)
 	_, err := tc.RestartNodeErr(2, engines[2], func(c *server.Config) {
-		c.BinaryVersionOverride = version.V1
+		c.BinaryVersionOverride = version.V2
 	})
 	if err == nil || !strings.Contains(err.Error(), "downgrading a node") {
-		t.Fatalf("v1 restart into finalized cluster: %v", err)
+		t.Fatalf("v2 restart into finalized cluster: %v", err)
 	}
 	// The same engine restarts fine on the current binary.
 	tc.RestartNode(2, engines[2])

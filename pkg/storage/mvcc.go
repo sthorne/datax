@@ -401,121 +401,15 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 
 	ok := it.SeekGE(lower)
 	for ok {
-		userKey, vts, err := DecodeMVCCKey(it.Key())
+		userKey, _, err := DecodeMVCCKey(it.Key())
 		if err != nil {
 			return ScanResult{}, err
 		}
 		cur := keys.Key(userKey).Clone()
-
-		var readAt, skipAt hlc.Timestamp
-		if vts.IsEmpty() {
-			// Intent metadata for cur.
-			meta, err := decodeMeta(it.Value())
-			if err != nil {
-				return ScanResult{}, err
-			}
-			switch {
-			case opts.Txn != nil && meta.Txn.ID == opts.Txn.ID:
-				if meta.Txn.Epoch == opts.Txn.Epoch {
-					readAt = meta.Timestamp
-				} else {
-					skipAt = meta.Timestamp
-				}
-			case opts.Inconsistent:
-				skipAt = meta.Timestamp // read beneath the intent
-			case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
-				// Foreign intent strictly above everything observable: read
-				// beneath it (see MVCCGet).
-				skipAt = meta.Timestamp
-			default:
-				intents = append(intents, Intent{Key: cur, Txn: meta.Txn})
-				if len(intents) >= maxIntentsPerError {
-					return ScanResult{}, &WriteIntentError{Intents: intents}
-				}
-				ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
-				continue
-			}
-			ok = it.Next()
-			if !ok {
-				break
-			}
+		value, found, err := mvccScanKey(it, cur, ts, opts, &intents)
+		if err != nil {
+			return ScanResult{}, err
 		}
-
-		// Positioned at the newest version of cur (or beyond cur entirely if
-		// it has no versions).
-		var value []byte
-		var found bool
-		if !readAt.IsEmpty() {
-			// Own intent: read the provisional version.
-			ok = it.SeekGE(EncodeMVCCKey(cur, readAt))
-			if ok {
-				k, pvts, err := DecodeMVCCKey(it.Key())
-				if err != nil {
-					return ScanResult{}, err
-				}
-				if bytes.Equal(k, cur) && pvts.Equal(readAt) {
-					data, tombstone, err := decodeMVCCValue(it.Value())
-					if err != nil {
-						return ScanResult{}, err
-					}
-					if !tombstone {
-						value, found = append([]byte(nil), data...), true
-					}
-				}
-			}
-		} else {
-			// Uncertainty check, then newest version <= ts.
-			if len(intents) == 0 && !opts.UncertaintyLimit.IsEmpty() && ts.Less(opts.UncertaintyLimit) {
-				uok := it.Valid()
-				k := it.Key()
-				// Current position is the newest version; walk down to the
-				// first version <= limit, skipping own old-epoch writes.
-				for uok {
-					ku, uvts, err := DecodeMVCCKey(k)
-					if err != nil {
-						return ScanResult{}, err
-					}
-					if !bytes.Equal(ku, cur) {
-						uok = false
-						break
-					}
-					if uvts.LessEq(opts.UncertaintyLimit) && !(!skipAt.IsEmpty() && uvts.Equal(skipAt)) {
-						if ts.Less(uvts) {
-							return ScanResult{}, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: uvts}
-						}
-						break
-					}
-					if !it.Next() {
-						uok = false
-						break
-					}
-					k = it.Key()
-				}
-			}
-			ok = it.SeekGE(EncodeMVCCKey(cur, ts))
-			for ok {
-				k, cvts, err := DecodeMVCCKey(it.Key())
-				if err != nil {
-					return ScanResult{}, err
-				}
-				if !bytes.Equal(k, cur) {
-					break
-				}
-				if !skipAt.IsEmpty() && cvts.Equal(skipAt) {
-					ok = it.Next()
-					continue
-				}
-				data, tombstone, err := decodeMVCCValue(it.Value())
-				if err != nil {
-					return ScanResult{}, err
-				}
-				if !tombstone {
-					value, found = append([]byte(nil), data...), true
-				}
-				break
-			}
-		}
-
 		if found && len(intents) == 0 {
 			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
 			if max > 0 && int64(len(res.KVs)) == max {
@@ -523,7 +417,6 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 				return res, nil
 			}
 		}
-
 		ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
 	}
 
@@ -531,6 +424,171 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 		return ScanResult{}, &WriteIntentError{Intents: intents}
 	}
 	return res, nil
+}
+
+// MVCCReverseScan is MVCCScan iterating [start, end) from the end
+// BACKWARDS: rows come back largest-key-first, and Resume, when max rows
+// stop the scan early, is the exclusive END of the continuation page
+// ([start, Resume)). Each user key costs one SeekLT to find it plus the
+// shared forward per-key walk to read it — metadata sorts before the
+// key's versions, so landing anywhere inside a key and re-seeking to its
+// first engine key reuses MVCCScan's visibility logic verbatim.
+func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts MVCCGetOptions) (ScanResult, error) {
+	lower := EncodeMVCCKey(start, hlc.Timestamp{})
+	upper := EncodeMVCCKey(end, hlc.Timestamp{})
+	it := r.NewIter(lower, upper)
+	defer func() { _ = it.Close() }()
+
+	var res ScanResult
+	var intents []Intent
+
+	ok := it.SeekLT(upper)
+	for ok {
+		userKey, _, err := DecodeMVCCKey(it.Key())
+		if err != nil {
+			return ScanResult{}, err
+		}
+		cur := keys.Key(userKey).Clone()
+		curStart := EncodeMVCCKey(cur, hlc.Timestamp{})
+		if !it.SeekGE(curStart) {
+			break // unreachable: an engine key of cur was just observed
+		}
+		value, found, err := mvccScanKey(it, cur, ts, opts, &intents)
+		if err != nil {
+			return ScanResult{}, err
+		}
+		if found && len(intents) == 0 {
+			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
+			if max > 0 && int64(len(res.KVs)) == max {
+				res.Resume = cur
+				return res, nil
+			}
+		}
+		ok = it.SeekLT(curStart)
+	}
+
+	if len(intents) > 0 {
+		return ScanResult{}, &WriteIntentError{Intents: intents}
+	}
+	return res, nil
+}
+
+// mvccScanKey reads user key cur's visible value during a scan. The
+// iterator must be positioned at cur's FIRST engine key (intent metadata
+// or newest version); it is left at an unspecified position, so callers
+// re-seek to continue. A blocking foreign intent is appended to *intents
+// and reported as not-found (the scan stops returning rows and
+// ultimately surfaces a WriteIntentError).
+func mvccScanKey(it Iterator, cur keys.Key, ts hlc.Timestamp, opts MVCCGetOptions, intents *[]Intent) ([]byte, bool, error) {
+	_, vts, err := DecodeMVCCKey(it.Key())
+	if err != nil {
+		return nil, false, err
+	}
+
+	var readAt, skipAt hlc.Timestamp
+	if vts.IsEmpty() {
+		// Intent metadata for cur.
+		meta, err := decodeMeta(it.Value())
+		if err != nil {
+			return nil, false, err
+		}
+		switch {
+		case opts.Txn != nil && meta.Txn.ID == opts.Txn.ID:
+			if meta.Txn.Epoch == opts.Txn.Epoch {
+				readAt = meta.Timestamp
+			} else {
+				skipAt = meta.Timestamp
+			}
+		case opts.Inconsistent:
+			skipAt = meta.Timestamp // read beneath the intent
+		case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
+			// Foreign intent strictly above everything observable: read
+			// beneath it (see MVCCGet).
+			skipAt = meta.Timestamp
+		default:
+			*intents = append(*intents, Intent{Key: cur, Txn: meta.Txn})
+			if len(*intents) >= maxIntentsPerError {
+				return nil, false, &WriteIntentError{Intents: *intents}
+			}
+			return nil, false, nil
+		}
+		if !it.Next() {
+			return nil, false, nil
+		}
+	}
+
+	// Positioned at the newest version of cur (or beyond cur entirely if
+	// it has no versions).
+	var value []byte
+	var found bool
+	if !readAt.IsEmpty() {
+		// Own intent: read the provisional version.
+		if it.SeekGE(EncodeMVCCKey(cur, readAt)) {
+			k, pvts, err := DecodeMVCCKey(it.Key())
+			if err != nil {
+				return nil, false, err
+			}
+			if bytes.Equal(k, cur) && pvts.Equal(readAt) {
+				data, tombstone, err := decodeMVCCValue(it.Value())
+				if err != nil {
+					return nil, false, err
+				}
+				if !tombstone {
+					value, found = append([]byte(nil), data...), true
+				}
+			}
+		}
+	} else {
+		// Uncertainty check, then newest version <= ts.
+		if len(*intents) == 0 && !opts.UncertaintyLimit.IsEmpty() && ts.Less(opts.UncertaintyLimit) {
+			uok := it.Valid()
+			k := it.Key()
+			// Current position is the newest version; walk down to the
+			// first version <= limit, skipping own old-epoch writes.
+			for uok {
+				ku, uvts, err := DecodeMVCCKey(k)
+				if err != nil {
+					return nil, false, err
+				}
+				if !bytes.Equal(ku, cur) {
+					break
+				}
+				if uvts.LessEq(opts.UncertaintyLimit) && !(!skipAt.IsEmpty() && uvts.Equal(skipAt)) {
+					if ts.Less(uvts) {
+						return nil, false, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: uvts}
+					}
+					break
+				}
+				if !it.Next() {
+					break
+				}
+				k = it.Key()
+			}
+		}
+		ok := it.SeekGE(EncodeMVCCKey(cur, ts))
+		for ok {
+			k, cvts, err := DecodeMVCCKey(it.Key())
+			if err != nil {
+				return nil, false, err
+			}
+			if !bytes.Equal(k, cur) {
+				break
+			}
+			if !skipAt.IsEmpty() && cvts.Equal(skipAt) {
+				ok = it.Next()
+				continue
+			}
+			data, tombstone, err := decodeMVCCValue(it.Value())
+			if err != nil {
+				return nil, false, err
+			}
+			if !tombstone {
+				value, found = append([]byte(nil), data...), true
+			}
+			break
+		}
+	}
+	return value, found, nil
 }
 
 // MVCCCheckForWrites reports whether [start, end) contains any write that a

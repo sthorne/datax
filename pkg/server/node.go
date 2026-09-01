@@ -350,6 +350,14 @@ func (n *Node) start() error {
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
+	// Version-gated request shapes key off the node's cluster-version
+	// mirror (refreshed by the heartbeat loop and at finalize).
+	n.db.SetVersionGate(func() version.Version {
+		if cv := version.Version(n.clusterVersion.Load()); cv > 0 {
+			return cv
+		}
+		return version.V1 // not yet mirrored: assume the floor
+	})
 	n.db.SetNodeLister(func() []base.NodeID {
 		nodes := n.registry.All()
 		ids := make([]base.NodeID, len(nodes))
