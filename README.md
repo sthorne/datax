@@ -54,7 +54,8 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes and
   ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
   transactions, joins up to 8 tables, GROUP BY — including over joins,
-  correlated subqueries to 4 levels, EXPLAIN) over ten column types
+  correlated subqueries to 4 levels, EXPLAIN, ANALYZE with a cost-based
+  planner over table statistics) over ten column types
   including exact DECIMAL and JSONB with `->`/`->>` extraction, served
   over the Postgres wire protocol with TLS + SCRAM-SHA-256
   authentication in secure mode.
