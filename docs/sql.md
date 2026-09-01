@@ -276,6 +276,16 @@ exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`.
 
+Whether an ORDER BY is satisfied is decided by `orderPlan`: skipping
+columns the plan pins by equality (constants order nothing), the
+remaining terms must follow the path's natural key order — all ascending,
+or all descending via a **reverse scan** (a v3 KV primitive; below
+cluster version v3 descending falls back to the sort). On a sharded
+timeseries fan-out the natural order is the LOGICAL primary key, restored
+by a K-way merge of the per-bucket scans (see docs/timeseries.md); the
+per-bucket scans carry the pushed limit, so `ORDER BY ts DESC LIMIT n`
+reads at most `buckets × n` rows.
+
 A non-unique index has no entry for rows with NULL in any indexed column,
 so the planner only uses one when the schema (`NOT NULL`) or the WHERE
 clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot

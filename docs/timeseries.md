@@ -50,9 +50,19 @@ The planner plans against the **logical** primary key:
 - All logical PK columns pinned by `=` → the bucket is recomputed from
   the pinned values and the lookup stays a **single point read**.
 - A pinned prefix or time window → the scan runs once per bucket
-  (`EXPLAIN` shows `(fan-out over N shard buckets)`), results are
-  concatenated, and `LIMIT` re-applies globally. Fanned output is not in
-  logical PK order, so `ORDER BY` always sorts in memory.
+  (`EXPLAIN` shows `(fan-out over N shard buckets)`) and `LIMIT`
+  re-applies globally. Each bucket's scan is in logical-PK order, so an
+  `ORDER BY` on the logical key (equality-pinned columns skipped) is
+  delivered by a **K-way merge** of the per-bucket scans — no in-memory
+  sort — with `LIMIT n` stopping after at most `buckets × n` scanned
+  rows. `ORDER BY ts DESC LIMIT n` (the dashboard query) rides
+  per-bucket **reverse scans** through the same merge: measured 1.23 ms
+  vs 27.9 ms for the full-scan-and-sort it replaces on a 5,000-row
+  series (22×; the gap grows with table size). `EXPLAIN` says
+  `order satisfied by K-way merge across shard buckets [(reverse
+  scans)]`. Reverse scans need cluster version v3; below it (a
+  not-yet-finalized upgrade) descending orders fall back to the
+  in-memory sort.
 
 ## Retention
 
@@ -159,8 +169,6 @@ eventual wipe as unreachable garbage.
 
 ## Limitations
 
-- Fan-out disables order pushdown: `ORDER BY ts` on a sharded table
-  always sorts in memory (bounded windows keep that cheap).
 - Retention expiry is range-granular and best-effort in timing (one
   housekeeping tick, default 30s, plus the ~30s descriptor cache).
 - Secondary indexes on sharded tables are unsharded (their own hot-tail

@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -517,7 +519,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if len(plan.residual) == 0 {
 			scanLimit = limit
 		}
-		kvs, err := txn.Scan(ctx, start, end, scanLimit)
+		kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 		if err != nil {
 			return nil, err
 		}
@@ -588,7 +590,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			}
 			return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 		}
-		var out []fetchedRow
+		runs := make([][]fetchedRow, 0, plan.fanBuckets)
 		for b := int32(0); b < plan.fanBuckets; b++ {
 			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefixFor(desc), types.Int, types.NewInt(int64(b)))
 			if err != nil {
@@ -600,13 +602,24 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			}
 			// The limit is only an upper bound per span (each span alone
 			// cannot yield more result rows than the global limit); the
-			// global limit re-applies to the concatenation below — and the
-			// caller re-applies it after sorting when there is an ORDER BY,
-			// in which case it passes limit 0 here.
+			// global limit re-applies below — and, without mergeFan, the
+			// caller re-applies it after sorting when there is an ORDER
+			// BY, in which case it passes limit 0 here.
 			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 			if err != nil {
 				return nil, err
 			}
+			runs = append(runs, rows)
+		}
+		if plan.mergeFan {
+			// Every fanned key shares a constant-length prefix (table +
+			// index + 8-byte bucket); the suffix is the order-preserving
+			// logical-PK encoding, so the merge compares raw suffix bytes.
+			suffixAt := len(rowenc.PrimaryKeyPrefixFor(desc)) + 8
+			return mergeFannedRows(runs, suffixAt, plan.reverse, limit), nil
+		}
+		var out []fetchedRow
+		for _, rows := range runs {
 			out = append(out, rows...)
 		}
 		if limit > 0 && int64(len(out)) > limit {
@@ -619,6 +632,47 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
 }
 
+// spanScan runs one KV scan in the plan's direction.
+func spanScan(ctx context.Context, txn *kvclient.Txn, start, end keys.Key, limit int64, reverse bool) ([]kvpb.KeyValue, error) {
+	if reverse {
+		return txn.ReverseScan(ctx, start, end, limit)
+	}
+	return txn.Scan(ctx, start, end, limit)
+}
+
+// mergeFannedRows K-way-merges per-bucket runs that are each already in
+// logical-PK order (descending when reverse), comparing the key bytes
+// beyond the constant prefix, and stops at limit. Linear best-pick per
+// output row: bucket counts are small (≤ 256).
+func mergeFannedRows(runs [][]fetchedRow, suffixAt int, reverse bool, limit int64) []fetchedRow {
+	idx := make([]int, len(runs))
+	var out []fetchedRow
+	for {
+		best := -1
+		for r := range runs {
+			if idx[r] >= len(runs[r]) {
+				continue
+			}
+			if best < 0 {
+				best = r
+				continue
+			}
+			c := bytes.Compare(runs[r][idx[r]].key[suffixAt:], runs[best][idx[best]].key[suffixAt:])
+			if (!reverse && c < 0) || (reverse && c > 0) {
+				best = r
+			}
+		}
+		if best < 0 {
+			return out
+		}
+		out = append(out, runs[best][idx[best]])
+		idx[best]++
+		if limit > 0 && int64(len(out)) == limit {
+			return out
+		}
+	}
+}
+
 // scanPrimarySpan scans [start, end) of the primary index, filters with the
 // full WHERE clause, and stops at limit. The limit is pushed into the KV
 // scan itself when the plan has no residual filter (every scanned row is a
@@ -628,7 +682,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 	if len(plan.residual) == 0 {
 		scanLimit = limit
 	}
-	kvs, err := txn.Scan(ctx, start, end, scanLimit)
+	kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 	if err != nil {
 		return nil, err
 	}
@@ -824,19 +878,25 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// must not stop early; the limit re-applies to the survivors.
 		fetchLimit = 0
 	}
+	st, _ := s.cat.Stats(ctx, desc.ID)
+	plan, err := pickPlanWithStats(desc, st, t.Where, params)
+	if err != nil {
+		return nil, err
+	}
 	needSort := false
 	if len(t.OrderBy) > 0 {
-		st, _ := s.cat.Stats(ctx, desc.ID)
-		plan, err := pickPlanWithStats(desc, st, t.Where, params)
-		if err != nil {
-			return nil, err
-		}
-		needSort = !orderSatisfiedByPlan(desc, plan, t.OrderBy)
+		dec := orderPlan(desc, plan, t.OrderBy, s.db.ReverseScansOK())
+		needSort = !dec.satisfied
 		if needSort {
 			fetchLimit = 0
+		} else {
+			// The access path delivers the order itself: reversed scans
+			// for descending, and a K-way merge across shard buckets on a
+			// fanned scan.
+			plan.reverse, plan.mergeFan = dec.reverse, dec.mergeFan
 		}
 	}
-	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, fetchLimit)
+	rows, err := s.executePlan(ctx, txn, desc, plan, t.Where, params, fetchLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1202,15 +1262,24 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		text += fmt.Sprintf("; correlated filter: nested loop over %d conjunct(s) (O(outer rows x inner query), memoized per correlation key)", len(corr))
 	}
 	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
+	dec := orderPlan(desc, plan, sel.OrderBy, s.db.ReverseScansOK())
 	if len(sel.OrderBy) > 0 && !grouped {
-		if orderSatisfiedByPlan(desc, plan, sel.OrderBy) {
+		switch {
+		case dec.satisfied && dec.mergeFan:
+			text += "; order satisfied by K-way merge across shard buckets"
+			if dec.reverse {
+				text += " (reverse scans)"
+			}
+		case dec.satisfied && dec.reverse:
+			text += "; order satisfied by access path (reverse scan)"
+		case dec.satisfied:
 			text += "; order satisfied by access path"
-		} else {
+		default:
 			text += "; in-memory sort"
 		}
 	}
 	if sel.Limit > 0 && !grouped && len(plan.residual) == 0 &&
-		(len(sel.OrderBy) == 0 || orderSatisfiedByPlan(desc, plan, sel.OrderBy)) {
+		(len(sel.OrderBy) == 0 || dec.satisfied) {
 		switch plan.kind {
 		case planFullScan, planPKScan, planIndexScan:
 			text += "; limit pushed into scan"

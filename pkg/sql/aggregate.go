@@ -550,39 +550,92 @@ func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.Or
 // ---------------------------------------------------------------------------
 // ORDER BY.
 
-// orderSatisfiedByPlan reports whether the access path already returns rows
-// in the requested order: an all-ascending ORDER BY whose columns are a
-// prefix of the path's natural order (primary key for primary paths,
-// indexed columns — then the primary key for non-unique indexes — for index
-// scans).
-func orderSatisfiedByPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.OrderCol) bool {
-	for _, oc := range order {
-		if oc.Desc {
-			return false
-		}
+// orderDecision is how (and whether) an access path delivers the
+// requested ORDER BY without an in-memory sort.
+type orderDecision struct {
+	satisfied bool // no in-memory sort needed
+	// mergeFan: a sharded fan-out delivers the order via a K-way merge of
+	// the per-bucket scans (each bucket's scan is in logical-PK order).
+	mergeFan bool
+	// reverse: the scan(s) run reversed (an all-descending ORDER BY).
+	// Set only when the caller allowed reverse scans (the cluster-version
+	// gate); without it a descending order falls back to the sort.
+	reverse bool
+}
+
+// orderPlan decides whether the access path already returns rows in the
+// requested order: skipping columns the plan pins to a single value by
+// equality (constants order nothing), the remaining ORDER BY columns
+// must be, in sequence, the path's natural order after that pinned
+// prefix (primary key for primary paths — the LOGICAL primary key for a
+// sharded fan-out, restored by a K-way merge; indexed columns, then the
+// primary key for non-unique indexes, for index scans), with every
+// non-pinned term ascending — or every one descending when reverse scans
+// are available (reverseOK). Mixed directions always sort.
+func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.OrderCol, reverseOK bool) orderDecision {
+	if len(order) == 0 {
+		return orderDecision{satisfied: true}
 	}
+
 	var natural []catalog.ColumnID
+	fanned := false
 	switch plan.kind {
-	case planFullScan, planPKPoint, planPKScan:
+	case planFullScan, planPKPoint:
+		// Physical order — on a sharded table that leads with the hidden
+		// shard column, which no ORDER BY names, so it stays unsatisfied.
 		natural = desc.PrimaryKey
+	case planPKScan:
+		natural = desc.PrimaryKey
+		if plan.fanBuckets > 0 {
+			// Each bucket's scan is in logical-PK order; the executor's
+			// K-way merge restores the global order.
+			natural = natural[1:]
+			fanned = true
+		}
 	case planUniquePoint:
-		return true // at most one row
+		return orderDecision{satisfied: true} // at most one row
 	case planIndexScan:
 		natural = append([]catalog.ColumnID(nil), plan.idx.ColumnIDs...)
 		if !plan.idx.Unique {
 			natural = append(natural, desc.PrimaryKey...)
 		}
 	}
-	if len(order) > len(natural) {
-		return false
+
+	// The plan's equality prefix pins natural[:len(idxVals)] to single
+	// values (the dashboard shape: WHERE series = 'x' ORDER BY ts).
+	pinned := map[catalog.ColumnID]bool{}
+	for i := 0; i < len(plan.idxVals) && i < len(natural); i++ {
+		pinned[natural[i]] = true
 	}
-	for i, oc := range order {
+	rest := natural[len(pinned):]
+
+	dir, dirSet := false, false
+	ri := 0
+	for _, oc := range order {
 		col, ok := desc.Col(oc.Column)
-		if !ok || natural[i] != col.ID {
-			return false
+		if !ok {
+			return orderDecision{}
 		}
+		if pinned[col.ID] {
+			continue // a constant: any direction, any position
+		}
+		if !dirSet {
+			dir, dirSet = oc.Desc, true
+		} else if oc.Desc != dir {
+			return orderDecision{} // mixed directions among ordering columns
+		}
+		if ri >= len(rest) || rest[ri] != col.ID {
+			return orderDecision{}
+		}
+		ri++
 	}
-	return true
+	if !dirSet {
+		return orderDecision{satisfied: true} // every term pinned: any order holds
+	}
+	if dir && !reverseOK {
+		return orderDecision{}
+	}
+	return orderDecision{satisfied: true, mergeFan: fanned, reverse: dir}
 }
 
 // sortRows sorts in place by the ORDER BY terms. NULL ordering follows

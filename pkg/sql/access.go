@@ -54,6 +54,16 @@ type accessPlan struct {
 	// statistics were used; the plan came from the structural fallback).
 	// EXPLAIN renders it; execution ignores it.
 	estRows float64
+
+	// Execution-order directives, stamped by execSelect from the ORDER BY
+	// decision (orderPlan) — never set by the planner itself. reverse
+	// runs the scan(s) backwards (all-descending ORDER BY; only stamped
+	// when the cluster-version gate allows reverse scans). mergeFan
+	// (sharded planPKScan only) K-way-merges the per-bucket scans by key,
+	// restoring logical-PK order — and, with a limit, stopping globally
+	// after limit rows instead of concatenating whole buckets.
+	reverse  bool
+	mergeFan bool
 }
 
 type planKind int

@@ -114,7 +114,10 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   tables `FROM (SELECT ...) AS d`; correlated subqueries in
   `EXISTS`/`IN`/scalar positions up to 4 nesting levels.
 - **ORDER BY** result-column names; sorts in memory unless the access path
-  already delivers the order.
+  already delivers the order — ascending along the key, descending via a
+  reverse scan, and on sharded timeseries tables either direction via a
+  K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
+  dashboards stop early instead of scanning everything).
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 
