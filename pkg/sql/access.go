@@ -20,10 +20,13 @@ type colBound struct {
 	inclusive bool
 }
 
-// accessPlan is the chosen access path for one table read. There is no
-// cost model: plans are ranked primary-key point > unique-index point >
-// best constrained scan (2 points per equality-pinned column + 1 point for
-// a range on the next column, ties preferring the primary key) > full scan.
+// accessPlan is the chosen access path for one table read. Without
+// statistics, plans are ranked structurally: primary-key point >
+// unique-index point > best constrained scan (2 points per
+// equality-pinned column + 1 point for a range on the next column, ties
+// preferring the primary key) > full scan. With statistics (ANALYZE or
+// the background sampler), competing constrained scans and the full scan
+// are ranked by estimated cost instead — see pickPlanWithStats.
 type accessPlan struct {
 	kind    planKind
 	idx     *catalog.IndexDescriptor
@@ -46,6 +49,11 @@ type accessPlan struct {
 	// LOGICAL primary key (PrimaryKey[1:]), and the executor prepends each
 	// bucket value in turn. Fanned results are not in logical PK order.
 	fanBuckets int32
+
+	// estRows is the statistics-based row estimate for this path (0 = no
+	// statistics were used; the plan came from the structural fallback).
+	// EXPLAIN renders it; execution ignores it.
+	estRows float64
 }
 
 type planKind int
@@ -169,6 +177,27 @@ func tightenHi(cur *colBound, nb colBound) *colBound {
 // range conjuncts. The executor re-filters fetched rows with the complete
 // WHERE clause regardless of path, so plan bounds only ever narrow the scan.
 func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
+	return pickPlanWithStats(desc, nil, where, params)
+}
+
+// Cost-model constants (statistics present only). A non-unique index
+// scan pays indexJoinCostMultiplier per estimated row for the per-entry
+// primary-key Get that follows it; equality selectivity comes from the
+// column's distinct count, ranges use a fixed fraction, and a column the
+// statistics never saw gets a conservative guess. All deliberately
+// simple: with NO statistics the structural ranking below runs
+// byte-identically to the pre-statistics planner.
+const (
+	indexJoinCostMultiplier = 4
+	rangeSelectivity        = 1.0 / 3
+	unknownEqSelectivity    = 1.0 / 10
+)
+
+// pickPlanWithStats is pickPlan with optional table statistics: when st
+// is non-nil, competing constrained scans are ranked by estimated cost
+// (estimated rows × per-row cost) instead of the structural score, and a
+// low-selectivity index scan loses to the full scan it would out-fetch.
+func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
 	if pkVals, ok, err := pkPointValues(desc, where, params); err != nil {
 		return accessPlan{}, err
 	} else if ok {
@@ -323,7 +352,48 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	if desc.ShardBuckets > 0 && len(pkCols) > 1 {
 		pkCols = pkCols[1:]
 	}
+	// estRowsFor estimates the rows a candidate's bounds select: table
+	// rows times the selectivity of each consumed conjunct (equalities by
+	// 1/distinct, ranges by a fixed fraction; naive independence).
+	tableRows := float64(1)
+	if st != nil && st.RowCount > 0 {
+		tableRows = float64(st.RowCount)
+	}
+	estRowsFor := func(cand scanCandidate) float64 {
+		rows := tableRows
+		for ci := range cand.consumed {
+			pc := conjs[ci]
+			switch pc.cmp.Op {
+			case "=":
+				sel := unknownEqSelectivity
+				if cs, ok := st.Column(pc.col.ID); ok && cs.Distinct > 0 {
+					sel = 1 / float64(cs.Distinct)
+				}
+				rows *= sel
+			default: // range bounds
+				rows *= rangeSelectivity
+			}
+		}
+		if rows < 1 {
+			rows = 1
+		}
+		return rows
+	}
+	// costFor: estimated rows times the per-row fetch cost — a non-unique
+	// index entry costs an extra primary-key Get per row.
+	costFor := func(cand scanCandidate) float64 {
+		c := estRowsFor(cand)
+		if cand.idx != nil && !cand.idx.Unique {
+			c *= indexJoinCostMultiplier
+		}
+		return c
+	}
+
 	best := buildCandidate(nil, pkCols) // ties prefer the primary key (no join)
+	bestCost := 0.0
+	if st != nil {
+		bestCost = costFor(best)
+	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		if !idx.Public() {
@@ -347,13 +417,32 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 				continue
 			}
 		}
-		if cand := buildCandidate(idx, idx.ColumnIDs); cand.score > best.score {
-			best = cand
+		cand := buildCandidate(idx, idx.ColumnIDs)
+		if st == nil {
+			if cand.score > best.score {
+				best = cand
+			}
+			continue
+		}
+		// Cost-based: strictly cheaper wins; ties keep the earlier choice
+		// (the PK candidate came first — no index→PK join on a tie).
+		if cand.score > 0 && (best.score == 0 || costFor(cand) < bestCost) {
+			best, bestCost = cand, costFor(cand)
 		}
 	}
 
 	if best.score == 0 {
-		return accessPlan{kind: planFullScan, residual: where}, nil
+		plan := accessPlan{kind: planFullScan, residual: where}
+		if st != nil {
+			plan.estRows = tableRows
+		}
+		return plan, nil
+	}
+	// With statistics, a constrained scan that would fetch MORE than the
+	// whole table (a low-selectivity index and its per-row PK joins) loses
+	// to the full scan.
+	if st != nil && bestCost >= tableRows {
+		return accessPlan{kind: planFullScan, residual: where, estRows: tableRows}, nil
 	}
 	plan := accessPlan{
 		idx:      best.idx,
@@ -362,6 +451,9 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 		lo:       best.lo,
 		hi:       best.hi,
 		rangeCol: best.rangeCol,
+	}
+	if st != nil {
+		plan.estRows = estRowsFor(best)
 	}
 	if best.idx == nil {
 		plan.kind = planPKScan

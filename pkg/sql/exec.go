@@ -456,7 +456,8 @@ type fetchedRow struct {
 }
 
 func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, accessPlan, error) {
-	plan, err := pickPlan(desc, where, params)
+	st, _ := s.cat.Stats(ctx, desc.ID)
+	plan, err := pickPlanWithStats(desc, st, where, params)
 	if err != nil {
 		return nil, plan, err
 	}
@@ -825,7 +826,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	needSort := false
 	if len(t.OrderBy) > 0 {
-		plan, err := pickPlan(desc, t.Where, params)
+		st, _ := s.cat.Stats(ctx, desc.ID)
+		plan, err := pickPlanWithStats(desc, st, t.Where, params)
 		if err != nil {
 			return nil, err
 		}
@@ -1187,11 +1189,15 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			Tag:     "EXPLAIN",
 		}, nil
 	}
-	plan, err := pickPlan(desc, sel.Where, params)
+	st, _ := s.cat.Stats(ctx, desc.ID)
+	plan, err := pickPlanWithStats(desc, st, sel.Where, params)
 	if err != nil {
 		return nil, err
 	}
 	text := plan.String()
+	if plan.estRows > 0 {
+		text += fmt.Sprintf(" [~%.0f rows]", plan.estRows)
+	}
 	if len(corr) > 0 {
 		text += fmt.Sprintf("; correlated filter: nested loop over %d conjunct(s) (O(outer rows x inner query), memoized per correlation key)", len(corr))
 	}

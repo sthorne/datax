@@ -119,11 +119,15 @@ Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 point lookup on primary key
 scan of index "by_city" (city = 'oslo') + primary key join
 range scan of primary key (series = 'cpu.node1', at >= 2026-08-30 10:00:00+00)
-full table scan
+full table scan [~5000 rows]
 ```
 
 A `full table scan` on a big table is the thing to fix (add an index, or
-constrain the leading PK columns).
+constrain the leading PK columns). When [table statistics](#table-statistics)
+exist, the plan carries a ` [~N rows]` estimate and competing paths are
+ranked by cost rather than structure — in particular, an index on a
+low-selectivity column (few distinct values) correctly loses to the full
+scan it would out-fetch.
 
 ## Writing
 

@@ -241,7 +241,7 @@ long-lived-transaction descriptor pinning noted under Catalog.
 
 ## Execution
 
-There is no cost model. The executor ranks access paths:
+The executor ranks access paths:
 
 1. WHERE pins every PK column by equality → primary point `Get`.
 2. Every column of a unique index pinned → unique-index point lookup.
@@ -249,9 +249,23 @@ There is no cost model. The executor ranks access paths:
    conjuncts pin a leading column prefix, and range conjuncts
    (`> >= < <=`) on the **next** key column become order-preserving scan
    bounds (`WHERE a = 1 AND b > 5 AND b <= 9` scans exactly the matching
-   key span). Paths score 2 per pinned column plus 1 for a range; ties
-   prefer the primary key (no index join).
+   key span). Without statistics, paths score 2 per pinned column plus 1
+   for a range; ties prefer the primary key (no index join).
 4. Otherwise → full `Scan` of the primary rows with in-memory filtering.
+
+With table statistics present (ANALYZE or the background sampler),
+step 3 ranks competing scans by **estimated cost** instead of the
+structural score: estimated rows (row count × 1/distinct per equality,
+×⅓ per range bound, ×⅒ for a column the statistics never saw; naive
+independence, floor of one row), times a ×4 index-join multiplier for
+non-unique indexes (modelling the per-entry primary-key `Get`). The
+cheapest path wins, exact ties keep the primary key, and a constrained
+scan whose cost reaches the full-scan cost loses to the full scan — the
+case the structural planner gets wrong on low-selectivity indexed
+columns. The point-lookup short-circuits (steps 1–2) are unaffected, and
+with no statistics the structural ranking runs byte-identically to the
+pre-statistics planner. `EXPLAIN` appends ` [~N rows]` to a plan whose
+estimate came from statistics.
 
 Conjuncts a path cannot absorb (`!=`, `IS [NOT] NULL`, columns outside
 the key prefix) stay as a **residual filter**: the executor re-checks the
