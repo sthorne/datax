@@ -51,7 +51,6 @@ type parser struct {
 }
 
 func (p *parser) peek() token { return p.toks[p.i] }
-func (p *parser) next() token { t := p.toks[p.i]; p.i++; return t }
 func (p *parser) errf(format string, args ...any) error {
 	return &SyntaxError{Msg: fmt.Sprintf(format, args...), Pos: p.peek().pos}
 }

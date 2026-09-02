@@ -69,17 +69,21 @@ Details that matter for correctness and confidentiality:
 
   ```sh
   datax debug rotate-enc-key --addr 10.0.0.1:26257 \
-    --old-key store.key --new-key new.key [--certs-dir certs --user ops]
+    --old-key store.key --new-key new.key --certs-dir certs [--user ops]
   ```
 
-  The `rotate-store-key` admin RPC (admin role required in secure mode)
-  verifies the old key against the on-disk registry (GCM
-  authentication), reseals the registry atomically (tmp + rename — the
-  same path the offline mode uses), swaps the key the node seals
-  artifacts with, and immediately re-seals the metadata backup. Data
-  keys and file contents are untouched, so rotation is O(registry), not
-  O(store). Restart the node with `--enc-key new.key` afterwards. The
-  offline mode (`--dir`, node stopped) remains for damaged stores.
+  The `rotate-store-key` admin RPC (admin role required) verifies the
+  old key against the on-disk registry (GCM authentication), reseals
+  the registry atomically (tmp + rename + directory fsync — the same
+  path the offline mode uses), swaps the key the node seals artifacts
+  with, and immediately re-seals the metadata backup. Data keys and
+  file contents are untouched, so rotation is O(registry), not
+  O(store). The request carries both store keys, so the op is served
+  only over mutual TLS: on an insecure cluster it is refused, and the
+  offline mode (`--dir`, node stopped) is the way to rotate. Restart the
+  node with `--enc-key new.key` afterwards (the node logs a reminder
+  that the old key file is now stale). The offline mode also remains
+  for damaged stores.
 
 - **Background re-encryption** retires old-data-key exposure on cold
   data. `datax debug reencrypt --addr ... [--wait]` starts a paced pass
@@ -91,6 +95,18 @@ Details that matter for correctness and confidentiality:
   and `datax debug reencrypt-status`. Only sstables can be stale — the
   WAL, MANIFEST, and OPTIONS are recreated under the fresh active key at
   every open.
+
+  Manual compaction is by key range, so a stale file's cost is the
+  on-disk size of its span across all levels (a pre-shutdown flush file
+  can span the whole keyspace); the burst budget counts that estimate,
+  and `rewritten_bytes_total` reports it. A file a compaction cannot
+  rewrite (a single-user-key file, a local-key-only file already at the
+  bottom level) is attempted once per run and then skipped, so it never
+  starves the files behind it; the worker stops when nothing more can
+  be rewritten and logs what remains — those files retire with natural
+  churn. `--wait` follows the worker and exits non-zero if bytes remain
+  or the stale-file sweep failed; a status carrying `sweep_error`
+  attests nothing (its counts are the last good reading).
 
   Mechanically, each stale file's compaction is *seeded* with a Pebble
   point tombstone at `smallest + 0x00` — provably not a valid MVCC key

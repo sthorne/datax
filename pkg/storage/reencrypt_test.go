@@ -126,7 +126,7 @@ func TestReencryptPass(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = e2.Close() }()
-	remaining, files := e2.ReencryptionStatus()
+	remaining, files, _ := e2.ReencryptionStatus()
 	if remaining == 0 || files == 0 {
 		t.Fatalf("no stale files after restart: %d bytes / %d files", remaining, files)
 	}
@@ -137,7 +137,7 @@ func TestReencryptPass(t *testing.T) {
 		if pass > 20 {
 			t.Fatalf("re-encryption did not converge; %d bytes remain", remaining)
 		}
-		targeted, rem, _, err := e2.ReencryptPass(ctx, 0)
+		targeted, rem, _, err := e2.ReencryptPass(ctx, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestReencryptPass(t *testing.T) {
 	if rewritten == 0 {
 		t.Fatal("no bytes were rewritten")
 	}
-	if rb, rf := e2.ReencryptionStatus(); rb != 0 || rf != 0 {
+	if rb, rf, serr := e2.ReencryptionStatus(); rb != 0 || rf != 0 || serr != nil {
 		t.Fatalf("status after convergence: %d bytes / %d files", rb, rf)
 	}
 

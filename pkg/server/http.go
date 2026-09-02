@@ -100,7 +100,7 @@ func (n *Node) startHTTP() error {
 			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",
 			}, func() float64 {
-				remaining, _ := eng.ReencryptionStatus()
+				remaining, _, _ := eng.ReencryptionStatus()
 				return float64(remaining)
 			}))
 		}

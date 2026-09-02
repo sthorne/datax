@@ -56,16 +56,26 @@ func CreateCA(certsDir string) error {
 	return writeCert(filepath.Join(certsDir, CACertFile), der)
 }
 
+// NodePrincipal is the CommonName of the node certificate: the identity
+// cluster peers present to each other. It is reserved — never a SQL user
+// and never a client certificate.
+const NodePrincipal = "node"
+
 // CreateNodeCert generates a node certificate (server + client usage, for
 // mutual internode TLS and the SQL listener) with the given host SANs.
 func CreateNodeCert(certsDir string, hosts []string) error {
-	return createSignedCert(certsDir, NodeCert, NodeKeyFile, "node", hosts,
+	return createSignedCert(certsDir, NodeCert, NodeKeyFile, NodePrincipal, hosts,
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
 }
 
 // CreateClientCert generates a client certificate whose CommonName is the
-// given user.
+// given user. "node" is the cluster's own identity (the node certificate)
+// and is never issued as a client certificate: it would carry node
+// authority over the internode KV and Raft surfaces.
 func CreateClientCert(certsDir, user string) error {
+	if user == NodePrincipal {
+		return fmt.Errorf("%q is the cluster's node identity, not a user; client certificates are issued to SQL users", user)
+	}
 	return createSignedCert(certsDir, fmt.Sprintf("client.%s.crt", user), fmt.Sprintf("client.%s.key", user),
 		user, nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 }

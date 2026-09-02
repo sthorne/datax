@@ -18,6 +18,13 @@ import (
 // nothing checks, and the enforced identity is client-claimed.
 
 func (s *Session) execCreateUser(ctx context.Context, txn *kvclient.Txn, t *parser.CreateUser) (*Result, error) {
+	if t.Name == security.NodePrincipal {
+		// The node certificate's CommonName is an admin principal on the
+		// HTTP and admin-RPC surfaces; a SQL user of that name would gain
+		// that authority through HTTP Basic auth and leave audit records
+		// indistinguishable from the cluster's own.
+		return nil, newErrf(CodeInvalidParameterValue, "user name %q is reserved for the cluster's node identity", t.Name)
+	}
 	key := keys.UserKey(t.Name)
 	existing, err := txn.Get(ctx, key)
 	if err != nil {

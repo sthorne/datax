@@ -12,8 +12,10 @@ import (
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -50,6 +52,9 @@ type Server struct {
 	rpcpb.UnimplementedInternodeServer
 	clock    *hlc.Clock
 	handlers ServerHandlers
+	// secure records whether the listener requires client certificates;
+	// the node-only surfaces fail closed on it (see requireNode).
+	secure bool
 }
 
 // NewServer returns a gRPC server with the Internode service registered.
@@ -61,7 +66,7 @@ func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *g
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
 	}
 	gs := grpc.NewServer(opts...)
-	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers})
+	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers, secure: tlsCfg != nil})
 	return gs
 }
 
@@ -86,6 +91,25 @@ func PeerCN(ctx context.Context) string {
 	return ti.State.VerifiedChains[0][0].Subject.CommonName
 }
 
+// requireNode admits a call only from a cluster peer: in secure mode the
+// caller must present the node certificate (CN "node"). Client
+// certificates issued to SQL users authenticate operators to the Admin
+// RPC, which authorizes per op; they carry no authority over the raw KV,
+// Raft, snapshot, and join surfaces, where a Batch over any key span
+// would bypass every SQL privilege check. Insecure mode has no
+// identities to check, matching pgwire's trust semantics.
+func (s *Server) requireNode(ctx context.Context, method string) error {
+	if !s.secure {
+		return nil
+	}
+	if cn := PeerCN(ctx); cn != "node" {
+		log.Audit("rpc-denied", "method", method, "principal", cn)
+		return status.Errorf(codes.PermissionDenied,
+			"%s requires the cluster's node certificate (connected as %q)", method, cn)
+	}
+	return nil
+}
+
 func (s *Server) updateClock(now *rpcpb.Hlc) {
 	if now == nil {
 		return
@@ -99,6 +123,9 @@ func (s *Server) updateClock(now *rpcpb.Hlc) {
 }
 
 func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
+	if err := s.requireNode(stream.Context(), "RaftMessages"); err != nil {
+		return err
+	}
 	for {
 		env, err := stream.Recv()
 		if err == io.EOF {
@@ -137,6 +164,9 @@ func (s *Server) payload(ctx context.Context, h PayloadHandler, in *rpcpb.Payloa
 // older senders) and replies in the encoding the request used, so a mixed
 // pair degrades to JSON instead of failing.
 func (s *Server) Batch(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	if err := s.requireNode(ctx, "Batch"); err != nil {
+		return nil, err
+	}
 	s.updateClock(in.Now)
 	var (
 		ba  *kvpb.BatchRequest
@@ -167,6 +197,9 @@ func (s *Server) Batch(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, 
 }
 
 func (s *Server) Join(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
+	if err := s.requireNode(ctx, "Join"); err != nil {
+		return nil, err
+	}
 	return s.payload(ctx, s.handlers.Join, in)
 }
 
@@ -175,6 +208,9 @@ func (s *Server) Admin(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, 
 }
 
 func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
+	if err := s.requireNode(stream.Context(), "Snapshot"); err != nil {
+		return err
+	}
 	if s.handlers.Snapshot == nil {
 		return io.EOF
 	}

@@ -133,15 +133,6 @@ func exprColumns(e parser.Expr, visit func(string)) {
 	}
 }
 
-// exprSubs walks a value-expression chain's subqueries.
-func exprSubs(e parser.Expr, visit func(*parser.Select)) {
-	for cur := &e; cur != nil; cur = cur.Right {
-		if cur.Sub != nil {
-			visit(cur.Sub)
-		}
-	}
-}
-
 // innerSubShape reports whether a subquery is a shape correlation
 // detection covers: a plain single-table select whose own nested
 // subqueries (WHERE positions only) are recursively covered too.

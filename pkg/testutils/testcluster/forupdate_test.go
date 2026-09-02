@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 )
@@ -135,11 +136,19 @@ func TestGetForUpdateBlocksWriters(t *testing.T) {
 		// window (common on a loaded box) — so it retries the scenario
 		// rather than failing the test.
 		if err := locker.Put(ctx, key, []byte("locked-write")); err != nil {
+			if !kvclient.IsRetryable(err) {
+				<-blocked
+				t.Fatalf("locker write failed with a non-retryable error: %v", err)
+			}
 			_ = locker.Rollback(ctx)
 			<-blocked
 			continue
 		}
 		if err := locker.Commit(ctx); err != nil {
+			if !kvclient.IsRetryable(err) {
+				<-blocked
+				t.Fatalf("locker commit failed with a non-retryable error: %v", err)
+			}
 			_ = locker.Rollback(ctx)
 			<-blocked
 			continue
@@ -196,7 +205,11 @@ func TestScanForUpdateLocksRows(t *testing.T) {
 		_ = w.Rollback(ctx)
 		if err := locker.Commit(ctx); err != nil {
 			// The writer's winning push surfaced after its 500ms window
-			// timed out — a late flip loss, so retry (issue #61).
+			// timed out — a late flip loss, so retry (issue #61). Only a
+			// conflict qualifies; anything else is a real failure.
+			if !kvclient.IsRetryable(err) {
+				t.Fatalf("locker commit failed with a non-retryable error: %v", err)
+			}
 			_ = locker.Rollback(ctx)
 			continue
 		}

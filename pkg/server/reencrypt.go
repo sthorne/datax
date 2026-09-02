@@ -39,6 +39,14 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 	if len(req.OldStoreKey) != enc.KeyLen || len(req.NewStoreKey) != enc.KeyLen {
 		return cluster.AdminResponse{Error: "rotate-store-key requires --old-key and --new-key (32 bytes each)"}
 	}
+	// The request carries both store keys. Over the insecure listener
+	// they would cross the network in cleartext — and anyone who can
+	// reach the port could rotate the store — which defeats encryption
+	// at rest; the offline path (`--dir` on a stopped node) covers
+	// insecure clusters.
+	if n.tlsCfgs == nil {
+		return cluster.AdminResponse{Error: "rotate-store-key carries the store key and is only served over mutual TLS (secure cluster); rotate a stopped node offline with --dir"}
+	}
 	if err := n.engine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
 	}
@@ -55,19 +63,26 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 		n.exportMetadata(ctx)
 	}
 	log.Infof("store key rotated online; registry and metadata backup sealed under the new key")
+	if n.cfg.EncKeyPath != "" {
+		log.Warnf("the key file %s still holds the retired store key; replace it with the new key before this node next restarts", n.cfg.EncKeyPath)
+	}
 	return cluster.AdminResponse{}
 }
 
 func (n *Node) reencryptionStatus() *cluster.ReencryptionStatus {
-	remaining, files := n.engine.ReencryptionStatus()
+	remaining, files, sweepErr := n.engine.ReencryptionStatus()
 	n.reencMu.Lock()
 	defer n.reencMu.Unlock()
-	return &cluster.ReencryptionStatus{
+	st := &cluster.ReencryptionStatus{
 		Active:         n.reencActive,
 		RemainingBytes: remaining,
 		RemainingFiles: files,
 		RewrittenBytes: n.reencRewritten,
 	}
+	if sweepErr != nil {
+		st.SweepError = sweepErr.Error()
+	}
+	return st
 }
 
 // serveReencrypt starts the background pass (idempotent while one runs)
@@ -99,8 +114,11 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 		n.reencActive = false
 		n.reencMu.Unlock()
 	}()
+	// attempted spans the run: a file a compaction left in place is not
+	// retried, so the files behind it get their turn (see ReencryptPass).
+	attempted := map[uint64]bool{}
 	for pass := 0; pass < reencryptMaxPasses; pass++ {
-		targeted, remaining, files, err := n.engine.ReencryptPass(ctx, reencryptPassBytes)
+		targeted, remaining, files, err := n.engine.ReencryptPass(ctx, reencryptPassBytes, attempted)
 		if targeted > 0 {
 			metrics.ReencryptionRewritten.Add(float64(targeted))
 			n.reencMu.Lock()
@@ -113,6 +131,10 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 		}
 		if remaining == 0 {
 			log.Infof("re-encryption complete: no live sstable under a retired data key")
+			return
+		}
+		if targeted == 0 {
+			log.Warnf("re-encryption stopped: %d bytes in %d files under retired keys cannot be rewritten by manual compaction (single-key or bottom-level files); they retire with natural churn — re-run `datax debug reencrypt` later", remaining, files)
 			return
 		}
 		log.Debugf("re-encryption: %d bytes in %d files remain under retired keys", remaining, files)

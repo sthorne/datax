@@ -194,7 +194,25 @@ func writeRegistry(base vfs.FS, dir string, storeKey []byte, reg *registryData) 
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return base.Rename(tmp, path)
+	if err := base.Rename(tmp, path); err != nil {
+		return err
+	}
+	// The rename is only durable once the directory entry is: without a
+	// directory fsync a crash after a "successful" rotation can bring the
+	// registry back sealed under the OLD store key — which the operator
+	// may already have retired. (In-memory stores have no directory.)
+	if dir == "" {
+		return nil
+	}
+	d, err := base.OpenDir(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // RotateStoreKey reseals the registry (and nothing else) under a new store

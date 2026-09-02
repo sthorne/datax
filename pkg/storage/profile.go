@@ -55,7 +55,7 @@ type softGate struct {
 	l0Sublevels   int
 	l0Files       int
 	memtableBytes uint64
-	// Compaction-debt gate, with hysteresis: enter above debtHigh, exit
+	// Compaction-debt gate, with hysteresis: enter at or above debtHigh, exit at or
 	// below debtLow (a single threshold would flap on every compaction).
 	// Debt measures scheduled-but-unfinished compaction work, so a
 	// sustained ingest that outruns compaction trips it long before L0
