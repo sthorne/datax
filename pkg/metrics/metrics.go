@@ -108,4 +108,17 @@ var (
 	StorageBackpressure = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_total", Help: "Table-data writes shed with a retryable error while the engine was overloaded.",
 	})
+	StorageBackpressureCause = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_storage_backpressure_cause_total",
+		Help: "Table-data writes shed, by cause: leader (this node's engine gates), debt (this node's latched compaction-debt gate), follower (an overloaded quorum member's piggybacked verdict).",
+	}, []string{"cause"})
+	ReencryptionRewritten = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_reencryption_rewritten_bytes_total", Help: "Bytes of stale-key sstables rewritten under the active data key by background re-encryption passes.",
+	})
+	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
+	})
+	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
+	})
 )

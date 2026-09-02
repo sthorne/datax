@@ -8,6 +8,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // SQL users. Only SCRAM verifiers are ever stored (never plaintext), at
@@ -46,6 +47,7 @@ func (s *Session) execCreateUser(ctx context.Context, txn *kvclient.Txn, t *pars
 	if t.Alter {
 		tag = "ALTER USER"
 	}
+	log.Audit("user-ddl", "stmt", tag, "target", t.Name, "principal", s.user)
 	return &Result{Tag: tag}, nil
 }
 
@@ -64,6 +66,7 @@ func (s *Session) execDropUser(ctx context.Context, txn *kvclient.Txn, t *parser
 	if err := txn.Delete(ctx, key); err != nil {
 		return nil, err
 	}
+	log.Audit("user-ddl", "stmt", "DROP USER", "target", t.Name, "principal", s.user)
 	return &Result{Tag: "DROP USER"}, nil
 }
 

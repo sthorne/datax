@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"encoding/json"
+
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 )
@@ -31,6 +33,23 @@ type AdminRequest struct {
 	// Version is the target for upgrade-cluster (0 = the serving node's
 	// binary version).
 	Version int `json:"version,omitempty"`
+	// Store-key rotation (rotate-store-key): the node's current store key
+	// (verified against the on-disk registry) and its replacement. Carried
+	// over mutual TLS in secure mode; never logged.
+	OldStoreKey []byte `json:"old_store_key,omitempty"`
+	NewStoreKey []byte `json:"new_store_key,omitempty"`
+}
+
+// ReencryptionStatus reports the background re-encryption pass on one
+// node: whether a pass is running, live sstable bytes/files still under
+// retired data keys, and total bytes rewritten by passes so far.
+// RemainingBytes == 0 with Active == false is the attestation that no
+// live sstable remains under a retired key.
+type ReencryptionStatus struct {
+	Active         bool  `json:"active"`
+	RemainingBytes int64 `json:"remaining_bytes"`
+	RemainingFiles int   `json:"remaining_files"`
+	RewrittenBytes int64 `json:"rewritten_bytes_total"`
 }
 
 // AdminResponse is the JSON reply.
@@ -52,6 +71,12 @@ type AdminResponse struct {
 	// ClusterVersion reports the finalized cluster version (nodes,
 	// upgrade-cluster).
 	ClusterVersion int `json:"cluster_version,omitempty"`
+	// Reencryption answers reencrypt / reencrypt-status.
+	Reencryption *ReencryptionStatus `json:"reencryption,omitempty"`
+	// Status answers node-status: the serving node's /status document
+	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
+	// this package does not depend on the server package's types.
+	Status json.RawMessage `json:"status,omitempty"`
 }
 
 // BackupTableSummary reports one table of a backup or restore.

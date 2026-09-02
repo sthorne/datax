@@ -7,7 +7,8 @@ datax runs in one of two modes, decided by whether nodes are started with
 |---|---|---|
 | Internode RPC | plaintext | mutual TLS |
 | SQL wire | plaintext, any username accepted (trust) | TLS + SCRAM-SHA-256 password auth, or client-certificate auth |
-| HTTP endpoints | open | HTTP Basic (any database user) or client certificate |
+| HTTP endpoints | open | HTTP Basic (any database user) or client certificate; `/api/range` admin-only |
+| Admin RPCs (`datax debug`, backup/restore) | open | client certificate; state-changing ops require the admin role |
 | SQL privileges | statements accepted but identity is unverified | enforced per user via `GRANT`/`REVOKE` |
 
 Insecure mode is for development only: anyone who can reach the SQL port is
@@ -90,10 +91,18 @@ statement returns.
 
 ## HTTP endpoints in secure mode
 
-Every HTTP route (`/`, `/metrics`, `/status`, `/api/cluster`) requires
-either HTTP Basic credentials of **any** database user, or a CA-verified
-client certificate. Everything served is read-only; there is no
-per-endpoint authorization yet.
+Every HTTP route requires either HTTP Basic credentials of a database
+user, or a CA-verified client certificate (CN = username). Authorization
+is per endpoint:
+
+| Endpoint | Who |
+|---|---|
+| `/`, `/metrics`, `/status`, `/api/cluster` | any database user (read-only) |
+| `/api/range` (cross-node drill-down) | admin role only — it fans out over internode RPC |
+
+Rejected credentials are audited (`datax_auth_failures_total`); an
+authenticated non-admin hitting an admin endpoint gets 403 and an
+`admin-denied` audit record (`datax_admin_denied_total`).
 
 Prometheus scrape config:
 
@@ -113,9 +122,39 @@ valid user, and that user needs no table grants.)
 The browser dashboard works with the same Basic credentials — the browser
 prompts once and same-origin fetches reuse them.
 
+## Admin RPCs in secure mode
+
+The RPC port (`--listen`) requires mutual TLS, so `datax debug`,
+`datax backup`, and `datax restore` need `--certs-dir` (and optionally
+`--user`, default `root`) to present a client certificate:
+
+```sh
+datax cert create-client --certs-dir certs --user ops   # once
+datax debug split --table 100 --addr 10.0.0.1:26257 --certs-dir certs --user ops
+datax backup --dest /backups/today --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+The server authorizes by the certificate's CommonName: read-only ops
+(`ranges`, `nodes`) accept any database user's certificate;
+state-changing ops (split, merge, rebalance, transfer-lease,
+decommission, upgrade, backup, restore) require the **admin role** —
+`root`, or a user granted `GRANT ADMIN`. In insecure mode the admin
+surface is open, like everything else.
+
+## Audit log
+
+Security-relevant actions are written to the node log as structured
+records (`msg=audit`), each with the acting principal:
+
+- authentication failures — SQL (SCRAM) and HTTP Basic
+  (`datax_auth_failures_total`)
+- denied admin operations (`datax_admin_denied_total`)
+- executed state-changing admin RPCs (op, principal, target)
+- user and privilege DDL: `CREATE`/`ALTER`/`DROP USER`,
+  `GRANT`/`REVOKE` (including `GRANT ADMIN`)
+- `datax debug unsafe-recover` (offline: records the OS user)
+
 ## What secure mode does not do
 
-- No per-endpoint HTTP authorization (any authenticated user sees all
-  read-only observability data).
 - No column- or row-level SQL privileges — grants are per table.
 - No certificate revocation — rotate the CA to invalidate issued certs.

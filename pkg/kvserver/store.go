@@ -127,6 +127,9 @@ type Store struct {
 		sync.Mutex
 		cursor uint64
 	}
+
+	// nodeHealth holds peers' storage-health verdicts (see node_health.go).
+	nodeHealth nodeHealthMap
 }
 
 // SetSender injects the routed KV client (once, at node startup).

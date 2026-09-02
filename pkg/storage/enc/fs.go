@@ -35,6 +35,25 @@ const (
 // FS (sealed with the store key, not a data key) and passed through raw.
 const RegistryName = "ENCRYPTION-REGISTRY"
 
+// FileKeyID reads the data-key ID from an encrypted file's header,
+// through the BASE (unencrypted) filesystem. ok=false when the file
+// carries no encryption header (the registry, LOCK, short files).
+func FileKeyID(base vfs.FS, path string) (uint32, bool, error) {
+	f, err := base.Open(path)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = f.Close() }()
+	var hdr [headerLen]byte
+	if _, err := f.ReadAt(hdr[:], 0); err != nil {
+		return 0, false, nil
+	}
+	if string(hdr[0:4]) != fileMagic {
+		return 0, false, nil
+	}
+	return binary.BigEndian.Uint32(hdr[4:8]), true, nil
+}
+
 // FS encrypts every file created through it. Non-file operations pass
 // through to the base FS.
 type FS struct {

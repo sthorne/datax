@@ -39,8 +39,12 @@ takes the DB mutex):
   and internally memtable *bytes*, which is
 - `datax_storage_write_stalls_total` — Pebble hard stalls (should stay 0)
 - `datax_storage_disk_slow_total`
+- `datax_storage_debt_gate` (0/1) and
+  `datax_storage_debt_gate_entered_total` — the compaction-debt gate's
+  latch state and entry count
 - `datax_storage_backpressure_total` (process-wide) — writes shed by the
-  gate below
+  gate below; `datax_storage_backpressure_cause_total{cause=leader|debt|
+  follower}` says which limit was hit
 
 ## Backpressure instead of stalls
 
@@ -53,6 +57,27 @@ retry); `pkg/kvclient` retries them with jittered exponential backoff
 (10ms → 1s), so an overloaded store sees its load thin out instead of a
 hot retry storm.
 
+Two further gates ride the same shed path (the per-cause counter says
+which fired):
+
+- **Compaction debt** (`cause=debt`): sustained ingest can keep L0
+  shallow while compaction debt compounds without bound. The gate
+  latches when `datax_storage_compaction_debt_bytes` crosses the
+  profile's high water (balanced 2 GiB, ingest 8 GiB) and — hysteresis,
+  so it cannot flap on every compaction — releases only below the low
+  water (half the high). While latched, table-data writes shed exactly
+  like an L0 trip.
+- **Quorum health** (`cause=follower`): every node piggybacks its own
+  soft-gate verdict on its outgoing raft envelopes
+  (`rpcpb.StorageHealth`), so leaders know each replica-set member's
+  health with no extra traffic. A leader sheds a range's table-data
+  writes when ANY member of that range's replica set is overloaded —
+  an overloaded follower otherwise lags raft silently until it needs a
+  catch-up snapshot, or quietly rides the range one node from quorum
+  loss. Verdicts older than 5s (or absent — old binaries, silent peers)
+  read as healthy: a node that stops talking is the liveness system's
+  problem, and stale shedding must not wedge writes after it recovers.
+
 Deliberately **not** gated:
 
 - `/system` and `/meta` writes — liveness heartbeats, descriptor and
@@ -62,10 +87,9 @@ Deliberately **not** gated:
   cleanup is what un-wedges contended keys.
 - GC batches — they are how the store digs itself out.
 
-Known limitations: the gate reads only the **leader's** engine — an
-overloaded follower simply lags raft (log growth, eventually a catch-up
-snapshot); and compaction debt is exported but not gated on (no honest
-threshold without more production data).
+Known limitation: the debt thresholds are first-cut constants (chosen
+conservatively — well past where a healthy store's debt cycles); tune
+with production data.
 
 ## WAL cost note (measurement first)
 

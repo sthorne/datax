@@ -16,7 +16,8 @@ func TestProfileOptions(t *testing.T) {
 		balanced.L0StopWritesThreshold != 0 || balanced.MaxConcurrentCompactions != nil {
 		t.Fatalf("balanced profile touched pebble options: %+v", balanced)
 	}
-	if gate.l0Sublevels != 10 || gate.l0Files != 400 || gate.memtableBytes != 0 {
+	if gate.l0Sublevels != 10 || gate.l0Files != 400 || gate.memtableBytes != 0 ||
+		gate.debtHigh != 2<<30 || gate.debtLow != 1<<30 {
 		t.Fatalf("balanced gate: %+v", gate)
 	}
 
@@ -30,7 +31,8 @@ func TestProfileOptions(t *testing.T) {
 	if ingest.MaxConcurrentCompactions == nil || ingest.MaxConcurrentCompactions() < 2 {
 		t.Fatal("ingest compaction concurrency not raised")
 	}
-	if gate.l0Sublevels != 20 || gate.l0Files != 1500 || gate.memtableBytes != 3*(64<<20) {
+	if gate.l0Sublevels != 20 || gate.l0Files != 1500 || gate.memtableBytes != 3*(64<<20) ||
+		gate.debtHigh != 8<<30 || gate.debtLow != 4<<30 {
 		t.Fatalf("ingest gate: %+v", gate)
 	}
 
@@ -84,6 +86,62 @@ func TestOverloaded(t *testing.T) {
 	inject(StorageMetrics{MemtableCount: 50, MemtableBytes: 1 << 30})
 	if over, _ := e.Overloaded(); over {
 		t.Fatal("disabled memtable criterion tripped")
+	}
+}
+
+// TestDebtGateHysteresis: the compaction-debt gate latches at the high
+// water, stays latched between the waters, releases at the low water, and
+// counts each entry once. While latched (and no engine gate trips) the
+// overload cause is "debt".
+func TestDebtGateHysteresis(t *testing.T) {
+	e := &Engine{}
+	e.health.gate = softGate{l0Sublevels: 10, l0Files: 400, debtHigh: 2 << 30, debtLow: 1 << 30}
+	inject := func(s StorageMetrics) {
+		e.health.snapshot.Store(&s)
+		e.health.refreshed.Store(time.Now().UnixNano())
+		e.updateDebtGate(s.CompactionDebtBytes)
+	}
+
+	inject(StorageMetrics{CompactionDebtBytes: 1 << 30})
+	if e.DebtGated() {
+		t.Fatal("gate latched below high water")
+	}
+	inject(StorageMetrics{CompactionDebtBytes: 2 << 30})
+	if !e.DebtGated() || e.DebtGateEntries() != 1 {
+		t.Fatalf("gate at high water: latched=%v entries=%d", e.DebtGated(), e.DebtGateEntries())
+	}
+	if over, cause, _ := e.OverloadedCause(); !over || cause != CauseDebt {
+		t.Fatalf("latched gate not reported: %v %s", over, cause)
+	}
+	// Between the waters: still latched (no flapping), no double count.
+	inject(StorageMetrics{CompactionDebtBytes: (1 << 30) + (1 << 29)})
+	if !e.DebtGated() || e.DebtGateEntries() != 1 {
+		t.Fatalf("hysteresis window: latched=%v entries=%d", e.DebtGated(), e.DebtGateEntries())
+	}
+	// At/below the low water: releases.
+	inject(StorageMetrics{CompactionDebtBytes: 1 << 30})
+	if e.DebtGated() {
+		t.Fatal("gate did not release at low water")
+	}
+	if over, _, _ := e.OverloadedCause(); over {
+		t.Fatal("released gate still overloaded")
+	}
+	// Re-entry counts again.
+	inject(StorageMetrics{CompactionDebtBytes: 3 << 30})
+	if !e.DebtGated() || e.DebtGateEntries() != 2 {
+		t.Fatalf("re-entry: latched=%v entries=%d", e.DebtGated(), e.DebtGateEntries())
+	}
+	// Immediate engine signals outrank the debt cause.
+	inject(StorageMetrics{CompactionDebtBytes: 3 << 30, L0Sublevels: 10})
+	if _, cause, _ := e.OverloadedCause(); cause != CauseEngine {
+		t.Fatalf("engine signal outranked by debt: %s", cause)
+	}
+	// A disabled gate (no thresholds) never latches.
+	e2 := &Engine{}
+	e2.health.gate = softGate{l0Sublevels: 10}
+	e2.updateDebtGate(100 << 30)
+	if e2.DebtGated() {
+		t.Fatal("disabled debt gate latched")
 	}
 }
 

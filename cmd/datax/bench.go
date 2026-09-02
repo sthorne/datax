@@ -313,6 +313,12 @@ func runBench(args []string) error {
 			after["datax_storage_write_stalls_total"]-before["datax_storage_write_stalls_total"])
 		fmt.Printf("  backpressured writes: %+.0f\n",
 			after["datax_storage_backpressure_total"]-before["datax_storage_backpressure_total"])
+		for _, cause := range []string{"leader", "debt", "follower"} {
+			series := fmt.Sprintf(`datax_storage_backpressure_cause_total{cause="%s"}`, cause)
+			if d := after[series] - before[series]; d != 0 {
+				fmt.Printf("    cause=%s: %+.0f\n", cause, d)
+			}
+		}
 	}
 	latMu.Lock()
 	if len(lats) > 0 {

@@ -10,6 +10,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -21,13 +22,15 @@ func runBackupCmd(args []string) error {
 	dest := fs.String("dest", "", "destination directory ON THE SERVING NODE")
 	basePath := fs.String("base", "", "prior backup directory (on the node) to take an incremental against")
 	allowPlaintext := fs.Bool("allow-plaintext", false, "allow plaintext backup files from an encrypted store")
+	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); must be an admin")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *dest == "" {
 		return fmt.Errorf("backup requires --dest")
 	}
-	resp, err := adminCall(*addr, cluster.AdminRequest{
+	resp, err := adminCall(*addr, *certsDir, *certUser, cluster.AdminRequest{
 		Op: "backup", Path: *dest, BasePath: *basePath, AllowPlaintext: *allowPlaintext,
 	})
 	if err != nil {
@@ -44,13 +47,15 @@ func runRestoreCmd(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
 	src := fs.String("src", "", "comma-separated backup directories ON THE SERVING NODE, full backup first")
+	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); must be an admin")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *src == "" {
 		return fmt.Errorf("restore requires --src")
 	}
-	resp, err := adminCall(*addr, cluster.AdminRequest{Op: "restore", Paths: strings.Split(*src, ",")})
+	resp, err := adminCall(*addr, *certsDir, *certUser, cluster.AdminRequest{Op: "restore", Paths: strings.Split(*src, ",")})
 	if err != nil {
 		return err
 	}
@@ -58,8 +63,15 @@ func runRestoreCmd(args []string) error {
 	return nil
 }
 
-func adminCall(addr string, req cluster.AdminRequest) (cluster.AdminResponse, error) {
+func adminCall(addr, certsDir, certUser string, req cluster.AdminRequest) (cluster.AdminResponse, error) {
 	trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
+	if certsDir != "" {
+		tlsCfg, err := security.LoadClientTLS(certsDir, certUser)
+		if err != nil {
+			return cluster.AdminResponse{}, err
+		}
+		trans.SetTLS(tlsCfg)
+	}
 	// Backups and restores move real data; give them time.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()

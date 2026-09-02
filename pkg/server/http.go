@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net"
@@ -83,7 +84,26 @@ func (n *Node) startHTTP() error {
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "datax_storage_disk_slow_total", Help: "Slow-disk events reported by Pebble.",
 			}, func() float64 { return float64(eng.StorageMetrics().DiskSlowEvents) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_debt_gate", Help: "1 while the compaction-debt backpressure gate is latched (hysteresis: enters above the profile's high-water debt, exits below the low).",
+			}, func() float64 {
+				if eng.DebtGated() {
+					return 1
+				}
+				return 0
+			}),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_debt_gate_entered_total", Help: "Times the compaction-debt gate latched.",
+			}, func() float64 { return float64(eng.DebtGateEntries()) }),
 		)
+		if eng.Encrypted() {
+			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",
+			}, func() float64 {
+				remaining, _ := eng.ReencryptionStatus()
+				return float64(remaining)
+			}))
+		}
 	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
@@ -96,6 +116,10 @@ func (n *Node) startHTTP() error {
 		_ = enc.Encode(n.statusSummary())
 	})
 	mux.HandleFunc("/api/cluster", n.serveClusterAPI)
+	// Cross-node drill-down: fans out over the internode RPC, so it is
+	// admin-gated (the read-only endpoints above stay open to any
+	// authenticated user).
+	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
 	page, uerr := ui.FS.ReadFile("index.html")
@@ -131,12 +155,35 @@ func (n *Node) startHTTP() error {
 	return nil
 }
 
+// httpPrincipal identifies the authenticated caller of an HTTP request:
+// the client-certificate CommonName or the HTTP Basic username. The zero
+// value means insecure mode (trust, like pgwire).
+type httpPrincipal struct {
+	User string
+	Via  string // "cert" or "basic"; "" in insecure mode
+}
+
+type principalCtxKey struct{}
+
+// principalFrom returns the request's authenticated principal (zero in
+// insecure mode).
+func principalFrom(req *http.Request) httpPrincipal {
+	p, _ := req.Context().Value(principalCtxKey{}).(httpPrincipal)
+	return p
+}
+
+func serveAs(next http.Handler, w http.ResponseWriter, req *http.Request, p httpPrincipal) {
+	next.ServeHTTP(w, req.WithContext(context.WithValue(req.Context(), principalCtxKey{}, p)))
+}
+
 // httpAuth wraps the WHOLE mux — a route added later is secure by default.
 // In secure mode every request must present either HTTP Basic credentials
 // matching a stored user's SCRAM verifier, or a CA-verified client
 // certificate whose CommonName is the user (the same two doors pgwire
-// offers). Any valid user suffices: every endpoint is read-only. Insecure
-// mode passes everything through, matching pgwire's trust semantics.
+// offers). Any valid user reaches the read-only endpoints; the resolved
+// principal rides the request context for per-endpoint authorization
+// (requireAdmin) and audit records. Insecure mode passes everything
+// through, matching pgwire's trust semantics.
 func (n *Node) httpAuth(next http.Handler) http.Handler {
 	if n.tlsCfgs == nil {
 		return next
@@ -148,7 +195,7 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 		if req.TLS != nil && len(req.TLS.VerifiedChains) > 0 &&
 			len(req.TLS.VerifiedChains[0]) > 0 &&
 			req.TLS.VerifiedChains[0][0].Subject.CommonName != "" {
-			next.ServeHTTP(w, req)
+			serveAs(next, w, req, httpPrincipal{User: req.TLS.VerifiedChains[0][0].Subject.CommonName, Via: "cert"})
 			return
 		}
 		user, pass, ok := req.BasicAuth()
@@ -162,12 +209,37 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 				verifier = security.DummyVerifier()
 			}
 			if security.VerifyPassword(verifier, pass) {
-				next.ServeHTTP(w, req)
+				serveAs(next, w, req, httpPrincipal{User: user, Via: "basic"})
 				return
 			}
+			// Credentials were presented and rejected (a bare challenge
+			// round-trip is normal browser flow, not an auth failure).
+			metrics.AuthFailures.Inc()
+			log.Audit("http-auth-failure", "principal", user, "remote", req.RemoteAddr, "path", req.URL.Path)
 		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="datax"`)
 		http.Error(w, "authentication required", http.StatusUnauthorized)
+	})
+}
+
+// requireAdmin gates an endpoint on the admin role: the authenticated
+// principal must be root, an admin-role member, or the cluster's own
+// certificate identity ("node"). Insecure mode passes through (trust,
+// like everything else). Denials are audited.
+func (n *Node) requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if n.tlsCfgs == nil {
+			next.ServeHTTP(w, req)
+			return
+		}
+		p := principalFrom(req)
+		if !n.isAdminPrincipal(req.Context(), p.User) {
+			metrics.AdminDenied.Inc()
+			log.Audit("admin-denied", "principal", p.User, "via", p.Via, "path", req.URL.Path, "remote", req.RemoteAddr)
+			http.Error(w, "admin role required", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, req)
 	})
 }
 

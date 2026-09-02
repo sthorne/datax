@@ -20,6 +20,45 @@ func denied(t *testing.T, ctx context.Context, s *sql.Session, stmt string) {
 	}
 }
 
+// Grants and revokes ride descriptor leases, so another gateway may serve
+// one more statement against the pre-change privileges (issue #61). These
+// helpers absorb that window instead of asserting on the first attempt.
+
+// execEventually retries stmt while it is denied (42501): the granted
+// privilege may take a lease refresh to reach this session's gateway.
+func execEventually(t *testing.T, ctx context.Context, s *sql.Session, stmt string) *sql.Result {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		res, serr := trySQL(ctx, s, stmt)
+		if serr == nil {
+			return res
+		}
+		if serr.Code != sql.CodeInsufficientPriv || time.Now().After(deadline) {
+			t.Fatalf("%s: [%s] %s", stmt, serr.Code, serr.Msg)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// awaitDenied polls a SIDE-EFFECT-FREE probe until it returns 42501 —
+// the barrier after a revoke, before asserting denials of statements
+// that WOULD have side effects on a stale lease.
+func awaitDenied(t *testing.T, ctx context.Context, s *sql.Session, probe string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		_, serr := trySQL(ctx, s, probe)
+		if serr != nil && serr.Code == sql.CodeInsufficientPriv {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: still not denied after revoke (last: %v)", probe, serr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestPrivileges: the admin role gates DDL, user management, and grants;
 // per-table privileges gate DML; grants and revokes take effect at runtime
 // across gateways (they ride the descriptor leases).
@@ -61,7 +100,7 @@ func TestPrivileges(t *testing.T) {
 
 	// SELECT grant: reads work, writes stay denied.
 	execSQL(t, ctx, root, `GRANT SELECT ON t TO alice`)
-	if res := execSQL(t, ctx, alice, `SELECT id FROM t ORDER BY id`); len(res.Rows) != 2 {
+	if res := execEventually(t, ctx, alice, `SELECT id FROM t ORDER BY id`); len(res.Rows) != 2 {
 		t.Fatalf("granted select: %+v", res.Rows)
 	}
 	denied(t, ctx, alice, `INSERT INTO t VALUES (3, 30)`)
@@ -70,16 +109,19 @@ func TestPrivileges(t *testing.T) {
 	denied(t, ctx, alice, `SELECT t.id FROM t JOIN t2 ON t.id = t2.id`)
 	denied(t, ctx, alice, `SELECT id FROM t WHERE id IN (SELECT id FROM t2)`)
 	execSQL(t, ctx, root, `GRANT SELECT ON t2 TO alice`)
-	if res := execSQL(t, ctx, alice, `SELECT t.id FROM t JOIN t2 ON t.id = t2.id`); len(res.Rows) != 1 {
+	if res := execEventually(t, ctx, alice, `SELECT t.id FROM t JOIN t2 ON t.id = t2.id`); len(res.Rows) != 1 {
 		t.Fatalf("granted join: %+v", res.Rows)
 	}
 
 	// ALL expands; revoking one privilege keeps the rest.
 	execSQL(t, ctx, root, `GRANT ALL ON t TO alice`)
-	execSQL(t, ctx, alice, `INSERT INTO t VALUES (3, 30)`)
+	execEventually(t, ctx, alice, `INSERT INTO t VALUES (3, 30)`)
 	execSQL(t, ctx, alice, `UPDATE t SET v = 33 WHERE id = 3`)
 	execSQL(t, ctx, alice, `DELETE FROM t WHERE id = 3`)
 	execSQL(t, ctx, root, `REVOKE INSERT, DELETE ON t FROM alice`)
+	// Barrier: a no-op DELETE is harmless on a stale lease and 42501 once
+	// the revoke lands; only then are the real denials deterministic.
+	awaitDenied(t, ctx, alice, `DELETE FROM t WHERE id = 999`)
 	denied(t, ctx, alice, `INSERT INTO t VALUES (4, 40)`)
 	denied(t, ctx, alice, `DELETE FROM t WHERE id = 1`)
 	execSQL(t, ctx, alice, `UPDATE t SET v = 11 WHERE id = 1`)
@@ -89,9 +131,12 @@ func TestPrivileges(t *testing.T) {
 
 	// Admin role: full DDL + grant rights, revocable at runtime.
 	execSQL(t, ctx, root, `GRANT ADMIN TO alice`)
-	execSQL(t, ctx, alice, `CREATE TABLE hers (id INT PRIMARY KEY)`)
+	execEventually(t, ctx, alice, `CREATE TABLE hers (id INT PRIMARY KEY)`)
 	execSQL(t, ctx, alice, `GRANT SELECT ON hers TO bob`)
 	execSQL(t, ctx, root, `REVOKE ADMIN FROM alice`)
+	// Barrier: dropping a nonexistent user is side-effect-free — "does not
+	// exist" while alice's admin bit is stale, 42501 once the revoke lands.
+	awaitDenied(t, ctx, alice, `DROP USER nobody_probe`)
 	denied(t, ctx, alice, `CREATE TABLE more (id INT PRIMARY KEY)`)
 
 	// root's membership is implicit and immutable.

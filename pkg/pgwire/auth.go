@@ -8,8 +8,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // dummyVerifier stands in for missing users so the SCRAM exchange runs to
@@ -45,6 +47,8 @@ func (c *conn) authenticateSCRAM(user string) error {
 	}
 
 	failed := func() error {
+		metrics.AuthFailures.Inc()
+		log.Audit("sql-auth-failure", "principal", user, "remote", c.nc.RemoteAddr().String())
 		c.sendError(&sql.Error{Code: "28P01", Msg: fmt.Sprintf("password authentication failed for user %q", user)})
 		_ = c.backend.Flush()
 		return fmt.Errorf("authentication failed for %q", user)

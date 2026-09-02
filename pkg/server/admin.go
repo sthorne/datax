@@ -12,6 +12,8 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -26,7 +28,53 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
+// adminReadOnlyOps are admin ops any authenticated principal may run (and
+// that skip the audit log — collect-checksum fires on every consistency
+// sweep). Everything else changes cluster state: admin role required.
+var adminReadOnlyOps = map[string]bool{
+	"ranges":           true,
+	"nodes":            true,
+	"collect-checksum": true,
+	"node-status":      true,
+	"reencrypt-status": true,
+}
+
+// isAdminPrincipal reports whether an authenticated identity carries
+// admin authority: the cluster's own certificate ("node" — internode
+// forwarding and probes act with operator authority), root, or an
+// admin-role member (the same rule the SQL layer applies).
+func (n *Node) isAdminPrincipal(ctx context.Context, cn string) bool {
+	if cn == "node" || cn == "root" {
+		return true
+	}
+	if cn == "" {
+		return false
+	}
+	v, err := n.db.Get(ctx, keys.AdminUserKey(cn))
+	return err == nil && v != nil
+}
+
 func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
+	// In secure mode the caller's identity is its CA-verified client
+	// certificate (mutual TLS is mandatory on this port); state-changing
+	// ops require the admin role and every one is audited with the
+	// principal. Insecure mode has no identities to check, matching
+	// pgwire's trust semantics.
+	principal := "(insecure)"
+	if n.tlsCfgs != nil {
+		cn := rpc.PeerCN(ctx)
+		principal = cn
+		if !adminReadOnlyOps[req.Op] && !n.isAdminPrincipal(ctx, cn) {
+			metrics.AdminDenied.Inc()
+			log.Audit("admin-denied", "op", req.Op, "principal", cn)
+			return cluster.AdminResponse{Error: fmt.Sprintf(
+				"permission denied: admin operation %q requires the admin role (connected as %q)", req.Op, cn)}
+		}
+	}
+	if !adminReadOnlyOps[req.Op] {
+		log.Audit("admin-op", "op", req.Op, "principal", principal,
+			"range", int64(req.RangeID), "node", int64(req.NodeID))
+	}
 	switch req.Op {
 	case "split":
 		if len(req.Key) == 0 {
@@ -89,6 +137,40 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 			return cluster.AdminResponse{Error: "checksum not available"}
 		}
 		return cluster.AdminResponse{Checksum: sum, AppliedIndex: idx}
+
+	case "rotate-store-key":
+		return n.serveRotateStoreKey(ctx, req)
+
+	case "reencrypt":
+		return n.serveReencrypt(req)
+
+	case "reencrypt-status":
+		if n.engine == nil || !n.engine.Encrypted() {
+			return cluster.AdminResponse{Error: "store is not encrypted"}
+		}
+		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
+
+	case "node-status":
+		// This node's /status document, optionally filtered to one range —
+		// the cross-node drill-down's data source (/api/range fans this out
+		// to every replica holder). During a mixed-version roll an old
+		// receiver answers "unknown admin op", which the caller surfaces as
+		// that replica's error rather than failing the whole document.
+		st := n.statusSummary()
+		if req.RangeID != 0 {
+			var only []RangeStatus
+			for _, rs := range st.Ranges {
+				if rs.RangeID == int64(req.RangeID) {
+					only = append(only, rs)
+				}
+			}
+			st.Ranges = only
+		}
+		raw, err := json.Marshal(st)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Status: raw}
 
 	case "merge":
 		if req.RangeID == 0 {

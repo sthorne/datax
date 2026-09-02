@@ -163,6 +163,33 @@ type TLSConfigs struct {
 	PGServer *tls.Config
 }
 
+// LoadClientTLS loads a client TLS configuration from certsDir: the
+// cluster CA as the trust root plus client.<user>.crt/.key as the
+// identity presented to servers. Used by the CLI (datax debug, backup,
+// restore) to authenticate against a secure cluster's RPC and HTTP
+// ports; the server authorizes by the certificate's CommonName.
+func LoadClientTLS(certsDir, user string) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(filepath.Join(certsDir, CACertFile))
+	if err != nil {
+		return nil, fmt.Errorf("reading CA cert: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certificates in %s", CACertFile)
+	}
+	pair, err := tls.LoadX509KeyPair(
+		filepath.Join(certsDir, fmt.Sprintf("client.%s.crt", user)),
+		filepath.Join(certsDir, fmt.Sprintf("client.%s.key", user)))
+	if err != nil {
+		return nil, fmt.Errorf("reading client cert pair (run 'datax cert create-client --user %s' first): %w", user, err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
 // LoadNodeTLS loads the node's certificates from certsDir.
 func LoadNodeTLS(certsDir string) (*TLSConfigs, error) {
 	caPEM, err := os.ReadFile(filepath.Join(certsDir, CACertFile))

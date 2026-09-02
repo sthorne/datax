@@ -66,10 +66,13 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   `datax restore`), rolling upgrades with an explicit finalize
   (`datax debug upgrade`), `datax bench`, and
   a built-in observability dashboard with `/metrics` + `/status` + `/api/cluster`
-  endpoints (`--http-listen`; the dashboard at `/` is read-only and
-  self-contained; in secure mode every endpoint requires HTTP Basic
+  + `/api/range` endpoints (`--http-listen`; the dashboard at `/` is
+  read-only and self-contained, with cross-node range drill-down over
+  internode RPC; in secure mode every endpoint requires HTTP Basic
   credentials of any database user — Prometheus `basic_auth` — or a
-  CA-verified client certificate, and in insecure mode stays open like
+  CA-verified client certificate, the drill-down and all state-changing
+  admin RPCs require the admin role, and security-relevant actions are
+  audit-logged with their principal; insecure mode stays open like
   pgwire trust auth).
 
 **User documentation** — installing, deploying, securing, and operating a
@@ -144,11 +147,11 @@ This is a prototype. Out of scope so far, deliberately:
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads require opting in per statement — exact-timestamp `AS OF SYSTEM TIME` and bounded-staleness `with_max_staleness('10s')` are both in |
 | SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), joins beyond 8 tables (nested loop; INNER joins cost-reorder when table statistics exist, LEFT joins keep syntactic order), typmods beyond DECIMAL (`DECIMAL(p,s)` is enforced; `VARCHAR(n)` parsed and ignored), JSONB indexing (`->`/`->>` extraction works in single-table queries and joins, `@>` containment single-table only; `@>` always filters — no inverted indexes) |
 | Wire | COPY TO and COPY options beyond FORMAT (COPY FROM STDIN is in — text/CSV/binary, chunked commits); cursor-style streaming (suspended portals serve materialized results — a fetch limit bounds wire traffic per round trip, not server memory) |
-| Ops | per-node drill-down across peers (the dashboard's range detail is the serving node's own); per-endpoint authorization (secure-mode HTTP auth accepts any valid user — everything served is read-only) |
+| Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only — cross-node dashboard drill-down, per-endpoint HTTP authorization, and audit logging of admin ops/auth failures/privilege DDL are all in) |
 | Upgrades | skipping versions (adjacent-version rolls only) or auto-finalize (the version bump is a deliberate `datax debug upgrade`; before it, binaries roll back freely — after it, never) |
 | Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
-| Encryption | online store-key rotation (`datax debug rotate-enc-key` runs against a stopped node); re-encrypting old files under rotated data keys (natural compaction churn only) |
-| Storage | backpressure reads only the leader's engine (an overloaded follower just lags raft); compaction debt is exported but not gated on |
+| Encryption | key escrow / HSM integration (keys live in process memory; online store-key rotation and on-demand background re-encryption of retired-key files are in — a stale sstable spanning a single user key still waits for natural churn) |
+| Storage | debt-gate thresholds are first-cut constants (quorum-health shedding via raft-piggybacked follower verdicts, and a latched compaction-debt gate with hysteresis, are in — per-cause counters tell them apart) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |
 
 ## License
