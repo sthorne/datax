@@ -424,8 +424,8 @@ func TestMergeStopNodeNoDeadlock(t *testing.T) {
 		// surviving quorum; n3 applies it just before the stop (the racy
 		// window), aborts cleanly mid-apply, or replays it at restart.
 		mergeDone := make(chan struct{})
-		var mergeErr error
-		go func(start keys.Key) {
+		var mergeErr, lastErr error
+		go func(start, rhsStart keys.Key, lhs base.RangeID) {
 			defer close(mergeDone)
 			mctx, mcancel := context.WithTimeout(ctx, 60*time.Second)
 			defer mcancel()
@@ -435,9 +435,28 @@ func TestMergeStopNodeNoDeadlock(t *testing.T) {
 				if mergeErr == nil || mctx.Err() != nil {
 					return
 				}
+				lastErr = mergeErr // the last real refusal, for the failure message
+				if strings.Contains(mergeErr.Error(), "does not lead the right neighbor") {
+					// The follower's restart can win the fresh RHS's
+					// election (its stream from the LHS leader broke at the
+					// stop, so it times out and campaigns at a higher term).
+					// A client-driven merge needs one node leading both
+					// sides; pull the RHS to the LHS leader, as the
+					// housekeeping driver does, then retry.
+					for i := range tc.Nodes {
+						n := tc.Node(i)
+						if n == nil {
+							continue
+						}
+						if r, ok := n.Store().GetReplica(lhs); ok && r.IsLeader() {
+							_ = db.AdminTransferLease(mctx, rhsStart, n.NodeID())
+							break
+						}
+					}
+				}
 				time.Sleep(50 * time.Millisecond)
 			}
-		}(sr.Left.StartKey.Clone())
+		}(sr.Left.StartKey.Clone(), sr.Right.StartKey.Clone(), sr.Left.RangeID)
 
 		stopped := make(chan struct{})
 		go func() { tc.StopNode(2); close(stopped) }()
@@ -451,7 +470,7 @@ func TestMergeStopNodeNoDeadlock(t *testing.T) {
 		tc.RestartNode(2, engines[2])
 		<-mergeDone
 		if mergeErr != nil {
-			t.Fatalf("round %d: merge never landed: %v", round, mergeErr)
+			t.Fatalf("round %d: merge never landed: %v (last refusal: %v)", round, mergeErr, lastErr)
 		}
 		waitMergedEverywhere(t, tc, sr.Left.RangeID, sr.Right.EndKey, 30*time.Second)
 	}
