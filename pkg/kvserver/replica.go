@@ -217,9 +217,10 @@ func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *ra
 	return cfg
 }
 
-// newReplica loads or creates the replica and starts its Raft group.
-// bootstrap must be true exactly once per replica lifetime — when the range
-// is first created with its initial membership.
+// newReplica loads or creates the replica and its Raft group; the Ready
+// loop starts with startRaftLoop, once the store holds the replica (see
+// Store.startReplica). bootstrap must be true exactly once per replica
+// lifetime — when the range is first created with its initial membership.
 func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
 	rs, err := newRaftStorage(s.cfg.Engine, desc.RangeID, desc)
 	if err != nil {
@@ -267,11 +268,20 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 		r.node = raft.RestartNode(cfg)
 	}
 
-	if err := s.cfg.Stopper.RunWorker(r.raftLoop); err != nil {
-		r.node.Stop()
-		return nil, err
-	}
 	return r, nil
+}
+
+// startRaftLoop starts the replica's Ready-processing goroutine. Separate
+// from construction so a restart can load every replica before any of
+// them applies: a replayed merge looks its RHS up in the store map, and
+// an LHS loop that started before its sibling was loaded would find it
+// missing and fatal the node (issue #70).
+func (r *Replica) startRaftLoop() error {
+	if err := r.store.cfg.Stopper.RunWorker(r.raftLoop); err != nil {
+		r.node.Stop()
+		return err
+	}
+	return nil
 }
 
 // Desc returns the replica's current view of the range descriptor.
