@@ -311,6 +311,10 @@ func (r *Replica) AppliedIndex() uint64 {
 	return r.mu.appliedIndex
 }
 
+// TestingRaftStopped is closed once the replica's raft loop has exited.
+// Test hook.
+func (r *Replica) TestingRaftStopped() <-chan struct{} { return r.stoppedCh }
+
 // IsLeader reports whether this replica believes it is the Raft leader.
 func (r *Replica) IsLeader() bool { return r.isLeader() }
 
@@ -399,10 +403,15 @@ func (r *Replica) raftLoop(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				if errors.Is(err, errApplyAborted) {
+				if err == errApplyAborted {
 					// Clean shutdown interleaved with a merge apply: nothing
 					// was applied; the restart replays the entry (issue #61).
 					log.Infof("%s/%d: apply aborted by shutdown; entry replays after restart", r.rangeID, r.replicaID)
+				} else if errors.Is(err, errApplyAborted) {
+					// Aborted without a shutdown (a dead local RHS at merge
+					// apply, issue #70): nothing was applied, and this
+					// replica is out of service until the node restarts.
+					log.Warnf("%s/%d: %v", r.rangeID, r.replicaID, err)
 				} else {
 					log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
 				}
@@ -910,7 +919,9 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			// set sheds too — a sick follower otherwise lags raft silently
 			// until it needs a catch-up snapshot (or the range quietly
 			// rides one node from quorum loss). Verdicts are piggybacked
-			// on raft traffic; absent/stale ones read as healthy.
+			// on raft traffic; an absent one reads as healthy, an
+			// overloaded one holds until the peer reports healthy again
+			// (a stalled follower sends nothing — see node_health.go).
 			desc := r.Desc()
 			for _, rep := range desc.Replicas {
 				if rep.NodeID == r.store.cfg.NodeID {

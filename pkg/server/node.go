@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/google/uuid"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -136,8 +137,12 @@ type Config struct {
 	LoadCooldown time.Duration
 	// StorageProfile selects the engine's Pebble tuning ("" = balanced).
 	StorageProfile storage.Profile
-	// EncKeyPath is a file holding the 32-byte store encryption key (raw or
-	// hex); empty = plaintext storage.
+	// EncKeyPath names the file holding the 32-byte store encryption key
+	// (raw or hex); empty = plaintext storage. A comma-separated list of
+	// files is tried in order against the store's key registry, so a new
+	// key can be staged beside the current one before an online rotation
+	// and a restart in between still opens the store (see
+	// enc.MatchStoreKey).
 	EncKeyPath string
 	// BinaryVersionOverride makes the node advertise (and gate on) this
 	// protocol version instead of version.Current — used by tests to
@@ -189,6 +194,13 @@ type Node struct {
 	// Guarded by encKeyMu: online rotation (rotate-store-key) swaps it.
 	encKeyMu sync.Mutex
 	encKey   []byte
+	// encKeyPaths are the key files EncKeyPath named (the one that opened
+	// the store first), consulted after an online rotation to tell the
+	// operator whether a restart would find the new key.
+	encKeyPaths []string
+	// rotateMu serializes online store-key rotations end to end: registry
+	// reseal, encKey swap, and metadata-backup reseal (issue #66).
+	rotateMu sync.Mutex
 
 	// Background re-encryption state (see reencrypt.go).
 	reencMu        sync.Mutex
@@ -232,10 +244,29 @@ func (n *Node) start() error {
 	}
 
 	var err error
-	if n.cfg.EncKeyPath != "" {
-		n.encKey, err = enc.LoadKeyFile(n.cfg.EncKeyPath)
+	if paths := enc.SplitKeyPaths(n.cfg.EncKeyPath); len(paths) > 0 {
+		candidates, err := enc.LoadKeyFiles(paths)
 		if err != nil {
 			return fmt.Errorf("loading encryption key: %w", err)
+		}
+		// Several key files are candidates: the one sealing the store's
+		// registry wins, so a new key staged before an online rotation is
+		// found by a restart on either side of it (issue #67).
+		var idx int
+		if len(candidates) > 1 {
+			// A single key is validated by Open itself, as before.
+			if n.cfg.Engine != nil {
+				idx, err = n.cfg.Engine.MatchStoreKey(candidates)
+			} else {
+				idx, err = enc.MatchStoreKey(vfs.Default, n.cfg.Dir, candidates)
+			}
+			if err != nil {
+				return fmt.Errorf("selecting the store encryption key: %w", err)
+			}
+		}
+		n.encKey, n.encKeyPaths = candidates[idx], paths
+		if len(paths) > 1 {
+			log.Infof("store encryption key: %s matches the store (%d key files given)", paths[idx], len(paths))
 		}
 	}
 	n.engine = n.cfg.Engine
@@ -393,7 +424,9 @@ func (n *Node) start() error {
 		} else if n.engine != nil {
 			over, _, why = n.engine.OverloadedCause()
 		}
-		h := &rpcpb.StorageHealth{Overloaded: over, Reason: why, WallTime: time.Now().UnixNano()}
+		// No wall_time: receivers stamp the verdict with their own receipt
+		// time, so clocks need not agree.
+		h := &rpcpb.StorageHealth{Overloaded: over, Reason: why}
 		if n.engine != nil {
 			m := n.engine.StorageMetrics()
 			h.L0Sublevels = int64(m.L0Sublevels)

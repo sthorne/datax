@@ -33,6 +33,15 @@ func addrOf(k keys.Key) (keys.Key, error) { return keys.Addr(k) }
 // the restart replays the entry from the log and applies it for real.
 var errApplyAborted = errors.New("apply aborted: node shutting down")
 
+// applyAbortedError is an errApplyAborted with its own message — the
+// merge wait's exit when the local RHS raft loop is dead (issue #70).
+// errors.Is(err, errApplyAborted) matches it, so every caller treats it
+// exactly like the shutdown abort.
+type applyAbortedError struct{ msg string }
+
+func (e *applyAbortedError) Error() string        { return e.msg }
+func (e *applyAbortedError) Is(target error) bool { return target == errApplyAborted }
+
 func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
@@ -41,6 +50,11 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 	r.mu.Unlock()
 	if ent.Index <= applied {
 		return nil
+	}
+	if k := r.store.cfg.TestingKnobs.FailApply; k != nil {
+		if err := k(r.rangeID, ent.Index); err != nil {
+			return err
+		}
 	}
 
 	switch ent.Type {

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/cluster"
@@ -47,6 +49,14 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 	if n.tlsCfgs == nil {
 		return cluster.AdminResponse{Error: "rotate-store-key carries the store key and is only served over mutual TLS (secure cluster); rotate a stopped node offline with --dir"}
 	}
+	// One rotation at a time, end to end. The registry reseal serializes
+	// on the engine's own lock, but the key swap and backup reseal below
+	// do not — two overlapping rotations k1→k2 and k2→k3 could otherwise
+	// interleave so that the registry ends under k3 while encKey, and the
+	// metadata backup it seals, end under k2: the next restart with k3
+	// opens the store but cannot read its backup (issue #66).
+	n.rotateMu.Lock()
+	defer n.rotateMu.Unlock()
 	if err := n.engine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
 	}
@@ -63,10 +73,26 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 		n.exportMetadata(ctx)
 	}
 	log.Infof("store key rotated online; registry and metadata backup sealed under the new key")
-	if n.cfg.EncKeyPath != "" {
-		log.Warnf("the key file %s still holds the retired store key; replace it with the new key before this node next restarts", n.cfg.EncKeyPath)
-	}
+	n.reportKeyFilesAfterRotation(req.NewStoreKey)
 	return cluster.AdminResponse{}
+}
+
+// reportKeyFilesAfterRotation tells the operator whether a restart would
+// find the new store key: the node opens with whichever of its --enc-key
+// files seals the registry, so a staged file (--enc-key old.key,new.key)
+// carries it through; otherwise the retired key is all a restart has.
+func (n *Node) reportKeyFilesAfterRotation(newKey []byte) {
+	if len(n.encKeyPaths) == 0 {
+		return
+	}
+	for _, p := range n.encKeyPaths {
+		if k, err := enc.LoadKeyFile(p); err == nil && bytes.Equal(k, newKey) {
+			log.Infof("key file %s holds the new store key; a restart opens the store with it", p)
+			return
+		}
+	}
+	log.Warnf("no key file given to --enc-key (%s) holds the new store key; a restart before it is added fails to open the store — write it to a file and restart with --enc-key <old>,<new> or replace the old file",
+		strings.Join(n.encKeyPaths, ","))
 }
 
 func (n *Node) reencryptionStatus() *cluster.ReencryptionStatus {

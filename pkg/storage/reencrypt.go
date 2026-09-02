@@ -37,6 +37,15 @@ func (e *Engine) RotateStoreKeyLive(oldKey, newKey []byte) error {
 	return enc.RotateStoreKey(e.encBase, e.encDir, oldKey, newKey)
 }
 
+// MatchStoreKey reports which of the candidate store keys seals this
+// engine's key registry (see enc.MatchStoreKey); 0 for a plaintext engine.
+func (e *Engine) MatchStoreKey(candidates [][]byte) (int, error) {
+	if !e.Encrypted() {
+		return 0, nil
+	}
+	return enc.MatchStoreKey(e.encBase, e.encDir, candidates)
+}
+
 // reencStatusCache caches the stale-table sweep (~one small pread per
 // live sstable) behind a TTL, for the /metrics gauge.
 type reencStatusCache struct {
@@ -55,6 +64,7 @@ const reencStatusTTL = 10 * time.Second
 // staleTable is one live sstable still encrypted under a retired key.
 type staleTable struct {
 	fileNum  uint64
+	level    int
 	size     uint64
 	smallest []byte
 	largest  []byte
@@ -72,7 +82,7 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 		return nil, err
 	}
 	var out []staleTable
-	for _, level := range levels {
+	for l, level := range levels {
 		for _, t := range level {
 			name := fmt.Sprintf("%06d.sst", t.FileNum)
 			id, ok, err := enc.FileKeyID(e.encBase, e.encBase.PathJoin(e.encDir, name))
@@ -82,6 +92,7 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 			if id != activeID {
 				out = append(out, staleTable{
 					fileNum:  uint64(t.FileNum),
+					level:    l,
 					size:     t.Size,
 					smallest: append([]byte(nil), t.Smallest.UserKey...),
 					largest:  append([]byte(nil), t.Largest.UserKey...),
@@ -142,15 +153,39 @@ func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int,
 // valid MVCC key (raft state) are compacted unseeded — that keyspace
 // rewrites on every apply anyway.
 //
-// Manual compaction is by key range, not by file: Compact rewrites every
-// file on every level overlapping the span, so the work a stale file
-// costs is the on-disk size of its span (a pre-shutdown flush file can
-// span the whole keyspace), not the file's own size. The pass budgets
-// that estimate. Files a compaction leaves in place (a single-user-key
-// file admits no seed, a local-key-only file resting in L6 is never an
-// input) are recorded in attempted and skipped by later passes of the
-// same run, so they neither starve the files behind them nor inflate the
-// rewritten count; they retire with natural churn.
+// Manual compaction is by key range, not by file, and Pebble v1.1.5 has
+// no file-targeted form: Compact(start, end) walks every level, each step
+// taking every file overlapping [start, end] as an input. What a stale
+// file costs is therefore set by the span passed, and a file is an input
+// whole whenever any key of it is in the span. The span depends on where
+// the file rests (issue #69):
+//
+//   - An L0 file's key span is unbounded — a flush covers whatever the
+//     memtable held, and a small pre-shutdown flush of scattered writes
+//     spans most of the keyspace — so it is compacted by the NARROWEST
+//     span that overlaps it, [smallest, smallest+0x00] (the seed
+//     included). Its own bounds would make every level's overlap an
+//     input: measured on a 63 MiB store, one 21 KiB flush file spanning a
+//     third of the keyspace rewrote 30 MiB that way. The narrow span walks
+//     a column instead — the file with its Lbase overlap (inherent: that
+//     overlap is whatever the file spans), then one file per level below,
+//     since Pebble splits compaction outputs at the next level's target
+//     size and grandparent overlap.
+//   - A file below L0 is bounded by construction (target file size,
+//     grandparent limit), so its own bounds are a narrow column already;
+//     they are used as is, which also retires the stale neighbours the
+//     column crosses in the same compaction. Measured on the same store,
+//     narrowing these too cost 15% more bytes and half again as many
+//     compactions for the same largest compaction.
+//
+// The budget and the rewritten total count what Pebble actually wrote
+// during each compaction (its per-level compacted-bytes counters, so a
+// background compaction running at the same time is credited too), not
+// an estimate over the span. Files a compaction leaves in place (a
+// single-user-key file admits no seed, a local-key-only file resting in
+// L6 is never an input) are recorded in attempted and skipped by later
+// passes of the same run, so they neither starve the files behind them
+// nor inflate the rewritten count; they retire with natural churn.
 func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted map[uint64]bool) (targeted int64, remainingBytes int64, remainingFiles int, err error) {
 	stale, err := e.staleTables()
 	if err != nil {
@@ -180,17 +215,21 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 				}
 			}
 		}
-		// Compact's span end is exclusive; cover the largest key. The call
-		// flushes the overlapping memtable (our seed) first.
-		end := append(append([]byte(nil), t.largest...), 0)
-		cost := t.size
-		if est, eerr := e.db.EstimateDiskUsage(t.smallest, end); eerr == nil && est > cost {
-			cost = est
+		// The span: the file's own bounds below L0, the narrowest overlapping
+		// one — smallest through the seed — for an L0 file (Compact's end is
+		// inclusive in this Pebble). The call flushes the overlapping
+		// memtable (our seed) first.
+		var end []byte
+		if t.level == 0 {
+			end = append(append([]byte(nil), t.smallest...), 0)
+		} else {
+			end = append(append([]byte(nil), t.largest...), 0)
 		}
+		before := e.compactedBytes()
 		if cerr := e.db.Compact(t.smallest, end, false); cerr != nil {
 			return targeted, 0, 0, cerr
 		}
-		targeted += int64(cost)
+		targeted += e.compactedBytes() - before
 	}
 	stale, err = e.staleTables()
 	if err != nil {
@@ -204,4 +243,16 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 	e.reenc.at, e.reenc.bytes, e.reenc.files, e.reenc.lastErr = time.Now(), remainingBytes, remainingFiles, nil
 	e.reenc.mu.Unlock()
 	return targeted, remainingBytes, remainingFiles, nil
+}
+
+// compactedBytes is the running total of bytes Pebble has written through
+// compactions (all levels; trivial moves excluded) — the honest measure of
+// what one manual compaction cost.
+func (e *Engine) compactedBytes() int64 {
+	m := e.db.Metrics()
+	var total int64
+	for i := range m.Levels {
+		total += int64(m.Levels[i].BytesCompacted)
+	}
+	return total
 }

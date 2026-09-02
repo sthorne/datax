@@ -241,6 +241,65 @@ func RotateStoreKey(base vfs.FS, dir string, oldKey, newKey []byte) error {
 	return writeRegistry(base, dir, newKey, &reg)
 }
 
+// MatchStoreKey picks, from candidate store keys, the one that unseals the
+// key registry in dir and returns its index. Without a registry (a store
+// about to be initialized — or a plaintext one; Open decides which) the
+// first candidate is chosen. Only reads: the registry is untouched. This
+// is what lets an operator stage a new store key next to the current one
+// (`--enc-key old.key,new.key`) before rotating online, so a restart in
+// the window between the rotation and the key-file swap still opens the
+// store (issue #67).
+func MatchStoreKey(base vfs.FS, dir string, candidates [][]byte) (int, error) {
+	if len(candidates) == 0 {
+		return 0, errors.New("no store key given")
+	}
+	for i, k := range candidates {
+		if len(k) != KeyLen {
+			return 0, fmt.Errorf("store key %d of %d must be %d bytes, got %d", i+1, len(candidates), KeyLen, len(k))
+		}
+	}
+	sealed, err := readAll(base, base.PathJoin(dir, RegistryName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	for i, k := range candidates {
+		if _, err := Unseal(registryMagic, k, sealed); err == nil {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("none of the %d store keys given matches the encrypted store in %s", len(candidates), dir)
+}
+
+// SplitKeyPaths parses an --enc-key value: one key file path, or several
+// separated by commas (surrounding whitespace ignored, empty entries
+// dropped). Several paths are candidates tried in order against the
+// store's registry; see MatchStoreKey.
+func SplitKeyPaths(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// LoadKeyFiles reads every path with LoadKeyFile.
+func LoadKeyFiles(paths []string) ([][]byte, error) {
+	keys := make([][]byte, 0, len(paths))
+	for _, p := range paths {
+		k, err := LoadKeyFile(p)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
 // RegistryExists reports whether dir contains a key registry (i.e. the
 // store is encrypted).
 func RegistryExists(base vfs.FS, dir string) bool {

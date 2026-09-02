@@ -110,6 +110,15 @@ type TestingKnobs struct {
 	// OverrideReplicaQPS injects a per-range request rate (trusted as
 	// mature) — lets tests drive load splits without real traffic.
 	OverrideReplicaQPS func(base.RangeID) (float64, bool)
+	// FailApply, when it returns an error for a committed entry, makes the
+	// replica's raft loop exit through its generic error branch without
+	// applying it — a simulated fatal ready-handling failure that leaves
+	// the replica in the store map with a frozen applied index.
+	FailApply func(rangeID base.RangeID, index uint64) error
+	// SkipMergeConfirmation disables the merge driver's pre-propose check
+	// that every RHS replica applied the subsume, exposing the apply-time
+	// wait to an RHS replica that never will (issue #70).
+	SkipMergeConfirmation bool
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

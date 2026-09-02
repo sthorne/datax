@@ -63,7 +63,10 @@ message StorageHealth {
   int64 l0_files = 4;
   int64 compaction_debt_bytes = 5;
   int64 memtable_bytes = 6;
-  int64 wall_time = 7; // sender wall clock, for staleness checks
+  // wall_time was the sender's wall clock. Receivers stamp a verdict with
+  // their own receipt time instead (clocks need not agree), so senders
+  // leave it zero; the field number stays reserved for wire compatibility.
+  int64 wall_time = 7;
 }
 
 message RaftAck {}

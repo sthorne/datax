@@ -199,9 +199,12 @@ type StorageHealth struct {
 	L0Files             int64                  `protobuf:"varint,4,opt,name=l0_files,json=l0Files,proto3" json:"l0_files,omitempty"`
 	CompactionDebtBytes int64                  `protobuf:"varint,5,opt,name=compaction_debt_bytes,json=compactionDebtBytes,proto3" json:"compaction_debt_bytes,omitempty"`
 	MemtableBytes       int64                  `protobuf:"varint,6,opt,name=memtable_bytes,json=memtableBytes,proto3" json:"memtable_bytes,omitempty"`
-	WallTime            int64                  `protobuf:"varint,7,opt,name=wall_time,json=wallTime,proto3" json:"wall_time,omitempty"` // sender wall clock, for staleness checks
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// wall_time was the sender's wall clock. Receivers stamp a verdict with
+	// their own receipt time instead (clocks need not agree), so senders
+	// leave it zero; the field number stays reserved for wire compatibility.
+	WallTime      int64 `protobuf:"varint,7,opt,name=wall_time,json=wallTime,proto3" json:"wall_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StorageHealth) Reset() {

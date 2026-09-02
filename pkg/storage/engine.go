@@ -56,6 +56,11 @@ type Engine struct {
 	reenc   reencStatusCache
 }
 
+// testingPebbleOptions, when set, adjusts the Pebble options after the
+// profile applied them — tests shrink memtables and target file sizes so
+// a few megabytes build a multi-level LSM. Never set in production.
+var testingPebbleOptions func(*pebble.Options)
+
 // Open opens (creating if needed) a Pebble store in dir with the given
 // options (zero value = balanced profile, plaintext). If dir is empty an
 // in-memory store is used (tests, demo mode).
@@ -63,6 +68,9 @@ func Open(dir string, o Options) (*Engine, error) {
 	e := &Engine{}
 	opts := &pebble.Options{}
 	e.health.gate = o.Profile.apply(opts)
+	if testingPebbleOptions != nil {
+		testingPebbleOptions(opts)
+	}
 	opts.EventListener = &pebble.EventListener{
 		WriteStallBegin: func(info pebble.WriteStallBeginInfo) {
 			e.health.stalls.Add(1)

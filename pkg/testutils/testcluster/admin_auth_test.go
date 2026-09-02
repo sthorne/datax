@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
@@ -35,6 +37,22 @@ func (a *auditRecorder) record(event string, kv []any) {
 		}
 	}
 	a.events = append(a.events, strings.Join(parts, " "))
+}
+
+// count returns how many recorded events carry one of the given names.
+func (a *auditRecorder) count(names ...string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, e := range a.events {
+		for _, name := range names {
+			if e == name || strings.HasPrefix(e, name+" ") {
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
 
 func (a *auditRecorder) has(substrs ...string) bool {
@@ -152,12 +170,25 @@ func TestAdminRPCAuthorization(t *testing.T) {
 	}
 
 	// A cleartext caller cannot reach the admin surface at all (mutual TLS
-	// is mandatory on the RPC port in secure mode).
+	// is mandatory on the RPC port in secure mode). The rejection must be
+	// the transport's: gRPC surfaces a failed handshake as Unavailable
+	// before any RPC is dispatched — never a handler verdict such as
+	// PermissionDenied, and never the client's own deadline — and the
+	// admin handler must not have seen the call, so no admin-op or
+	// admin-denied audit record may appear (issue #71).
+	auditedBefore := rec.count("admin-op", "admin-denied")
 	bare := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
-	bctx, bcancel := context.WithTimeout(ctx, 3*time.Second)
+	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
 	defer bcancel()
 	var bresp cluster.AdminResponse
-	if err := bare.Call(bctx, tc.Nodes[0].Addr(), "admin", cluster.AdminRequest{Op: "nodes"}, &bresp); err == nil {
+	err = bare.Call(bctx, tc.Nodes[0].Addr(), "admin", cluster.AdminRequest{Op: "nodes"}, &bresp)
+	if err == nil {
 		t.Fatal("cleartext admin call against a secure cluster succeeded")
+	}
+	if c := status.Code(err); c != codes.Unavailable {
+		t.Fatalf("cleartext admin call failed with %v (%v), want Unavailable from the failed TLS handshake", c, err)
+	}
+	if n := rec.count("admin-op", "admin-denied") - auditedBefore; n != 0 {
+		t.Fatalf("cleartext call reached the admin handler: %d new audit records; all: %v", n, rec.events)
 	}
 }

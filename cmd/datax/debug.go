@@ -35,12 +35,14 @@ func osUsername() string {
 	return "unknown"
 }
 
-// loadOptionalKey resolves an --enc-key flag value (empty = no key).
-func loadOptionalKey(path string) ([]byte, error) {
-	if path == "" {
+// loadKeyCandidates resolves an --enc-key flag value: no key (empty), one
+// key file, or a comma-separated list of candidates (see enc.MatchStoreKey).
+func loadKeyCandidates(value string) ([][]byte, error) {
+	paths := enc.SplitKeyPaths(value)
+	if len(paths) == 0 {
 		return nil, nil
 	}
-	return enc.LoadKeyFile(path)
+	return enc.LoadKeyFiles(paths)
 }
 
 // runDebugMetadata prints the node's periodic metadata export (written to
@@ -49,7 +51,7 @@ func loadOptionalKey(path string) ([]byte, error) {
 func runDebugMetadata(args []string) error {
 	fs := flag.NewFlagSet("debug metadata", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of a (stopped or running) node")
-	keyPath := fs.String("enc-key", "", "store encryption key file (for an encrypted store's sealed backup)")
+	keyPath := fs.String("enc-key", "", "store encryption key file (for an encrypted store's sealed backup); a comma-separated list is tried in order")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,16 +63,23 @@ func runDebugMetadata(args []string) error {
 		return fmt.Errorf("no metadata backup found: %w", err)
 	}
 	if len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
-		key, err := loadOptionalKey(*keyPath)
+		keys, err := loadKeyCandidates(*keyPath)
 		if err != nil {
 			return err
 		}
-		if key == nil {
+		if len(keys) == 0 {
 			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key is required")
 		}
-		if raw, err = enc.Unseal(server.MetadataBackupMagic, key, raw); err != nil {
+		var plain []byte
+		for _, key := range keys {
+			if plain, err = enc.Unseal(server.MetadataBackupMagic, key, raw); err == nil {
+				break
+			}
+		}
+		if err != nil {
 			return err
 		}
+		raw = plain
 	}
 	_, err = os.Stdout.Write(raw)
 	return err
@@ -159,7 +168,7 @@ func runDebugUnsafeRecover(args []string) error {
 	fs := flag.NewFlagSet("debug unsafe-recover", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of the STOPPED surviving node")
 	rangeID := fs.Int64("range", 0, "recover only this range (default: every range on the store)")
-	keyPath := fs.String("enc-key", "", "store encryption key file (required for an encrypted store)")
+	keyPath := fs.String("enc-key", "", "store encryption key file (required for an encrypted store); a comma-separated list is tried in order")
 	yes := fs.Bool("yes", false, "confirm: I understand this discards the other replicas")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -178,9 +187,17 @@ nodes join.
 
 Re-run with --yes to proceed`)
 	}
-	key, err := loadOptionalKey(*keyPath)
+	keys, err := loadKeyCandidates(*keyPath)
 	if err != nil {
 		return err
+	}
+	var key []byte
+	if len(keys) > 0 {
+		idx, err := enc.MatchStoreKey(vfs.Default, *dir, keys)
+		if err != nil {
+			return err
+		}
+		key = keys[idx]
 	}
 	descs, err := server.UnsafeRecover(*dir, base.RangeID(*rangeID), key)
 	if err != nil {
