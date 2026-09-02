@@ -100,6 +100,9 @@ func runDebugRotateEncKey(args []string) error {
 		return fmt.Errorf("rotate-enc-key requires exactly one of --dir (stopped node) or --addr (running node)")
 	}
 	if *addr != "" {
+		if *certsDir == "" {
+			return fmt.Errorf("online rotation sends the store keys to the node and requires --certs-dir (mutual TLS); use --dir on a stopped node otherwise")
+		}
 		oldKey, err := enc.LoadKeyFile(*oldPath)
 		if err != nil {
 			return err
@@ -376,7 +379,10 @@ func runDebug(args []string) error {
 	case "reencrypt", "reencrypt-status":
 		printReencryption(resp.Reencryption)
 		if sub == "reencrypt" && *wait {
-			for resp.Reencryption != nil && (resp.Reencryption.Active || resp.Reencryption.RemainingBytes > 0) {
+			// Follow the worker until it exits; it stops on its own when
+			// nothing more can be rewritten, so looping on the remaining
+			// bytes would never return.
+			for resp.Reencryption != nil && resp.Reencryption.Active {
 				time.Sleep(2 * time.Second)
 				wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
 				err := trans.Call(wctx, *addr, "admin", cluster.AdminRequest{Op: "reencrypt-status"}, &resp)
@@ -388,6 +394,14 @@ func runDebug(args []string) error {
 					return fmt.Errorf("%s", resp.Error)
 				}
 				printReencryption(resp.Reencryption)
+			}
+			if st := resp.Reencryption; st != nil {
+				if st.SweepError != "" {
+					return fmt.Errorf("re-encryption status unknown: stale-file sweep failed: %s", st.SweepError)
+				}
+				if st.RemainingBytes > 0 {
+					return fmt.Errorf("re-encryption stopped with %d bytes in %d files still under retired keys (see the node log); re-run later", st.RemainingBytes, st.RemainingFiles)
+				}
 			}
 		}
 	}
@@ -403,8 +417,11 @@ func printReencryption(st *cluster.ReencryptionStatus) {
 	if st.Active {
 		state = "running"
 	}
-	if !st.Active && st.RemainingBytes == 0 {
+	if !st.Active && st.RemainingBytes == 0 && st.SweepError == "" {
 		state = "complete — no live sstable under a retired data key"
+	}
+	if st.SweepError != "" {
+		state += " (stale-file sweep FAILED: " + st.SweepError + "; counts are the last good reading)"
 	}
 	fmt.Printf("re-encryption %s: %d bytes in %d files remain under retired keys (%d bytes rewritten)\n",
 		state, st.RemainingBytes, st.RemainingFiles, st.RewrittenBytes)

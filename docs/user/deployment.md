@@ -81,13 +81,15 @@ serving:
 ```sh
 datax debug rotate-enc-key --addr 10.0.0.1:26257 \
   --old-key /etc/datax/store.key --new-key /etc/datax/store-v2.key \
-  [--certs-dir certs --user ops]     # secure cluster: admin role required
+  --certs-dir certs [--user ops]     # admin role required
 ```
 
 Rotation re-wraps the data keys atomically and re-seals the metadata
 backup (fast — nothing is re-encrypted); update the node's `--enc-key`
-path before its next restart. The offline form
-(`--dir /var/lib/datax`, node stopped) remains for damaged stores.
+path before its next restart. The request carries the store keys, so
+online rotation is served only over mutual TLS (a secure cluster); on an
+insecure cluster, and for damaged stores, use the offline form
+(`--dir /var/lib/datax`, node stopped).
 
 Files written under retired data keys are re-encrypted on demand:
 
@@ -97,7 +99,10 @@ datax debug reencrypt --addr 10.0.0.1:26257 --wait   # per node
 
 paces compactions over stale-key sstables until
 `datax_reencryption_remaining_bytes` reaches 0 — the attestation that no
-live sstable remains under a retired key. Losing the key file means
+live sstable remains under a retired key. `--wait` exits non-zero if the
+worker stops with bytes remaining (files manual compaction cannot
+rewrite; they retire with natural churn — re-run later) or the sweep
+behind the count failed. Losing the key file means
 losing the store — back it up separately from the data. Details in
 [docs/encryption.md](../encryption.md).
 

@@ -137,9 +137,19 @@ datax backup --dest /backups/today --addr 10.0.0.1:26257 --certs-dir certs
 The server authorizes by the certificate's CommonName: read-only ops
 (`ranges`, `nodes`) accept any database user's certificate;
 state-changing ops (split, merge, rebalance, transfer-lease,
-decommission, upgrade, backup, restore) require the **admin role** —
-`root`, or a user granted `GRANT ADMIN`. In insecure mode the admin
-surface is open, like everything else.
+decommission, upgrade, backup, restore, store-key rotation) and
+`node-status` (per-replica internals, the `/api/range` data source)
+require the **admin role** — `root`, or a user granted `GRANT ADMIN`.
+Every admin op except the read-only ones is audited with its outcome.
+In insecure mode the admin surface is open, like everything else.
+
+Only the admin RPC accepts user certificates. The internode surfaces on
+the same port — KV batches, Raft messages, snapshots, join — require the
+cluster's own **node certificate** (CN `node`) and reject any other
+principal with `permission denied` (audited as `rpc-denied`), since a raw
+KV batch would bypass every SQL privilege check. `node` is therefore
+reserved: `datax cert create-client --user node` and `CREATE USER node`
+are both refused.
 
 ## Audit log
 

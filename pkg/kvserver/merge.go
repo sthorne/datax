@@ -53,6 +53,10 @@ import (
 // RHS descriptor key is deleted in the merge batch, so a restart never
 // revives the absorbed group.
 
+// mergeApplicationWait bounds how long the merge driver waits for every
+// RHS replica to confirm the subsume before proposing the merge.
+const mergeApplicationWait = 10 * time.Second
+
 // mergeTrigger is carried by the replicated merge command on the LHS.
 type mergeTrigger struct {
 	Left   kvpb.RangeDescriptor `json:"left"`   // pre-merge LHS (generation check)
@@ -233,6 +237,29 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		RightSizeBytes:    rhs.SizeBytes(),
 		RightGCThreshold:  rhs.GCThreshold(),
 	}
+
+	// Every RHS replica must hold the subsume before the merge is
+	// proposed. The merge trigger waits at apply for the local RHS to
+	// reach RightAppliedIndex, and once the merge applies on a quorum the
+	// RHS group is detached there — a replica that had not yet learned
+	// the subsume's commit (partitioned, restarting, a dropped MsgApp)
+	// would then have no leader left to learn it from and would wait at
+	// merge apply forever, wedging its raft loop. Confirming application
+	// here keeps the RHS group alive until every member has caught up;
+	// a straggler defers the merge, which housekeeping re-drives.
+	if wait := r.store.cfg.WaitForApplication; wait != nil {
+		wctx, cancel := context.WithTimeout(ctx, mergeApplicationWait)
+		defer cancel()
+		for _, rep := range rhsDesc.Replicas {
+			if rep.NodeID == r.store.cfg.NodeID {
+				continue
+			}
+			if err := wait(wctx, rep.NodeID, rhsDesc.RangeID, trig.RightAppliedIndex); err != nil {
+				return nil, kvpb.NewErrorf("%s: cannot merge %s yet: its replica on n%d has not applied the subsume: %v (re-driven by housekeeping)",
+					r.rangeID, rhsDesc.RangeID, rep.NodeID, err)
+			}
+		}
+	}
 	gen := desc.Generation
 	if rhsDesc.Generation > gen {
 		gen = rhsDesc.Generation
@@ -331,13 +358,15 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 		log.Fatalf("%s: merge apply: local RHS replica %s missing", r.rangeID, trig.Right.RangeID)
 	}
 	// The RHS's engine content is identical on every node once it reaches
-	// the subsume index (its final command). The subsume is committed, so
-	// on a live node this terminates — raft progress is independent of
-	// this loop. During node shutdown it does NOT: the RHS's raft loop may
-	// have exited before applying the subsume, and spinning here wedges
-	// this replica's raft loop and, with it, Stop() itself (issue #61).
-	// Abort instead; the applied index stays put and the restart replays
-	// this command, waiting again with a live RHS group.
+	// the subsume index (its final command). The driver confirmed every
+	// RHS replica had applied it before proposing the merge (adminMerge),
+	// so on a live node this loop normally passes at once; it still
+	// covers a replica whose RHS is re-applying after a restart. During
+	// node shutdown it must NOT spin: the RHS's raft loop may have exited
+	// before applying the subsume, and spinning here wedges this
+	// replica's raft loop and, with it, Stop() itself (issue #61). Abort
+	// instead; the applied index stays put and the restart replays this
+	// command, waiting again with a live RHS group.
 	for rhs.AppliedIndex() < trig.RightAppliedIndex {
 		select {
 		case <-ctx.Done():

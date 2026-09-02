@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -80,6 +83,31 @@ func (n *Node) collectAndCompare(ctx context.Context, probe *kvserver.Consistenc
 		}
 	}
 	return mismatch, nil
+}
+
+// waitForApplication asks nodeID to block until its replica of rangeID has
+// applied index (kvserver.StoreConfig.WaitForApplication, over the
+// wait-applied admin op). A node running a binary that predates the op
+// answers "unknown admin op"; the merge then proceeds as it did before
+// the check existed rather than stalling merges for the whole roll.
+func (n *Node) waitForApplication(ctx context.Context, nodeID base.NodeID, rangeID base.RangeID, index uint64) error {
+	nd, ok := n.registry.Get(nodeID)
+	if !ok {
+		return fmt.Errorf("n%d has no registry entry", nodeID)
+	}
+	req := cluster.AdminRequest{Op: "wait-applied", RangeID: rangeID, Index: index}
+	var resp cluster.AdminResponse
+	if err := n.trans.Call(ctx, nd.Address, "admin", req, &resp); err != nil {
+		return err
+	}
+	if resp.Error != "" {
+		if strings.Contains(resp.Error, "unknown admin op") {
+			log.Warnf("n%d runs a binary without wait-applied; merging %s without confirming its subsume there", nodeID, rangeID)
+			return nil
+		}
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 // startConsistencyLoop runs the paced sweep when enabled.

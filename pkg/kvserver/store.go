@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -80,8 +81,16 @@ type StoreConfig struct {
 	// included) WITHOUT ratcheting the range's GC threshold, so the
 	// range's other tenants keep their history. Keys with a live intent
 	// are never offered to the predicate.
-	RowExpiry    func(start, end keys.Key) (func(key keys.Key, vts hlc.Timestamp) bool, bool)
-	TestingKnobs TestingKnobs
+	RowExpiry func(start, end keys.Key) (func(key keys.Key, vts hlc.Timestamp) bool, bool)
+	// WaitForApplication, when set, blocks until the replica of rangeID
+	// on nodeID has applied index (or ctx ends). The merge driver uses it
+	// to confirm every RHS replica holds the subsume before proposing the
+	// merge: a replica that missed the subsume commit would otherwise
+	// wait for it forever at merge apply, after the RHS group it needs
+	// has been torn down everywhere else (see stageMerge). Implemented by
+	// pkg/server over the admin RPC; nil skips the check.
+	WaitForApplication func(ctx context.Context, nodeID base.NodeID, rangeID base.RangeID, index uint64) error
+	TestingKnobs       TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.
@@ -260,6 +269,27 @@ func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID
 }
 
 // GetReplica returns the replica of the given range, if this store has one.
+// WaitForApplied blocks until this store's replica of rangeID has applied
+// at least index, returning the applied index it observed. It fails when
+// the store holds no such replica or ctx ends first.
+func (s *Store) WaitForApplied(ctx context.Context, rangeID base.RangeID, index uint64) (uint64, error) {
+	for {
+		r, ok := s.GetReplica(rangeID)
+		if !ok {
+			return 0, fmt.Errorf("%s: no replica on n%d", rangeID, s.cfg.NodeID)
+		}
+		ai := r.AppliedIndex()
+		if ai >= index {
+			return ai, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ai, fmt.Errorf("%s on n%d: applied index %d has not reached %d: %w", rangeID, s.cfg.NodeID, ai, index, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func (s *Store) GetReplica(rangeID base.RangeID) (*Replica, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

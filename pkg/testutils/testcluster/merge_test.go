@@ -399,7 +399,12 @@ func TestMergeTimestampCache(t *testing.T) {
 // TestMergeTimestampCache's cleanup in issue #61. The apply now aborts on
 // shutdown WITHOUT advancing the applied index, and the restart replays
 // the merge. Exercised by racing merges against stop/restart cycles of a
-// follower, each stop under a watchdog.
+// follower, each stop under a watchdog. Every round must also LAND: the
+// driver defers a merge until every RHS replica confirms the subsume
+// (a stopped follower blocks it, a restarted one unblocks it), and
+// afterwards all three replicas — the restarted follower included — hold
+// the merged descriptor, proving the follower neither skipped the merge
+// nor wedged waiting for an RHS group that no longer exists.
 func TestMergeStopNodeNoDeadlock(t *testing.T) {
 	tc, engines := StartWithEngines(t, 3)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -419,12 +424,15 @@ func TestMergeStopNodeNoDeadlock(t *testing.T) {
 		// surviving quorum; n3 applies it just before the stop (the racy
 		// window), aborts cleanly mid-apply, or replays it at restart.
 		mergeDone := make(chan struct{})
+		var mergeErr error
 		go func(start keys.Key) {
 			defer close(mergeDone)
 			mctx, mcancel := context.WithTimeout(ctx, 60*time.Second)
 			defer mcancel()
+			db := tc.Nodes[0].DB()
 			for {
-				if _, err := tc.Nodes[0].DB().AdminMerge(mctx, start); err == nil || mctx.Err() != nil {
+				_, mergeErr = db.AdminMerge(mctx, start)
+				if mergeErr == nil || mctx.Err() != nil {
 					return
 				}
 				time.Sleep(50 * time.Millisecond)
@@ -436,13 +444,48 @@ func TestMergeStopNodeNoDeadlock(t *testing.T) {
 		select {
 		case <-stopped:
 		case <-time.After(45 * time.Second):
+			cancel() // release the merge goroutine before failing
+			<-mergeDone
 			t.Fatal("StopNode wedged: merge-apply vs shutdown deadlock (issue #61)")
 		}
-		<-mergeDone
 		tc.RestartNode(2, engines[2])
+		<-mergeDone
+		if mergeErr != nil {
+			t.Fatalf("round %d: merge never landed: %v", round, mergeErr)
+		}
+		waitMergedEverywhere(t, tc, sr.Left.RangeID, sr.Right.EndKey, 30*time.Second)
 	}
 
 	if v, err := tc.Nodes[0].DB().Get(ctx, append(prefix.Clone(), "a"...)); err != nil || string(v) != "v" {
 		t.Fatalf("read after merge/stop rounds: %q %v", v, err)
+	}
+}
+
+// waitMergedEverywhere waits until every node's replica of rangeID
+// reports the merged descriptor (end key extended to endKey), then checks
+// the replica is live enough to report it again — a wedged raft loop
+// (stuck at merge apply) never advances its descriptor.
+func waitMergedEverywhere(t *testing.T, tc *TestCluster, rangeID base.RangeID, endKey keys.Key, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		var lagging []string
+		for i, n := range tc.Nodes {
+			r, ok := n.Store().GetReplica(rangeID)
+			if !ok {
+				lagging = append(lagging, fmt.Sprintf("n%d: no replica", i+1))
+				continue
+			}
+			if d := r.Desc(); !d.EndKey.Equal(endKey) {
+				lagging = append(lagging, fmt.Sprintf("n%d: end key %s at applied %d", i+1, d.EndKey, r.AppliedIndex()))
+			}
+		}
+		if len(lagging) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: merge not applied on every replica: %v", rangeID, lagging)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

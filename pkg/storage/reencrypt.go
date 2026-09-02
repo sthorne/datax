@@ -45,12 +45,16 @@ type reencStatusCache struct {
 	bytes     int64
 	files     int
 	sweepErrs int64
+	// lastErr is the most recent sweep failure, cleared by a successful
+	// sweep; surfaced so a failed sweep never reads as "nothing stale".
+	lastErr error
 }
 
 const reencStatusTTL = 10 * time.Second
 
 // staleTable is one live sstable still encrypted under a retired key.
 type staleTable struct {
+	fileNum  uint64
 	size     uint64
 	smallest []byte
 	largest  []byte
@@ -77,6 +81,7 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 			}
 			if id != activeID {
 				out = append(out, staleTable{
+					fileNum:  uint64(t.FileNum),
 					size:     t.Size,
 					smallest: append([]byte(nil), t.Smallest.UserKey...),
 					largest:  append([]byte(nil), t.Largest.UserKey...),
@@ -88,25 +93,31 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 }
 
 // ReencryptionStatus reports live sstable bytes and files still encrypted
-// under retired data keys, refreshed at most every reencStatusTTL.
-func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int) {
+// under retired data keys, refreshed at most every reencStatusTTL. A
+// failed sweep returns the previous reading together with the error (and
+// no reading at all — zero bytes would falsely attest completion — when
+// no sweep has ever succeeded); callers must not treat a status carrying
+// an error as an attestation.
+func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int, err error) {
 	e.reenc.mu.Lock()
 	defer e.reenc.mu.Unlock()
-	if time.Since(e.reenc.at) < reencStatusTTL {
-		return e.reenc.bytes, e.reenc.files
+	if !e.reenc.at.IsZero() && time.Since(e.reenc.at) < reencStatusTTL {
+		return e.reenc.bytes, e.reenc.files, e.reenc.lastErr
 	}
 	stale, err := e.staleTables()
 	if err != nil {
 		e.reenc.sweepErrs++
-		return e.reenc.bytes, e.reenc.files // serve the previous reading
+		e.reenc.lastErr = err
+		return e.reenc.bytes, e.reenc.files, err // serve the previous reading
 	}
 	e.reenc.at = time.Now()
+	e.reenc.lastErr = nil
 	e.reenc.bytes, e.reenc.files = 0, 0
 	for _, t := range stale {
 		e.reenc.bytes += int64(t.size)
 		e.reenc.files++
 	}
-	return e.reenc.bytes, e.reenc.files
+	return e.reenc.bytes, e.reenc.files, nil
 }
 
 // ReencryptPass compacts up to maxBytes (0 = unlimited) of stale-key
@@ -130,7 +141,17 @@ func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int)
 // iteration included) can observe it. Files whose smallest key is not a
 // valid MVCC key (raft state) are compacted unseeded — that keyspace
 // rewrites on every apply anyway.
-func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64) (targeted int64, remainingBytes int64, remainingFiles int, err error) {
+//
+// Manual compaction is by key range, not by file: Compact rewrites every
+// file on every level overlapping the span, so the work a stale file
+// costs is the on-disk size of its span (a pre-shutdown flush file can
+// span the whole keyspace), not the file's own size. The pass budgets
+// that estimate. Files a compaction leaves in place (a single-user-key
+// file admits no seed, a local-key-only file resting in L6 is never an
+// input) are recorded in attempted and skipped by later passes of the
+// same run, so they neither starve the files behind them nor inflate the
+// rewritten count; they retire with natural churn.
+func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted map[uint64]bool) (targeted int64, remainingBytes int64, remainingFiles int, err error) {
 	stale, err := e.staleTables()
 	if err != nil {
 		return 0, 0, 0, err
@@ -141,6 +162,12 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64) (targeted in
 		}
 		if maxBytes > 0 && targeted >= maxBytes {
 			break
+		}
+		if attempted[t.fileNum] {
+			continue
+		}
+		if attempted != nil {
+			attempted[t.fileNum] = true
 		}
 		if _, _, derr := DecodeMVCCKey(t.smallest); derr == nil {
 			seed := append(append([]byte(nil), t.smallest...), 0)
@@ -156,10 +183,14 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64) (targeted in
 		// Compact's span end is exclusive; cover the largest key. The call
 		// flushes the overlapping memtable (our seed) first.
 		end := append(append([]byte(nil), t.largest...), 0)
+		cost := t.size
+		if est, eerr := e.db.EstimateDiskUsage(t.smallest, end); eerr == nil && est > cost {
+			cost = est
+		}
 		if cerr := e.db.Compact(t.smallest, end, false); cerr != nil {
 			return targeted, 0, 0, cerr
 		}
-		targeted += int64(t.size)
+		targeted += int64(cost)
 	}
 	stale, err = e.staleTables()
 	if err != nil {
@@ -170,7 +201,7 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64) (targeted in
 		remainingFiles++
 	}
 	e.reenc.mu.Lock()
-	e.reenc.at, e.reenc.bytes, e.reenc.files = time.Now(), remainingBytes, remainingFiles
+	e.reenc.at, e.reenc.bytes, e.reenc.files, e.reenc.lastErr = time.Now(), remainingBytes, remainingFiles, nil
 	e.reenc.mu.Unlock()
 	return targeted, remainingBytes, remainingFiles, nil
 }

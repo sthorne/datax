@@ -13,6 +13,8 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/security"
+	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -21,7 +23,9 @@ import (
 // TestOnlineRotationAndReencryptRPC: the rotate-store-key admin op
 // re-wraps a LIVE node's key registry under write load with zero write
 // errors (wrong old key refused; a second rotation needs the new key),
-// and the reencrypt/reencrypt-status ops report the pass. Issue #48.
+// and the reencrypt/reencrypt-status ops report the pass. The op carries
+// the store keys, so it is served only over mutual TLS: the cluster is
+// secure and the caller presents root's client certificate. Issue #48.
 func TestOnlineRotationAndReencryptRPC(t *testing.T) {
 	newKey := func() []byte {
 		k := make([]byte, enc.KeyLen)
@@ -31,9 +35,32 @@ func TestOnlineRotationAndReencryptRPC(t *testing.T) {
 		return k
 	}
 	key1, key2, key3 := newKey(), newKey(), newKey()
-	tc, _ := StartWithEngineOptions(t, 3, storage.Options{EncryptionKey: key1})
+	engines := make([]*storage.Engine, 3)
+	for i := range engines {
+		eng, err := storage.Open("", storage.Options{EncryptionKey: key1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		engines[i] = eng
+	}
+	t.Cleanup(func() {
+		for _, eng := range engines {
+			_ = eng.Close()
+		}
+	})
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		cfg.Engine = engines[i]
+		cfg.GCInterval = -1 // no background housekeeping
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	if err := security.CreateClientCert(certsDir, "root"); err != nil {
+		t.Fatal(err)
+	}
+	rootTLS, err := security.LoadClientTLS(certsDir, "root")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Continuous table-data writes for the whole rotation sequence.
 	var writeErrs atomic.Int64
@@ -57,6 +84,7 @@ func TestOnlineRotationAndReencryptRPC(t *testing.T) {
 	}()
 
 	trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
+	trans.SetTLS(rootTLS)
 	call := func(req cluster.AdminRequest) cluster.AdminResponse {
 		t.Helper()
 		cctx, ccancel := context.WithTimeout(ctx, 20*time.Second)
@@ -95,7 +123,7 @@ func TestOnlineRotationAndReencryptRPC(t *testing.T) {
 		if resp.Error != "" {
 			t.Fatalf("reencrypt-status: %s", resp.Error)
 		}
-		if st := resp.Reencryption; st != nil && !st.Active && st.RemainingBytes == 0 {
+		if st := resp.Reencryption; st != nil && !st.Active && st.RemainingBytes == 0 && st.SweepError == "" {
 			break
 		}
 		if time.Now().After(deadline) {

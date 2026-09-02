@@ -30,6 +30,8 @@ type AdminRequest struct {
 	AllowPlaintext bool     `json:"allow_plaintext,omitempty"`
 	// CheckID identifies a consistency probe for collect-checksum.
 	CheckID string `json:"check_id,omitempty"`
+	// Index is the applied index wait-applied blocks for (with RangeID).
+	Index uint64 `json:"index,omitempty"`
 	// Version is the target for upgrade-cluster (0 = the serving node's
 	// binary version).
 	Version int `json:"version,omitempty"`
@@ -50,6 +52,10 @@ type ReencryptionStatus struct {
 	RemainingBytes int64 `json:"remaining_bytes"`
 	RemainingFiles int   `json:"remaining_files"`
 	RewrittenBytes int64 `json:"rewritten_bytes_total"`
+	// SweepError is set when the stale-file sweep behind RemainingBytes
+	// failed; the counts are then the last good reading (or zero if there
+	// never was one) and attest nothing.
+	SweepError string `json:"sweep_error,omitempty"`
 }
 
 // AdminResponse is the JSON reply.

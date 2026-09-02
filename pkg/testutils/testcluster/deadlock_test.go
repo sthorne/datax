@@ -155,9 +155,17 @@ func TestNonDeadlockedWaiterSurvives(t *testing.T) {
 		}
 		if err := holder.Commit(ctx); err != nil {
 			// The waiter's winning push surfaced after the 3s window — a
-			// late flip loss, so retry the scenario (issue #61).
+			// late flip loss, so retry the scenario (issue #61). Only a
+			// conflict is a flip loss; anything else is a real failure
+			// that retrying would hide.
+			if !kvclient.IsRetryable(err) {
+				<-done
+				t.Fatalf("holder commit failed with a non-retryable error: %v", err)
+			}
 			_ = holder.Rollback(ctx)
-			<-done
+			if werr := <-done; werr != nil && !kvclient.IsRetryable(werr) {
+				t.Fatalf("waiter failed with a non-retryable error: %v", werr)
+			}
 			continue
 		}
 		if err := <-done; err != nil {

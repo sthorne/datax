@@ -356,6 +356,7 @@ func (n *Node) start() error {
 		RetentionOverride:       retention.override,
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
+		WaitForApplication:      n.waitForApplication,
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()

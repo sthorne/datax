@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
@@ -14,6 +15,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/rpc"
+	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -28,15 +30,29 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
-// adminReadOnlyOps are admin ops any authenticated principal may run (and
-// that skip the audit log — collect-checksum fires on every consistency
-// sweep). Everything else changes cluster state: admin role required.
+// adminReadOnlyOps are admin ops any authenticated principal may run.
+// Everything else changes cluster state or exposes per-replica internals:
+// admin role required.
 var adminReadOnlyOps = map[string]bool{
 	"ranges":           true,
 	"nodes":            true,
 	"collect-checksum": true,
-	"node-status":      true,
+	"wait-applied":     true,
 	"reencrypt-status": true,
+}
+
+// adminUnauditedOps skip the audit log: the read-only ops (collect-checksum
+// fires on every consistency sweep) and node-status, which /api/range fans
+// out to every replica holder under the node identity on each dashboard
+// drill-down. node-status is admin-only like /api/range, whose data
+// source it is; it is just not worth a record per fan-out.
+var adminUnauditedOps = map[string]bool{
+	"ranges":           true,
+	"nodes":            true,
+	"collect-checksum": true,
+	"wait-applied":     true,
+	"reencrypt-status": true,
+	"node-status":      true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -44,7 +60,7 @@ var adminReadOnlyOps = map[string]bool{
 // forwarding and probes act with operator authority), root, or an
 // admin-role member (the same rule the SQL layer applies).
 func (n *Node) isAdminPrincipal(ctx context.Context, cn string) bool {
-	if cn == "node" || cn == "root" {
+	if cn == security.NodePrincipal || cn == "root" {
 		return true
 	}
 	if cn == "" {
@@ -71,10 +87,50 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 				"permission denied: admin operation %q requires the admin role (connected as %q)", req.Op, cn)}
 		}
 	}
-	if !adminReadOnlyOps[req.Op] {
-		log.Audit("admin-op", "op", req.Op, "principal", principal,
-			"range", int64(req.RangeID), "node", int64(req.NodeID))
+	if adminUnauditedOps[req.Op] {
+		return n.serveAdminOp(ctx, req)
 	}
+	resp := n.serveAdminOp(ctx, req)
+	// Audited after the fact so the record carries the outcome and the
+	// target: an operator tracing a rejected op, or a restore from the
+	// wrong path, can tell what actually happened. Store-key material
+	// (rotate-store-key) is never logged.
+	kv := []any{"op", req.Op, "principal", principal, "range", int64(req.RangeID), "node", int64(req.NodeID)}
+	if req.ToNode != 0 {
+		kv = append(kv, "to_node", int64(req.ToNode))
+	}
+	if req.FromNode != 0 {
+		kv = append(kv, "from_node", int64(req.FromNode))
+	}
+	if req.Cancel {
+		kv = append(kv, "cancel", true)
+	}
+	if len(req.Key) != 0 {
+		kv = append(kv, "key", fmt.Sprintf("%q", req.Key))
+	}
+	if req.Path != "" {
+		kv = append(kv, "path", req.Path)
+	}
+	if req.BasePath != "" {
+		kv = append(kv, "base_path", req.BasePath)
+	}
+	if len(req.Paths) != 0 {
+		kv = append(kv, "paths", strings.Join(req.Paths, ","))
+	}
+	if req.Version != 0 {
+		kv = append(kv, "version", int64(req.Version))
+	}
+	if resp.Error != "" {
+		kv = append(kv, "outcome", "error", "error", resp.Error)
+	} else {
+		kv = append(kv, "outcome", "ok")
+	}
+	log.Audit("admin-op", kv...)
+	return resp
+}
+
+// serveAdminOp dispatches an admin op the caller is already authorized for.
+func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
 	switch req.Op {
 	case "split":
 		if len(req.Key) == 0 {
@@ -137,6 +193,21 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 			return cluster.AdminResponse{Error: "checksum not available"}
 		}
 		return cluster.AdminResponse{Checksum: sum, AppliedIndex: idx}
+
+	case "wait-applied":
+		// The merge driver's pre-proposal check (see kvserver.adminMerge):
+		// block until this node's replica has applied req.Index, bounded
+		// here as well as by the caller's deadline.
+		if req.RangeID == 0 {
+			return cluster.AdminResponse{Error: "wait-applied requires a range"}
+		}
+		wctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		idx, err := n.store.WaitForApplied(wctx, req.RangeID, req.Index)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{AppliedIndex: idx}
 
 	case "rotate-store-key":
 		return n.serveRotateStoreKey(ctx, req)
