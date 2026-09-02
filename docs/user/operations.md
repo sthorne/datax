@@ -52,6 +52,9 @@ index), `datax_stats_refreshes_total` / `datax_stats_rows_scanned_total`
 (the table-statistics sampler's pace and cost),
 `datax_retention_rows_expired_total` (row-level retention expiry on
 mixed ranges),
+`datax_reencryption_remaining_bytes` (encrypted stores: live sstable
+bytes still under retired data keys — 0 attests re-encryption is
+complete),
 `datax_auto_splits_total` / `datax_load_splits_total` /
 `datax_range_merges_total`, `datax_gc_runs_total`.
 

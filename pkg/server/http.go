@@ -96,6 +96,14 @@ func (n *Node) startHTTP() error {
 				Name: "datax_storage_debt_gate_entered_total", Help: "Times the compaction-debt gate latched.",
 			}, func() float64 { return float64(eng.DebtGateEntries()) }),
 		)
+		if eng.Encrypted() {
+			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",
+			}, func() float64 {
+				remaining, _ := eng.ReencryptionStatus()
+				return float64(remaining)
+			}))
+		}
 	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 

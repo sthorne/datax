@@ -75,16 +75,30 @@ datax init --dir /var/lib/datax --enc-key /etc/datax/store.key ...
 ```
 
 The store key wraps per-file data keys; measured cost is ~13% on a mixed
-workload. To rotate the store key the node must be **stopped**:
+workload. The store key rotates **online** — the node stays up and
+serving:
 
 ```sh
-datax debug rotate-enc-key --dir /var/lib/datax \
-  --old-key /etc/datax/store.key --new-key /etc/datax/store-v2.key
+datax debug rotate-enc-key --addr 10.0.0.1:26257 \
+  --old-key /etc/datax/store.key --new-key /etc/datax/store-v2.key \
+  [--certs-dir certs --user ops]     # secure cluster: admin role required
 ```
 
-Rotation re-wraps the data keys (fast); old data files are re-encrypted
-only through natural compaction churn. Losing the key file means losing the
-store — back it up separately from the data. Details in
+Rotation re-wraps the data keys atomically and re-seals the metadata
+backup (fast — nothing is re-encrypted); update the node's `--enc-key`
+path before its next restart. The offline form
+(`--dir /var/lib/datax`, node stopped) remains for damaged stores.
+
+Files written under retired data keys are re-encrypted on demand:
+
+```sh
+datax debug reencrypt --addr 10.0.0.1:26257 --wait   # per node
+```
+
+paces compactions over stale-key sstables until
+`datax_reencryption_remaining_bytes` reaches 0 — the attestation that no
+live sstable remains under a retired key. Losing the key file means
+losing the store — back it up separately from the data. Details in
 [docs/encryption.md](../encryption.md).
 
 ## Tuning flags (rarely needed)

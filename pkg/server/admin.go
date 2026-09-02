@@ -36,6 +36,7 @@ var adminReadOnlyOps = map[string]bool{
 	"nodes":            true,
 	"collect-checksum": true,
 	"node-status":      true,
+	"reencrypt-status": true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -136,6 +137,18 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 			return cluster.AdminResponse{Error: "checksum not available"}
 		}
 		return cluster.AdminResponse{Checksum: sum, AppliedIndex: idx}
+
+	case "rotate-store-key":
+		return n.serveRotateStoreKey(ctx, req)
+
+	case "reencrypt":
+		return n.serveReencrypt(req)
+
+	case "reencrypt-status":
+		if n.engine == nil || !n.engine.Encrypted() {
+			return cluster.AdminResponse{Error: "store is not encrypted"}
+		}
+		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
 
 	case "node-status":
 		// This node's /status document, optionally filtered to one range —

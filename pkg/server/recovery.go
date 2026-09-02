@@ -94,9 +94,13 @@ func (n *Node) exportMetadata(ctx context.Context) {
 		return
 	}
 	// On an encrypted store the backup holds the same data the sstables do
-	// (descriptors, user verifiers) — seal it with the store key.
-	if n.encKey != nil {
-		if raw, err = enc.Seal(MetadataBackupMagic, n.encKey, raw); err != nil {
+	// (descriptors, user verifiers) — seal it with the store key (the
+	// CURRENT one: online rotation swaps it).
+	n.encKeyMu.Lock()
+	encKey := n.encKey
+	n.encKeyMu.Unlock()
+	if encKey != nil {
+		if raw, err = enc.Seal(MetadataBackupMagic, encKey, raw); err != nil {
 			log.Debugf("metadata export: sealing: %v", err)
 			return
 		}

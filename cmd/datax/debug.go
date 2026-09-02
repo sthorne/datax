@@ -76,19 +76,45 @@ func runDebugMetadata(args []string) error {
 	return err
 }
 
-// runDebugRotateEncKey reseals a STOPPED encrypted store's key registry
-// (and sealed metadata backup) under a new store key. Data keys — and so
-// the file contents — are untouched; only the wrapping changes.
+// runDebugRotateEncKey reseals an encrypted store's key registry (and
+// sealed metadata backup) under a new store key. Data keys — and so the
+// file contents — are untouched; only the wrapping changes. Two modes:
+// --addr rotates a LIVE node over the admin RPC (the node reseals
+// atomically and swaps the key it seals artifacts with); --dir is the
+// offline path for a stopped or damaged store.
 func runDebugRotateEncKey(args []string) error {
 	fs := flag.NewFlagSet("debug rotate-enc-key", flag.ContinueOnError)
-	dir := fs.String("dir", "", "data directory of the STOPPED node")
+	dir := fs.String("dir", "", "offline mode: data directory of the STOPPED node")
+	addr := fs.String("addr", "", "online mode: RPC address of the RUNNING node to rotate")
 	oldPath := fs.String("old-key", "", "current store encryption key file")
 	newPath := fs.String("new-key", "", "new store encryption key file")
+	certsDir := fs.String("certs-dir", "", "online mode, secure cluster: certificate directory (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "online mode: username whose client certificate authenticates the call; must be an admin")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *dir == "" || *oldPath == "" || *newPath == "" {
-		return fmt.Errorf("rotate-enc-key requires --dir, --old-key, and --new-key (stop the node first: a running node keeps sealing with the key it loaded at startup)")
+	if *oldPath == "" || *newPath == "" {
+		return fmt.Errorf("rotate-enc-key requires --old-key and --new-key")
+	}
+	if (*dir == "") == (*addr == "") {
+		return fmt.Errorf("rotate-enc-key requires exactly one of --dir (stopped node) or --addr (running node)")
+	}
+	if *addr != "" {
+		oldKey, err := enc.LoadKeyFile(*oldPath)
+		if err != nil {
+			return err
+		}
+		newKey, err := enc.LoadKeyFile(*newPath)
+		if err != nil {
+			return err
+		}
+		if _, err := adminCall(*addr, *certsDir, *certUser, cluster.AdminRequest{
+			Op: "rotate-store-key", OldStoreKey: oldKey, NewStoreKey: newKey,
+		}); err != nil {
+			return err
+		}
+		fmt.Println("store key rotated online; the node now seals with the new key (keep the new key file for restarts)")
+		return nil
 	}
 	oldKey, err := enc.LoadKeyFile(*oldPath)
 	if err != nil {
@@ -205,7 +231,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|metadata|unsafe-recover|rotate-enc-key> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|metadata|unsafe-recover|rotate-enc-key|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -267,6 +293,7 @@ func runDebug(args []string) error {
 	case "upgrade":
 		req.Op = "upgrade-cluster"
 		req.Version = int(*toNode)
+	case "reencrypt", "reencrypt-status":
 	case "ranges", "nodes":
 	default:
 		return fmt.Errorf("unknown debug subcommand %q", sub)
@@ -346,6 +373,39 @@ func runDebug(args []string) error {
 		default:
 			fmt.Printf("node n%d draining: %d replicas remaining (re-run or use --wait to follow)\n", *nodeID, resp.RemainingReplicas)
 		}
+	case "reencrypt", "reencrypt-status":
+		printReencryption(resp.Reencryption)
+		if sub == "reencrypt" && *wait {
+			for resp.Reencryption != nil && (resp.Reencryption.Active || resp.Reencryption.RemainingBytes > 0) {
+				time.Sleep(2 * time.Second)
+				wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				err := trans.Call(wctx, *addr, "admin", cluster.AdminRequest{Op: "reencrypt-status"}, &resp)
+				wcancel()
+				if err != nil {
+					return err
+				}
+				if resp.Error != "" {
+					return fmt.Errorf("%s", resp.Error)
+				}
+				printReencryption(resp.Reencryption)
+			}
+		}
 	}
 	return nil
+}
+
+func printReencryption(st *cluster.ReencryptionStatus) {
+	if st == nil {
+		fmt.Println("no re-encryption status reported")
+		return
+	}
+	state := "idle"
+	if st.Active {
+		state = "running"
+	}
+	if !st.Active && st.RemainingBytes == 0 {
+		state = "complete — no live sstable under a retired data key"
+	}
+	fmt.Printf("re-encryption %s: %d bytes in %d files remain under retired keys (%d bytes rewritten)\n",
+		state, st.RemainingBytes, st.RemainingFiles, st.RewrittenBytes)
 }

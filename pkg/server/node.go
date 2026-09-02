@@ -186,7 +186,14 @@ type Node struct {
 
 	// encKey is the loaded store encryption key; non-nil means the store is
 	// encrypted and node-written artifacts (metadata backup) are sealed too.
-	encKey []byte
+	// Guarded by encKeyMu: online rotation (rotate-store-key) swaps it.
+	encKeyMu sync.Mutex
+	encKey   []byte
+
+	// Background re-encryption state (see reencrypt.go).
+	reencMu        sync.Mutex
+	reencActive    bool
+	reencRewritten int64
 
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and

@@ -5,6 +5,7 @@ package storage
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
@@ -45,6 +46,14 @@ type Iterator interface {
 type Engine struct {
 	db     *pebble.DB
 	health health
+	// Encryption state (all zero for a plaintext store): the base
+	// (unencrypted) FS and dir for registry/header access, the unsealed
+	// key set, and the online-maintenance state (see reencrypt.go).
+	encBase vfs.FS
+	encDir  string
+	encKeys *enc.KeySet
+	encMu   sync.Mutex // serializes registry reseals
+	reenc   reencStatusCache
 }
 
 // Open opens (creating if needed) a Pebble store in dir with the given
@@ -70,9 +79,12 @@ func Open(dir string, o Options) (*Engine, error) {
 		base = vfs.NewMem()
 		dir = "in-mem"
 	}
-	fs, err := maybeEncrypt(base, dir, o.EncryptionKey)
+	fs, keys, err := maybeEncrypt(base, dir, o.EncryptionKey)
 	if err != nil {
 		return nil, err
+	}
+	if keys != nil {
+		e.encBase, e.encDir, e.encKeys = base, dir, keys
 	}
 	opts.FS = fs
 	db, err := pebble.Open(dir, opts)
@@ -94,22 +106,22 @@ func Open(dir string, o Options) (*Engine, error) {
 //     the ciphertext-looking sstables would just be unreadable garbage)
 //   - no registry + key + empty dir -> initialize encryption
 //   - no key, no registry     -> plaintext, exactly as before
-func maybeEncrypt(base vfs.FS, dir string, key []byte) (vfs.FS, error) {
+func maybeEncrypt(base vfs.FS, dir string, key []byte) (vfs.FS, *enc.KeySet, error) {
 	encrypted := enc.RegistryExists(base, dir)
 	if key == nil {
 		if encrypted {
-			return nil, fmt.Errorf("store in %s is encrypted; --enc-key is required", dir)
+			return nil, nil, fmt.Errorf("store in %s is encrypted; --enc-key is required", dir)
 		}
-		return base, nil
+		return base, nil, nil
 	}
 	if !encrypted && storeHasFiles(base, dir) {
-		return nil, fmt.Errorf("store in %s exists unencrypted; refusing to open it with an encryption key (encrypting in place is not supported)", dir)
+		return nil, nil, fmt.Errorf("store in %s exists unencrypted; refusing to open it with an encryption key (encrypting in place is not supported)", dir)
 	}
 	keys, err := enc.LoadOrInitRegistry(base, dir, key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return enc.NewFS(base, keys), nil
+	return enc.NewFS(base, keys), keys, nil
 }
 
 // storeHasFiles reports whether dir already holds a Pebble store (CURRENT /

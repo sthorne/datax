@@ -64,18 +64,43 @@ Details that matter for correctness and confidentiality:
 ## Key rotation
 
 - **Data keys** rotate themselves: every node start mints a new active
-  key. Fully rewriting old files under new keys is not implemented
-  (Pebble compactions gradually do it as a side effect).
-- **Store key**, offline only:
+  key.
+- **Store key**, online (the node stays up):
 
   ```sh
-  # stop the node first — a running node keeps sealing with the key it
-  # loaded at startup
-  datax debug rotate-enc-key --dir data1 --old-key store.key --new-key new.key
+  datax debug rotate-enc-key --addr 10.0.0.1:26257 \
+    --old-key store.key --new-key new.key [--certs-dir certs --user ops]
   ```
 
-  This reseals the registry and metadata backup; data keys and file
-  contents are untouched.
+  The `rotate-store-key` admin RPC (admin role required in secure mode)
+  verifies the old key against the on-disk registry (GCM
+  authentication), reseals the registry atomically (tmp + rename — the
+  same path the offline mode uses), swaps the key the node seals
+  artifacts with, and immediately re-seals the metadata backup. Data
+  keys and file contents are untouched, so rotation is O(registry), not
+  O(store). Restart the node with `--enc-key new.key` afterwards. The
+  offline mode (`--dir`, node stopped) remains for damaged stores.
+
+- **Background re-encryption** retires old-data-key exposure on cold
+  data. `datax debug reencrypt --addr ... [--wait]` starts a paced pass
+  that rewrites live sstables still encrypted under retired data keys
+  (64 MiB per burst, 500ms pauses) by scheduling manual compactions; a
+  rewritten file carries the active key. Progress:
+  `datax_reencryption_remaining_bytes` (gauge, 0 = attested: no live
+  sstable under a retired key), `datax_reencryption_rewritten_bytes_total`,
+  and `datax debug reencrypt-status`. Only sstables can be stale — the
+  WAL, MANIFEST, and OPTIONS are recreated under the fresh active key at
+  every open.
+
+  Mechanically, each stale file's compaction is *seeded* with a Pebble
+  point tombstone at `smallest + 0x00` — provably not a valid MVCC key
+  encoding, so nothing can ever write it and no reader can observe it —
+  because Pebble's manual compaction otherwise never touches a file
+  already resting in the bottom level and trivially MOVES single files
+  without rewriting them. The seed gives it a real L0 input to compact
+  through, and the compaction itself elides the seed. One caveat: a
+  stale file spanning a single user key admits no interior seed and
+  waits for natural churn.
 
 ## Recovery tooling
 
@@ -106,9 +131,11 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
 
 ## Limitations
 
-- Store-key rotation is offline (stop the node first).
-- No re-encryption of old files under rotated data keys beyond natural
-  compaction churn.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
 - Keys live in memory unprotected (no mlock/HSM integration).
+- Re-encryption covers live sstables; a stale file spanning a single
+  user key waits for natural compaction churn.
+- After an online rotation the node's `--enc-key` file must be updated
+  before its next restart (the node does not rewrite the operator's key
+  file).
