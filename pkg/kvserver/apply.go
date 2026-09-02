@@ -1,7 +1,9 @@
 package kvserver
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -25,7 +27,13 @@ func addrOf(k keys.Key) (keys.Key, error) { return keys.Addr(k) }
 // crash-recovery replay safe — and also lets a catch-up snapshot install
 // (which raises the applied index under applyMu) turn any entries it
 // superseded into no-ops.
-func (r *Replica) applyEntry(ent raftpb.Entry) error {
+// errApplyAborted marks an apply abandoned because the node is shutting
+// down (see stageMerge). It is NOT deterministic across replicas, so the
+// command's effects and applied-index advance must both be discarded —
+// the restart replays the entry from the log and applies it for real.
+var errApplyAborted = errors.New("apply aborted: node shutting down")
+
+func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
 	r.mu.Lock()
@@ -96,7 +104,12 @@ func (r *Replica) applyEntry(ent raftpb.Entry) error {
 		if err != nil {
 			return fmt.Errorf("corrupt raft command at index %d: %w", ent.Index, err)
 		}
-		resp, aerr := r.applyCommand(cmd, ent.Index)
+		resp, aerr, abort := r.applyCommand(ctx, cmd, ent.Index)
+		if abort != nil {
+			// Nothing was applied and no waiter is answered: the command
+			// replays after restart.
+			return abort
+		}
 
 		// Deliver the outcome to a local waiter, if this replica proposed it.
 		r.mu.Lock()
@@ -153,7 +166,10 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 // the state machine at this log position), so every replica computes the
 // same result, including errors: on error the command's writes are discarded
 // and only the applied index advances.
-func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchResponse, *kvpb.Error) {
+// The trailing error is non-nil only when the apply was ABANDONED whole
+// (errApplyAborted): no effects landed, the applied index did not move,
+// and the raft loop must stop instead of advancing.
+func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64) (*kvpb.BatchResponse, *kvpb.Error, error) {
 	eng := r.store.cfg.Engine
 	b := eng.NewBatch()
 	resp, aerr := r.evalWriteBatch(b, &cmd.Batch)
@@ -208,16 +224,19 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 		}
 	}
 	if aerr == nil && cmd.Merge != nil {
-		if err := r.stageMerge(b, cmd.Merge); err != nil {
-			log.Warnf("%s: merge application refused: %v", r.rangeID, err)
+		if err := r.stageMerge(ctx, b, cmd.Merge); err != nil {
 			_ = b.Close()
+			if errors.Is(err, errApplyAborted) {
+				return nil, nil, err
+			}
+			log.Warnf("%s: merge application refused: %v", r.rangeID, err)
 			b = eng.NewBatch()
 			aerr = kvpb.NewError(err)
 		}
 	}
 	if err := r.stageAppliedIndex(b, idx); err != nil {
 		_ = b.Close()
-		return nil, kvpb.NewError(err)
+		return nil, kvpb.NewError(err), nil
 	}
 	if err := b.Commit(false); err != nil {
 		// Failing to commit the state machine is not recoverable.
@@ -240,7 +259,7 @@ func (r *Replica) applyCommand(cmd *raftCommand, idx uint64) (*kvpb.BatchRespons
 		// is exactly this entry's state on every replica.
 		r.startChecksum(cmd.Checksum.ID, idx)
 	}
-	return resp, aerr
+	return resp, aerr, nil
 }
 
 // evalWriteBatch executes the batch's requests against the engine batch.

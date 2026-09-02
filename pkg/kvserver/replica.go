@@ -399,7 +399,13 @@ func (r *Replica) raftLoop(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
+				if errors.Is(err, errApplyAborted) {
+					// Clean shutdown interleaved with a merge apply: nothing
+					// was applied; the restart replays the entry (issue #61).
+					log.Infof("%s/%d: apply aborted by shutdown; entry replays after restart", r.rangeID, r.replicaID)
+				} else {
+					log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
+				}
 				r.node.Stop()
 				return
 			}
@@ -497,7 +503,7 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 
 	// 5. Apply committed entries.
 	for _, ent := range rd.CommittedEntries {
-		if err := r.applyEntry(ent); err != nil {
+		if err := r.applyEntry(ctx, ent); err != nil {
 			return err
 		}
 	}

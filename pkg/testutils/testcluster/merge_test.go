@@ -390,3 +390,59 @@ func TestMergeTimestampCache(t *testing.T) {
 		t.Fatalf("write beneath a pre-merge read was not pushed: %v", kerr)
 	}
 }
+
+// TestMergeStopNodeNoDeadlock: stopping a node while it is applying a
+// merge must not wedge Stop(). The merge apply used to spin waiting for
+// the local RHS replica to reach the subsume index even after node
+// shutdown had stopped the RHS's raft loop, deadlocking Stop() — the
+// raftLoop stuck in stageMerge while Stop waited for it, the hang behind
+// TestMergeTimestampCache's cleanup in issue #61. The apply now aborts on
+// shutdown WITHOUT advancing the applied index, and the restart replays
+// the merge. Exercised by racing merges against stop/restart cycles of a
+// follower, each stop under a watchdog.
+func TestMergeStopNodeNoDeadlock(t *testing.T) {
+	tc, engines := StartWithEngines(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	prefix := keys.TableDataPrefix(856)
+	if err := tc.Nodes[0].DB().Put(ctx, append(prefix.Clone(), "a"...), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	for round := 0; round < 3; round++ {
+		splitKey := append(prefix.Clone(), fmt.Sprintf("m%d", round)...)
+		sr, err := tc.Nodes[0].DB().AdminSplit(ctx, splitKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Merge in the background while n3 stops: the merge commits on the
+		// surviving quorum; n3 applies it just before the stop (the racy
+		// window), aborts cleanly mid-apply, or replays it at restart.
+		mergeDone := make(chan struct{})
+		go func(start keys.Key) {
+			defer close(mergeDone)
+			mctx, mcancel := context.WithTimeout(ctx, 60*time.Second)
+			defer mcancel()
+			for {
+				if _, err := tc.Nodes[0].DB().AdminMerge(mctx, start); err == nil || mctx.Err() != nil {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}(sr.Left.StartKey.Clone())
+
+		stopped := make(chan struct{})
+		go func() { tc.StopNode(2); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(45 * time.Second):
+			t.Fatal("StopNode wedged: merge-apply vs shutdown deadlock (issue #61)")
+		}
+		<-mergeDone
+		tc.RestartNode(2, engines[2])
+	}
+
+	if v, err := tc.Nodes[0].DB().Get(ctx, append(prefix.Clone(), "a"...)); err != nil || string(v) != "v" {
+		t.Fatalf("read after merge/stop rounds: %q %v", v, err)
+	}
+}

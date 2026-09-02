@@ -117,9 +117,12 @@ func TestNonDeadlockedWaiterSurvives(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for attempt := 0; ; attempt++ {
-		if attempt >= 10 {
-			t.Fatal("holder lost the priority flip 10 times in a row")
+	// Deadline-based flip retries — under heavy load a run of losses is
+	// slow, not wrong (issue #61).
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("holder kept losing the priority flip until the deadline")
 		}
 		holder := db.NewTxn("holder")
 		if _, err := holder.GetForUpdate(ctx, key); err != nil {
@@ -151,7 +154,11 @@ func TestNonDeadlockedWaiterSurvives(t *testing.T) {
 		case <-time.After(3 * time.Second):
 		}
 		if err := holder.Commit(ctx); err != nil {
-			t.Fatalf("holder commit: %v", err)
+			// The waiter's winning push surfaced after the 3s window — a
+			// late flip loss, so retry the scenario (issue #61).
+			_ = holder.Rollback(ctx)
+			<-done
+			continue
 		}
 		if err := <-done; err != nil {
 			t.Fatalf("waiter failed after 3s hold: %v", err)

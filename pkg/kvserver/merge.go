@@ -314,8 +314,11 @@ func updateMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, pu
 // stageMerge applies the merge on an LHS replica: wait out the local RHS,
 // quiesce its group, and absorb its span, size, and GC threshold into the
 // staged batch. Returns a deterministic error (the merge no-ops everywhere)
-// when the LHS generation moved between propose and apply.
-func (r *Replica) stageMerge(b *storage.Batch, trig *mergeTrigger) error {
+// when the LHS generation moved between propose and apply, and the
+// NON-deterministic errApplyAborted when the node shuts down mid-wait —
+// the caller then abandons the apply without advancing the applied index,
+// so the restart replays the merge instead of skipping it.
+func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeTrigger) error {
 	if r.Desc().Generation != trig.Left.Generation {
 		return kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
 			r.rangeID, trig.Left.Generation, r.Desc().Generation)
@@ -329,8 +332,18 @@ func (r *Replica) stageMerge(b *storage.Batch, trig *mergeTrigger) error {
 	}
 	// The RHS's engine content is identical on every node once it reaches
 	// the subsume index (its final command). The subsume is committed, so
-	// this terminates; raft progress is independent of this loop.
+	// on a live node this terminates — raft progress is independent of
+	// this loop. During node shutdown it does NOT: the RHS's raft loop may
+	// have exited before applying the subsume, and spinning here wedges
+	// this replica's raft loop and, with it, Stop() itself (issue #61).
+	// Abort instead; the applied index stays put and the restart replays
+	// this command, waiting again with a live RHS group.
 	for rhs.AppliedIndex() < trig.RightAppliedIndex {
+		select {
+		case <-ctx.Done():
+			return errApplyAborted
+		default:
+		}
 		time.Sleep(2 * time.Millisecond)
 	}
 	// Stop the RHS group before its unreplicated keys go: a live Ready
