@@ -53,6 +53,18 @@ func (tc *TestCluster) setNode(i int, n *server.Node) {
 // is parsed as a locality string for node i+1.
 func Start(t testing.TB, numNodes int, localities ...string) *TestCluster {
 	t.Helper()
+	return startCluster(t, numNodes, localities, nil)
+}
+
+// StartWithOptions is Start with a hook applied to every node's config
+// before it starts (housekeeping cadence, thresholds, knobs).
+func StartWithOptions(t testing.TB, numNodes int, opt func(*server.Config), localities ...string) *TestCluster {
+	t.Helper()
+	return startCluster(t, numNodes, localities, opt)
+}
+
+func startCluster(t testing.TB, numNodes int, localities []string, opt func(*server.Config)) *TestCluster {
+	t.Helper()
 	clusterID := uuid.New()
 
 	listeners := make([]net.Listener, numNodes)
@@ -81,7 +93,7 @@ func Start(t testing.TB, numNodes int, localities ...string) *TestCluster {
 		if err != nil {
 			t.Fatal(err)
 		}
-		n, err := server.Start(server.Config{
+		cfg := server.Config{
 			Listener:              listeners[i],
 			PGListener:            pglis,
 			Locality:              locality(t, localities, i),
@@ -92,7 +104,11 @@ func Start(t testing.TB, numNodes int, localities ...string) *TestCluster {
 				Range1:    range1,
 				Nodes:     nodes,
 			},
-		})
+		}
+		if opt != nil {
+			opt(&cfg)
+		}
+		n, err := server.Start(cfg)
 		if err != nil {
 			t.Fatalf("starting node %d: %v", i+1, err)
 		}

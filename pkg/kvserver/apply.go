@@ -299,16 +299,29 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 		}
 	}
 
+	// A write-intent conflict does not stop evaluation: the batch's other
+	// requests are still evaluated (into a batch that is discarded anyway)
+	// so that EVERY conflicting intent is reported at once. Reporting only
+	// the first made a batch that overlapped n stale intents of one dead
+	// transaction cost n proposals, each failing on the next key after the
+	// client resolved the previous one (issue #74).
+	var conflicts intentCollector
 	for i := range ba.Requests {
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
 		case *kvpb.PutRequest:
 			if err := storage.MVCCPut(b, req.Key, ts, req.Value, txnMeta); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			ru.Put = &kvpb.PutResponse{}
 		case *kvpb.DeleteRequest:
 			if err := storage.MVCCDelete(b, req.Key, ts, txnMeta); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			ru.Delete = &kvpb.DeleteResponse{}
@@ -317,6 +330,9 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			// a snapshot — that is what makes them atomic counters.
 			cur, err := storage.MVCCGet(b, req.Key, maxTimestamp, storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			var v int64
@@ -328,12 +344,18 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			v += req.By
 			if err := storage.MVCCPut(b, req.Key, ts, []byte(strconv.FormatInt(v, 10)), txnMeta); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			ru.Increment = &kvpb.IncrementResponse{NewValue: v}
 		case *kvpb.GetRequest:
 			val, err := storage.MVCCGet(b, req.Key, readTimestamp(ba), storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			if req.ForUpdate {
@@ -345,6 +367,9 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 					return nil, kvpb.NewErrorf("locking read outside a transaction")
 				}
 				if err := storage.MVCCLock(b, req.Key, readTimestamp(ba), val, txnMeta); err != nil {
+					if conflicts.collect(err) {
+						continue
+					}
 					return nil, kvpb.NewError(err)
 				}
 			}
@@ -359,16 +384,27 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			res, err := scan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			if req.ForUpdate {
 				if txnMeta == nil {
 					return nil, kvpb.NewErrorf("locking scan outside a transaction")
 				}
+				locked := true
 				for _, kv := range res.KVs {
 					if err := storage.MVCCLock(b, kv.Key, readTimestamp(ba), kv.Value, txnMeta); err != nil {
+						if conflicts.collect(err) {
+							locked = false
+							continue
+						}
 						return nil, kvpb.NewError(err)
 					}
+				}
+				if !locked {
+					continue
 				}
 			}
 			ru.Scan = scanResponse(res)
@@ -448,6 +484,9 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			return nil, kvpb.NewErrorf("unsupported request in write batch: %T", ba.Requests[i].GetInner())
 		}
 		br.Responses = append(br.Responses, ru)
+	}
+	if err := conflicts.err(); err != nil {
+		return nil, kvpb.NewError(err)
 	}
 	return br, nil
 }
@@ -575,4 +614,38 @@ func commandSizeDelta(ba *kvpb.BatchRequest) int64 {
 		}
 	}
 	return delta
+}
+
+// intentCollector gathers the write-intent conflicts a batch evaluation
+// runs into so they are reported together (see evalWriteBatch).
+type intentCollector struct {
+	intents []storage.Intent
+	seen    map[string]bool
+}
+
+// collect records err's intents and reports true when err was a
+// write-intent conflict (evaluation continues); any other error is left
+// to the caller.
+func (c *intentCollector) collect(err error) bool {
+	var wie *storage.WriteIntentError
+	if !errors.As(err, &wie) {
+		return false
+	}
+	if c.seen == nil {
+		c.seen = map[string]bool{}
+	}
+	for _, in := range wie.Intents {
+		if k := string(in.Key); !c.seen[k] {
+			c.seen[k] = true
+			c.intents = append(c.intents, in)
+		}
+	}
+	return true
+}
+
+func (c *intentCollector) err() error {
+	if len(c.intents) == 0 {
+		return nil
+	}
+	return &storage.WriteIntentError{Intents: c.intents}
 }

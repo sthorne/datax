@@ -527,8 +527,11 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 	}
 	waited := time.Duration(0)
 	refreshes := 0
-	for {
+	for attempt := 1; ; attempt++ {
 		br, kerr := t.db.Send(ctx, ba)
+		if kerr != nil && attempt%20 == 0 {
+			log.Debugf("txn %s: batch of %d still failing after %d attempts (%s waited on live conflicts): %v", t.mu.txn.ID, len(ba.Requests), attempt, waited, kerr)
+		}
 		if kerr == nil {
 			t.publishWait(ctx, nil) // no longer blocked, if we were
 			if br.Txn != nil {
@@ -554,6 +557,9 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 			}
 			// We are blocked on a live transaction: publish the wait edge
 			// and walk the chain for a cycle before backing off.
+			if waited > 0 && waited%(2*time.Second) == 0 {
+				log.Debugf("txn %s: blocked %s on live transaction %s at %s", t.mu.txn.ID, waited, pending.Txn.ID, pending.Key)
+			}
 			t.publishWait(ctx, &pending.Txn)
 			if derr := t.detectDeadlock(ctx, pending); derr != nil {
 				return nil, derr // self chosen as deadlock victim
@@ -572,6 +578,23 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 		case kerr.TxnAborted != nil:
 			t.markFinished()
 			return nil, &RetryableError{Cause: kerr}
+		case kerr.Ambiguous != nil && !batchHasEndTxn(ba):
+			// The proposal's fate is unknown: leadership was interrupted
+			// with it in flight. Re-sending a transactional batch that
+			// carries no EndTxn is safe — a write lays down this
+			// transaction's intent again (a rewrite by the same transaction
+			// supersedes the earlier one; the value is the same), and reads
+			// are idempotent — so retry in place rather than surface an
+			// error the statement cannot act on. An EndTxn is not: its
+			// fate must be read from the record, which parallelCommit's
+			// recovery does. Issue #74.
+			metrics.TxnAmbiguousResends.Inc()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(ambiguousResendDelay):
+			}
+			continue
 		case kerr.IsRetryableTxnError():
 			// Timestamp conflict (WriteTooOld / tsCache push / uncertainty
 			// / commit equality): try to move the read timestamp forward by
@@ -594,6 +617,21 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 
 // maxRefreshesPerOp bounds refresh loops under pathological contention.
 const maxRefreshesPerOp = 10
+
+// ambiguousResendDelay is the pause before a batch whose proposal was
+// interrupted by a leadership change is re-sent — long enough for the
+// range to settle on a leader.
+const ambiguousResendDelay = 50 * time.Millisecond
+
+// batchHasEndTxn reports whether the batch finalizes the transaction.
+func batchHasEndTxn(ba *kvpb.BatchRequest) bool {
+	for _, u := range ba.Requests {
+		if u.EndTxn != nil {
+			return true
+		}
+	}
+	return false
+}
 
 // txnPoisonGuardAge is how old a transaction may be before parallelCommit
 // stops racing its write batch against the record-creating staged EndTxn.
@@ -783,51 +821,72 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 // every intent was resolved (the pushees were finalized, expired, or
 // aborted by priority) and the operation can be retried immediately;
 // otherwise pending names one still-live blocker.
+//
+// Each conflicting transaction is pushed once, however many of its
+// intents the batch ran into, and the intents of every finalized pushee
+// are resolved in one batch (the sender splits it by range). A batch
+// that overlaps hundreds of intents left by one dead transaction — a
+// re-shard backfill chunk retried after its first attempt was aborted —
+// then costs one push and one resolve round, not one of each per key
+// (issue #74).
 func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbort bool) (bool, *storage.Intent, error) {
 	all := true
 	var pending *storage.Intent
+	type verdict struct {
+		status   enginepb.TxnStatus
+		commitTS hlc.Timestamp
+		live     bool
+	}
+	verdicts := map[uuid.UUID]verdict{}
+	rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
 	for _, intent := range intents {
-		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
-		ba.Add(&kvpb.PushTxnRequest{
-			RequestHeader: kvpb.RequestHeader{Key: keys.Key(intent.Txn.Key).Clone()},
-			PusherTxn:     t.proto(),
-			PusheeTxn:     intent.Txn,
-			PushAbort:     pushAbort,
-			Now:           t.db.clock.Now(),
-		})
-		br, kerr := t.db.Send(ctx, ba)
-		if kerr != nil {
-			return false, nil, kerr
-		}
-		push := br.Responses[0].PushTxn
-		if push.Status == enginepb.STAGING {
-			// A parallel commit in flight: run status recovery, then let
-			// the next push observe the finalized record.
-			t.db.recoverStagedTxn(ctx, intent.Txn, push)
-			br, kerr = t.db.Send(ctx, ba)
+		v, pushed := verdicts[intent.Txn.ID]
+		if !pushed {
+			ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
+			ba.Add(&kvpb.PushTxnRequest{
+				RequestHeader: kvpb.RequestHeader{Key: keys.Key(intent.Txn.Key).Clone()},
+				PusherTxn:     t.proto(),
+				PusheeTxn:     intent.Txn,
+				PushAbort:     pushAbort,
+				Now:           t.db.clock.Now(),
+			})
+			br, kerr := t.db.Send(ctx, ba)
 			if kerr != nil {
 				return false, nil, kerr
 			}
-			push = br.Responses[0].PushTxn
-		}
-		switch push.Status {
-		case enginepb.COMMITTED, enginepb.ABORTED:
-			rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: t.db.clock.Now()}}
-			rba.Add(&kvpb.ResolveIntentRequest{
-				RequestHeader: kvpb.RequestHeader{Key: intent.Key.Clone()},
-				TxnID:         intent.Txn.ID,
-				Status:        push.Status,
-				CommitTS:      push.CommitTS,
-			})
-			if _, kerr := t.db.Send(ctx, rba); kerr != nil {
-				return false, nil, kerr
+			push := br.Responses[0].PushTxn
+			if push.Status == enginepb.STAGING {
+				// A parallel commit in flight: run status recovery, then let
+				// the next push observe the finalized record.
+				t.db.recoverStagedTxn(ctx, intent.Txn, push)
+				br, kerr = t.db.Send(ctx, ba)
+				if kerr != nil {
+					return false, nil, kerr
+				}
+				push = br.Responses[0].PushTxn
 			}
-		default:
+			v = verdict{status: push.Status, commitTS: push.CommitTS}
+			v.live = push.Status != enginepb.COMMITTED && push.Status != enginepb.ABORTED
+			verdicts[intent.Txn.ID] = v
+		}
+		if v.live {
 			all = false // pushee alive; caller waits
 			if pending == nil {
 				p := intent
 				pending = &p
 			}
+			continue
+		}
+		rba.Add(&kvpb.ResolveIntentRequest{
+			RequestHeader: kvpb.RequestHeader{Key: intent.Key.Clone()},
+			TxnID:         intent.Txn.ID,
+			Status:        v.status,
+			CommitTS:      v.commitTS,
+		})
+	}
+	if len(rba.Requests) > 0 {
+		if _, kerr := t.db.Send(ctx, rba); kerr != nil {
+			return false, nil, kerr
 		}
 	}
 	return all, pending, nil
@@ -1389,6 +1448,9 @@ func (db *DB) RunTxn(ctx context.Context, name string, fn func(ctx context.Conte
 		}
 		if err == nil {
 			return nil
+		}
+		if attempt >= 3 {
+			log.Debugf("txn %s: attempt %d failed, retrying: %v", name, attempt, err)
 		}
 		if !IsRetryable(err) || ctx.Err() != nil || attempt >= 20 {
 			_ = txn.Rollback(ctx)

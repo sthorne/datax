@@ -195,16 +195,24 @@ func (r *Replica) evalOnePhase(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb.B
 	}
 	ts := txn.WriteTimestamp
 	br := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
+	// Every intent conflict is reported together (see evalWriteBatch).
+	var conflicts intentCollector
 	for i := range ba.Requests {
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
 		case *kvpb.PutRequest:
 			if err := storage.MVCCPutCommitted(b, req.Key, ts, req.Value); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			ru.Put = &kvpb.PutResponse{}
 		case *kvpb.DeleteRequest:
 			if err := storage.MVCCDeleteCommitted(b, req.Key, ts); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
 				return nil, kvpb.NewError(err)
 			}
 			ru.Delete = &kvpb.DeleteResponse{}
@@ -216,6 +224,9 @@ func (r *Replica) evalOnePhase(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb.B
 			return nil, kvpb.NewErrorf("unsupported request in one-phase batch: %T", ba.Requests[i].GetInner())
 		}
 		br.Responses = append(br.Responses, ru)
+	}
+	if err := conflicts.err(); err != nil {
+		return nil, kvpb.NewError(err)
 	}
 	return br, nil
 }

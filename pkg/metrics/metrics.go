@@ -23,6 +23,9 @@ var (
 	TxnRetries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_retries_total", Help: "Retryable transaction errors surfaced to clients (40001s).",
 	})
+	TxnAmbiguousResends = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_txn_ambiguous_resends_total", Help: "Transactional batches re-sent because a leadership change left their proposal's fate unknown.",
+	})
 	TxnRefreshes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_refreshes_total", Help: "Successful read refreshes (restarts avoided).",
 	})
