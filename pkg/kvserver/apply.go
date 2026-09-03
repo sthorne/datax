@@ -431,6 +431,12 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				return nil, kvpb.NewError(err)
 			}
 			ru.ResolveIntent = &kvpb.ResolveIntentResponse{}
+		case *kvpb.UpdateMetaRequest:
+			applied, err := evalUpdateMeta(b, req, ts)
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.UpdateMeta = &kvpb.UpdateMetaResponse{Applied: applied}
 		case *kvpb.RollbackIntentRequest:
 			if err := storage.MVCCRollbackIntent(b, req.Key, req.TxnID, req.Sequence); err != nil {
 				return nil, kvpb.NewError(err)
@@ -648,4 +654,47 @@ func (c *intentCollector) err() error {
 		return nil
 	}
 	return &storage.WriteIntentError{Intents: c.intents}
+}
+
+// evalUpdateMeta applies an ordered range-addressing update: the record
+// at req.Key is replaced by req.Desc only if no record is there, the
+// record's generation is older, or it is the same range at the same
+// generation (an idempotent repeat); a delete (nil Desc) applies only
+// while the record still names req.IfRangeID at req.IfGeneration or
+// older. Evaluated at apply, in log order, so every replica agrees.
+func evalUpdateMeta(b *storage.Batch, req *kvpb.UpdateMetaRequest, ts hlc.Timestamp) (bool, error) {
+	raw, err := storage.MVCCGet(b, req.Key, maxTimestamp, storage.MVCCGetOptions{})
+	if err != nil {
+		return false, err
+	}
+	var existing *kvpb.RangeDescriptor
+	if raw != nil {
+		var d kvpb.RangeDescriptor
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return false, fmt.Errorf("corrupt meta record at %s: %w", req.Key, err)
+		}
+		existing = &d
+	}
+	if !metaUpdateApplies(existing, req) {
+		return false, nil
+	}
+	if req.Desc == nil {
+		return true, storage.MVCCDelete(b, req.Key, ts, nil)
+	}
+	val, err := json.Marshal(req.Desc)
+	if err != nil {
+		return false, err
+	}
+	return true, storage.MVCCPut(b, req.Key, ts, val, nil)
+}
+
+// metaUpdateApplies is evalUpdateMeta's rule, kept pure for tests.
+func metaUpdateApplies(existing *kvpb.RangeDescriptor, req *kvpb.UpdateMetaRequest) bool {
+	if req.Desc == nil {
+		return existing != nil && existing.RangeID == req.IfRangeID && existing.Generation <= req.IfGeneration
+	}
+	if existing == nil || existing.Generation < req.Desc.Generation {
+		return true
+	}
+	return existing.RangeID == req.Desc.RangeID && existing.Generation == req.Desc.Generation
 }

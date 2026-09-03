@@ -210,6 +210,17 @@ message UnfreezeRequest {
   RequestHeader header = 1;
 }
 
+// UpdateMetaRequest writes (or, with an empty desc, deletes) the range
+// addressing record at header.key, only if that advances the record's
+// generation — so a split's or merge's repair that lands after a later
+// operation's cannot resurrect stale addressing. Cluster version v4.
+message UpdateMetaRequest {
+  RequestHeader header = 1;
+  bytes desc = 2;          // JSON RangeDescriptor to store; empty = delete
+  int64 if_range_id = 3;   // delete only this range's record ...
+  int64 if_generation = 4; // ... at this generation or older
+}
+
 message RequestUnion {
   oneof value {
     GetRequest get = 1;
@@ -233,6 +244,7 @@ message RequestUnion {
     SubsumeRequest subsume = 17;
     UnfreezeRequest unfreeze = 18;
     ExportRequest export = 21;
+    UpdateMetaRequest update_meta = 22;
   }
 }
 
@@ -333,6 +345,10 @@ message SubsumeResponse {}
 
 message UnfreezeResponse {}
 
+message UpdateMetaResponse {
+  bool applied = 1; // false: a newer record was left in place
+}
+
 message ResponseUnion {
   oneof value {
     GetResponse get = 1;
@@ -356,6 +372,7 @@ message ResponseUnion {
     SubsumeResponse subsume = 17;
     UnfreezeResponse unfreeze = 18;
     ExportResponse export = 21;
+    UpdateMetaResponse update_meta = 22;
   }
 }
 

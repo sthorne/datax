@@ -388,6 +388,12 @@ func (n *Node) start() error {
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
 		WaitForApplication:      n.waitForApplication,
+		ClusterVersion: func() version.Version {
+			if cv := version.Version(n.clusterVersion.Load()); cv > 0 {
+				return cv
+			}
+			return version.V1 // not yet mirrored: assume the floor
+		},
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()

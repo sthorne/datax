@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // RaftTransport is the store's outbound Raft message channel, implemented
@@ -90,7 +91,11 @@ type StoreConfig struct {
 	// has been torn down everywhere else (see stageMerge). Implemented by
 	// pkg/server over the admin RPC; nil skips the check.
 	WaitForApplication func(ctx context.Context, nodeID base.NodeID, rangeID base.RangeID, index uint64) error
-	TestingKnobs       TestingKnobs
+	// ClusterVersion reports the finalized cluster version (the node's
+	// mirror), consulted before sending version-gated request shapes;
+	// nil reads as the binary's own version (single-binary processes).
+	ClusterVersion func() version.Version
+	TestingKnobs   TestingKnobs
 }
 
 // TestingKnobs are test-only hooks; all nil in production.
@@ -311,6 +316,15 @@ func (s *Store) addReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, 
 	s.mu.replicas[desc.RangeID] = r
 	s.mu.Unlock()
 	return r, true, nil
+}
+
+// orderedMetaUpdates reports whether range-addressing repairs may use
+// kvpb.UpdateMetaRequest (cluster version v4); before that, blind writes.
+func (s *Store) orderedMetaUpdates() bool {
+	if s.cfg.ClusterVersion == nil {
+		return true
+	}
+	return s.cfg.ClusterVersion() >= version.V4
 }
 
 // GetReplica returns the replica of the given range, if this store has one.

@@ -1091,7 +1091,7 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 	spans := make([]latchSpan, 0, len(ba.Requests))
 	for _, u := range ba.Requests {
 		switch r := u.GetInner().(type) {
-		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest:
+		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest, *kvpb.UpdateMetaRequest:
 		case *kvpb.GetRequest:
 			if !r.ForUpdate {
 				continue

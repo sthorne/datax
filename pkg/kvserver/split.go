@@ -80,7 +80,7 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	// Repair the addressing records (one batch, both on the meta range, so
 	// the update is atomic). Done outside the latch: if the split was on
 	// the meta-carrying range itself this would deadlock inside it.
-	if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), left, right); err != nil {
+	if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), left, right); err != nil {
 		// Routing still works via mismatch corrections; log and continue.
 		log.Warnf("%s: split committed but meta update failed: %v", r.rangeID, err)
 	}
@@ -89,9 +89,16 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 
 // putMetaRecords writes the /meta addressing records for the given
 // descriptors in one atomic batch (all meta keys live on the meta range).
-func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, descs ...kvpb.RangeDescriptor) error {
+// With ordered set, each write lands only if it advances the record's
+// generation (kvpb.UpdateMetaRequest); otherwise it is a blind put.
+func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, ordered bool, descs ...kvpb.RangeDescriptor) error {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: now}}
-	for _, d := range descs {
+	for i := range descs {
+		d := descs[i]
+		if ordered {
+			ba.Add(&kvpb.UpdateMetaRequest{RequestHeader: kvpb.RequestHeader{Key: keys.RangeMetaKey(d.EndKey)}, Desc: &d})
+			continue
+		}
 		raw, err := json.Marshal(d)
 		if err != nil {
 			return err

@@ -1,6 +1,7 @@
 package kvpb
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -313,6 +314,20 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		out.Value = &rpcpb.RequestUnion_Subsume{Subsume: &rpcpb.SubsumeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeInto: int64(r.MergeInto)}}
 	case *UnfreezeRequest:
 		out.Value = &rpcpb.RequestUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+	case *UpdateMetaRequest:
+		var desc []byte
+		if r.Desc != nil {
+			var err error
+			if desc, err = json.Marshal(r.Desc); err != nil {
+				return nil, err
+			}
+		}
+		out.Value = &rpcpb.RequestUnion_UpdateMeta{UpdateMeta: &rpcpb.UpdateMetaRequest{
+			Header:       reqHeaderToProto(r.RequestHeader),
+			Desc:         desc,
+			IfRangeId:    int64(r.IfRangeID),
+			IfGeneration: r.IfGeneration,
+		}}
 	default:
 		return nil, fmt.Errorf("unencodable request type %T", r)
 	}
@@ -435,6 +450,20 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		u.Subsume = &SubsumeRequest{RequestHeader: reqHeaderFromProto(v.Subsume.Header), MergeInto: base.RangeID(v.Subsume.MergeInto)}
 	case *rpcpb.RequestUnion_Unfreeze:
 		u.Unfreeze = &UnfreezeRequest{RequestHeader: reqHeaderFromProto(v.Unfreeze.Header)}
+	case *rpcpb.RequestUnion_UpdateMeta:
+		req := &UpdateMetaRequest{
+			RequestHeader: reqHeaderFromProto(v.UpdateMeta.Header),
+			IfRangeID:     base.RangeID(v.UpdateMeta.IfRangeId),
+			IfGeneration:  v.UpdateMeta.IfGeneration,
+		}
+		if len(v.UpdateMeta.Desc) > 0 {
+			var d RangeDescriptor
+			if err := json.Unmarshal(v.UpdateMeta.Desc, &d); err != nil {
+				return RequestUnion{}, fmt.Errorf("update_meta: corrupt descriptor: %w", err)
+			}
+			req.Desc = &d
+		}
+		u.UpdateMeta = req
 	default:
 		return u, fmt.Errorf("undecodable request union %T", p.Value)
 	}
@@ -556,6 +585,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		out.Value = &rpcpb.ResponseUnion_Subsume{Subsume: &rpcpb.SubsumeResponse{}}
 	case u.Unfreeze != nil:
 		out.Value = &rpcpb.ResponseUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeResponse{}}
+	case u.UpdateMeta != nil:
+		out.Value = &rpcpb.ResponseUnion_UpdateMeta{UpdateMeta: &rpcpb.UpdateMetaResponse{Applied: u.UpdateMeta.Applied}}
 	}
 	return out
 }
@@ -633,6 +664,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		u.Subsume = &SubsumeResponse{}
 	case *rpcpb.ResponseUnion_Unfreeze:
 		u.Unfreeze = &UnfreezeResponse{}
+	case *rpcpb.ResponseUnion_UpdateMeta:
+		u.UpdateMeta = &UpdateMetaResponse{Applied: v.UpdateMeta.Applied}
 	default:
 		return u, fmt.Errorf("undecodable response union %T", p.Value)
 	}
