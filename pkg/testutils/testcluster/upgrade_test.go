@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,7 +147,7 @@ func TestBinaryTooOldRestart(t *testing.T) {
 	tc, engines := StartWithEngines(t, 3)
 	tc.LeaderIndex(1)
 	// The first heartbeat mirrors the replicated version into each store.
-	waitForStoreVersionMirror(t, engines[2], "3")
+	waitForStoreVersionMirror(t, engines[2], strconv.Itoa(int(version.Current)))
 	tc.StopNode(2)
 	_, err := tc.RestartNodeErr(2, engines[2], func(c *server.Config) {
 		c.BinaryVersionOverride = version.V2
