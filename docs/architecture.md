@@ -119,7 +119,11 @@ SEND a gated shape below its introduction version. The first such shape
 is the reverse scan (`ScanRequest.Reverse`, introduced under **v3**): a
 v2 node would silently ignore the field and run a forward scan, so until
 the operator finalizes v3 the SQL layer transparently falls back to the
-pre-v3 plan (an in-memory sort).
+pre-v3 plan (an in-memory sort). The second is the ordered
+range-addressing repair (`UpdateMetaRequest`, introduced under **v4**):
+a v3 leader of the meta range does not know the request, so until v4 is
+finalized splits and merges repair `/meta` with the blind writes they
+always used.
 
 ## Modules
 

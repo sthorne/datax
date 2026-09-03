@@ -230,6 +230,25 @@ type SubsumeRequest struct {
 	MergeInto     base.RangeID `json:"merge_into"`
 }
 
+// UpdateMetaRequest writes the range addressing record at Key — or, with
+// a nil Desc, deletes it — only if that advances the record's generation.
+// Splits and merges repair addressing after they commit, outside any
+// latch, so two of them on the same key lineage can land in either
+// order; a blind put or delete from the earlier one could then overwrite
+// the later one's record with a range that no longer exists, and nothing
+// re-cleans /meta. Generations are strictly increasing along a lineage
+// (every split and merge takes max(inputs)+1), so "newer generation wins"
+// orders them. A delete is applied only while the record still names
+// IfRangeID at IfGeneration or older. Sent only once the cluster has
+// finalized v4 (older leaders do not know the request); before that the
+// blind writes are used. Issue #74.
+type UpdateMetaRequest struct {
+	RequestHeader
+	Desc         *RangeDescriptor `json:"desc,omitempty"`
+	IfRangeID    base.RangeID     `json:"if_range_id,omitempty"`
+	IfGeneration int64            `json:"if_generation,omitempty"`
+}
+
 // UnfreezeRequest clears a Subsume freeze (the merge was abandoned).
 type UnfreezeRequest struct {
 	RequestHeader // Key = start key, EndKey = end key
@@ -264,6 +283,7 @@ type RequestUnion struct {
 	AdminMerge          *AdminMergeRequest          `json:"admin_merge,omitempty"`
 	Subsume             *SubsumeRequest             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeRequest            `json:"unfreeze,omitempty"`
+	UpdateMeta          *UpdateMetaRequest          `json:"update_meta,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -311,6 +331,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Subsume
 	case u.Unfreeze != nil:
 		return u.Unfreeze
+	case u.UpdateMeta != nil:
+		return u.UpdateMeta
 	}
 	return nil
 }
@@ -345,6 +367,7 @@ func (h *AdminTransferLeaseRequest) Header() RequestHeader  { return h.RequestHe
 func (h *AdminMergeRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *SubsumeRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *UnfreezeRequest) Header() RequestHeader            { return h.RequestHeader }
+func (h *UpdateMetaRequest) Header() RequestHeader          { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -367,6 +390,7 @@ func (*AdminTransferLeaseRequest) Method() string  { return "AdminTransferLease"
 func (*AdminMergeRequest) Method() string          { return "AdminMerge" }
 func (*SubsumeRequest) Method() string             { return "Subsume" }
 func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
+func (*UpdateMetaRequest) Method() string          { return "UpdateMeta" }
 
 func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -389,6 +413,7 @@ func (*AdminTransferLeaseRequest) IsReadOnly() bool  { return false }
 func (*AdminMergeRequest) IsReadOnly() bool          { return false }
 func (*SubsumeRequest) IsReadOnly() bool             { return false }
 func (*UnfreezeRequest) IsReadOnly() bool            { return false }
+func (*UpdateMetaRequest) IsReadOnly() bool          { return false }
 
 // Response types.
 
@@ -497,6 +522,12 @@ type SubsumeResponse struct{}
 
 type UnfreezeResponse struct{}
 
+// UpdateMetaResponse reports whether the record was written (or deleted);
+// false means a newer record was left in place.
+type UpdateMetaResponse struct {
+	Applied bool `json:"applied"`
+}
+
 // ResponseUnion holds exactly one response.
 type ResponseUnion struct {
 	Get                 *GetResponse                 `json:"get,omitempty"`
@@ -520,6 +551,7 @@ type ResponseUnion struct {
 	AdminMerge          *AdminMergeResponse          `json:"admin_merge,omitempty"`
 	Subsume             *SubsumeResponse             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeResponse            `json:"unfreeze,omitempty"`
+	UpdateMeta          *UpdateMetaResponse          `json:"update_meta,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -570,7 +602,7 @@ func (b *BatchRequest) IsReadOnly() bool {
 func (b *BatchRequest) HasMVCCWrites() bool {
 	for _, u := range b.Requests {
 		switch r := u.GetInner().(type) {
-		case *PutRequest, *DeleteRequest, *IncrementRequest:
+		case *PutRequest, *DeleteRequest, *IncrementRequest, *UpdateMetaRequest:
 			return true
 		case *GetRequest:
 			if r.ForUpdate {
@@ -631,6 +663,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Subsume = t
 	case *UnfreezeRequest:
 		u.Unfreeze = t
+	case *UpdateMetaRequest:
+		u.UpdateMeta = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

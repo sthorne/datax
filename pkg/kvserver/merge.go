@@ -292,9 +292,8 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// its span to the same range ID, and the pass re-cleans.
 	sender := r.store.getSender()
 	if sender != nil {
-		if err := updateMetaRecords(ctx, sender, r.store.cfg.Clock.Now(),
-			[]kvpb.RangeDescriptor{trig.Merged},
-			[]keys.Key{keys.RangeMetaKey(trig.Left.EndKey)}); err != nil {
+		if err := updateMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(),
+			[]kvpb.RangeDescriptor{trig.Merged}, []kvpb.RangeDescriptor{trig.Left}); err != nil {
 			log.Warnf("%s: merge committed but meta update failed: %v", r.rangeID, err)
 		}
 	}
@@ -320,17 +319,31 @@ func (s *Store) tryUnfreeze(ctx context.Context, rhs *Replica) {
 }
 
 // updateMetaRecords writes and deletes /meta addressing records in one
-// atomic batch (all meta keys live on the meta range).
-func updateMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, puts []kvpb.RangeDescriptor, deletes []keys.Key) error {
+// atomic batch (all meta keys live on the meta range). deletes name the
+// descriptors whose records go (the pre-merge LHS): with ordered set the
+// delete applies only while the record still names that range at that
+// generation or older, and the puts only if they advance the record
+// (kvpb.UpdateMetaRequest); otherwise blind writes.
+func updateMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, ordered bool, puts, deletes []kvpb.RangeDescriptor) error {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: now}}
-	for _, d := range puts {
+	for i := range puts {
+		d := puts[i]
+		if ordered {
+			ba.Add(&kvpb.UpdateMetaRequest{RequestHeader: kvpb.RequestHeader{Key: keys.RangeMetaKey(d.EndKey)}, Desc: &d})
+			continue
+		}
 		raw, err := json.Marshal(d)
 		if err != nil {
 			return err
 		}
 		ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: keys.RangeMetaKey(d.EndKey)}, Value: raw})
 	}
-	for _, k := range deletes {
+	for _, d := range deletes {
+		k := keys.RangeMetaKey(d.EndKey)
+		if ordered {
+			ba.Add(&kvpb.UpdateMetaRequest{RequestHeader: kvpb.RequestHeader{Key: k}, IfRangeID: d.RangeID, IfGeneration: d.Generation})
+			continue
+		}
 		ba.Add(&kvpb.DeleteRequest{RequestHeader: kvpb.RequestHeader{Key: k}})
 	}
 	if _, kerr := sender.Send(ctx, ba); kerr != nil {

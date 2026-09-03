@@ -434,47 +434,68 @@ func (r *Replica) raftLoop(ctx context.Context) {
 }
 
 func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
-	// 1. Track leadership changes.
+	// 1. Track term and leadership changes. Raft keeps stepping messages
+	// while this loop works through a Ready, so a leadership interruption
+	// can complete entirely between two Readies — lost and regained, or
+	// transferred away and back — and the next Ready then carries NO
+	// SoftState (the soft state equals the last one this loop saw), only a
+	// higher HardState.Term. A raft leader never changes term without
+	// stepping down first, so a term advance on a replica that was and
+	// still is the leader means it was not the leader in between: entries
+	// proposed in the old term may have been truncated by the interim
+	// leader, so their proposers are answered (ambiguously) now instead of
+	// waiting out the client's deadline, and the interim leader may have
+	// served reads this replica knows nothing about, so the timestamp
+	// cache is bumped exactly as on any new leadership (issue #74).
+	var (
+		becameLeader, lostLeadership bool
+		term                         uint64
+		handoff                      *loadHandoff
+		pending                      []chan proposalResult
+	)
+	r.mu.Lock()
+	prevTerm := r.mu.term
+	if !raft.IsEmptyHardState(rd.HardState) && rd.HardState.Term > r.mu.term {
+		r.mu.term = rd.HardState.Term
+	}
+	term = r.mu.term
+	termAdvanced := term > prevTerm
+	self := uint64(r.replicaID)
+	wasLeader := r.mu.leader == self
+	isLeader := wasLeader
 	if rd.SoftState != nil {
-		r.mu.Lock()
-		if rd.HardState.Term > r.mu.term {
-			r.mu.term = rd.HardState.Term
-		}
-		term := r.mu.term
-		prevLeader := r.mu.leader
 		r.mu.leader = rd.SoftState.Lead
-		becameLeader := rd.SoftState.RaftState == raft.StateLeader && prevLeader != uint64(r.replicaID)
-		lostLeadership := prevLeader == uint64(r.replicaID) && rd.SoftState.RaftState != raft.StateLeader
-		var handoff *loadHandoff
-		if becameLeader {
-			handoff, r.mu.loadHandoff = r.mu.loadHandoff, nil
+		isLeader = rd.SoftState.RaftState == raft.StateLeader
+	}
+	becameLeader = isLeader && (!wasLeader || termAdvanced)
+	lostLeadership = wasLeader && (!isLeader || termAdvanced)
+	if becameLeader {
+		handoff, r.mu.loadHandoff = r.mu.loadHandoff, nil
+	}
+	if lostLeadership {
+		for id, ch := range r.mu.proposals {
+			pending = append(pending, ch)
+			delete(r.mu.proposals, id)
 		}
-		var pending []chan proposalResult
-		if lostLeadership {
-			for id, ch := range r.mu.proposals {
-				pending = append(pending, ch)
-				delete(r.mu.proposals, id)
-			}
-		}
-		r.mu.Unlock()
-		if becameLeader && term > 1 {
-			// A new leader cannot know what reads the old leader served:
-			// conservatively push all future writes above now. A term-1
-			// leader is the range's first ever — no prior reads exist, so
-			// fresh ranges (splits, bootstrap) skip the bump.
-			r.tsCache.Bump([]latchSpan{wholeRangeSpan}, r.store.cfg.Clock.Now(), uuid.Nil)
-		}
-		if becameLeader && handoff != nil {
-			// A lease transfer handed us the outgoing leader's measured
-			// rate: start warm instead of amnesiac (see loadHandoff).
-			r.load.seed(handoff.QPS, handoff.AtNanos)
-		}
-		for _, ch := range pending {
-			ch <- proposalResult{err: &kvpb.Error{
-				Message:   "leadership lost with proposal in flight",
-				Ambiguous: &kvpb.AmbiguousResultError{},
-			}}
-		}
+	}
+	r.mu.Unlock()
+	if becameLeader && term > 1 {
+		// A new leader cannot know what reads the old leader served:
+		// conservatively push all future writes above now. A term-1
+		// leader is the range's first ever — no prior reads exist, so
+		// fresh ranges (splits, bootstrap) skip the bump.
+		r.tsCache.Bump([]latchSpan{wholeRangeSpan}, r.store.cfg.Clock.Now(), uuid.Nil)
+	}
+	if becameLeader && handoff != nil {
+		// A lease transfer handed us the outgoing leader's measured
+		// rate: start warm instead of amnesiac (see loadHandoff).
+		r.load.seed(handoff.QPS, handoff.AtNanos)
+	}
+	for _, ch := range pending {
+		ch <- proposalResult{err: &kvpb.Error{
+			Message:   "leadership lost with proposal in flight",
+			Ambiguous: &kvpb.AmbiguousResultError{},
+		}}
 	}
 
 	// 2. Acknowledge the snapshot (state already installed out of band),
@@ -1070,7 +1091,7 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 	spans := make([]latchSpan, 0, len(ba.Requests))
 	for _, u := range ba.Requests {
 		switch r := u.GetInner().(type) {
-		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest:
+		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest, *kvpb.UpdateMetaRequest:
 		case *kvpb.GetRequest:
 			if !r.ForUpdate {
 				continue

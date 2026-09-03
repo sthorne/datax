@@ -10,12 +10,18 @@ It speaks the **PostgreSQL wire protocol**, so any Postgres client or driver
 works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 `database/sql`.
 
-> **Status: prototype (v2).** The core is real — MVCC storage with garbage
-> collection, Raft-replicated ranges with log truncation and size-based
-> auto-splitting, serializable distributed transactions with read refresh,
-> rack-aware placement with dead-node repair, secondary indexes, TLS +
-> SCRAM authentication, and Prometheus metrics — but this is not production
-> software. See [Limitations](#limitations).
+> **Status: prototype (cluster version v3).** The core is real — MVCC
+> storage with garbage collection and row-level retention, Raft-replicated
+> ranges with log truncation and automatic splitting and merging by size
+> and load, serializable distributed transactions with read refresh and
+> one-phase commit, rack-aware placement with dead-node repair and load
+> rebalancing, secondary indexes, a cost-based planner over table
+> statistics, sharded time-series tables with online re-sharding,
+> follower reads, encryption at rest with online key rotation, mutual TLS
+> + SCRAM with admin authorization and audit logging, consistent
+> backup/restore, rolling upgrades, and Prometheus metrics with a built-in
+> dashboard — but this is not production software. See
+> [Limitations](#limitations).
 
 ## Architecture at a glance
 
@@ -38,7 +44,14 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 
 - **Storage**: [Pebble](https://github.com/cockroachdb/pebble) LSM with
   multi-version concurrency control. Every value is versioned by a hybrid
-  logical clock (HLC) timestamp.
+  logical clock (HLC) timestamp. Per-node tuning profiles
+  (`--storage-profile balanced|ingest`); **encryption at rest**
+  (`--enc-key`: per-file data keys sealed under a store key, online store-key
+  rotation with the new key staged beside the old — `--enc-key old.key,new.key`
+  — and background re-encryption of files under retired keys); and write
+  **backpressure** that sheds table-data writes with a retryable error when
+  the leader's engine, or any follower's, is overloaded, plus a latched
+  compaction-debt gate with hysteresis.
 - **Replication**: the keyspace is split into **ranges**; each range is an
   independent [etcd Raft](https://github.com/etcd-io/raft) consensus group
   (multi-raft). Writes commit only once a quorum has them on disk.
@@ -47,33 +60,51 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   many ranges it touched. Serializable isolation. Multi-range writes fan
   out to their ranges in parallel; a single-range implicit transaction
   commits in **one raft proposal** (one-phase commit — no record, no
-  intents).
+  intents). Current-time reads are served by the leader (lease-based
+  ReadIndex); `AS OF SYSTEM TIME` — an exact timestamp or
+  `with_max_staleness('10s')` — is served by any replica whose closed
+  timestamp covers it (**follower reads**).
 - **Placement**: nodes declare a locality (`--locality=region=r1,rack=a`);
   the allocator maximizes diversity across failure domains, so losing a rack
   never loses more than one replica of a range.
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes and
-  ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY and aggregates,
-  transactions, joins up to 8 tables, GROUP BY — including over joins,
-  correlated subqueries to 4 levels, EXPLAIN, ANALYZE with a cost-based
-  planner over table statistics) over ten column types
-  including exact DECIMAL and JSONB with `->`/`->>` extraction, served
-  over the Postgres wire protocol with TLS + SCRAM-SHA-256
-  authentication in secure mode.
+  ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY — DESC via
+  reverse scans — and aggregates, transactions, joins up to 8 tables,
+  GROUP BY — including over joins, correlated subqueries to 4 levels,
+  `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
+  cost-based planner — a background sampler keeps statistics fresh) over
+  ten column types including exact DECIMAL and JSONB with `->`/`->>`
+  extraction and `@>` containment, served over the Postgres wire protocol
+  with TLS + SCRAM-SHA-256 authentication in secure mode.
+- **Time-series tables**: `CREATE TABLE ... WITH (timeseries = true,
+  retention = '7d', shards = 8)` — age-based expiry with no SQL DELETEs,
+  a hidden hash-shard column that spreads the write hot tail across
+  ranges, ordered fan-out across shards, and an **online re-shard**
+  (`ALTER TABLE ... SET (shards = 16)`) that rebuilds the layout and its
+  secondary indexes under live ingest, keeping the retired layout for
+  historical reads until a janitor reclaims it.
 - **Operations**: leader-driven housekeeping per range — MVCC garbage
-  collection, raft log truncation, size-based splitting and merging —
-  plus dead-node repair, load rebalancing, decommission,
-  consistent cluster backup/restore (full + incremental, `datax backup` /
+  collection, raft log truncation, splitting and merging by size and
+  load — plus dead-node repair, load rebalancing (count, bytes, and lease
+  shedding), decommission, a paced replica consistency sweep, consistent
+  cluster backup/restore (full + incremental, `datax backup` /
   `datax restore`), rolling upgrades with an explicit finalize
-  (`datax debug upgrade`), `datax bench`, and
-  a built-in observability dashboard with `/metrics` + `/status` + `/api/cluster`
-  + `/api/range` endpoints (`--http-listen`; the dashboard at `/` is
+  (`datax debug upgrade`), the `datax debug` toolbox (split, merge,
+  transfer-lease, rebalance, status, metadata, unsafe-recover,
+  rotate-enc-key, reencrypt), `datax bench`, and a built-in
+  observability dashboard with `/metrics` + `/status` + `/api/cluster` +
+  `/api/range` endpoints (`--http-listen`; the dashboard at `/` is
   read-only and self-contained, with cross-node range drill-down over
-  internode RPC; in secure mode every endpoint requires HTTP Basic
-  credentials of any database user — Prometheus `basic_auth` — or a
-  CA-verified client certificate, the drill-down and all state-changing
-  admin RPCs require the admin role, and security-relevant actions are
-  audit-logged with their principal; insecure mode stays open like
-  pgwire trust auth).
+  internode RPC).
+- **Security**: `--certs-dir` turns on mutual internode TLS and SQL TLS +
+  SCRAM. Internode RPCs accept only the node certificate; the admin RPC
+  authenticates operators by client certificate, and state-changing ops
+  (and the dashboard drill-down) require the admin role (`root`, or
+  `GRANT ADMIN`). Every HTTP endpoint takes HTTP Basic credentials of any
+  database user — Prometheus `basic_auth` — or a client certificate.
+  Authentication failures, denied and executed admin ops, and privilege
+  DDL are audit-logged with their principal. Insecure mode stays open,
+  like pgwire trust auth.
 
 **User documentation** — installing, deploying, securing, and operating a
 cluster, plus the SQL reference and a differences-from-PostgreSQL guide —
@@ -130,10 +161,14 @@ datax start --dir data3 --listen :26259 --pg-listen :26435 --join 127.0.0.1:2625
 
 Once three nodes are up, every range is automatically replicated 3× with one
 replica per rack. Add `--certs-dir` (after `datax cert create-ca` /
-`create-node`) for mutual internode TLS and SQL TLS + SCRAM, and
+`create-node`) for mutual internode TLS and SQL TLS + SCRAM,
 `--http-listen :8080` for the observability dashboard (Prometheus `/metrics`, JSON `/status` and
-`/api/cluster`, and a self-contained web UI at `/`).
-Benchmark with `datax bench kv|bank`; on the in-process demo the kv
+`/api/cluster`, and a self-contained web UI at `/`), `--enc-key store.key`
+for encryption at rest, and `--storage-profile ingest` on append-heavy
+nodes. `datax sql` is a built-in client for scripts; `datax backup` /
+`datax restore` and `datax debug` cover day-2 operations
+([operations guide](docs/user/operations.md)).
+Benchmark with `datax bench kv|bank|ingest`; on the in-process demo the kv
 workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
 ## Limitations
@@ -150,8 +185,8 @@ This is a prototype. Out of scope so far, deliberately:
 | Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only — cross-node dashboard drill-down, per-endpoint HTTP authorization, and audit logging of admin ops/auth failures/privilege DDL are all in) |
 | Upgrades | skipping versions (adjacent-version rolls only) or auto-finalize (the version bump is a deliberate `datax debug upgrade`; before it, binaries roll back freely — after it, never) |
 | Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
-| Encryption | key escrow / HSM integration (keys live in process memory; online store-key rotation and on-demand background re-encryption of retired-key files are in — a stale sstable spanning a single user key still waits for natural churn) |
-| Storage | debt-gate thresholds are first-cut constants (quorum-health shedding via raft-piggybacked follower verdicts, and a latched compaction-debt gate with hysteresis, are in — per-cause counters tell them apart) |
+| Encryption | key escrow / HSM integration (keys live in process memory; the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; background re-encryption of retired-key files is in, and a stale sstable spanning a single user key still waits for natural churn) |
+| Storage | debt-gate thresholds are first-cut constants (quorum-health shedding via raft-piggybacked follower verdicts — an overloaded verdict holds until the follower reports healthy again — and a latched compaction-debt gate with hysteresis are in; per-cause counters tell them apart) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |
 
 ## License

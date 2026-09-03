@@ -105,7 +105,7 @@ func (r *Replica) adminChangeReplicas(ctx context.Context, req *kvpb.AdminChange
 		desc = newDesc
 	}
 
-	if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), desc); err != nil {
+	if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), desc); err != nil {
 		log.Warnf("%s: replica change committed but meta update failed: %v", r.rangeID, err)
 	}
 	return &kvpb.AdminChangeReplicasResponse{Desc: desc}, nil

@@ -45,9 +45,14 @@ const (
 	// ignores the field and runs a forward scan, so reverse scans are
 	// sent only once the cluster has finalized v3 (rule 4).
 	V3 Version = 3
+	// V4 introduces ordered range-addressing repair
+	// (kvpb.UpdateMetaRequest): a v3 leader of the meta range does not
+	// know the request, so splits and merges keep repairing /meta with
+	// blind writes until the cluster has finalized v4 (rule 4).
+	V4 Version = 4
 
 	// Current is the newest cluster version this binary can run.
-	Current = V3
+	Current = V4
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

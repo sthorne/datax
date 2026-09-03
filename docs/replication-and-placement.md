@@ -36,8 +36,15 @@ leaseholder = Raft leader.
 (`datax debug split <key>`): the split is proposed as a replicated command;
 at apply time each replica atomically writes both descriptors and creates
 the right-hand side's Raft state. No data moves, because range membership
-of a key is logical. The `/meta/` addressing records are then updated
-transactionally.
+of a key is logical. The `/meta/` addressing records are then repaired
+in one batch, after the split commits and outside its latch. Repairs
+from a split and a merge on the same key lineage can land in either
+order, so each is **ordered by descriptor generation** (cluster version
+v4, `UpdateMetaRequest`): a record is replaced only by a newer
+generation, and a merge's delete of the old left-hand record applies
+only while that record still names the range it meant to remove — a
+late repair can no longer resurrect a range that no longer exists and
+send every lookup into "no replica" until it gives up.
 
 **Merges** are the inverse: when a range and its right neighbor are both
 below the merge threshold (default: a quarter of the split threshold) and
