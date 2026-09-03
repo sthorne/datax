@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test test-race vet fmt-check proto lint all
+.PHONY: build test test-race vet fmt fmt-check proto lint all
 
 all: build
 
@@ -15,6 +15,13 @@ test-race:
 
 vet:
 	$(GO) vet ./...
+
+# Format with gofmt, never goimports: goimports regroups the imports of the
+# generated *.pb.go files (std library first), which `make proto` then flips
+# back to protoc-gen-go's order — a spurious diff either way. The generated
+# files are canonical as committed; `make proto` is a no-op on them.
+fmt:
+	gofmt -l -s -w $$(git ls-files '*.go' | grep -v '\.pb\.go$$')
 
 fmt-check:
 	@out=$$(gofmt -l -s .); if [ -n "$$out" ]; then echo "gofmt needed on:"; echo "$$out"; exit 1; fi

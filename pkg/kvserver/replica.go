@@ -217,9 +217,10 @@ func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *ra
 	return cfg
 }
 
-// newReplica loads or creates the replica and starts its Raft group.
-// bootstrap must be true exactly once per replica lifetime — when the range
-// is first created with its initial membership.
+// newReplica loads or creates the replica and its Raft group; the Ready
+// loop starts with startRaftLoop, once the store holds the replica (see
+// Store.startReplica). bootstrap must be true exactly once per replica
+// lifetime — when the range is first created with its initial membership.
 func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
 	rs, err := newRaftStorage(s.cfg.Engine, desc.RangeID, desc)
 	if err != nil {
@@ -267,11 +268,20 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 		r.node = raft.RestartNode(cfg)
 	}
 
-	if err := s.cfg.Stopper.RunWorker(r.raftLoop); err != nil {
-		r.node.Stop()
-		return nil, err
-	}
 	return r, nil
+}
+
+// startRaftLoop starts the replica's Ready-processing goroutine. Separate
+// from construction so a restart can load every replica before any of
+// them applies: a replayed merge looks its RHS up in the store map, and
+// an LHS loop that started before its sibling was loaded would find it
+// missing and fatal the node (issue #70).
+func (r *Replica) startRaftLoop() error {
+	if err := r.store.cfg.Stopper.RunWorker(r.raftLoop); err != nil {
+		r.node.Stop()
+		return err
+	}
+	return nil
 }
 
 // Desc returns the replica's current view of the range descriptor.
@@ -310,6 +320,10 @@ func (r *Replica) AppliedIndex() uint64 {
 	defer r.mu.Unlock()
 	return r.mu.appliedIndex
 }
+
+// TestingRaftStopped is closed once the replica's raft loop has exited.
+// Test hook.
+func (r *Replica) TestingRaftStopped() <-chan struct{} { return r.stoppedCh }
 
 // IsLeader reports whether this replica believes it is the Raft leader.
 func (r *Replica) IsLeader() bool { return r.isLeader() }
@@ -399,10 +413,15 @@ func (r *Replica) raftLoop(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				if errors.Is(err, errApplyAborted) {
+				if err == errApplyAborted {
 					// Clean shutdown interleaved with a merge apply: nothing
 					// was applied; the restart replays the entry (issue #61).
 					log.Infof("%s/%d: apply aborted by shutdown; entry replays after restart", r.rangeID, r.replicaID)
+				} else if errors.Is(err, errApplyAborted) {
+					// Aborted without a shutdown (a dead local RHS at merge
+					// apply, issue #70): nothing was applied, and this
+					// replica is out of service until the node restarts.
+					log.Warnf("%s/%d: %v", r.rangeID, r.replicaID, err)
 				} else {
 					log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
 				}
@@ -910,7 +929,9 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			// set sheds too — a sick follower otherwise lags raft silently
 			// until it needs a catch-up snapshot (or the range quietly
 			// rides one node from quorum loss). Verdicts are piggybacked
-			// on raft traffic; absent/stale ones read as healthy.
+			// on raft traffic; an absent one reads as healthy, an
+			// overloaded one holds until the peer reports healthy again
+			// (a stalled follower sends nothing — see node_health.go).
 			desc := r.Desc()
 			for _, rep := range desc.Replicas {
 				if rep.NodeID == r.store.cfg.NodeID {

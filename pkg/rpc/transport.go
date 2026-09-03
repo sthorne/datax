@@ -46,9 +46,11 @@ type Transport struct {
 
 	// healthProv supplies this node's storage-health snapshot, piggybacked
 	// on outgoing raft envelopes (refreshed at most every healthCacheFor).
+	// The cached snapshot and its timestamp travel as ONE pointer so a
+	// racing reader can never pair a fresh snapshot with a stale stamp or
+	// vice versa.
 	healthProv  atomic.Pointer[func() *rpcpb.StorageHealth]
-	healthCache atomic.Pointer[rpcpb.StorageHealth]
-	healthAt    atomic.Int64
+	healthCache atomic.Pointer[cachedHealth]
 
 	mu struct {
 		sync.Mutex
@@ -88,19 +90,24 @@ func (t *Transport) SetHealthProvider(fn func() *rpcpb.StorageHealth) {
 	t.healthProv.Store(&fn)
 }
 
+// cachedHealth is one health snapshot with the time it was taken.
+type cachedHealth struct {
+	health *rpcpb.StorageHealth
+	at     int64 // unix nanos
+}
+
 func (t *Transport) health() *rpcpb.StorageHealth {
 	p := t.healthProv.Load()
 	if p == nil {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	if h := t.healthCache.Load(); h != nil && now-t.healthAt.Load() < int64(healthCacheFor) {
-		return h
+	if c := t.healthCache.Load(); c != nil && now-c.at < int64(healthCacheFor) {
+		return c.health
 	}
 	h := (*p)()
 	if h != nil {
-		t.healthCache.Store(h)
-		t.healthAt.Store(now)
+		t.healthCache.Store(&cachedHealth{health: h, at: now})
 	}
 	return h
 }

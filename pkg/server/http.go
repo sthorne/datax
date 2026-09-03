@@ -87,6 +87,11 @@ func (n *Node) startHTTP() error {
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_storage_debt_gate", Help: "1 while the compaction-debt backpressure gate is latched (hysteresis: enters above the profile's high-water debt, exits below the low).",
 			}, func() float64 {
+				// The latch is re-evaluated on snapshot refresh, and refreshes
+				// otherwise ride write/raft traffic — an idle node would report
+				// its last latched value forever. StorageMetrics refreshes at
+				// most once per second, so scraping is rate-limited by design.
+				_ = eng.StorageMetrics()
 				if eng.DebtGated() {
 					return 1
 				}

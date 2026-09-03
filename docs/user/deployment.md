@@ -85,8 +85,13 @@ datax debug rotate-enc-key --addr 10.0.0.1:26257 \
 ```
 
 Rotation re-wraps the data keys atomically and re-seals the metadata
-backup (fast — nothing is re-encrypted); update the node's `--enc-key`
-path before its next restart. The request carries the store keys, so
+backup (fast — nothing is re-encrypted). Stage the new key first:
+`--enc-key` takes a comma-separated list of key files and the node opens
+with whichever one matches the store, so a node started (or set to
+restart) with `--enc-key store.key,store-v2.key` survives a restart on
+either side of the rotation; drop the old file afterwards. Without the
+staging, a restart between the rotation and the key-file swap cannot
+open the store. The request carries the store keys, so
 online rotation is served only over mutual TLS (a secure cluster); on an
 insecure cluster, and for damaged stores, use the offline form
 (`--dir /var/lib/datax`, node stopped).

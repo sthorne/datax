@@ -110,6 +110,15 @@ type TestingKnobs struct {
 	// OverrideReplicaQPS injects a per-range request rate (trusted as
 	// mature) — lets tests drive load splits without real traffic.
 	OverrideReplicaQPS func(base.RangeID) (float64, bool)
+	// FailApply, when it returns an error for a committed entry, makes the
+	// replica's raft loop exit through its generic error branch without
+	// applying it — a simulated fatal ready-handling failure that leaves
+	// the replica in the store map with a frozen applied index.
+	FailApply func(rangeID base.RangeID, index uint64) error
+	// SkipMergeConfirmation disables the merge driver's pre-propose check
+	// that every RHS replica applied the subsume, exposing the apply-time
+	// wait to an RHS replica that never will (issue #70).
+	SkipMergeConfirmation bool
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store
@@ -211,22 +220,37 @@ func LoadLocalRangeDescriptors(eng *storage.Engine) ([]kvpb.RangeDescriptor, err
 }
 
 // LoadReplicas restarts the Raft groups for every replica found on disk
-// (called once at node startup).
+// (called once at node startup). Every replica is loaded into the store
+// before any Ready loop starts: replicas apply entries that refer to
+// their neighbours — a merge replayed after a restart looks its RHS up
+// in the store map — and descriptors load in range-ID order, so an LHS
+// started first could replay a merge before its RHS existed and fatal
+// the node.
 func (s *Store) LoadReplicas() error {
 	descs, err := LoadLocalRangeDescriptors(s.cfg.Engine)
 	if err != nil {
 		return err
 	}
+	var loaded []*Replica
 	for _, desc := range descs {
 		rep, ok := desc.GetReplica(s.cfg.NodeID)
 		if !ok {
 			log.Warnf("%s: descriptor on disk but this node is not a member; skipping", desc.RangeID)
 			continue
 		}
-		if _, err := s.startReplica(desc, rep.ReplicaID, false /* bootstrap */); err != nil {
+		r, created, err := s.addReplica(desc, rep.ReplicaID, false /* bootstrap */)
+		if err != nil {
 			return err
 		}
+		if created {
+			loaded = append(loaded, r)
+		}
 		log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
+	}
+	for _, r := range loaded {
+		if err := r.startRaftLoop(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -250,22 +274,43 @@ func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Repli
 	return s.startReplica(desc, rep.ReplicaID, bootstrap)
 }
 
+// startReplica adds the replica to the store (or returns the existing one)
+// and starts its raft loop.
 func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
+	r, created, err := s.addReplica(desc, replicaID, bootstrap)
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		if err := r.startRaftLoop(); err != nil {
+			s.mu.Lock()
+			delete(s.mu.replicas, desc.RangeID)
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+// addReplica constructs the replica and enters it into the store map
+// WITHOUT starting its raft loop; created reports whether this call made
+// it (false: the store already held one, which is returned).
+func (s *Store) addReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (r *Replica, created bool, err error) {
 	s.mu.Lock()
 	if existing, ok := s.mu.replicas[desc.RangeID]; ok {
 		s.mu.Unlock()
-		return existing, nil
+		return existing, false, nil
 	}
 	s.mu.Unlock()
 
-	r, err := newReplica(s, desc, replicaID, bootstrap)
+	r, err = newReplica(s, desc, replicaID, bootstrap)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.mu.Lock()
 	s.mu.replicas[desc.RangeID] = r
 	s.mu.Unlock()
-	return r, nil
+	return r, true, nil
 }
 
 // GetReplica returns the replica of the given range, if this store has one.

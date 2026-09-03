@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -247,7 +248,7 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// merge apply forever, wedging its raft loop. Confirming application
 	// here keeps the RHS group alive until every member has caught up;
 	// a straggler defers the merge, which housekeeping re-drives.
-	if wait := r.store.cfg.WaitForApplication; wait != nil {
+	if wait := r.store.cfg.WaitForApplication; wait != nil && !r.store.cfg.TestingKnobs.SkipMergeConfirmation {
 		wctx, cancel := context.WithTimeout(ctx, mergeApplicationWait)
 		defer cancel()
 		for _, rep := range rhsDesc.Replicas {
@@ -342,9 +343,10 @@ func updateMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, pu
 // quiesce its group, and absorb its span, size, and GC threshold into the
 // staged batch. Returns a deterministic error (the merge no-ops everywhere)
 // when the LHS generation moved between propose and apply, and the
-// NON-deterministic errApplyAborted when the node shuts down mid-wait —
-// the caller then abandons the apply without advancing the applied index,
-// so the restart replays the merge instead of skipping it.
+// NON-deterministic errApplyAborted when the node shuts down mid-wait or
+// the local RHS's raft loop is dead short of the subsume — the caller then
+// abandons the apply without advancing the applied index, so the restart
+// replays the merge instead of skipping it.
 func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeTrigger) error {
 	if r.Desc().Generation != trig.Left.Generation {
 		return kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
@@ -361,16 +363,34 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 	// the subsume index (its final command). The driver confirmed every
 	// RHS replica had applied it before proposing the merge (adminMerge),
 	// so on a live node this loop normally passes at once; it still
-	// covers a replica whose RHS is re-applying after a restart. During
-	// node shutdown it must NOT spin: the RHS's raft loop may have exited
-	// before applying the subsume, and spinning here wedges this
-	// replica's raft loop and, with it, Stop() itself (issue #61). Abort
-	// instead; the applied index stays put and the restart replays this
+	// covers a replica whose RHS is re-applying after a restart. It must
+	// NOT spin when nothing can advance the RHS any more: during node
+	// shutdown (the RHS's raft loop may have exited before applying the
+	// subsume; spinning wedges this replica's raft loop and, with it,
+	// Stop() itself — issue #61), and when the RHS's raft loop died on
+	// its own through an error, which leaves the replica in the store map
+	// with its applied index frozen until a restart (issue #70). Both
+	// abort: the applied index stays put and the restart replays this
 	// command, waiting again with a live RHS group.
+wait:
 	for rhs.AppliedIndex() < trig.RightAppliedIndex {
 		select {
 		case <-ctx.Done():
 			return errApplyAborted
+		case <-rhs.stoppedCh:
+			if ctx.Err() != nil {
+				return errApplyAborted
+			}
+			// A merge is the only thing that detaches a live RHS, and this
+			// is that merge — so the loop exited through an error. It may
+			// have applied the subsume first; only a stop short of it is
+			// fatal to this apply.
+			if rhs.AppliedIndex() >= trig.RightAppliedIndex {
+				break wait
+			}
+			return &applyAbortedError{msg: fmt.Sprintf(
+				"%s: merge apply aborted: local RHS %s raft loop stopped at applied index %d, short of the subsume index %d; this replica is out of service until a restart replays the merge",
+				r.rangeID, trig.Right.RangeID, rhs.AppliedIndex(), trig.RightAppliedIndex)}
 		default:
 		}
 		time.Sleep(2 * time.Millisecond)

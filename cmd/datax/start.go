@@ -49,7 +49,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
 	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
-	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext)")
+	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.Float64Var(&f.shedFactor, "lease-shed-factor", 0, "leader-QPS multiple of the cluster mean at which a node sheds hot leases (0 = default 1.5)")
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")

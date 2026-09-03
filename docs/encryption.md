@@ -80,10 +80,23 @@ Details that matter for correctness and confidentiality:
   file contents are untouched, so rotation is O(registry), not
   O(store). The request carries both store keys, so the op is served
   only over mutual TLS: on an insecure cluster it is refused, and the
-  offline mode (`--dir`, node stopped) is the way to rotate. Restart the
-  node with `--enc-key new.key` afterwards (the node logs a reminder
-  that the old key file is now stale). The offline mode also remains
-  for damaged stores.
+  offline mode (`--dir`, node stopped) is the way to rotate. One
+  rotation runs at a time on a node: the registry reseal, the key swap
+  and the backup reseal are serialized end to end, so two overlapping
+  rotations cannot leave the registry and the backup under different
+  keys. The offline mode also remains for damaged stores.
+
+  **Stage the new key before rotating.** `--enc-key` accepts a
+  comma-separated list of key files; at startup the node tries each
+  against the store's registry and opens with the one that matches
+  (`datax debug metadata` and `unsafe-recover` accept the same list).
+  So the safe sequence is: write `new.key`, restart (or, for a running
+  node, plan the next restart) with `--enc-key store.key,new.key`,
+  rotate online, and retire `store.key` at leisure — a crash or a
+  supervisor restart anywhere in that window finds a key that opens the
+  store. After a rotation the node logs which of its key files holds
+  the new key, or a warning that none does (then a restart before the
+  file is added fails with "none of the store keys given matches").
 
 - **Background re-encryption** retires old-data-key exposure on cold
   data. `datax debug reencrypt --addr ... [--wait]` starts a paced pass
@@ -96,17 +109,29 @@ Details that matter for correctness and confidentiality:
   WAL, MANIFEST, and OPTIONS are recreated under the fresh active key at
   every open.
 
-  Manual compaction is by key range, so a stale file's cost is the
-  on-disk size of its span across all levels (a pre-shutdown flush file
-  can span the whole keyspace); the burst budget counts that estimate,
-  and `rewritten_bytes_total` reports it. A file a compaction cannot
-  rewrite (a single-user-key file, a local-key-only file already at the
-  bottom level) is attempted once per run and then skipped, so it never
-  starves the files behind it; the worker stops when nothing more can
-  be rewritten and logs what remains — those files retire with natural
-  churn. `--wait` follows the worker and exits non-zero if bytes remain
-  or the stale-file sweep failed; a status carrying `sweep_error`
-  attests nothing (its counts are the last good reading).
+  Manual compaction is by key range, not by file, and Pebble takes as
+  inputs every file overlapping the span at every level, so what a
+  stale file costs is set by the span compacted. An L0 file's span is
+  unbounded — a small pre-shutdown flush of scattered writes covers
+  most of the keyspace, and compacting its own bounds rewrote 30 MiB of
+  a 63 MiB store to retire one 21 KiB file — so L0 files are compacted
+  by the *narrowest* span that overlaps them, their smallest key
+  through the seed: a single column, the file with its Lbase overlap
+  and then one file per level below (Pebble splits compaction outputs
+  at the next level's target size and grandparent overlap). Files below
+  L0 are bounded by construction and are compacted by their own bounds,
+  which retires their stale neighbours in the same compaction. The
+  burst budget and `rewritten_bytes_total` count what Pebble actually
+  wrote during each compaction, from its compacted-bytes counters, so
+  they include any background compaction that happened to run at the
+  same time. A file a compaction cannot rewrite (a single-user-key file,
+  a local-key-only file already at the bottom level) is attempted once
+  per run and then skipped, so it never starves the files behind it;
+  the worker stops when nothing more can be rewritten and logs what
+  remains — those files retire with natural churn. `--wait` follows the
+  worker and exits non-zero if bytes remain or the stale-file sweep
+  failed; a status carrying `sweep_error` attests nothing (its counts
+  are the last good reading).
 
   Mechanically, each stale file's compaction is *seeded* with a Pebble
   point tombstone at `smallest + 0x00` — provably not a valid MVCC key
@@ -152,6 +177,6 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
 - Keys live in memory unprotected (no mlock/HSM integration).
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
-- After an online rotation the node's `--enc-key` file must be updated
-  before its next restart (the node does not rewrite the operator's key
-  file).
+- The node never rewrites the operator's key file: after an online
+  rotation, a restart needs the new key in one of the `--enc-key`
+  files (stage it beforehand, see Key rotation).
