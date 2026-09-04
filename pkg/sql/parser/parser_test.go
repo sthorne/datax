@@ -632,3 +632,49 @@ func TestParseDatabases(t *testing.T) {
 		t.Fatalf("current_database(): %v", err)
 	}
 }
+
+// TestParseReturningAndOnConflict: RETURNING on every write, the ON
+// CONFLICT forms, and UPSERT INTO.
+func TestParseReturningAndOnConflict(t *testing.T) {
+	ins := parseOne(t, `INSERT INTO t (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET v = excluded.v, n = t.n + 1 WHERE t.n < 5 RETURNING id, v AS val, *`).(*Insert)
+	oc := ins.OnConflict
+	if oc == nil || len(oc.Columns) != 1 || oc.Columns[0] != "id" || oc.DoNothing || len(oc.Set) != 2 ||
+		oc.Set[0].Column != "v" || oc.Set[0].Value.Column != "excluded.v" || oc.Set[1].Value.BinOp != "+" || len(oc.Where) != 1 {
+		t.Fatalf("on conflict: %+v", oc)
+	}
+	if len(ins.Returning) != 3 || ins.Returning[0].Expr.Column != "id" || ins.Returning[1].Alias != "val" || !ins.Returning[2].Star {
+		t.Fatalf("returning: %+v", ins.Returning)
+	}
+	ins = parseOne(t, `INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING`).(*Insert)
+	if ins.OnConflict == nil || !ins.OnConflict.DoNothing || ins.OnConflict.Columns != nil || ins.Returning != nil {
+		t.Fatalf("do nothing: %+v", ins.OnConflict)
+	}
+	ins = parseOne(t, `INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET v = 2`).(*Insert)
+	if ins.OnConflict == nil || ins.OnConflict.Constraint != "t_pkey" || len(ins.OnConflict.Set) != 1 {
+		t.Fatalf("on constraint: %+v", ins.OnConflict)
+	}
+	ins = parseOne(t, `UPSERT INTO t (id, v) VALUES (1, 'a') RETURNING id`).(*Insert)
+	if !ins.Upsert || len(ins.Returning) != 1 {
+		t.Fatalf("upsert: %+v", ins)
+	}
+	up := parseOne(t, `UPDATE t SET v = 'b' WHERE id = 1 RETURNING v, id * 2 doubled`).(*Update)
+	if len(up.Returning) != 2 || up.Returning[1].Alias != "doubled" {
+		t.Fatalf("update returning: %+v", up.Returning)
+	}
+	del := parseOne(t, `DELETE FROM t WHERE id = 1 RETURNING *`).(*Delete)
+	if len(del.Returning) != 1 || !del.Returning[0].Star {
+		t.Fatalf("delete returning: %+v", del.Returning)
+	}
+	if n := CountParams(parseOne(t, `INSERT INTO t VALUES ($1) ON CONFLICT (id) DO UPDATE SET v = $2 WHERE t.n > $3 RETURNING v || $4`)); n != 4 {
+		t.Fatalf("params: %d", n)
+	}
+	for _, bad := range []string{
+		`INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET v = 2`, // DO UPDATE needs a target
+		`INSERT INTO t VALUES (1) ON CONFLICT (id) DO`,
+		`UPSERT INTO t VALUES (1) ON CONFLICT DO NOTHING`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("no error for %q", bad)
+		}
+	}
+}

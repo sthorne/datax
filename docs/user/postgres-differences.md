@@ -12,7 +12,6 @@ syntax error or `0A000` feature not supported):
 | Missing | Workaround |
 |---|---|
 | `OFFSET` | paginate by key: `WHERE id > $last ORDER BY id LIMIT n` (faster anyway) |
-| `RETURNING` | `SELECT` after the write, in the same transaction |
 | Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`, `array_to_string()`, `pg_size_pretty()` and the catalog functions tools call ([list](sql.md#reading)) — SQLSTATE `42883` | compute client-side |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` **is supported**) | merge client-side |
 | `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
@@ -71,6 +70,12 @@ syntax error or `0A000` feature not supported):
   chunks committed — the error names the failing row and how many rows
   were already committed. For the same reason COPY is refused inside
   `BEGIN` (SQLSTATE `25001`) and only the `FORMAT` option is accepted.
+- **`ON CONFLICT`** works on the primary key and unique indexes (by
+  columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
+  NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
+  change a primary-key column, and there is no `ON CONFLICT ... DO
+  UPDATE` over exclusion constraints (there are none). `UPSERT INTO`
+  (CockroachDB syntax) is the primary-key shorthand.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
   inside a transaction block.

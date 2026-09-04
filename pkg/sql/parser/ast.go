@@ -136,6 +136,30 @@ type Insert struct {
 	Table   string
 	Columns []string // empty = all columns in order
 	Rows    [][]Expr
+	// OnConflict is the ON CONFLICT clause; Upsert marks UPSERT INTO
+	// (ON CONFLICT (primary key) DO UPDATE SET every target column).
+	OnConflict *OnConflict
+	Upsert     bool
+	// Returning is the RETURNING list (nil = none): expressions over the
+	// written row, "*" for every visible column.
+	Returning []SelectExpr
+}
+
+// OnConflict is ON CONFLICT [(cols) | ON CONSTRAINT name] DO NOTHING |
+// DO UPDATE SET ... [WHERE ...]. In Set values and Where, "excluded.col"
+// names the row proposed for insertion.
+type OnConflict struct {
+	Columns    []string // the conflict target's columns (nil with Constraint or none)
+	Constraint string   // ON CONSTRAINT name (a primary key or unique index name)
+	DoNothing  bool
+	Set        []SetClause
+	Where      []Comparison
+}
+
+// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET.
+type SetClause struct {
+	Column string
+	Value  Expr
 }
 
 // CopyFormat selects the data encoding of a COPY FROM STDIN stream.
@@ -262,12 +286,10 @@ type Select struct {
 }
 
 type Update struct {
-	Table string
-	Set   []struct {
-		Column string
-		Value  Expr
-	}
-	Where []Comparison
+	Table     string
+	Set       []SetClause
+	Where     []Comparison
+	Returning []SelectExpr
 }
 
 // AlterTable is ALTER TABLE t ADD [COLUMN] def | DROP [COLUMN] name.
@@ -281,8 +303,9 @@ type AlterTable struct {
 }
 
 type Delete struct {
-	Table string
-	Where []Comparison
+	Table     string
+	Where     []Comparison
+	Returning []SelectExpr
 }
 
 // CreateUser is CREATE USER / ALTER USER ... PASSWORD 'pw'.

@@ -360,9 +360,18 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	ret, err := s.returningProjection(desc, t.Table, t.Returning)
+	if err != nil {
+		return nil, err
+	}
+	conflict, err := resolveConflict(desc, t, target)
+	if err != nil {
+		return nil, err
+	}
 	count := 0
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
+	res := &Result{}
 	for _, exprRow := range t.Rows {
 		if len(exprRow) != len(target) {
 			return nil, newErrf(CodeSyntaxError, "INSERT has %d values but %d target columns", len(exprRow), len(target))
@@ -379,15 +388,360 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			}
 			vals[i] = d
 		}
-		if err := insertRow(ctx, txn, desc, target, vals, &wb, inserted, false); err != nil {
-			return nil, err
+		var row map[catalog.ColumnID]types.Datum
+		if conflict == nil {
+			if row, err = insertRowReturning(ctx, txn, desc, target, vals, &wb, inserted); err != nil {
+				return nil, err
+			}
+		} else {
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, target, vals, conflict, params, &wb, inserted)
+			if err != nil {
+				return nil, err
+			}
+			if !written {
+				continue
+			}
+			row = wrow
 		}
 		count++
+		if ret != nil {
+			out, err := ret.project(desc, row, params)
+			if err != nil {
+				return nil, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
-	return &Result{Tag: fmt.Sprintf("INSERT 0 %d", count)}, nil
+	if ret != nil {
+		res.Columns = ret.columns()
+	}
+	res.Tag = fmt.Sprintf("INSERT 0 %d", count)
+	return res, nil
+}
+
+// conflictPlan is a resolved ON CONFLICT clause: which unique key
+// arbitrates (the primary key, or one unique index), and what to do.
+type conflictPlan struct {
+	pk    bool                     // the arbiter is the primary key
+	index *catalog.IndexDescriptor // else this unique index
+	any   bool                     // DO NOTHING with no target: any unique key
+	oc    *parser.OnConflict
+}
+
+// resolveConflict validates the ON CONFLICT clause (or UPSERT) against the
+// table's unique keys: the target must name the primary key's columns
+// or a unique index's (42P10 otherwise), or a constraint by name.
+func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []catalog.Column) (*conflictPlan, error) {
+	oc := t.OnConflict
+	if t.Upsert {
+		// UPSERT: ON CONFLICT (primary key) DO UPDATE SET every target
+		// column = excluded.column.
+		oc = &parser.OnConflict{}
+		for _, c := range target {
+			if desc.IsPKCol(c.ID) {
+				continue
+			}
+			oc.Set = append(oc.Set, parser.SetClause{Column: c.Name, Value: parser.Expr{Column: "excluded." + c.Name}})
+		}
+		return &conflictPlan{pk: true, oc: oc}, nil
+	}
+	if oc == nil {
+		return nil, nil
+	}
+	for _, set := range oc.Set {
+		col, ok := desc.Col(set.Column)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", set.Column)
+		}
+		if desc.IsPKCol(col.ID) {
+			return nil, newErrf(CodeFeatureNotSupported, "ON CONFLICT DO UPDATE cannot change primary key column %q", set.Column)
+		}
+	}
+	plan := &conflictPlan{oc: oc}
+	if oc.Constraint != "" {
+		if oc.Constraint == desc.Name+"_pkey" {
+			plan.pk = true
+			return plan, nil
+		}
+		for i := range desc.Indexes {
+			if desc.Indexes[i].Name == oc.Constraint && desc.Indexes[i].Unique {
+				plan.index = &desc.Indexes[i]
+				return plan, nil
+			}
+		}
+		return nil, newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", oc.Constraint, desc.Name)
+	}
+	if oc.Columns == nil {
+		plan.any = true // DO NOTHING without a target
+		return plan, nil
+	}
+	ids := map[catalog.ColumnID]bool{}
+	for _, name := range oc.Columns {
+		col, ok := desc.Col(name)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+		}
+		ids[col.ID] = true
+	}
+	same := func(cols []catalog.ColumnID) bool {
+		n := 0
+		for _, id := range cols {
+			if c, ok := desc.ColByID(id); ok && c.Hidden {
+				continue // the shard column is not a user-facing key column
+			}
+			if !ids[id] {
+				return false
+			}
+			n++
+		}
+		return n == len(ids)
+	}
+	if same(desc.PrimaryKey) {
+		plan.pk = true
+		return plan, nil
+	}
+	for i := range desc.Indexes {
+		if desc.Indexes[i].Unique && same(desc.Indexes[i].ColumnIDs) {
+			plan.index = &desc.Indexes[i]
+			return plan, nil
+		}
+	}
+	return nil, newErrf(CodeInvalidColumnReference, "there is no unique or exclusion constraint matching the ON CONFLICT specification")
+}
+
+// insertRowReturning is insertRow, handing back the row it wrote.
+func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) (map[catalog.ColumnID]types.Datum, error) {
+	row, _, err := buildInsertRow(desc, target, vals)
+	if err != nil {
+		return nil, err
+	}
+	if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, false); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// insertOnConflict inserts one row, or — when its primary key or a
+// unique index entry already exists — applies the ON CONFLICT action.
+// It reports whether a row was written (inserted or updated) and that
+// row. A conflict on a unique key other than the arbiter is the usual
+// unique violation, as in PostgreSQL.
+func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) (bool, map[catalog.ColumnID]types.Datum, error) {
+	row, key, err := buildInsertRow(desc, target, vals)
+	if err != nil {
+		return false, nil, err
+	}
+	if inserted[string(key)] {
+		if plan.oc.DoNothing {
+			return false, nil, nil
+		}
+		return false, nil, newErrf(CodeCardinality, "ON CONFLICT DO UPDATE command cannot affect row a second time")
+	}
+	// Find the existing row the new one collides with: by primary key,
+	// then by each unique index (whose entry value is the row's PK).
+	var oldKey keys.Key
+	var oldRow map[catalog.ColumnID]types.Datum
+	arbiter := ""
+	if existing, err := txn.Get(ctx, key); err != nil {
+		return false, nil, err
+	} else if existing != nil {
+		oldKey = key
+		if oldRow, err = decodeFullRow(desc, key, existing); err != nil {
+			return false, nil, err
+		}
+		arbiter = "pk"
+	}
+	if oldRow == nil {
+		for i := range desc.Indexes {
+			idx := &desc.Indexes[i]
+			if !idx.Unique {
+				continue
+			}
+			ekey, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+			if err != nil {
+				return false, nil, newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+			}
+			if skip {
+				continue
+			}
+			existing, err := txn.Get(ctx, ekey)
+			if err != nil {
+				return false, nil, err
+			}
+			if existing == nil {
+				continue
+			}
+			pk := append(rowenc.PrimaryKeyPrefixFor(desc), existing...)
+			raw, err := txn.Get(ctx, pk)
+			if err != nil {
+				return false, nil, err
+			}
+			if raw == nil {
+				continue // a dangling entry: let the insert path report it
+			}
+			oldKey = pk
+			if oldRow, err = decodeFullRow(desc, pk, raw); err != nil {
+				return false, nil, err
+			}
+			arbiter = idx.Name
+			break
+		}
+	}
+	if oldRow == nil {
+		// No conflict: a plain insert (the PK read above already ran).
+		if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, true); err != nil {
+			return false, nil, err
+		}
+		return true, row, nil
+	}
+	matches := plan.any || (plan.pk && arbiter == "pk") || (plan.index != nil && arbiter == plan.index.Name)
+	if !matches {
+		if arbiter == "pk" {
+			return false, nil, newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+		}
+		return false, nil, newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", arbiter)
+	}
+	if plan.oc.DoNothing {
+		return false, nil, nil
+	}
+	// DO UPDATE: SET and WHERE see the existing row by its columns and
+	// the proposed one as excluded.*.
+	env := conflictEnv{desc: desc, table: desc.Name, old: oldRow, excluded: row}
+	if len(plan.oc.Where) > 0 {
+		ok, err := condsHold(plan.oc.Where, env, params)
+		if err != nil {
+			return false, nil, err
+		}
+		if !ok {
+			return false, nil, nil
+		}
+	}
+	newRow := copyRow(oldRow)
+	for _, set := range plan.oc.Set {
+		col, _ := desc.Col(set.Column)
+		d, err := evalExprEnv(set.Value, env, params)
+		if err != nil {
+			return false, nil, err
+		}
+		d, cerr := d.Coerce(col.Type)
+		if cerr != nil {
+			return false, nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
+		}
+		if d.Null && col.NotNull {
+			return false, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+		}
+		if d, err = enforceTypmod(col, d); err != nil {
+			return false, nil, err
+		}
+		newRow[col.ID] = d
+	}
+	value, err := rowenc.EncodeValue(desc, newRow)
+	if err != nil {
+		return false, nil, err
+	}
+	wb.Put(oldKey, value)
+	if desc.Reshard != nil {
+		shadow, serr := reshardShadowKey(desc, newRow)
+		if serr != nil {
+			return false, nil, serr
+		}
+		wb.Put(shadow, value)
+	}
+	if err := updateIndexEntries(ctx, txn, desc, oldRow, newRow, wb, inserted); err != nil {
+		return false, nil, err
+	}
+	inserted[string(oldKey)] = true
+	return true, newRow, nil
+}
+
+// conflictEnv resolves names inside ON CONFLICT DO UPDATE: "excluded.c"
+// is the proposed row, anything else the existing row.
+type conflictEnv struct {
+	desc          *catalog.TableDescriptor
+	table         string
+	old, excluded map[catalog.ColumnID]types.Datum
+}
+
+func (e conflictEnv) col(name string) (types.Datum, error) {
+	q, bare := splitQualified(name)
+	row := e.old
+	switch q {
+	case "excluded":
+		row = e.excluded
+	case "", e.table:
+	default:
+		return types.Datum{}, newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
+	}
+	col, ok := e.desc.Col(bare)
+	if !ok {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	}
+	d, ok := row[col.ID]
+	if !ok {
+		d = types.DNull
+	}
+	return d, nil
+}
+
+// returning is a resolved RETURNING list: the projection over the rows a
+// write statement has in hand.
+type returning struct {
+	proj []projCol
+}
+
+// returningProjection resolves RETURNING against the table (nil when
+// the statement has no clause). Qualifiers naming the table are
+// stripped, as for a single-table select.
+func (s *Session) returningProjection(desc *catalog.TableDescriptor, table string, exprs []parser.SelectExpr) (*returning, error) {
+	if exprs == nil {
+		return nil, nil
+	}
+	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...)}
+	stripTableAlias(sel)
+	for _, se := range sel.Exprs {
+		if se.Agg != "" {
+			return nil, newErrf(CodeGrouping, "aggregate functions are not allowed in RETURNING")
+		}
+		if !se.Star && exprHasSubquery(se.Expr) {
+			return nil, newErrf(CodeFeatureNotSupported, "subqueries are not supported in RETURNING")
+		}
+	}
+	proj, err := resolveProjection(desc, sel.Exprs)
+	if err != nil {
+		return nil, err
+	}
+	return &returning{proj: proj}, nil
+}
+
+func (r *returning) columns() []ResultColumn {
+	cols := make([]ResultColumn, len(r.proj))
+	for i, p := range r.proj {
+		cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
+	}
+	return cols
+}
+
+func (r *returning) project(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) ([]types.Datum, error) {
+	out := make([]types.Datum, len(r.proj))
+	for i, p := range r.proj {
+		if p.expr != nil {
+			d, err := evalExpr(*p.expr, desc, row, params)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = d
+			continue
+		}
+		d, ok := row[p.col.ID]
+		if !ok {
+			d = types.DNull
+		}
+		out[i] = d
+	}
+	return out, nil
 }
 
 // resolveInsertTargets resolves an INSERT/COPY target-column list: empty
@@ -1140,6 +1494,11 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		}
 		rows = kept
 	}
+	ret, err := s.returningProjection(desc, t.Table, t.Returning)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{}
 	var wb kvclient.WriteBatch
 	seen := map[string]bool{}
 	for _, fr := range rows {
@@ -1179,11 +1538,22 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen); err != nil {
 			return nil, err
 		}
+		if ret != nil {
+			out, err := ret.project(desc, fr.row, params)
+			if err != nil {
+				return nil, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
-	return &Result{Tag: fmt.Sprintf("UPDATE %d", len(rows))}, nil
+	if ret != nil {
+		res.Columns = ret.columns()
+	}
+	res.Tag = fmt.Sprintf("UPDATE %d", len(rows))
+	return res, nil
 }
 
 func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*Result, error) {
@@ -1224,6 +1594,11 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		}
 		rows = kept
 	}
+	ret, err := s.returningProjection(desc, t.Table, t.Returning)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{}
 	var wb kvclient.WriteBatch
 	for _, fr := range rows {
 		wb.Delete(fr.key)
@@ -1237,11 +1612,22 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		if err := dropIndexEntries(desc, fr.row, &wb); err != nil {
 			return nil, err
 		}
+		if ret != nil {
+			out, err := ret.project(desc, fr.row, params)
+			if err != nil {
+				return nil, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
-	return &Result{Tag: fmt.Sprintf("DELETE %d", len(rows))}, nil
+	if ret != nil {
+		res.Columns = ret.columns()
+	}
+	res.Tag = fmt.Sprintf("DELETE %d", len(rows))
+	return res, nil
 }
 
 // execAlterTable adds or drops a column. Adds are nullable-only (existing

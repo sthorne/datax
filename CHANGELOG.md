@@ -8,6 +8,19 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.12.0 — unreleased
+
+### Added
+- `RETURNING` on `INSERT`, `UPDATE` and `DELETE` (#90): any expression
+  over the written row, `*`, aliases; rows come from the values the
+  statement has in hand, so `INSERT ... RETURNING id` costs no read.
+- `ON CONFLICT (columns | ON CONSTRAINT name) DO NOTHING | DO UPDATE SET
+  ... [WHERE ...]` with `EXCLUDED`, arbitrated by the primary key or a
+  unique index (`42P10` otherwise; a conflict on another unique key stays
+  `23505`), `ON CONFLICT DO NOTHING` without a target, and `UPSERT INTO`.
+  Command tags are PostgreSQL's (`INSERT 0 n` counts inserted and
+  updated rows; under `DO NOTHING`, inserted rows only).
+
 ## 0.11.0 — unreleased
 
 ### Added

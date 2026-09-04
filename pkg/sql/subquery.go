@@ -492,10 +492,7 @@ func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			out = &c
 		}
 		if &out.Set[0] == &t.Set[0] {
-			out.Set = append([]struct {
-				Column string
-				Value  parser.Expr
-			}(nil), t.Set...)
+			out.Set = append([]parser.SetClause(nil), t.Set...)
 		}
 		out.Set[i].Value = v
 	}

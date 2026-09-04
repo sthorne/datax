@@ -304,7 +304,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return p.parseDropTable()
 	case "INSERT":
-		return p.parseInsert()
+		return p.parseInsert(false)
+	case "upsert": // not a reserved word; lexes as an identifier
+		return p.parseInsert(true)
 	case "SELECT":
 		return p.parseSelect()
 	case "UPDATE":
@@ -792,12 +794,12 @@ func (p *parser) parseDropTable() (Statement, error) {
 	return dt, nil
 }
 
-func (p *parser) parseInsert() (Statement, error) {
-	p.i++ // INSERT
+func (p *parser) parseInsert(upsert bool) (Statement, error) {
+	p.i++ // INSERT / UPSERT
 	if err := p.expectKeyword("INTO"); err != nil {
 		return nil, err
 	}
-	ins := &Insert{}
+	ins := &Insert{Upsert: upsert}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
@@ -844,7 +846,127 @@ func (p *parser) parseInsert() (Statement, error) {
 			break
 		}
 	}
+	// ON CONFLICT ... ("conflict", "do", "nothing", "constraint" are not
+	// reserved words).
+	if p.peek().kind == tkKeyword && p.peek().text == "ON" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "conflict" {
+		if upsert {
+			return nil, p.errf("UPSERT does not take ON CONFLICT")
+		}
+		p.i += 2
+		oc := &OnConflict{}
+		if p.consumeOp("(") {
+			for {
+				col, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				oc.Columns = append(oc.Columns, col)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		} else if p.consumeKeyword("ON") {
+			if !p.consumeIdentWord("constraint") {
+				return nil, p.errf("expected CONSTRAINT after ON CONFLICT ON, found %q", p.peek().text)
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			oc.Constraint = name
+		}
+		if !p.consumeIdentWord("do") {
+			return nil, p.errf("expected DO NOTHING or DO UPDATE after ON CONFLICT, found %q", p.peek().text)
+		}
+		switch {
+		case p.consumeIdentWord("nothing"):
+			oc.DoNothing = true
+		case p.consumeKeyword("UPDATE"):
+			if oc.Columns == nil && oc.Constraint == "" {
+				return nil, p.errf("ON CONFLICT DO UPDATE requires a conflict target: ON CONFLICT (columns) or ON CONSTRAINT name")
+			}
+			set, err := p.parseSetClauses()
+			if err != nil {
+				return nil, err
+			}
+			oc.Set = set
+			if oc.Where, err = p.parseOptWhere(); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, p.errf("expected NOTHING or UPDATE after DO, found %q", p.peek().text)
+		}
+		ins.OnConflict = oc
+	}
+	var err2 error
+	if ins.Returning, err2 = p.parseOptReturning(); err2 != nil {
+		return nil, err2
+	}
 	return ins, nil
+}
+
+// parseSetClauses parses "col = expr, ..." after SET.
+func (p *parser) parseSetClauses() ([]SetClause, error) {
+	if err := p.expectKeyword("SET"); err != nil {
+		return nil, err
+	}
+	var out []SetClause
+	for {
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		e, err := p.parseValueOrColumnExpr()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SetClause{Column: col, Value: e})
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return out, nil
+}
+
+// parseOptReturning parses RETURNING * | expr [AS alias], ... ("returning"
+// is not a reserved word). nil means no clause.
+func (p *parser) parseOptReturning() ([]SelectExpr, error) {
+	if !p.consumeIdentWord("returning") {
+		return nil, nil
+	}
+	var out []SelectExpr
+	for {
+		if p.consumeOp("*") {
+			out = append(out, SelectExpr{Star: true})
+		} else {
+			e, err := p.parseValueOrBool()
+			if err != nil {
+				return nil, err
+			}
+			se := SelectExpr{Expr: e}
+			if p.consumeKeyword("AS") {
+				alias, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				se.Alias = alias
+			} else if t := p.peek(); t.kind == tkIdent {
+				p.i++
+				se.Alias = t.text
+			}
+			out = append(out, se)
+		}
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return out, nil
 }
 
 // parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause].
@@ -1504,31 +1626,14 @@ func (p *parser) parseUpdate() (Statement, error) {
 		return nil, err
 	}
 	up.Table = name
-	if err := p.expectKeyword("SET"); err != nil {
+	if up.Set, err = p.parseSetClauses(); err != nil {
 		return nil, err
-	}
-	for {
-		col, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp("="); err != nil {
-			return nil, err
-		}
-		e, err := p.parseValueOrColumnExpr()
-		if err != nil {
-			return nil, err
-		}
-		up.Set = append(up.Set, struct {
-			Column string
-			Value  Expr
-		}{Column: col, Value: e})
-		if !p.consumeOp(",") {
-			break
-		}
 	}
 	up.Where, err = p.parseOptWhere()
 	if err != nil {
+		return nil, err
+	}
+	if up.Returning, err = p.parseOptReturning(); err != nil {
 		return nil, err
 	}
 	return up, nil
@@ -1547,6 +1652,9 @@ func (p *parser) parseDelete() (Statement, error) {
 	del.Table = name
 	del.Where, err = p.parseOptWhere()
 	if err != nil {
+		return nil, err
+	}
+	if del.Returning, err = p.parseOptReturning(); err != nil {
 		return nil, err
 	}
 	return del, nil

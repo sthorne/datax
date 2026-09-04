@@ -172,7 +172,30 @@ scan it would out-fetch.
 INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y');     -- multi-row is one atomic statement
 UPDATE t SET b = 'z', c = c + 1 WHERE a = 1;        -- expressions: col ± value
 DELETE FROM t WHERE a = 1;
+
+INSERT INTO t (a, b) VALUES (3, 'q') RETURNING a, b;            -- any expression over the written row, or *
+UPDATE t SET c = c + 1 WHERE a = 1 RETURNING *;
+DELETE FROM t WHERE a = 1 RETURNING a;
+
+INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT DO NOTHING;    -- any unique key; the tag counts inserted rows
+INSERT INTO t (a, b, c) VALUES (1, 'x', 1)
+  ON CONFLICT (a) DO UPDATE SET c = t.c + excluded.c, b = excluded.b
+  WHERE t.c < 100                                               -- optional; EXCLUDED is the proposed row
+  RETURNING c;
+INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING;
+UPSERT INTO t (a, b, c) VALUES (1, 'x', 5);                     -- ON CONFLICT (primary key) DO UPDATE SET every column
 ```
+
+`RETURNING` rows come from the values the statement already has (no
+extra read). The `ON CONFLICT` target must be the primary key or a
+unique index — by columns or by constraint name (`<table>_pkey`, the
+index name) — else SQLSTATE `42P10`; a conflict on some other unique key
+is still the usual `23505`. `ON CONFLICT DO NOTHING` without a target
+accepts a conflict on any unique key. `DO UPDATE` cannot change primary
+key columns, and the same key twice in one statement is `21000`. The
+whole statement is one transaction: the read of the existing row and the
+write are serializable, so two sessions upserting the same key never lose
+an update — one of them restarts with `40001` and retries.
 
 Batching inserts matters enormously for throughput — a 100-row `INSERT` is
 one replication round; 100 single-row statements are 100.
