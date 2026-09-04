@@ -282,6 +282,7 @@ applies to `datax sql` and `datax debug status`.
 ```sh
 datax debug nodes                      # liveness, locality, last heartbeat
 datax debug ranges                     # every range: span, replicas, leader
+#   r7 [/table/orders/primary/1000, /table/orders/by_city) gen=3 replicas=[...]
 datax debug status --url http://127.0.0.1:8080/status
 
 datax debug split --table 100          # manual split (also: --key <hex>)
@@ -293,6 +294,14 @@ datax debug rebalance --range 5 [--from 1]
 Splits and merges also happen automatically (by size: 64 MiB; by load:
 sustained 500 QPS); the manual commands are for pre-splitting before a bulk
 load and for tests.
+
+Keys print as paths everywhere — logs, `datax debug`, the dashboard and
+its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range
+addressing records, `/system/desc/7` and friends the catalog, and
+`/table/orders/primary/1000` is row 1000 of `orders` (`/table/orders/by_city/"oslo"/42`
+an index entry). Where the printer has no schema (a log line written
+before the node has read the catalog) a table shows by ID and key values
+by shape, e.g. `/table/3/1/1000`.
 
 ## Consistency checking
 

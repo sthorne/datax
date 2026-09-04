@@ -55,8 +55,8 @@ func (n *Node) serveRangeAPI(w http.ResponseWriter, req *http.Request) {
 	}
 	doc := RangeDetail{
 		RangeID:    int64(desc.RangeID),
-		StartKey:   desc.StartKey.String(),
-		EndKey:     desc.EndKey.String(),
+		StartKey:   n.prettyKey(desc.StartKey),
+		EndKey:     n.prettyKey(desc.EndKey),
 		Generation: desc.Generation,
 	}
 

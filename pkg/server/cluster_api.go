@@ -141,8 +141,8 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 		for _, d := range descs {
 			cr := ClusterRange{
 				RangeID:    int64(d.RangeID),
-				StartKey:   d.StartKey.String(),
-				EndKey:     d.EndKey.String(),
+				StartKey:   n.prettyKey(d.StartKey),
+				EndKey:     n.prettyKey(d.EndKey),
 				Generation: d.Generation,
 				Table:      n.tableNameOf(d.StartKey),
 			}

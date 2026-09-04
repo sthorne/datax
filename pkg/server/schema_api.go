@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
@@ -126,6 +127,9 @@ type schemaCache struct {
 	at   time.Time
 	doc  *SchemaStatus
 	name map[uint64]string // table ID → name, for range labeling
+	// descs keeps the descriptors too, so range spans render with table,
+	// index and typed key values (rowenc.PrettyKey).
+	descs map[uint64]*catalog.TableDescriptor
 	// refreshing marks a background rebuild in flight (see refreshSchema).
 	refreshing bool
 }
@@ -178,11 +182,20 @@ func (n *Node) schemaDoc(ctx context.Context) *SchemaStatus {
 func (n *Node) rebuildSchema(ctx context.Context) *SchemaStatus {
 	ctx, cancel := context.WithTimeout(ctx, schemaBuildTimeout)
 	defer cancel()
-	doc, names := n.buildSchemaDoc(ctx)
+	doc, names, descs := n.buildSchemaDoc(ctx)
 	n.schema.mu.Lock()
 	n.schema.doc, n.schema.at = doc, time.Now()
 	if doc.Error == "" || n.schema.name == nil {
 		n.schema.name = names
+		n.schema.descs = descs
+		// Lend the names to the key printer, so this process's log lines
+		// name tables too (every node of a cluster knows the same names).
+		keys.SetTableNamer(func(id uint64) (string, bool) {
+			n.schema.mu.Lock()
+			defer n.schema.mu.Unlock()
+			name, ok := n.schema.name[id]
+			return name, ok
+		})
 	}
 	n.schema.mu.Unlock()
 	return doc
@@ -226,6 +239,35 @@ func (n *Node) cachedSchemaDoc() *SchemaStatus {
 
 // tableNameOf labels a range with the table its start key belongs to
 // ("" for system and meta ranges, or before the first catalog scan).
+// prettyKey renders a key for the APIs and the dashboard: with the
+// table, index and typed values when the key belongs to a table this
+// node's schema cache knows, by shape otherwise.
+func (n *Node) prettyKey(k keys.Key) string {
+	if id, ok := tableIDOfKey(k); ok {
+		n.schema.mu.Lock()
+		d := n.schema.descs[id]
+		n.schema.mu.Unlock()
+		if d != nil {
+			return rowenc.PrettyKey(d, k)
+		}
+	}
+	return keys.Pretty(k)
+}
+
+// tableNames is the current table ID → name map, rebuilt now so a table
+// created a moment ago is named too, for admin responses that print
+// spans (admin operations are rare; the catalog scan is cheap).
+func (n *Node) tableNames(ctx context.Context) map[uint64]string {
+	n.rebuildSchema(ctx)
+	n.schema.mu.Lock()
+	defer n.schema.mu.Unlock()
+	out := make(map[uint64]string, len(n.schema.name))
+	for id, name := range n.schema.name {
+		out[id] = name
+	}
+	return out
+}
+
 func (n *Node) tableNameOf(start keys.Key) string {
 	id, ok := tableIDOfKey(start)
 	if !ok {
@@ -249,9 +291,10 @@ func tableIDOfKey(k keys.Key) (uint64, bool) {
 	return id, true
 }
 
-func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string) {
+func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string, map[uint64]*catalog.TableDescriptor) {
 	doc := &SchemaStatus{NodeID: int(n.ident.NodeID)}
 	names := map[uint64]string{}
+	byID := map[uint64]*catalog.TableDescriptor{}
 
 	var descs []*catalog.TableDescriptor
 	dbNames := map[uint64]string{0: catalog.DefaultDatabase}
@@ -272,7 +315,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 	})
 	if err != nil {
 		doc.Error = "catalog listing unavailable: " + err.Error()
-		return doc, names
+		return doc, names, byID
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].Name < descs[j].Name })
 
@@ -296,21 +339,22 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			Privileges: d.Privileges,
 		}
 		names[d.ID] = d.Name
-		byID := map[catalog.ColumnID]string{}
+		byID[d.ID] = d
+		colName := map[catalog.ColumnID]string{}
 		for _, c := range d.Columns {
-			byID[c.ID] = c.Name
+			colName[c.ID] = c.Name
 			t.Columns = append(t.Columns, SchemaColumn{
 				Name: c.Name, Type: c.Type.String(), NotNull: c.NotNull, Hidden: c.Hidden,
 				Precision: c.Precision, Scale: c.Scale,
 			})
 		}
 		for _, id := range d.PrimaryKey {
-			t.PrimaryKey = append(t.PrimaryKey, byID[id])
+			t.PrimaryKey = append(t.PrimaryKey, colName[id])
 		}
 		for _, idx := range d.Indexes {
 			si := SchemaIndex{Name: idx.Name, Unique: idx.Unique, State: idx.State}
 			for _, id := range idx.ColumnIDs {
-				si.Columns = append(si.Columns, byID[id])
+				si.Columns = append(si.Columns, colName[id])
 			}
 			t.Indexes = append(t.Indexes, si)
 		}
@@ -375,7 +419,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		doc.Users = append(doc.Users, SchemaUser{Name: "root", Admin: true})
 	}
 	sort.Slice(doc.Users, func(i, j int) bool { return doc.Users[i].Name < doc.Users[j].Name })
-	return doc, names
+	return doc, names, byID
 }
 
 // nameOfKey decodes the user name from a users or admins record key.

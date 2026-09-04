@@ -11,6 +11,13 @@ state or the internode protocol does, and an entry below says so.
 ## 0.11.0 — unreleased
 
 ### Added
+- Keys and range spans print as readable paths everywhere (logs, `datax
+  debug ranges|split|merge`, the dashboard's range tables and `/api/*`):
+  `/Min`, `/Max`, `/meta/...`, `/system/desc/7`,
+  `/table/orders/primary/1000`, `/table/orders/by_city/"oslo"/42` —
+  with table and index names and typed key values where the schema is
+  known, IDs and shape-decoded values where it is not (`/table/3/1/1000`)
+  — instead of escaped bytes (`"\x04\x00...\x80..."`).
 - PostgreSQL catalogs and `SHOW` (#89): read-only `pg_catalog` and
   `information_schema` virtual tables over the live schema
   (`pg_database`, `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
