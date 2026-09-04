@@ -8,6 +8,33 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.7.0 — unreleased
+
+Cluster version **v5**: the `datax_metrics` system table. Clusters
+upgraded from earlier versions record metrics only after
+`datax debug upgrade` finalizes v5.
+
+### Added
+- The cluster records its own metrics: every node writes about fifty
+  series (host, storage, ranges, the network matrix, transactions, SQL,
+  and once per cluster the table gauges) every `--metrics-record-interval`
+  (default 10 s) into `datax_metrics`, a sharded time-series table with
+  a 7-day retention that the nodes create at a reserved descriptor ID
+  once the cluster has finalized v5. History survives restarts, is
+  queryable with plain SQL from any client, and `/api/metrics` serves it
+  aligned and downsampled per node (rates for counters). The dashboard
+  gains a Metrics view (`/#/metrics`): a time-range picker, a grouped
+  series picker, one chart per series with one line per node, a
+  crosshair readout, a per-node mode, and a table view; every overview
+  tile links to its series and draws its sparkline from the table. The
+  table is reserved (create, drop and column DDL refused; retention and
+  shards settable; a `SELECT` grant for reporting users; only admins
+  write), excluded from backups unless `datax backup --include-metrics`,
+  and tolerated by restore. `ALTER TABLE ... SET (retention = '...')` now
+  works for any time-series table. `/metrics` gains
+  `datax_metrics_record_rows_total`, `datax_metrics_record_skipped_total`
+  and `datax_metrics_record_errors_total` (#115).
+
 ## 0.6.0 — unreleased
 
 ### Added

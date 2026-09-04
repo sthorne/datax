@@ -25,7 +25,12 @@ serves, on that address:
   lease sheds, repairs, snapshots, backups, upgrades, key rotations and
   consistency failures, newest first, with a kind filter; admins also
   see the audit stream), range tables with replica placement, storage
-  health. The cluster
+  health, and a **Metrics view** (`/#/metrics`) that charts any of the
+  series the cluster records about itself over the last 15 minutes to 7
+  days, one chart per series with one line per node, from the
+  `datax_metrics` table described under [Metrics history](#metrics-history);
+  every tile on the overview links to its own series charted, and the
+  tiles' sparklines are the last 15 minutes from that table. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -54,6 +59,15 @@ serves, on that address:
   only those after sequence `N`, which is how the dashboard tails). In
   secure mode audit records (authentication failures, admin operations,
   privilege DDL) are included only for the admin role.
+- **`/api/metrics`** — JSON: without parameters, the catalog of recorded
+  series and the label values this node knows; with
+  `?series=a,b&node=1,2&since=1h&step=30s&rate=1`, aligned `[t, v]`
+  arrays per node from the `datax_metrics` table, downsampled to at most
+  500 points per series (the average for gauges; with `rate=1`, the
+  per-second rate for counters). `from`/`to` in unix milliseconds
+  replace `since`. Any database user may read it, the same rule as
+  `/metrics`. An unknown series is a 404; before the cluster has
+  finalized v5 it is a 503.
 - **`/api/schema`** — JSON: the schema browser's document. In secure mode
   root and admins see every table and the user list; another user sees
   the tables it holds a grant on. Rebuilt at most every 5 s per node.
@@ -102,6 +116,75 @@ section the dashboard row links to:
 | `auth-failures` | warning | more than one authentication or admin-authorization failure per second over the last five minutes (events) |
 | `stale-statistics` | info | tables with over a thousand rows have statistics older than an hour (schema) |
 
+## Metrics history
+
+The cluster keeps its own metrics in a table, so history survives
+restarts, is queryable with plain SQL from any client, and the
+dashboard charts it from one place. Every node writes one batch of
+rows every `--metrics-record-interval` (default 10 s; `0` disables
+recording on that node) into `datax_metrics`, a sharded time-series
+table the nodes create themselves once the cluster has finalized v5
+(clusters upgraded from an earlier version need `datax debug upgrade`
+first):
+
+```sql
+CREATE TABLE datax_metrics (
+  node  INT8 NOT NULL,        -- 0 for cluster-level series (table sizes)
+  name  TEXT NOT NULL,        -- 'node.cpu_percent', 'rpc.rtt_us{peer=n2}', ...
+  at    TIMESTAMPTZ NOT NULL, -- the node's clock, truncated to the interval
+  value FLOAT8,
+  PRIMARY KEY (node, name, at)
+) WITH (timeseries = true, retention = '7d', shards = 8);
+```
+
+The series: host figures (`node.cpu_percent`, `node.load1`,
+`node.mem_available`, `node.rss`, `store.disk_free`, disk and network
+throughput, `node.open_fds`, `go.goroutines`, `go.heap_in_use`),
+storage (`store.l0_files`, `store.l0_sublevels`, `store.compaction_debt`,
+`store.memtable_bytes`, `store.write_stalls`, `store.debt_gated`,
+`storage.backpressure`), ranges (`node.ranges`, `node.leaders`,
+`node.leader_qps`, `node.replica_bytes`), the network matrix
+(`rpc.rtt_us{peer=nN}`, `rpc.clock_offset_us{peer=nN}`,
+`rpc.reachable{peer=nN}`), transactions (`txn.commits`, `txn.aborts`,
+`txn.retries`, `kv.batch_p99_us`), SQL (`sql.connections`,
+`sql.idle_in_txn`, `sql.statements`, `sql.serialization_failures`,
+`sql.rows_scanned`, `sql.p99_us`) and, recorded once per cluster as
+node 0 by the leader of range 1, the table gauges
+(`table.rows{table=t}`, `table.ranges{table=t}`). Counters are stored
+cumulative; the query side (and the dashboard) differentiate them. The
+full list, with kinds and units, is the `/api/metrics` catalog.
+
+The same data by SQL, for `psql` or a Grafana PostgreSQL data source
+(pass an absolute timestamp; `now() - interval` needs the INTERVAL type):
+
+```sql
+SELECT at, value FROM datax_metrics
+WHERE node = 1 AND name = 'node.cpu_percent' AND at >= '2026-09-04 15:00:00Z'
+ORDER BY at;
+```
+
+Cost, bounded by construction: about 50 series per node every 10 s is
+5·N rows per second; a 3-node cluster writes 15 rows per second and
+keeps about 13 M rows at 7 days, tens of MB after compaction. The
+recorder writes through the SQL layer on the node's own KV client, under
+backpressure like any writer: when the store sheds writes it skips the
+tick (`datax_metrics_record_skipped_total`) rather than adding load;
+`datax_metrics_record_rows_total` and
+`datax_metrics_record_errors_total` count what it wrote and what
+failed.
+
+The table is reserved: `CREATE TABLE datax_metrics`, `DROP TABLE`,
+`ADD COLUMN` and `DROP COLUMN` are refused; admins may `DELETE FROM` it,
+`ALTER TABLE datax_metrics SET (retention = '30d')` and
+`SET (shards = 16)` (the online re-shard, while the recorder keeps
+writing) work as for any time-series table; `GRANT SELECT ON
+datax_metrics TO grafana` lets a reporting user read it and nobody but
+admins writes to it. Backups leave it out unless asked
+(`datax backup --include-metrics`), since it is bulky and regenerable;
+a restore into a cluster whose nodes have already created the table
+proceeds (the table sits at a reserved descriptor ID no user table can
+collide with, and a backup that carries it lands on top).
+
 ## Metrics worth alerting on
 
 Full list: scrape `/metrics`. The load-bearing ones:
@@ -129,6 +212,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
 | `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
+| `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
 

@@ -171,7 +171,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
 		}
-		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext)
+		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext, req.IncludeMetrics)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

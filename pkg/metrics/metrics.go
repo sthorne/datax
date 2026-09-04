@@ -168,4 +168,13 @@ var (
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
 	})
+	MetricsRecordRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_rows_total", Help: "Rows this node has written to the datax_metrics table.",
+	})
+	MetricsRecordSkipped = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_skipped_total", Help: "Metrics-recorder ticks skipped because this node's store was shedding writes.",
+	})
+	MetricsRecordErrors = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
+	})
 )

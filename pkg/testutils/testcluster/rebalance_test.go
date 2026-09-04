@@ -46,6 +46,7 @@ func startRebalanceCluster(t *testing.T, numSeed, numSpare int, localities []str
 			UpreplicationInterval: 500 * time.Millisecond,
 			LivenessGrace:         repairTestGrace,
 			DeadNodeThreshold:     repairTestThreshold,
+			MetricsRecordInterval: -1, // the range set under study must not grow
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
 			},
@@ -68,6 +69,7 @@ func startRebalanceCluster(t *testing.T, numSeed, numSpare int, localities []str
 			UpreplicationInterval: 500 * time.Millisecond,
 			LivenessGrace:         repairTestGrace,
 			DeadNodeThreshold:     repairTestThreshold,
+			MetricsRecordInterval: -1,
 		})
 		if err != nil {
 			t.Fatalf("joining spare node: %v", err)

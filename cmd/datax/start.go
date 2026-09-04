@@ -16,25 +16,26 @@ import (
 )
 
 type serverFlags struct {
-	fs         *flag.FlagSet
-	dir        string
-	listen     string
-	pgListen   string
-	join       string
-	locality   string
-	maxOffset  time.Duration
-	advertise  string
-	certsDir   string
-	rootPw     string
-	httpListen string
-	profile    string
-	encKeyPath string
-	loadSplit  float64
-	shedFactor float64
-	consistInt time.Duration
-	bytesThr   int64
-	verbose    bool
-	slowStmt   time.Duration
+	fs            *flag.FlagSet
+	dir           string
+	listen        string
+	pgListen      string
+	join          string
+	locality      string
+	maxOffset     time.Duration
+	advertise     string
+	certsDir      string
+	rootPw        string
+	httpListen    string
+	profile       string
+	encKeyPath    string
+	loadSplit     float64
+	shedFactor    float64
+	consistInt    time.Duration
+	bytesThr      int64
+	verbose       bool
+	slowStmt      time.Duration
+	metricsRecord time.Duration
 }
 
 func newServerFlags(name string) *serverFlags {
@@ -56,6 +57,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.DurationVar(&f.slowStmt, "slow-statement-threshold", 0, "SQL statements slower than this are kept for the dashboard's slow list (0 = default 500ms)")
+	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -77,6 +79,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		LeaseShedFactor:         f.shedFactor,
 		ConsistencyInterval:     f.consistInt,
 		SlowStatementThreshold:  f.slowStmt,
+		MetricsRecordInterval:   metricsRecordInterval(f.metricsRecord),
 		RebalanceBytesThreshold: f.bytesThr,
 		Dir:                     f.dir,
 		Listen:                  f.listen,
@@ -90,6 +93,15 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		RootPassword:            f.rootPw,
 		HTTPListen:              f.httpListen,
 	}, nil
+}
+
+// metricsRecordInterval maps the flag (0 = off) onto the config's
+// convention (negative = off, 0 = default).
+func metricsRecordInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return -1
+	}
+	return d
 }
 
 func runServer(cfg server.Config) error {

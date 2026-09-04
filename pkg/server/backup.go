@@ -180,7 +180,7 @@ func hashLiveRecord(h hash.Hash, rec kvpb.ExportRecord) {
 }
 
 // RunBackup executes a backup to dest on this node's filesystem.
-func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaintext bool) (*cluster.BackupSummary, error) {
+func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaintext, includeMetrics bool) (*cluster.BackupSummary, error) {
 	if n.cfg.EncKeyPath != "" && !allowPlaintext {
 		return nil, fmt.Errorf("the store is encrypted but backup files are written in plaintext; pass --allow-plaintext to proceed")
 	}
@@ -222,6 +222,9 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		var d catalog.TableDescriptor
 		if err := json.Unmarshal(rec.Value, &d); err != nil {
 			return fmt.Errorf("corrupt table descriptor at %s: %v", keys.Key(rec.Key), err)
+		}
+		if catalog.IsSystemTable(d.Name) && !includeMetrics {
+			return nil // the cluster's own metrics: bulky, regenerable, opt-in
 		}
 		descs = append(descs, backupTable{ID: d.ID, Name: d.Name, Descriptor: append(json.RawMessage(nil), rec.Value...)})
 		return nil
@@ -358,14 +361,23 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 
 	// The target must hold no user tables: restored data keys bake in the
 	// backed-up table IDs, which an existing catalog could collide with.
+	// The cluster's own metrics table does not count: it lives at a
+	// reserved ID no user table can carry, and a backup that includes it
+	// simply lands on top (same ID, same name; the rows merge). The
+	// recorder is held off while the restore runs.
 	descStart, descEnd := keys.TableDescSpan()
-	existing, err := n.db.Scan(ctx, descStart, descEnd, 1)
+	existing, err := n.db.Scan(ctx, descStart, descEnd, 0)
 	if err != nil {
 		return nil, err
 	}
-	if len(existing) > 0 {
-		return nil, fmt.Errorf("the target cluster already has tables; restore requires an empty cluster")
+	for _, kv := range existing {
+		var d catalog.TableDescriptor
+		if json.Unmarshal(kv.Value, &d) != nil || !catalog.IsSystemTableID(d.ID) {
+			return nil, fmt.Errorf("the target cluster already has tables; restore requires an empty cluster")
+		}
 	}
+	n.metricsPaused.Store(true)
+	defer n.metricsPaused.Store(false)
 
 	// Metadata from the final manifest: descriptors + namespace entries,
 	// users, admin markers — one small transaction.
@@ -375,7 +387,7 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 		for _, t := range final.Tables {
 			wb.Put(keys.TableDescKey(t.ID), []byte(t.Descriptor))
 			wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
-			if t.ID > maxID {
+			if t.ID > maxID && !catalog.IsSystemTableID(t.ID) {
 				maxID = t.ID
 			}
 		}

@@ -50,9 +50,16 @@ const (
 	// know the request, so splits and merges keep repairing /meta with
 	// blind writes until the cluster has finalized v4 (rule 4).
 	V4 Version = 4
+	// V5 introduces the datax_metrics system table (see
+	// pkg/sql/catalog.MetricsTableName): once the cluster has finalized
+	// v5 every node creates it if missing and records its metrics into it.
+	// A v4 node knows nothing of the reservation and would treat the
+	// table as an ordinary user table (droppable, backed up), so nothing
+	// creates it before finalize (rule 4).
+	V5 Version = 5
 
 	// Current is the newest cluster version this binary can run.
-	Current = V4
+	Current = V5
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

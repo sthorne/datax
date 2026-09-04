@@ -296,3 +296,13 @@ describe as text.
    (paths never plan as bounds).
 3. Joins: the plan prints one line per join level, in execution order —
    confirm the first table is the filtered one.
+
+## Reserved tables
+
+`datax_metrics` belongs to the cluster: its nodes create it and record
+their metrics into it (see the operations guide's "Metrics history").
+`CREATE TABLE datax_metrics`, `DROP TABLE datax_metrics` and column DDL
+on it are refused. Admins may read and delete from it and set its
+`retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
+another user read it, and no grant lets a non-admin write to it.
+

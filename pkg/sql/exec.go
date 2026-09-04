@@ -67,7 +67,13 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 }
 
 func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *parser.CreateTable) (*Result, error) {
+	if catalog.IsSystemTable(t.Name) && !s.system {
+		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved for the cluster's own use", t.Name)
+	}
 	desc := &catalog.TableDescriptor{Name: t.Name}
+	if catalog.IsSystemTable(t.Name) {
+		desc.ID = catalog.MetricsTableID
+	}
 	seen := map[string]bool{}
 	var colPK []string
 	for i, cd := range t.Columns {
@@ -228,6 +234,32 @@ func parseRetention(s string) (int64, error) {
 	return n * mult, nil
 }
 
+// execSetRetention is ALTER TABLE ... SET (retention = '<n><d|h|m|s>'):
+// one descriptor write; the retention provider picks the new TTL up on
+// its next refresh (the session has already checked admin).
+func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
+	secs, perr := parseRetention(t.SetOptions["retention"])
+	if perr != nil {
+		return nil, newErrf(CodeSyntaxError, "retention: %v", perr)
+	}
+	err := s.db.RunTxn(ctx, "set-retention", func(ctx context.Context, txn *kvclient.Txn) error {
+		shared, err := s.cat.Lookup(ctx, txn, t.Table)
+		if err != nil {
+			return err
+		}
+		if !shared.Timeseries {
+			return newErrf(CodeFeatureNotSupported, "retention applies to timeseries tables (created WITH (timeseries = true))")
+		}
+		desc := shared.Clone()
+		desc.RetentionSeconds = secs
+		return s.cat.Update(ctx, txn, desc)
+	})
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	return &Result{Tag: "ALTER TABLE"}, nil
+}
+
 // presplitTimeseries pre-carves a fresh timeseries table's key space:
 // splits at the table's span boundaries (so ranges rarely straddle the
 // table edge — the common case for per-table retention GC is then "range
@@ -259,6 +291,9 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
+	if catalog.IsSystemTable(t.Name) && !s.system {
+		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", t.Name)
+	}
 	desc, err := s.cat.Drop(ctx, txn, t.Name)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -1122,6 +1157,9 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 // primary-key or indexed columns. Column IDs are never reused, so a
 // drop-then-re-add cannot resurrect old values.
 func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *parser.AlterTable) (*Result, error) {
+	if catalog.IsSystemTable(t.Table) && !s.system && t.SetOptions == nil {
+		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
+	}
 	shared, err := s.cat.Lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err

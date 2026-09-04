@@ -28,6 +28,9 @@ type AdminRequest struct {
 	BasePath       string   `json:"base_path,omitempty"`
 	Paths          []string `json:"paths,omitempty"`
 	AllowPlaintext bool     `json:"allow_plaintext,omitempty"`
+	// IncludeMetrics backs up the datax_metrics system table too (bulky
+	// and regenerable, so excluded by default).
+	IncludeMetrics bool `json:"include_metrics,omitempty"`
 	// CheckID identifies a consistency probe for collect-checksum.
 	CheckID string `json:"check_id,omitempty"`
 	// Index is the applied index wait-applied blocks for (with RangeID).

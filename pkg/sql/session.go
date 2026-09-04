@@ -106,6 +106,9 @@ type Session struct {
 	// In insecure/trust mode it is the client-claimed name: privileges are
 	// enforced against it, but nothing verified the identity.
 	user string
+	// system marks the node's own internal session (see NewSystemSession):
+	// the only one allowed to create or drop a system table.
+	system bool
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -118,6 +121,12 @@ type Session struct {
 // The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
 	return &Session{db: db, cat: cat, user: "root"}
+}
+
+// NewSystemSession creates the node's own root session, the one that may
+// create and drop system tables (the metrics recorder's).
+func NewSystemSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
+	return &Session{db: db, cat: cat, user: "root", system: true}
 }
 
 // NewSessionForUser creates a session for an authenticated user.
@@ -259,6 +268,22 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 		if aerr != nil {
 			return nil, ToSQLError(aerr)
+		}
+		if _, ok := at.SetOptions["retention"]; ok {
+			res, rerr := s.execSetRetention(ctx, at)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if _, reshard := at.SetOptions["shards"]; !reshard {
+				return res, nil
+			}
+			rest := map[string]string{}
+			for k, v := range at.SetOptions {
+				if k != "retention" {
+					rest[k] = v
+				}
+			}
+			at = &parser.AlterTable{Table: at.Table, SetOptions: rest}
 		}
 		return s.execReshardOnline(ctx, at)
 	}
