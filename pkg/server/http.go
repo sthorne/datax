@@ -191,6 +191,7 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
+	mux.HandleFunc("/api/node", n.serveNodeAPI)
 	mux.HandleFunc("/api/events", n.serveEventsAPI)
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
@@ -419,15 +420,7 @@ type ActivityStatus struct {
 }
 
 func (n *Node) serveActivityAPI(w http.ResponseWriter, req *http.Request) {
-	doc := ActivityStatus{NodeID: int(n.ident.NodeID), Connections: []pgwire.ConnectionInfo{}, Active: []pgwire.ActiveStatement{}, Slow: []pgwire.SlowStatement{}}
-	if n.pgServer != nil {
-		act := n.pgServer.Activity()
-		doc.Summary = act.Summary()
-		doc.Connections = act.Connections()
-		doc.Active = act.Active()
-		doc.Slow = act.Slow()
-		doc.SlowThresholdMillis = act.SlowThreshold().Milliseconds()
-	}
+	doc := n.activityStatus()
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

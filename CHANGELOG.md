@@ -8,6 +8,20 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.8.0 — unreleased
+
+### Added
+- A node detail page on the dashboard (`/#/node/N`, from a click on the
+  Nodes table): identity and versions, machine tiles, the node's last 15
+  minutes of CPU, QPS, statements and KV latency from the metrics
+  table, storage with the debt gate, overload verdict and encryption
+  status, the replicas it holds with their raft log depth, its SQL
+  summary and (for admins) statements, its network row, its settings
+  and its recent events. `/api/node?id=N` serves the document: the
+  serving node's own to any user, another node's through the internode
+  RPC for admins (a new `node-detail` admin op). Sub-KiB byte figures on
+  the dashboard are rounded (#86).
+
 ## 0.7.0 — unreleased
 
 Cluster version **v5**: the `datax_metrics` system table. Clusters

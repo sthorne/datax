@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,6 +174,17 @@ func TestHTTPAuthSecure(t *testing.T) {
 	// 401 — they authenticated fine), an admin gets every replica's view.
 	if code, _, _ := authedGet(t, client, base+"/api/range?id=1", "scraper", "metrics-pw"); code != http.StatusForbidden {
 		t.Fatalf("/api/range as non-admin: want 403")
+	}
+	// The node detail page follows the same rule: the serving node's own
+	// document for anyone, another node's only for admins.
+	if code, _, _ := authedGet(t, client, base+"/api/node?id=2", "scraper", "metrics-pw"); code != http.StatusForbidden {
+		t.Fatalf("/api/node?id=2 as non-admin: want 403")
+	}
+	if code, body, _ := authedGet(t, client, base+"/api/node", "scraper", "metrics-pw"); code != http.StatusOK || !strings.Contains(body, `"node_id": 1`) {
+		t.Fatalf("/api/node (self) as non-admin: %d %s", code, body)
+	}
+	if code, body, _ := authedGet(t, client, base+"/api/node?id=2", "root", "topsecret"); code != http.StatusOK || !strings.Contains(body, `"node_id": 2`) {
+		t.Fatalf("/api/node?id=2 as root: %d %s", code, body)
 	}
 	code, body, _ := authedGet(t, client, base+"/api/range?id=1", "root", "topsecret")
 	if code != http.StatusOK {

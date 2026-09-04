@@ -53,6 +53,7 @@ var adminUnauditedOps = map[string]bool{
 	"wait-applied":     true,
 	"reencrypt-status": true,
 	"node-status":      true,
+	"node-detail":      true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -220,6 +221,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			return cluster.AdminResponse{Error: "store is not encrypted"}
 		}
 		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
+
+	case "node-detail":
+		// This node's /api/node document, for another node's dashboard
+		// (/api/node?id=N fans out under the node identity; admin-only
+		// like node-status, so the admin-only material is included).
+		raw, err := json.Marshal(n.localNodeDetail(ctx, true))
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Status: raw}
 
 	case "node-status":
 		// This node's /status document, optionally filtered to one range —

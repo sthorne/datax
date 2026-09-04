@@ -30,7 +30,16 @@ serves, on that address:
   days, one chart per series with one line per node, from the
   `datax_metrics` table described under [Metrics history](#metrics-history);
   every tile on the overview links to its own series charted, and the
-  tiles' sparklines are the last 15 minutes from that table. The cluster
+  tiles' sparklines are the last 15 minutes from that table. Clicking a
+  node in the Nodes table opens its **detail page** (`/#/node/N`):
+  identity (address, locality, release and protocol version, the
+  cluster version it has mirrored, uptime), its machine tiles, its
+  last 15 minutes of CPU, QPS, statements and KV latency, storage
+  (engine figures, the debt gate, the overload verdict, encryption and
+  re-encryption progress), the replicas it holds with their raft log
+  depth, its SQL summary (and, for admins, its statements in flight and
+  slow statements), its row of the network matrix, its settings, and
+  its recent events. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -59,6 +68,11 @@ serves, on that address:
   only those after sequence `N`, which is how the dashboard tails). In
   secure mode audit records (authentication failures, admin operations,
   privilege DDL) are included only for the admin role.
+- **`/api/node?id=N`** — JSON: the node detail page's document. The
+  serving node answers for itself to any authenticated user; another
+  node's document is fetched from that node over the internode RPC and
+  needs the admin role (403 otherwise). Statement text and audit
+  events are included only for admins.
 - **`/api/metrics`** — JSON: without parameters, the catalog of recorded
   series and the label values this node knows; with
   `?series=a,b&node=1,2&since=1h&step=30s&rate=1`, aligned `[t, v]`
@@ -73,8 +87,8 @@ serves, on that address:
   the tables it holds a grant on. Rebuilt at most every 5 s per node.
 
 In secure mode all of it requires HTTP Basic credentials of any database
-user, or a client certificate; `/api/range` additionally requires the
-admin role ([Security](security.md)). The dashboard header shows who it
+user, or a client certificate; `/api/range`, `/api/activity` and
+another node's `/api/node` additionally require the admin role ([Security](security.md)). The dashboard header shows who it
 is signed in as and how (`signed in as ops (basic)`, with an **admin**
 badge when the role is held); without the role the cluster ranges are
 not clickable and the note under them says which user is signed in and
