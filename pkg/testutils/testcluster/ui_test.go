@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +98,53 @@ func TestClusterAPI(t *testing.T) {
 		}
 		if len(doc.Local.Ranges) == 0 {
 			t.Fatalf("node %d: no local ranges", i+1)
+		}
+		// Every node's row carries the host summary its heartbeat
+		// advertised (the very first beat may predate range 1's leader,
+		// so allow a beat or two), and the serving node's own full sample
+		// rides along; the in-memory test store has no disk to report.
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			missing := 0
+			for _, cn := range doc.Nodes {
+				if cn.Machine == nil {
+					missing++
+					continue
+				}
+				if cn.Machine.Cores <= 0 || cn.Machine.UptimeSeconds < 0 {
+					t.Fatalf("node %d sees n%d with a bad machine summary: %+v", i+1, cn.NodeID, cn.Machine)
+				}
+				if runtime.GOOS == "linux" && (cn.Machine.MemTotal == 0 || cn.Machine.FDLimit == 0) {
+					t.Fatalf("node %d sees n%d without host memory or fd figures: %+v", i+1, cn.NodeID, cn.Machine)
+				}
+			}
+			if missing == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("node %d: %d nodes never advertised a machine summary", i+1, missing)
+			}
+			time.Sleep(500 * time.Millisecond)
+			_, _, body = httpGet(t, "http://"+n.HTTPAddr()+"/api/cluster")
+			if err := json.Unmarshal([]byte(body), &doc); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m := doc.Local.Machine
+		if m == nil || m.Goroutines == 0 || m.Cores == 0 {
+			t.Fatalf("node %d: no local machine sample: %+v", i+1, m)
+		}
+		if m.DiskTotal != 0 {
+			t.Fatalf("node %d: an in-memory store reported a disk: %+v", i+1, m)
+		}
+	}
+
+	// /metrics exports the host figures next to the standard Go and
+	// process collectors.
+	_, _, body := httpGet(t, "http://"+tc.Nodes[0].HTTPAddr()+"/metrics")
+	for _, want := range []string{"datax_node_cpu_percent{scope=\"host\"}", "datax_node_memory_bytes{kind=\"available\"}", "datax_node_load1", "datax_process_fd_limit", "go_goroutines", "process_open_fds"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics lacks %s", want)
 		}
 	}
 }

@@ -87,6 +87,11 @@ type NodeDescriptor struct {
 	LeaderCount int `json:"leader_count,omitempty"`
 	// ReplicaBytes sums SizeBytes over all replicas this node hosts.
 	ReplicaBytes int64 `json:"replica_bytes,omitempty"`
+	// Machine is the node's host summary (CPU, memory, store disk, load,
+	// file descriptors), sampled by the node itself and re-asserted on
+	// every heartbeat so any node can show every node's row without a
+	// fan-out. Absent from nodes on binaries that predate it.
+	Machine *MachineSummary `json:"machine,omitempty"`
 	// HotRanges are the node's heaviest mature leaseholders by QPS, and
 	// BigRanges its largest replicas by bytes (top-K each) — the concrete
 	// candidates a lease-shedding or byte-rebalancing pass acts on.
@@ -166,4 +171,29 @@ func (t *Transaction) Restart(now hlc.Timestamp) {
 type KeyValue struct {
 	Key   keys.Key `json:"key"`
 	Value []byte   `json:"value"`
+}
+
+// MachineSummary is the compact host picture a node advertises on its
+// heartbeat (see pkg/util/sysstats for the full sample behind it).
+type MachineSummary struct {
+	// CPUPercent is host CPU busy, percent of all cores, over the last
+	// sampling interval; Load1 the one-minute load average; Cores the
+	// logical CPU count.
+	CPUPercent float64 `json:"cpu_percent"`
+	Load1      float64 `json:"load1"`
+	Cores      int     `json:"cores"`
+	// Host memory in bytes: total, and available as the kernel defines
+	// it; RSS is the datax process's resident set.
+	MemTotal     uint64 `json:"mem_total"`
+	MemAvailable uint64 `json:"mem_available"`
+	RSS          uint64 `json:"rss"`
+	// The store directory's filesystem in bytes (zero for in-memory
+	// stores or platforms without the figure).
+	DiskTotal uint64 `json:"disk_total"`
+	DiskFree  uint64 `json:"disk_free"`
+	// File descriptors held and the soft limit.
+	OpenFDs int `json:"open_fds"`
+	FDLimit int `json:"fd_limit"`
+	// UptimeSeconds is how long the process has been up.
+	UptimeSeconds int64 `json:"uptime_seconds"`
 }

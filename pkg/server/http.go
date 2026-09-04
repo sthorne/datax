@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/sthorne/datax/pkg/kvserver"
@@ -15,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server/ui"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/util/sysstats"
 )
 
 // startHTTP brings up the observability endpoint (--http-listen):
@@ -64,6 +66,63 @@ func (n *Node) startHTTP() error {
 			return float64(total)
 		}),
 	)
+	// The host: the standard Go and process collectors (goroutines, heap,
+	// GC, process CPU seconds, RSS, open fds) plus datax gauges for what
+	// only the host can tell — host CPU, load, memory, the store disk and
+	// the network — all read from the node's sampler.
+	nodeReg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	if sys := n.sys; sys != nil {
+		latest := func() sysstats.Sample { return sys.Latest() }
+		cpu := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "datax_node_cpu_percent", Help: "Host CPU busy over the last sampling interval, percent of all cores (scope=host), and this process's share of one core (scope=process).",
+		}, []string{"scope"})
+		mem := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "datax_node_memory_bytes", Help: "Host memory: kind=total, available (as the kernel defines it), process_rss.",
+		}, []string{"kind"})
+		disk := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "datax_store_disk_bytes", Help: "The store directory's filesystem: kind=total, free.",
+		}, []string{"kind"})
+		diskIO := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "datax_store_disk_io_bytes_per_second", Help: "Throughput of the block device backing the store over the last sampling interval: op=read, write.",
+		}, []string{"op"})
+		net := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "datax_node_net_bytes_per_second", Help: "Network throughput over every non-loopback interface: dir=rx, tx.",
+		}, []string{"dir"})
+		nodeReg.MustRegister(cpu, mem, disk, diskIO, net,
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_node_load1", Help: "One-minute load average.",
+			}, func() float64 { return latest().Load1 }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_node_cores", Help: "Logical CPUs on the host.",
+			}, func() float64 { return float64(latest().Cores) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_store_disk_busy_percent", Help: "Share of the last sampling interval the store's block device had I/O in flight.",
+			}, func() float64 { return latest().DiskBusyPercent }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_process_fd_limit", Help: "Soft limit on open file descriptors (Pebble holds one per open sstable).",
+			}, func() float64 { return float64(latest().FDLimit) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_process_uptime_seconds", Help: "Seconds since the node started.",
+			}, func() float64 { return float64(latest().ProcessUp) }),
+		)
+		// Vectors have no Func form; refresh them from each sample, and
+		// seed them now so the first scrape already carries every series.
+		update := func(m sysstats.Sample) {
+			cpu.WithLabelValues("host").Set(m.CPUPercent)
+			cpu.WithLabelValues("process").Set(m.ProcessCPUPercent)
+			mem.WithLabelValues("total").Set(float64(m.MemTotal))
+			mem.WithLabelValues("available").Set(float64(m.MemAvailable))
+			mem.WithLabelValues("process_rss").Set(float64(m.RSS))
+			disk.WithLabelValues("total").Set(float64(m.DiskTotal))
+			disk.WithLabelValues("free").Set(float64(m.DiskFree))
+			diskIO.WithLabelValues("read").Set(m.DiskReadBytesPS)
+			diskIO.WithLabelValues("write").Set(m.DiskWriteBytesPS)
+			net.WithLabelValues("rx").Set(m.NetRxBytesPS)
+			net.WithLabelValues("tx").Set(m.NetTxBytesPS)
+		}
+		sys.OnSample(update)
+		update(latest())
+	}
 	if eng := n.engine; eng != nil {
 		nodeReg.MustRegister(
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -276,6 +335,10 @@ type NodeStatus struct {
 	Ranges    []RangeStatus `json:"ranges"`
 	LeaderOf  int           `json:"leader_of"`
 	LiveNodes int           `json:"live_nodes"`
+	// Machine is the node's latest host sample (CPU, memory, the store
+	// disk, network, file descriptors, Go runtime); nil before the first
+	// sample.
+	Machine *sysstats.Sample `json:"machine,omitempty"`
 }
 
 func (n *Node) rangeStatuses() []RangeStatus {
@@ -316,6 +379,11 @@ func (n *Node) statusSummary() NodeStatus {
 		Locality:  n.cfg.Locality.String(),
 		Ranges:    ranges,
 		LiveNodes: len(n.registry.All()),
+	}
+	if n.sys != nil {
+		if m := n.sys.Latest(); !m.At.IsZero() {
+			st.Machine = &m
+		}
 	}
 	for _, rs := range ranges {
 		if rs.Leader {
