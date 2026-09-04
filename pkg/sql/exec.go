@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -15,6 +17,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -67,7 +70,9 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 	case *parser.Delete:
 		return s.execDelete(ctx, txn, t, params)
 	case *parser.ShowTables:
-		return s.execShowTables(ctx, txn)
+		return s.execShowTables(ctx, txn, t.Database)
+	case *parser.Show:
+		return s.execShow(ctx, txn, t)
 	case *parser.ShowStats:
 		return s.execShowStats(ctx, txn, t)
 	case *parser.Analyze:
@@ -345,6 +350,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	if err := mustBeReal(desc); err != nil {
+		return nil, err
+	}
 	if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 		return nil, err
 	}
@@ -527,6 +535,11 @@ func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalo
 }
 
 func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if desc.Virtual != "" {
+		// A virtual table has no keys: whatever the plan, generate and
+		// filter (its "primary key" is the hidden ordinal).
+		return s.fetchVirtual(ctx, txn, desc, where, params, limit)
+	}
 	switch plan.kind {
 	case planPKPoint:
 		key, err := rowenc.EncodePK(desc, plan.pkVals)
@@ -848,14 +861,19 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	if t.Union != nil {
+		return s.execUnion(ctx, txn, t, params)
+	}
 	// Correlated conjuncts leave the WHERE clause before eager subquery
 	// resolution and access planning ever see them; they come back as a
 	// per-row filter after the fetch. Only the plain single-table path
 	// supports them.
 	var corr []correlatedConjunct
-	if t.Table != "" && len(t.Joins) == 0 && t.Derived == nil {
-		if cdesc, derr := s.lookup(ctx, txn, t.Table); derr == nil {
-			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, t.Where, cdesc, t.Alias)
+	var corrProjs []corrProj
+	var jc *joinCorr
+	if t.Table != "" && t.Derived == nil {
+		if outer, rowOf, ok := s.selectScope(ctx, txn, t); ok {
+			plannable, cc, serr := s.splitCorrelatedWhereScope(ctx, txn, t.Where, outer)
 			if serr != nil {
 				return nil, serr
 			}
@@ -863,6 +881,16 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				c := *t
 				c.Where = plannable
 				t, corr = &c, cc
+			}
+			if !hasAggregates(t.Exprs) && len(t.GroupBy) == 0 {
+				cp, c, perr := s.splitCorrelatedProj(ctx, txn, t, outer)
+				if perr != nil {
+					return nil, perr
+				}
+				t, corrProjs = c, cp
+			}
+			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0) {
+				jc = &joinCorr{conds: corr, projs: corrProjs, desc: outer.desc, rowOf: rowOf}
 			}
 		}
 	}
@@ -872,6 +900,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	if t.Derived != nil {
 		return s.execDerivedSelect(ctx, txn, t, params)
+	}
+	if t.FuncTable != nil {
+		return s.execFuncTableSelect(ctx, txn, t, params)
 	}
 	if t.Table == "" {
 		// FROM-less SELECT: one row of evaluated expressions.
@@ -909,7 +940,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return nil, err
 	}
 	if len(t.Joins) > 0 {
-		return s.execJoinSelect(ctx, txn, desc, t, params)
+		return s.execJoinSelect(ctx, txn, desc, t, params, jc)
 	}
 	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 		if t.ForUpdate {
@@ -923,6 +954,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Distinct && t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with DISTINCT")
 	}
+	stripTableAlias(t)
 	proj, perr := resolveProjection(desc, t.Exprs)
 	if perr != nil {
 		return nil, perr
@@ -943,8 +975,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return nil, err
 	}
 	needSort := false
-	if len(t.OrderBy) > 0 {
-		dec := orderPlan(desc, plan, t.OrderBy, s.db.ReverseScansOK())
+	order := resolveOrderAliases(t)
+	if len(order) > 0 {
+		dec := orderPlan(desc, plan, order, s.db.ReverseScansOK())
 		needSort = !dec.satisfied
 		if needSort {
 			fetchLimit = 0
@@ -988,7 +1021,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 	}
 	if needSort {
-		if err := sortRows(desc, rows, t.OrderBy); err != nil {
+		if err := sortRows(desc, rows, order, params); err != nil {
 			return nil, err
 		}
 		if !t.Distinct && t.Limit > 0 && int64(len(rows)) > t.Limit {
@@ -998,6 +1031,25 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	res := &Result{}
 	for _, p := range proj {
 		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+	}
+	// Output positions of the correlated subqueries (SELECT * expands to
+	// several projection columns ahead of them).
+	projMemo := corrMemo{}
+	projAt := make([]int, len(corrProjs))
+	if len(corrProjs) > 0 {
+		pos := make([]int, len(t.Exprs))
+		n := 0
+		for i, se := range t.Exprs {
+			pos[i] = n
+			if se.Star {
+				n += len(desc.VisibleColumns())
+			} else {
+				n++
+			}
+		}
+		for i, cp := range corrProjs {
+			projAt[i] = pos[cp.idx]
+		}
 	}
 	for _, fr := range rows {
 		out := make([]types.Datum, len(proj))
@@ -1015,6 +1067,17 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				d = types.DNull
 			}
 			out[i] = d
+		}
+		for i := range corrProjs {
+			cp := &corrProjs[i]
+			d, err := s.evalCorrProj(ctx, txn, cp, desc, fr.row, params, projMemo)
+			if err != nil {
+				return nil, err
+			}
+			out[projAt[i]] = d
+			if !d.Null {
+				res.Columns[projAt[i]].Type = d.Fam
+			}
 		}
 		res.Rows = append(res.Rows, out)
 	}
@@ -1042,6 +1105,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	}
 	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := mustBeReal(desc); err != nil {
 		return nil, err
 	}
 	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
@@ -1134,6 +1200,9 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
+	if err := mustBeReal(desc); err != nil {
+		return nil, err
+	}
 	if err := s.checkTablePriv(ctx, txn, desc, "DELETE"); err != nil {
 		return nil, err
 	}
@@ -1180,12 +1249,23 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 // stay in old row values and are skipped on decode) and refused for
 // primary-key or indexed columns. Column IDs are never reused, so a
 // drop-then-re-add cannot resurrect old values.
+// mustBeReal refuses a write or DDL against a virtual catalog table.
+func mustBeReal(desc *catalog.TableDescriptor) error {
+	if desc.Virtual != "" {
+		return newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be modified", desc.Virtual)
+	}
+	return nil
+}
+
 func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *parser.AlterTable) (*Result, error) {
 	if _, bare := catalog.SplitTableName(t.Table); catalog.IsSystemTable(bare) && !s.system && t.SetOptions == nil {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
 	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := mustBeReal(shared); err != nil {
 		return nil, err
 	}
 	desc := shared.Clone()
@@ -1354,8 +1434,11 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	}, nil
 }
 
-func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn) (*Result, error) {
-	db, err := s.cat.Database(ctx, txn, s.database)
+func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName string) (*Result, error) {
+	if dbName == "" {
+		dbName = s.database
+	}
+	db, err := s.cat.Database(ctx, txn, dbName)
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
@@ -1374,4 +1457,349 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn) (*Resul
 // asErr is errors.As with less ceremony at call sites.
 func asErr[T error](err error, target *T) bool {
 	return errors.As(err, target)
+}
+
+// stripTableAlias rewrites alias-qualified column references (r.rolname
+// in SELECT r.rolname FROM pg_roles r) to bare names for a single-table
+// select, where the executor addresses columns by name alone. Joins keep
+// their qualifiers; they resolve them per side.
+func stripTableAlias(t *parser.Select) {
+	if len(t.Joins) > 0 || t.Table == "" {
+		return
+	}
+	_, bare := catalog.SplitTableName(t.Table)
+	prefixes := map[string]bool{bare + ".": true, t.Table + ".": true}
+	if t.Alias != "" {
+		prefixes[t.Alias+"."] = true
+	}
+	strip := func(name string) string {
+		for pre := range prefixes {
+			if strings.HasPrefix(name, pre) && !strings.Contains(name[len(pre):], ".") {
+				return name[len(pre):]
+			}
+		}
+		return name
+	}
+	var walk func(e *parser.Expr)
+	walk = func(e *parser.Expr) {
+		if e == nil {
+			return
+		}
+		if e.Column != "" {
+			e.Column = strip(e.Column)
+		}
+		walk(e.Left)
+		walk(e.Right)
+		for i := range e.Args {
+			walk(&e.Args[i])
+		}
+		if e.Case != nil {
+			walk(e.Case.Operand)
+			for i := range e.Case.Whens {
+				walk(e.Case.Whens[i].Value)
+				walk(&e.Case.Whens[i].Result)
+				stripConds(e.Case.Whens[i].Cond, strip, walk)
+			}
+			walk(e.Case.Else)
+		}
+		if e.Cmp != nil {
+			c := *e.Cmp
+			stripConds([]parser.Comparison{c}, strip, walk)
+			e.Cmp = &c
+		}
+	}
+	for i := range t.Exprs {
+		walk(&t.Exprs[i].Expr)
+	}
+	stripConds(t.Where, strip, walk)
+	for i := range t.OrderBy {
+		t.OrderBy[i].Column = strip(t.OrderBy[i].Column)
+		walk(t.OrderBy[i].Expr)
+	}
+	for i := range t.GroupBy {
+		t.GroupBy[i] = strip(t.GroupBy[i])
+	}
+}
+
+func stripConds(conds []parser.Comparison, strip func(string) string, walk func(*parser.Expr)) {
+	for i := range conds {
+		c := &conds[i]
+		if c.Column != "" {
+			c.Column = strip(c.Column)
+		}
+		walk(c.Expr)
+		walk(&c.Value)
+		for j := range c.Values {
+			walk(&c.Values[j])
+		}
+		for j := range c.Or {
+			stripConds(c.Or[j], strip, walk)
+		}
+	}
+}
+
+// execUnion runs each member of a UNION [ALL] chain and concatenates the
+// results (UNION removes duplicate rows). Column names come from the
+// head; ORDER BY names resolve against the head's output columns, then
+// positionally through the last member's.
+func (s *Session) execUnion(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	head := *t
+	head.Union, head.OrderBy, head.Limit = nil, nil, -1
+	res, err := s.execSelect(ctx, txn, &head, params)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := s.execSelect(ctx, txn, t.Union, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(tail.Columns) != len(res.Columns) {
+		return nil, newErrf(CodeSyntaxError, "each UNION query must have the same number of columns")
+	}
+	rows := append(res.Rows, tail.Rows...)
+	if !t.UnionAll {
+		rows = dedupeRows(rows)
+	}
+	if len(t.OrderBy) > 0 {
+		order := append([]parser.OrderCol(nil), t.OrderBy...)
+		for i, oc := range order {
+			if oc.Expr != nil {
+				continue // sortResultRows reports it
+			}
+			known := false
+			for _, c := range res.Columns {
+				if c.Name == oc.Column {
+					known = true
+					break
+				}
+			}
+			if known {
+				continue
+			}
+			for j, c := range tail.Columns {
+				if c.Name == oc.Column {
+					order[i].Column = res.Columns[j].Name
+					break
+				}
+			}
+		}
+		if err := sortResultRows(res.Columns, rows, order); err != nil {
+			return nil, err
+		}
+	}
+	if t.Limit > 0 && int64(len(rows)) > t.Limit {
+		rows = rows[:t.Limit]
+	}
+	res.Rows = rows
+	res.Tag = fmt.Sprintf("SELECT %d", len(rows))
+	return res, nil
+}
+
+// resolveOrderAliases maps ORDER BY names that name an output column
+// (SELECT x AS nsp ... ORDER BY nsp) onto what that output computes: the
+// underlying column, or the expression itself. Output names take
+// precedence over input columns, as in PostgreSQL.
+func resolveOrderAliases(t *parser.Select) []parser.OrderCol {
+	if len(t.OrderBy) == 0 {
+		return nil
+	}
+	out := make([]parser.OrderCol, len(t.OrderBy))
+	for i, oc := range t.OrderBy {
+		out[i] = oc
+		if oc.Expr != nil || oc.Column == "" {
+			continue
+		}
+		for _, se := range t.Exprs {
+			if se.Star || se.Agg != "" || se.Alias != oc.Column {
+				continue
+			}
+			e := se.Expr
+			if plainColumn(e) {
+				out[i].Column = e.Column
+			} else {
+				out[i].Expr = &e
+			}
+			break
+		}
+	}
+	return out
+}
+
+// plainColumn reports whether e is a bare column reference.
+func plainColumn(e parser.Expr) bool {
+	return e.Column != "" && len(e.Path) == 0 && e.BinOp == "" && e.Func == "" && e.Left == nil &&
+		e.Case == nil && e.Cmp == nil && e.Lit == nil && e.Sub == nil
+}
+
+// selectScope builds the correlation scope a select's subqueries bind
+// against: its table, or the merged sides of its joins. Lookups that
+// fail leave the ordinary path to report them.
+func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.Select) (scopeLevel, func(joinedRow) map[catalog.ColumnID]types.Datum, bool) {
+	desc, err := s.lookup(ctx, txn, t.Table)
+	if err != nil {
+		return scopeLevel{}, nil, false
+	}
+	if len(t.Joins) == 0 {
+		level := scopeLevel{desc: desc, alias: t.Alias}
+		if level.alias == "" {
+			level.alias = desc.Name
+			if t.Table != desc.Name {
+				level.aliases = []string{t.Table}
+			}
+		}
+		return level, nil, true
+	}
+	inner := make([]*catalog.TableDescriptor, len(t.Joins))
+	for i := range t.Joins {
+		if inner[i], err = s.lookup(ctx, txn, t.Joins[i].Table); err != nil {
+			return scopeLevel{}, nil, false
+		}
+	}
+	sides, err := makeJoinSides(desc, inner, t)
+	if err != nil {
+		return scopeLevel{}, nil, false
+	}
+	level, rowOf := joinScope(sides)
+	return level, rowOf, true
+}
+
+// execShow runs the introspection statements (SHOW COLUMNS / INDEXES /
+// CREATE TABLE / USERS / GRANTS / ALL).
+func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Show) (*Result, error) {
+	str := types.NewString
+	res := &Result{Tag: "SHOW"}
+	cols := func(names ...string) {
+		for _, n := range names {
+			res.Columns = append(res.Columns, ResultColumn{Name: n, Type: types.String})
+		}
+	}
+	switch t.Kind {
+	case "columns":
+		desc, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return nil, err
+		}
+		cols("column_name", "data_type", "is_nullable", "column_default", "indices")
+		res.Columns[2].Type = types.Bool
+		for i := range desc.Columns {
+			c := &desc.Columns[i]
+			if c.Hidden {
+				continue
+			}
+			def := types.DNull
+			if c.Default != nil {
+				def = str(c.Default.Text())
+			}
+			var in []string
+			if desc.IsPKCol(c.ID) {
+				in = append(in, desc.Name+"_pkey")
+			}
+			for _, idx := range desc.Indexes {
+				for _, id := range idx.ColumnIDs {
+					if id == c.ID {
+						in = append(in, idx.Name)
+					}
+				}
+			}
+			res.Rows = append(res.Rows, []types.Datum{str(c.Name), str(vtable.FormatType(c)), types.NewBool(!c.NotNull && !desc.IsPKCol(c.ID)), def, str("{" + strings.Join(in, ",") + "}")})
+		}
+	case "indexes":
+		desc, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return nil, err
+		}
+		cols("table_name", "index_name", "non_unique", "seq_in_index", "column_name")
+		res.Columns[2].Type, res.Columns[3].Type = types.Bool, types.Int
+		seq := int64(0)
+		for _, id := range desc.PrimaryKey {
+			if c, ok := desc.ColByID(id); ok && !c.Hidden {
+				seq++
+				res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(desc.Name + "_pkey"), types.NewBool(false), types.NewInt(seq), str(c.Name)})
+			}
+		}
+		for _, idx := range desc.Indexes {
+			for j, id := range idx.ColumnIDs {
+				if c, ok := desc.ColByID(id); ok {
+					res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(idx.Name), types.NewBool(!idx.Unique), types.NewInt(int64(j + 1)), str(c.Name)})
+				}
+			}
+		}
+	case "create":
+		desc, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return nil, err
+		}
+		if err := mustBeReal(desc); err != nil {
+			return nil, err
+		}
+		cols("table_name", "create_statement")
+		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDef(desc))})
+	case "users":
+		env, err := s.virtualEnv(ctx, txn)
+		if err != nil {
+			return nil, err
+		}
+		cols("username", "is_admin")
+		res.Columns[1].Type = types.Bool
+		for _, u := range env.Users {
+			res.Rows = append(res.Rows, []types.Datum{str(u), types.NewBool(u == "root" || env.Admins[u])})
+		}
+	case "grants":
+		env, err := s.virtualEnv(ctx, txn)
+		if err != nil {
+			return nil, err
+		}
+		cols("database_name", "table_name", "grantee", "privilege_type")
+		var only *catalog.TableDescriptor
+		if t.Table != "" {
+			if only, err = s.lookup(ctx, txn, t.Table); err != nil {
+				return nil, err
+			}
+		}
+		for _, d := range env.Tables {
+			if only != nil && d.ID != only.ID {
+				continue
+			}
+			dbName := s.database
+			for _, db := range env.Databases {
+				if db.ID == d.DatabaseID {
+					dbName = db.Name
+				}
+			}
+			if only == nil && dbName != s.database {
+				continue
+			}
+			users := make([]string, 0, len(d.Privileges))
+			for u := range d.Privileges {
+				users = append(users, u)
+			}
+			sort.Strings(users)
+			for _, u := range users {
+				if t.User != "" && u != t.User {
+					continue
+				}
+				for _, priv := range d.Privileges[u] {
+					res.Rows = append(res.Rows, []types.Datum{str(dbName), str(d.Name), str(u), str(priv)})
+				}
+			}
+		}
+	case "all":
+		cols("name", "setting")
+		for _, kv := range s.settings() {
+			res.Rows = append(res.Rows, []types.Datum{str(kv[0]), str(kv[1])})
+		}
+	default:
+		return nil, newErrf(CodeInternal, "unknown SHOW form %q", t.Kind)
+	}
+	res.Tag = fmt.Sprintf("SHOW %d", len(res.Rows))
+	return res, nil
 }

@@ -9,6 +9,8 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Uncorrelated subqueries: the inner SELECT is evaluated first, within the
@@ -72,6 +74,60 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 	case "current_schema":
 		d := types.NewString(catalog.PublicSchema)
 		out.Func, out.Lit = "", &d
+	case "current_user", "session_user":
+		d := types.NewString(s.user)
+		out.Func, out.Lit = "", &d
+	case "version":
+		d := types.NewString("PostgreSQL 14.0 datax " + version.Release)
+		out.Func, out.Lit = "", &d
+	case "pg_backend_pid":
+		d := types.NewInt(0)
+		out.Func, out.Lit = "", &d
+	case "pg_get_userbyid":
+		// Every object is owned by root (there is no ownership yet).
+		d := types.NewString("root")
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_table_is_visible":
+		d := types.NewBool(true)
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_encoding_to_char":
+		d := types.NewString("UTF8")
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "pg_get_statisticsobjdef_columns":
+		d := types.DNull
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_relation_is_publishable":
+		d := types.NewBool(true)
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "array":
+		// array(SELECT ...): the subquery's single column rendered as a
+		// text array literal.
+		if len(e.Args) == 1 && e.Args[0].Sub != nil {
+			res, err := s.execSubSelect(ctx, txn, e.Args[0].Sub, params)
+			if err != nil {
+				return e, err
+			}
+			if len(res.Columns) != 1 {
+				return e, newErrf(CodeSyntaxError, "subquery must return only one column")
+			}
+			elems := make([]string, len(res.Rows))
+			for i, r := range res.Rows {
+				elems[i] = arrayElemText(r[0])
+			}
+			d := types.NewString("{" + strings.Join(elems, ",") + "}")
+			out.Func, out.Args, out.Lit = "", nil, &d
+		}
+	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr":
+		// Row-dependent catalog renderings: the virtual tables carry them
+		// as hidden columns beside the OID the function takes, so the
+		// call becomes a column reference on the same row.
+		if len(e.Args) > 0 && e.Args[0].Column != "" && (e.Func != "format_type" || len(e.Args) == 2 && e.Args[1].Column != "") {
+			prefix := ""
+			if i := strings.LastIndexByte(e.Args[0].Column, '.'); i >= 0 {
+				prefix = e.Args[0].Column[:i+1]
+			}
+			out.Func, out.Args, out.Column = "", nil, prefix+vtable.HiddenColumnFor(e.Func)
+		}
 	}
 	if e.Left != nil {
 		l, err := s.resolveValueExpr(ctx, txn, *e.Left, params)
@@ -87,9 +143,9 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		out.Right = &r
 	}
-	if len(e.Args) > 0 {
-		args := make([]parser.Expr, len(e.Args))
-		for i, a := range e.Args {
+	if len(out.Args) > 0 {
+		args := make([]parser.Expr, len(out.Args))
+		for i, a := range out.Args {
 			ra, err := s.resolveValueExpr(ctx, txn, a, params)
 			if err != nil {
 				return e, err
@@ -98,23 +154,139 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		out.Args = args
 	}
+	if e.Cmp != nil {
+		// A boolean value: its EXISTS / IN / scalar subqueries resolve
+		// like a WHERE conjunct's.
+		resolved, err := s.resolveWhereSubs(ctx, txn, []parser.Comparison{*e.Cmp}, params)
+		if err != nil {
+			return e, err
+		}
+		out.Cmp = &resolved[0]
+	}
+	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
+		// 'name'::regclass: the table's OID (a real table's, or a catalog
+		// view's), 42P01 when nothing is so named.
+		desc, err := s.lookup(ctx, txn, out.Lit.Text())
+		if err != nil {
+			return e, newErrf(CodeUndefinedTable, "relation %q does not exist", out.Lit.Text())
+		}
+		d := types.NewInt(vtable.TableOID(desc))
+		out.Lit, out.Cast = &d, ""
+	}
+	if e.Case != nil {
+		ce := *e.Case
+		if ce.Operand != nil {
+			op, err := s.resolveValueExpr(ctx, txn, *ce.Operand, params)
+			if err != nil {
+				return e, err
+			}
+			ce.Operand = &op
+		}
+		whens := make([]parser.CaseWhen, len(ce.Whens))
+		for i, w := range ce.Whens {
+			nw := w
+			if w.Value != nil {
+				v, err := s.resolveValueExpr(ctx, txn, *w.Value, params)
+				if err != nil {
+					return e, err
+				}
+				nw.Value = &v
+			}
+			if len(w.Cond) > 0 {
+				c, err := s.resolveWhereSubs(ctx, txn, w.Cond, params)
+				if err != nil {
+					return e, err
+				}
+				nw.Cond = c
+			}
+			r, err := s.resolveValueExpr(ctx, txn, w.Result, params)
+			if err != nil {
+				return e, err
+			}
+			nw.Result = r
+			whens[i] = nw
+		}
+		ce.Whens = whens
+		if ce.Else != nil {
+			el, err := s.resolveValueExpr(ctx, txn, *ce.Else, params)
+			if err != nil {
+				return e, err
+			}
+			ce.Else = &el
+		}
+		out.Case = &ce
+	}
 	return out, nil
 }
 
 // exprHasSub reports whether an expression needs the pre-execution
 // resolve pass: a scalar subquery or a now() call anywhere inside it.
 func exprHasSub(e parser.Expr) bool {
-	if e.Sub != nil || e.Func == "now" || e.Func == "current_database" || e.Func == "current_schema" {
+	return exprHas(e, func(x parser.Expr) bool {
+		return x.Sub != nil || x.Cast != "" || (x.Func != "" && splicedFuncs[x.Func])
+	})
+}
+
+// exprHasSubquery reports whether an actual (SELECT ...) appears
+// anywhere inside the expression (spliced functions do not count).
+func exprHasSubquery(e parser.Expr) bool {
+	return exprHas(e, func(x parser.Expr) bool { return x.Sub != nil })
+}
+
+// condHas is exprHas over a conjunct: its subquery, its expressions,
+// and (recursively) an OR group's disjuncts.
+func condHas(c parser.Comparison, pred func(parser.Expr) bool) bool {
+	if c.Sub != nil && pred(parser.Expr{Sub: c.Sub}) || exprHas(c.Value, pred) || c.Expr != nil && exprHas(*c.Expr, pred) {
 		return true
 	}
-	if e.Left != nil && exprHasSub(*e.Left) {
+	for _, v := range c.Values {
+		if exprHas(v, pred) {
+			return true
+		}
+	}
+	for _, d := range c.Or {
+		for _, inner := range d {
+			if condHas(inner, pred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func exprHas(e parser.Expr, pred func(parser.Expr) bool) bool {
+	if pred(e) {
 		return true
 	}
-	if e.Right != nil && exprHasSub(*e.Right) {
+	if e.Cmp != nil && condHas(*e.Cmp, pred) {
+		return true
+	}
+	if e.Case != nil {
+		if e.Case.Operand != nil && exprHas(*e.Case.Operand, pred) {
+			return true
+		}
+		for _, w := range e.Case.Whens {
+			if w.Value != nil && exprHas(*w.Value, pred) || exprHas(w.Result, pred) {
+				return true
+			}
+			for _, c := range w.Cond {
+				if condHas(c, pred) {
+					return true
+				}
+			}
+		}
+		if e.Case.Else != nil && exprHas(*e.Case.Else, pred) {
+			return true
+		}
+	}
+	if e.Left != nil && exprHas(*e.Left, pred) {
+		return true
+	}
+	if e.Right != nil && exprHas(*e.Right, pred) {
 		return true
 	}
 	for _, a := range e.Args {
-		if exprHasSub(a) {
+		if exprHas(a, pred) {
 			return true
 		}
 	}
@@ -163,8 +335,8 @@ func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where
 	for i := range out {
 		cmp := &out[i]
 		if len(cmp.Or) > 0 {
-			// OR groups hold no subqueries (the parser rejects them), but
-			// may hold now() calls: resolve each disjunct recursively.
+			// OR groups may hold scalar subqueries and now() calls:
+			// resolve each disjunct recursively.
 			or := make([][]parser.Comparison, len(cmp.Or))
 			for j, d := range cmp.Or {
 				rd, err := s.resolveWhereSubs(ctx, txn, d, params)
@@ -441,11 +613,49 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 	if err != nil {
 		return nil, err
 	}
-	desc := derivedDesc(t.Alias, inner.Columns)
-	t = derivedSelect(t)
+	return s.execMaterialized(ctx, txn, derivedDesc(t.Alias, inner.Columns), inner.Rows, t, params)
+}
 
-	rows := make([]fetchedRow, 0, len(inner.Rows))
-	for _, r := range inner.Rows {
+// funcTableDesc is the one-column descriptor of a FROM table function.
+func funcTableDesc(t *parser.Select) *catalog.TableDescriptor {
+	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: types.String}}}
+}
+
+// execFuncTableSelect materializes FROM unnest(array): one text row per
+// array element (NULL when the array is NULL), then runs the select's
+// pipeline over them.
+func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	e, err := s.resolveValueExpr(ctx, txn, *t.FuncTable, params)
+	if err != nil {
+		return nil, err
+	}
+	if e.Func != "unnest" || len(e.Args) != 1 {
+		return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
+	}
+	arg, err := evalExpr(e.Args[0], nil, nil, params)
+	if err != nil {
+		return nil, err
+	}
+	var rows [][]types.Datum
+	if !arg.Null {
+		for _, el := range arrayElems(arg.Text()) {
+			d := types.NewString(el)
+			if el == "NULL" {
+				d = types.DNull
+			}
+			rows = append(rows, []types.Datum{d})
+		}
+	}
+	return s.execMaterialized(ctx, txn, funcTableDesc(t), rows, t, params)
+}
+
+// execMaterialized runs a select's pipeline (WHERE filter, grouping or
+// projection, ORDER BY, DISTINCT, LIMIT) over in-memory rows shaped by
+// desc, for derived tables and table functions.
+func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, inRows [][]types.Datum, t *parser.Select, params []types.Datum) (*Result, error) {
+	t = derivedSelect(t)
+	rows := make([]fetchedRow, 0, len(inRows))
+	for _, r := range inRows {
 		row := make(map[catalog.ColumnID]types.Datum, len(r))
 		for i, d := range r {
 			row[catalog.ColumnID(i+1)] = d
@@ -467,7 +677,7 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 
 	if len(t.OrderBy) > 0 {
-		if err := sortRows(desc, rows, t.OrderBy); err != nil {
+		if err := sortRows(desc, rows, t.OrderBy, params); err != nil {
 			return nil, err
 		}
 	}
@@ -506,4 +716,27 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
+}
+
+// splicedFuncs are resolved by the session before execution: they
+// depend on the session, the clock, or the catalog rather than the row.
+var splicedFuncs = map[string]bool{
+	"now": true, "current_database": true, "current_schema": true, "current_user": true, "session_user": true,
+	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true,
+	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
+	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true,
+	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
+	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
+}
+
+// arrayElemText renders one datum as a text array element.
+func arrayElemText(d types.Datum) string {
+	if d.Null {
+		return "NULL"
+	}
+	t := d.Text()
+	if t == "" || strings.ContainsAny(t, ",{}\"\\ ") {
+		return "\"" + strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(t) + "\""
+	}
+	return t
 }

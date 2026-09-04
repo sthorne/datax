@@ -283,7 +283,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				}
 			}
 			for _, kv := range [][2]string{
-				{"server_version", "13.0 datax"},
+				{"server_version", "14.0 datax"},
 				{"server_encoding", "UTF8"},
 				{"client_encoding", "UTF8"},
 				{"DateStyle", "ISO"},

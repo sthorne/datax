@@ -34,16 +34,16 @@ func TestCorrScopeClassify(t *testing.T) {
 		level   int
 		errCode string
 	}{
-		{name: "dept_id", level: 0},            // bare, inner only
-		{name: "region", level: 1},             // bare, outer only → correlated
-		{name: "id", level: 0},                 // bare, both → inner shadows
-		{name: "emp.id", level: 0},             // inner-qualified
-		{name: "d.id", level: 1},               // outer-alias-qualified
-		{name: "depts.region", level: 1},       // outer-table-qualified
-		{name: "emp.region", errCode: "42703"}, // inner-qualified, not an inner column
-		{name: "d.dept_id", errCode: "42703"},  // outer-qualified, not an outer column
-		{name: "nosuch", errCode: "42703"},     // bare, neither scope
-		{name: "other.id", errCode: "42P01"},   // unknown qualifier
+		{name: "dept_id", level: 0},              // bare, inner only
+		{name: "region", level: 1},               // bare, outer only → correlated
+		{name: "id", level: 0},                   // bare, both → inner shadows
+		{name: "emp.id", level: 0},               // inner-qualified
+		{name: "d.id", level: 1},                 // outer-alias-qualified
+		{name: "depts.region", errCode: "42P01"}, // an aliased table answers to its alias only (PostgreSQL)
+		{name: "emp.region", errCode: "42703"},   // inner-qualified, not an inner column
+		{name: "d.dept_id", errCode: "42703"},    // outer-qualified, not an outer column
+		{name: "nosuch", errCode: "42703"},       // bare, neither scope
+		{name: "other.id", errCode: "42P01"},     // unknown qualifier
 	}
 	for _, tc := range cases {
 		level, err := sc.classify(tc.name)
@@ -86,12 +86,11 @@ func TestCorrScopeStack(t *testing.T) {
 		name  string
 		level int
 	}{
-		{"id", 0},           // all three have it: innermost wins
-		{"region_id", 1},    // mid only
-		{"zone", 2},         // grandparent only
-		{"d.id", 1},         // qualified to mid
-		{"r.id", 2},         // qualified to grandparent
-		{"regions.zone", 2}, // table-name qualifier reaches the far scope
+		{"id", 0},        // all three have it: innermost wins
+		{"region_id", 1}, // mid only
+		{"zone", 2},      // grandparent only
+		{"d.id", 1},      // qualified to mid
+		{"r.id", 2},      // qualified to grandparent
 	} {
 		level, err := sc.classify(tc.name)
 		if err != nil {

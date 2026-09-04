@@ -461,7 +461,7 @@ explicit `BEGIN ... COMMIT`.
   as schema changes: by the time GRANT returns, every gateway enforces
   it. In insecure (trust) mode the username is client-claimed, so
   enforcement there is advisory — anyone can claim `root`.
-  Then `ParameterStatus` for `server_version` (reports a PG-13-compatible
+  Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;
   then `BackendKeyData` and `ReadyForQuery`.

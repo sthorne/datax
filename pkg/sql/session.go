@@ -2,17 +2,23 @@ package sql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/decimal"
+	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -154,10 +160,155 @@ func (s *Session) User() string { return s.user }
 // Database returns the session's current database.
 func (s *Session) Database() string { return s.database }
 
-// lookup resolves a table name in the session's current database (or
-// the name's own qualifier).
+// settings lists the session variables SHOW ALL and pg_settings report:
+// the wire's startup parameters plus the ones the session honors.
+func (s *Session) settings() [][2]string {
+	return [][2]string{
+		{"application_name", ""},
+		{"client_encoding", "UTF8"},
+		{"database", s.database},
+		{"DateStyle", "ISO"},
+		{"integer_datetimes", "on"},
+		{"search_path", catalog.PublicSchema},
+		{"server_encoding", "UTF8"},
+		{"server_version", "14.0 datax"},
+		{"standard_conforming_strings", "on"},
+		{"TimeZone", "UTC"},
+		{"transaction_isolation", "serializable"},
+	}
+}
+
+// setting resolves a SHOW name (case-insensitively; SHOW TIME ZONE and
+// SHOW TRANSACTION ISOLATION LEVEL by their spelled-out forms) to the
+// setting's canonical name and value.
+func (s *Session) setting(name string) (string, string, bool) {
+	switch strings.ToLower(name) {
+	case "time_zone":
+		name = "TimeZone"
+	case "transaction_isolation_level":
+		name = "transaction_isolation"
+	}
+	for _, kv := range s.settings() {
+		if strings.EqualFold(kv[0], name) {
+			return kv[0], kv[1], true
+		}
+	}
+	return "", "", false
+}
+
+// lookup resolves a table name: a virtual catalog table (pg_catalog.x,
+// information_schema.x, or a bare pg_catalog name that no real table in
+// the current database shadows) or a table in the session's current
+// database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
-	return s.cat.LookupIn(ctx, txn, s.database, name)
+	db, bare := catalog.SplitTableName(name)
+	if vtable.IsSchema(db) {
+		if vt, ok := vtable.Lookup(name); ok {
+			return vt.Descriptor(), nil
+		}
+		return nil, &catalog.ErrTableNotFound{Name: name}
+	}
+	d, err := s.cat.LookupIn(ctx, txn, s.database, name)
+	if err != nil && db == "" {
+		var nf *catalog.ErrTableNotFound
+		if errors.As(err, &nf) {
+			if vt, ok := vtable.Lookup(bare); ok {
+				return vt.Descriptor(), nil
+			}
+		}
+	}
+	return d, err
+}
+
+// virtualEnv gathers what the virtual tables render: every database,
+// the tables the session may see (all of them for admins; for others,
+// the tables they hold a privilege on), statistics, users and admins.
+func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.Env, error) {
+	env := &vtable.Env{User: s.user, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Admins: map[string]bool{}}
+	dbs, err := catalog.ListDatabases(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	env.Databases = dbs
+	admin, err := s.isAdmin(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	env.IsAdmin = admin
+	all, err := s.cat.List(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range all {
+		if !admin && len(d.Privileges[s.user]) == 0 {
+			continue
+		}
+		env.Tables = append(env.Tables, d)
+		if st, _ := s.cat.Stats(ctx, d.ID); st != nil {
+			env.Stats[d.ID] = st
+		}
+	}
+	lo, hi := keys.UserSpan()
+	users, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return nil, err
+	}
+	env.Users = []string{"root"}
+	for _, kv := range users {
+		if _, name, derr := encoding.DecodeString(kv.Key[len(lo):]); derr == nil && name != "root" {
+			env.Users = append(env.Users, name)
+		}
+	}
+	alo, ahi := keys.AdminUserSpan()
+	admins, err := txn.Scan(ctx, alo, ahi, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, kv := range admins {
+		if _, name, derr := encoding.DecodeString(kv.Key[len(alo):]); derr == nil {
+			env.Admins[name] = true
+		}
+	}
+	env.Settings = s.settings()
+	return env, nil
+}
+
+// fetchVirtual generates a virtual table's rows and applies the WHERE
+// conjuncts (no index ever applies).
+func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	vt, ok := vtable.Lookup(desc.Virtual)
+	if !ok {
+		return nil, newErrf(CodeInternal, "virtual table %q vanished", desc.Virtual)
+	}
+	env, err := s.virtualEnv(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := vt.Rows(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	ord := desc.PrimaryKey[0]
+	var out []fetchedRow
+	for i, r := range rows {
+		row := make(map[catalog.ColumnID]types.Datum, len(r)+1)
+		for j, d := range r {
+			row[catalog.ColumnID(j+1)] = d
+		}
+		row[ord] = types.NewInt(int64(i))
+		ok, err := matchesWhere(where, desc, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		out = append(out, fetchedRow{row: row})
+		if limit > 0 && int64(len(out)) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *Session) State() TxnState { return s.state }
@@ -248,15 +399,12 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return s.execRollbackToSavepoint(ctx, t.Name)
 
 	case *parser.SetVar:
-		if t.Name == "show:database" || t.Name == "show:search_path" {
-			v := s.database
-			if t.Name == "show:search_path" {
-				v = catalog.PublicSchema
-			}
-			return &Result{Columns: []ResultColumn{{Name: t.Name[5:], Type: types.String}}, Rows: [][]types.Datum{{types.NewString(v)}}, Tag: "SHOW"}, nil
-		}
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
-			return &Result{Columns: []ResultColumn{{Name: t.Name[5:], Type: types.String}}, Tag: "SHOW"}, nil
+			name, value, ok := s.setting(t.Name[5:])
+			if !ok {
+				return nil, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", t.Name[5:])
+			}
+			return &Result{Columns: []ResultColumn{{Name: name, Type: types.String}}, Rows: [][]types.Datum{{types.NewString(value)}}, Tag: "SHOW"}, nil
 		}
 		if t.Name == "database" {
 			if serr := s.UseDatabase(ctx, t.Value); serr != nil {
@@ -492,6 +640,12 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, err
 		}
 		base = d
+	case e.Case != nil:
+		d, err := evalCase(e.Case, env, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		base = d
 	case e.Func != "":
 		d, err := evalFunc(e, env, params)
 		if err != nil {
@@ -511,6 +665,12 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, err
 		}
 		base = d
+	case e.Cmp != nil:
+		ok, err := condsHold([]parser.Comparison{*e.Cmp}, env, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		base = types.NewBool(ok)
 	case e.Sub != nil:
 		// Scalar subqueries are evaluated and spliced before execution.
 		return types.Datum{}, newErrf(CodeInternal, "unresolved scalar subquery")
@@ -537,6 +697,9 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	if l.Null || r.Null {
 		return types.DNull, nil
+	}
+	if op == "||" {
+		return types.NewString(l.Text() + r.Text()), nil
 	}
 	if l.Fam == types.Int && r.Fam == types.Int {
 		switch op {
@@ -678,10 +841,63 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 			return d, nil
 		}
 		return types.Datum{}, newErrf(CodeFeatureNotSupported, "abs() requires a numeric argument, got %s", d.Fam)
+	case "quote_ident":
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		return types.NewString(`"` + strings.ReplaceAll(args[0].Text(), `"`, `""`) + `"`), nil
+	case "pg_typeof":
+		return types.NewString(vtable.TypeName(args[0].Fam)), nil
+	case "format_type":
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		return types.NewString(vtable.FormatTypeOID(args[0].I)), nil
 	case "now":
 		return types.Datum{}, newErrf(CodeInternal, "now() was not resolved before execution")
+	case "array_to_string":
+		if args[0].Null || args[1].Null {
+			return types.DNull, nil
+		}
+		return types.NewString(strings.Join(arrayElems(args[0].Text()), args[1].Text())), nil
+	case "pg_size_pretty":
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		n, err := args[0].Coerce(types.Int)
+		if err != nil {
+			return types.DNull, nil
+		}
+		return types.NewString(sizePretty(n.I)), nil
+	case "pg_table_size", "pg_total_relation_size", "pg_relation_size", "pg_database_size",
+		"pg_get_function_result", "pg_get_function_arguments", "pg_get_function_identity_arguments",
+		"pg_get_functiondef", "pg_get_triggerdef", "pg_get_ruledef":
+		return types.DNull, nil
+	case "pg_char_to_encoding":
+		return types.NewInt(6), nil // UTF8
+	case "getdatabaseencoding":
+		return types.NewString("UTF8"), nil
+	case "pg_tablespace_location":
+		return types.NewString(""), nil
+	case "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible":
+		return types.NewBool(true), nil
 	}
-	return types.Datum{}, newErrf(CodeFeatureNotSupported, "unknown function %q", e.Func)
+	return types.Datum{}, newErrf(CodeUndefinedFunction, "unknown function %q", e.Func)
+}
+
+// sizePretty renders bytes the way pg_size_pretty does.
+func sizePretty(n int64) string {
+	units := []string{"bytes", "kB", "MB", "GB", "TB", "PB"}
+	v := float64(n)
+	i := 0
+	for i < len(units)-1 && (v >= 10240 || v <= -10240) {
+		v /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d bytes", n)
+	}
+	return fmt.Sprintf("%.0f %s", v, units[i])
 }
 
 // matchesWhere evaluates the conjunction against a full row.
@@ -708,11 +924,8 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			if lhs.Null || rhs.Null {
 				return false, nil
 			}
-			c, err := lhs.Compare(rhs)
-			if err != nil {
-				return false, nil
-			}
-			if !cmpHolds(cmp.Op, c) {
+			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			if err != nil || !ok {
 				return false, nil
 			}
 			continue
@@ -798,6 +1011,16 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if lhs.Null || rhs.Null {
 			return false, nil // NULL comparisons never match
 		}
+		if !plainCmpOp(cmp.Op) {
+			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
+			}
+			continue
+		}
 		rhs, err = rhs.Coerce(cmpType)
 		if err != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, err)
@@ -811,6 +1034,281 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		}
 	}
 	return true, nil
+}
+
+// evalCase evaluates a CASE expression: the simple form compares the
+// operand with each WHEN value, the searched form tests each condition.
+func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Datum, error) {
+	var operand types.Datum
+	if ce.Operand != nil {
+		d, err := evalExprEnv(*ce.Operand, env, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		operand = d
+	}
+	for _, w := range ce.Whens {
+		hit := false
+		if ce.Operand != nil {
+			v, err := evalExprEnv(*w.Value, env, params)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			if !operand.Null && !v.Null {
+				if c, err := operand.Compare(v); err == nil && c == 0 {
+					hit = true
+				}
+			}
+		} else {
+			ok, err := condsHold(w.Cond, env, params)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			hit = ok
+		}
+		if hit {
+			return evalExprEnv(w.Result, env, params)
+		}
+	}
+	if ce.Else != nil {
+		return evalExprEnv(*ce.Else, env, params)
+	}
+	return types.DNull, nil
+}
+
+// condsHold evaluates WHERE-shaped conjuncts against an expression
+// environment (CASE WHEN conditions): comparisons, IS NULL, IN lists, OR.
+func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool, error) {
+	for _, cmp := range conds {
+		switch cmp.Op {
+		case "TRUE":
+			continue
+		case "FALSE":
+			return false, nil
+		case "OR":
+			any := false
+			for _, alt := range cmp.Or {
+				ok, err := condsHold(alt, env, params)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					any = true
+					break
+				}
+			}
+			if !any {
+				return false, nil
+			}
+			continue
+		}
+		var lhs types.Datum
+		var err error
+		if cmp.Expr != nil {
+			lhs, err = evalExprEnv(*cmp.Expr, env, params)
+		} else {
+			lhs, err = env.col(cmp.Column)
+		}
+		if err != nil {
+			return false, err
+		}
+		switch cmp.Op {
+		case "IS NULL":
+			if !lhs.Null {
+				return false, nil
+			}
+			continue
+		case "IS NOT NULL":
+			if lhs.Null {
+				return false, nil
+			}
+			continue
+		case "IN", "NOT IN":
+			found := false
+			for _, ve := range cmp.Values {
+				v, err := evalExprEnv(ve, env, params)
+				if err != nil {
+					return false, err
+				}
+				if !lhs.Null && !v.Null {
+					if c, err := lhs.Compare(v); err == nil && c == 0 {
+						found = true
+						break
+					}
+				}
+			}
+			if found != (cmp.Op == "IN") {
+				return false, nil
+			}
+			continue
+		}
+		rhs, err := evalExprEnv(cmp.Value, env, params)
+		if err != nil {
+			return false, err
+		}
+		if lhs.Null || rhs.Null {
+			return false, nil
+		}
+		ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+		if err != nil || !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// applyCmpOp applies an operator to two values: ordering operators
+// through Compare, the regular-expression operators on text.
+func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
+	switch op {
+	case "~", "!~", "~*", "!~*":
+		re, err := regexFor(rhs.Text(), op == "~*" || op == "!~*")
+		if err != nil {
+			return false, err
+		}
+		m := re.MatchString(lhs.Text())
+		return m == (op == "~" || op == "~*"), nil
+	}
+	switch op {
+	case "LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE":
+		re, err := regexFor(likeToRegexp(rhs.Text()), strings.HasSuffix(op, "ILIKE"))
+		if err != nil {
+			return false, err
+		}
+		m := re.MatchString(lhs.Text())
+		return m == !strings.HasPrefix(op, "NOT"), nil
+	}
+	if i := strings.IndexByte(op, ' '); i >= 0 {
+		// Quantified comparison over a text array value ('{a,b}'): ANY
+		// holds when some element does, ALL when every element does.
+		base, quant := op[:i], op[i+1:]
+		for _, el := range arrayElems(rhs.Text()) {
+			ed := types.NewString(el)
+			if c, err := ed.Coerce(lhs.Fam); err == nil {
+				ed = c
+			}
+			ok, err := applyCmpOp(base, lhs, ed)
+			if err != nil {
+				return false, err
+			}
+			if ok && quant == "ANY" {
+				return true, nil
+			}
+			if !ok && quant == "ALL" {
+				return false, nil
+			}
+		}
+		return quant == "ALL", nil
+	}
+	if lhs.Fam != rhs.Fam {
+		if c, err := rhs.Coerce(lhs.Fam); err == nil {
+			rhs = c
+		}
+	}
+	c, err := lhs.Compare(rhs)
+	if err != nil {
+		return false, err
+	}
+	return cmpHolds(op, c), nil
+}
+
+// likeToRegexp translates a LIKE pattern (% and _ wildcards, backslash
+// escapes) into an anchored regular expression.
+func likeToRegexp(pattern string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	escaped := false
+	for _, r := range pattern {
+		switch {
+		case escaped:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '%':
+			b.WriteString(".*")
+		case r == '_':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString("$")
+	return b.String()
+}
+
+// plainCmpOp reports whether op is an ordering comparison the typed
+// Coerce-and-Compare path handles; the rest go through applyCmpOp.
+func plainCmpOp(op string) bool {
+	switch op {
+	case "=", "!=", "<", "<=", ">", ">=":
+		return true
+	}
+	return false
+}
+
+// arrayElems splits a PostgreSQL text array literal ('{a,"b c",d}') into
+// its elements. NULL elements come back as the text "NULL".
+func arrayElems(text string) []string {
+	text = strings.TrimSpace(text)
+	if len(text) >= 2 && text[0] == '{' && text[len(text)-1] == '}' {
+		text = text[1 : len(text)-1]
+	} else {
+		// An int2vector (pg_index.indkey): space-separated, no braces.
+		return strings.Fields(text)
+	}
+	if text == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	quoted, escaped := false, false
+	for _, r := range text {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '"':
+			quoted = !quoted
+		case r == ',' && !quoted:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	out = append(out, cur.String())
+	return out
+}
+
+var (
+	regexMu    sync.Mutex
+	regexCache = map[string]*regexp.Regexp{}
+)
+
+// regexFor compiles a POSIX-style pattern (Go's RE2 covers what psql and
+// the tools send), cached.
+func regexFor(pattern string, fold bool) (*regexp.Regexp, error) {
+	key := pattern
+	if fold {
+		key = "(?i)" + pattern
+	}
+	regexMu.Lock()
+	defer regexMu.Unlock()
+	if re, ok := regexCache[key]; ok {
+		return re, nil
+	}
+	re, err := regexp.Compile(key)
+	if err != nil {
+		return nil, newErrf(CodeInvalidParameterValue, "invalid regular expression %q: %v", pattern, err)
+	}
+	if len(regexCache) > 256 {
+		regexCache = map[string]*regexp.Regexp{}
+	}
+	regexCache[key] = re
+	return re, nil
 }
 
 // cmpHolds applies a comparison operator to a Compare result.

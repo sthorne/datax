@@ -8,6 +8,40 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.11.0 — unreleased
+
+### Added
+- PostgreSQL catalogs and `SHOW` (#89): read-only `pg_catalog` and
+  `information_schema` virtual tables over the live schema
+  (`pg_database`, `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+  `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_roles`, `pg_settings`,
+  `pg_tables`, `pg_indexes`, `pg_collation`, `pg_tablespace`, ...,
+  `information_schema.tables` / `columns` / `table_constraints` /
+  `key_column_usage` / `statistics` / `role_table_grants`, and empty
+  stand-ins for the catalogs of features datax lacks), the catalog
+  functions tools call (`format_type`, `pg_get_indexdef`,
+  `pg_get_constraintdef`, `pg_get_expr`, `pg_get_userbyid`,
+  `pg_table_is_visible`, `current_setting`, `array_to_string`,
+  `pg_size_pretty`, `has_*_privilege`, ...), and `SHOW COLUMNS FROM t`,
+  `SHOW INDEXES FROM t`, `SHOW CREATE TABLE t`, `SHOW USERS`, `SHOW
+  GRANTS [ON t] [FOR user]`, `SHOW TABLES FROM db`, `SHOW ALL` and `SHOW
+  <setting>` (unknown settings are `42704`). psql's `\d`, `\dt`, `\di`,
+  `\l`, `\du`, `\dn`, `\dp` and their `+` forms render; ORM introspection
+  sees the schema. `server_version` now reports 14.0.
+- SQL the catalog queries (and everyone else) needed: `UNION [ALL]`;
+  `[NOT] LIKE` / `ILIKE`; `= ANY | SOME | ALL (array)` and `= ANY
+  (SELECT ...)`; `||`; `CASE`; comparisons and boolean expressions as
+  values; `CAST(x AS type)` and `::type` (absorbed) with
+  `'name'::regclass` resolving a table; `E'...'` strings; regular
+  expression operators `~ !~ ~* !~*`; `OPERATOR(pg_catalog.op)`;
+  `COLLATE` (ignored); `ORDER BY` expressions and output aliases;
+  parenthesized `JOIN ... ON` with non-equality conjuncts as join
+  filters; `CROSS JOIN` and `FROM a, b`; `array(SELECT ...)`; `FROM
+  unnest(array) AS s(x)`; scalar subqueries as predicates and inside
+  `OR`; correlated subqueries in the select list, in `CASE` arms and in
+  `array(...)`, and correlated subqueries over joins; any `f(...)` parses
+  and an unknown function is `42883`.
+
 ## 0.10.0 — unreleased
 
 ### Added

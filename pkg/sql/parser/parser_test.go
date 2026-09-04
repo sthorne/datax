@@ -126,7 +126,7 @@ func TestParseErrors(t *testing.T) {
 		"SELECT FROM t",
 		"INSERT INTO t VALUES",
 		"UPDATE t SET",
-		"SELECT * FROM t WHERE a LIKE 'x'",
+		"SELECT * FROM t WHERE a LIKE",
 		"CREATE TABLE t (a FANCYTYPE)",
 		"SELECT * FROM t; garbage",
 	} {

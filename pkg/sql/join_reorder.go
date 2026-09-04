@@ -49,6 +49,11 @@ func reorderJoins(t *parser.Select, sides []joinSide, stats []*catalog.TableStat
 			return nil, nil, false, false
 		}
 	}
+	for _, jc := range t.Joins {
+		if len(jc.Filter) > 0 || jc.Cross {
+			return nil, nil, false, false // ON filters stay bound to their level
+		}
+	}
 	// Qualifier uniqueness: every alias and table name must name exactly
 	// one side, or qualified references would bind by position.
 	quals := map[string]int{}

@@ -67,6 +67,9 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 		if err != nil {
 			return err
 		}
+		if err := mustBeReal(desc); err != nil {
+			return err
+		}
 		if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 			return err
 		}

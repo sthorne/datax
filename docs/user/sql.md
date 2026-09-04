@@ -73,51 +73,82 @@ SHOW TABLES;
 
 ```sql
 SELECT * | expr [AS alias], ... FROM t [AS a]
-  [JOIN t2 [AS b] ON b.x = a.y [AND ...]]       -- INNER or LEFT [OUTER], up to 8 tables
+  [JOIN t2 [AS b] ON b.x = a.y [AND ...]]       -- INNER, LEFT [OUTER], CROSS or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
   [GROUP BY cols] [HAVING ...]
-  [ORDER BY col [ASC|DESC], ...] [LIMIT n];
+  [UNION [ALL] SELECT ...]
+  [ORDER BY col | expr [ASC|DESC], ...] [LIMIT n];
 ```
 
 - **WHERE** supports full boolean logic: `AND`, `OR`, `NOT`, and
   parentheses over conditions of the form `expr op value`
-  (`= != < <= > >=`, jsonb `j @> '...'`), `col IS [NOT] NULL`,
-  `col [NOT] IN (list | SELECT ...)`, `[NOT] EXISTS (SELECT ...)`,
-  `j ->> 'k' op value`. The left side may be a computed expression
-  (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a literal,
-  parameter, column, or scalar `(SELECT ...)`. Computed left-hand sides
-  and `->`/`->>` conjuncts work in joins too (evaluated on the joined
-  row). Restrictions: subqueries cannot appear inside `OR`. `OR`
-  conditions and path/computed conjuncts filter fetched rows — they
-  never become index bounds, so pair them with an indexable `AND`
-  condition on large tables.
+  (`= != < <= > >=`, `[NOT] LIKE` / `ILIKE`, regular expressions
+  `~ !~ ~* !~*`, jsonb `j @> '...'`), `expr op ANY | SOME | ALL (array)`
+  (`qty = ANY ('{3,4}')`, `= ANY (SELECT ...)` is `IN`),
+  `col IS [NOT] NULL`, `col [NOT] IN (list | SELECT ...)`, `[NOT] EXISTS
+  (SELECT ...)`, a bare boolean column or call (`WHERE active AND
+  pg_table_is_visible(oid)`), a scalar `(SELECT ...)` used as a
+  predicate, and `j ->> 'k' op value`. The left side may be a computed
+  expression (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a
+  literal, parameter, column, or scalar `(SELECT ...)`. Computed
+  left-hand sides and `->`/`->>` conjuncts work in joins too (evaluated
+  on the joined row). `IN` and `EXISTS` subqueries cannot appear inside
+  `OR` (scalar ones can). `OR` conditions, `LIKE`, `ANY` and
+  path/computed conjuncts filter fetched rows — they never become index
+  bounds, so pair them with an indexable `AND` condition on large tables.
 - **Expressions**: arithmetic `+ - * /` with standard precedence and
   parentheses (exact on DECIMAL/INT8; integer division truncates;
-  division by zero is SQLSTATE `22012`), and the functions `now()`,
-  `coalesce(...)`, `length(s)`, `lower(s)`, `upper(s)`, `abs(n)` — in
-  SELECT lists, WHERE, INSERT VALUES, and UPDATE SET. Computed SELECT
-  outputs describe as text on the wire.
+  division by zero is SQLSTATE `22012`), text concatenation `||`,
+  `CASE` (simple and searched), a comparison or boolean expression used
+  as a value (`qty > 3 AS big`, `(NOT a) AND EXISTS (...)`), `CAST(x AS
+  type)` and `x::type` (absorbed — types come from the schema — except
+  `'name'::regclass`, which resolves a table name to its catalog OID),
+  `E'...'` escape strings, and the functions `now()`, `coalesce(...)`,
+  `length(s)`, `lower(s)`, `upper(s)`, `abs(n)`, plus the catalog
+  functions tools call (`version()`, `current_user`, `current_schema()`,
+  `current_setting(name)`, `format_type`, `pg_get_indexdef`,
+  `pg_get_constraintdef`, `pg_get_expr`, `pg_get_userbyid`,
+  `pg_table_is_visible`, `obj_description`, `array_to_string`,
+  `quote_ident`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`, ...)
+  — in SELECT lists, WHERE, INSERT VALUES, and UPDATE SET. An unknown
+  function is SQLSTATE `42883`. Computed SELECT outputs describe as text
+  on the wire.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   whole-table or per `GROUP BY` group, including over joins. `HAVING`
   filters on aggregates or group columns. `DISTINCT` is supported.
 - **Joins** execute left-deep in the order written — until
   [statistics](#table-statistics) exist for every joined table, at which
   point INNER joins are automatically reordered to drive from the
-  cheapest side (`EXPLAIN` says `join reordered by cost`; LEFT joins and
-  self-joins always keep the written order). `ON` must equate a
-  column of the newly joined table with one from an earlier table. Join
-  select lists take columns, `*`, expressions (`o.qty * 2`, rendered as
-  text), and `->`/`->>` paths; under `GROUP BY` they narrow to plain
-  columns and aggregates, and join `ORDER BY` sorts by side columns
-  (not computed aliases).
-- **Subqueries**: uncorrelated scalars anywhere a value goes; derived
-  tables `FROM (SELECT ...) AS d`; correlated subqueries in
-  `EXISTS`/`IN`/scalar positions up to 4 nesting levels.
-- **ORDER BY** result-column names; sorts in memory unless the access path
-  already delivers the order — ascending along the key, descending via a
-  reverse scan, and on sharded timeseries tables either direction via a
-  K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
-  dashboards stop early instead of scanning everything).
+  cheapest side (`EXPLAIN` says `join reordered by cost`; LEFT joins,
+  self-joins, cross joins and joins with correlated subqueries or ON
+  filters always keep the written order). `ON` is a boolean expression
+  (parentheses welcome) that must include at least one equality between
+  a column of the newly joined table and one from an earlier table; its
+  other conjuncts (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN
+  (...)`) are join conditions, evaluated per candidate match — a LEFT
+  JOIN NULL-extends when they fail, unlike a `WHERE` filter. `CROSS
+  JOIN` and the comma form `FROM a, b WHERE a.x = b.y` are cross
+  products filtered by `WHERE`. Join select lists take columns, `*`,
+  expressions (`o.qty * 2`, rendered as text), `->`/`->>` paths and
+  subqueries; under `GROUP BY` they narrow to plain columns and
+  aggregates.
+- **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
+  (the subquery's column as a text array, e.g. for `array_to_string`),
+  derived tables `FROM (SELECT ...) AS d`, and table functions `FROM
+  unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
+  the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
+  select list, `array(...)`, `CASE` arms or `OR` groups, over a single
+  table or a join — are evaluated per row of the enclosing query,
+  memoized on the referenced values, up to 4 nesting levels.
+- **UNION [ALL]** concatenates selects with the same number of columns
+  (`UNION` removes duplicate rows); a trailing `ORDER BY` / `LIMIT`
+  applies to the whole result, by output name or position.
+- **ORDER BY** takes result-column names, output aliases, positions, or
+  expressions (`ORDER BY lower(name), qty > 3`); sorts in memory unless
+  the access path already delivers the order — ascending along the key,
+  descending via a reverse scan, and on sharded timeseries tables either
+  direction via a K-way merge of the per-bucket scans (`ORDER BY ts DESC
+  LIMIT n` dashboards stop early instead of scanning everything).
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 
@@ -296,6 +327,38 @@ describe as text.
    (paths never plan as bounds).
 3. Joins: the plan prints one line per join level, in execution order —
    confirm the first table is the filtered one.
+
+## Introspection: SHOW and the catalogs
+
+```sql
+SHOW TABLES [FROM db];          -- table_name
+SHOW COLUMNS FROM t;            -- column_name, data_type, is_nullable, column_default, indices
+SHOW INDEXES FROM t;            -- table_name, index_name, non_unique, seq_in_index, column_name
+SHOW CREATE TABLE t;            -- the CREATE TABLE statement that recreates t
+SHOW USERS;                     -- username, is_admin
+SHOW GRANTS [ON t] [FOR user];  -- database_name, table_name, grantee, privilege_type
+SHOW DATABASES;                 -- database_name, owner
+SHOW STATS FOR t;               -- see Table statistics
+SHOW ALL;                       -- every session setting
+SHOW server_version;            -- one setting (SHOW TIME ZONE, SHOW search_path, ...);
+                                -- an unknown name is SQLSTATE 42704
+```
+
+The PostgreSQL catalogs are there too, as read-only virtual tables over
+the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
+`pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
+`pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`,
+`pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`
+(and empty stand-ins for the catalogs of features datax lacks —
+policies, publications, extensions, functions, triggers, ...), plus
+`information_schema.schemata`, `tables`, `columns`,
+`table_constraints`, `key_column_usage`, `statistics` and
+`role_table_grants`. OIDs are stable across the cluster (a table's is its
+descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
+the catalog when no table of that name exists in the current database.
+This is what makes `psql`'s `\d`, `\dt`, `\di`, `\du`, `\l`, `\dn`, `\dp`
+and friends, and ORM schema introspection, work unmodified — see
+[Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).
 
 ## Reserved tables
 

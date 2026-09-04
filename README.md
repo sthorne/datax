@@ -71,11 +71,14 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   ALTER TABLE, INSERT/SELECT/UPDATE/DELETE with ORDER BY — DESC via
   reverse scans — and aggregates, transactions, joins up to 8 tables,
   GROUP BY — including over joins, correlated subqueries to 4 levels,
-  `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
+  UNION, `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over
   ten column types including exact DECIMAL and JSONB with `->`/`->>`
   extraction and `@>` containment, served over the Postgres wire protocol
-  with TLS + SCRAM-SHA-256 authentication in secure mode.
+  with TLS + SCRAM-SHA-256 authentication in secure mode; databases,
+  the `pg_catalog` / `information_schema` views and the `SHOW` family,
+  so `psql`'s `\d` commands and ORM introspection work as they do
+  against PostgreSQL.
 - **Time-series tables**: `CREATE TABLE ... WITH (timeseries = true,
   retention = '7d', shards = 8)` — age-based expiry with no SQL DELETEs,
   a hidden hash-shard column that spreads the write hot tail across

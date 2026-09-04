@@ -158,6 +158,9 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
+	if err := mustBeReal(shared); err != nil {
+		return nil, err
+	}
 	desc := shared.Clone()
 	if desc.Privileges == nil {
 		desc.Privileges = map[string][]string{}
