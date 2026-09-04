@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -275,6 +276,8 @@ type Accessor struct {
 	clock   *hlc.Clock
 	gateway uuid.UUID
 	ttl     time.Duration
+	// renewalPaused makes the renewal loop skip its ticks (tests only).
+	renewalPaused atomic.Bool
 
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
@@ -284,9 +287,12 @@ type Accessor struct {
 
 type cachedDesc struct {
 	desc *TableDescriptor
-	// expireAt bounds cache use to the lease's lifetime (zero = forever,
-	// leasing disabled).
-	expireAt time.Time
+	// expiration is the HLC wall time at which this gateway's lease on
+	// the descriptor expires — the very value written into the lease
+	// record, so the cache never outlives what a DDL drain will wait for
+	// (zero = forever, an unleased accessor). Transactions that plan
+	// against the entry take it as their commit deadline.
+	expiration int64
 }
 
 func NewAccessor() *Accessor {
@@ -309,8 +315,9 @@ func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (
 		return lookupUncached(ctx, txn, name)
 	}
 	a.mu.Lock()
-	if c, ok := a.cache[name]; ok && (c.expireAt.IsZero() || time.Now().Before(c.expireAt)) {
+	if c, ok := a.cache[name]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
 		a.mu.Unlock()
+		pinDeadline(txn, c.expiration)
 		return c.desc, nil
 	}
 	a.mu.Unlock()
@@ -320,17 +327,41 @@ func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (
 	}
 	entry := &cachedDesc{desc: d}
 	if a.leasing {
-		if err := a.writeLease(ctx, d); err != nil {
+		exp, err := a.writeLease(ctx, d)
+		if err != nil {
 			// Without a lease the cache may not be trusted beyond this
 			// statement; return the descriptor uncached.
 			return d, nil
 		}
-		entry.expireAt = time.Now().Add(a.ttl)
+		entry.expiration = exp
 	}
 	a.mu.Lock()
 	a.cache[name] = entry
 	a.mu.Unlock()
+	pinDeadline(txn, entry.expiration)
 	return d, nil
+}
+
+// nowWallLocked is the wall clock the lease records are stamped with
+// (the node's HLC when leasing; the process clock otherwise). Callers
+// hold a.mu or have no leasing state to race with.
+func (a *Accessor) nowWallLocked() int64 {
+	if a.clock != nil {
+		return a.clock.Now().WallTime
+	}
+	return time.Now().UnixNano()
+}
+
+// pinDeadline bounds txn's commit by a lease expiration: a statement
+// planned under a lease must commit before the lease ends, or a DDL
+// drain that wrote the lease off could take its backfill boundary before
+// the statement's writes (issue #110). The server commits at the write
+// timestamp the client sends, so the check lives in the client.
+func pinDeadline(txn *kvclient.Txn, expiration int64) {
+	if txn == nil || expiration == 0 {
+		return
+	}
+	txn.UpdateDeadline(hlc.Timestamp{WallTime: expiration})
 }
 
 // LookupFresh resolves a table by name within txn, bypassing the cache

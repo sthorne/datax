@@ -182,12 +182,23 @@ func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint6
 		if err != nil {
 			return err
 		}
-		if len(plan) == 0 {
-			return nil
+		// The chunks' serializable reads must cover the WHOLE primary span,
+		// the tail beyond the last row and an empty table included: they
+		// are what the timestamp cache remembers, and a writer that
+		// planned under a lease the drain has since written off is pushed
+		// above this backfill only for keys some chunk read (a pushed
+		// commit then fails its lease deadline and re-plans with the
+		// index; issue #110). A write into an unread tail would land in
+		// the past, below the boundary, and never reach the index.
+		chunkEnd := end
+		if len(plan) == backfillChunkSize {
+			chunkEnd = plan[len(plan)-1].Key.Next()
 		}
-		chunkEnd := plan[len(plan)-1].Key.Next()
 		if err := s.backfillChunk(ctx, table, indexID, cursor, chunkEnd); err != nil {
 			return err
+		}
+		if chunkEnd.Equal(end) {
+			return nil
 		}
 		cursor = chunkEnd
 	}
