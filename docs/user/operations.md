@@ -9,7 +9,9 @@ serves, on that address:
   load, each node's host figures (CPU, load, memory, free space on the
   store's disk, file descriptors — colored when they deserve a look), the
   serving node's full machine picture (disk and network throughput, Go
-  runtime, uptime), range tables with replica placement, storage health. The cluster
+  runtime, uptime), a network matrix (every node's round trip to every
+  other, with clock offsets judged against `--max-offset`), range tables
+  with replica placement, storage health. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -54,6 +56,16 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_node_cpu_percent{scope="host"}` / `datax_node_load1` vs `datax_node_cores` | sustained > 80% / load > cores | the node is CPU-bound; check `scope="process"` to see whether datax or something else is using it |
 | `process_open_fds` vs `datax_process_fd_limit` | > 80% | raise the limit (`ulimit -n`); Pebble holds one descriptor per open sstable |
 | `datax_node_memory_bytes{kind="available"}` | < 10% of `kind="total"` | the host is running out of memory; the block cache and memtables are the usual tenants |
+| `datax_clock_offset_seconds{peer}` | \|offset\| > half of `--max-offset` (0.25 s by default) | a node's clock is drifting; past the tolerance the node refuses the peer's timestamps and exits — fix NTP now (the node also logs a warning at this point) |
+| `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
+| `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
+
+Each node also pings every peer every 2 seconds (the NTP exchange, so
+one ping yields both the round trip and the peer's clock offset); the
+matrix on the dashboard and the `datax_rpc_rtt_seconds`,
+`datax_clock_offset_seconds` and `datax_peer_reachable` series come from
+it. A ping that fails or times out (1 s) marks the peer unreachable
+rather than recording a huge round trip.
 
 The host series (`datax_node_*`, `datax_store_disk_*`, and the standard
 `go_*` / `process_*` collectors) come from a sampler each node runs

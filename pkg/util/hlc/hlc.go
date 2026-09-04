@@ -72,6 +72,10 @@ func NewClock(physical func() int64, maxOffset time.Duration) *Clock {
 
 func (c *Clock) MaxOffset() time.Duration { return c.maxOffset }
 
+// PhysicalNow returns the physical clock reading (ns since epoch) without
+// the HLC ratchet: what clock-offset measurements compare between nodes.
+func (c *Clock) PhysicalNow() int64 { return c.physical() }
+
 // Now returns a timestamp strictly greater than every previous Now or
 // Update result on this clock.
 func (c *Clock) Now() Timestamp {

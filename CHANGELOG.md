@@ -8,6 +8,19 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.3.0 — unreleased
+
+### Added
+- Inter-node latency and clock offset: each node pings every peer every
+  2 s (an NTP-style exchange yielding both the round trip and the peer's
+  clock offset), advertises its row on the heartbeat, and the dashboard
+  shows the whole matrix with offsets judged against `--max-offset`;
+  `/metrics` gains `datax_rpc_rtt_seconds{peer}`,
+  `datax_clock_offset_seconds{peer}` and `datax_peer_reachable{peer}`, and
+  a node logs a warning once a peer's offset passes half the tolerance
+  (#82). New internode RPC `Ping`; a node on an older binary answers
+  "unimplemented" and reads as unreachable until upgraded.
+
 ## 0.2.0 — 2026-09-04
 
 Cluster protocol v4 (ordered range-addressing repair). Binaries from

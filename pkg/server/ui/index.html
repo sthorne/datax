@@ -103,6 +103,12 @@
   </section>
 
   <section>
+    <h2>Network</h2>
+    <div class="tablewrap"><table id="latency"></table></div>
+    <p class="muted" id="latency-note"></p>
+  </section>
+
+  <section>
     <h2>Ranges (local replicas, this node)</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th></tr></thead>
@@ -248,6 +254,8 @@ function render(d) {
     <td class="num">${fmtAgo(n.heartbeat_ago_ms)}</td>
   </tr>`; }).join("");
 
+  renderNetwork(d);
+
   const lm = d.local && d.local.machine;
   if (lm) {
     document.getElementById("machine").innerHTML =
@@ -295,6 +303,45 @@ function render(d) {
   const errBox = document.getElementById("cluster-err");
   if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
   else errBox.style.display = "none";
+}
+// The network matrix: each row is one node's measured round trip to
+// every other node (from its heartbeat; the serving node's row is live),
+// colored by RTT, with that node's clock offset to each peer on hover
+// and the worst offset in the last column, judged against --max-offset.
+function fmtRTT(us) { return us < 1000 ? (us / 1000).toFixed(2) + " ms" : us < 100000 ? (us / 1000).toFixed(1) + " ms" : Math.round(us / 1000) + " ms"; }
+function fmtOffset(us) { const ms = us / 1000; return (ms >= 0 ? "+" : "") + (Math.abs(ms) < 10 ? ms.toFixed(2) : ms.toFixed(0)) + " ms"; }
+function renderNetwork(d) {
+  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
+  const table = document.getElementById("latency");
+  const note = document.getElementById("latency-note");
+  if (nodes.length < 2) { table.innerHTML = ""; note.textContent = "one node: nothing to measure"; return; }
+  const maxOff = (d.max_offset_ms || 0) * 1000; // µs
+  let html = `<thead><tr><th>from \\ to</th>` + nodes.map(n => `<th class="num">n${n.node_id}</th>`).join("") +
+    `<th class="num" title="largest clock offset this node measured to any peer, vs the tolerated --max-offset">clock offset</th></tr></thead><tbody>`;
+  for (const from of nodes) {
+    const row = new Map((from.latency || []).map(l => [l.peer, l]));
+    let worst = null;
+    html += `<tr><td>n${from.node_id}</td>`;
+    for (const to of nodes) {
+      if (to.node_id === from.node_id) { html += `<td class="num muted">—</td>`; continue; }
+      const l = row.get(to.node_id);
+      if (!l) { html += `<td class="num muted" title="no measurement yet">·</td>`; continue; }
+      if (!l.reachable) { html += `<td class="num"><span class="st down">✕ unreachable</span></td>`; continue; }
+      if (worst === null || Math.abs(l.offset_us) > Math.abs(worst)) worst = l.offset_us;
+      const lvl = l.rtt_us < 2000 ? "live" : l.rtt_us < 20000 ? "draining" : "down";
+      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtAgo(l.age_ms)}"><span class="st ${lvl}">${fmtRTT(l.rtt_us)}</span></td>`;
+    }
+    if (worst === null) html += `<td class="num muted">—</td>`;
+    else {
+      const a = Math.abs(worst);
+      const lvl = maxOff && a >= maxOff ? "down" : maxOff && a >= maxOff / 2 ? "draining" : "";
+      html += `<td class="num">${lvl ? `<span class="st ${lvl}">${fmtOffset(worst)}</span>` : fmtOffset(worst)}</td>`;
+    }
+    html += `</tr>`;
+  }
+  table.innerHTML = html + "</tbody>";
+  note.textContent = "round trip from row node to column node (smoothed; hover for p99 and clock offset); pinged every 2s" +
+    (d.max_offset_ms ? `; clock offsets are judged against the tolerated ${d.max_offset_ms} ms` : "");
 }
 // Cross-node drill-down: clicking a cluster range fetches /api/range?id=N
 // (admin role) — every holding node's view of that range over internode

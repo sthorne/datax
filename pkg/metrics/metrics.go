@@ -111,6 +111,18 @@ var (
 	StorageBackpressure = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_total", Help: "Table-data writes shed with a retryable error while the engine was overloaded.",
 	})
+	RPCRoundTrip = promauto.With(Registry).NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "datax_rpc_rtt_seconds",
+		Help:    "Round-trip time of this node's periodic ping to each peer.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 14), // 100µs .. ~0.8s
+	}, []string{"peer"})
+	ClockOffset = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_clock_offset_seconds", Help: "Measured physical clock offset of each peer relative to this node (positive: the peer runs ahead); compare with --max-offset.",
+	}, []string{"peer"})
+	PeerReachable = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_peer_reachable", Help: "1 while this node's last ping to the peer succeeded, 0 once one failed or timed out.",
+	}, []string{"peer"})
+
 	StorageBackpressureCause = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_cause_total",
 		Help: "Table-data writes shed, by cause: leader (this node's engine gates), debt (this node's latched compaction-debt gate), follower (an overloaded quorum member's piggybacked verdict).",

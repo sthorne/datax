@@ -170,6 +170,9 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			BigRanges:     load.BigRanges,
 			Machine:       n.machineSummary(),
 		}
+		if n.pinger != nil {
+			nd.Latency = n.pinger.Snapshot()
+		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 			log.Debugf("liveness heartbeat failed: %v", err)

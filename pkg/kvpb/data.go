@@ -92,6 +92,10 @@ type NodeDescriptor struct {
 	// every heartbeat so any node can show every node's row without a
 	// fan-out. Absent from nodes on binaries that predate it.
 	Machine *MachineSummary `json:"machine,omitempty"`
+	// Latency is this node's measured round trip and clock offset to each
+	// peer (see PeerLatency), re-asserted on every heartbeat so any node
+	// can show the whole matrix without a fan-out.
+	Latency []PeerLatency `json:"latency,omitempty"`
 	// HotRanges are the node's heaviest mature leaseholders by QPS, and
 	// BigRanges its largest replicas by bytes (top-K each) — the concrete
 	// candidates a lease-shedding or byte-rebalancing pass acts on.
@@ -196,4 +200,20 @@ type MachineSummary struct {
 	FDLimit int `json:"fd_limit"`
 	// UptimeSeconds is how long the process has been up.
 	UptimeSeconds int64 `json:"uptime_seconds"`
+}
+
+// PeerLatency is one node's view of the network to one peer, from a
+// periodic ping (the NTP exchange, see pkg/rpc).
+type PeerLatency struct {
+	Peer base.NodeID `json:"peer"`
+	// RTTMicros is the smoothed round-trip time and P99Micros the 99th
+	// percentile over the recent ring; OffsetMicros is the peer's physical
+	// clock minus this node's (positive: the peer runs ahead).
+	RTTMicros    int64 `json:"rtt_us"`
+	P99Micros    int64 `json:"p99_us"`
+	OffsetMicros int64 `json:"offset_us"`
+	// Reachable is false once a ping has timed out or failed; AgeMillis is
+	// how long ago the last successful ping was.
+	Reachable bool  `json:"reachable"`
+	AgeMillis int64 `json:"age_ms"`
 }

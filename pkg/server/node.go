@@ -175,6 +175,13 @@ type StaticBootstrap struct {
 // dashboard are deltas over this interval.
 const sysSampleInterval = 5 * time.Second
 
+// pingInterval is how often a node pings every peer for the latency and
+// clock-offset matrix; pingTimeout is when a ping counts as unreachable.
+const (
+	pingInterval = 2 * time.Second
+	pingTimeout  = time.Second
+)
+
 type Node struct {
 	cfg      Config
 	tlsCfgs  *security.TLSConfigs // nil in insecure mode
@@ -225,6 +232,8 @@ type Node struct {
 	// sys samples the host (CPU, memory, disk, network, runtime) every
 	// few seconds for the heartbeat summary, /status and /metrics.
 	sys *sysstats.Sampler
+	// pinger measures round trips and clock offsets to every peer.
+	pinger *rpc.Pinger
 
 	// loadCooldown stamps the last load-driven op (lease shed / byte move)
 	// per range while this node acts as the allocator; see loadOpAllowed.
@@ -430,6 +439,17 @@ func (n *Node) start() error {
 	n.store.SetSender(n.db)
 
 	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
+	n.pinger = rpc.NewPinger(n.trans, n.ident.NodeID, func() []base.NodeID {
+		all := n.registry.All()
+		ids := make([]base.NodeID, 0, len(all))
+		for _, nd := range all {
+			ids = append(ids, nd.NodeID)
+		}
+		return ids
+	}, pingTimeout)
+	if err := n.stopper.RunWorker(func(ctx context.Context) { n.pinger.Run(ctx, pingInterval) }); err != nil {
+		return err
+	}
 	// Piggyback this node's storage-health verdict on outgoing raft
 	// envelopes, so peers' leaders can factor it into their write path.
 	// The testing knob is consulted first — the advertised verdict must
@@ -717,3 +737,7 @@ func (n *Node) Registry() *cluster.Registry { return n.registry }
 // this node's outbound RPC traffic — the fault-injection hook partition
 // tests use. Never call in production.
 func (n *Node) InjectRPCDrop(fn func(to base.NodeID) bool) { n.trans.SetTestingDrop(fn) }
+
+// Pinger exposes the node's peer-latency measurements (tests and the
+// cluster API).
+func (n *Node) Pinger() *rpc.Pinger { return n.pinger }

@@ -26,6 +26,130 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type PingRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	FromNode int64                  `protobuf:"varint,1,opt,name=from_node,json=fromNode,proto3" json:"from_node,omitempty"`
+	// send_wall is the caller's physical clock (ns since epoch) when the
+	// request left.
+	SendWall      int64 `protobuf:"varint,2,opt,name=send_wall,json=sendWall,proto3" json:"send_wall,omitempty"`
+	Now           *Hlc  `protobuf:"bytes,3,opt,name=now,proto3" json:"now,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PingRequest) Reset() {
+	*x = PingRequest{}
+	mi := &file_datax_v1_transport_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PingRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PingRequest) ProtoMessage() {}
+
+func (x *PingRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_transport_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PingRequest.ProtoReflect.Descriptor instead.
+func (*PingRequest) Descriptor() ([]byte, []int) {
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *PingRequest) GetFromNode() int64 {
+	if x != nil {
+		return x.FromNode
+	}
+	return 0
+}
+
+func (x *PingRequest) GetSendWall() int64 {
+	if x != nil {
+		return x.SendWall
+	}
+	return 0
+}
+
+func (x *PingRequest) GetNow() *Hlc {
+	if x != nil {
+		return x.Now
+	}
+	return nil
+}
+
+type PingResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// recv_wall and send_wall are the peer's physical clock when the
+	// request arrived and when the reply left.
+	RecvWall      int64 `protobuf:"varint,1,opt,name=recv_wall,json=recvWall,proto3" json:"recv_wall,omitempty"`
+	SendWall      int64 `protobuf:"varint,2,opt,name=send_wall,json=sendWall,proto3" json:"send_wall,omitempty"`
+	Now           *Hlc  `protobuf:"bytes,3,opt,name=now,proto3" json:"now,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PingResponse) Reset() {
+	*x = PingResponse{}
+	mi := &file_datax_v1_transport_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PingResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PingResponse) ProtoMessage() {}
+
+func (x *PingResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_transport_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PingResponse.ProtoReflect.Descriptor instead.
+func (*PingResponse) Descriptor() ([]byte, []int) {
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *PingResponse) GetRecvWall() int64 {
+	if x != nil {
+		return x.RecvWall
+	}
+	return 0
+}
+
+func (x *PingResponse) GetSendWall() int64 {
+	if x != nil {
+		return x.SendWall
+	}
+	return 0
+}
+
+func (x *PingResponse) GetNow() *Hlc {
+	if x != nil {
+		return x.Now
+	}
+	return nil
+}
+
 // Hlc carries an HLC reading; every message type embeds one so receivers can
 // ratchet their clocks (see docs/transactions.md).
 type Hlc struct {
@@ -38,7 +162,7 @@ type Hlc struct {
 
 func (x *Hlc) Reset() {
 	*x = Hlc{}
-	mi := &file_datax_v1_transport_proto_msgTypes[0]
+	mi := &file_datax_v1_transport_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -50,7 +174,7 @@ func (x *Hlc) String() string {
 func (*Hlc) ProtoMessage() {}
 
 func (x *Hlc) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[0]
+	mi := &file_datax_v1_transport_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -63,7 +187,7 @@ func (x *Hlc) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hlc.ProtoReflect.Descriptor instead.
 func (*Hlc) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{0}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Hlc) GetWallTime() int64 {
@@ -103,7 +227,7 @@ type RaftEnvelope struct {
 
 func (x *RaftEnvelope) Reset() {
 	*x = RaftEnvelope{}
-	mi := &file_datax_v1_transport_proto_msgTypes[1]
+	mi := &file_datax_v1_transport_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -115,7 +239,7 @@ func (x *RaftEnvelope) String() string {
 func (*RaftEnvelope) ProtoMessage() {}
 
 func (x *RaftEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[1]
+	mi := &file_datax_v1_transport_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -128,7 +252,7 @@ func (x *RaftEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftEnvelope.ProtoReflect.Descriptor instead.
 func (*RaftEnvelope) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{1}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *RaftEnvelope) GetRangeId() int64 {
@@ -209,7 +333,7 @@ type StorageHealth struct {
 
 func (x *StorageHealth) Reset() {
 	*x = StorageHealth{}
-	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -221,7 +345,7 @@ func (x *StorageHealth) String() string {
 func (*StorageHealth) ProtoMessage() {}
 
 func (x *StorageHealth) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[2]
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -234,7 +358,7 @@ func (x *StorageHealth) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageHealth.ProtoReflect.Descriptor instead.
 func (*StorageHealth) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{2}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *StorageHealth) GetOverloaded() bool {
@@ -294,7 +418,7 @@ type RaftAck struct {
 
 func (x *RaftAck) Reset() {
 	*x = RaftAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[3]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -306,7 +430,7 @@ func (x *RaftAck) String() string {
 func (*RaftAck) ProtoMessage() {}
 
 func (x *RaftAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[3]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -319,7 +443,7 @@ func (x *RaftAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAck.ProtoReflect.Descriptor instead.
 func (*RaftAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{3}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
 }
 
 type Payload struct {
@@ -336,7 +460,7 @@ type Payload struct {
 
 func (x *Payload) Reset() {
 	*x = Payload{}
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -348,7 +472,7 @@ func (x *Payload) String() string {
 func (*Payload) ProtoMessage() {}
 
 func (x *Payload) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -361,7 +485,7 @@ func (x *Payload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Payload.ProtoReflect.Descriptor instead.
 func (*Payload) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Payload) GetJson() []byte {
@@ -398,7 +522,7 @@ type SnapshotChunk struct {
 
 func (x *SnapshotChunk) Reset() {
 	*x = SnapshotChunk{}
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -410,7 +534,7 @@ func (x *SnapshotChunk) String() string {
 func (*SnapshotChunk) ProtoMessage() {}
 
 func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -423,7 +547,7 @@ func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
 func (*SnapshotChunk) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *SnapshotChunk) GetHeaderJson() []byte {
@@ -457,7 +581,7 @@ type SnapshotKV struct {
 
 func (x *SnapshotKV) Reset() {
 	*x = SnapshotKV{}
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -469,7 +593,7 @@ func (x *SnapshotKV) String() string {
 func (*SnapshotKV) ProtoMessage() {}
 
 func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -482,7 +606,7 @@ func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotKV.ProtoReflect.Descriptor instead.
 func (*SnapshotKV) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SnapshotKV) GetKey() []byte {
@@ -507,7 +631,7 @@ type SnapshotAck struct {
 
 func (x *SnapshotAck) Reset() {
 	*x = SnapshotAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[7]
+	mi := &file_datax_v1_transport_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -519,7 +643,7 @@ func (x *SnapshotAck) String() string {
 func (*SnapshotAck) ProtoMessage() {}
 
 func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[7]
+	mi := &file_datax_v1_transport_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -532,14 +656,22 @@ func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotAck.ProtoReflect.Descriptor instead.
 func (*SnapshotAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{7}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{9}
 }
 
 var File_datax_v1_transport_proto protoreflect.FileDescriptor
 
 const file_datax_v1_transport_proto_rawDesc = "" +
 	"\n" +
-	"\x18datax/v1/transport.proto\x12\bdatax.v1\"<\n" +
+	"\x18datax/v1/transport.proto\x12\bdatax.v1\"h\n" +
+	"\vPingRequest\x12\x1b\n" +
+	"\tfrom_node\x18\x01 \x01(\x03R\bfromNode\x12\x1b\n" +
+	"\tsend_wall\x18\x02 \x01(\x03R\bsendWall\x12\x1f\n" +
+	"\x03now\x18\x03 \x01(\v2\r.datax.v1.HlcR\x03now\"i\n" +
+	"\fPingResponse\x12\x1b\n" +
+	"\trecv_wall\x18\x01 \x01(\x03R\brecvWall\x12\x1b\n" +
+	"\tsend_wall\x18\x02 \x01(\x03R\bsendWall\x12\x1f\n" +
+	"\x03now\x18\x03 \x01(\v2\r.datax.v1.HlcR\x03now\"<\n" +
 	"\x03Hlc\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
 	"\alogical\x18\x02 \x01(\x05R\alogical\"\x91\x02\n" +
@@ -577,13 +709,14 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"SnapshotKV\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"\r\n" +
-	"\vSnapshotAck2\x92\x02\n" +
+	"\vSnapshotAck2\xc9\x02\n" +
 	"\tInternode\x12;\n" +
 	"\fRaftMessages\x12\x16.datax.v1.RaftEnvelope\x1a\x11.datax.v1.RaftAck(\x01\x12-\n" +
 	"\x05Batch\x12\x11.datax.v1.Payload\x1a\x11.datax.v1.Payload\x12,\n" +
 	"\x04Join\x12\x11.datax.v1.Payload\x1a\x11.datax.v1.Payload\x12-\n" +
 	"\x05Admin\x12\x11.datax.v1.Payload\x1a\x11.datax.v1.Payload\x12<\n" +
-	"\bSnapshot\x12\x17.datax.v1.SnapshotChunk\x1a\x15.datax.v1.SnapshotAck(\x01B(Z&github.com/sthorne/datax/pkg/rpc/rpcpbb\x06proto3"
+	"\bSnapshot\x12\x17.datax.v1.SnapshotChunk\x1a\x15.datax.v1.SnapshotAck(\x01\x125\n" +
+	"\x04Ping\x12\x15.datax.v1.PingRequest\x1a\x16.datax.v1.PingResponseB(Z&github.com/sthorne/datax/pkg/rpc/rpcpbb\x06proto3"
 
 var (
 	file_datax_v1_transport_proto_rawDescOnce sync.Once
@@ -597,38 +730,44 @@ func file_datax_v1_transport_proto_rawDescGZIP() []byte {
 	return file_datax_v1_transport_proto_rawDescData
 }
 
-var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_datax_v1_transport_proto_goTypes = []any{
-	(*Hlc)(nil),           // 0: datax.v1.Hlc
-	(*RaftEnvelope)(nil),  // 1: datax.v1.RaftEnvelope
-	(*StorageHealth)(nil), // 2: datax.v1.StorageHealth
-	(*RaftAck)(nil),       // 3: datax.v1.RaftAck
-	(*Payload)(nil),       // 4: datax.v1.Payload
-	(*SnapshotChunk)(nil), // 5: datax.v1.SnapshotChunk
-	(*SnapshotKV)(nil),    // 6: datax.v1.SnapshotKV
-	(*SnapshotAck)(nil),   // 7: datax.v1.SnapshotAck
+	(*PingRequest)(nil),   // 0: datax.v1.PingRequest
+	(*PingResponse)(nil),  // 1: datax.v1.PingResponse
+	(*Hlc)(nil),           // 2: datax.v1.Hlc
+	(*RaftEnvelope)(nil),  // 3: datax.v1.RaftEnvelope
+	(*StorageHealth)(nil), // 4: datax.v1.StorageHealth
+	(*RaftAck)(nil),       // 5: datax.v1.RaftAck
+	(*Payload)(nil),       // 6: datax.v1.Payload
+	(*SnapshotChunk)(nil), // 7: datax.v1.SnapshotChunk
+	(*SnapshotKV)(nil),    // 8: datax.v1.SnapshotKV
+	(*SnapshotAck)(nil),   // 9: datax.v1.SnapshotAck
 }
 var file_datax_v1_transport_proto_depIdxs = []int32{
-	0,  // 0: datax.v1.RaftEnvelope.now:type_name -> datax.v1.Hlc
-	2,  // 1: datax.v1.RaftEnvelope.health:type_name -> datax.v1.StorageHealth
-	0,  // 2: datax.v1.Payload.now:type_name -> datax.v1.Hlc
-	6,  // 3: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
-	0,  // 4: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
-	1,  // 5: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
-	4,  // 6: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
-	4,  // 7: datax.v1.Internode.Join:input_type -> datax.v1.Payload
-	4,  // 8: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
-	5,  // 9: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
-	3,  // 10: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
-	4,  // 11: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
-	4,  // 12: datax.v1.Internode.Join:output_type -> datax.v1.Payload
-	4,  // 13: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
-	7,  // 14: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
-	10, // [10:15] is the sub-list for method output_type
-	5,  // [5:10] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	2,  // 0: datax.v1.PingRequest.now:type_name -> datax.v1.Hlc
+	2,  // 1: datax.v1.PingResponse.now:type_name -> datax.v1.Hlc
+	2,  // 2: datax.v1.RaftEnvelope.now:type_name -> datax.v1.Hlc
+	4,  // 3: datax.v1.RaftEnvelope.health:type_name -> datax.v1.StorageHealth
+	2,  // 4: datax.v1.Payload.now:type_name -> datax.v1.Hlc
+	8,  // 5: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
+	2,  // 6: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
+	3,  // 7: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
+	6,  // 8: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
+	6,  // 9: datax.v1.Internode.Join:input_type -> datax.v1.Payload
+	6,  // 10: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
+	7,  // 11: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
+	0,  // 12: datax.v1.Internode.Ping:input_type -> datax.v1.PingRequest
+	5,  // 13: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
+	6,  // 14: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
+	6,  // 15: datax.v1.Internode.Join:output_type -> datax.v1.Payload
+	6,  // 16: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
+	9,  // 17: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
+	1,  // 18: datax.v1.Internode.Ping:output_type -> datax.v1.PingResponse
+	13, // [13:19] is the sub-list for method output_type
+	7,  // [7:13] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_transport_proto_init() }
@@ -642,7 +781,7 @@ func file_datax_v1_transport_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_transport_proto_rawDesc), len(file_datax_v1_transport_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

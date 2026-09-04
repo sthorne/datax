@@ -29,6 +29,7 @@ const (
 	Internode_Join_FullMethodName         = "/datax.v1.Internode/Join"
 	Internode_Admin_FullMethodName        = "/datax.v1.Internode/Admin"
 	Internode_Snapshot_FullMethodName     = "/datax.v1.Internode/Snapshot"
+	Internode_Ping_FullMethodName         = "/datax.v1.Internode/Ping"
 )
 
 // InternodeClient is the client API for Internode service.
@@ -47,6 +48,10 @@ type InternodeClient interface {
 	Admin(ctx context.Context, in *Payload, opts ...grpc.CallOption) (*Payload, error)
 	// Snapshot streams a range snapshot to seed a new replica.
 	Snapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, SnapshotAck], error)
+	// Ping measures the round trip and the clock offset to a peer (the NTP
+	// exchange: the caller stamps its send time, the peer its receive and
+	// send times, the caller its receive time).
+	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 }
 
 type internodeClient struct {
@@ -113,6 +118,16 @@ func (c *internodeClient) Snapshot(ctx context.Context, opts ...grpc.CallOption)
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Internode_SnapshotClient = grpc.ClientStreamingClient[SnapshotChunk, SnapshotAck]
 
+func (c *internodeClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PingResponse)
+	err := c.cc.Invoke(ctx, Internode_Ping_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternodeServer is the server API for Internode service.
 // All implementations must embed UnimplementedInternodeServer
 // for forward compatibility.
@@ -129,6 +144,10 @@ type InternodeServer interface {
 	Admin(context.Context, *Payload) (*Payload, error)
 	// Snapshot streams a range snapshot to seed a new replica.
 	Snapshot(grpc.ClientStreamingServer[SnapshotChunk, SnapshotAck]) error
+	// Ping measures the round trip and the clock offset to a peer (the NTP
+	// exchange: the caller stamps its send time, the peer its receive and
+	// send times, the caller its receive time).
+	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	mustEmbedUnimplementedInternodeServer()
 }
 
@@ -153,6 +172,9 @@ func (UnimplementedInternodeServer) Admin(context.Context, *Payload) (*Payload, 
 }
 func (UnimplementedInternodeServer) Snapshot(grpc.ClientStreamingServer[SnapshotChunk, SnapshotAck]) error {
 	return status.Errorf(codes.Unimplemented, "method Snapshot not implemented")
+}
+func (UnimplementedInternodeServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
 }
 func (UnimplementedInternodeServer) mustEmbedUnimplementedInternodeServer() {}
 func (UnimplementedInternodeServer) testEmbeddedByValue()                   {}
@@ -243,6 +265,24 @@ func _Internode_Snapshot_Handler(srv interface{}, stream grpc.ServerStream) erro
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Internode_SnapshotServer = grpc.ClientStreamingServer[SnapshotChunk, SnapshotAck]
 
+func _Internode_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternodeServer).Ping(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internode_Ping_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternodeServer).Ping(ctx, req.(*PingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internode_ServiceDesc is the grpc.ServiceDesc for Internode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -261,6 +301,10 @@ var Internode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Admin",
 			Handler:    _Internode_Admin_Handler,
+		},
+		{
+			MethodName: "Ping",
+			Handler:    _Internode_Ping_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
