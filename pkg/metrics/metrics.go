@@ -123,6 +123,10 @@ var (
 		Name: "datax_peer_reachable", Help: "1 while this node's last ping to the peer succeeded, 0 once one failed or timed out.",
 	}, []string{"peer"})
 
+	HealthProblems = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_health_problems", Help: "Problems the dashboard's health panel currently lists, by severity and check (refreshed with the panel, at most every 3s).",
+	}, []string{"severity", "check"})
+
 	SQLConnections = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "datax_sql_connections", Help: "SQL connections by state: open (all), active (a statement in flight), idle_in_txn (idle inside an open transaction, holding its intents).",
 	}, []string{"state"})

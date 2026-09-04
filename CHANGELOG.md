@@ -8,6 +8,26 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.6.0 — unreleased
+
+### Added
+- Health checks and an events feed on the dashboard: every node runs a
+  fixed set of checks against data it already holds (node liveness and
+  draining, mixed binaries and unfinalized upgrades, lost quorum,
+  under-replication and locality diversity, `/meta` reachability,
+  storage backpressure, debt gate, write stalls and errors, overloaded
+  followers, disk, file-descriptor and memory headroom, peer
+  reachability and clock offset, consistency failures, authentication
+  failure rate, stale statistics) and shows the findings in a problems
+  panel at the top of the page, each linking to the section with the
+  figure. A per-node ring of operational events (splits, merges,
+  auto-splits, rebalances, lease sheds, dead-node repairs, snapshots,
+  decommissions, upgrades, key rotations, backups and restores,
+  consistency failures; the audit stream for admins) feeds an events
+  section with a kind filter. New endpoints `/api/health` and
+  `/api/events?since=N`; `/metrics` gains
+  `datax_health_problems{severity,check}` (#85).
+
 ## 0.5.0 — unreleased
 
 ### Added

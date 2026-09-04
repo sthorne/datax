@@ -28,6 +28,7 @@ import (
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
+	"github.com/sthorne/datax/pkg/util/events"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
@@ -242,6 +243,13 @@ type Node struct {
 	schema schemaCache
 	// rangeList is the last /meta listing served to the dashboard.
 	rangeList rangeListCache
+	// events is the node's operational event ring (see health_api.go).
+	events *events.Ring
+	// consistencyFailures counts checksum mismatches this node's sweeps
+	// found (readable, unlike the Prometheus counter).
+	consistencyFailures atomic.Int64
+	// health caches the problems panel (see health_api.go).
+	health healthCache
 
 	// loadCooldown stamps the last load-driven op (lease shed / byte move)
 	// per range while this node acts as the allocator; see loadOpAllowed.
@@ -315,6 +323,8 @@ func (n *Node) start() error {
 		n.addr = lis.Addr().String()
 	}
 
+	n.events = events.New()
+	n.installAuditSink()
 	n.sys = sysstats.New(n.cfg.Dir)
 	n.sys.Sample() // the first heartbeat should already carry a summary
 	if err := n.stopper.RunWorker(func(ctx context.Context) { n.sys.Run(ctx, sysSampleInterval) }); err != nil {
@@ -403,6 +413,7 @@ func (n *Node) start() error {
 	retention := &retentionProvider{node: n, defaultTTL: defaultGCTTL}
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
 		NodeID:                  n.ident.NodeID,
+		Events:                  n.events,
 		StoreID:                 n.ident.StoreID,
 		Engine:                  n.engine,
 		Clock:                   n.clock,
@@ -749,3 +760,6 @@ func (n *Node) InjectRPCDrop(fn func(to base.NodeID) bool) { n.trans.SetTestingD
 // Pinger exposes the node's peer-latency measurements (tests and the
 // cluster API).
 func (n *Node) Pinger() *rpc.Pinger { return n.pinger }
+
+// Events exposes the node's event ring (tests and the API).
+func (n *Node) Events() *events.Ring { return n.events }

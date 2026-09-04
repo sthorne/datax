@@ -280,6 +280,7 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		log.Infof("backup: table %s (id %d): %d records, %d live bytes", bt.Name, bt.ID, bt.Records, bt.Bytes)
 	}
 
+	n.events.Record("backup", "backup written to %s: %d tables", dest, len(descs))
 	// Manifest last, atomically: its presence marks the backup complete.
 	raw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -493,5 +494,6 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 		log.Infof("restore: table %s (id %d): %d live records restored", t.Name, t.ID, records)
 	}
 	log.Infof("restore: applied %d records from %d backup(s)", applied, len(srcs))
+	n.events.Record("restore", "restore applied %d records from %d backup(s)", applied, len(srcs))
 	return sum, nil
 }

@@ -73,6 +73,7 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 		n.exportMetadata(ctx)
 	}
 	log.Infof("store key rotated online; registry and metadata backup sealed under the new key")
+	n.events.Record("key-rotation", "store key rotated online; registry and metadata backup sealed under the new key")
 	n.reportKeyFilesAfterRotation(req.NewStoreKey)
 	return cluster.AdminResponse{}
 }
@@ -157,6 +158,7 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 		}
 		if remaining == 0 {
 			log.Infof("re-encryption complete: no live sstable under a retired data key")
+			n.events.Record("re-encryption", "re-encryption complete: no live sstable under a retired data key")
 			return
 		}
 		if targeted == 0 {

@@ -77,6 +77,8 @@ func (n *Node) collectAndCompare(ctx context.Context, probe *kvserver.Consistenc
 		if !bytes.Equal(resp.Checksum, probe.LocalSum) {
 			mismatch = true
 			metrics.ConsistencyFailures.Inc()
+			n.consistencyFailures.Add(1)
+			n.events.Record("consistency-failure", "%s: leader n%d and replica n%d disagree at applied index %d (check %s)", probe.RangeID, n.ident.NodeID, rep.NodeID, probe.Index, probe.CheckID)
 			log.Errorf("CONSISTENCY FAILURE on %s (check %s at applied index %d): leader n%d has %s, replica n%d has %s",
 				probe.RangeID, probe.CheckID, probe.Index, n.ident.NodeID,
 				hex.EncodeToString(probe.LocalSum), rep.NodeID, hex.EncodeToString(resp.Checksum))

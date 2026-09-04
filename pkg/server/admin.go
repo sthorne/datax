@@ -306,6 +306,7 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	}
 	n.mirrorClusterVersion(ctx)
 	log.Infof("cluster version finalized at %s", target)
+	n.events.Record("upgrade", "cluster version finalized at %s", target)
 	return cluster.AdminResponse{ClusterVersion: int(target)}
 }
 

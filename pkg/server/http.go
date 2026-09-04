@@ -189,6 +189,8 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
 	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
+	mux.HandleFunc("/api/health", n.serveHealthAPI)
+	mux.HandleFunc("/api/events", n.serveEventsAPI)
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
 	page, uerr := ui.FS.ReadFile("index.html")

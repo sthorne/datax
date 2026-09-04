@@ -18,7 +18,13 @@ serves, on that address:
   activity (connections by state with the oldest idle transaction,
   statements per second by kind, `40001` rate, latency percentiles per
   node; for admins the serving node's statements in flight and its
-  slowest recent ones), range tables with replica placement, storage
+  slowest recent ones), a problems panel at the top (every finding of
+  the health checks below, colored by severity, each linking to the
+  section that shows the figure; a green line when there are none), an
+  events feed (the serving node's recent splits, merges, rebalances,
+  lease sheds, repairs, snapshots, backups, upgrades, key rotations and
+  consistency failures, newest first, with a kind filter; admins also
+  see the audit stream), range tables with replica placement, storage
   health. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
@@ -39,6 +45,15 @@ serves, on that address:
   flight, and the slow-statement ring (past `--slow-statement-threshold`,
   default 500 ms). Admin role required in secure mode; statement text can
   carry data.
+- **`/api/health`** — JSON: the problems panel's document: the findings
+  of the health checks (see [Health checks](#health-checks)), sorted
+  critical first, and how many checks ran. Empty `problems` with a
+  non-zero `checks` count means green. Recomputed at most every 3 s.
+- **`/api/events?since=N&limit=M`** — JSON: the serving node's recent
+  operational events (the last 500 are kept in memory; `since` returns
+  only those after sequence `N`, which is how the dashboard tails). In
+  secure mode audit records (authentication failures, admin operations,
+  privilege DDL) are included only for the admin role.
 - **`/api/schema`** — JSON: the schema browser's document. In secure mode
   root and admins see every table and the user list; another user sees
   the tables it holds a grant on. Rebuilt at most every 5 s per node.
@@ -52,6 +67,40 @@ not clickable and the note under them says which user is signed in and
 how to proceed (`GRANT ADMIN TO ops`, or sign in as `root` from a private
 window, since browsers cache Basic credentials per site). `/api/cluster`
 carries the same identity in its `principal` field.
+
+## Health checks
+
+Every node runs the same set of checks against data it already holds
+(the node registry, the `/meta` range list, its own store, the peer
+pinger, the schema cache) and publishes the findings on the dashboard,
+in `/api/health`, and as the gauge `datax_health_problems{severity,check}`
+(one series per finding; a check that finds nothing has no series).
+Alert on `datax_health_problems{severity="critical"} > 0` for the
+page-worthy ones and on `severity="warning"` for the rest, and the panel
+on any node's dashboard says what and where. The checks, with the
+section the dashboard row links to:
+
+| Check | Severity | Fires when |
+|---|---|---|
+| `node-down` | critical | a node's heartbeat is older than the dead-node threshold (30 s); its replicas are being repaired away (nodes) |
+| `node-unresponsive` | warning | a node's heartbeat is older than the liveness grace (15 s) but not yet the dead-node threshold (nodes) |
+| `node-draining` | info | a decommission is in progress (nodes) |
+| `mixed-binaries` | warning | nodes run different binary versions (nodes) |
+| `upgrade-unfinalized` | warning | every node runs a newer binary than the cluster version; `datax admin upgrade` has not been run (nodes) |
+| `quorum-lost` | critical | a range has fewer live replicas than a majority; it cannot serve until a node returns (ranges) |
+| `under-replicated` | warning | a range has fewer live replicas than its replication factor (ranges) |
+| `diversity` | warning | a range's replicas share a locality tier they could spread across (ranges) |
+| `meta-unavailable` | critical | the serving node cannot read the `/meta` range list, so it cannot route (ranges) |
+| `backpressure`, `debt-gate`, `write-stalls`, `storage-errors` | warning / critical | the storage counters in the table below are moving over the last five minutes (storage) |
+| `follower-overloaded` | warning | a node reports itself overloaded and writes to the ranges it replicates are being shed (storage) |
+| `disk-low`, `disk-full` | warning / critical | a node's store has under 15% / 5% of its disk free (nodes) |
+| `fd-limit` | warning | a node holds over 80% of its file-descriptor limit (nodes) |
+| `memory-low` | warning | a node's host has under 10% of its memory available (nodes) |
+| `peer-unreachable` | warning | the serving node's pings to a peer fail: a partition, a firewall, or the peer is down, in which case its heartbeat row says so (network) |
+| `clock-offset` | warning / critical | a peer's clock is past half of / past `--max-offset` (network) |
+| `consistency-failure` | critical | a consistency sweep found diverged replica checksums since this node started; the events feed carries the range (events) |
+| `auth-failures` | warning | more than one authentication or admin-authorization failure per second over the last five minutes (events) |
+| `stale-statistics` | info | tables with over a thousand rows have statistics older than an hour (schema) |
 
 ## Metrics worth alerting on
 
@@ -80,6 +129,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
 | `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
+| `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so

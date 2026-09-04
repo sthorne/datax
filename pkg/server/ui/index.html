@@ -71,6 +71,28 @@
   td.detail { padding: 0 12px 10px; }
   td.detail table { margin-top: 4px; }
   td.detail .note { color: var(--text-3); font-size: 12px; padding: 6px 0; }
+  /* Problems panel: one row per finding, severity-colored, hidden when green. */
+  #problems { margin-top: 10px; }
+  #problems .ok { color: var(--good); font-size: 13px; }
+  .problem {
+    display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+    border-left-width: 4px;
+  }
+  .problem.critical { border-left-color: var(--critical); }
+  .problem.warning { border-left-color: var(--warning); }
+  .problem.info { border-left-color: var(--series-1); }
+  .problem .sev { font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; width: 62px; flex: none; }
+  .problem.critical .sev { color: var(--critical); }
+  .problem.warning .sev { color: var(--warning); }
+  .problem.info .sev { color: var(--series-1); }
+  .problem .check { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2); flex: none; }
+  .problem a { color: var(--text-2); margin-left: auto; font-size: 12px; white-space: nowrap; }
+  /* Events: newest first, kind badge, audit rows marked. */
+  #events td.when { color: var(--text-3); font-size: 12px; }
+  .kind { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; border: 1px solid var(--border); color: var(--text-2); }
+  .kind.audit { border-color: var(--warning); }
+  select.filter { font-size: 13px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); margin-left: 12px; }
 </style>
 </head>
 <body>
@@ -82,13 +104,14 @@
 </header>
 <main>
   <div class="err" id="cluster-err"></div>
+  <div id="problems" title="checks run on this node every few seconds from data it already holds"></div>
 
   <section>
     <h2>Cluster</h2>
     <div class="tiles" id="tiles"></div>
   </section>
 
-  <section>
+  <section id="sec-nodes">
     <h2>Nodes</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
@@ -125,13 +148,13 @@
     </div>
   </section>
 
-  <section>
+  <section id="sec-network">
     <h2>Network</h2>
     <div class="tablewrap"><table id="latency"></table></div>
     <p class="muted" id="latency-note"></p>
   </section>
 
-  <section>
+  <section id="sec-schema">
     <h2>Schema <input id="schema-filter" type="search" placeholder="filter tables and ranges" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
     <div class="tablewrap"><table>
       <thead><tr><th>table</th><th>columns</th><th>primary key</th><th>indexes</th>
@@ -158,7 +181,7 @@
     <p class="muted" id="cluster-range-note"></p>
   </section>
 
-  <section>
+  <section id="sec-cluster-ranges">
     <h2>Ranges (cluster)</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
@@ -167,13 +190,22 @@
     <p class="muted" id="cluster-range-hint">click a range for its per-replica detail from every holding node (admin role)</p>
   </section>
 
+  <section id="sec-events">
+    <h2>Events (this node) <select class="filter" id="events-filter" title="show one kind of event"><option value="">all kinds</option></select></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table></div>
+    <p class="muted" id="events-note"></p>
+  </section>
+
   <section>
     <h2>Machine (this node)</h2>
     <div class="tiles" id="machine"></div>
     <p class="muted" id="machine-note"></p>
   </section>
 
-  <section>
+  <section id="sec-storage">
     <h2>Storage health</h2>
     <div class="tiles" id="storage"></div>
   </section>
@@ -579,6 +611,65 @@ async function toggleRangeDetail(id) {
   }
   poll();
 }
+// Problems panel: /api/health on the same cadence. Rows link to the
+// dashboard section that shows the underlying figure.
+const SECTION_NAMES = { nodes: "nodes", network: "network", schema: "schema", "cluster-ranges": "ranges", storage: "storage", events: "events" };
+async function pollHealth() {
+  const box = document.getElementById("problems");
+  try {
+    const resp = await fetch("/api/health", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const h = await resp.json();
+    const probs = h.problems || [];
+    if (!probs.length) {
+      box.innerHTML = `<span class="ok">✓ no problems found (${h.checks} checks)</span>`;
+      return;
+    }
+    box.innerHTML = probs.map(p => `<div class="problem ${esc(p.severity)}">
+      <span class="sev">${esc(p.severity)}</span>
+      <span class="check">${esc(p.check)}</span>
+      <span>${esc(p.summary)}</span>
+      ${p.section ? `<a href="#sec-${esc(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} ↓</a>` : ""}
+    </div>`).join("");
+  } catch (err) {
+    box.innerHTML = `<span class="muted">health checks unavailable: ${esc(err.message || err)}</span>`;
+  }
+}
+// Events: the first poll loads the recent ring, later polls tail from
+// the last sequence seen; the kind filter is applied on render. Audit
+// rows arrive only for admins (the server filters).
+const EVENTS_MAX = 300;
+let eventsSeen = 0, eventsAll = [], eventsKinds = new Set();
+function renderEvents() {
+  const sel = document.getElementById("events-filter");
+  const want = sel.value;
+  const opts = [`<option value="">all kinds</option>`].concat([...eventsKinds].sort().map(k => `<option value="${esc(k)}"${k === want ? " selected" : ""}>${esc(k)}</option>`));
+  if (sel.options.length !== opts.length) sel.innerHTML = opts.join("");
+  const rows = eventsAll.filter(e => !want || e.kind === want).slice().reverse().map(e => `<tr>
+    <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
+    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
+  </tr>`);
+  document.getElementById("events").innerHTML = rows.join("") ||
+    `<tr><td colspan="3" class="muted">${want ? "no " + esc(want) + " events" : "nothing recorded yet"}</td></tr>`;
+  document.getElementById("events-note").textContent =
+    `${eventsAll.length} recent events on this node (splits, merges, rebalances, repairs, snapshots, backups, upgrades)` +
+    (canDrillDown() ? "; audit records (auth failures, admin operations, privilege DDL) are outlined in amber" : "; audit records need the admin role");
+}
+async function pollEvents() {
+  try {
+    const resp = await fetch("/api/events?since=" + eventsSeen + (eventsSeen ? "" : "&limit=" + EVENTS_MAX), { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const d = await resp.json();
+    for (const e of d.events || []) { eventsAll.push(e); eventsKinds.add(e.kind); }
+    if (eventsAll.length > EVENTS_MAX) eventsAll = eventsAll.slice(eventsAll.length - EVENTS_MAX);
+    eventsSeen = Math.max(eventsSeen, d.latest_seq || 0);
+    renderEvents();
+  } catch (err) {
+    document.getElementById("events-note").textContent = "events unavailable: " + (err.message || err);
+  }
+}
+document.getElementById("events-filter").addEventListener("change", renderEvents);
 async function poll() {
   try {
     const resp = await fetch("/api/cluster", { cache: "no-store" });
@@ -592,10 +683,14 @@ async function poll() {
 }
 poll();
 pollSchema();
+pollHealth();
+pollEvents();
 setTimeout(pollActivity, 500);
 setInterval(poll, 3000);
 setInterval(pollSchema, 3000);
 setInterval(pollActivity, 3000);
+setInterval(pollHealth, 3000);
+setInterval(pollEvents, 3000);
 </script>
 </body>
 </html>
