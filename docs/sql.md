@@ -139,11 +139,69 @@ join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; LEFT joins and self-joins keep syntactic order),
 deferrable constraints,
-typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
-JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
-`<@` and the `?`/`?|`/`?&` existence operators,
-path operators and expressions in GROUPED join select lists,
+typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
+ignored; casts apply both),
+JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
+inverted indexes),
+expressions over aggregates (`SUM(a) / COUNT(*)`), window functions, an
+INTERVAL type (intervals are text), user-defined functions,
 DEFAULT expressions that reference other columns.
+
+### Expressions and builtins
+
+`pkg/sql/builtins` is the single registry of scalar functions: each
+`Builtin` carries its argument and result families, arity (optional
+and variadic tails), volatility (immutable / stable / volatile),
+strictness and a one-line description. The parser checks arity against
+it (`42883` for an unknown name or a wrong count), the evaluator
+(`Session.evalFunc`) dispatches through `Builtin.Call` — which applies
+strict-NULL handling and coerces arguments to the declared families
+(numerics lift among themselves, anything renders as text for a text
+parameter) — `pg_proc` is built from it (`provolatile`, `proisstrict`,
+argument and result OIDs), `SHOW FUNCTIONS` lists it, and
+`docs/user/functions.md` is generated from it (`go generate
+./pkg/sql/builtins`; a test fails when the file drifts). Functions that
+need the session, the catalog or the transaction (`now()`,
+`current_user`, `nextval`, `pg_get_*`) are registered with `Session:
+true` for listing and arity only; the session splices them before the
+row loop (`resolveWhereSubs` and friends in subquery.go, `spliceVolatile`
+in sequence.go), and a CHECK expression goes through the same splice
+each statement so `CHECK (at <= now())` sees the statement's clock.
+
+Casts are performed (`builtins.Cast`): every family pair PostgreSQL
+allows, with its text forms and error codes, `DECIMAL(p,s)` /
+`VARCHAR(n)` typmods applied on the cast, `regclass` resolved through
+the catalog, and the catalog-only pseudo types (`name`, `oid`, `regtype`,
+...) passing values through. A cast chain (`x::text::int`) applies in
+order. `typing.go` types computed outputs statically (`exprFamily`:
+arithmetic promotes INT8 → DECIMAL → FLOAT8, `^` and the float builtins
+are FLOAT8, predicates BOOL, a cast its target, a builtin its declared
+result or the family of the argument it mirrors), and `conformTo`
+coerces each produced datum to the described family so the wire type
+and the value agree. A cast column keeps the column's name.
+
+Predicates evaluate three-valued: `cond3` returns TRUE / FALSE /
+UNKNOWN and a predicate used as a value renders UNKNOWN as NULL, while
+WHERE and HAVING treat it as not matching. `BETWEEN` lowers to two
+conjuncts so the planner can turn it into scan bounds; a `LIKE` with a
+literal prefix becomes bounds on a keyed column (`withLikeBounds`), the
+rest of the pattern staying a residual regexp filter; `SIMILAR TO`
+translates SQL regular expressions to Go's; `IS [NOT] DISTINCT FROM`,
+`IS [NOT] TRUE / FALSE / UNKNOWN` and `ESCAPE` are null-aware
+operators in `applyCmpOp`. Integer arithmetic overflow is `22003`;
+date arithmetic (`DateArith`) adds days to dates, text intervals to
+timestamps (a month step clamps to the end of the shorter month) and
+subtracts dates to a day count. Timestamps are int64 nanoseconds, so
+the representable range is 1678-01-01 to 2261-12-31 and a value
+outside it is refused at parse time rather than wrapped.
+
+Aggregates (`aggregate.go`) take an expression argument, `DISTINCT`,
+`FILTER (WHERE ...)` and `WITHIN GROUP (ORDER BY ...)`: an `aggSpec`
+per select item accumulates over the evaluated argument — sums exactly,
+counts, string / array / json aggregation, the boolean aggregates, the
+statistical ones (two-pass over the collected values), the percentiles collected then sorted — in
+single-table and join grouping alike (`join_agg.go` canonicalizes the
+expression text so `GROUP BY` output naming stays stable).
 
 ## Catalog
 

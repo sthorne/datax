@@ -8,6 +8,55 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.15.0 — unreleased
+
+### Added
+- The expression language and builtin functions (#93): a registry of
+  88 scalar functions (`pkg/sql/builtins`) — conditionals (`coalesce`,
+  `nullif`, `greatest`, `least`), strings (`substring`, `position`,
+  `trim`, `lpad`, `split_part`, `format`, `md5`, `sha256`, `encode`,
+  `initcap`, `translate`, ...), math (`round`, `trunc`, `mod`, `power`,
+  `sqrt`, `ln`, `log`, `random`, `width_bucket`, ...), date and time
+  (`date_trunc`, `extract` / `date_part`, `to_char`, `to_timestamp`,
+  `to_date`, `make_date`, `make_timestamp`, `age`, `clock_timestamp`),
+  JSON (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
+  `jsonb_set`, `jsonb_typeof`, `jsonb_extract_path[_text]`, ...) and
+  the session functions — with their arity checked by the parser,
+  `pg_proc` (`provolatile`, `proisstrict`) and `SHOW FUNCTIONS` listing
+  them, and the [Functions reference](docs/user/functions.md) generated
+  from the same registry. Casts are now **performed** (`CAST(x AS t)`,
+  `x::t`, chains) with PostgreSQL's text forms and error codes,
+  `DECIMAL(p,s)` and `VARCHAR(n)` typmods applied on the cast, and
+  `regclass` resolved. Operators `%`, `^`, integer overflow detection
+  (`22003`), date arithmetic (`date + n`, `date - date`, `ts + '2
+  hours'`, month steps clamp), predicates `BETWEEN [SYMMETRIC]` (index
+  bounds on a keyed column), `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS
+  [NOT] DISTINCT FROM`, `LIKE ... ESCAPE`, `SIMILAR TO`, and a literal
+  `LIKE` prefix becoming index bounds. The SQL-form calls
+  `substring(s FROM n FOR m)`, `position(a IN b)`, `trim(BOTH x FROM
+  s)`, `extract(f FROM ts)`. JSONB `#>` / `#>>` paths, array-index
+  `->`, `<@`, `?`, `?|`, `?&` everywhere an expression goes, HAVING
+  included. Aggregates over expressions with `DISTINCT` and `FILTER
+  (WHERE ...)`: `string_agg`, `array_agg`, `bool_and` / `bool_or` /
+  `every`, `stddev*` / `var*`, `percentile_cont` / `percentile_disc
+  ... WITHIN GROUP`, `json[b]_agg`, `json[b]_object_agg`. Computed
+  outputs describe with their real type on the wire (`qty * 2` is
+  INT8, `qty > 3` BOOL, `now()` TIMESTAMPTZ), a cast column keeps its
+  name, and `now()`, `current_timestamp` and `current_date` share one
+  statement clock. Predicates used as values are three-valued (`NULL
+  BETWEEN 1 AND 2` is NULL, not false).
+- `CHECK` constraints may use the stable session functions (`CHECK (at
+  <= now())`, `CHECK (who = current_user)`), evaluated per statement.
+
+### Changed
+- `AVG` of an `INT8` column is a `DECIMAL` (exact, 6 fractional
+  digits), as in PostgreSQL, where it was a `FLOAT8`.
+
+### Fixed
+- A timestamp outside the representable years 1678 to 2261 (int64
+  nanoseconds) was silently wrapped (`'2999-01-01'` became 1829); it
+  is now refused.
+
 ## 0.14.0 — unreleased
 
 ### Added

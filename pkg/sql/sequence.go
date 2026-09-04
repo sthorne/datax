@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"strconv"
 	"strings"
 	"sync"
@@ -444,7 +445,7 @@ func (s *Session) uniqueRowID() int64 {
 }
 
 // volatileFuncs are evaluated per row by the session, not by evalFunc.
-var volatileFuncs = map[string]bool{"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true}
+var volatileFuncs = map[string]bool{"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true, "uuid_generate_v4": true}
 
 // spliceVolatile evaluates the volatile row functions inside e into
 // literals, for one row. Arguments must be constants.
@@ -505,7 +506,7 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 			d = types.NewInt(v)
 		case "unique_rowid":
 			d = types.NewInt(s.uniqueRowID())
-		case "gen_random_uuid":
+		case "gen_random_uuid", "uuid_generate_v4":
 			d = types.NewUUID(uuid.New())
 		}
 		out.Func, out.Args, out.Lit = "", nil, &d
@@ -537,9 +538,22 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 	return out, nil
 }
 
-// exprIsVolatile reports whether e calls a volatile row function.
+// exprIsVolatile reports whether e calls a volatile row function: the
+// session's (nextval, unique_rowid, ...) or a volatile builtin
+// (random()), which the evaluator calls afresh per row.
 func exprIsVolatile(e parser.Expr) bool {
-	return exprHas(e, func(x parser.Expr) bool { return x.Func != "" && volatileFuncs[x.Func] })
+	return exprHas(e, isVolatileCall)
+}
+
+func isVolatileCall(x parser.Expr) bool {
+	if x.Func == "" {
+		return false
+	}
+	if volatileFuncs[x.Func] {
+		return true
+	}
+	b, ok := builtins.Lookup(x.Func)
+	return ok && !b.Session && b.Vol == builtins.Volatile
 }
 
 // columnDefaults holds a statement's parsed expression defaults, with

@@ -77,9 +77,12 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		out.Sub, out.Lit = nil, &d
 	}
 	switch e.Func {
-	case "now":
-		d := types.NewTimestamp(s.db.Clock().Now().WallTime)
-		out.Func, out.Lit = "", &d
+	case "now", "current_timestamp", "localtimestamp", "statement_timestamp", "transaction_timestamp":
+		d := types.NewTimestamp(s.statementTime())
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "current_date":
+		d := types.NewDate(s.statementTime() / (86400 * 1e9))
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "current_database":
 		d := types.NewString(s.database)
 		out.Func, out.Lit = "", &d
@@ -761,7 +764,8 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 // splicedFuncs are resolved by the session before execution: they
 // depend on the session, the clock, or the catalog rather than the row.
 var splicedFuncs = map[string]bool{
-	"now": true, "current_database": true, "current_schema": true, "current_user": true, "session_user": true,
+	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
+	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
 	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,

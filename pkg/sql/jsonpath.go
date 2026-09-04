@@ -1,7 +1,9 @@
 package sql
 
 import (
+	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -30,15 +32,19 @@ func applyPath(d types.Datum, path []parser.PathStep) (types.Datum, error) {
 	}
 	raw := json.RawMessage(d.S)
 	for _, step := range path {
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &obj); err != nil {
-			return types.DNull, nil // scalar or array: no field to extract
+		keys := step.Keys
+		if step.IsIndex {
+			keys = []string{strconv.Itoa(step.Index)}
+		} else if keys == nil {
+			keys = []string{step.Key}
 		}
-		v, ok := obj[step.Key]
-		if !ok {
-			return types.DNull, nil
+		for _, key := range keys {
+			v, ok := rawStep(raw, key)
+			if !ok {
+				return types.DNull, nil
+			}
+			raw = v
 		}
-		raw = v
 		if step.Text { // terminal by grammar
 			if string(raw) == "null" {
 				return types.DNull, nil
@@ -54,6 +60,42 @@ func applyPath(d types.Datum, path []parser.PathStep) (types.Datum, error) {
 		}
 	}
 	return types.NewJsonb(string(raw)), nil
+}
+
+// rawStep takes one step into a raw JSON value: a field of an object, or
+// an element of an array by position (negative from the end) when the
+// key is numeric.
+func rawStep(raw json.RawMessage, key string) (json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, false
+	}
+	switch trimmed[0] {
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, false
+		}
+		v, ok := obj[key]
+		return v, ok
+	case '[':
+		i, err := strconv.Atoi(key)
+		if err != nil {
+			return nil, false
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil, false
+		}
+		if i < 0 {
+			i += len(arr)
+		}
+		if i < 0 || i >= len(arr) {
+			return nil, false
+		}
+		return arr[i], true
+	}
+	return nil, false
 }
 
 // pathResultType is the SQL type a non-empty path chain produces: text for

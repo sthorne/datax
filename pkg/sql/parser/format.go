@@ -19,9 +19,14 @@ func formatExpr(b *strings.Builder, e Expr) {
 	if e.Left != nil {
 		b.WriteString("(")
 		formatExpr(b, *e.Left)
-		b.WriteString(" " + e.BinOp + " ")
-		formatExpr(b, *e.Right)
+		if e.BinOp != "" {
+			b.WriteString(" " + e.BinOp + " ")
+			formatExpr(b, *e.Right)
+		}
 		b.WriteString(")")
+		if e.Cast != "" {
+			b.WriteString("::" + e.Cast)
+		}
 		return
 	}
 	switch {

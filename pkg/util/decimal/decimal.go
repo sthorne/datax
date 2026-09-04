@@ -305,3 +305,47 @@ func FromMantissa(neg bool, digits string, e int64) (Dec, error) {
 	}
 	return canon(c, int32(exp)), nil
 }
+
+// rescale returns a's coefficient at exponent -scale, with the digits
+// beyond the scale in rem (rem's magnitude is below one unit of the
+// scale); both carry a's sign.
+func rescale(a Dec, scale int32) (q, rem, unit *big.Int) {
+	c := new(big.Int).Set(coeffOf(a))
+	exp := a.exp
+	unit = big.NewInt(1)
+	if exp > -scale {
+		for ; exp > -scale; exp-- {
+			c.Mul(c, ten)
+		}
+		return c, new(big.Int), unit
+	}
+	for ; exp < -scale; exp++ {
+		unit.Mul(unit, ten)
+	}
+	q, rem = new(big.Int).QuoRem(c, unit, new(big.Int))
+	return q, rem, unit
+}
+
+// Truncate drops the digits beyond the given scale (toward zero).
+func Truncate(a Dec, scale int32) Dec {
+	q, _, _ := rescale(a, scale)
+	return canon(q, -scale)
+}
+
+// RoundHalfAway rounds to the given scale with halves away from zero
+// (PostgreSQL's round() on numeric).
+func RoundHalfAway(a Dec, scale int32) Dec {
+	q, rem, unit := rescale(a, scale)
+	if rem.Sign() != 0 {
+		twice := new(big.Int).Abs(rem)
+		twice.Mul(twice, big.NewInt(2))
+		if twice.Cmp(unit) >= 0 {
+			if rem.Sign() < 0 {
+				q.Sub(q, big.NewInt(1))
+			} else {
+				q.Add(q, big.NewInt(1))
+			}
+		}
+	}
+	return canon(q, -scale)
+}

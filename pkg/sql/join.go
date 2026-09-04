@@ -230,7 +230,7 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 			}
 		case se.Agg != "":
 			return nil, newErrf(CodeInternal, "aggregate reached the join projection")
-		case se.Expr.Column != "" && se.Expr.BinOp == "":
+		case se.Expr.Column != "" && se.Expr.BinOp == "" && se.Expr.Cast == "":
 			ref, err := resolveJoinRef(sides, se.Expr.Column)
 			if err != nil {
 				return nil, err
@@ -261,7 +261,17 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 			if name == "" {
 				name = "?column?"
 			}
-			proj = append(proj, joinProj{name: name, expr: &e, typ: types.String})
+			typ := exprFamily(e, func(n string) (types.Family, bool) {
+				ref, err := resolveJoinRef(sides, n)
+				if err != nil {
+					return types.Unknown, false
+				}
+				return ref.col.Type, true
+			})
+			if typ == types.Unknown {
+				typ = types.String
+			}
+			proj = append(proj, joinProj{name: name, expr: &e, typ: typ})
 		}
 	}
 	return proj, nil
@@ -686,7 +696,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				if err != nil {
 					return nil, err
 				}
-				out[i] = d
+				out[i] = conformTo(d, p.typ)
 				continue
 			}
 			out[i] = jr.datum(p.ref)

@@ -2,7 +2,9 @@ package vtable
 
 import (
 	"context"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -311,11 +313,32 @@ func init() {
 	pg("pg_description", []catalog.Column{
 		col("objoid", types.Int), col("classoid", types.Int), col("objsubid", types.Int), col("description", types.String),
 	}, empty)
+	// pg_proc: the builtin functions, from the registry (aliases included,
+	// as PostgreSQL lists each name).
 	pg("pg_proc", []catalog.Column{
 		col("oid", types.Int), col("proname", types.String), col("pronamespace", types.Int), col("proowner", types.Int),
 		col("prolang", types.Int), col("prokind", types.String), col("proretset", types.Bool), col("prorettype", types.Int),
 		col("pronargs", types.Int), col("proargtypes", types.String), col("proargnames", types.String), col("prosrc", types.String),
-	}, empty)
+		col("provolatile", types.String), col("proisstrict", types.Bool),
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		var rows []Row
+		for i, b := range builtins.All() {
+			argOIDs := make([]string, len(b.Args))
+			for j, f := range b.Args {
+				argOIDs[j] = strconv.FormatInt(TypeOID(f), 10)
+			}
+			vol := "i"
+			switch b.Vol {
+			case builtins.Stable:
+				vol = "s"
+			case builtins.Volatile:
+				vol = "v"
+			}
+			rows = append(rows, Row{i64(int64(1<<28) + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
+				i64(TypeOID(b.ResultFamily(b.Args))), i64(int64(len(b.Args))), str(strings.Join(argOIDs, " ")), null(), str(b.Name), str(vol), boolean(!b.NotStrict)})
+		}
+		return rows, nil
+	})
 
 	// Catalogs psql consults for features datax does not have: row-level
 	// security policies, extended statistics, logical-replication

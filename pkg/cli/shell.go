@@ -177,8 +177,11 @@ Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
   CHECK / UNIQUE / FOREIGN KEY constraints, ALTER TABLE ... ADD / DROP /
   VALIDATE CONSTRAINT, ALTER COLUMN SET / DROP NOT NULL, DROP TABLE CASCADE,
   COPY ... FROM STDIN, BEGIN / COMMIT / ROLLBACK / SAVEPOINT, EXPLAIN,
-  ANALYZE, SHOW TABLES, SHOW STATS, CREATE USER, GRANT / REVOKE.
-  Details: docs/user/sql.md (the SQL reference) and docs/timeseries.md.
+  ANALYZE, SHOW TABLES, SHOW STATS, SHOW FUNCTIONS (the builtin
+  functions: strings, math, date/time, JSON, casts, aggregates),
+  CREATE USER, GRANT / REVOKE.
+  Details: docs/user/sql.md (the SQL reference), docs/user/functions.md
+  and docs/timeseries.md.
 
 Command line: datax sql -e "<statement>" runs one statement and exits;
   -url, -certs-dir and -user pick the cluster and the identity.

@@ -71,7 +71,9 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   ALTER TABLE, sequences, SERIAL / identity columns, expression
   defaults, CHECK / UNIQUE / FOREIGN KEY constraints with cascading
   actions, INSERT/SELECT/UPDATE/DELETE with ORDER BY — DESC via
-  reverse scans — and aggregates, transactions, joins up to 8 tables,
+  reverse scans — the usual scalar functions, operators and casts
+  ([reference](docs/user/functions.md)) and aggregates, transactions,
+  joins up to 8 tables,
   GROUP BY — including over joins, correlated subqueries to 4 levels,
   UNION, `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over

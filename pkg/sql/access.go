@@ -190,6 +190,74 @@ func pickPlan(desc *catalog.TableDescriptor, where []parser.Comparison, params [
 	return pickPlanWithStats(desc, nil, where, params)
 }
 
+// withLikeBounds derives key bounds from LIKE patterns with a literal
+// prefix: col LIKE 'abc%' also satisfies col >= 'abc' AND col < 'abd',
+// which the planner can turn into an index range (the LIKE itself
+// still filters). Case-insensitive patterns and prefixes ending in the
+// highest byte derive nothing.
+func withLikeBounds(where []parser.Comparison) []parser.Comparison {
+	var extra []parser.Comparison
+	for _, cmp := range where {
+		if cmp.Op != "LIKE" || cmp.Column == "" || len(cmp.Path) > 0 || cmp.Value.Lit == nil || cmp.Value.Lit.Fam != types.String {
+			continue
+		}
+		prefix, ok := likePrefix(cmp.Value.Lit.S, cmp.Escape)
+		if !ok || prefix == "" {
+			continue
+		}
+		lo := types.NewString(prefix)
+		extra = append(extra, parser.Comparison{Column: cmp.Column, Op: ">=", Value: parser.Expr{Lit: &lo}})
+		if next, ok := nextPrefix(prefix); ok {
+			hi := types.NewString(next)
+			extra = append(extra, parser.Comparison{Column: cmp.Column, Op: "<", Value: parser.Expr{Lit: &hi}})
+		}
+	}
+	if len(extra) == 0 {
+		return where
+	}
+	return append(append([]parser.Comparison(nil), where...), extra...)
+}
+
+// likePrefix is the literal text before the first wildcard of a LIKE
+// pattern (escapes resolved); ok is false when the pattern is one the
+// planner should not touch.
+func likePrefix(pattern, escape string) (string, bool) {
+	esc, hasEsc := escapeRune(escape)
+	var b strings.Builder
+	escaped := false
+	for _, r := range pattern {
+		switch {
+		case escaped:
+			b.WriteRune(r)
+			escaped = false
+		case hasEsc && r == esc:
+			escaped = true
+		case r == '%' || r == '_':
+			return b.String(), true
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if escaped {
+		return "", false
+	}
+	return b.String(), true
+}
+
+// nextPrefix is the smallest string greater than every string with the
+// prefix: the last byte incremented (bytes 0xff are dropped first).
+func nextPrefix(prefix string) (string, bool) {
+	b := []byte(prefix)
+	for len(b) > 0 && b[len(b)-1] == 0xff {
+		b = b[:len(b)-1]
+	}
+	if len(b) == 0 {
+		return "", false
+	}
+	b[len(b)-1]++
+	return string(b), true
+}
+
 // Cost-model constants (statistics present only). A non-unique index
 // scan pays indexJoinCostMultiplier per estimated row for the per-entry
 // primary-key Get that follows it; equality selectivity comes from the
@@ -208,6 +276,7 @@ const (
 // (estimated rows × per-row cost) instead of the structural score, and a
 // low-selectivity index scan loses to the full scan it would out-fetch.
 func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
+	where = withLikeBounds(where)
 	if pkVals, ok, err := pkPointValues(desc, where, params); err != nil {
 		return accessPlan{}, err
 	} else if ok {

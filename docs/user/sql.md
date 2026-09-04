@@ -13,7 +13,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
 | `TEXT` | `STRING`, `VARCHAR` | |
 | `BOOL` | `BOOLEAN` | |
-| `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire |
+| `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
 | `UUID` | | |
@@ -25,9 +25,10 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
   column converts (correctly rounded).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
-  operand demotes the expression to float. `AVG(DECIMAL)` rounds to 6
-  fractional digits (half-even). Float values never implicitly convert
-  *to* DECIMAL.
+  operand demotes the expression to float. `AVG` of an `INT8` or a
+  `DECIMAL` is a DECIMAL rounded to 6 fractional digits (half-even), as
+  in PostgreSQL; `AVG(FLOAT8)` is a FLOAT8. Float values never
+  implicitly convert *to* DECIMAL.
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored
@@ -37,15 +38,16 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
-  JSONB cannot be a primary key or indexed. `->`/`->>` work in
-  single-table queries and joins (SELECT lists and WHERE; a LEFT-joined
-  NULL side extracts to NULL) — not in grouped SELECT lists.
-- Containment: `j @> '{"tags":["go"]}'` — PostgreSQL semantics (objects
-  contain recursively, arrays contain each right element somewhere, a
-  top-level array contains a matching scalar), numbers compared
-  numerically (`1` contains `1.0`). Works in WHERE — including `NOT`,
-  `OR`, a `->` path on the left, and the WHERE of grouped queries — but
-  is single-table only and always a filter (no index acceleration).
+  JSONB cannot be a primary key or indexed. `->`/`->>` (by key or array
+  index) and `#>`/`#>>` (by path: `j #>> '{a,0,b}'`) work everywhere an
+  expression does — single-table queries, joins, grouped select lists
+  and HAVING; a LEFT-joined NULL side extracts to NULL.
+- Containment: `j @> '{"tags":["go"]}'` and `<@` — PostgreSQL semantics
+  (objects contain recursively, arrays contain each right element
+  somewhere, a top-level array contains a matching scalar), numbers
+  compared numerically (`1` contains `1.0`) — and key existence `j ?
+  'k'`, `j ?| '{a,b}'`, `j ?& '{a,b}'`. All are filters (no index
+  acceleration): pair them with an indexable condition on large tables.
 - Every type except JSONB can appear in primary keys and indexes.
 
 ## DDL
@@ -99,10 +101,11 @@ DROP SEQUENCE [IF EXISTS] s;
 SHOW SEQUENCES;
 ```
 
-A `DEFAULT` expression may use constants, operators and the functions
-above plus the volatile ones — `nextval`, `currval`, `lastval`,
-`setval`, `unique_rowid()`, `gen_random_uuid()` — but not other columns
-or subqueries. Volatile functions are evaluated **per row**: a 100-row
+A `DEFAULT` expression may use constants, operators, casts and the
+immutable and stable [builtin functions](functions.md) (`now()`,
+`current_user`, `lower(...)`, ...) plus the volatile ones — `nextval`,
+`currval`, `lastval`, `setval`, `unique_rowid()`, `gen_random_uuid()`,
+`random()` — but not other columns or subqueries. Volatile functions are evaluated **per row**: a 100-row
 `INSERT` draws 100 sequence values. `now()` and `current_user` are fixed
 for the statement.
 
@@ -171,9 +174,9 @@ Names default to PostgreSQL's (`orders_qty_check`, `orders_code_key`,
 `referential_constraints` / `key_column_usage` and `SHOW CREATE TABLE`
 show them.
 
-**CHECK** expressions use the row's columns, constants, operators and
-the non-volatile functions (no subqueries, parameters, or `nextval`
-and friends). A NULL result passes, as in PostgreSQL; a violation is
+**CHECK** expressions use the row's columns, constants, operators,
+casts and the non-volatile [builtin functions](functions.md) (no
+subqueries, parameters, `random()`, or `nextval` and friends). A NULL result passes, as in PostgreSQL; a violation is
 `23514`. They are checked on `INSERT`, `UPDATE`, `COPY` and on the rows
 a cascade rewrites.
 
@@ -245,29 +248,73 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   `OR` (scalar ones can). `OR` conditions, `LIKE`, `ANY` and
   path/computed conjuncts filter fetched rows — they never become index
   bounds, so pair them with an indexable `AND` condition on large tables.
-- **Expressions**: arithmetic `+ - * /` with standard precedence and
-  parentheses (exact on DECIMAL/INT8; integer division truncates;
-  division by zero is SQLSTATE `22012`), text concatenation `||`,
-  `CASE` (simple and searched), a comparison or boolean expression used
-  as a value (`qty > 3 AS big`, `(NOT a) AND EXISTS (...)`), `CAST(x AS
-  type)` and `x::type` (absorbed — types come from the schema — except
-  `'name'::regclass`, which resolves a table name to its catalog OID),
-  `E'...'` escape strings, and the functions `now()`, `coalesce(...)`,
-  `length(s)`, `lower(s)`, `upper(s)`, `abs(n)`, the sequence and id
-  functions `nextval`, `currval`, `lastval`, `setval`, `unique_rowid()`,
-  `gen_random_uuid()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)),
-  `oid::regclass` on a column (the table's name), plus the catalog
-  functions tools call (`version()`, `current_user`, `current_schema()`,
-  `current_setting(name)`, `format_type`, `pg_get_indexdef`,
-  `pg_get_constraintdef`, `pg_get_expr`, `pg_get_userbyid`,
-  `pg_table_is_visible`, `obj_description`, `array_to_string`,
-  `quote_ident`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`, ...)
-  — in SELECT lists, WHERE, INSERT VALUES, and UPDATE SET. An unknown
-  function is SQLSTATE `42883`. Computed SELECT outputs describe as text
-  on the wire.
+- **Predicates**: `[NOT] BETWEEN [SYMMETRIC] a AND b` (two conjuncts,
+  so a keyed column's range becomes index bounds), `IS [NOT] TRUE |
+  FALSE | UNKNOWN`, `IS [NOT] DISTINCT FROM`, `[NOT] LIKE / ILIKE ...
+  [ESCAPE 'c']` (a literal prefix — `LIKE 'ab%'` — becomes index bounds
+  on a keyed column) and `[NOT] SIMILAR TO` (SQL regular expressions;
+  an invalid pattern is SQLSTATE `2201B`). A predicate used as a value
+  (`qty > 3 AS big`) is three-valued: NULL when an input is NULL.
+- **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
+  parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
+  always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
+  `22003`), date arithmetic (`date + 1`, `date - date` in days,
+  `timestamp + '2 hours'`, `timestamp - '1 month'` — intervals are
+  text and month steps clamp to the end of the month), text
+  concatenation `||` (any operand renders as text), `CASE` (simple and
+  searched), `CAST(x AS type)` and `x::type` — **performed**, in every
+  position, with PostgreSQL's text forms and error codes (`'abc'::int`
+  is `22P02`), `DECIMAL(p,s)` and `VARCHAR(n)` typmods applied on the
+  cast, `'name'::regclass` resolving a table name to its catalog OID
+  and `oid::regclass` on a column giving the table's name —, `E'...'`
+  escape strings, and the builtin functions: conditionals (`coalesce`,
+  `nullif`, `greatest`, `least`), strings (`length`, `lower`, `upper`,
+  `substring` / `substr`, `position`, `trim` / `ltrim` / `rtrim` /
+  `btrim`, `left`, `right`, `lpad`, `rpad`, `repeat`, `replace`,
+  `reverse`, `split_part`, `starts_with`, `initcap`, `concat`,
+  `concat_ws`, `format`, `md5`, `sha256`, `encode` / `decode`,
+  `to_hex`, `chr` / `ascii`, `translate`, `quote_ident`,
+  `quote_literal`), math (`abs`,
+  `ceil`, `floor`, `round`, `trunc`, `mod`, `div`, `power`, `sqrt`,
+  `cbrt`, `exp`, `ln`, `log`, `sign`, `pi`, `random`, the
+  trigonometric functions, ...), date and time (`now()`,
+  `current_timestamp`, `current_date`, `date_trunc`, `date_part` /
+  `extract(field FROM x)`, `to_char`, `to_timestamp`, `to_date`,
+  `make_date`, `make_timestamp`, `age`, `justify_hours`), JSON
+  (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
+  `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
+  `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
+  `current_user`, `current_schema()`, `current_setting(name)`,
+  `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`,
+  `pg_get_expr`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`,
+  ...) as well as the sequence and id functions `nextval`, `currval`,
+  `lastval`, `setval`, `unique_rowid()`, `gen_random_uuid()` /
+  `uuid_generate_v4()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)).
+  The complete list with signatures, aliases and volatility is the
+  [Functions reference](functions.md); `SHOW FUNCTIONS` prints the same
+  from a session, and `pg_catalog.pg_proc` lists them for tools. All
+  of it works in SELECT lists, WHERE, HAVING, ORDER BY, INSERT VALUES,
+  UPDATE SET and RETURNING, in single-table queries and joins. An
+  unknown function is SQLSTATE `42883`; the wrong number of arguments
+  too. Computed SELECT outputs describe with their real type on the
+  wire (`qty * 2` is INT8, `price * 1.1` DECIMAL, `qty > 3` BOOL,
+  `now()` TIMESTAMPTZ, `j -> 'a'` JSONB); a cast column keeps the
+  column's name (`at::date` describes as `at`).
+- **JSONB operators**: `->` / `->>` (key or array index: `j -> 0`),
+  `#>` / `#>>` with a text-array path (`j #>> '{a,0,b}'`), containment
+  `@>` / `<@`, and key existence `?`, `?|`, `?&` — everywhere an
+  expression goes, including HAVING and grouped select lists.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
-  whole-table or per `GROUP BY` group, including over joins. `HAVING`
-  filters on aggregates or group columns. `DISTINCT` is supported.
+  `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
+  `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
+  `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
+  `json[b]_agg`, `json[b]_object_agg` — over a column or an expression
+  (`SUM(qty * price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER
+  (WHERE ...)`, whole-table or per `GROUP BY` group, including over
+  joins. `HAVING` filters on aggregates or group columns (a bare
+  boolean aggregate works: `HAVING bool_and(ok)`). An expression *over*
+  an aggregate (`SUM(a) / COUNT(*)`) is not yet supported; compute it
+  in the client or a derived table.
 - **Joins** execute left-deep in the order written — until
   [statistics](#table-statistics) exist for every joined table, at which
   point INNER joins are automatically reordered to drive from the
@@ -514,6 +561,7 @@ SHOW USERS;                     -- username, is_admin
 SHOW GRANTS [ON t] [FOR user];  -- database_name, table_name, grantee, privilege_type
 SHOW DATABASES;                 -- database_name, owner
 SHOW STATS FOR t;               -- see Table statistics
+SHOW FUNCTIONS;                 -- name, signature, category, volatility, aliases, description
 SHOW ALL;                       -- every session setting
 SHOW server_version;            -- one setting (SHOW TIME ZONE, SHOW search_path, ...);
                                 -- an unknown name is SQLSTATE 42704
