@@ -173,6 +173,9 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		if n.pinger != nil {
 			nd.Latency = n.pinger.Snapshot()
 		}
+		if n.pgServer != nil {
+			nd.SQL = n.pgServer.Activity().Summary()
+		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 			log.Debugf("liveness heartbeat failed: %v", err)

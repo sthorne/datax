@@ -113,6 +113,21 @@ type conn struct {
 	// skipToSync: an extended-protocol error occurred; ignore messages
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
+	// act is the server's client accounting (nil in unit tests that build
+	// a conn without a server).
+	act *Activity
+}
+
+// execute runs one statement through the session with activity
+// accounting around it.
+func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum) (*sql.Result, *sql.Error) {
+	if c.act == nil {
+		return c.session.Execute(ctx, stmt, params)
+	}
+	tok := c.act.begin(c, stmt, text)
+	res, serr := c.session.Execute(ctx, stmt, params)
+	tok.end(res, serr, c.session.State() == sql.StateOpen)
+	return res, serr
 }
 
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
@@ -254,6 +269,9 @@ func (c *conn) handleStartup() error {
 			// Privileges are enforced against this identity. In trust mode
 			// it is client-claimed (nothing verified it) — documented.
 			c.session.SetUser(m.Parameters["user"])
+			if c.act != nil {
+				c.act.setUser(c, m.Parameters["user"])
+			}
 			for _, kv := range [][2]string{
 				{"server_version", "13.0 datax"},
 				{"server_encoding", "UTF8"},
@@ -320,7 +338,7 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			c.handleCopyIn(ctx, cf)
 			return
 		}
-		res, serr := c.session.Execute(ctx, stmt, nil)
+		res, serr := c.execute(ctx, stmt, q, nil)
 		if serr != nil {
 			c.sendError(serr)
 			return
@@ -641,7 +659,7 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		return
 	}
 	if pt.res == nil {
-		res, serr := c.session.Execute(ctx, pt.stmt.stmt, pt.params)
+		res, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params)
 		if serr != nil {
 			c.extError(serr)
 			return

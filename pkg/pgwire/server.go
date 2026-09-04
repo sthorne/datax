@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/security"
@@ -29,6 +30,9 @@ type ServerOptions struct {
 	TLS *tls.Config
 	// Auth, when set, requires SCRAM-SHA-256; nil = trust.
 	Auth Authenticator
+	// SlowStatementThreshold is the duration past which a statement is
+	// kept in the slow-statement ring (0 = the default, 500 ms).
+	SlowStatementThreshold time.Duration
 }
 
 // Server accepts SQL client connections.
@@ -41,11 +45,15 @@ type Server struct {
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
+	act   *Activity
 }
+
+// Activity exposes the server's client accounting.
+func (s *Server) Activity() *Activity { return s.act }
 
 // Serve starts accepting connections on lis (returns immediately).
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
-	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]struct{})}
+	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]struct{}), act: newActivity(opts.SlowStatementThreshold)}
 	stopper.AddCloser(func() { _ = lis.Close() })
 	go s.acceptLoop()
 	return s
@@ -75,6 +83,9 @@ func (s *Server) acceptLoop() {
 				_ = nc.Close()
 			}()
 			c := newConn(nc, s.db, s.cat, s.opts)
+			c.act = s.act
+			s.act.connOpened(c, nc.RemoteAddr().String())
+			defer s.act.connClosed(c)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			go func() { // tear the connection down on server shutdown

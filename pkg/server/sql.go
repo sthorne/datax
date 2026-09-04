@@ -35,7 +35,7 @@ func (n *Node) startSQL() error {
 			return err
 		}
 	}
-	var opts pgwire.ServerOptions
+	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold}
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier

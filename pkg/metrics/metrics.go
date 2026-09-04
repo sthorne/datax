@@ -123,6 +123,24 @@ var (
 		Name: "datax_peer_reachable", Help: "1 while this node's last ping to the peer succeeded, 0 once one failed or timed out.",
 	}, []string{"peer"})
 
+	SQLConnections = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_sql_connections", Help: "SQL connections by state: open (all), active (a statement in flight), idle_in_txn (idle inside an open transaction, holding its intents).",
+	}, []string{"state"})
+	SQLStatements = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_sql_statements_total", Help: "Statements executed, by kind (select, insert, update, delete, copy, txn, ddl, other).",
+	}, []string{"kind"})
+	SQLStatementLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_sql_statement_latency_seconds",
+		Help:    "Statement latency as seen by the SQL server (parse to result).",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 18), // 100µs .. ~13s
+	})
+	SQLSerializationFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_serialization_failures_total", Help: "Statements that ended in SQLSTATE 40001 (the client must retry the transaction).",
+	})
+	SQLCopyRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_copy_rows_total", Help: "Rows loaded through COPY FROM STDIN.",
+	})
+
 	TableRanges = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "datax_table_ranges", Help: "Ranges covering each table's key space (refreshed with the schema browser's cache).",
 	}, []string{"table"})

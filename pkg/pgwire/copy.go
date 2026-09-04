@@ -132,6 +132,9 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 			c.sendError(sql.ToSQLError(ferr))
 			return
 		}
+		if c.act != nil {
+			c.act.copied(int64(n))
+		}
 		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("COPY %d", n))})
 		return
 	}

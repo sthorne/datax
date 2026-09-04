@@ -40,6 +40,9 @@ type ClusterNode struct {
 	// clock offset to each peer, from its heartbeat (fresh from the pinger
 	// for the serving node itself).
 	Latency []kvpb.PeerLatency `json:"latency,omitempty"`
+	// SQL is the node's SQL activity summary from its heartbeat (live for
+	// the serving node).
+	SQL *kvpb.SQLSummary `json:"sql,omitempty"`
 }
 
 // ClusterRange is one cluster-wide range descriptor (from /meta — every
@@ -115,9 +118,16 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			ReplicaBytes: nd.ReplicaBytes,
 			Machine:      nd.Machine,
 			Latency:      nd.Latency,
+			SQL:          nd.SQL,
 		})
-		if nd.NodeID == n.ident.NodeID && n.pinger != nil {
-			doc.Nodes[len(doc.Nodes)-1].Latency = n.pinger.Snapshot()
+		if nd.NodeID == n.ident.NodeID {
+			last := &doc.Nodes[len(doc.Nodes)-1]
+			if n.pinger != nil {
+				last.Latency = n.pinger.Snapshot()
+			}
+			if n.pgServer != nil {
+				last.SQL = n.pgServer.Activity().Summary()
+			}
 		}
 	}
 	descs, age, err := n.clusterRanges(req.Context())

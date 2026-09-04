@@ -14,8 +14,12 @@ serves, on that address:
   browser (every table with its columns, primary key, indexes,
   time-series options, grants, statistics and their age, and range
   footprint; the users for admins; a filter box that narrows the tables
-  and both range lists, which name the table each range belongs to),
-  range tables with replica placement, storage health. The cluster
+  and both range lists, which name the table each range belongs to), SQL
+  activity (connections by state with the oldest idle transaction,
+  statements per second by kind, `40001` rate, latency percentiles per
+  node; for admins the serving node's statements in flight and its
+  slowest recent ones), range tables with replica placement, storage
+  health. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -31,6 +35,10 @@ serves, on that address:
   `error` saying how old it is.
 - **`/api/range?id=N`** — JSON: the cross-node drill-down document behind
   the range detail view. Admin role required in secure mode.
+- **`/api/activity`** — JSON: this node's SQL connections, statements in
+  flight, and the slow-statement ring (past `--slow-statement-threshold`,
+  default 500 ms). Admin role required in secure mode; statement text can
+  carry data.
 - **`/api/schema`** — JSON: the schema browser's document. In secure mode
   root and admins see every table and the user list; another user sees
   the tables it holds a grant on. Rebuilt at most every 5 s per node.
@@ -70,6 +78,9 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
 | `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
+| `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard) |
+| `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
+| `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
 one ping yields both the round trip and the peer's clock offset); the
