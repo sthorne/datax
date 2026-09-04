@@ -12,11 +12,10 @@ syntax error or `0A000` feature not supported):
 | Missing | Workaround |
 |---|---|
 | `OFFSET` | paginate by key: `WHERE id > $last ORDER BY id LIMIT n` (faster anyway) |
-| `RETURNING` | `SELECT` after the write, in the same transaction |
 | Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`, `array_to_string()`, `pg_size_pretty()` and the catalog functions tools call ([list](sql.md#reading)) — SQLSTATE `42883` | compute client-side |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` **is supported**) | merge client-side |
 | `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
-| Sequences / `SERIAL` / `DEFAULT` expressions | generate ids client-side (UUIDs distribute writes better than sequences here anyway) |
+| `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Views, triggers, stored procedures, `LISTEN/NOTIFY` | — |
@@ -71,6 +70,12 @@ syntax error or `0A000` feature not supported):
   chunks committed — the error names the failing row and how many rows
   were already committed. For the same reason COPY is refused inside
   `BEGIN` (SQLSTATE `25001`) and only the `FORMAT` option is accepted.
+- **`ON CONFLICT`** works on the primary key and unique indexes (by
+  columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
+  NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
+  change a primary-key column, and there is no `ON CONFLICT ... DO
+  UPDATE` over exclusion constraints (there are none). `UPSERT INTO`
+  (CockroachDB syntax) is the primary-key shorthand.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
   inside a transaction block.
@@ -131,8 +136,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_get_constraintdef`, `'t'::regclass` and `to_regclass`-style
   existence checks (`SELECT 1 FROM pg_class WHERE relname = ...`) return
   what PostgreSQL would for a schema in the datax subset. Reads of
-  features datax lacks (sequences, foreign keys, triggers, comments,
-  extensions) come back empty rather than erroring.
+  features datax lacks (foreign keys, triggers, comments, extensions)
+  come back empty rather than erroring; `pg_sequences`, `pg_sequence`
+  and `pg_class` rows with `relkind = 'S'` list the sequences.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 
 ## Client compatibility notes

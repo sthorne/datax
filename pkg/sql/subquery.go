@@ -56,7 +56,18 @@ func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, sub *par
 // evaluated once, before row-by-row execution: scalar subqueries and
 // now() (the statement timestamp).
 func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (parser.Expr, error) {
+	return s.resolveValueExprOpts(ctx, txn, e, params, false)
+}
+
+// resolveValueExprOpts is resolveValueExpr; keepVolatile leaves the
+// volatile row functions (nextval, ...) in place for a per-row caller.
+func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum, keepVolatile bool) (parser.Expr, error) {
 	out := e
+	if e.Func != "" && volatileFuncs[e.Func] && !keepVolatile {
+		// nextval() and friends outside a write's per-row path (SELECT
+		// nextval('s')): once per statement.
+		return s.spliceVolatile(ctx, txn, e, params)
+	}
 	if e.Sub != nil {
 		d, err := s.execScalarSub(ctx, txn, e.Sub, params)
 		if err != nil {
@@ -130,14 +141,14 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		}
 	}
 	if e.Left != nil {
-		l, err := s.resolveValueExpr(ctx, txn, *e.Left, params)
+		l, err := s.resolveValueExprOpts(ctx, txn, *e.Left, params, keepVolatile)
 		if err != nil {
 			return e, err
 		}
 		out.Left = &l
 	}
 	if e.Right != nil {
-		r, err := s.resolveValueExpr(ctx, txn, *e.Right, params)
+		r, err := s.resolveValueExprOpts(ctx, txn, *e.Right, params, keepVolatile)
 		if err != nil {
 			return e, err
 		}
@@ -146,7 +157,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 	if len(out.Args) > 0 {
 		args := make([]parser.Expr, len(out.Args))
 		for i, a := range out.Args {
-			ra, err := s.resolveValueExpr(ctx, txn, a, params)
+			ra, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
 			if err != nil {
 				return e, err
 			}
@@ -176,7 +187,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 	if e.Case != nil {
 		ce := *e.Case
 		if ce.Operand != nil {
-			op, err := s.resolveValueExpr(ctx, txn, *ce.Operand, params)
+			op, err := s.resolveValueExprOpts(ctx, txn, *ce.Operand, params, keepVolatile)
 			if err != nil {
 				return e, err
 			}
@@ -186,7 +197,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		for i, w := range ce.Whens {
 			nw := w
 			if w.Value != nil {
-				v, err := s.resolveValueExpr(ctx, txn, *w.Value, params)
+				v, err := s.resolveValueExprOpts(ctx, txn, *w.Value, params, keepVolatile)
 				if err != nil {
 					return e, err
 				}
@@ -199,7 +210,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 				}
 				nw.Cond = c
 			}
-			r, err := s.resolveValueExpr(ctx, txn, w.Result, params)
+			r, err := s.resolveValueExprOpts(ctx, txn, w.Result, params, keepVolatile)
 			if err != nil {
 				return e, err
 			}
@@ -208,7 +219,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		ce.Whens = whens
 		if ce.Else != nil {
-			el, err := s.resolveValueExpr(ctx, txn, *ce.Else, params)
+			el, err := s.resolveValueExprOpts(ctx, txn, *ce.Else, params, keepVolatile)
 			if err != nil {
 				return e, err
 			}
@@ -492,10 +503,7 @@ func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			out = &c
 		}
 		if &out.Set[0] == &t.Set[0] {
-			out.Set = append([]struct {
-				Column string
-				Value  parser.Expr
-			}(nil), t.Set...)
+			out.Set = append([]parser.SetClause(nil), t.Set...)
 		}
 		out.Set[i].Value = v
 	}
@@ -727,6 +735,7 @@ var splicedFuncs = map[string]bool{
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
+	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
 }
 
 // arrayElemText renders one datum as a text array element.

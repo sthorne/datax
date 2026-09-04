@@ -140,6 +140,14 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				}
 			}
 		}
+		if oc := t.OnConflict; oc != nil {
+			for _, set := range oc.Set {
+				if col, ok := desc.Col(set.Column); ok {
+					assign(set.Value, col.Type)
+				}
+			}
+			fromWhere(desc, oc.Where)
+		}
 	case *parser.Select:
 		if t.Table != "" {
 			desc, err := s.lookupForPlan(ctx, t.Table)
@@ -311,6 +319,13 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		return cols, nil
 
+	case *parser.Insert:
+		return s.planReturning(ctx, t.Table, t.Returning)
+	case *parser.Update:
+		return s.planReturning(ctx, t.Table, t.Returning)
+	case *parser.Delete:
+		return s.planReturning(ctx, t.Table, t.Returning)
+
 	case *parser.Explain:
 		return []ResultColumn{{Name: "plan", Type: types.String}}, nil
 
@@ -331,6 +346,13 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			cols[i] = ResultColumn{Name: n, Type: types.String}
 		}
 		return cols, nil
+
+	case *parser.ShowSequences:
+		return []ResultColumn{
+			{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},
+			{Name: "min_value", Type: types.Int}, {Name: "max_value", Type: types.Int}, {Name: "cycle", Type: types.Bool},
+			{Name: "cache", Type: types.Int}, {Name: "last_value", Type: types.Int}, {Name: "owned_by", Type: types.String},
+		}, nil
 
 	case *parser.ShowStats:
 		return []ResultColumn{
@@ -395,4 +417,20 @@ func maskSubqueryExprs(t *parser.Select) *parser.Select {
 		return t
 	}
 	return out
+}
+
+// planReturning describes a write's RETURNING columns (nil without one).
+func (s *Session) planReturning(ctx context.Context, table string, exprs []parser.SelectExpr) ([]ResultColumn, *Error) {
+	if exprs == nil {
+		return nil, nil
+	}
+	desc, err := s.lookupForPlan(ctx, table)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	ret, rerr := s.returningProjection(desc, table, exprs)
+	if rerr != nil {
+		return nil, ToSQLError(rerr)
+	}
+	return ret.columns(), nil
 }

@@ -44,6 +44,9 @@ type Expr struct {
 	// Cmp is a comparison used as a boolean value ('d' = any(stxkind) AS
 	// enabled, ORDER BY f(x) = 'DEFAULT'): NULL when either side is.
 	Cmp *Comparison `json:"cmp,omitempty"`
+	// IsDefault is the DEFAULT keyword used as a value (INSERT VALUES
+	// (DEFAULT, ...), UPDATE SET c = DEFAULT).
+	IsDefault bool `json:"is_default,omitempty"`
 	// Cast is the last ::type applied when it changes the value: only
 	// "regclass" ('t'::regclass resolves a table name to its OID) is kept;
 	// every other cast is absorbed.
@@ -93,8 +96,18 @@ type ColumnDef struct {
 	Type       types.Family
 	NotNull    bool
 	PrimaryKey bool // column-level PRIMARY KEY shorthand
-	// Default is the DEFAULT literal (constants only; no expressions).
-	Default *types.Datum
+	// Default is a constant DEFAULT; DefaultExpr any other DEFAULT
+	// expression (now(), gen_random_uuid(), unique_rowid(), nextval('s'),
+	// arithmetic over constants), kept as an expression.
+	Default     *types.Datum
+	DefaultExpr *Expr
+	// Serial marks SERIAL / BIGSERIAL / SMALLSERIAL (an owned sequence
+	// with DEFAULT nextval); Identity is GENERATED { ALWAYS | BY DEFAULT }
+	// AS IDENTITY ("always" / "by default"), with optional sequence
+	// options.
+	Serial      bool
+	Identity    string
+	IdentitySeq *SequenceOptions
 	// Precision/Scale carry a DECIMAL(p,s) typmod (0 precision = bare
 	// DECIMAL, unconstrained). Typmods on other types are still accepted
 	// and ignored (documented).
@@ -112,6 +125,45 @@ type CreateTable struct {
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
 }
+
+// SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an
+// identity column; a nil pointer leaves the option unset.
+type SequenceOptions struct {
+	Increment  *int64
+	MinValue   *int64 // NoMin: NO MINVALUE
+	MaxValue   *int64
+	NoMin      bool
+	NoMax      bool
+	Start      *int64
+	Cache      *int64
+	Cycle      *bool
+	Restart    *int64 // ALTER SEQUENCE RESTART [WITH n]; RestartSet marks a bare RESTART
+	RestartSet bool
+	// OwnedBy is "table.column" (or "none" / "" for none).
+	OwnedBy string
+}
+
+// CreateSequence is CREATE SEQUENCE [IF NOT EXISTS] name [options].
+type CreateSequence struct {
+	Name        string
+	IfNotExists bool
+	Options     SequenceOptions
+}
+
+// DropSequence is DROP SEQUENCE [IF EXISTS] name.
+type DropSequence struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterSequence is ALTER SEQUENCE name [options | RESTART [WITH n]].
+type AlterSequence struct {
+	Name    string
+	Options SequenceOptions
+}
+
+// ShowSequences is SHOW SEQUENCES.
+type ShowSequences struct{}
 
 // CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
 type CreateIndex struct {
@@ -136,6 +188,36 @@ type Insert struct {
 	Table   string
 	Columns []string // empty = all columns in order
 	Rows    [][]Expr
+	// DefaultValues is INSERT INTO t DEFAULT VALUES (one row of defaults).
+	DefaultValues bool
+	// Overriding is OVERRIDING { SYSTEM | USER } VALUE ("system" /
+	// "user"): SYSTEM lets an explicit value into a GENERATED ALWAYS
+	// identity column.
+	Overriding string
+	// OnConflict is the ON CONFLICT clause; Upsert marks UPSERT INTO
+	// (ON CONFLICT (primary key) DO UPDATE SET every target column).
+	OnConflict *OnConflict
+	Upsert     bool
+	// Returning is the RETURNING list (nil = none): expressions over the
+	// written row, "*" for every visible column.
+	Returning []SelectExpr
+}
+
+// OnConflict is ON CONFLICT [(cols) | ON CONSTRAINT name] DO NOTHING |
+// DO UPDATE SET ... [WHERE ...]. In Set values and Where, "excluded.col"
+// names the row proposed for insertion.
+type OnConflict struct {
+	Columns    []string // the conflict target's columns (nil with Constraint or none)
+	Constraint string   // ON CONSTRAINT name (a primary key or unique index name)
+	DoNothing  bool
+	Set        []SetClause
+	Where      []Comparison
+}
+
+// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET.
+type SetClause struct {
+	Column string
+	Value  Expr
 }
 
 // CopyFormat selects the data encoding of a COPY FROM STDIN stream.
@@ -262,12 +344,10 @@ type Select struct {
 }
 
 type Update struct {
-	Table string
-	Set   []struct {
-		Column string
-		Value  Expr
-	}
-	Where []Comparison
+	Table     string
+	Set       []SetClause
+	Where     []Comparison
+	Returning []SelectExpr
 }
 
 // AlterTable is ALTER TABLE t ADD [COLUMN] def | DROP [COLUMN] name.
@@ -281,8 +361,9 @@ type AlterTable struct {
 }
 
 type Delete struct {
-	Table string
-	Where []Comparison
+	Table     string
+	Where     []Comparison
+	Returning []SelectExpr
 }
 
 // CreateUser is CREATE USER / ALTER USER ... PASSWORD 'pw'.
@@ -376,6 +457,10 @@ type SetVar struct {
 
 func (*CreateTable) stmt()         {}
 func (*Show) stmt()                {}
+func (*CreateSequence) stmt()      {}
+func (*DropSequence) stmt()        {}
+func (*AlterSequence) stmt()       {}
+func (*ShowSequences) stmt()       {}
 func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}

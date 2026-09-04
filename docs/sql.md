@@ -138,12 +138,12 @@ Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; LEFT joins and self-joins keep syntactic order),
-constraints beyond PRIMARY KEY / NOT NULL, sequences,
+constraints beyond PRIMARY KEY / NOT NULL,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
 `<@` and the `?`/`?|`/`?&` existence operators,
 path operators and expressions in GROUPED join select lists,
-DEFAULT expressions beyond constants.
+DEFAULT expressions that reference other columns.
 
 ## Catalog
 
@@ -153,6 +153,16 @@ Table descriptors are JSON documents stored in system keys (range 1):
   PrimaryKey: [colID...]}`
 - `/system/ns/<name>` → tableID (namespace index)
 - `/system/idgen` → next descriptor ID (incremented transactionally)
+- `/system/seqdesc/<seqID>` → sequence descriptor `{ID, Name,
+  DatabaseID, Increment, MinValue, MaxValue, Start, Cache, Cycle,
+  OwnerTable, OwnerColumn}`; `/system/seqns/<dbID>/<name>` → seqID;
+  `/system/seq/<seqID>` → the counter, the last value handed out. The
+  counter is advanced with a non-transactional `Increment` of
+  `Cache × Increment` per block a gateway takes (`pkg/sql/sequence.go`),
+  which is what makes `nextval` non-rolling-back and gappy. Columns
+  carry `DefaultExpr` (the expression's text, re-parsed per statement),
+  `Identity` (`always` / `default`) and `SequenceID` (the owned
+  sequence).
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

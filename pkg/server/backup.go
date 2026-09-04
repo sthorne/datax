@@ -83,6 +83,8 @@ type backupManifest struct {
 	// a manifest without them restores every table into the flat layout,
 	// which the catalog migration then moves under the default database.
 	Databases []backupKV `json:"databases,omitempty"`
+	// Sequences are the sequence descriptors, names and counters (v7).
+	Sequences []backupKV `json:"sequences,omitempty"`
 }
 
 // exportAll streams every export record in [start, end) for the window
@@ -264,6 +266,13 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		return nil, err
 	}
 	man.Databases = append(man.Databases, dbNames...)
+	for _, span := range [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())} {
+		kvs, err := collectRaw(span[0], span[1])
+		if err != nil {
+			return nil, err
+		}
+		man.Sequences = append(man.Sequences, kvs...)
+	}
 
 	// Table data: the (baseTS, endTS] window over each table's full data
 	// span — every index, raw, so restore needs no backfill.
@@ -401,6 +410,12 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 		for _, kv := range final.Databases {
 			wb.Put(keys.Key(kv.Key), kv.Value)
 		}
+		for _, kv := range final.Sequences {
+			wb.Put(keys.Key(kv.Key), kv.Value)
+			if id, ok := catalog.SequenceIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
+				maxID = id
+			}
+		}
 		for _, t := range final.Tables {
 			wb.Put(keys.TableDescKey(t.ID), []byte(t.Descriptor))
 			var d catalog.TableDescriptor
@@ -537,3 +552,6 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 	n.events.Record("restore", "restore applied %d records from %d backup(s)", applied, len(srcs))
 	return sum, nil
 }
+
+// spanOf pairs a (start, end) return into one value.
+func spanOf(start, end keys.Key) [2]keys.Key { return [2]keys.Key{start, end} }

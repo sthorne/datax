@@ -40,6 +40,18 @@ type Column struct {
 	NotNull   bool  `json:"not_null,omitempty"`
 	// Default is the value INSERT uses when the column is omitted.
 	Default *types.Datum `json:"default,omitempty"`
+	// DefaultExpr is an expression default (SQL text: now(),
+	// gen_random_uuid(), unique_rowid(), nextval('s'), 1 + 2), evaluated
+	// per row at insert time when the column is omitted or given
+	// DEFAULT. Requires cluster version v7. Exclusive with Default.
+	DefaultExpr string `json:"default_expr,omitempty"`
+	// Identity marks GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+	// ("always" / "by default"): the column draws from its own sequence;
+	// ALWAYS refuses an explicit value unless OVERRIDING SYSTEM VALUE.
+	Identity string `json:"identity,omitempty"`
+	// SequenceID is the sequence this column owns (SERIAL / identity):
+	// dropped with the column or table; pg_attrdef renders nextval(it).
+	SequenceID uint64 `json:"sequence_id,omitempty"`
 	// FillDefault marks a column added by ALTER TABLE ... DEFAULT: rows
 	// written before the ADD lack the column entirely and decode as the
 	// default (fill-on-read). Rows written afterwards store an explicit
@@ -542,6 +554,20 @@ func lookupUncached(ctx context.Context, txn *kvclient.Txn, dbID uint64, name st
 	}
 	if raw == nil {
 		return nil, fmt.Errorf("namespace entry for %q points at missing descriptor %d", name, id)
+	}
+	var d TableDescriptor
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("corrupt descriptor %d: %w", id, err)
+	}
+	return &d, nil
+}
+
+// ReadTable reads a table descriptor by ID, uncached (nil, nil when
+// there is none).
+func ReadTable(ctx context.Context, txn *kvclient.Txn, id uint64) (*TableDescriptor, error) {
+	raw, err := txn.Get(ctx, keys.TableDescKey(id))
+	if err != nil || raw == nil {
+		return nil, err
 	}
 	var d TableDescriptor
 	if err := json.Unmarshal(raw, &d); err != nil {

@@ -123,11 +123,26 @@ func (db *DB) SetVersionGate(f func() version.Version) { db.versionGate.Store(&f
 // introduced under cluster version v3, and a v2 node silently runs a
 // forward scan when it sees one (pkg/version rule 4).
 func (db *DB) ReverseScansOK() bool {
+	return db.ClusterVersion() >= version.V3
+}
+
+// ClusterVersion reports the finalized cluster version the gate observes
+// (the binary's own version when no gate is installed: a single-binary
+// process).
+func (db *DB) ClusterVersion() version.Version {
 	f := db.versionGate.Load()
 	if f == nil {
-		return true // no gate: single-binary process at the binary's version
+		return version.Current
 	}
-	return (*f)() >= version.V3
+	return (*f)()
+}
+
+// LocalNodeID is the node this DB runs on (0 for a store-less client).
+func (db *DB) LocalNodeID() base.NodeID {
+	if db.local == nil {
+		return 0
+	}
+	return db.local.store.NodeID()
 }
 
 type localSender struct {

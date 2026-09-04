@@ -116,11 +116,11 @@ func prettySystem(b *strings.Builder, rest []byte) {
 	// The parts each system table keys by, in order.
 	var shape string
 	switch name {
-	case "nodes", "desc", "stats", "db":
+	case "nodes", "desc", "stats", "db", "seqdesc", "seq":
 		shape = "u"
 	case "idgen", "users", "admins", "ns", "dbns":
 		shape = "s"
-	case "nsdb":
+	case "nsdb", "seqns":
 		shape = "us"
 	case "lease":
 		shape = "uU"

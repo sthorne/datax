@@ -34,6 +34,13 @@ func CountParams(stmt Statement) int {
 			}
 		}
 	}
+	visitReturning := func(exprs []SelectExpr) {
+		for _, se := range exprs {
+			if !se.Star {
+				visit(se.Expr)
+			}
+		}
+	}
 	switch t := stmt.(type) {
 	case *Insert:
 		for _, row := range t.Rows {
@@ -41,6 +48,13 @@ func CountParams(stmt Statement) int {
 				visit(e)
 			}
 		}
+		if oc := t.OnConflict; oc != nil {
+			for _, set := range oc.Set {
+				visit(set.Value)
+			}
+			visitWhere(oc.Where)
+		}
+		visitReturning(t.Returning)
 	case *Select:
 		for _, se := range t.Exprs {
 			if !se.Star {
@@ -53,8 +67,10 @@ func CountParams(stmt Statement) int {
 			visit(set.Value)
 		}
 		visitWhere(t.Where)
+		visitReturning(t.Returning)
 	case *Delete:
 		visitWhere(t.Where)
+		visitReturning(t.Returning)
 	}
 	return max
 }

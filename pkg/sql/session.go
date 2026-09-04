@@ -119,6 +119,10 @@ type Session struct {
 	// the only one allowed to create or drop a system table.
 	system bool
 
+	// seqs is the session's sequence state (value blocks, currval,
+	// lastval), created on first use.
+	seqs *seqState
+
 	txn   *kvclient.Txn
 	state TxnState
 	// pendingDDL names tables changed inside the open explicit transaction;
@@ -209,15 +213,36 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		return nil, &catalog.ErrTableNotFound{Name: name}
 	}
 	d, err := s.cat.LookupIn(ctx, txn, s.database, name)
-	if err != nil && db == "" {
+	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if errors.As(err, &nf) {
-			if vt, ok := vtable.Lookup(bare); ok {
-				return vt.Descriptor(), nil
+			if db == "" {
+				if vt, ok := vtable.Lookup(bare); ok {
+					return vt.Descriptor(), nil
+				}
+			}
+			// A sequence reads as a one-row relation (last_value, log_cnt,
+			// is_called), as in PostgreSQL — psql's \d of a sequence needs it.
+			if sd, serr := s.lookupSequence(ctx, txn, name); serr == nil {
+				return sequenceRelation(sd), nil
 			}
 		}
 	}
 	return d, err
+}
+
+// sequenceRelation is the virtual one-row descriptor a sequence reads as.
+func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
+	return &catalog.TableDescriptor{
+		ID: sd.ID, Name: sd.Name, DatabaseID: sd.DatabaseID, Virtual: "sequence",
+		Columns: []catalog.Column{
+			{ID: 1, Name: "last_value", Type: types.Int, NotNull: true},
+			{ID: 2, Name: "log_cnt", Type: types.Int, NotNull: true},
+			{ID: 3, Name: "is_called", Type: types.Bool, NotNull: true},
+			{ID: 4, Name: "_ord", Type: types.Int, NotNull: true, Hidden: true},
+		},
+		PrimaryKey: []catalog.ColumnID{4},
+	}
 }
 
 // virtualEnv gathers what the virtual tables render: every database,
@@ -230,6 +255,10 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 		return nil, err
 	}
 	env.Databases = dbs
+	if env.Sequences, err = catalog.ListSequences(ctx, txn, 0); err != nil {
+		return nil, err
+	}
+	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) { return s.sequenceValue(ctx, sd) }
 	admin, err := s.isAdmin(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -276,6 +305,25 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 // fetchVirtual generates a virtual table's rows and applies the WHERE
 // conjuncts (no index ever applies).
 func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if desc.Virtual == "sequence" {
+		sd, err := catalog.ReadSequence(ctx, txn, desc.ID)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		v, called, err := s.sequenceValue(ctx, sd)
+		if err != nil {
+			return nil, err
+		}
+		if !called {
+			v = sd.Start
+		}
+		row := map[catalog.ColumnID]types.Datum{1: types.NewInt(v), 2: types.NewInt(0), 3: types.NewBool(called), 4: types.NewInt(0)}
+		ok, err := matchesWhere(where, desc, row, params)
+		if err != nil || !ok {
+			return nil, err
+		}
+		return []fetchedRow{{row: row}}, nil
+	}
 	vt, ok := vtable.Lookup(desc.Virtual)
 	if !ok {
 		return nil, newErrf(CodeInternal, "virtual table %q vanished", desc.Virtual)

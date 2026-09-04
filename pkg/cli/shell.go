@@ -170,7 +170,10 @@ Meta-commands:
 Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
   CREATE TABLE ... [WITH (timeseries = true, retention = '7d', shards = 8)],
   CREATE INDEX, ALTER TABLE ... ADD/DROP COLUMN | SET (retention | shards),
-  DROP TABLE, INSERT, SELECT [... AS OF SYSTEM TIME ...], UPDATE, DELETE,
+  DROP TABLE, INSERT [ON CONFLICT ...] / UPSERT, SELECT [... AS OF SYSTEM
+  TIME ...], UPDATE, DELETE (all three take RETURNING),
+  CREATE / ALTER / DROP SEQUENCE, SHOW SEQUENCES (SERIAL, identity
+  columns and expression DEFAULTs: nextval, unique_rowid, gen_random_uuid),
   COPY ... FROM STDIN, BEGIN / COMMIT / ROLLBACK / SAVEPOINT, EXPLAIN,
   ANALYZE, SHOW TABLES, SHOW STATS, CREATE USER, GRANT / REVOKE.
   Details: docs/user/sql.md (the SQL reference) and docs/timeseries.md.
