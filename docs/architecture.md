@@ -100,7 +100,9 @@ Each binary has an integer protocol version with a supported window
 cluster persists one **cluster version** at `/system/cluster-version`,
 seeded at bootstrap and advanced only by the operator-triggered
 `upgrade-cluster` admin op once every live node's heartbeat advertises a
-new-enough binary. Gates: join (a node whose window excludes the cluster
+new-enough binary. Bootstrap also seeds whatever catalog state that
+version implies (from v6, the default databases), so a fresh cluster
+never runs a migration against its own first transactions. Gates: join (a node whose window excludes the cluster
 version is refused), startup (each store mirrors the last observed cluster
 version locally and refuses to start under an older binary — the
 no-downgrade-after-finalize rule, enforceable even with quorum down), and

@@ -328,3 +328,28 @@ func ensureDatabase(ctx context.Context, txn *kvclient.Txn, a *Accessor, name st
 	}
 	return d, nil
 }
+
+// BootstrapDatabases seeds the database catalog of a brand-new cluster
+// born at v6 or later: the default and system databases (IDs 1 and 2,
+// exactly what MigrateNamespace would allocate) and the descriptor ID
+// counter past them. Seeding at bootstrap means no table is ever created
+// in the flat namespace only to be moved moments later by the leader's
+// migration — a move that would surprise a transaction reading the
+// table's descriptor at the same time (an uncertainty restart). put
+// writes one key of the pre-Raft seed state.
+func BootstrapDatabases(put func(key keys.Key, value []byte) error) error {
+	for i, name := range []string{DefaultDatabase, SystemDatabase} {
+		d := &DatabaseDescriptor{ID: uint64(i + 1), Name: name, Owner: "root"}
+		raw, err := json.Marshal(d)
+		if err != nil {
+			return err
+		}
+		if err := put(keys.DatabaseDescKey(d.ID), raw); err != nil {
+			return err
+		}
+		if err := put(keys.DatabaseNamespaceKey(name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+			return err
+		}
+	}
+	return put(keys.DescIDGenKey(), []byte("2"))
+}
