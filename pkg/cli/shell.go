@@ -174,6 +174,8 @@ Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
   TIME ...], UPDATE, DELETE (all three take RETURNING),
   CREATE / ALTER / DROP SEQUENCE, SHOW SEQUENCES (SERIAL, identity
   columns and expression DEFAULTs: nextval, unique_rowid, gen_random_uuid),
+  CHECK / UNIQUE / FOREIGN KEY constraints, ALTER TABLE ... ADD / DROP /
+  VALIDATE CONSTRAINT, ALTER COLUMN SET / DROP NOT NULL, DROP TABLE CASCADE,
   COPY ... FROM STDIN, BEGIN / COMMIT / ROLLBACK / SAVEPOINT, EXPLAIN,
   ANALYZE, SHOW TABLES, SHOW STATS, CREATE USER, GRANT / REVOKE.
   Details: docs/user/sql.md (the SQL reference) and docs/timeseries.md.

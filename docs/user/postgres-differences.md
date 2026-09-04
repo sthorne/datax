@@ -14,7 +14,7 @@ syntax error or `0A000` feature not supported):
 | `OFFSET` | paginate by key: `WHERE id > $last ORDER BY id LIMIT n` (faster anyway) |
 | Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`, `array_to_string()`, `pg_size_pretty()` and the catalog functions tools call ([list](sql.md#reading)) — SQLSTATE `42883` | compute client-side |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` **is supported**) | merge client-side |
-| `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
+| `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
@@ -136,9 +136,11 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_get_constraintdef`, `'t'::regclass` and `to_regclass`-style
   existence checks (`SELECT 1 FROM pg_class WHERE relname = ...`) return
   what PostgreSQL would for a schema in the datax subset. Reads of
-  features datax lacks (foreign keys, triggers, comments, extensions)
-  come back empty rather than erroring; `pg_sequences`, `pg_sequence`
-  and `pg_class` rows with `relkind = 'S'` list the sequences.
+  features datax lacks (triggers, comments, extensions) come back
+  empty rather than erroring — whatever shape the tool's query takes;
+  `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
+  'S'` list the sequences, and `pg_constraint` (with
+  `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 
 ## Client compatibility notes

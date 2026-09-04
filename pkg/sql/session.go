@@ -119,6 +119,12 @@ type Session struct {
 	// the only one allowed to create or drop a system table.
 	system bool
 
+	// cascadeLimit is SET foreign_key_cascade_limit (0 = the default);
+	// pendingWipes are indexes dropped by statements of this session
+	// whose entries are reclaimed once the statement commits.
+	cascadeLimit int
+	pendingWipes []indexWipe
+	extraDDL     []string
 	// seqs is the session's sequence state (value blocks, currval,
 	// lastval), created on first use.
 	seqs *seqState
@@ -172,6 +178,7 @@ func (s *Session) settings() [][2]string {
 		{"client_encoding", "UTF8"},
 		{"database", s.database},
 		{"DateStyle", "ISO"},
+		{"foreign_key_cascade_limit", strconv.Itoa(s.fkCascadeLimit())},
 		{"integer_datetimes", "on"},
 		{"search_path", catalog.PublicSchema},
 		{"server_encoding", "UTF8"},
@@ -416,6 +423,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 				return nil, ToSQLError(derr)
 			}
 		}
+		s.runPendingWipes(ctx)
 		return &Result{Tag: "COMMIT"}, nil
 
 	case *parser.Rollback:
@@ -459,6 +467,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 				return nil, serr
 			}
 		}
+		if t.Name == "foreign_key_cascade_limit" {
+			n, err := strconv.Atoi(strings.Trim(t.Value, "'"))
+			if err != nil || n < 1 {
+				return nil, newErrf(CodeInvalidParameterValue, "foreign_key_cascade_limit must be a positive integer, not %q", t.Value)
+			}
+			s.cascadeLimit = n
+		}
 		return &Result{Tag: "SET"}, nil
 	case *parser.Use:
 		if serr := s.UseDatabase(ctx, t.Name); serr != nil {
@@ -480,6 +495,33 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// explicit transaction block.
 	// ALTER TABLE ... SET (shards = N) is the online re-shard: the same
 	// multi-transaction state-machine shape, with the same restrictions.
+	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
+	// and then sweep the existing rows: multi-transaction, like CREATE
+	// INDEX.
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "") {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
+		}
+		var aerr error
+		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			aerr = s.checkAdmin(ctx, txn)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if aerr != nil {
+			return nil, ToSQLError(aerr)
+		}
+		switch {
+		case at.AddConstraint != nil:
+			return s.execAddConstraintOnline(ctx, at)
+		case at.ValidateConstraint != "":
+			return s.execValidateConstraintOnline(ctx, at)
+		default:
+			return s.execSetNotNullOnline(ctx, at)
+		}
+	}
+
 	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
@@ -603,32 +645,50 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	}
 
 	if s.state == StateOpen {
+		s.extraDDL = nil
 		res, err := s.execStmt(ctx, s.txn, stmt, params)
 		if err != nil {
 			// Any error fails the explicit transaction (PG semantics).
 			s.state = StateFailed
+			s.extraDDL, s.pendingWipes = nil, nil
 			return nil, ToSQLError(err)
 		}
 		if name := ddlTableName(stmt); name != "" {
 			s.pendingDDL = append(s.pendingDDL, name)
 		}
+		s.pendingDDL = append(s.pendingDDL, s.extraDDL...)
+		s.extraDDL = nil
 		return res, nil
 	}
 	var res *Result
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
+		s.extraDDL, s.pendingWipes = nil, nil
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		return err
 	})
 	if err != nil {
+		s.extraDDL, s.pendingWipes = nil, nil
 		return nil, ToSQLError(err)
 	}
+	names := s.extraDDL
+	s.extraDDL = nil
 	if name := ddlTableName(stmt); name != "" {
+		names = append([]string{name}, names...)
+	}
+	for _, name := range names {
 		if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
 			return nil, ToSQLError(derr)
 		}
 	}
+	s.runPendingWipes(ctx)
 	return res, nil
+}
+
+// noteDDL records another table a statement's DDL changed (a foreign
+// key's parent, a dropped table's children), for the post-commit drain.
+func (s *Session) noteDDL(name string) {
+	s.extraDDL = append(s.extraDDL, name)
 }
 
 func (s *Session) rollback(ctx context.Context) {
@@ -636,7 +696,7 @@ func (s *Session) rollback(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
-	s.pendingDDL = nil
+	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.state = StateIdle
 }
 
@@ -981,6 +1041,11 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if cmp.Op == "OR" {
 			matched := false
 			for _, disjunct := range cmp.Or {
+				for _, inner := range disjunct {
+					if inner.Sub != nil {
+						return false, newErrf(CodeFeatureNotSupported, "IN and EXISTS subqueries are not supported inside OR")
+					}
+				}
 				ok, err := matchesWhere(disjunct, desc, row, params)
 				if err != nil {
 					return false, err

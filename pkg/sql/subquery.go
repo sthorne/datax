@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -101,10 +102,21 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "pg_table_is_visible":
 		d := types.NewBool(true)
 		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_partition_ancestors":
+		// No partitions: a relation's only ancestor is itself. The
+		// argument is an OID, as a number or a regclass literal.
+		if len(e.Args) == 1 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+			oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text())
+			if err != nil {
+				return e, err
+			}
+			d := types.NewInt(oid)
+			out.Func, out.Args, out.Lit = "", nil, &d
+		}
 	case "pg_encoding_to_char":
 		d := types.NewString("UTF8")
 		out.Func, out.Args, out.Lit = "", nil, &d
-	case "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "pg_get_statisticsobjdef_columns":
+	case "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
 		d := types.DNull
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_relation_is_publishable":
@@ -176,13 +188,30 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	}
 	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
 		// 'name'::regclass: the table's OID (a real table's, or a catalog
-		// view's), 42P01 when nothing is so named.
-		desc, err := s.lookup(ctx, txn, out.Lit.Text())
+		// view's), 42P01 when nothing is so named; '4'::regclass is the
+		// OID itself.
+		oid, err := s.regclassOID(ctx, txn, out.Lit.Text())
 		if err != nil {
-			return e, newErrf(CodeUndefinedTable, "relation %q does not exist", out.Lit.Text())
+			return e, err
 		}
-		d := types.NewInt(vtable.TableOID(desc))
+		d := types.NewInt(oid)
 		out.Lit, out.Cast = &d, ""
+	} else if out.Cast == "regclass" && out.Lit == nil {
+		// oid::regclass on a column or expression (conrelid::regclass in
+		// psql's constraint queries): the table's name per row, as a
+		// CASE over every OID the session can see.
+		names, err := s.regclassNames(ctx, txn)
+		if err != nil {
+			return e, err
+		}
+		inner := out
+		inner.Cast = ""
+		ce := &parser.CaseExpr{Operand: &inner, Else: &inner}
+		for _, on := range names {
+			oid, name := types.NewInt(on.oid), types.NewString(on.name)
+			ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &oid}, Result: parser.Expr{Lit: &name}})
+		}
+		out = parser.Expr{Case: ce}
 	}
 	if e.Case != nil {
 		ce := *e.Case
@@ -331,6 +360,9 @@ func cmpNeedsResolve(cmp parser.Comparison) bool {
 // resolveWhereSubs evaluates every subquery in a WHERE conjunction,
 // returning a spliced copy (or the original slice when nothing changed).
 func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, params []types.Datum) ([]parser.Comparison, error) {
+	if parser.HasSubInOr(where) {
+		return nil, newErrf(CodeFeatureNotSupported, "IN and EXISTS subqueries are not supported inside OR")
+	}
 	changed := false
 	for _, cmp := range where {
 		if cmpNeedsResolve(cmp) {
@@ -730,9 +762,9 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 // depend on the session, the clock, or the catalog rather than the row.
 var splicedFuncs = map[string]bool{
 	"now": true, "current_database": true, "current_schema": true, "current_user": true, "session_user": true,
-	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true,
+	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
-	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true,
+	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
@@ -748,4 +780,39 @@ func arrayElemText(d types.Datum) string {
 		return "\"" + strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(t) + "\""
 	}
 	return t
+}
+
+// regclassOID resolves a regclass literal: a number is the OID itself,
+// a name the table's OID (42P01 when nothing is so named).
+func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text string) (int64, error) {
+	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return n, nil
+	}
+	desc, err := s.lookup(ctx, txn, text)
+	if err != nil {
+		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
+	}
+	return vtable.TableOID(desc), nil
+}
+
+// regclassNames lists the (OID, name) of every table the session can
+// see — real tables of every database, then the catalogs.
+func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidName, error) {
+	all, err := s.cat.List(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]oidName, 0, len(all))
+	for _, d := range all {
+		out = append(out, oidName{oid: vtable.TableOID(d), name: d.Name})
+	}
+	vtable.EachTable(func(t *vtable.Table) {
+		out = append(out, oidName{oid: vtable.TableOID(t.Descriptor()), name: t.Name})
+	})
+	return out, nil
+}
+
+type oidName struct {
+	oid  int64
+	name string
 }

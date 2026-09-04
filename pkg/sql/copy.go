@@ -163,7 +163,12 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		guard, err := ci.s.guard(ctx, txn, desc)
+		if err != nil {
+			return err
+		}
 		targets := make([][]catalog.Column, len(rows))
+		built := make([]map[catalog.ColumnID]types.Datum, len(rows))
 		pkKeys := make([]keys.Key, len(rows))
 		for i, r := range rows {
 			rt, rv, err := ci.s.expandDefaults(ctx, txn, desc, defaults, target, r.vals, nil)
@@ -171,11 +176,11 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 				return ci.rowErr(r.ordinal, err)
 			}
 			targets[i], rows[i].vals = rt, rv
-			_, key, err := buildInsertRow(desc, rt, rv)
+			row, key, err := buildInsertRow(desc, rt, rv)
 			if err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
-			pkKeys[i] = key
+			built[i], pkKeys[i] = row, key
 		}
 		existing, err := txn.GetBatch(ctx, pkKeys)
 		if err != nil {
@@ -189,6 +194,9 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 					"duplicate key value violates unique constraint on %q", desc.Name))
 			}
 			if err := insertRow(ctx, txn, desc, targets[i], r.vals, &wb, inserted, true); err != nil {
+				return ci.rowErr(r.ordinal, err)
+			}
+			if err := guard.checkInsert(ctx, txn, built[i], inserted); err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
 		}

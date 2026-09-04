@@ -26,7 +26,7 @@ func Parse(src string) ([]Statement, error) {
 	if err != nil {
 		return nil, &SyntaxError{Msg: err.Error()}
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	var stmts []Statement
 	for {
 		for p.consumeOp(";") {
@@ -48,6 +48,7 @@ func Parse(src string) ([]Statement, error) {
 type parser struct {
 	toks []token
 	i    int
+	src  string
 }
 
 func (p *parser) peek() token { return p.toks[p.i] }
@@ -56,7 +57,7 @@ func (p *parser) errf(format string, args ...any) error {
 }
 
 // tableFuncs are the set-returning functions accepted in FROM.
-var tableFuncs = map[string]bool{"unnest": true}
+var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true}
 
 // parseFuncTable parses a FROM-clause table function call, if present.
 func (p *parser) parseFuncTable() (*Expr, bool, error) {
@@ -530,7 +531,7 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		sv := &SetVar{Name: name}
 		if p.consumeOp("=") || p.consumeKeyword("TO") {
-			if t := p.peek(); t.kind == tkIdent || t.kind == tkString {
+			if t := p.peek(); t.kind == tkIdent || t.kind == tkString || t.kind == tkNumber {
 				sv.Value = t.text
 			}
 		}
@@ -578,27 +579,37 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		return nil, err
 	}
 	for {
-		if p.consumeKeyword("PRIMARY") {
+		cname := ""
+		if p.consumeKeyword("CONSTRAINT") {
+			n, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			cname = n
+		}
+		switch {
+		case p.consumeKeyword("PRIMARY"):
+			if len(ct.PrimaryKey) > 0 {
+				return nil, p.errf("multiple primary key definitions")
+			}
 			if err := p.expectKeyword("KEY"); err != nil {
 				return nil, err
 			}
-			if err := p.expectOp("("); err != nil {
+			cols, err := p.parseColumnList()
+			if err != nil {
 				return nil, err
 			}
-			for {
-				col, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				ct.PrimaryKey = append(ct.PrimaryKey, col)
-				if !p.consumeOp(",") {
-					break
-				}
-			}
-			if err := p.expectOp(")"); err != nil {
+			ct.PrimaryKey, ct.PrimaryKeyName = cols, cname
+		case p.peekKeyword("UNIQUE") || p.peekKeyword("CHECK") || p.peekKeyword("FOREIGN"):
+			cd, err := p.parseTableConstraint(cname)
+			if err != nil {
 				return nil, err
 			}
-		} else {
+			ct.Constraints = append(ct.Constraints, cd)
+		default:
+			if cname != "" {
+				return nil, p.errf("expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY after CONSTRAINT %s, found %q", cname, p.peek().text)
+			}
 			col, err := p.parseColumnDef()
 			if err != nil {
 				return nil, err
@@ -745,6 +756,15 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		}
 	}
 	for {
+		// A column constraint may carry its own name.
+		cname := ""
+		if p.consumeKeyword("CONSTRAINT") {
+			n, err := p.expectIdent()
+			if err != nil {
+				return def, err
+			}
+			cname = n
+		}
 		switch {
 		case p.consumeKeyword("NOT"):
 			if err := p.expectKeyword("NULL"); err != nil {
@@ -758,6 +778,20 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 			def.PrimaryKey = true
 			def.NotNull = true
+		case p.consumeKeyword("UNIQUE"):
+			def.Constraints = append(def.Constraints, ConstraintDef{Name: cname, Kind: "unique", Columns: []string{def.Name}})
+		case p.peekKeyword("CHECK"):
+			cd, err := p.parseCheckClause(cname)
+			if err != nil {
+				return def, err
+			}
+			def.Constraints = append(def.Constraints, cd)
+		case p.consumeKeyword("REFERENCES"):
+			cd := ConstraintDef{Name: cname, Kind: "foreign", Columns: []string{def.Name}}
+			if err := p.parseReferences(&cd); err != nil {
+				return def, err
+			}
+			def.Constraints = append(def.Constraints, cd)
 		case p.consumeIdentWord("default"):
 			// A constant stays a literal default; anything else (a
 			// call, arithmetic) is an expression default ("default" is
@@ -804,12 +838,174 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					return def, err
 				}
 			}
-		case p.consumeKeyword("UNIQUE"):
-			return def, p.errf("column-level UNIQUE is not supported: CREATE UNIQUE INDEX instead")
 		default:
+			if cname != "" {
+				return def, p.errf("expected a constraint after CONSTRAINT %s, found %q", cname, p.peek().text)
+			}
 			return def, nil
 		}
 	}
+}
+
+func (p *parser) peekKeyword(kw string) bool {
+	t := p.peek()
+	return t.kind == tkKeyword && t.text == kw
+}
+
+// parseColumnList parses a parenthesized, comma-separated column list.
+func (p *parser) parseColumnList() ([]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var cols []string
+	for {
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, col)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+// parseTableConstraint parses UNIQUE (cols) | CHECK (expr) | FOREIGN KEY
+// (cols) REFERENCES ... after an optional CONSTRAINT name.
+func (p *parser) parseTableConstraint(name string) (ConstraintDef, error) {
+	switch {
+	case p.consumeKeyword("UNIQUE"):
+		cols, err := p.parseColumnList()
+		if err != nil {
+			return ConstraintDef{}, err
+		}
+		return ConstraintDef{Name: name, Kind: "unique", Columns: cols}, nil
+	case p.peekKeyword("CHECK"):
+		return p.parseCheckClause(name)
+	case p.consumeKeyword("FOREIGN"):
+		if err := p.expectKeyword("KEY"); err != nil {
+			return ConstraintDef{}, err
+		}
+		cols, err := p.parseColumnList()
+		if err != nil {
+			return ConstraintDef{}, err
+		}
+		cd := ConstraintDef{Name: name, Kind: "foreign", Columns: cols}
+		if err := p.expectKeyword("REFERENCES"); err != nil {
+			return ConstraintDef{}, err
+		}
+		if err := p.parseReferences(&cd); err != nil {
+			return ConstraintDef{}, err
+		}
+		return cd, nil
+	}
+	return ConstraintDef{}, p.errf("expected UNIQUE, CHECK or FOREIGN KEY, found %q", p.peek().text)
+}
+
+// parseCheckClause parses CHECK (expr), keeping the expression's source
+// text (what the descriptor stores and the catalogs show) and lowering
+// its negation for validation.
+func (p *parser) parseCheckClause(name string) (ConstraintDef, error) {
+	if err := p.expectKeyword("CHECK"); err != nil {
+		return ConstraintDef{}, err
+	}
+	if err := p.expectOp("("); err != nil {
+		return ConstraintDef{}, err
+	}
+	start := p.peek().pos
+	n, err := p.parseBoolOr()
+	if err != nil {
+		return ConstraintDef{}, err
+	}
+	end := p.peek().pos
+	if err := p.expectOp(")"); err != nil {
+		return ConstraintDef{}, err
+	}
+	fails, err := lowerBool(n, true)
+	if err != nil {
+		return ConstraintDef{}, p.errf("CHECK: %v", err)
+	}
+	text := strings.TrimSpace(p.src[start:end])
+	return ConstraintDef{Name: name, Kind: "check", Check: text, CheckFails: fails}, nil
+}
+
+// parseReferences parses what follows REFERENCES: the table, optional
+// column list, MATCH SIMPLE, and the ON DELETE / ON UPDATE actions.
+func (p *parser) parseReferences(cd *ConstraintDef) error {
+	table, err := p.parseTableName()
+	if err != nil {
+		return err
+	}
+	cd.RefTable = table
+	if p.peek().kind == tkOp && p.peek().text == "(" {
+		cols, err := p.parseColumnList()
+		if err != nil {
+			return err
+		}
+		cd.RefColumns = cols
+	}
+	for {
+		switch {
+		case p.consumeIdentWord("match"):
+			if p.consumeIdentWord("simple") {
+				continue
+			}
+			return p.errf("only MATCH SIMPLE is supported, found %q", p.peek().text)
+		case p.consumeKeyword("ON"):
+			var target *string
+			switch {
+			case p.consumeKeyword("DELETE"):
+				target = &cd.OnDelete
+			case p.consumeKeyword("UPDATE"):
+				target = &cd.OnUpdate
+			default:
+				return p.errf("expected DELETE or UPDATE after ON, found %q", p.peek().text)
+			}
+			switch {
+			case p.consumeIdentWord("restrict"):
+				*target = "restrict"
+			case p.consumeIdentWord("cascade"):
+				*target = "cascade"
+			case p.consumeIdentWord("no"):
+				if !p.consumeIdentWord("action") {
+					return p.errf("expected ACTION after NO, found %q", p.peek().text)
+				}
+				*target = "restrict"
+			case p.consumeKeyword("SET"):
+				if !p.consumeKeyword("NULL") {
+					return p.errf("only ON %s SET NULL is supported (no SET DEFAULT), found %q", "DELETE/UPDATE", p.peek().text)
+				}
+				*target = "set null"
+			default:
+				return p.errf("expected RESTRICT, CASCADE, NO ACTION or SET NULL, found %q", p.peek().text)
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+// ParseCheck lowers a stored CHECK expression to the conjuncts that
+// hold when a row VIOLATES it (NOT expr is true): the three-valued rule
+// that a NULL result passes falls out of WHERE keeping only TRUE.
+func ParseCheck(text string) ([]Comparison, error) {
+	toks, err := lex(text)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: text}
+	n, err := p.parseBoolOr()
+	if err != nil {
+		return nil, err
+	}
+	if p.peek().kind != tkEOF {
+		return nil, p.errf("unexpected %q after expression", p.peek().text)
+	}
+	return lowerBool(n, true)
 }
 
 // exprContainsColumn reports whether an expression references a column.
@@ -1016,6 +1212,11 @@ func (p *parser) parseDropTable() (Statement, error) {
 		return nil, err
 	}
 	dt.Name = name
+	if p.consumeIdentWord("cascade") {
+		dt.Cascade = true
+	} else {
+		p.consumeIdentWord("restrict")
+	}
 	return dt, nil
 }
 
@@ -1091,7 +1292,7 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 			break
 		}
 	}
-	// ON CONFLICT ... ("conflict", "do", "nothing", "constraint" are not
+	// ON CONFLICT ... ("conflict", "do", "nothing" are not
 	// reserved words).
 	if p.peek().kind == tkKeyword && p.peek().text == "ON" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "conflict" {
 		if upsert {
@@ -1114,7 +1315,7 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 				return nil, err
 			}
 		} else if p.consumeKeyword("ON") {
-			if !p.consumeIdentWord("constraint") {
+			if !p.consumeKeyword("CONSTRAINT") {
 				return nil, p.errf("expected CONSTRAINT after ON CONFLICT ON, found %q", p.peek().text)
 			}
 			name, err := p.expectIdent()
@@ -1373,6 +1574,9 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, err
 		} else if ok {
 			sel.FuncTable = fe
+			if p.peekIdentSeq("with", "ordinality") {
+				p.i += 2
+			}
 			sel.Alias = p.parseOptTableAlias(false)
 			if sel.Alias == "" {
 				sel.Alias = fe.Func
@@ -1430,6 +1634,39 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 			if len(sel.Joins) >= maxJoinTables-1 {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
+			}
+			if fe, ok, err := p.parseFuncTable(); err != nil {
+				return nil, err
+			} else if ok {
+				// A table function as a join member.
+				if p.peekIdentSeq("with", "ordinality") {
+					p.i += 2
+				}
+				jc := JoinClause{Left: left, Cross: cross, FuncTable: fe}
+				jc.Alias = p.parseOptTableAlias(false)
+				if jc.Alias == "" {
+					jc.Alias = fe.Func
+				}
+				if p.consumeOp("(") {
+					for {
+						col, err := p.expectIdent()
+						if err != nil {
+							return nil, err
+						}
+						jc.FuncCols = append(jc.FuncCols, col)
+						if !p.consumeOp(",") {
+							break
+						}
+					}
+					if err := p.expectOp(")"); err != nil {
+						return nil, err
+					}
+				}
+				if !cross {
+					return nil, p.errf("a table function can only be cross-joined")
+				}
+				sel.Joins = append(sel.Joins, jc)
+				continue
 			}
 			jt, err := p.parseTableName()
 			if err != nil {
@@ -1609,13 +1846,19 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 	// to the union as a whole and moves to the head.
 	if p.consumeIdentWord("union") {
 		all := p.consumeIdentWord("all")
-		if t := p.peek(); t.kind != tkKeyword || t.text != "SELECT" {
-			return nil, p.errf("expected SELECT after UNION, found %q", t.text)
+		if t := p.peek(); t.kind != tkKeyword || (t.text != "SELECT" && t.text != "VALUES") {
+			return nil, p.errf("expected SELECT or VALUES after UNION, found %q", t.text)
 		}
 		if sel.ForUpdate {
 			return nil, p.errf("FOR UPDATE is not allowed with UNION")
 		}
-		tailStmt, err := p.parseSelect()
+		var tailStmt Statement
+		var err error
+		if p.peek().text == "VALUES" {
+			tailStmt, err = p.parseValuesQuery()
+		} else {
+			tailStmt, err = p.parseSelect()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1628,6 +1871,42 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 		sel.Union, sel.UnionAll = tail, all
 	}
 	return sel, nil
+}
+
+// parseValuesQuery parses VALUES (a, b), (c, d) as a query: one FROM-less
+// select per row, chained with UNION ALL.
+func (p *parser) parseValuesQuery() (Statement, error) {
+	p.i++ // VALUES
+	var head, last *Select
+	for {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		row := &Select{Limit: -1}
+		for {
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			row.Exprs = append(row.Exprs, SelectExpr{Expr: e, Alias: fmt.Sprintf("column%d", len(row.Exprs)+1)})
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		if head == nil {
+			head = row
+		} else {
+			last.Union, last.UnionAll = row, true
+		}
+		last = row
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return head, nil
 }
 
 // caseWords are the CASE-expression words that can follow a predicate.
@@ -1846,6 +2125,31 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	at := &AlterTable{Table: name}
 	switch {
 	case p.consumeKeyword("ADD"):
+		cname, named := "", false
+		if p.consumeKeyword("CONSTRAINT") {
+			n, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			cname, named = n, true
+		}
+		if named || p.peekKeyword("UNIQUE") || p.peekKeyword("CHECK") || p.peekKeyword("FOREIGN") || p.peekKeyword("PRIMARY") {
+			if p.peekKeyword("PRIMARY") {
+				return nil, p.errf("ADD PRIMARY KEY is not supported: the primary key is fixed at CREATE TABLE")
+			}
+			cd, err := p.parseTableConstraint(cname)
+			if err != nil {
+				return nil, err
+			}
+			if p.consumeKeyword("NOT") {
+				if !p.consumeIdentWord("valid") {
+					return nil, p.errf("expected VALID after NOT, found %q", p.peek().text)
+				}
+				cd.NotValid = true
+			}
+			at.AddConstraint = &cd
+			break
+		}
 		p.consumeKeyword("COLUMN")
 		def, err := p.parseColumnDef()
 		if err != nil {
@@ -1853,12 +2157,61 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.AddCol = &def
 	case p.consumeKeyword("DROP"):
+		if p.consumeKeyword("CONSTRAINT") {
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				at.DropConstraintIfExists = true
+			}
+			n, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			at.DropConstraint = n
+			break
+		}
 		p.consumeKeyword("COLUMN")
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
 		at.DropCol = col
+	case p.consumeIdentWord("validate"):
+		if err := p.expectKeyword("CONSTRAINT"); err != nil {
+			return nil, err
+		}
+		n, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		at.ValidateConstraint = n
+	case p.consumeKeyword("ALTER"):
+		p.consumeKeyword("COLUMN")
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case p.consumeKeyword("SET"):
+			if err := p.expectKeyword("NOT"); err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("NULL"); err != nil {
+				return nil, err
+			}
+			at.SetNotNull = col
+		case p.consumeKeyword("DROP"):
+			if err := p.expectKeyword("NOT"); err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("NULL"); err != nil {
+				return nil, err
+			}
+			at.DropNotNull = col
+		default:
+			return nil, p.errf("expected SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
 		if err != nil {
@@ -1866,7 +2219,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.SetOptions = opts
 	default:
-		return nil, p.errf("expected ADD, DROP, or SET, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
 	}
 	return at, nil
 }
@@ -2316,11 +2669,6 @@ func lowerBool(n boolNode, negated bool) ([]Comparison, error) {
 			if err != nil {
 				return nil, err
 			}
-			for _, c := range kc {
-				if err := rejectSubInOr(c); err != nil {
-					return nil, err
-				}
-			}
 			disjuncts = append(disjuncts, kc)
 		}
 		if in, ok := orAsIn(disjuncts); ok {
@@ -2340,21 +2688,25 @@ func lowerBool(n boolNode, negated bool) ([]Comparison, error) {
 	}
 }
 
-// rejectSubInOr refuses [NOT] IN / [NOT] EXISTS subqueries inside an OR
-// group (scalar subqueries in value positions are evaluated per
-// disjunct and are fine).
-func rejectSubInOr(c Comparison) error {
-	if c.Sub != nil {
-		return fmt.Errorf("IN and EXISTS subqueries are not supported inside OR")
-	}
-	for _, d := range c.Or {
-		for _, inner := range d {
-			if err := rejectSubInOr(inner); err != nil {
-				return err
+// HasSubInOr reports whether an [NOT] IN / [NOT] EXISTS subquery sits
+// inside an OR group of conds — a shape the executor does not evaluate
+// (scalar subqueries in value positions are evaluated per disjunct and
+// are fine). Parsed, so a query over an always-empty catalog can still
+// be answered.
+func HasSubInOr(conds []Comparison) bool {
+	for _, c := range conds {
+		if len(c.Or) < 2 {
+			continue // a one-disjunct group is a packed AND, not an OR
+		}
+		for _, d := range c.Or {
+			for _, inner := range d {
+				if inner.Sub != nil || HasSubInOr([]Comparison{inner}) {
+					return true
+				}
 			}
 		}
 	}
-	return nil
+	return false
 }
 
 func exprContainsSub(e Expr) bool {
@@ -2630,12 +2982,13 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	}
 	// Optional ::type casts — absorbed (types come from the schema); the
 	// type may be qualified (pg_catalog.regclass) and casts may chain.
-	// A regclass cast of a literal is kept: it resolves a table name.
+	// A regclass cast is kept: it resolves a table name (a literal) or
+	// renders one (an OID column).
 	cast, err := p.parseCasts()
 	if err != nil {
 		return e, err
 	}
-	if cast != "" && e.Lit != nil {
+	if cast != "" {
 		e.Cast = cast
 	}
 	return e, nil
@@ -2786,7 +3139,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
 	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1,
-	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
+	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
 	"pg_get_statisticsobjdef_columns": 1, "pg_relation_is_publishable": 1,
@@ -2953,9 +3306,12 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return Expr{}, err
 		}
 		e.Path = path
-		if err := p.skipCasts(); err != nil {
+		// oid::regclass renders the table name; other casts are absorbed.
+		cast, err := p.parseCasts()
+		if err != nil {
 			return e, err
 		}
+		e.Cast = cast
 		return e, nil
 	}
 	return p.parseValueExpr()

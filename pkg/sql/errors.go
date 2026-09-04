@@ -39,6 +39,9 @@ const (
 	CodeObjectNotInState       = "55000"
 	CodeGeneratedAlways        = "428C9"
 	CodeDuplicateObject        = "42710"
+	CodeCheckViolation         = "23514"
+	CodeForeignKeyViolation    = "23503"
+	CodeProgramLimitExceeded   = "54000"
 	CodeInvalidParameterValue  = "22023"
 	// DECIMAL(p,s): integer digits exceed precision−scale.
 	CodeNumericValueOutOfRange = "22003"

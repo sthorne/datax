@@ -138,7 +138,7 @@ Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; LEFT joins and self-joins keep syntactic order),
-constraints beyond PRIMARY KEY / NOT NULL,
+deferrable constraints,
 typmod enforcement beyond DECIMAL (`VARCHAR(n)` parsed and ignored),
 JSONB indexing (`@>` evaluates as a filter; no inverted indexes),
 `<@` and the `?`/`?|`/`?&` existence operators,
@@ -163,6 +163,22 @@ Table descriptors are JSON documents stored in system keys (range 1):
   carry `DefaultExpr` (the expression's text, re-parsed per statement),
   `Identity` (`always` / `default`) and `SequenceID` (the owned
   sequence).
+- `Constraints` (v8, `pkg/sql/constraint.go`) — `{ID, Name, Kind:
+  check|foreign|unique, Columns, Expr, RefTable, RefColumns, OnDelete,
+  OnUpdate, IndexID, AutoIndex, Validated}` — and `InboundFKs`
+  `[{TableID, ConstraintID}]`, the foreign keys of other tables that
+  reference this one, so a parent delete finds its children without
+  scanning the catalog. A CHECK is evaluated as the lowered negation of
+  its expression (the row violates it when `NOT expr` is TRUE, so a
+  NULL result passes); a UNIQUE constraint is a unique index of the
+  same name; a foreign key is a point read of the parent on the child
+  side and, on the parent side, a lookup of the children through the
+  index on the referencing columns followed by the action, cascading
+  into the statement's write batch under a per-statement row cap.
+  `ALTER TABLE ... ADD CONSTRAINT` is a multi-transaction statement of
+  the `CREATE INDEX` shape: publish (unvalidated), drain lease
+  adoption, backfill the index, sweep the existing rows in chunks as of
+  a boundary, mark validated.
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

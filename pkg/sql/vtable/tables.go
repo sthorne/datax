@@ -112,9 +112,21 @@ func init() {
 			if st := env.Stats[t.ID]; st != nil {
 				tuples = float64(st.RowCount)
 			}
+			// relchecks counts the CHECK constraints and relhastriggers
+			// marks foreign keys either way: psql fetches a table's
+			// constraints only when they say so.
+			checks, triggers := int64(0), len(t.InboundFKs) > 0
+			for i := range t.Constraints {
+				switch t.Constraints[i].Kind {
+				case catalog.ConstraintCheck:
+					checks++
+				case catalog.ConstraintForeign:
+					triggers = true
+				}
+			}
 			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(10), i64(2), i64(TableOID(t)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
-				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null()})
+				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null()})
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(10), i64(403), i64(IndexOID(t, 1)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null()})
@@ -377,24 +389,55 @@ func init() {
 		col("inhrelid", types.Int), col("inhparent", types.Int), col("inhseqno", types.Int), col("inhdetachpending", types.Bool),
 	}, empty)
 
-	// pg_constraint: primary keys ('p') and unique indexes ('u').
+	// pg_constraint: primary keys ('p'), unique indexes and constraints
+	// ('u'), checks ('c') and foreign keys ('f').
 	pg("pg_constraint", []catalog.Column{
 		col("oid", types.Int), col("conname", types.String), col("connamespace", types.Int), col("contype", types.String),
 		col("condeferrable", types.Bool), col("condeferred", types.Bool), col("convalidated", types.Bool), col("conrelid", types.Int),
 		col("contypid", types.Int), col("conindid", types.Int), col("confrelid", types.Int), col("conkey", types.String), col("confkey", types.String), col("conbin", types.String),
+		col("conparentid", types.Int), col("confupdtype", types.String), col("confdeltype", types.String), col("confmatchtype", types.String),
 		hidden("__condef"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
+		fkAction := func(a string) string {
+			switch a {
+			case catalog.FKCascade:
+				return "c"
+			case catalog.FKSetNull:
+				return "n"
+			}
+			return "r"
+		}
 		for _, t := range env.currentTables() {
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
-				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), str(PrimaryKeyDef(t))})
+				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), str(PrimaryKeyDef(t))})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				if !idx.Unique {
 					continue
 				}
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), str("u"), boolean(false), boolean(false), boolean(true),
-					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), str(UniqueDef(t, idx))})
+					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), str(UniqueDef(t, idx))})
+			}
+			for i := range t.Constraints {
+				c := &t.Constraints[i]
+				def := ConstraintDef(t, c, env.tableByID)
+				switch c.Kind {
+				case catalog.ConstraintCheck:
+					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("c"), boolean(false), boolean(false), boolean(c.Validated),
+						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), str(def)})
+				case catalog.ConstraintForeign:
+					ref := t
+					if c.RefTable != t.ID {
+						ref = env.tableByID(c.RefTable)
+					}
+					confkey, confrelid := null(), i64(int64(c.RefTable))
+					if ref != nil {
+						confkey = str(intArray(attnums(ref, c.RefColumns)))
+					}
+					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("f"), boolean(false), boolean(false), boolean(c.Validated),
+						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), str(def)})
+				}
 			}
 		}
 		return rows, nil
@@ -569,6 +612,89 @@ func init() {
 						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(idx.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str("UNIQUE"), str("NO"), str("NO")})
 					}
 				}
+				for i := range t.Constraints {
+					c := &t.Constraints[i]
+					kind := ""
+					switch c.Kind {
+					case catalog.ConstraintCheck:
+						kind = "CHECK"
+					case catalog.ConstraintForeign:
+						kind = "FOREIGN KEY"
+					default:
+						continue // unique constraints are listed as their index
+					}
+					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(kind), str("NO"), str("NO")})
+				}
+			}
+			return rows, nil
+		})
+	is("check_constraints", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("check_clause", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, t := range env.currentTables() {
+				for i := range t.Constraints {
+					if c := &t.Constraints[i]; c.Kind == catalog.ConstraintCheck {
+						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(c.Expr)})
+					}
+				}
+			}
+			return rows, nil
+		})
+	is("referential_constraints", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("unique_constraint_catalog", types.String), col("unique_constraint_schema", types.String), col("unique_constraint_name", types.String), col("match_option", types.String), col("update_rule", types.String), col("delete_rule", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			rule := func(a string) string {
+				switch a {
+				case catalog.FKCascade:
+					return "CASCADE"
+				case catalog.FKSetNull:
+					return "SET NULL"
+				}
+				return "NO ACTION"
+			}
+			for _, t := range env.currentTables() {
+				for i := range t.Constraints {
+					c := &t.Constraints[i]
+					if c.Kind != catalog.ConstraintForeign {
+						continue
+					}
+					ref := t
+					if c.RefTable != t.ID {
+						ref = env.tableByID(c.RefTable)
+					}
+					unique := null()
+					if ref != nil {
+						unique = str(uniqueConstraintNameFor(ref, c.RefColumns))
+					}
+					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), unique, str("NONE"), str(rule(c.OnUpdate)), str(rule(c.OnDelete))})
+				}
+			}
+			return rows, nil
+		})
+	is("constraint_column_usage", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("column_name", types.String), col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, t := range env.currentTables() {
+				for i := range t.Constraints {
+					c := &t.Constraints[i]
+					switch c.Kind {
+					case catalog.ConstraintCheck, catalog.ConstraintUnique:
+						for _, id := range c.Columns {
+							rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), str(env.Database), str(catalog.PublicSchema), str(c.Name)})
+						}
+					case catalog.ConstraintForeign:
+						ref := t
+						if c.RefTable != t.ID {
+							ref = env.tableByID(c.RefTable)
+						}
+						if ref == nil {
+							continue
+						}
+						for _, id := range c.RefColumns {
+							rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(ref.Name), str(columnName(ref, id)), str(env.Database), str(catalog.PublicSchema), str(c.Name)})
+						}
+					}
+				}
 			}
 			return rows, nil
 		})
@@ -585,6 +711,15 @@ func init() {
 					}
 					for i, id := range idx.ColumnIDs {
 						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(idx.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
+					}
+				}
+				for ci := range t.Constraints {
+					c := &t.Constraints[ci]
+					if c.Kind != catalog.ConstraintForeign {
+						continue
+					}
+					for i, id := range c.Columns {
+						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
 					}
 				}
 			}
@@ -625,6 +760,35 @@ func init() {
 }
 
 // visiblePK is the primary key without the hidden shard column.
+// uniqueConstraintNameFor names the primary key or unique index that
+// holds cols, for referential_constraints.
+func uniqueConstraintNameFor(t *catalog.TableDescriptor, cols []catalog.ColumnID) string {
+	same := func(key []catalog.ColumnID) bool {
+		if len(key) != len(cols) {
+			return false
+		}
+		set := map[catalog.ColumnID]bool{}
+		for _, id := range cols {
+			set[id] = true
+		}
+		for _, id := range key {
+			if !set[id] {
+				return false
+			}
+		}
+		return true
+	}
+	if same(visiblePK(t)) {
+		return t.Name + "_pkey"
+	}
+	for i := range t.Indexes {
+		if t.Indexes[i].Unique && same(t.Indexes[i].ColumnIDs) {
+			return t.Indexes[i].Name
+		}
+	}
+	return ""
+}
+
 func visiblePK(t *catalog.TableDescriptor) []catalog.ColumnID {
 	var out []catalog.ColumnID
 	for _, id := range t.PrimaryKey {

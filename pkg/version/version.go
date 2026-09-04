@@ -69,9 +69,16 @@ const (
 	// NULL), so the DDL that creates one is refused until finalize, when
 	// every node runs a v7 binary (rule 4).
 	V7 Version = 7
+	// V8 introduces table constraints (pkg/sql/constraint.go): CHECK,
+	// FOREIGN KEY and named UNIQUE constraints live in the table
+	// descriptor, and a foreign key's parent records its referencing
+	// tables. A v7 node would write rows without checking them and drop
+	// a parent row without touching its children, so the DDL that
+	// creates a constraint is refused until finalize (rule 4).
+	V8 Version = 8
 
 	// Current is the newest cluster version this binary can run.
-	Current = V7
+	Current = V8
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

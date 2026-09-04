@@ -8,6 +8,38 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.14.0 — unreleased
+
+### Added
+- Table constraints (#92): `CHECK (expr)`, column and table `UNIQUE`,
+  and `FOREIGN KEY ... REFERENCES t (cols) [ON DELETE | ON UPDATE
+  RESTRICT | NO ACTION | CASCADE | SET NULL]` (MATCH SIMPLE), named or
+  auto-named as PostgreSQL does; `ALTER TABLE ... ADD CONSTRAINT`
+  (publishes, then validates the existing rows in bounded chunks; `NOT
+  VALID` defers that to `VALIDATE CONSTRAINT`), `DROP CONSTRAINT [IF
+  EXISTS]`, `ALTER COLUMN ... SET NOT NULL` (sweeps first) / `DROP NOT
+  NULL`, `DROP TABLE ... CASCADE`. A CHECK passes on NULL and is
+  `23514` otherwise; a foreign key is checked by a point read of the
+  parent in the writing transaction (`23503`) and, on the parent side,
+  through an index the constraint creates on the referencing columns
+  when none covers them, so a parent delete never scans the child;
+  cascades are bounded per statement by `SET
+  foreign_key_cascade_limit` (default 10000, `54000` beyond it). `COPY`
+  respects every constraint and names the failing row. The catalogs
+  show them (`pg_constraint` with `conparentid`, `confupdtype`,
+  `confdeltype`; `information_schema.check_constraints`,
+  `referential_constraints`, `constraint_column_usage`; `pg_class`
+  `relchecks` / `relhastriggers`), so psql's `\d` lists check
+  constraints, foreign keys and "Referenced by". For those queries:
+  `oid::regclass` on a column, `VALUES` as a `UNION` member,
+  `pg_partition_ancestors`, table functions as join members (parsed),
+  and selects over an always-empty catalog (`pg_trigger`, ...) answer
+  empty whatever shape they take. **Cluster version v8**: descriptors
+  gain the constraint fields, which a v7 node would ignore on write, so
+  the DDL is refused with `0A000` until `datax debug upgrade` finalizes
+  v8.
+- `SET name = <number>` is accepted (numeric settings).
+
 ## 0.13.0 — unreleased
 
 ### Added
