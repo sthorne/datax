@@ -230,10 +230,25 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		return nil, kerr
 	}
 
+	// Re-read both descriptors now that the subsume is the RHS's last
+	// command. Anything captured before it can be stale: a split of the
+	// RHS proposed just ahead of the subsume applies first, and the merge
+	// must absorb the post-split span and generation — building the
+	// merged descriptor from the earlier copy produced a range claiming
+	// the split-off half's keys as well (issue #111). The LHS may have
+	// moved too (a split of its own); its generation is re-checked at
+	// apply, but the spans must still meet here.
+	desc = r.Desc()
+	rhsDesc = rhs.Desc()
+	if !rhsDesc.StartKey.Equal(desc.EndKey) {
+		return nil, kvpb.NewErrorf("%s: cannot merge: right neighbor %s now starts at %s, not at this range's end %s; retried by housekeeping",
+			r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey, desc.EndKey)
+	}
+
 	// Capture the RHS's final position: subsume was its last command.
 	trig := &mergeTrigger{
 		Left:              desc,
-		Right:             rhs.Desc(),
+		Right:             rhsDesc,
 		RightAppliedIndex: rhs.AppliedIndex(),
 		RightSizeBytes:    rhs.SizeBytes(),
 		RightGCThreshold:  rhs.GCThreshold(),
@@ -407,6 +422,14 @@ wait:
 		default:
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+	// The RHS is frozen at the subsume, so its descriptor here is final
+	// and identical on every replica: the trigger must have been built
+	// from it, or the merged span would not be the RHS's (deterministic
+	// refusal; the frozen RHS is re-driven by housekeeping).
+	if rd := rhs.Desc(); rd.Generation != trig.Right.Generation || !rd.EndKey.Equal(trig.Merged.EndKey) {
+		return kvpb.NewErrorf("%s: merge trigger carries %s at generation %d ending at %s, but the frozen replica is at generation %d ending at %s; retried by housekeeping",
+			r.rangeID, trig.Right.RangeID, trig.Right.Generation, trig.Merged.EndKey, rd.Generation, rd.EndKey)
 	}
 	// Stop the RHS group before its unreplicated keys go: a live Ready
 	// handler could otherwise resurrect its HardState after our batch.

@@ -145,6 +145,11 @@ func NewDB(local LocalStore, transport *rpc.Transport, clock *hlc.Clock) *DB {
 // SeedDescriptor primes the range cache (bootstrap: range 1 from init/join).
 func (db *DB) SeedDescriptor(desc kvpb.RangeDescriptor) { db.cache.Insert(desc) }
 
+// EvictDescriptor drops the cached routing entry for a range, forcing the
+// next request for its keys through a /meta lookup (tests use it to
+// exercise the lookup path).
+func (db *DB) EvictDescriptor(rangeID base.RangeID) { db.cache.Evict(rangeID) }
+
 // CachedDescriptor returns the cached descriptor covering key, if any.
 func (db *DB) CachedDescriptor(key keys.Key) (kvpb.RangeDescriptor, bool) {
 	return db.cache.Lookup(key)
@@ -560,23 +565,39 @@ func (db *DB) descForKey(ctx context.Context, addr keys.Key) (kvpb.RangeDescript
 	return d, nil
 }
 
+// metaStaleWait bounds how long lookupMeta keeps re-scanning /meta while
+// the records it finds do not cover the key. Splits and merges repair
+// addressing with separate writes after they commit, so a scan can land
+// between them (the old record gone, the new one not yet there, or the
+// old one still naming a span that has since shrunk); the repair lands
+// within milliseconds, and a batch should wait for it rather than fail.
+const metaStaleWait = 3 * time.Second
+
 // lookupMeta scans /meta for the first record whose range ends beyond key.
 // The scan is inconsistent (never blocks on intents) and itself routed via
 // the cache — the bootstrap invariant is that a descriptor covering the
-// meta span is always seeded.
+// meta span is always seeded. A record that does not cover the key, or no
+// record at all, is treated as an addressing repair in flight and
+// re-scanned with backoff for up to metaStaleWait.
 func (db *DB) lookupMeta(ctx context.Context, key keys.Key) (kvpb.RangeDescriptor, error) {
 	start := keys.Key(keys.RangeMetaKey(key)).Next()
 	_, metaEnd := keys.MetaSpan()
 	header := kvpb.BatchHeader{Timestamp: db.clock.Now(), ReadInconsistent: true}
 	scan := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: metaEnd}, MaxRows: 1}
 
-	for attempt := 0; attempt < 5; attempt++ {
+	deadline := time.Now().Add(metaStaleWait)
+	backoff := 5 * time.Millisecond
+	var stale error
+	for regroups := 0; ; {
 		desc, ok := db.cache.Lookup(start)
 		if !ok {
 			return kvpb.RangeDescriptor{}, fmt.Errorf("no routing descriptor for the meta span; cluster bootstrap incomplete")
 		}
 		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Scan: scan}}, desc)
 		if regroup {
+			if regroups++; regroups >= 5 {
+				return kvpb.RangeDescriptor{}, fmt.Errorf("meta lookup for %s did not converge", key)
+			}
 			continue
 		}
 		if kerr != nil {
@@ -584,18 +605,32 @@ func (db *DB) lookupMeta(ctx context.Context, key keys.Key) (kvpb.RangeDescripto
 		}
 		rows := br.Responses[0].Scan.Rows
 		if len(rows) == 0 {
-			return kvpb.RangeDescriptor{}, fmt.Errorf("no meta record covering key %s", key)
+			stale = fmt.Errorf("no meta record covering key %s", key)
+		} else {
+			var d kvpb.RangeDescriptor
+			if err := json.Unmarshal(rows[0].Value, &d); err != nil {
+				return kvpb.RangeDescriptor{}, fmt.Errorf("corrupt meta record: %w", err)
+			}
+			if d.ContainsKey(key) {
+				return d, nil
+			}
+			stale = fmt.Errorf("meta record %s does not cover key %s (stale addressing)", &d, key)
+			// Whatever this gateway cached for that range is no fresher.
+			db.cache.Evict(d.RangeID)
 		}
-		var d kvpb.RangeDescriptor
-		if err := json.Unmarshal(rows[0].Value, &d); err != nil {
-			return kvpb.RangeDescriptor{}, fmt.Errorf("corrupt meta record: %w", err)
+		if time.Now().After(deadline) {
+			return kvpb.RangeDescriptor{}, fmt.Errorf("addressing did not converge within %s: %w", metaStaleWait, stale)
 		}
-		if !d.ContainsKey(key) {
-			return kvpb.RangeDescriptor{}, fmt.Errorf("meta record %s does not cover key %s (stale addressing)", &d, key)
+		select {
+		case <-ctx.Done():
+			return kvpb.RangeDescriptor{}, ctx.Err()
+		case <-time.After(backoff):
 		}
-		return d, nil
+		if backoff *= 2; backoff > 100*time.Millisecond {
+			backoff = 100 * time.Millisecond
+		}
+		header.Timestamp = db.clock.Now() // read at a fresh timestamp: the repair may have just landed
 	}
-	return kvpb.RangeDescriptor{}, fmt.Errorf("meta lookup for %s did not converge", key)
 }
 
 // sendScan executes a scan, stitching across range boundaries.
