@@ -10,18 +10,18 @@ It speaks the **PostgreSQL wire protocol**, so any Postgres client or driver
 works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 `database/sql`.
 
-> **Status: prototype (cluster version v3).** The core is real — MVCC
-> storage with garbage collection and row-level retention, Raft-replicated
-> ranges with log truncation and automatic splitting and merging by size
-> and load, serializable distributed transactions with read refresh and
-> one-phase commit, rack-aware placement with dead-node repair and load
-> rebalancing, secondary indexes, a cost-based planner over table
-> statistics, sharded time-series tables with online re-sharding,
-> follower reads, encryption at rest with online key rotation, mutual TLS
-> + SCRAM with admin authorization and audit logging, consistent
-> backup/restore, rolling upgrades, and Prometheus metrics with a built-in
-> dashboard — but this is not production software. See
-> [Limitations](#limitations).
+> **Status: cluster version v4.** MVCC storage with garbage collection
+> and row-level retention, Raft-replicated ranges with log truncation and
+> automatic splitting and merging by size and load, serializable
+> distributed transactions with read refresh and one-phase commit,
+> rack-aware placement with dead-node repair and load rebalancing,
+> secondary indexes, a cost-based planner over table statistics, sharded
+> time-series tables with online re-sharding, follower reads, encryption
+> at rest with online key rotation, mutual TLS + SCRAM with admin
+> authorization and audit logging, consistent backup/restore, rolling
+> upgrades, and Prometheus metrics with a built-in dashboard. Every push
+> runs the full race suite in CI. What is deliberately out of scope is
+> listed under [Scope](#scope).
 
 ## Architecture at a glance
 
@@ -171,22 +171,23 @@ nodes. `datax sql` is a built-in client for scripts; `datax backup` /
 Benchmark with `datax bench kv|bank|ingest`; on the in-process demo the kv
 workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
-## Limitations
+## Scope
 
-This is a prototype. Out of scope so far, deliberately:
+Everything described above is implemented and covered by the test suite.
+These are the boundaries, chosen deliberately rather than left unfinished:
 
-| Area | Not yet implemented |
+| Area | Out of scope today |
 |---|---|
-| Ranges | load stats are leader-local samples (a lease transfer now hands the measured rate to the new leader, but reservoir split-key samples start fresh; splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
-| Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements; count rebalancing, lease shedding, byte moves and decommission are all automatic) |
-| Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads require opting in per statement — exact-timestamp `AS OF SYSTEM TIME` and bounded-staleness `with_max_staleness('10s')` are both in |
-| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes (multi-level correlation is in, as a per-level memoized nested loop — O(product of level row counts)), joins beyond 8 tables (nested loop; INNER joins cost-reorder when table statistics exist, LEFT joins keep syntactic order), typmods beyond DECIMAL (`DECIMAL(p,s)` is enforced; `VARCHAR(n)` parsed and ignored), JSONB indexing (`->`/`->>` extraction works in single-table queries and joins, `@>` containment single-table only; `@>` always filters — no inverted indexes) |
-| Wire | COPY TO and COPY options beyond FORMAT (COPY FROM STDIN is in — text/CSV/binary, chunked commits); cursor-style streaming (suspended portals serve materialized results — a fetch limit bounds wire traffic per round trip, not server memory) |
-| Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only — cross-node dashboard drill-down, per-endpoint HTTP authorization, and audit logging of admin ops/auth failures/privilege DDL are all in) |
-| Upgrades | skipping versions (adjacent-version rolls only) or auto-finalize (the version bump is a deliberate `datax debug upgrade`; before it, binaries roll back freely — after it, never) |
-| Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp; MVCC history is not preserved) |
-| Encryption | key escrow / HSM integration (keys live in process memory; the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; background re-encryption of retired-key files is in, and a stale sstable spanning a single user key still waits for natural churn) |
-| Storage | debt-gate thresholds are first-cut constants (quorum-health shedding via raft-piggybacked follower verdicts — an overloaded verdict holds until the follower reports healthy again — and a latched compaction-debt gate with hysteresis are in; per-cause counters tell them apart) |
+| Ranges | load statistics are leader-local samples: a lease transfer hands the measured rate to the new leader, but reservoir split-key samples start fresh (splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
+| Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements); zone and lease preferences are parsed and stored but not acted on automatically |
+| Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads are opt-in per statement — exact-timestamp `AS OF SYSTEM TIME` or bounded staleness `with_max_staleness('10s')` |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)` (`VARCHAR(n)` is parsed and ignored); JSONB indexing (`@>` always filters — no inverted indexes — and is single-table only) |
+| Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming (suspended portals serve materialized results, so a fetch limit bounds wire traffic per round trip, not server memory) |
+| Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
+| Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |
+| Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
+| Encryption | key escrow / HSM integration (keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |
+| Storage | debt-gate thresholds are first-cut constants (per-cause counters tell the compaction-debt gate and follower-health shedding apart; tune with production data) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |
 
 ## License
