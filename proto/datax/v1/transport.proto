@@ -25,6 +25,27 @@ service Internode {
 
   // Snapshot streams a range snapshot to seed a new replica.
   rpc Snapshot(stream SnapshotChunk) returns (SnapshotAck);
+
+  // Ping measures the round trip and the clock offset to a peer (the NTP
+  // exchange: the caller stamps its send time, the peer its receive and
+  // send times, the caller its receive time).
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {
+  int64 from_node = 1;
+  // send_wall is the caller's physical clock (ns since epoch) when the
+  // request left.
+  int64 send_wall = 2;
+  Hlc now = 3;
+}
+
+message PingResponse {
+  // recv_wall and send_wall are the peer's physical clock when the
+  // request arrived and when the reply left.
+  int64 recv_wall = 1;
+  int64 send_wall = 2;
+  Hlc now = 3;
 }
 
 // Hlc carries an HLC reading; every message type embeds one so receivers can

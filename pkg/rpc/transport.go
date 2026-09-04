@@ -197,6 +197,36 @@ func (t *Transport) Probe(ctx context.Context, addr string) error {
 	return nil
 }
 
+// Ping measures the round trip to a peer and the peer's clock offset
+// relative to this node (positive: the peer runs ahead), by the NTP
+// exchange: rtt = (t4 - t1) - (t3 - t2), offset = ((t2 - t1) + (t3 - t4)) / 2
+// with t1/t4 this node's physical clock at send and receive and t2/t3
+// the peer's at receipt and reply. Honors the testing partition hook, so
+// a partitioned peer reads as unreachable.
+func (t *Transport) Ping(ctx context.Context, to base.NodeID) (rtt, offset time.Duration, err error) {
+	if t.dropTo(to) {
+		return 0, 0, fmt.Errorf("ping to n%d dropped (partitioned)", to)
+	}
+	cc, err := t.Dial(to)
+	if err != nil {
+		return 0, 0, err
+	}
+	self, _ := t.localInfo()
+	t1 := t.clock.PhysicalNow()
+	resp, err := rpcpb.NewInternodeClient(cc).Ping(ctx, &rpcpb.PingRequest{FromNode: int64(self), SendWall: t1, Now: t.now()})
+	t4 := t.clock.PhysicalNow()
+	if err != nil {
+		return 0, 0, err
+	}
+	t.updateClock(resp.Now)
+	rtt = time.Duration((t4 - t1) - (resp.SendWall - resp.RecvWall))
+	if rtt < 0 {
+		rtt = 0
+	}
+	offset = time.Duration(((resp.RecvWall - t1) + (resp.SendWall - t4)) / 2)
+	return rtt, offset, nil
+}
+
 // SetTestingDrop installs (or clears, with nil) a per-destination veto on
 // all outbound traffic — the partition hook for fault-injection tests.
 func (t *Transport) SetTestingDrop(fn func(to base.NodeID) bool) {

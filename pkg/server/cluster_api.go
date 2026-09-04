@@ -33,6 +33,10 @@ type ClusterNode struct {
 	// Machine is the node's host summary from its heartbeat (nil for a
 	// node on a binary that does not advertise one).
 	Machine *kvpb.MachineSummary `json:"machine,omitempty"`
+	// Latency is the node's row of the network matrix: its round trip and
+	// clock offset to each peer, from its heartbeat (fresh from the pinger
+	// for the serving node itself).
+	Latency []kvpb.PeerLatency `json:"latency,omitempty"`
 }
 
 // ClusterRange is one cluster-wide range descriptor (from /meta — every
@@ -67,6 +71,9 @@ type ClusterPrincipal struct {
 type ClusterStatus struct {
 	Now    int64 `json:"now_unix_ms"`
 	NodeID int   `json:"node_id"`
+	// MaxOffsetMs is the clock skew the cluster tolerates (--max-offset);
+	// measured offsets are judged against it.
+	MaxOffsetMs int64 `json:"max_offset_ms"`
 	// Principal is per request: the caller's identity, not cluster state.
 	Principal ClusterPrincipal        `json:"principal"`
 	Nodes     []ClusterNode           `json:"nodes"`
@@ -86,6 +93,7 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 		Principal: n.clusterPrincipal(req),
 		Local:     n.statusSummary(),
 	}
+	doc.MaxOffsetMs = n.clock.MaxOffset().Milliseconds()
 	grace := n.livenessGrace().Nanoseconds()
 	for _, nd := range n.registry.All() {
 		doc.Nodes = append(doc.Nodes, ClusterNode{
@@ -99,7 +107,11 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			LeaderCount:  nd.LeaderCount,
 			ReplicaBytes: nd.ReplicaBytes,
 			Machine:      nd.Machine,
+			Latency:      nd.Latency,
 		})
+		if nd.NodeID == n.ident.NodeID && n.pinger != nil {
+			doc.Nodes[len(doc.Nodes)-1].Latency = n.pinger.Snapshot()
+		}
 	}
 	if descs, err := n.listRanges(req.Context()); err != nil {
 		doc.Error = "cluster range listing unavailable: " + err.Error()

@@ -150,6 +150,23 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 	}
 }
 
+// Ping answers a peer's latency probe with this node's physical clock at
+// receipt and at reply (the NTP exchange the caller completes with its
+// own send and receive times).
+func (s *Server) Ping(ctx context.Context, in *rpcpb.PingRequest) (*rpcpb.PingResponse, error) {
+	recv := s.clock.PhysicalNow()
+	if err := s.requireNode(ctx, "Ping"); err != nil {
+		return nil, err
+	}
+	s.updateClock(in.Now)
+	now := s.clock.Now()
+	return &rpcpb.PingResponse{
+		RecvWall: recv,
+		SendWall: s.clock.PhysicalNow(),
+		Now:      &rpcpb.Hlc{WallTime: now.WallTime, Logical: now.Logical},
+	}, nil
+}
+
 func (s *Server) payload(ctx context.Context, h PayloadHandler, in *rpcpb.Payload) (*rpcpb.Payload, error) {
 	s.updateClock(in.Now)
 	out, err := h(ctx, in.Json)
