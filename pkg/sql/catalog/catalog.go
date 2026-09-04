@@ -79,6 +79,62 @@ type IndexDescriptor struct {
 	State string `json:"state,omitempty"`
 }
 
+// Constraint kinds.
+const (
+	ConstraintCheck   = "check"
+	ConstraintForeign = "foreign"
+	ConstraintUnique  = "unique"
+)
+
+// Foreign-key referential actions (ON DELETE / ON UPDATE). NO ACTION is
+// stored as restrict: without deferred checking the two behave alike.
+const (
+	FKRestrict = "restrict"
+	FKCascade  = "cascade"
+	FKSetNull  = "set null"
+)
+
+// Constraint is a table constraint beyond the primary key and NOT NULL
+// (cluster version v8): a CHECK expression, a foreign key, or a named
+// UNIQUE constraint backed by a unique index. Constraint IDs are never
+// reused.
+type Constraint struct {
+	ID   uint64 `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	// Columns are the constrained columns: the columns a CHECK
+	// expression references, the referencing columns of a foreign key,
+	// or the unique columns.
+	Columns []ColumnID `json:"columns,omitempty"`
+	// Expr is a CHECK constraint's expression, as SQL text.
+	Expr string `json:"expr,omitempty"`
+	// RefTable / RefColumns are a foreign key's referenced table and
+	// columns (its primary key or a unique index), parallel to Columns.
+	RefTable   uint64     `json:"ref_table,omitempty"`
+	RefColumns []ColumnID `json:"ref_columns,omitempty"`
+	// OnDelete / OnUpdate are a foreign key's referential actions
+	// (FKRestrict, FKCascade, FKSetNull; "" = restrict).
+	OnDelete string `json:"on_delete,omitempty"`
+	OnUpdate string `json:"on_update,omitempty"`
+	// IndexID is the unique index a UNIQUE constraint is (dropped with
+	// it), or the index created for a foreign key's referencing columns
+	// when none covered them (AutoIndex; dropped with the constraint).
+	IndexID   uint64 `json:"index_id,omitempty"`
+	AutoIndex bool   `json:"auto_index,omitempty"`
+	// Validated is false for a CHECK or FOREIGN KEY added NOT VALID (or
+	// still being validated): new writes are checked, existing rows
+	// were not.
+	Validated bool `json:"validated"`
+}
+
+// ForeignKeyRef points from a referenced table to a foreign key on one
+// of its referencing tables, so a delete or key update on the parent
+// finds its children without scanning the catalog.
+type ForeignKeyRef struct {
+	TableID      uint64 `json:"table_id"`
+	ConstraintID uint64 `json:"constraint_id"`
+}
+
 // Index lifecycle states.
 const (
 	IndexStatePublic    = "public"
@@ -111,6 +167,13 @@ type TableDescriptor struct {
 	// 2; IDs are never reused).
 	Indexes     []IndexDescriptor `json:"indexes,omitempty"`
 	NextIndexID uint64            `json:"next_index_id,omitempty"`
+	// Constraints are the table's CHECK, FOREIGN KEY and named UNIQUE
+	// constraints (v8); NextConstraintID the next ID to allocate.
+	// InboundFKs are the foreign keys of other tables that reference
+	// this one.
+	Constraints      []Constraint    `json:"constraints,omitempty"`
+	NextConstraintID uint64          `json:"next_constraint_id,omitempty"`
+	InboundFKs       []ForeignKeyRef `json:"inbound_fks,omitempty"`
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
@@ -220,6 +283,15 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		out.Indexes[i] = idx
 		out.Indexes[i].ColumnIDs = append([]ColumnID(nil), idx.ColumnIDs...)
 	}
+	if d.Constraints != nil {
+		out.Constraints = make([]Constraint, len(d.Constraints))
+		for i, c := range d.Constraints {
+			out.Constraints[i] = c
+			out.Constraints[i].Columns = append([]ColumnID(nil), c.Columns...)
+			out.Constraints[i].RefColumns = append([]ColumnID(nil), c.RefColumns...)
+		}
+	}
+	out.InboundFKs = append([]ForeignKeyRef(nil), d.InboundFKs...)
 	if d.Privileges != nil {
 		out.Privileges = make(map[string][]string, len(d.Privileges))
 		for u, ps := range d.Privileges {
@@ -239,6 +311,36 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		}
 	}
 	return &out
+}
+
+// Constraint returns the named constraint.
+func (d *TableDescriptor) Constraint(name string) (*Constraint, bool) {
+	for i := range d.Constraints {
+		if d.Constraints[i].Name == name {
+			return &d.Constraints[i], true
+		}
+	}
+	return nil, false
+}
+
+// ConstraintByID returns the constraint with the given ID.
+func (d *TableDescriptor) ConstraintByID(id uint64) (*Constraint, bool) {
+	for i := range d.Constraints {
+		if d.Constraints[i].ID == id {
+			return &d.Constraints[i], true
+		}
+	}
+	return nil, false
+}
+
+// IndexByID returns the index with the given ID.
+func (d *TableDescriptor) IndexByID(id uint64) (*IndexDescriptor, bool) {
+	for i := range d.Indexes {
+		if d.Indexes[i].ID == id {
+			return &d.Indexes[i], true
+		}
+	}
+	return nil, false
 }
 
 // Col returns the column with the given name.

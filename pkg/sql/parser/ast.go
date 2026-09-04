@@ -113,6 +113,32 @@ type ColumnDef struct {
 	// and ignored (documented).
 	Precision int32
 	Scale     int32
+	// Constraints are the column's UNIQUE, CHECK and REFERENCES clauses,
+	// as table constraints over this one column.
+	Constraints []ConstraintDef
+}
+
+// ConstraintDef is a table constraint: [CONSTRAINT name] UNIQUE (cols)
+// | CHECK (expr) | FOREIGN KEY (cols) REFERENCES t [(cols)] [ON DELETE
+// action] [ON UPDATE action]. Name is "" when the statement gave none.
+type ConstraintDef struct {
+	Name    string
+	Kind    string // "unique", "check", "foreign"
+	Columns []string
+	// Check is the CHECK expression's source text; CheckFails the lowered
+	// negation (the row violates the constraint when it holds), for
+	// validation at parse time.
+	Check      string
+	CheckFails []Comparison
+	// Foreign keys: the referenced table and columns (empty = its
+	// primary key) and the actions ("restrict", "cascade", "set null").
+	RefTable   string
+	RefColumns []string
+	OnDelete   string
+	OnUpdate   string
+	// NotValid is ALTER TABLE ... ADD CONSTRAINT ... NOT VALID: existing
+	// rows are not checked.
+	NotValid bool
 }
 
 type CreateTable struct {
@@ -120,6 +146,10 @@ type CreateTable struct {
 	IfNotExists bool
 	Columns     []ColumnDef
 	PrimaryKey  []string // table-level constraint (column names)
+	// PrimaryKeyName is an explicit CONSTRAINT name on the primary key
+	// (accepted; the primary key is always named <table>_pkey).
+	PrimaryKeyName string
+	Constraints    []ConstraintDef
 	// Options is the trailing WITH (name = value, ...) list, lowercased
 	// names mapping to raw literal text (e.g. timeseries=true,
 	// retention='7d', shards=8). Nil when no WITH clause was given.
@@ -182,6 +212,9 @@ type Explain struct {
 type DropTable struct {
 	Name     string
 	IfExists bool
+	// Cascade drops the foreign keys of other tables that reference this
+	// one along with it; without it such a table is refused.
+	Cascade bool
 }
 
 type Insert struct {
@@ -294,7 +327,12 @@ type JoinClause struct {
 	Cross bool // CROSS JOIN / comma join: no ON clause
 	Table string
 	Alias string
-	On    []JoinCond
+	// FuncTable is a table function joined in (FROM t, f(x) [WITH
+	// ORDINALITY] AS a(c1, c2)), with its column names; Table is empty
+	// then. Parsed for the catalog queries tools send; not executable.
+	FuncTable *Expr
+	FuncCols  []string
+	On        []JoinCond
 	// Filter holds the ON conjuncts that are not join-key equalities
 	// (tc.relkind = 't', a.attnum > 0, NOT a.attisdropped). They are part
 	// of the join condition: a candidate match failing them is not a
@@ -358,6 +396,17 @@ type AlterTable struct {
 	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
 	// shards = N, the online re-shard.
 	SetOptions map[string]string
+	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
+	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
+	// CONSTRAINT name.
+	AddConstraint          *ConstraintDef
+	DropConstraint         string
+	DropConstraintIfExists bool
+	ValidateConstraint     string
+	// SetNotNull / DropNotNull are ALTER [COLUMN] c SET NOT NULL / DROP
+	// NOT NULL (the column name).
+	SetNotNull  string
+	DropNotNull string
 }
 
 type Delete struct {

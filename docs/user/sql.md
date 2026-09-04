@@ -137,6 +137,87 @@ Expression defaults and sequences need **cluster version v7**: a
 cluster upgraded from older binaries refuses the DDL with `0A000` until
 `datax debug upgrade` finalizes v7 (a v6 node could not evaluate them).
 
+### Constraints: CHECK, UNIQUE and FOREIGN KEY
+
+```sql
+CREATE TABLE orders (
+  id      INT8 PRIMARY KEY,
+  cust    INT8 NOT NULL REFERENCES customers ON DELETE CASCADE,      -- the primary key of customers
+  sku     TEXT CONSTRAINT orders_sku_fkey REFERENCES products (sku)  -- or a UNIQUE column / constraint
+            ON DELETE SET NULL ON UPDATE CASCADE,
+  qty     INT8 CHECK (qty > 0),
+  code    TEXT UNIQUE,
+  region  TEXT,
+  CONSTRAINT orders_region_code UNIQUE (region, code),
+  CHECK (qty < 1000 OR region IS NULL),
+  FOREIGN KEY (region, code) REFERENCES zones (region, code) ON DELETE RESTRICT
+);
+
+ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100);            -- validates existing rows
+ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100) NOT VALID;  -- new writes only, for now
+ALTER TABLE orders VALIDATE CONSTRAINT qty_small;
+ALTER TABLE orders ADD UNIQUE (code);                                     -- an online unique index build
+ALTER TABLE orders ADD FOREIGN KEY (cust) REFERENCES customers;
+ALTER TABLE orders DROP CONSTRAINT [IF EXISTS] qty_small;
+ALTER TABLE orders ALTER COLUMN region SET NOT NULL;                      -- sweeps existing rows first
+ALTER TABLE orders ALTER COLUMN region DROP NOT NULL;
+DROP TABLE customers CASCADE;                    -- also drops the foreign keys that reference it
+SET foreign_key_cascade_limit = 50000;           -- per statement; default 10000
+```
+
+Names default to PostgreSQL's (`orders_qty_check`, `orders_code_key`,
+`orders_cust_fkey`, numbered when taken); `\d`, `pg_constraint`,
+`information_schema.table_constraints` / `check_constraints` /
+`referential_constraints` / `key_column_usage` and `SHOW CREATE TABLE`
+show them.
+
+**CHECK** expressions use the row's columns, constants, operators and
+the non-volatile functions (no subqueries, parameters, or `nextval`
+and friends). A NULL result passes, as in PostgreSQL; a violation is
+`23514`. They are checked on `INSERT`, `UPDATE`, `COPY` and on the rows
+a cascade rewrites.
+
+**UNIQUE** constraints are unique indexes carrying the constraint's
+name (`23505` on a duplicate); `ON CONFLICT ON CONSTRAINT name` and
+`ON CONFLICT (cols)` resolve through them. Adding one to a table with
+rows is the online index build: it cannot run inside a transaction
+block, and duplicates fail it with nothing left behind.
+
+**FOREIGN KEY**s reference the parent's primary key or a unique
+constraint / index (`42P10` otherwise), column types must match, and
+the parent must be in the same database (`0A000`). `MATCH SIMPLE`
+only: a NULL anywhere in the key exempts the row. The child side is a
+point read of the parent inside the writing transaction (`23503` when
+absent); the parent side, on `DELETE` or an update of the referenced
+columns, finds the children through the referencing columns'
+index — **the referencing side gets an index automatically**
+(`<constraint>_idx`, dropped with the constraint) when none covers
+them, so a parent delete never scans the child — and applies the
+action: `RESTRICT` / `NO ACTION` (`23503`; both check at statement
+end, there is no deferring), `CASCADE` (deletes or re-keys the
+children, recursively), `SET NULL` (`23502` if the column is `NOT
+NULL`). `SET DEFAULT` is not supported. A cascade is bounded per
+statement by `foreign_key_cascade_limit` (`54000` beyond it): an
+unbounded cascade is an unbounded transaction. Serializable isolation
+already makes a parent delete and a concurrent child insert conflict
+(one of them restarts with `40001`), so no extra locking is involved.
+
+`ALTER TABLE ... ADD CONSTRAINT` publishes the constraint first — new
+writes honor it as soon as every gateway has the descriptor — then
+validates the existing rows in bounded chunks; a violation removes the
+constraint again. `NOT VALID` skips the sweep (the catalogs show
+`convalidated = false`); `VALIDATE CONSTRAINT` runs it later. Like
+`CREATE INDEX`, these cannot run inside a transaction block. `DROP
+CONSTRAINT`, `DROP NOT NULL` and `CREATE TABLE` constraints are
+ordinary transactional DDL. Dropping a column a constraint uses, or a
+table a foreign key references, is refused (`2BP01`) until the
+constraint is dropped or `DROP TABLE ... CASCADE` drops the keys with
+it. `ADD COLUMN` takes no constraint: add the column, then the
+constraint.
+
+Constraints need **cluster version v8** (`0A000` until `datax debug
+upgrade` finalizes it): a v7 node would write rows unchecked.
+
 ## Reading
 
 ```sql
@@ -174,7 +255,8 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   `E'...'` escape strings, and the functions `now()`, `coalesce(...)`,
   `length(s)`, `lower(s)`, `upper(s)`, `abs(n)`, the sequence and id
   functions `nextval`, `currval`, `lastval`, `setval`, `unique_rowid()`,
-  `gen_random_uuid()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)), plus the catalog
+  `gen_random_uuid()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)),
+  `oid::regclass` on a column (the table's name), plus the catalog
   functions tools call (`version()`, `current_user`, `current_schema()`,
   `current_setting(name)`, `format_type`, `pg_get_indexdef`,
   `pg_get_constraintdef`, `pg_get_expr`, `pg_get_userbyid`,

@@ -267,13 +267,18 @@ func TestBooleanWhere(t *testing.T) {
 		t.Fatalf("params through IN rewrite: %d", CountParams(sel))
 	}
 
-	// Mixed columns stay an OR; subqueries inside OR are rejected.
+	// Mixed columns stay an OR; subqueries inside OR parse (the executor
+	// refuses them, unless the query never runs) and are reported.
 	sel = parseOne(t, `SELECT id FROM t WHERE a = 1 OR b = 2`).(*Select)
 	if sel.Where[0].Op != "OR" {
 		t.Fatalf("mixed: %+v", sel.Where[0])
 	}
-	if _, err := Parse(`SELECT id FROM t WHERE a = 1 OR b IN (SELECT x FROM u)`); err == nil {
-		t.Fatal("subquery inside OR accepted")
+	if HasSubInOr(sel.Where) {
+		t.Fatal("plain OR reported as holding a subquery")
+	}
+	sel = parseOne(t, `SELECT id FROM t WHERE a = 1 OR b IN (SELECT x FROM u)`).(*Select)
+	if !HasSubInOr(sel.Where) {
+		t.Fatal("subquery inside OR not reported")
 	}
 	// NOT IN and NOT EXISTS still parse as leaves.
 	sel = parseOne(t, `SELECT id FROM t WHERE a NOT IN (1, 2) AND NOT EXISTS (SELECT 1 FROM u)`).(*Select)
@@ -743,5 +748,110 @@ func TestParseSequencesAndDefaults(t *testing.T) {
 	sel := parseOne(t, `SELECT nextval('s'), currval('s'), lastval(), setval('s', 10, false)`).(*Select)
 	if len(sel.Exprs) != 4 || sel.Exprs[0].Expr.Func != "nextval" || sel.Exprs[3].Expr.Func != "setval" {
 		t.Fatalf("sequence functions: %+v", sel.Exprs)
+	}
+}
+
+// TestParseConstraints: column and table constraints in CREATE TABLE,
+// every ALTER TABLE constraint form, and DROP TABLE CASCADE.
+func TestParseConstraints(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE c (
+		id INT8 PRIMARY KEY,
+		pid INT8 REFERENCES p ON DELETE CASCADE,
+		code TEXT CONSTRAINT c_code_fkey REFERENCES p (code) MATCH SIMPLE ON DELETE SET NULL ON UPDATE CASCADE,
+		qty INT8 CHECK (qty > 0),
+		a INT8 UNIQUE,
+		b TEXT,
+		CONSTRAINT c_ab UNIQUE (a, b),
+		CHECK (qty < 100 OR b IS NULL),
+		CONSTRAINT c_pair_fkey FOREIGN KEY (a, b) REFERENCES q (x, y) ON UPDATE NO ACTION
+	)`).(*CreateTable)
+	if len(ct.Columns) != 6 || len(ct.Constraints) != 3 {
+		t.Fatalf("shape: %d columns, %d constraints", len(ct.Columns), len(ct.Constraints))
+	}
+	pid := ct.Columns[1].Constraints
+	if len(pid) != 1 || pid[0].Kind != "foreign" || pid[0].RefTable != "p" || len(pid[0].RefColumns) != 0 || pid[0].OnDelete != "cascade" || pid[0].OnUpdate != "" {
+		t.Fatalf("pid references: %+v", pid)
+	}
+	code := ct.Columns[2].Constraints
+	if len(code) != 1 || code[0].Name != "c_code_fkey" || code[0].RefColumns[0] != "code" || code[0].OnDelete != "set null" || code[0].OnUpdate != "cascade" {
+		t.Fatalf("code references: %+v", code)
+	}
+	qty := ct.Columns[3].Constraints
+	if len(qty) != 1 || qty[0].Kind != "check" || qty[0].Check != "qty > 0" || len(qty[0].CheckFails) != 1 || qty[0].CheckFails[0].Op != "<=" {
+		t.Fatalf("qty check: %+v", qty)
+	}
+	if a := ct.Columns[4].Constraints; len(a) != 1 || a[0].Kind != "unique" || a[0].Columns[0] != "a" {
+		t.Fatalf("a unique: %+v", a)
+	}
+	if c := ct.Constraints[0]; c.Name != "c_ab" || c.Kind != "unique" || len(c.Columns) != 2 {
+		t.Fatalf("table unique: %+v", c)
+	}
+	if c := ct.Constraints[1]; c.Kind != "check" || c.Check != "qty < 100 OR b IS NULL" || len(c.CheckFails) != 2 {
+		t.Fatalf("table check: %+v", c)
+	}
+	if c := ct.Constraints[2]; c.Name != "c_pair_fkey" || c.Kind != "foreign" || c.RefTable != "q" || len(c.RefColumns) != 2 || c.OnUpdate != "restrict" {
+		t.Fatalf("table foreign key: %+v", c)
+	}
+	ct = parseOne(t, `CREATE TABLE p (a INT8, b INT8, CONSTRAINT p_pk PRIMARY KEY (a, b))`).(*CreateTable)
+	if len(ct.PrimaryKey) != 2 || ct.PrimaryKeyName != "p_pk" {
+		t.Fatalf("named primary key: %+v", ct)
+	}
+	for _, bad := range []string{
+		`CREATE TABLE t (a INT8 PRIMARY KEY, CONSTRAINT x)`,
+		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p ON DELETE SET DEFAULT)`,
+		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p MATCH FULL)`,
+		`ALTER TABLE t ADD PRIMARY KEY (a)`,
+		`ALTER TABLE t ALTER COLUMN a SET DEFAULT 1`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%q parsed", bad)
+		}
+	}
+	at := parseOne(t, `ALTER TABLE t ADD CONSTRAINT t_qty_check CHECK (qty > 0) NOT VALID`).(*AlterTable)
+	if at.AddConstraint == nil || at.AddConstraint.Name != "t_qty_check" || at.AddConstraint.Kind != "check" || !at.AddConstraint.NotValid {
+		t.Fatalf("add check: %+v", at.AddConstraint)
+	}
+	at = parseOne(t, `ALTER TABLE t ADD FOREIGN KEY (pid) REFERENCES p (id) ON DELETE RESTRICT`).(*AlterTable)
+	if at.AddConstraint == nil || at.AddConstraint.Kind != "foreign" || at.AddConstraint.Name != "" || at.AddConstraint.OnDelete != "restrict" {
+		t.Fatalf("add foreign key: %+v", at.AddConstraint)
+	}
+	at = parseOne(t, `ALTER TABLE t ADD UNIQUE (a, b)`).(*AlterTable)
+	if at.AddConstraint == nil || at.AddConstraint.Kind != "unique" || len(at.AddConstraint.Columns) != 2 {
+		t.Fatalf("add unique: %+v", at.AddConstraint)
+	}
+	at = parseOne(t, `ALTER TABLE t DROP CONSTRAINT IF EXISTS t_qty_check`).(*AlterTable)
+	if at.DropConstraint != "t_qty_check" || !at.DropConstraintIfExists {
+		t.Fatalf("drop constraint: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t VALIDATE CONSTRAINT t_qty_check`).(*AlterTable)
+	if at.ValidateConstraint != "t_qty_check" {
+		t.Fatalf("validate: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t ALTER COLUMN a SET NOT NULL`).(*AlterTable)
+	if at.SetNotNull != "a" {
+		t.Fatalf("set not null: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t ALTER a DROP NOT NULL`).(*AlterTable)
+	if at.DropNotNull != "a" {
+		t.Fatalf("drop not null: %+v", at)
+	}
+	// ADD COLUMN still parses, with a column constraint attached.
+	at = parseOne(t, `ALTER TABLE t ADD COLUMN c INT8 DEFAULT 0`).(*AlterTable)
+	if at.AddCol == nil || at.AddCol.Name != "c" {
+		t.Fatalf("add column: %+v", at)
+	}
+	dt := parseOne(t, `DROP TABLE IF EXISTS p CASCADE`).(*DropTable)
+	if !dt.IfExists || !dt.Cascade {
+		t.Fatalf("drop cascade: %+v", dt)
+	}
+	// The stored CHECK text round-trips through ParseCheck.
+	fails, err := ParseCheck("qty < 100 OR b IS NULL")
+	if err != nil || len(fails) != 2 || fails[0].Op != ">=" || fails[1].Op != "IS NOT NULL" {
+		t.Fatalf("ParseCheck: %+v %v", fails, err)
+	}
+	// ON CONFLICT ON CONSTRAINT still parses with CONSTRAINT a keyword.
+	ins := parseOne(t, `INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_a_key DO NOTHING`).(*Insert)
+	if ins.OnConflict == nil || ins.OnConflict.Constraint != "t_a_key" {
+		t.Fatalf("on conflict on constraint: %+v", ins.OnConflict)
 	}
 }

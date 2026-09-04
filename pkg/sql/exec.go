@@ -234,7 +234,11 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col.DefaultExpr = fmt.Sprintf("nextval('%s')", sd.Name)
 		owned = true
 	}
-	if owned {
+	constrained, err := s.createTableConstraints(ctx, txn, desc, t)
+	if err != nil {
+		return nil, err
+	}
+	if owned || constrained {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}
@@ -414,6 +418,11 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
+	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
+		if err := s.dropTableConstraints(ctx, txn, existing, t.Cascade); err != nil {
+			return nil, err
+		}
+	}
 	desc, err := s.cat.DropIn(ctx, txn, s.database, t.Name)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -494,6 +503,10 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	guard, err := s.guard(ctx, txn, desc)
+	if err != nil {
+		return nil, err
+	}
 	count := 0
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
@@ -534,8 +547,11 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted); err != nil {
 				return nil, err
 			}
+			if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
+				return nil, err
+			}
 		} else {
-			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted)
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard)
 			if err != nil {
 				return nil, err
 			}
@@ -670,7 +686,7 @@ func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 // It reports whether a row was written (inserted or updated) and that
 // row. A conflict on a unique key other than the arbiter is the usual
 // unique violation, as in PostgreSQL.
-func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) (bool, map[catalog.ColumnID]types.Datum, error) {
+func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard) (bool, map[catalog.ColumnID]types.Datum, error) {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return false, nil, err
@@ -736,6 +752,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, true); err != nil {
 			return false, nil, err
 		}
+		if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
+			return false, nil, err
+		}
 		return true, row, nil
 	}
 	matches := plan.any || (plan.pk && arbiter == "pk") || (plan.index != nil && arbiter == plan.index.Name)
@@ -778,6 +797,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			return false, nil, err
 		}
 		newRow[col.ID] = d
+	}
+	if err := guard.checkUpdate(ctx, txn, oldRow, newRow, wb); err != nil {
+		return false, nil, err
 	}
 	value, err := rowenc.EncodeValue(desc, newRow)
 	if err != nil {
@@ -1356,6 +1378,14 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	if res, ok := s.emptyCatalogSelect(ctx, txn, t); ok {
+		return res, nil
+	}
+	for _, jc := range t.Joins {
+		if jc.FuncTable != nil {
+			return nil, newErrf(CodeFeatureNotSupported, "table function %s cannot be joined", jc.FuncTable.Func)
+		}
+	}
 	if t.Union != nil {
 		return s.execUnion(ctx, txn, t, params)
 	}
@@ -1646,6 +1676,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
+	guard, err := s.guard(ctx, txn, desc)
+	if err != nil {
+		return nil, err
+	}
 	for _, fr := range rows {
 		oldRow := copyRow(fr.row)
 		for _, set := range t.Set {
@@ -1679,6 +1713,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 				return nil, cerr2
 			}
 			fr.row[col.ID] = d
+		}
+		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
+			return nil, err
 		}
 		value, verr := rowenc.EncodeValue(desc, fr.row)
 		if verr != nil {
@@ -1756,9 +1793,16 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
+	guard, err := s.guard(ctx, txn, desc)
+	if err != nil {
+		return nil, err
+	}
 	res := &Result{}
 	var wb kvclient.WriteBatch
 	for _, fr := range rows {
+		if err := guard.checkDelete(ctx, txn, fr.row, &wb); err != nil {
+			return nil, err
+		}
 		wb.Delete(fr.key)
 		if desc.Reshard != nil {
 			shadow, serr := reshardShadowKey(desc, fr.row)
@@ -1823,8 +1867,31 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		desc.NextColumnID = max + 1
 	}
 	switch {
+	case t.AddConstraint != nil || t.ValidateConstraint != "" || t.SetNotNull != "":
+		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
+	case t.DropConstraint != "":
+		return s.execDropConstraint(ctx, txn, desc, t)
+	case t.DropNotNull != "":
+		col, ok := desc.Col(t.DropNotNull)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropNotNull)
+		}
+		if desc.IsPKCol(col.ID) {
+			return nil, newErrf(CodeInvalidColumnReference, "column %q is in the primary key and cannot be nullable", t.DropNotNull)
+		}
+		if col.Identity != "" {
+			return nil, newErrf(CodeSyntaxError, "column %q is an identity column and cannot be nullable", t.DropNotNull)
+		}
+		for i := range desc.Columns {
+			if desc.Columns[i].ID == col.ID {
+				desc.Columns[i].NotNull = false
+			}
+		}
 	case t.AddCol != nil:
 		def := t.AddCol
+		if len(def.Constraints) > 0 {
+			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot carry a constraint: add the column, then ALTER TABLE ... ADD CONSTRAINT")
+		}
 		if def.PrimaryKey {
 			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot add a primary key column")
 		}
@@ -1864,6 +1931,11 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		if desc.IsPKCol(col.ID) {
 			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
+		}
+		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
+			return nil, err
+		} else if len(uses) > 0 {
+			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by constraint %s (drop the constraint first)", t.DropCol, strings.Join(uses, ", "))
 		}
 		for _, idx := range desc.Indexes {
 			for _, id := range idx.ColumnIDs {
@@ -2092,6 +2164,54 @@ func stripConds(conds []parser.Comparison, strip func(string) string, walk func(
 	}
 }
 
+// emptyCatalogSelect answers a select whose base table is an
+// always-empty catalog (pg_trigger, pg_policy, ...) without planning it:
+// the tools' queries over those take shapes (correlated table
+// functions, WITH ORDINALITY) the executor does not run, and the answer
+// is empty either way. Aggregates, grouping and LEFT JOINs from the
+// empty side are left to the planner; unions too.
+func (s *Session) emptyCatalogSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select) (*Result, bool) {
+	if t.Table == "" || t.Union != nil || t.Derived != nil || hasAggregates(t.Exprs) || len(t.GroupBy) > 0 || len(t.Having) > 0 {
+		return nil, false
+	}
+	// lookup resolves a real table of the same name first.
+	desc, err := s.lookup(ctx, txn, t.Table)
+	if err != nil || desc.Virtual == "" || !vtable.IsAlwaysEmpty(desc.Virtual) {
+		return nil, false
+	}
+	vt, ok := vtable.Lookup(desc.Virtual)
+	if !ok {
+		return nil, false
+	}
+	for _, jc := range t.Joins {
+		if jc.Left {
+			return nil, false
+		}
+	}
+	res := &Result{Tag: "SELECT 0"}
+	for _, se := range t.Exprs {
+		switch {
+		case se.Star:
+			for _, c := range vt.Columns {
+				if !c.Hidden {
+					res.Columns = append(res.Columns, ResultColumn{Name: c.Name, Type: c.Type})
+				}
+			}
+		case se.Alias != "":
+			res.Columns = append(res.Columns, ResultColumn{Name: se.Alias, Type: types.String})
+		case se.Expr.Column != "":
+			name := se.Expr.Column
+			if i := strings.LastIndexByte(name, '.'); i >= 0 {
+				name = name[i+1:]
+			}
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: types.String})
+		default:
+			res.Columns = append(res.Columns, ResultColumn{Name: "?column?", Type: types.String})
+		}
+	}
+	return res, true
+}
+
 // execUnion runs each member of a UNION [ALL] chain and concatenates the
 // results (UNION removes duplicate rows). Column names come from the
 // head; ORDER BY names resolve against the head's output columns, then
@@ -2296,7 +2416,14 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return nil, err
 		}
 		cols("table_name", "create_statement")
-		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDef(desc))})
+		byID := func(id uint64) *catalog.TableDescriptor {
+			d, err := catalog.ReadTable(ctx, txn, id)
+			if err != nil {
+				return nil
+			}
+			return d
+		}
+		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDefWith(desc, byID))})
 	case "users":
 		env, err := s.virtualEnv(ctx, txn)
 		if err != nil {

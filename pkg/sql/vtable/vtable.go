@@ -15,6 +15,7 @@ package vtable
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -116,6 +117,27 @@ func Lookup(name string) (*Table, bool) {
 		return t, ok
 	}
 	return nil, false
+}
+
+// IsAlwaysEmpty reports whether name is a catalog that never has rows
+// (the stand-in for a feature datax lacks): a select over it can answer
+// empty without planning whatever shape the tool's query takes.
+func IsAlwaysEmpty(name string) bool {
+	t, ok := Lookup(name)
+	if !ok {
+		return false
+	}
+	return reflect.ValueOf(t.Rows).Pointer() == reflect.ValueOf(empty).Pointer()
+}
+
+// EachTable calls fn for every virtual table, pg_catalog's first.
+func EachTable(fn func(*Table)) {
+	for _, t := range pgCatalogTables {
+		fn(t)
+	}
+	for _, t := range informationSchemaTables {
+		fn(t)
+	}
 }
 
 // IsSchema reports whether name is a virtual schema (so "pg_catalog.x"
@@ -273,6 +295,65 @@ func UniqueDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string 
 	return "UNIQUE (" + strings.Join(cols, ", ") + ")"
 }
 
+// ConstraintOID is a constraint's pg_constraint OID (a bit above the
+// index OIDs of the same table, so the two never collide).
+func ConstraintOID(d *catalog.TableDescriptor, c *catalog.Constraint) int64 {
+	return int64(d.ID)<<16 | 1<<15 | int64(c.ID)
+}
+
+// ConstraintDef renders pg_get_constraintdef() for a CHECK, FOREIGN KEY
+// or UNIQUE constraint. byID resolves a foreign key's referenced table
+// (nil renders its ID).
+func ConstraintDef(d *catalog.TableDescriptor, c *catalog.Constraint, byID func(uint64) *catalog.TableDescriptor) string {
+	names := func(t *catalog.TableDescriptor, ids []catalog.ColumnID) string {
+		cols := make([]string, 0, len(ids))
+		for _, id := range ids {
+			cols = append(cols, columnName(t, id))
+		}
+		return strings.Join(cols, ", ")
+	}
+	switch c.Kind {
+	case catalog.ConstraintCheck:
+		return "CHECK (" + c.Expr + ")"
+	case catalog.ConstraintUnique:
+		return "UNIQUE (" + names(d, c.Columns) + ")"
+	case catalog.ConstraintForeign:
+		ref := d
+		if c.RefTable != d.ID {
+			ref = nil
+			if byID != nil {
+				ref = byID(c.RefTable)
+			}
+		}
+		refName, refCols := fmt.Sprintf("<%d>", c.RefTable), ""
+		if ref != nil {
+			refName, refCols = ref.Name, names(ref, c.RefColumns)
+		}
+		def := "FOREIGN KEY (" + names(d, c.Columns) + ") REFERENCES " + refName + "(" + refCols + ")"
+		if c.OnUpdate != "" && c.OnUpdate != catalog.FKRestrict {
+			def += " ON UPDATE " + strings.ToUpper(c.OnUpdate)
+		}
+		if c.OnDelete != "" && c.OnDelete != catalog.FKRestrict {
+			def += " ON DELETE " + strings.ToUpper(c.OnDelete)
+		}
+		if !c.Validated {
+			def += " NOT VALID"
+		}
+		return def
+	}
+	return ""
+}
+
+// tableByID finds a table among those the session sees.
+func (env *Env) tableByID(id uint64) *catalog.TableDescriptor {
+	for _, t := range env.Tables {
+		if t.ID == id {
+			return t
+		}
+	}
+	return nil
+}
+
 func columnByID(d *catalog.TableDescriptor, id catalog.ColumnID) (*catalog.Column, bool) {
 	for i := range d.Columns {
 		if d.Columns[i].ID == id {
@@ -291,6 +372,12 @@ func columnName(d *catalog.TableDescriptor, id catalog.ColumnID) string {
 
 // CreateTableDef renders SHOW CREATE TABLE.
 func CreateTableDef(d *catalog.TableDescriptor) string {
+	return CreateTableDefWith(d, nil)
+}
+
+// CreateTableDefWith is CreateTableDef with a resolver for the tables
+// the table's foreign keys reference.
+func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.TableDescriptor) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CREATE TABLE %s (\n", d.Name)
 	for _, c := range d.Columns {
@@ -315,7 +402,16 @@ func CreateTableDef(d *catalog.TableDescriptor) string {
 		b.WriteString(",\n")
 	}
 	fmt.Fprintf(&b, "  %s", PrimaryKeyDef(d))
+	owned := map[uint64]bool{} // indexes a constraint owns render as the constraint
+	for i := range d.Constraints {
+		if c := &d.Constraints[i]; c.Kind == catalog.ConstraintUnique || c.AutoIndex {
+			owned[c.IndexID] = true
+		}
+	}
 	for _, idx := range d.Indexes {
+		if owned[idx.ID] {
+			continue
+		}
 		unique := ""
 		if idx.Unique {
 			unique = "UNIQUE "
@@ -325,6 +421,10 @@ func CreateTableDef(d *catalog.TableDescriptor) string {
 			cols = append(cols, columnName(d, id))
 		}
 		fmt.Fprintf(&b, ",\n  %sINDEX %s (%s)", unique, idx.Name, strings.Join(cols, ", "))
+	}
+	for i := range d.Constraints {
+		c := &d.Constraints[i]
+		fmt.Fprintf(&b, ",\n  CONSTRAINT %s %s", c.Name, ConstraintDef(d, c, byID))
 	}
 	b.WriteString("\n)")
 	if d.Timeseries {
