@@ -79,6 +79,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDropSequence(ctx, txn, t)
 	case *parser.ShowSequences:
 		return s.execShowSequences(ctx, txn)
+	case *parser.ShowFunctions:
+		return execShowFunctions(), nil
 	case *parser.Show:
 		return s.execShow(ctx, txn, t)
 	case *parser.ShowStats:
@@ -895,7 +897,7 @@ func (r *returning) project(desc *catalog.TableDescriptor, row map[catalog.Colum
 			if err != nil {
 				return nil, err
 			}
-			out[i] = d
+			out[i] = conformTo(d, p.col.Type)
 			continue
 		}
 		d, ok := row[p.col.ID]
@@ -1445,12 +1447,17 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if name == "" {
 				name = "?column?"
 			}
-			fam := d.Fam
-			if d.Null {
-				fam = types.String
+			// Typed as described (Describe sees the expression, not the
+			// value); the value is conformed to it.
+			fam := exprFamily(se.Expr, nil)
+			if fam == types.Unknown {
+				fam = d.Fam
+				if d.Null {
+					fam = types.String
+				}
 			}
 			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
-			row = append(row, d)
+			row = append(row, conformTo(d, fam))
 		}
 		res.Rows = [][]types.Datum{row}
 		res.Tag = "SELECT 1"
@@ -1584,7 +1591,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				if err != nil {
 					return nil, err
 				}
-				out[i] = d
+				out[i] = conformTo(d, p.col.Type)
 				continue
 			}
 			d, ok := fr.row[p.col.ID]

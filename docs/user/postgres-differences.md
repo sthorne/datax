@@ -12,7 +12,7 @@ syntax error or `0A000` feature not supported):
 | Missing | Workaround |
 |---|---|
 | `OFFSET` | paginate by key: `WHERE id > $last ORDER BY id LIMIT n` (faster anyway) |
-| Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`, `array_to_string()`, `pg_size_pretty()` and the catalog functions tools call ([list](sql.md#reading)) — SQLSTATE `42883` | compute client-side |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `INTERVAL` as a type (intervals are text: `ts + '2 hours'`); expressions over aggregates (`SUM(a) / COUNT(*)`); window functions; user-defined functions | compute client-side or in a derived table |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` **is supported**) | merge client-side |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |

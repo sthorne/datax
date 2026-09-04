@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"math"
 	"regexp"
 	"strconv"
@@ -125,6 +126,9 @@ type Session struct {
 	cascadeLimit int
 	pendingWipes []indexWipe
 	extraDDL     []string
+	// stmtNow is the statement timestamp (now(), current_timestamp):
+	// taken from the clock on first use in each statement.
+	stmtNow int64
 	// seqs is the session's sequence state (value blocks, currval,
 	// lastval), created on first use.
 	seqs *seqState
@@ -368,6 +372,16 @@ func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *cat
 
 func (s *Session) State() TxnState { return s.state }
 
+// statementTime is now() for the statement in flight: one reading of
+// the clock, so now(), current_timestamp and current_date agree within
+// a statement.
+func (s *Session) statementTime() int64 {
+	if s.stmtNow == 0 {
+		s.stmtNow = s.db.Clock().Now().WallTime
+	}
+	return s.stmtNow
+}
+
 // Close rolls back any open transaction (connection teardown).
 func (s *Session) Close(ctx context.Context) {
 	if s.txn != nil {
@@ -379,6 +393,7 @@ func (s *Session) Close(ctx context.Context) {
 
 // Execute runs one parsed statement with the given parameter values.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+	s.stmtNow = 0
 	// A failed transaction accepts only ROLLBACK (or COMMIT, which also
 	// rolls back) — and ROLLBACK TO SAVEPOINT, which escapes the failed
 	// state by restoring the savepoint (PostgreSQL semantics).
@@ -774,11 +789,17 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		}
 		base = d
 	case e.Cmp != nil:
-		ok, err := condsHold([]parser.Comparison{*e.Cmp}, env, params)
+		// A predicate as a value is three-valued: a comparison with a
+		// NULL operand is NULL, not false (WHERE's rule).
+		ok, null, err := cond3(*e.Cmp, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
-		base = types.NewBool(ok)
+		if null {
+			base = types.DNull
+		} else {
+			base = types.NewBool(ok)
+		}
 	case e.Sub != nil:
 		// Scalar subqueries are evaluated and spliced before execution.
 		return types.Datum{}, newErrf(CodeInternal, "unresolved scalar subquery")
@@ -792,31 +813,63 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, err
 		}
 	}
-	if e.BinOp == "" {
-		return base, nil
+	if e.BinOp != "" {
+		rhs, err := evalExprEnv(*e.Right, env, params)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		if base, err = applyArith(base, e.BinOp, rhs); err != nil {
+			return types.Datum{}, err
+		}
 	}
-	rhs, err := evalExprEnv(*e.Right, env, params)
-	if err != nil {
-		return types.Datum{}, err
+	if e.Cast != "" {
+		d, err := builtins.Cast(base, e.Cast)
+		return d, builtinErr(err)
 	}
-	return applyArith(base, e.BinOp, rhs)
+	return base, nil
 }
 
 func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	if l.Null || r.Null {
 		return types.DNull, nil
 	}
-	if op == "||" {
+	if d, ok, err := builtins.DateArith(l, op, r); ok {
+		return d, builtinErr(err)
+	}
+	switch op {
+	case "||":
 		return types.NewString(l.Text() + r.Text()), nil
+	case "%":
+		d, err := builtins.Mod(l, r)
+		return d, builtinErr(err)
+	case "^":
+		d, err := builtins.Power(l, r)
+		return d, builtinErr(err)
 	}
 	if l.Fam == types.Int && r.Fam == types.Int {
+		// Integer arithmetic overflows to an error, never wraps.
 		switch op {
 		case "+":
-			return types.NewInt(l.I + r.I), nil
+			s := l.I + r.I
+			if (s > l.I) != (r.I > 0) && r.I != 0 {
+				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
+			}
+			return types.NewInt(s), nil
 		case "-":
-			return types.NewInt(l.I - r.I), nil
+			s := l.I - r.I
+			if (s < l.I) != (r.I > 0) && r.I != 0 {
+				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
+			}
+			return types.NewInt(s), nil
 		case "*":
-			return types.NewInt(l.I * r.I), nil
+			if l.I != 0 && r.I != 0 {
+				p := l.I * r.I
+				if p/r.I != l.I || (l.I == -1 && r.I == math.MinInt64) || (r.I == -1 && l.I == math.MinInt64) {
+					return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
+				}
+				return types.NewInt(p), nil
+			}
+			return types.NewInt(0), nil
 		case "/":
 			// Integer division truncates (PostgreSQL semantics).
 			if r.I == 0 {
@@ -898,57 +951,18 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		}
 		args[i] = d
 	}
+	if b, ok := builtins.Lookup(e.Func); ok && !b.Session {
+		d, err := b.Call(args)
+		if err != nil {
+			var be *builtins.Error
+			if errors.As(err, &be) {
+				return types.Datum{}, newErrf(be.Code, "%s", be.Msg)
+			}
+			return types.Datum{}, err
+		}
+		return d, nil
+	}
 	switch e.Func {
-	case "coalesce":
-		for _, d := range args {
-			if !d.Null {
-				return d, nil
-			}
-		}
-		return types.DNull, nil
-	case "length":
-		if args[0].Null {
-			return types.DNull, nil
-		}
-		if args[0].Fam != types.String {
-			return types.Datum{}, newErrf(CodeFeatureNotSupported, "length() requires a text argument, got %s", args[0].Fam)
-		}
-		return types.NewInt(int64(len([]rune(args[0].S)))), nil
-	case "lower", "upper":
-		if args[0].Null {
-			return types.DNull, nil
-		}
-		if args[0].Fam != types.String {
-			return types.Datum{}, newErrf(CodeFeatureNotSupported, "%s() requires a text argument, got %s", e.Func, args[0].Fam)
-		}
-		if e.Func == "lower" {
-			return types.NewString(strings.ToLower(args[0].S)), nil
-		}
-		return types.NewString(strings.ToUpper(args[0].S)), nil
-	case "abs":
-		d := args[0]
-		if d.Null {
-			return types.DNull, nil
-		}
-		switch d.Fam {
-		case types.Int:
-			if d.I < 0 {
-				return types.NewInt(-d.I), nil
-			}
-			return d, nil
-		case types.Float:
-			return types.NewFloat(math.Abs(d.F)), nil
-		case types.Decimal:
-			v, err := d.DecimalVal()
-			if err != nil {
-				return types.Datum{}, newErrf(CodeInternal, "%v", err)
-			}
-			if v.Sign() < 0 {
-				return types.NewDecimal(decimal.Neg(v).String()), nil
-			}
-			return d, nil
-		}
-		return types.Datum{}, newErrf(CodeFeatureNotSupported, "abs() requires a numeric argument, got %s", d.Fam)
 	case "quote_ident":
 		if args[0].Null {
 			return types.DNull, nil
@@ -1021,19 +1035,11 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if cmp.Expr != nil {
 			// Computed left-hand side: evaluate both sides and compare raw
 			// (Compare lifts numerics; no column type to coerce toward).
-			lhs, err := evalExpr(*cmp.Expr, desc, row, params)
+			ok, err := condsHold([]parser.Comparison{cmp}, tableEnv{desc: desc, row: row}, params)
 			if err != nil {
 				return false, err
 			}
-			rhs, err := evalExpr(cmp.Value, desc, row, params)
-			if err != nil {
-				return false, err
-			}
-			if lhs.Null || rhs.Null {
-				return false, nil
-			}
-			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
-			if err != nil || !ok {
+			if !ok {
 				return false, nil
 			}
 			continue
@@ -1084,6 +1090,24 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			}
 			continue
 		}
+		if nullAwareOp(cmp.Op) {
+			var rhs types.Datum
+			if !isBoolTestOp(cmp.Op) {
+				v, err := evalExpr(cmp.Value, desc, row, params)
+				if err != nil {
+					return false, err
+				}
+				rhs = v
+			}
+			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
+			}
+			continue
+		}
 		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
 			match, err := matchesIn(cmp, cmpType, lhs, desc, row, params)
 			if err != nil || !match {
@@ -1125,7 +1149,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			return false, nil // NULL comparisons never match
 		}
 		if !plainCmpOp(cmp.Op) {
-			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
 			if err != nil {
 				return false, err
 			}
@@ -1255,14 +1279,26 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 			}
 			continue
 		}
-		rhs, err := evalExprEnv(cmp.Value, env, params)
-		if err != nil {
-			return false, err
+		var rhs types.Datum
+		if !isBoolTestOp(cmp.Op) {
+			if rhs, err = evalExprEnv(cmp.Value, env, params); err != nil {
+				return false, err
+			}
+		}
+		if nullAwareOp(cmp.Op) {
+			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
+			}
+			continue
 		}
 		if lhs.Null || rhs.Null {
 			return false, nil
 		}
-		ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+		ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
 		if err != nil || !ok {
 			return false, nil
 		}
@@ -1270,9 +1306,234 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 	return true, nil
 }
 
+// cond3 evaluates one conjunct under three-valued logic: (value, false)
+// when it is TRUE or FALSE, (_, true) when it is UNKNOWN.
+func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool, error) {
+	switch cmp.Op {
+	case "TRUE":
+		return true, false, nil
+	case "FALSE":
+		return false, false, nil
+	case "OR":
+		// OR of ANDs: TRUE if any disjunct is TRUE, else UNKNOWN if any
+		// is UNKNOWN, else FALSE.
+		unknown := false
+		for _, alt := range cmp.Or {
+			ok, null, err := conds3(alt, env, params)
+			if err != nil {
+				return false, false, err
+			}
+			if ok {
+				return true, false, nil
+			}
+			unknown = unknown || null
+		}
+		return false, unknown, nil
+	}
+	var lhs types.Datum
+	var err error
+	if cmp.Expr != nil {
+		lhs, err = evalExprEnv(*cmp.Expr, env, params)
+	} else {
+		lhs, err = env.col(cmp.Column)
+		if err == nil && len(cmp.Path) > 0 {
+			lhs, err = applyPath(lhs, cmp.Path)
+		}
+	}
+	if err != nil {
+		return false, false, err
+	}
+	switch cmp.Op {
+	case "IS NULL":
+		return lhs.Null, false, nil
+	case "IS NOT NULL":
+		return !lhs.Null, false, nil
+	case "IN", "NOT IN":
+		if lhs.Null {
+			return false, true, nil
+		}
+		sawNull := false
+		for _, ve := range cmp.Values {
+			v, err := evalExprEnv(ve, env, params)
+			if err != nil {
+				return false, false, err
+			}
+			if v.Null {
+				sawNull = true
+				continue
+			}
+			if c, err := lhs.Compare(v); err == nil && c == 0 {
+				return cmp.Op == "IN", false, nil
+			}
+		}
+		if sawNull {
+			return false, true, nil
+		}
+		return cmp.Op != "IN", false, nil
+	}
+	var rhs types.Datum
+	if !isBoolTestOp(cmp.Op) {
+		if rhs, err = evalExprEnv(cmp.Value, env, params); err != nil {
+			return false, false, err
+		}
+	}
+	if nullAwareOp(cmp.Op) {
+		ok, err := applyNullAware(cmp.Op, lhs, rhs)
+		return ok, false, err
+	}
+	if lhs.Null || rhs.Null {
+		return false, true, nil
+	}
+	ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+	if err != nil {
+		return false, false, err
+	}
+	return ok, false, nil
+}
+
+// conds3 is the three-valued AND of a conjunction.
+func conds3(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool, bool, error) {
+	unknown := false
+	for _, c := range conds {
+		ok, null, err := cond3(c, env, params)
+		if err != nil {
+			return false, false, err
+		}
+		if !ok && !null {
+			return false, false, nil
+		}
+		unknown = unknown || null
+	}
+	return !unknown, unknown, nil
+}
+
+// jsonOp evaluates the jsonb operators: @> and <@ (containment), ?
+// (the key or string element exists), ?| and ?& (any / all of a text
+// array of keys exist).
+func jsonOp(op string, lhs, rhs types.Datum) (bool, error) {
+	l, err := lhs.Coerce(types.Jsonb)
+	if err != nil {
+		return false, newErrf(CodeFeatureNotSupported, "%s requires a jsonb left operand (got %s)", op, lhs.Fam)
+	}
+	switch op {
+	case "@>", "<@":
+		r, err := rhs.Coerce(types.Jsonb)
+		if err != nil {
+			return false, newErrf(CodeInvalidTextRepresentation, "%s: %v", op, err)
+		}
+		if op == "<@" {
+			l, r = r, l
+		}
+		return jsonbContains(l, r)
+	case "?":
+		v, err := decodeJSONValue(l.S)
+		if err != nil {
+			return false, err
+		}
+		return builtins.JSONHasKey(v, rhs.Text()), nil
+	case "?|", "?&":
+		v, err := decodeJSONValue(l.S)
+		if err != nil {
+			return false, err
+		}
+		keys := builtins.TextArrayElems(rhs.Text())
+		for _, k := range keys {
+			has := builtins.JSONHasKey(v, k)
+			if has && op == "?|" {
+				return true, nil
+			}
+			if !has && op == "?&" {
+				return false, nil
+			}
+		}
+		return op == "?&" && len(keys) > 0, nil
+	}
+	return false, newErrf(CodeInternal, "unknown jsonb operator %q", op)
+}
+
+func decodeJSONValue(s string) (any, error) {
+	var v any
+	if err := decodeJSONNumber(s, &v); err != nil {
+		return nil, newErrf(CodeInternal, "malformed stored jsonb: %v", err)
+	}
+	return v, nil
+}
+
+// builtinErr converts a builtins error into a SQL error with its
+// SQLSTATE (nil stays nil).
+func builtinErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var be *builtins.Error
+	if errors.As(err, &be) {
+		return newErrf(be.Code, "%s", be.Msg)
+	}
+	return err
+}
+
+// boolTest evaluates x IS [NOT] TRUE | FALSE: a NULL is neither.
+func boolTest(op string, d types.Datum) (bool, error) {
+	want := strings.HasSuffix(op, "TRUE")
+	not := strings.Contains(op, "NOT")
+	if d.Null {
+		return not, nil
+	}
+	b, err := d.Coerce(types.Bool)
+	if err != nil {
+		return false, newErrf(CodeInvalidTextRepresentation, "%s: %v", op, err)
+	}
+	return (b.B == want) != not, nil
+}
+
+// distinctFrom evaluates x IS [NOT] DISTINCT FROM y: NULLs compare as a
+// value, equal to each other and different from everything else.
+func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
+	distinct := lhs.Null != rhs.Null
+	if !lhs.Null && !rhs.Null {
+		if rhs.Fam != lhs.Fam {
+			if c, err := rhs.Coerce(lhs.Fam); err == nil {
+				rhs = c
+			}
+		}
+		c, err := lhs.Compare(rhs)
+		distinct = err != nil || c != 0
+	}
+	return distinct != strings.Contains(op, "NOT"), nil
+}
+
+// isBoolTestOp reports the one-sided IS [NOT] TRUE | FALSE tests.
+func isBoolTestOp(op string) bool {
+	return strings.HasSuffix(op, "TRUE") || strings.HasSuffix(op, "FALSE")
+}
+
+// nullAwareOp reports whether op decides on NULL operands itself
+// (instead of the NULL-never-matches rule).
+func nullAwareOp(op string) bool {
+	switch op {
+	case "IS TRUE", "IS NOT TRUE", "IS FALSE", "IS NOT FALSE", "IS DISTINCT FROM", "IS NOT DISTINCT FROM":
+		return true
+	}
+	return false
+}
+
+// applyNullAware evaluates the null-aware operators.
+func applyNullAware(op string, lhs, rhs types.Datum) (bool, error) {
+	if strings.Contains(op, "DISTINCT") {
+		return distinctFrom(op, lhs, rhs)
+	}
+	return boolTest(op, lhs)
+}
+
 // applyCmpOp applies an operator to two values: ordering operators
 // through Compare, the regular-expression operators on text.
 func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
+	return applyCmpOpEsc(op, lhs, rhs, "")
+}
+
+// applyCmpOpEsc is applyCmpOp with a pattern's ESCAPE character ("" =
+// backslash, parser.NoEscape = none).
+func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
 	switch op {
 	case "~", "!~", "~*", "!~*":
 		re, err := regexFor(rhs.Text(), op == "~*" || op == "!~*")
@@ -1284,12 +1545,25 @@ func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
 	}
 	switch op {
 	case "LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE":
-		re, err := regexFor(likeToRegexp(rhs.Text()), strings.HasSuffix(op, "ILIKE"))
+		re, err := regexFor(likeToRegexpEsc(rhs.Text(), escape), strings.HasSuffix(op, "ILIKE"))
 		if err != nil {
 			return false, err
 		}
 		m := re.MatchString(lhs.Text())
 		return m == !strings.HasPrefix(op, "NOT"), nil
+	case "SIMILAR TO", "NOT SIMILAR TO":
+		re, err := regexFor(similarToRegexp(rhs.Text(), escape), false)
+		if err != nil {
+			return false, newErrf(CodeInvalidRegexp, "invalid SIMILAR TO pattern: %v", err)
+		}
+		m := re.MatchString(lhs.Text())
+		return m == !strings.HasPrefix(op, "NOT"), nil
+	case "@>", "NOT @>", "<@", "NOT <@", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
+		ok, err := jsonOp(strings.TrimPrefix(op, "NOT "), lhs, rhs)
+		if err != nil {
+			return false, err
+		}
+		return ok == !strings.HasPrefix(op, "NOT "), nil
 	}
 	if i := strings.IndexByte(op, ' '); i >= 0 {
 		// Quantified comparison over a text array value ('{a,b}'): ANY
@@ -1328,6 +1602,24 @@ func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
 // likeToRegexp translates a LIKE pattern (% and _ wildcards, backslash
 // escapes) into an anchored regular expression.
 func likeToRegexp(pattern string) string {
+	return likeToRegexpEsc(pattern, "")
+}
+
+// escapeRune resolves a pattern's ESCAPE character: backslash by
+// default, none for parser.NoEscape.
+func escapeRune(escape string) (rune, bool) {
+	switch escape {
+	case "":
+		return '\\', true
+	case parser.NoEscape:
+		return 0, false
+	}
+	r := []rune(escape)
+	return r[0], true
+}
+
+func likeToRegexpEsc(pattern, escape string) string {
+	esc, hasEsc := escapeRune(escape)
 	var b strings.Builder
 	b.WriteString("^")
 	escaped := false
@@ -1336,7 +1628,7 @@ func likeToRegexp(pattern string) string {
 		case escaped:
 			b.WriteString(regexp.QuoteMeta(string(r)))
 			escaped = false
-		case r == '\\':
+		case hasEsc && r == esc:
 			escaped = true
 		case r == '%':
 			b.WriteString(".*")
@@ -1403,6 +1695,35 @@ var (
 
 // regexFor compiles a POSIX-style pattern (Go's RE2 covers what psql and
 // the tools send), cached.
+// similarToRegexp translates a SIMILAR TO pattern — SQL's % and _
+// wildcards over a regular expression using | * + ? {m,n} ( ) [ ] —
+// into an anchored RE2 expression.
+func similarToRegexp(pattern, escape string) string {
+	esc, hasEsc := escapeRune(escape)
+	var b strings.Builder
+	b.WriteString("^(?:")
+	escaped := false
+	for _, r := range pattern {
+		switch {
+		case escaped:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+			escaped = false
+		case hasEsc && r == esc:
+			escaped = true
+		case r == '%':
+			b.WriteString(".*")
+		case r == '_':
+			b.WriteString(".")
+		case strings.ContainsRune("|*+?{}()[]", r):
+			b.WriteRune(r)
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString(")$")
+	return b.String()
+}
+
 func regexFor(pattern string, fold bool) (*regexp.Regexp, error) {
 	key := pattern
 	if fold {

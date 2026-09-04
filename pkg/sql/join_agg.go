@@ -71,6 +71,9 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 			}
 			se.AggCol = name
 		}
+		if err := canonAggExprs(se, canon); err != nil {
+			return nil, err
+		}
 	}
 	c.GroupBy = append([]string(nil), t.GroupBy...)
 	for i := range c.GroupBy {
@@ -91,6 +94,9 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 					return nil, err
 				}
 				agg.AggCol = name
+			}
+			if err := canonAggExprs(&agg, canon); err != nil {
+				return nil, err
 			}
 			hc.Agg = &agg
 		} else if hc.Column != "" {
@@ -117,6 +123,135 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 	// double-resolve un-canonicalized names.
 	c.Where = nil
 	return &c, nil
+}
+
+// canonAggExprs rewrites the column references inside an aggregate's
+// expression argument, extra arguments, FILTER and WITHIN GROUP to the
+// synthetic descriptor's names.
+func canonAggExprs(se *parser.SelectExpr, canon func(string) (string, error)) error {
+	var err error
+	rename := func(name string) string {
+		if err != nil {
+			return name
+		}
+		n, e := canon(name)
+		if e != nil {
+			err = e
+			return name
+		}
+		return n
+	}
+	if se.AggArg != nil {
+		e := renameExprColumns(*se.AggArg, rename)
+		se.AggArg = &e
+	}
+	if len(se.AggArgs) > 0 {
+		args := make([]parser.Expr, len(se.AggArgs))
+		for i, a := range se.AggArgs {
+			args[i] = renameExprColumns(a, rename)
+		}
+		se.AggArgs = args
+	}
+	if len(se.AggFilter) > 0 {
+		se.AggFilter = renameCondColumns(se.AggFilter, rename)
+	}
+	if len(se.AggOrder) > 0 {
+		order := make([]parser.OrderCol, len(se.AggOrder))
+		for i, oc := range se.AggOrder {
+			order[i] = oc
+			if oc.Expr != nil {
+				e := renameExprColumns(*oc.Expr, rename)
+				order[i].Expr = &e
+			} else if oc.Column != "" {
+				order[i].Column = rename(oc.Column)
+			}
+		}
+		se.AggOrder = order
+	}
+	return err
+}
+
+// renameExprColumns returns a copy of e with every column reference
+// renamed.
+func renameExprColumns(e parser.Expr, rename func(string) string) parser.Expr {
+	out := e
+	if e.Column != "" {
+		out.Column = rename(e.Column)
+	}
+	if e.Left != nil {
+		l := renameExprColumns(*e.Left, rename)
+		out.Left = &l
+	}
+	if e.Right != nil {
+		r := renameExprColumns(*e.Right, rename)
+		out.Right = &r
+	}
+	if len(e.Args) > 0 {
+		out.Args = make([]parser.Expr, len(e.Args))
+		for i, a := range e.Args {
+			out.Args[i] = renameExprColumns(a, rename)
+		}
+	}
+	if e.Case != nil {
+		ce := *e.Case
+		if ce.Operand != nil {
+			op := renameExprColumns(*ce.Operand, rename)
+			ce.Operand = &op
+		}
+		ce.Whens = make([]parser.CaseWhen, len(e.Case.Whens))
+		for i, w := range e.Case.Whens {
+			nw := w
+			if w.Value != nil {
+				v := renameExprColumns(*w.Value, rename)
+				nw.Value = &v
+			}
+			if len(w.Cond) > 0 {
+				nw.Cond = renameCondColumns(w.Cond, rename)
+			}
+			nw.Result = renameExprColumns(w.Result, rename)
+			ce.Whens[i] = nw
+		}
+		if ce.Else != nil {
+			el := renameExprColumns(*ce.Else, rename)
+			ce.Else = &el
+		}
+		out.Case = &ce
+	}
+	if e.Cmp != nil {
+		c := renameCondColumns([]parser.Comparison{*e.Cmp}, rename)[0]
+		out.Cmp = &c
+	}
+	return out
+}
+
+// renameCondColumns is renameExprColumns over a conjunction.
+func renameCondColumns(conds []parser.Comparison, rename func(string) string) []parser.Comparison {
+	out := make([]parser.Comparison, len(conds))
+	for i, c := range conds {
+		nc := c
+		if c.Column != "" {
+			nc.Column = rename(c.Column)
+		}
+		if c.Expr != nil {
+			e := renameExprColumns(*c.Expr, rename)
+			nc.Expr = &e
+		}
+		nc.Value = renameExprColumns(c.Value, rename)
+		if len(c.Values) > 0 {
+			nc.Values = make([]parser.Expr, len(c.Values))
+			for j, v := range c.Values {
+				nc.Values[j] = renameExprColumns(v, rename)
+			}
+		}
+		if len(c.Or) > 0 {
+			nc.Or = make([][]parser.Comparison, len(c.Or))
+			for j, d := range c.Or {
+				nc.Or[j] = renameCondColumns(d, rename)
+			}
+		}
+		out[i] = nc
+	}
+	return out
 }
 
 // groupedJoinQuery canonicalizes the select and resolves it against the

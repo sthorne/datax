@@ -73,6 +73,17 @@ func TestConstraints(t *testing.T) {
 	code("check unknown column", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8 CHECK (m > 0))`, sql.CodeUndefinedColumn)
 	code("check unknown function", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8 CHECK (nosuch(n) > 0))`, sql.CodeSyntaxError)
 	code("check volatile", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8 CHECK (n > unique_rowid()))`, sql.CodeFeatureNotSupported)
+	// Stable session functions are allowed and resolved per statement.
+	execSQL(t, ctx, s, `CREATE TABLE stamped (id INT8 PRIMARY KEY, at TIMESTAMPTZ CHECK (at <= now()), who TEXT CHECK (who = current_user))`)
+	execSQL(t, ctx, s, `INSERT INTO stamped VALUES (1, '2020-01-01 00:00:00Z', 'root')`)
+	code("check now()@stamped_at_check", `INSERT INTO stamped VALUES (2, '2100-01-01 00:00:00Z', 'root')`, sql.CodeCheckViolation)
+	code("check current_user@stamped_who_check", `INSERT INTO stamped VALUES (2, '2020-01-01 00:00:00Z', 'bob')`, sql.CodeCheckViolation)
+	execSQL(t, ctx, s, `CREATE TABLE stamped2 (id INT8 PRIMARY KEY, at TIMESTAMPTZ)`)
+	execSQL(t, ctx, s, `INSERT INTO stamped2 VALUES (1, '2020-01-01 00:00:00Z'), (2, '2100-01-01 00:00:00Z')`)
+	code("add check now() validates@fut", `ALTER TABLE stamped2 ADD CONSTRAINT fut CHECK (at <= now())`, sql.CodeCheckViolation)
+	execSQL(t, ctx, s, `DELETE FROM stamped2 WHERE id = 2`)
+	execSQL(t, ctx, s, `ALTER TABLE stamped2 ADD CONSTRAINT fut CHECK (at <= now())`)
+	code("added check now() enforced@fut", `INSERT INTO stamped2 VALUES (2, '2100-01-01 00:00:00Z')`, sql.CodeCheckViolation)
 	code("duplicate constraint name", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8, CONSTRAINT c CHECK (n > 0), CONSTRAINT c CHECK (n < 9))`, sql.CodeDuplicateObject)
 	expect("check constraints in the catalog",
 		execSQL(t, ctx, s, `SELECT conname, contype, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'items'::regclass AND contype = 'c' ORDER BY conname`),

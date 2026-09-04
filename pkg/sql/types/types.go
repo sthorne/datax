@@ -4,6 +4,7 @@ package types
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -138,13 +139,30 @@ var timestampFormats = []string{
 	"2006-01-02 15:04:05.999999999Z07",
 	"2006-01-02 15:04:05.999999999",
 	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04Z07:00",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
 	"2006-01-02",
 }
+
+// Timestamps are Unix nanoseconds in an int64, which spans the years
+// 1678 to 2262; values outside are refused (ErrTimestampRange) rather
+// than wrapped.
+var (
+	minTimestamp = time.Date(1678, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxTimestamp = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
+	// ErrTimestampRange wraps a parse of a timestamp outside the
+	// representable years.
+	ErrTimestampRange = errors.New("timestamp out of range")
+)
 
 // ParseTimestamp parses a timestamp string to UTC Unix nanoseconds.
 func ParseTimestamp(s string) (int64, error) {
 	for _, f := range timestampFormats {
 		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
+			if t.Before(minTimestamp) || !t.Before(maxTimestamp) {
+				return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
+			}
 			return t.UTC().UnixNano(), nil
 		}
 	}

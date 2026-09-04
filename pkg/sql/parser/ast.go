@@ -13,6 +13,13 @@ type Statement interface{ stmt() }
 type PathStep struct {
 	Key  string `json:"key"`
 	Text bool   `json:"text,omitempty"`
+	// IsIndex marks -> n / ->> n: Index is an array position (negative
+	// from the end).
+	IsIndex bool `json:"is_index,omitempty"`
+	Index   int  `json:"index,omitempty"`
+	// Keys is a #> '{a,b}' / #>> '{a,b}' path: each key an object field
+	// or, when numeric, an array position.
+	Keys []string `json:"keys,omitempty"`
 }
 
 // Expr is a scalar expression: a literal, a parameter ($N), a column
@@ -83,6 +90,9 @@ type Comparison struct {
 	// conjuncts are never usable for key bounds and are v1-restricted to
 	// single-table queries.
 	Expr *Expr `json:"expr,omitempty"`
+	// Escape is the ESCAPE character of a LIKE / ILIKE / SIMILAR TO
+	// pattern ("" = backslash).
+	Escape string `json:"escape,omitempty"`
 	// Or (Op "OR") is a disjunction of conjunctions: the conjunct is true
 	// when ANY inner []Comparison is entirely true. NOT was eliminated at
 	// parse time (De Morgan + operator negation — sound under SQL
@@ -195,6 +205,9 @@ type AlterSequence struct {
 // ShowSequences is SHOW SEQUENCES.
 type ShowSequences struct{}
 
+// ShowFunctions is SHOW FUNCTIONS: the builtin function reference.
+type ShowFunctions struct{}
+
 // CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
 type CreateIndex struct {
 	Unique  bool
@@ -286,11 +299,22 @@ type SelectExpr struct {
 	Star  bool
 	Expr  Expr
 	Alias string
-	// Agg is an aggregate call (COUNT/SUM/AVG/MIN/MAX, upper-cased).
-	// AggStar marks COUNT(*); otherwise AggCol names the argument column.
-	Agg     string
-	AggStar bool
-	AggCol  string
+	// Agg is an aggregate call (COUNT, SUM, AVG, MIN, MAX, STRING_AGG,
+	// ARRAY_AGG, BOOL_AND, BOOL_OR, STDDEV, VARIANCE, PERCENTILE_CONT,
+	// PERCENTILE_DISC, JSONB_AGG, JSONB_OBJECT_AGG, ..., upper-cased).
+	// AggStar marks COUNT(*); AggCol names a plain column argument, else
+	// AggArg is the argument expression. AggArgs are further arguments
+	// (string_agg's separator, jsonb_object_agg's value); AggDistinct
+	// marks DISTINCT; AggFilter is FILTER (WHERE ...); AggOrder is WITHIN
+	// GROUP (ORDER BY ...) for the ordered-set aggregates.
+	Agg         string
+	AggStar     bool
+	AggCol      string
+	AggArg      *Expr
+	AggArgs     []Expr
+	AggDistinct bool
+	AggFilter   []Comparison
+	AggOrder    []OrderCol
 }
 
 // OrderCol is one ORDER BY term: an output/column name, or (Expr set) a
@@ -510,6 +534,7 @@ func (*CreateSequence) stmt()      {}
 func (*DropSequence) stmt()        {}
 func (*AlterSequence) stmt()       {}
 func (*ShowSequences) stmt()       {}
+func (*ShowFunctions) stmt()       {}
 func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}

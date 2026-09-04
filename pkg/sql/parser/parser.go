@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"strconv"
 	"strings"
 
@@ -444,6 +445,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		if p.consumeIdentWord("sequences") {
 			return &ShowSequences{}, nil
+		}
+		if p.consumeIdentWord("functions") {
+			return &ShowFunctions{}, nil
 		}
 		if p.consumeIdentWord("columns") || p.consumeIdentWord("indexes") || p.consumeIdentWord("index") {
 			kind := "columns"
@@ -1973,16 +1977,17 @@ func (p *parser) parseHaving() ([]HavingCond, error) {
 			}
 			hc.Column = col
 		}
-		t := p.peek()
-		if t.kind != tkOp || !isCmpOp(t.text) {
-			return nil, p.errf("expected comparison operator, found %q", t.text)
+		if op, ok := p.parseCmpOp(); ok {
+			val, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			hc.Op, hc.Value = op, val
+		} else {
+			// A bare boolean aggregate or column: HAVING bool_or(x).
+			tr := types.NewBool(true)
+			hc.Op, hc.Value = "=", Expr{Lit: &tr}
 		}
-		p.i++
-		val, err := p.parseValueOrColumnExpr()
-		if err != nil {
-			return nil, err
-		}
-		hc.Op, hc.Value = t.text, val
 		out = append(out, hc)
 		if !p.consumeKeyword("AND") {
 			break
@@ -1991,10 +1996,17 @@ func (p *parser) parseHaving() ([]HavingCond, error) {
 	return out, nil
 }
 
-var aggNames = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+var aggNames = map[string]bool{
+	"count": true, "sum": true, "avg": true, "min": true, "max": true,
+	"string_agg": true, "array_agg": true, "bool_and": true, "bool_or": true, "every": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "variance": true, "var_samp": true, "var_pop": true,
+	"percentile_cont": true, "percentile_disc": true,
+	"json_agg": true, "jsonb_agg": true, "json_object_agg": true, "jsonb_object_agg": true,
+}
 
-// parseAggExpr parses COUNT(*) / COUNT(col) / SUM(col) / AVG(col) /
-// MIN(col) / MAX(col) when the next tokens form one; ok=false otherwise.
+// parseAggExpr parses an aggregate call when the next tokens form one:
+// name([DISTINCT] * | expr [, expr ...]) [WITHIN GROUP (ORDER BY expr
+// [ASC | DESC])] [FILTER (WHERE cond)]; ok=false otherwise.
 func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	t := p.peek()
 	if t.kind != tkIdent || !aggNames[t.text] {
@@ -2005,21 +2017,86 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	}
 	p.i += 2 // name (
 	se := SelectExpr{Agg: strings.ToUpper(t.text)}
+	if p.consumeIdentWord("distinct") {
+		se.AggDistinct = true
+	}
 	if p.consumeOp("*") {
 		if se.Agg != "COUNT" {
 			return se, false, p.errf("%s(*) is not supported", se.Agg)
 		}
 		se.AggStar = true
 	} else {
-		// Possibly qualified: SUM(o.total) over a join.
-		ref, err := p.parseColumnRef()
+		// A plain column keeps the column form (SUM(o.total) over a
+		// join); anything else — a predicate included (bool_and(x > 1))
+		// — is an expression evaluated per row.
+		e, err := p.parseValueOrBool()
 		if err != nil {
 			return se, false, err
 		}
-		se.AggCol = ref.String()
+		if isPlainColumn(e) && e.Cast == "" {
+			se.AggCol = e.Column
+		} else {
+			se.AggArg = &e
+		}
+		for p.consumeOp(",") {
+			a, err := p.parseAddExpr()
+			if err != nil {
+				return se, false, err
+			}
+			se.AggArgs = append(se.AggArgs, a)
+		}
 	}
 	if err := p.expectOp(")"); err != nil {
 		return se, false, err
+	}
+	if p.peekIdentSeq("within", "group") {
+		p.i += 2
+		if err := p.expectOp("("); err != nil {
+			return se, false, err
+		}
+		if err := p.expectKeyword("ORDER"); err != nil {
+			return se, false, err
+		}
+		if err := p.expectKeyword("BY"); err != nil {
+			return se, false, err
+		}
+		e, err := p.parseAddExpr()
+		if err != nil {
+			return se, false, err
+		}
+		oc := OrderCol{Expr: &e}
+		if isPlainColumn(e) {
+			oc.Column, oc.Expr = e.Column, nil
+		}
+		if p.consumeKeyword("DESC") {
+			oc.Desc = true
+		} else {
+			p.consumeKeyword("ASC")
+		}
+		if err := p.expectOp(")"); err != nil {
+			return se, false, err
+		}
+		se.AggOrder = []OrderCol{oc}
+	}
+	if p.consumeIdentWord("filter") {
+		if err := p.expectOp("("); err != nil {
+			return se, false, err
+		}
+		if err := p.expectKeyword("WHERE"); err != nil {
+			return se, false, err
+		}
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return se, false, err
+		}
+		conds, err := lowerBool(n, false)
+		if err != nil {
+			return se, false, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return se, false, err
+		}
+		se.AggFilter = conds
 	}
 	return se, true, nil
 }
@@ -2355,96 +2432,154 @@ func (p *parser) parseBoolFactor() (boolNode, error) {
 		tr := types.NewBool(true)
 		return boolNode{op: "leaf", leaf: Comparison{Expr: &e, Op: "=", Value: Expr{Lit: &tr}}}, nil
 	}
-	// Parenthesized boolean group. A leaf conjunct never starts with "(",
-	// so the paren is unambiguous here.
+	// Parenthesized boolean group — unless an operator follows the
+	// closing paren ((x ->> 'n')::int > 2, (a + b) * 2 = c), which makes
+	// it a grouped value inside a conjunct: then re-parse as one.
 	if p.peek().kind == tkOp && p.peek().text == "(" {
+		save := p.i
 		p.i++
 		n, err := p.parseBoolOr()
-		if err != nil {
-			return n, err
+		if err == nil {
+			err = p.expectOp(")")
 		}
-		if err := p.expectOp(")"); err != nil {
-			return n, err
+		if err == nil && !p.continuesValue() {
+			return n, nil
 		}
-		return n, nil
+		p.i = save
 	}
-	cmp, err := p.parseConjunct()
+	conds, negated, err := p.parseConjuncts()
 	if err != nil {
 		return boolNode{}, err
 	}
-	return boolNode{op: "leaf", leaf: cmp}, nil
+	var n boolNode
+	if len(conds) == 1 {
+		n = boolNode{op: "leaf", leaf: conds[0]}
+	} else {
+		n = boolNode{op: "and"}
+		for _, c := range conds {
+			n.kids = append(n.kids, boolNode{op: "leaf", leaf: c})
+		}
+	}
+	if negated {
+		n = boolNode{op: "not", kids: []boolNode{n}}
+	}
+	return n, nil
 }
 
-// parseConjunct parses one atomic condition: [NOT] EXISTS(...), col IS
-// [NOT] NULL, col [NOT] IN (...), or col op value.
+// parseConjunct parses one atomic condition as a single comparison (a
+// BETWEEN's two conjuncts pack as a one-disjunct OR).
 func (p *parser) parseConjunct() (Comparison, error) {
-	if cmp, ok, err := p.parseExistsCond(); err != nil {
-		return Comparison{}, err
-	} else if ok {
-		return cmp, nil
-	}
-	lhs, err := p.parseAddExpr()
+	conds, negated, err := p.parseConjuncts()
 	if err != nil {
 		return Comparison{}, err
 	}
-	col, path := lhs.Column, lhs.Path
-	computed := lhs.Column == "" || lhs.BinOp != "" || lhs.Func != "" || lhs.Left != nil
+	var cmp Comparison
+	if len(conds) == 1 {
+		cmp = conds[0]
+	} else {
+		cmp = Comparison{Op: "OR", Or: [][]Comparison{conds}}
+	}
+	if negated {
+		return negateComparison(cmp)
+	}
+	return cmp, nil
+}
+
+// continuesValue reports whether the next token extends a parenthesized
+// group into a larger value or predicate (a cast, an operator, a path
+// step, or a predicate suffix).
+func (p *parser) continuesValue() bool {
+	t := p.peek()
+	if t.kind == tkOp {
+		switch t.text {
+		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>":
+			return true
+		}
+	}
+	return p.startsPredicateSuffix()
+}
+
+// notWords are the words a NOT may precede inside a predicate suffix.
+var notWords = map[string]bool{"in": true, "between": true, "similar": true}
+
+// parseConjuncts parses one atomic predicate: [NOT] EXISTS (...), x IS
+// [NOT] NULL | TRUE | FALSE | DISTINCT FROM y, x [NOT] IN (...), x [NOT]
+// BETWEEN [SYMMETRIC] a AND b (two conjuncts; negated reports the NOT for
+// the caller to apply to both), x [NOT] LIKE | ILIKE | SIMILAR TO p
+// [ESCAPE e], x @> y, x op y, or a bare boolean value.
+func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
+	if cmp, ok, err := p.parseExistsCond(); err != nil {
+		return nil, false, err
+	} else if ok {
+		return []Comparison{cmp}, false, nil
+	}
+	lhs, err := p.parseAddExpr()
+	if err != nil {
+		return nil, false, err
+	}
+	// A plain column reference keeps the key-bound form; anything
+	// computed (a cast included) is evaluated per row.
+	computed := lhs.Column == "" || lhs.BinOp != "" || lhs.Func != "" || lhs.Left != nil || lhs.Cast != ""
+	base := Comparison{Column: lhs.Column, Path: lhs.Path}
 	if computed {
-		// Computed left-hand side: only plain comparisons apply. A bare
-		// boolean call (pg_table_is_visible(c.oid)) is "= true".
-		op, ok := p.parseCmpOp()
-		if !ok {
-			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil {
-				tr := types.NewBool(true)
-				return Comparison{Expr: &lhs, Op: "=", Value: Expr{Lit: &tr}}, nil
-			}
-			return Comparison{}, p.errf("expected comparison operator, found %q", p.peek().text)
-		}
-		cmp, err := p.finishComparison(Comparison{Expr: &lhs}, op)
-		if err != nil {
-			return Comparison{}, err
-		}
-		p.skipCollate()
-		return cmp, nil
+		base = Comparison{Expr: &lhs}
 	}
-	// col IS [NOT] NULL ("is" is not a reserved keyword).
+	one := func(c Comparison) ([]Comparison, bool, error) { return []Comparison{c}, false, nil }
+	// x IS [NOT] NULL | TRUE | FALSE | DISTINCT FROM y ("is" and
+	// "distinct" are not reserved words).
 	if p.consumeIdentWord("is") {
-		op := "IS NULL"
-		if p.consumeKeyword("NOT") {
-			op = "IS NOT NULL"
+		not := p.consumeKeyword("NOT")
+		neg := func(op string) string {
+			if not {
+				return strings.Replace(op, "IS ", "IS NOT ", 1)
+			}
+			return op
 		}
-		if err := p.expectKeyword("NULL"); err != nil {
-			return Comparison{}, err
+		switch {
+		case p.consumeKeyword("NULL"):
+			base.Op = neg("IS NULL")
+		case p.consumeKeyword("TRUE"):
+			base.Op = neg("IS TRUE")
+		case p.consumeKeyword("FALSE"):
+			base.Op = neg("IS FALSE")
+		case p.consumeIdentWord("distinct"):
+			if err := p.expectKeyword("FROM"); err != nil {
+				return nil, false, err
+			}
+			v, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, false, err
+			}
+			base.Op, base.Value = neg("IS DISTINCT FROM"), v
+		default:
+			return nil, false, p.errf("expected NULL, TRUE, FALSE or DISTINCT FROM after IS, found %q", p.peek().text)
 		}
-		return Comparison{Column: col, Path: path, Op: op}, nil
+		return one(base)
 	}
-	// col [NOT] IN (value, ... | SELECT ...) ("in" is an identifier).
-	notIn := false
-	if p.peek().kind == tkKeyword && p.peek().text == "NOT" &&
-		p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "in" {
+	// A NOT before IN / BETWEEN / SIMILAR TO (NOT LIKE is an operator).
+	not := false
+	if t := p.peek(); t.kind == tkKeyword && t.text == "NOT" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && notWords[p.toks[p.i+1].text] {
 		p.i++
-		notIn = true
+		not = true
 	}
-	if notIn || p.consumeIdentWord("in") {
-		if notIn {
-			p.i++ // the "in" identifier
-		}
-		cmp := Comparison{Column: col, Path: path, Op: "IN"}
-		if notIn {
+	if p.consumeIdentWord("in") {
+		cmp := base
+		cmp.Op = "IN"
+		if not {
 			cmp.Op = "NOT IN"
 		}
 		if sub, ok, err := p.parseSubquery(); err != nil {
-			return Comparison{}, err
+			return nil, false, err
 		} else if ok {
 			cmp.Sub = sub
 		} else {
 			if err := p.expectOp("("); err != nil {
-				return Comparison{}, err
+				return nil, false, err
 			}
 			for {
 				v, err := p.parseAddExpr()
 				if err != nil {
-					return Comparison{}, err
+					return nil, false, err
 				}
 				cmp.Values = append(cmp.Values, v)
 				if !p.consumeOp(",") {
@@ -2452,37 +2587,107 @@ func (p *parser) parseConjunct() (Comparison, error) {
 				}
 			}
 			if err := p.expectOp(")"); err != nil {
-				return Comparison{}, err
+				return nil, false, err
 			}
 		}
-		return cmp, nil
+		return one(cmp)
 	}
-	// JSONB containment: accepted only in this plain-column form (an
-	// optional path on the left is fine — it must still produce jsonb).
-	// HAVING and computed left-hand sides deliberately do not take @>.
-	var op string
-	if t := p.peek(); t.kind == tkOp && t.text == "@>" {
-		p.i++
-		op = "@>"
-	} else if o, ok := p.parseCmpOp(); ok {
-		op = o
-	} else if t.kind == tkEOF || (t.kind == tkOp && (t.text == ")" || t.text == ";" || t.text == ",")) || t.kind == tkKeyword ||
-		(t.kind == tkIdent && (tableClauseWords[t.text] || caseWords[t.text])) {
-		// A bare boolean column (WHERE a.attisdropped, ... AND NOT x).
+	if p.consumeIdentWord("between") {
+		symmetric := p.consumeIdentWord("symmetric")
+		lo, err := p.parseAddExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		if err := p.expectKeyword("AND"); err != nil {
+			return nil, false, err
+		}
+		hi, err := p.parseAddExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		if symmetric {
+			lo, hi = Expr{Func: "least", Args: []Expr{lo, hi}}, Expr{Func: "greatest", Args: []Expr{lo, hi}}
+		}
+		low, high := base, base
+		low.Op, low.Value = ">=", lo
+		high.Op, high.Value = "<=", hi
+		return []Comparison{low, high}, not, nil
+	}
+	if p.consumeIdentWord("similar") {
+		if err := p.expectKeyword("TO"); err != nil {
+			return nil, false, err
+		}
+		pat, err := p.parseValueOrColumnExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		cmp := base
+		cmp.Op, cmp.Value = "SIMILAR TO", pat
+		if not {
+			cmp.Op = "NOT SIMILAR TO"
+		}
+		if cmp.Escape, err = p.parseOptEscape(); err != nil {
+			return nil, false, err
+		}
+		return one(cmp)
+	}
+	if not {
+		return nil, false, p.errf("expected IN, BETWEEN or SIMILAR TO after NOT, found %q", p.peek().text)
+	}
+	op, ok := p.parseCmpOp()
+	if !ok {
+		t := p.peek()
 		tr := types.NewBool(true)
-		return Comparison{Column: col, Path: path, Op: "=", Value: Expr{Lit: &tr}}, nil
-	} else {
-		return Comparison{}, p.errf("expected comparison operator, found %q", t.text)
+		if computed {
+			// A bare boolean call or value (pg_table_is_visible(c.oid)).
+			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil || lhs.Cast != "" {
+				base.Op, base.Value = "=", Expr{Lit: &tr}
+				return one(base)
+			}
+			return nil, false, p.errf("expected comparison operator, found %q", t.text)
+		}
+		if t.kind == tkEOF || (t.kind == tkOp && (t.text == ")" || t.text == ";" || t.text == ",")) || t.kind == tkKeyword ||
+			(t.kind == tkIdent && (tableClauseWords[t.text] || caseWords[t.text])) {
+			// A bare boolean column (WHERE a.attisdropped, ... AND NOT x).
+			base.Op, base.Value = "=", Expr{Lit: &tr}
+			return one(base)
+		}
+		return nil, false, p.errf("expected comparison operator, found %q", t.text)
 	}
-	// The right side may itself be a column reference (a = b, or a
-	// correlated outer.col inside a subquery); row-dependent values
-	// are excluded from access planning and checked by the filter.
-	cmp, err := p.finishComparison(Comparison{Column: col, Path: path}, op)
+	cmp, err := p.finishComparison(base, op)
 	if err != nil {
-		return Comparison{}, err
+		return nil, false, err
+	}
+	if strings.HasSuffix(op, "LIKE") {
+		if cmp.Escape, err = p.parseOptEscape(); err != nil {
+			return nil, false, err
+		}
 	}
 	p.skipCollate()
-	return cmp, nil
+	return one(cmp)
+}
+
+// NoEscape is the Escape of a pattern given ESCAPE ”: no character
+// escapes the wildcards.
+const NoEscape = "\x00"
+
+// parseOptEscape parses ESCAPE 'c' after a pattern ("" when absent).
+func (p *parser) parseOptEscape() (string, error) {
+	if !p.consumeIdentWord("escape") {
+		return "", nil
+	}
+	t := p.peek()
+	if t.kind != tkString {
+		return "", p.errf("expected a string after ESCAPE, found %q", t.text)
+	}
+	p.i++
+	if len([]rune(t.text)) > 1 {
+		return "", p.errf("invalid escape string: must be empty or one character")
+	}
+	if t.text == "" {
+		return NoEscape, nil
+	}
+	return t.text, nil
 }
 
 // finishComparison parses the right-hand side of "lhs op": a value, or
@@ -2544,33 +2749,63 @@ func (p *parser) parseValueOrBool() (Expr, error) {
 		}
 		return p.finishBoolValue(n)
 	}
+	save := p.i
 	e, err := p.parseValueOrColumnExpr()
 	if err != nil {
 		return e, err
 	}
-	var leaf Comparison
-	if op, ok := p.parseCmpOp(); ok {
-		if leaf, err = p.finishComparison(Comparison{Expr: &e}, op); err != nil {
+	if p.startsPredicateSuffix() {
+		// x op y, x IS ..., x [NOT] IN | BETWEEN | LIKE | SIMILAR TO ...
+		// as a boolean value: re-parse as a predicate.
+		p.i = save
+		conds, negated, err := p.parseConjuncts()
+		if err != nil {
 			return e, err
 		}
-		p.skipCollate()
-	} else if p.peekIdentWord("is") {
-		// expr IS [NOT] NULL as a value.
-		p.i++
-		op := "IS NULL"
-		if p.consumeKeyword("NOT") {
-			op = "IS NOT NULL"
+		var n boolNode
+		if len(conds) == 1 {
+			n = boolNode{op: "leaf", leaf: conds[0]}
+		} else {
+			n = boolNode{op: "and"}
+			for _, c := range conds {
+				n.kids = append(n.kids, boolNode{op: "leaf", leaf: c})
+			}
 		}
-		if err := p.expectKeyword("NULL"); err != nil {
-			return e, err
+		if negated {
+			n = boolNode{op: "not", kids: []boolNode{n}}
 		}
-		leaf = Comparison{Expr: &e, Op: op}
-	} else if t := p.peek(); t.kind == tkKeyword && (t.text == "AND" || t.text == "OR") {
-		leaf = boolLeaf(e)
-	} else {
-		return e, nil
+		return p.finishBoolValue(n)
 	}
-	return p.finishBoolValue(boolNode{op: "leaf", leaf: leaf})
+	if t := p.peek(); t.kind == tkKeyword && (t.text == "AND" || t.text == "OR") {
+		return p.finishBoolValue(boolNode{op: "leaf", leaf: boolLeaf(e)})
+	}
+	return e, nil
+}
+
+// startsPredicateSuffix reports whether the next tokens continue a value
+// into a predicate: a comparison operator, IS, [NOT] IN / BETWEEN /
+// SIMILAR TO / LIKE / ILIKE, or @>.
+func (p *parser) startsPredicateSuffix() bool {
+	t := p.peek()
+	switch t.kind {
+	case tkOp:
+		return isCmpOp(t.text) || t.text == "@>"
+	case tkIdent:
+		switch t.text {
+		case "is", "in", "between", "similar", "like", "ilike":
+			return true
+		case "operator":
+			return p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "("
+		}
+	case tkKeyword:
+		if t.text == "NOT" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+			switch p.toks[p.i+1].text {
+			case "in", "between", "similar", "like", "ilike":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // finishBoolValue continues a boolean expression after its first factor
@@ -2760,7 +2995,13 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"IN": "NOT IN", "NOT IN": "IN",
 		"EXISTS": "NOT EXISTS", "NOT EXISTS": "EXISTS",
 		"TRUE": "FALSE", "FALSE": "TRUE",
-		"@>": "NOT @>", "NOT @>": "@>",
+		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@",
+		"?": "NOT ?", "NOT ?": "?", "?|": "NOT ?|", "NOT ?|": "?|", "?&": "NOT ?&", "NOT ?&": "?&",
+		"LIKE": "NOT LIKE", "NOT LIKE": "LIKE", "ILIKE": "NOT ILIKE", "NOT ILIKE": "ILIKE",
+		"SIMILAR TO": "NOT SIMILAR TO", "NOT SIMILAR TO": "SIMILAR TO",
+		"~": "!~", "!~": "~", "~*": "!~*", "!~*": "~*",
+		"IS TRUE": "IS NOT TRUE", "IS NOT TRUE": "IS TRUE", "IS FALSE": "IS NOT FALSE", "IS NOT FALSE": "IS FALSE",
+		"IS DISTINCT FROM": "IS NOT DISTINCT FROM", "IS NOT DISTINCT FROM": "IS DISTINCT FROM",
 	}
 	if c.Op == "OR" {
 		// NOT over a lowered OR: De Morgan by hand — negate every inner
@@ -2825,7 +3066,7 @@ func (p *parser) parseExistsCond() (Comparison, bool, error) {
 
 func isCmpOp(op string) bool {
 	switch op {
-	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*":
+	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "?", "?|", "?&":
 		return true
 	}
 	return false
@@ -2984,14 +3225,7 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	// type may be qualified (pg_catalog.regclass) and casts may chain.
 	// A regclass cast is kept: it resolves a table name (a literal) or
 	// renders one (an OID column).
-	cast, err := p.parseCasts()
-	if err != nil {
-		return e, err
-	}
-	if cast != "" {
-		e.Cast = cast
-	}
-	return e, nil
+	return p.applyCasts(e)
 }
 
 func (p *parser) skipCasts() error {
@@ -2999,20 +3233,58 @@ func (p *parser) skipCasts() error {
 	return err
 }
 
-// parseCasts absorbs a chain of ::type casts and reports the one that
-// changes the value ("regclass"); all others are absorbed.
-func (p *parser) parseCasts() (string, error) {
-	cast := ""
+// parseCasts reads a chain of ::type casts.
+func (p *parser) parseCasts() ([]string, error) {
+	var casts []string
 	for p.consumeOp("::") {
 		name, err := p.skipTypeName()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if name == "regclass" {
-			cast = name
-		}
+		casts = append(casts, name)
 	}
-	return cast, nil
+	return casts, nil
+}
+
+// applyCasts reads the ::type casts after e and attaches them: the
+// first on e itself when it carries no operator yet, each further one
+// wrapping the expression so far (x::a::b casts x to a, then to b). A
+// node's Cast applies to its whole value; foldBinOp keeps a cast node
+// from acquiring an operator.
+func (p *parser) applyCasts(e Expr) (Expr, error) {
+	casts, err := p.parseCasts()
+	if err != nil {
+		return e, err
+	}
+	e = castChain(e, casts)
+	// A -> / ->> / #> / #>> chain may follow any value ('{...}'::jsonb
+	// -> 'a', f(x) ->> 'k'); it applies to the value as cast, so a node
+	// that already carries a cast (or an operator) is wrapped.
+	steps, err := p.parsePathSteps()
+	if err != nil {
+		return e, err
+	}
+	if len(steps) > 0 {
+		if e.Cast != "" || e.BinOp != "" || len(e.Path) > 0 {
+			inner := e
+			e = Expr{Left: &inner}
+		}
+		e.Path = steps
+		return p.applyCasts(e)
+	}
+	return e, nil
+}
+
+func castChain(e Expr, casts []string) Expr {
+	for _, c := range casts {
+		if e.Cast == "" && e.BinOp == "" && e.Left == nil {
+			e.Cast = c
+			continue
+		}
+		inner := e
+		e = Expr{Left: &inner, Cast: c}
+	}
+	return e
 }
 
 // skipTypeName absorbs a type name: [schema.]name, an optional (typmod)
@@ -3033,17 +3305,30 @@ func (p *parser) skipTypeName() (string, error) {
 		name = n
 	}
 	if p.consumeOp("(") {
+		// The typmod: kept for the types where it changes the value
+		// (numeric(p,s) rounds, varchar(n) truncates), dropped elsewhere.
+		var mods []string
 		for p.peek().kind != tkEOF && !(p.peek().kind == tkOp && p.peek().text == ")") {
+			if t := p.peek(); t.kind == tkNumber {
+				mods = append(mods, t.text)
+			}
 			p.i++
 		}
 		if err := p.expectOp(")"); err != nil {
 			return "", err
+		}
+		switch name {
+		case "numeric", "decimal", "dec", "varchar", "char", "character", "bpchar":
+			if len(mods) > 0 {
+				name += "(" + strings.Join(mods, ",") + ")"
+			}
 		}
 	}
 	for p.consumeOp("[") {
 		if err := p.expectOp("]"); err != nil {
 			return "", err
 		}
+		name += "[]"
 	}
 	return name, nil
 }
@@ -3055,20 +3340,175 @@ func (p *parser) parsePathSteps() ([]PathStep, error) {
 	var steps []PathStep
 	for {
 		t := p.peek()
-		if t.kind != tkOp || (t.text != "->" && t.text != "->>") {
+		if t.kind != tkOp || (t.text != "->" && t.text != "->>" && t.text != "#>" && t.text != "#>>") {
 			return steps, nil
 		}
 		if len(steps) > 0 && steps[len(steps)-1].Text {
-			return nil, p.errf("cannot apply %s after ->> (->> yields text, not jsonb)", t.text)
+			return nil, p.errf("cannot apply %s after a text extraction (->> / #>> yield text, not jsonb)", t.text)
 		}
 		p.i++
 		key := p.peek()
-		if key.kind != tkString {
-			return nil, p.errf("expected string key after %s, found %q", t.text, key.text)
+		text := strings.HasSuffix(t.text, ">>")
+		switch {
+		case strings.HasPrefix(t.text, "#"):
+			// #> '{a,b}': a path array literal.
+			if key.kind != tkString {
+				return nil, p.errf("expected a path array after %s, found %q", t.text, key.text)
+			}
+			p.i++
+			steps = append(steps, PathStep{Keys: splitTextArray(key.text), Text: text})
+		case key.kind == tkString:
+			p.i++
+			steps = append(steps, PathStep{Key: key.text, Text: text})
+		case key.kind == tkNumber || (key.kind == tkOp && key.text == "-" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber):
+			neg := key.kind == tkOp
+			if neg {
+				p.i++
+				key = p.peek()
+			}
+			n, err := strconv.Atoi(key.text)
+			if err != nil {
+				return nil, p.errf("expected an array index after %s, found %q", t.text, key.text)
+			}
+			if neg {
+				n = -n
+			}
+			p.i++
+			steps = append(steps, PathStep{IsIndex: true, Index: n, Text: text})
+		default:
+			return nil, p.errf("expected a key or index after %s, found %q", t.text, key.text)
+		}
+	}
+}
+
+// splitTextArray splits a '{a,b,"c d"}' literal into its elements.
+func splitTextArray(s string) []string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
+		s = s[1 : len(s)-1]
+	}
+	if s == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case c == '\\' && i+1 < len(s):
+			i++
+			cur.WriteByte(s[i])
+		case c == ',' && !inQuote:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	return append(out, cur.String())
+}
+
+// parseSQLFuncForm parses the SQL-standard keyword forms of a few
+// functions, after the opening parenthesis: substring(s FROM n [FOR m]),
+// position(needle IN haystack), trim([BOTH | LEADING | TRAILING] [chars]
+// FROM s), extract(field FROM x). Returns ok=false, consuming nothing,
+// when the call is the plain form.
+func (p *parser) parseSQLFuncForm(name string) (Expr, bool, error) {
+	save := p.i
+	plain := func() (Expr, bool, error) {
+		p.i = save
+		return Expr{}, false, nil
+	}
+	switch name {
+	case "substring", "substr":
+		s, err := p.parseAddExpr()
+		if err != nil || !p.consumeKeyword("FROM") {
+			return plain()
+		}
+		from, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		args := []Expr{s, from}
+		if p.consumeIdentWord("for") {
+			n, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			args = append(args, n)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		return Expr{Func: name, Args: args}, true, nil
+	case "position":
+		needle, err := p.parseAddExpr()
+		if err != nil || !p.consumeIdentWord("in") {
+			return plain()
+		}
+		hay, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		return Expr{Func: "position", Args: []Expr{needle, hay}}, true, nil
+	case "trim":
+		fn := "trim"
+		switch {
+		case p.consumeIdentWord("both"):
+		case p.consumeIdentWord("leading"):
+			fn = "ltrim"
+		case p.consumeIdentWord("trailing"):
+			fn = "rtrim"
+		}
+		var chars *Expr
+		if !p.peekKeyword("FROM") {
+			c, err := p.parseAddExpr()
+			if err != nil {
+				return plain()
+			}
+			chars = &c
+		}
+		if !p.consumeKeyword("FROM") {
+			return plain()
+		}
+		s, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		args := []Expr{s}
+		if chars != nil {
+			args = append(args, *chars)
+		}
+		return Expr{Func: fn, Args: args}, true, nil
+	case "extract":
+		t := p.peek()
+		if t.kind != tkIdent && t.kind != tkKeyword && t.kind != tkString {
+			return plain()
 		}
 		p.i++
-		steps = append(steps, PathStep{Key: key.text, Text: t.text == "->>"})
+		if !p.consumeKeyword("FROM") {
+			return plain()
+		}
+		x, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		field := types.NewString(strings.ToLower(t.text))
+		return Expr{Func: "extract", Args: []Expr{{Lit: &field}, x}}, true, nil
 	}
+	return Expr{}, false, nil
 }
 
 // parseValueOrColumnExpr additionally allows column references and
@@ -3101,17 +3541,17 @@ func (p *parser) parseAddExpr() (Expr, error) {
 }
 
 func (p *parser) parseMulExpr() (Expr, error) {
-	e, err := p.parsePrimaryExpr()
+	e, err := p.parsePowExpr()
 	if err != nil {
 		return e, err
 	}
 	for {
 		op := p.peek()
-		if op.kind != tkOp || (op.text != "*" && op.text != "/") {
+		if op.kind != tkOp || (op.text != "*" && op.text != "/" && op.text != "%") {
 			return e, nil
 		}
 		p.i++
-		rhs, err := p.parsePrimaryExpr()
+		rhs, err := p.parsePowExpr()
 		if err != nil {
 			return e, err
 		}
@@ -3119,11 +3559,32 @@ func (p *parser) parseMulExpr() (Expr, error) {
 	}
 }
 
+// parsePowExpr parses the ^ operator, which binds tighter than * / %
+// and associates to the left, as in PostgreSQL.
+func (p *parser) parsePowExpr() (Expr, error) {
+	e, err := p.parsePrimaryExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		op := p.peek()
+		if op.kind != tkOp || op.text != "^" {
+			return e, nil
+		}
+		p.i++
+		rhs, err := p.parsePrimaryExpr()
+		if err != nil {
+			return e, err
+		}
+		e = foldBinOp(e, "^", rhs)
+	}
+}
+
 // foldBinOp attaches (lhs op rhs), reusing lhs's own node when it carries
 // no operator yet (the flat historical shape) and nesting through Left
 // otherwise (left associativity).
 func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
-	if lhs.BinOp == "" {
+	if lhs.BinOp == "" && lhs.Cast == "" {
 		lhs.BinOp = op
 		lhs.Right = &rhs
 		return lhs
@@ -3135,7 +3596,8 @@ func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
 // scalarFuncs are the builtin scalar functions ("now" is spliced by the
 // session before execution; the rest evaluate per row).
 var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
-	"now": 0, "current_database": 0, "current_schema": 0, "length": 1, "lower": 1, "upper": 1, "abs": 1, "coalesce": -1,
+	"now": 0, "current_database": 0, "current_schema": 0, "current_timestamp": 0, "localtimestamp": 0, "current_date": 0,
+	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
 	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1,
@@ -3151,7 +3613,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 }
 
 // bareFuncs are called without parentheses (SQL keywords in PostgreSQL).
-var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true}
+var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true, "current_timestamp": true, "current_date": true, "localtimestamp": true}
 
 // parsePrimaryExpr parses one operand: a parenthesized expression, a
 // builtin call, a possibly-qualified column reference (with an optional
@@ -3175,17 +3637,19 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			}
 			return boolValue(conds), nil
 		}
-		// A scalar subquery is "(SELECT"; anything else is grouping.
+		// A scalar subquery is "(SELECT"; anything else is grouping — of
+		// a value, or of a predicate used as a boolean value.
 		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") {
 			p.i++
-			e, err := p.parseAddExpr()
+			e, err := p.parseValueOrBool()
 			if err != nil {
 				return e, err
 			}
 			if err := p.expectOp(")"); err != nil {
 				return e, err
 			}
-			return e, nil
+			// (a + b)::t casts the group as a whole.
+			return p.applyCasts(e)
 		}
 		return p.parseValueExpr()
 	}
@@ -3217,10 +3681,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if err := p.expectOp(")"); err != nil {
 				return e, err
 			}
-			if name == "regclass" {
-				e.Cast = name
-			}
-			return e, nil
+			return p.applyCasts(castChain(e, []string{name}))
 		}
 		// array(SELECT ...): the subquery's single column as a text array.
 		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
@@ -3233,10 +3694,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 				return Expr{}, p.errf("array(...) takes a subquery")
 			}
 			e := Expr{Func: "array", Args: []Expr{{Sub: sub}}}
-			if err := p.skipCasts(); err != nil {
-				return e, err
-			}
-			return e, nil
+			return p.applyCasts(e)
 		}
 		// pg_catalog.f(...): the schema qualifier is dropped.
 		if t.text == "pg_catalog" && p.i+3 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "." &&
@@ -3248,10 +3706,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		if bareFuncs[t.text] && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "(" || p.toks[p.i+1].text == ".")) {
 			p.i++
 			e := Expr{Func: t.text}
-			if err := p.skipCasts(); err != nil {
-				return e, err
-			}
-			return e, nil
+			return p.applyCasts(e)
 		}
 		// Function call: a name followed by "(". Known builtins have
 		// their arity checked here; anything else parses and is refused
@@ -3262,8 +3717,17 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if !isFunc {
 				arity = -2 // unchecked
 			}
+			bi, registered := builtins.Lookup(t.text)
+			if registered && bi.Session {
+				registered = false // the session's own: arity from scalarFuncs
+			}
 			p.i += 2
 			e := Expr{Func: t.text}
+			if fe, ok, err := p.parseSQLFuncForm(t.text); err != nil {
+				return e, err
+			} else if ok {
+				return p.applyCasts(fe)
+			}
 			if !p.consumeOp(")") {
 				for {
 					a, err := p.parseAddExpr()
@@ -3280,16 +3744,16 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 				}
 			}
 			switch {
+			case registered:
+				if !bi.ArityOK(len(e.Args)) {
+					return e, p.errf("%s() takes %s argument(s), got %d", t.text, bi.ArityText(), len(e.Args))
+				}
 			case arity == -1 && len(e.Args) == 0:
 				return e, p.errf("%s() requires at least one argument", t.text)
 			case arity >= 0 && len(e.Args) != arity:
 				return e, p.errf("%s() takes %d argument(s), got %d", t.text, arity, len(e.Args))
 			}
-			// f(x) AS alias / f(x) alias: nothing more to do here.
-			if err := p.skipCasts(); err != nil {
-				return e, err
-			}
-			return e, nil
+			return p.applyCasts(e)
 		}
 		p.i++
 		name := t.text
@@ -3306,13 +3770,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return Expr{}, err
 		}
 		e.Path = path
-		// oid::regclass renders the table name; other casts are absorbed.
-		cast, err := p.parseCasts()
-		if err != nil {
-			return e, err
-		}
-		e.Cast = cast
-		return e, nil
+		return p.applyCasts(e)
 	}
 	return p.parseValueExpr()
 }
@@ -3387,10 +3845,7 @@ func (p *parser) parseCase() (Expr, error) {
 		return Expr{}, p.errf("expected END to close CASE, found %q", p.peek().text)
 	}
 	e := Expr{Case: ce}
-	if err := p.skipCasts(); err != nil {
-		return e, err
-	}
-	return e, nil
+	return p.applyCasts(e)
 }
 
 func (p *parser) peekIdentWord(word string) bool {

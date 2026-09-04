@@ -159,7 +159,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if exprHasSub := condsHave(cd.CheckFails, func(e parser.Expr) bool { return e.Sub != nil || e.Param > 0 }); exprHasSub {
 			return nil, nil, newErrf(CodeFeatureNotSupported, "CHECK constraints cannot use subqueries or parameters")
 		}
-		if condsHave(cd.CheckFails, func(e parser.Expr) bool { return e.Func != "" && volatileFuncs[e.Func] }) {
+		if condsHave(cd.CheckFails, isVolatileCall) {
 			return nil, nil, newErrf(CodeFeatureNotSupported, "CHECK constraints cannot use volatile functions")
 		}
 		var names []string
@@ -181,8 +181,12 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		}
 		// Try it once so an unknown function or a type mismatch fails now,
 		// not at the first INSERT: against a NULL row and a sample row.
+		probeFails, err := s.resolveCheck(ctx, txn, cd.CheckFails)
+		if err != nil {
+			return nil, nil, err
+		}
 		for _, probe := range []map[catalog.ColumnID]types.Datum{nullRow(desc), sampleRow(desc)} {
-			if _, err := matchesWhere(cd.CheckFails, desc, probe, nil); err != nil {
+			if _, err := matchesWhere(probeFails, desc, probe, nil); err != nil {
 				return nil, nil, newErrf(CodeSyntaxError, "CHECK constraint: %v", err)
 			}
 		}
@@ -444,12 +448,23 @@ func (s *Session) guardWithState(ctx context.Context, txn *kvclient.Txn, desc *c
 			if err != nil {
 				return nil, newErrf(CodeInternal, "constraint %q: stored expression %q: %v", c.Name, c.Expr, err)
 			}
+			if fails, err = s.resolveCheck(ctx, txn, fails); err != nil {
+				return nil, err
+			}
 			g.checks = append(g.checks, guardCheck{c: c, fails: fails})
 		case catalog.ConstraintForeign:
 			g.fks = append(g.fks, c)
 		}
 	}
 	return g, nil
+}
+
+// resolveCheck splices the stable session functions a CHECK may use
+// (now(), current_user, ...) into the parsed expression, as the WHERE
+// resolve pass does for a query: the stored text keeps the call and
+// every statement evaluates it afresh.
+func (s *Session) resolveCheck(ctx context.Context, txn *kvclient.Txn, fails []parser.Comparison) ([]parser.Comparison, error) {
+	return s.resolveWhereSubs(ctx, txn, fails, nil)
 }
 
 func (s *Session) fkCascadeLimit() int {
@@ -1117,6 +1132,9 @@ func (s *Session) validateConstraintRows(ctx context.Context, table string, cID 
 			case catalog.ConstraintCheck:
 				fails, err := parser.ParseCheck(c.Expr)
 				if err != nil {
+					return err
+				}
+				if fails, err = s.resolveCheck(ctx, txn, fails); err != nil {
 					return err
 				}
 				g.checks = []guardCheck{{c: c, fails: fails}}

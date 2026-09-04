@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -25,7 +26,7 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 			}
 			continue
 		}
-		if se.Expr.Column != "" && se.Expr.BinOp == "" {
+		if se.Expr.Column != "" && se.Expr.BinOp == "" && se.Expr.Cast == "" {
 			c, ok := desc.Col(se.Expr.Column)
 			if !ok {
 				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", se.Expr.Column)
@@ -53,10 +54,28 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 		name := se.Alias
 		if name == "" {
 			name = "?column?"
+			if e.Column != "" && e.BinOp == "" && len(e.Path) == 0 {
+				name = stripQualifier(e.Column) // col::type is still "col"
+			}
 		}
-		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: types.String}})
+		typ := exprFamily(e, func(n string) (types.Family, bool) {
+			c, ok := desc.Col(stripQualifier(n))
+			return c.Type, ok
+		})
+		if typ == types.Unknown {
+			typ = types.String
+		}
+		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ}})
 	}
 	return proj, nil
+}
+
+// stripQualifier drops a table or alias qualifier from a column name.
+func stripQualifier(name string) string {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }
 
 // lookupForPlan resolves a descriptor for planning: inside the session's
@@ -246,9 +265,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 				if name == "" {
 					name = "?column?"
 				}
-				fam := types.String
-				if se.Expr.Lit != nil && !se.Expr.Lit.Null {
-					fam = se.Expr.Lit.Fam
+				fam := exprFamily(se.Expr, nil)
+				if fam == types.Unknown {
+					fam = types.String
 				}
 				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
 					if sc, serr := s.PlanColumns(ctx, se.Expr.Sub); serr == nil && len(sc) == 1 {
@@ -347,6 +366,8 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		return cols, nil
 
+	case *parser.ShowFunctions:
+		return execShowFunctions().Columns, nil
 	case *parser.ShowSequences:
 		return []ResultColumn{
 			{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},

@@ -173,11 +173,11 @@ func TestJSONBPathParsing(t *testing.T) {
 		t.Fatalf("exprs: %+v", sel.Exprs)
 	}
 	p0 := sel.Exprs[0].Expr.Path
-	if sel.Exprs[0].Expr.Column != "j" || len(p0) != 1 || p0[0] != (PathStep{Key: "a"}) {
+	if sel.Exprs[0].Expr.Column != "j" || len(p0) != 1 || !stepIs(p0[0], "a", false) {
 		t.Fatalf("expr 0: %+v", sel.Exprs[0].Expr)
 	}
 	p1 := sel.Exprs[1].Expr.Path
-	if len(p1) != 2 || p1[0] != (PathStep{Key: "a"}) || p1[1] != (PathStep{Key: "b", Text: true}) {
+	if len(p1) != 2 || !stepIs(p1[0], "a", false) || !stepIs(p1[1], "b", true) {
 		t.Fatalf("expr 1: %+v", sel.Exprs[1].Expr)
 	}
 	if sel.Exprs[1].Alias != "x" {
@@ -191,14 +191,13 @@ func TestJSONBPathParsing(t *testing.T) {
 		t.Fatalf("where 0: %+v", w0)
 	}
 	w1 := sel.Where[1]
-	if w1.Op != "IS NULL" || len(w1.Path) != 1 || w1.Path[0] != (PathStep{Key: "n"}) {
+	if w1.Op != "IS NULL" || len(w1.Path) != 1 || !stepIs(w1.Path[0], "n", false) {
 		t.Fatalf("where 1: %+v", w1)
 	}
 
 	for _, bad := range []string{
 		`SELECT j ->> 'a' -> 'b' FROM t`, // ->> yields text: not chainable
-		`SELECT j -> 5 FROM t`,           // keys are string literals
-		`SELECT j -> col FROM t`,
+		`SELECT j -> col FROM t`,         // keys are string literals or array positions
 	} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("accepted %q", bad)
@@ -502,10 +501,8 @@ func TestJSONBContainmentParsing(t *testing.T) {
 	if len(w) != 2 || w[0].Op != "NOT @>" || w[1].Op != "!=" {
 		t.Fatalf("de morgan: %+v", w)
 	}
-	// Rejected surfaces: computed LHS, HAVING, bare @.
+	// Rejected surfaces: a bare @.
 	for _, src := range []string{
-		`SELECT * FROM t WHERE x + 1 @> '1'`,
-		`SELECT a FROM t GROUP BY a HAVING count(*) @> '1'`,
 		`SELECT * FROM t WHERE j @ '1'`,
 	} {
 		if _, err := Parse(src); err == nil {
@@ -854,4 +851,10 @@ func TestParseConstraints(t *testing.T) {
 	if ins.OnConflict == nil || ins.OnConflict.Constraint != "t_a_key" {
 		t.Fatalf("on conflict on constraint: %+v", ins.OnConflict)
 	}
+}
+
+// stepIs reports whether a path step is the given key with the given
+// text flag.
+func stepIs(s PathStep, key string, text bool) bool {
+	return s.Key == key && s.Text == text && !s.IsIndex && len(s.Keys) == 0
 }

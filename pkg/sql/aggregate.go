@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"math"
 	"sort"
 	"strings"
@@ -28,38 +29,109 @@ func hasAggregates(exprs []parser.SelectExpr) bool {
 
 // aggSpec is one resolved aggregate output.
 type aggSpec struct {
-	fn   string // COUNT SUM AVG MIN MAX
+	fn   string // COUNT SUM AVG MIN MAX STRING_AGG ARRAY_AGG BOOL_AND ...
 	star bool
-	col  catalog.Column // zero for COUNT(*)
-	name string
+	col  catalog.Column // the plain-column argument (zero otherwise)
+	arg  *parser.Expr   // the expression argument (nil for a column or *)
+	// argType is the argument's family (the column's, or inferred).
+	argType  types.Family
+	extra    []parser.Expr // string_agg's separator, jsonb_object_agg's value
+	distinct bool
+	filter   []parser.Comparison
+	order    *parser.OrderCol // WITHIN GROUP (ORDER BY ...): the ordered-set input
+	name     string
+	key      string // identity, for HAVING reuse
 }
 
 // resolveAggSpec validates and resolves one aggregate select item.
 func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpec, error) {
-	sp := aggSpec{fn: se.Agg, star: se.AggStar, name: se.Alias}
+	sp := aggSpec{fn: se.Agg, star: se.AggStar, name: se.Alias, distinct: se.AggDistinct, extra: se.AggArgs, filter: se.AggFilter}
 	if sp.name == "" {
 		sp.name = strings.ToLower(se.Agg)
 	}
-	if !se.AggStar {
+	colType := func(n string) (types.Family, bool) {
+		c, ok := desc.Col(stripQualifier(n))
+		return c.Type, ok
+	}
+	switch {
+	case se.AggStar:
+	case se.AggCol != "":
 		col, ok := desc.Col(se.AggCol)
 		if !ok {
 			return sp, newErrf(CodeUndefinedColumn, "column %q does not exist", se.AggCol)
 		}
-		if (se.Agg == "SUM" || se.Agg == "AVG") && col.Type != types.Int && col.Type != types.Float && col.Type != types.Decimal {
-			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, col.Type)
-		}
-		if (se.Agg == "MIN" || se.Agg == "MAX") && col.Type == types.Jsonb {
-			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported (JSONB has no order)", se.Agg, col.Type)
-		}
-		sp.col = col
+		sp.col, sp.argType = col, col.Type
+	case se.AggArg != nil:
+		sp.arg, sp.argType = se.AggArg, exprFamily(*se.AggArg, colType)
+	default:
+		return sp, newErrf(CodeSyntaxError, "%s() requires an argument", se.Agg)
 	}
+	switch sp.fn {
+	case "PERCENTILE_CONT", "PERCENTILE_DISC":
+		if len(se.AggOrder) != 1 {
+			return sp, newErrf(CodeSyntaxError, "%s requires WITHIN GROUP (ORDER BY ...)", strings.ToLower(sp.fn))
+		}
+		oc := se.AggOrder[0]
+		sp.order = &oc
+		if oc.Expr != nil {
+			sp.argType = exprFamily(*oc.Expr, colType)
+		} else if c, ok := desc.Col(oc.Column); ok {
+			sp.argType = c.Type
+		} else {
+			return sp, newErrf(CodeUndefinedColumn, "column %q does not exist", oc.Column)
+		}
+	case "STRING_AGG":
+		if len(sp.extra) != 1 {
+			return sp, newErrf(CodeSyntaxError, "string_agg() takes a value and a separator")
+		}
+	case "JSONB_OBJECT_AGG", "JSON_OBJECT_AGG":
+		if len(sp.extra) != 1 {
+			return sp, newErrf(CodeSyntaxError, "%s() takes a key and a value", strings.ToLower(sp.fn))
+		}
+	case "SUM", "AVG", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
+		if sp.argType != types.Unknown && sp.argType != types.Int && sp.argType != types.Float && sp.argType != types.Decimal {
+			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, sp.argType)
+		}
+	case "MIN", "MAX":
+		if sp.argType == types.Jsonb {
+			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported (JSONB has no order)", se.Agg, sp.argType)
+		}
+	case "BOOL_AND", "BOOL_OR", "EVERY":
+		if sp.argType != types.Unknown && sp.argType != types.Bool {
+			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, sp.argType)
+		}
+	}
+	var kb strings.Builder
+	kb.WriteString(sp.fn)
+	if sp.star {
+		kb.WriteString("(*)")
+	} else if sp.arg != nil {
+		kb.WriteString("(" + parser.FormatExpr(*sp.arg) + ")")
+	} else {
+		fmt.Fprintf(&kb, "(#%d)", sp.col.ID)
+	}
+	if sp.distinct {
+		kb.WriteString(" distinct")
+	}
+	for _, e := range sp.extra {
+		kb.WriteString("," + parser.FormatExpr(e))
+	}
+	if sp.order != nil {
+		if sp.order.Expr != nil {
+			kb.WriteString(" order " + parser.FormatExpr(*sp.order.Expr))
+		} else {
+			kb.WriteString(" order " + sp.order.Column)
+		}
+	}
+	fmt.Fprintf(&kb, " filter%d", len(sp.filter))
+	sp.key = kb.String()
 	return sp, nil
 }
 
 // sameSpec reports whether two aggregate computations are identical (so a
 // HAVING aggregate can reuse a projected one's state).
 func sameSpec(a, b aggSpec) bool {
-	return a.fn == b.fn && a.star == b.star && a.col.ID == b.col.ID
+	return a.key == b.key
 }
 
 func (sp aggSpec) resultType() types.Family {
@@ -67,12 +139,28 @@ func (sp aggSpec) resultType() types.Family {
 	case "COUNT":
 		return types.Int
 	case "AVG":
-		if sp.col.Type == types.Decimal {
+		if sp.argType == types.Decimal || sp.argType == types.Int {
 			return types.Decimal // exact, quantized to 6 fractional digits
 		}
 		return types.Float
+	case "SUM":
+		if sp.argType == types.Unknown {
+			return types.Decimal
+		}
+		return sp.argType
+	case "STRING_AGG", "ARRAY_AGG":
+		return types.String
+	case "BOOL_AND", "BOOL_OR", "EVERY":
+		return types.Bool
+	case "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "PERCENTILE_CONT":
+		return types.Float
+	case "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG":
+		return types.Jsonb
 	}
-	return sp.col.Type
+	if sp.argType == types.Unknown {
+		return types.String
+	}
+	return sp.argType
 }
 
 // aggState is the streaming accumulator for one group's aggregates.
@@ -83,47 +171,146 @@ type aggState struct {
 	sumD   []decimal.Dec // exact register for DECIMAL SUM/AVG
 	best   []types.Datum // MIN/MAX candidate; zero = none yet
 	seen   []bool
+	// vals collects the inputs of the aggregates that need them all
+	// (string_agg, array_agg, the json ones, percentiles, stddev);
+	// keys pairs them for the object aggregates; distinct dedupes.
+	vals     [][]types.Datum
+	keys     [][]types.Datum
+	distinct []map[string]bool
+	all      []bool // bool_and / every
+	any      []bool // bool_or
 }
 
 func newAggState(n int) *aggState {
 	return &aggState{
-		counts: make([]int64, n),
-		sumI:   make([]int64, n),
-		sumF:   make([]float64, n),
-		sumD:   make([]decimal.Dec, n),
-		best:   make([]types.Datum, n),
-		seen:   make([]bool, n),
+		counts:   make([]int64, n),
+		sumI:     make([]int64, n),
+		sumF:     make([]float64, n),
+		sumD:     make([]decimal.Dec, n),
+		best:     make([]types.Datum, n),
+		seen:     make([]bool, n),
+		vals:     make([][]types.Datum, n),
+		keys:     make([][]types.Datum, n),
+		distinct: make([]map[string]bool, n),
+		all:      make([]bool, n),
+		any:      make([]bool, n),
 	}
 }
 
-func (st *aggState) accumulate(specs []aggSpec, row map[catalog.ColumnID]types.Datum) error {
+// collects reports whether the aggregate keeps every input value.
+func (sp aggSpec) collects() bool {
+	switch sp.fn {
+	case "STRING_AGG", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG",
+		"PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
+		return true
+	}
+	return false
+}
+
+// input evaluates the aggregate's argument for a row.
+func (sp aggSpec) input(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+	switch {
+	case sp.order != nil:
+		if sp.order.Expr != nil {
+			return evalExpr(*sp.order.Expr, desc, row, params)
+		}
+		c, _ := desc.Col(sp.order.Column)
+		d, ok := row[c.ID]
+		if !ok {
+			return types.DNull, nil
+		}
+		return d, nil
+	case sp.arg != nil:
+		return evalExpr(*sp.arg, desc, row, params)
+	}
+	d, ok := row[sp.col.ID]
+	if !ok {
+		return types.DNull, nil
+	}
+	return d, nil
+}
+
+func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) error {
 	for i, sp := range specs {
+		if len(sp.filter) > 0 {
+			ok, err := matchesWhere(sp.filter, desc, row, params)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+		}
 		if sp.star {
 			st.counts[i]++
 			continue
 		}
-		d, ok := row[sp.col.ID]
-		if !ok || d.Null {
+		d, err := sp.input(desc, row, params)
+		if err != nil {
+			return err
+		}
+		// The object aggregates pair a key with a value; the json
+		// aggregates keep NULL inputs (as JSON null).
+		if sp.fn == "JSON_OBJECT_AGG" || sp.fn == "JSONB_OBJECT_AGG" {
+			if d.Null {
+				return newErrf(CodeInvalidParameterValue, "field name must not be null")
+			}
+			v, err := evalExpr(sp.extra[0], desc, row, params)
+			if err != nil {
+				return err
+			}
+			st.keys[i] = append(st.keys[i], d)
+			st.vals[i] = append(st.vals[i], v)
 			continue
 		}
-		d, cerr := d.Coerce(sp.col.Type)
-		if cerr != nil {
-			return newErrf(CodeInternal, "column %q: %v", sp.col.Name, cerr)
+		if d.Null {
+			if sp.fn == "JSON_AGG" || sp.fn == "JSONB_AGG" || sp.fn == "ARRAY_AGG" {
+				st.vals[i] = append(st.vals[i], d)
+			}
+			continue
+		}
+		if sp.argType != types.Unknown && d.Fam != sp.argType {
+			if c, cerr := d.Coerce(sp.argType); cerr == nil {
+				d = c
+			}
+		}
+		if sp.distinct {
+			if st.distinct[i] == nil {
+				st.distinct[i] = map[string]bool{}
+			}
+			k := encodeGroupKey([]types.Datum{d})
+			if st.distinct[i][k] {
+				continue
+			}
+			st.distinct[i][k] = true
 		}
 		st.counts[i]++
+		if sp.collects() {
+			st.vals[i] = append(st.vals[i], d)
+			continue
+		}
 		switch sp.fn {
 		case "SUM", "AVG":
-			switch sp.col.Type {
+			switch d.Fam {
 			case types.Int:
-				st.sumI[i] += d.I
+				s := st.sumI[i] + d.I
+				if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
+					return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
+				}
+				st.sumI[i] = s
+				st.sumD[i] = decimal.Add(st.sumD[i], decimal.FromInt(d.I))
 			case types.Decimal:
 				v, err := d.DecimalVal()
 				if err != nil {
-					return newErrf(CodeInternal, "column %q: %v", sp.col.Name, err)
+					return newErrf(CodeInternal, "%s: %v", sp.name, err)
 				}
 				st.sumD[i] = decimal.Add(st.sumD[i], v)
 			default:
-				st.sumF[i] += d.F
+				f, err := d.Coerce(types.Float)
+				if err != nil {
+					return newErrf(CodeFeatureNotSupported, "%s over %s is not supported", sp.fn, d.Fam)
+				}
+				st.sumF[i] += f.F
 			}
 		case "MIN", "MAX":
 			if !st.seen[i] {
@@ -137,12 +324,22 @@ func (st *aggState) accumulate(specs []aggSpec, row map[catalog.ColumnID]types.D
 			if (sp.fn == "MIN" && c < 0) || (sp.fn == "MAX" && c > 0) {
 				st.best[i] = d
 			}
+		case "BOOL_AND", "EVERY", "BOOL_OR":
+			b, err := d.Coerce(types.Bool)
+			if err != nil {
+				return newErrf(CodeFeatureNotSupported, "%s over %s is not supported", sp.fn, d.Fam)
+			}
+			if !st.seen[i] {
+				st.all[i], st.any[i], st.seen[i] = true, false, true
+			}
+			st.all[i] = st.all[i] && b.B
+			st.any[i] = st.any[i] || b.B
 		}
 	}
 	return nil
 }
 
-func (st *aggState) finish(specs []aggSpec) []types.Datum {
+func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum, error) {
 	out := make([]types.Datum, len(specs))
 	for i, sp := range specs {
 		switch sp.fn {
@@ -152,9 +349,9 @@ func (st *aggState) finish(specs []aggSpec) []types.Datum {
 			switch {
 			case st.counts[i] == 0:
 				out[i] = types.DNull
-			case sp.col.Type == types.Int:
+			case sp.argType == types.Int:
 				out[i] = types.NewInt(st.sumI[i])
-			case sp.col.Type == types.Decimal:
+			case sp.argType == types.Decimal, sp.argType == types.Unknown:
 				out[i] = types.NewDecimal(st.sumD[i].String())
 			default:
 				out[i] = types.NewFloat(st.sumF[i])
@@ -163,7 +360,7 @@ func (st *aggState) finish(specs []aggSpec) []types.Datum {
 			switch {
 			case st.counts[i] == 0:
 				out[i] = types.DNull
-			case sp.col.Type == types.Decimal:
+			case sp.argType == types.Decimal || sp.argType == types.Int:
 				q, err := decimal.DivQuantize(st.sumD[i], decimal.FromInt(st.counts[i]), 6)
 				if err != nil {
 					out[i] = types.DNull
@@ -171,11 +368,7 @@ func (st *aggState) finish(specs []aggSpec) []types.Datum {
 					out[i] = types.NewDecimal(q.String())
 				}
 			default:
-				total := st.sumF[i]
-				if sp.col.Type == types.Int {
-					total = float64(st.sumI[i])
-				}
-				out[i] = types.NewFloat(total / float64(st.counts[i]))
+				out[i] = types.NewFloat(st.sumF[i] / float64(st.counts[i]))
 			}
 		case "MIN", "MAX":
 			if !st.seen[i] {
@@ -183,9 +376,177 @@ func (st *aggState) finish(specs []aggSpec) []types.Datum {
 			} else {
 				out[i] = st.best[i]
 			}
+		case "BOOL_AND", "EVERY":
+			if !st.seen[i] {
+				out[i] = types.DNull
+			} else {
+				out[i] = types.NewBool(st.all[i])
+			}
+		case "BOOL_OR":
+			if !st.seen[i] {
+				out[i] = types.DNull
+			} else {
+				out[i] = types.NewBool(st.any[i])
+			}
+		case "STRING_AGG":
+			if len(st.vals[i]) == 0 {
+				out[i] = types.DNull
+				continue
+			}
+			sep, err := evalExpr(sp.extra[0], nil, nil, params)
+			if err != nil {
+				return nil, err
+			}
+			parts := make([]string, len(st.vals[i]))
+			for j, v := range st.vals[i] {
+				parts[j] = v.Text()
+			}
+			out[i] = types.NewString(strings.Join(parts, sep.Text()))
+		case "ARRAY_AGG":
+			if len(st.vals[i]) == 0 {
+				out[i] = types.DNull
+				continue
+			}
+			elems := make([]string, len(st.vals[i]))
+			nulls := make([]bool, len(st.vals[i]))
+			for j, v := range st.vals[i] {
+				elems[j], nulls[j] = v.Text(), v.Null
+			}
+			out[i] = types.NewString(builtins.TextArrayLiteral(elems, nulls))
+		case "JSON_AGG", "JSONB_AGG":
+			if len(st.vals[i]) == 0 {
+				out[i] = types.DNull
+				continue
+			}
+			d, err := builtins.JSONArrayOf(st.vals[i])
+			if err != nil {
+				return nil, builtinErr(err)
+			}
+			out[i] = d
+		case "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG":
+			if len(st.vals[i]) == 0 {
+				out[i] = types.DNull
+				continue
+			}
+			d, err := builtins.JSONObjectOf(st.keys[i], st.vals[i])
+			if err != nil {
+				return nil, builtinErr(err)
+			}
+			out[i] = d
+		case "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
+			out[i] = statistic(sp.fn, st.vals[i])
+		case "PERCENTILE_CONT", "PERCENTILE_DISC":
+			frac, err := aggFraction(sp, params)
+			if err != nil {
+				return nil, err
+			}
+			d, err := percentile(sp, frac, st.vals[i])
+			if err != nil {
+				return nil, err
+			}
+			out[i] = d
 		}
 	}
-	return out
+	return out, nil
+}
+
+// aggFraction evaluates a percentile's constant fraction argument.
+func aggFraction(sp aggSpec, params []types.Datum) (float64, error) {
+	var d types.Datum
+	var err error
+	if sp.arg != nil {
+		d, err = evalExpr(*sp.arg, nil, nil, params)
+	} else {
+		return 0, newErrf(CodeFeatureNotSupported, "%s takes a constant fraction", strings.ToLower(sp.fn))
+	}
+	if err != nil {
+		return 0, err
+	}
+	f, err := d.Coerce(types.Float)
+	if err != nil || f.F < 0 || f.F > 1 {
+		return 0, newErrf(CodeInvalidParameterValue, "percentile value %s is not between 0 and 1", d.Text())
+	}
+	return f.F, nil
+}
+
+// percentile computes the ordered-set aggregates over the collected
+// values: _cont interpolates between neighbors, _disc takes the first
+// value at or past the fraction.
+func percentile(sp aggSpec, frac float64, vals []types.Datum) (types.Datum, error) {
+	if len(vals) == 0 {
+		return types.DNull, nil
+	}
+	sorted := append([]types.Datum(nil), vals...)
+	var sortErr error
+	sort.SliceStable(sorted, func(a, b int) bool {
+		c, err := sorted[a].Compare(sorted[b])
+		if err != nil {
+			sortErr = err
+		}
+		if sp.order.Desc {
+			return c > 0
+		}
+		return c < 0
+	})
+	if sortErr != nil {
+		return types.Datum{}, newErrf(CodeFeatureNotSupported, "%s: %v", strings.ToLower(sp.fn), sortErr)
+	}
+	n := len(sorted)
+	if sp.fn == "PERCENTILE_DISC" {
+		idx := int(math.Ceil(frac*float64(n))) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		return sorted[idx], nil
+	}
+	pos := frac * float64(n-1)
+	lo := int(math.Floor(pos))
+	hi := int(math.Ceil(pos))
+	lf, err := sorted[lo].Coerce(types.Float)
+	if err != nil {
+		return types.Datum{}, newErrf(CodeFeatureNotSupported, "percentile_cont requires numeric input, got %s", sorted[lo].Fam)
+	}
+	if lo == hi {
+		return lf, nil
+	}
+	hf, err := sorted[hi].Coerce(types.Float)
+	if err != nil {
+		return types.Datum{}, newErrf(CodeFeatureNotSupported, "percentile_cont requires numeric input, got %s", sorted[hi].Fam)
+	}
+	return types.NewFloat(lf.F + (pos-float64(lo))*(hf.F-lf.F)), nil
+}
+
+// statistic computes the variance family over the collected values.
+func statistic(fn string, vals []types.Datum) types.Datum {
+	n := float64(len(vals))
+	sample := fn == "STDDEV" || fn == "STDDEV_SAMP" || fn == "VARIANCE" || fn == "VAR_SAMP"
+	if len(vals) == 0 || (sample && len(vals) < 2) {
+		return types.DNull
+	}
+	var mean float64
+	fs := make([]float64, len(vals))
+	for i, v := range vals {
+		f, err := v.Coerce(types.Float)
+		if err != nil {
+			return types.DNull
+		}
+		fs[i] = f.F
+		mean += f.F
+	}
+	mean /= n
+	var ss float64
+	for _, f := range fs {
+		ss += (f - mean) * (f - mean)
+	}
+	div := n
+	if sample {
+		div = n - 1
+	}
+	v := ss / div
+	if strings.HasPrefix(fn, "STDDEV") {
+		v = math.Sqrt(v)
+	}
+	return types.NewFloat(v)
 }
 
 // groupedOut is one output column of a grouped SELECT: either a group key
@@ -381,7 +742,7 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 			groups[k] = g
 			order = append(order, k)
 		}
-		if err := g.st.accumulate(gq.specs, fr.row); err != nil {
+		if err := g.st.accumulate(gq.specs, desc, fr.row, params); err != nil {
 			return nil, err
 		}
 	}
@@ -398,7 +759,10 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 	}
 	for _, k := range order {
 		g := groups[k]
-		aggVals := g.st.finish(gq.specs)
+		aggVals, err := g.st.finish(gq.specs, params)
+		if err != nil {
+			return nil, err
+		}
 		keep := true
 		for _, ref := range gq.having {
 			var lhs types.Datum
@@ -454,6 +818,9 @@ func compareDatum(lhs types.Datum, op string, value parser.Expr, params []types.
 	}
 	if lhs.Null || rhs.Null {
 		return false, nil
+	}
+	if !plainCmpOp(op) {
+		return applyCmpOp(op, lhs, rhs)
 	}
 	rhs, cerr := rhs.Coerce(lhs.Fam)
 	if cerr != nil {
