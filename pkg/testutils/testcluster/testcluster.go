@@ -377,9 +377,24 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 	if tc.Nodes[i] != nil {
 		tc.T.Fatalf("node %d is still running", i+1)
 	}
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tc.T.Fatal(err)
+	// The kernel may hand the just-released port straight back, and the
+	// point of the restart is a DIFFERENT address: hold any listener that
+	// lands on the old one until a fresh port has been bound.
+	var held []net.Listener
+	var lis net.Listener
+	for {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			tc.T.Fatal(err)
+		}
+		if l.Addr().String() != tc.addrs[i] {
+			lis = l
+			break
+		}
+		held = append(held, l)
+	}
+	for _, l := range held {
+		_ = l.Close()
 	}
 	cfg := server.Config{
 		Listener:   lis,
