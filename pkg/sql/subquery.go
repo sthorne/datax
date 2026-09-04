@@ -754,9 +754,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 	if t.Distinct {
 		res.Rows = dedupeRows(res.Rows)
 	}
-	if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
-		res.Rows = res.Rows[:t.Limit]
-	}
+	res.Rows = trimRows(res.Rows, t)
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
 }

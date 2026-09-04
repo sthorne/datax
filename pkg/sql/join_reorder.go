@@ -45,7 +45,7 @@ func reorderJoins(t *parser.Select, sides []joinSide, stats []*catalog.TableStat
 		return nil, nil, false, false
 	}
 	for _, js := range sides {
-		if js.left {
+		if js.left || js.right {
 			return nil, nil, false, false
 		}
 	}

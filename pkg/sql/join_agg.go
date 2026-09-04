@@ -113,9 +113,25 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 	// bare form set above); leave aggregate output names untouched.
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 	for i := range c.OrderBy {
-		if _, err := resolveJoinRef(sides, c.OrderBy[i].Column); err == nil {
-			_, bare := splitQualified(c.OrderBy[i].Column)
-			c.OrderBy[i].Column = bare
+		oc := &c.OrderBy[i]
+		if oc.Agg != nil {
+			agg := *oc.Agg
+			if agg.AggCol != "" && agg.AggCol != "*" {
+				name, err := canon(agg.AggCol)
+				if err != nil {
+					return nil, err
+				}
+				agg.AggCol = name
+			}
+			if err := canonAggExprs(&agg, canon); err != nil {
+				return nil, err
+			}
+			oc.Agg = &agg
+			continue
+		}
+		if _, err := resolveJoinRef(sides, oc.Column); err == nil {
+			_, bare := splitQualified(oc.Column)
+			oc.Column = bare
 		}
 	}
 	// WHERE was already applied to the joined rows; the grouped executor

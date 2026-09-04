@@ -323,6 +323,17 @@ type OrderCol struct {
 	Column string
 	Expr   *Expr
 	Desc   bool
+	// Nulls is "first" or "last" when NULLS FIRST | LAST was written; ""
+	// is PostgreSQL's default (NULLS LAST ascending, NULLS FIRST
+	// descending).
+	Nulls string
+	// Position is a 1-based output position, kept when the select list
+	// is not known at parse time (ORDER BY after a parenthesized query);
+	// otherwise positions are rewritten to output names.
+	Position int
+	// Agg is an aggregate call (ORDER BY count(*) DESC) in a grouped
+	// query: sorted by, and computed when no select item is the same.
+	Agg *SelectExpr
 }
 
 // HavingCond is one HAVING conjunct: an aggregate call (HAVING COUNT(*) > 5)
@@ -349,8 +360,20 @@ type JoinCond struct {
 type JoinClause struct {
 	Left  bool // LEFT OUTER; false = inner
 	Cross bool // CROSS JOIN / comma join: no ON clause
-	Table string
-	Alias string
+	// Right and Full mark RIGHT [OUTER] and FULL [OUTER] joins: the
+	// joined table's unmatched rows are kept, NULL-extended on every
+	// earlier side (Full also keeps the earlier sides' unmatched rows,
+	// like Left).
+	Right, Full bool
+	// Using lists the columns of JOIN ... USING (cols): each is equated
+	// between the joined table and the earlier side that has it, shows
+	// once in SELECT *, and resolves unqualified without ambiguity.
+	// Natural asks for USING over every column name the sides share (a
+	// cross join when they share none).
+	Using   []string
+	Natural bool
+	Table   string
+	Alias   string
 	// FuncTable is a table function joined in (FROM t, f(x) [WITH
 	// ORDINALITY] AS a(c1, c2)), with its column names; Table is empty
 	// then. Parsed for the catalog queries tools send; not executable.
@@ -383,11 +406,21 @@ type Select struct {
 	// apply to the whole union and are carried by the head select.
 	Union    *Select
 	UnionAll bool
-	Where    []Comparison
-	GroupBy  []string
-	Having   []HavingCond
-	OrderBy  []OrderCol
-	Limit    int64 // -1 = none
+	// SetOp is the operator between this member and Union: "UNION" (or
+	// ""), "INTERSECT" or "EXCEPT". Members form a flat list in written
+	// order; INTERSECT binds tighter than the other two, which associate
+	// left to right, and the executor applies that precedence.
+	SetOp   string
+	Where   []Comparison
+	GroupBy []string
+	Having  []HavingCond
+	OrderBy []OrderCol
+	Limit   int64 // -1 = none
+	// Offset skips that many rows before Limit applies (0 = none).
+	Offset int64
+	// LimitParam and OffsetParam name the parameter ($n) supplying the
+	// count at execution (0 = written as a number, or absent).
+	LimitParam, OffsetParam int
 	// AsOf is the AS OF SYSTEM TIME operand ("" = none): a string literal
 	// holding a negative duration ('-5s'), an RFC 3339 timestamp, or a
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and

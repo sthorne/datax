@@ -30,16 +30,42 @@ type joinSide struct {
 	alias   string // alias if given, else the table name
 	aliased bool   // an explicit alias was written
 	left    bool   // this side was LEFT-joined (side 0: false)
+	// right: this side's unmatched rows are kept too (RIGHT or FULL
+	// JOIN), NULL-extended on every earlier side.
+	right bool
+	// merged maps a column name this side joined USING (or NATURALly) to
+	// the earlier side it was equated with: it shows once in SELECT *,
+	// resolves unqualified to the earlier side, and reads as
+	// COALESCE(earlier, this) so an outer join's unmatched rows keep it.
+	merged map[string]int
 }
 
 func (js joinSide) matches(qualifier string) bool {
 	return qualifier == js.alias || qualifier == js.desc.Name
 }
 
-// joinRef is a column resolved to a side.
+// joinRef is a column resolved to a side; alt, when set, is the later
+// side's copy of a USING column, read when this side's value is NULL.
 type joinRef struct {
 	side int
 	col  catalog.Column
+	alt  *joinRef
+}
+
+// sideRef makes the reference to side i's column col, attaching the
+// later side that merged the same column USING it, if any.
+func sideRef(sides []joinSide, i int, col catalog.Column) joinRef {
+	ref := joinRef{side: i, col: col}
+	for k := i + 1; k < len(sides); k++ {
+		if m, ok := sides[k].merged[col.Name]; ok && m == i {
+			if c, ok := sides[k].desc.Col(col.Name); ok {
+				alt := sideRef(sides, k, c)
+				ref.alt = &alt
+			}
+			break
+		}
+	}
+	return ref
 }
 
 // splitQualified splits "t.c" into ("t", "c"); no dot → ("", name).
@@ -70,6 +96,9 @@ func resolveJoinRef(sides []joinSide, name string) (joinRef, error) {
 	found := -1
 	var fcol catalog.Column
 	for i, js := range sides {
+		if _, merged := js.merged[colName]; merged {
+			continue // a USING column: the earlier side owns the name
+		}
 		if col, ok := js.desc.Col(colName); ok {
 			if found >= 0 {
 				return joinRef{}, newErrf(CodeAmbiguousColumn, "column reference %q is ambiguous", name)
@@ -80,7 +109,7 @@ func resolveJoinRef(sides []joinSide, name string) (joinRef, error) {
 	if found < 0 {
 		return joinRef{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 	}
-	return joinRef{side: found, col: fcol}, nil
+	return sideRef(sides, found, fcol), nil
 }
 
 // joinedRow holds one row per side; a nil entry is a LEFT JOIN's NULL
@@ -90,12 +119,14 @@ type joinedRow struct {
 }
 
 func (jr joinedRow) datum(ref joinRef) types.Datum {
-	if ref.side >= len(jr.rows) || jr.rows[ref.side] == nil {
-		return types.DNull
+	d := types.DNull
+	if ref.side < len(jr.rows) && jr.rows[ref.side] != nil {
+		if v, ok := jr.rows[ref.side][ref.col.ID]; ok {
+			d = v
+		}
 	}
-	d, ok := jr.rows[ref.side][ref.col.ID]
-	if !ok {
-		return types.DNull
+	if d.Null && ref.alt != nil {
+		return jr.datum(*ref.alt)
 	}
 	return d
 }
@@ -225,7 +256,10 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 		case se.Star:
 			for i, js := range sides {
 				for _, c := range js.desc.VisibleColumns() {
-					proj = append(proj, joinProj{name: c.Name, ref: joinRef{side: i, col: c}, typ: c.Type})
+					if _, merged := js.merged[c.Name]; merged {
+						continue // shown once, from the side it was merged with
+					}
+					proj = append(proj, joinProj{name: c.Name, ref: sideRef(sides, i, c), typ: c.Type})
 				}
 			}
 		case se.Agg != "":
@@ -454,9 +488,10 @@ func makeJoinSides(baseDesc *catalog.TableDescriptor, innerDescs []*catalog.Tabl
 	}
 	sides = append(sides, base)
 	for i := range t.Joins {
-		js := joinSide{desc: innerDescs[i], alias: innerDescs[i].Name, left: t.Joins[i].Left}
-		if t.Joins[i].Alias != "" {
-			js.alias, js.aliased = t.Joins[i].Alias, true
+		jc := t.Joins[i]
+		js := joinSide{desc: innerDescs[i], alias: innerDescs[i].Name, left: jc.Left || jc.Full, right: jc.Right || jc.Full}
+		if jc.Alias != "" {
+			js.alias, js.aliased = jc.Alias, true
 		}
 		sides = append(sides, js)
 	}
@@ -499,6 +534,9 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 	}
 	sides, err := makeJoinSides(baseDesc, innerDescs, t)
 	if err != nil {
+		return nil, err
+	}
+	if t, err = expandUsing(sides, t); err != nil {
 		return nil, err
 	}
 	jq := &joinQuery{sides: sides, sel: t}
@@ -560,6 +598,12 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	if err != nil {
 		return nil, err
 	}
+	if anyRightSide(sides) {
+		// A RIGHT/FULL join keeps rows the base never matched, whose base
+		// columns are NULL: WHERE must see those after the join, not
+		// prune the base first.
+		baseWhere = nil
+	}
 
 	baseRows, _, err := s.fetchRows(ctx, txn, sides[0].desc, baseWhere, params, 0)
 	if err != nil {
@@ -574,6 +618,10 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	// over that side's matches, NULL-extends (LEFT), or drops (INNER).
 	for k := 1; k < len(sides); k++ {
 		var next []joinedRow
+		var matchedKeys map[string]bool // RIGHT/FULL: side k's rows that found a partner
+		if sides[k].right {
+			matchedKeys = map[string]bool{}
+		}
 		for _, jr := range joined {
 			// Synthetic equality predicate from the partial row's join
 			// keys. A NULL key (including a NULL-extended earlier side)
@@ -622,9 +670,28 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				}
 				next = append(next, ext)
 				matched++
+				if matchedKeys != nil {
+					matchedKeys[string(ifr.key)] = true
+				}
 			}
 			if matched == 0 && sides[k].left {
 				next = append(next, jr.extend(nil))
+			}
+		}
+		if sides[k].right {
+			// The joined side's unmatched rows, NULL-extended on every
+			// earlier side.
+			all, _, err := s.fetchRows(ctx, txn, sides[k].desc, nil, params, 0)
+			if err != nil {
+				return nil, err
+			}
+			for _, fr := range all {
+				if matchedKeys[string(fr.key)] {
+					continue
+				}
+				ext := joinedRow{rows: make([]map[catalog.ColumnID]types.Datum, k+1)}
+				ext.rows[k] = fr.row
+				next = append(next, ext)
 			}
 		}
 		joined = next
@@ -716,9 +783,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	if t.Distinct {
 		res.Rows = dedupeRows(res.Rows)
 	}
-	if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
-		res.Rows = res.Rows[:t.Limit]
-	}
+	res.Rows = trimRows(res.Rows, t)
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
 }
@@ -739,6 +804,12 @@ func sortJoinedRows(sides []joinSide, rows []joinedRow, order []parser.OrderCol,
 	for i, oc := range order {
 		if oc.Expr != nil {
 			continue
+		}
+		if oc.Agg != nil {
+			return newErrf(CodeGrouping, "aggregate functions in ORDER BY require GROUP BY or an aggregated select list")
+		}
+		if oc.Position > 0 {
+			return newErrf(CodeFeatureNotSupported, "ORDER BY position after a parenthesized join query is not supported")
 		}
 		ref, err := resolveJoinRef(sides, oc.Column)
 		if err != nil {
@@ -776,7 +847,7 @@ func sortJoinedRows(sides []joinSide, rows []joinedRow, order []parser.OrderCol,
 				if da.Null == db.Null {
 					continue
 				}
-				return db.Null != oc.Desc
+				return da.Null == nullsFirst(oc)
 			}
 			c, err := da.Compare(db)
 			if err != nil {
@@ -857,12 +928,7 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		}
 		return ""
 	}
-	kind := "inner"
-	if sides[1].left {
-		kind = "left"
-	} else if t.Joins[0].Cross {
-		kind = "cross"
-	}
+	kind := joinKindName(sides[1], t.Joins[0])
 	var b strings.Builder
 	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s%s", kind, sides[0].alias, basePlan.String(), estimate(basePlan))
 	for k := 1; k < len(sides); k++ {
@@ -882,13 +948,16 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		}
 		if k == 1 {
 			fmt.Fprintf(&b, "; inner (%s) per outer row: %s%s", sides[k].alias, innerPathDesc(plan), estimate(plan))
+			if sides[k].right {
+				fmt.Fprintf(&b, " + unmatched %s rows appended", sides[k].alias)
+			}
 			continue
 		}
-		lk := "inner"
-		if sides[k].left {
-			lk = "left"
-		}
+		lk := joinKindName(sides[k], t.Joins[k-1])
 		fmt.Fprintf(&b, "; then %s (%s) per row: %s%s", lk, sides[k].alias, innerPathDesc(plan), estimate(plan))
+		if sides[k].right {
+			fmt.Fprintf(&b, " + unmatched %s rows appended", sides[k].alias)
+		}
 	}
 	if grouped {
 		b.WriteString("; then group/aggregate over the joined rows")
@@ -897,4 +966,103 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		b.WriteString("; join reordered by cost")
 	}
 	return b.String(), nil
+}
+
+// joinKindName names a join level for EXPLAIN.
+func joinKindName(js joinSide, jc parser.JoinClause) string {
+	switch {
+	case js.left && js.right:
+		return "full"
+	case js.right:
+		return "right"
+	case js.left:
+		return "left"
+	case jc.Cross:
+		return "cross"
+	}
+	return "inner"
+}
+
+// anyRightSide reports whether a RIGHT or FULL join is in the chain.
+func anyRightSide(sides []joinSide) bool {
+	for _, js := range sides {
+		if js.right {
+			return true
+		}
+	}
+	return false
+}
+
+// expandUsing rewrites JOIN ... USING (cols) and NATURAL JOIN into ON
+// equalities on a copy of t (the caller's statement, possibly cached,
+// is never changed), marking each merged column on its side so it shows
+// once and resolves to the earlier side. A NATURAL join with no common
+// column is a cross join.
+func expandUsing(sides []joinSide, t *parser.Select) (*parser.Select, error) {
+	var out *parser.Select
+	for i := range t.Joins {
+		jc := t.Joins[i]
+		if !jc.Natural && len(jc.Using) == 0 {
+			continue
+		}
+		if out == nil {
+			c := *t
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+			out = &c
+		}
+		k := i + 1
+		names := jc.Using
+		if jc.Natural {
+			names = nil
+			for _, col := range sides[k].desc.VisibleColumns() {
+				for j := 0; j < k; j++ {
+					if _, merged := sides[j].merged[col.Name]; merged {
+						continue
+					}
+					if _, ok := sides[j].desc.Col(col.Name); ok {
+						names = append(names, col.Name)
+						break
+					}
+				}
+			}
+			if len(names) == 0 {
+				out.Joins[i].Cross, out.Joins[i].Natural = true, false
+				continue
+			}
+		}
+		on := append([]parser.JoinCond(nil), out.Joins[i].On...)
+		for _, name := range names {
+			name = strings.ToLower(name)
+			rcol, ok := sides[k].desc.Col(name)
+			if !ok {
+				return nil, newErrf(CodeUndefinedColumn, "column %q specified in USING clause does not exist in right table", name)
+			}
+			from := -1
+			for j := 0; j < k; j++ {
+				if _, merged := sides[j].merged[name]; merged {
+					continue
+				}
+				if _, ok := sides[j].desc.Col(name); ok {
+					from = j
+					break
+				}
+			}
+			if from < 0 {
+				return nil, newErrf(CodeUndefinedColumn, "column %q specified in USING clause does not exist in left table", name)
+			}
+			on = append(on, parser.JoinCond{
+				L: parser.ColumnRef{Table: sides[from].alias, Column: name},
+				R: parser.ColumnRef{Table: sides[k].alias, Column: rcol.Name},
+			})
+			if sides[k].merged == nil {
+				sides[k].merged = map[string]int{}
+			}
+			sides[k].merged[name] = from
+		}
+		out.Joins[i].On, out.Joins[i].Using, out.Joins[i].Natural = on, nil, false
+	}
+	if out == nil {
+		return t, nil
+	}
+	return out, nil
 }

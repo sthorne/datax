@@ -15,10 +15,12 @@ INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 SELECT [DISTINCT] * | col, ... | aggregates
     FROM t [[AS] alias] | (SELECT ...) [AS] alias
-    [[INNER | LEFT [OUTER]] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...]]
+    [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS | NATURAL] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...] | USING (cols)]
     [AS OF SYSTEM TIME 't' | AS OF SYSTEM TIME with_max_staleness('d')]
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
-    [ORDER BY col [ASC|DESC], ...] [LIMIT n] [FOR UPDATE]
+    [UNION | INTERSECT | EXCEPT [ALL] query]
+    [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
+    [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]
@@ -137,7 +139,8 @@ on the recent side and the GC TTL (default 25h) on the old side.
 Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
-exist; LEFT joins and self-joins keep syntactic order),
+exist; outer joins and self-joins keep syntactic order),
+CTEs (`WITH`), window functions, `EXPLAIN ANALYZE`,
 deferrable constraints,
 typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
 ignored; casts apply both),

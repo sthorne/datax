@@ -8,6 +8,21 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.17.0 — unreleased
+
+### Added
+- Query shapes, part one (#94): `OFFSET n`, `LIMIT ALL`, `FETCH FIRST
+  n ROWS ONLY` on every query shape (`LIMIT 0` returns no rows);
+  `ORDER BY ... NULLS FIRST | LAST`, positions and expressions over
+  grouped and set-operation output, and aggregate calls (`ORDER BY
+  count(*)`) in grouped queries; `INTERSECT` and `EXCEPT`, each
+  `[ALL]`, with PostgreSQL's precedence, parenthesized members that keep
+  their own `ORDER BY` / `LIMIT`, `VALUES` as a member or a statement,
+  and column types unified across members; `RIGHT` and `FULL [OUTER]
+  JOIN`, `JOIN ... USING (cols)` and `NATURAL JOIN` (the merged column
+  shows once and reads as `COALESCE` across an outer join). `EXPLAIN`
+  names the join kind and the offset.
+
 ## 0.16.0 — unreleased
 
 ### Added

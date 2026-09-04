@@ -236,6 +236,15 @@ func (p *parser) expectIdent() (string, error) {
 
 func (p *parser) parseStatement() (Statement, error) {
 	t := p.peek()
+	if (t.kind == tkOp && t.text == "(") || (t.kind == tkKeyword && t.text == "VALUES") {
+		// (SELECT ...) [UNION ...] [ORDER BY ...]: a parenthesized query;
+		// VALUES (...), (...) as a statement of its own.
+		sel, err := p.parseSetMember()
+		if err != nil {
+			return nil, err
+		}
+		return sel, nil
+	}
 	if t.kind != tkKeyword && t.kind != tkIdent {
 		return nil, p.errf("unexpected %q", t.text)
 	}
@@ -1607,35 +1616,14 @@ func (p *parser) parseSelect() (Statement, error) {
 		// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
 		// words. Joins execute left-deep in syntactic order.
 		for {
-			var left, cross bool
-			join := false
-			switch {
-			case p.consumeOp(","):
-				// FROM a, b: a cross join (the WHERE clause carries the
-				// join predicate, if any).
-				join, cross = true, true
-			case p.consumeIdentWord("cross"):
-				if !p.consumeIdentWord("join") {
-					return nil, p.errf("expected JOIN after CROSS, found %q", p.peek().text)
-				}
-				join, cross = true, true
-			case p.consumeIdentWord("join"):
-				join = true
-			case p.consumeIdentWord("inner"):
-				if !p.consumeIdentWord("join") {
-					return nil, p.errf("expected JOIN after INNER, found %q", p.peek().text)
-				}
-				join = true
-			case p.consumeIdentWord("left"):
-				p.consumeIdentWord("outer")
-				if !p.consumeIdentWord("join") {
-					return nil, p.errf("expected JOIN after LEFT [OUTER], found %q", p.peek().text)
-				}
-				join, left = true, true
+			jk, join, err := p.parseJoinKind()
+			if err != nil {
+				return nil, err
 			}
 			if !join {
 				break
 			}
+			left, cross := jk.left, jk.cross
 			if len(sel.Joins) >= maxJoinTables-1 {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
 			}
@@ -1676,9 +1664,29 @@ func (p *parser) parseSelect() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
-			jc := JoinClause{Left: left, Cross: cross, Table: jt}
+			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural, Table: jt}
 			jc.Alias = p.parseOptTableAlias(false)
-			if cross {
+			if cross || jk.natural {
+				sel.Joins = append(sel.Joins, jc)
+				continue
+			}
+			if p.consumeIdentWord("using") {
+				if err := p.expectOp("("); err != nil {
+					return nil, err
+				}
+				for {
+					col, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					jc.Using = append(jc.Using, col)
+					if !p.consumeOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
 				sel.Joins = append(sel.Joins, jc)
 				continue
 			}
@@ -1781,58 +1789,8 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, err
 		}
 	}
-	if p.consumeKeyword("ORDER") {
-		if err := p.expectKeyword("BY"); err != nil {
-			return nil, err
-		}
-		for {
-			var col string
-			if t := p.peek(); t.kind == tkNumber {
-				n, err := strconv.Atoi(t.text)
-				if err != nil || n < 1 || n > len(sel.Exprs) {
-					return nil, p.errf("ORDER BY position %s is not in the select list", t.text)
-				}
-				p.i++
-				col = outputName(sel.Exprs[n-1])
-			}
-			var oc OrderCol
-			if col != "" {
-				oc = OrderCol{Column: col}
-			} else {
-				// A bare (possibly qualified) name sorts by that column or
-				// output name; anything else is a computed sort key.
-				e, err := p.parseValueOrBool()
-				if err != nil {
-					return nil, err
-				}
-				if isPlainColumn(e) {
-					oc = OrderCol{Column: e.Column}
-				} else {
-					oc = OrderCol{Expr: &e}
-				}
-			}
-			if p.consumeKeyword("DESC") {
-				oc.Desc = true
-			} else {
-				p.consumeKeyword("ASC")
-			}
-			sel.OrderBy = append(sel.OrderBy, oc)
-			if !p.consumeOp(",") {
-				break
-			}
-		}
-	}
-	if p.consumeKeyword("LIMIT") {
-		t := p.peek()
-		if t.kind != tkNumber {
-			return nil, p.errf("expected LIMIT count, found %q", t.text)
-		}
-		p.i++
-		v, err := strconv.ParseInt(t.text, 10, 64)
-		if err != nil {
-			return nil, p.errf("invalid LIMIT %q", t.text)
-		}
-		sel.Limit = v
+	if err := p.parseOrderLimit(sel, true); err != nil {
+		return nil, err
 	}
 	// FOR UPDATE (FOR is not a reserved word — it lexes as an identifier).
 	if t := p.peek(); t.kind == tkIdent && t.text == "for" {
@@ -1845,34 +1803,310 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 		}
 		sel.ForUpdate = true
 	}
-	// UNION [ALL] SELECT ... ("union" is not a reserved word). The tail
-	// parses as a full select; an ORDER BY / LIMIT it swallowed belongs
-	// to the union as a whole and moves to the head.
-	if p.consumeIdentWord("union") {
+	if err := p.parseSetOps(sel); err != nil {
+		return nil, err
+	}
+	return sel, nil
+}
+
+// joinKind is what a join introducer said: LEFT/RIGHT/FULL [OUTER],
+// CROSS (or a comma), NATURAL, or a plain [INNER] JOIN.
+type joinKind struct {
+	left, right, full, cross, natural bool
+}
+
+// parseJoinKind consumes a join introducer, reporting its kind, or
+// consumes nothing (ok false) when the next tokens do not start a join.
+// None of the words are reserved.
+func (p *parser) parseJoinKind() (jk joinKind, ok bool, err error) {
+	if p.consumeOp(",") {
+		// FROM a, b: a cross join (the WHERE clause carries the join
+		// predicate, if any).
+		return joinKind{cross: true}, true, nil
+	}
+	jk.natural = p.consumeIdentWord("natural")
+	after := func(what string) (joinKind, bool, error) {
+		if !p.consumeIdentWord("join") {
+			return jk, false, p.errf("expected JOIN after %s, found %q", what, p.peek().text)
+		}
+		return jk, true, nil
+	}
+	switch {
+	case p.consumeIdentWord("cross"):
+		if jk.natural {
+			return jk, false, p.errf("NATURAL CROSS JOIN is not valid")
+		}
+		jk.cross = true
+		return after("CROSS")
+	case p.consumeIdentWord("join"):
+		return jk, true, nil
+	case p.consumeIdentWord("inner"):
+		return after("INNER")
+	case p.consumeIdentWord("left"):
+		p.consumeIdentWord("outer")
+		jk.left = true
+		return after("LEFT [OUTER]")
+	case p.consumeIdentWord("right"):
+		p.consumeIdentWord("outer")
+		jk.right = true
+		return after("RIGHT [OUTER]")
+	case p.consumeIdentWord("full"):
+		p.consumeIdentWord("outer")
+		jk.full = true
+		return after("FULL [OUTER]")
+	}
+	if jk.natural {
+		return jk, false, p.errf("expected JOIN after NATURAL, found %q", p.peek().text)
+	}
+	return jk, false, nil
+}
+
+// parseOrderLimit parses the optional ORDER BY, LIMIT, OFFSET and FETCH
+// clauses onto sel. With exprsKnown, a positional ORDER BY is checked
+// against and rewritten to the select list's output names; otherwise
+// (a parenthesized query) the position is kept for the executor.
+func (p *parser) parseOrderLimit(sel *Select, exprsKnown bool) error {
+	if p.consumeKeyword("ORDER") {
+		if err := p.expectKeyword("BY"); err != nil {
+			return err
+		}
+		for {
+			var oc OrderCol
+			if t := p.peek(); t.kind == tkNumber {
+				n, err := strconv.Atoi(t.text)
+				if err != nil || n < 1 || (exprsKnown && n > len(sel.Exprs)) {
+					return p.errf("ORDER BY position %s is not in the select list", t.text)
+				}
+				p.i++
+				if exprsKnown {
+					oc = OrderCol{Column: outputName(sel.Exprs[n-1])}
+				} else {
+					oc = OrderCol{Position: n}
+				}
+			} else if se, ok, err := p.parseAggExpr(); err != nil {
+				return err
+			} else if ok {
+				oc = OrderCol{Agg: &se}
+			} else {
+				// A bare (possibly qualified) name sorts by that column or
+				// output name; anything else is a computed sort key.
+				e, err := p.parseValueOrBool()
+				if err != nil {
+					return err
+				}
+				if isPlainColumn(e) {
+					oc = OrderCol{Column: e.Column}
+				} else {
+					oc = OrderCol{Expr: &e}
+				}
+			}
+			if p.consumeKeyword("DESC") {
+				oc.Desc = true
+			} else {
+				p.consumeKeyword("ASC")
+			}
+			if p.consumeIdentWord("nulls") {
+				switch {
+				case p.consumeIdentWord("first"):
+					oc.Nulls = "first"
+				case p.consumeIdentWord("last"):
+					oc.Nulls = "last"
+				default:
+					return p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
+				}
+			}
+			sel.OrderBy = append(sel.OrderBy, oc)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
+	// LIMIT n | LIMIT ALL, OFFSET n [ROW | ROWS], FETCH {FIRST | NEXT} [n]
+	// {ROW | ROWS} ONLY — in either order, each at most once.
+	seenLimit, seenOffset := false, false
+	for {
+		switch {
+		case p.consumeKeyword("LIMIT"):
+			if seenLimit {
+				return p.errf("multiple LIMIT clauses")
+			}
+			seenLimit = true
+			if p.consumeIdentWord("all") {
+				sel.Limit = -1
+				continue
+			}
+			n, param, err := p.parseCount("LIMIT")
+			if err != nil {
+				return err
+			}
+			sel.Limit, sel.LimitParam = n, param
+		case p.consumeIdentWord("offset"):
+			if seenOffset {
+				return p.errf("multiple OFFSET clauses")
+			}
+			seenOffset = true
+			n, param, err := p.parseCount("OFFSET")
+			if err != nil {
+				return err
+			}
+			sel.Offset, sel.OffsetParam = n, param
+			if !p.consumeIdentWord("rows") {
+				p.consumeIdentWord("row")
+			}
+		case p.consumeIdentWord("fetch"):
+			if seenLimit {
+				return p.errf("multiple LIMIT clauses")
+			}
+			seenLimit = true
+			if !p.consumeIdentWord("first") && !p.consumeIdentWord("next") {
+				return p.errf("expected FIRST or NEXT after FETCH, found %q", p.peek().text)
+			}
+			n, param := int64(1), 0
+			if t := p.peek(); t.kind == tkNumber || t.kind == tkParam {
+				var err error
+				if n, param, err = p.parseCount("FETCH"); err != nil {
+					return err
+				}
+			}
+			if !p.consumeIdentWord("rows") && !p.consumeIdentWord("row") {
+				return p.errf("expected ROW or ROWS in FETCH FIRST, found %q", p.peek().text)
+			}
+			if !p.consumeIdentWord("only") {
+				return p.errf("expected ONLY in FETCH FIRST, found %q", p.peek().text)
+			}
+			sel.Limit, sel.LimitParam = n, param
+		default:
+			return nil
+		}
+	}
+}
+
+// parseCount parses the count of a LIMIT / OFFSET / FETCH clause: a
+// non-negative integer, or a parameter ($n) resolved at execution (the
+// count is then -1 and param names it).
+func (p *parser) parseCount(clause string) (n int64, param int, err error) {
+	t := p.peek()
+	if t.kind == tkParam {
+		p.i++
+		idx, err := strconv.Atoi(t.text)
+		if err != nil || idx < 1 {
+			return 0, 0, p.errf("invalid parameter $%s", t.text)
+		}
+		return -1, idx, nil
+	}
+	if t.kind != tkNumber {
+		return 0, 0, p.errf("expected %s count, found %q", clause, t.text)
+	}
+	v, err := strconv.ParseInt(t.text, 10, 64)
+	if err != nil || v < 0 {
+		return 0, 0, p.errf("invalid %s %q", clause, t.text)
+	}
+	p.i++
+	return v, 0, nil
+}
+
+// parseSetOps parses a [UNION | INTERSECT | EXCEPT] [ALL | DISTINCT]
+// member after sel, chaining it onto the END of sel's member list (none
+// of the words are reserved). The member parses as a full query, so its
+// own tail — further members, and the ORDER BY / LIMIT / OFFSET written
+// after the last member — comes back with it; the members flatten into
+// sel's list and the ordering clauses move to the head, which applies
+// them to the whole result. Precedence (INTERSECT first, then left to
+// right) is the executor's, over the flat list.
+func (p *parser) parseSetOps(sel *Select) error {
+	for {
+		var op string
+		switch {
+		case p.consumeIdentWord("union"):
+			op = "UNION"
+		case p.consumeIdentWord("intersect"):
+			op = "INTERSECT"
+		case p.consumeIdentWord("except"):
+			op = "EXCEPT"
+		default:
+			return nil
+		}
 		all := p.consumeIdentWord("all")
-		if t := p.peek(); t.kind != tkKeyword || (t.text != "SELECT" && t.text != "VALUES") {
-			return nil, p.errf("expected SELECT or VALUES after UNION, found %q", t.text)
+		if !all {
+			p.consumeIdentWord("distinct")
 		}
 		if sel.ForUpdate {
-			return nil, p.errf("FOR UPDATE is not allowed with UNION")
+			return p.errf("FOR UPDATE is not allowed with %s", op)
 		}
-		var tailStmt Statement
-		var err error
-		if p.peek().text == "VALUES" {
-			tailStmt, err = p.parseValuesQuery()
-		} else {
-			tailStmt, err = p.parseSelect()
+		if len(sel.OrderBy) > 0 || sel.Limit >= 0 || sel.Offset > 0 || sel.LimitParam > 0 || sel.OffsetParam > 0 {
+			return p.errf("ORDER BY, LIMIT and OFFSET must follow the last %s member", op)
 		}
+		tail, err := p.parseSetMember()
 		if err != nil {
-			return nil, err
-		}
-		tail := tailStmt.(*Select)
-		if len(sel.OrderBy) > 0 || sel.Limit >= 0 {
-			return nil, p.errf("ORDER BY and LIMIT must follow the last UNION member")
+			return err
 		}
 		sel.OrderBy, tail.OrderBy = tail.OrderBy, nil
 		sel.Limit, tail.Limit = tail.Limit, -1
-		sel.Union, sel.UnionAll = tail, all
+		sel.Offset, tail.Offset = tail.Offset, 0
+		sel.LimitParam, tail.LimitParam = tail.LimitParam, 0
+		sel.OffsetParam, tail.OffsetParam = tail.OffsetParam, 0
+		last := sel
+		for last.Union != nil {
+			last = last.Union
+		}
+		last.Union, last.UnionAll, last.SetOp = tail, all, op
+		// The tail's own list continues from it; nothing more to parse
+		// here unless it stopped at a parenthesized member's boundary.
+	}
+}
+
+// parseSetMember parses one member of a set operation: SELECT ...,
+// VALUES ..., or a parenthesized query.
+func (p *parser) parseSetMember() (*Select, error) {
+	t := p.peek()
+	switch {
+	case t.kind == tkOp && t.text == "(":
+		return p.parseParenMember()
+	case t.kind == tkKeyword && t.text == "SELECT":
+		stmt, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		return stmt.(*Select), nil
+	case t.kind == tkKeyword && t.text == "VALUES":
+		stmt, err := p.parseValuesQuery()
+		if err != nil {
+			return nil, err
+		}
+		head := stmt.(*Select)
+		if err := p.parseOrderLimit(head, true); err != nil {
+			return nil, err
+		}
+		if err := p.parseSetOps(head); err != nil {
+			return nil, err
+		}
+		return head, nil
+	}
+	return nil, p.errf("expected SELECT, VALUES or a parenthesized query, found %q", t.text)
+}
+
+// parseParenMember parses (query) [ORDER BY ...] [LIMIT ...] [set ops]:
+// the parenthesized query — with any ordering clauses of its own —
+// becomes a derived table selected whole, so it can carry its own ORDER
+// BY / LIMIT inside a set operation, and the clauses after the closing
+// parenthesis apply to the result.
+func (p *parser) parseParenMember() (*Select, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	inner, err := p.parseSetMember()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	sel := &Select{Limit: -1, Exprs: []SelectExpr{{Star: true}}, Derived: inner, Alias: "_q"}
+	if err := p.parseOrderLimit(sel, false); err != nil {
+		return nil, err
+	}
+	if err := p.parseSetOps(sel); err != nil {
+		return nil, err
 	}
 	return sel, nil
 }
@@ -1919,7 +2153,9 @@ var caseWords = map[string]bool{"then": true, "else": true, "end": true, "when":
 // tableClauseWords are non-reserved identifier words that begin a clause
 // after a table name — never a bare table alias.
 var tableClauseWords = map[string]bool{
-	"join": true, "inner": true, "left": true, "cross": true, "group": true, "having": true, "for": true, "union": true,
+	"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true, "natural": true, "using": true,
+	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
+	"window": true,
 }
 
 // peekIdentSeq reports whether the next tokens are exactly this sequence of
@@ -3786,7 +4022,7 @@ func outputName(se SelectExpr) string {
 		return se.Alias
 	}
 	if se.Agg != "" {
-		return se.Agg
+		return strings.ToLower(se.Agg) // the aggregate's output name
 	}
 	return "?column?"
 }
