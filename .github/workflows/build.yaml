@@ -31,8 +31,16 @@ jobs:
         run: go build ./...
       - name: version
         id: version
-        # Tag-relative when tags exist, short SHA until then.
-        run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+        # An exact release tag when the commit carries one; otherwise the
+        # release constant plus the commit, so every artifact says which
+        # release line it came from (see pkg/version/release.go).
+        run: |
+          if tag=$(git describe --tags --exact-match 2>/dev/null); then
+            echo "version=${tag}" >> "$GITHUB_OUTPUT"
+          else
+            rel=$(sed -n 's/.*Release = "\(.*\)".*/\1/p' pkg/version/release.go)
+            echo "version=v${rel}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: verify

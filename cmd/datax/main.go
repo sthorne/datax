@@ -4,10 +4,15 @@ package main
 import (
 	"fmt"
 	"os"
+
+	dataxversion "github.com/sthorne/datax/pkg/version"
 )
 
-// version is the build version, overridable via -ldflags "-X main.version=...".
-var version = "0.1.0-dev"
+// version is the build stamp, set by the build workflow via
+// -ldflags "-X main.version=..." (an exact git tag, or
+// "v<release>+<commit>"); a plain `go build` reports the release with a
+// -dev suffix.
+var version = "v" + dataxversion.Release + "-dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -17,7 +22,7 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "version", "--version", "-v":
-		fmt.Printf("datax %s\n", version)
+		fmt.Printf("datax %s (cluster protocol v%d, supports v%d..v%d)\n", version, dataxversion.Current, dataxversion.MinSupported, dataxversion.Current)
 	case "init":
 		err = runInit(os.Args[2:])
 	case "start":
