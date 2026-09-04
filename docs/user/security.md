@@ -71,6 +71,20 @@ psql "host=10.0.0.1 port=26433 user=root dbname=datax \
       sslcert=certs/client.root.crt sslkey=certs/client.root.key"
 ```
 
+The built-in shell takes the certificate directory directly and picks
+`ca.crt` and `client.<user>.crt` from it, whatever `sslmode` the URL
+says:
+
+```sh
+datax sql --url postgres://10.0.0.1:26433/datax --certs-dir certs --user root
+datax sql --url postgres://10.0.0.1:26433/datax --certs-dir certs --user ops -e "SHOW TABLES"
+```
+
+`--user` names both the certificate to present and the session user
+(they must agree: the server takes the username from the certificate);
+without it the URL's user is used. A missing certificate is refused with
+the `datax cert create-client` command that creates it.
+
 ## Users and privileges
 
 ```sql
@@ -133,6 +147,13 @@ datax cert create-client --certs-dir certs --user ops   # once
 datax debug split --table 100 --addr 10.0.0.1:26257 --certs-dir certs --user ops
 datax backup --dest /backups/today --addr 10.0.0.1:26257 --certs-dir certs
 ```
+
+Every client command dials and completes the TLS handshake before it
+sends anything, under `--connect-timeout` (default 10s), so a node that
+is down, unreachable, or presenting a certificate that does not match
+its address is reported as `could not connect to 10.0.0.1:26257 (admin
+rpc, TLS with client certificate): ...` with the cause, instead of the
+operation's own timeout expiring in silence.
 
 The server authorizes by the certificate's CommonName: read-only ops
 (`ranges`, `nodes`) accept any database user's certificate;

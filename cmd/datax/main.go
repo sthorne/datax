@@ -57,7 +57,8 @@ Usage:
   datax start  --dir <dir> --join <addr> [flags]
                                        start a node, joining an existing cluster
   datax demo   [--nodes N]             run an in-process demo cluster across racks
-  datax sql    --url <postgres-url>    interactive SQL shell
+  datax sql    [--url <postgres-url>] [--certs-dir <dir> --user <name>]
+                                       interactive SQL shell (or -e "<statement>")
   datax bench  <kv|bank|ingest|timeseries> [flags]  benchmark a running cluster over pgwire
   datax cert   <create-ca|create-node|create-client>
                                        manage TLS certificates (secure mode)

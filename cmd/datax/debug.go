@@ -11,18 +11,18 @@ import (
 	"os"
 	osuser "os/user"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/pebble/vfs"
 
 	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/cli"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
-	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage/enc"
-	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -99,6 +99,7 @@ func runDebugRotateEncKey(args []string) error {
 	newPath := fs.String("new-key", "", "new store encryption key file")
 	certsDir := fs.String("certs-dir", "", "online mode, secure cluster: certificate directory (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "online mode: username whose client certificate authenticates the call; must be an admin")
+	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -120,7 +121,7 @@ func runDebugRotateEncKey(args []string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := adminCall(*addr, *certsDir, *certUser, cluster.AdminRequest{
+		if _, err := adminCall(*addr, *certsDir, *certUser, *timeout, cluster.AdminRequest{
 			Op: "rotate-store-key", OldStoreKey: oldKey, NewStoreKey: newKey,
 		}); err != nil {
 			return err
@@ -225,10 +226,11 @@ func runDebugStatus(args []string) error {
 	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification")
 	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir)")
+	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{}
 	tlsCfg := &tls.Config{}
 	if *certsDir != "" {
 		var err error
@@ -240,12 +242,37 @@ func runDebugStatus(args []string) error {
 	if *certsDir != "" || *insecureTLS {
 		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}
-	resp, err := client.Get(*url)
+	kind := "http"
+	if *certsDir != "" {
+		kind = "http, TLS with client certificate"
+	}
+	// The document is small; fetch it whole under the connect timeout (the
+	// request context ends with the connect phase, so the body must be
+	// read inside it).
+	var body []byte
+	err := cli.Connect(context.Background(), nil, *url, kind, *timeout, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, "GET", *url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return cli.ConnectedError{Err: fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))}
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	_, err = io.Copy(os.Stdout, resp.Body)
+	_, err = os.Stdout.Write(body)
 	return err
 }
 
@@ -276,6 +303,7 @@ func runDebug(args []string) error {
 	nodeID := fs.Int64("node", 0, "decommission: node ID to drain")
 	cancelDrain := fs.Bool("cancel", false, "decommission: stop draining the node instead")
 	wait := fs.Bool("wait", false, "decommission: block until the node holds no replicas")
+	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -319,19 +347,15 @@ func runDebug(args []string) error {
 		return fmt.Errorf("unknown debug subcommand %q", sub)
 	}
 
-	trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
-	if *certsDir != "" {
-		tlsCfg, err := security.LoadClientTLS(*certsDir, *certUser)
-		if err != nil {
-			return err
-		}
-		trans.SetTLS(tlsCfg)
+	trans, err := connectAdmin(*addr, *certsDir, *certUser, *timeout)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var resp cluster.AdminResponse
 	if err := trans.Call(ctx, *addr, "admin", req, &resp); err != nil {
-		return err
+		return adminCallError(err, *certsDir)
 	}
 	if resp.Error != "" {
 		return fmt.Errorf("%s", resp.Error)

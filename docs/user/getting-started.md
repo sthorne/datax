@@ -55,7 +55,15 @@ There is also a built-in shell:
 ./datax sql                                  # defaults to the URL above
 ./datax sql -e "SHOW TABLES"                 # one statement, then exit
 ./datax sql -url "postgres://root@127.0.0.1:26434/datax?sslmode=disable"
+./datax sql -url postgres://10.0.0.1:26433/datax -certs-dir certs -user root   # secure cluster
 ```
+
+While a connection is being established the shell reports what it is
+doing on stderr (`still connecting to 10.0.0.1:26433 (sql) ... 5s`), and
+gives up after `-connect-timeout` (default 10s) with the address and the
+cause in the error. Against a secure cluster, `-certs-dir` connects over
+TLS with the named user's client certificate
+([Security](security.md#connecting)).
 
 From Go, use [pgx](https://github.com/jackc/pgx) directly or through
 `database/sql`:

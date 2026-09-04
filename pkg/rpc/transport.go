@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -162,6 +163,38 @@ func DialAddr(addr string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
 		return grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 	}
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+// Probe establishes and immediately closes a connection to addr — the TCP
+// dial and, with TLS configured, the full handshake against the node's
+// certificate — under ctx. It exists so a CLI client can separate "the
+// node is unreachable" (a dial or verification error, with its cause)
+// from "the operation is slow": gRPC dials lazily on the first call and
+// reports only the deadline when that dial never completes.
+func (t *Transport) Probe(ctx context.Context, addr string) error {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if t.tlsCfg == nil {
+		return nil
+	}
+	cfg := t.tlsCfg.Clone()
+	if cfg.ServerName == "" {
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			cfg.ServerName = host
+		}
+	}
+	// The node's gRPC listener requires ALPN; offer h2 so the handshake
+	// matches what the real connection will do.
+	cfg.NextProtos = []string{"h2"}
+	tc := tls.Client(conn, cfg)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetTestingDrop installs (or clears, with nil) a per-destination veto on

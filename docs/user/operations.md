@@ -67,6 +67,16 @@ certificate; state-changing subcommands require the admin role, and each
 one lands in the node's audit log with the acting principal
 ([Security](security.md#admin-rpcs-in-secure-mode)).
 
+Connecting is its own phase: the client dials (and, in secure mode,
+completes the TLS handshake) under `--connect-timeout` (default 10s),
+reporting `still connecting to 10.0.0.1:26257 (admin rpc) ... 5s` on
+stderr while it waits — rewritten in place on a terminal, appended as
+lines in a log — and failing with `could not connect to <addr> (...)`
+plus the cause. Only then does the operation run under its own budget
+(30s for `debug`, 30 minutes for `backup`/`restore`), so a dead node is
+reported in seconds rather than after that budget expires. The same
+applies to `datax sql` and `datax debug status`.
+
 ```sh
 datax debug nodes                      # liveness, locality, last heartbeat
 datax debug ranges                     # every range: span, replicas, leader
