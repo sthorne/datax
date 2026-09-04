@@ -28,6 +28,14 @@ state or the internode protocol does, and an entry below says so.
   `/api/events?since=N`; `/metrics` gains
   `datax_health_problems{severity,check}` (#85).
 
+### Fixed
+- Scans and reverse scans retried stale range routing thirty times with
+  no pause, so a read that met a range mid-move or mid-merge could
+  exhaust its retries in microseconds and fail with "scan routing did
+  not converge" while the meta repair was still landing. They now back
+  off between retries the way batches already did (10 ms per retry
+  after the third, capped at 200 ms).
+
 ## 0.5.0 — unreleased
 
 ### Added
