@@ -8,6 +8,18 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.9.0 — unreleased
+
+### Added
+- `datax sql` is a line editor when run on a terminal: the up and down
+  arrows recall earlier lines, kept across sessions in
+  `~/.datax_sql_history` (or `$DATAX_SQL_HISTORY`, the last 1000 lines);
+  Left/Right, Home/End and the usual control keys edit the line; `\?`,
+  `\h` and `help` print the keys, meta-commands and statement families;
+  `\dt` lists tables. Ctrl-D quits, or cancels a multi-line statement in
+  progress. Piped input keeps the plain line-by-line reader. Adds the
+  `golang.org/x/term` dependency (its `x/sys` sibling was already one).
+
 ## 0.8.0 — unreleased
 
 ### Added

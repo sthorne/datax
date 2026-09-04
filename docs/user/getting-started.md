@@ -58,6 +58,14 @@ There is also a built-in shell:
 ./datax sql -url postgres://10.0.0.1:26433/datax -certs-dir certs -user root   # secure cluster
 ```
 
+In the shell, the up and down arrows recall earlier lines (history is
+kept in `~/.datax_sql_history`, or the file named by
+`$DATAX_SQL_HISTORY`; the last 1000 lines), `\?` or `help` prints the
+keys, meta-commands and statement families, `\dt` lists tables, and
+`\q` (or Ctrl-D) leaves. A statement may span lines until its `;`.
+Piped input (`datax sql < script.sql`) is read line by line without the
+editor.
+
 While a connection is being established the shell reports what it is
 doing on stderr (`still connecting to 10.0.0.1:26433 (sql) ... 5s`), and
 gives up after `-connect-timeout` (default 10s) with the address and the
