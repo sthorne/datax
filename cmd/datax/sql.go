@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/sthorne/datax/pkg/cli"
 )
 
 // runSQL is a small interactive SQL shell speaking the PostgreSQL wire
@@ -17,20 +19,28 @@ import (
 func runSQL(args []string) error {
 	fs := flag.NewFlagSet("sql", flag.ContinueOnError)
 	url := fs.String("url", "postgres://root@127.0.0.1:26433/datax?sslmode=disable", "database URL")
+	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster: connect over TLS verified against ca.crt and authenticate with client.<user>.crt (no password)")
+	user := fs.String("user", "", "username; with --certs-dir, the client certificate to present (default: the URL's user)")
 	execStmt := fs.String("e", "", "execute this statement and exit")
+	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	cfg, err := pgx.ParseConfig(*url)
+	cfg, err := cli.SQLConfig(*url, *certsDir, *user)
 	if err != nil {
 		return err
 	}
 	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	ctx := context.Background()
-	conn, err := pgx.ConnectConfig(ctx, cfg)
+	var conn *pgx.Conn
+	err = cli.Connect(ctx, nil, cli.SQLTarget(cfg), cli.SQLKind(cfg, *certsDir), *timeout, func(ctx context.Context) error {
+		var err error
+		conn, err = pgx.ConnectConfig(ctx, cfg)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("connecting to %s: %w", *url, err)
+		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
@@ -38,7 +48,7 @@ func runSQL(args []string) error {
 		return runOne(ctx, conn, *execStmt)
 	}
 
-	fmt.Printf("datax sql shell (connected to %s)\n", *url)
+	fmt.Printf("datax sql shell (connected to %s as %s)\n", cli.SQLTarget(cfg), cfg.User)
 	fmt.Println(`Type SQL statements terminated by ';', or \q to quit.`)
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)

@@ -41,14 +41,34 @@ type ClusterRange struct {
 	Generation int64  `json:"generation"`
 }
 
+// ClusterPrincipal tells the dashboard who it is signed in as, so the page
+// can show the identity and explain an admin-only refusal in terms of it
+// (the browser caches Basic credentials per realm, so "which user am I"
+// is not otherwise visible to the person at the keyboard).
+type ClusterPrincipal struct {
+	// Secure is false in insecure mode, where there is no identity: User
+	// and Via are empty and Admin is true (trust, like everything else).
+	Secure bool `json:"secure"`
+	// User is the authenticated database user; Via is how it
+	// authenticated: "basic" (HTTP Basic credentials) or "cert" (a
+	// CA-verified client certificate).
+	User string `json:"user,omitempty"`
+	Via  string `json:"via,omitempty"`
+	// Admin reports whether User holds the admin role (root, an admin-role
+	// member, or the node identity), which the range drill-down requires.
+	Admin bool `json:"admin"`
+}
+
 // ClusterStatus is the /api/cluster document.
 type ClusterStatus struct {
-	Now     int64                   `json:"now_unix_ms"`
-	NodeID  int                     `json:"node_id"`
-	Nodes   []ClusterNode           `json:"nodes"`
-	Ranges  []ClusterRange          `json:"ranges"`
-	Local   NodeStatus              `json:"local"`
-	Storage *storage.StorageMetrics `json:"storage,omitempty"`
+	Now    int64 `json:"now_unix_ms"`
+	NodeID int   `json:"node_id"`
+	// Principal is per request: the caller's identity, not cluster state.
+	Principal ClusterPrincipal        `json:"principal"`
+	Nodes     []ClusterNode           `json:"nodes"`
+	Ranges    []ClusterRange          `json:"ranges"`
+	Local     NodeStatus              `json:"local"`
+	Storage   *storage.StorageMetrics `json:"storage,omitempty"`
 	// Error carries a partial-data note (e.g. the meta scan failed during
 	// startup or a partition); the rest of the document is still valid.
 	Error string `json:"error,omitempty"`
@@ -57,9 +77,10 @@ type ClusterStatus struct {
 func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 	now := n.clock.Now().WallTime
 	doc := ClusterStatus{
-		Now:    now / int64(time.Millisecond),
-		NodeID: int(n.ident.NodeID),
-		Local:  n.statusSummary(),
+		Now:       now / int64(time.Millisecond),
+		NodeID:    int(n.ident.NodeID),
+		Principal: n.clusterPrincipal(req),
+		Local:     n.statusSummary(),
 	}
 	grace := n.livenessGrace().Nanoseconds()
 	for _, nd := range n.registry.All() {
@@ -99,4 +120,19 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(doc)
+}
+
+// clusterPrincipal describes the request's authenticated caller for the
+// dashboard (see ClusterPrincipal).
+func (n *Node) clusterPrincipal(req *http.Request) ClusterPrincipal {
+	if n.tlsCfgs == nil {
+		return ClusterPrincipal{Secure: false, Admin: true}
+	}
+	p := principalFrom(req)
+	return ClusterPrincipal{
+		Secure: true,
+		User:   p.User,
+		Via:    p.Via,
+		Admin:  n.isAdminPrincipal(req.Context(), p.User),
+	}
 }

@@ -32,6 +32,11 @@
   header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
   header .sub { color: var(--text-2); font-size: 13px; }
   header .stale { color: var(--critical); font-size: 13px; margin-left: auto; display: none; }
+  header .role {
+    display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase;
+    color: var(--good); border: 1px solid var(--good);
+  }
   main { padding: 16px 20px 40px; max-width: 1200px; margin: 0 auto; }
   section { margin-top: 22px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 8px; }
@@ -72,6 +77,7 @@
 <header>
   <h1>datax</h1>
   <span class="sub" id="hdr-node">connecting…</span>
+  <span class="sub" id="hdr-user" title="who this page is signed in as"></span>
   <span class="stale" id="hdr-stale">● stale — last update failed</span>
 </header>
 <main>
@@ -105,7 +111,7 @@
       <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
       <tbody id="cluster-ranges"></tbody>
     </table></div>
-    <p class="muted">click a range for its per-replica detail from every holding node (admin role)</p>
+    <p class="muted" id="cluster-range-hint">click a range for its per-replica detail from every holding node (admin role)</p>
   </section>
 
   <section>
@@ -157,9 +163,29 @@ function statusCell(n) {
   if (n.draining) return `<span class="st draining"><span class="dot"></span>draining</span>`;
   return `<span class="st live"><span class="dot"></span>live</span>`;
 }
+// who is the signed-in principal from the last /api/cluster document
+// (null until the first poll). In insecure mode there is no identity and
+// every viewer is treated as admin.
+let who = null;
+function renderPrincipal(p) {
+  who = p || null;
+  const el = document.getElementById("hdr-user");
+  if (!who) { el.innerHTML = ""; return; }
+  if (!who.secure) { el.innerHTML = `<span class="muted">insecure mode · no sign-in</span>`; return; }
+  el.innerHTML = `signed in as <b>${esc(who.user || "?")}</b> (${esc(who.via || "?")})` +
+    (who.admin ? `<span class="role">admin</span>` : "");
+}
+function canDrillDown() { return !who || who.admin; }
+function drillDownRefusal() {
+  if (!who || !who.secure || !who.user) return "admin role required for cross-node drill-down";
+  return `signed in as ${esc(who.user)}: the admin role is required for cross-node drill-down. ` +
+    `Grant it with <code>GRANT ADMIN TO ${esc(who.user)}</code>, or sign in as root ` +
+    `(open a private window to be prompted for credentials again).`;
+}
 function render(d) {
   document.getElementById("hdr-node").textContent =
     "node n" + d.node_id + " · " + (d.local.address || "");
+  renderPrincipal(d.principal);
   const liveCount = (d.nodes || []).filter(n => n.live).length;
   const totalQPS = (d.local.ranges || []).reduce((s, r) => s + (r.qps || 0), 0);
   const totalBytes = (d.local.ranges || []).reduce((s, r) => s + (r.size_bytes || 0), 0);
@@ -216,8 +242,13 @@ function detailRow(html) {
   return `<tr class="detailrow"><td class="detail" colspan="3">${html}</td></tr>`;
 }
 function renderClusterRanges(ranges) {
+  const admin = canDrillDown();
+  const hint = document.getElementById("cluster-range-hint");
+  hint.innerHTML = admin
+    ? "click a range for its per-replica detail from every holding node (admin role)"
+    : `per-replica detail needs the admin role — ${drillDownRefusal()}`;
   const rows = ranges.slice().sort((a, b) => a.range_id - b.range_id).map(r => {
-    let row = `<tr class="clickable" data-range="${r.range_id}">
+    let row = `<tr class="${admin ? "clickable" : ""}" data-range="${r.range_id}">
       <td>r${r.range_id}</td>
       <td class="key">${esc(r.start_key)} → ${esc(r.end_key)}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
@@ -238,7 +269,7 @@ async function toggleRangeDetail(id) {
   try {
     const resp = await fetch("/api/range?id=" + id, { cache: "no-store" });
     if (resp.status === 403) {
-      openDetailHTML = `<div class="note">admin role required for cross-node drill-down</div>`;
+      openDetailHTML = `<div class="note">${drillDownRefusal()}</div>`;
     } else if (!resp.ok) {
       openDetailHTML = `<div class="note">error: HTTP ${resp.status}</div>`;
     } else {
