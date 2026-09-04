@@ -91,7 +91,13 @@
   <section>
     <h2>Nodes</h2>
     <div class="tablewrap"><table>
-      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th><th class="num">heartbeat</th></tr></thead>
+      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
+        <th class="num" title="host CPU busy, all cores">cpu</th>
+        <th class="num" title="one-minute load average / cores">load</th>
+        <th class="num" title="host memory in use / total">memory</th>
+        <th class="num" title="free space on the store's filesystem">disk free</th>
+        <th class="num" title="open file descriptors / soft limit">fds</th>
+        <th class="num">heartbeat</th></tr></thead>
       <tbody id="nodes"></tbody>
     </table></div>
   </section>
@@ -115,6 +121,12 @@
   </section>
 
   <section>
+    <h2>Machine (this node)</h2>
+    <div class="tiles" id="machine"></div>
+    <p class="muted" id="machine-note"></p>
+  </section>
+
+  <section>
     <h2>Storage health</h2>
     <div class="tiles" id="storage"></div>
   </section>
@@ -133,6 +145,31 @@ function pushHist(name, v) {
 }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+function pct(v) { return (v === undefined || v === null) ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + "%"; }
+function fmtDuration(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${Math.floor(sec % 60)}s`;
+}
+// Nodes-table cells: colored when a figure is worth a look. Disk free
+// goes amber under 15% and red under 5%; load above the core count and
+// fds past 80% of the limit likewise.
+function warn(level, text) { return level ? `<span class="st ${level}">${text}</span>` : text; }
+function loadCell(load1, cores) {
+  const ratio = load1 / cores;
+  return warn(ratio > 2 ? "down" : ratio > 1 ? "draining" : "", (load1 ?? 0).toFixed(2));
+}
+function memCell(m) {
+  const used = m.mem_total - m.mem_available, frac = used / m.mem_total;
+  return warn(frac > 0.95 ? "down" : frac > 0.85 ? "draining" : "", fmtBytes(used) + " / " + fmtBytes(m.mem_total));
+}
+function diskCell(m) {
+  const frac = m.disk_free / m.disk_total;
+  return warn(frac < 0.05 ? "down" : frac < 0.15 ? "draining" : "", fmtBytes(m.disk_free) + " (" + Math.round(frac * 100) + "%)");
+}
+function fdCell(m) {
+  const frac = m.open_fds / m.fd_limit;
+  return warn(frac > 0.95 ? "down" : frac > 0.8 ? "draining" : "", m.open_fds + " / " + m.fd_limit);
 }
 function fmtBytes(b) {
   if (b >= 1 << 30) return (b / (1 << 30)).toFixed(1) + " GiB";
@@ -196,13 +233,39 @@ function render(d) {
     tile("this node QPS", Math.round(totalQPS), "qps", totalQPS) +
     tile("this node data", fmtBytes(totalBytes), "bytes", totalBytes);
 
-  document.getElementById("nodes").innerHTML = (d.nodes || []).map(n => `<tr>
+  document.getElementById("nodes").innerHTML = (d.nodes || []).map(n => {
+    const m = n.machine;
+    return `<tr>
     <td>n${n.node_id}</td>
     <td>${statusCell(n)}</td>
     <td class="key">${esc(n.address)}</td>
     <td>${esc(n.locality || "—")}</td>
+    <td class="num">${m ? pct(m.cpu_percent) : "—"}</td>
+    <td class="num">${m && m.cores ? loadCell(m.load1, m.cores) : "—"}</td>
+    <td class="num">${m && m.mem_total ? memCell(m) : "—"}</td>
+    <td class="num">${m && m.disk_total ? diskCell(m) : "—"}</td>
+    <td class="num">${m && m.fd_limit ? fdCell(m) : "—"}</td>
     <td class="num">${fmtAgo(n.heartbeat_ago_ms)}</td>
-  </tr>`).join("");
+  </tr>`; }).join("");
+
+  const lm = d.local && d.local.machine;
+  if (lm) {
+    document.getElementById("machine").innerHTML =
+      tile("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? " (" + pct(lm.iowait_percent) + " iowait)" : ""), "cpu", lm.cpu_percent) +
+      tile("load", lm.cores ? (lm.Load1 ?? 0).toFixed(2) + " / " + lm.cores + " cores" : "—") +
+      tile("memory", lm.mem_total ? fmtBytes(lm.mem_total - lm.mem_available) + " / " + fmtBytes(lm.mem_total) : "—") +
+      tile("process", fmtBytes(lm.rss || 0) + " rss · " + pct(lm.process_cpu_percent) + " cpu") +
+      tile("disk free", lm.disk_total ? fmtBytes(lm.disk_free) + " / " + fmtBytes(lm.disk_total) : "in-memory store", "diskfree", lm.disk_free || 0) +
+      tile("disk i/o", lm.disk_total ? fmtBytes(lm.disk_read_bytes_ps || 0) + "/s r · " + fmtBytes(lm.disk_write_bytes_ps || 0) + "/s w · " + pct(lm.disk_busy_percent) + " busy" : "—", "diskw", lm.disk_write_bytes_ps || 0) +
+      tile("network", fmtBytes(lm.net_rx_bytes_ps || 0) + "/s in · " + fmtBytes(lm.net_tx_bytes_ps || 0) + "/s out", "net", (lm.net_rx_bytes_ps || 0) + (lm.net_tx_bytes_ps || 0)) +
+      tile("file descriptors", lm.fd_limit ? lm.open_fds + " / " + lm.fd_limit : "—") +
+      tile("go runtime", lm.goroutines + " goroutines · " + fmtBytes(lm.heap_in_use || 0) + " heap · gc p99 " + (lm.gc_pause_p99_ns / 1e6).toFixed(1) + " ms") +
+      tile("uptime", fmtDuration(lm.process_uptime_seconds || 0));
+    const un = lm.unavailable || [];
+    document.getElementById("machine-note").textContent = un.length
+      ? "not available on this platform: " + un.join(", ")
+      : "sampled every 5s; rates are averages over the interval";
+  }
 
   const local = (d.local.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
   document.getElementById("ranges").innerHTML = local.map(r => `<tr>

@@ -6,7 +6,10 @@ Start nodes with `--http-listen` (or `demo -http-port`) and each node
 serves, on that address:
 
 - **`/`** — a self-contained web UI: node liveness, per-node leader/QPS/byte
-  load, range tables with replica placement, storage health. The cluster
+  load, each node's host figures (CPU, load, memory, free space on the
+  store's disk, file descriptors — colored when they deserve a look), the
+  serving node's full machine picture (disk and network throughput, Go
+  runtime, uptime), range tables with replica placement, storage health. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -47,6 +50,17 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
+| `datax_store_disk_bytes{kind="free"}` | < 15% of `kind="total"` | the store's disk is filling; Pebble needs headroom to compact (a full disk is a hard stall) |
+| `datax_node_cpu_percent{scope="host"}` / `datax_node_load1` vs `datax_node_cores` | sustained > 80% / load > cores | the node is CPU-bound; check `scope="process"` to see whether datax or something else is using it |
+| `process_open_fds` vs `datax_process_fd_limit` | > 80% | raise the limit (`ulimit -n`); Pebble holds one descriptor per open sstable |
+| `datax_node_memory_bytes{kind="available"}` | < 10% of `kind="total"` | the host is running out of memory; the block cache and memtables are the usual tenants |
+
+The host series (`datax_node_*`, `datax_store_disk_*`, and the standard
+`go_*` / `process_*` collectors) come from a sampler each node runs
+every 5 seconds; rates are averages over that interval. Host CPU, load,
+memory, network and disk throughput need `/proc` (Linux); elsewhere
+`/status` lists them under `machine.unavailable` and the dashboard says
+so.
 
 Also useful: `datax_kv_batch_latency_seconds` (histogram — p99 of the
 replication path), `datax_follower_reads_total` vs

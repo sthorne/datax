@@ -168,6 +168,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			ReplicaBytes:  load.ReplicaBytes,
 			HotRanges:     load.HotRanges,
 			BigRanges:     load.BigRanges,
+			Machine:       n.machineSummary(),
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
@@ -230,4 +231,28 @@ func (n *Node) mirrorClusterVersion(ctx context.Context) {
 		log.Warnf("persisting store cluster version: %v", err)
 	}
 	log.Infof("cluster version is now %s", version.Version(v))
+}
+
+// machineSummary condenses the latest host sample for the heartbeat.
+func (n *Node) machineSummary() *kvpb.MachineSummary {
+	if n.sys == nil {
+		return nil
+	}
+	m := n.sys.Latest()
+	if m.At.IsZero() {
+		return nil
+	}
+	return &kvpb.MachineSummary{
+		CPUPercent:    m.CPUPercent,
+		Load1:         m.Load1,
+		Cores:         m.Cores,
+		MemTotal:      m.MemTotal,
+		MemAvailable:  m.MemAvailable,
+		RSS:           m.RSS,
+		DiskTotal:     m.DiskTotal,
+		DiskFree:      m.DiskFree,
+		OpenFDs:       m.OpenFDs,
+		FDLimit:       m.FDLimit,
+		UptimeSeconds: m.ProcessUp,
+	}
 }

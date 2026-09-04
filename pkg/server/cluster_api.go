@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/storage"
 )
 
@@ -29,6 +30,9 @@ type ClusterNode struct {
 	LeaderQPS    float64 `json:"leader_qps,omitempty"`
 	LeaderCount  int     `json:"leader_count,omitempty"`
 	ReplicaBytes int64   `json:"replica_bytes,omitempty"`
+	// Machine is the node's host summary from its heartbeat (nil for a
+	// node on a binary that does not advertise one).
+	Machine *kvpb.MachineSummary `json:"machine,omitempty"`
 }
 
 // ClusterRange is one cluster-wide range descriptor (from /meta — every
@@ -94,6 +98,7 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			LeaderQPS:    nd.LeaderQPS,
 			LeaderCount:  nd.LeaderCount,
 			ReplicaBytes: nd.ReplicaBytes,
+			Machine:      nd.Machine,
 		})
 	}
 	if descs, err := n.listRanges(req.Context()); err != nil {

@@ -31,6 +31,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
+	"github.com/sthorne/datax/pkg/util/sysstats"
 	"github.com/sthorne/datax/pkg/version"
 )
 
@@ -170,6 +171,10 @@ type StaticBootstrap struct {
 }
 
 // Node is a running datax node.
+// sysSampleInterval is how often the node samples its host; rates on the
+// dashboard are deltas over this interval.
+const sysSampleInterval = 5 * time.Second
+
 type Node struct {
 	cfg      Config
 	tlsCfgs  *security.TLSConfigs // nil in insecure mode
@@ -217,6 +222,9 @@ type Node struct {
 	// be initiated from any node) and re-asserts it on every beat, so the
 	// flag survives both heartbeat overwrites and restarts.
 	draining atomic.Bool
+	// sys samples the host (CPU, memory, disk, network, runtime) every
+	// few seconds for the heartbeat summary, /status and /metrics.
+	sys *sysstats.Sampler
 
 	// loadCooldown stamps the last load-driven op (lease shed / byte move)
 	// per range while this node acts as the allocator; see loadOpAllowed.
@@ -288,6 +296,12 @@ func (n *Node) start() error {
 	n.addr = n.cfg.AdvertiseAddr
 	if n.addr == "" {
 		n.addr = lis.Addr().String()
+	}
+
+	n.sys = sysstats.New(n.cfg.Dir)
+	n.sys.Sample() // the first heartbeat should already carry a summary
+	if err := n.stopper.RunWorker(func(ctx context.Context) { n.sys.Run(ctx, sysSampleInterval) }); err != nil {
+		return err
 	}
 
 	n.registry = cluster.NewRegistry()
