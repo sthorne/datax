@@ -343,6 +343,50 @@ func AllTableNamespaceSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// SequenceDescKey holds the JSON sequence descriptor for a sequence ID
+// (IDs come from the shared descriptor counter, so tables and sequences
+// never collide).
+func SequenceDescKey(seqID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("seqdesc"), seqID))
+}
+
+// SequenceDescSpan covers all sequence descriptors.
+func SequenceDescSpan() (Key, Key) {
+	p := systemKey("seqdesc")
+	return p, p.PrefixEnd()
+}
+
+// SequenceNamespaceKey maps a sequence name within a database to its ID.
+func SequenceNamespaceKey(dbID uint64, name string) Key {
+	k := Key(encoding.EncodeUint64(systemKey("seqns"), dbID))
+	return Key(encoding.EncodeString(k, name))
+}
+
+// SequenceNamespaceSpan covers one database's sequence names.
+func SequenceNamespaceSpan(dbID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("seqns"), dbID))
+	return p, p.PrefixEnd()
+}
+
+// AllSequenceNamespaceSpan covers every database's sequence names.
+func AllSequenceNamespaceSpan() (Key, Key) {
+	p := systemKey("seqns")
+	return p, p.PrefixEnd()
+}
+
+// SequenceValueKey is a sequence's counter: the last value handed out
+// (decimal, advanced with Increment outside any transaction — never
+// rolled back, as in PostgreSQL).
+func SequenceValueKey(seqID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("seq"), seqID))
+}
+
+// SequenceValueSpan covers every sequence counter.
+func SequenceValueSpan() (Key, Key) {
+	p := systemKey("seq")
+	return p, p.PrefixEnd()
+}
+
 // DescLeaseKey holds one gateway's lease on a table descriptor: proof that
 // the gateway may be using the descriptor at the recorded version until the
 // recorded expiration. DDL drains against these.

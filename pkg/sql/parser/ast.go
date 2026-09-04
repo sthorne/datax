@@ -44,6 +44,9 @@ type Expr struct {
 	// Cmp is a comparison used as a boolean value ('d' = any(stxkind) AS
 	// enabled, ORDER BY f(x) = 'DEFAULT'): NULL when either side is.
 	Cmp *Comparison `json:"cmp,omitempty"`
+	// IsDefault is the DEFAULT keyword used as a value (INSERT VALUES
+	// (DEFAULT, ...), UPDATE SET c = DEFAULT).
+	IsDefault bool `json:"is_default,omitempty"`
 	// Cast is the last ::type applied when it changes the value: only
 	// "regclass" ('t'::regclass resolves a table name to its OID) is kept;
 	// every other cast is absorbed.
@@ -93,8 +96,18 @@ type ColumnDef struct {
 	Type       types.Family
 	NotNull    bool
 	PrimaryKey bool // column-level PRIMARY KEY shorthand
-	// Default is the DEFAULT literal (constants only; no expressions).
-	Default *types.Datum
+	// Default is a constant DEFAULT; DefaultExpr any other DEFAULT
+	// expression (now(), gen_random_uuid(), unique_rowid(), nextval('s'),
+	// arithmetic over constants), kept as an expression.
+	Default     *types.Datum
+	DefaultExpr *Expr
+	// Serial marks SERIAL / BIGSERIAL / SMALLSERIAL (an owned sequence
+	// with DEFAULT nextval); Identity is GENERATED { ALWAYS | BY DEFAULT }
+	// AS IDENTITY ("always" / "by default"), with optional sequence
+	// options.
+	Serial      bool
+	Identity    string
+	IdentitySeq *SequenceOptions
 	// Precision/Scale carry a DECIMAL(p,s) typmod (0 precision = bare
 	// DECIMAL, unconstrained). Typmods on other types are still accepted
 	// and ignored (documented).
@@ -112,6 +125,45 @@ type CreateTable struct {
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
 }
+
+// SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an
+// identity column; a nil pointer leaves the option unset.
+type SequenceOptions struct {
+	Increment  *int64
+	MinValue   *int64 // NoMin: NO MINVALUE
+	MaxValue   *int64
+	NoMin      bool
+	NoMax      bool
+	Start      *int64
+	Cache      *int64
+	Cycle      *bool
+	Restart    *int64 // ALTER SEQUENCE RESTART [WITH n]; RestartSet marks a bare RESTART
+	RestartSet bool
+	// OwnedBy is "table.column" (or "none" / "" for none).
+	OwnedBy string
+}
+
+// CreateSequence is CREATE SEQUENCE [IF NOT EXISTS] name [options].
+type CreateSequence struct {
+	Name        string
+	IfNotExists bool
+	Options     SequenceOptions
+}
+
+// DropSequence is DROP SEQUENCE [IF EXISTS] name.
+type DropSequence struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterSequence is ALTER SEQUENCE name [options | RESTART [WITH n]].
+type AlterSequence struct {
+	Name    string
+	Options SequenceOptions
+}
+
+// ShowSequences is SHOW SEQUENCES.
+type ShowSequences struct{}
 
 // CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
 type CreateIndex struct {
@@ -136,6 +188,12 @@ type Insert struct {
 	Table   string
 	Columns []string // empty = all columns in order
 	Rows    [][]Expr
+	// DefaultValues is INSERT INTO t DEFAULT VALUES (one row of defaults).
+	DefaultValues bool
+	// Overriding is OVERRIDING { SYSTEM | USER } VALUE ("system" /
+	// "user"): SYSTEM lets an explicit value into a GENERATED ALWAYS
+	// identity column.
+	Overriding string
 	// OnConflict is the ON CONFLICT clause; Upsert marks UPSERT INTO
 	// (ON CONFLICT (primary key) DO UPDATE SET every target column).
 	OnConflict *OnConflict
@@ -399,6 +457,10 @@ type SetVar struct {
 
 func (*CreateTable) stmt()         {}
 func (*Show) stmt()                {}
+func (*CreateSequence) stmt()      {}
+func (*DropSequence) stmt()        {}
+func (*AlterSequence) stmt()       {}
+func (*ShowSequences) stmt()       {}
 func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}

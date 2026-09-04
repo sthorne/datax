@@ -35,6 +35,9 @@ const (
 	CodeInvalidParameter       = "08P01"
 	CodeUndefinedObject        = "42704"
 	CodeInvalidColumnReference = "42P10"
+	CodeSequenceLimit          = "2200H"
+	CodeObjectNotInState       = "55000"
+	CodeGeneratedAlways        = "428C9"
 	CodeDuplicateObject        = "42710"
 	CodeInvalidParameterValue  = "22023"
 	// DECIMAL(p,s): integer digits exceed precision−scale.

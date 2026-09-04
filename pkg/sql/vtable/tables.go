@@ -26,6 +26,30 @@ func is(name string, cols []catalog.Column, rows func(ctx context.Context, env *
 
 // visibleTables are the session's tables in its current database, the
 // ones psql lists; every database's tables are reachable qualified.
+// currentSequences lists the sequences of the session's database.
+func (env *Env) currentSequences() []*catalog.SequenceDescriptor {
+	dbID := uint64(0)
+	for _, d := range env.Databases {
+		if d.Name == env.Database {
+			dbID = d.ID
+		}
+	}
+	var out []*catalog.SequenceDescriptor
+	for _, sq := range env.Sequences {
+		if sq.DatabaseID == dbID || dbID == 0 {
+			out = append(out, sq)
+		}
+	}
+	return out
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "YES"
+	}
+	return "NO"
+}
+
 func (env *Env) currentTables() []*catalog.TableDescriptor {
 	var out []*catalog.TableDescriptor
 	var cur *catalog.DatabaseDescriptor
@@ -100,6 +124,11 @@ func init() {
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null()})
 			}
 		}
+		for _, sq := range env.currentSequences() {
+			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(OIDPublic), i64(0), i64(10), i64(0), i64(int64(sq.ID)), i64(0),
+				i64(1), types.NewFloat(1), i64(0), boolean(false), boolean(false), str("p"), str("S"), i64(3),
+				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null()})
+		}
 		for i, name := range Names() {
 			rows = append(rows, Row{i64(int64(1<<30) + int64(i)), str(name[len(PgCatalog)+1:]), i64(OIDPgCatalog), i64(0), i64(10), i64(0), i64(0), i64(0),
 				i64(0), types.NewFloat(0), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(0),
@@ -128,9 +157,16 @@ func init() {
 			if indexed {
 				indexdef = str(c.Name) // pg_get_indexdef(index, attnum, true): the key expression
 			}
+			identity := ""
+			switch c.Identity {
+			case "always":
+				identity = "a"
+			case "by default":
+				identity = "d"
+			}
 			return Row{i64(relid), str(c.Name), i64(TypeOID(c.Type)), i64(-1),
 				i64(-1), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
-				boolean(c.Default != nil), boolean(false), str(""), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
+				boolean(c.Default != nil || c.DefaultExpr != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
 				str(""), null(), null(), null(), str(FormatType(c)), indexdef}
 		}
 		for _, t := range env.currentTables() {
@@ -315,7 +351,28 @@ func init() {
 	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)}, empty)
 	pg("pg_range", []catalog.Column{col("rngtypid", types.Int), col("rngsubtype", types.Int), col("rngmultitypid", types.Int), col("rngcollation", types.Int), col("rngsubopc", types.Int), col("rngcanonical", types.Int), col("rngsubdiff", types.Int)}, empty)
 	pg("pg_partitioned_table", []catalog.Column{col("partrelid", types.Int), col("partstrat", types.String), col("partnatts", types.Int), col("partdefid", types.Int), col("partattrs", types.String)}, empty)
-	pg("pg_sequences", []catalog.Column{col("schemaname", types.String), col("sequencename", types.String), col("sequenceowner", types.String), col("data_type", types.String), col("start_value", types.Int), col("min_value", types.Int), col("max_value", types.Int), col("increment_by", types.Int), col("cycle", types.Bool), col("cache_size", types.Int), col("last_value", types.Int)}, empty)
+	pg("pg_sequences", []catalog.Column{col("schemaname", types.String), col("sequencename", types.String), col("sequenceowner", types.String), col("data_type", types.String), col("start_value", types.Int), col("min_value", types.Int), col("max_value", types.Int), col("increment_by", types.Int), col("cycle", types.Bool), col("cache_size", types.Int), col("last_value", types.Int)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, sq := range env.currentSequences() {
+				last := null()
+				if env.SequenceValue != nil {
+					if v, called, err := env.SequenceValue(sq); err == nil && called {
+						last = i64(v)
+					}
+				}
+				rows = append(rows, Row{str(catalog.PublicSchema), str(sq.Name), str("root"), str("bigint"), i64(sq.Start), i64(sq.MinValue), i64(sq.MaxValue), i64(sq.Increment), boolean(sq.Cycle), i64(sq.Cache), last})
+			}
+			return rows, nil
+		})
+	pg("pg_sequence", []catalog.Column{col("seqrelid", types.Int), col("seqtypid", types.Int), col("seqstart", types.Int), col("seqincrement", types.Int), col("seqmax", types.Int), col("seqmin", types.Int), col("seqcache", types.Int), col("seqcycle", types.Bool)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, sq := range env.currentSequences() {
+				rows = append(rows, Row{i64(int64(sq.ID)), i64(TypeOID(types.Int)), i64(sq.Start), i64(sq.Increment), i64(sq.MaxValue), i64(sq.MinValue), i64(sq.Cache), boolean(sq.Cycle)})
+			}
+			return rows, nil
+		})
 	pg("pg_inherits", []catalog.Column{
 		col("inhrelid", types.Int), col("inhparent", types.Int), col("inhseqno", types.Int), col("inhdetachpending", types.Bool),
 	}, empty)
@@ -354,8 +411,8 @@ func init() {
 						continue
 					}
 					n++
-					if c.Default != nil {
-						rows = append(rows, Row{i64(TableOID(t)<<8 + n), i64(TableOID(t)), i64(n), str(renderDefault(*c.Default)), str(renderDefault(*c.Default))})
+					if def := ColumnDefault(&c); def != "" {
+						rows = append(rows, Row{i64(TableOID(t)<<8 + n), i64(TableOID(t)), i64(n), str(def), str(def)})
 					}
 				}
 			}
@@ -485,8 +542,8 @@ func init() {
 					}
 					n++
 					def, nullable := null(), "YES"
-					if c.Default != nil {
-						def = str(renderDefault(*c.Default))
+					if text := ColumnDefault(c); text != "" {
+						def = str(text)
 					}
 					if c.NotNull {
 						nullable = "NO"
@@ -496,7 +553,7 @@ func init() {
 						prec, scale = i64(int64(c.Precision)), i64(int64(c.Scale))
 					}
 					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(FormatType(c)),
-						null(), prec, scale, str(TypeName(c.Type)), str("NO"), str("NEVER")})
+						null(), prec, scale, str(TypeName(c.Type)), str(yesNo(c.Identity != "")), str("NEVER")})
 				}
 			}
 		}

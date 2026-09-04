@@ -8,6 +8,26 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.13.0 — unreleased
+
+### Added
+- Sequences, `SERIAL` / `BIGSERIAL` / `SMALLSERIAL`, `GENERATED
+  {ALWAYS | BY DEFAULT} AS IDENTITY` columns and expression `DEFAULT`s
+  (#91): `CREATE / ALTER / DROP SEQUENCE` with `INCREMENT`, `MINVALUE`,
+  `MAXVALUE`, `START`, `CACHE`, `CYCLE`, `OWNED BY` and `RESTART`;
+  `nextval`, `currval`, `lastval`, `setval`; `unique_rowid()` and
+  `gen_random_uuid()`; `DEFAULT` as a value, `INSERT ... DEFAULT
+  VALUES`, `OVERRIDING SYSTEM VALUE`, `UPDATE ... SET col = DEFAULT`;
+  `SHOW SEQUENCES`, a sequence as a one-row relation, and the
+  `pg_sequence(s)` / `pg_attrdef` / `information_schema.columns` rows
+  psql and ORMs read. `nextval` advances one counter key with an atomic
+  increment outside the transaction (never rolled back, gaps normal);
+  each gateway serves `CACHE` values (default 32) per increment.
+  Backups carry sequences and their counters. **Cluster version v7**:
+  descriptors gain the default-expression, identity and owned-sequence
+  fields, which older nodes cannot evaluate, so the DDL is refused with
+  `0A000` until `datax debug upgrade` finalizes v7.
+
 ## 0.12.0 — unreleased
 
 ### Added

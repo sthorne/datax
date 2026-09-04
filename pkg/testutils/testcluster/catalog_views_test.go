@@ -327,24 +327,33 @@ func TestPsqlCatalogQueries(t *testing.T) {
 
 	// psql itself, when available: every describe command renders
 	// without an error on stderr.
-	psql, err := exec.LookPath("psql")
+	psql, err := lookPsql()
 	if err != nil {
 		t.Log("psql not installed; skipping the end-to-end run")
 		return
 	}
 	for _, cmd := range []string{`\l`, `\dt`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
-		out, err := exec.CommandContext(ctx, psql, url, "-c", cmd).CombinedOutput()
-		if err != nil || strings.Contains(string(out), "ERROR") {
+		out, err := runPsql(ctx, psql, url, cmd)
+		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
 		}
 		if cmd == `\d t` {
 			for _, s := range []string{`"t_pkey" PRIMARY KEY, btree (id)`, `"t_name" UNIQUE CONSTRAINT, btree (name)`, `"t_qty" btree (qty)`, `qty    | bigint |           |          | 0`} {
-				if !strings.Contains(string(out), s) {
+				if !strings.Contains(out, s) {
 					t.Fatalf("psql \\d t lacks %q:\n%s", s, out)
 				}
 			}
 		}
 	}
+}
+
+// lookPsql finds the psql binary, for end-to-end runs.
+func lookPsql() (string, error) { return exec.LookPath("psql") }
+
+// runPsql runs one backslash command through psql and returns its output.
+func runPsql(ctx context.Context, psql, url, cmd string) (string, error) {
+	out, err := exec.CommandContext(ctx, psql, url, "-c", cmd).CombinedOutput()
+	return string(out), err
 }
 
 // TestSQLSurfaceForTools: the SQL that psql, drivers and ORMs lean on

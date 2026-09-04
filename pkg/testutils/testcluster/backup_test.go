@@ -37,6 +37,8 @@ func TestBackupRestore(t *testing.T) {
 		PRIMARY KEY (series, at)) WITH (timeseries = true, shards = 4)`)
 	execSQL(t, ctx, s, `CREATE USER analyst PASSWORD 'trustno1'`)
 	execSQL(t, ctx, s, `GRANT SELECT ON accounts TO analyst`)
+	execSQL(t, ctx, s, `CREATE TABLE events (id SERIAL PRIMARY KEY, what TEXT)`)
+	execSQL(t, ctx, s, `INSERT INTO events (what) VALUES ('a'), ('b'), ('c')`)
 
 	const nAccounts, seedBalance = 16, 1000
 	for i := 0; i < nAccounts; i++ {
@@ -88,6 +90,7 @@ func TestBackupRestore(t *testing.T) {
 	execSQL(t, ctx, s, `INSERT INTO items VALUES (4, 'stove', 45, '{"kg": 2}')`)
 	execSQL(t, ctx, s, `DELETE FROM items WHERE id = 2`)
 	execSQL(t, ctx, s, `DELETE FROM accounts WHERE id = 15`)
+	execSQL(t, ctx, s, `INSERT INTO events (what) VALUES ('d')`)
 
 	dirInc := t.TempDir()
 	if _, err := tc.Nodes[0].RunBackup(ctx, dirInc, dirFull, false, false); err != nil {
@@ -157,6 +160,18 @@ func TestBackupRestore(t *testing.T) {
 	// The user's verifier row and grant came across.
 	if v, err := tc2.Nodes[0].DB().Get(ctx, keys.UserKey("analyst")); err != nil || v == nil {
 		t.Fatalf("analyst user not restored: %v %v", v, err)
+	}
+	// The SERIAL column's sequence came across with its counter: a new
+	// row draws a value past everything the source handed out, and the
+	// sequence still shows as owned by the column.
+	if res = execSQL(t, ctx, s2, `INSERT INTO events (what) VALUES ('e') RETURNING id`); res.Rows[0][0].I <= 4 {
+		t.Fatalf("restored sequence reissued an id: %+v", res.Rows)
+	}
+	if res = execSQL(t, ctx, s2, `SELECT COUNT(*) FROM events`); res.Rows[0][0].I != 5 {
+		t.Fatalf("events rows: %+v", res.Rows)
+	}
+	if res = execSQL(t, ctx, s2, `SHOW SEQUENCES`); len(res.Rows) != 1 || res.Rows[0][0].S != "events_id_seq" || res.Rows[0][8].S != "events.id" {
+		t.Fatalf("restored sequences: %+v", res.Rows)
 	}
 	// New DDL works: the descriptor ID generator was bumped past the
 	// restored IDs (a collision would corrupt an existing table's data).

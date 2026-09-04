@@ -42,6 +42,11 @@ type Env struct {
 	Databases []*catalog.DatabaseDescriptor
 	// Tables holds every table the session may see, in every database.
 	Tables []*catalog.TableDescriptor
+	// Sequences holds every sequence, in every database.
+	Sequences []*catalog.SequenceDescriptor
+	// SequenceValue reads a sequence's last value (called reports whether
+	// nextval has run); nil when the caller cannot read counters.
+	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	Users []string // every SQL user, root first
@@ -302,6 +307,11 @@ func CreateTableDef(d *catalog.TableDescriptor) string {
 		if c.Default != nil {
 			fmt.Fprintf(&b, " DEFAULT %s", renderDefault(*c.Default))
 		}
+		if c.Identity != "" {
+			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", strings.ToUpper(c.Identity))
+		} else if c.DefaultExpr != "" {
+			fmt.Fprintf(&b, " DEFAULT %s", c.DefaultExpr)
+		}
 		b.WriteString(",\n")
 	}
 	fmt.Fprintf(&b, "  %s", PrimaryKeyDef(d))
@@ -328,6 +338,19 @@ func CreateTableDef(d *catalog.TableDescriptor) string {
 		b.WriteString(")")
 	}
 	return b.String()
+}
+
+// ColumnDefault renders a column's default as the catalogs show it:
+// the expression text (nextval('t_id_seq') for an owned sequence), or
+// the constant as a literal; "" when the column has none.
+func ColumnDefault(c *catalog.Column) string {
+	switch {
+	case c.DefaultExpr != "":
+		return c.DefaultExpr
+	case c.Default != nil:
+		return renderDefault(*c.Default)
+	}
+	return ""
 }
 
 func renderDefault(d types.Datum) string {

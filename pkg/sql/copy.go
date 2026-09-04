@@ -157,9 +157,21 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 		// sub-batches fan out in parallel) instead of a sequential Get per
 		// row — the difference between a chunk costing one round trip and
 		// costing 128.
+		// Expression defaults (sequences, uuids) for the columns the COPY
+		// does not supply, evaluated per row.
+		defaults, err := ci.s.prepareDefaults(ctx, txn, desc, nil)
+		if err != nil {
+			return err
+		}
+		targets := make([][]catalog.Column, len(rows))
 		pkKeys := make([]keys.Key, len(rows))
 		for i, r := range rows {
-			_, key, err := buildInsertRow(desc, target, r.vals)
+			rt, rv, err := ci.s.expandDefaults(ctx, txn, desc, defaults, target, r.vals, nil)
+			if err != nil {
+				return ci.rowErr(r.ordinal, err)
+			}
+			targets[i], rows[i].vals = rt, rv
+			_, key, err := buildInsertRow(desc, rt, rv)
 			if err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
@@ -176,7 +188,7 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 				return ci.rowErr(r.ordinal, newErrf(CodeUniqueViolation,
 					"duplicate key value violates unique constraint on %q", desc.Name))
 			}
-			if err := insertRow(ctx, txn, desc, target, r.vals, &wb, inserted, true); err != nil {
+			if err := insertRow(ctx, txn, desc, targets[i], r.vals, &wb, inserted, true); err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
 		}

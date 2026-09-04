@@ -678,3 +678,70 @@ func TestParseReturningAndOnConflict(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSequencesAndDefaults: expression defaults, SERIAL, identity
+// columns, DEFAULT as a value, DEFAULT VALUES, OVERRIDING, and the
+// sequence statements.
+func TestParseSequencesAndDefaults(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (id SERIAL PRIMARY KEY, u UUID DEFAULT gen_random_uuid(), at TIMESTAMPTZ DEFAULT now(), n INT8 DEFAULT 1 + 2, k INT8 GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), c TEXT DEFAULT 'x')`).(*CreateTable)
+	cols := ct.Columns
+	if !cols[0].Serial || !cols[0].NotNull || !cols[0].PrimaryKey || cols[0].Type != types.Int {
+		t.Fatalf("serial: %+v", cols[0])
+	}
+	if cols[1].DefaultExpr == nil || cols[1].DefaultExpr.Func != "gen_random_uuid" || cols[2].DefaultExpr.Func != "now" || cols[3].DefaultExpr.BinOp != "+" {
+		t.Fatalf("expression defaults: %+v %+v %+v", cols[1].DefaultExpr, cols[2].DefaultExpr, cols[3].DefaultExpr)
+	}
+	if cols[4].Identity != "always" || cols[4].IdentitySeq == nil || *cols[4].IdentitySeq.Start != 10 || *cols[4].IdentitySeq.Increment != 5 || !cols[4].NotNull {
+		t.Fatalf("identity: %+v", cols[4])
+	}
+	if cols[5].Default == nil || cols[5].Default.S != "x" || cols[5].DefaultExpr != nil {
+		t.Fatalf("constant default: %+v", cols[5])
+	}
+	if _, err := Parse(`CREATE TABLE t (a INT8, b INT8 DEFAULT a + 1)`); err == nil {
+		t.Fatal("a DEFAULT referencing a column parsed")
+	}
+	ins := parseOne(t, `INSERT INTO t (id, c) VALUES (DEFAULT, 'y'), (3, DEFAULT)`).(*Insert)
+	if !ins.Rows[0][0].IsDefault || ins.Rows[0][1].IsDefault || !ins.Rows[1][1].IsDefault {
+		t.Fatalf("DEFAULT values: %+v", ins.Rows)
+	}
+	ins = parseOne(t, `INSERT INTO t DEFAULT VALUES RETURNING id`).(*Insert)
+	if !ins.DefaultValues || len(ins.Rows) != 0 || len(ins.Returning) != 1 {
+		t.Fatalf("DEFAULT VALUES: %+v", ins)
+	}
+	ins = parseOne(t, `INSERT INTO t (k) OVERRIDING SYSTEM VALUE VALUES (7)`).(*Insert)
+	if ins.Overriding != "system" || len(ins.Rows) != 1 {
+		t.Fatalf("overriding: %+v", ins)
+	}
+	up := parseOne(t, `UPDATE t SET c = DEFAULT, n = 5 WHERE id = 1`).(*Update)
+	if !up.Set[0].Value.IsDefault || up.Set[1].Value.IsDefault {
+		t.Fatalf("SET DEFAULT: %+v", up.Set)
+	}
+	cs := parseOne(t, `CREATE SEQUENCE IF NOT EXISTS s AS int8 INCREMENT BY 2 MINVALUE 0 MAXVALUE 100 START WITH 4 CACHE 8 CYCLE OWNED BY t.id`).(*CreateSequence)
+	o := cs.Options
+	if cs.Name != "s" || !cs.IfNotExists || *o.Increment != 2 || *o.MinValue != 0 || *o.MaxValue != 100 || *o.Start != 4 || *o.Cache != 8 || o.Cycle == nil || !*o.Cycle || o.OwnedBy != "t.id" {
+		t.Fatalf("create sequence: %+v", o)
+	}
+	cs = parseOne(t, `CREATE SEQUENCE s2 INCREMENT -1 NO MINVALUE NO MAXVALUE NO CYCLE`).(*CreateSequence)
+	if *cs.Options.Increment != -1 || !cs.Options.NoMin || !cs.Options.NoMax || cs.Options.Cycle == nil || *cs.Options.Cycle {
+		t.Fatalf("create sequence 2: %+v", cs.Options)
+	}
+	as := parseOne(t, `ALTER SEQUENCE s RESTART WITH 50 MAXVALUE 200`).(*AlterSequence)
+	if as.Name != "s" || !as.Options.RestartSet || *as.Options.Restart != 50 || *as.Options.MaxValue != 200 {
+		t.Fatalf("alter sequence: %+v", as.Options)
+	}
+	as = parseOne(t, `ALTER SEQUENCE s RESTART`).(*AlterSequence)
+	if !as.Options.RestartSet || as.Options.Restart != nil {
+		t.Fatalf("bare restart: %+v", as.Options)
+	}
+	ds := parseOne(t, `DROP SEQUENCE IF EXISTS s`).(*DropSequence)
+	if ds.Name != "s" || !ds.IfExists {
+		t.Fatalf("drop sequence: %+v", ds)
+	}
+	if _, ok := parseOne(t, `SHOW SEQUENCES`).(*ShowSequences); !ok {
+		t.Fatal("SHOW SEQUENCES")
+	}
+	sel := parseOne(t, `SELECT nextval('s'), currval('s'), lastval(), setval('s', 10, false)`).(*Select)
+	if len(sel.Exprs) != 4 || sel.Exprs[0].Expr.Func != "nextval" || sel.Exprs[3].Expr.Func != "setval" {
+		t.Fatalf("sequence functions: %+v", sel.Exprs)
+	}
+}

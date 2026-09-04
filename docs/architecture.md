@@ -26,6 +26,7 @@ Raft group. The layout (see `pkg/keys`):
 | `/system/nodes/<id>` | node registry: address, locality, liveness | range 1 |
 | `/system/desc/<tableID>`, `/system/db/<dbID>`, `/system/dbns/<name>`, `/system/nsdb/<dbID>/<name>` | SQL catalog: table descriptors, database descriptors, database names, table names per database (`/system/ns/<name>` is the pre-v6 flat table namespace, empty once v6 is finalized) | range 1 |
 | `/system/idgen` | descriptor / table ID counter | range 1 |
+| `/system/seqdesc/<seqID>`, `/system/seqns/<dbID>/<name>`, `/system/seq/<seqID>` | sequences (v7): descriptors, names per database, and each sequence's counter, advanced by non-transactional increments of one `CACHE` block at a time | range 1 |
 | `/t/<tableID>/<pk...>` | user table rows | user ranges |
 
 Range 1 initially spans the whole keyspace; splits carve off new ranges.

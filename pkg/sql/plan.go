@@ -347,6 +347,13 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		return cols, nil
 
+	case *parser.ShowSequences:
+		return []ResultColumn{
+			{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},
+			{Name: "min_value", Type: types.Int}, {Name: "max_value", Type: types.Int}, {Name: "cycle", Type: types.Bool},
+			{Name: "cache", Type: types.Int}, {Name: "last_value", Type: types.Int}, {Name: "owned_by", Type: types.String},
+		}, nil
+
 	case *parser.ShowStats:
 		return []ResultColumn{
 			{Name: "table_name", Type: types.String},

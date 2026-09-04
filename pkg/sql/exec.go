@@ -71,6 +71,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDelete(ctx, txn, t, params)
 	case *parser.ShowTables:
 		return s.execShowTables(ctx, txn, t.Database)
+	case *parser.CreateSequence:
+		return s.execCreateSequence(ctx, txn, t)
+	case *parser.AlterSequence:
+		return s.execAlterSequence(ctx, txn, t)
+	case *parser.DropSequence:
+		return s.execDropSequence(ctx, txn, t)
+	case *parser.ShowSequences:
+		return s.execShowSequences(ctx, txn)
 	case *parser.Show:
 		return s.execShow(ctx, txn, t)
 	case *parser.ShowStats:
@@ -124,6 +132,28 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 				return nil, terr
 			}
 			col.Default = &d
+		}
+		if cd.DefaultExpr != nil {
+			text, err := s.validateDefaultExpr(ctx, txn, cd.Name, cd.Type, *cd.DefaultExpr)
+			if err != nil {
+				return nil, err
+			}
+			col.DefaultExpr = text
+		}
+		if cd.Serial || cd.Identity != "" {
+			if err := s.requireV7("SERIAL and identity columns"); err != nil {
+				return nil, err
+			}
+			if cd.Type != types.Int {
+				return nil, newErrf(CodeInvalidParameter, "identity column %q must be an integer type", cd.Name)
+			}
+			if cd.Default != nil || cd.DefaultExpr != nil {
+				return nil, newErrf(CodeSyntaxError, "column %q: both a DEFAULT and an identity are specified", cd.Name)
+			}
+			col.Identity = cd.Identity
+			if cd.Serial {
+				col.Identity = "" // SERIAL is a plain default, not an identity: explicit values are fine
+			}
 		}
 		desc.Columns = append(desc.Columns, col)
 		if cd.PrimaryKey {
@@ -181,8 +211,69 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 		return nil, err
 	}
+	// SERIAL and identity columns own a sequence named <table>_<col>_seq,
+	// created now that the table has its ID; the column defaults to
+	// nextval of it.
+	owned := false
+	for i, cd := range t.Columns {
+		if !cd.Serial && cd.Identity == "" {
+			continue
+		}
+		col := &desc.Columns[i]
+		sd := catalog.NewSequenceDescriptor(desc.Name+"_"+col.Name+"_seq", desc.DatabaseID)
+		sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
+		if cd.IdentitySeq != nil {
+			if err := applySequenceOptions(sd, cd.IdentitySeq, true); err != nil {
+				return nil, err
+			}
+		}
+		if err := catalog.CreateSequence(ctx, txn, sd); err != nil {
+			return nil, ToSQLError(err)
+		}
+		col.SequenceID = sd.ID
+		col.DefaultExpr = fmt.Sprintf("nextval('%s')", sd.Name)
+		owned = true
+	}
+	if owned {
+		if err := s.cat.Update(ctx, txn, desc); err != nil {
+			return nil, err
+		}
+	}
 	s.presplitTimeseries(ctx, desc)
 	return &Result{Tag: "CREATE TABLE"}, nil
+}
+
+// validateDefaultExpr checks an expression default at DDL time — the v7
+// gate, no column references or subqueries, the value coercible to the
+// column's type — and returns its stored text.
+func (s *Session) validateDefaultExpr(ctx context.Context, txn *kvclient.Txn, colName string, typ types.Family, e parser.Expr) (string, error) {
+	if err := s.requireV7("expression DEFAULTs"); err != nil {
+		return "", err
+	}
+	if exprHasSubquery(e) || e.Case != nil || e.Cmp != nil {
+		return "", newErrf(CodeFeatureNotSupported, "DEFAULT for column %q: subqueries, CASE and comparisons are not supported in defaults", colName)
+	}
+	text := parser.FormatExpr(e)
+	if _, err := parser.ParseExpr(text); err != nil {
+		return "", newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, err)
+	}
+	// Try it once: an unknown function or a type mismatch fails now, not
+	// at the first INSERT. nextval is not exercised (the sequence may be
+	// created after the table).
+	if !exprIsVolatile(e) {
+		r, err := s.resolveValueExpr(ctx, txn, e, nil)
+		if err != nil {
+			return "", newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, err)
+		}
+		d, err := evalExpr(r, nil, nil, nil)
+		if err != nil {
+			return "", newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, err)
+		}
+		if _, err := d.Coerce(typ); err != nil {
+			return "", newErrf(CodeInvalidTextRepresentation, "DEFAULT for column %q: %v", colName, err)
+		}
+	}
+	return text, nil
 }
 
 // applyTableOptions validates the WITH (...) options and stamps the
@@ -332,10 +423,22 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, err
 	}
 	// Statistics die with the table (same DDL txn; the background
-	// sampler's orphan sweep is the backstop for anything missed).
+	// sampler's orphan sweep is the backstop for anything missed), and so
+	// do the sequences its columns own.
 	if desc != nil {
 		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
 			return nil, err
+		}
+		seqs, err := catalog.ListSequences(ctx, txn, desc.DatabaseID)
+		if err != nil {
+			return nil, err
+		}
+		for _, sd := range seqs {
+			if sd.OwnerTable == desc.ID {
+				if err := catalog.DropSequence(ctx, txn, sd); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	return &Result{Tag: "DROP TABLE"}, nil
@@ -360,6 +463,25 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	// GENERATED ALWAYS AS IDENTITY refuses an explicit value unless the
+	// statement says OVERRIDING SYSTEM VALUE (a DEFAULT value is fine).
+	rows := t.Rows
+	if t.DefaultValues {
+		rows = [][]parser.Expr{{}}
+		target = nil
+	}
+	if t.Overriding != "system" {
+		for i, c := range target {
+			if c.Identity != "always" {
+				continue
+			}
+			for _, r := range rows {
+				if i < len(r) && !r[i].IsDefault {
+					return nil, newErrf(CodeGeneratedAlways, "cannot insert a non-DEFAULT value into column %q: it is an identity column defined as GENERATED ALWAYS (use OVERRIDING SYSTEM VALUE to override)", c.Name)
+				}
+			}
+		}
+	}
 	ret, err := s.returningProjection(desc, t.Table, t.Returning)
 	if err != nil {
 		return nil, err
@@ -368,19 +490,34 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	defaults, err := s.prepareDefaults(ctx, txn, desc, params)
+	if err != nil {
+		return nil, err
+	}
 	count := 0
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
 	res := &Result{}
-	for _, exprRow := range t.Rows {
+	for _, exprRow := range rows {
 		if len(exprRow) != len(target) {
 			return nil, newErrf(CodeSyntaxError, "INSERT has %d values but %d target columns", len(exprRow), len(target))
 		}
 		vals := make([]types.Datum, len(exprRow))
 		for i, e := range exprRow {
-			d, err := evalExpr(e, nil, nil, params)
-			if err != nil {
-				return nil, err
+			var d types.Datum
+			if e.IsDefault {
+				if d, err = s.defaultValue(ctx, txn, defaults, &target[i], params); err != nil {
+					return nil, err
+				}
+			} else {
+				if exprIsVolatile(e) {
+					if e, err = s.spliceVolatile(ctx, txn, e, params); err != nil {
+						return nil, err
+					}
+				}
+				if d, err = evalExpr(e, nil, nil, params); err != nil {
+					return nil, err
+				}
 			}
 			d, cerr := d.Coerce(target[i].Type)
 			if cerr != nil {
@@ -388,13 +525,17 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			}
 			vals[i] = d
 		}
+		rowTarget, rowVals, err := s.expandDefaults(ctx, txn, desc, defaults, target, vals, params)
+		if err != nil {
+			return nil, err
+		}
 		var row map[catalog.ColumnID]types.Datum
 		if conflict == nil {
-			if row, err = insertRowReturning(ctx, txn, desc, target, vals, &wb, inserted); err != nil {
+			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted); err != nil {
 				return nil, err
 			}
 		} else {
-			written, wrow, err := s.insertOnConflict(ctx, txn, desc, target, vals, conflict, params, &wb, inserted)
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted)
 			if err != nil {
 				return nil, err
 			}
@@ -1501,13 +1642,30 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	res := &Result{}
 	var wb kvclient.WriteBatch
 	seen := map[string]bool{}
+	defaults, err := s.prepareDefaults(ctx, txn, desc, params)
+	if err != nil {
+		return nil, err
+	}
 	for _, fr := range rows {
 		oldRow := copyRow(fr.row)
 		for _, set := range t.Set {
 			col, _ := desc.Col(set.Column)
-			d, err := evalExpr(set.Value, desc, fr.row, params)
-			if err != nil {
-				return nil, err
+			var d types.Datum
+			switch {
+			case set.Value.IsDefault:
+				if d, err = s.defaultValue(ctx, txn, defaults, &col, params); err != nil {
+					return nil, err
+				}
+			default:
+				value := set.Value
+				if exprIsVolatile(value) {
+					if value, err = s.spliceVolatile(ctx, txn, value, params); err != nil {
+						return nil, err
+					}
+				}
+				if d, err = evalExpr(value, desc, fr.row, params); err != nil {
+					return nil, err
+				}
 			}
 			d, cerr := d.Coerce(col.Type)
 			if cerr != nil {
@@ -1670,6 +1828,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		if def.PrimaryKey {
 			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot add a primary key column")
 		}
+		if def.DefaultExpr != nil || def.Serial || def.Identity != "" {
+			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN takes a constant DEFAULT only (existing rows would each need the expression evaluated)")
+		}
 		if def.NotNull && (def.Default == nil || def.Default.Null) {
 			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN ... NOT NULL requires a DEFAULT (existing rows need a value)")
 		}
@@ -1718,6 +1879,13 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			}
 		}
 		desc.Columns = kept
+		if col.SequenceID != 0 {
+			if sd, err := catalog.ReadSequence(ctx, txn, col.SequenceID); err == nil {
+				if err := catalog.DropSequence(ctx, txn, sd); err != nil {
+					return nil, err
+				}
+			}
+		}
 	default:
 		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires ADD or DROP COLUMN")
 	}

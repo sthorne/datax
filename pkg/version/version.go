@@ -63,9 +63,15 @@ const (
 	// node reads; at finalize the upgrade migrates the flat entries under
 	// the default database in one transaction (rule 4).
 	V6 Version = 6
+	// V7 introduces expression DEFAULTs, sequences, SERIAL and identity
+	// columns (pkg/sql/catalog/sequence.go): a column descriptor may
+	// carry a DefaultExpr that a v6 node cannot evaluate (it would insert
+	// NULL), so the DDL that creates one is refused until finalize, when
+	// every node runs a v7 binary (rule 4).
+	V7 Version = 7
 
 	// Current is the newest cluster version this binary can run.
-	Current = V6
+	Current = V7
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

@@ -120,7 +120,7 @@ func (a *Activity) setUser(c *conn, user string) {
 // statementKind classifies a parsed statement for counting.
 func statementKind(stmt parser.Statement) string {
 	switch stmt.(type) {
-	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases:
+	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases, *parser.ShowSequences:
 		return "select"
 	case *parser.Insert:
 		return "insert"
@@ -132,7 +132,8 @@ func statementKind(stmt parser.Statement) string {
 		return "copy"
 	case *parser.Begin, *parser.Commit, *parser.Rollback, *parser.Savepoint, *parser.ReleaseSavepoint, *parser.RollbackToSavepoint:
 		return "txn"
-	case *parser.CreateTable, *parser.CreateIndex, *parser.DropTable, *parser.AlterTable, *parser.CreateUser, *parser.DropUser, *parser.GrantRevoke, *parser.Analyze:
+	case *parser.CreateTable, *parser.CreateIndex, *parser.DropTable, *parser.AlterTable, *parser.CreateUser, *parser.DropUser, *parser.GrantRevoke, *parser.Analyze,
+		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
 		return "ddl"
 	default:
 		return "other"

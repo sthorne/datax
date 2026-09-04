@@ -15,7 +15,7 @@ syntax error or `0A000` feature not supported):
 | Functions beyond `now()`, `coalesce()`, `length()`, `lower()`, `upper()`, `abs()`, `array_to_string()`, `pg_size_pretty()` and the catalog functions tools call ([list](sql.md#reading)) — SQLSTATE `42883` | compute client-side |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` **is supported**) | merge client-side |
 | `CHECK` / `FOREIGN KEY` / `UNIQUE` column constraints | `CREATE UNIQUE INDEX` covers uniqueness; enforce the rest in the application |
-| Sequences / `SERIAL` / `DEFAULT` expressions | generate ids client-side (UUIDs distribute writes better than sequences here anyway) |
+| `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Views, triggers, stored procedures, `LISTEN/NOTIFY` | — |
@@ -136,8 +136,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_get_constraintdef`, `'t'::regclass` and `to_regclass`-style
   existence checks (`SELECT 1 FROM pg_class WHERE relname = ...`) return
   what PostgreSQL would for a schema in the datax subset. Reads of
-  features datax lacks (sequences, foreign keys, triggers, comments,
-  extensions) come back empty rather than erroring.
+  features datax lacks (foreign keys, triggers, comments, extensions)
+  come back empty rather than erroring; `pg_sequences`, `pg_sequence`
+  and `pg_class` rows with `relkind = 'S'` list the sequences.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 
 ## Client compatibility notes
