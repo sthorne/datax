@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,8 +81,13 @@ func (idx *IndexDescriptor) Public() bool {
 // TableDescriptor describes a table. Primary rows are stored at
 // /t/<ID>/1/<encoded primary key> (see pkg/sql/rowenc).
 type TableDescriptor struct {
-	ID         uint64     `json:"id"`
-	Name       string     `json:"name"`
+	ID   uint64 `json:"id"`
+	Name string `json:"name"`
+	// DatabaseID is the owning database (see DatabaseDescriptor). 0 marks
+	// a table created before the cluster finalized v6, which lives in the
+	// flat namespace and belongs to the default database until the
+	// migration stamps it.
+	DatabaseID uint64     `json:"database_id,omitempty"`
 	Columns    []Column   `json:"columns"`
 	PrimaryKey []ColumnID `json:"primary_key"`
 	// Indexes are the table's secondary indexes. NextIndexID is the next
@@ -267,7 +273,12 @@ func (e *ErrTableExists) Error() string { return fmt.Sprintf("table %q already e
 // against every gateway's lease before completing — see lease.go.
 type Accessor struct {
 	mu    sync.Mutex
-	cache map[string]*cachedDesc
+	cache map[string]*cachedDesc // keyed by cacheKey(dbID, name)
+	// dbs caches database name → ID (0 = the default database before
+	// the v6 migration); invalidated by database DDL on this gateway and
+	// re-read on a miss, so another gateway's CREATE DATABASE is seen on
+	// first use.
+	dbs map[string]uint64
 
 	// Leasing state; zero when disabled (bare accessors behave as a plain
 	// cache that never expires, today's pre-lease semantics).
@@ -311,17 +322,32 @@ func NewAccessor() *Accessor {
 // cache and stall concurrent DDL drains waiting for every live lease to
 // adopt the new version.
 func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
-	if txn != nil && txn.Historical() {
-		return lookupUncached(ctx, txn, name)
+	return a.LookupIn(ctx, txn, DefaultDatabase, name)
+}
+
+// LookupIn resolves a table by name within txn, in database db unless
+// name is qualified ("otherdb.t"), using the cache while its lease (if
+// any) is live.
+func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if q, bare := SplitTableName(name); q != "" {
+		db, name = q, bare
 	}
+	dbID, err := a.databaseID(ctx, txn, db)
+	if err != nil {
+		return nil, err
+	}
+	if txn != nil && txn.Historical() {
+		return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	}
+	key := cacheKey(dbID, name)
 	a.mu.Lock()
-	if c, ok := a.cache[name]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
+	if c, ok := a.cache[key]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
 		a.mu.Unlock()
 		pinDeadline(txn, c.expiration)
 		return c.desc, nil
 	}
 	a.mu.Unlock()
-	d, err := lookupUncached(ctx, txn, name)
+	d, err := lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
 	if err != nil {
 		return nil, err
 	}
@@ -336,10 +362,70 @@ func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (
 		entry.expiration = exp
 	}
 	a.mu.Lock()
-	a.cache[name] = entry
+	a.cache[key] = entry
 	a.mu.Unlock()
 	pinDeadline(txn, entry.expiration)
 	return d, nil
+}
+
+// cacheKey is the cache's key for a table: its database ID and name.
+func cacheKey(dbID uint64, name string) string { return strconv.FormatUint(dbID, 10) + "/" + name }
+
+func splitCacheKey(key string) (uint64, string) {
+	i := strings.IndexByte(key, '/')
+	if i < 0 {
+		return 0, key
+	}
+	id, _ := strconv.ParseUint(key[:i], 10, 64)
+	return id, key[i+1:]
+}
+
+// databaseID resolves a database name (the default database is ID 0
+// until the v6 migration creates its descriptor).
+func (a *Accessor) databaseID(ctx context.Context, txn *kvclient.Txn, db string) (uint64, error) {
+	if db == "" {
+		db = DefaultDatabase
+	}
+	a.mu.Lock()
+	id, ok := a.dbs[db]
+	a.mu.Unlock()
+	if ok && (id != 0 || db != DefaultDatabase) {
+		return id, nil
+	}
+	d, err := LookupDatabase(ctx, txn, db)
+	if err != nil {
+		return 0, err
+	}
+	a.mu.Lock()
+	if a.dbs == nil {
+		a.dbs = map[string]uint64{}
+	}
+	a.dbs[db] = d.ID
+	a.mu.Unlock()
+	return d.ID, nil
+}
+
+// Database resolves a database descriptor by name.
+func (a *Accessor) Database(ctx context.Context, txn *kvclient.Txn, db string) (*DatabaseDescriptor, error) {
+	if db == "" {
+		db = DefaultDatabase
+	}
+	return LookupDatabase(ctx, txn, db)
+}
+
+func (a *Accessor) invalidateDatabase(name string) {
+	a.mu.Lock()
+	delete(a.dbs, name)
+	a.mu.Unlock()
+}
+
+// InvalidateAll drops every cached descriptor (database rename: the
+// names' owners changed underneath the cache keys).
+func (a *Accessor) InvalidateAll() {
+	a.mu.Lock()
+	a.cache = map[string]*cachedDesc{}
+	a.dbs = nil
+	a.mu.Unlock()
 }
 
 // nowWallLocked is the wall clock the lease records are stamped with
@@ -369,18 +455,73 @@ func pinDeadline(txn *kvclient.Txn, expiration int64) {
 // descriptor (the re-shard historical-read guard) rather than a leased
 // snapshot.
 func (a *Accessor) LookupFresh(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
-	return lookupUncached(ctx, txn, name)
+	return a.LookupFreshIn(ctx, txn, DefaultDatabase, name)
+}
+
+// LookupFreshIn is LookupFresh within a database (or name's qualifier).
+func (a *Accessor) LookupFreshIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if q, bare := SplitTableName(name); q != "" {
+		db, name = q, bare
+	}
+	dbID, err := a.databaseID(ctx, txn, db)
+	if err != nil {
+		return nil, err
+	}
+	return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+}
+
+// isDefaultID reports whether dbID is the default database's (0 before
+// the migration; its allocated ID after, once this accessor has seen it).
+func (a *Accessor) isDefaultID(dbID uint64) bool {
+	if dbID == 0 {
+		return true
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.dbs[DefaultDatabase] == dbID
+}
+
+// DatabaseID resolves a database name to its ID (0 = the default
+// database before the v6 migration).
+func (a *Accessor) DatabaseID(ctx context.Context, txn *kvclient.Txn, db string) (uint64, error) {
+	return a.databaseID(ctx, txn, db)
 }
 
 // Invalidate drops a cached entry (after DDL or a stale-descriptor error).
 func (a *Accessor) Invalidate(name string) {
+	_, bare := SplitTableName(name)
 	a.mu.Lock()
-	delete(a.cache, name)
+	for k := range a.cache {
+		if _, n := splitCacheKey(k); n == bare {
+			delete(a.cache, k)
+		}
+	}
 	a.mu.Unlock()
 }
 
-func lookupUncached(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
-	idRaw, err := txn.Get(ctx, keys.NamespaceKey(name))
+// namespaceLookup finds a table's ID in database dbID: the v6 layout
+// first, then — for the default database only — the flat pre-v6 layout,
+// where tables created before finalize still live (and where a
+// historical read below the migration's timestamp finds every table).
+func namespaceLookup(ctx context.Context, txn *kvclient.Txn, dbID uint64, name string, isDefault bool) ([]byte, error) {
+	if dbID != 0 {
+		idRaw, err := txn.Get(ctx, keys.TableNamespaceKey(dbID, name))
+		if err != nil || idRaw != nil {
+			return idRaw, err
+		}
+		if !isDefault {
+			return nil, nil
+		}
+	}
+	return txn.Get(ctx, keys.NamespaceKey(name))
+}
+
+// isDefaultDatabase reports whether a database name is the default
+// database (whose pre-migration tables sit in the flat namespace).
+func isDefaultDatabase(db string) bool { return db == "" || db == DefaultDatabase }
+
+func lookupUncached(ctx context.Context, txn *kvclient.Txn, dbID uint64, name string, isDefault bool) (*TableDescriptor, error) {
+	idRaw, err := namespaceLookup(ctx, txn, dbID, name, isDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +549,7 @@ func lookupUncached(ctx context.Context, txn *kvclient.Txn, name string) (*Table
 // Create writes a new table descriptor within txn. The caller has validated
 // the definition.
 func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
-	existing, err := txn.Get(ctx, keys.NamespaceKey(d.Name))
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.Name, a.isDefaultID(d.DatabaseID))
 	if err != nil {
 		return err
 	}
@@ -432,11 +573,20 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if err := txn.Put(ctx, keys.TableDescKey(d.ID), raw); err != nil {
 		return err
 	}
-	if err := txn.Put(ctx, keys.NamespaceKey(d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
 	a.Invalidate(d.Name)
 	return nil
+}
+
+// namespaceKey is where a table's name entry lives: the v6 layout under
+// its database, or the flat layout for a pre-migration table (ID 0).
+func namespaceKey(dbID uint64, name string) keys.Key {
+	if dbID == 0 {
+		return keys.NamespaceKey(name)
+	}
+	return keys.TableNamespaceKey(dbID, name)
 }
 
 // Update rewrites an existing table's descriptor within txn (DDL like
@@ -457,11 +607,24 @@ func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 // Drop removes a table's descriptor and namespace entry. Row data is left
 // behind (unreachable; space reclamation is a GC concern, out of scope).
 func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
-	d, err := lookupUncached(ctx, txn, name)
+	return a.DropIn(ctx, txn, DefaultDatabase, name)
+}
+
+// DropIn drops a table by name in database db (or the qualifier in name).
+func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if q, bare := SplitTableName(name); q != "" {
+		db, name = q, bare
+	}
+	dbID, err := a.databaseID(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}
-	if err := txn.Delete(ctx, keys.NamespaceKey(name)); err != nil {
+	d, err := lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	if err != nil {
+		return nil, err
+	}
+	// The name entry is wherever the descriptor says it is.
+	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, name)); err != nil {
 		return nil, err
 	}
 	if err := txn.Delete(ctx, keys.TableDescKey(d.ID)); err != nil {

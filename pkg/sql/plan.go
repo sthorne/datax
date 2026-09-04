@@ -63,12 +63,12 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 // open transaction if any, else in a throwaway one.
 func (s *Session) lookupForPlan(ctx context.Context, name string) (*catalog.TableDescriptor, error) {
 	if s.state == StateOpen {
-		return s.cat.Lookup(ctx, s.txn, name)
+		return s.lookup(ctx, s.txn, name)
 	}
 	var desc *catalog.TableDescriptor
 	err := s.db.RunTxn(ctx, "plan", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
-		desc, err = s.cat.Lookup(ctx, txn, name)
+		desc, err = s.lookup(ctx, txn, name)
 		return err
 	})
 	return desc, err

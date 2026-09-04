@@ -42,7 +42,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	// Step 1: publish write-only.
 	var indexID uint64
 	err := s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
-		shared, err := s.cat.Lookup(ctx, txn, t.Table)
+		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
@@ -90,7 +90,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDL(ctx, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 
@@ -100,7 +100,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	// Step 3: flip public in its own small transaction.
 	if backfillErr == nil {
 		backfillErr = s.db.RunTxn(ctx, "create-index-public", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.cat.Lookup(ctx, txn, t.Table)
+			shared, err := s.lookup(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
@@ -121,7 +121,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		// wasted space), then surface the original failure.
 		var tableID uint64
 		_ = s.db.RunTxn(ctx, "create-index-abandon", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.cat.Lookup(ctx, txn, t.Table)
+			shared, err := s.lookup(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
@@ -136,7 +136,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			desc.Indexes = kept
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDL(ctx, t.Table)
+		_ = s.cat.FinishDDLIn(ctx, s.database, t.Table)
 		if tableID != 0 {
 			s.wipeIndexEntries(ctx, tableID, indexID)
 		}
@@ -144,7 +144,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	}
 
 	// Step 3: drain adoption of the public index.
-	if err := s.cat.FinishDDL(ctx, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "CREATE INDEX"}, nil
@@ -168,7 +168,7 @@ func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint6
 
 	var cursor, end keys.Key
 	if err := s.db.RunTxn(ctx, "create-index-plan", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, err := s.cat.Lookup(ctx, txn, table)
+		desc, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}
@@ -208,7 +208,7 @@ func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint6
 // [start, end) in one serializable transaction.
 func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint64, start, end keys.Key) error {
 	return s.db.RunTxn(ctx, "create-index-backfill", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, err := s.cat.Lookup(ctx, txn, table)
+		desc, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}

@@ -261,8 +261,10 @@ type GrantRevoke struct {
 	Revoke     bool
 	Admin      bool     // admin-role form; Privileges/Table empty
 	Privileges []string // upper-cased: SELECT INSERT UPDATE DELETE ALL
-	Table      string
-	User       string
+	// Database names the database for GRANT ... ON DATABASE (Table empty).
+	Database string
+	Table    string
+	User     string
 }
 
 type Begin struct{}
@@ -284,9 +286,38 @@ type Analyze struct{ Table string }
 // ShowStats renders the stored statistics for a table (read-only).
 type ShowStats struct{ Table string }
 
+// CreateDatabase is CREATE DATABASE [IF NOT EXISTS] name.
+type CreateDatabase struct {
+	Name        string
+	IfNotExists bool
+}
+
+// DropDatabase is DROP DATABASE [IF EXISTS] name [CASCADE | RESTRICT].
+type DropDatabase struct {
+	Name     string
+	IfExists bool
+	Cascade  bool
+}
+
+// AlterDatabase is ALTER DATABASE name RENAME TO new.
+type AlterDatabase struct {
+	Name    string
+	NewName string
+}
+
+// ShowDatabases is SHOW DATABASES.
+type ShowDatabases struct{}
+
+// Use is USE name (CockroachDB syntax for SET database = name).
+type Use struct{ Name string }
+
 // SetVar is `SET name = value` / `SET SESSION ...`: parsed and ignored
 // (clients send these at startup).
-type SetVar struct{ Name string }
+type SetVar struct {
+	Name string
+	// Value is the literal or identifier after = / TO, when there is one.
+	Value string
+}
 
 func (*CreateTable) stmt()         {}
 func (*CreateIndex) stmt()         {}
@@ -311,3 +342,8 @@ func (*ShowTables) stmt()          {}
 func (*Analyze) stmt()             {}
 func (*ShowStats) stmt()           {}
 func (*SetVar) stmt()              {}
+func (*CreateDatabase) stmt()      {}
+func (*DropDatabase) stmt()        {}
+func (*AlterDatabase) stmt()       {}
+func (*ShowDatabases) stmt()       {}
+func (*Use) stmt()                 {}

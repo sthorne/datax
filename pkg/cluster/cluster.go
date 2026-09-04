@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/version"
@@ -94,6 +95,17 @@ func BootstrapEngine(eng *storage.Engine, ident StoreIdent, range1 kvpb.RangeDes
 	// born finalized at its binary's version.
 	if err := storage.MVCCPut(b, keys.ClusterVersionKey(), bootstrapTimestamp, []byte(fmt.Sprintf("%d", int(cv))), nil); err != nil {
 		return err
+	}
+	// The database catalog (v6+): born with its default databases, so the
+	// leader's migration finds nothing to do and no table ever starts
+	// out in the flat namespace.
+	if cv >= version.V6 {
+		err := catalog.BootstrapDatabases(func(key keys.Key, value []byte) error {
+			return storage.MVCCPut(b, key, bootstrapTimestamp, value, nil)
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return b.Commit(true)
 }

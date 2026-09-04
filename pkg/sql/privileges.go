@@ -25,7 +25,8 @@ var tablePrivs = map[string]bool{"SELECT": true, "INSERT": true, "UPDATE": true,
 func requiresAdmin(stmt parser.Statement) bool {
 	switch stmt.(type) {
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable,
-		*parser.CreateIndex, *parser.CreateUser, *parser.Analyze, *parser.DropUser, *parser.GrantRevoke:
+		*parser.CreateIndex, *parser.CreateUser, *parser.Analyze, *parser.DropUser, *parser.GrantRevoke,
+		*parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
 		return true
 	}
 	return false
@@ -85,11 +86,41 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 	return nil
 }
 
+// checkCreateInDatabase admits CREATE TABLE for root, admins, and users
+// holding CREATE on the target database.
+func (s *Session) checkCreateInDatabase(ctx context.Context, txn *kvclient.Txn, table string) error {
+	if s.user == "root" {
+		return nil
+	}
+	ok, err := s.isAdmin(ctx, txn)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	dbName, _ := catalog.SplitTableName(table)
+	if dbName == "" {
+		dbName = s.database
+	}
+	db, err := s.cat.Database(ctx, txn, dbName)
+	if err != nil {
+		return ToSQLError(err)
+	}
+	if db.HasPrivilege(s.user, catalog.PrivCreate) {
+		return nil
+	}
+	return newErrf(CodeInsufficientPriv, "permission denied: %q needs the admin role or CREATE on database %q", s.user, dbName)
+}
+
 // execGrantRevoke applies a GRANT/REVOKE (the admin gate has already run).
 func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *parser.GrantRevoke) (*Result, error) {
 	tag := "GRANT"
 	if t.Revoke {
 		tag = "REVOKE"
+	}
+	if t.Database != "" {
+		return s.execGrantRevokeDatabase(ctx, txn, t, tag)
 	}
 
 	if t.Admin {
@@ -118,12 +149,12 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 			continue
 		}
 		if !tablePrivs[p] {
-			return nil, newErrf(CodeSyntaxError, "unknown privilege %q", p)
+			return nil, newErrf(CodeSyntaxError, "%s is not a table privilege (table privileges: SELECT, INSERT, UPDATE, DELETE, ALL)", p)
 		}
 		set[p] = true
 	}
 
-	shared, err := s.cat.Lookup(ctx, txn, t.Table)
+	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}

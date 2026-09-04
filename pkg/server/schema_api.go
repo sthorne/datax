@@ -71,7 +71,10 @@ type SchemaStats struct {
 
 // SchemaTable is one table in the browser.
 type SchemaTable struct {
-	ID         uint64         `json:"id"`
+	ID uint64 `json:"id"`
+	// Database is the table's database (the default one for tables that
+	// predate the v6 migration).
+	Database   string         `json:"database"`
 	Name       string         `json:"name"`
 	Version    uint64         `json:"version"`
 	Columns    []SchemaColumn `json:"columns"`
@@ -251,10 +254,21 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 	names := map[uint64]string{}
 
 	var descs []*catalog.TableDescriptor
+	dbNames := map[uint64]string{0: catalog.DefaultDatabase}
 	err := n.db.RunTxn(ctx, "schema-api", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		descs, err = catalog.NewAccessor().List(ctx, txn)
-		return err
+		if err != nil {
+			return err
+		}
+		dbs, err := catalog.ListDatabases(ctx, txn)
+		if err != nil {
+			return err
+		}
+		for _, db := range dbs {
+			dbNames[db.ID] = db.Name
+		}
+		return nil
 	})
 	if err != nil {
 		doc.Error = "catalog listing unavailable: " + err.Error()
@@ -277,6 +291,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 	for _, d := range descs {
 		t := SchemaTable{
 			ID: d.ID, Name: d.Name, Version: d.Version,
+			Database:   dbNames[d.DatabaseID],
 			Timeseries: d.Timeseries, RetentionSeconds: d.RetentionSeconds, Shards: d.ShardBuckets,
 			Privileges: d.Privileges,
 		}

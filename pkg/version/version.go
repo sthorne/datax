@@ -57,9 +57,15 @@ const (
 	// table as an ordinary user table (droppable, backed up), so nothing
 	// creates it before finalize (rule 4).
 	V5 Version = 5
+	// V6 introduces databases (pkg/sql/catalog/database.go): database
+	// descriptors and a per-database table namespace. Before finalize
+	// every node keeps creating tables in the flat namespace, which a v5
+	// node reads; at finalize the upgrade migrates the flat entries under
+	// the default database in one transaction (rule 4).
+	V6 Version = 6
 
 	// Current is the newest cluster version this binary can run.
-	Current = V5
+	Current = V6
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

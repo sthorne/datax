@@ -170,7 +170,7 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	if len(outers) > maxCorrDepth {
 		return nil, nil, newErrf(CodeFeatureNotSupported, "correlated subqueries nest deeper than %d levels", maxCorrDepth)
 	}
-	innerDesc, err := s.cat.Lookup(ctx, txn, sub.Table)
+	innerDesc, err := s.lookup(ctx, txn, sub.Table)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -345,7 +345,7 @@ func (s *Session) splitCorrelatedWhere(ctx context.Context, txn *kvclient.Txn, w
 // splitCorrelatedUpdate strips correlated conjuncts from an UPDATE's
 // WHERE clause (the outer scope is the bare table name).
 func (s *Session) splitCorrelatedUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update) ([]correlatedConjunct, *parser.Update, error) {
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, t, nil // let the ordinary path report the missing table
 	}
@@ -363,7 +363,7 @@ func (s *Session) splitCorrelatedUpdate(ctx context.Context, txn *kvclient.Txn, 
 
 // splitCorrelatedDelete is splitCorrelatedUpdate for DELETE.
 func (s *Session) splitCorrelatedDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete) ([]correlatedConjunct, *parser.Delete, error) {
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, t, nil
 	}

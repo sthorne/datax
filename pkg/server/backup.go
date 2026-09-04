@@ -79,6 +79,10 @@ type backupManifest struct {
 	Tables    []backupTable `json:"tables"`
 	Users     []backupKV    `json:"users"`
 	Admins    []backupKV    `json:"admins"`
+	// Databases are the database descriptors and their name entries (v6);
+	// a manifest without them restores every table into the flat layout,
+	// which the catalog migration then moves under the default database.
+	Databases []backupKV `json:"databases,omitempty"`
 }
 
 // exportAll streams every export record in [start, end) for the window
@@ -250,6 +254,16 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 	if man.Admins, err = collectRaw(aStart, aEnd); err != nil {
 		return nil, err
 	}
+	dStart, dEnd := keys.DatabaseDescSpan()
+	if man.Databases, err = collectRaw(dStart, dEnd); err != nil {
+		return nil, err
+	}
+	nStart, nEnd := keys.DatabaseNamespaceSpan()
+	dbNames, err := collectRaw(nStart, nEnd)
+	if err != nil {
+		return nil, err
+	}
+	man.Databases = append(man.Databases, dbNames...)
 
 	// Table data: the (baseTS, endTS] window over each table's full data
 	// span — every index, raw, so restore needs no backfill.
@@ -384,9 +398,17 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 	var maxID uint64
 	err = n.db.RunTxn(ctx, "restore-metadata", func(ctx context.Context, txn *kvclient.Txn) error {
 		var wb kvclient.WriteBatch
+		for _, kv := range final.Databases {
+			wb.Put(keys.Key(kv.Key), kv.Value)
+		}
 		for _, t := range final.Tables {
 			wb.Put(keys.TableDescKey(t.ID), []byte(t.Descriptor))
-			wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
+			var d catalog.TableDescriptor
+			if json.Unmarshal(t.Descriptor, &d) == nil && d.DatabaseID != 0 {
+				wb.Put(keys.TableNamespaceKey(d.DatabaseID, t.Name), []byte(fmt.Sprintf("%d", t.ID)))
+			} else {
+				wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
+			}
 			if t.ID > maxID && !catalog.IsSystemTableID(t.ID) {
 				maxID = t.ID
 			}
@@ -404,14 +426,20 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 	}
 	// The descriptor ID generator must never re-issue a restored ID.
 	if maxID > 0 {
-		cur, err := n.db.Increment(ctx, keys.DescIDGenKey(), 0)
-		if err != nil {
-			return nil, err
-		}
-		if uint64(cur) <= maxID {
-			if _, err := n.db.Increment(ctx, keys.DescIDGenKey(), int64(maxID)-cur+1); err != nil {
-				return nil, err
+		// Transactional, so a concurrent allocation (the catalog migration
+		// creating the default databases on a fresh cluster) retries
+		// instead of failing on its intent.
+		if err := n.db.RunTxn(ctx, "restore-idgen", func(ctx context.Context, txn *kvclient.Txn) error {
+			cur, err := txn.Increment(ctx, keys.DescIDGenKey(), 0)
+			if err != nil {
+				return err
 			}
+			if uint64(cur) <= maxID {
+				_, err = txn.Increment(ctx, keys.DescIDGenKey(), int64(maxID)-cur+1)
+			}
+			return err
+		}); err != nil {
+			return nil, err
 		}
 	}
 

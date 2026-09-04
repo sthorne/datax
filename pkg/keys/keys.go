@@ -290,10 +290,57 @@ func TableStatsID(k Key) (uint64, bool) {
 	return id, true
 }
 
-// NamespaceKey maps a table name to its ID.
+// NamespaceKey maps a table name to its ID in the flat, pre-v6 layout.
+// Tables created before the cluster finalized v6 live here until the
+// migration moves them under their database (TableNamespaceKey); the
+// catalog still reads it for the default database.
 func NamespaceKey(name string) Key {
 	k := systemKey("ns")
 	return Key(encoding.EncodeString(k, name))
+}
+
+// DatabaseDescKey holds the JSON database descriptor for a database ID.
+func DatabaseDescKey(dbID uint64) Key {
+	k := systemKey("db")
+	return Key(encoding.EncodeUint64(k, dbID))
+}
+
+// DatabaseDescSpan covers all database descriptors.
+func DatabaseDescSpan() (Key, Key) {
+	p := systemKey("db")
+	return p, p.PrefixEnd()
+}
+
+// DatabaseNamespaceKey maps a database name to its ID.
+func DatabaseNamespaceKey(name string) Key {
+	k := systemKey("dbns")
+	return Key(encoding.EncodeString(k, name))
+}
+
+// DatabaseNamespaceSpan covers all database names.
+func DatabaseNamespaceSpan() (Key, Key) {
+	p := systemKey("dbns")
+	return p, p.PrefixEnd()
+}
+
+// TableNamespaceKey maps a table name within a database to its table ID
+// (the v6 layout). Schemas are not encoded: public is the only one, and
+// a schema level would slot in between the database and the name.
+func TableNamespaceKey(dbID uint64, name string) Key {
+	k := Key(encoding.EncodeUint64(systemKey("nsdb"), dbID))
+	return Key(encoding.EncodeString(k, name))
+}
+
+// TableNamespaceSpan covers one database's table names.
+func TableNamespaceSpan(dbID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("nsdb"), dbID))
+	return p, p.PrefixEnd()
+}
+
+// AllTableNamespaceSpan covers every database's table names.
+func AllTableNamespaceSpan() (Key, Key) {
+	p := systemKey("nsdb")
+	return p, p.PrefixEnd()
 }
 
 // DescLeaseKey holds one gateway's lease on a table descriptor: proof that

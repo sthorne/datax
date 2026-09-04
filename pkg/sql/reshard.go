@@ -103,7 +103,7 @@ func reshardShadowRow(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 // (which surfaces missing tables and GC-threshold errors itself), and
 // only sharded timeseries descriptors pay the current-descriptor read.
 func (s *Session) checkHistoricalLayout(ctx context.Context, htxn *kvclient.Txn, table string) *Error {
-	hdesc, err := s.cat.Lookup(ctx, htxn, table)
+	hdesc, err := s.lookup(ctx, htxn, table)
 	if err != nil || !hdesc.Timeseries || hdesc.ShardBuckets <= 0 {
 		return nil
 	}
@@ -112,7 +112,7 @@ func (s *Session) checkHistoricalLayout(ctx context.Context, htxn *kvclient.Txn,
 	var cur *catalog.TableDescriptor
 	gctx, gcancel := context.WithTimeout(ctx, 2*time.Second)
 	_ = s.db.RunTxn(gctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
-		cur, _ = s.cat.LookupFresh(ctx, gtxn, table)
+		cur, _ = s.cat.LookupFreshIn(ctx, gtxn, s.database, table)
 		return nil
 	})
 	gcancel()
@@ -149,7 +149,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	var tableID, newIndexID, oldIndexID uint64
 	var newSecondaryIDs []uint64
 	rerr := s.db.RunTxn(ctx, "reshard-publish", func(ctx context.Context, txn *kvclient.Txn) error {
-		shared, err := s.cat.Lookup(ctx, txn, t.Table)
+		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
@@ -189,7 +189,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	if rerr != nil {
 		return nil, ToSQLError(rerr)
 	}
-	if err := s.cat.FinishDDL(ctx, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	// The drain waits for every gateway's LEASE to adopt the dual-write
@@ -210,7 +210,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	// Step 4: the atomic swap.
 	if backfillErr == nil {
 		backfillErr = s.db.RunTxn(ctx, "reshard-swap", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.cat.Lookup(ctx, txn, t.Table)
+			shared, err := s.lookup(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
@@ -250,7 +250,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 		// marker.
 		cctx := context.WithoutCancel(ctx)
 		_ = s.db.RunTxn(cctx, "reshard-abandon", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.cat.Lookup(ctx, txn, t.Table)
+			shared, err := s.lookup(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
@@ -261,14 +261,14 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 			desc.Reshard = nil
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDL(cctx, t.Table)
+		_ = s.cat.FinishDDLIn(cctx, s.database, t.Table)
 		s.wipeIndexEntries(cctx, tableID, newIndexID)
 		for _, id := range newSecondaryIDs {
 			s.wipeIndexEntries(cctx, tableID, id)
 		}
 		return nil, ToSQLError(backfillErr)
 	}
-	if err := s.cat.FinishDDL(ctx, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	// Same grace on the way out: stale-descriptor readers may still be
@@ -320,7 +320,7 @@ func (s *Session) backfillReshard(ctx context.Context, table string, oldIndexID 
 
 	var cursor, end keys.Key
 	if err := s.db.RunTxn(ctx, "reshard-plan", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, err := s.cat.Lookup(ctx, txn, table)
+		desc, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}
@@ -407,7 +407,7 @@ const reshardChunkSize = 512
 
 func (s *Session) reshardChunk(ctx context.Context, table string, start, end keys.Key) error {
 	return s.db.RunTxn(ctx, "reshard-backfill", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, err := s.cat.Lookup(ctx, txn, table)
+		desc, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}

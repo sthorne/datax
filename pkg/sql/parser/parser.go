@@ -130,6 +130,40 @@ func (p *parser) expectOp(op string) error {
 	return nil
 }
 
+// parseTableName parses a possibly qualified table name: t, public.t,
+// db.t or db.public.t. The only schema is public, so the result is the
+// bare name or "db.name"; the session resolves an unqualified name in
+// its current database.
+func (p *parser) parseTableName() (string, error) {
+	first, err := p.expectIdent()
+	if err != nil {
+		return "", err
+	}
+	parts := []string{first}
+	for p.consumeOp(".") {
+		next, err := p.expectIdent()
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, next)
+	}
+	switch len(parts) {
+	case 1:
+		return parts[0], nil
+	case 2:
+		if parts[0] == "public" {
+			return parts[1], nil
+		}
+		return parts[0] + "." + parts[1], nil
+	case 3:
+		if parts[1] != "public" {
+			return "", p.errf("schema %q does not exist (public is the only schema)", parts[1])
+		}
+		return parts[0] + "." + parts[2], nil
+	}
+	return "", p.errf("too many qualifiers in table name %q", strings.Join(parts, "."))
+}
+
 func (p *parser) expectIdent() (string, error) {
 	t := p.peek()
 	if t.kind == tkIdent {
@@ -157,6 +191,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
 			return p.parseUserStmt(false)
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+			p.i += 2 // CREATE DATABASE
+			cd := &CreateDatabase{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("NOT"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				cd.IfNotExists = true
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			cd.Name = name
+			return cd, nil
+		}
 		return p.parseCreateTable()
 	case "EXPLAIN":
 		p.i++
@@ -174,6 +227,27 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return &DropUser{Name: name}, nil
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+			p.i += 2 // DROP DATABASE
+			dd := &DropDatabase{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				dd.IfExists = true
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			dd.Name = name
+			if p.consumeIdentWord("cascade") {
+				dd.Cascade = true
+			} else {
+				p.consumeIdentWord("restrict")
+			}
+			return dd, nil
+		}
 		return p.parseDropTable()
 	case "INSERT":
 		return p.parseInsert()
@@ -186,6 +260,24 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "ALTER":
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
 			return p.parseUserStmt(true)
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+			p.i += 2 // ALTER DATABASE name RENAME TO new
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if !p.consumeIdentWord("rename") {
+				return nil, p.errf("ALTER DATABASE supports only RENAME TO")
+			}
+			if err := p.expectKeyword("TO"); err != nil {
+				return nil, err
+			}
+			newName, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterDatabase{Name: name, NewName: newName}, nil
 		}
 		return p.parseAlterTable()
 	case "BEGIN":
@@ -238,7 +330,7 @@ func (p *parser) parseStatement() (Statement, error) {
 		p.i++
 		a := &Analyze{}
 		if p.peek().kind == tkIdent {
-			name, err := p.expectIdent()
+			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
@@ -250,12 +342,15 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.consumeKeyword("TABLES") {
 			return &ShowTables{}, nil
 		}
+		if p.consumeIdentWord("databases") {
+			return &ShowDatabases{}, nil
+		}
 		// SHOW STATS FOR <table>: read-only statistics view.
 		if p.consumeIdentWord("stats") {
 			if !p.consumeIdentWord("for") {
 				return nil, p.errf("expected FOR in SHOW STATS FOR <table>")
 			}
-			name, err := p.expectIdent()
+			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
@@ -266,7 +361,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		name, _ := p.expectIdent()
 		return &SetVar{Name: "show:" + name}, nil
 	case "SET":
-		// SET [SESSION|LOCAL] name = value / SET ... TO ...: parse & ignore.
+		// SET [SESSION|LOCAL] name = value / SET ... TO ...: the value is
+		// kept for the variables the session honors (database), the rest
+		// are accepted and ignored.
 		p.i++
 		p.consumeKeyword("SESSION")
 		p.consumeKeyword("LOCAL")
@@ -274,10 +371,23 @@ func (p *parser) parseStatement() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
+		sv := &SetVar{Name: name}
+		if p.consumeOp("=") || p.consumeKeyword("TO") {
+			if t := p.peek(); t.kind == tkIdent || t.kind == tkString {
+				sv.Value = t.text
+			}
+		}
 		for !p.atStatementEnd() {
 			p.i++
 		}
-		return &SetVar{Name: name}, nil
+		return sv, nil
+	case "use": // not a reserved word; lexes as an identifier
+		p.i++
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Use{Name: name}, nil
 	}
 	return nil, p.errf("unsupported statement %q", t.text)
 }
@@ -302,7 +412,7 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		}
 		ct.IfNotExists = true
 	}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +628,7 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectKeyword("ON"); err != nil {
 		return nil, err
 	}
-	table, err := p.expectIdent()
+	table, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +664,7 @@ func (p *parser) parseDropTable() (Statement, error) {
 		}
 		dt.IfExists = true
 	}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +678,7 @@ func (p *parser) parseInsert() (Statement, error) {
 		return nil, err
 	}
 	ins := &Insert{}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +739,7 @@ func (p *parser) parseInsert() (Statement, error) {
 func (p *parser) parseCopy() (Statement, error) {
 	p.i++ // copy
 	cf := &CopyFrom{Format: CopyFormatText}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +872,7 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 			return p.finishSelect(sel)
 		}
-		name, err := p.expectIdent()
+		name, err := p.parseTableName()
 		if err != nil {
 			return nil, err
 		}
@@ -794,7 +904,7 @@ func (p *parser) parseSelect() (Statement, error) {
 			if len(sel.Joins) >= maxJoinTables-1 {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
 			}
-			jt, err := p.expectIdent()
+			jt, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
@@ -1085,8 +1195,11 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 		case t.kind == tkIdent && t.text == "all":
 			priv = "ALL"
 			p.i++
+		case t.kind == tkKeyword && t.text == "CREATE", t.kind == tkIdent && t.text == "connect":
+			priv = strings.ToUpper(t.text)
+			p.i++
 		default:
-			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, ALL), found %q", t.text)
+			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, CREATE, CONNECT, ALL), found %q", t.text)
 		}
 		gr.Privileges = append(gr.Privileges, priv)
 		if !p.consumeOp(",") {
@@ -1096,12 +1209,20 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 	if err := p.expectKeyword("ON"); err != nil {
 		return nil, err
 	}
-	p.consumeKeyword("TABLE")
-	table, err := p.expectIdent()
-	if err != nil {
-		return nil, err
+	if p.consumeIdentWord("database") {
+		db, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		gr.Database = db
+	} else {
+		p.consumeKeyword("TABLE")
+		table, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		gr.Table = table
 	}
-	gr.Table = table
 	if err := p.expectKeyword(linkKw); err != nil {
 		return nil, err
 	}
@@ -1136,7 +1257,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1171,7 +1292,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 func (p *parser) parseUpdate() (Statement, error) {
 	p.i++ // UPDATE
 	up := &Update{}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1212,7 +1333,7 @@ func (p *parser) parseDelete() (Statement, error) {
 		return nil, err
 	}
 	del := &Delete{}
-	name, err := p.expectIdent()
+	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1806,7 +1927,7 @@ func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
 // scalarFuncs are the builtin scalar functions ("now" is spliced by the
 // session before execution; the rest evaluate per row).
 var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
-	"now": 0, "length": 1, "lower": 1, "upper": 1, "abs": 1, "coalesce": -1,
+	"now": 0, "current_database": 0, "current_schema": 0, "length": 1, "lower": 1, "upper": 1, "abs": 1, "coalesce": -1,
 }
 
 // parsePrimaryExpr parses one operand: a parenthesized expression, a

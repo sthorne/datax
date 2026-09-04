@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/security"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -314,6 +315,17 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	}
 	if err := n.db.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target)))); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
+	}
+	if target >= version.V6 {
+		// The v6 catalog migration: every pre-existing table moves under the
+		// default database. Idempotent; a node that starts later at v6 runs
+		// it again as a no-op (ensureDatabaseCatalog).
+		if moved, err := catalog.MigrateNamespace(ctx, n.db); err != nil {
+			return cluster.AdminResponse{Error: fmt.Sprintf("cluster version is %s but the database catalog migration failed: %v (rerun the upgrade)", target, err)}
+		} else if moved > 0 {
+			log.Infof("catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
+			n.events.Record("upgrade", "catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
+		}
 	}
 	n.mirrorClusterVersion(ctx)
 	log.Infof("cluster version finalized at %s", target)

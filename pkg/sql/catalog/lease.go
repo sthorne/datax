@@ -101,9 +101,10 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 // table is uncached and its lease released. Returns the fresh descriptor
 // (nil when dropped).
 func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescriptor, error) {
+	dbID, bare := splitCacheKey(name)
 	var desc *TableDescriptor
 	err := a.db.RunTxn(ctx, "lease-refresh", func(ctx context.Context, txn *kvclient.Txn) error {
-		d, err := lookupUncached(ctx, txn, name)
+		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
 		var nf *ErrTableNotFound
 		if errors.As(err, &nf) {
 			desc = nil
@@ -155,13 +156,30 @@ func (a *Accessor) writeLease(ctx context.Context, desc *TableDescriptor) (int64
 // until every live gateway lease on the descriptor has adopted it. Nil for
 // unleased accessors and for dropped tables.
 func (a *Accessor) FinishDDL(ctx context.Context, name string) error {
+	return a.FinishDDLIn(ctx, DefaultDatabase, name)
+}
+
+// FinishDDLIn is FinishDDL for a table in database db (or name's own
+// qualifier).
+func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	a.mu.Lock()
 	leasing := a.leasing
 	a.mu.Unlock()
 	if !leasing {
 		return nil
 	}
-	desc, err := a.refreshOne(ctx, name)
+	if q, bare := SplitTableName(name); q != "" {
+		db, name = q, bare
+	}
+	var dbID uint64
+	if err := a.db.RunTxn(ctx, "ddl-database", func(ctx context.Context, txn *kvclient.Txn) error {
+		id, err := a.databaseID(ctx, txn, db)
+		dbID = id
+		return err
+	}); err != nil {
+		return err
+	}
+	desc, err := a.refreshOne(ctx, cacheKey(dbID, name))
 	if err != nil || desc == nil {
 		return err
 	}

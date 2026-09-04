@@ -63,7 +63,7 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 	}
 	var target []catalog.Column
 	err := s.db.RunTxn(ctx, "copy-begin", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, err := s.cat.Lookup(ctx, txn, cf.Table)
+		desc, err := s.lookup(ctx, txn, cf.Table)
 		if err != nil {
 			return err
 		}
@@ -138,7 +138,7 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 	err := ci.s.db.RunTxn(ctx, "copy-chunk", func(ctx context.Context, txn *kvclient.Txn) error {
 		// Re-resolve the descriptor inside the transaction so concurrent
 		// DDL (a new index mid-COPY) is honored, like the index backfill.
-		desc, err := ci.s.cat.Lookup(ctx, txn, ci.table)
+		desc, err := ci.s.lookup(ctx, txn, ci.table)
 		if err != nil {
 			return err
 		}

@@ -543,3 +543,92 @@ func TestAnalyzeAndShowStats(t *testing.T) {
 		t.Fatal("missing FOR accepted")
 	}
 }
+
+// Qualified table names and the database statements (issue #88).
+func TestParseDatabases(t *testing.T) {
+	for src, want := range map[string]string{
+		`SELECT id FROM t`:                         "t",
+		`SELECT id FROM public.t`:                  "t",
+		`SELECT id FROM app.t`:                     "app.t",
+		`SELECT id FROM app.public.t`:              "app.t",
+		`INSERT INTO app.t VALUES (1)`:             "app.t",
+		`DELETE FROM app.public.t`:                 "app.t",
+		`UPDATE app.t SET x = 1`:                   "app.t",
+		`DROP TABLE app.t`:                         "app.t",
+		`ALTER TABLE app.t ADD COLUMN y INT8`:      "app.t",
+		`CREATE TABLE app.t (id INT8 PRIMARY KEY)`: "app.t",
+	} {
+		stmts, err := Parse(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		var got string
+		switch s := stmts[0].(type) {
+		case *Select:
+			got = s.Table
+		case *Insert:
+			got = s.Table
+		case *Delete:
+			got = s.Table
+		case *Update:
+			got = s.Table
+		case *DropTable:
+			got = s.Name
+		case *AlterTable:
+			got = s.Table
+		case *CreateTable:
+			got = s.Name
+		}
+		if got != want {
+			t.Errorf("%s: table %q, want %q", src, got, want)
+		}
+	}
+	if _, err := Parse(`SELECT 1 FROM app.other.t`); err == nil {
+		t.Fatal("a schema other than public parsed")
+	}
+	stmts, err := Parse(`SELECT a.id FROM app.t AS a JOIN app.u AS b ON a.id = b.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel := stmts[0].(*Select); sel.Table != "app.t" || sel.Alias != "a" || sel.Joins[0].Table != "app.u" || sel.Joins[0].Alias != "b" {
+		t.Fatalf("joined qualified names: %+v", sel)
+	}
+
+	stmts, err = Parse(`CREATE DATABASE IF NOT EXISTS app; DROP DATABASE IF EXISTS app CASCADE; ALTER DATABASE app RENAME TO app2; SHOW DATABASES; USE app; SET database = app; SET search_path TO public; GRANT CONNECT, CREATE ON DATABASE app TO bob; REVOKE CONNECT ON DATABASE app FROM public; GRANT SELECT ON app.t TO bob`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cd := stmts[0].(*CreateDatabase); cd.Name != "app" || !cd.IfNotExists {
+		t.Fatalf("create: %+v", cd)
+	}
+	if dd := stmts[1].(*DropDatabase); dd.Name != "app" || !dd.IfExists || !dd.Cascade {
+		t.Fatalf("drop: %+v", dd)
+	}
+	if ad := stmts[2].(*AlterDatabase); ad.Name != "app" || ad.NewName != "app2" {
+		t.Fatalf("alter: %+v", ad)
+	}
+	if _, ok := stmts[3].(*ShowDatabases); !ok {
+		t.Fatalf("show databases: %T", stmts[3])
+	}
+	if u := stmts[4].(*Use); u.Name != "app" {
+		t.Fatalf("use: %+v", u)
+	}
+	if sv := stmts[5].(*SetVar); sv.Name != "database" || sv.Value != "app" {
+		t.Fatalf("set database: %+v", sv)
+	}
+	if sv := stmts[6].(*SetVar); sv.Name != "search_path" || sv.Value != "public" {
+		t.Fatalf("set search_path: %+v", sv)
+	}
+	if gr := stmts[7].(*GrantRevoke); gr.Database != "app" || gr.User != "bob" || len(gr.Privileges) != 2 || gr.Privileges[1] != "CREATE" {
+		t.Fatalf("grant on database: %+v", gr)
+	}
+	if gr := stmts[8].(*GrantRevoke); !gr.Revoke || gr.Database != "app" || gr.User != "public" {
+		t.Fatalf("revoke from public: %+v", gr)
+	}
+	if gr := stmts[9].(*GrantRevoke); gr.Table != "app.t" || gr.Database != "" {
+		t.Fatalf("grant on qualified table: %+v", gr)
+	}
+	if e, err := Parse(`SELECT current_database(), current_schema()`); err != nil || e[0].(*Select).Exprs[0].Expr.Func != "current_database" {
+		t.Fatalf("current_database(): %v", err)
+	}
+}

@@ -306,3 +306,45 @@ on it are refused. Admins may read and delete from it and set its
 `retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
 another user read it, and no grant lets a non-admin write to it.
 
+## Databases
+
+A cluster holds any number of databases; a table belongs to exactly one.
+A new cluster has `datax` (the database every connection URL in this
+guide names) and a reserved, empty `system` database.
+
+```sql
+CREATE DATABASE app;
+CREATE DATABASE IF NOT EXISTS app;
+SHOW DATABASES;
+USE app;                      -- or: SET database = app
+SELECT current_database();    -- app
+CREATE TABLE orders (id INT8 PRIMARY KEY);      -- app.orders
+SELECT id FROM app.orders;                      -- from any database
+SELECT id FROM app.public.orders;               -- public is the only schema
+ALTER DATABASE app RENAME TO shop;
+DROP DATABASE shop;           -- refused while it holds tables ...
+DROP DATABASE shop CASCADE;   -- ... unless CASCADE drops them too
+```
+
+A connection starts in the database its URL names (`postgres://.../app`);
+an unknown one is refused with SQLSTATE `3D000`, as in PostgreSQL. An
+unqualified table name resolves in the session's current database;
+`db.table` reaches another database. `SHOW TABLES` and `ANALYZE` (with no
+table) act on the current database. `datax` and `system` cannot be
+dropped or renamed, and the session cannot drop the database it is in.
+
+Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
+bob`. `CREATE` lets a non-admin create tables there (admins always can).
+`CONNECT` is granted to `PUBLIC` on every database, as in PostgreSQL;
+`REVOKE CONNECT ON DATABASE app FROM PUBLIC` closes it to everyone but
+admins and users holding an explicit `CONNECT` grant, checked when a
+session opens the database (the URL or `USE`). Table grants work as
+before, and take qualified names (`GRANT SELECT ON app.orders TO bob`).
+
+Databases arrive with cluster version v6. A cluster upgraded from an
+earlier version keeps every existing table in `datax`; `datax debug
+upgrade` finalizes v6 and moves the catalog entries in one transaction,
+after which `CREATE DATABASE` works. Row data never moves: a table's
+database is a catalog fact, and backups carry the database catalog along
+with the tables.
+

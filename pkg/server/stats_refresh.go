@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -60,17 +62,21 @@ func (n *Node) statsRefreshLoop(ctx context.Context) {
 // orphaned statistics keys. Errors are logged, never fatal: statistics
 // are advisory.
 func (n *Node) statsRefreshOnce(ctx context.Context, staleness time.Duration) {
-	// Load descriptors and existing stats blobs.
-	dlo, dhi := keys.TableDescSpan()
-	descKVs, err := n.db.Scan(ctx, dlo, dhi, 0)
-	if err != nil {
-		log.Debugf("stats refresh: descriptor scan: %v", err)
-		return
-	}
-	slo, shi := keys.TableStatsSpan()
-	statKVs, err := n.db.Scan(ctx, slo, shi, 0)
-	if err != nil {
-		log.Debugf("stats refresh: stats scan: %v", err)
+	// Load descriptors and existing stats blobs, transactionally: a
+	// transactional read pushes any intent a concurrent DDL or catalog
+	// migration left on a descriptor instead of failing on it.
+	var descKVs, statKVs []kvpb.KeyValue
+	if err := n.db.RunTxn(ctx, "stats-refresh-scan", func(ctx context.Context, txn *kvclient.Txn) error {
+		dlo, dhi := keys.TableDescSpan()
+		var err error
+		if descKVs, err = txn.Scan(ctx, dlo, dhi, 0); err != nil {
+			return err
+		}
+		slo, shi := keys.TableStatsSpan()
+		statKVs, err = txn.Scan(ctx, slo, shi, 0)
+		return err
+	}); err != nil {
+		log.Debugf("stats refresh: catalog scan: %v", err)
 		return
 	}
 	collected := make(map[uint64]int64, len(statKVs)) // tableID → CollectedAt
