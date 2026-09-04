@@ -167,7 +167,8 @@ Meta-commands:
   \dt            list tables (SHOW TABLES)
   \q  quit exit  leave the shell
 
-Statements: CREATE TABLE ... [WITH (timeseries = true, retention = '7d', shards = 8)],
+Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
+  CREATE TABLE ... [WITH (timeseries = true, retention = '7d', shards = 8)],
   CREATE INDEX, ALTER TABLE ... ADD/DROP COLUMN | SET (retention | shards),
   DROP TABLE, INSERT, SELECT [... AS OF SYSTEM TIME ...], UPDATE, DELETE,
   COPY ... FROM STDIN, BEGIN / COMMIT / ROLLBACK / SAVEPOINT, EXPLAIN,

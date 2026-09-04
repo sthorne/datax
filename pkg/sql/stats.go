@@ -193,14 +193,18 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 	var descs []*catalog.TableDescriptor
 	if err := s.db.RunTxn(ctx, "analyze-plan", func(ctx context.Context, txn *kvclient.Txn) error {
 		if an.Table != "" {
-			d, derr := s.cat.Lookup(ctx, txn, an.Table)
+			d, derr := s.lookup(ctx, txn, an.Table)
 			if derr != nil {
 				return derr
 			}
 			descs = []*catalog.TableDescriptor{d}
 			return nil
 		}
-		all, lerr := s.cat.List(ctx, txn)
+		db, derr := s.cat.Database(ctx, txn, s.database)
+		if derr != nil {
+			return derr
+		}
+		all, lerr := s.cat.ListIn(ctx, txn, db)
 		if lerr != nil {
 			return lerr
 		}
@@ -233,7 +237,7 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 // column, the table row count and collection time repeated (read-only,
 // no admin needed).
 func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parser.ShowStats) (*Result, error) {
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}

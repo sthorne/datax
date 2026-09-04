@@ -62,8 +62,15 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		out.Sub, out.Lit = nil, &d
 	}
-	if e.Func == "now" {
+	switch e.Func {
+	case "now":
 		d := types.NewTimestamp(s.db.Clock().Now().WallTime)
+		out.Func, out.Lit = "", &d
+	case "current_database":
+		d := types.NewString(s.database)
+		out.Func, out.Lit = "", &d
+	case "current_schema":
+		d := types.NewString(catalog.PublicSchema)
 		out.Func, out.Lit = "", &d
 	}
 	if e.Left != nil {
@@ -97,7 +104,7 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 // exprHasSub reports whether an expression needs the pre-execution
 // resolve pass: a scalar subquery or a now() call anywhere inside it.
 func exprHasSub(e parser.Expr) bool {
-	if e.Sub != nil || e.Func == "now" {
+	if e.Sub != nil || e.Func == "now" || e.Func == "current_database" || e.Func == "current_schema" {
 		return true
 	}
 	if e.Left != nil && exprHasSub(*e.Left) {

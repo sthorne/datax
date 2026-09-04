@@ -8,6 +8,25 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.10.0 — unreleased
+
+### Added
+- Databases (#88): `CREATE DATABASE`, `DROP DATABASE [CASCADE]`, `ALTER
+  DATABASE ... RENAME TO`, `SHOW DATABASES`, `USE` / `SET database`,
+  `current_database()` and `current_schema()`; the connection URL's
+  database selects the session's database and an unknown one is refused
+  with `3D000`; qualified names (`db.t`, `db.public.t`, `public.t`) in
+  every statement that names a table; `GRANT CREATE | CONNECT | ALL ON
+  DATABASE ... TO user | PUBLIC`, with CONNECT checked when a session
+  opens a database and CREATE letting a non-admin create tables. A new
+  cluster has `datax` and a reserved `system` database. `SHOW TABLES` and
+  a bare `ANALYZE` act on the current database; the schema browser shows
+  each table's database; backups carry the database catalog. **Cluster
+  version v6**: descriptors gain a database ID and table names move
+  under their database; until `datax debug upgrade` finalizes v6 every
+  table stays in the flat namespace (which v5 nodes read) and database
+  DDL is refused; finalize migrates the catalog in one transaction.
+
 ## 0.9.0 — unreleased
 
 ### Added

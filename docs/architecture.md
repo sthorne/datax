@@ -24,7 +24,7 @@ Raft group. The layout (see `pkg/keys`):
 | `/local/r/<rangeID>/...` | Raft state: HardState, log, applied index, descriptor copy | no (per replica) |
 | `/meta/<endKey>` | range addressing: end key → RangeDescriptor | range 1 |
 | `/system/nodes/<id>` | node registry: address, locality, liveness | range 1 |
-| `/system/desc/<tableID>`, `/system/ns/<name>` | SQL catalog | range 1 |
+| `/system/desc/<tableID>`, `/system/db/<dbID>`, `/system/dbns/<name>`, `/system/nsdb/<dbID>/<name>` | SQL catalog: table descriptors, database descriptors, database names, table names per database (`/system/ns/<name>` is the pre-v6 flat table namespace, empty once v6 is finalized) | range 1 |
 | `/system/idgen` | descriptor / table ID counter | range 1 |
 | `/t/<tableID>/<pk...>` | user table rows | user ranges |
 

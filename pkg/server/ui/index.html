@@ -550,7 +550,7 @@ function renderSchema(d) {
     const age = st ? (st.stale ? `<span class="st draining">${fmtAgo(st.age_seconds * 1000)}</span>` : fmtAgo(st.age_seconds * 1000)) : "—";
     const grants = Object.entries(t.privileges || {}).map(([u, p]) => `${esc(u)}: ${p.map(esc).join(",").toLowerCase()}`).join("<br>") || `<span class="muted">admins only</span>`;
     return `<tr>
-      <td><b>${esc(t.name)}</b>${ts}</td>
+      <td><b>${esc(t.database && t.database !== "datax" ? t.database + "." + t.name : t.name)}</b>${ts}</td>
       <td title="${esc(colList)}">${cols.length}</td>
       <td class="key" title="${hiddenNames.size ? "led by the hidden shard column" : ""}">${pk.map(esc).join(", ")}</td>
       <td>${idx || "—"}</td>

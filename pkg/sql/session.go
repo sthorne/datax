@@ -106,6 +106,9 @@ type Session struct {
 	// In insecure/trust mode it is the client-claimed name: privileges are
 	// enforced against it, but nothing verified the identity.
 	user string
+	// database is the session's current database (the startup parameter,
+	// USE, or SET database); unqualified table names resolve in it.
+	database string
 	// system marks the node's own internal session (see NewSystemSession):
 	// the only one allowed to create or drop a system table.
 	system bool
@@ -120,13 +123,13 @@ type Session struct {
 // NewSession creates a root session (internal components, tests, tools).
 // The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root"}
+	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase}
 }
 
 // NewSystemSession creates the node's own root session, the one that may
 // create and drop system tables (the metrics recorder's).
 func NewSystemSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", system: true}
+	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase, system: true}
 }
 
 // NewSessionForUser creates a session for an authenticated user.
@@ -134,7 +137,7 @@ func NewSessionForUser(db *kvclient.DB, cat *catalog.Accessor, user string) *Ses
 	if user == "" {
 		user = "root"
 	}
-	return &Session{db: db, cat: cat, user: user}
+	return &Session{db: db, cat: cat, user: user, database: catalog.DefaultDatabase}
 }
 
 // SetUser rebinds the session's user (pgwire sets it after startup).
@@ -147,6 +150,15 @@ func (s *Session) SetUser(user string) {
 
 // User returns the session's SQL user.
 func (s *Session) User() string { return s.user }
+
+// Database returns the session's current database.
+func (s *Session) Database() string { return s.database }
+
+// lookup resolves a table name in the session's current database (or
+// the name's own qualifier).
+func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
+	return s.cat.LookupIn(ctx, txn, s.database, name)
+}
 
 func (s *Session) State() TxnState { return s.state }
 
@@ -201,7 +213,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
-			if derr := s.cat.FinishDDL(ctx, name); derr != nil {
+			if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
 				return nil, ToSQLError(derr)
 			}
 		}
@@ -236,8 +248,25 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return s.execRollbackToSavepoint(ctx, t.Name)
 
 	case *parser.SetVar:
+		if t.Name == "show:database" || t.Name == "show:search_path" {
+			v := s.database
+			if t.Name == "show:search_path" {
+				v = catalog.PublicSchema
+			}
+			return &Result{Columns: []ResultColumn{{Name: t.Name[5:], Type: types.String}}, Rows: [][]types.Datum{{types.NewString(v)}}, Tag: "SHOW"}, nil
+		}
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
 			return &Result{Columns: []ResultColumn{{Name: t.Name[5:], Type: types.String}}, Tag: "SHOW"}, nil
+		}
+		if t.Name == "database" {
+			if serr := s.UseDatabase(ctx, t.Value); serr != nil {
+				return nil, serr
+			}
+		}
+		return &Result{Tag: "SET"}, nil
+	case *parser.Use:
+		if serr := s.UseDatabase(ctx, t.Name); serr != nil {
+			return nil, serr
 		}
 		return &Result{Tag: "SET"}, nil
 
@@ -399,7 +428,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return nil, ToSQLError(err)
 	}
 	if name := ddlTableName(stmt); name != "" {
-		if derr := s.cat.FinishDDL(ctx, name); derr != nil {
+		if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
 			return nil, ToSQLError(derr)
 		}
 	}

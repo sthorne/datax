@@ -444,7 +444,7 @@ type joinQuery struct {
 func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select) (*joinQuery, error) {
 	innerDescs := make([]*catalog.TableDescriptor, len(t.Joins))
 	for i := range t.Joins {
-		desc, err := s.cat.Lookup(ctx, txn, t.Joins[i].Table)
+		desc, err := s.lookup(ctx, txn, t.Joins[i].Table)
 		if err != nil {
 			return nil, err
 		}

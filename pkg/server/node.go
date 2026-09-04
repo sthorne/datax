@@ -602,6 +602,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
+		return err
+	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err
@@ -783,3 +786,37 @@ func (n *Node) Pinger() *rpc.Pinger { return n.pinger }
 
 // Events exposes the node's event ring (tests and the API).
 func (n *Node) Events() *events.Ring { return n.events }
+
+// ensureDatabaseCatalog runs the v6 catalog migration once the cluster is
+// at v6: a freshly bootstrapped cluster gets its default and system
+// databases, and a cluster finalized by a node that then crashed
+// mid-migration gets the rest of its tables moved. Idempotent.
+func (n *Node) ensureDatabaseCatalog(ctx context.Context) {
+	delay := 500 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if n.readClusterVersion(ctx) < version.V6 {
+			delay = 5 * time.Second
+			continue
+		}
+		// One node at a time: range 1's leader (the cluster-singleton
+		// idiom), so a fresh cluster's nodes do not race identical
+		// transactions against each other.
+		if r1, ok := n.store.GetReplica(1); !ok || !r1.IsLeader() {
+			delay = time.Second
+			continue
+		}
+		if moved, err := catalog.MigrateNamespace(ctx, n.db); err != nil {
+			log.Debugf("database catalog: %v (retrying)", err)
+			delay = 2 * time.Second
+			continue
+		} else if moved > 0 {
+			log.Infof("catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
+		}
+		return
+	}
+}

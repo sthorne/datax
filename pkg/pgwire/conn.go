@@ -143,7 +143,7 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 
 func (c *conn) run(ctx context.Context) error {
 	defer c.session.Close(context.Background())
-	if err := c.handleStartup(); err != nil {
+	if err := c.handleStartup(ctx); err != nil {
 		return err
 	}
 	for {
@@ -219,7 +219,7 @@ func (c *conn) run(ctx context.Context) error {
 	}
 }
 
-func (c *conn) handleStartup() error {
+func (c *conn) handleStartup(ctx context.Context) error {
 	for {
 		msg, err := c.backend.ReceiveStartupMessage()
 		if err != nil {
@@ -271,6 +271,16 @@ func (c *conn) handleStartup() error {
 			c.session.SetUser(m.Parameters["user"])
 			if c.act != nil {
 				c.act.setUser(c, m.Parameters["user"])
+			}
+			// The startup database selects the session's current database;
+			// an unknown one is refused like PostgreSQL does (3D000), and
+			// one whose CONNECT was revoked from PUBLIC needs a grant.
+			if dbName := m.Parameters["database"]; dbName != "" {
+				if serr := c.session.UseDatabase(ctx, dbName); serr != nil {
+					c.sendError(serr)
+					_ = c.backend.Flush()
+					return fmt.Errorf("startup database %q: %v", dbName, serr)
+				}
 			}
 			for _, kv := range [][2]string{
 				{"server_version", "13.0 datax"},

@@ -79,6 +79,20 @@ func (n *Node) exportMetadata(ctx context.Context) {
 			}
 		}
 	}
+	// The v6 layout: names live under their database ID; the export keys
+	// them by bare name (the descriptor carries the database).
+	dbLo, dbHi := keys.AllTableNamespaceSpan()
+	if rows, err = n.db.Scan(ctx, dbLo, dbHi, 0); err == nil {
+		for _, kv := range rows {
+			rest, _, derr := encoding.DecodeUint64(kv.Key[len(dbLo):])
+			if derr != nil {
+				continue
+			}
+			if _, name, derr := encoding.DecodeString(rest); derr == nil {
+				bak.Namespace[name] = string(kv.Value)
+			}
+		}
+	}
 	uLo, uHi := keys.UserSpan()
 	if rows, err = n.db.Scan(ctx, uLo, uHi, 0); err == nil {
 		for _, kv := range rows {

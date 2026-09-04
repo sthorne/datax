@@ -49,6 +49,10 @@ them:
 psql "postgres://root@127.0.0.1:26433/datax?sslmode=disable"
 ```
 
+The URL's database is `datax`, the database every new cluster has; create
+more with `CREATE DATABASE` and name one in the URL or switch with `USE`
+([Databases](sql.md#databases)).
+
 There is also a built-in shell:
 
 ```sh

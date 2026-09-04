@@ -41,6 +41,10 @@ const (
 	CodeInvalidTextRepresentation = "22P02"
 	CodeBadCopyFormat             = "22P04"
 	CodeQueryCanceled             = "57014"
+	CodeInvalidCatalogName        = "3D000"
+	CodeDuplicateDatabase         = "42P04"
+	CodeDependentObjectsExist     = "2BP01"
+	CodeObjectInUse               = "55006"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.
@@ -74,6 +78,14 @@ func ToSQLError(err error) *Error {
 	var nf *catalog.ErrTableNotFound
 	if errors.As(err, &nf) {
 		return &Error{Code: CodeUndefinedTable, Msg: nf.Error()}
+	}
+	var dbNF *catalog.ErrDatabaseNotFound
+	if errors.As(err, &dbNF) {
+		return &Error{Code: CodeInvalidCatalogName, Msg: dbNF.Error()}
+	}
+	var dbEx *catalog.ErrDatabaseExists
+	if errors.As(err, &dbEx) {
+		return &Error{Code: CodeDuplicateDatabase, Msg: dbEx.Error()}
 	}
 	var ex *catalog.ErrTableExists
 	if errors.As(err, &ex) {

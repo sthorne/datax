@@ -21,7 +21,12 @@ import (
 // execStmt executes one data statement within txn. It is safe to re-run on
 // transaction retry (all state flows through txn).
 func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.Statement, params []types.Datum) (*Result, error) {
-	if requiresAdmin(stmt) {
+	if ct, ok := stmt.(*parser.CreateTable); ok {
+		// CREATE TABLE: admins, or a user granted CREATE on the database.
+		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
+			return nil, err
+		}
+	} else if requiresAdmin(stmt) {
 		if err := s.checkAdmin(ctx, txn); err != nil {
 			return nil, err
 		}
@@ -29,6 +34,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 	switch t := stmt.(type) {
 	case *parser.GrantRevoke:
 		return s.execGrantRevoke(ctx, txn, t)
+	case *parser.CreateDatabase:
+		return s.execCreateDatabase(ctx, txn, t)
+	case *parser.DropDatabase:
+		return s.execDropDatabase(ctx, txn, t)
+	case *parser.AlterDatabase:
+		return s.execAlterDatabase(ctx, txn, t)
+	case *parser.ShowDatabases:
+		return s.execShowDatabases(ctx, txn)
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
 	case *parser.Explain:
@@ -67,11 +80,22 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 }
 
 func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *parser.CreateTable) (*Result, error) {
-	if catalog.IsSystemTable(t.Name) && !s.system {
-		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved for the cluster's own use", t.Name)
+	dbName, bare := catalog.SplitTableName(t.Name)
+	if dbName == "" {
+		dbName = s.database
 	}
-	desc := &catalog.TableDescriptor{Name: t.Name}
-	if catalog.IsSystemTable(t.Name) {
+	if catalog.IsSystemTable(bare) && !s.system {
+		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved for the cluster's own use", bare)
+	}
+	if dbName == catalog.SystemDatabase && !s.system {
+		return nil, newErrf(CodeInsufficientPriv, "database %q is reserved for the cluster", dbName)
+	}
+	dbID, err := s.cat.DatabaseID(ctx, txn, dbName)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID}
+	if catalog.IsSystemTable(bare) {
 		desc.ID = catalog.MetricsTableID
 	}
 	seen := map[string]bool{}
@@ -243,7 +267,7 @@ func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*
 		return nil, newErrf(CodeSyntaxError, "retention: %v", perr)
 	}
 	err := s.db.RunTxn(ctx, "set-retention", func(ctx context.Context, txn *kvclient.Txn) error {
-		shared, err := s.cat.Lookup(ctx, txn, t.Table)
+		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
@@ -291,10 +315,10 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
-	if catalog.IsSystemTable(t.Name) && !s.system {
-		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", t.Name)
+	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
+		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
-	desc, err := s.cat.Drop(ctx, txn, t.Name)
+	desc, err := s.cat.DropIn(ctx, txn, s.database, t.Name)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {
@@ -317,7 +341,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -830,7 +854,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// supports them.
 	var corr []correlatedConjunct
 	if t.Table != "" && len(t.Joins) == 0 && t.Derived == nil {
-		if cdesc, derr := s.cat.Lookup(ctx, txn, t.Table); derr == nil {
+		if cdesc, derr := s.lookup(ctx, txn, t.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, t.Where, cdesc, t.Alias)
 			if serr != nil {
 				return nil, serr
@@ -877,7 +901,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return res, nil
 	}
 
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,7 +1040,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -1106,7 +1130,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
-	desc, err := s.cat.Lookup(ctx, txn, t.Table)
+	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -1157,10 +1181,10 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 // primary-key or indexed columns. Column IDs are never reused, so a
 // drop-then-re-add cannot resurrect old values.
 func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *parser.AlterTable) (*Result, error) {
-	if catalog.IsSystemTable(t.Table) && !s.system && t.SetOptions == nil {
+	if _, bare := catalog.SplitTableName(t.Table); catalog.IsSystemTable(bare) && !s.system && t.SetOptions == nil {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
 	}
-	shared, err := s.cat.Lookup(ctx, txn, t.Table)
+	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -1247,7 +1271,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	// so the plan below describes the plannable remainder.
 	var corr []correlatedConjunct
 	if sel.Table != "" && len(sel.Joins) == 0 && sel.Derived == nil {
-		if cdesc, derr := s.cat.Lookup(ctx, txn, sel.Table); derr == nil {
+		if cdesc, derr := s.lookup(ctx, txn, sel.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Alias)
 			if serr != nil {
 				return nil, serr
@@ -1272,7 +1296,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			Tag:     "EXPLAIN",
 		}, nil
 	}
-	desc, err := s.cat.Lookup(ctx, txn, sel.Table)
+	desc, err := s.lookup(ctx, txn, sel.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -1331,7 +1355,11 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 }
 
 func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn) (*Result, error) {
-	descs, err := s.cat.List(ctx, txn)
+	db, err := s.cat.Database(ctx, txn, s.database)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	descs, err := s.cat.ListIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}
