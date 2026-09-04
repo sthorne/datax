@@ -123,6 +123,16 @@ var (
 		Name: "datax_peer_reachable", Help: "1 while this node's last ping to the peer succeeded, 0 once one failed or timed out.",
 	}, []string{"peer"})
 
+	TableRanges = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_table_ranges", Help: "Ranges covering each table's key space (refreshed with the schema browser's cache).",
+	}, []string{"table"})
+	TableRows = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_table_rows", Help: "Row count from each table's statistics, as of their collection.",
+	}, []string{"table"})
+	TableStatsAge = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_table_stats_age_seconds", Help: "Age of each table's statistics; the planner falls back to structural estimates without them.",
+	}, []string{"table"})
+
 	StorageBackpressureCause = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_cause_total",
 		Help: "Table-data writes shed, by cause: leader (this node's engine gates), debt (this node's latched compaction-debt gate), follower (an overloaded quorum member's piggybacked verdict).",

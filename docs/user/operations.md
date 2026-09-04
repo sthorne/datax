@@ -10,8 +10,12 @@ serves, on that address:
   store's disk, file descriptors — colored when they deserve a look), the
   serving node's full machine picture (disk and network throughput, Go
   runtime, uptime), a network matrix (every node's round trip to every
-  other, with clock offsets judged against `--max-offset`), range tables
-  with replica placement, storage health. The cluster
+  other, with clock offsets judged against `--max-offset`), a schema
+  browser (every table with its columns, primary key, indexes,
+  time-series options, grants, statistics and their age, and range
+  footprint; the users for admins; a filter box that narrows the tables
+  and both range lists, which name the table each range belongs to),
+  range tables with replica placement, storage health. The cluster
   ranges table drills down: clicking a range fetches every holding node's
   view of it (leader, applied index, size, QPS, closed timestamp) over
   internode RPC, so any node's dashboard can inspect any range.
@@ -22,8 +26,14 @@ serves, on that address:
   `datax debug status --url ...` pretty-prints it.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
   liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges).
+  A node that cannot reach the meta range (a partition) still answers
+  within a couple of seconds, with the last range list it fetched and an
+  `error` saying how old it is.
 - **`/api/range?id=N`** — JSON: the cross-node drill-down document behind
   the range detail view. Admin role required in secure mode.
+- **`/api/schema`** — JSON: the schema browser's document. In secure mode
+  root and admins see every table and the user list; another user sees
+  the tables it holds a grant on. Rebuilt at most every 5 s per node.
 
 In secure mode all of it requires HTTP Basic credentials of any database
 user, or a client certificate; `/api/range` additionally requires the
@@ -59,6 +69,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_clock_offset_seconds{peer}` | \|offset\| > half of `--max-offset` (0.25 s by default) | a node's clock is drifting; past the tolerance the node refuses the peer's timestamps and exits — fix NTP now (the node also logs a warning at this point) |
 | `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
+| `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
 one ping yields both the round trip and the peer's clock offset); the

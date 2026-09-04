@@ -8,6 +8,29 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.4.0 — unreleased
+
+### Added
+- Schema browser on the dashboard and `/api/schema`: every table with
+  its columns, primary key, indexes (and whether one is still being
+  built), time-series options, grants, statistics with their age, and
+  range footprint (ranges cluster-wide; replicas, leaders and bytes on
+  the serving node); the users for admins; a filter box that narrows the
+  tables and both range lists. Ranges in `/api/cluster` and `/status` now
+  name the table their keys belong to. Secure mode shows a non-admin
+  user only the tables it holds a grant on. `/metrics` gains
+  `datax_table_ranges{table}`, `datax_table_rows{table}` and
+  `datax_table_stats_age_seconds{table}` (#83).
+
+### Fixed
+- `/api/cluster` and `/status` on a node cut off from the meta range's
+  leader answered only when the client gave up: the range listing
+  retried until then. The listing is now bounded (2 s) and falls back to
+  the last list the node fetched, with its age noted in `error`; the
+  table-name refresh runs in the background and `/api/schema`'s catalog
+  scan is bounded (5 s) and reports the catalog unavailable instead of
+  hanging.
+
 ## 0.3.0 — unreleased
 
 ### Added

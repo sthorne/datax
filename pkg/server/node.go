@@ -234,6 +234,10 @@ type Node struct {
 	sys *sysstats.Sampler
 	// pinger measures round trips and clock offsets to every peer.
 	pinger *rpc.Pinger
+	// schema caches the schema browser's document (see schema_api.go).
+	schema schemaCache
+	// rangeList is the last /meta listing served to the dashboard.
+	rangeList rangeListCache
 
 	// loadCooldown stamps the last load-driven op (lease shed / byte move)
 	// per range while this node acts as the allocator; see loadOpAllowed.

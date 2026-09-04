@@ -174,6 +174,7 @@ func (n *Node) startHTTP() error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
@@ -184,6 +185,7 @@ func (n *Node) startHTTP() error {
 	// admin-gated (the read-only endpoints above stay open to any
 	// authenticated user).
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
+	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
 	page, uerr := ui.FS.ReadFile("index.html")
@@ -312,6 +314,7 @@ type RangeStatus struct {
 	RangeID        int64  `json:"range_id"`
 	StartKey       string `json:"start_key"`
 	EndKey         string `json:"end_key"`
+	Table          string `json:"table,omitempty"`
 	Replicas       []int  `json:"replicas"`
 	Leader         bool   `json:"leader"`
 	AppliedIndex   uint64 `json:"applied_index"`
@@ -349,6 +352,7 @@ func (n *Node) rangeStatuses() []RangeStatus {
 			RangeID:        int64(desc.RangeID),
 			StartKey:       desc.StartKey.String(),
 			EndKey:         desc.EndKey.String(),
+			Table:          n.tableNameOf(desc.StartKey),
 			Leader:         r.IsLeader(),
 			AppliedIndex:   r.AppliedIndex(),
 			TruncatedIndex: r.TruncatedIndex(),
