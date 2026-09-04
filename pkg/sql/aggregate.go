@@ -502,6 +502,9 @@ func dedupeRows(rows [][]types.Datum) [][]types.Datum {
 func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.OrderCol) error {
 	idx := make([]int, len(order))
 	for i, oc := range order {
+		if oc.Expr != nil {
+			return newErrf(CodeFeatureNotSupported, "ORDER BY expressions are not supported with GROUP BY, DISTINCT aggregates, or UNION")
+		}
 		found := -1
 		for j, c := range cols {
 			if c.Name == oc.Column {
@@ -576,6 +579,11 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 	if len(order) == 0 {
 		return orderDecision{satisfied: true}
 	}
+	for _, oc := range order {
+		if oc.Expr != nil {
+			return orderDecision{} // computed keys always sort in memory
+		}
+	}
 
 	var natural []catalog.ColumnID
 	fanned := false
@@ -640,28 +648,54 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 
 // sortRows sorts in place by the ORDER BY terms. NULL ordering follows
 // PostgreSQL's default: NULLS LAST ascending, NULLS FIRST descending.
-func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.OrderCol) error {
+func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.OrderCol, params []types.Datum) error {
 	cols := make([]catalog.Column, len(order))
 	for i, oc := range order {
+		if oc.Expr != nil {
+			continue
+		}
 		col, ok := desc.Col(oc.Column)
 		if !ok {
 			return newErrf(CodeUndefinedColumn, "column %q does not exist", oc.Column)
 		}
 		cols[i] = col
 	}
-	var sortErr error
-	sort.SliceStable(rows, func(a, b int) bool {
+	// Sort keys are materialized per row up front (computed expressions
+	// evaluate once), then the rows are permuted to match.
+	keys := make([][]types.Datum, len(rows))
+	for r := range rows {
+		keys[r] = make([]types.Datum, len(order))
 		for i, oc := range order {
-			da, okA := rows[a].row[cols[i].ID]
-			db, okB := rows[b].row[cols[i].ID]
-			nullA := !okA || da.Null
-			nullB := !okB || db.Null
-			if nullA || nullB {
-				if nullA == nullB {
+			if oc.Expr == nil {
+				d, ok := rows[r].row[cols[i].ID]
+				if !ok {
+					d = types.DNull
+				}
+				keys[r][i] = d
+				continue
+			}
+			d, err := evalExpr(*oc.Expr, desc, rows[r].row, params)
+			if err != nil {
+				return err
+			}
+			keys[r][i] = d
+		}
+	}
+	perm := make([]int, len(rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	var sortErr error
+	sort.SliceStable(perm, func(a, b int) bool {
+		ka, kb := keys[perm[a]], keys[perm[b]]
+		for i, oc := range order {
+			da, db := ka[i], kb[i]
+			if da.Null || db.Null {
+				if da.Null == db.Null {
 					continue
 				}
 				// ASC: NULLS LAST → null sorts after; DESC: NULLS FIRST.
-				return nullB != oc.Desc
+				return db.Null != oc.Desc
 			}
 			c, err := da.Compare(db)
 			if err != nil {
@@ -683,5 +717,10 @@ func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.O
 	if sortErr != nil {
 		return newErrf(CodeInternal, "ORDER BY: %v", sortErr)
 	}
+	sorted := make([]fetchedRow, len(rows))
+	for i, p := range perm {
+		sorted[i] = rows[p]
+	}
+	copy(rows, sorted)
 	return nil
 }

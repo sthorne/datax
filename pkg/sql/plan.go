@@ -189,12 +189,23 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
 	switch t := stmt.(type) {
 	case *parser.Select:
-		if t.Derived != nil {
-			innerCols, err := s.PlanColumns(ctx, t.Derived)
-			if err != nil {
-				return nil, err
+		if t.Union != nil {
+			// A union's output is shaped by its head.
+			head := *t
+			head.Union, head.OrderBy, head.Limit = nil, nil, -1
+			return s.PlanColumns(ctx, &head)
+		}
+		if t.Derived != nil || t.FuncTable != nil {
+			var desc *catalog.TableDescriptor
+			if t.FuncTable != nil {
+				desc = funcTableDesc(t)
+			} else {
+				innerCols, err := s.PlanColumns(ctx, t.Derived)
+				if err != nil {
+					return nil, err
+				}
+				desc = derivedDesc(t.Alias, innerCols)
 			}
-			desc := derivedDesc(t.Alias, innerCols)
 			td := derivedSelect(t)
 			if hasAggregates(td.Exprs) || len(td.GroupBy) > 0 {
 				gq, aerr := resolveGrouped(desc, td)
@@ -249,6 +260,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			if jerr != nil {
 				return nil, ToSQLError(jerr)
 			}
+			// Subqueries in the select list are evaluated per row at
+			// execution (text on the wire): describe them as such.
+			t = maskSubqueryExprs(t)
 			if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 				jdesc, _, sel, gerr := groupedJoinQuery(sides, t)
 				if gerr != nil {
@@ -285,7 +299,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			return cols, nil
 		}
-		proj, perr := resolveProjection(desc, t.Exprs)
+		// Execution addresses a single table's columns by bare name.
+		stripTableAlias(t)
+		proj, perr := resolveProjection(desc, maskSubqueryExprs(t).Exprs)
 		if perr != nil {
 			return nil, ToSQLError(perr)
 		}
@@ -300,6 +316,21 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 
 	case *parser.ShowTables:
 		return []ResultColumn{{Name: "table_name", Type: types.String}}, nil
+
+	case *parser.Show:
+		names := map[string][]string{
+			"columns": {"column_name", "data_type", "is_nullable", "column_default", "indices"},
+			"indexes": {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
+			"create":  {"table_name", "create_statement"},
+			"users":   {"username", "is_admin"},
+			"grants":  {"database_name", "table_name", "grantee", "privilege_type"},
+			"all":     {"name", "setting"},
+		}[t.Kind]
+		cols := make([]ResultColumn, len(names))
+		for i, n := range names {
+			cols[i] = ResultColumn{Name: n, Type: types.String}
+		}
+		return cols, nil
 
 	case *parser.ShowStats:
 		return []ResultColumn{
@@ -316,7 +347,11 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 
 	case *parser.SetVar:
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
-			return []ResultColumn{{Name: t.Name[5:], Type: types.String}}, nil
+			name := t.Name[5:]
+			if canonical, _, ok := s.setting(name); ok {
+				name = canonical
+			}
+			return []ResultColumn{{Name: name, Type: types.String}}, nil
 		}
 		return nil, nil
 
@@ -337,4 +372,27 @@ func (s *Session) planJoinSides(ctx context.Context, baseDesc *catalog.TableDesc
 		inner[i] = d
 	}
 	return makeJoinSides(baseDesc, inner, t)
+}
+
+// maskSubqueryExprs returns t with every select-list expression that
+// carries a subquery replaced by a NULL placeholder (the original is
+// untouched), for describing a statement without evaluating it.
+func maskSubqueryExprs(t *parser.Select) *parser.Select {
+	var out *parser.Select
+	for i, se := range t.Exprs {
+		if se.Star || !exprHasSubquery(se.Expr) {
+			continue
+		}
+		if out == nil {
+			c := *t
+			c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+			out = &c
+		}
+		null := types.DNull
+		out.Exprs[i].Expr = parser.Expr{Lit: &null}
+	}
+	if out == nil {
+		return t
+	}
+	return out
 }

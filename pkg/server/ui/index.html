@@ -487,7 +487,7 @@ function render(d) {
 function rangeRow(r, leaderLabel, extra) {
   return `<tr>
     <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
-    <td class="key">${r.table ? `<b>${esc(r.table)}</b> · ` : ""}${esc(r.start_key)} → ${esc(r.end_key)}</td>
+    <td class="key">${spanText(r)}</td>
     <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     <td>${r.leader ? leaderLabel : ""}</td>
     <td class="num">${fmtBytes(r.size_bytes)}</td>
@@ -684,6 +684,19 @@ function renderNetwork(d) {
 // (admin role) — every holding node's view of that range over internode
 // RPC. The open detail row survives the 3s re-render (cached HTML) and is
 // refreshed only on click.
+// spanText renders a range's span: keys are already human-readable
+// (/table/orders/primary/42); inside a labeled table the table part is
+// dropped so the row reads "orders · /primary/42 → /primary/99".
+function spanText(r) {
+  let s = r.start_key || "", e = r.end_key || "";
+  if (r.table) {
+    const p = "/table/" + r.table;
+    const trim = k => k === p ? "/" : (k.startsWith(p + "/") ? k.slice(p.length) : k);
+    s = trim(s); e = trim(e);
+    return `<b>${esc(r.table)}</b> · ${esc(s)} → ${esc(e)}`;
+  }
+  return `${esc(s)} → ${esc(e)}`;
+}
 let openRange = null, openDetailHTML = "";
 function detailRow(html) {
   return `<tr class="detailrow"><td class="detail" colspan="3">${html}</td></tr>`;
@@ -697,7 +710,7 @@ function renderClusterRanges(ranges) {
   const rows = ranges.filter(matchesFilter).slice().sort((a, b) => a.range_id - b.range_id).map(r => {
     let row = `<tr class="${admin ? "clickable" : ""}" data-range="${r.range_id}">
       <td>r${r.range_id}</td>
-      <td class="key">${r.table ? `<b>${esc(r.table)}</b> · ` : ""}${esc(r.start_key)} → ${esc(r.end_key)}</td>
+      <td class="key">${spanText(r)}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     </tr>`;
     if (r.range_id === openRange) row += detailRow(openDetailHTML);

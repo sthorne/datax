@@ -377,8 +377,10 @@ func runDebug(args []string) error {
 	}
 	switch sub {
 	case "split":
+		useTableNames(resp.TableNames)
 		fmt.Printf("split done:\n  left:  %s\n  right: %s\n", resp.Left, resp.Right)
 	case "ranges":
+		useTableNames(resp.TableNames)
 		for _, d := range resp.Ranges {
 			fmt.Printf("%s\n", &d)
 		}
@@ -406,6 +408,7 @@ func runDebug(args []string) error {
 		fmt.Printf("cluster version finalized at v%d\n", resp.ClusterVersion)
 	case "merge":
 		if len(resp.Ranges) == 1 {
+			useTableNames(resp.TableNames)
 			fmt.Printf("merged: %s\n", &resp.Ranges[0])
 		}
 	case "decommission":
@@ -466,4 +469,16 @@ func printReencryption(st *cluster.ReencryptionStatus) {
 	}
 	fmt.Printf("re-encryption %s: %d bytes in %d files remain under retired keys (%d bytes rewritten)\n",
 		state, st.RemainingBytes, st.RemainingFiles, st.RewrittenBytes)
+}
+
+// useTableNames lets range spans print with table names (the admin
+// response carries the cluster's table ID → name map).
+func useTableNames(names map[uint64]string) {
+	if len(names) == 0 {
+		return
+	}
+	keys.SetTableNamer(func(id uint64) (string, bool) {
+		name, ok := names[id]
+		return name, ok
+	})
 }

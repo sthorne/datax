@@ -26,9 +26,10 @@ import (
 
 // joinSide names one side of the join.
 type joinSide struct {
-	desc  *catalog.TableDescriptor
-	alias string // alias if given, else the table name
-	left  bool   // this side was LEFT-joined (side 0: false)
+	desc    *catalog.TableDescriptor
+	alias   string // alias if given, else the table name
+	aliased bool   // an explicit alias was written
+	left    bool   // this side was LEFT-joined (side 0: false)
 }
 
 func (js joinSide) matches(qualifier string) bool {
@@ -192,6 +193,20 @@ func walkExprRefs(sides []joinSide, e parser.Expr) error {
 			return err
 		}
 	}
+	if e.Cmp != nil {
+		if e.Cmp.Expr != nil {
+			if err := walkExprRefs(sides, *e.Cmp.Expr); err != nil {
+				return err
+			}
+		} else if e.Cmp.Column != "" {
+			if _, err := resolveJoinRef(sides, e.Cmp.Column); err != nil {
+				return err
+			}
+		}
+		if err := walkExprRefs(sides, e.Cmp.Value); err != nil {
+			return err
+		}
+	}
 	if e.Sub != nil {
 		return newErrf(CodeFeatureNotSupported, "subqueries in join SELECT lists are not supported")
 	}
@@ -283,11 +298,8 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			if lhs.Null || rhs.Null {
 				return false, nil
 			}
-			c, err := lhs.Compare(rhs)
-			if err != nil {
-				return false, nil
-			}
-			if !cmpHolds(cmp.Op, c) {
+			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			if err != nil || !ok {
 				return false, nil
 			}
 			continue
@@ -348,6 +360,16 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if lhs.Null || rhs.Null {
 			return false, nil
 		}
+		if !plainCmpOp(cmp.Op) {
+			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
+			}
+			continue
+		}
 		rhs, cerr := rhs.Coerce(cmpType)
 		if cerr != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, cerr)
@@ -393,11 +415,23 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 		if ref.side != 0 {
 			continue
 		}
+		// A row-dependent right side (c.oid = i.indrelid) is a join
+		// predicate, not a base bound: the post-join filter applies it.
+		if exprHasColumn(cmp.Value) {
+			continue
+		}
 		bare := cmp
 		bare.Column = ref.col.Name
 		out = append(out, bare)
 	}
 	return out, nil
+}
+
+// exprHasColumn reports whether a value expression references any column.
+func exprHasColumn(e parser.Expr) bool {
+	found := false
+	exprColumns(e, func(string) { found = true })
+	return found
 }
 
 // makeJoinSides pairs every descriptor with its alias and checks for
@@ -406,13 +440,13 @@ func makeJoinSides(baseDesc *catalog.TableDescriptor, innerDescs []*catalog.Tabl
 	sides := make([]joinSide, 0, 1+len(t.Joins))
 	base := joinSide{desc: baseDesc, alias: baseDesc.Name}
 	if t.Alias != "" {
-		base.alias = t.Alias
+		base.alias, base.aliased = t.Alias, true
 	}
 	sides = append(sides, base)
 	for i := range t.Joins {
 		js := joinSide{desc: innerDescs[i], alias: innerDescs[i].Name, left: t.Joins[i].Left}
 		if t.Joins[i].Alias != "" {
-			js.alias = t.Joins[i].Alias
+			js.alias, js.aliased = t.Joins[i].Alias, true
 		}
 		sides = append(sides, js)
 	}
@@ -441,7 +475,7 @@ type joinQuery struct {
 // resolveJoinQuery looks up and privilege-checks every joined table,
 // applies cost-based join reordering when statistics allow it, and
 // resolves each level's ON conditions.
-func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select) (*joinQuery, error) {
+func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, noReorder bool) (*joinQuery, error) {
 	innerDescs := make([]*catalog.TableDescriptor, len(t.Joins))
 	for i := range t.Joins {
 		desc, err := s.lookup(ctx, txn, t.Joins[i].Table)
@@ -470,7 +504,7 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 		}
 		stats[i] = st
 	}
-	if haveAll {
+	if haveAll && !noReorder {
 		if clone, order, changed, ok := reorderJoins(t, sides, stats); ok && changed {
 			jq.sel, jq.reordered = clone, true
 			permuted := make([]joinSide, len(sides))
@@ -491,11 +525,12 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 	return jq, nil
 }
 
-func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (*Result, error) {
+func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, params []types.Datum, jc *joinCorr) (*Result, error) {
 	if t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with joins")
 	}
-	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
+	// Correlated subqueries bind against the syntactic side order.
+	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t, jc != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -559,20 +594,46 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				}
 				continue
 			}
+			// Non-key ON conjuncts (tc.relkind = 't', NOT a.attisdropped)
+			// decide matching, not the final row set: a candidate that
+			// fails them is a miss, so a LEFT side NULL-extends.
+			filter := t.Joins[k-1].Filter
+			matched := 0
 			for _, ifr := range matches {
-				next = append(next, jr.extend(ifr.row))
+				ext := jr.extend(ifr.row)
+				if len(filter) > 0 {
+					ok, err := evalJoinWhere(sides, filter, ext, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				next = append(next, ext)
+				matched++
+			}
+			if matched == 0 && sides[k].left {
+				next = append(next, jr.extend(nil))
 			}
 		}
 		joined = next
 	}
 
 	// The full WHERE filters complete rows only (LEFT JOIN semantics:
-	// after NULL-extension).
+	// after NULL-extension). Correlated conjuncts evaluate per row
+	// against the merged scope.
+	memo := corrMemo{}
 	filtered := joined[:0]
 	for _, jr := range joined {
 		match, err := evalJoinWhere(sides, t.Where, jr, params)
 		if err != nil {
 			return nil, err
+		}
+		if match && jc != nil && len(jc.conds) > 0 {
+			if match, err = s.evalCorrelated(ctx, txn, jc.conds, jc.desc, jc.rowOf(jr), params, memo); err != nil {
+				return nil, err
+			}
 		}
 		if match {
 			filtered = append(filtered, jr)
@@ -581,11 +642,14 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	joined = filtered
 
 	if grouped {
+		if jc != nil && len(jc.projs) > 0 {
+			return nil, newErrf(CodeFeatureNotSupported, "correlated subqueries in the select list are not supported with GROUP BY")
+		}
 		return s.execGroupedJoin(sides, joined, t, params)
 	}
 
 	if len(t.OrderBy) > 0 {
-		if err := sortJoinedRows(sides, joined, t.OrderBy); err != nil {
+		if err := sortJoinedRows(sides, joined, resolveOrderAliases(t), params); err != nil {
 			return nil, err
 		}
 	}
@@ -594,6 +658,26 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	for _, p := range proj {
 		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.typ, Typmod: colTypmod(p.ref.col)})
 	}
+	// Output positions of the correlated expressions (a star ahead of
+	// them expands to every side's visible columns).
+	var projAt []int
+	if jc != nil && len(jc.projs) > 0 {
+		pos, n := make([]int, len(t.Exprs)), 0
+		for i, se := range t.Exprs {
+			pos[i] = n
+			if se.Star {
+				for _, js := range sides {
+					n += len(js.desc.VisibleColumns())
+				}
+			} else {
+				n++
+			}
+		}
+		for _, cp := range jc.projs {
+			projAt = append(projAt, pos[cp.idx])
+		}
+	}
+	projMemo := corrMemo{}
 	for _, jr := range joined {
 		out := make([]types.Datum, len(proj))
 		for i, p := range proj {
@@ -606,6 +690,16 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				continue
 			}
 			out[i] = jr.datum(p.ref)
+		}
+		for i := range projAt {
+			d, err := s.evalCorrProj(ctx, txn, &jc.projs[i], jc.desc, jc.rowOf(jr), params, projMemo)
+			if err != nil {
+				return nil, err
+			}
+			out[projAt[i]] = d
+			if !d.Null {
+				res.Columns[projAt[i]].Type = d.Fam
+			}
 		}
 		res.Rows = append(res.Rows, out)
 	}
@@ -628,20 +722,46 @@ func (s *Session) fetchRowsInner(ctx context.Context, txn *kvclient.Txn, desc *c
 }
 
 // sortJoinedRows sorts joined rows by possibly-qualified ORDER BY columns
-// (PostgreSQL NULL ordering: NULLS LAST ascending, NULLS FIRST descending).
-func sortJoinedRows(sides []joinSide, rows []joinedRow, order []parser.OrderCol) error {
+// or computed expressions (PostgreSQL NULL ordering: NULLS LAST
+// ascending, NULLS FIRST descending).
+func sortJoinedRows(sides []joinSide, rows []joinedRow, order []parser.OrderCol, params []types.Datum) error {
 	refs := make([]joinRef, len(order))
 	for i, oc := range order {
+		if oc.Expr != nil {
+			continue
+		}
 		ref, err := resolveJoinRef(sides, oc.Column)
 		if err != nil {
 			return err
 		}
 		refs[i] = ref
 	}
-	var sortErr error
-	sort.SliceStable(rows, func(a, b int) bool {
+	// Sort keys are materialized per row up front (computed expressions
+	// evaluate once), then the rows are permuted to match.
+	keys := make([][]types.Datum, len(rows))
+	for r := range rows {
+		keys[r] = make([]types.Datum, len(order))
 		for i, oc := range order {
-			da, db := rows[a].datum(refs[i]), rows[b].datum(refs[i])
+			if oc.Expr == nil {
+				keys[r][i] = rows[r].datum(refs[i])
+				continue
+			}
+			d, err := evalExprEnv(*oc.Expr, joinEnv{sides, rows[r]}, params)
+			if err != nil {
+				return err
+			}
+			keys[r][i] = d
+		}
+	}
+	perm := make([]int, len(rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	var sortErr error
+	sort.SliceStable(perm, func(a, b int) bool {
+		ka, kb := keys[perm[a]], keys[perm[b]]
+		for i, oc := range order {
+			da, db := ka[i], kb[i]
 			if da.Null || db.Null {
 				if da.Null == db.Null {
 					continue
@@ -668,6 +788,11 @@ func sortJoinedRows(sides []joinSide, rows []joinedRow, order []parser.OrderCol)
 	if sortErr != nil {
 		return newErrf(CodeInternal, "ORDER BY: %v", sortErr)
 	}
+	sorted := make([]joinedRow, len(rows))
+	for i, p := range perm {
+		sorted[i] = rows[p]
+	}
+	copy(rows, sorted)
 	return nil
 }
 
@@ -690,7 +815,7 @@ func innerPathDesc(plan accessPlan) string {
 // explainJoin renders the join plan: the base access path (with real
 // bounds) and each level's per-row path implied by its ON keys.
 func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *catalog.TableDescriptor, t *parser.Select, params []types.Datum) (string, error) {
-	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t)
+	jq, err := s.resolveJoinQuery(ctx, txn, baseDesc, t, false)
 	if err != nil {
 		return "", err
 	}
@@ -725,6 +850,8 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 	kind := "inner"
 	if sides[1].left {
 		kind = "left"
+	} else if t.Joins[0].Cross {
+		kind = "cross"
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s%s", kind, sides[0].alias, basePlan.String(), estimate(basePlan))

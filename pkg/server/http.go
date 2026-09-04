@@ -357,8 +357,8 @@ func (n *Node) rangeStatuses() []RangeStatus {
 		desc := r.Desc()
 		rs := RangeStatus{
 			RangeID:        int64(desc.RangeID),
-			StartKey:       desc.StartKey.String(),
-			EndKey:         desc.EndKey.String(),
+			StartKey:       n.prettyKey(desc.StartKey),
+			EndKey:         n.prettyKey(desc.EndKey),
 			Table:          n.tableNameOf(desc.StartKey),
 			Leader:         r.IsLeader(),
 			AppliedIndex:   r.AppliedIndex(),

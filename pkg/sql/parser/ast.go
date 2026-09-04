@@ -38,6 +38,31 @@ type Expr struct {
 	BinOp string `json:"bin_op,omitempty"`
 	Left  *Expr  `json:"left,omitempty"`
 	Right *Expr  `json:"right,omitempty"`
+	// Case is a CASE expression (simple: CASE x WHEN v THEN r ...; searched:
+	// CASE WHEN cond THEN r ...).
+	Case *CaseExpr `json:"case,omitempty"`
+	// Cmp is a comparison used as a boolean value ('d' = any(stxkind) AS
+	// enabled, ORDER BY f(x) = 'DEFAULT'): NULL when either side is.
+	Cmp *Comparison `json:"cmp,omitempty"`
+	// Cast is the last ::type applied when it changes the value: only
+	// "regclass" ('t'::regclass resolves a table name to its OID) is kept;
+	// every other cast is absorbed.
+	Cast string `json:"cast,omitempty"`
+}
+
+// CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
+type CaseExpr struct {
+	Operand *Expr      `json:"operand,omitempty"`
+	Whens   []CaseWhen `json:"whens"`
+	Else    *Expr      `json:"else,omitempty"`
+}
+
+// CaseWhen is one arm: Value compares against the operand (simple form)
+// or Cond holds (searched form).
+type CaseWhen struct {
+	Value  *Expr        `json:"value,omitempty"`
+	Cond   []Comparison `json:"cond,omitempty"`
+	Result Expr         `json:"result"`
 }
 
 // Comparison is one WHERE conjunct: col op value, col IS [NOT] NULL,
@@ -46,7 +71,7 @@ type Expr struct {
 type Comparison struct {
 	Column string     // lower-cased; empty for [NOT] EXISTS, TRUE/FALSE, and OR
 	Path   []PathStep // ->/->> chain applied to Column (JSONB extraction)
-	Op     string     // = != < <= > >= | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE | OR
+	Op     string     // = != < <= > >= ~ !~ ~* !~* | IS [NOT] NULL | [NOT] IN | [NOT] EXISTS | TRUE FALSE | OR
 	Value  Expr       // scalar ops: literal, param, or scalar subquery
 	Values []Expr     // [NOT] IN: the value list (spliced from Sub when a subquery)
 	Sub    *Select    // [NOT] IN / [NOT] EXISTS subquery
@@ -58,8 +83,8 @@ type Comparison struct {
 	// Or (Op "OR") is a disjunction of conjunctions: the conjunct is true
 	// when ANY inner []Comparison is entirely true. NOT was eliminated at
 	// parse time (De Morgan + operator negation — sound under SQL
-	// three-valued logic because WHERE keeps only TRUE), and subqueries
-	// are rejected inside OR (documented v1 restriction).
+	// three-valued logic because WHERE keeps only TRUE); scalar subqueries
+	// may appear inside OR, IN and EXISTS subqueries may not.
 	Or [][]Comparison `json:"or,omitempty"`
 }
 
@@ -153,9 +178,11 @@ type SelectExpr struct {
 	AggCol  string
 }
 
-// OrderCol is one ORDER BY term.
+// OrderCol is one ORDER BY term: an output/column name, or (Expr set) a
+// computed expression evaluated per row.
 type OrderCol struct {
 	Column string
+	Expr   *Expr
 	Desc   bool
 }
 
@@ -182,9 +209,15 @@ type JoinCond struct {
 // JoinClause is [INNER | LEFT [OUTER]] JOIN table [AS] alias ON conds.
 type JoinClause struct {
 	Left  bool // LEFT OUTER; false = inner
+	Cross bool // CROSS JOIN / comma join: no ON clause
 	Table string
 	Alias string
 	On    []JoinCond
+	// Filter holds the ON conjuncts that are not join-key equalities
+	// (tc.relkind = 't', a.attnum > 0, NOT a.attisdropped). They are part
+	// of the join condition: a candidate match failing them is not a
+	// match (so a LEFT JOIN NULL-extends), unlike a WHERE conjunct.
+	Filter []Comparison
 }
 
 type Select struct {
@@ -193,14 +226,24 @@ type Select struct {
 	Table    string  // empty for FROM-less and derived-table selects
 	Alias    string  // optional alias for Table (or the derived table's alias)
 	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
+	// FuncTable is FROM unnest(array) [AS] alias [(column)]: a
+	// set-returning call materialized as a one-column table named Alias
+	// with column FuncCol.
+	FuncTable *Expr
+	FuncCol   string
 	// Joins are the JOIN clauses in syntactic order; execution joins
 	// left-deep in exactly this order.
-	Joins   []JoinClause
-	Where   []Comparison
-	GroupBy []string
-	Having  []HavingCond
-	OrderBy []OrderCol
-	Limit   int64 // -1 = none
+	Joins []JoinClause
+	// Union chains the next member of a UNION [ALL] (its own Union links
+	// further members). ORDER BY and LIMIT written after the last member
+	// apply to the whole union and are carried by the head select.
+	Union    *Select
+	UnionAll bool
+	Where    []Comparison
+	GroupBy  []string
+	Having   []HavingCond
+	OrderBy  []OrderCol
+	Limit    int64 // -1 = none
 	// AsOf is the AS OF SYSTEM TIME operand ("" = none): a string literal
 	// holding a negative duration ('-5s'), an RFC 3339 timestamp, or a
 	// Unix-nanoseconds integer. The read runs at that fixed timestamp and
@@ -276,7 +319,19 @@ type Rollback struct{}
 type Savepoint struct{ Name string }
 type ReleaseSavepoint struct{ Name string }
 type RollbackToSavepoint struct{ Name string }
-type ShowTables struct{}
+
+// ShowTables is SHOW TABLES [FROM database].
+type ShowTables struct{ Database string }
+
+// Show is one of the introspection statements: SHOW COLUMNS FROM t, SHOW
+// INDEXES FROM t, SHOW CREATE TABLE t, SHOW USERS, SHOW GRANTS [ON t]
+// [FOR user], SHOW ALL. Kind is "columns", "indexes", "create", "users",
+// "grants", or "all".
+type Show struct {
+	Kind  string
+	Table string
+	User  string
+}
 
 // Analyze collects table statistics (row count, per-column distinct
 // estimates) for one table, or every table when Table is empty. Runs
@@ -320,6 +375,7 @@ type SetVar struct {
 }
 
 func (*CreateTable) stmt()         {}
+func (*Show) stmt()                {}
 func (*CreateIndex) stmt()         {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}

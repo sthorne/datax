@@ -108,7 +108,7 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 		kv = append(kv, "cancel", true)
 	}
 	if len(req.Key) != 0 {
-		kv = append(kv, "key", fmt.Sprintf("%q", req.Key))
+		kv = append(kv, "key", keys.Key(req.Key).String())
 	}
 	if req.Path != "" {
 		kv = append(kv, "path", req.Path)
@@ -142,14 +142,14 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Left: &sr.Left, Right: &sr.Right}
+		return cluster.AdminResponse{Left: &sr.Left, Right: &sr.Right, TableNames: n.tableNames(ctx)}
 
 	case "ranges":
 		descs, err := n.listRanges(ctx)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Ranges: descs}
+		return cluster.AdminResponse{Ranges: descs, TableNames: n.tableNames(ctx)}
 
 	case "nodes":
 		return cluster.AdminResponse{

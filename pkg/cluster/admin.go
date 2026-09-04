@@ -65,9 +65,12 @@ type ReencryptionStatus struct {
 type AdminResponse struct {
 	Error  string                 `json:"error,omitempty"`
 	Ranges []kvpb.RangeDescriptor `json:"ranges,omitempty"`
-	Nodes  []kvpb.NodeDescriptor  `json:"nodes,omitempty"`
-	Left   *kvpb.RangeDescriptor  `json:"left,omitempty"`
-	Right  *kvpb.RangeDescriptor  `json:"right,omitempty"`
+	// TableNames (ranges, split, merge) maps table IDs to names, so a
+	// client can print spans as /table/orders/... (keys.SetTableNamer).
+	TableNames map[uint64]string     `json:"table_names,omitempty"`
+	Nodes      []kvpb.NodeDescriptor `json:"nodes,omitempty"`
+	Left       *kvpb.RangeDescriptor `json:"left,omitempty"`
+	Right      *kvpb.RangeDescriptor `json:"right,omitempty"`
 	// Decommission progress.
 	Draining          bool `json:"draining,omitempty"`
 	RemainingReplicas int  `json:"remaining_replicas,omitempty"`

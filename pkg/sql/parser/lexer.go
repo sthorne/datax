@@ -62,7 +62,7 @@ func lex(src string) ([]token, error) {
 			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
 				l.pos++
 			}
-		case unicode.IsLetter(rune(c)) || c == '_':
+		case (unicode.IsLetter(rune(c)) || c == '_') && !((c == 'E' || c == 'e') && l.peekAt(1) == '\''):
 			for l.pos < len(l.src) && (unicode.IsLetter(rune(l.src[l.pos])) || unicode.IsDigit(rune(l.src[l.pos])) || l.src[l.pos] == '_') {
 				l.pos++
 			}
@@ -78,7 +78,11 @@ func lex(src string) ([]token, error) {
 				l.pos++
 			}
 			l.toks = append(l.toks, token{kind: tkNumber, text: l.src[start:l.pos], pos: start})
-		case c == '\'':
+		case c == '\'' || ((c == 'E' || c == 'e') && l.peekAt(1) == '\''):
+			escapes := c != '\''
+			if escapes {
+				l.pos++ // the E prefix: backslash escapes apply
+			}
 			var sb strings.Builder
 			l.pos++
 			for {
@@ -93,6 +97,20 @@ func lex(src string) ([]token, error) {
 					}
 					l.pos++
 					break
+				}
+				if escapes && l.src[l.pos] == '\\' && l.pos+1 < len(l.src) {
+					switch l.src[l.pos+1] {
+					case 'n':
+						sb.WriteByte('\n')
+					case 't':
+						sb.WriteByte('\t')
+					case 'r':
+						sb.WriteByte('\r')
+					default:
+						sb.WriteByte(l.src[l.pos+1])
+					}
+					l.pos += 2
+					continue
 				}
 				sb.WriteByte(l.src[l.pos])
 				l.pos++
@@ -132,16 +150,20 @@ func lex(src string) ([]token, error) {
 				two = l.src[l.pos : l.pos+2]
 			}
 			switch two {
-			case "!=", "<>", "<=", ">=", "::", "->", "@>":
+			case "!=", "<>", "<=", ">=", "::", "->", "@>", "!~", "~*", "||":
 				op := two
 				if op == "<>" {
 					op = "!="
+				}
+				if op == "!~" && l.peekAt(2) == '*' {
+					op = "!~*"
+					l.pos++
 				}
 				l.toks = append(l.toks, token{kind: tkOp, text: op, pos: start})
 				l.pos += 2
 			default:
 				switch c {
-				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '/', '.':
+				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '/', '.', '~':
 					l.toks = append(l.toks, token{kind: tkOp, text: string(c), pos: start})
 					l.pos++
 				default:

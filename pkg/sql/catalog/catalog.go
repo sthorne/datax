@@ -83,6 +83,10 @@ func (idx *IndexDescriptor) Public() bool {
 type TableDescriptor struct {
 	ID   uint64 `json:"id"`
 	Name string `json:"name"`
+	// Virtual names the virtual catalog table this descriptor renders
+	// ("pg_catalog.pg_class"); never persisted. Its rows come from a
+	// generator (pkg/sql/vtable), never from the key space.
+	Virtual string `json:"-"`
 	// DatabaseID is the owning database (see DatabaseDescriptor). 0 marks
 	// a table created before the cluster finalized v6, which lives in the
 	// flat namespace and belongs to the default database until the

@@ -34,7 +34,7 @@ func (k Key) Compare(o Key) int    { return bytes.Compare(k, o) }
 func (k Key) Less(o Key) bool      { return bytes.Compare(k, o) < 0 }
 func (k Key) Clone() Key           { return append(Key(nil), k...) }
 func (k Key) HasPrefix(p Key) bool { return bytes.HasPrefix(k, p) }
-func (k Key) String() string       { return fmt.Sprintf("%q", []byte(k)) }
+func (k Key) String() string       { return Pretty(k) }
 func (k Key) Next() Key            { return append(k.Clone(), 0) }
 
 // PrefixEnd returns the smallest key greater than every key with prefix k:

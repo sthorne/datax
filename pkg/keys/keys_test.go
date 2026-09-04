@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/util/decimal"
+	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
 func TestKeyspaceOrdering(t *testing.T) {
@@ -106,4 +108,47 @@ func TestTableStatsKey(t *testing.T) {
 	if _, ok := TableStatsID(TableDescKey(42)); ok {
 		t.Fatal("desc key decoded as stats key")
 	}
+}
+
+// TestPretty: every kind of key renders as a readable path, and the
+// datum heuristics tell strings, integers and decimals apart.
+func TestPretty(t *testing.T) {
+	row := Key(encoding.EncodeInt64(TableIndexPrefix(3, 1), 42))
+	row = Key(encoding.EncodeString(row, "oslo"))
+	dec := Key(encoding.EncodeDecimal(TableIndexPrefix(3, 2), mustDec("12.5")))
+	txn := TransactionKey(TableDataPrefix(3), uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8"))
+	for _, tc := range []struct {
+		key  Key
+		want string
+	}{
+		{MinKey, "/Min"},
+		{MaxKey, "/Max"},
+		{RangeMetaKey(MaxKey), "/meta/Max"},
+		{RangeMetaKey(TableDataPrefix(3)), "/meta/table/3"},
+		{ClusterVersionKey(), "/system/cluster-version"},
+		{NodeRegistryKey(2), "/system/nodes/2"},
+		{DescIDGenKey(), `/system/idgen/"desc"`},
+		{TableDescKey(7), "/system/desc/7"},
+		{TableNamespaceKey(1, "orders"), `/system/nsdb/1/"orders"`},
+		{TableDataPrefix(3), "/table/3"},
+		{TableDataPrefix(3).PrefixEnd(), "/table/4"},
+		{TableIndexPrefix(3, 1), "/table/3/1"},
+		{row, `/table/3/1/42/"oslo"`},
+		{dec, "/table/3/2/12.5"},
+		{RaftLogKey(5, 9), "/local/r5/log/9"},
+		{RangeDescriptorKey(5), "/local/r5/desc"},
+		{txn, "/local/addressed/table/3/txn/6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+	} {
+		if got := tc.key.String(); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.key.Raw(), got, tc.want)
+		}
+	}
+}
+
+func mustDec(s string) decimal.Dec {
+	d, err := decimal.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return d
 }
