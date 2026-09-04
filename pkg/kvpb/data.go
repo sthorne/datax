@@ -67,6 +67,11 @@ type NodeDescriptor struct {
 	// replicas away and never places new ones on it. The node itself
 	// adopts and re-asserts the flag through its heartbeats.
 	Draining bool `json:"draining,omitempty"`
+	// ShuttingDown marks a node draining for a stop: it is shedding its
+	// leases and SQL connections and will be gone within seconds, so
+	// peers hand it no new leases and place no replicas on it. Unlike
+	// Draining its replicas stay — the node is expected back.
+	ShuttingDown bool `json:"shutting_down,omitempty"`
 	// BinaryVersion is the protocol version of the binary the node runs
 	// (see pkg/version), re-asserted on every heartbeat. 0 (absent, or an
 	// entry synthesized from raft traffic before the node's first
@@ -240,3 +245,7 @@ type SQLSummary struct {
 	P50Micros int64 `json:"p50_us"`
 	P99Micros int64 `json:"p99_us"`
 }
+
+// Leaving reports whether the node should receive no new leases or
+// replicas: it is decommissioning (Draining) or stopping (ShuttingDown).
+func (nd NodeDescriptor) Leaving() bool { return nd.Draining || nd.ShuttingDown }

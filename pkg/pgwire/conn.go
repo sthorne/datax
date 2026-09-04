@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"net"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
@@ -116,6 +120,80 @@ type conn struct {
 	// act is the server's client accounting (nil in unit tests that build
 	// a conn without a server).
 	act *Activity
+
+	// mu guards st, the connection's phase as seen by Server.Drain: the
+	// connection goroutine records when it is idle (waiting for the next
+	// client message) and whether a transaction is open; Drain sets the
+	// draining flags and, when the connection is idle, wakes its Receive
+	// with a read deadline so the goroutine itself says goodbye.
+	mu sync.Mutex
+	st connState
+}
+
+// connState is the drain-visible phase of a connection. idle means
+// waiting for a client message at a cycle boundary — after a simple
+// Query or a Sync has been answered with ReadyForQuery — never between
+// the messages of one extended-protocol pipeline, where a goodbye would
+// land between an Execute already applied and its Sync and the client
+// would take the 57P01 as that statement's outcome.
+type connState struct {
+	idle, inTxn bool
+	// draining asks the connection to end at its next idle point outside
+	// a transaction; cut asks it to end at its next idle point regardless
+	// (the drain deadline).
+	draining, cut bool
+}
+
+// adminShutdown is the error a drained connection ends with: PostgreSQL's
+// FATAL 57P01, which drivers report as the failure of the statement in
+// flight (or the next one) before reconnecting.
+var adminShutdown = &pgproto3.ErrorResponse{
+	Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "57P01",
+	Message: "terminating connection due to administrator command",
+}
+
+// drain asks the connection to end: soft (at its next idle point
+// outside a transaction) or hard (now: an idle connection is woken to
+// say goodbye, a busy one is closed under its statement).
+func (c *conn) drain(hard bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.st.draining = true
+	if hard {
+		c.st.cut = true
+	}
+	switch {
+	case c.st.idle && (hard || !c.st.inTxn):
+		_ = c.nc.SetReadDeadline(time.Now()) // wakes Receive; see run
+	case hard:
+		_ = c.nc.Close()
+	}
+}
+
+// setIdle records the connection's phase and reports whether a pending
+// drain means it should say goodbye now rather than serve (or wait
+// for) another message.
+func (c *conn) setIdle(idle bool) (goodbye bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.st.idle = idle
+	c.st.inTxn = c.session.State() == sql.StateOpen
+	return c.st.cut || (c.st.draining && !c.st.inTxn)
+}
+
+// goodbye ends a drained connection: the admin_shutdown error, flushed;
+// the caller returns and the deferred cleanup rolls back and closes.
+func (c *conn) goodbye() {
+	_ = c.nc.SetReadDeadline(time.Time{})
+	c.backend.Send(adminShutdown)
+	_ = c.backend.Flush()
+}
+
+// isTimeout reports a read that ended because of a deadline (the way a
+// drain wakes an idle connection) rather than a broken connection.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
 // execute runs one statement through the session with activity
@@ -146,10 +224,25 @@ func (c *conn) run(ctx context.Context) error {
 	if err := c.handleStartup(ctx); err != nil {
 		return err
 	}
+	boundary := true // the next message starts a new protocol cycle
 	for {
+		if c.setIdle(boundary) && boundary {
+			c.goodbye()
+			return nil
+		}
 		msg, err := c.backend.Receive()
-		if err != nil {
+		if goodbye := c.setIdle(false); err != nil {
+			if goodbye && boundary && isTimeout(err) {
+				c.goodbye() // woken by drain, not a broken connection
+				return nil
+			}
 			return err
+		}
+		switch msg.(type) {
+		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.Terminate:
+			boundary = true
+		default:
+			boundary = false
 		}
 		switch m := msg.(type) {
 		case *pgproto3.Query:

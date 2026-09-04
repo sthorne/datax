@@ -357,6 +357,40 @@ compare them against the backup's to verify the restore byte-for-byte.
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.
 
+## Stopping a node
+
+`SIGTERM` or Ctrl-C stops a node cleanly. The node first **drains**, for
+up to `--drain-timeout` (default 10s): it tells its peers it is leaving
+(they hand it no new leases and place nothing on it), transfers every
+lease it holds to a live peer so no range waits for a lease to expire,
+closes its SQL listener, and ends its SQL connections — an idle
+connection gets PostgreSQL's `FATAL 57P01 admin_shutdown` at once, one
+running a statement or inside a transaction is left to finish and told
+the same at its next idle point. When the deadline arrives the
+connections still open are closed (a transaction left open gets the
+`57P01` too) and the leases still held stay held; then the node stops
+and prints what the drain achieved:
+
+```
+shutting down: draining for up to 10s (signal again to skip)...
+drained: 12 leases transferred (0 kept), 3 SQL connections closed (0 cut)
+stopped
+```
+
+Clients that retry on `57P01` (every pool does; pgx, psycopg and JDBC
+reconnect on the next statement) see nothing else; a serializable
+write caught by a lease handoff can surface as `40001`, the retry every
+datax client already handles. A second signal skips the rest of the
+drain; a third — or a stop that has not completed one drain timeout
+after the second — exits without waiting. `--drain-timeout 0` stops at
+once (the pre-0.16 behavior); data is never at risk either way, Raft
+and applied state are synced on every commit. The dashboard and
+`/api/health` show a draining node as **stopping**; its replicas stay
+where they are, unlike a [decommission](#decommissioning-a-node).
+
+For systemd, `KillSignal=SIGTERM` (the default) and a `TimeoutStopSec`
+above the drain timeout are all it takes.
+
 ## Rolling upgrades
 
 A cluster upgrades with no downtime, one node at a time. Each binary has a
@@ -366,7 +400,7 @@ Adjacent versions only: upgrade one major version at a time.
 
 ```sh
 # For each node, one at a time:
-#   1. stop the node (optionally decommission-drain first for zero blips)
+#   1. stop the node (SIGTERM: it drains its leases and connections first)
 #   2. restart it on the new binary
 #   3. wait until `datax debug nodes` shows it heartbeating with the new
 #      version and the cluster is healthy

@@ -117,8 +117,8 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 		}
 		var candidates []placement.Candidate
 		for _, nd := range liveNodes {
-			if nd.Draining {
-				continue // never place new replicas on a draining node
+			if nd.Leaving() {
+				continue // never place new replicas on a draining or stopping node
 			}
 			if _, holds := desc.GetReplica(nd.NodeID); !holds {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
@@ -199,8 +199,8 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 		}
 		var candidates []placement.Candidate
 		for _, nd := range live {
-			if nd.Draining {
-				continue // never place new replicas on a draining node
+			if nd.Leaving() {
+				continue // never place new replicas on a draining or stopping node
 			}
 			if _, holds := desc.GetReplica(nd.NodeID); !holds {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})

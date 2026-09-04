@@ -144,3 +144,7 @@ upgrades](operations.md#rolling-upgrades).
 - Upgrades: same binary version on every node at bootstrap; upgrade
   rolling, one node at a time, and treat `datax debug upgrade` as the
   point of no return.
+- Stop nodes with `SIGTERM` (systemd's default) and give the unit a
+  `TimeoutStopSec` above `--drain-timeout` (10s): the node hands its
+  leases to peers and finishes SQL connections before it exits
+  ([Operations → Stopping a node](operations.md#stopping-a-node)).

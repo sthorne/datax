@@ -153,6 +153,10 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			add(Problem{Severity: SeverityInfo, Check: "node-draining", Node: int(nd.NodeID), Section: "nodes",
 				Summary: fmt.Sprintf("n%d is draining (decommission in progress)", nd.NodeID)})
 		}
+		if nd.ShuttingDown {
+			add(Problem{Severity: SeverityInfo, Check: "node-stopping", Node: int(nd.NodeID), Section: "nodes",
+				Summary: fmt.Sprintf("n%d is shutting down (shedding its leases and SQL connections)", nd.NodeID)})
+		}
 		bv := version.Version(nd.BinaryVersion)
 		if bv == 0 {
 			bv = version.V1

@@ -28,6 +28,8 @@ type ClusterNode struct {
 	Live     bool  `json:"live"`
 	AgoMs    int64 `json:"heartbeat_ago_ms"`
 	Draining bool  `json:"draining,omitempty"`
+	// ShuttingDown: the node is draining for a stop (kvpb.NodeDescriptor).
+	ShuttingDown bool `json:"shutting_down,omitempty"`
 	// Load aggregates from the node's own heartbeat (leader-local QPS;
 	// see kvpb.NodeDescriptor).
 	LeaderQPS    float64 `json:"leader_qps,omitempty"`
@@ -113,6 +115,7 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			Live:         now-nd.LivenessTime <= grace,
 			AgoMs:        (now - nd.LivenessTime) / int64(time.Millisecond),
 			Draining:     nd.Draining,
+			ShuttingDown: nd.ShuttingDown,
 			LeaderQPS:    nd.LeaderQPS,
 			LeaderCount:  nd.LeaderCount,
 			ReplicaBytes: nd.ReplicaBytes,

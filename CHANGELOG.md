@@ -8,6 +8,21 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.16.0 — unreleased
+
+### Added
+- Graceful shutdown (#124): on `SIGTERM` or Ctrl-C a node drains before
+  it stops — it announces itself as leaving (`shutting_down` in its
+  registry row: peers hand it no leases and place nothing on it),
+  transfers every lease it holds to a live peer, closes its SQL
+  listener and ends its connections with `FATAL 57P01` (idle ones at
+  once, busy ones at their next idle point, open transactions at the
+  deadline) — bounded by `--drain-timeout` (default 10s; 0 stops at
+  once). A second signal skips the rest of the drain; a third, or a
+  stop that hangs past the timeout, exits. `datax demo` drains the same
+  way. The dashboard and `/api/health` show a stopping node;
+  `Node.Drain` returns what the drain achieved and the node logs it.
+
 ## 0.15.0 — unreleased
 
 ### Added

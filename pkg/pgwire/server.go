@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -44,8 +45,11 @@ type Server struct {
 	opts    ServerOptions
 
 	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	act   *Activity
+	conns map[net.Conn]*conn
+	// draining is set by Drain: the listener is closed and every
+	// connection has been asked to finish.
+	draining atomic.Bool
+	act      *Activity
 }
 
 // Activity exposes the server's client accounting.
@@ -53,7 +57,7 @@ func (s *Server) Activity() *Activity { return s.act }
 
 // Serve starts accepting connections on lis (returns immediately).
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
-	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]struct{}), act: newActivity(opts.SlowStatementThreshold)}
+	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold)}
 	stopper.AddCloser(func() { _ = lis.Close() })
 	go s.acceptLoop()
 	return s
@@ -68,12 +72,16 @@ func (s *Server) acceptLoop() {
 			select {
 			case <-s.stopper.ShouldQuiesce():
 			default:
-				log.Debugf("pgwire accept: %v", err)
+				if !s.draining.Load() {
+					log.Debugf("pgwire accept: %v", err)
+				}
 			}
 			return
 		}
+		c := newConn(nc, s.db, s.cat, s.opts)
+		c.act = s.act
 		s.mu.Lock()
-		s.conns[nc] = struct{}{}
+		s.conns[nc] = c
 		s.mu.Unlock()
 		go func() {
 			defer func() {
@@ -82,8 +90,6 @@ func (s *Server) acceptLoop() {
 				s.mu.Unlock()
 				_ = nc.Close()
 			}()
-			c := newConn(nc, s.db, s.cat, s.opts)
-			c.act = s.act
 			s.act.connOpened(c, nc.RemoteAddr().String())
 			defer s.act.connClosed(c)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -99,5 +105,60 @@ func (s *Server) acceptLoop() {
 				log.Debugf("pgwire conn %s: %v", nc.RemoteAddr(), err)
 			}
 		}()
+	}
+}
+
+// Drain stops accepting connections and asks every open one to finish:
+// an idle connection outside a transaction is sent a FATAL 57P01
+// (admin_shutdown) and closed at once; one running a statement or
+// inside a transaction is left to finish, and told the same the moment
+// it is idle again. At ctx's deadline the connections still open are
+// closed: idle ones with the 57P01 first, busy ones under the
+// statement. Returns how many ended cleanly and how many were cut.
+func (s *Server) Drain(ctx context.Context) (closed, cut int) {
+	s.draining.Store(true)
+	_ = s.lis.Close()
+	s.mu.Lock()
+	initial := len(s.conns)
+	for _, c := range s.conns {
+		c.drain(false)
+	}
+	s.mu.Unlock()
+
+	remaining := s.waitConns(ctx)
+	for _, c := range remaining {
+		c.drain(true)
+	}
+	if len(remaining) > 0 {
+		// Give the cut connections a moment to send their 57P01.
+		gctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		s.waitConns(gctx)
+		cancel()
+	}
+	return initial - len(remaining), len(remaining)
+}
+
+// waitConns waits until no connection remains or ctx ends, returning
+// the connections still open.
+func (s *Server) waitConns(ctx context.Context) []*conn {
+	for {
+		s.mu.Lock()
+		if len(s.conns) == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		if ctx.Err() != nil {
+			out := make([]*conn, 0, len(s.conns))
+			for _, c := range s.conns {
+				out = append(out, c)
+			}
+			s.mu.Unlock()
+			return out
+		}
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }

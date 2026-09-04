@@ -155,31 +155,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 				n.draining.Store(true)
 			}
 		}
-		load := n.store.LoadSummary(loadAdvertiseTopK)
-		nd := kvpb.NodeDescriptor{
-			NodeID:        n.ident.NodeID,
-			Address:       n.addr,
-			Locality:      n.cfg.Locality,
-			LivenessTime:  n.clock.Now().WallTime,
-			Draining:      n.draining.Load(),
-			BinaryVersion: int(n.binaryVersion()),
-			LeaderQPS:     load.LeaderQPS,
-			LeaderCount:   load.LeaderCount,
-			ReplicaBytes:  load.ReplicaBytes,
-			HotRanges:     load.HotRanges,
-			BigRanges:     load.BigRanges,
-			Machine:       n.machineSummary(),
-		}
-		if n.pinger != nil {
-			nd.Latency = n.pinger.Snapshot()
-		}
-		if n.pgServer != nil {
-			nd.SQL = n.pgServer.Activity().Summary()
-		}
-		raw, _ := json.Marshal(nd)
-		if err := n.db.Put(hctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
-			log.Debugf("liveness heartbeat failed: %v", err)
-		}
+		n.publishLiveness(hctx)
 		start, end := keys.NodeRegistrySpan()
 		if rows, err := n.db.Scan(hctx, start, end, 0); err == nil {
 			for _, kv := range rows {
@@ -197,6 +173,39 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		}
 		n.mirrorClusterVersion(hctx)
 		cancel()
+	}
+}
+
+// publishLiveness writes this node's registry row: its address, the
+// liveness time, the decommission and shutdown flags, and the load and
+// host summaries peers plan with. The heartbeat loop calls it every
+// beat; Drain calls it once more so peers see the node leaving at once.
+func (n *Node) publishLiveness(ctx context.Context) {
+	load := n.store.LoadSummary(loadAdvertiseTopK)
+	nd := kvpb.NodeDescriptor{
+		NodeID:        n.ident.NodeID,
+		Address:       n.addr,
+		Locality:      n.cfg.Locality,
+		LivenessTime:  n.clock.Now().WallTime,
+		Draining:      n.draining.Load(),
+		ShuttingDown:  n.shuttingDown.Load(),
+		BinaryVersion: int(n.binaryVersion()),
+		LeaderQPS:     load.LeaderQPS,
+		LeaderCount:   load.LeaderCount,
+		ReplicaBytes:  load.ReplicaBytes,
+		HotRanges:     load.HotRanges,
+		BigRanges:     load.BigRanges,
+		Machine:       n.machineSummary(),
+	}
+	if n.pinger != nil {
+		nd.Latency = n.pinger.Snapshot()
+	}
+	if n.pgServer != nil {
+		nd.SQL = n.pgServer.Activity().Summary()
+	}
+	raw, _ := json.Marshal(nd)
+	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
+		log.Debugf("liveness heartbeat failed: %v", err)
 	}
 }
 

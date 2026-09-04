@@ -36,6 +36,7 @@ type serverFlags struct {
 	verbose       bool
 	slowStmt      time.Duration
 	metricsRecord time.Duration
+	drainTimeout  time.Duration
 }
 
 func newServerFlags(name string) *serverFlags {
@@ -58,6 +59,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.DurationVar(&f.slowStmt, "slow-statement-threshold", 0, "SQL statements slower than this are kept for the dashboard's slow list (0 = default 500ms)")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
+	f.fs.DurationVar(&f.drainTimeout, "drain-timeout", server.DefaultDrainTimeout, "on SIGTERM or Ctrl-C, how long to spend handing leases to peers and letting SQL connections finish before stopping (0 stops at once)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
 }
@@ -80,6 +82,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		ConsistencyInterval:     f.consistInt,
 		SlowStatementThreshold:  f.slowStmt,
 		MetricsRecordInterval:   metricsRecordInterval(f.metricsRecord),
+		DrainTimeout:            f.drainTimeout,
 		RebalanceBytesThreshold: f.bytesThr,
 		Dir:                     f.dir,
 		Listen:                  f.listen,
@@ -119,11 +122,15 @@ func runServer(cfg server.Config) error {
 		fmt.Printf("  SQL clients:   postgres://root@%s/datax?%s\n", n.SQLAddr(), mode)
 	}
 
-	ch := make(chan os.Signal, 1)
+	ch := make(chan os.Signal, 3)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	<-ch
-	fmt.Println("shutting down...")
-	n.Stop()
+	awaitShutdown(ch, shutdownHooks{
+		timeout: cfg.DrainTimeout,
+		drain:   n.Drain,
+		stop:    n.Stop,
+		exit:    os.Exit,
+		out:     os.Stdout,
+	})
 	return nil
 }
 
