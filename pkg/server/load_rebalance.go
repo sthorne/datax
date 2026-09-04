@@ -68,7 +68,7 @@ func (n *Node) loadCooldownWindow() time.Duration {
 	return defaultLoadCooldown
 }
 
-// balanceLiveSet builds the live, non-draining node set every balancing
+// balanceLiveSet builds the live, non-leaving node set every balancing
 // pass works over. ok=false when a dead node is present (repair owns the
 // field) — balancing against a shrinking live set only causes churn.
 func (n *Node) balanceLiveSet() (map[base.NodeID]kvpb.NodeDescriptor, bool) {
@@ -76,7 +76,7 @@ func (n *Node) balanceLiveSet() (map[base.NodeID]kvpb.NodeDescriptor, bool) {
 	live := map[base.NodeID]kvpb.NodeDescriptor{}
 	for _, nd := range n.registry.All() {
 		switch {
-		case nd.Draining:
+		case nd.Leaving():
 			continue
 		case nd.NodeID == n.ident.NodeID:
 			live[nd.NodeID] = nd

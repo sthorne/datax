@@ -409,6 +409,7 @@ async function pollTileHistory() {
 }
 function statusCell(n) {
   if (!n.live) return `<span class="st down"><span class="dot"></span>down</span>`;
+  if (n.shutting_down) return `<span class="st draining"><span class="dot"></span>stopping</span>`;
   if (n.draining) return `<span class="st draining"><span class="dot"></span>draining</span>`;
   return `<span class="st live"><span class="dot"></span>live</span>`;
 }

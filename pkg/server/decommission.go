@@ -143,7 +143,7 @@ func (n *Node) drainOnce(ctx context.Context) {
 			}
 			var candidates []placement.Candidate
 			for _, nd := range live {
-				if nd.Draining {
+				if nd.Leaving() {
 					continue
 				}
 				if _, holds := desc.GetReplica(nd.NodeID); !holds {

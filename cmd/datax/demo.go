@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -92,10 +93,44 @@ func runDemo(args []string) error {
 	fmt.Println()
 	fmt.Println("Press Ctrl-C to shut down (in-memory data is discarded).")
 
-	ch := make(chan os.Signal, 1)
+	ch := make(chan os.Signal, 3)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	<-ch
-	fmt.Println("\nshutting down...")
+	fmt.Println()
+	awaitShutdown(ch, shutdownHooks{
+		timeout: 5 * time.Second,
+		drain: func(ctx context.Context) server.DrainReport {
+			// Every node is going: drain them together (their SQL
+			// connections end cleanly; leases have nowhere to go).
+			var mu sync.Mutex
+			var wg sync.WaitGroup
+			var total server.DrainReport
+			for _, n := range started {
+				wg.Add(1)
+				go func(n *server.Node) {
+					defer wg.Done()
+					r := n.Drain(ctx)
+					mu.Lock()
+					total.LeasesTransferred += r.LeasesTransferred
+					total.LeasesKept += r.LeasesKept
+					total.ConnsClosed += r.ConnsClosed
+					total.ConnsCut += r.ConnsCut
+					if r.Incomplete != "" {
+						total.Incomplete = r.Incomplete
+					}
+					mu.Unlock()
+				}(n)
+			}
+			wg.Wait()
+			return total
+		},
+		stop: func() {
+			for i := len(started) - 1; i >= 0; i-- {
+				started[i].Stop()
+			}
+		},
+		exit: os.Exit,
+		out:  os.Stdout,
+	})
 	return nil
 }
 

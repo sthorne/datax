@@ -134,7 +134,7 @@ always used.
 - `pkg/version` — the protocol version, support window, and compat rules.
 - `pkg/util/hlc` — hybrid logical clock.
 - `pkg/util/encoding` — order-preserving key encodings.
-- `pkg/util/stop` — goroutine lifecycle / graceful shutdown.
+- `pkg/util/stop` — goroutine lifecycle / graceful shutdown (`server.Node.Drain` sheds leases and SQL connections before `Stop`).
 - `pkg/keys` — keyspace layout helpers.
 - `pkg/storage` — Pebble engine wrapper + MVCC (get/put/delete/scan, intents).
 - `pkg/kvpb` — the KV API: `BatchRequest` / `BatchResponse` and request types.

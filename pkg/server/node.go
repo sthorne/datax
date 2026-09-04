@@ -102,6 +102,9 @@ type Config struct {
 	// balance (0 = default 2, the minimum with hysteresis; negative
 	// disables automatic rebalancing).
 	RebalanceThreshold int
+	// DrainTimeout bounds Drain (lease transfers and the SQL connection
+	// drain a stop performs first); 0 = 10s.
+	DrainTimeout time.Duration
 	// MetricsRecordInterval paces the metrics recorder, which writes this
 	// node's metrics into the datax_metrics system table (see
 	// metrics_recorder.go). 0 = 10s; negative disables recording.
@@ -239,6 +242,9 @@ type Node struct {
 	// be initiated from any node) and re-asserts it on every beat, so the
 	// flag survives both heartbeat overwrites and restarts.
 	draining atomic.Bool
+	// shuttingDown is set by Drain: the node is shedding its leases and
+	// SQL connections ahead of a stop, and says so in its heartbeats.
+	shuttingDown atomic.Bool
 	// sys samples the host (CPU, memory, disk, network, runtime) every
 	// few seconds for the heartbeat summary, /status and /metrics.
 	sys *sysstats.Sampler

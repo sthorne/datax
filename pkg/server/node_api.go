@@ -32,6 +32,7 @@ type NodeDetail struct {
 	Locality      string `json:"locality,omitempty"`
 	Live          bool   `json:"live"`
 	Draining      bool   `json:"draining,omitempty"`
+	ShuttingDown  bool   `json:"shutting_down,omitempty"`
 	HeartbeatAgo  int64  `json:"heartbeat_ago_ms"`
 	BinaryVersion int    `json:"binary_version,omitempty"`
 	// ClusterVersion is the version this node has mirrored locally.
@@ -71,6 +72,7 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		Locality:       n.cfg.Locality.String(),
 		Live:           true,
 		Draining:       n.draining.Load(),
+		ShuttingDown:   n.shuttingDown.Load(),
 		BinaryVersion:  int(n.binaryVersion()),
 		ClusterVersion: int(n.readClusterVersion(ctx)),
 		Release:        version.Release,
@@ -166,7 +168,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	now := n.clock.Now().WallTime
-	doc.Address, doc.Locality, doc.Draining = nd.Address, nd.Locality.String(), nd.Draining
+	doc.Address, doc.Locality, doc.Draining, doc.ShuttingDown = nd.Address, nd.Locality.String(), nd.Draining, nd.ShuttingDown
 	doc.Live = now-nd.LivenessTime <= n.livenessGrace().Nanoseconds()
 	doc.HeartbeatAgo = (now - nd.LivenessTime) / int64(time.Millisecond)
 	doc.BinaryVersion = nd.BinaryVersion
@@ -193,6 +195,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 			doc.Error = "undecodable detail: " + err.Error()
 		} else {
 			remote.Live, remote.HeartbeatAgo, remote.Draining = doc.Live, doc.HeartbeatAgo, doc.Draining || remote.Draining
+			remote.ShuttingDown = doc.ShuttingDown || remote.ShuttingDown
 			doc = remote
 		}
 	}
