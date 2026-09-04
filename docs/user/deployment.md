@@ -132,7 +132,7 @@ Before finalize you can roll any node back; after it, never. Full
 procedure and rules: [Operations → Rolling
 upgrades](operations.md#rolling-upgrades).
 
-## Checklist for production-ish deployments
+## Checklist for production deployments
 
 - One `datax` process per machine, `--dir` on its own disk (NVMe strongly
   preferred — every write commits through an fsync'd raft log).
