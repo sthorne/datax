@@ -31,6 +31,62 @@ func (e *RetryableError) Error() string {
 	return fmt.Sprintf("restart transaction: %s", e.Cause.Message)
 }
 
+// UpdateDeadline lowers the transaction's commit deadline to ts (a zero
+// ts is ignored; a later ts than the current deadline leaves it alone).
+// Historical (pinned-timestamp) transactions never commit writes and
+// take no deadline.
+func (t *Txn) UpdateDeadline(ts hlc.Timestamp) {
+	if ts.IsEmpty() || t.historical {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mu.deadline.IsEmpty() || ts.Less(t.mu.deadline) {
+		t.mu.deadline = ts
+	}
+}
+
+// Deadline returns the commit deadline, zero when none is set.
+func (t *Txn) Deadline() hlc.Timestamp {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mu.deadline
+}
+
+// checkDeadline refuses to send a committing batch whose transaction
+// would commit at or past its deadline. The server commits at exactly
+// the write timestamp the batch carries (EndTxn and the one-phase path
+// both require it to equal the read timestamp, refreshing otherwise),
+// so this client-side check is the authoritative one.
+func (t *Txn) checkDeadline(ba *kvpb.BatchRequest) error {
+	if !batchCommits(ba) {
+		return nil
+	}
+	t.mu.Lock()
+	deadline := t.mu.deadline
+	ts := t.mu.txn.WriteTimestamp
+	t.mu.Unlock()
+	if ba.Header.Txn != nil {
+		ts = ts.Forward(ba.Header.Txn.WriteTimestamp)
+	}
+	if deadline.IsEmpty() || ts.Less(deadline) {
+		return nil
+	}
+	e := kvpb.NewErrorf("transaction cannot commit at %s: past its deadline %s (a schema lease it planned under has expired)", ts, deadline)
+	e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: ts}
+	return &RetryableError{Cause: e}
+}
+
+// batchCommits reports whether ba carries a committing EndTxn.
+func batchCommits(ba *kvpb.BatchRequest) bool {
+	for _, u := range ba.Requests {
+		if u.EndTxn != nil && u.EndTxn.Commit {
+			return true
+		}
+	}
+	return false
+}
+
 // IsRetryable reports whether err calls for a transaction restart.
 func IsRetryable(err error) bool {
 	var re *RetryableError
@@ -71,7 +127,15 @@ type Txn struct {
 		// savepoints by name; spOrder hands out creation order so RELEASE
 		// and ROLLBACK TO can discard later savepoints (PG semantics).
 		savepoints map[string]*savepoint
-		spOrder    int
+		// deadline, when set, bounds the commit timestamp: the transaction
+		// may not commit at or above it. The SQL layer pins it to the
+		// expiration of every descriptor lease the transaction planned
+		// against, so a statement that planned under a lease the DDL
+		// drain has since written off cannot commit past the drain's
+		// boundary (issue #110). Cleared by Restart: a new epoch
+		// re-plans and re-pins.
+		deadline hlc.Timestamp
+		spOrder  int
 		// waitingFor/waitingForKey: the transaction this one is currently
 		// blocked on in a push loop (Nil = none). Published on the record
 		// (immediately on change, and with every heartbeat) so pushers can
@@ -528,6 +592,10 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 	waited := time.Duration(0)
 	refreshes := 0
 	for attempt := 1; ; attempt++ {
+		if err := t.checkDeadline(ba); err != nil {
+			t.publishWait(ctx, nil)
+			return nil, err
+		}
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr != nil && attempt%20 == 0 {
 			log.Debugf("txn %s: batch of %d still failing after %d attempts (%s waited on live conflicts): %v", t.mu.txn.ID, len(ba.Requests), attempt, waited, kerr)
@@ -1352,6 +1420,7 @@ func (t *Txn) Restart(cause error) {
 	}
 	t.mu.txn.Restart(now)
 	t.mu.finished = false
+	t.mu.deadline = hlc.Timestamp{} // the new epoch re-plans and re-pins
 }
 
 func (t *Txn) markFinished() {

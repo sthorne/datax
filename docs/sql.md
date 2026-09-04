@@ -170,11 +170,24 @@ descriptor **versions and leases** make that cache safe across gateways:
   crashed or partitioned gateway delays the drain by at most one TTL
   (hard cap 2×TTL). When the statement returns, no gateway is still
   planning against the old schema.
+- The cache entry and the lease record share one expiration (the value
+  written into the record), so a gateway never serves a descriptor the
+  drain has already written off; and every transaction that plans against
+  a leased descriptor takes the lease's expiration as its **commit
+  deadline**: it may not commit at or past it, and instead fails with a
+  retryable error (`40001`; implicit statements retry transparently and
+  re-plan). The server commits at exactly the write timestamp the client
+  sends, so the check is the client's. Without it, a statement that
+  planned under a lease just before it expired could commit after the
+  drain took its backfill boundary, and an index build would miss the
+  row (issue #110).
 
 Remaining gap: a transaction that issued its `BEGIN` before the drain, on
 another gateway, keeps the descriptor version it started with until it
-commits. Statement-sized windows are closed; long-lived explicit
-transactions are not (tracked in issue #22).
+commits, and its gateway's renewals keep the lease live at the new
+version meanwhile. The deadline closes this once the lease lapses;
+long-lived explicit transactions under a healthy gateway are not covered
+(tracked in issue #22).
 
 ## Row encoding (v2)
 
@@ -235,7 +248,15 @@ the entries. A concurrent delete or update inside a chunk invalidates its
 read and forces a rescan, so entries always reflect rows that exist at the
 chunk's commit; writes elsewhere in the table never restart a chunk.
 Memory, transaction size, and raft entry size stay bounded regardless of
-table size.
+table size. The chunks' serializable reads together cover the **whole**
+primary span — the last chunk runs to the span's end, and an empty table
+still gets one — because those reads are what the timestamp cache
+remembers: a writer that planned under a lease the drain has since
+written off is either waited for (its intent already down: the chunk
+indexes the row once it commits) or pushed above the backfill, where its
+commit fails the lease deadline and re-plans with the index (issue #110).
+A tail no chunk read would let such a write land in the past, below the
+boundary, and never reach the index.
 
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.

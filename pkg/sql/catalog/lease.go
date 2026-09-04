@@ -26,11 +26,18 @@ import (
 // Expired leases cannot be used (the cache entry expires with them), so a
 // crashed gateway delays the drain by at most one TTL.
 //
+// Two rules keep the drain sound against a gateway whose renewals stall
+// (issue #110): the cache entry carries the very expiration written into
+// the lease record, so the cache never outlives what the drain waits for;
+// and a transaction that plans against a leased descriptor takes the
+// lease's expiration as its commit deadline (kvclient.Txn.UpdateDeadline),
+// so it cannot commit after the drain has written the lease off.
+//
 // Remaining gap (tracked in issue #22): a transaction that BEGAN before the
 // drain, on another gateway, may keep using the descriptor version it
-// started with until it commits — statements are pinned to the descriptor
-// they planned against, not re-checked at commit. Statement-sized windows
-// are closed by the drain; long-running explicit transactions are not.
+// started with until it commits while its gateway's renewals keep the
+// lease live at the NEW version — statements are pinned to the descriptor
+// they planned against. The deadline covers the lapsed-lease case only.
 
 // DefaultDescLeaseTTL is how long a gateway's descriptor lease (and cache
 // entry) lives without renewal.
@@ -41,6 +48,11 @@ type descLease struct {
 	Version    uint64 `json:"version"`
 	Expiration int64  `json:"expiration"` // HLC wall nanos
 }
+
+// TestingPauseRenewal stops (or resumes) the background lease renewal:
+// tests use it to let this gateway's leases expire while its sessions
+// keep running, the shape of a stalled gateway.
+func (a *Accessor) TestingPauseRenewal(paused bool) { a.renewalPaused.Store(paused) }
 
 // StartLeasing enables leasing on this accessor and starts the renewal
 // loop. Call once, before serving sessions. ttl <= 0 uses the default.
@@ -66,6 +78,9 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if a.renewalPaused.Load() {
+				continue
+			}
 			a.mu.Lock()
 			names := make([]string, 0, len(a.cache))
 			for name := range a.cache {
@@ -110,26 +125,29 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		}
 		return nil, nil
 	}
-	if err := a.writeLease(ctx, desc); err != nil {
+	exp, err := a.writeLease(ctx, desc)
+	if err != nil {
 		return desc, err // keep the old (still-live) cache entry
 	}
 	a.mu.Lock()
-	a.cache[name] = &cachedDesc{desc: desc, expireAt: time.Now().Add(a.ttl)}
+	a.cache[name] = &cachedDesc{desc: desc, expiration: exp}
 	a.mu.Unlock()
 	return desc, nil
 }
 
 // writeLease records that this gateway may use desc at its version until
-// expiration.
-func (a *Accessor) writeLease(ctx context.Context, desc *TableDescriptor) error {
-	raw, err := json.Marshal(descLease{
-		Version:    desc.Version,
-		Expiration: a.clock.Now().WallTime + a.ttl.Nanoseconds(),
-	})
+// the returned expiration (HLC wall nanos) — the one value both the
+// lease record and the cache entry carry.
+func (a *Accessor) writeLease(ctx context.Context, desc *TableDescriptor) (int64, error) {
+	exp := a.clock.Now().WallTime + a.ttl.Nanoseconds()
+	raw, err := json.Marshal(descLease{Version: desc.Version, Expiration: exp})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return a.db.Put(ctx, keys.DescLeaseKey(desc.ID, a.gateway), raw)
+	if err := a.db.Put(ctx, keys.DescLeaseKey(desc.ID, a.gateway), raw); err != nil {
+		return 0, err
+	}
+	return exp, nil
 }
 
 // FinishDDL runs after a schema change on name commits: it adopts the new
