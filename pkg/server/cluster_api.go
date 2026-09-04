@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -47,6 +50,9 @@ type ClusterRange struct {
 	EndKey     string `json:"end_key"`
 	Replicas   []int  `json:"replicas"`
 	Generation int64  `json:"generation"`
+	// Table names the table the range's start key belongs to ("" for
+	// system and meta ranges, or before the first catalog scan).
+	Table string `json:"table,omitempty"`
 }
 
 // ClusterPrincipal tells the dashboard who it is signed in as, so the page
@@ -87,6 +93,7 @@ type ClusterStatus struct {
 
 func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 	now := n.clock.Now().WallTime
+	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	doc := ClusterStatus{
 		Now:       now / int64(time.Millisecond),
 		NodeID:    int(n.ident.NodeID),
@@ -113,15 +120,21 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			doc.Nodes[len(doc.Nodes)-1].Latency = n.pinger.Snapshot()
 		}
 	}
-	if descs, err := n.listRanges(req.Context()); err != nil {
+	descs, age, err := n.clusterRanges(req.Context())
+	if err != nil {
 		doc.Error = "cluster range listing unavailable: " + err.Error()
-	} else {
+		if descs != nil {
+			doc.Error += fmt.Sprintf("; showing the list from %s ago", age.Truncate(time.Second))
+		}
+	}
+	{
 		for _, d := range descs {
 			cr := ClusterRange{
 				RangeID:    int64(d.RangeID),
 				StartKey:   d.StartKey.String(),
 				EndKey:     d.EndKey.String(),
 				Generation: d.Generation,
+				Table:      n.tableNameOf(d.StartKey),
 			}
 			for _, rep := range d.Replicas {
 				cr.Replicas = append(cr.Replicas, int(rep.NodeID))
@@ -152,4 +165,37 @@ func (n *Node) clusterPrincipal(req *http.Request) ClusterPrincipal {
 		Via:    p.Via,
 		Admin:  n.isAdminPrincipal(req.Context(), p.User),
 	}
+}
+
+// rangeListTimeout bounds the /meta scan behind the dashboard's range
+// list. The scan is routed like any read, so a node cut off from the
+// meta range's leader would otherwise retry until the client gave up —
+// and a partitioned node's dashboard is exactly when an operator looks.
+const rangeListTimeout = 2 * time.Second
+
+type rangeListCache struct {
+	mu    sync.Mutex
+	at    time.Time
+	descs []kvpb.RangeDescriptor
+}
+
+// clusterRanges returns the cluster's range descriptors for the
+// observability endpoints: the /meta scan bounded by rangeListTimeout,
+// falling back to the last list this node fetched (with its age) and the
+// error when the scan fails, so the picture stays up while it is stale
+// rather than going blank.
+func (n *Node) clusterRanges(ctx context.Context) ([]kvpb.RangeDescriptor, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, rangeListTimeout)
+	defer cancel()
+	descs, err := n.listRanges(ctx)
+	n.rangeList.mu.Lock()
+	defer n.rangeList.mu.Unlock()
+	if err == nil {
+		n.rangeList.descs, n.rangeList.at = descs, time.Now()
+		return descs, 0, nil
+	}
+	if n.rangeList.descs == nil {
+		return nil, 0, err
+	}
+	return n.rangeList.descs, time.Since(n.rangeList.at), err
 }
