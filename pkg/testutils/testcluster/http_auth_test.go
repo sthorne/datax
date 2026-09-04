@@ -147,6 +147,28 @@ func TestHTTPAuthSecure(t *testing.T) {
 		t.Fatal("scraper with wrong password accepted")
 	}
 
+	// /api/cluster tells the caller who it is signed in as and whether it
+	// holds the admin role, so the dashboard can show it and explain a
+	// drill-down refusal in terms of it.
+	principalOf := func(user, pass string) server.ClusterPrincipal {
+		t.Helper()
+		code, body, _ := authedGet(t, client, base+"/api/cluster", user, pass)
+		if code != http.StatusOK {
+			t.Fatalf("/api/cluster as %s: %d (%s)", user, code, body)
+		}
+		var doc server.ClusterStatus
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatalf("undecodable /api/cluster body: %v", err)
+		}
+		return doc.Principal
+	}
+	if p := principalOf("scraper", "metrics-pw"); !p.Secure || p.User != "scraper" || p.Via != "basic" || p.Admin {
+		t.Fatalf("principal as scraper: %+v", p)
+	}
+	if p := principalOf("root", "topsecret"); !p.Secure || p.User != "root" || p.Via != "basic" || !p.Admin {
+		t.Fatalf("principal as root: %+v", p)
+	}
+
 	// The cross-node drill-down is admin-gated: a non-admin gets 403 (not
 	// 401 — they authenticated fine), an admin gets every replica's view.
 	if code, _, _ := authedGet(t, client, base+"/api/range?id=1", "scraper", "metrics-pw"); code != http.StatusForbidden {
@@ -184,8 +206,16 @@ func TestHTTPAuthSecure(t *testing.T) {
 		t.Fatal(err)
 	}
 	certClient := httpsClient(t, certsDir, "root")
-	if code, _, _ := authedGet(t, certClient, base+"/api/cluster", "", ""); code != http.StatusOK {
+	code, body, _ = authedGet(t, certClient, base+"/api/cluster", "", "")
+	if code != http.StatusOK {
 		t.Fatal("client-cert auth failed")
+	}
+	var certDoc server.ClusterStatus
+	if err := json.Unmarshal([]byte(body), &certDoc); err != nil {
+		t.Fatal(err)
+	}
+	if p := certDoc.Principal; !p.Secure || p.User != "root" || p.Via != "cert" || !p.Admin {
+		t.Fatalf("principal via client certificate: %+v", p)
 	}
 }
 
@@ -198,5 +228,14 @@ func TestHTTPAuthInsecure(t *testing.T) {
 		if code, _, _ := httpGet(t, base+path); code != http.StatusOK {
 			t.Fatalf("insecure %s: %d, want 200", path, code)
 		}
+	}
+	// No identity to report, and every viewer may drill down.
+	_, _, body := httpGet(t, base+"/api/cluster")
+	var doc server.ClusterStatus
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if p := doc.Principal; p.Secure || p.User != "" || !p.Admin {
+		t.Fatalf("insecure principal: %+v", p)
 	}
 }

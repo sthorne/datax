@@ -22,7 +22,13 @@ serves, on that address:
 
 In secure mode all of it requires HTTP Basic credentials of any database
 user, or a client certificate; `/api/range` additionally requires the
-admin role ([Security](security.md)).
+admin role ([Security](security.md)). The dashboard header shows who it
+is signed in as and how (`signed in as ops (basic)`, with an **admin**
+badge when the role is held); without the role the cluster ranges are
+not clickable and the note under them says which user is signed in and
+how to proceed (`GRANT ADMIN TO ops`, or sign in as `root` from a private
+window, since browsers cache Basic credentials per site). `/api/cluster`
+carries the same identity in its `principal` field.
 
 ## Metrics worth alerting on
 
