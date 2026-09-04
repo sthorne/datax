@@ -18,6 +18,7 @@ func runBackupCmd(args []string) error {
 	dest := fs.String("dest", "", "destination directory ON THE SERVING NODE")
 	basePath := fs.String("base", "", "prior backup directory (on the node) to take an incremental against")
 	allowPlaintext := fs.Bool("allow-plaintext", false, "allow plaintext backup files from an encrypted store")
+	includeMetrics := fs.Bool("include-metrics", false, "also back up the cluster's own datax_metrics table (bulky and regenerable; excluded by default)")
 	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); must be an admin")
 	timeout := connectTimeoutFlag(fs)
@@ -28,7 +29,7 @@ func runBackupCmd(args []string) error {
 		return fmt.Errorf("backup requires --dest")
 	}
 	resp, err := adminCall(*addr, *certsDir, *certUser, *timeout, cluster.AdminRequest{
-		Op: "backup", Path: *dest, BasePath: *basePath, AllowPlaintext: *allowPlaintext,
+		Op: "backup", Path: *dest, BasePath: *basePath, AllowPlaintext: *allowPlaintext, IncludeMetrics: *includeMetrics,
 	})
 	if err != nil {
 		return err

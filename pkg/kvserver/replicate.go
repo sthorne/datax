@@ -298,6 +298,7 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 	}
 	log.Infof("%s: replica %d seeded from snapshot (%d keys, applied index %d)",
 		h.Desc.RangeID, h.ReplicaID, count, h.AppliedIndex)
+	s.cfg.Events.Record("snapshot", "%s: replica %d seeded from snapshot (%d keys, applied index %d)", h.Desc.RangeID, h.ReplicaID, count, h.AppliedIndex)
 	return nil
 }
 
@@ -321,4 +322,5 @@ func (s *Store) removeReplica(rangeID base.RangeID, desc kvpb.RangeDescriptor) {
 		log.Warnf("%s: removing replica state: %v", rangeID, err)
 	}
 	log.Infof("%s: replica and its data removed from this store", rangeID)
+	s.cfg.Events.Record("replica-removed", "%s: replica and its data removed from this store", rangeID)
 }

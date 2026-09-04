@@ -62,6 +62,14 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 	if s.user == "root" {
 		return nil
 	}
+	if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
+		// Only the cluster and its admins write the metrics table; a
+		// SELECT grant is how a reporting user reads it.
+		if err := s.checkAdmin(ctx, txn); err != nil {
+			return newErrf(CodeInsufficientPriv, "permission denied for table %q: only admins may %s it", desc.Name, priv)
+		}
+		return nil
+	}
 	for _, p := range desc.Privileges[s.user] {
 		if p == priv {
 			return nil

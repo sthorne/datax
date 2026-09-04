@@ -156,6 +156,7 @@ func (n *Node) drainOnce(ctx context.Context) {
 				continue
 			}
 			log.Infof("draining %s off n%d to n%d", desc.RangeID, dn.NodeID, target)
+			n.events.Record("decommission", "%s: moving the replica off draining n%d to n%d", desc.RangeID, dn.NodeID, target)
 			if _, err := n.moveReplica(ctx, desc, target, dn.NodeID); err != nil {
 				log.Warnf("draining %s off n%d: %v", desc.RangeID, dn.NodeID, err)
 				continue

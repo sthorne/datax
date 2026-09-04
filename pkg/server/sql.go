@@ -28,12 +28,9 @@ func (n *Node) startSQL() error {
 			return err
 		}
 	}
-	cat := catalog.NewAccessor()
-	cat.EnableStats(n.db)
-	if n.cfg.DescLeaseTTL >= 0 {
-		if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
-			return err
-		}
+	cat, err := n.catalogAccessor()
+	if err != nil {
+		return err
 	}
 	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold}
 	if n.tlsCfgs != nil {
@@ -48,6 +45,24 @@ func (n *Node) startSQL() error {
 	n.pgServer = pgwire.Serve(lis, n.db, cat, n.stopper, opts)
 	log.Infof("node %s serving SQL at %s", n.ident.NodeID, n.pgServer.Addr())
 	return nil
+}
+
+// catalogAccessor returns the node's catalog accessor, built on first use
+// with statistics and descriptor leasing enabled (the SQL server and the
+// metrics recorder share it, so one lease serves both).
+func (n *Node) catalogAccessor() (*catalog.Accessor, error) {
+	n.catOnce.Do(func() {
+		cat := catalog.NewAccessor()
+		cat.EnableStats(n.db)
+		if n.cfg.DescLeaseTTL >= 0 {
+			if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
+				n.catErr = err
+				return
+			}
+		}
+		n.cat = cat
+	})
+	return n.cat, n.catErr
 }
 
 // lookupVerifier reads a user's stored SCRAM verifier (nil, nil = no such

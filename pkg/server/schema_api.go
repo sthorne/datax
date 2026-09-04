@@ -213,6 +213,14 @@ func (n *Node) refreshSchema() {
 	}
 }
 
+// cachedSchemaDoc returns the last built document without rebuilding
+// (nil before the first build); pair with refreshSchema.
+func (n *Node) cachedSchemaDoc() *SchemaStatus {
+	n.schema.mu.Lock()
+	defer n.schema.mu.Unlock()
+	return n.schema.doc
+}
+
 // tableNameOf labels a range with the table its start key belongs to
 // ("" for system and meta ranges, or before the first catalog scan).
 func (n *Node) tableNameOf(start keys.Key) string {

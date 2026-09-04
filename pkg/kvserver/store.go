@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/encoding"
+	"github.com/sthorne/datax/pkg/util/events"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
@@ -27,7 +28,10 @@ type RaftTransport interface {
 
 // StoreConfig collects a store's dependencies.
 type StoreConfig struct {
-	NodeID           base.NodeID
+	NodeID base.NodeID
+	// Events, when set, receives the store's operational events (splits,
+	// merges, snapshots) for the dashboard's feed.
+	Events           *events.Ring
 	StoreID          base.StoreID
 	Engine           *storage.Engine
 	Clock            *hlc.Clock

@@ -129,6 +129,7 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 			continue // not enough distinct live nodes yet
 		}
 		log.Infof("upreplicating %s (%d/%d replicas) to n%d", desc.RangeID, len(desc.Replicas), base.DefaultReplicationFactor, target)
+		n.events.Record("upreplicate", "%s has %d of %d replicas: adding one on n%d", desc.RangeID, len(desc.Replicas), base.DefaultReplicationFactor, target)
 		if _, err := n.db.AdminChangeReplicas(ctx, desc.StartKey, target, 0); err != nil {
 			log.Warnf("upreplicating %s to n%d: %v", desc.RangeID, target, err)
 			continue
@@ -210,6 +211,7 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 			continue // no spare live node to repair onto
 		}
 		log.Infof("repairing %s: replacing dead n%d with n%d", desc.RangeID, deadNode, target)
+		n.events.Record("dead-node-repair", "%s: replacing the replica on dead n%d with one on n%d", desc.RangeID, deadNode, target)
 		if _, err := n.db.AdminChangeReplicas(ctx, desc.StartKey, target, 0); err != nil {
 			log.Warnf("repairing %s: adding replica on n%d: %v", desc.RangeID, target, err)
 			continue
@@ -274,6 +276,7 @@ func (n *Node) rebalanceOnce(ctx context.Context) bool {
 			continue
 		}
 		log.Infof("removing surplus replica of %s from n%d", desc.RangeID, from)
+		n.events.Record("downreplicate", "%s: removing the surplus replica on n%d", desc.RangeID, from)
 		if err := n.removeReplicaFrom(ctx, desc, from); err != nil {
 			log.Warnf("removing surplus replica of %s from n%d: %v", desc.RangeID, from, err)
 		}
@@ -327,6 +330,7 @@ func (n *Node) rebalanceOnce(ctx context.Context) bool {
 				continue
 			}
 			log.Infof("rebalancing %s: n%d (%d ranges) -> n%d (%d ranges)", desc.RangeID, src, rangeCount[src], dst, rangeCount[dst])
+			n.events.Record("rebalance", "%s: n%d (%d ranges) → n%d (%d ranges)", desc.RangeID, src, rangeCount[src], dst, rangeCount[dst])
 			if _, err := n.moveReplica(ctx, desc, dst, src); err != nil {
 				log.Warnf("rebalancing %s: %v", desc.RangeID, err)
 				return true // attempted: don't stack another op this tick

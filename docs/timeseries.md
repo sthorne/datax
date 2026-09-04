@@ -187,3 +187,15 @@ eventual wipe as unreachable garbage.
   row-granular but skips tables with secondary indexes.
 - Secondary indexes on sharded tables are unsharded (their own hot-tail
   characteristics apply).
+
+## The cluster's own metrics
+
+datax dogfoods this table type: every node records its metrics into
+`datax_metrics`, a sharded (8 buckets) time-series table with a 7-day
+retention that the nodes create at a reserved descriptor ID once the
+cluster has finalized v5. It exercises everything above under a steady
+write load of a few rows per second per node: the hidden shard column
+spreads the write tail, retention ages history out, and
+`ALTER TABLE datax_metrics SET (shards = 16)` re-shards it live while the
+recorder keeps writing. See the operations guide's "Metrics history".
+

@@ -75,7 +75,7 @@ func TestBackupRestore(t *testing.T) {
 	}
 
 	dirFull := t.TempDir()
-	sumFull, err := tc.Nodes[0].RunBackup(ctx, dirFull, "", false)
+	sumFull, err := tc.Nodes[0].RunBackup(ctx, dirFull, "", false, false)
 	if err != nil {
 		t.Fatalf("full backup: %v", err)
 	}
@@ -90,14 +90,14 @@ func TestBackupRestore(t *testing.T) {
 	execSQL(t, ctx, s, `DELETE FROM accounts WHERE id = 15`)
 
 	dirInc := t.TempDir()
-	if _, err := tc.Nodes[0].RunBackup(ctx, dirInc, dirFull, false); err != nil {
+	if _, err := tc.Nodes[0].RunBackup(ctx, dirInc, dirFull, false, false); err != nil {
 		t.Fatalf("incremental backup: %v", err)
 	}
 
 	// Reference: a quiesced full backup — its checksums are the source's
 	// exact live state, which the restored cluster must reproduce.
 	dirRef := t.TempDir()
-	sumRef, err := tc.Nodes[0].RunBackup(ctx, dirRef, "", false)
+	sumRef, err := tc.Nodes[0].RunBackup(ctx, dirRef, "", false, false)
 	if err != nil {
 		t.Fatalf("reference backup: %v", err)
 	}
@@ -212,7 +212,7 @@ func BenchmarkBackup(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := tc.Nodes[0].RunBackup(ctx, b.TempDir(), "", false); err != nil {
+		if _, err := tc.Nodes[0].RunBackup(ctx, b.TempDir(), "", false, false); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -223,7 +223,7 @@ func BenchmarkRestore(b *testing.B) {
 	tc, rows := benchBackupCluster(b)
 	ctx := context.Background()
 	dir := b.TempDir()
-	if _, err := tc.Nodes[0].RunBackup(ctx, dir, "", false); err != nil {
+	if _, err := tc.Nodes[0].RunBackup(ctx, dir, "", false, false); err != nil {
 		b.Fatal(err)
 	}
 	b.ResetTimer()

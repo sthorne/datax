@@ -9,7 +9,8 @@
     color-scheme: light;
     --surface: #fcfcfb; --panel: #ffffff; --border: #e4e3df;
     --text: #0b0b0b; --text-2: #52514e; --text-3: #8a897f;
-    --series-1: #2a78d6; --series-2: #eb6834;
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
     --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   }
   @media (prefers-color-scheme: dark) {
@@ -17,7 +18,8 @@
       color-scheme: dark;
       --surface: #1a1a19; --panel: #232322; --border: #3a3936;
       --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
-      --series-1: #3987e5; --series-2: #d95926;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
     }
   }
   * { box-sizing: border-box; }
@@ -47,6 +49,7 @@
   }
   .tile .label { font-size: 12px; color: var(--text-2); }
   .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tiles.ident .value { font-size: 15px; word-break: break-all; }
   .tile svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
   .tile polyline { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
   .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
@@ -71,6 +74,70 @@
   td.detail { padding: 0 12px 10px; }
   td.detail table { margin-top: 4px; }
   td.detail .note { color: var(--text-3); font-size: 12px; padding: 6px 0; }
+  /* Problems panel: one row per finding, severity-colored, hidden when green. */
+  #problems { margin-top: 10px; }
+  #problems .ok { color: var(--good); font-size: 13px; }
+  .problem {
+    display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+    border-left-width: 4px;
+  }
+  .problem.critical { border-left-color: var(--critical); }
+  .problem.warning { border-left-color: var(--warning); }
+  .problem.info { border-left-color: var(--series-1); }
+  .problem .sev { font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; width: 62px; flex: none; }
+  .problem.critical .sev { color: var(--critical); }
+  .problem.warning .sev { color: var(--warning); }
+  .problem.info .sev { color: var(--series-1); }
+  .problem .check { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2); flex: none; }
+  .problem a { color: var(--text-2); margin-left: auto; font-size: 12px; white-space: nowrap; }
+  /* Events: newest first, kind badge, audit rows marked. */
+  #events td.when { color: var(--text-3); font-size: 12px; }
+  .kind { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; border: 1px solid var(--border); color: var(--text-2); }
+  .kind.audit { border-color: var(--warning); }
+  /* Views: the overview and the Metrics view share the header; hash routing switches. */
+  header nav { display: flex; gap: 10px; font-size: 13px; }
+  header nav a { color: var(--text-2); text-decoration: none; padding: 2px 8px; border-radius: 6px; }
+  header nav a.current { background: color-mix(in srgb, var(--border) 50%, transparent); color: var(--text); }
+  a.tile { text-decoration: none; color: inherit; display: block; }
+  a.tile:hover { border-color: var(--text-3); }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 8px 0 14px; font-size: 13px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--panel); }
+  .seg button { border: 0; background: none; color: var(--text-2); padding: 4px 10px; font: inherit; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--text); }
+  #series-details { margin-top: 14px; }
+  #series-details summary { cursor: pointer; font-size: 13px; }
+  #series-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; font-size: 13px; margin: 6px 0 14px; }
+  #series-picker h4 { grid-column: 1 / -1; margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); }
+  #series-picker label { display: flex; gap: 6px; align-items: baseline; cursor: pointer; }
+  #series-picker label span.h { color: var(--text-3); font-size: 12px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 14px; }
+  .charts.compare { grid-template-columns: 1fr; }
+  .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
+  .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
+  .chart .title b { font-weight: 600; }
+  .chart .title span { color: var(--text-3); font-size: 12px; }
+  .chart svg { display: block; width: 100%; height: auto; margin-top: 6px; }
+  .chart .grid line { stroke: var(--border); stroke-width: 1; }
+  .chart .axis text { fill: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .chart path.line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .xhair { stroke: var(--text-3); stroke-width: 1; display: none; }
+  .chart .dot { stroke: var(--panel); stroke-width: 2; display: none; }
+  .chart .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin-top: 4px; }
+  .chart .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; border-radius: 1px; }
+  .chart .tip {
+    position: absolute; display: none; pointer-events: none; z-index: 2; font-size: 12px; font-variant-numeric: tabular-nums;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15);
+  }
+  .chart .tip .t { color: var(--text-3); margin-bottom: 3px; }
+  .chart .tip div.r { display: flex; gap: 8px; justify-content: space-between; }
+  .chart .tip div.r b { font-weight: 600; }
+  .chart details { font-size: 12px; color: var(--text-3); margin-top: 4px; }
+  .chart details table { font-size: 12px; margin-top: 4px; }
+  .chart details th, .chart details td { padding: 2px 8px; }
+  .chart .empty { color: var(--text-3); font-size: 12px; padding: 60px 0; text-align: center; }
+  select.filter { font-size: 13px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); margin-left: 12px; }
 </style>
 </head>
 <body>
@@ -78,17 +145,75 @@
   <h1>datax</h1>
   <span class="sub" id="hdr-node">connecting…</span>
   <span class="sub" id="hdr-user" title="who this page is signed in as"></span>
+  <nav><a href="#/" id="nav-main" class="current">overview</a><a href="#/metrics" id="nav-metrics">metrics</a></nav>
   <span class="stale" id="hdr-stale">● stale — last update failed</span>
 </header>
-<main>
+<main id="view-metrics" hidden>
+  <section>
+    <h2>Metrics</h2>
+    <div class="controls">
+      <span class="seg" id="range-picker"></span>
+      <label><input type="checkbox" id="compare-toggle"> one chart per node</label>
+      <span class="muted" id="metrics-note"></span>
+    </div>
+    <div class="charts" id="charts"></div>
+    <details id="series-details"><summary class="muted" id="series-summary">choose series</summary><div id="series-picker"></div></details>
+  </section>
+</main>
+<main id="view-node" hidden>
+  <section>
+    <h2 id="node-title">Node</h2>
+    <div class="err" id="node-err"></div>
+    <div class="tiles ident" id="node-ident"></div>
+  </section>
+  <section><h2>Machine</h2><div class="tiles" id="node-machine"></div><p class="muted" id="node-machine-note"></p></section>
+  <section><h2>Recent history</h2><div class="charts" id="node-charts"></div><p class="muted">the last 15 minutes from the datax_metrics table; <a href="#/metrics" id="node-metrics-link">chart more on the Metrics view</a></p></section>
+  <section><h2>Storage</h2><div class="tiles" id="node-storage"></div><p class="muted" id="node-storage-note"></p></section>
+  <section>
+    <h2>Ranges (replicas on this node)</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th><th class="num" title="entries kept in the raft log since the last truncation">log</th></tr></thead>
+      <tbody id="node-ranges"></tbody>
+    </table></div>
+  </section>
+  <section>
+    <h2>SQL</h2>
+    <div class="tiles" id="node-sql"></div>
+    <div id="node-activity" hidden><div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
+      <tbody id="node-statements"></tbody>
+    </table></div></div>
+    <p class="muted" id="node-sql-note"></p>
+  </section>
+  <section>
+    <h2>Network (this node's row)</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>peer</th><th class="num">round trip</th><th class="num">p99</th><th class="num">clock offset</th><th>reachable</th><th class="num">measured</th></tr></thead>
+      <tbody id="node-latency"></tbody>
+    </table></div>
+  </section>
+  <section>
+    <h2>Settings</h2>
+    <div class="tablewrap"><table><tbody id="node-settings"></tbody></table></div>
+  </section>
+  <section>
+    <h2>Recent events</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="node-events"></tbody>
+    </table></div>
+  </section>
+</main>
+<main id="view-main">
   <div class="err" id="cluster-err"></div>
+  <div id="problems" title="checks run on this node every few seconds from data it already holds"></div>
 
   <section>
     <h2>Cluster</h2>
     <div class="tiles" id="tiles"></div>
   </section>
 
-  <section>
+  <section id="sec-nodes">
     <h2>Nodes</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
@@ -125,13 +250,13 @@
     </div>
   </section>
 
-  <section>
+  <section id="sec-network">
     <h2>Network</h2>
     <div class="tablewrap"><table id="latency"></table></div>
     <p class="muted" id="latency-note"></p>
   </section>
 
-  <section>
+  <section id="sec-schema">
     <h2>Schema <input id="schema-filter" type="search" placeholder="filter tables and ranges" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
     <div class="tablewrap"><table>
       <thead><tr><th>table</th><th>columns</th><th>primary key</th><th>indexes</th>
@@ -158,7 +283,7 @@
     <p class="muted" id="cluster-range-note"></p>
   </section>
 
-  <section>
+  <section id="sec-cluster-ranges">
     <h2>Ranges (cluster)</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
@@ -167,13 +292,22 @@
     <p class="muted" id="cluster-range-hint">click a range for its per-replica detail from every holding node (admin role)</p>
   </section>
 
+  <section id="sec-events">
+    <h2>Events (this node) <select class="filter" id="events-filter" title="show one kind of event"><option value="">all kinds</option></select></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table></div>
+    <p class="muted" id="events-note"></p>
+  </section>
+
   <section>
     <h2>Machine (this node)</h2>
     <div class="tiles" id="machine"></div>
     <p class="muted" id="machine-note"></p>
   </section>
 
-  <section>
+  <section id="sec-storage">
     <h2>Storage health</h2>
     <div class="tiles" id="storage"></div>
   </section>
@@ -222,7 +356,7 @@ function fmtBytes(b) {
   if (b >= 1 << 30) return (b / (1 << 30)).toFixed(1) + " GiB";
   if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + " MiB";
   if (b >= 1 << 10) return (b / (1 << 10)).toFixed(1) + " KiB";
-  return b + " B";
+  return Math.round(b) + " B";
 }
 function fmtAgo(ms) {
   if (ms < 1500) return "now";
@@ -237,10 +371,41 @@ function spark(h) {
   ).join(" ");
   return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="recent trend"><polyline points="${pts}"/></svg>`;
 }
+// Tiles link to the same figure charted over time (the Metrics view);
+// their sparkline is the last 15 minutes from the datax_metrics table
+// when the recorder has data, else this tab's own memory of the polls.
+const TILE_SERIES = {
+  "this node QPS": "node.leader_qps", "this node data": "node.replica_bytes",
+  "host cpu": "node.cpu_percent", "load": "node.load1", "memory": "node.mem_available", "process": "node.rss",
+  "disk free": "store.disk_free", "disk i/o": "store.disk_write_bps", "network": "node.net_rx_bps",
+  "file descriptors": "node.open_fds", "go runtime": "go.goroutines",
+  "L0 files": "store.l0_files", "L0 sublevels": "store.l0_sublevels", "compaction debt": "store.compaction_debt",
+  "memtables": "store.memtable_bytes", "write stalls": "store.write_stalls",
+  "connections": "sql.connections", "statements/s": "sql.statements", "40001/s": "sql.serialization_failures", "worst p99": "sql.p99_us",
+};
+const TILE_RATE = { "write stalls": 1, "statements/s": 1, "40001/s": 1 };
+let tileHist = {}; // series -> number[] from the table (this node, last 15 minutes)
 function tile(label, value, histName, histVal) {
   let sp = "";
-  if (histName !== undefined) sp = spark(pushHist(histName, histVal));
-  return `<div class="tile"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div>${sp}</div>`;
+  const series = TILE_SERIES[label];
+  if (series && tileHist[series] && tileHist[series].length > 1) sp = spark(tileHist[series]);
+  else if (histName !== undefined) sp = spark(pushHist(histName, histVal));
+  const body = `<div class="label">${esc(label)}</div><div class="value">${esc(value)}</div>${sp}`;
+  if (!series) return `<div class="tile">${body}</div>`;
+  return `<a class="tile" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time">${body}</a>`;
+}
+async function pollTileHistory() {
+  try {
+    const names = [...new Set(Object.values(TILE_SERIES))];
+    const me = lastCluster ? lastCluster.node_id : null;
+    if (!me) return;
+    const resp = await fetch(`/api/metrics?series=${names.join(",")}&node=${me}&since=15m&rate=1`, { cache: "no-store" });
+    if (!resp.ok) { tileHist = {}; return; }
+    const d = await resp.json();
+    const h = {};
+    for (const s of d.series || []) { const pts = (s.nodes || {})[String(me)]; if (pts && pts.length > 1) h[s.name] = pts.map(p => p[1]); }
+    tileHist = h;
+  } catch (err) { tileHist = {}; }
 }
 function statusCell(n) {
   if (!n.live) return `<span class="st down"><span class="dot"></span>down</span>`;
@@ -282,7 +447,7 @@ function render(d) {
 
   document.getElementById("nodes").innerHTML = (d.nodes || []).map(n => {
     const m = n.machine;
-    return `<tr>
+    return `<tr class="clickable" data-node="${n.node_id}" title="open n${n.node_id}'s detail page">
     <td>n${n.node_id}</td>
     <td>${statusCell(n)}</td>
     <td class="key">${esc(n.address)}</td>
@@ -295,13 +460,43 @@ function render(d) {
     <td class="num">${fmtAgo(n.heartbeat_ago_ms)}</td>
   </tr>`; }).join("");
 
+  document.querySelectorAll("#nodes tr.clickable").forEach(tr => tr.addEventListener("click", () => { location.hash = "#/node/" + tr.dataset.node; }));
   renderNetwork(d);
   renderSQL(d);
 
   const lm = d.local && d.local.machine;
   if (lm) {
-    document.getElementById("machine").innerHTML =
-      tile("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? " (" + pct(lm.iowait_percent) + " iowait)" : ""), "cpu", lm.cpu_percent) +
+    document.getElementById("machine").innerHTML = machineTiles(lm);
+    const un = lm.unavailable || [];
+    document.getElementById("machine-note").textContent = un.length
+      ? "not available on this platform: " + un.join(", ")
+      : "sampled every 5s; rates are averages over the interval";
+  }
+  const local = (d.local.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
+  document.getElementById("ranges").innerHTML = local.filter(matchesFilter).map(r => rangeRow(r, "this node")).join("");
+  const clusterN = (d.ranges || []).length;
+  document.getElementById("cluster-range-note").textContent = clusterN
+    ? "cluster-wide: " + clusterN + " ranges (★ = led by this node; qps is the leader's local rate)"
+    : "";
+  renderClusterRanges(d.ranges || []);
+  document.getElementById("storage").innerHTML = storageTiles(d.storage || {});
+  const errBox = document.getElementById("cluster-err");
+  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
+  else errBox.style.display = "none";
+}
+function rangeRow(r, leaderLabel, extra) {
+  return `<tr>
+    <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
+    <td class="key">${r.table ? `<b>${esc(r.table)}</b> · ` : ""}${esc(r.start_key)} → ${esc(r.end_key)}</td>
+    <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
+    <td>${r.leader ? leaderLabel : ""}</td>
+    <td class="num">${fmtBytes(r.size_bytes)}</td>
+    <td class="num">${r.qps ? r.qps.toFixed(0) : "0"}</td>
+    <td class="num">${r.applied_index}</td>${extra ? `<td class="num">${esc(extra(r))}</td>` : ""}
+  </tr>`;
+}
+function machineTiles(lm) {
+  return tile("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? " (" + pct(lm.iowait_percent) + " iowait)" : ""), "cpu", lm.cpu_percent) +
       tile("load", lm.cores ? (lm.Load1 ?? 0).toFixed(2) + " / " + lm.cores + " cores" : "—") +
       tile("memory", lm.mem_total ? fmtBytes(lm.mem_total - lm.mem_available) + " / " + fmtBytes(lm.mem_total) : "—") +
       tile("process", fmtBytes(lm.rss || 0) + " rss · " + pct(lm.process_cpu_percent) + " cpu") +
@@ -311,40 +506,14 @@ function render(d) {
       tile("file descriptors", lm.fd_limit ? lm.open_fds + " / " + lm.fd_limit : "—") +
       tile("go runtime", lm.goroutines + " goroutines · " + fmtBytes(lm.heap_in_use || 0) + " heap · gc p99 " + (lm.gc_pause_p99_ns / 1e6).toFixed(1) + " ms") +
       tile("uptime", fmtDuration(lm.process_uptime_seconds || 0));
-    const un = lm.unavailable || [];
-    document.getElementById("machine-note").textContent = un.length
-      ? "not available on this platform: " + un.join(", ")
-      : "sampled every 5s; rates are averages over the interval";
-  }
-
-  const local = (d.local.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
-  document.getElementById("ranges").innerHTML = local.filter(matchesFilter).map(r => `<tr>
-    <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
-    <td class="key">${r.table ? `<b>${esc(r.table)}</b> · ` : ""}${esc(r.start_key)} → ${esc(r.end_key)}</td>
-    <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
-    <td>${r.leader ? "this node" : ""}</td>
-    <td class="num">${fmtBytes(r.size_bytes)}</td>
-    <td class="num">${r.qps ? r.qps.toFixed(0) : "0"}</td>
-    <td class="num">${r.applied_index}</td>
-  </tr>`).join("");
-  const clusterN = (d.ranges || []).length;
-  document.getElementById("cluster-range-note").textContent = clusterN
-    ? "cluster-wide: " + clusterN + " ranges (★ = led by this node; qps is the leader's local rate)"
-    : "";
-  renderClusterRanges(d.ranges || []);
-
-  const s = d.storage || {};
-  document.getElementById("storage").innerHTML =
-    tile("L0 files", s.L0Files ?? 0) +
+}
+function storageTiles(s) {
+  return tile("L0 files", s.L0Files ?? 0) +
     tile("L0 sublevels", s.L0Sublevels ?? 0) +
     tile("compaction debt", fmtBytes(s.CompactionDebtBytes || 0), "debt", s.CompactionDebtBytes || 0) +
     tile("memtables", (s.MemtableCount ?? 0) + " (" + fmtBytes(s.MemtableBytes || 0) + ")") +
     tile("write stalls", s.WriteStalls ?? 0) +
     tile("disk slow events", s.DiskSlowEvents ?? 0);
-
-  const errBox = document.getElementById("cluster-err");
-  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
-  else errBox.style.display = "none";
 }
 // Schema browser: /api/schema is fetched on the same 3s cadence as the
 // cluster document; the filter box narrows the table list and both range
@@ -579,6 +748,384 @@ async function toggleRangeDetail(id) {
   }
   poll();
 }
+// Problems panel: /api/health on the same cadence. Rows link to the
+// dashboard section that shows the underlying figure.
+const SECTION_NAMES = { nodes: "nodes", network: "network", schema: "schema", "cluster-ranges": "ranges", storage: "storage", events: "events" };
+async function pollHealth() {
+  const box = document.getElementById("problems");
+  try {
+    const resp = await fetch("/api/health", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const h = await resp.json();
+    const probs = h.problems || [];
+    if (!probs.length) {
+      box.innerHTML = `<span class="ok">✓ no problems found (${h.checks} checks)</span>`;
+      return;
+    }
+    box.innerHTML = probs.map(p => `<div class="problem ${esc(p.severity)}">
+      <span class="sev">${esc(p.severity)}</span>
+      <span class="check">${esc(p.check)}</span>
+      <span>${esc(p.summary)}</span>
+      ${p.section ? `<a href="#sec-${esc(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} ↓</a>` : ""}
+    </div>`).join("");
+  } catch (err) {
+    box.innerHTML = `<span class="muted">health checks unavailable: ${esc(err.message || err)}</span>`;
+  }
+}
+// Events: the first poll loads the recent ring, later polls tail from
+// the last sequence seen; the kind filter is applied on render. Audit
+// rows arrive only for admins (the server filters).
+const EVENTS_MAX = 300;
+let eventsSeen = 0, eventsAll = [], eventsKinds = new Set();
+function renderEvents() {
+  const sel = document.getElementById("events-filter");
+  const want = sel.value;
+  const opts = [`<option value="">all kinds</option>`].concat([...eventsKinds].sort().map(k => `<option value="${esc(k)}"${k === want ? " selected" : ""}>${esc(k)}</option>`));
+  if (sel.options.length !== opts.length) sel.innerHTML = opts.join("");
+  const rows = eventsAll.filter(e => !want || e.kind === want).slice().reverse().map(e => `<tr>
+    <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
+    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
+  </tr>`);
+  document.getElementById("events").innerHTML = rows.join("") ||
+    `<tr><td colspan="3" class="muted">${want ? "no " + esc(want) + " events" : "nothing recorded yet"}</td></tr>`;
+  document.getElementById("events-note").textContent =
+    `${eventsAll.length} recent events on this node (splits, merges, rebalances, repairs, snapshots, backups, upgrades)` +
+    (canDrillDown() ? "; audit records (auth failures, admin operations, privilege DDL) are outlined in amber" : "; audit records need the admin role");
+}
+async function pollEvents() {
+  try {
+    const resp = await fetch("/api/events?since=" + eventsSeen + (eventsSeen ? "" : "&limit=" + EVENTS_MAX), { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const d = await resp.json();
+    for (const e of d.events || []) { eventsAll.push(e); eventsKinds.add(e.kind); }
+    if (eventsAll.length > EVENTS_MAX) eventsAll = eventsAll.slice(eventsAll.length - EVENTS_MAX);
+    eventsSeen = Math.max(eventsSeen, d.latest_seq || 0);
+    renderEvents();
+  } catch (err) {
+    document.getElementById("events-note").textContent = "events unavailable: " + (err.message || err);
+  }
+}
+document.getElementById("events-filter").addEventListener("change", renderEvents);
+// ---- Metrics view: /#/metrics?series=a,b&range=1h&nodes=1,2&rate=1&compare=1 ----
+// Charts the datax_metrics table through /api/metrics: one chart per
+// series with one line per node (categorical slots 1-8 by node ID; a
+// ninth node or beyond draws in gray), y from zero for gauges, a
+// crosshair readout with every node's exact value at that time, and a
+// gap where a node recorded nothing (a restart is a gap, not a fall to
+// zero). Counters are charted as rates.
+const RANGES = ["15m", "1h", "6h", "24h", "7d"];
+const RANGE_SECONDS = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
+const DEFAULT_SERIES = ["node.leader_qps", "node.cpu_percent", "sql.statements", "store.compaction_debt"];
+const mv = { range: "1h", series: [], nodes: null, rate: true, compare: false, catalog: null, data: null, timer: null };
+function nodeColor(id) { id = Number(id); return id >= 1 && id <= 8 ? `var(--series-${id})` : "var(--text-3)"; }
+function parseRoute() {
+  const h = location.hash.replace(/^#\/?/, "");
+  const q = h.indexOf("?");
+  const path = q < 0 ? h : h.slice(0, q);
+  const node = path.match(/^node\/(\d+)$/);
+  const view = path === "metrics" ? "metrics" : node ? "node" : "main";
+  return { view, node: node ? Number(node[1]) : 0, params: new URLSearchParams(q < 0 ? "" : h.slice(q + 1)) };
+}
+function route() {
+  const r = parseRoute();
+  document.getElementById("view-main").hidden = r.view !== "main";
+  document.getElementById("view-metrics").hidden = r.view !== "metrics";
+  document.getElementById("view-node").hidden = r.view !== "node";
+  document.getElementById("nav-main").classList.toggle("current", r.view !== "metrics");
+  document.getElementById("nav-metrics").classList.toggle("current", r.view === "metrics");
+  if (mv.timer) { clearInterval(mv.timer); mv.timer = null; }
+  if (nv.timer) { clearInterval(nv.timer); nv.timer = null; }
+  if (r.view === "node") { nv.id = r.node; pollNode(); nv.timer = setInterval(pollNode, 5000); return; }
+  if (r.view !== "metrics") return;
+  const p = r.params;
+  if (p.get("series")) mv.series = p.get("series").split(",").filter(Boolean);
+  if (mv.series.length === 0) mv.series = DEFAULT_SERIES.slice();
+  if (p.get("range") && RANGE_SECONDS[p.get("range")]) mv.range = p.get("range");
+  mv.nodes = p.get("nodes") ? p.get("nodes").split(",").filter(Boolean) : null;
+  mv.compare = p.get("compare") === "1";
+  mv.rate = p.get("rate") !== "0";
+  document.getElementById("compare-toggle").checked = mv.compare;
+  loadCatalog().then(() => { renderPickers(); fetchMetrics(); });
+  mv.timer = setInterval(fetchMetrics, 15000);
+}
+function pushRoute() {
+  const p = new URLSearchParams();
+  p.set("series", mv.series.join(","));
+  p.set("range", mv.range);
+  if (mv.nodes) p.set("nodes", mv.nodes.join(","));
+  if (mv.compare) p.set("compare", "1");
+  if (!mv.rate) p.set("rate", "0");
+  history.replaceState(null, "", "#/metrics?" + p.toString());
+}
+async function loadCatalog() {
+  if (mv.catalog) return;
+  try {
+    const resp = await fetch("/api/metrics", { cache: "no-store" });
+    if (resp.ok) mv.catalog = await resp.json();
+  } catch (err) { /* rendered as unavailable below */ }
+}
+// The picker lists every series the recorder writes, grouped; a
+// labelled series expands to the label values this node knows.
+function seriesChoices() {
+  const out = [];
+  if (!mv.catalog) return out;
+  for (const def of mv.catalog.series || []) {
+    if (!def.label) { out.push({ name: def.name, def }); continue; }
+    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def });
+  }
+  return out;
+}
+function renderPickers() {
+  const rp = document.getElementById("range-picker");
+  rp.innerHTML = RANGES.map(r => `<button data-range="${r}" class="${r === mv.range ? "on" : ""}">${r}</button>`).join("");
+  rp.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { mv.range = b.dataset.range; renderPickers(); pushRoute(); fetchMetrics(); }));
+  const sp = document.getElementById("series-picker");
+  const choices = seriesChoices();
+  const groups = new Map();
+  for (const c of choices) { if (!groups.has(c.def.group)) groups.set(c.def.group, []); groups.get(c.def.group).push(c); }
+  let html = "";
+  for (const [g, items] of groups) {
+    html += `<h4>${esc(g)}</h4>` + items.map(c => `<label><input type="checkbox" value="${esc(c.name)}" ${mv.series.includes(c.name) ? "checked" : ""}> ${esc(c.name)} <span class="h">${esc(c.def.kind === "counter" ? "rate" : c.def.unit || "")}</span></label>`).join("");
+  }
+  sp.innerHTML = html || `<span class="muted">${mv.catalog ? "no series" : "the metrics catalog is unavailable"}</span>`;
+  document.getElementById("series-summary").textContent = `choose series (${mv.series.length} of ${choices.length} selected)`;
+  document.getElementById("series-details").open = mv.series.length === 0;
+  sp.querySelectorAll("input").forEach(cb => cb.addEventListener("change", () => {
+    mv.series = [...sp.querySelectorAll("input:checked")].map(x => x.value);
+    pushRoute(); fetchMetrics();
+  }));
+  const note = document.getElementById("metrics-note");
+  if (mv.catalog && !mv.catalog.enabled) note.textContent = "recording is disabled on this node (--metrics-record-interval 0)";
+  else if (mv.catalog && !mv.catalog.ready) note.textContent = "the datax_metrics table does not exist yet: recording starts once the cluster has finalized v5";
+  else if (mv.catalog) note.textContent = `from the datax_metrics table, recorded every ${mv.catalog.interval_seconds}s per node; the same data by SQL: SELECT at, value FROM datax_metrics WHERE node = 1 AND name = '…' ORDER BY at`;
+}
+async function fetchMetrics() {
+  const box = document.getElementById("charts");
+  if (mv.series.length === 0) { box.innerHTML = `<div class="muted">pick a series above</div>`; return; }
+  try {
+    const p = new URLSearchParams({ series: mv.series.join(","), since: RANGE_SECONDS[mv.range] + "s" });
+    if (mv.rate) p.set("rate", "1");
+    if (mv.nodes) p.set("node", mv.nodes.join(","));
+    const resp = await fetch("/api/metrics?" + p.toString(), { cache: "no-store" });
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      box.innerHTML = `<div class="err" style="display:block">${esc(e.error || ("HTTP " + resp.status))}</div>`;
+      return;
+    }
+    mv.data = await resp.json();
+    renderCharts();
+  } catch (err) {
+    box.innerHTML = `<div class="err" style="display:block">metrics unavailable: ${esc(err.message || err)}</div>`;
+  }
+}
+function fmtUnit(v, unit) {
+  if (v === null || v === undefined) return "—";
+  switch (unit) {
+    case "bytes": return fmtBytes(Math.max(0, v));
+    case "bytes/s": return fmtBytes(Math.max(0, v)) + "/s";
+    case "percent": return pct(v);
+    case "us": return Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + " ms" : v.toFixed(0) + " µs";
+    case "us/s": return (v / 1000).toFixed(1) + " ms/s";
+    case "/s": return v.toFixed(v < 10 ? 2 : 0) + "/s";
+    default: return Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  }
+}
+function fmtTime(ms, long) {
+  const d = new Date(ms), hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0");
+  return long ? `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}` : `${hh}:${mm}`;
+}
+function renderCharts() {
+  const box = document.getElementById("charts");
+  box.classList.toggle("compare", mv.compare);
+  box.innerHTML = "";
+  const d = mv.data;
+  for (const s of d.series || []) {
+    const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
+    if (mv.compare && ids.length > 1) {
+      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d));
+    } else {
+      box.appendChild(chart(s, s.nodes || {}, "", d));
+    }
+  }
+  if (!box.children.length) box.innerHTML = `<div class="muted">nothing to chart</div>`;
+}
+// chart builds one panel: inline SVG, recessive grid, 2px lines, a
+// legend of node line-keys, the crosshair tooltip, and a table view.
+function chart(s, nodes, suffix, win) {
+  const el = document.createElement("div");
+  el.className = "chart";
+  const unit = s.rate ? (s.unit || "/s") : s.unit;
+  const ids = Object.keys(nodes).sort((a, b) => a - b);
+  const W = 800, H = 200, L = 58, R = 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
+  const from = win.from_ms, to = win.to_ms, step = win.step_ms;
+  let min = 0, max = 0, any = false;
+  for (const id of ids) for (const p of nodes[id]) { any = true; if (p[1] > max) max = p[1]; if (p[1] < min) min = p[1]; }
+  if (max === min) max = min + 1;
+  max = max + (max - min) * 0.05;
+  const x = t => L + (t - from) / (to - from) * PW;
+  const y = v => T + (max - v) / (max - min) * PH;
+  const label = (id) => id === "0" ? "cluster" : "n" + id;
+  let title = `<div class="title"><b>${esc(s.name)}${esc(suffix)}</b><span>${esc(s.rate ? "per second" : unit || "")}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span></div>`;
+  if (!any) { el.innerHTML = title + `<div class="empty">no samples in this range</div>`; return el; }
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(s.name)} over time"><g class="grid">`;
+  const ticks = 4;
+  for (let i = 0; i <= ticks; i++) {
+    const v = min + (max - min) * i / ticks, yy = y(v).toFixed(1);
+    svg += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}"/>`;
+  }
+  svg += `</g><g class="axis">`;
+  for (let i = 0; i <= ticks; i++) {
+    const v = min + (max - min) * i / ticks;
+    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtUnit(v, unit))}</text>`;
+  }
+  const long = to - from > 36 * 3600 * 1000;
+  for (let i = 0; i <= 4; i++) {
+    const t = from + (to - from) * i / 4;
+    svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fmtTime(t, long))}</text>`;
+  }
+  svg += `</g>`;
+  for (const id of ids) {
+    let dpath = "", prev = null;
+    for (const p of nodes[id]) {
+      const gap = prev !== null && p[0] - prev > 2 * step;
+      dpath += (prev === null || gap ? "M" : "L") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1);
+      prev = p[0];
+    }
+    svg += `<path class="line" stroke="${nodeColor(id)}" d="${dpath}"/>`;
+  }
+  svg += `<line class="xhair" y1="${T}" y2="${T + PH}"/>`;
+  for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;
+  svg += `<rect class="hit" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
+  let legend = ids.length > 1 ? `<div class="legend">` + ids.map(id => `<span><i style="background:${nodeColor(id)}"></i>${label(id)}</span>`).join("") + `</div>` : "";
+  let table = `<details><summary>as a table</summary><div class="tablewrap"><table><thead><tr><th>time</th>` + ids.map(id => `<th class="num">${label(id)}</th>`).join("") + `</tr></thead><tbody>`;
+  const times = [...new Set(ids.flatMap(id => nodes[id].map(p => p[0])))].sort((a, b) => b - a).slice(0, 30);
+  const byT = {}; for (const id of ids) { byT[id] = new Map(nodes[id].map(p => [p[0], p[1]])); }
+  for (const t of times) table += `<tr><td>${esc(fmtTime(t, true))}</td>` + ids.map(id => `<td class="num">${esc(byT[id].has(t) ? fmtUnit(byT[id].get(t), unit) : "—")}</td>`).join("") + `</tr>`;
+  table += `</tbody></table></div></details>`;
+  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + table;
+  // Crosshair: snap to the nearest bucket; the readout lists every node.
+  const svgEl = el.querySelector("svg"), hit = el.querySelector(".hit"), xh = el.querySelector(".xhair"), tip = el.querySelector(".tip");
+  const dots = {}; el.querySelectorAll(".dot").forEach(c => dots[c.dataset.node] = c);
+  hit.addEventListener("pointermove", ev => {
+    const r = svgEl.getBoundingClientRect();
+    const px = (ev.clientX - r.left) / r.width * W;
+    let t = from + Math.round((px - L) / PW * (to - from) / step) * step;
+    t = Math.max(from, Math.min(to, t));
+    xh.setAttribute("x1", x(t)); xh.setAttribute("x2", x(t)); xh.style.display = "block";
+    tip.replaceChildren();
+    const tt = document.createElement("div"); tt.className = "t"; tt.textContent = fmtTime(t, true); tip.appendChild(tt);
+    for (const id of ids) {
+      const v = byT[id].get(t);
+      const dot = dots[id];
+      if (v === undefined) { dot.style.display = "none"; continue; }
+      dot.setAttribute("cx", x(t)); dot.setAttribute("cy", y(v)); dot.style.display = "block";
+      const row = document.createElement("div"); row.className = "r";
+      const k = document.createElement("span"); const key = document.createElement("i"); key.style.cssText = `display:inline-block;width:12px;height:2px;margin-right:5px;vertical-align:middle;background:${nodeColor(id)}`;
+      k.appendChild(key); k.appendChild(document.createTextNode(label(id)));
+      const b = document.createElement("b"); b.textContent = fmtUnit(v, unit);
+      row.appendChild(b); row.appendChild(k); tip.appendChild(row);
+    }
+    tip.style.display = "block";
+    const left = (ev.clientX - r.left) + 14, flip = left + 160 > r.width;
+    tip.style.left = flip ? (ev.clientX - r.left - 14 - tip.offsetWidth) + "px" : left + "px";
+    tip.style.top = (ev.clientY - r.top + 20) + "px";
+  });
+  hit.addEventListener("pointerleave", () => { xh.style.display = "none"; tip.style.display = "none"; for (const id of ids) dots[id].style.display = "none"; });
+  return el;
+}
+// ---- Node detail: /#/node/N ----
+// /api/node?id=N is the node's own document when N is the serving node,
+// else fetched from N over the internode RPC (admin role). Its recent
+// history is the last 15 minutes from the datax_metrics table.
+const nv = { id: 0, timer: null, chartsAt: 0 };
+const NODE_CHART_SERIES = ["node.cpu_percent", "node.leader_qps", "sql.statements", "kv.batch_p99_us"];
+async function pollNode() {
+  const id = nv.id;
+  const errBox = document.getElementById("node-err");
+  document.getElementById("node-title").textContent = `Node n${id}`;
+  document.getElementById("node-metrics-link").href = `#/metrics?nodes=${id}&range=1h`;
+  try {
+    const resp = await fetch("/api/node?id=" + id, { cache: "no-store" });
+    const d = await resp.json();
+    if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
+    renderNode(d);
+    if (Date.now() - nv.chartsAt > 30000) { nv.chartsAt = Date.now(); pollNodeCharts(id); }
+  } catch (err) {
+    errBox.style.display = "block";
+    errBox.innerHTML = /admin role/.test(err.message) ? drillDownRefusal() : esc(err.message || err);
+  }
+}
+function renderNode(d) {
+  const errBox = document.getElementById("node-err");
+  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
+  else errBox.style.display = "none";
+  const st = d.status || {};
+  document.getElementById("node-ident").innerHTML =
+    tile("status", (d.live ? (d.draining ? "draining" : "live") : "down") + (d.heartbeat_ago_ms ? " · heartbeat " + fmtAgo(d.heartbeat_ago_ms) : "")) +
+    tile("address", d.address || "—") +
+    tile("sql", d.sql_address || "—") +
+    tile("locality", d.locality || "—") +
+    tile("version", (d.release ? "v" + d.release + " · " : "") + "protocol v" + (d.binary_version || 1) + (d.cluster_version ? " · cluster v" + d.cluster_version : "")) +
+    tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—") +
+    tile("replicas", (st.ranges || []).length + (st.leader_of !== undefined ? " · leads " + st.leader_of : ""));
+  const lm = st.machine;
+  document.getElementById("node-machine").innerHTML = lm ? machineTiles(lm) : `<span class="muted">no machine sample</span>`;
+  document.getElementById("node-machine-note").textContent = lm && (lm.unavailable || []).length ? "not available on this platform: " + lm.unavailable.join(", ") : "";
+  document.getElementById("node-storage").innerHTML = storageTiles(d.storage || {}) +
+    tile("debt gate", d.debt_gated ? "latched" : "open" + (d.debt_gate_entries ? " · " + d.debt_gate_entries + " entries" : "")) +
+    tile("overload", d.overloaded ? "shedding: " + (d.overload_reason || "") : "no") +
+    tile("encryption", d.encrypted ? (d.reencryption && d.reencryption.active ? "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left" : "encrypted at rest") : "plaintext");
+  document.getElementById("node-storage-note").textContent = d.reencryption && d.reencryption.sweep_error ? "re-encryption sweep error: " + d.reencryption.sweep_error : "";
+  const ranges = (st.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
+  document.getElementById("node-ranges").innerHTML = ranges.map(r => rangeRow(r, "this node", x => String(Math.max(0, (x.applied_index || 0) - (x.truncated_index || 0))))).join("") ||
+    `<tr><td colspan="8" class="muted">no replicas</td></tr>`;
+  const q = d.sql;
+  document.getElementById("node-sql").innerHTML = q
+    ? tile("connections", `${q.open} (${q.active} active, ${q.idle_in_txn} idle in txn)`) +
+      tile("statements", Object.values(q.statements || {}).reduce((a, b) => a + b, 0) + " total") +
+      tile("40001", q.serialization_failures + " total") +
+      tile("p50 / p99", `${(q.p50_us / 1000).toFixed(1)} / ${(q.p99_us / 1000).toFixed(1)} ms`)
+    : `<span class="muted">no SQL listener</span>`;
+  const act = d.activity, box = document.getElementById("node-activity");
+  if (act) {
+    box.hidden = false;
+    const rows = [];
+    for (const s of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(s.text)}</td></tr>`);
+    for (const s of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}</td></tr>`);
+    document.getElementById("node-statements").innerHTML = rows.join("") || `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently</td></tr>`;
+    document.getElementById("node-sql-note").textContent = "";
+  } else {
+    box.hidden = true;
+    document.getElementById("node-sql-note").textContent = q ? "statements in flight and slow statements need the admin role" : "";
+  }
+  document.getElementById("node-latency").innerHTML = (d.latency || []).slice().sort((a, b) => a.peer - b.peer).map(l => `<tr>
+    <td>n${l.peer}</td>
+    <td class="num">${l.reachable ? fmtRTT(l.rtt_us) : "—"}</td>
+    <td class="num">${l.reachable ? fmtRTT(l.p99_us) : "—"}</td>
+    <td class="num">${l.reachable ? fmtOffset(l.offset_us) : "—"}</td>
+    <td>${l.reachable ? `<span class="st live"><span class="dot"></span>yes</span>` : `<span class="st down"><span class="dot"></span>no</span>`}</td>
+    <td class="num">${l.age_ms >= 0 ? fmtAgo(l.age_ms) : "never"}</td>
+  </tr>`).join("") || `<tr><td colspan="6" class="muted">no peers measured</td></tr>`;
+  document.getElementById("node-settings").innerHTML = Object.entries(d.settings || {}).sort().map(([k, v]) => `<tr><td>${esc(k)}</td><td class="key">${esc(v)}</td></tr>`).join("");
+  document.getElementById("node-events").innerHTML = (d.events || []).slice().reverse().map(e => `<tr>
+    <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
+    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
+  </tr>`).join("") || `<tr><td colspan="3" class="muted">nothing recorded yet</td></tr>`;
+}
+async function pollNodeCharts(id) {
+  const box = document.getElementById("node-charts");
+  try {
+    const resp = await fetch(`/api/metrics?series=${NODE_CHART_SERIES.join(",")}&node=${id}&since=15m&rate=1`, { cache: "no-store" });
+    if (!resp.ok) { const e = await resp.json().catch(() => ({})); box.innerHTML = `<span class="muted">${esc(e.error || "history unavailable")}</span>`; return; }
+    const d = await resp.json();
+    box.innerHTML = "";
+    for (const s of d.series || []) box.appendChild(chart(s, s.nodes || {}, "", d));
+  } catch (err) { box.innerHTML = `<span class="muted">history unavailable: ${esc(err.message || err)}</span>`; }
+}
+document.getElementById("compare-toggle").addEventListener("change", ev => { mv.compare = ev.target.checked; pushRoute(); renderCharts(); });
+window.addEventListener("hashchange", route);
 async function poll() {
   try {
     const resp = await fetch("/api/cluster", { cache: "no-store" });
@@ -590,12 +1137,18 @@ async function poll() {
     document.getElementById("hdr-stale").style.display = "inline";
   }
 }
-poll();
+poll().then(pollTileHistory);
 pollSchema();
+pollHealth();
+pollEvents();
+route();
 setTimeout(pollActivity, 500);
 setInterval(poll, 3000);
 setInterval(pollSchema, 3000);
 setInterval(pollActivity, 3000);
+setInterval(pollHealth, 3000);
+setInterval(pollEvents, 3000);
+setInterval(pollTileHistory, 30000);
 </script>
 </body>
 </html>

@@ -5,11 +5,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/term"
 
 	"github.com/sthorne/datax/pkg/cli"
 )
@@ -49,21 +51,125 @@ func runSQL(args []string) error {
 	}
 
 	fmt.Printf("datax sql shell (connected to %s as %s)\n", cli.SQLTarget(cfg), cfg.User)
-	fmt.Println(`Type SQL statements terminated by ';', or \q to quit.`)
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	fmt.Println(`Type SQL statements terminated by ';'; \? for help, \q to quit.`)
+	return shellLoop(ctx, conn, newLineReader())
+}
+
+// lineReader reads one line of input with a prompt: a line editor with
+// history when stdin and stdout are a terminal, a plain scanner for piped
+// input. io.EOF ends the input.
+type lineReader interface {
+	ReadLine(prompt string) (string, error)
+	Close()
+}
+
+func newLineReader() lineReader {
+	if cli.IsTerminal(os.Stdin) && cli.IsTerminal(os.Stdout) {
+		if r, err := newTermReader(); err == nil {
+			return r
+		}
+	}
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	return &scanReader{sc: sc}
+}
+
+type scanReader struct{ sc *bufio.Scanner }
+
+func (r *scanReader) ReadLine(prompt string) (string, error) {
+	fmt.Print(prompt)
+	if !r.sc.Scan() {
+		fmt.Println()
+		if err := r.sc.Err(); err != nil {
+			return "", err
+		}
+		return "", io.EOF
+	}
+	return r.sc.Text(), nil
+}
+
+func (r *scanReader) Close() {}
+
+// termReader is golang.org/x/term's editor over the terminal in raw mode.
+// Raw mode is entered only while a line is being read and left before a
+// statement runs, so results and errors print normally. History is
+// cli.History, persisted to the history file.
+type termReader struct {
+	fd   int
+	t    *term.Terminal
+	hist *cli.History
+}
+
+func newTermReader() (*termReader, error) {
+	hist, err := cli.LoadHistory(cli.HistoryPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "history: %v (continuing without it)\n", err)
+	}
+	t := term.NewTerminal(struct {
+		io.Reader
+		io.Writer
+	}{os.Stdin, os.Stdout}, "")
+	t.History = hist
+	// Without a known size the editor wraps every character; assume the
+	// classic 80x24 when the terminal will not say.
+	w, h, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 || h <= 0 {
+		w, h = 80, 24
+	}
+	_ = t.SetSize(w, h)
+	return &termReader{fd: int(os.Stdin.Fd()), t: t, hist: hist}, nil
+}
+
+func (r *termReader) ReadLine(prompt string) (string, error) {
+	state, err := term.MakeRaw(r.fd)
+	if err != nil {
+		return "", err
+	}
+	r.t.SetPrompt(prompt)
+	line, err := r.t.ReadLine()
+	_ = term.Restore(r.fd, state)
+	if err == io.EOF {
+		fmt.Println() // leave the prompt line before the shell's last word
+	}
+	return line, err
+}
+
+func (r *termReader) Close() {
+	if err := r.hist.Compact(); err != nil {
+		fmt.Fprintf(os.Stderr, "history: %v\n", err)
+	}
+}
+
+// shellLoop is the read-eval-print loop over any lineReader: statements
+// accumulate until a ';', meta-commands act on a line of their own, and
+// end of input cancels a statement in progress before it ends the shell.
+func shellLoop(ctx context.Context, conn *pgx.Conn, in lineReader) error {
+	defer in.Close()
 	var buf strings.Builder
 	prompt := "datax> "
 	for {
-		fmt.Print(prompt)
-		if !scanner.Scan() {
-			fmt.Println()
-			return scanner.Err()
-		}
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if buf.Len() == 0 && (trimmed == `\q` || trimmed == "quit" || trimmed == "exit") {
+		line, err := in.ReadLine(prompt)
+		if err == io.EOF {
+			if buf.Len() > 0 {
+				buf.Reset()
+				prompt = "datax> "
+				continue
+			}
 			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if buf.Len() == 0 {
+			switch cli.MetaCommand(line) {
+			case cli.MetaQuit:
+				return nil
+			case cli.MetaHelp:
+				fmt.Print(cli.HelpText)
+				continue
+			case cli.MetaTables:
+				line = "SHOW TABLES;"
+			}
 		}
 		buf.WriteString(line)
 		buf.WriteString("\n")

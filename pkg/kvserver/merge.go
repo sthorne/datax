@@ -314,6 +314,7 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	}
 	metrics.RangeMerges.Inc()
 	log.Infof("merged %s into %s: now [%s, %s)", trig.Right.RangeID, r.rangeID, trig.Merged.StartKey, trig.Merged.EndKey)
+	r.store.cfg.Events.Record("merge", "%s absorbed %s; now [%s, %s)", r.rangeID, trig.Right.RangeID, trig.Merged.StartKey, trig.Merged.EndKey)
 	return &kvpb.AdminMergeResponse{Desc: trig.Merged}, nil
 }
 

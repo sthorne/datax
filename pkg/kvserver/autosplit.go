@@ -43,6 +43,7 @@ func (s *Store) RunAutoSplitOnce(ctx context.Context) {
 				return true // all bytes under one user key: nothing to split
 			}
 			log.Infof("%s: size %d bytes exceeds %d; auto-splitting at %s", r.rangeID, size, sizeThreshold, splitKey)
+			s.cfg.Events.Record("auto-split", "%s at %d bytes (threshold %d): splitting at %s", r.rangeID, size, sizeThreshold, splitKey)
 			if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
 				log.Warnf("%s: auto-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
 			} else {
@@ -80,6 +81,7 @@ func (s *Store) maybeLoadSplit(ctx context.Context, r *Replica, threshold float6
 		}
 	}
 	log.Infof("%s: %.0f qps exceeds %.0f; load-splitting at %s", r.rangeID, qps, threshold, splitKey)
+	s.cfg.Events.Record("load-split", "%s at %.0f qps (threshold %.0f): splitting at %s", r.rangeID, qps, threshold, splitKey)
 	if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
 		log.Warnf("%s: load-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
 		return

@@ -268,20 +268,8 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
 			}
-			// A few immediate retries absorb simple staleness; after that,
-			// back off briefly — mid-flight replica moves and meta repairs
-			// need real time to land, and spinning burns the retry budget
-			// in microseconds.
-			if regroups > 3 {
-				delay := time.Duration(regroups) * 10 * time.Millisecond
-				if delay > 200*time.Millisecond {
-					delay = 200 * time.Millisecond
-				}
-				select {
-				case <-ctx.Done():
-					return nil, kvpb.NewError(ctx.Err())
-				case <-time.After(delay):
-				}
+			if berr := routingBackoff(ctx, regroups); berr != nil {
+				return nil, berr
 			}
 			continue // descriptors refreshed; re-group from request i
 		}
@@ -459,18 +447,7 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 		if regroups++; regroups > maxRoutingRetries {
 			return kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
 		}
-		if regroups > 3 {
-			delay := time.Duration(regroups) * 10 * time.Millisecond
-			if delay > 200*time.Millisecond {
-				delay = 200 * time.Millisecond
-			}
-			select {
-			case <-ctx.Done():
-				return kvpb.NewError(ctx.Err())
-			case <-time.After(delay):
-			}
-		}
-		return nil
+		return routingBackoff(ctx, regroups)
 	}
 	repartition := func(gs []rangeGroup) ([]rangeGroup, *kvpb.Error) {
 		var reqs []kvpb.RequestUnion
@@ -633,6 +610,26 @@ func (db *DB) lookupMeta(ctx context.Context, key keys.Key) (kvpb.RangeDescripto
 	}
 }
 
+// routingBackoff paces a routing retry: a few immediate retries absorb
+// simple staleness; after that, back off briefly — mid-flight replica
+// moves and meta repairs need real time to land, and spinning burns the
+// retry budget in microseconds. Returns the ctx error once it expires.
+func routingBackoff(ctx context.Context, regroups int) *kvpb.Error {
+	if regroups <= 3 {
+		return nil
+	}
+	delay := time.Duration(regroups) * 10 * time.Millisecond
+	if delay > 200*time.Millisecond {
+		delay = 200 * time.Millisecond
+	}
+	select {
+	case <-ctx.Done():
+		return kvpb.NewError(ctx.Err())
+	case <-time.After(delay):
+		return nil
+	}
+}
+
 // sendScan executes a scan, stitching across range boundaries.
 func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.ScanRequest) (*kvpb.ScanResponse, *kvpb.Error) {
 	if req.Reverse {
@@ -665,6 +662,9 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("scan routing did not converge: %v", kerr)
+			}
+			if berr := routingBackoff(ctx, regroups); berr != nil {
+				return nil, berr
 			}
 			continue
 		}
@@ -732,6 +732,9 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
 				return nil, kvpb.NewErrorf("reverse scan routing did not converge: %v", kerr)
+			}
+			if berr := routingBackoff(ctx, regroups); berr != nil {
+				return nil, berr
 			}
 			continue
 		}

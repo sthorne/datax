@@ -182,6 +182,8 @@ func (n *Node) shedLeaseOnce(ctx context.Context) bool {
 		}
 		log.Infof("shedding lease of %s (%.0f qps) from n%d (%.0f qps) to n%d (%.0f qps)",
 			hr.RangeID, hr.QPS, src, srcQPS, target, live[target].LeaderQPS)
+		n.events.Record("lease-shed", "shedding lease of %s (%.0f qps) from n%d (%.0f qps) to n%d (%.0f qps)",
+			hr.RangeID, hr.QPS, src, srcQPS, target, live[target].LeaderQPS)
 		if err := n.db.AdminTransferLease(ctx, desc.StartKey, target); err != nil {
 			log.Warnf("shedding lease of %s: %v", hr.RangeID, err)
 			return true // attempted: don't stack another op this tick
@@ -258,6 +260,8 @@ func (n *Node) rebalanceBytesOnce(ctx context.Context) bool {
 			continue
 		}
 		log.Infof("byte-rebalancing %s (%d MiB): n%d (%d MiB total) -> n%d (%d MiB total)",
+			br.RangeID, br.Bytes>>20, src, live[src].ReplicaBytes>>20, dst, live[dst].ReplicaBytes>>20)
+		n.events.Record("byte-rebalance", "byte-rebalancing %s (%d MiB): n%d (%d MiB total) → n%d (%d MiB total)",
 			br.RangeID, br.Bytes>>20, src, live[src].ReplicaBytes>>20, dst, live[dst].ReplicaBytes>>20)
 		if _, err := n.moveReplica(ctx, desc, dst, src); err != nil {
 			log.Warnf("byte-rebalancing %s: %v", br.RangeID, err)

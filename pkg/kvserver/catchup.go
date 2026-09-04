@@ -89,6 +89,7 @@ func (r *Replica) runCatchupSnapshot(ctx context.Context, target base.NodeID, m 
 	r.node.ReportSnapshot(m.To, raft.SnapshotFinish)
 	metrics.CatchupSnapshots.Inc()
 	log.Infof("%s: caught up replica %d on n%d by snapshot at index %d", r.rangeID, m.To, target, hdr.AppliedIndex)
+	r.store.cfg.Events.Record("snapshot", "%s: replica %d on n%d caught up by snapshot at index %d", r.rangeID, m.To, target, hdr.AppliedIndex)
 }
 
 // minSnapshotInFlight returns the lowest applied index of any outgoing

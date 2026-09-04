@@ -123,6 +123,10 @@ var (
 		Name: "datax_peer_reachable", Help: "1 while this node's last ping to the peer succeeded, 0 once one failed or timed out.",
 	}, []string{"peer"})
 
+	HealthProblems = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
+		Name: "datax_health_problems", Help: "Problems the dashboard's health panel currently lists, by severity and check (refreshed with the panel, at most every 3s).",
+	}, []string{"severity", "check"})
+
 	SQLConnections = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "datax_sql_connections", Help: "SQL connections by state: open (all), active (a statement in flight), idle_in_txn (idle inside an open transaction, holding its intents).",
 	}, []string{"state"})
@@ -163,5 +167,14 @@ var (
 	})
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
+	})
+	MetricsRecordRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_rows_total", Help: "Rows this node has written to the datax_metrics table.",
+	})
+	MetricsRecordSkipped = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_skipped_total", Help: "Metrics-recorder ticks skipped because this node's store was shedding writes.",
+	})
+	MetricsRecordErrors = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
 	})
 )

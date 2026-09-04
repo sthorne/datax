@@ -200,4 +200,5 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 		})
 	}
 	log.Infof("split %s at %s → %s [%s, %s)", r.rangeID, trig.Left.EndKey, trig.Right.RangeID, trig.Right.StartKey, trig.Right.EndKey)
+	r.store.cfg.Events.Record("split", "%s split at %s; %s takes [%s, %s)", r.rangeID, trig.Left.EndKey, trig.Right.RangeID, trig.Right.StartKey, trig.Right.EndKey)
 }

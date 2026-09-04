@@ -415,11 +415,15 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if existing != nil {
 		return &ErrTableExists{Name: d.Name}
 	}
-	id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
-	if err != nil {
-		return err
+	if d.ID == 0 {
+		id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+		if err != nil {
+			return err
+		}
+		d.ID = uint64(id)
+	} else if !IsSystemTableID(d.ID) {
+		return fmt.Errorf("table %q: only system tables carry a preset ID", d.Name)
 	}
-	d.ID = uint64(id)
 	d.Version = 1
 	raw, err := json.Marshal(d)
 	if err != nil {

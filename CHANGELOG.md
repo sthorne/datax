@@ -8,6 +8,87 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.9.0 — unreleased
+
+### Added
+- `datax sql` is a line editor when run on a terminal: the up and down
+  arrows recall earlier lines, kept across sessions in
+  `~/.datax_sql_history` (or `$DATAX_SQL_HISTORY`, the last 1000 lines);
+  Left/Right, Home/End and the usual control keys edit the line; `\?`,
+  `\h` and `help` print the keys, meta-commands and statement families;
+  `\dt` lists tables. Ctrl-D quits, or cancels a multi-line statement in
+  progress. Piped input keeps the plain line-by-line reader. Adds the
+  `golang.org/x/term` dependency (its `x/sys` sibling was already one).
+
+## 0.8.0 — unreleased
+
+### Added
+- A node detail page on the dashboard (`/#/node/N`, from a click on the
+  Nodes table): identity and versions, machine tiles, the node's last 15
+  minutes of CPU, QPS, statements and KV latency from the metrics
+  table, storage with the debt gate, overload verdict and encryption
+  status, the replicas it holds with their raft log depth, its SQL
+  summary and (for admins) statements, its network row, its settings
+  and its recent events. `/api/node?id=N` serves the document: the
+  serving node's own to any user, another node's through the internode
+  RPC for admins (a new `node-detail` admin op). Sub-KiB byte figures on
+  the dashboard are rounded (#86).
+
+## 0.7.0 — unreleased
+
+Cluster version **v5**: the `datax_metrics` system table. Clusters
+upgraded from earlier versions record metrics only after
+`datax debug upgrade` finalizes v5.
+
+### Added
+- The cluster records its own metrics: every node writes about fifty
+  series (host, storage, ranges, the network matrix, transactions, SQL,
+  and once per cluster the table gauges) every `--metrics-record-interval`
+  (default 10 s) into `datax_metrics`, a sharded time-series table with
+  a 7-day retention that the nodes create at a reserved descriptor ID
+  once the cluster has finalized v5. History survives restarts, is
+  queryable with plain SQL from any client, and `/api/metrics` serves it
+  aligned and downsampled per node (rates for counters). The dashboard
+  gains a Metrics view (`/#/metrics`): a time-range picker, a grouped
+  series picker, one chart per series with one line per node, a
+  crosshair readout, a per-node mode, and a table view; every overview
+  tile links to its series and draws its sparkline from the table. The
+  table is reserved (create, drop and column DDL refused; retention and
+  shards settable; a `SELECT` grant for reporting users; only admins
+  write), excluded from backups unless `datax backup --include-metrics`,
+  and tolerated by restore. `ALTER TABLE ... SET (retention = '...')` now
+  works for any time-series table. `/metrics` gains
+  `datax_metrics_record_rows_total`, `datax_metrics_record_skipped_total`
+  and `datax_metrics_record_errors_total` (#115).
+
+## 0.6.0 — unreleased
+
+### Added
+- Health checks and an events feed on the dashboard: every node runs a
+  fixed set of checks against data it already holds (node liveness and
+  draining, mixed binaries and unfinalized upgrades, lost quorum,
+  under-replication and locality diversity, `/meta` reachability,
+  storage backpressure, debt gate, write stalls and errors, overloaded
+  followers, disk, file-descriptor and memory headroom, peer
+  reachability and clock offset, consistency failures, authentication
+  failure rate, stale statistics) and shows the findings in a problems
+  panel at the top of the page, each linking to the section with the
+  figure. A per-node ring of operational events (splits, merges,
+  auto-splits, rebalances, lease sheds, dead-node repairs, snapshots,
+  decommissions, upgrades, key rotations, backups and restores,
+  consistency failures; the audit stream for admins) feeds an events
+  section with a kind filter. New endpoints `/api/health` and
+  `/api/events?since=N`; `/metrics` gains
+  `datax_health_problems{severity,check}` (#85).
+
+### Fixed
+- Scans and reverse scans retried stale range routing thirty times with
+  no pause, so a read that met a range mid-move or mid-merge could
+  exhaust its retries in microseconds and fail with "scan routing did
+  not converge" while the meta repair was still landing. They now back
+  off between retries the way batches already did (10 ms per retry
+  after the third, capped at 200 ms).
+
 ## 0.5.0 — unreleased
 
 ### Added

@@ -53,6 +53,7 @@ var adminUnauditedOps = map[string]bool{
 	"wait-applied":     true,
 	"reencrypt-status": true,
 	"node-status":      true,
+	"node-detail":      true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -171,7 +172,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
 		}
-		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext)
+		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext, req.IncludeMetrics)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
@@ -220,6 +221,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			return cluster.AdminResponse{Error: "store is not encrypted"}
 		}
 		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
+
+	case "node-detail":
+		// This node's /api/node document, for another node's dashboard
+		// (/api/node?id=N fans out under the node identity; admin-only
+		// like node-status, so the admin-only material is included).
+		raw, err := json.Marshal(n.localNodeDetail(ctx, true))
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Status: raw}
 
 	case "node-status":
 		// This node's /status document, optionally filtered to one range —
@@ -306,6 +317,7 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	}
 	n.mirrorClusterVersion(ctx)
 	log.Infof("cluster version finalized at %s", target)
+	n.events.Record("upgrade", "cluster version finalized at %s", target)
 	return cluster.AdminResponse{ClusterVersion: int(target)}
 }
 
