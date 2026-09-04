@@ -11,8 +11,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server/ui"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -186,6 +188,7 @@ func (n *Node) startHTTP() error {
 	// authenticated user).
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
+	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
 	page, uerr := ui.FS.ReadFile("index.html")
@@ -395,4 +398,35 @@ func (n *Node) statusSummary() NodeStatus {
 		}
 	}
 	return st
+}
+
+// ActivityStatus is the /api/activity document: this node's SQL
+// connections and the statements in flight and recently slow. Statement
+// text can carry data, so the route is admin-only, and it covers the
+// serving node (each node keeps its own).
+type ActivityStatus struct {
+	NodeID      int                      `json:"node_id"`
+	Summary     *kvpb.SQLSummary         `json:"summary,omitempty"`
+	Connections []pgwire.ConnectionInfo  `json:"connections"`
+	Active      []pgwire.ActiveStatement `json:"active"`
+	Slow        []pgwire.SlowStatement   `json:"slow"`
+	// SlowThresholdMillis is the duration past which statements land in
+	// Slow.
+	SlowThresholdMillis int64 `json:"slow_threshold_ms"`
+}
+
+func (n *Node) serveActivityAPI(w http.ResponseWriter, req *http.Request) {
+	doc := ActivityStatus{NodeID: int(n.ident.NodeID), Connections: []pgwire.ConnectionInfo{}, Active: []pgwire.ActiveStatement{}, Slow: []pgwire.SlowStatement{}}
+	if n.pgServer != nil {
+		act := n.pgServer.Activity()
+		doc.Summary = act.Summary()
+		doc.Connections = act.Connections()
+		doc.Active = act.Active()
+		doc.Slow = act.Slow()
+		doc.SlowThresholdMillis = act.SlowThreshold().Milliseconds()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(doc)
 }

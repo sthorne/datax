@@ -103,6 +103,29 @@
   </section>
 
   <section>
+    <h2>SQL</h2>
+    <div class="tiles" id="sql-tiles"></div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>node</th>
+        <th class="num" title="open connections (active running a statement / idle inside an open transaction)">connections</th>
+        <th class="num" title="longest an open transaction has been idle; its intents block other writers">oldest idle txn</th>
+        <th class="num" title="statements per second over the last poll interval">stmt/s</th>
+        <th>mix</th>
+        <th class="num" title="statements that ended in SQLSTATE 40001 per second">40001/s</th>
+        <th class="num" title="statement latency percentiles over the node's recent ring">p50 / p99</th></tr></thead>
+      <tbody id="sql-nodes"></tbody>
+    </table></div>
+    <p class="muted" id="sql-note"></p>
+    <div id="sql-detail" hidden>
+      <p class="muted">statements on this node (admin): in flight, then the slowest recent ones</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
+        <tbody id="sql-statements"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section>
     <h2>Network</h2>
     <div class="tablewrap"><table id="latency"></table></div>
     <p class="muted" id="latency-note"></p>
@@ -273,6 +296,7 @@ function render(d) {
   </tr>`; }).join("");
 
   renderNetwork(d);
+  renderSQL(d);
 
   const lm = d.local && d.local.machine;
   if (lm) {
@@ -384,6 +408,69 @@ async function pollSchema() {
     if (!resp.ok) return;
     renderSchema(await resp.json());
   } catch (err) { /* the cluster poll reports staleness */ }
+}
+// SQL activity: connection states and statement counters from every
+// node's heartbeat (live for the serving node). Counters are cumulative,
+// so rates are differences between consecutive polls.
+const sqlPrev = new Map(); // node_id → {at, total, retries}
+function sumStatements(st) { return Object.values(st || {}).reduce((a, b) => a + b, 0); }
+function renderSQL(d) {
+  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
+  const now = Date.now();
+  let open = 0, active = 0, idleTxn = 0, stmtRate = 0, retryRate = 0, p99 = 0, p99Node = null, oldest = 0;
+  const rows = nodes.map(n => {
+    const q = n.sql;
+    if (!q) return `<tr><td>n${n.node_id}</td><td colspan="6" class="muted">no SQL summary (older binary?)</td></tr>`;
+    open += q.open; active += q.active; idleTxn += q.idle_in_txn;
+    if ((q.oldest_idle_txn_ms || 0) > oldest) oldest = q.oldest_idle_txn_ms;
+    if (q.p99_us > p99) { p99 = q.p99_us; p99Node = n.node_id; }
+    const total = sumStatements(q.statements), prev = sqlPrev.get(n.node_id);
+    let rate = null, rrate = null;
+    if (prev && now > prev.at && total >= prev.total) {
+      const dt = (now - prev.at) / 1000;
+      rate = (total - prev.total) / dt;
+      rrate = (q.serialization_failures - prev.retries) / dt;
+      stmtRate += rate; retryRate += rrate;
+    }
+    sqlPrev.set(n.node_id, { at: now, total, retries: q.serialization_failures });
+    const mix = Object.entries(q.statements || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([k, v]) => `${esc(k)} ${Math.round(100 * v / Math.max(total, 1))}%`).join(" · ");
+    const idle = q.oldest_idle_txn_ms ? warn(q.oldest_idle_txn_ms > 60000 ? "down" : q.oldest_idle_txn_ms > 10000 ? "draining" : "", fmtAgo(q.oldest_idle_txn_ms)) : "—";
+    return `<tr>
+      <td>n${n.node_id}</td>
+      <td class="num">${q.open} <span class="muted">(${q.active} / ${q.idle_in_txn})</span></td>
+      <td class="num">${idle}</td>
+      <td class="num">${rate === null ? "…" : rate.toFixed(1)}</td>
+      <td>${mix || "—"}</td>
+      <td class="num">${rrate === null ? "…" : rrate.toFixed(2)}</td>
+      <td class="num">${(q.p50_us / 1000).toFixed(1)} / ${(q.p99_us / 1000).toFixed(1)} ms</td>
+    </tr>`;
+  });
+  document.getElementById("sql-nodes").innerHTML = rows.join("");
+  document.getElementById("sql-tiles").innerHTML =
+    tile("connections", `${open} (${active} active, ${idleTxn} idle in txn)`) +
+    tile("statements/s", stmtRate.toFixed(1), "stmt", stmtRate) +
+    tile("40001/s", retryRate.toFixed(2), "retry", retryRate) +
+    tile("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms (n${p99Node})` : "—", "p99", p99 / 1000) +
+    tile("oldest idle txn", oldest ? fmtAgo(oldest) : "none");
+  document.getElementById("sql-note").textContent = "rates are differences between polls; kinds: select, insert, update, delete, copy, txn (BEGIN/COMMIT/ROLLBACK/savepoints), ddl";
+}
+async function pollActivity() {
+  const box = document.getElementById("sql-detail");
+  if (!canDrillDown()) { box.hidden = true; return; }
+  try {
+    const resp = await fetch("/api/activity", { cache: "no-store" });
+    if (!resp.ok) { box.hidden = true; return; }
+    const a = await resp.json();
+    box.hidden = false;
+    const rows = [];
+    for (const st of a.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
+      <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}</td></tr>`);
+    for (const st of a.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
+      <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
+    document.getElementById("sql-statements").innerHTML = rows.join("") ||
+      `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${a.slow_threshold_ms} ms recently</td></tr>`;
+  } catch (err) { box.hidden = true; }
 }
 // The network matrix: each row is one node's measured round trip to
 // every other node (from its heartbeat; the serving node's row is live),
@@ -505,8 +592,10 @@ async function poll() {
 }
 poll();
 pollSchema();
+setTimeout(pollActivity, 500);
 setInterval(poll, 3000);
 setInterval(pollSchema, 3000);
+setInterval(pollActivity, 3000);
 </script>
 </body>
 </html>

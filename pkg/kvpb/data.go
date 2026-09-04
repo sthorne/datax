@@ -92,6 +92,9 @@ type NodeDescriptor struct {
 	// every heartbeat so any node can show every node's row without a
 	// fan-out. Absent from nodes on binaries that predate it.
 	Machine *MachineSummary `json:"machine,omitempty"`
+	// SQL summarizes the node's SQL activity (connections, statement
+	// counts, latency percentiles), re-asserted on every heartbeat.
+	SQL *SQLSummary `json:"sql,omitempty"`
 	// Latency is this node's measured round trip and clock offset to each
 	// peer (see PeerLatency), re-asserted on every heartbeat so any node
 	// can show the whole matrix without a fan-out.
@@ -216,4 +219,24 @@ type PeerLatency struct {
 	// how long ago the last successful ping was.
 	Reachable bool  `json:"reachable"`
 	AgeMillis int64 `json:"age_ms"`
+}
+
+// SQLSummary is one node's SQL activity as its heartbeat advertises it.
+type SQLSummary struct {
+	// Connections by state; OldestIdleTxnMillis is how long the
+	// longest-idle open transaction has been idle (its intents block
+	// every other writer to those keys).
+	Open                int            `json:"open"`
+	Active              int            `json:"active"`
+	IdleInTxn           int            `json:"idle_in_txn"`
+	OldestIdleTxnMillis int64          `json:"oldest_idle_txn_ms,omitempty"`
+	ByUser              map[string]int `json:"by_user,omitempty"`
+	// Statements is the cumulative count by kind since the node started;
+	// consumers difference consecutive heartbeats for rates.
+	Statements            map[string]uint64 `json:"statements,omitempty"`
+	SerializationFailures uint64            `json:"serialization_failures"`
+	CopyRows              uint64            `json:"copy_rows"`
+	// Statement latency percentiles over the node's recent ring.
+	P50Micros int64 `json:"p50_us"`
+	P99Micros int64 `json:"p99_us"`
 }

@@ -8,6 +8,23 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.5.0 — unreleased
+
+### Added
+- SQL activity on the dashboard: the wire server now accounts for its
+  connections by state (idle, active, idle inside an open transaction
+  with the age of the oldest), statements by kind, statement latency
+  percentiles, serialization failures and COPY rows; the summary rides
+  each node's heartbeat, the dashboard's SQL section shows per-node
+  connections, statements per second, the statement mix, the `40001`
+  rate and p50/p99, and admins see the serving node's statements in
+  flight and its slowest recent ones (`/api/activity`, threshold
+  `SlowStatementThreshold`, default 500 ms). `/metrics` gains
+  `datax_sql_connections{state}`, `datax_sql_statements_total{kind}`,
+  `datax_sql_statement_latency_seconds`,
+  `datax_sql_serialization_failures_total` and
+  `datax_sql_copy_rows_total` (#84).
+
 ## 0.4.0 — unreleased
 
 ### Added

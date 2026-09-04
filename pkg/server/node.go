@@ -74,6 +74,10 @@ type Config struct {
 	// SplitSizeThreshold is the range size that triggers an automatic split
 	// (default 64 MiB; negative disables).
 	SplitSizeThreshold int64
+	// SlowStatementThreshold is the statement duration past which the SQL
+	// server records the statement for the dashboard's slow list (0 =
+	// 500 ms).
+	SlowStatementThreshold time.Duration
 	// CertsDir enables secure mode: mutual TLS between nodes, TLS +
 	// SCRAM-SHA-256 authentication on the SQL listener. Empty = insecure
 	// (cleartext, trust auth).
