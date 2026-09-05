@@ -8,6 +8,19 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.40.0 — unreleased
+
+### Changed
+- Scans step instead of seeking (#160). `MVCCScan` advanced to the next
+  row with an LSM seek and found each row's visible version with
+  another; both are now bounded walks with `Next` (a reverse scan steps
+  back with `Prev`), seeking only past a chain of more than eight
+  versions, and versions are recognized by their encoded suffix rather
+  than decoded per key. A 1,000-row scan over single-version rows takes
+  under half the time it did; `TestScanStepMatchesSeekPerRow` checks the
+  stepping scan against the seeking one over version chains, tombstones,
+  intents and uncertainty windows, forward and reverse.
+
 ## 0.39.0 — unreleased
 
 ### Added

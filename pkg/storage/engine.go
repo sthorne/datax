@@ -42,6 +42,8 @@ type Iterator interface {
 	// scans walk user keys backwards with it).
 	SeekLT(key []byte) bool
 	Next() bool
+	// Prev steps to the previous key; false at the lower bound.
+	Prev() bool
 	Valid() bool
 	Key() []byte
 	Value() []byte
@@ -485,6 +487,7 @@ type pebbleIter struct {
 func (i *pebbleIter) SeekGE(key []byte) bool { i.valid = i.it.SeekGE(key); return i.valid }
 func (i *pebbleIter) SeekLT(key []byte) bool { i.valid = i.it.SeekLT(key); return i.valid }
 func (i *pebbleIter) Next() bool             { i.valid = i.it.Next(); return i.valid }
+func (i *pebbleIter) Prev() bool             { i.valid = i.it.Prev(); return i.valid }
 func (i *pebbleIter) Valid() bool            { return i.valid }
 func (i *pebbleIter) Key() []byte            { return i.it.Key() }
 func (i *pebbleIter) Value() []byte          { return i.it.Value() }
@@ -495,6 +498,7 @@ type errIter struct{ err error }
 func (i *errIter) SeekGE([]byte) bool { return false }
 func (i *errIter) SeekLT([]byte) bool { return false }
 func (i *errIter) Next() bool         { return false }
+func (i *errIter) Prev() bool         { return false }
 func (i *errIter) Valid() bool        { return false }
 func (i *errIter) Key() []byte        { return nil }
 func (i *errIter) Value() []byte      { return nil }

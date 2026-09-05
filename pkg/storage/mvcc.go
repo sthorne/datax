@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 
@@ -385,7 +386,8 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 			return ScanResult{}, err
 		}
 		cur := keys.Key(userKey).Clone()
-		value, found, err := mvccScanKey(it, cur, ts, opts, &intents)
+		prefix := EncodeMVCCKey(cur, hlc.Timestamp{})
+		value, found, err := mvccScanKey(it, cur, prefix, ts, opts, &intents)
 		if err != nil {
 			return ScanResult{}, err
 		}
@@ -397,7 +399,7 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 				return res, nil
 			}
 		}
-		ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
+		ok = stepPastKey(it, cur, prefix)
 	}
 
 	if len(intents) > 0 {
@@ -406,13 +408,60 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 	return res, nil
 }
 
+// maxStepsBeforeSeek bounds how many engine keys a scan walks with Next
+// (or Prev) before it falls back to a seek: versions of one user key sort
+// together, newest first, so a shallow version chain — a GC'd table — is
+// crossed in a step or two, while a hot row rewritten thousands of times
+// still costs one seek rather than a walk of every version (issue #160).
+const maxStepsBeforeSeek = 8
+
+// keyPrefixOf reports whether an encoded engine key belongs to the user
+// key whose metadata key is prefix: the encoding is prefix-free, so the
+// metadata key of K is a prefix of exactly K's engine keys.
+func keyPrefixOf(engineKey, prefix []byte) bool { return bytes.HasPrefix(engineKey, prefix) }
+
+// versionOf reads the version timestamp off an engine key of a user key
+// whose metadata key is prefix (zero for the metadata key itself), without
+// decoding the user key.
+func versionOf(engineKey, prefix []byte) hlc.Timestamp {
+	rest := engineKey[len(prefix):]
+	if len(rest) != versionSuffixLen {
+		return hlc.Timestamp{}
+	}
+	return hlc.Timestamp{
+		WallTime: int64(^binary.BigEndian.Uint64(rest[:8])),
+		Logical:  int32(^binary.BigEndian.Uint32(rest[8:12])),
+	}
+}
+
+// stepPastKey moves the iterator to the first engine key after every
+// engine key of cur (whose metadata key is prefix): a bounded walk with
+// Next, then a seek past the key if the walk runs long. The iterator may
+// be anywhere within cur's engine keys, or already past them. ok=false
+// at the end of the range.
+func stepPastKey(it Iterator, cur keys.Key, prefix []byte) bool {
+	for steps := 0; it.Valid(); steps++ {
+		if !keyPrefixOf(it.Key(), prefix) {
+			return true
+		}
+		if steps >= maxStepsBeforeSeek {
+			return it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))
+		}
+		if !it.Next() {
+			return false
+		}
+	}
+	return false
+}
+
 // MVCCReverseScan is MVCCScan iterating [start, end) from the end
 // BACKWARDS: rows come back largest-key-first, and Resume, when max rows
 // stop the scan early, is the exclusive END of the continuation page
-// ([start, Resume)). Each user key costs one SeekLT to find it plus the
-// shared forward per-key walk to read it — metadata sorts before the
-// key's versions, so landing anywhere inside a key and re-seeking to its
-// first engine key reuses MVCCScan's visibility logic verbatim.
+// ([start, Resume)). Landing anywhere inside a user key, the scan steps
+// back to its first engine key (metadata sorts before the versions) and
+// reuses MVCCScan's forward per-key walk to read it; both moves are
+// bounded walks with Prev and Next, seeking only past a deep version
+// chain (issue #160).
 func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts MVCCGetOptions) (ScanResult, error) {
 	lower := EncodeMVCCKey(start, hlc.Timestamp{})
 	upper := EncodeMVCCKey(end, hlc.Timestamp{})
@@ -431,10 +480,10 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 		}
 		cur := keys.Key(userKey).Clone()
 		curStart := EncodeMVCCKey(cur, hlc.Timestamp{})
-		if !it.SeekGE(curStart) {
+		if !stepToKeyStart(it, curStart) {
 			break // unreachable: an engine key of cur was just observed
 		}
-		value, found, err := mvccScanKey(it, cur, ts, opts, &intents)
+		value, found, err := mvccScanKey(it, cur, curStart, ts, opts, &intents)
 		if err != nil {
 			return ScanResult{}, err
 		}
@@ -446,7 +495,7 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 				return res, nil
 			}
 		}
-		ok = it.SeekLT(curStart)
+		ok = stepBeforeKey(it, curStart)
 	}
 
 	if len(intents) > 0 {
@@ -455,17 +504,54 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 	return res, nil
 }
 
-// mvccScanKey reads user key cur's visible value during a scan. The
-// iterator must be positioned at cur's FIRST engine key (intent metadata
-// or newest version); it is left at an unspecified position, so callers
-// re-seek to continue. A blocking foreign intent is appended to *intents
-// and reported as not-found (the scan stops returning rows and
-// ultimately surfaces a WriteIntentError).
-func mvccScanKey(it Iterator, cur keys.Key, ts hlc.Timestamp, opts MVCCGetOptions, intents *[]Intent) ([]byte, bool, error) {
-	_, vts, err := DecodeMVCCKey(it.Key())
-	if err != nil {
-		return nil, false, err
+// stepToKeyStart moves the iterator, positioned on some engine key of
+// the user key whose metadata key is prefix, to that key's FIRST engine
+// key: a bounded walk with Prev, then one Next back onto the key (or a
+// seek, past the bound). ok=false only if the key vanished (it cannot).
+func stepToKeyStart(it Iterator, prefix []byte) bool {
+	for steps := 0; ; steps++ {
+		if steps >= maxStepsBeforeSeek {
+			return it.SeekGE(prefix)
+		}
+		if !it.Prev() {
+			// Nothing before the key in the range: its first engine key
+			// is the range's first.
+			return it.SeekGE(prefix)
+		}
+		if !keyPrefixOf(it.Key(), prefix) {
+			return it.Next()
+		}
 	}
+}
+
+// stepBeforeKey moves the iterator, positioned within the engine keys of
+// the user key whose metadata key is prefix, to the last engine key
+// before them: a bounded walk with Prev, then a seek past the bound.
+// ok=false when no key precedes it in the range.
+func stepBeforeKey(it Iterator, prefix []byte) bool {
+	for steps := 0; ; steps++ {
+		if steps >= maxStepsBeforeSeek {
+			return it.SeekLT(prefix)
+		}
+		if !it.Prev() {
+			return false
+		}
+		if !keyPrefixOf(it.Key(), prefix) {
+			return true
+		}
+	}
+}
+
+// mvccScanKey reads user key cur's visible value during a scan. prefix is
+// cur's metadata key (the encoded prefix every engine key of cur shares).
+// The iterator must be positioned at cur's FIRST engine key (intent
+// metadata or newest version); it is left somewhere within cur's engine
+// keys or just past them, so callers step on from there (stepPastKey). A
+// blocking foreign intent is appended to *intents and reported as
+// not-found (the scan stops returning rows and ultimately surfaces a
+// WriteIntentError).
+func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opts MVCCGetOptions, intents *[]Intent) ([]byte, bool, error) {
+	vts := versionOf(it.Key(), prefix)
 
 	var readAt, skipAt hlc.Timestamp
 	if vts.IsEmpty() {
@@ -506,11 +592,8 @@ func mvccScanKey(it Iterator, cur keys.Key, ts hlc.Timestamp, opts MVCCGetOption
 	if !readAt.IsEmpty() {
 		// Own intent: read the provisional version.
 		if it.SeekGE(EncodeMVCCKey(cur, readAt)) {
-			k, pvts, err := DecodeMVCCKey(it.Key())
-			if err != nil {
-				return nil, false, err
-			}
-			if bytes.Equal(k, cur) && pvts.Equal(readAt) {
+			k := it.Key()
+			if keyPrefixOf(k, prefix) && versionOf(k, prefix).Equal(readAt) {
 				data, tombstone, err := decodeMVCCValue(it.Value())
 				if err != nil {
 					return nil, false, err
@@ -521,43 +604,43 @@ func mvccScanKey(it Iterator, cur keys.Key, ts hlc.Timestamp, opts MVCCGetOption
 			}
 		}
 	} else {
-		// Uncertainty check, then newest version <= ts.
+		// Uncertainty check, then newest version <= ts. The iterator sits
+		// on cur's newest version; versions sort newest first, so the
+		// newest at or below ts is reached by stepping forward — a seek
+		// only past a deep chain of newer versions.
 		if len(*intents) == 0 && !opts.UncertaintyLimit.IsEmpty() && ts.Less(opts.UncertaintyLimit) {
-			uok := it.Valid()
-			k := it.Key()
-			// Current position is the newest version; walk down to the
-			// first version <= limit, skipping own old-epoch writes.
-			for uok {
-				ku, uvts, err := DecodeMVCCKey(k)
-				if err != nil {
-					return nil, false, err
-				}
-				if !bytes.Equal(ku, cur) {
+			// Walk down to the first version <= limit, skipping own
+			// old-epoch writes.
+			for uok := it.Valid(); uok; uok = it.Next() {
+				k := it.Key()
+				if !keyPrefixOf(k, prefix) {
 					break
 				}
+				uvts := versionOf(k, prefix)
 				if uvts.LessEq(opts.UncertaintyLimit) && !(!skipAt.IsEmpty() && uvts.Equal(skipAt)) {
 					if ts.Less(uvts) {
 						return nil, false, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: uvts}
 					}
 					break
 				}
-				if !it.Next() {
-					break
-				}
-				k = it.Key()
 			}
 		}
-		ok := it.SeekGE(EncodeMVCCKey(cur, ts))
-		for ok {
-			k, cvts, err := DecodeMVCCKey(it.Key())
-			if err != nil {
-				return nil, false, err
-			}
-			if !bytes.Equal(k, cur) {
+		steps := 0
+		for ok := it.Valid(); ok; {
+			k := it.Key()
+			if !keyPrefixOf(k, prefix) {
 				break
 			}
-			if !skipAt.IsEmpty() && cvts.Equal(skipAt) {
+			cvts := versionOf(k, prefix)
+			if ts.Less(cvts) || !skipAt.IsEmpty() && cvts.Equal(skipAt) {
+				// Newer than the read, or the transaction's own superseded
+				// write: on to the next version.
+				if steps >= maxStepsBeforeSeek {
+					ok, steps = it.SeekGE(EncodeMVCCKey(cur, ts)), 0
+					continue
+				}
 				ok = it.Next()
+				steps++
 				continue
 			}
 			data, tombstone, err := decodeMVCCValue(it.Value())
