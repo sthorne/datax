@@ -102,6 +102,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		return nil, nil
 	}
 	fams := make([]types.Family, n)
+	if expanded, err := s.expandViews(ctx, nil, stmt); err != nil {
+		return nil, ToSQLError(err)
+	} else {
+		stmt = expanded
+	}
 	if with := stmtWith(stmt); len(with) > 0 {
 		// The members bind (columns only) so lookups resolve, and each
 		// member's own parameters type as in its query once it and the
@@ -277,6 +282,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
+	expanded, err := s.expandViews(ctx, nil, stmt)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	stmt = expanded
 	if with := stmtWith(stmt); len(with) > 0 {
 		restore, err := s.bindWith(ctx, nil, with, nil, true, nil)
 		if err != nil {
@@ -491,6 +501,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			"columns": {"column_name", "data_type", "is_nullable", "column_default", "indices"},
 			"indexes": {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
 			"create":  {"table_name", "create_statement"},
+			"views":   {"view_name", "definition"},
 			"users":   {"username", "is_admin"},
 			"grants":  {"database_name", "table_name", "grantee", "privilege_type"},
 			"all":     {"name", "setting"},

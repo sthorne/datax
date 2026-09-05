@@ -18,7 +18,8 @@ syntax error or `0A000` feature not supported):
 | `ALTER COLUMN TYPE`, `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `CREATE TABLE AS` / `LIKE`, `COMMENT ON` | `DROP INDEX`, `ALTER INDEX RENAME`, `ALTER TABLE RENAME TO / RENAME COLUMN / RENAME CONSTRAINT`, `TRUNCATE [RESTART IDENTITY] [CASCADE]` and `IF [NOT] EXISTS` on every `CREATE` / `DROP` / `ALTER` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
-| Views, triggers, stored procedures, `LISTEN/NOTIFY` | — |
+| Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY DEFINER` semantics (a view's query runs with the reader's privileges, not its owner's), renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, `pg_views`, `information_schema.views`, `\dv` |
+| Triggers, stored procedures, `LISTEN/NOTIFY` | — |
 
 ## Things that exist but behave differently
 

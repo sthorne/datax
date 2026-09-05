@@ -15,6 +15,7 @@ ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN]
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
+CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -258,6 +259,16 @@ CONSTRAINT` uses, run after the commit and the lease drain. `RENAME TO`
 moves the namespace entry (the descriptor ID, and so every by-ID
 reference, is unchanged); a gateway caching the old name drops that
 entry at its next lease renewal, which the statement's drain waits for.
+
+A view is a table descriptor carrying its query's text and no rows
+(`ViewQuery`, cluster version v9). Before a statement runs — or is
+described — every view it names is bound as a leading implicit `WITH`
+member (pkg/sql/view.go over the relation machinery of pkg/sql/cte.go):
+the view's query executes once as the member and the statement reads
+the materialized rows through the ordinary access path, so a view works
+wherever a table does and a view over a view expands as the member
+executes. Views record the relations they read (`ViewDepends`) for the
+drop / rename refusals; DML and physical DDL on a view are refused.
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

@@ -246,9 +246,17 @@ func (s *Session) setting(name string) (string, string, bool) {
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
 	db, bare := catalog.SplitTableName(name)
-	if db == "" && len(s.rels) > 0 {
-		if r, ok := s.rels[strings.ToLower(bare)]; ok {
-			return r.desc, nil // a WITH member shadows a table of its name
+	if len(s.rels) > 0 {
+		if db == "" {
+			if r, ok := s.rels[strings.ToLower(bare)]; ok {
+				return r.desc, nil // a WITH member shadows a table of its name
+			}
+		} else {
+			for _, r := range s.rels {
+				if r.alias != "" && r.alias == strings.ToLower(name) {
+					return r.desc, nil // a view referenced by its qualified name
+				}
+			}
 		}
 	}
 	if vtable.IsSchema(db) {
@@ -257,7 +265,17 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		}
 		return nil, &catalog.ErrTableNotFound{Name: name}
 	}
-	d, err := s.cat.LookupIn(ctx, txn, s.database, name)
+	// A descriptor this transaction's DDL wrote is read through the
+	// transaction and never cached: the cache is shared with other
+	// sessions on the gateway and must not carry uncommitted state, and
+	// a rollback must not leave the phantom behind.
+	var d *catalog.TableDescriptor
+	var err error
+	if s.state == StateOpen && s.ddlTouched(name) {
+		d, err = s.cat.LookupFreshIn(ctx, txn, s.database, name)
+	} else {
+		d, err = s.cat.LookupIn(ctx, txn, s.database, name)
+	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -464,10 +482,12 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.txn = nil
 		s.state = StateIdle
 		pending := s.pendingDDL
-		s.pendingDDL = nil
 		if err != nil {
+			s.forgetDDL()
+			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 			return nil, ToSQLError(err)
 		}
+		s.pendingDDL = nil
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
@@ -751,8 +771,33 @@ func (s *Session) rollback(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
+	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.state = StateIdle
+}
+
+// ddlTouched reports whether the open transaction's DDL changed name.
+func (s *Session) ddlTouched(name string) bool {
+	_, bare := catalog.SplitTableName(name)
+	for _, lists := range [][]string{s.pendingDDL, s.extraDDL} {
+		for _, n := range lists {
+			if _, b := catalog.SplitTableName(n); strings.EqualFold(b, bare) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// forgetDDL drops the cache entries of the tables the transaction's DDL
+// touched (a rollback, or a failed commit): what the cache holds for
+// them may be the transaction's own uncommitted view.
+func (s *Session) forgetDDL() {
+	for _, lists := range [][]string{s.pendingDDL, s.extraDDL} {
+		for _, n := range lists {
+			s.cat.Invalidate(n)
+		}
+	}
 }
 
 // evalExpr evaluates an expression given an optional row context.

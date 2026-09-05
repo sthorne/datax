@@ -27,6 +27,9 @@ import (
 type relation struct {
 	desc *catalog.TableDescriptor
 	rows [][]types.Datum
+	// alias is a database-qualified name the relation also answers to
+	// (a view referenced as db.v).
+	alias string
 }
 
 // relationPrefix marks a relation's descriptor.
@@ -160,7 +163,7 @@ func (s *Session) bindWith(ctx context.Context, txn *kvclient.Txn, with []parser
 			restore()
 			return nil, err
 		}
-		if prev, had := s.bindRelation(name, &relation{desc: desc, rows: res.Rows}); had {
+		if prev, had := s.bindRelation(name, &relation{desc: desc, rows: res.Rows, alias: cte.Qualified}); had {
 			if _, seen := saved[name]; !seen {
 				saved[name] = prev
 			}

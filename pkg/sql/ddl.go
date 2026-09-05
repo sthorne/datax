@@ -162,6 +162,9 @@ func (s *Session) execRenameTable(ctx context.Context, txn *kvclient.Txn, desc *
 	if catalog.IsSystemTable(t.RenameTo) || vtableName(t.RenameTo) {
 		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved", t.RenameTo)
 	}
+	if err := s.refuseIfViewed(ctx, txn, desc, "rename table "+desc.Name); err != nil {
+		return nil, err
+	}
 	old := desc.Name
 	if err := s.cat.RenameTable(ctx, txn, desc, t.RenameTo); err != nil {
 		return nil, err
@@ -190,6 +193,9 @@ func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	if _, exists := desc.Col(r.To); exists {
 		return nil, newErrf(CodeDuplicateObject, "column %q already exists", r.To)
+	}
+	if err := s.refuseIfViewed(ctx, txn, desc, "rename column "+r.From); err != nil {
+		return nil, err
 	}
 	for i := range desc.Columns {
 		if desc.Columns[i].ID == col.ID {

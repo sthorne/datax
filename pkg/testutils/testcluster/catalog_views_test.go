@@ -163,6 +163,18 @@ WHERE c.relkind IN ('r','p','')
       AND n.nspname <> 'information_schema'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;`,
+	`\dv`: `SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('v','')
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname <> 'information_schema'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 1,2;`,
 	`\di`: `SELECT n.nspname as "Schema",
   c.relname as "Name",
   CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
@@ -317,8 +329,10 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		}
 	}
 
-	// The list commands.
-	want := map[string]int{`\l`: 2, `\dt`: 1, `\di`: 3, `\du`: 2, `\dn`: 1, `\dp`: 1, `\dT`: 0}
+	// The list commands (a view alongside the table: \dt lists tables
+	// only, \dv the view).
+	execSQL(t, ctx, root, `CREATE VIEW tv AS SELECT id, name FROM t WHERE qty > 0`)
+	want := map[string]int{`\l`: 2, `\dt`: 1, `\dv`: 1, `\di`: 3, `\du`: 2, `\dn`: 1, `\dp`: 2, `\dT`: 0}
 	for cmd, q := range psqlListQueries {
 		if got := rowsOf(q); len(got) != want[cmd] {
 			t.Fatalf("%s: %d rows, want %d: %v", cmd, len(got), want[cmd], got)
@@ -332,10 +346,16 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		t.Log("psql not installed; skipping the end-to-end run")
 		return
 	}
-	for _, cmd := range []string{`\l`, `\dt`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
+	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
 		out, err := runPsql(ctx, psql, url, cmd)
 		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
+		}
+		if cmd == `\dv` && !strings.Contains(out, "tv") {
+			t.Fatalf("psql \\dv lacks the view:\n%s", out)
+		}
+		if cmd == `\d+ tv` && !strings.Contains(out, "SELECT id, name FROM t WHERE qty > 0") {
+			t.Fatalf("psql \\d+ tv lacks the definition:\n%s", out)
 		}
 		if cmd == `\d t` {
 			for _, s := range []string{`"t_pkey" PRIMARY KEY, btree (id)`, `"t_name" UNIQUE CONSTRAINT, btree (name)`, `"t_qty" btree (qty)`, `qty    | bigint |           |          | 0`} {

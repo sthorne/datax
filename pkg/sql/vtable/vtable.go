@@ -477,7 +477,7 @@ func col(name string, fam types.Family) catalog.Column { return catalog.Column{N
 // HiddenColumnFor names the hidden column that carries a catalog
 // function's rendering on the rows it applies to: format_type on
 // pg_attribute, pg_get_indexdef on pg_index, pg_get_constraintdef on
-// pg_constraint, pg_get_expr on pg_attrdef.
+// pg_constraint, pg_get_expr on pg_attrdef, pg_get_viewdef on pg_class.
 func HiddenColumnFor(fn string) string {
 	switch fn {
 	case "format_type":
@@ -488,6 +488,8 @@ func HiddenColumnFor(fn string) string {
 		return "__condef"
 	case "pg_get_expr":
 		return "__expr"
+	case "pg_get_viewdef":
+		return "__viewdef"
 	}
 	return "__" + fn
 }

@@ -695,6 +695,7 @@ SHOW TABLES [FROM db];          -- table_name
 SHOW COLUMNS FROM t;            -- column_name, data_type, is_nullable, column_default, indices
 SHOW INDEXES FROM t;            -- table_name, index_name, non_unique, seq_in_index, column_name
 SHOW CREATE TABLE t;            -- the CREATE TABLE statement that recreates t
+SHOW VIEWS;                     -- view_name, definition (SHOW CREATE VIEW v for one)
 SHOW USERS;                     -- username, is_admin
 SHOW GRANTS [ON t] [FOR user];  -- database_name, table_name, grantee, privilege_type
 SHOW DATABASES;                 -- database_name, owner
@@ -708,16 +709,16 @@ SHOW server_version;            -- one setting (SHOW TIME ZONE, SHOW search_path
 The PostgreSQL catalogs are there too, as read-only virtual tables over
 the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
-`pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`,
+`pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
 `pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`
 (and empty stand-ins for the catalogs of features datax lacks —
 policies, publications, extensions, functions, triggers, ...), plus
-`information_schema.schemata`, `tables`, `columns`,
+`information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
-This is what makes `psql`'s `\d`, `\dt`, `\di`, `\du`, `\l`, `\dn`, `\dp`
+This is what makes `psql`'s `\d`, `\dt`, `\dv`, `\di`, `\du`, `\l`, `\dn`, `\dp`
 and friends, and ORM schema introspection, work unmodified — see
 [Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).
 
@@ -729,6 +730,52 @@ their metrics into it (see the operations guide's "Metrics history").
 on it are refused. Admins may read and delete from it and set its
 `retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
 another user read it, and no grant lets a non-admin write to it.
+
+## Views
+
+```sql
+CREATE VIEW big_orders AS SELECT id, cust, qty FROM orders WHERE qty > 100;
+CREATE OR REPLACE VIEW big_orders (id, customer, qty) AS SELECT id, cust, qty FROM orders WHERE qty > 50;
+SELECT customer, count(*) FROM big_orders GROUP BY customer;   -- reads like a table
+CREATE VIEW top AS SELECT customer FROM big_orders GROUP BY customer HAVING count(*) > 3;  -- a view over a view
+SHOW VIEWS;                       -- view_name, definition
+SHOW CREATE VIEW big_orders;
+DROP VIEW [IF EXISTS] top [, ...] [CASCADE];
+```
+
+A view stores its query as written and runs it when a statement names
+it: the view's rows are materialized for the statement — once, however
+many times the statement names it — and it then reads anywhere a table
+does: the base of a `SELECT`, a join side, a subquery, a set-operation
+member, an `INSERT ... SELECT` source, inside `WITH`. A view over a
+view expands the same way. A view's query is any `SELECT` (joins,
+grouping, `WITH`, window functions, set operations) without
+parameters, `AS OF SYSTEM TIME` or `FOR UPDATE`; the optional column
+list renames its output. Views are read-only (`42809` on `INSERT`,
+`UPDATE`, `DELETE`, `COPY`, `ALTER TABLE`, `CREATE INDEX`, `TRUNCATE`).
+`SELECT *` in a view sees a column added to the base table later
+(PostgreSQL freezes the list at creation).
+
+**Dependencies.** A view records the tables and views it reads. `DROP
+TABLE` / `DROP VIEW` refuse (`2BP01`) while a view depends on the
+relation unless `CASCADE`, which drops the dependent views too;
+`RENAME TO`, `RENAME COLUMN` and `DROP COLUMN` on a table a view reads
+are refused the same way (drop or replace the view first — its query
+is stored as text). `CREATE OR REPLACE VIEW` keeps the view's identity
+and grants and may change its column set; a view cannot depend on
+itself (`42P17`).
+
+**Privileges.** Reading a view needs `SELECT` on the view *and* on the
+tables its query reads — the query runs as the reader, not as the
+view's creator (PostgreSQL runs it with the owner's rights). `GRANT` /
+`REVOKE ... ON view` work as on tables; creating a view needs the
+database's `CREATE` privilege, dropping one is for admins.
+
+The catalogs show views as PostgreSQL does — `pg_class` with `relkind =
+'v'`, `pg_views`, `information_schema.tables` (`VIEW`) and
+`information_schema.views`, `pg_attribute` for their columns — so
+`psql`'s `\dv` and `\d view` work. Views need **cluster version v9**
+(`0A000` until `datax debug upgrade` finalizes it).
 
 ## Databases
 
@@ -753,8 +800,9 @@ DROP DATABASE shop CASCADE;   -- ... unless CASCADE drops them too
 A connection starts in the database its URL names (`postgres://.../app`);
 an unknown one is refused with SQLSTATE `3D000`, as in PostgreSQL. An
 unqualified table name resolves in the session's current database;
-`db.table` reaches another database. `SHOW TABLES` and `ANALYZE` (with no
-table) act on the current database. `datax` and `system` cannot be
+`db.table` reaches another database. `SHOW TABLES` (tables only; `SHOW
+VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
+database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO

@@ -262,6 +262,17 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			return p.parseCreateSequence()
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			return p.parseCreateView(false)
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "OR" {
+			p.i += 2 // CREATE OR
+			if !p.consumeIdentWord("replace") || !p.peekIdentWord("view") {
+				return nil, p.errf("expected REPLACE VIEW after CREATE OR, found %q", p.peek().text)
+			}
+			p.i-- // parseCreateView consumes one token, then VIEW
+			return p.parseCreateView(true)
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // CREATE DATABASE
 			cd := &CreateDatabase{}
@@ -349,6 +360,32 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			ds.Name = name
 			return ds, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			p.i += 2 // DROP VIEW
+			dv := &DropView{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				dv.IfExists = true
+			}
+			for {
+				name, err := p.parseTableName()
+				if err != nil {
+					return nil, err
+				}
+				dv.Names = append(dv.Names, name)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if p.consumeIdentWord("cascade") {
+				dv.Cascade = true
+			} else {
+				p.consumeIdentWord("restrict")
+			}
+			return dv, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // DROP DATABASE
@@ -530,6 +567,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.consumeIdentWord("functions") {
 			return &ShowFunctions{}, nil
 		}
+		if p.consumeIdentWord("views") {
+			return &Show{Kind: "views"}, nil
+		}
 		if p.consumeIdentWord("columns") || p.consumeIdentWord("indexes") || p.consumeIdentWord("index") {
 			kind := "columns"
 			if p.toks[p.i-1].text != "columns" {
@@ -545,7 +585,9 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &Show{Kind: kind, Table: name}, nil
 		}
 		if p.consumeKeyword("CREATE") {
-			p.consumeKeyword("TABLE")
+			if !p.consumeKeyword("TABLE") {
+				p.consumeIdentWord("view")
+			}
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
@@ -2889,6 +2931,41 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
 	}
 	return at, nil
+}
+
+// parseCreateView parses [CREATE] VIEW name [(cols)] AS query, keeping
+// the query's source text (the view stores it as written).
+func (p *parser) parseCreateView(orReplace bool) (Statement, error) {
+	p.i++ // CREATE (or the REPLACE slot)
+	if !p.consumeIdentWord("view") {
+		return nil, p.errf("expected VIEW, found %q", p.peek().text)
+	}
+	cv := &CreateView{OrReplace: orReplace}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	cv.Name = name
+	if p.peek().kind == tkOp && p.peek().text == "(" {
+		if cv.Columns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	start := p.peek().pos
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := q.(*Select)
+	if !ok {
+		return nil, p.errf("a view's query must be a SELECT")
+	}
+	cv.Query = sel
+	cv.Text = strings.TrimSpace(p.src[start:p.peek().pos])
+	return cv, nil
 }
 
 // parseRename parses `old TO new`.

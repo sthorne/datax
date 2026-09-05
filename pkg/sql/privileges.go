@@ -25,7 +25,7 @@ var tablePrivs = map[string]bool{"SELECT": true, "INSERT": true, "UPDATE": true,
 func requiresAdmin(stmt parser.Statement) bool {
 	switch stmt.(type) {
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable,
-		*parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex,
+		*parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex, *parser.DropView,
 		*parser.CreateUser, *parser.Analyze, *parser.DropUser, *parser.GrantRevoke,
 		*parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
 		return true
@@ -162,8 +162,8 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
-	if err := mustBeReal(shared); err != nil {
-		return nil, err
+	if shared.Virtual != "" {
+		return nil, newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be granted on", shared.Virtual)
 	}
 	desc := shared.Clone()
 	if desc.Privileges == nil {

@@ -119,7 +119,7 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "pg_encoding_to_char":
 		d := types.NewString("UTF8")
 		out.Func, out.Args, out.Lit = "", nil, &d
-	case "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
+	case "obj_description", "col_description", "shobj_description", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
 		d := types.DNull
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_relation_is_publishable":
@@ -143,6 +143,23 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			d := types.NewString("{" + strings.Join(elems, ",") + "}")
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
+	case "pg_get_viewdef":
+		// pg_get_viewdef(oid [, pretty]): a literal OID (psql's \d+ view)
+		// resolves to the view's stored query here; a column reference
+		// reads pg_class's hidden rendering like the functions below.
+		if len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+			oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text())
+			if err != nil {
+				return e, err
+			}
+			d := types.DNull
+			if desc, rerr := catalog.ReadTable(ctx, txn, uint64(oid)); rerr == nil && desc != nil && desc.IsView() {
+				d = types.NewString(desc.ViewQuery)
+			}
+			out.Func, out.Args, out.Lit = "", nil, &d
+			break
+		}
+		fallthrough
 	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr":
 		// Row-dependent catalog renderings: the virtual tables carry them
 		// as hidden columns beside the OID the function takes, so the

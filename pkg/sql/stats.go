@@ -197,6 +197,9 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 			if derr != nil {
 				return derr
 			}
+			if derr := mustBeReal(d); derr != nil {
+				return derr
+			}
 			descs = []*catalog.TableDescriptor{d}
 			return nil
 		}
@@ -208,7 +211,11 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 		if lerr != nil {
 			return lerr
 		}
-		descs = all
+		for _, d := range all {
+			if !d.IsView() {
+				descs = append(descs, d)
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, ToSQLError(err)

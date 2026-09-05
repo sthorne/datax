@@ -8,6 +8,24 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.22.0 — unreleased
+
+### Added
+- DDL completeness, part two (#95): views. `CREATE [OR REPLACE] VIEW
+  name [(cols)] AS query` stores the query; a statement that names the
+  view runs it and reads the rows like a table (as a base, join side,
+  subquery, set-operation member, `INSERT ... SELECT` source, inside
+  `WITH`; a view over a view expands the same way). `DROP VIEW [IF
+  EXISTS] ... [CASCADE]`; `DROP TABLE`, `DROP VIEW`, `RENAME TO`,
+  `RENAME COLUMN` and `DROP COLUMN` refuse (`2BP01`) while a view
+  depends on the relation unless `CASCADE` drops the views; DML and
+  physical DDL on a view are `42809`. `SHOW VIEWS`, `SHOW CREATE VIEW`,
+  `pg_class` (`relkind = 'v'`), `pg_views`, `information_schema.tables`
+  and `.views`, the dashboard's schema browser, psql's `\dv` and `\d
+  view`. Reading a view needs `SELECT` on the view and on the tables
+  its query reads. Cluster version **v9**: `CREATE VIEW` is refused
+  until `datax debug upgrade` finalizes it.
+
 ## 0.21.0 — unreleased
 
 ### Added

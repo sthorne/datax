@@ -48,6 +48,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		if err != nil {
 			return err
 		}
+		if err := mustBeReal(shared); err != nil {
+			return err
+		}
 		desc := shared.Clone()
 		if desc.Reshard != nil {
 			// The re-shard allocated shadow IDs for the indexes it saw at
@@ -345,6 +348,8 @@ func ddlTableName(stmt parser.Statement) string {
 		}
 		return t.Table
 	case *parser.DropTable:
+		return t.Name
+	case *parser.CreateView:
 		return t.Name
 	case *parser.GrantRevoke:
 		// Table grants ride the descriptor: drain leases like any DDL so

@@ -81,6 +81,9 @@ type SchemaTable struct {
 	Columns    []SchemaColumn `json:"columns"`
 	PrimaryKey []string       `json:"primary_key"`
 	Indexes    []SchemaIndex  `json:"indexes,omitempty"`
+	// View marks a view; Definition is its query.
+	View       bool   `json:"view,omitempty"`
+	Definition string `json:"definition,omitempty"`
 	// Time-series options, when the table was created WITH (timeseries).
 	Timeseries       bool  `json:"timeseries,omitempty"`
 	RetentionSeconds int64 `json:"retention_seconds,omitempty"`
@@ -337,6 +340,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			Database:   dbNames[d.DatabaseID],
 			Timeseries: d.Timeseries, RetentionSeconds: d.RetentionSeconds, Shards: d.ShardBuckets,
 			Privileges: d.Privileges,
+			View:       d.IsView(), Definition: d.ViewQuery,
 		}
 		names[d.ID] = d.Name
 		byID[d.ID] = d
@@ -357,6 +361,10 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 				si.Columns = append(si.Columns, colName[id])
 			}
 			t.Indexes = append(t.Indexes, si)
+		}
+		if d.IsView() {
+			doc.Tables = append(doc.Tables, t) // no rows, no ranges
+			continue
 		}
 		if raw, err := n.db.Get(ctx, keys.TableStatsKey(d.ID)); err == nil && raw != nil {
 			var st catalog.TableStatistics

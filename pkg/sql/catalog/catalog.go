@@ -177,6 +177,14 @@ type TableDescriptor struct {
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
+	// ViewQuery is the SELECT a view stands for, as SQL text; a
+	// descriptor carrying one is a view (cluster version v9): it owns no
+	// rows and no primary key, Columns describe the query's output, and
+	// a statement that names it runs the query (pkg/sql/view.go).
+	ViewQuery string `json:"view_query,omitempty"`
+	// ViewDepends are the tables and views the view's query reads, by
+	// ID: dropping one of them is refused while the view exists.
+	ViewDepends []uint64 `json:"view_depends,omitempty"`
 	// Privileges maps a user name to its granted per-table privileges
 	// (SELECT/INSERT/UPDATE/DELETE, upper-cased; ALL is stored expanded).
 	// root and admin-role members bypass the map entirely.
@@ -263,6 +271,10 @@ func (d *TableDescriptor) VisibleColumns() []Column {
 	return out
 }
 
+// IsView reports whether the descriptor is a view (it carries a query
+// and no rows).
+func (d *TableDescriptor) IsView() bool { return d.ViewQuery != "" }
+
 // Index returns the secondary index with the given name.
 func (d *TableDescriptor) Index(name string) (IndexDescriptor, bool) {
 	for _, idx := range d.Indexes {
@@ -292,6 +304,7 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		}
 	}
 	out.InboundFKs = append([]ForeignKeyRef(nil), d.InboundFKs...)
+	out.ViewDepends = append([]uint64(nil), d.ViewDepends...)
 	if d.Privileges != nil {
 		out.Privileges = make(map[string][]string, len(d.Privileges))
 		for u, ps := range d.Privileges {

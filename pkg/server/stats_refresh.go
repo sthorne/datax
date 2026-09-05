@@ -99,7 +99,7 @@ func (n *Node) statsRefreshOnce(ctx context.Context, staleness time.Duration) {
 	var pickAge int64 = -1
 	for _, kv := range descKVs {
 		var d catalog.TableDescriptor
-		if json.Unmarshal(kv.Value, &d) != nil || d.ID == 0 {
+		if json.Unmarshal(kv.Value, &d) != nil || d.ID == 0 || d.IsView() {
 			continue
 		}
 		live[d.ID] = true

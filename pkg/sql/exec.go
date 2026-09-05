@@ -30,11 +30,21 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
 			return nil, err
 		}
+	} else if cv, ok := stmt.(*parser.CreateView); ok {
+		if err := s.checkCreateInDatabase(ctx, txn, cv.Name); err != nil {
+			return nil, err
+		}
 	} else if requiresAdmin(stmt) {
 		if err := s.checkAdmin(ctx, txn); err != nil {
 			return nil, err
 		}
 	}
+	// Views the statement names bind as leading WITH members.
+	expanded, err := s.expandViews(ctx, txn, stmt)
+	if err != nil {
+		return nil, err
+	}
+	stmt = expanded
 	switch t := stmt.(type) {
 	case *parser.GrantRevoke:
 		return s.execGrantRevoke(ctx, txn, t)
@@ -54,6 +64,10 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterTable(ctx, txn, t)
 	case *parser.DropIndex:
 		return s.execDropIndex(ctx, txn, t)
+	case *parser.CreateView:
+		return s.execCreateView(ctx, txn, t)
+	case *parser.DropView:
+		return s.execDropView(ctx, txn, t)
 	case *parser.AlterIndex:
 		return s.execAlterIndex(ctx, txn, t)
 	case *parser.Truncate:
@@ -428,6 +442,12 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
 	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
+		if existing.IsView() {
+			return nil, newErrf(CodeWrongObjectType, "%q is a view (use DROP VIEW)", t.Name)
+		}
+		if err := s.dropDependentViews(ctx, txn, existing.ID, "table "+existing.Name, t.Cascade, "DROP TABLE ..."); err != nil {
+			return nil, err
+		}
 		if err := s.dropTableConstraints(ctx, txn, existing, t.Cascade); err != nil {
 			return nil, err
 		}
@@ -1978,6 +1998,9 @@ func mustBeReal(desc *catalog.TableDescriptor) error {
 	if desc.Virtual != "" {
 		return newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be modified", desc.Virtual)
 	}
+	if desc.IsView() {
+		return newErrf(CodeWrongObjectType, "%q is a view", desc.Name)
+	}
 	return nil
 }
 
@@ -2087,6 +2110,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		if desc.IsPKCol(col.ID) {
 			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
+		}
+		if err := s.refuseIfViewed(ctx, txn, desc, "drop column "+t.DropCol); err != nil {
+			return nil, err
 		}
 		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
 			return nil, err
@@ -2265,6 +2291,9 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 	}
 	res := &Result{Columns: []ResultColumn{{Name: "table_name", Type: types.String}}}
 	for _, d := range descs {
+		if d.IsView() {
+			continue // SHOW VIEWS
+		}
 		res.Rows = append(res.Rows, []types.Datum{types.NewString(d.Name)})
 	}
 	res.Tag = fmt.Sprintf("SHOW TABLES %d", len(res.Rows))
@@ -2541,6 +2570,21 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 				}
 			}
 		}
+	case "views":
+		db, err := s.cat.Database(ctx, txn, s.database)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		descs, err := s.cat.ListIn(ctx, txn, db)
+		if err != nil {
+			return nil, err
+		}
+		cols("view_name", "definition")
+		for _, d := range descs {
+			if d.IsView() {
+				res.Rows = append(res.Rows, []types.Datum{str(d.Name), str(d.ViewQuery)})
+			}
+		}
 	case "create":
 		desc, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
@@ -2548,6 +2592,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		}
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
+		}
+		if desc.IsView() {
+			cols("table_name", "create_statement")
+			res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(CreateViewDef(desc))})
+			break
 		}
 		if err := mustBeReal(desc); err != nil {
 			return nil, err

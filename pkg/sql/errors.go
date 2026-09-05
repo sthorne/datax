@@ -54,6 +54,8 @@ const (
 	CodeDuplicateDatabase         = "42P04"
 	CodeDependentObjectsExist     = "2BP01"
 	CodeObjectInUse               = "55006"
+	CodeWrongObjectType           = "42809"
+	CodeInvalidObjectDefinition   = "42P17"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.

@@ -473,6 +473,9 @@ type CTE struct {
 	Columns   []string
 	Query     Statement
 	Recursive bool
+	// Qualified is a second, database-qualified name the bound relation
+	// answers to (a view referenced as db.v; see pkg/sql/view.go).
+	Qualified string
 }
 
 type Select struct {
@@ -577,6 +580,23 @@ type AlterTable struct {
 	DropNotNull string
 }
 
+// CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
+type CreateView struct {
+	Name      string
+	Columns   []string
+	OrReplace bool
+	Query     *Select
+	// Text is the query's SQL as written; the view stores it.
+	Text string
+}
+
+// DropView is DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
+type DropView struct {
+	Names    []string
+	IfExists bool
+	Cascade  bool
+}
+
 // Rename is an old name and its replacement.
 type Rename struct{ From, To string }
 
@@ -638,8 +658,8 @@ type RollbackToSavepoint struct{ Name string }
 type ShowTables struct{ Database string }
 
 // Show is one of the introspection statements: SHOW COLUMNS FROM t, SHOW
-// INDEXES FROM t, SHOW CREATE TABLE t, SHOW USERS, SHOW GRANTS [ON t]
-// [FOR user], SHOW ALL. Kind is "columns", "indexes", "create", "users",
+// INDEXES FROM t, SHOW CREATE TABLE | VIEW t, SHOW VIEWS, SHOW USERS, SHOW
+// GRANTS [ON t] [FOR user], SHOW ALL. Kind is "columns", "indexes", "create", "views", "users",
 // "grants", or "all".
 type Show struct {
 	Kind  string
@@ -697,6 +717,8 @@ func (*ShowSequences) stmt()       {}
 func (*ShowFunctions) stmt()       {}
 func (*CreateIndex) stmt()         {}
 func (*DropIndex) stmt()           {}
+func (*CreateView) stmt()          {}
+func (*DropView) stmt()            {}
 func (*AlterIndex) stmt()          {}
 func (*Truncate) stmt()            {}
 func (*Explain) stmt()             {}

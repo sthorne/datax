@@ -76,9 +76,14 @@ const (
 	// a parent row without touching its children, so the DDL that
 	// creates a constraint is refused until finalize (rule 4).
 	V8 Version = 8
+	// V9 introduces views (pkg/sql/view.go): a table descriptor may carry
+	// a ViewQuery, and then describes no rows of its own. A v8 node would
+	// read such a descriptor as an empty table and let DML target it, so
+	// CREATE VIEW is refused until finalize (rule 4).
+	V9 Version = 9
 
 	// Current is the newest cluster version this binary can run.
-	Current = V8
+	Current = V9
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.
