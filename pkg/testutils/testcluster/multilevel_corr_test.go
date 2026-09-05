@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -88,15 +89,20 @@ func TestMultiLevelCorrelated(t *testing.T) {
 		ORDER BY name`),
 		[]string{"eng", "ops"})
 
-	// Depth cap: four nested subqueries are the limit; a fifth rejects
-	// with a clear error.
-	deep := `SELECT id FROM regions r1 WHERE EXISTS (
-		SELECT 1 FROM regions r2 WHERE r2.id = r1.id AND EXISTS (
-			SELECT 1 FROM regions r3 WHERE r3.id = r1.id AND EXISTS (
-				SELECT 1 FROM regions r4 WHERE r4.id = r1.id AND EXISTS (
-					SELECT 1 FROM regions r5 WHERE r5.id = r1.id AND EXISTS (
-						SELECT 1 FROM regions r6 WHERE r6.id = r1.id)))))`
-	if _, serr := trySQL(ctx, s, deep); serr == nil || serr.Code != sql.CodeFeatureNotSupported ||
+	// Depth cap: eight levels of correlated nesting are the limit; the
+	// ninth rejects with a clear error.
+	nest := func(levels int) string {
+		q := "SELECT id FROM regions r1 WHERE "
+		for i := 2; i <= levels; i++ {
+			q += fmt.Sprintf("EXISTS (SELECT 1 FROM regions r%d WHERE r%d.id = r1.id", i, i)
+			if i < levels {
+				q += " AND "
+			}
+		}
+		return q + strings.Repeat(")", levels-1) + " ORDER BY id"
+	}
+	eq(col(nest(9)), []string{"1", "2", "3"})
+	if _, serr := trySQL(ctx, s, nest(10)); serr == nil || serr.Code != sql.CodeFeatureNotSupported ||
 		!strings.Contains(serr.Msg, "nest deeper") {
 		t.Fatalf("depth cap: %+v", serr)
 	}

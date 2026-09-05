@@ -363,9 +363,6 @@ func cmpNeedsResolve(cmp parser.Comparison) bool {
 // resolveWhereSubs evaluates every subquery in a WHERE conjunction,
 // returning a spliced copy (or the original slice when nothing changed).
 func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, params []types.Datum) ([]parser.Comparison, error) {
-	if parser.HasSubInOr(where) {
-		return nil, newErrf(CodeFeatureNotSupported, "IN and EXISTS subqueries are not supported inside OR")
-	}
 	changed := false
 	for _, cmp := range where {
 		if cmpNeedsResolve(cmp) {
@@ -508,6 +505,20 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			c.Having = append([]parser.HavingCond(nil), t.Having...)
 		}
 		c.Having[i].Value = v
+	}
+	for i, oc := range t.OrderBy {
+		if oc.Expr == nil || !exprHasSub(*oc.Expr) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, *oc.Expr, params)
+		if err != nil {
+			return nil, err
+		}
+		c := cloned()
+		if &c.OrderBy[0] == &t.OrderBy[0] {
+			c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
+		}
+		c.OrderBy[i].Expr = &v
 	}
 	return out, nil
 }

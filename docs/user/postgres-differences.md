@@ -12,7 +12,7 @@ syntax error or `0A000` feature not supported):
 | Missing | Workaround |
 |---|---|
 | Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `INTERVAL` as a type (intervals are text: `ts + '2 hours'`); expressions over aggregates (`SUM(a) / COUNT(*)`); window functions; user-defined functions | compute client-side or in a derived table |
-| `EXPLAIN ANALYZE`; `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call | Window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
+| `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
@@ -44,9 +44,9 @@ syntax error or `0A000` feature not supported):
   normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
-  indexable `AND` condition alongside on large tables. `IN` and `EXISTS`
-  subqueries cannot appear inside `OR` (scalar subqueries can). Computed
-  left-hand sides (`qty * 2 > 10`) work in single-table queries and joins.
+  indexable `AND` condition alongside on large tables. `IN`, `EXISTS`
+  and scalar subqueries may appear inside `OR`. Computed left-hand sides
+  (`qty * 2 > 10`) work in single-table queries and joins.
 - **`LIKE` / `ILIKE` and regular expressions (`~`, `~*`)** filter fetched
   rows; there is no pattern-prefix index optimization.
 - **Join order is execution order until statistics exist** — with

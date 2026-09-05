@@ -8,6 +8,17 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.20.0 — unreleased
+
+### Added
+- Query shapes, part four (#94, closing it): `IN` and `EXISTS`
+  subqueries inside `OR` (uncorrelated ones evaluated once, correlated
+  ones per row); correlated subqueries up to 8 nesting levels; scalar
+  subqueries in `ORDER BY`; `EXPLAIN ANALYZE`, which runs the statement
+  and reports each stage's actual rows and time (scans with their
+  paths, join levels, group / window / set-operation and sort stages)
+  and the total.
+
 ## 0.19.0 — unreleased
 
 ### Added

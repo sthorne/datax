@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -1099,7 +1100,11 @@ func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalo
 	if err != nil {
 		return nil, plan, err
 	}
+	start := time.Now()
 	rows, err := s.executePlan(ctx, txn, desc, plan, where, params, limit)
+	if err == nil && s.explain != nil {
+		s.note("scan %s: %s; %d rows in %s", desc.Name, plan.String(), len(rows), explainDuration(time.Since(start)))
+	}
 	return rows, plan, err
 }
 
@@ -1655,6 +1660,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		if err := sortRows(desc, rows, order, params); err != nil {
 			return nil, err
 		}
+		s.note("sort: %d rows in memory", len(rows))
 		if !t.Distinct {
 			rows = cutRows(rows, keepCount(t))
 		}
@@ -2096,6 +2102,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	sel, ok := t.Stmt.(*parser.Select)
 	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
+	}
+	if t.Analyze {
+		return s.execExplainAnalyze(ctx, txn, sel, params)
 	}
 	if len(sel.With) > 0 {
 		// The members bind by shape only: EXPLAIN runs nothing.
@@ -2663,4 +2672,50 @@ func trimRows[T any](rows []T, t *parser.Select) []T {
 		rows = rows[:t.Limit]
 	}
 	return rows
+}
+
+// explainStats is what EXPLAIN ANALYZE gathers while the statement runs:
+// one line per stage (a scan with its path, rows and time; a join level;
+// the group, window, set-operation and sort stages), in execution order.
+type explainStats struct {
+	lines []string
+}
+
+// note records a stage line when EXPLAIN ANALYZE is running.
+func (s *Session) note(format string, args ...any) {
+	if s.explain != nil {
+		s.explain.lines = append(s.explain.lines, fmt.Sprintf(format, args...))
+	}
+}
+
+// explainDuration renders a stage duration for EXPLAIN ANALYZE.
+func explainDuration(d time.Duration) string {
+	return fmt.Sprintf("%.3f ms", float64(d.Microseconds())/1000)
+}
+
+// execExplainAnalyze runs the select with stage accounting on and
+// reports the plan line followed by one line per stage with its actual
+// rows and time, then the output row count and the total time.
+func (s *Session) execExplainAnalyze(ctx context.Context, txn *kvclient.Txn, sel *parser.Select, params []types.Datum) (*Result, error) {
+	plan, err := s.execExplain(ctx, txn, &parser.Explain{Stmt: sel}, params)
+	if err != nil {
+		return nil, err
+	}
+	stats := &explainStats{}
+	s.explain = stats
+	start := time.Now()
+	res, err := s.execSelect(ctx, txn, sel, params)
+	elapsed := time.Since(start)
+	s.explain = nil
+	if err != nil {
+		return nil, err
+	}
+	out := &Result{Columns: []ResultColumn{{Name: "plan", Type: types.String}}}
+	out.Rows = append(out.Rows, []types.Datum{types.NewString("plan: " + plan.Rows[0][0].Text())})
+	for _, line := range stats.lines {
+		out.Rows = append(out.Rows, []types.Datum{types.NewString("  " + line)})
+	}
+	out.Rows = append(out.Rows, []types.Datum{types.NewString(fmt.Sprintf("output: %d rows; total %s", len(res.Rows), explainDuration(elapsed)))})
+	out.Tag = fmt.Sprintf("EXPLAIN %d", len(out.Rows))
+	return out, nil
 }

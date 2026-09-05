@@ -224,6 +224,9 @@ type CreateIndex struct {
 // of executed.
 type Explain struct {
 	Stmt Statement
+	// Analyze runs the statement and reports each stage's actual rows and
+	// time along with the plan.
+	Analyze bool
 }
 
 type DropTable struct {

@@ -505,6 +505,7 @@ func (s *Session) execWindowed(ctx context.Context, txn *kvclient.Txn, t *parser
 		return nil, err
 	}
 	vis := len(inner.Columns) - wp.hidden
+	s.note("window: %d function(s) over %d rows", len(wp.items), len(inner.Rows))
 	values := make([][]types.Datum, len(wp.items))
 	for i := range wp.items {
 		vals, err := wp.items[i].compute(inner, vis, params)
