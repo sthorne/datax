@@ -98,7 +98,13 @@ state or the internode protocol does, and an entry below says so.
   #167 names, `TestMergeFrozenAndRecovery`, already waits for the RHS
   leader before it subsumes (since 0.35.0); the new
   `TestSplitKeepsServedReadsProtected` had the same race and now waits
-  the same way (`waitForLeader`). `make test` and
+  the same way (`waitForLeader`). The crash tests' child node inherits
+  its listeners from the parent instead of binding ports the parent
+  picked and released a process start earlier — a race with the
+  packages testing alongside, whose nodes and clients take ephemeral
+  ports on the same loopback, that killed the child on "address
+  already in use" before it served (one CI run in a few); a child that
+  fails to serve now has its log quoted in the failure. `make test` and
   `make test-race` pass `-timeout 30m`: the cluster suite outruns
   `go test`'s default 10 minutes on a small machine.
 - CI runs `staticcheck` (pinned at 2025.1.1, before the suite so a

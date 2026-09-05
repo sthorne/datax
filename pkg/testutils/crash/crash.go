@@ -78,24 +78,53 @@ func Start(t testing.TB, opts Options) *Node {
 	if opts.LogPath == "" {
 		opts.LogPath = filepath.Join(opts.Dir, "child.log")
 	}
-	n := &Node{t: t, opts: opts, rpc: freePort(t), pg: freePort(t), http: freePort(t)}
+	n := &Node{t: t, opts: opts}
 	n.spawn(opts.FaultPoint)
 	return n
 }
 
 // spawn starts the child on the node's ports and waits for readiness.
+// The listeners are opened here and handed to the child as inherited
+// descriptors: picking a free port and letting the child bind it a
+// process start later lost a race with the packages testing alongside,
+// whose nodes and clients take ephemeral ports on the same loopback —
+// the child then died on "address already in use" before serving.
+// The first spawn takes any free ports; a restart reopens the same ones.
 func (n *Node) spawn(fault string) {
 	n.t.Helper()
 	logf, err := os.OpenFile(n.opts.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		n.t.Fatal(err)
 	}
+	var files []*os.File
+	for _, addr := range []*string{&n.rpc, &n.pg, &n.http} {
+		want := *addr
+		if want == "" {
+			want = "127.0.0.1:0"
+		}
+		l, err := net.Listen("tcp", want)
+		if err != nil {
+			n.t.Fatal(err)
+		}
+		*addr = l.Addr().String()
+		f, err := l.(*net.TCPListener).File()
+		_ = l.Close() // the socket lives on through the duplicate
+		if err != nil {
+			n.t.Fatal(err)
+		}
+		files = append(files, f)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashNodeChild$", "-test.v")
 	cmd.Env = append(os.Environ(),
 		envChild+"=1", envDir+"="+n.opts.Dir, envRPC+"="+n.rpc, envPG+"="+n.pg, envHTTP+"="+n.http,
 		envMemTable+"="+strconv.Itoa(n.opts.MemTableSize), faultpoint.EnvVar+"="+fault)
 	cmd.Stdout, cmd.Stderr = logf, logf
-	if err := cmd.Start(); err != nil {
+	cmd.ExtraFiles = files // descriptors 3, 4, 5 in the child
+	err = cmd.Start()
+	for _, f := range files {
+		_ = f.Close() // the child holds the only copies now
+	}
+	if err != nil {
 		_ = logf.Close()
 		n.t.Fatalf("starting the child node: %v", err)
 	}
@@ -109,7 +138,7 @@ func (n *Node) spawn(fault string) {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		if n.Exited() {
-			n.t.Fatalf("child node exited before serving (see %s)", n.opts.LogPath)
+			n.t.Fatalf("child node exited before serving; its log %s ends:\n%s", n.opts.LogPath, n.logTail())
 		}
 		if c, err := net.DialTimeout("tcp", n.pg, 200*time.Millisecond); err == nil {
 			_ = c.Close()
@@ -118,10 +147,23 @@ func (n *Node) spawn(fault string) {
 			}
 		}
 		if time.Now().After(deadline) {
-			n.t.Fatalf("child node never became ready (see %s)", n.opts.LogPath)
+			n.t.Fatalf("child node never became ready; its log %s ends:\n%s", n.opts.LogPath, n.logTail())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// logTail is the end of the child's log, for a failure message.
+func (n *Node) logTail() string {
+	raw, err := os.ReadFile(n.opts.LogPath)
+	if err != nil {
+		return err.Error()
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) > 30 {
+		lines = lines[len(lines)-30:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // URL is the node's SQL connection URL.
@@ -271,11 +313,26 @@ func ChildMain(t testing.TB) {
 		return
 	}
 	memTable, _ := strconv.Atoi(os.Getenv(envMemTable))
+	// The listeners the parent opened, inherited as descriptors 3-5.
+	var ls [3]net.Listener
+	for i := range ls {
+		f := os.NewFile(uintptr(3+i), []string{"rpc", "pg", "http"}[i])
+		l, err := net.FileListener(f)
+		_ = f.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "child node: inherited listener %d: %v\n", i, err)
+			os.Exit(1)
+		}
+		ls[i] = l
+	}
 	cfg := server.Config{
 		Dir:                 os.Getenv(envDir),
 		Listen:              os.Getenv(envRPC),
+		Listener:            ls[0],
 		PGListen:            os.Getenv(envPG),
+		PGListener:          ls[1],
 		HTTPListen:          os.Getenv(envHTTP),
+		HTTPListener:        ls[2],
 		BootstrapSelf:       true, // a store that already has an identity reopens instead
 		StorageMemTableSize: memTable,
 	}
@@ -285,18 +342,6 @@ func ChildMain(t testing.TB) {
 	}
 	fmt.Printf("child node serving sql=%s http=%s fault=%q\n", cfg.PGListen, cfg.HTTPListen, faultpoint.Armed())
 	select {}
-}
-
-// freePort picks a free loopback port.
-func freePort(t testing.TB) string {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := l.Addr().String()
-	_ = l.Close()
-	return addr
 }
 
 // IsChild reports whether this process is a spawned child (tests skip
