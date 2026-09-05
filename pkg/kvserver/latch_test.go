@@ -2,6 +2,8 @@ package kvserver
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -126,5 +128,121 @@ func TestLatchSpansFromBatch(t *testing.T) {
 	_, mode, err = latchSpans(wb)
 	if err != nil || mode != latchExclusive {
 		t.Fatalf("%v %v", mode, err)
+	}
+}
+
+// naiveConflict is the reference linear overlap scan the point index
+// replaced; the randomized test below checks the index agrees with it.
+func naiveConflict(held map[*latch]struct{}, l *latch) bool {
+	for h := range held {
+		if l.mode == latchShared && h.mode == latchShared {
+			continue
+		}
+		for _, hs := range h.spans {
+			for _, ls := range l.spans {
+				sEnd, oEnd := hs.End, ls.End
+				if sEnd == nil {
+					sEnd = hs.Start.Next()
+				}
+				if oEnd == nil {
+					oEnd = ls.Start.Next()
+				}
+				if hs.Start.Compare(oEnd) < 0 && ls.Start.Compare(sEnd) < 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func TestLatchIndexMatchesNaiveScan(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	randSpan := func() latchSpan {
+		a := keys.Key{byte('a' + rng.Intn(8))}
+		if rng.Intn(4) != 0 {
+			return latchSpan{Start: a}
+		}
+		b := keys.Key{byte('a' + rng.Intn(8))}
+		if b.Compare(a) <= 0 {
+			b = a.Next()
+		}
+		return latchSpan{Start: a, End: b}
+	}
+	randLatch := func() *latch {
+		l := &latch{mode: latchMode(rng.Intn(2)), done: make(chan struct{})}
+		for i := rng.Intn(4) + 1; i > 0; i-- {
+			sp := randSpan()
+			l.spans = append(l.spans, sp)
+			if sp.End != nil {
+				l.ranged = true
+			}
+		}
+		return l
+	}
+	m := newLatchManager()
+	var holders []*latch
+	for i := 0; i < 5000; i++ {
+		if len(holders) > 0 && rng.Intn(3) == 0 {
+			j := rng.Intn(len(holders))
+			m.remove(holders[j])
+			holders = append(holders[:j], holders[j+1:]...)
+		}
+		l := randLatch()
+		got := m.findConflict(l) != nil
+		want := naiveConflict(m.held, l)
+		if got != want {
+			t.Fatalf("step %d: index says conflict=%v, naive says %v for %+v", i, got, want, l.spans)
+		}
+		if !got {
+			m.insert(l)
+			holders = append(holders, l)
+		}
+	}
+	for _, l := range holders {
+		m.remove(l)
+	}
+	if len(m.held) != 0 || len(m.points) != 0 || len(m.ranged) != 0 {
+		t.Fatalf("index not empty after releasing everything: %d held, %d point keys, %d ranged", len(m.held), len(m.points), len(m.ranged))
+	}
+}
+
+func TestLatchPointUnderRangedHolder(t *testing.T) {
+	m := newLatchManager()
+	g := mustAcquire(t, m, []latchSpan{span("b", "d")}, latchExclusive)
+	ch := acquireBlocks(t, m, []latchSpan{span("c", "")}, latchShared)
+	// A point outside the range and a point at the exclusive end are free.
+	mustAcquire(t, m, []latchSpan{span("a", "")}, latchExclusive).Release()
+	mustAcquire(t, m, []latchSpan{span("d", "")}, latchExclusive).Release()
+	g.Release()
+	(<-ch).Release()
+}
+
+// BenchmarkLatchAcquirePoints models a 100-key write batch contending with
+// many disjoint holders — the shape the probe batches of INSERT produce.
+func BenchmarkLatchAcquirePoints(b *testing.B) {
+	m := newLatchManager()
+	ctx := context.Background()
+	for i := 0; i < 64; i++ {
+		spans := make([]latchSpan, 100)
+		for j := range spans {
+			spans[j] = latchSpan{Start: keys.Key(fmt.Sprintf("h%03d-%03d", i, j))}
+		}
+		if _, err := m.Acquire(ctx, spans, latchExclusive); err != nil {
+			b.Fatal(err)
+		}
+	}
+	spans := make([]latchSpan, 100)
+	for j := range spans {
+		spans[j] = latchSpan{Start: keys.Key(fmt.Sprintf("x-%03d", j))}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		g, err := m.Acquire(ctx, spans, latchExclusive)
+		if err != nil {
+			b.Fatal(err)
+		}
+		g.Release()
 	}
 }

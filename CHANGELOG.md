@@ -26,6 +26,14 @@ state or the internode protocol does, and an entry below says so.
   not primed with still reads on its own. Before/after on the harness in
   the PR; the set gains `index-join-1pct` and `index-join-10pct` (200 and
   2,000 rows per lookup).
+- The latch manager indexes point spans by key (#108, latch part). Its
+  conflict check was a linear scan of every held latch's spans against
+  every span of the new request, allocating per comparison; with the
+  wide batches of #103 (100-key probes under the 8-way `ingest` load) it
+  reached 40% of a node's CPU and cost ingest a quarter of its throughput.
+  A point span now checks the holders under its key plus the ranged
+  holders; only ranged spans (scans, splits, merges) still scan every
+  holder, and overlap checks no longer allocate.
 
 ## 0.33.0 — unreleased
 

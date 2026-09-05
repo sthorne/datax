@@ -24,9 +24,11 @@ import (
 // latch until apply) or R serialized before W (W's tsCache check observes
 // R's bump and is pushed above it). Non-overlapping pairs need no ordering.
 //
-// The implementation is a mutex-protected set of held latches with a linear
-// overlap scan — at prototype request rates an interval tree is unearned
-// complexity, and the API allows swapping the implementation later.
+// The implementation is a mutex-protected set of held latches. Point spans
+// (the overwhelmingly common case: every Get/Put/CPut in a batch) are
+// indexed by key so a conflict check for a point is a map lookup plus a
+// scan of the (rare) held latches that cover key ranges. Only ranged
+// requests — scans, splits, merges — pay for a linear scan of every holder.
 // Fairness is best-effort (a waiter re-scans after any conflicting release);
 // starvation of writers behind a stream of readers is possible and accepted.
 
@@ -43,30 +45,47 @@ type latchSpan struct {
 	Start, End keys.Key
 }
 
+// overlaps reports whether the two intervals intersect. It does not
+// allocate: a point span [p, p.Next()) intersects [s, e) iff s <= p < e.
 func (s latchSpan) overlaps(o latchSpan) bool {
-	sEnd, oEnd := s.End, o.End
-	if sEnd == nil {
-		sEnd = s.Start.Next()
+	switch {
+	case s.End == nil && o.End == nil:
+		return s.Start.Equal(o.Start)
+	case s.End == nil:
+		return o.Start.Compare(s.Start) <= 0 && s.Start.Compare(o.End) < 0
+	case o.End == nil:
+		return s.Start.Compare(o.Start) <= 0 && o.Start.Compare(s.End) < 0
+	default:
+		return s.Start.Compare(o.End) < 0 && o.Start.Compare(s.End) < 0
 	}
-	if oEnd == nil {
-		oEnd = o.Start.Next()
-	}
-	return s.Start.Compare(oEnd) < 0 && o.Start.Compare(sEnd) < 0
 }
 
 type latch struct {
 	spans []latchSpan
 	mode  latchMode
 	done  chan struct{}
+	// ranged is set when at least one span covers a key range; such latches
+	// are kept in latchManager.ranged so point lookups can consult them.
+	ranged bool
 }
 
 type latchManager struct {
-	mu   sync.Mutex
+	mu sync.Mutex
+	// held is every latch currently held.
 	held map[*latch]struct{}
+	// points indexes holders by the exact key of each point span. A latch
+	// with n point spans appears under n keys (twice under a repeated key).
+	points map[string][]*latch
+	// ranged is the subset of held latches with at least one ranged span.
+	ranged map[*latch]struct{}
 }
 
 func newLatchManager() *latchManager {
-	return &latchManager{held: make(map[*latch]struct{})}
+	return &latchManager{
+		held:   make(map[*latch]struct{}),
+		points: make(map[string][]*latch),
+		ranged: make(map[*latch]struct{}),
+	}
 }
 
 // latchGuard releases an acquired latch. Release is idempotent.
@@ -79,7 +98,7 @@ type latchGuard struct {
 func (g *latchGuard) Release() {
 	g.once.Do(func() {
 		g.m.mu.Lock()
-		delete(g.m.held, g.l)
+		g.m.remove(g.l)
 		g.m.mu.Unlock()
 		close(g.l.done)
 	})
@@ -90,11 +109,17 @@ func (g *latchGuard) Release() {
 // or ctx is done.
 func (m *latchManager) Acquire(ctx context.Context, spans []latchSpan, mode latchMode) (*latchGuard, error) {
 	l := &latch{spans: spans, mode: mode, done: make(chan struct{})}
+	for _, sp := range spans {
+		if sp.End != nil {
+			l.ranged = true
+			break
+		}
+	}
 	for {
 		m.mu.Lock()
 		conflict := m.findConflict(l)
 		if conflict == nil {
-			m.held[l] = struct{}{}
+			m.insert(l)
 			m.mu.Unlock()
 			return &latchGuard{m: m, l: l}, nil
 		}
@@ -109,14 +134,78 @@ func (m *latchManager) Acquire(ctx context.Context, spans []latchSpan, mode latc
 	}
 }
 
-func (m *latchManager) findConflict(l *latch) *latch {
-	for held := range m.held {
-		if l.mode == latchShared && held.mode == latchShared {
+func (m *latchManager) insert(l *latch) {
+	m.held[l] = struct{}{}
+	if l.ranged {
+		m.ranged[l] = struct{}{}
+	}
+	for _, sp := range l.spans {
+		if sp.End == nil {
+			k := string(sp.Start)
+			m.points[k] = append(m.points[k], l)
+		}
+	}
+}
+
+func (m *latchManager) remove(l *latch) {
+	delete(m.held, l)
+	delete(m.ranged, l)
+	for _, sp := range l.spans {
+		if sp.End != nil {
 			continue
 		}
-		for _, hs := range held.spans {
-			for _, ls := range l.spans {
-				if hs.overlaps(ls) {
+		k := string(sp.Start)
+		hs := m.points[k]
+		n := hs[:0]
+		for _, h := range hs {
+			if h != l {
+				n = append(n, h)
+			}
+		}
+		if len(n) == 0 {
+			delete(m.points, k)
+			continue
+		}
+		clear(hs[len(n):])
+		m.points[k] = n
+	}
+}
+
+// conflicts reports whether a held latch conflicts with l: at least one of
+// the two must write. Span overlap is checked by the caller.
+func (l *latch) conflicts(held *latch) bool {
+	return l.mode == latchExclusive || held.mode == latchExclusive
+}
+
+func (m *latchManager) findConflict(l *latch) *latch {
+	for _, ls := range l.spans {
+		if ls.End != nil {
+			// A ranged span may overlap any holder: scan them all.
+			for held := range m.held {
+				if !l.conflicts(held) {
+					continue
+				}
+				for _, hs := range held.spans {
+					if hs.overlaps(ls) {
+						return held
+					}
+				}
+			}
+			continue
+		}
+		// A point span conflicts with holders of exactly that key and with
+		// ranged holders whose ranged spans cover it.
+		for _, held := range m.points[string(ls.Start)] {
+			if l.conflicts(held) {
+				return held
+			}
+		}
+		for held := range m.ranged {
+			if !l.conflicts(held) {
+				continue
+			}
+			for _, hs := range held.spans {
+				if hs.End != nil && hs.overlaps(ls) {
 					return held
 				}
 			}

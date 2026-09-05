@@ -116,6 +116,15 @@ read it does not overlap — so they run in parallel. Transaction-record
 operations latch under their **anchor key** (the record's addressed key),
 and splits take a whole-range exclusive latch.
 
+The manager keeps the held latches in a set and indexes every **point**
+span (a single key: every `Get`, `Put` and `ConditionalPut` in a batch) by
+its key, alongside the subset of holders that cover a key **range**. A
+point span's conflict check is a lookup under its key plus a scan of the
+ranged holders only; a ranged span (a scan, a split, a merge) scans every
+holder. Overlap checks do not allocate. Before the index a 100-key batch
+under 64 similar holders cost about 60 ms and 1.9 million allocations in
+the conflict scan; with it, about 20 µs.
+
 ### Timestamp cache
 
 Per range, leader-side, and **interval-based** (v2; v1 kept a single
