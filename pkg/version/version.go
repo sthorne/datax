@@ -81,9 +81,15 @@ const (
 	// read such a descriptor as an empty table and let DML target it, so
 	// CREATE VIEW is refused until finalize (rule 4).
 	V9 Version = 9
+	// V10 introduces the INTERVAL and TIME column types (pkg/sql/types):
+	// their row encodings (rowenc tags 12 and 13) are unknown to a v9
+	// node, which would refuse every row of such a table, so a CREATE
+	// TABLE, ADD COLUMN or ALTER COLUMN TYPE naming them is refused
+	// until finalize (rule 4).
+	V10 Version = 10
 
 	// Current is the newest cluster version this binary can run.
-	Current = V9
+	Current = V10
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

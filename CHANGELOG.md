@@ -8,6 +8,31 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.25.0 — unreleased
+
+### Added
+- Type system, part two (#96): `INTERVAL` and `TIME` as column types
+  (cluster version **v10**: a v9 node cannot decode their rows, so a
+  column of either is refused until the upgrade is finalized). An
+  interval is PostgreSQL's months / days / clock triple: every input
+  form (verbose, `'2h30m'`, `'... ago'`, SQL standard `'1-2 3
+  04:05:06'`, ISO 8601), the `INTERVAL '...'` / `DATE '...'` / `TIME
+  '...'` / `TIMESTAMP '...'` typed literals, PostgreSQL's rendering and
+  comparison rule, `timestamp - timestamp` and `age()` now return an
+  interval (they were text), `interval ± interval`, `interval * / n`,
+  `time ± interval`, `time - time`, `date + time`, `extract` over
+  intervals and times, `justify_hours` / `justify_days` /
+  `justify_interval`, `make_interval` / `make_time`, `sum` / `avg` /
+  `min` / `max` over intervals, indexes and primary keys on both,
+  `interval` (1186) / `time` (1083) text and binary wire codecs (pgx's
+  `pgtype.Interval`, `time.Duration`, `pgtype.Time`), `pg_type` rows,
+  `ALTER COLUMN TYPE` from text. The timeseries `retention` option and
+  `with_max_staleness` accept interval text.
+
+### Changed
+- `timestamp - timestamp`, `age()`, `make_interval()` and
+  `justify_hours()` return `INTERVAL` (OID 1186) instead of text.
+
 ## 0.24.0 — unreleased
 
 ### Added

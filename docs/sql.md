@@ -41,15 +41,30 @@ ANALYZE [t]                             -- collect table statistics (admin; not 
 SHOW STATS FOR t
 ```
 
-- Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
-  `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
-  (alias TIMESTAMP [WITH TIME ZONE]; UTC nanoseconds internally,
-  microsecond precision on the binary wire), `DATE`, `BYTES` (alias
-  BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases NUMERIC, DEC),
-  `JSONB` (alias JSON). String literals coerce into the
-  new types (`WHERE at >= '2026-08-30 02:00:00Z'` becomes a key bound),
-  and all but JSONB are usable in primary keys and indexes via
-  order-preserving encodings (JSONB has no ordering and refuses with
+- Types: `INT8` (BIGINT), `INT4` (INT, INTEGER) and `INT2` (SMALLINT) —
+  one `Int` family, the width a column attribute (`catalog.Column.Width`)
+  that bounds values and picks the wire OID; `FLOAT8` (DOUBLE PRECISION),
+  `TEXT` (aliases STRING, VARCHAR) with `VARCHAR(n)` / `CHAR(n)` as
+  attributes (`MaxLen`, `Char`), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
+  (TIMESTAMP WITH TIME ZONE; UTC nanoseconds internally, microsecond
+  precision on the binary wire) and `TIMESTAMP` without time zone
+  (attribute `NoTZ`: the same nanoseconds, rendered without an offset,
+  an input offset ignored), `TIMESTAMP(p)` / `TIME(p)` (`TimePrecision`,
+  stored as p+1), `DATE`, `TIME` (nanoseconds since midnight), `INTERVAL`
+  (a months / days / nanoseconds triple: `Datum.Mo`, `Datum.Dy`,
+  `Datum.I`; compared by PostgreSQL's 30-day-month, 24-hour-day value),
+  `BYTES` (alias BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases
+  NUMERIC, DEC), `JSONB` (alias JSON). The attributes are enforced on
+  every write by `catalog.Column.Conform` (a `ValueError` carries the
+  SQLSTATE) and described by `sql.ResultColumn`, so pgwire picks the OID,
+  size and rendering per described column; below cluster version v9 a
+  new column drops them (the earlier meaning), and INTERVAL / TIME
+  columns need v10 (their rowenc tags 12 and 13 are unknown to v9).
+  String literals coerce into the new types (`WHERE at >= '2026-08-30
+  02:00:00Z'` becomes a key bound), and all but JSONB are usable in
+  primary keys and indexes via order-preserving encodings (an interval
+  key is its comparison value followed by the months and days; JSONB
+  has no ordering and refuses with
   `0A000`).
 - DECIMAL is exact arbitrary-precision arithmetic (`math/big` coefficient
   × 10^exp). Non-integer numeric literals are DECIMAL, as in PostgreSQL —
@@ -70,10 +85,14 @@ SHOW STATS FOR t
   memo identity are untouched — while the datum carries the declared
   scale as a display-only field: `Text()` pads to it (`9.90`), and the
   binary NUMERIC encoder derives its `dscale` from that padded render.
-  RowDescription reports the typmod (`(p<<16)|(s+4)`) for enforced
-  columns. Precision/scale live on the column descriptor as append-only
-  `omitempty` JSON fields (zero = bare DECIMAL, the pre-existing
-  meaning), so old descriptors and rolling upgrades are unaffected.
+  RowDescription reports the typmod (`(p<<16)|(s+4)`; `n+4` for
+  `VARCHAR(n)` / `CHAR(n)`, `p` for `TIMESTAMP(p)`) for enforced
+  columns. Precision/scale and the other attributes live on the column
+  descriptor as append-only `omitempty` JSON fields (zero = the
+  pre-existing meaning), so old descriptors and rolling upgrades are
+  unaffected. `CHAR(n)` stores its value trimmed and stamps a display
+  pad (`Datum.Pad`), `TIMESTAMP` without time zone a display flag
+  (`Datum.NoTZ`), both like `Dscale`: never part of identity.
 - JSONB stores normalized text (sorted object keys, compact, duplicate
   keys last-wins). Numbers pass through `json.Number`, so integer
   fidelity is preserved on ingest; equality compares normalized text, and
@@ -152,12 +171,12 @@ joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; outer joins and self-joins keep syntactic order),
 `EXPLAIN` options in parentheses, RANGE frames with an offset,
 deferrable constraints,
-typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
-ignored; casts apply both),
+typmods on other types than DECIMAL, the integer widths, `VARCHAR(n)` /
+`CHAR(n)`, `TIMESTAMP(p)` and `TIME(p)` (parsed and ignored),
+`TIME WITH TIME ZONE`, arrays, enums,
 JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
 inverted indexes),
-expressions over aggregates (`SUM(a) / COUNT(*)`), window functions, an
-INTERVAL type (intervals are text), user-defined functions,
+expressions over aggregates (`SUM(a) / COUNT(*)`), user-defined functions,
 DEFAULT expressions that reference other columns.
 
 ### Expressions and builtins

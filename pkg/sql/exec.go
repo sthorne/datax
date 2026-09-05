@@ -157,6 +157,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 		col.Hidden = cd.Hidden
 		s.stripTypeAttrs(&col)
+		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
 		if cd.Default != nil && !cd.Default.Null {
 			d, cerr := coerceColumn(col, *cd.Default)
 			if cerr != nil {
@@ -369,14 +372,26 @@ func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string,
 	return nil
 }
 
-// parseRetention parses a duration like 90d, 36h, 30m, or 45s into
-// seconds.
+// parseRetention parses a duration like 90d, 36h, 30m, or 45s — or any
+// interval text ('7 days', '1 month 12 hours'; a month counts 30 days)
+// — into seconds.
 func parseRetention(s string) (int64, error) {
 	if len(s) < 2 {
-		return 0, fmt.Errorf("want <number><d|h|m|s>, got %q", s)
+		return 0, fmt.Errorf("want <number><d|h|m|s> or an interval, got %q", s)
 	}
 	n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
-	if err != nil || n <= 0 {
+	if err != nil {
+		iv, ierr := types.ParseInterval(s)
+		if ierr != nil {
+			return 0, fmt.Errorf("want <number><d|h|m|s> or an interval, got %q", s)
+		}
+		secs := iv.CmpValue() / int64(time.Second)
+		if secs <= 0 {
+			return 0, fmt.Errorf("retention %q must be positive", s)
+		}
+		return secs, nil
+	}
+	if n <= 0 {
 		return 0, fmt.Errorf("want a positive number before the unit in %q", s)
 	}
 	var mult int64
@@ -2111,6 +2126,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			Width: def.Width, MaxLen: def.MaxLen, Char: def.Char, NoTZ: def.NoTZ, TimePrecision: def.TimePrecision,
 		}
 		s.stripTypeAttrs(&col)
+		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
 		if def.Default != nil && !def.Default.Null {
 			d, cerr := coerceColumn(col, *def.Default)
 			if cerr != nil {

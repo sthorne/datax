@@ -89,7 +89,17 @@ func arithFamily(op string, l, r types.Family) types.Family {
 	switch {
 	case l == types.Timestamp && (r == types.Timestamp || r == types.Date) && op == "-",
 		l == types.Date && r == types.Timestamp && op == "-":
-		return types.String // an interval, as text
+		return types.IntervalFam
+	case l == types.IntervalFam && r == types.IntervalFam,
+		l == types.IntervalFam && rn > 0 && (op == "*" || op == "/"),
+		ln > 0 && r == types.IntervalFam && op == "*":
+		return types.IntervalFam
+	case l == types.Time && r == types.Time && op == "-":
+		return types.IntervalFam
+	case l == types.Time && (r == types.IntervalFam || r == types.String), r == types.Time && l == types.IntervalFam:
+		return types.Time
+	case l == types.Date && r == types.Time, l == types.Time && r == types.Date:
+		return types.Timestamp
 	case l == types.Timestamp || r == types.Timestamp:
 		return types.Timestamp
 	case l == types.Date && r == types.Date && op == "-":

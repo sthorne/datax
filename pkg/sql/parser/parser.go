@@ -934,6 +934,15 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 // parseColumnType parses a column type with its optional typmod: the
 // family, a DECIMAL(p,s) precision and scale, and whether the type was
 // a SERIAL alias (INT8 with an owned sequence).
+// intervalFieldWords are the INTERVAL field qualifiers.
+var intervalFieldWords = map[string]bool{"year": true, "month": true, "day": true, "hour": true, "minute": true, "second": true, "to": true}
+
+// typedLiteralNames are the type names that may prefix a string
+// literal (INTERVAL '1 day', DATE '2024-01-01', TIME '10:00',
+// TIMESTAMP '...', TIMESTAMPTZ '...'), each parsed as a cast of the
+// literal.
+var typedLiteralNames = map[string]string{"interval": "interval", "date": "date", "time": "time", "timestamp": "timestamptz", "timestamptz": "timestamptz"}
+
 // setTypeOf builds the ALTER COLUMN TYPE target from a parsed type.
 func setTypeOf(col string, spec TypeSpec) *SetType {
 	return &SetType{Column: col, Type: spec.Family, Precision: spec.Precision, Scale: spec.Scale,
@@ -972,6 +981,8 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		spec.Char, spec.MaxLen = true, 1
 	case "TIMESTAMP":
 		spec.NoTZ = true
+	case "TIMETZ":
+		return spec, false, p.errf("TIME WITH TIME ZONE is not supported: use TIME (the offset of an input is ignored) or TIMESTAMPTZ")
 	}
 	fam, perr := types.ParseType(typeName)
 	if perr != nil {
@@ -1024,12 +1035,33 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 				return spec, false, p.errf("length for type %s must be between 1 and 10485760", strings.ToLower(upper))
 			}
 			spec.MaxLen = int32(n)
-		case fam == types.Timestamp && len(mods) == 1:
+		case (fam == types.Timestamp || fam == types.Time) && len(mods) == 1:
 			n, nerr := strconv.ParseInt(mods[0], 10, 32)
 			if nerr != nil || n < 0 || n > 6 {
 				return spec, false, p.errf("%s(%s) precision must be between 0 and 6", strings.ToLower(upper), mods[0])
 			}
 			spec.TimePrecision = int32(n) + 1
+		}
+	}
+	// TIME [WITHOUT TIME ZONE]; TIME WITH TIME ZONE is refused.
+	if fam == types.Time {
+		if p.peekIdentSeq("with", "time", "zone") {
+			return spec, false, p.errf("TIME WITH TIME ZONE is not supported: use TIME (the offset of an input is ignored) or TIMESTAMPTZ")
+		}
+		if p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
+	// INTERVAL fields (YEAR TO MONTH, DAY TO SECOND, ...) are accepted
+	// and ignored: every interval stores the full triple.
+	if fam == types.IntervalFam {
+		for {
+			t := p.peek()
+			if (t.kind == tkIdent || t.kind == tkKeyword) && intervalFieldWords[strings.ToLower(t.text)] {
+				p.i++
+				continue
+			}
+			break
 		}
 	}
 	// TIMESTAMP [WITH | WITHOUT] TIME ZONE: the trailing words decide.
@@ -4681,6 +4713,15 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(e)
 		}
 		return p.parseValueExpr()
+	}
+	if t.kind == tkIdent || t.kind == tkKeyword {
+		// Typed literals: INTERVAL '1 day', DATE '2024-01-01', ... — a
+		// cast of the string.
+		if cast, ok := typedLiteralNames[strings.ToLower(t.text)]; ok && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkString {
+			d := types.NewString(p.toks[p.i+1].text)
+			p.i += 2
+			return p.applyCasts(Expr{Lit: &d, Cast: cast})
+		}
 	}
 	if t.kind == tkIdent {
 		// CASE expressions ("case" is not a reserved word).

@@ -38,6 +38,8 @@ const (
 	oidUUID        = 2950
 	oidNumeric     = 1700
 	oidJsonb       = 3802
+	oidTime        = 1083
+	oidInterval    = 1186
 )
 
 // pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
@@ -102,6 +104,10 @@ func typeOID(f types.Family) uint32 {
 		return oidNumeric
 	case types.Jsonb:
 		return oidJsonb
+	case types.IntervalFam:
+		return oidInterval
+	case types.Time:
+		return oidTime
 	default:
 		return oidText
 	}
@@ -109,8 +115,10 @@ func typeOID(f types.Family) uint32 {
 
 func typeSize(f types.Family) int16 {
 	switch f {
-	case types.Int, types.Float, types.Timestamp:
+	case types.Int, types.Float, types.Timestamp, types.Time:
 		return 8
+	case types.IntervalFam:
+		return 16
 	case types.Bool:
 		return 1
 	case types.Date:
@@ -597,6 +605,14 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	case types.Jsonb:
 		// Binary jsonb: version byte 1 + the UTF-8 text.
 		return append([]byte{1}, d.S...)
+	case types.IntervalFam:
+		// Binary interval: microseconds (int64), days (int32), months (int32).
+		out := binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
+		out = binary.BigEndian.AppendUint32(out, uint32(int32(d.Dy)))
+		return binary.BigEndian.AppendUint32(out, uint32(int32(d.Mo)))
+	case types.Time:
+		// Binary time: microseconds since midnight.
+		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
 	default:
 		return []byte(d.Text())
 	}
@@ -659,6 +675,20 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.Datum{}, fmt.Errorf("bad binary jsonb version")
 		}
 		return types.ParseJSONB(string(raw[1:]))
+	case types.IntervalFam:
+		if len(raw) != 16 {
+			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
+		}
+		return types.NewInterval(types.Interval{
+			Nanos:  int64(binary.BigEndian.Uint64(raw[:8])) * 1000,
+			Days:   int64(int32(binary.BigEndian.Uint32(raw[8:12]))),
+			Months: int64(int32(binary.BigEndian.Uint32(raw[12:16]))),
+		}), nil
+	case types.Time:
+		if len(raw) != 8 {
+			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
+		}
+		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}

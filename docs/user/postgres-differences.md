@@ -11,7 +11,7 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `INTERVAL` as a type (intervals are text: `ts + '2 hours'`); expressions over aggregates (`SUM(a) / COUNT(*)`); window functions; user-defined functions | compute client-side or in a derived table |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
@@ -44,6 +44,12 @@ syntax error or `0A000` feature not supported):
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
+- **Intervals** compare, group and index by PostgreSQL's rule (`'30
+  days' = '1 month'`), but a primary key or unique index keeps `'30
+  days'` and `'1 month'` as distinct keys (the stored triple is part of
+  the key); `extract` on an interval reports the stored fields
+  unjustified, as in PostgreSQL. A `TIME` input's offset is ignored;
+  `TIME WITH TIME ZONE` is refused at parse (`42601`).
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
 - **JSONB**: `->`/`->>` extraction (single-table queries and joins;

@@ -113,7 +113,7 @@ func (c *Column) HasTypmod() bool {
 
 // FracDigits is the declared TIMESTAMP(p) precision, when there is one.
 func (c *Column) FracDigits() (int32, bool) {
-	if c.Type == types.Timestamp && c.TimePrecision > 0 {
+	if (c.Type == types.Timestamp || c.Type == types.Time) && c.TimePrecision > 0 {
 		return c.TimePrecision - 1, true
 	}
 	return 0, false
@@ -193,6 +193,14 @@ func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 		}
 		d.NoTZ = c.NoTZ
 		return d, nil
+	case types.Time:
+		if d.Fam != types.Time {
+			return d, nil
+		}
+		if p, ok := c.FracDigits(); ok {
+			d.I = types.RoundTimestamp(d.I, p)
+		}
+		return d, nil
 	}
 	return d, nil
 }
@@ -241,6 +249,11 @@ func (c *Column) TypeSQL() string {
 			return fmt.Sprintf("%s(%d)", name, p)
 		}
 		return name
+	case types.Time:
+		if p, ok := c.FracDigits(); ok {
+			return fmt.Sprintf("TIME(%d)", p)
+		}
+		return "TIME"
 	case types.Decimal:
 		if c.Precision > 0 {
 			return fmt.Sprintf("DECIMAL(%d,%d)", c.Precision, c.Scale)
@@ -265,7 +278,7 @@ func (c *Column) Typmod() int32 {
 		if c.MaxLen > 0 {
 			return c.MaxLen + 4
 		}
-	case types.Timestamp:
+	case types.Timestamp, types.Time:
 		if p, ok := c.FracDigits(); ok {
 			return p
 		}

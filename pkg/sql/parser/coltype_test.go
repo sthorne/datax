@@ -71,3 +71,48 @@ func TestParseColumnTypeSpec(t *testing.T) {
 		}
 	}
 }
+
+// TestParseIntervalTimeTypes: the INTERVAL and TIME column types (issue
+// #96, part two), their modifiers, the typed literals INTERVAL '...' /
+// DATE '...' / TIME '...' / TIMESTAMP '...', and the refusals.
+func TestParseIntervalTimeTypes(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (a INTERVAL, b INTERVAL DAY TO SECOND, c TIME, d TIME WITHOUT TIME ZONE, e TIME(3), f INTERVAL YEAR TO MONTH)`).(*CreateTable)
+	want := map[string]ColumnDef{
+		"a": {Type: types.IntervalFam}, "b": {Type: types.IntervalFam}, "f": {Type: types.IntervalFam},
+		"c": {Type: types.Time}, "d": {Type: types.Time}, "e": {Type: types.Time, TimePrecision: 4},
+	}
+	for _, c := range ct.Columns {
+		w := want[c.Name]
+		if c.Type != w.Type || c.TimePrecision != w.TimePrecision {
+			t.Errorf("column %s: %+v, want %+v", c.Name, c, w)
+		}
+	}
+	for _, bad := range []string{`CREATE TABLE t (a TIME WITH TIME ZONE)`, `CREATE TABLE t (a TIMETZ)`, `CREATE TABLE t (a TIME(9))`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+
+	sel := parseOne(t, `SELECT INTERVAL '1 day', DATE '2024-01-02', TIME '10:00', TIMESTAMP '2024-01-02 03:04:05', TIMESTAMPTZ '2024-01-02 03:04:05Z', now() - INTERVAL '2 hours', INTERVAL '1 hour'::text`).(*Select)
+	casts := []string{"interval", "date", "time", "timestamptz", "timestamptz", "", "text"}
+	for i, c := range casts {
+		e := sel.Exprs[i].Expr
+		switch i {
+		case 5:
+			if e.Right == nil || e.Right.Cast != "interval" || e.Right.Lit == nil || e.Right.Lit.S != "2 hours" {
+				t.Errorf("now() - INTERVAL '2 hours': %+v", e)
+			}
+			continue
+		case 6:
+			if e.Left == nil || e.Left.Cast != "interval" {
+				t.Fatalf("INTERVAL '1 hour'::text: %+v", e)
+			}
+		}
+		if e.Cast != c {
+			t.Errorf("expression %d: cast %q, want %q (%+v)", i+1, e.Cast, c, e)
+		}
+	}
+	if sel.Exprs[0].Expr.Lit == nil || sel.Exprs[0].Expr.Lit.S != "1 day" {
+		t.Fatalf("INTERVAL literal: %+v", sel.Exprs[0].Expr)
+	}
+}

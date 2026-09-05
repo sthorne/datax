@@ -104,9 +104,13 @@ func statsHashDatum(d types.Datum) uint64 {
 	kind[0] = byte(d.Fam)
 	_, _ = h.Write(kind[:])
 	switch d.Fam {
-	case types.Int, types.Timestamp, types.Date:
+	case types.Int, types.Timestamp, types.Date, types.Time:
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], uint64(d.I))
+		_, _ = h.Write(b[:])
+	case types.IntervalFam:
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(d.IntervalVal().CmpValue()))
 		_, _ = h.Write(b[:])
 	case types.Float:
 		var b [8]byte

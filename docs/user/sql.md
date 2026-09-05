@@ -20,6 +20,8 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
 | `TIMESTAMP` | `TIMESTAMP WITHOUT TIME ZONE` | wall-clock time: an offset in the input is ignored (`'2024-01-02 03:04:05+05'` stores `03:04:05`) and the output carries none; `timestamp` (OID 1114) on the wire. Expressions over it (`ts + '1 day'`, `date_trunc`) and casts (`::timestamp`) are `TIMESTAMPTZ` |
 | `TIMESTAMP(p)`, `TIMESTAMPTZ(p)` | | `p` in 0–6: values round to `p` fractional digits on write (half away from zero) |
+| `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
+| `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
 | `UUID` | | |
@@ -400,9 +402,13 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
   parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
   always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), date arithmetic (`date + 1`, `date - date` in days,
-  `timestamp + '2 hours'`, `timestamp - '1 month'` — intervals are
-  text and month steps clamp to the end of the month), text
+  `22003`), date and time arithmetic (`date + 1`, `date - date` in
+  days, `timestamp ± interval` and `date ± interval` on the calendar
+  with month steps clamped to the end of the month, `timestamp -
+  timestamp` an `INTERVAL`, `interval ± interval`, `interval * 2`,
+  `interval / 2`, `time ± interval` wrapping at midnight, `time - time`,
+  `date + time` a timestamp; the interval operand may be a value,
+  `INTERVAL '2 hours'` or plain text `'2 hours'`), text
   concatenation `||` (any operand renders as text), `CASE` (simple and
   searched), `CAST(x AS type)` and `x::type` — **performed**, in every
   position, with PostgreSQL's text forms and error codes (`'abc'::int`
@@ -422,7 +428,9 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   trigonometric functions, ...), date and time (`now()`,
   `current_timestamp`, `current_date`, `date_trunc`, `date_part` /
   `extract(field FROM x)`, `to_char`, `to_timestamp`, `to_date`,
-  `make_date`, `make_timestamp`, `age`, `justify_hours`), JSON
+  `make_date`, `make_timestamp`, `make_time`, `make_interval`, `age`,
+  `extract` over intervals and times, `justify_hours`, `justify_days`,
+  `justify_interval`), JSON
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
@@ -742,7 +750,8 @@ CREATE TABLE metrics (
 
 - `shards` (2–256): rows spread over that many hash buckets, each its own
   range — inserts scale across nodes instead of hammering one tail.
-- `retention` (`30d`, `12h`, ...): rows older than this are garbage
+- `retention` (`30d`, `12h`, or interval text such as `'7 days'`; a
+  month counts 30 days): rows older than this are garbage
   collected automatically.
 - Queries are unchanged — `WHERE series = '...' AND at >= ...` fans out
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:

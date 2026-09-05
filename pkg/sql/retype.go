@@ -64,9 +64,13 @@ func retypeAllowed(from, to types.Family) bool {
 		return to == types.Float || to == types.Decimal
 	case types.Date:
 		return to == types.Timestamp
+	case types.Timestamp:
+		return to == types.Time
+	case types.Time:
+		return to == types.IntervalFam
 	case types.String:
 		switch to {
-		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb:
+		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time:
 			return true
 		}
 	}
@@ -78,6 +82,9 @@ func retypeAllowed(from, to types.Family) bool {
 func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
 	st := t.SetType
 	if err := s.requireV9("ALTER COLUMN TYPE"); err != nil {
+		return nil, ToSQLError(err)
+	}
+	if err := s.requireV10(st.Type); err != nil {
 		return nil, ToSQLError(err)
 	}
 	var shadowID, oldID catalog.ColumnID

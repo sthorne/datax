@@ -60,7 +60,12 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 func resolveMaxStaleness(operand string, now, localClosed hlc.Timestamp) (hlc.Timestamp, error) {
 	d, err := time.ParseDuration(operand)
 	if err != nil {
-		return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration", operand)
+		// Interval text ('10 seconds', '1 minute'; a day is 24 hours).
+		iv, ierr := types.ParseInterval(operand)
+		if ierr != nil {
+			return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration", operand)
+		}
+		d = time.Duration(iv.CmpValue())
 	}
 	if d <= 0 {
 		return hlc.Timestamp{}, fmt.Errorf("max staleness %q must be a positive duration", operand)

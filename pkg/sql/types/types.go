@@ -19,17 +19,19 @@ import (
 type Family int
 
 const (
-	Unknown   Family = iota
-	Int              // INT8
-	Float            // FLOAT8
-	String           // TEXT
-	Bool             // BOOL
-	Timestamp        // TIMESTAMPTZ: UTC nanoseconds since the Unix epoch (in I)
-	Date             // DATE: days since the Unix epoch (in I)
-	Bytes            // BYTES/BYTEA: raw bytes (in S)
-	Uuid             // UUID: 16 raw bytes (in S)
-	Decimal          // DECIMAL/NUMERIC: canonical decimal string (in S)
-	Jsonb            // JSONB: normalized compact JSON text (in S)
+	Unknown     Family = iota
+	Int                // INT8
+	Float              // FLOAT8
+	String             // TEXT
+	Bool               // BOOL
+	Timestamp          // TIMESTAMPTZ: UTC nanoseconds since the Unix epoch (in I)
+	Date               // DATE: days since the Unix epoch (in I)
+	Bytes              // BYTES/BYTEA: raw bytes (in S)
+	Uuid               // UUID: 16 raw bytes (in S)
+	Decimal            // DECIMAL/NUMERIC: canonical decimal string (in S)
+	Jsonb              // JSONB: normalized compact JSON text (in S)
+	IntervalFam        // INTERVAL: months (Mo), days (Dy) and nanoseconds (I)
+	Time               // TIME: nanoseconds since midnight (in I)
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
@@ -57,6 +59,10 @@ func (f Family) String() string {
 		return "DECIMAL"
 	case Jsonb:
 		return "JSONB"
+	case IntervalFam:
+		return "INTERVAL"
+	case Time:
+		return "TIME"
 	}
 	return "UNKNOWN"
 }
@@ -84,6 +90,10 @@ func ParseType(name string) (Family, error) {
 		return Decimal, nil
 	case "JSONB", "JSON":
 		return Jsonb, nil
+	case "INTERVAL":
+		return IntervalFam, nil
+	case "TIME":
+		return Time, nil
 	}
 	return Unknown, fmt.Errorf("unsupported type %q", name)
 }
@@ -112,6 +122,10 @@ type Datum struct {
 	// trailing-space-trimmed text that equality, grouping and storage
 	// compare.
 	Pad int32 `json:"pad,omitempty"`
+	// Mo and Dy are an INTERVAL's months and days (its clock part is in
+	// I, as nanoseconds).
+	Mo int64 `json:"mo,omitempty"`
+	Dy int64 `json:"dy,omitempty"`
 }
 
 var DNull = Datum{Null: true}
@@ -373,6 +387,31 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		return NewFloat(v.Float64()), nil
 	case d.Fam == String && target == Jsonb:
 		return ParseJSONB(d.S)
+	case d.Fam == String && target == IntervalFam:
+		iv, err := ParseInterval(d.S)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewInterval(iv), nil
+	case d.Fam == String && target == Time:
+		n, err := ParseTime(d.S)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTime(n), nil
+	case d.Fam == Timestamp && target == Time:
+		t := time.Unix(0, d.I).UTC()
+		return NewTime(int64(t.Hour())*int64(time.Hour) + int64(t.Minute())*int64(time.Minute) + int64(t.Second())*int64(time.Second) + int64(t.Nanosecond())), nil
+	case d.Fam == IntervalFam && target == Time:
+		// PostgreSQL's interval → time cast keeps the clock part modulo
+		// a day.
+		n := d.I % NanosPerDay
+		if n < 0 {
+			n += NanosPerDay
+		}
+		return NewTime(n), nil
+	case d.Fam == Time && target == IntervalFam:
+		return NewInterval(Interval{Nanos: d.I}), nil
 	}
 	return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 }
@@ -409,8 +448,10 @@ func (d Datum) Compare(o Datum) (int, error) {
 		return 0, fmt.Errorf("cannot compare %s with %s", d.Fam, o.Fam)
 	}
 	switch d.Fam {
-	case Int, Timestamp, Date:
+	case Int, Timestamp, Date, Time:
 		return cmpInt(d.I, o.I), nil
+	case IntervalFam:
+		return cmpInt(d.IntervalVal().CmpValue(), o.IntervalVal().CmpValue()), nil
 	case Float:
 		return cmpFloat(d.F, o.F), nil
 	case String, Bytes, Uuid:
@@ -536,6 +577,10 @@ func (d Datum) Text() string {
 		return d.S // canonical text IS the wire text
 	case Jsonb:
 		return d.S // normalized text IS the wire text
+	case IntervalFam:
+		return d.IntervalVal().String()
+	case Time:
+		return FormatClock(d.I)
 	}
 	return ""
 }

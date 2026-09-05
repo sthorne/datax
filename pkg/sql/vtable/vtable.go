@@ -202,6 +202,10 @@ func TypeOID(f types.Family) int64 {
 		return 1700
 	case types.Jsonb:
 		return 3802
+	case types.IntervalFam:
+		return 1186
+	case types.Time:
+		return 1083
 	}
 	return 25
 }
@@ -249,8 +253,10 @@ func ColumnTypeLen(c *catalog.Column) int64 {
 		return 2
 	case 23, 1082:
 		return 4
-	case 20, 701, 1114, 1184:
+	case 20, 701, 1114, 1184, 1083:
 		return 8
+	case 1186:
+		return 16
 	case 2950:
 		return 16
 	}
@@ -282,7 +288,10 @@ func typeNameOID(oid int64) string {
 	return "text"
 }
 
-var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb}
+var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time}
+
+// Families lists every type family, in pg_type order.
+func Families() []types.Family { return families }
 
 // TypeName is PostgreSQL's name for a datax type family (pg_type.typname).
 func TypeName(f types.Family) string {
@@ -307,6 +316,10 @@ func TypeName(f types.Family) string {
 		return "numeric"
 	case types.Jsonb:
 		return "jsonb"
+	case types.IntervalFam:
+		return "interval"
+	case types.Time:
+		return "time"
 	}
 	return "text"
 }
@@ -344,6 +357,11 @@ func FormatType(c *catalog.Column) string {
 			return "timestamp" + p + " without time zone"
 		}
 		return "timestamp" + p + " with time zone"
+	case types.Time:
+		if p, ok := c.FracDigits(); ok {
+			return fmt.Sprintf("time(%d) without time zone", p)
+		}
+		return "time without time zone"
 	case types.Decimal:
 		if c.Precision > 0 {
 			return fmt.Sprintf("numeric(%d,%d)", c.Precision, c.Scale)
@@ -358,7 +376,7 @@ func FormatType(c *catalog.Column) string {
 // NUMERIC(10,2)) over the pg_type name.
 func ColumnTypeSQL(c *catalog.Column) string {
 	switch c.Type {
-	case types.Int, types.String, types.Timestamp:
+	case types.Int, types.String, types.Timestamp, types.Time:
 		return c.TypeSQL()
 	case types.Decimal:
 		if c.Precision > 0 {

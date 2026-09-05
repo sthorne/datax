@@ -262,15 +262,17 @@ func init() {
 		col("typacl", types.String), hidden("__format_type"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
-		for _, f := range []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb} {
+		for _, f := range Families() {
 			cat := "S"
 			switch f {
 			case types.Bool:
 				cat = "B"
 			case types.Int, types.Float, types.Decimal:
 				cat = "N"
-			case types.Date, types.Timestamp:
+			case types.Date, types.Timestamp, types.Time:
 				cat = "D"
+			case types.IntervalFam:
+				cat = "T"
 			case types.Bytes, types.Uuid, types.Jsonb:
 				cat = "U"
 			}
