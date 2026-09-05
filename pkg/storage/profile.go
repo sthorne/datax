@@ -97,7 +97,13 @@ func applyCommon(opts *pebble.Options) {
 		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(BloomBitsPerKey)
 		opts.Levels[i].FilterType = pebble.TableFilter
 	}
-	opts.FormatMajorVersion = pebble.FormatNewest
+	// Pinned, not FormatNewest (issue #166): FormatNewest moves with the
+	// Pebble version, and the formats past this one — columnar blocks,
+	// value separation — change what lands on disk. Adopting one is a
+	// deliberate, cluster-version-gated step with its own measurements,
+	// not a side effect of a dependency bump. A store already at a
+	// higher format keeps it (Pebble never downgrades a store).
+	opts.FormatMajorVersion = pebble.FormatVirtualSSTables
 	opts.MaxOpenFiles = maxOpenFiles()
 }
 
