@@ -37,7 +37,19 @@ remaining versions onto the next row (a reverse scan steps back with
 `Prev`), and seeks only past a chain of more than eight versions (issue
 #160 — a seek per row and another per version lookup had been half of a
 scan's time; versions are told apart by their encoded suffix, without
-decoding the user key per version).
+decoding the user key per version). The bookkeeping around those seeks
+is allocation-light (issue #163): a key's two iterator bounds come out
+of one allocation — the upper bound is the metadata key with its
+terminator bumped, which is exactly the end of that key's engine keys —
+and the version keys the read seeks to are appended onto the lower
+bound's spare capacity; encoding and decoding a key each allocate once
+at the exact size; a scan copies each row's prefix off the iterator
+rather than re-encoding the row's key. A point read went from 16
+allocations to 5 (3 through a `storage.Getter`, which re-bounds one
+iterator per key for the Gets of a batch — an index join's primary-row
+fetches, a statement's per-row reads — instead of building and tearing
+down an iterator for each); a 1,000-row scan from 8 allocations per
+row to 2 (the key and the value the caller keeps).
 
 Rules:
 

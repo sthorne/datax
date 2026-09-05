@@ -29,11 +29,31 @@ const versionSuffixLen = 12
 // EncodeMVCCKey encodes a user key with a version timestamp. A zero
 // timestamp encodes the metadata (intent) key.
 func EncodeMVCCKey(key keys.Key, ts hlc.Timestamp) []byte {
-	b := encoding.EncodeBytes(nil, key)
+	b := encoding.EncodeBytes(make([]byte, 0, encoding.EncodedBytesLen(key)+versionSuffixLen), key)
 	if ts.IsEmpty() {
 		return b
 	}
 	return appendVersionSuffix(b, ts)
+}
+
+// mvccKeyBounds returns the engine-key span of one user key: its metadata
+// key (the lower bound) and the exclusive upper bound of every engine key
+// that starts with it. Both come out of one allocation, and the lower
+// bound has versionSuffixLen bytes of spare capacity so a version key of
+// k can be appended onto it in place (issue #163). The upper bound is the
+// metadata key with its terminator bumped: every engine key of k has the
+// metadata key as a prefix and so sorts below it, and the encoding of any
+// other user key either differs earlier or, for a key extending k,
+// continues with an escaped byte (0x00 0xff) or a byte above the
+// terminator — above the bump either way.
+func mvccKeyBounds(k keys.Key) (lower, upper []byte) {
+	n := encoding.EncodedBytesLen(k)
+	buf := make([]byte, 2*n+versionSuffixLen)
+	lower = encoding.EncodeBytes(buf[:0:n+versionSuffixLen], k)
+	upper = buf[n+versionSuffixLen:]
+	copy(upper, lower)
+	upper[n-1]++
+	return lower, upper
 }
 
 func appendVersionSuffix(b []byte, ts hlc.Timestamp) []byte {

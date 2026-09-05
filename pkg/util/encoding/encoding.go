@@ -5,9 +5,11 @@
 package encoding
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // Uint64 is encoded as 8 bytes big-endian: fixed width, naturally ordered.
@@ -111,6 +113,10 @@ const (
 )
 
 func EncodeBytes(b []byte, data []byte) []byte {
+	// Sized up front (issue #163): the encoding is the data plus one byte
+	// per NUL plus the terminator, so one growth step covers it instead
+	// of a chain of appends from an empty slice.
+	b = slices.Grow(b, EncodedBytesLen(data))
 	for _, c := range data {
 		if c == escape {
 			b = append(b, escape, escapedNul)
@@ -121,12 +127,18 @@ func EncodeBytes(b []byte, data []byte) []byte {
 	return append(b, escape, terminator)
 }
 
+// EncodedBytesLen is the length EncodeBytes appends for data.
+func EncodedBytesLen(data []byte) int {
+	return len(data) + 2 + bytes.Count(data, []byte{escape})
+}
+
 func DecodeBytes(b []byte) (rest []byte, data []byte, err error) {
-	for i := 0; i < len(b); {
-		c := b[i]
-		if c != escape {
-			data = append(data, c)
-			i++
+	// One pass finds the terminator and counts escaped NULs, so the
+	// decoded bytes are allocated once at their exact size (issue #163);
+	// the common key without a NUL is then a single copy.
+	end, escapes := -1, 0
+	for i := 0; i < len(b) && end < 0; i++ {
+		if b[i] != escape {
 			continue
 		}
 		if i+1 >= len(b) {
@@ -134,15 +146,29 @@ func DecodeBytes(b []byte) (rest []byte, data []byte, err error) {
 		}
 		switch b[i+1] {
 		case escapedNul:
-			data = append(data, 0x00)
-			i += 2
+			escapes++
+			i++
 		case terminator:
-			return b[i+2:], data, nil
+			end = i
 		default:
 			return nil, nil, fmt.Errorf("decode bytes: invalid escape 0x00 0x%02x", b[i+1])
 		}
 	}
-	return nil, nil, fmt.Errorf("decode bytes: missing terminator")
+	if end < 0 {
+		return nil, nil, fmt.Errorf("decode bytes: missing terminator")
+	}
+	data = make([]byte, end-escapes)
+	if escapes == 0 {
+		copy(data, b[:end])
+		return b[end+2:], data, nil
+	}
+	for i, j := 0, 0; i < end; i, j = i+1, j+1 {
+		data[j] = b[i] // an escaped NUL decodes to its first byte, 0x00
+		if b[i] == escape {
+			i++
+		}
+	}
+	return b[end+2:], data, nil
 }
 
 func EncodeString(b []byte, s string) []byte {

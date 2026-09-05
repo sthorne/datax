@@ -8,6 +8,33 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.41.0 — unreleased
+
+### Changed
+- The MVCC read path allocates a fraction of what it did (#163). A user
+  key's two iterator bounds come out of one allocation (the upper bound
+  is the metadata key with its terminator bumped — exactly the end of
+  the key's engine keys — instead of encoding the key's successor), the
+  version keys a read seeks to are appended onto that buffer's spare
+  capacity, `encoding.EncodeBytes` and `DecodeBytes` allocate once at
+  the exact size, and a scan copies each row's prefix off the iterator
+  rather than re-encoding the decoded key (and no longer copies the
+  decoded key a second time). `storage.Getter` serves the point reads
+  of one server batch — the read path's Gets and the write path's Gets
+  and Increments — through one iterator re-bounded per key, refreshed
+  past the batch's own writes where the reader is a batch. Measured on
+  the storage benchmarks (100k rows, 128-byte values): a point read
+  4.28 → 3.60 µs and 16 → 5 allocations (2.75 µs and 3 through a
+  Getter), a miss 3.66 → 3.12 µs (2.63 reused) and 12 → 3 (1); a
+  1,000-row scan over 3 versions 735 → 518 µs and 8,019 → 2,016
+  allocations, in reverse 1,472 → 1,252 µs.
+- The Pebble format version is pinned at `FormatVirtualSSTables` (16)
+  instead of tracking `FormatNewest` (#166): the formats past it change
+  what lands on disk (columnar blocks, value separation), and adopting
+  one is a deliberate, cluster-version-gated step with its own
+  measurements, not a side effect of a dependency bump. Nothing changes
+  for existing stores (16 is what the bundled Pebble's newest is).
+
 ## 0.40.1 — unreleased
 
 ### Fixed

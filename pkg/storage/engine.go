@@ -44,6 +44,12 @@ type Iterator interface {
 	Next() bool
 	// Prev steps to the previous key; false at the lower bound.
 	Prev() bool
+	// SetBounds re-bounds the iterator to [lower, upper) and invalidates
+	// its position (reposition with a seek). Over an indexed batch the
+	// view is refreshed to the batch's latest writes; over an engine or
+	// snapshot the view is unchanged. The bound slices must not be
+	// modified until the iterator is closed or re-bounded again.
+	SetBounds(lower, upper []byte)
 	Valid() bool
 	Key() []byte
 	Value() []byte
@@ -431,7 +437,7 @@ func (b *Batch) NewIter(lower, upper []byte) Iterator {
 	if err != nil {
 		return &errIter{err: err}
 	}
-	return &pebbleIter{it: it}
+	return &pebbleIter{it: it, refreshOnRebound: true}
 }
 
 func (b *Batch) Put(key, value []byte) error { return b.b.Set(key, value, nil) }
@@ -482,6 +488,18 @@ func (b *Batch) Repr() []byte { return b.b.Repr() }
 type pebbleIter struct {
 	it    *pebble.Iterator
 	valid bool
+	// refreshOnRebound: the iterator reads an indexed batch, whose view
+	// only SetOptions refreshes (SetBounds keeps the view of creation).
+	refreshOnRebound bool
+}
+
+func (i *pebbleIter) SetBounds(lower, upper []byte) {
+	if i.refreshOnRebound {
+		i.it.SetOptions(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	} else {
+		i.it.SetBounds(lower, upper)
+	}
+	i.valid = false
 }
 
 func (i *pebbleIter) SeekGE(key []byte) bool { i.valid = i.it.SeekGE(key); return i.valid }
@@ -495,11 +513,12 @@ func (i *pebbleIter) Close() error           { return i.it.Close() }
 
 type errIter struct{ err error }
 
-func (i *errIter) SeekGE([]byte) bool { return false }
-func (i *errIter) SeekLT([]byte) bool { return false }
-func (i *errIter) Next() bool         { return false }
-func (i *errIter) Prev() bool         { return false }
-func (i *errIter) Valid() bool        { return false }
-func (i *errIter) Key() []byte        { return nil }
-func (i *errIter) Value() []byte      { return nil }
-func (i *errIter) Close() error       { return i.err }
+func (i *errIter) SeekGE([]byte) bool    { return false }
+func (i *errIter) SeekLT([]byte) bool    { return false }
+func (i *errIter) Next() bool            { return false }
+func (i *errIter) Prev() bool            { return false }
+func (i *errIter) SetBounds(_, _ []byte) {}
+func (i *errIter) Valid() bool           { return false }
+func (i *errIter) Key() []byte           { return nil }
+func (i *errIter) Value() []byte         { return nil }
+func (i *errIter) Close() error          { return i.err }
