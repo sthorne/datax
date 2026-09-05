@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -199,6 +200,13 @@ type conn struct {
 
 	stmts   map[string]*prepared
 	portals map[string]*portal
+	// parsed is the connection's parse cache for the simple protocol:
+	// query text → its statements, bounded (parseCacheSize, LRU). A
+	// client that repeats a text (a dashboard's queries, a driver in
+	// simple mode re-sending the same statement) skips the parse, and the
+	// session's plan cache sees the same statement each time (issue
+	// #107).
+	parsed *parseCache
 	// ioErr is a failed write of streamed rows (the connection is gone);
 	// the run loop ends on it.
 	ioErr error
@@ -582,9 +590,47 @@ func (c *conn) sendError(serr *sql.Error) {
 	})
 }
 
+// parseCacheSize bounds a connection's parse cache.
+const parseCacheSize = 64
+
+// parseCache is a connection's text → statements cache (LRU).
+type parseCache struct {
+	entries map[string]*list.Element
+	lru     *list.List
+}
+
+type parsedQuery struct {
+	text  string
+	stmts []parser.Statement
+}
+
+// parse returns the statements of q, from the connection's parse cache
+// when it has seen the text before.
+func (c *conn) parse(q string) ([]parser.Statement, error) {
+	if c.parsed == nil {
+		c.parsed = &parseCache{entries: make(map[string]*list.Element), lru: list.New()}
+	}
+	if el, ok := c.parsed.entries[q]; ok {
+		c.parsed.lru.MoveToFront(el)
+		metrics.SQLParseCacheHits.Inc()
+		return el.Value.(*parsedQuery).stmts, nil
+	}
+	stmts, err := parser.Parse(q)
+	if err != nil {
+		return nil, err
+	}
+	c.parsed.entries[q] = c.parsed.lru.PushFront(&parsedQuery{text: q, stmts: stmts})
+	for c.parsed.lru.Len() > parseCacheSize {
+		old := c.parsed.lru.Back()
+		c.parsed.lru.Remove(old)
+		delete(c.parsed.entries, old.Value.(*parsedQuery).text)
+	}
+	return stmts, nil
+}
+
 // handleSimpleQuery runs a (possibly multi-statement) simple query.
 func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
-	stmts, err := parser.Parse(q)
+	stmts, err := c.parse(q)
 	if err != nil {
 		c.sendError(sql.ToSQLError(err))
 		return

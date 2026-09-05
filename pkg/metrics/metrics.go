@@ -8,6 +8,7 @@ package metrics
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Registry holds the process-wide datax series.
@@ -206,6 +207,18 @@ var (
 	SQLCopyRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_copy_rows_total", Help: "Rows loaded through COPY FROM STDIN.",
 	})
+	SQLPlanCacheHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_hits_total", Help: "Statement executions that reused a session's cached plan (the descriptor, projection and access path of a single-table SELECT, UPDATE or DELETE).",
+	})
+	SQLPlanCacheMisses = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_misses_total", Help: "Statement executions planned in full: no cached plan, or one built on a descriptor or statistics since replaced.",
+	})
+	SQLPlanCacheEvictions = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_evictions_total", Help: "Cached plans dropped because a session's cache was over its bound (128 statements).",
+	})
+	SQLParseCacheHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_parse_cache_hits_total", Help: "Simple-protocol queries whose text a connection had parsed before (served from its parse cache).",
+	})
 	SQLStreamedRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_streamed_rows_total", Help: "Result rows delivered by streaming SELECTs (pulled from KV page by page as the client reads).",
 	})
@@ -249,3 +262,13 @@ var (
 		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
 	})
 )
+
+// CounterValue reads a counter's current value (for status summaries;
+// Prometheus counters expose it only through their wire form).
+func CounterValue(c prometheus.Counter) float64 {
+	var m dto.Metric
+	if err := c.Write(&m); err != nil || m.Counter == nil {
+		return 0
+	}
+	return m.Counter.GetValue()
+}

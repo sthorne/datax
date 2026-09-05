@@ -607,11 +607,44 @@ Every statement runs in a transaction: implicit (auto-commit, with
 transparent server-side retry on serialization conflicts) or the session's
 explicit `BEGIN ... COMMIT`.
 
+### Plan cache
+
+A prepared statement is parsed once, but the work after parsing — the
+view check over its table names, the alias strip, the projection, the
+statistics lookup and the access-path choice — ran on every execution.
+Measured with the harness (kv point lookups through pgx's extended
+protocol, one gateway on two cores) it was about 8 % of the gateway's
+CPU: the executor's own share is small next to the KV round trip, so
+the cache (`pkg/sql/plancache.go`, issue #107) is scoped to what that
+supports. Each session keeps a bounded LRU (128 statements) keyed by the
+statement's parsed form — a prepared statement's, or the one the wire
+layer's parse cache hands the simple protocol for a repeated text — and
+the current database, for the single-table `SELECT`, `UPDATE` and
+`DELETE` paths. An entry holds the descriptor the statement resolved to,
+the statistics it planned with, the projection, and the shape of a
+primary-key point lookup (which conjuncts pin which key column), so a
+hit binds the parameters into a point plan without re-planning; other
+shapes reuse the projection and re-run the (parameter-dependent) path
+choice. Invalidation is by identity: the catalog hands out one
+descriptor pointer per version and the statistics cache one per
+refresh, so an entry is used only while the lookups it skips return the
+same pointers — a schema change, `ANALYZE`, a dropped table or a
+recreated one all miss. A data statement also resolves each table name
+once per execution (the view check and the plan share the lookup).
+`EXPLAIN` appends `(cached plan)` when the plan it shows is the cached
+one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
+`_evictions_total`, and the hit rate on the console's node page.
+
 ## Wire protocol
 
 `pkg/pgwire` implements the PostgreSQL v3 protocol on
 [`pgproto3`](https://github.com/jackc/pgx/tree/master/pgproto3):
 
+- **Parse cache**: a connection keeps the last 64 simple-protocol query
+  texts it parsed; a repeated text skips the parser and reaches the
+  session as the same statement, so the plan cache applies to it
+  (`datax_sql_parse_cache_hits_total`). Per connection, since the
+  executor annotates statements in place.
 - **Startup**: in secure mode (`--certs-dir`), `SSLRequest` is answered
   with `S`, the connection upgrades to TLS, and the client authenticates
   with **SCRAM-SHA-256** or **SCRAM-SHA-256-PLUS** (RFC 5802/7677/5929,

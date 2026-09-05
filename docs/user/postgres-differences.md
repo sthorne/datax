@@ -185,6 +185,10 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
 
 - pgx (native and `database/sql`), lib/pq, and psql work, in both simple
   and extended protocol modes, text and binary formats.
+- Prepared statements plan once per session and reuse the plan until the
+  table's schema or statistics change (`EXPLAIN` shows `(cached plan)`);
+  there is no custom-vs-generic plan choice — bounds stay parameterized
+  and non-point shapes re-choose their path per execution.
 - Prepared statements and portal suspension both work — JDBC-style fetch
   sizes are fine. A scan-shaped `SELECT` (one table, no sort, aggregate,
   join, `DISTINCT` or window) streams: each fetch pulls the next rows

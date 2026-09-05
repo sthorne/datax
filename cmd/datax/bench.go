@@ -118,6 +118,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	keys := fs.String("keys", "random", "ingest workload: key order — random (LSM stress), sequential (per-worker monotone), uuid (text keys)")
 	rate := fs.Int("rate", 0, "ingest workload: target rows/s across all workers (0 = unthrottled)")
 	reportInterval := fs.Duration("report-interval", 5*time.Second, "ingest/timeseries: throughput-over-time reporting cadence")
+	protocol := fs.String("protocol", "auto", "wire protocol: extended (pgx's default: statements prepared once per connection, then Bind/Execute), simple, or auto (extended for the parameterized kv and bank workloads, simple for the literal-text ones)")
 	metricsURL := fs.String("metrics-url", "", "node /metrics URL for server counter deltas (or derive it from --server-url)")
 	serverURL := fs.String("server-url", "", "node HTTP base URL (http://host:8080): counter deltas, and --server-profile")
 	serverProfile := fs.String("server-profile", "", "pull a server profile for the run's duration: cpu (needs --server-url)")
@@ -240,12 +241,24 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 
 	ctx := context.Background()
+	simple := true
+	switch *protocol {
+	case "auto":
+		simple = workload != "kv" && workload != "bank"
+	case "simple":
+	case "extended":
+		simple = false
+	default:
+		return nil, fmt.Errorf("--protocol takes auto, simple or extended")
+	}
 	connect := func() (*pgx.Conn, error) {
 		cfg, err := pgx.ParseConfig(*url)
 		if err != nil {
 			return nil, err
 		}
-		cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+		if simple {
+			cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+		}
 		return pgx.ConnectConfig(ctx, cfg)
 	}
 
@@ -505,14 +518,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 				var err error
 				switch workload {
 				case "kv":
+					// Parameterized, as an application would send them:
+					// pgx prepares each statement text once per connection
+					// and every execution after that is Bind/Execute of the
+					// same shape (issue #107).
 					if rng.Intn(100) < *readPct {
 						var v string
-						err = conn.QueryRow(ctx, fmt.Sprintf("SELECT v FROM %s WHERE k = %d", kvTable, rng.Intn(*preload))).Scan(&v)
+						err = conn.QueryRow(ctx, "SELECT v FROM "+kvTable+" WHERE k = $1", int64(rng.Intn(*preload))).Scan(&v)
 						if err == pgx.ErrNoRows {
 							err = nil
 						}
 					} else {
-						_, err = conn.Exec(ctx, fmt.Sprintf("UPDATE %s SET v = 'u%d' WHERE k = %d", kvTable, rng.Int63(), rng.Intn(*preload)))
+						_, err = conn.Exec(ctx, "UPDATE "+kvTable+" SET v = $1 WHERE k = $2", fmt.Sprintf("u%d", rng.Int63()), int64(rng.Intn(*preload)))
 					}
 				case "bank":
 					err = bankTransfer(ctx, conn, rng, bankTable, *preload, *forUpdate)
@@ -874,20 +891,22 @@ func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, table str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var balA, balB int64
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM %s WHERE id = %d%s", table, a, suffix)).Scan(&balA); err != nil {
+	sel := "SELECT balance FROM " + table + " WHERE id = $1" + suffix
+	if err := tx.QueryRow(ctx, sel, int64(a)).Scan(&balA); err != nil {
 		return err
 	}
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM %s WHERE id = %d%s", table, b, suffix)).Scan(&balB); err != nil {
+	if err := tx.QueryRow(ctx, sel, int64(b)).Scan(&balB); err != nil {
 		return err
 	}
 	amount := int64(rng.Intn(10) + 1)
 	if balA < amount {
 		return tx.Commit(ctx) // nothing to move
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE %s SET balance = %d WHERE id = %d", table, balA-amount, a)); err != nil {
+	upd := "UPDATE " + table + " SET balance = $1 WHERE id = $2"
+	if _, err := tx.Exec(ctx, upd, balA-amount, int64(a)); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE %s SET balance = %d WHERE id = %d", table, balB+amount, b)); err != nil {
+	if _, err := tx.Exec(ctx, upd, balB+amount, int64(b)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

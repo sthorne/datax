@@ -8,6 +8,29 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.39.0 — unreleased
+
+### Added
+- A plan cache for prepared statements (#107). Each session keeps a
+  bounded LRU (128) of what its single-table `SELECT`, `UPDATE` and
+  `DELETE` statements planned against — the descriptor, the statistics,
+  the projection and the shape of a primary-key point lookup — keyed by
+  the statement as prepared and the current database; an execution
+  whose lookups return the same descriptor and statistics reuses it,
+  binding the parameters into the point plan without re-planning, and
+  any schema change, `ANALYZE`, drop or re-create misses. A data
+  statement resolves each table name once per execution. `EXPLAIN`
+  appends `(cached plan)`; `datax_sql_plan_cache_hits_total`,
+  `_misses_total`, `_evictions_total`; the hit rate on the console's
+  node page and in the internal metrics table. Connections keep a parse
+  cache of their last 64 simple-protocol texts
+  (`datax_sql_parse_cache_hits_total`). Measured first: planning was
+  ~8 % of a gateway's CPU on point lookups through the extended
+  protocol, so the cache is scoped to that; the statement activity
+  tracker's per-statement connection walk (3 %) is gone too.
+- `datax bench kv` and `bank` send parameterized statements over the
+  extended protocol (`--protocol simple|extended|auto`).
+
 ## 0.38.0 — unreleased
 
 ### Changed

@@ -112,6 +112,8 @@ var metricSeriesDefs = []MetricSeries{
 	{Name: "sql.statements", Kind: SeriesCounter, Unit: "", Group: "sql", Help: "statements executed"},
 	{Name: "sql.serialization_failures", Kind: SeriesCounter, Unit: "", Group: "sql", Help: "statements that ended in 40001"},
 	{Name: "sql.rows_scanned", Kind: SeriesCounter, Unit: "", Group: "sql", Help: "rows scanned by SQL"},
+	{Name: "sql.plan_cache_hits", Kind: SeriesCounter, Unit: "", Group: "sql", Help: "statement executions that reused a cached plan"},
+	{Name: "sql.plan_cache_misses", Kind: SeriesCounter, Unit: "", Group: "sql", Help: "statement executions planned in full"},
 	{Name: "sql.p99_us", Kind: SeriesGauge, Unit: "us", Group: "sql", Help: "statement latency p99 over the recent ring"},
 
 	{Name: "table.rows", Kind: SeriesGauge, Unit: "", Group: "tables", Label: "table", Cluster: true, Help: "rows per table (from statistics)"},
@@ -392,6 +394,8 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 			add("sql.idle_in_txn", float64(s.IdleInTxn))
 			add("sql.statements", float64(stmts))
 			add("sql.serialization_failures", float64(s.SerializationFailures))
+			add("sql.plan_cache_hits", float64(s.PlanCacheHits))
+			add("sql.plan_cache_misses", float64(s.PlanCacheMisses))
 			add("sql.p99_us", float64(s.P99Micros))
 		}
 	}

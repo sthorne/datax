@@ -82,6 +82,16 @@ stalls or backpressure even when throughput hides it.
   mutex and block profiles are always on at low sampling rates.
 - `go tool pprof -http=:0 server-cpu.pprof` to inspect.
 
+## Wire protocol
+
+`kv` and `bank` send parameterized statements (`WHERE k = $1`) over
+pgx's default extended protocol: each text is prepared once per
+connection and then bound and executed, as a driver or an ORM does, so
+the server's plan cache is exercised (`datax_sql_plan_cache_hits_total`
+in the counter deltas). The literal-text workloads (ingest, timeseries,
+scan, index-join) use the simple protocol. `--protocol simple|extended`
+overrides either.
+
 ## The write pipeline below SQL
 
 `BenchmarkRangeWritePipeline` (`pkg/testutils/testcluster`) measures one

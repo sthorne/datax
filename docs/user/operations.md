@@ -281,7 +281,11 @@ see [Capacity planning](#capacity-planning)),
 replica had more than 64 MiB of committed entries queued for apply — a
 follower falling behind its leader), `datax_latch_wait_seconds` (time
 requests spent waiting for a conflicting in-flight request's latch: key
-contention).
+contention), `datax_sql_plan_cache_hits_total` /
+`datax_sql_plan_cache_misses_total` (prepared statements reusing their
+plan; a low hit rate under an ORM workload means statements are not
+being prepared, or schemas or statistics change constantly),
+`datax_sql_parse_cache_hits_total` (repeated simple-protocol texts).
 
 ## Everyday admin: `datax debug`
 

@@ -187,6 +187,12 @@ type Session struct {
 	// explain collects each stage's actual rows and time while EXPLAIN
 	// ANALYZE runs a statement (nil otherwise).
 	explain *explainStats
+	// plans is the session's plan cache (plancache.go), made on first
+	// use; stmtLookups memoizes the catalog lookups of the statement
+	// being executed (a name is resolved once per statement, not once
+	// for the view check and again for the plan).
+	plans       *planCache
+	stmtLookups *lookupMemo
 	// streaming lets scan-shaped SELECTs return a RowStream instead of
 	// materialized rows (the wire layer opts in; internal callers read
 	// Result.Rows). memUsed is the running statement's charged memory
@@ -309,7 +315,16 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	if s.state == StateOpen && s.ddlTouched(name) {
 		d, err = s.cat.LookupFreshIn(ctx, txn, s.database, name)
 	} else {
+		memo := s.stmtLookups
+		if memo != nil && memo.txn == txn {
+			if md, ok := memo.m[name]; ok {
+				return md, nil
+			}
+		}
 		d, err = s.cat.LookupIn(ctx, txn, s.database, name)
+		if err == nil && memo != nil && memo.txn == txn {
+			memo.m[name] = d
+		}
 	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -328,6 +343,24 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	}
 	return d, err
 }
+
+// lookupMemo caches one statement's table lookups within one transaction
+// attempt (see Session.stmtLookups).
+type lookupMemo struct {
+	txn *kvclient.Txn
+	m   map[string]*catalog.TableDescriptor
+}
+
+// plansFor returns the session's plan cache, creating it.
+func (s *Session) plansFor() *planCache {
+	if s.plans == nil {
+		s.plans = newPlanCache()
+	}
+	return s.plans
+}
+
+// PlanCacheLen is the number of plans the session holds (tests).
+func (s *Session) PlanCacheLen() int { return s.plans.len() }
 
 // sequenceRelation is the virtual one-row descriptor a sequence reads as.
 func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
