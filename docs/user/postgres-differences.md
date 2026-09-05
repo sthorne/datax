@@ -147,6 +147,7 @@ syntax error or `0A000` feature not supported):
 | `23505` | unique violation | application-level conflict |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |
+| `42601` "statement nests too deeply" | more than 1,000 nesting levels (parentheses, subqueries, derived tables, `CASE`) | flatten the statement; PostgreSQL bounds the same recursion by stack depth (issue #135) |
 
 ## What psql and ORMs can see
 

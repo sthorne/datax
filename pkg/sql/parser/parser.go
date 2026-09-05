@@ -53,7 +53,30 @@ type parser struct {
 	pendingPK []string
 	i         int
 	src       string
+	// depth counts the nesting the recursive descent is inside (a
+	// parenthesized expression, a subquery, a derived table, a CASE — each
+	// passes through parsePrimaryExpr or parseSelect); past maxParseDepth
+	// the statement is refused with a syntax error instead of exhausting
+	// the goroutine stack, which is a fatal error no recover() catches
+	// (issue #135).
+	depth int
 }
+
+// maxParseDepth bounds statement nesting: far above any real query, far
+// below the stack budget (a level of expression descent is about ten
+// frames).
+const maxParseDepth = 1000
+
+// enter counts one level of nesting; leave undoes it.
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > maxParseDepth {
+		return p.errf("statement nests too deeply (more than %d levels)", maxParseDepth)
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
 
 func (p *parser) peek() token { return p.toks[p.i] }
 func (p *parser) errf(format string, args ...any) error {
@@ -238,6 +261,10 @@ func (p *parser) expectIdent() (string, error) {
 }
 
 func (p *parser) parseStatement() (Statement, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	t := p.peek()
 	if (t.kind == tkOp && t.text == "(") || (t.kind == tkKeyword && t.text == "VALUES") {
 		// (SELECT ...) [UNION ...] [ORDER BY ...]: a parenthesized query;
@@ -2116,6 +2143,10 @@ func (p *parser) parseCopyOptions(cf *CopyFrom) error {
 }
 
 func (p *parser) parseSelect() (Statement, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	p.i++ // SELECT
 	sel := &Select{Limit: -1}
 	// DISTINCT is not a reserved word — it lexes as an identifier.
@@ -4987,6 +5018,10 @@ var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "cur
 // builtin call, a possibly-qualified column reference (with an optional
 // ->/->> chain), or a literal/parameter/scalar subquery.
 func (p *parser) parsePrimaryExpr() (Expr, error) {
+	if err := p.enter(); err != nil {
+		return Expr{}, err
+	}
+	defer p.leave()
 	t := p.peek()
 	if t.kind == tkOp && t.text == "(" {
 		// (NOT x) / (EXISTS ...): a parenthesized boolean value.

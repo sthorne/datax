@@ -11,6 +11,13 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- A statement nested more than 1,000 levels deep (parentheses,
+  subqueries, derived tables, `CASE`) is refused with a syntax error
+  (`42601`, "statement nests too deeply") instead of exhausting the
+  goroutine stack — a fatal error that took the node and every
+  connection on it down, reachable by any client with a ~240 KB
+  statement (#135). One depth counter in the parser covers every
+  recursive production.
 - A split's right-hand range keeps the timestamp-cache protection for
   reads the parent served on its span (#134). The RHS inherited the
   parent's closed timestamp as its cache floor, which trails now() by
