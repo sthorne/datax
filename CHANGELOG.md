@@ -11,6 +11,16 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- A panic on the SQL statement path no longer kills the node (#136).
+  The connection goroutine had no recover, so a bug in the planner,
+  the executor, a builtin or an encoder — reached by one statement —
+  ended the process with every connection on it. The statement path
+  is now a panic barrier: the statement fails with `XX000` (its stack
+  in the log, `datax_sql_statement_panics_total` counting it), its
+  transaction fails as on any other error, and the connection and node
+  keep serving; streamed results are covered on every pull. Stack
+  exhaustion and out-of-memory remain fatal, as Go makes them.
+  `TestStatementPanicBarrier`.
 - Binary `NUMERIC` parameters are bounded on decode (#140): `weight` and
   `dscale` came off the wire unchecked, so an eight-byte parameter with
   no digit groups expanded to ~200 KB of zeros per value. Both are now

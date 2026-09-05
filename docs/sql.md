@@ -461,6 +461,22 @@ exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`.
 
+**Panic barrier.** The statement path is a panic barrier (#136): a
+panic anywhere below `Session.Execute` — in the planner, the executor,
+a builtin, an encoder — becomes an internal error (`XX000`) for that
+statement, logged with its stack and counted in
+`datax_sql_statement_panics_total`; the connection goes on, and the
+transaction fails as it would on any other error (an implicit one
+rolls back, a block is failed until `ROLLBACK`). The barrier sits at
+three points: inside the transaction's retry loop (`execStmt`, so
+`RunTxn` sees an error and rolls back), around the whole statement
+(`Execute`: a `COMMIT`, a DDL finish or a session variable), and on
+every pull of a streamed result (`RowStream.Next`, after `Execute`
+returned). What Go cannot recover — a stack overflow (the parser
+bounds nesting for that, #135), out of memory — still ends the
+process, and the barrier does not hide bugs: each recovered panic is
+one to fix, with its stack in the log.
+
 **Streaming.** On a wire session a scan-shaped select — one table, a
 scan plan (full, primary-key range or index), no join, aggregate,
 DISTINCT, window, set operation, correlated conjunct or projection, no

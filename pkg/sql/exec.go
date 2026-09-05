@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -21,9 +22,22 @@ import (
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
-// execStmt executes one data statement within txn. It is safe to re-run on
-// transaction retry (all state flows through txn).
-func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.Statement, params []types.Datum) (*Result, error) {
+// execStmt runs one statement in txn. It is the panic barrier of the
+// statement path (issue #136): a panic in the planner, the executor, a
+// builtin or an encoder becomes an internal error (XX000) for this
+// statement — logged with its stack and counted — and the session goes
+// on, the transaction failed as by any other error, instead of the
+// process dying with every connection on it. What Go cannot recover
+// (a stack overflow, out of memory) is not caught, and not papered over.
+func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.Statement, params []types.Datum) (res *Result, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res, err = nil, s.recoveredPanic(r, stmt)
+		}
+	}()
+	if TestingPanicBeforeExec != nil {
+		TestingPanicBeforeExec(stmt)
+	}
 	switch stmt.(type) {
 	case *parser.Select, *parser.Insert, *parser.Update, *parser.Delete:
 		// A data statement resolves each table once (the view check and
@@ -1618,6 +1632,20 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		out = append([]types.Datum{bucket}, out...)
 	}
 	return out, true, nil
+}
+
+// TestingPanicBeforeExec, when set, runs before every statement executes
+// — a test's way to inject a panic into the statement path.
+var TestingPanicBeforeExec func(stmt parser.Statement)
+
+// recoveredPanic turns a panic caught on the statement path into the
+// statement's error: logged at error level with the goroutine's stack
+// (the only evidence of the bug underneath), counted in
+// datax_sql_statement_panics_total, reported as XX000.
+func (s *Session) recoveredPanic(r any, stmt parser.Statement) *Error {
+	metrics.SQLStatementPanics.Inc()
+	log.Errorf("panic executing %T statement (recovered; the statement fails with XX000): %v\n%s", stmt, r, debug.Stack())
+	return newErrf(CodeInternal, "internal error: %v", r)
 }
 
 // planAccess chooses the access path: a cached point shape bound to the

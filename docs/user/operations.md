@@ -233,6 +233,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_raft_replayed_entries_total` | jumps after a restart | the node came back from a crash (or an unflushed close) and re-applied that many committed entries from its raft log — expected after a crash, a sign the shutdown was not clean otherwise |
 | `datax_storage_bytes_written_total{engine="state",kind="wal"}` | increasing on a split store | the state engine is writing a WAL it should not have; the store did not migrate (`datax_storage_split` is 0: restart the node after the v13 finalize) |
 | `datax_sql_memory_limit_hits_total` | increasing | statements are failing with `53200`: a query sorts, aggregates or joins more than `statement_memory_limit` allows on the gateway — narrow it, add an index that delivers the order, or raise the limit for that session (`datax_sql_streamed_rows_total` vs the statement count says how much of the read traffic streams and never counts against the limit) |
+| `datax_sql_statement_panics_total` | **any change — file a bug** | a statement panicked inside the SQL layer (a planner, executor, builtin or encoder bug). The barrier on the statement path turned it into an `XX000` for that statement, failed its transaction and kept the connection and the node serving; the log has the stack under `panic executing`. It never happens by design, so every count is a bug to report with that stack |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
 one ping yields both the round trip and the peer's clock offset); the

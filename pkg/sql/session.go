@@ -540,6 +540,19 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			res.Stream.deadline, res.Stream.lockTimeout = deadline, s.vars.lockTimeout
 		}
 	}()
+	defer func() {
+		// The outer panic barrier (issue #136; execStmt has the inner one,
+		// inside the transaction's retry loop). Whatever panicked outside
+		// it — a COMMIT, a DDL finish, a session variable — fails this
+		// statement with XX000 and, in a transaction block, the block.
+		if r := recover(); r != nil {
+			res, serr = nil, s.recoveredPanic(r, stmt)
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
+		}
+	}()
 	if serr := s.readOnlyViolation(stmt); serr != nil {
 		return nil, serr
 	}
