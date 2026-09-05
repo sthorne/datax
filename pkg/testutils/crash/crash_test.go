@@ -3,7 +3,9 @@ package crash
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,23 +18,65 @@ func TestCrashNodeChild(t *testing.T) { ChildMain(t) }
 
 // insertUntilDead inserts rows one at a time, recording every key whose
 // INSERT was acknowledged, until the node dies or limit acks are in.
-func insertUntilDead(t *testing.T, n *Node, start, limit int) (acked []int) {
+func insertUntilDead(t *testing.T, n *Node, start, limit int) []int {
 	t.Helper()
+	acked, err := insertKeys(n, start, 1, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return acked
+}
+
+// insertConcurrently runs workers inserters over interleaved keys (the
+// group commit joins their appends into shared syncs when the table is
+// pre-split), until the node dies or limit acks are in overall.
+func insertConcurrently(t *testing.T, n *Node, start, limit, workers int) []int {
+	t.Helper()
+	var (
+		mu    sync.Mutex
+		acked []int
+		errs  []error
+		wg    sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			got, err := insertKeys(n, start+w, workers, limit/workers)
+			mu.Lock()
+			acked = append(acked, got...)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			mu.Unlock()
+		}(w)
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		t.Fatal(errs[0])
+	}
+	sort.Ints(acked)
+	return acked
+}
+
+// insertKeys inserts start, start+stride, ... until the node dies or
+// limit acks are in.
+func insertKeys(n *Node, start, stride, limit int) (acked []int, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	conn, err := pgx.Connect(ctx, n.URL())
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS acked (k INT8 PRIMARY KEY, pad TEXT)`); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	pad := fmt.Sprintf("%0512d", 0)
-	for k := start; len(acked) < limit; k++ {
+	for k := start; len(acked) < limit; k += stride {
 		if _, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO acked VALUES (%d, '%s')`, k, pad)); err != nil {
 			if n.Exited() {
-				return acked
+				return acked, nil
 			}
 			if strings.Contains(err.Error(), "23505") {
 				// A write the crash made ambiguous (durable in the log,
@@ -42,13 +86,35 @@ func insertUntilDead(t *testing.T, n *Node, start, limit int) (acked []int) {
 				continue
 			}
 			// A transient error while the node is alive: retry the key.
-			k--
+			k -= stride
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
 		acked = append(acked, k)
 	}
-	return acked
+	return acked, nil
+}
+
+// presplit carves the acked table into ranges every step keys from start.
+func presplit(t *testing.T, n *Node, start, step, ranges int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, n.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS acked (k INT8 PRIMARY KEY, pad TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	var tuples []string
+	for i := 1; i < ranges; i++ {
+		tuples = append(tuples, fmt.Sprintf("(%d)", start+i*step))
+	}
+	if _, err := conn.Exec(ctx, "ALTER TABLE acked SPLIT AT VALUES "+strings.Join(tuples, ", ")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // verifyAcked checks that every acknowledged key is readable after the
@@ -99,16 +165,29 @@ func TestCrashConsistency(t *testing.T) {
 		opts  Options
 		limit int
 		kill  bool // the parent kills after limit acks
+		// ranges > 1 pre-splits the table and inserts from eight
+		// connections, so the store's group commit joins several
+		// ranges' appends in every synced batch (issue #102): the
+		// fault point then fires at a group-commit boundary.
+		ranges int
 	}{
 		{name: "raft-append", opts: Options{FaultPoint: "raft-append:150"}, limit: 100000},
 		{name: "raft-apply", opts: Options{FaultPoint: "raft-apply:150"}, limit: 100000},
 		{name: "flush-begin", opts: Options{FaultPoint: "flush-begin:1", MemTableSize: 256 << 10}, limit: 100000},
 		{name: "external-kill", opts: Options{}, limit: 200, kill: true},
+		{name: "group-commit", opts: Options{FaultPoint: "raft-append:300"}, limit: 100000, ranges: 16},
+		{name: "group-commit-kill", opts: Options{}, limit: 800, kill: true, ranges: 16},
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
 			n := Start(t, sc.opts)
-			acked := insertUntilDead(t, n, 1, sc.limit)
+			var acked []int
+			if sc.ranges > 1 {
+				presplit(t, n, 1, 64, sc.ranges)
+				acked = insertConcurrently(t, n, 1, sc.limit, 8)
+			} else {
+				acked = insertUntilDead(t, n, 1, sc.limit)
+			}
 			if sc.kill {
 				n.Kill()
 			} else {

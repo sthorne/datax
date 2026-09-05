@@ -123,3 +123,20 @@ func TestRenameColumnRefs(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSplitAt: ALTER TABLE ... SPLIT AT VALUES (k, ...), ... (issue
+// #102's pre-split for benchmarks and bulk loads).
+func TestParseSplitAt(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10), (20, 'x'), (30 + 1)`).(*AlterTable)
+	if at.Table != "t" || len(at.SplitAt) != 3 || len(at.SplitAt[0]) != 1 || len(at.SplitAt[1]) != 2 || at.SplitAt[1][1].Lit == nil {
+		t.Fatalf("split at: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE IF EXISTS t SPLIT AT VALUES (1)`).(*AlterTable); !at.IfExists || len(at.SplitAt) != 1 {
+		t.Fatalf("split at if exists: %+v", at)
+	}
+	for _, bad := range []string{`ALTER TABLE t SPLIT VALUES (1)`, `ALTER TABLE t SPLIT AT (1)`, `ALTER TABLE t SPLIT AT VALUES 1`} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%s: parsed", bad)
+		}
+	}
+}

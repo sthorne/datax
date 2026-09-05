@@ -50,6 +50,13 @@ duration, so two runs draw the same keys:
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join` | secondary-index lookups fanning out to wide primary rows |
 | `scan` | large result sets streamed through pgwire |
+| `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
+
+`--presplit N` carves the workload's table into N ranges before the run
+(`ALTER TABLE ... SPLIT AT` at evenly spaced keys; a sharded timeseries
+table is carved by `--shards` instead), so a run measures many raft
+groups on one store rather than one hot range; 10,000 is the largest
+worth trying on a laptop (the splits themselves take a few minutes).
 
 `bench/run.sh` starts a fresh single-node on-disk store
 (`datax init --dir`) and a fresh in-memory 3-node cluster (`datax demo`)

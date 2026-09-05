@@ -622,6 +622,24 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 	}
 
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SplitAt != nil {
+		// A split is a range operation, not a descriptor write: it runs
+		// outside any transaction, like the manual datax debug split.
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SPLIT AT cannot run inside a transaction block")
+		}
+		if at.IfExists && !s.tableExists(ctx, at.Table) {
+			return &Result{Tag: "ALTER TABLE"}, nil
+		}
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
+		}
+		res, err := s.execSplitAt(ctx, at, params)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		return res, nil
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")

@@ -12,8 +12,8 @@ Per-replica Raft state lives in unreplicated local keys
 (`/local/r/<rangeID>/...`) in the node's shared Pebble store:
 HardState, log entries, applied index, and a copy of the descriptor.
 
-**Durability contract** (the classic etcd-raft rules, enforced in the ready
-loop):
+**Durability contract** (the classic etcd-raft rules, enforced when a
+Ready is handled):
 
 1. Persist HardState + new entries (synced batch) **before** sending any Raft
    messages from the same Ready.
@@ -21,8 +21,22 @@ loop):
    Pebble batch, so replay after a crash is idempotent (entries at or below
    the applied index are skipped).
 
-A single 200ms ticker drives all Raft groups on a node. `PreVote` and
-`CheckQuorum` are enabled.
+**The store's raft scheduler** (`pkg/kvserver/scheduler.go`) drives every
+group on a node from one fixed pool of workers (`GOMAXPROCS`;
+`StoreConfig.RaftWorkers`) instead of a goroutine and a ticker per
+replica. A message, a proposal, a read-index request or the store's one
+100 ms ticker *enqueues* a replica; a worker takes a group of queued
+replicas (up to 64), ticks or steps each `RawNode`, and handles one Ready
+per replica. Their HardStates and entries are staged into **one Pebble
+batch and synced once** — group commit: ten ranges appending in the same
+moment cost one fsync — before any of them sends a message, satisfies a
+read-index waiter or applies committed entries; then each is advanced,
+and one that still has work is re-queued so every range gets a turn. A
+replica is never handled by two workers at once (work arriving during
+its pass only raises its flags). The scheduler's queue wait is
+`datax_raft_scheduler_latency_seconds`; `datax_raft_log_syncs_total` and
+`datax_raft_readies_per_sync` show how many replicas each sync served.
+`PreVote` and `CheckQuorum` are enabled.
 
 **Transport**: one gRPC bidirectional stream per node pair; each message is
 `{RangeID, To, From, opaque raftpb bytes}`. Raft messages are opaque to the
@@ -244,7 +258,7 @@ tick-rate skew.
 
 Two hardenings close the sleeping-leader gap (a GC pause, cgroup
 throttling, or VM freeze that stops the whole process): a **stall
-detector** — the raft ticker notes when a gap far exceeds its interval and
+detector** — the scheduler's tick notes when a gap far exceeds its interval and
 invalidates all pre-stall follower contact, so a leader that just woke
 cannot serve until a majority answers *again* — and a **post-evaluation
 re-check** of the backstop immediately before read results are returned,

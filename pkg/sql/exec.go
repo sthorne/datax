@@ -494,6 +494,68 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 	}
 }
 
+// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ...: carve a
+// range boundary at each primary-key tuple (a prefix of the key is
+// allowed), so a bulk load or a benchmark spreads over many ranges from
+// the start instead of waiting for size- and load-based splits. Rows are
+// the boundaries as key paths. A sharded timeseries table's key begins
+// with its shard bucket, so it is split by shard (SET (shards = N)), not
+// here.
+func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	var desc *catalog.TableDescriptor
+	if err := s.db.RunTxn(ctx, "split-at", func(ctx context.Context, txn *kvclient.Txn) error {
+		shared, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return err
+		}
+		desc = shared
+		return nil
+	}); err != nil {
+		var nf *catalog.ErrTableNotFound
+		if t.IfExists && asErr(err, &nf) {
+			return &Result{Tag: "ALTER TABLE"}, nil
+		}
+		return nil, err
+	}
+	if err := mustBeReal(desc); err != nil {
+		return nil, err
+	}
+	if desc.ShardBuckets > 1 {
+		return nil, newErrf(CodeFeatureNotSupported, "%q is sharded: its key space is carved by shard (ALTER TABLE ... SET (shards = N)), not by primary key", desc.Name)
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	for _, tuple := range t.SplitAt {
+		if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
+			return nil, newErrf(CodeSyntaxError, "SPLIT AT: a tuple names 1 to %d primary key values (%q has %d)", len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
+		}
+		key := rowenc.PrimaryKeyPrefixFor(desc)
+		for i, e := range tuple {
+			col, _ := desc.ColByID(desc.PrimaryKey[i])
+			d, err := evalExpr(e, nil, nil, params)
+			if err != nil {
+				return nil, err
+			}
+			if d, err = col.Conform(d); err != nil {
+				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
+			}
+			if d.Null {
+				return nil, newErrf(CodeSyntaxError, "SPLIT AT: column %q: a split key cannot be NULL", col.Name)
+			}
+			if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
+				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
+			}
+		}
+		// An existing boundary is the state asked for (a re-run of a
+		// load script or a benchmark's set-up), not an error.
+		if _, err := s.db.AdminSplit(ctx, key); err != nil && !strings.Contains(err.Error(), "already a range boundary") {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
 	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)

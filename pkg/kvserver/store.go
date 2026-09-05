@@ -39,6 +39,9 @@ type StoreConfig struct {
 	SnapshotSender   SnapshotSender
 	Stopper          *stop.Stopper
 	RaftTickInterval time.Duration
+	// RaftWorkers is the size of the store's raft scheduler pool (0 =
+	// GOMAXPROCS; see scheduler.go).
+	RaftWorkers int
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
@@ -157,6 +160,9 @@ type Store struct {
 
 	// nodeHealth holds peers' storage-health verdicts (see node_health.go).
 	nodeHealth nodeHealthMap
+
+	// sched drives every replica's raft group (scheduler.go).
+	sched *raftScheduler
 }
 
 // SetSender injects the routed KV client (once, at node startup).
@@ -181,6 +187,7 @@ func NewStore(cfg StoreConfig) *Store {
 	}
 	s := &Store{cfg: cfg}
 	s.mu.replicas = make(map[base.RangeID]*Replica)
+	s.sched = newRaftScheduler(s, cfg.RaftWorkers)
 	return s
 }
 
@@ -257,7 +264,7 @@ func (s *Store) LoadReplicas() error {
 		log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
 	}
 	for _, r := range loaded {
-		if err := r.startRaftLoop(); err != nil {
+		if err := r.startRaft(); err != nil {
 			return err
 		}
 	}
@@ -284,14 +291,14 @@ func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Repli
 }
 
 // startReplica adds the replica to the store (or returns the existing one)
-// and starts its raft loop.
+// and hands it to the raft scheduler.
 func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
 	r, created, err := s.addReplica(desc, replicaID, bootstrap)
 	if err != nil {
 		return nil, err
 	}
 	if created {
-		if err := r.startRaftLoop(); err != nil {
+		if err := r.startRaft(); err != nil {
 			s.mu.Lock()
 			delete(s.mu.replicas, desc.RangeID)
 			s.mu.Unlock()
@@ -302,7 +309,7 @@ func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID
 }
 
 // addReplica constructs the replica and enters it into the store map
-// WITHOUT starting its raft loop; created reports whether this call made
+// WITHOUT scheduling its raft group; created reports whether this call made
 // it (false: the store already held one, which is returned).
 func (s *Store) addReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (r *Replica, created bool, err error) {
 	s.mu.Lock()

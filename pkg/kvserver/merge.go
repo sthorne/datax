@@ -153,7 +153,7 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 			lead := r.mu.leader
 			r.mu.Unlock()
 			if lead != 0 && lead != uint64(r.replicaID) {
-				r.node.TransferLeadership(ctx, lead, uint64(r.replicaID))
+				r.transferLeader(uint64(r.replicaID))
 			}
 			return true
 		}
@@ -434,7 +434,7 @@ wait:
 	}
 	// Stop the RHS group before its unreplicated keys go: a live Ready
 	// handler could otherwise resurrect its HardState after our batch.
-	r.store.detachReplica(trig.Right.RangeID)
+	r.store.detachReplica(trig.Right.RangeID, r)
 
 	if err := PutRangeDescriptor(b, trig.Merged); err != nil {
 		return err
@@ -474,8 +474,10 @@ func (r *Replica) finishMerge(trig *mergeTrigger) {
 
 // detachReplica stops a replica's raft group and removes it from the store
 // WITHOUT touching its data — the merge path, where the range's content now
-// belongs to its neighbor. Compare removeReplica, which wipes.
-func (s *Store) detachReplica(rangeID base.RangeID) {
+// belongs to its neighbor. Compare removeReplica, which wipes. from is the
+// replica whose apply is detaching (the LHS), so a pass that holds both
+// sides does not wait for itself.
+func (s *Store) detachReplica(rangeID base.RangeID, from *Replica) {
 	s.mu.Lock()
 	r, ok := s.mu.replicas[rangeID]
 	if ok {
@@ -485,8 +487,7 @@ func (s *Store) detachReplica(rangeID base.RangeID) {
 	if !ok {
 		return
 	}
-	r.quiesceOnce.Do(func() { close(r.quiesceCh) })
-	<-r.stoppedCh
+	s.sched.stopReplica(r, from)
 	r.mu.Lock()
 	r.mu.destroyed = true
 	r.mu.Unlock()

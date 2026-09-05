@@ -8,6 +8,30 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.32.0 — unreleased
+
+### Changed
+- Store-level raft scheduler with group commit (#102, parts a and b): a
+  node's raft groups are driven by one fixed pool of workers
+  (`GOMAXPROCS`; `StoreConfig.RaftWorkers`) and one 100 ms ticker
+  instead of a goroutine and a ticker per replica. A worker takes a
+  group of queued replicas, handles one Ready each, and stages every
+  HardState and log entry into one synced Pebble batch — ten ranges
+  appending in the same moment cost one fsync, not ten — before any of
+  them sends a message or applies. New series:
+  `datax_raft_scheduler_latency_seconds`, `datax_raft_ready_passes_total`,
+  `datax_raft_log_syncs_total`, `datax_raft_readies_per_sync`. The
+  crash-consistency test kills the node at group-commit boundaries with
+  eight writers over sixteen ranges. Before/after on the harness in the PR.
+
+### Added
+- `ALTER TABLE t SPLIT AT VALUES (k, ...), ...` carves ranges at
+  primary-key tuples (a prefix of the key is allowed) and returns the
+  boundaries; idempotent, refused inside a transaction block (`25001`)
+  and on sharded timeseries tables (`0A000`, carved by shard). `datax
+  bench ... --presplit N` uses it; the checked-in set gains
+  `kv-50-50-1000-ranges` and `ingest-random-1000-ranges`.
+
 ## 0.31.0 — unreleased
 
 ### Changed

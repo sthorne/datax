@@ -78,6 +78,22 @@ var (
 	RangeMerges = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_range_merges_total", Help: "Adjacent underfull ranges merged.",
 	})
+	RaftSchedulerLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_raft_scheduler_latency_seconds",
+		Help:    "Time a replica waited in the store's raft scheduler queue before a worker picked it up.",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
+	})
+	RaftReadyPasses = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_ready_passes_total", Help: "Raft Readies (one replica's persist, send and apply) handled by the store's scheduler workers.",
+	})
+	RaftLogSyncs = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_log_syncs_total", Help: "Synced commits of raft log entries and HardStates: one per scheduler pass, however many replicas the pass grouped.",
+	})
+	RaftReadiesPerSync = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_raft_readies_per_sync",
+		Help:    "Replicas whose raft log writes shared one synced commit.",
+		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+	})
 	FollowerReads = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_follower_reads_total", Help: "Stale reads served by non-leader replicas at their closed timestamp.",
 	})

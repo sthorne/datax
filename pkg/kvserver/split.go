@@ -188,7 +188,7 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 				if rhs.hasLeader() {
 					return
 				}
-				if err := rhs.node.Campaign(ctx); err != nil {
+				if err := rhs.campaign(); err != nil {
 					log.Debugf("%s: campaign after split: %v", trig.Right.RangeID, err)
 				}
 				select {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -120,6 +121,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
 	groups := fs.Int("groups", 1000, "index-join workload: distinct indexed values (rows per lookup = preload / groups)")
+	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	name := fs.String("name", "", "label in the JSON record (default: the workload)")
 	jsonOut := fs.String("json", "", "write the run's record to this file")
@@ -248,9 +250,15 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		return nil
 	}
+	split := func(table string, max int64, text bool) error {
+		return presplitTable(ctx, setup, table, *presplit, max, text)
+	}
 	switch workload {
 	case "kv":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_kv (k INT8 PRIMARY KEY, v TEXT)"); err != nil {
+			return nil, err
+		}
+		if err := split("bench_kv", int64(*preload), false); err != nil {
 			return nil, err
 		}
 		if err := preloadRows("bench_kv", "k, v", func(j int) string { return fmt.Sprintf("(%d, 'v%d')", j, j) }); err != nil {
@@ -264,6 +272,17 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		if _, err := setup.Exec(ctx, ddl); err != nil {
 			return nil, err
 		}
+		switch *keys {
+		case "uuid":
+			err = split(ingestTable, 0, true)
+		case "sequential":
+			err = split(ingestTable, int64(*concurrency)<<40, false) // each worker's keys start at worker<<40
+		default:
+			err = split(ingestTable, math.MaxInt64, false)
+		}
+		if err != nil {
+			return nil, err
+		}
 	case "timeseries":
 		opts := "timeseries = true"
 		if *shards > 0 {
@@ -273,8 +292,16 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		if _, err := setup.Exec(ctx, ddl); err != nil {
 			return nil, err
 		}
+		if *shards == 0 {
+			if err := split(tsTable, int64(*series), false); err != nil {
+				return nil, err
+			}
+		}
 	case "bank":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_bank (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
+			return nil, err
+		}
+		if err := split("bench_bank", int64(*preload), false); err != nil {
 			return nil, err
 		}
 		if err := preloadRows("bench_bank", "id, balance", func(j int) string { return fmt.Sprintf("(%d, 1000)", j) }); err != nil {
@@ -289,11 +316,17 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS bench_ij_g ON bench_ij (g)"); err != nil {
 			return nil, err
 		}
+		if err := split("bench_ij", int64(*preload), false); err != nil {
+			return nil, err
+		}
 		if err := preloadRows("bench_ij", "k, g, pad", func(j int) string { return fmt.Sprintf("(%d, %d, '%s')", j, j%*groups, pad) }); err != nil {
 			return nil, err
 		}
 	case "scan":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_scan (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
+			return nil, err
+		}
+		if err := split("bench_scan", int64(*preload), false); err != nil {
 			return nil, err
 		}
 		if err := preloadRows("bench_scan", "k, pad", func(j int) string { return fmt.Sprintf("(%d, '%s')", j, pad) }); err != nil {
@@ -714,6 +747,39 @@ func scrapeCounters(client *http.Client, url string) map[string]float64 {
 
 // counterDeltas returns after - before for every datax_* series that
 // moved.
+// presplitTable carves table into n ranges at evenly spaced primary
+// keys — integer keys over [0, max), text keys over the hexadecimal
+// prefixes of a uuid — through ALTER TABLE ... SPLIT AT, 100 boundaries
+// per statement. n <= 1 is a no-op.
+func presplitTable(ctx context.Context, conn *pgx.Conn, table string, n int, max int64, text bool) error {
+	if n <= 1 {
+		return nil
+	}
+	width := 1
+	for text && (1<<(4*width)) < n {
+		width++
+	}
+	var tuples []string
+	for i := 1; i < n; i++ {
+		if text {
+			tuples = append(tuples, fmt.Sprintf("('%0*x')", width, int64(i)*int64(1<<(4*width))/int64(n)))
+		} else {
+			tuples = append(tuples, fmt.Sprintf("(%d)", max/int64(n)*int64(i)))
+		}
+	}
+	fmt.Printf("pre-splitting %s into %d ranges...\n", table, n)
+	for i := 0; i < len(tuples); i += 100 {
+		end := i + 100
+		if end > len(tuples) {
+			end = len(tuples)
+		}
+		if err := execRetrying(ctx, conn, fmt.Sprintf("ALTER TABLE %s SPLIT AT VALUES %s", table, strings.Join(tuples[i:end], ", "))); err != nil {
+			return fmt.Errorf("pre-splitting %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
 func counterDeltas(before, after map[string]float64) map[string]float64 {
 	out := map[string]float64{}
 	for name, a := range after {

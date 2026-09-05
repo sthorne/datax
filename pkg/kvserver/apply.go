@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -63,7 +64,13 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 		if err := cc.Unmarshal(ent.Data); err != nil {
 			return fmt.Errorf("corrupt conf change: %w", err)
 		}
-		state := r.node.ApplyConfChange(cc)
+		var state *raftpb.ConfState
+		if err := r.withRaftGroup(func(rn *raft.RawNode) error {
+			state = rn.ApplyConfChange(cc)
+			return nil
+		}); err != nil {
+			return err
+		}
 		r.rs.setConfStateRaw(*state)
 
 		// Membership-change conf changes carry the new descriptor; adopt it

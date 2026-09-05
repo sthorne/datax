@@ -294,6 +294,9 @@ func (b *Batch) Commit(sync bool) error {
 
 func (b *Batch) Close() error { return b.b.Close() }
 
+// Empty reports whether nothing has been staged.
+func (b *Batch) Empty() bool { return b.b.Empty() }
+
 // Repr returns the batch's serialized representation (valid before Commit).
 // Used to ship a batch through Raft.
 func (b *Batch) Repr() []byte { return b.b.Repr() }
