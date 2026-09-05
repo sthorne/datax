@@ -52,6 +52,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execExplain(ctx, txn, t, params)
 	case *parser.AlterTable:
 		return s.execAlterTable(ctx, txn, t)
+	case *parser.DropIndex:
+		return s.execDropIndex(ctx, txn, t)
+	case *parser.AlterIndex:
+		return s.execAlterIndex(ctx, txn, t)
+	case *parser.Truncate:
+		return s.execTruncate(ctx, txn, t)
 	case *parser.CreateUser:
 		return s.execCreateUser(ctx, txn, t)
 	case *parser.DropUser:
@@ -1981,6 +1987,10 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		var nf *catalog.ErrTableNotFound
+		if t.IfExists && asErr(err, &nf) {
+			return &Result{Tag: "ALTER TABLE"}, nil
+		}
 		return nil, err
 	}
 	if err := mustBeReal(shared); err != nil {
@@ -2001,6 +2011,16 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 	case t.DropConstraint != "":
 		return s.execDropConstraint(ctx, txn, desc, t)
+	case t.RenameTo != "":
+		return s.execRenameTable(ctx, txn, desc, t)
+	case t.RenameCol != nil:
+		return s.execRenameColumn(ctx, txn, desc, t.RenameCol)
+	case t.RenameConstraint != nil:
+		return s.execRenameConstraint(ctx, txn, desc, t.RenameConstraint)
+	case t.SetDefault != nil:
+		return s.execSetDefault(ctx, txn, desc, t.SetDefault.Column, t.SetDefault)
+	case t.DropDefault != "":
+		return s.execSetDefault(ctx, txn, desc, t.DropDefault, nil)
 	case t.DropNotNull != "":
 		col, ok := desc.Col(t.DropNotNull)
 		if !ok {
@@ -2032,7 +2052,10 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN ... NOT NULL requires a DEFAULT (existing rows need a value)")
 		}
 		if _, exists := desc.Col(def.Name); exists {
-			return nil, newErrf(CodeSyntaxError, "column %q already exists", def.Name)
+			if t.AddColIfNotExists {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
+			return nil, newErrf(CodeDuplicateObject, "column %q already exists", def.Name)
 		}
 		col := catalog.Column{
 			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
@@ -2056,7 +2079,10 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		desc.NextColumnID++
 	case t.DropCol != "":
 		col, ok := desc.Col(t.DropCol)
-		if !ok {
+		if !ok || col.Hidden {
+			if t.DropColIfExists {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
 			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropCol)
 		}
 		if desc.IsPKCol(col.ID) {
@@ -2089,7 +2115,7 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			}
 		}
 	default:
-		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires ADD or DROP COLUMN")
+		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires an action (ADD, DROP, RENAME, ALTER COLUMN, SET)")
 	}
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err

@@ -798,7 +798,7 @@ func TestParseConstraints(t *testing.T) {
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p ON DELETE SET DEFAULT)`,
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p MATCH FULL)`,
 		`ALTER TABLE t ADD PRIMARY KEY (a)`,
-		`ALTER TABLE t ALTER COLUMN a SET DEFAULT 1`,
+		`ALTER TABLE t ALTER COLUMN a SET TYPE INT8`,
 	} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("%q parsed", bad)

@@ -182,6 +182,9 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 func (s *Session) execAlterSequence(ctx context.Context, txn *kvclient.Txn, t *parser.AlterSequence) (*Result, error) {
 	d, err := s.lookupSequence(ctx, txn, t.Name)
 	if err != nil {
+		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedTable && t.IfExists {
+			return &Result{Tag: "ALTER SEQUENCE"}, nil
+		}
 		return nil, err
 	}
 	if err := s.checkSequencePriv(ctx, txn, d); err != nil {

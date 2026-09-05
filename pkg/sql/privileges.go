@@ -25,7 +25,8 @@ var tablePrivs = map[string]bool{"SELECT": true, "INSERT": true, "UPDATE": true,
 func requiresAdmin(stmt parser.Statement) bool {
 	switch stmt.(type) {
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable,
-		*parser.CreateIndex, *parser.CreateUser, *parser.Analyze, *parser.DropUser, *parser.GrantRevoke,
+		*parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex,
+		*parser.CreateUser, *parser.Analyze, *parser.DropUser, *parser.GrantRevoke,
 		*parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
 		return true
 	}

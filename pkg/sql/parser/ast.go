@@ -200,10 +200,11 @@ type DropSequence struct {
 	IfExists bool
 }
 
-// AlterSequence is ALTER SEQUENCE name [options | RESTART [WITH n]].
+// AlterSequence is ALTER SEQUENCE [IF EXISTS] name [options | RESTART [WITH n]].
 type AlterSequence struct {
-	Name    string
-	Options SequenceOptions
+	Name     string
+	IfExists bool
+	Options  SequenceOptions
 }
 
 // ShowSequences is SHOW SEQUENCES.
@@ -212,12 +213,35 @@ type ShowSequences struct{}
 // ShowFunctions is SHOW FUNCTIONS: the builtin function reference.
 type ShowFunctions struct{}
 
-// CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
+// CreateIndex is CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols).
 type CreateIndex struct {
-	Unique  bool
-	Name    string
-	Table   string
-	Columns []string
+	Unique      bool
+	IfNotExists bool
+	Name        string
+	Table       string
+	Columns     []string
+}
+
+// DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on
+// whichever table of the database carries it.
+type DropIndex struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterIndex is ALTER INDEX [IF EXISTS] [db.]name RENAME TO new.
+type AlterIndex struct {
+	Name     string
+	NewName  string
+	IfExists bool
+}
+
+// Truncate is TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE
+// IDENTITY] [CASCADE | RESTRICT].
+type Truncate struct {
+	Tables          []string
+	RestartIdentity bool
+	Cascade         bool
 }
 
 // Explain wraps a statement whose access plan should be described instead
@@ -516,11 +540,27 @@ type Update struct {
 	Returning []SelectExpr
 }
 
-// AlterTable is ALTER TABLE t ADD [COLUMN] def | DROP [COLUMN] name.
+// AlterTable is ALTER TABLE [IF EXISTS] t <action>: one of the fields
+// below is set.
 type AlterTable struct {
-	Table   string
-	AddCol  *ColumnDef // set for ADD COLUMN
-	DropCol string     // set for DROP COLUMN
+	Table string
+	// IfExists makes a missing table a no-op.
+	IfExists bool
+	AddCol   *ColumnDef // set for ADD COLUMN
+	DropCol  string     // set for DROP COLUMN
+	// AddColIfNotExists / DropColIfExists are ADD COLUMN IF NOT EXISTS /
+	// DROP COLUMN IF EXISTS: an existing / missing column is a no-op.
+	AddColIfNotExists bool
+	DropColIfExists   bool
+	// RenameTo is RENAME TO new; RenameCol and RenameConstraint are
+	// RENAME [COLUMN] a TO b and RENAME CONSTRAINT a TO b.
+	RenameTo         string
+	RenameCol        *Rename
+	RenameConstraint *Rename
+	// SetDefault is ALTER [COLUMN] c SET DEFAULT value; DropDefault is
+	// ALTER [COLUMN] c DROP DEFAULT (the column name).
+	SetDefault  *SetDefault
+	DropDefault string
 	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
 	// shards = N, the online re-shard.
 	SetOptions map[string]string
@@ -537,6 +577,17 @@ type AlterTable struct {
 	DropNotNull string
 }
 
+// Rename is an old name and its replacement.
+type Rename struct{ From, To string }
+
+// SetDefault is a column's new default: a constant (Default) or an
+// expression (Expr), exactly as a column definition carries them.
+type SetDefault struct {
+	Column  string
+	Default *types.Datum
+	Expr    *Expr
+}
+
 type Delete struct {
 	With      []CTE
 	Table     string
@@ -549,11 +600,15 @@ type CreateUser struct {
 	Name     string
 	Password string
 	Alter    bool // ALTER USER: the user must already exist
+	// IfNotExists is CREATE USER IF NOT EXISTS: an existing user is a
+	// no-op (the password is left alone).
+	IfNotExists bool
 }
 
-// DropUser is DROP USER name.
+// DropUser is DROP USER [IF EXISTS] name.
 type DropUser struct {
-	Name string
+	Name     string
+	IfExists bool
 }
 
 // GrantRevoke is GRANT/REVOKE: either the admin role
@@ -641,6 +696,9 @@ func (*AlterSequence) stmt()       {}
 func (*ShowSequences) stmt()       {}
 func (*ShowFunctions) stmt()       {}
 func (*CreateIndex) stmt()         {}
+func (*DropIndex) stmt()           {}
+func (*AlterIndex) stmt()          {}
+func (*Truncate) stmt()            {}
 func (*Explain) stmt()             {}
 func (*DropTable) stmt()           {}
 func (*Insert) stmt()              {}

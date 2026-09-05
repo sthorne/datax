@@ -8,6 +8,32 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.21.0 — unreleased
+
+### Added
+- DDL completeness, part one (#95): `DROP INDEX [IF EXISTS]` (the
+  index leaves the schema at once; its entries are reclaimed after the
+  commit and lease drain), `ALTER INDEX ... RENAME TO`, `ALTER TABLE
+  ... RENAME TO / RENAME [COLUMN] / RENAME CONSTRAINT` (foreign keys,
+  sequences and grants follow the table's ID; `CHECK` expressions are
+  rewritten for a renamed column; a `UNIQUE` constraint and its index
+  rename together), `ALTER TABLE ... ALTER COLUMN SET DEFAULT | DROP
+  DEFAULT` (constants and expressions; a fill-on-read column keeps
+  filling its old rows from the original constant), `TRUNCATE [TABLE] t
+  [, ...] [RESTART IDENTITY] [CASCADE]` as a transactional layout swap
+  (one descriptor write for any table size; the old layout serves `AS OF
+  SYSTEM TIME` until the re-shard janitor reclaims it; referencing
+  tables refused without `CASCADE`), and `IF [NOT] EXISTS` on `ALTER
+  TABLE`, `ADD COLUMN`, `DROP COLUMN`, `CREATE INDEX`, `ALTER INDEX`,
+  `ALTER SEQUENCE`, `CREATE USER` and `DROP USER`. The reference
+  documents which DDL runs inside a transaction block (every
+  single-descriptor-write statement) and which is refused (`25001`: the
+  multi-transaction online statements).
+
+### Changed
+- `CREATE INDEX` on a taken name and `ADD COLUMN` on a taken name report
+  `42710` (duplicate object) instead of `42601`.
+
 ## 0.20.0 — unreleased
 
 ### Added

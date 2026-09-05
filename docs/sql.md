@@ -10,6 +10,10 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
+ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN] a TO b | RENAME CONSTRAINT a TO b
+    | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
+TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
@@ -241,6 +245,19 @@ Table descriptors are JSON documents stored in system keys (range 1):
   the `CREATE INDEX` shape: publish (unvalidated), drain lease
   adoption, backfill the index, sweep the existing rows in chunks as of
   a boundary, mark validated.
+
+`TRUNCATE` reuses the re-shard's layout swap: the descriptor moves the
+primary rows and every secondary index to fresh index IDs in one write
+and records the superseded layout in `RetiredLayouts`, where the
+re-shard janitor reclaims it after the keep window — so a truncation
+costs one descriptor write whatever the table's size or range count,
+rolls back with its transaction, and keeps `AS OF SYSTEM TIME` reads
+below it working meanwhile. `DROP INDEX` removes the index from the
+descriptor and queues its keyspace for the same chunked wipe `DROP
+CONSTRAINT` uses, run after the commit and the lease drain. `RENAME TO`
+moves the namespace entry (the descriptor ID, and so every by-ID
+reference, is unchanged); a gateway caching the old name drops that
+entry at its next lease renewal, which the statement's drain waits for.
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

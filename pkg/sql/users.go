@@ -34,6 +34,9 @@ func (s *Session) execCreateUser(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, newErrf(CodeUndefinedObject, "user %q does not exist", t.Name)
 	}
 	if !t.Alter && existing != nil {
+		if t.IfNotExists {
+			return &Result{Tag: "CREATE USER"}, nil
+		}
 		return nil, newErrf(CodeDuplicateObject, "user %q already exists", t.Name)
 	}
 	if t.Password == "" {
@@ -68,6 +71,9 @@ func (s *Session) execDropUser(ctx context.Context, txn *kvclient.Txn, t *parser
 		return nil, err
 	}
 	if existing == nil {
+		if t.IfExists {
+			return &Result{Tag: "DROP USER"}, nil
+		}
 		return nil, newErrf(CodeUndefinedObject, "user %q does not exist", t.Name)
 	}
 	if err := txn.Delete(ctx, key); err != nil {

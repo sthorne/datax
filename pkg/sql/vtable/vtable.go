@@ -391,13 +391,10 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		if c.NotNull {
 			b.WriteString(" NOT NULL")
 		}
-		if c.Default != nil {
-			fmt.Fprintf(&b, " DEFAULT %s", renderDefault(*c.Default))
-		}
 		if c.Identity != "" {
 			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", strings.ToUpper(c.Identity))
-		} else if c.DefaultExpr != "" {
-			fmt.Fprintf(&b, " DEFAULT %s", c.DefaultExpr)
+		} else if def := ColumnDefault(&c); def != "" {
+			fmt.Fprintf(&b, " DEFAULT %s", def)
 		}
 		b.WriteString(",\n")
 	}
@@ -445,6 +442,10 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 // the constant as a literal; "" when the column has none.
 func ColumnDefault(c *catalog.Column) string {
 	switch {
+	case c.DefaultExpr == "NULL":
+		// DROP DEFAULT on a fill-on-read column: the constant stays as
+		// the fill value, the expression says inserts get NULL.
+		return ""
 	case c.DefaultExpr != "":
 		return c.DefaultExpr
 	case c.Default != nil:

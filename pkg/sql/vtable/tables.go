@@ -180,7 +180,7 @@ func init() {
 			}
 			return Row{i64(relid), str(c.Name), i64(TypeOID(c.Type)), i64(-1),
 				i64(-1), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
-				boolean(c.Default != nil || c.DefaultExpr != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
+				boolean(ColumnDefault(c) != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
 				str(""), null(), null(), null(), str(FormatType(c)), indexdef}
 		}
 		for _, t := range env.currentTables() {

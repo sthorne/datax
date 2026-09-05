@@ -527,6 +527,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
 	// and then sweep the existing rows: multi-transaction, like CREATE
 	// INDEX.
+	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil) && !s.tableExists(ctx, at.Table) {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "") {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")

@@ -301,11 +301,38 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DROP":
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
 			p.i += 2 // DROP USER
+			du := &DropUser{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				du.IfExists = true
+			}
 			name, err := p.expectIdent()
 			if err != nil {
 				return nil, err
 			}
-			return &DropUser{Name: name}, nil
+			du.Name = name
+			return du, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
+			p.i += 2 // DROP INDEX
+			di := &DropIndex{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				di.IfExists = true
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			di.Name = name
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return di, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // DROP SEQUENCE
@@ -345,6 +372,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			return dd, nil
 		}
 		return p.parseDropTable()
+	case "truncate": // not a reserved word; lexes as an identifier
+		return p.parseTruncate()
 	case "INSERT":
 		return p.parseInsert(false)
 	case "upsert": // not a reserved word; lexes as an identifier
@@ -359,9 +388,40 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
 			return p.parseUserStmt(true)
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
+			p.i += 2 // ALTER INDEX
+			ai := &AlterIndex{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				ai.IfExists = true
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			ai.Name = name
+			if !p.consumeIdentWord("rename") {
+				return nil, p.errf("ALTER INDEX supports only RENAME TO")
+			}
+			if err := p.expectKeyword("TO"); err != nil {
+				return nil, err
+			}
+			if ai.NewName, err = p.expectIdent(); err != nil {
+				return nil, err
+			}
+			return ai, nil
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // ALTER SEQUENCE
 			as := &AlterSequence{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				as.IfExists = true
+			}
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
@@ -821,18 +881,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			// A constant stays a literal default; anything else (a
 			// call, arithmetic) is an expression default ("default" is
 			// not a reserved word).
-			e, err := p.parseValueOrColumnExpr()
+			sd, err := p.parseDefaultValue()
 			if err != nil {
 				return def, err
 			}
-			if e.Lit != nil && e.BinOp == "" && e.Cast == "" {
-				def.Default = e.Lit
-			} else {
-				if e.Column != "" || exprContainsColumn(e) {
-					return def, p.errf("DEFAULT cannot reference columns")
-				}
-				def.DefaultExpr = &e
-			}
+			def.Default, def.DefaultExpr = sd.Default, sd.Expr
 		case p.peekIdentWord("generated"):
 			// GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]
 			p.i++
@@ -1187,6 +1240,15 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	}
 	if err := p.expectKeyword("INDEX"); err != nil {
 		return nil, err
+	}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ci.IfNotExists = true
 	}
 	name, err := p.expectIdent()
 	if err != nil {
@@ -2635,6 +2697,16 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 // parseUserStmt parses CREATE USER / ALTER USER name PASSWORD 'pw'.
 func (p *parser) parseUserStmt(alter bool) (Statement, error) {
 	p.i += 2 // CREATE|ALTER USER
+	ifNotExists := false
+	if !alter && p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
 	name, err := p.expectIdent()
 	if err != nil {
 		return nil, err
@@ -2647,7 +2719,7 @@ func (p *parser) parseUserStmt(alter bool) (Statement, error) {
 		return nil, p.errf("expected password string, found %q", t.text)
 	}
 	p.i++
-	return &CreateUser{Name: name, Password: t.text, Alter: alter}, nil
+	return &CreateUser{Name: name, Password: t.text, Alter: alter, IfNotExists: ifNotExists}, nil
 }
 
 func (p *parser) parseAlterTable() (Statement, error) {
@@ -2655,12 +2727,39 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
+	at := &AlterTable{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		at.IfExists = true
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
-	at := &AlterTable{Table: name}
+	at.Table = name
 	switch {
+	case p.consumeIdentWord("rename"):
+		switch {
+		case p.consumeKeyword("TO"):
+			if at.RenameTo, err = p.expectIdent(); err != nil {
+				return nil, err
+			}
+		case p.consumeKeyword("CONSTRAINT"):
+			r, err := p.parseRename()
+			if err != nil {
+				return nil, err
+			}
+			at.RenameConstraint = r
+		default:
+			p.consumeKeyword("COLUMN")
+			r, err := p.parseRename()
+			if err != nil {
+				return nil, err
+			}
+			at.RenameCol = r
+		}
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
@@ -2688,6 +2787,15 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		p.consumeKeyword("COLUMN")
+		if p.consumeKeyword("IF") {
+			if err := p.expectKeyword("NOT"); err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("EXISTS"); err != nil {
+				return nil, err
+			}
+			at.AddColIfNotExists = true
+		}
 		def, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
@@ -2709,11 +2817,20 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		p.consumeKeyword("COLUMN")
+		if p.consumeKeyword("IF") {
+			if err := p.expectKeyword("EXISTS"); err != nil {
+				return nil, err
+			}
+			at.DropColIfExists = true
+		}
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
 		at.DropCol = col
+		if !p.consumeIdentWord("cascade") {
+			p.consumeIdentWord("restrict")
+		}
 	case p.consumeIdentWord("validate"):
 		if err := p.expectKeyword("CONSTRAINT"); err != nil {
 			return nil, err
@@ -2731,23 +2848,36 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		switch {
 		case p.consumeKeyword("SET"):
+			if p.consumeIdentWord("default") {
+				sd, err := p.parseDefaultValue()
+				if err != nil {
+					return nil, err
+				}
+				sd.Column = col
+				at.SetDefault = sd
+				break
+			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, err
+				return nil, p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
 				return nil, err
 			}
 			at.SetNotNull = col
 		case p.consumeKeyword("DROP"):
+			if p.consumeIdentWord("default") {
+				at.DropDefault = col
+				break
+			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, err
+				return nil, p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
 				return nil, err
 			}
 			at.DropNotNull = col
 		default:
-			return nil, p.errf("expected SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return nil, p.errf("expected SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
@@ -2756,9 +2886,77 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.SetOptions = opts
 	default:
-		return nil, p.errf("expected ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
 	}
 	return at, nil
+}
+
+// parseRename parses `old TO new`.
+func (p *parser) parseRename() (*Rename, error) {
+	from, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, err
+	}
+	to, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	return &Rename{From: from, To: to}, nil
+}
+
+// parseDefaultValue parses the value after DEFAULT: a constant stays a
+// literal default, anything else (a call, arithmetic) is an expression
+// default; columns cannot be referenced.
+func (p *parser) parseDefaultValue() (*SetDefault, error) {
+	e, err := p.parseValueOrColumnExpr()
+	if err != nil {
+		return nil, err
+	}
+	if e.Lit != nil && e.BinOp == "" && e.Cast == "" {
+		return &SetDefault{Default: e.Lit}, nil
+	}
+	if e.Column != "" || exprContainsColumn(e) {
+		return nil, p.errf("DEFAULT cannot reference columns")
+	}
+	return &SetDefault{Expr: &e}, nil
+}
+
+// parseTruncate parses TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY |
+// CONTINUE IDENTITY] [CASCADE | RESTRICT].
+func (p *parser) parseTruncate() (Statement, error) {
+	p.i++ // TRUNCATE
+	p.consumeKeyword("TABLE")
+	tr := &Truncate{}
+	for {
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		tr.Tables = append(tr.Tables, name)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	switch {
+	case p.consumeIdentWord("restart"):
+		if !p.consumeIdentWord("identity") {
+			return nil, p.errf("expected IDENTITY after RESTART, found %q", p.peek().text)
+		}
+		tr.RestartIdentity = true
+	case p.consumeIdentWord("continue"):
+		if !p.consumeIdentWord("identity") {
+			return nil, p.errf("expected IDENTITY after CONTINUE, found %q", p.peek().text)
+		}
+	}
+	if p.consumeIdentWord("cascade") {
+		tr.Cascade = true
+	} else {
+		p.consumeIdentWord("restrict")
+	}
+	return tr, nil
 }
 
 func (p *parser) parseUpdate() (Statement, error) {

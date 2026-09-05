@@ -736,6 +736,34 @@ func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	return nil
 }
 
+// RenameTable moves a table's name entry and rewrites its descriptor
+// under the new name (bumping the version, like Update). The ID is
+// unchanged, so every reference by ID — foreign keys, owned sequences,
+// gateway leases — still holds; a gateway caching the old name drops
+// that entry at its next renewal (the old name resolves to nothing).
+func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor, newName string) error {
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newName, a.isDefaultID(d.DatabaseID))
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return &ErrTableExists{Name: newName}
+	}
+	oldName := d.Name
+	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, oldName)); err != nil {
+		return err
+	}
+	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newName), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+		return err
+	}
+	d.Name = newName
+	if err := a.Update(ctx, txn, d); err != nil {
+		return err
+	}
+	a.Invalidate(oldName)
+	return nil
+}
+
 // Drop removes a table's descriptor and namespace entry. Row data is left
 // behind (unreachable; space reclamation is a GC concern, out of scope).
 func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
