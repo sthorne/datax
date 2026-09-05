@@ -338,7 +338,10 @@ descriptor **versions and leases** make that cache safe across gateways:
   deadline**: it may not commit at or past it, and instead fails with a
   retryable error (`40001`; implicit statements retry transparently and
   re-plan). The server commits at exactly the write timestamp the client
-  sends, so the check is the client's. Without it, a statement that
+  sends, so the check is the client's, and it runs on both commit paths:
+  the classic EndTxn and the one-phase commit an implicit single-range
+  statement takes (issue #133 — the latter had skipped it, on the most
+  common write path). Without it, a statement that
   planned under a lease just before it expired could commit after the
   drain took its backfill boundary, and an index build would miss the
   row (issue #110).

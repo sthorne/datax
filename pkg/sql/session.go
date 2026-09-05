@@ -344,6 +344,11 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	return d, err
 }
 
+// TestingBeforeImplicitCommit, when set, runs after an implicit
+// statement has executed and before its transaction commits — a test's
+// window to change the schema underneath a planned statement.
+var TestingBeforeImplicitCommit func()
+
 // lookupMemo caches one statement's table lookups within one transaction
 // attempt (see Session.stmtLookups).
 type lookupMemo struct {
@@ -857,6 +862,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		var err error
 		s.extraDDL, s.pendingWipes = nil, nil
 		res, err = s.execStmt(ctx, txn, stmt, params)
+		if err == nil && TestingBeforeImplicitCommit != nil {
+			TestingBeforeImplicitCommit()
+		}
 		return err
 	})
 	if err != nil {

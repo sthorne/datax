@@ -1196,6 +1196,12 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 	waited := time.Duration(0)
 	refreshes := 0
 	for {
+		// The commit deadline holds on this path as on send's (issue
+		// #133): inside the loop, since a refresh moves the write
+		// timestamp and the moved timestamp is what would commit.
+		if err := t.checkDeadline(ba); err != nil {
+			return nil, true, err
+		}
 		gh := ba.Header
 		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
 		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)

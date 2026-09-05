@@ -8,6 +8,21 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.40.1 — unreleased
+
+### Fixed
+- The one-phase commit path honors the transaction's commit deadline
+  (#133). The deadline — a schema lease's expiration, pinned when a
+  statement plans against the leased descriptor — was checked only on
+  the classic commit path; the one-phase path every implicit
+  single-range `INSERT`, `UPDATE` and `DELETE` takes skipped it, so a
+  statement planned under a lease an index build had since drained could
+  commit past the drain and leave a row the index never saw. The check
+  now runs inside that path's retry loop too (a refresh moves the write
+  timestamp, and the moved timestamp is what commits).
+  `TestOnePhaseCommitHonorsDeadline`,
+  `TestOnlineCreateIndexUnderLapsedLeaseImplicit`.
+
 ## 0.40.0 — unreleased
 
 ### Changed
