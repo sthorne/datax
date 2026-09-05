@@ -238,8 +238,8 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		// A query cancel forwarded from the node a CancelRequest landed
 		// on (or pg_cancel_backend run there): the connection lives here.
 		found := false
-		if n.pgServer != nil {
-			found = n.pgServer.CancelLocal(req.PID, req.Secret, req.Terminate)
+		if n.sqlServer() != nil {
+			found = n.sqlServer().CancelLocal(req.PID, req.Secret, req.Terminate)
 		}
 		raw, _ := json.Marshal(found)
 		return cluster.AdminResponse{Status: raw}

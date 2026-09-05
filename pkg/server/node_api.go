@@ -50,7 +50,10 @@ type NodeDetail struct {
 	// EngineMode is "split" when the raft log has its own engine and the
 	// state engine runs without a WAL (issue #105), "single" otherwise;
 	// RaftStorage is the raft engine's snapshot when split.
-	EngineMode      string                      `json:"engine_mode,omitempty"`
+	EngineMode string `json:"engine_mode,omitempty"`
+	// StoreFormat is the state engine's Pebble format major version (16
+	// before cluster version v14, 19 from it: columnar blocks).
+	StoreFormat     int                         `json:"store_format,omitempty"`
 	RaftStorage     *storage.StorageMetrics     `json:"raft_storage,omitempty"`
 	DebtGated       bool                        `json:"debt_gated,omitempty"`
 	DebtGateEntries int64                       `json:"debt_gate_entries,omitempty"`
@@ -100,6 +103,7 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		sm := n.engine.StorageMetrics()
 		d.Storage = &sm
 		d.EngineMode = n.engineMode()
+		d.StoreFormat = n.storeFormat()
 		if n.raftEngine != nil {
 			rm := n.raftEngine.StorageMetrics()
 			d.RaftStorage = &rm
@@ -115,8 +119,8 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 	if n.pinger != nil {
 		d.Latency = n.pinger.Snapshot()
 	}
-	if n.pgServer != nil {
-		d.SQL = n.pgServer.Activity().Summary()
+	if n.sqlServer() != nil {
+		d.SQL = n.sqlServer().Activity().Summary()
 		if admin {
 			a := n.activityStatus()
 			d.Activity = &a
@@ -215,8 +219,8 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 // activityStatus builds the /api/activity document.
 func (n *Node) activityStatus() ActivityStatus {
 	doc := ActivityStatus{NodeID: int(n.ident.NodeID), Connections: []pgwire.ConnectionInfo{}, Active: []pgwire.ActiveStatement{}, Slow: []pgwire.SlowStatement{}}
-	if n.pgServer != nil {
-		act := n.pgServer.Activity()
+	if n.sqlServer() != nil {
+		act := n.sqlServer().Activity()
 		doc.Summary = act.Summary()
 		doc.Connections = act.Connections()
 		doc.Active = act.Active()

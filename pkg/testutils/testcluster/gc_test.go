@@ -94,9 +94,12 @@ func txnRecordsAnchoredAt(t *testing.T, eng *storage.Engine, k keys.Key) int {
 	defer func() { _ = it.Close() }()
 	count := 0
 	for ok := it.SeekGE(lo); ok; ok = it.Next() {
-		var txn kvpb.Transaction
-		if err := jsonUnmarshal(it.Value(), &txn); err != nil {
+		if !keys.IsTransactionKey(keys.Key(it.Key())) {
 			continue
+		}
+		txn, err := kvpb.UnmarshalTxnRecord(it.Value())
+		if err != nil {
+			t.Fatalf("decoding transaction record at %s: %v", keys.Pretty(keys.Key(it.Key())), err)
 		}
 		if bytes.Equal(txn.Key, k) {
 			count++

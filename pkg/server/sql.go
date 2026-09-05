@@ -66,8 +66,9 @@ func (n *Node) startSQL() error {
 			}
 		}
 	}
-	n.pgServer = pgwire.Serve(lis, n.db, cat, n.stopper, opts)
-	log.Infof("node %s serving SQL at %s", n.ident.NodeID, n.pgServer.Addr())
+	srv := pgwire.Serve(lis, n.db, cat, n.stopper, opts)
+	n.pgServer.Store(srv)
+	log.Infof("node %s serving SQL at %s", n.ident.NodeID, srv.Addr())
 	return nil
 }
 
@@ -199,3 +200,7 @@ func (n *Node) seedRootUser(ctx context.Context) {
 		}
 	}
 }
+
+// sqlServer is the SQL server once startSQL has started it (nil before,
+// and on a node without a SQL listener).
+func (n *Node) sqlServer() *pgwire.Server { return n.pgServer.Load() }

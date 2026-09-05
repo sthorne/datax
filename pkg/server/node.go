@@ -243,8 +243,11 @@ type Node struct {
 	// the DB exists to seed.
 	joinRange1 kvpb.RangeDescriptor
 
-	pgServer *pgwire.Server // set when PGListen/PGListener is configured
-	httpAddr string         // set when HTTPListen/HTTPListener is configured
+	// pgServer is set by startSQL after the heartbeat loop already runs,
+	// which reads it to publish SQL activity: an atomic pointer, not a
+	// plain field.
+	pgServer atomic.Pointer[pgwire.Server] // set when PGListen/PGListener is configured
+	httpAddr string                        // set when HTTPListen/HTTPListener is configured
 
 	// encKey is the loaded store encryption key; non-nil means the store is
 	// encrypted and node-written artifacts (metadata backup) are sealed too.
@@ -436,6 +439,7 @@ func (n *Node) start() error {
 				stored, n.binaryVersion())
 		} else if stored != 0 {
 			n.clusterVersion.Store(int64(stored))
+			n.ratchetStoreFormat()
 		}
 		// A restarting node must reach its peers before any range can
 		// elect a leader: reload the last known registry.
@@ -454,6 +458,9 @@ func (n *Node) start() error {
 		}
 		n.ident = id
 		freshRange1 = &desc
+		if err := n.adoptBootstrapVersion(); err != nil {
+			return err
+		}
 		log.Infof("bootstrapped new cluster %s as %s (version %s)", id.ClusterID, id.NodeID, n.binaryVersion())
 	case n.cfg.StaticBootstrap != nil:
 		sb := n.cfg.StaticBootstrap
@@ -464,6 +471,9 @@ func (n *Node) start() error {
 		n.ident = id
 		desc := sb.Range1
 		freshRange1 = &desc
+		if err := n.adoptBootstrapVersion(); err != nil {
+			return err
+		}
 		for _, nd := range sb.Nodes {
 			n.registry.Upsert(nd)
 		}
@@ -814,6 +824,7 @@ func (n *Node) join() error {
 				return fmt.Errorf("activating the split store: %w", err)
 			}
 		}
+		n.ratchetStoreFormat()
 	}
 	for _, nd := range resp.Nodes {
 		n.registry.Upsert(nd)
@@ -833,6 +844,18 @@ func (n *Node) Stop() { n.stopper.Stop() }
 // engine, the state engine without a WAL) or "single".
 func (n *Node) EngineMode() string { return n.engineMode() }
 
+// StoreFormat is the state engine's Pebble format major version.
+func (n *Node) StoreFormat() int { return n.storeFormat() }
+
+// RaftStoreFormat is the raft engine's Pebble format major version (0
+// on a single-engine store).
+func (n *Node) RaftStoreFormat() int {
+	if n.raftEngine == nil {
+		return 0
+	}
+	return n.raftEngine.Format()
+}
+
 // ClusterVersion is the finalized cluster version this node has observed.
 func (n *Node) ClusterVersion() version.Version { return version.Version(n.clusterVersion.Load()) }
 
@@ -842,10 +865,10 @@ func (n *Node) Addr() string        { return n.addr }
 
 // SQLAddr is the SQL listener address (real listener from Phase 6 on).
 func (n *Node) SQLAddr() string {
-	if n.pgServer == nil {
+	if n.sqlServer() == nil {
 		return ""
 	}
-	return n.pgServer.Addr()
+	return n.sqlServer().Addr()
 }
 
 // HTTPAddr is the observability listener address ("" when disabled).

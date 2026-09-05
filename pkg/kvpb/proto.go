@@ -89,37 +89,50 @@ func keysFromProto(bs [][]byte) []keys.Key {
 
 // ---- transactions ----
 
-func txnMetaToProto(m enginepb.TxnMeta) *rpcpb.TxnMeta {
-	return &rpcpb.TxnMeta{
-		Id:             uuidToProto(m.ID),
-		Key:            m.Key,
-		Epoch:          m.Epoch,
-		WriteTimestamp: tsToProto(m.WriteTimestamp),
-		MinTimestamp:   tsToProto(m.MinTimestamp),
-		Priority:       m.Priority,
-		Sequence:       m.Sequence,
-		HistoryFloor:   m.HistoryFloor,
-	}
-}
+func txnMetaToProto(m enginepb.TxnMeta) *rpcpb.TxnMeta { return enginepb.TxnMetaToProto(m) }
 
 func txnMetaFromProto(p *rpcpb.TxnMeta) (enginepb.TxnMeta, error) {
-	if p == nil {
-		return enginepb.TxnMeta{}, nil
+	return enginepb.TxnMetaFromProto(p)
+}
+
+// TxnToProto and TxnFromProto convert a transaction; from cluster
+// version v14 they are also the stored encoding of transaction records
+// (kvserver, issue #141).
+func TxnToProto(t *Transaction) *rpcpb.Transaction { return txnToProto(t) }
+
+// TxnFromProto is the inverse of TxnToProto.
+func TxnFromProto(p *rpcpb.Transaction) (*Transaction, error) { return txnFromProto(p) }
+
+// MarshalTxnRecord encodes a transaction record the way the store keeps
+// it: protobuf when the coordinator asked for binary metadata (cluster
+// version v14 and later, TxnMeta.BinaryMeta), JSON otherwise (issue #141).
+func MarshalTxnRecord(t *Transaction) ([]byte, error) {
+	if t.BinaryMeta {
+		return proto.MarshalOptions{Deterministic: true}.Marshal(txnToProto(t))
 	}
-	id, err := uuidFromProto(p.Id)
-	if err != nil {
-		return enginepb.TxnMeta{}, err
+	return json.Marshal(t)
+}
+
+// UnmarshalTxnRecord decodes a stored transaction record in either
+// encoding; the first byte tells them apart ('{' opens a JSON object, a
+// protobuf record starts with its first field's tag), so records from
+// either era read under both.
+func UnmarshalTxnRecord(raw []byte) (*Transaction, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty transaction record")
 	}
-	return enginepb.TxnMeta{
-		ID:             id,
-		Key:            p.Key,
-		Epoch:          p.Epoch,
-		WriteTimestamp: tsFromProto(p.WriteTimestamp),
-		MinTimestamp:   tsFromProto(p.MinTimestamp),
-		Priority:       p.Priority,
-		Sequence:       p.Sequence,
-		HistoryFloor:   p.HistoryFloor,
-	}, nil
+	if raw[0] == '{' {
+		var txn Transaction
+		if err := json.Unmarshal(raw, &txn); err != nil {
+			return nil, err
+		}
+		return &txn, nil
+	}
+	var pb rpcpb.Transaction
+	if err := proto.Unmarshal(raw, &pb); err != nil {
+		return nil, err
+	}
+	return txnFromProto(&pb)
 }
 
 func txnToProto(t *Transaction) *rpcpb.Transaction {

@@ -2,7 +2,7 @@ package kvserver
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -292,8 +292,8 @@ func enumerateGarbageVersions(snap *storage.Snapshot, desc kvpb.RangeDescriptor,
 
 // intentTxnID extracts the owning transaction's ID from raw intent metadata.
 func intentTxnID(raw []byte) (uuid.UUID, error) {
-	var meta enginepb.MVCCMetadata
-	if err := json.Unmarshal(raw, &meta); err != nil {
+	meta, err := storage.DecodeMVCCMetadata(raw)
+	if err != nil {
 		return uuid.Nil, err
 	}
 	return meta.Txn.ID, nil
@@ -321,10 +321,13 @@ func enumerateGarbageTxnRecords(snap *storage.Snapshot, desc kvpb.RangeDescripto
 
 	var out []gcTxnRecord
 	for ok := it.SeekGE(lo); ok; ok = it.Next() {
-		var txn kvpb.Transaction
-		if err := json.Unmarshal(it.Value(), &txn); err != nil {
-			// Not a transaction record; leave unknown range-local keys alone.
+		if !keys.IsTransactionKey(keys.Key(it.Key())) {
+			// Leave unknown range-local keys alone.
 			continue
+		}
+		txn, err := kvpb.UnmarshalTxnRecord(it.Value())
+		if err != nil {
+			return nil, fmt.Errorf("corrupt transaction record at %s: %w", keys.Pretty(keys.Key(it.Key())), err)
 		}
 		if txn.Status == enginepb.PENDING || txn.Status == enginepb.STAGING {
 			// Live, expired-but-unpushed, or awaiting status recovery

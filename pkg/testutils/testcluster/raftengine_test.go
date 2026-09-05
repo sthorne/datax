@@ -277,3 +277,76 @@ func TestSplitStoreDeferredTruncation(t *testing.T) {
 		t.Fatalf("rows: %d, %v", count, err)
 	}
 }
+
+// TestColumnarBlocksRatchet (issue #166): a store created by a v13 binary
+// runs at Pebble format 16; the v14 binary keeps it there while the
+// cluster is at v13; the finalize of v14 ratchets both engines to format
+// 19 online, within a heartbeat, no restart; the store stays there across
+// a restart with every row intact.
+func TestColumnarBlocksRatchet(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	asV13 := func(c *server.Config) { c.BinaryVersionOverride = version.V13 }
+
+	n := startDiskNode(t, dir, true, "", withPG, asV13)
+	if n.StoreFormat() != storage.FormatBase || n.RaftStoreFormat() != storage.FormatBase {
+		t.Fatalf("a v13 store: formats %d / %d, want %d", n.StoreFormat(), n.RaftStoreFormat(), storage.FormatBase)
+	}
+	conn := diskSQL(t, ctx, n)
+	if _, err := conn.Exec(ctx, `CREATE TABLE t (k INT8 PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		if _, err := conn.Exec(ctx, `INSERT INTO t VALUES ($1, $2)`, int64(i), fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = conn.Close(ctx)
+	n.Stop()
+
+	// The v14 binary on a v13 cluster: the format is the cluster's, not
+	// the binary's.
+	n = startDiskNode(t, dir, false, "", withPG)
+	if n.StoreFormat() != storage.FormatBase {
+		t.Fatalf("before finalize: format %d, want %d", n.StoreFormat(), storage.FormatBase)
+	}
+	resp := adminCall(t, ctx, n.Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: int(version.V14)})
+	if resp.Error != "" {
+		t.Fatalf("finalize v14: %+v", resp)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for n.StoreFormat() != storage.FormatColumnarBlocks || n.RaftStoreFormat() != storage.FormatColumnarBlocks {
+		if time.Now().After(deadline) {
+			t.Fatalf("formats after finalize: %d / %d (cluster version %s)", n.StoreFormat(), n.RaftStoreFormat(), n.ClusterVersion())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Serving while ratcheted, and after a restart.
+	conn = diskSQL(t, ctx, n)
+	for i := 300; i < 600; i++ {
+		if _, err := conn.Exec(ctx, `INSERT INTO t VALUES ($1, $2)`, int64(i), fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = conn.Close(ctx)
+	n.Stop()
+	n = startDiskNode(t, dir, false, "", withPG)
+	defer n.Stop()
+	if n.StoreFormat() != storage.FormatColumnarBlocks || n.RaftStoreFormat() != storage.FormatColumnarBlocks {
+		t.Fatalf("after a restart: formats %d / %d", n.StoreFormat(), n.RaftStoreFormat())
+	}
+	conn = diskSQL(t, ctx, n)
+	defer func() { _ = conn.Close(ctx) }()
+	var count int64
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM t`).Scan(&count); err != nil || count != 600 {
+		t.Fatalf("rows after the ratchet and a restart: %d, %v", count, err)
+	}
+
+	// A fresh store bootstrapped by a v14 binary starts at format 19.
+	fresh := startDiskNode(t, t.TempDir(), true, "", withPG)
+	defer fresh.Stop()
+	if fresh.StoreFormat() != storage.FormatColumnarBlocks {
+		t.Fatalf("a fresh v14 store: format %d", fresh.StoreFormat())
+	}
+}

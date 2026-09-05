@@ -152,3 +152,22 @@ func mustDec(s string) decimal.Dec {
 	}
 	return d
 }
+
+func TestIsTransactionKey(t *testing.T) {
+	id := uuid.New()
+	anchor := Key("table\x00row")
+	if k := TransactionKey(anchor, id); !IsTransactionKey(k) {
+		t.Fatalf("%x should be a transaction key", k)
+	}
+	for _, k := range []Key{
+		RangeDescriptorKey(3),
+		TransactionKey(anchor, id)[:len(TransactionKey(anchor, id))-1],
+		append(TransactionKey(anchor, id), 0),
+		Key(encoding.EncodeBytes(localAddressedPrefix.Clone(), anchor)),
+		anchor,
+	} {
+		if IsTransactionKey(k) {
+			t.Fatalf("%x should not be a transaction key", k)
+		}
+	}
+}

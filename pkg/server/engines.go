@@ -195,6 +195,55 @@ func (n *Node) persistStoreClusterVersion(raw []byte) error {
 	return nil
 }
 
+// ratchetStoreFormat moves both engines to the Pebble format the cluster
+// version calls for (issue #166): FormatColumnarBlocks from v14 on. Run
+// wherever the node learns its cluster version — at start from the
+// store's copy, on join, after a bootstrap, and when the running node
+// observes a finalize — so the ratchet is online and needs no restart.
+// Idempotent; an error is logged, not fatal: the store keeps serving at
+// its current format and the next observation retries.
+func (n *Node) ratchetStoreFormat() {
+	if version.Version(n.clusterVersion.Load()) < version.V14 || n.engine == nil {
+		return
+	}
+	for _, e := range []*storage.Engine{n.engine, n.raftEngine} {
+		if e == nil {
+			continue
+		}
+		was := e.Format()
+		if err := e.RatchetFormat(storage.FormatColumnarBlocks); err != nil {
+			log.Warnf("ratcheting the store's Pebble format to %d: %v", storage.FormatColumnarBlocks, err)
+			continue
+		}
+		if was != e.Format() {
+			log.Infof("store Pebble format %d → %d (cluster version %s: columnar blocks)", was, e.Format(), version.Version(n.clusterVersion.Load()))
+		}
+	}
+}
+
+// adoptBootstrapVersion records, on a store this binary just bootstrapped,
+// the cluster version it was born at — in memory and in the store's own
+// copy (what the heartbeat mirror would otherwise write on its first
+// pass, and what the downgrade gate reads before quorum) — and applies
+// what that version asks of the store (the format ratchet).
+func (n *Node) adoptBootstrapVersion() error {
+	cv := n.binaryVersion()
+	n.clusterVersion.Store(int64(cv))
+	if err := n.persistStoreClusterVersion([]byte(fmt.Sprintf("%d", int(cv)))); err != nil {
+		return err
+	}
+	n.ratchetStoreFormat()
+	return nil
+}
+
+// storeFormat is the state engine's Pebble format for status output.
+func (n *Node) storeFormat() int {
+	if n.engine == nil {
+		return 0
+	}
+	return n.engine.Format()
+}
+
 // engineMode names the store layout for status output.
 func (n *Node) engineMode() string {
 	if n.raftEngine != nil {

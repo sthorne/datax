@@ -7,7 +7,10 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
@@ -53,15 +56,46 @@ func intentAboveRead(intentTS, ts, uncertaintyLimit hlc.Timestamp) bool {
 
 // mvccKeyBounds returns engine-key bounds covering exactly the metadata and
 // versions of user key k.
+// Intent metadata is stored in one of two encodings (issue #141): JSON,
+// what every store wrote before cluster version v14, and protobuf, what
+// a transaction whose coordinator runs at v14 or later asks for
+// (TxnMeta.BinaryMeta — the flag rides in the command, so every replica
+// encodes alike). The first byte tells them apart: JSON opens with '{',
+// a protobuf MVCCMetadata with the tag of its first field (0x0a), so a
+// record written under either is read under both.
+// DecodeMVCCMetadata decodes a stored intent metadata record in either of
+// its encodings (JSON before cluster version v14, protobuf from it; issue
+// #141). Readers outside the MVCC layer, such as GC, use it instead of
+// assuming one encoding.
+func DecodeMVCCMetadata(raw []byte) (enginepb.MVCCMetadata, error) { return decodeMeta(raw) }
+
 func decodeMeta(raw []byte) (enginepb.MVCCMetadata, error) {
-	var meta enginepb.MVCCMetadata
-	if err := json.Unmarshal(raw, &meta); err != nil {
+	if len(raw) > 0 && raw[0] == '{' {
+		var meta enginepb.MVCCMetadata
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return meta, fmt.Errorf("malformed MVCC metadata: %w", err)
+		}
+		return meta, nil
+	}
+	var pb rpcpb.MVCCMetadata
+	if err := proto.Unmarshal(raw, &pb); err != nil {
+		return enginepb.MVCCMetadata{}, fmt.Errorf("malformed MVCC metadata: %w", err)
+	}
+	meta, err := enginepb.MetadataFromProto(&pb)
+	if err != nil {
 		return meta, fmt.Errorf("malformed MVCC metadata: %w", err)
 	}
 	return meta, nil
 }
 
 func encodeMeta(meta enginepb.MVCCMetadata) []byte {
+	if meta.Txn.BinaryMeta {
+		b, err := proto.MarshalOptions{Deterministic: true}.Marshal(enginepb.MetadataToProto(meta))
+		if err != nil {
+			panic(err) // MVCCMetadata is always marshalable
+		}
+		return b
+	}
 	b, err := json.Marshal(meta)
 	if err != nil {
 		panic(err) // MVCCMetadata is always marshalable

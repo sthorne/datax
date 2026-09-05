@@ -1,6 +1,7 @@
 // Package enginepb holds the small types shared between the storage engine
 // and the transaction layer. (The name follows CockroachDB convention; the
-// types are plain Go with JSON serialization in this prototype.)
+// types are plain Go; stored as JSON before cluster version v14 and as
+// protobuf from it, see proto.go and issue #141.)
 package enginepb
 
 import (
@@ -68,6 +69,13 @@ type TxnMeta struct {
 	// it, and every entry above it). Set by the coordinator on every
 	// batch; a savepoint rollback is the history's only reader.
 	HistoryFloor int32 `json:"history_floor,omitempty"`
+	// BinaryMeta: the coordinator runs at cluster version v14 or later, so
+	// the intent metadata this transaction lays down and its transaction
+	// record are written in the binary (protobuf) encoding rather than
+	// JSON (issue #141). It rides in every command, so all replicas
+	// encode alike; a decoder tells the encodings apart by the first
+	// byte, so records from before the flag stay readable.
+	BinaryMeta bool `json:"binary_meta,omitempty"`
 }
 
 // IntentValue is one superseded provisional value of the SAME transaction,

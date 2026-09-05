@@ -12,7 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
-func openTestEngine(t *testing.T) *Engine {
+func openTestEngine(t testing.TB) *Engine {
 	t.Helper()
 	eng, err := Open("", Options{}) // in-memory
 	if err != nil {

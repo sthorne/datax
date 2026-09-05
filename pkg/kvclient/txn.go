@@ -18,6 +18,7 @@ import (
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // RetryableError wraps a conflict that requires restarting the transaction
@@ -173,6 +174,9 @@ func (db *DB) NewTxn(name string) *Txn {
 	t := &Txn{db: db}
 	t.mu.txn = *kvpb.NewTransaction(name, rand.Int31n(1<<20), db.clock.Now())
 	t.mu.txn.HistoryFloor = -1 // no savepoint yet: rewrites keep no history (issue #162)
+	// From cluster version v14 the intents and the record are stored in
+	// the binary encoding (issue #141); the flag rides in every command.
+	t.mu.txn.BinaryMeta = db.ClusterVersion() >= version.V14
 	t.mu.writes = make(map[string]struct{})
 	return t
 }

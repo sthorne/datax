@@ -12,13 +12,13 @@ shared by every engine, released when the last closes), bloom filters at
 10 bits per key on every level (a missing-key point read — the
 uniqueness probe and the intent lookup on every write — skips the levels
 that cannot hold the key), `FormatMajorVersion` pinned at
-`FormatVirtualSSTables` (16 — the newest Pebble v1 supported, and what
-every store runs; the engine is Pebble v2 since 0.41.0, whose newest
-is 24, so the pin is what keeps a dependency bump from switching the
-on-disk format — columnar blocks at 19, value separation at 24 — as a
-side effect, issue #166: adopting a format is its own gated step; a
-store already at a higher format keeps it), and `MaxOpenFiles` at half
-the descriptor limit (1000–16384). Block sizes and per-level compression are left at
+`FormatVirtualSSTables` (16 — what every store is created at; the
+engine is Pebble v2 since 0.41.0, whose newest is 24, so the pin is what
+keeps a dependency bump from switching the on-disk format as a side
+effect, issue #166: each format is its own cluster-version-gated step —
+v14 ratchets a store to 19, columnar blocks, online; value separation
+at 24 is not adopted yet; a store already at a higher format keeps it),
+and `MaxOpenFiles` at half the descriptor limit (1000–16384). Block sizes and per-level compression are left at
 Pebble's defaults for now — not measured in this pass; zstd on the
 bottom level would trade CPU the write path needs for space.
 

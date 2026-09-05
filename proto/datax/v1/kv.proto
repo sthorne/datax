@@ -32,6 +32,27 @@ message TxnMeta {
   // nothing), n > 0 = the oldest live savepoint is at sequence n-1
   // (keep the newest entry at or below it and everything above).
   int32 history_floor = 8;
+  // binary_meta: the coordinator runs at cluster version v14 or later,
+  // so intent metadata and the transaction record are written in the
+  // binary (protobuf) encoding rather than JSON (issue #141). Carried in
+  // every command so all replicas encode alike.
+  bool binary_meta = 9;
+}
+
+// IntentValue is a superseded provisional value kept in an intent's
+// history for a savepoint rollback (storage/enginepb.IntentValue).
+message IntentValue {
+  int32 sequence = 1;
+  bytes value = 2;
+  bool tombstone = 3;
+}
+
+// MVCCMetadata is an intent's metadata record (enginepb.MVCCMetadata),
+// the binary encoding written from cluster version v14 (issue #141).
+message MVCCMetadata {
+  TxnMeta txn = 1;
+  Hlc timestamp = 2;
+  repeated IntentValue history = 3;
 }
 
 message Transaction {

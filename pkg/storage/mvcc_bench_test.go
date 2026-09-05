@@ -3,7 +3,11 @@ package storage
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"strconv"
 	"testing"
+
+	"github.com/cockroachdb/pebble/v2"
 
 	"github.com/sthorne/datax/pkg/keys"
 )
@@ -32,6 +36,13 @@ func benchKey(i int) keys.Key { return benchKeys[i] }
 // versionsPerKey versions each and flushes.
 func buildBenchEngine(b *testing.B, versionsPerKey int) *Engine {
 	b.Helper()
+	// DATAX_BENCH_FORMAT=19 builds the store at Pebble's columnar-block
+	// format (what cluster version v14 ratchets a store to, issue #166)
+	// instead of the base format, for a format A/B on these benchmarks.
+	if f, _ := strconv.Atoi(os.Getenv("DATAX_BENCH_FORMAT")); f > 0 {
+		testingPebbleOptions = func(o *pebble.Options) { o.FormatMajorVersion = pebble.FormatMajorVersion(f) }
+		b.Cleanup(func() { testingPebbleOptions = nil })
+	}
 	eng, err := Open(b.TempDir(), Options{})
 	if err != nil {
 		b.Fatal(err)
