@@ -49,7 +49,7 @@ duration, so two runs draw the same keys:
 | `ingest-random`, `ingest-sequential`, `ingest-uuid` | batched INSERTs with random integer, per-worker monotone, and UUID text keys |
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
-| `scan` | large result sets streamed through pgwire |
+| `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
@@ -81,6 +81,39 @@ stalls or backpressure even when throughput hides it.
   --seconds 30 --url http://host:8080` fetches one profile at any time;
   mutex and block profiles are always on at low sampling rates.
 - `go tool pprof -http=:0 server-cpu.pprof` to inspect.
+
+## Wire protocol
+
+`kv` and `bank` send parameterized statements (`WHERE k = $1`) over
+pgx's default extended protocol: each text is prepared once per
+connection and then bound and executed, as a driver or an ORM does, so
+the server's plan cache is exercised (`datax_sql_plan_cache_hits_total`
+in the counter deltas). The literal-text workloads (ingest, timeseries,
+scan, index-join) use the simple protocol. `--protocol simple|extended`
+overrides either.
+
+## The write pipeline below SQL
+
+`BenchmarkRangeWritePipeline` (`pkg/testutils/testcluster`) measures one
+range's write ceiling without SQL: one node on disk, W writers each
+committing one-phase transactions of B puts to their own keys, for B in
+1, 10, 100, 1000 and W in 1, 4, 16, 64, with the raft log's sync on and
+stubbed to a no-op (`storage.TestingNoSync`). It reports proposals per
+second, rows per second, syncs per second, entries per synced commit and
+the mean apply time per entry:
+
+```
+go test ./pkg/testutils/testcluster -run - -bench RangeWritePipeline -benchtime 3s
+```
+
+The same knob is available to a running node for a measurement (never
+in production: a crash loses acknowledged writes): `DATAX_TESTING_NOSYNC=1
+datax start ...` logs a warning and commits the raft log unsynced. The
+server-side counters `datax_raft_entries_appended_total`,
+`datax_raft_log_syncs_total`, `datax_raft_apply_seconds` and
+`datax_latch_wait_seconds` are what `--server-url` reports for a SQL run
+of the same shape (`datax bench ingest --keys sequential --batch B
+--concurrency W`).
 
 ## Nightly
 

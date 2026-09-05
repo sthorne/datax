@@ -36,12 +36,14 @@ type sessionVars struct {
 	idleInTxnTimeout  time.Duration
 	cascadeLimit      int
 	cascadeLimitIsSet bool
+	// memoryLimit is statement_memory_limit in bytes (0 = none).
+	memoryLimit int64
 	// role is SET ROLE's role ("" = none: the session user).
 	role string
 }
 
 func defaultVars() sessionVars {
-	return sessionVars{searchPath: catalog.PublicSchema, timeZone: time.UTC, timeZoneName: "UTC", dateStyle: "ISO, MDY", clientEncoding: "UTF8", isolation: "serializable"}
+	return sessionVars{searchPath: catalog.PublicSchema, timeZone: time.UTC, timeZoneName: "UTC", dateStyle: "ISO, MDY", clientEncoding: "UTF8", isolation: "serializable", memoryLimit: defaultMemoryLimit}
 }
 
 // varNames are the settings in SHOW ALL order, with their pg_settings
@@ -61,6 +63,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"server_encoding", "string", ""},
 	{"server_version", "string", ""},
 	{"standard_conforming_strings", "bool", ""},
+	{"statement_memory_limit", "integer", "B"},
 	{"statement_timeout", "integer", "ms"},
 	{"TimeZone", "string", ""},
 	{"transaction_isolation", "string", ""},
@@ -123,6 +126,8 @@ func (s *Session) varValue(name string) string {
 		return "14.0 datax"
 	case "statement_timeout":
 		return strconv.FormatInt(v.statementTimeout.Milliseconds(), 10)
+	case "statement_memory_limit":
+		return strconv.FormatInt(v.memoryLimit, 10)
 	case "TimeZone":
 		return v.timeZoneName
 	case "transaction_isolation":
@@ -182,6 +187,45 @@ func (s *Session) StatementTimeout() time.Duration { return s.vars.statementTime
 
 // ApplicationName is the session's application_name.
 func (s *Session) ApplicationName() string { return s.vars.applicationName }
+
+// defaultMemoryLimit is statement_memory_limit's default: what one
+// statement may hold in memory on the gateway (64 MiB).
+const defaultMemoryLimit = 64 << 20
+
+// parseMemory reads a memory setting: bytes, or a number with a unit
+// (B, kB, MB, GB, TB, in PostgreSQL's binary sense); 0 disables the
+// limit.
+func parseMemory(value string) (int64, error) {
+	v := strings.TrimSpace(strings.Trim(value, "'\""))
+	if v == "" {
+		return 0, fmt.Errorf("empty memory size")
+	}
+	i := len(v)
+	for i > 0 && (v[i-1] < '0' || v[i-1] > '9') && v[i-1] != '.' {
+		i--
+	}
+	num, unit := strings.TrimSpace(v[:i]), strings.ToLower(strings.TrimSpace(v[i:]))
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%q is not a memory size", value)
+	}
+	var mult float64
+	switch unit {
+	case "", "b":
+		mult = 1
+	case "kb", "k", "kib":
+		mult = 1 << 10
+	case "mb", "m", "mib":
+		mult = 1 << 20
+	case "gb", "g", "gib":
+		mult = 1 << 30
+	case "tb", "t", "tib":
+		mult = 1 << 40
+	default:
+		return 0, fmt.Errorf("%q is not a memory size (use B, kB, MB, GB or TB)", value)
+	}
+	return int64(f * mult), nil
+}
 
 // parseDuration reads a timeout setting: PostgreSQL's integer
 // milliseconds or a number with a unit (us, ms, s, min, h, d); 0
@@ -295,6 +339,15 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 				return invalid("must be a positive integer, not %q", value)
 			}
 			vars.cascadeLimit, vars.cascadeLimitIsSet = n, true
+		}
+	case "statement_memory_limit":
+		vars.memoryLimit = def.memoryLimit
+		if !reset {
+			n, err := parseMemory(value)
+			if err != nil {
+				return invalid("%v", err)
+			}
+			vars.memoryLimit = n
 		}
 	case "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout":
 		var d time.Duration

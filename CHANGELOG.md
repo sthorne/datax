@@ -8,6 +8,124 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.39.0 — unreleased
+
+### Added
+- A plan cache for prepared statements (#107). Each session keeps a
+  bounded LRU (128) of what its single-table `SELECT`, `UPDATE` and
+  `DELETE` statements planned against — the descriptor, the statistics,
+  the projection and the shape of a primary-key point lookup — keyed by
+  the statement as prepared and the current database; an execution
+  whose lookups return the same descriptor and statistics reuses it,
+  binding the parameters into the point plan without re-planning, and
+  any schema change, `ANALYZE`, drop or re-create misses. A data
+  statement resolves each table name once per execution. `EXPLAIN`
+  appends `(cached plan)`; `datax_sql_plan_cache_hits_total`,
+  `_misses_total`, `_evictions_total`; the hit rate on the console's
+  node page and in the internal metrics table. Connections keep a parse
+  cache of their last 64 simple-protocol texts
+  (`datax_sql_parse_cache_hits_total`). Measured first: planning was
+  ~8 % of a gateway's CPU on point lookups through the extended
+  protocol, so the cache is scoped to that; the statement activity
+  tracker's per-statement connection walk (3 %) is gone too.
+- `datax bench kv` and `bank` send parameterized statements over the
+  extended protocol (`--protocol simple|extended|auto`).
+
+## 0.38.0 — unreleased
+
+### Changed
+- The timestamp cache is indexed by key (#108, with the latch index that
+  landed in 0.34.0). A generation holds its point reads in a map — one
+  entry per key, the newest read of it — and only its ranged reads in a
+  slice, so a point write looks its keys up instead of scanning every
+  entry against every span: a 100-key write against two full generations
+  takes ~2 µs instead of ~1.5 ms, which was a quarter of a leader's CPU
+  under batched ingest (each INSERT's uniqueness probes put one entry per
+  row in the cache). Generations hold 4,096 entries (1,024 before) and a
+  key read repeatedly costs one, so a hot key set no longer rotates the
+  cache — and rotation is what briefly pushes every writer on the range.
+
+## 0.37.0 — unreleased
+
+### Changed
+- The single-range write pipeline (#106). Measured first, one range on
+  one node below SQL (`BenchmarkRangeWritePipeline`): the ceiling was
+  the apply, not the disk — every MVCC write cost two LSM reads on a
+  fresh iterator (~10 µs a row), serialized per range inside the raft
+  pass that committed it, so a range topped out near 100k rows/s at any
+  batch size with the sync on or stubbed out. Two changes: each write
+  now finds what it lands on with one bounded seek on an iterator its
+  batch keeps (`Batch.writeState`; a 100-row commit applies in ~0.4 ms
+  instead of ~1 ms), and committed entries apply on a pool of apply
+  workers off the raft pass, so a range's next append and sync run while
+  its previous entries apply (conf changes still apply inline; a replica
+  with more than 64 MiB queued gets no pass until it drains,
+  `datax_raft_apply_backpressure_total`). One range on one node, 16
+  writers: 100-row commits 857 → 1,739/s, single-row commits 12.6k →
+  16.3k/s, 1,000-row commits 100 → 262/s. New metrics:
+  `datax_raft_entries_appended_total`, `datax_raft_entries_applied_total`,
+  `datax_raft_apply_seconds`, `datax_latch_wait_seconds`. A proposal whose
+  replica stops (shutdown, removal, a failed apply) is answered with an
+  ambiguous error instead of waiting out its context. Test-only:
+  `DATAX_TESTING_NOSYNC=1` commits the raft log unsynced for a
+  measurement. Capacity planning in `docs/user/operations.md` restates
+  the per-range ceiling from the measured costs.
+
+## 0.36.0 — unreleased
+
+### Changed
+- The split store (#105; cluster version **v13**). A store's raft state —
+  every replica's HardState, log entries and truncated state — moves to
+  a raft engine of its own under `--dir/raft`, and the state-machine
+  engine under `--dir` runs without a write-ahead log: a replicated write
+  reaches disk once, through the synced group-committed raft log, instead
+  of twice. What a crash takes from the state engine's memtable is
+  replayed from the log (`datax_raft_replayed_entries_total`); a clean
+  shutdown flushes first. Log truncation is deferred until the state
+  engine has flushed past the entries it removes
+  (`datax_raft_deferred_truncations_total`; a truncation pending past
+  30 s has the housekeeping tick flush for it,
+  `datax_raft_truncation_flushes_total`); merges, replica removals and
+  catch-up snapshots flush before touching the raft engine; raft state
+  orphaned by a crash is swept at startup. A store created by a
+  v13 binary or joining a v13 cluster is split from the start; an older
+  store migrates on its first start after the finalize and then refuses
+  a v12 binary (the one upgrade step that cannot roll back). Both
+  engines are encrypted, rotated and re-encrypted together.
+  `datax_storage_split`, `datax_storage_bytes_written_total{engine,kind}`;
+  `/api/node` reports `engine_mode` and the raft engine's metrics. On
+  the harness's single node, batched ingest writes about half as many
+  bytes to disk per row (balanced profile: 7.5× → 3.5× of the row
+  bytes with sequential keys, 14.2× → 6.9× with UUID keys) at 16–19 %
+  more rows per second; the ingest profile goes 3.2× → 2.3× and
+  6.2× → 4.1× at 3–5 % more.
+
+## 0.35.0 — unreleased
+
+### Changed
+- Streaming SELECT execution (#104). A scan-shaped `SELECT` — one
+  table, no join, aggregate, `DISTINCT`, window, set operation,
+  correlated subquery or in-memory sort — no longer materializes its
+  result on the gateway: the wire layer pulls rows from KV in pages of
+  512 as it writes them, flushing every 64 kB, so the first row leaves
+  before the last is read and a full-table `SELECT` holds one page at a
+  time. A row-limited `Execute` (JDBC fetch sizes) pulls its rows on
+  demand and a suspended portal keeps the scan open. An error after
+  rows have gone out (a bad row, a cancellation, `statement_timeout`)
+  arrives after them, as in PostgreSQL; an implicit transaction re-runs
+  the statement on a retryable error only while nothing has been
+  flushed, otherwise the `40001` is surfaced. `datax_sql_streamed_rows_total`,
+  `datax_sql_stream_restarts_total`.
+- `statement_memory_limit` (default `64MB`; `0` = none). The paths that
+  do materialize — sorts, aggregates, joins, `DISTINCT`, `WITH` members,
+  derived tables, index joins that collect their rows — charge what they
+  hold against it and fail with `53200` beyond it instead of growing
+  without bound. `SET`, `SET LOCAL`, `RESET`, `SHOW`, `pg_settings`;
+  `datax_sql_memory_limit_hits_total`.
+- `datax bench` records the time to the first row of the `scan` and
+  `index-join` workloads (`first_row_p50_us`, `first_row_p99_us`;
+  `bench compare` shows them).
+
 ## 0.34.0 — unreleased
 
 ### Changed

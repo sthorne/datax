@@ -8,6 +8,7 @@ package metrics
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Registry holds the process-wide datax series.
@@ -86,6 +87,15 @@ var (
 	RaftReadyPasses = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_ready_passes_total", Help: "Raft Readies (one replica's persist, send and apply) handled by the store's scheduler workers.",
 	})
+	RaftDeferredTruncations = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_deferred_truncations_total", Help: "Log truncations performed on the raft engine once the state engine had flushed past them (split stores).",
+	})
+	RaftTruncationFlushes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_truncation_flushes_total", Help: "State-engine flushes the housekeeping tick forced so that a log truncation pending past its bound could proceed (split stores).",
+	})
+	RaftReplayedEntries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_replayed_entries_total", Help: "Committed log entries re-applied at startup because the state engine had not flushed them before the last shutdown.",
+	})
 	RaftLogSyncs = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_log_syncs_total", Help: "Synced commits of raft log entries and HardStates: one per scheduler pass, however many replicas the pass grouped.",
 	})
@@ -93,6 +103,25 @@ var (
 		Name:    "datax_raft_readies_per_sync",
 		Help:    "Replicas whose raft log writes shared one synced commit.",
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+	})
+	RaftEntriesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entries_appended_total", Help: "Raft log entries written by this store (leader proposals and follower appends).",
+	})
+	RaftEntriesApplied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entries_applied_total", Help: "Committed raft entries applied to the state machine.",
+	})
+	RaftApplyLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_raft_apply_seconds",
+		Help:    "Time to apply one committed raft entry: decode, evaluate, commit to the state engine.",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
+	})
+	RaftApplyBackpressure = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_apply_backpressure_total", Help: "Raft passes deferred because the replica's queue of committed entries awaiting apply was over its bound.",
+	})
+	LatchWait = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_latch_wait_seconds",
+		Help:    "Time a request waited for a conflicting in-flight request's latch before it could proceed (requests that waited at all).",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
 	})
 	RaftHeartbeatsCoalesced = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_heartbeats_coalesced_total", Help: "Raft heartbeats and responses carried inside coalesced per-node envelopes (cluster v12).",
@@ -178,6 +207,27 @@ var (
 	SQLCopyRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_copy_rows_total", Help: "Rows loaded through COPY FROM STDIN.",
 	})
+	SQLPlanCacheHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_hits_total", Help: "Statement executions that reused a session's cached plan (the descriptor, projection and access path of a single-table SELECT, UPDATE or DELETE).",
+	})
+	SQLPlanCacheMisses = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_misses_total", Help: "Statement executions planned in full: no cached plan, or one built on a descriptor or statistics since replaced.",
+	})
+	SQLPlanCacheEvictions = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_plan_cache_evictions_total", Help: "Cached plans dropped because a session's cache was over its bound (128 statements).",
+	})
+	SQLParseCacheHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_parse_cache_hits_total", Help: "Simple-protocol queries whose text a connection had parsed before (served from its parse cache).",
+	})
+	SQLStreamedRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_streamed_rows_total", Help: "Result rows delivered by streaming SELECTs (pulled from KV page by page as the client reads).",
+	})
+	SQLStreamRestarts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_stream_restarts_total", Help: "Streaming SELECTs re-run from the start after a retryable error before any row reached the client.",
+	})
+	SQLMemoryLimitHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_memory_limit_hits_total", Help: "Statements refused with 53200 for exceeding statement_memory_limit.",
+	})
 
 	TableRanges = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "datax_table_ranges", Help: "Ranges covering each table's key space (refreshed with the schema browser's cache).",
@@ -212,3 +262,13 @@ var (
 		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
 	})
 )
+
+// CounterValue reads a counter's current value (for status summaries;
+// Prometheus counters expose it only through their wire form).
+func CounterValue(c prometheus.Counter) float64 {
+	var m dto.Metric
+	if err := c.Write(&m); err != nil || m.Counter == nil {
+		return 0
+	}
+	return m.Counter.GetValue()
+}

@@ -24,6 +24,15 @@ import (
 // execStmt executes one data statement within txn. It is safe to re-run on
 // transaction retry (all state flows through txn).
 func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.Statement, params []types.Datum) (*Result, error) {
+	switch stmt.(type) {
+	case *parser.Select, *parser.Insert, *parser.Update, *parser.Delete:
+		// A data statement resolves each table once (the view check and
+		// the plan both ask); the memo lives for this attempt.
+		if s.stmtLookups == nil || s.stmtLookups.txn != txn {
+			s.stmtLookups = &lookupMemo{txn: txn, m: make(map[string]*catalog.TableDescriptor, 2)}
+			defer func() { s.stmtLookups = nil }()
+		}
+	}
 	if ct, ok := stmt.(*parser.CreateTable); ok {
 		// CREATE TABLE: admins, or a user granted CREATE on the database.
 		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
@@ -1293,10 +1302,27 @@ type fetchedRow struct {
 }
 
 func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, accessPlan, error) {
+	return s.fetchRowsFor(ctx, txn, desc, where, params, limit, nil)
+}
+
+// fetchRowsFor is fetchRows for a statement whose plan may be cached
+// (stmt: the UPDATE or DELETE as prepared; nil plans in full).
+func (s *Session) fetchRowsFor(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64, stmt parser.Statement) ([]fetchedRow, accessPlan, error) {
 	st, _ := s.cat.Stats(ctx, desc.ID)
-	plan, err := pickPlanWithStats(desc, st, where, params)
+	var pe *planEntry
+	if stmt != nil {
+		if e := s.plansFor().get(stmt, s.database); e != nil && e.valid(desc, st) {
+			pe = e
+		}
+	}
+	plan, err := s.planAccess(desc, st, where, params, pe)
 	if err != nil {
 		return nil, plan, err
+	}
+	if stmt != nil && pe == nil {
+		if err := s.cachePlan(stmt, desc, st, nil, where); err != nil {
+			return nil, plan, err
+		}
 	}
 	start := time.Now()
 	rows, err := s.executePlan(ctx, txn, desc, plan, where, params, limit)
@@ -1400,6 +1426,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 				if !match {
 					continue
 				}
+				if err := s.chargeRow(row); err != nil {
+					return false, err
+				}
 				out = append(out, fetchedRow{key: pk, row: row})
 				if limit > 0 && int64(len(out)) == limit {
 					return false, nil
@@ -1419,53 +1448,21 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		// The plan's pinned prefix and bounds constrain the logical PK; on
 		// a sharded table (fanBuckets > 0) that is PrimaryKey[1:], and the
 		// scan runs once per bucket with the bucket value prepended.
-		pkCols := desc.PrimaryKey
-		if plan.fanBuckets > 0 {
-			pkCols = pkCols[1:]
-		}
-		buildSpan := func(prefix keys.Key) (keys.Key, keys.Key, error) {
-			for i, d := range plan.idxVals {
-				col, _ := desc.ColByID(pkCols[i])
-				var err error
-				prefix, err = rowenc.AppendKeyDatum(prefix, col.Type, d)
-				if err != nil {
-					return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
-				}
-			}
-			var fam types.Family
-			if plan.hasBounds() {
-				col, _ := desc.ColByID(pkCols[len(plan.idxVals)])
-				fam = col.Type
-			}
-			start, end, err := plan.spanBounds(prefix, fam)
-			if err != nil {
-				return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
-			}
-			return start, end, nil
+		spans, err := pkScanSpans(desc, plan)
+		if err != nil {
+			return nil, err
 		}
 		if plan.fanBuckets == 0 {
-			start, end, err := buildSpan(rowenc.PrimaryKeyPrefixFor(desc))
-			if err != nil {
-				return nil, err
-			}
-			return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+			return s.scanPrimarySpan(ctx, txn, desc, plan, spans[0].start, spans[0].end, where, params, limit)
 		}
 		runs := make([][]fetchedRow, 0, plan.fanBuckets)
-		for b := int32(0); b < plan.fanBuckets; b++ {
-			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefixFor(desc), types.Int, types.NewInt(int64(b)))
-			if err != nil {
-				return nil, newErrf(CodeInternal, "shard bound: %v", err)
-			}
-			start, end, err := buildSpan(bp)
-			if err != nil {
-				return nil, err
-			}
+		for _, sp := range spans {
 			// The limit is only an upper bound per span (each span alone
 			// cannot yield more result rows than the global limit); the
 			// global limit re-applies below — and, without mergeFan, the
 			// caller re-applies it after sorting when there is an ORDER
 			// BY, in which case it passes limit 0 here.
-			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, sp.start, sp.end, where, params, limit)
 			if err != nil {
 				return nil, err
 			}
@@ -1560,6 +1557,9 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 		if !match {
 			continue
 		}
+		if err := s.chargeRow(row); err != nil {
+			return nil, err
+		}
 		out = append(out, fetchedRow{key: kv.Key, row: row})
 		if limit > 0 && int64(len(out)) == limit {
 			break
@@ -1620,6 +1620,36 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 	return out, true, nil
 }
 
+// planAccess chooses the access path: a cached point shape bound to the
+// parameters when the entry has one and the values bind, else the
+// planner in full.
+func (s *Session) planAccess(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum, pe *planEntry) (accessPlan, error) {
+	if pe != nil && pe.point != nil {
+		plan, ok, err := bindPKPoint(desc, pe.point, where, params)
+		if err != nil {
+			return accessPlan{}, err
+		}
+		if ok {
+			return plan, nil
+		}
+	}
+	return pickPlanWithStats(desc, st, where, params)
+}
+
+// cachePlan records what a statement planned against.
+func (s *Session) cachePlan(stmt parser.Statement, desc *catalog.TableDescriptor, st *catalog.TableStatistics, proj []projCol, where []parser.Comparison) error {
+	e := &planEntry{key: planKey{stmt: stmt, db: s.database}, desc: desc, stats: st, proj: proj, stripped: true}
+	shape, ok, err := pkPointShape(desc, where)
+	if err != nil {
+		return err
+	}
+	if ok {
+		e.point = shape
+	}
+	s.plansFor().put(e)
+	return nil
+}
+
 func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
 	row, err := rowenc.DecodeValue(desc, value)
 	if err != nil {
@@ -1650,6 +1680,15 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	// Only the statement's own select may stream; every select run
+	// underneath (WITH members, derived tables, set members, subqueries)
+	// sees the flag cleared and materializes.
+	top := s.streamTop
+	s.streamTop = false
+	// The plan cache keys on the statement as prepared: a select that is
+	// rewritten below (WITH, derived tables, spliced subqueries, LIMIT
+	// parameters) plans in full.
+	orig := t
 	if len(t.With) > 0 {
 		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
 		if err != nil {
@@ -1846,10 +1885,22 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Distinct && t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with DISTINCT")
 	}
-	stripTableAlias(t)
-	proj, perr := resolveProjection(desc, t.Exprs)
-	if perr != nil {
-		return nil, perr
+	st, _ := s.cat.Stats(ctx, desc.ID)
+	var pe *planEntry
+	if t == orig {
+		if e := s.plansFor().get(t, s.database); e != nil && e.valid(desc, st) {
+			pe = e
+		}
+	}
+	var proj []projCol
+	if pe != nil {
+		proj = pe.proj
+	} else {
+		stripTableAlias(t)
+		var perr error
+		if proj, perr = resolveProjection(desc, t.Exprs); perr != nil {
+			return nil, perr
+		}
 	}
 
 	// With ORDER BY the limit applies only after sorting (unless the access
@@ -1861,10 +1912,14 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// must not stop early; the limit re-applies to the survivors.
 		fetchLimit = 0
 	}
-	st, _ := s.cat.Stats(ctx, desc.ID)
-	plan, err := pickPlanWithStats(desc, st, t.Where, params)
+	plan, err := s.planAccess(desc, st, t.Where, params, pe)
 	if err != nil {
 		return nil, err
+	}
+	if pe == nil && t == orig {
+		if err := s.cachePlan(t, desc, st, proj, t.Where); err != nil {
+			return nil, err
+		}
 	}
 	needSort := false
 	order := resolveOrderAliases(t)
@@ -1879,6 +1934,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			// fanned scan.
 			plan.reverse, plan.mergeFan = dec.reverse, dec.mergeFan
 		}
+	}
+	if s.streamable(top, desc, plan, t, needSort, corr, corrProjs) {
+		return s.newScanStream(txn, desc, plan, t, proj, t.Where, params, fetchLimit)
 	}
 	rows, err := s.executePlan(ctx, txn, desc, plan, t.Where, params, fetchLimit)
 	if err != nil {
@@ -1974,6 +2032,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				res.Columns[projAt[i]].Type = d.Fam
 			}
 		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
+		}
 		res.Rows = append(res.Rows, out)
 	}
 	if t.Distinct {
@@ -1987,6 +2048,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 }
 
 func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update, params []types.Datum) (*Result, error) {
+	orig := t
 	if len(t.With) > 0 {
 		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
 		if err != nil {
@@ -2025,7 +2087,11 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			return nil, newErrf(CodeFeatureNotSupported, "updating primary key column %q is not supported", set.Column)
 		}
 	}
-	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
+	var planKeyStmt parser.Statement
+	if t == orig {
+		planKeyStmt = t
+	}
+	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2152,6 +2218,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 }
 
 func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*Result, error) {
+	orig := t
 	if len(t.With) > 0 {
 		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
 		if err != nil {
@@ -2181,7 +2248,11 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err := s.checkTablePriv(ctx, txn, desc, "DELETE"); err != nil {
 		return nil, err
 	}
-	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
+	var planKeyStmt parser.Statement
+	if t == orig {
+		planKeyStmt = t
+	}
+	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2503,6 +2574,15 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	text := plan.String()
 	if plan.estRows > 0 {
 		text += fmt.Sprintf(" [~%.0f rows]", plan.estRows)
+	}
+	if e := s.plans.peek(sel, s.database); e != nil && e.desc == desc && e.stats == st {
+		text += " (cached plan)"
+	} else if sel == t.Stmt {
+		// EXPLAIN plans exactly as execution would: the next execution of
+		// this statement (or of this EXPLAIN) reuses it.
+		if err := s.cachePlan(sel, desc, st, nil, sel.Where); err != nil {
+			return nil, err
+		}
 	}
 	if len(corr) > 0 {
 		text += fmt.Sprintf("; correlated filter: nested loop over %d conjunct(s) (O(outer rows x inner query), memoized per correlation key)", len(corr))

@@ -113,6 +113,10 @@ type Result struct {
 	Rows    [][]types.Datum
 	// Tag is the PostgreSQL command tag ("SELECT 3", "INSERT 0 2", ...).
 	Tag string
+	// Stream, when set, delivers the rows on demand instead of Rows (a
+	// scan-shaped SELECT on a streaming session, see stream.go); the
+	// consumer pulls it with Next, closes it, and takes the tag from it.
+	Stream *RowStream
 }
 
 // TxnState is the session's transaction status, mirrored into the wire
@@ -183,6 +187,23 @@ type Session struct {
 	// explain collects each stage's actual rows and time while EXPLAIN
 	// ANALYZE runs a statement (nil otherwise).
 	explain *explainStats
+	// plans is the session's plan cache (plancache.go), made on first
+	// use; stmtLookups memoizes the catalog lookups of the statement
+	// being executed (a name is resolved once per statement, not once
+	// for the view check and again for the plan).
+	plans       *planCache
+	stmtLookups *lookupMemo
+	// streaming lets scan-shaped SELECTs return a RowStream instead of
+	// materialized rows (the wire layer opts in; internal callers read
+	// Result.Rows). memUsed is the running statement's charged memory
+	// (stream.go).
+	streaming bool
+	memUsed   int64
+	// streamTop marks the statement about to run as a top-level SELECT
+	// whose result may stream; execSelect takes it on entry, so the
+	// selects it runs underneath (WITH members, derived tables, set
+	// members, subqueries) materialize as they must.
+	streamTop bool
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -221,6 +242,12 @@ func (s *Session) SetUser(user string) {
 	s.vars.role = ""
 	s.applyRole()
 }
+
+// SetStreaming lets scan-shaped SELECTs return their rows as a
+// RowStream (Result.Stream) instead of materializing them. Only a
+// consumer that pulls and closes streams (the wire layer) should turn
+// it on.
+func (s *Session) SetStreaming(on bool) { s.streaming = on }
 
 // User returns the session's current role (current_user): the session
 // user unless SET ROLE changed it.
@@ -288,7 +315,16 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	if s.state == StateOpen && s.ddlTouched(name) {
 		d, err = s.cat.LookupFreshIn(ctx, txn, s.database, name)
 	} else {
+		memo := s.stmtLookups
+		if memo != nil && memo.txn == txn {
+			if md, ok := memo.m[name]; ok {
+				return md, nil
+			}
+		}
 		d, err = s.cat.LookupIn(ctx, txn, s.database, name)
+		if err == nil && memo != nil && memo.txn == txn {
+			memo.m[name] = d
+		}
 	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -307,6 +343,24 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	}
 	return d, err
 }
+
+// lookupMemo caches one statement's table lookups within one transaction
+// attempt (see Session.stmtLookups).
+type lookupMemo struct {
+	txn *kvclient.Txn
+	m   map[string]*catalog.TableDescriptor
+}
+
+// plansFor returns the session's plan cache, creating it.
+func (s *Session) plansFor() *planCache {
+	if s.plans == nil {
+		s.plans = newPlanCache()
+	}
+	return s.plans
+}
+
+// PlanCacheLen is the number of plans the session holds (tests).
+func (s *Session) PlanCacheLen() int { return s.plans.len() }
 
 // sequenceRelation is the virtual one-row descriptor a sequence reads as.
 func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
@@ -454,11 +508,14 @@ func (s *Session) Close(ctx context.Context) {
 // under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
+	s.memUsed = 0
 	s.invalidateRoles()
+	var deadline time.Time
 	if d := s.vars.statementTimeout; d > 0 {
 		parent := ctx
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d)
+		deadline = time.Now().Add(d)
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 		defer func() {
 			// The message names the statement timeout only when it is
@@ -471,6 +528,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	if d := s.vars.lockTimeout; d > 0 {
 		ctx = kvclient.WithLockTimeout(ctx, d)
 	}
+	defer func() {
+		// A streamed result outlives this call: it carries the timeouts
+		// into every pull.
+		if res != nil && res.Stream != nil {
+			res.Stream.deadline, res.Stream.lockTimeout = deadline, s.vars.lockTimeout
+		}
+	}()
 	if serr := s.readOnlyViolation(stmt); serr != nil {
 		return nil, serr
 	}
@@ -740,22 +804,43 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 				return nil, serr
 			}
 		}
+		s.streamTop = true
 		res, serr := s.execSelect(ctx, txn, sel, params)
-		_ = txn.Commit(ctx) // read-only: releases nothing, marks finished
+		s.streamTop = false
 		if serr != nil {
+			_ = txn.Rollback(ctx)
 			return nil, ToSQLError(serr)
 		}
+		if res.Stream != nil {
+			// The stream commits the historical transaction once drained
+			// (no restarts: a pinned read has nothing to retry).
+			res.Stream.attachImplicit(txn, nil, nil)
+			res.Stream.attempt = 20
+			return res, nil
+		}
+		_ = txn.Commit(ctx) // read-only: releases nothing, marks finished
 		return res, nil
 	}
 
 	if s.state == StateOpen {
 		s.extraDDL = nil
+		_, s.streamTop = stmt.(*parser.Select)
 		res, err := s.execStmt(ctx, s.txn, stmt, params)
+		s.streamTop = false
 		if err != nil {
 			// Any error fails the explicit transaction (PG semantics).
 			s.state = StateFailed
 			s.extraDDL, s.pendingWipes = nil, nil
 			return nil, ToSQLError(err)
+		}
+		if res.Stream != nil {
+			// An error while the client pulls fails the block too (if it
+			// is still the block the stream ran in).
+			res.Stream.attachExplicit(func() {
+				if s.state == StateOpen {
+					s.state = StateFailed
+				}
+			})
 		}
 		if name := ddlTableName(stmt); name != "" {
 			s.pendingDDL = append(s.pendingDDL, name)
@@ -763,6 +848,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		s.pendingDDL = append(s.pendingDDL, s.extraDDL...)
 		s.extraDDL = nil
 		return res, nil
+	}
+	if sel, ok := stmt.(*parser.Select); ok && s.streaming {
+		return s.executeStreamingSelect(ctx, sel, params)
 	}
 	var res *Result
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
@@ -787,6 +875,44 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	}
 	s.runPendingWipes(ctx)
 	return res, nil
+}
+
+// executeStreamingSelect runs a SELECT in an implicit transaction the
+// way RunTxn would, except that a streamed result keeps the transaction
+// open for the stream, which commits it when drained and re-runs the
+// statement itself on a retryable error before the first flush.
+func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select, params []types.Datum) (*Result, *Error) {
+	txn := s.db.NewTxn("sql-implicit")
+	txn.EnablePipelining()
+	for attempt := 0; ; attempt++ {
+		s.streamTop = true
+		res, err := s.execStmt(ctx, txn, sel, params)
+		s.streamTop = false
+		if err == nil && res.Stream != nil {
+			res.Stream.attachImplicit(txn, sel, params)
+			res.Stream.attempt = attempt
+			return res, nil
+		}
+		if err == nil {
+			err = txn.Commit(ctx)
+		}
+		if err == nil {
+			return res, nil
+		}
+		_ = txn.Rollback(ctx)
+		if !kvclient.IsRetryable(err) || ctx.Err() != nil || attempt >= 20 {
+			return nil, ToSQLError(err)
+		}
+		next := s.db.NewTxn("sql-implicit")
+		next.EnablePipelining()
+		next.BumpPriority(txn)
+		txn = next
+		select {
+		case <-ctx.Done():
+			return nil, ToSQLError(ctx.Err())
+		case <-time.After(time.Duration(attempt+1) * 20 * time.Millisecond):
+		}
+	}
 }
 
 // noteDDL records another table a statement's DDL changed (a foreign

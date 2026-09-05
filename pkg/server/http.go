@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/storage"
 	"math"
 	"net"
 	"net/http"
@@ -193,6 +194,22 @@ func (n *Node) startHTTP() error {
 				Name: "datax_storage_debt_gate_entered_total", Help: "Times the compaction-debt gate latched.",
 			}, func() float64 { return float64(eng.DebtGateEntries()) }),
 		)
+		// Bytes written by each engine since it opened: WAL, memtable
+		// flushes and compactions — the write amplification a split store
+		// (issue #105) is about. engine=state is the state machine (no
+		// WAL bytes once split), engine=raft the raft log.
+		written := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "datax_storage_bytes_written_total", Help: "Bytes an engine wrote since it opened: kind=wal, flush, compaction; engine=state (the state machine), raft (the raft log, split stores only).",
+		}, []string{"engine", "kind"})
+		nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "datax_storage_split", Help: "1 when the raft log lives on its own engine and the state engine runs without a WAL (issue #105).",
+		}, func() float64 {
+			if n.raftEngine != nil {
+				return 1
+			}
+			return 0
+		}))
+		nodeReg.MustRegister(&writtenCollector{vec: written, node: n})
 		if eng.Encrypted() {
 			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",
@@ -495,4 +512,28 @@ func (n *Node) serveActivityAPI(w http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(doc)
+}
+
+// writtenCollector reports the engines' cumulative write counters on each
+// scrape (a counter vector whose values come from Pebble, not from
+// increments).
+type writtenCollector struct {
+	vec  *prometheus.CounterVec
+	node *Node
+}
+
+func (c *writtenCollector) Describe(ch chan<- *prometheus.Desc) { c.vec.Describe(ch) }
+
+func (c *writtenCollector) Collect(ch chan<- prometheus.Metric) {
+	set := func(engine string, eng *storage.Engine) {
+		if eng == nil {
+			return
+		}
+		w := eng.WriteMetrics()
+		for kind, v := range map[string]uint64{"wal": w.WALBytes, "flush": w.FlushedBytes, "compaction": w.CompactedBytes} {
+			ch <- prometheus.MustNewConstMetric(c.vec.WithLabelValues(engine, kind).Desc(), prometheus.CounterValue, float64(v), engine, kind)
+		}
+	}
+	set("state", c.node.engine)
+	set("raft", c.node.raftEngine)
 }

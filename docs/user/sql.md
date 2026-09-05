@@ -599,6 +599,21 @@ batching covers a statement's other point reads: `INSERT` reads all its
 uniqueness probes and foreign-key parents at once, `UPDATE` the entries
 it moves, `SELECT ... FOR UPDATE` locks its rows in one batch.
 
+**Streaming.** A `SELECT` that reads one table without sorting in
+memory, aggregating, joining, `DISTINCT` or a window function streams
+its rows: the gateway reads storage in pages of 512 rows as it writes
+to the client, so the first row arrives before the last is read, a
+full-table `SELECT` holds one page at a time however big the table,
+and a driver's fetch size (JDBC's, or a suspended portal) bounds server
+memory as well as wire traffic. Because rows go out as they are found,
+an error on a later row — a division by zero, a cancellation,
+`statement_timeout` — arrives after the rows already sent, as in
+PostgreSQL; the client discards the partial result. Statements that do
+materialize (the sort, aggregate, join and `DISTINCT` shapes, `WITH`
+members, derived tables) are bounded by `statement_memory_limit` and
+fail with `53200` past it; `datax_sql_streamed_rows_total` counts what
+streamed.
+
 A `full table scan` on a big table is the thing to fix (add an index, or
 constrain the leading PK columns). When [table statistics](#table-statistics)
 exist, the plan carries a ` [~N rows]` estimate and competing paths are
@@ -704,6 +719,7 @@ Deadlocks are detected and broken automatically (one victim gets `40001`).
 
 ```sql
 SET statement_timeout = '5s';                 -- 57014 when a statement runs longer
+SET statement_memory_limit = '256MB';         -- 53200 when a statement holds more than this
 SET lock_timeout = 200;                       -- ms: 55P03 instead of waiting on a live intent
 SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is rolled back, the connection ended
 SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ output rendered in the zone
@@ -724,6 +740,7 @@ invalid value `22023`:
 | Variable | Values | Effect |
 |---|---|---|
 | `statement_timeout` | ms, or `'5s'`, `'1min'`, `'500ms'`; `0` = none | a statement past it is cancelled: `57014`, its transaction block failed |
+| `statement_memory_limit` | bytes, or `'64MB'`, `'1GB'`, `'512kB'`; `0` = none; default `64MB` | what one statement may hold in memory on the gateway (rows it sorts, aggregates, joins or otherwise collects); past it the statement fails with `53200` instead of growing without bound. Streamed `SELECT`s are unaffected (see [Streaming](#reading)) |
 | `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`) |
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
 | `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |

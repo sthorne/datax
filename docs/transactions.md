@@ -132,11 +132,20 @@ high-water mark that made every read push every writer on the range). Each
 read records its key spans and timestamp; a write consults only entries
 that **overlap** its own spans, so disjoint readers and writers never
 interact. Structure: a range-wide **floor** timestamp plus two bounded
-generations of span entries. Bumps append to the current generation; when
-it fills, the older generation folds into the floor (the max of its
-timestamps — conservative, never incorrect) and rotation continues. Memory
-stays bounded per range, recent reads keep full span precision, and old
-reads age into range-wide coverage. The floor is also set directly by
+generations of entries, each holding its **point reads in a map by key**
+(one entry per key: the newest read of it; two readers at the same
+timestamp leave it unattributed) and its ranged reads (scans) in a
+slice. A point write looks its key up in both maps and scans only the
+ranged entries; a ranged write scans everything (issue #108: the
+full scan of every entry against every write span was a quarter of a
+leader's CPU under batched ingest, whose uniqueness probes put one point
+entry per row in the cache — a 100-key write against two full
+generations went from ~1.5 ms to ~2 µs). Bumps go to the current
+generation; when it fills (4,096 entries), the older generation folds
+into the floor (the max of its timestamps — conservative, never
+incorrect) and rotation continues. Memory stays bounded per range,
+recent reads keep full span precision, and old reads age into
+range-wide coverage. The floor is also set directly by
 whole-range events: leadership acquisition (a new leader cannot know what
 the old one served) and, span-scoped to the absorbed keys, range merges.
 Entries carry the reader's transaction ID: a transaction writing at

@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/google/uuid"
@@ -122,7 +123,7 @@ func TestTSCacheRotation(t *testing.T) {
 	}
 	// Memory stays bounded.
 	c.mu.Lock()
-	total := len(c.cur) + len(c.prev)
+	total := c.cur.len() + c.prev.len()
 	c.mu.Unlock()
 	if total > 2*tsCacheGenerationSize {
 		t.Fatalf("cache grew unbounded: %d entries", total)
@@ -136,7 +137,7 @@ func TestTSCacheFloorSwallowsCoveredBumps(t *testing.T) {
 	c.Bump(spans(wholeRangeSpan), ts(100), uuid.Nil)
 	c.Bump(spans(sp("k", "")), ts(50), uuid.Nil)
 	c.mu.Lock()
-	n := len(c.cur)
+	n := c.cur.len()
 	c.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("covered bump stored %d entries", n)
@@ -159,6 +160,105 @@ func BenchmarkTSCacheAllowsWriteFull(b *testing.B) {
 		c.Bump(spans(sp(fmt.Sprintf("k%06d", i), "")), ts(int64(i+1)), uuid.Nil)
 	}
 	w := spans(sp("zzz-unread", ""))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.AllowsWrite(w, ts(1<<40), uuid.Nil)
+	}
+}
+
+// naiveTSCache is the v2 cache — a slice of entries scanned in full —
+// kept as the oracle for the indexed one (issue #108). It never rotates,
+// so the comparison stays under one generation.
+type naiveTSCache struct {
+	floor   hlc.Timestamp
+	entries []tsCacheEntry
+}
+
+func (n *naiveTSCache) bump(spans []latchSpan, ts hlc.Timestamp, txnID uuid.UUID) {
+	if !n.floor.Less(ts) {
+		return
+	}
+	for _, sp := range spans {
+		n.entries = append(n.entries, tsCacheEntry{span: sp, ts: ts, txnID: txnID})
+	}
+}
+
+func (n *naiveTSCache) allowsWrite(spans []latchSpan, ts hlc.Timestamp, txnID uuid.UUID) (bool, hlc.Timestamp) {
+	low := n.floor
+	ok := n.floor.Less(ts)
+	for _, e := range n.entries {
+		if !overlapsAny(e.span, spans) {
+			continue
+		}
+		if low.Less(e.ts) {
+			low = e.ts
+		}
+		if ts.Less(e.ts) || (ts.Equal(e.ts) && (txnID == uuid.Nil || txnID != e.txnID)) {
+			ok = false
+		}
+	}
+	return ok, low
+}
+
+// TestTSCacheIndexMatchesNaiveScan: random point and ranged reads by a
+// few transactions, then random point and ranged writes — the indexed
+// cache answers exactly as the full scan does (both verdict and the
+// timestamp to exceed), under one generation.
+func TestTSCacheIndexMatchesNaiveScan(t *testing.T) {
+	rng := rand.New(rand.NewSource(108))
+	txns := []uuid.UUID{uuid.Nil, uuid.New(), uuid.New(), uuid.New()}
+	key := func() string { return fmt.Sprintf("k%03d", rng.Intn(200)) }
+	randSpan := func() latchSpan {
+		if rng.Intn(4) == 0 {
+			a, b := key(), key()
+			if a > b {
+				a, b = b, a
+			}
+			if a == b {
+				b += "z"
+			}
+			return sp(a, b)
+		}
+		return sp(key(), "")
+	}
+	var c tsCache
+	var n naiveTSCache
+	for i := 0; i < 3000; i++ {
+		spans := []latchSpan{randSpan()}
+		if rng.Intn(3) == 0 {
+			spans = append(spans, randSpan())
+		}
+		ts := ts(int64(1 + rng.Intn(50)))
+		txn := txns[rng.Intn(len(txns))]
+		c.Bump(spans, ts, txn)
+		n.bump(spans, ts, txn)
+	}
+	for i := 0; i < 5000; i++ {
+		spans := []latchSpan{randSpan()}
+		if rng.Intn(3) == 0 {
+			spans = append(spans, randSpan())
+		}
+		ts := ts(int64(1 + rng.Intn(50)))
+		txn := txns[rng.Intn(len(txns))]
+		gotOK, gotLow := c.AllowsWrite(spans, ts, txn)
+		wantOK, wantLow := n.allowsWrite(spans, ts, txn)
+		if gotOK != wantOK || !gotLow.Equal(wantLow) {
+			t.Fatalf("write %v at %v by %s: indexed (%v, %v), scan (%v, %v)", spans, ts, txn, gotOK, gotLow, wantOK, wantLow)
+		}
+	}
+}
+
+// BenchmarkTSCacheAllowsWritePoints: the ingest shape — both generations
+// holding point reads, a 100-key point write.
+func BenchmarkTSCacheAllowsWritePoints(b *testing.B) {
+	var c tsCache
+	for i := 0; i < 2*tsCacheGenerationSize-1; i++ {
+		c.Bump(spans(sp(fmt.Sprintf("k%06d", i), "")), ts(int64(i+1)), uuid.Nil)
+	}
+	w := make([]latchSpan, 100)
+	for i := range w {
+		w[i] = sp(fmt.Sprintf("w%06d", i), "")
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		c.AllowsWrite(w, ts(1<<40), uuid.Nil)

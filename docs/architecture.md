@@ -47,7 +47,10 @@ moves no data**.
    sub-batches sent **in parallel** (the record-creating one first).
 4. `kvserver` on the Raft leader checks the timestamp cache, then proposes the
    write to the range's Raft group. Once a quorum has appended it, each replica
-   **applies** it: an MVCC *write intent* lands in Pebble.
+   **applies** it — on an apply worker, off the raft pass that committed
+   it, so the range's next append is already syncing meanwhile
+   (docs/replication-and-placement.md, "Pipelined apply"): an MVCC *write
+   intent* lands in Pebble.
 5. At `COMMIT`, the coordinator flips the transaction record to COMMITTED — a
    single Raft write — then asynchronously resolves intents to plain values.
    Fast paths skip stages of this: an implicit transaction stages its
@@ -75,7 +78,11 @@ These are the load-bearing rules; tests assert them.
 1. **Raft durability order**: HardState and log entries are synced to Pebble
    *before* any outbound Raft message that acknowledges them. Applied state and
    the applied index are written in one atomic batch, so crash-recovery replay
-   is idempotent.
+   is idempotent. On a **split store** (v13, issue #105) the log has its own
+   engine and the state engine runs without a write-ahead log: what a crash
+   takes from the state engine's memtable is replayed from the log, whose
+   truncation waits for the state engine to flush past the entries it removes
+   (see [replication-and-placement.md](replication-and-placement.md#raft-log-truncation)).
 2. **Linearizable reads**: only via ReadIndex on the leader. On leadership
    acquisition the timestamp cache floor is bumped to `now()`, because a new
    leader cannot know what reads the old leader served. The one non-leader

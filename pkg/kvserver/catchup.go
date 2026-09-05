@@ -145,9 +145,14 @@ func (s *Store) installSnapshot(r *Replica, h snapshotHeader, next func() ([]Sna
 	if err := b.DeleteRange(loL, hiL); err != nil {
 		return fail(err)
 	}
-	logPre := keys.RaftLogPrefix(r.rangeID)
-	if err := b.DeleteRange(logPre, logPre.PrefixEnd()); err != nil {
-		return fail(err)
+	if !s.splitEngines() {
+		// The log lives on this engine: reset it in the same batch. A
+		// split store resets it on the raft engine after the state has
+		// flushed (applySnapshot).
+		logPre := keys.RaftLogPrefix(r.rangeID)
+		if err := b.DeleteRange(logPre, logPre.PrefixEnd()); err != nil {
+			return fail(err)
+		}
 	}
 	count := 0
 	for {
@@ -222,7 +227,29 @@ func (r *Replica) applySnapshot(snap raftpb.Snapshot) error {
 	if err := p.b.Commit(true); err != nil {
 		return err
 	}
+	if r.store.splitEngines() {
+		// The state is replaced; make it durable, then reset the log on
+		// the raft engine to start after the snapshot (a crash in between
+		// leaves a longer log, which is harmless).
+		if err := r.store.flushState(); err != nil {
+			return err
+		}
+		rb := r.store.raftEngine().NewBatch()
+		logPre := keys.RaftLogPrefix(r.rangeID)
+		if err := rb.DeleteRange(logPre, logPre.PrefixEnd()); err != nil {
+			_ = rb.Close()
+			return err
+		}
+		if err := putTruncatedState(rb, r.rangeID, truncatedState{Index: p.h.AppliedIndex, Term: p.h.Term}); err != nil {
+			_ = rb.Close()
+			return err
+		}
+		if err := rb.Commit(true); err != nil {
+			return err
+		}
+	}
 	r.rs.applyIncomingSnapshot(p.h.AppliedIndex, p.h.Term)
+	r.noteAppliedSeq(p.h.AppliedIndex, p.b.SeqNum())
 	r.rs.setConfState(p.h.Desc)
 	r.mu.Lock()
 	r.mu.desc = p.h.Desc

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/sthorne/datax/pkg/util/faultpoint"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -168,6 +169,15 @@ type Replica struct {
 		// pendingInstall is a staged incoming snapshot awaiting raft's
 		// restore (committed by applySnapshot). See catchup.go.
 		pendingInstall *pendingSnapshot
+		// Split stores (raftengine.go): applySeqs pairs recent applied
+		// indexes with their batches' sequence numbers, durableApplied
+		// is the highest one the state engine has flushed, and
+		// pendingTrunc is an applied TruncateLog whose raft-side deletion
+		// waits for that flush.
+		applySeqs      []appliedSeq
+		durableApplied uint64
+		pendingTrunc   truncatedState
+		pendingSince   time.Time
 		// frozen: a Subsume applied — the range refuses traffic pending a
 		// merge into mergedInto (see merge.go). Mirrors replicaState.
 		frozen     bool
@@ -209,6 +219,11 @@ type Replica struct {
 	// scheduler will never run another pass for this replica.
 	stopOnce  sync.Once
 	stoppedCh chan struct{}
+
+	// inlineApply is set while the replica's own raft pass applies its
+	// entries (finishReady's conf-change path) rather than an apply
+	// worker: a merge apply then tells stopReplica which pass is its own.
+	inlineApply atomic.Bool
 }
 
 // errRaftStopped is returned by every raft-group call on a stopped
@@ -259,7 +274,7 @@ func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *ra
 // Store.startReplica). bootstrap must be true exactly once per replica
 // lifetime — when the range is first created with its initial membership.
 func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
-	rs, err := newRaftStorage(s.cfg.Engine, desc.RangeID, desc)
+	rs, err := newRaftStorage(s.raftEngine(), s.cfg.Engine, desc.RangeID, desc)
 	if err != nil {
 		return nil, err
 	}
@@ -619,11 +634,14 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 			return err
 		}
 	}
+	metrics.RaftEntriesAppended.Add(float64(len(rd.Entries)))
 	return r.rs.append(b, rd.Entries)
 }
 
 // finishReady is the second half, after the group batch is durable: send
-// the messages, satisfy read-index waiters, apply the committed entries.
+// the messages, satisfy read-index waiters, hand the committed entries
+// to the apply workers (or apply them inline when one is a conf change,
+// which raft must learn of before it hands out the next Ready).
 func (r *Replica) finishReady(ctx context.Context, rd raft.Ready) error {
 	// 3. Send messages.
 	r.sendRaftMessages(ctx, rd.Messages)
@@ -641,11 +659,40 @@ func (r *Replica) finishReady(ctx context.Context, rd raft.Ready) error {
 		}
 	}
 
-	// 5. Apply committed entries.
-	for _, ent := range rd.CommittedEntries {
+	// 5. Apply committed entries: queued for the apply workers, in log
+	// order behind the replica's earlier entries.
+	if len(rd.CommittedEntries) == 0 {
+		return nil
+	}
+	inline := r.store.cfg.TestingKnobs.SyncApply
+	for i := range rd.CommittedEntries {
+		if rd.CommittedEntries[i].Type != raftpb.EntryNormal {
+			inline = true
+			break
+		}
+	}
+	if inline {
+		if !r.store.sched.drainApply(r) {
+			return errApplyAborted // shutdown with entries still queued ahead: replayed after restart
+		}
+		r.inlineApply.Store(true)
+		defer r.inlineApply.Store(false)
+		return r.applyEntries(ctx, rd.CommittedEntries)
+	}
+	r.store.sched.enqueueApply(r, rd.CommittedEntries)
+	return nil
+}
+
+// applyEntries applies committed entries in order, stopping at the first
+// failure.
+func (r *Replica) applyEntries(ctx context.Context, ents []raftpb.Entry) error {
+	for _, ent := range ents {
+		start := time.Now()
 		if err := r.applyEntry(ctx, ent); err != nil {
 			return err
 		}
+		metrics.RaftEntriesApplied.Inc()
+		metrics.RaftApplyLatency.Observe(time.Since(start).Seconds())
 		faultpoint.Hit("raft-apply")
 	}
 	return nil
@@ -858,6 +905,17 @@ func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cm
 		return nil, e
 	case res := <-ch:
 		return res.resp, res.err
+	case <-r.stoppedCh:
+		// The group stopped (shutdown, removal, a failed apply) with the
+		// proposal's fate unknown: it may yet apply after a restart.
+		select {
+		case res := <-ch:
+			return res.resp, res.err
+		default:
+		}
+		e := kvpb.NewErrorf("%s: replica stopped with proposal in flight", r.rangeID)
+		e.Ambiguous = &kvpb.AmbiguousResultError{}
+		return nil, e
 	}
 }
 

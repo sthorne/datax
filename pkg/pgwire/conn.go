@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -176,9 +177,18 @@ type portal struct {
 	// CommandComplete when exhausted. PostgreSQL portal semantics: a
 	// portal executes its statement once; re-running requires a re-Bind
 	// (which replaces this struct and resets the state).
+	// A streamed result (res.Stream) is pulled MaxRows rows per Execute
+	// instead; it is closed when the portal is.
 	res    *sql.Result
 	offset int
 	done   bool
+}
+
+// close releases a portal's stream, if any.
+func (pt *portal) close(ctx context.Context) {
+	if pt.res != nil && pt.res.Stream != nil {
+		pt.res.Stream.Close(ctx)
+	}
 }
 
 type conn struct {
@@ -190,6 +200,16 @@ type conn struct {
 
 	stmts   map[string]*prepared
 	portals map[string]*portal
+	// parsed is the connection's parse cache for the simple protocol:
+	// query text → its statements, bounded (parseCacheSize, LRU). A
+	// client that repeats a text (a dashboard's queries, a driver in
+	// simple mode re-sending the same statement) skips the parse, and the
+	// session's plan cache sees the same statement each time (issue
+	// #107).
+	parsed *parseCache
+	// ioErr is a failed write of streamed rows (the connection is gone);
+	// the run loop ends on it.
+	ioErr error
 	// skipToSync: an extended-protocol error occurred; ignore messages
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
@@ -278,9 +298,11 @@ func isTimeout(err error) bool {
 	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
-// execute runs one statement through the session with activity
-// accounting around it.
-func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum) (*sql.Result, *sql.Error) {
+// execute runs a statement under the connection's cancel registration
+// and activity accounting. emit, when given, delivers the result's rows
+// inside that scope (a streamed result is pulled there, so cancellation
+// covers the pull) and returns how many it sent.
+func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum, emit func(context.Context, *sql.Result) (int64, *sql.Error)) (*sql.Result, *sql.Error) {
 	ctx, done := c.beginStatement(ctx)
 	defer done()
 	_, isSet := stmt.(*parser.SetVar)
@@ -288,14 +310,20 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	if isSet {
 		before = c.session.ReportedParams()
 	}
-	var res *sql.Result
-	var serr *sql.Error
-	if c.act == nil {
-		res, serr = c.session.Execute(ctx, stmt, params)
-	} else {
-		tok := c.act.begin(c, stmt, text)
-		res, serr = c.session.Execute(ctx, stmt, params)
-		tok.end(res, serr, c.session.State() == sql.StateOpen)
+	var tok *stmtToken
+	if c.act != nil {
+		tok = c.act.begin(c, stmt, text)
+	}
+	res, serr := c.session.Execute(ctx, stmt, params)
+	var rows int64
+	if res != nil {
+		rows = int64(len(res.Rows))
+	}
+	if serr == nil && emit != nil && res != nil {
+		rows, serr = emit(ctx, res)
+	}
+	if tok != nil {
+		tok.end(rows, serr, c.session.State() == sql.StateOpen)
 		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
 	}
 	if isSet && serr == nil {
@@ -311,10 +339,12 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 }
 
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
+	session := sql.NewSession(db, cat)
+	session.SetStreaming(true)
 	return &conn{
 		backend: pgproto3.NewBackend(nc, nc),
 		nc:      nc,
-		session: sql.NewSession(db, cat),
+		session: session,
 		opts:    opts,
 		stmts:   make(map[string]*prepared),
 		portals: make(map[string]*portal),
@@ -323,6 +353,7 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 
 func (c *conn) run(ctx context.Context) error {
 	defer c.session.Close(context.Background())
+	defer c.reapPortals() // streams first: their transactions are the session's
 	if err := c.handleStartup(ctx); err != nil {
 		return err
 	}
@@ -363,6 +394,9 @@ func (c *conn) run(ctx context.Context) error {
 		default:
 			boundary = false
 		}
+		if c.ioErr != nil {
+			return c.ioErr
+		}
 		switch m := msg.(type) {
 		case *pgproto3.Query:
 			c.skipToSync = false
@@ -397,7 +431,10 @@ func (c *conn) run(ctx context.Context) error {
 				case 'S':
 					delete(c.stmts, m.Name)
 				case 'P':
-					delete(c.portals, m.Name)
+					if pt, ok := c.portals[m.Name]; ok {
+						pt.close(ctx)
+						delete(c.portals, m.Name)
+					}
 				}
 				c.backend.Send(&pgproto3.CloseComplete{})
 			}
@@ -553,9 +590,47 @@ func (c *conn) sendError(serr *sql.Error) {
 	})
 }
 
+// parseCacheSize bounds a connection's parse cache.
+const parseCacheSize = 64
+
+// parseCache is a connection's text → statements cache (LRU).
+type parseCache struct {
+	entries map[string]*list.Element
+	lru     *list.List
+}
+
+type parsedQuery struct {
+	text  string
+	stmts []parser.Statement
+}
+
+// parse returns the statements of q, from the connection's parse cache
+// when it has seen the text before.
+func (c *conn) parse(q string) ([]parser.Statement, error) {
+	if c.parsed == nil {
+		c.parsed = &parseCache{entries: make(map[string]*list.Element), lru: list.New()}
+	}
+	if el, ok := c.parsed.entries[q]; ok {
+		c.parsed.lru.MoveToFront(el)
+		metrics.SQLParseCacheHits.Inc()
+		return el.Value.(*parsedQuery).stmts, nil
+	}
+	stmts, err := parser.Parse(q)
+	if err != nil {
+		return nil, err
+	}
+	c.parsed.entries[q] = c.parsed.lru.PushFront(&parsedQuery{text: q, stmts: stmts})
+	for c.parsed.lru.Len() > parseCacheSize {
+		old := c.parsed.lru.Back()
+		c.parsed.lru.Remove(old)
+		delete(c.parsed.entries, old.Value.(*parsedQuery).text)
+	}
+	return stmts, nil
+}
+
 // handleSimpleQuery runs a (possibly multi-statement) simple query.
 func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
-	stmts, err := parser.Parse(q)
+	stmts, err := c.parse(q)
 	if err != nil {
 		c.sendError(sql.ToSQLError(err))
 		return
@@ -577,14 +652,21 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			c.handleCopyIn(ctx, cf)
 			return
 		}
-		res, serr := c.execute(ctx, stmt, q, nil)
+		res, serr := c.execute(ctx, stmt, q, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+			if res.Columns == nil {
+				return 0, nil
+			}
+			c.backend.Send(rowDescription(res.Columns))
+			if res.Stream == nil {
+				c.sendDataRows(res, nil)
+				return int64(len(res.Rows)), nil
+			}
+			n, _, serr := c.sendStream(ctx, res, nil, 0)
+			return n, serr
+		})
 		if serr != nil {
 			c.sendError(serr)
 			return
-		}
-		if res.Columns != nil {
-			c.backend.Send(rowDescription(res.Columns))
-			c.sendDataRows(res, nil)
 		}
 		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(res.Tag)})
 	}
@@ -612,7 +694,8 @@ func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
 // reapPortals destroys every portal (end of implicit cycle or of the
 // enclosing transaction).
 func (c *conn) reapPortals() {
-	for name := range c.portals {
+	for name, pt := range c.portals {
+		pt.close(context.Background())
 		delete(c.portals, name)
 	}
 }
@@ -992,6 +1075,9 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 	default:
 		copy(resFormats, m.ResultFormatCodes)
 	}
+	if old, ok := c.portals[m.DestinationPortal]; ok {
+		old.close(context.Background())
+	}
 	c.portals[m.DestinationPortal] = &portal{stmt: p, params: params, resFormats: resFormats}
 	c.backend.Send(&pgproto3.BindComplete{})
 }
@@ -1049,12 +1135,47 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		return
 	}
 	if pt.res == nil {
-		res, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params)
+		var suspended bool
+		_, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+			pt.res = res
+			if res.Stream == nil {
+				return int64(len(res.Rows)), nil
+			}
+			// A streamed portal pulls its first page here, under the
+			// statement's cancel registration; the rest on later Executes.
+			n, more, serr := c.sendStream(ctx, res, pt.resFormats, int64(m.MaxRows))
+			suspended = more
+			if serr != nil {
+				pt.done = true
+				pt.close(context.Background())
+			}
+			return n, serr
+		})
 		if serr != nil {
 			c.extError(serr)
 			return
 		}
-		pt.res = res
+		if pt.res.Stream != nil {
+			c.finishStreamExecute(pt, suspended, nil)
+			return
+		}
+	}
+	if pt.res.Stream != nil {
+		if pt.done {
+			c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+			return
+		}
+		if c.session.State() == sql.StateFailed {
+			pt.done = true
+			pt.close(context.Background())
+			c.extError(&sql.Error{Code: sql.CodeInFailedTransaction, Msg: "current transaction is aborted, commands ignored until end of transaction block"})
+			return
+		}
+		ctx, done := c.beginStatement(ctx)
+		_, suspended, serr := c.sendStream(ctx, pt.res, pt.resFormats, int64(m.MaxRows))
+		done()
+		c.finishStreamExecute(pt, suspended, serr)
+		return
 	}
 	if pt.res.Columns == nil {
 		// Row-less statements complete in one Execute regardless of limit.
@@ -1074,4 +1195,116 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	}
 	pt.done = true
 	c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+}
+
+// finishStreamExecute ends one Execute on a streamed portal: an error
+// (after the rows already sent), a suspension, or completion.
+func (c *conn) finishStreamExecute(pt *portal, suspended bool, serr *sql.Error) {
+	switch {
+	case serr != nil:
+		pt.done = true
+		pt.close(context.Background())
+		c.extError(serr)
+	case suspended:
+		c.backend.Send(&pgproto3.PortalSuspended{})
+	default:
+		pt.done = true
+		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+	}
+}
+
+// streamFlushBytes is how many encoded row bytes accumulate before they
+// are written to the client.
+const streamFlushBytes = 64 << 10
+
+// rawRows carries already-encoded DataRow messages through the backend's
+// own buffer, so a result that never reached a flush goes out with the
+// CommandComplete and ReadyForQuery behind it in one write, as a
+// materialized result does.
+type rawRows []byte
+
+func (r rawRows) Backend()                          {}
+func (r rawRows) Decode([]byte) error               { return errors.New("rawRows: not decodable") }
+func (r rawRows) Encode(dst []byte) ([]byte, error) { return append(dst, r...), nil }
+
+// sendStream pulls up to max rows (0 = all) from a streamed result and
+// writes them as DataRows, flushing every streamFlushBytes. It reports
+// the rows sent and whether the stream has more (a suspended portal).
+// Rows are encoded into a private buffer so that a restart before the
+// first flush can discard them; once anything is written the stream is
+// told, and a later error is surfaced after the rows already sent. On
+// completion the result's tag is the stream's.
+func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16, max int64) (sent int64, more bool, serr *sql.Error) {
+	st := res.Stream
+	var buf []byte
+	loc := c.session.TimeZone()
+	flush := func() bool {
+		if len(buf) == 0 {
+			return true
+		}
+		// Anything queued on the backend (the RowDescription) goes first.
+		if err := c.backend.Flush(); err != nil {
+			c.ioErr = err
+			return false
+		}
+		if _, err := c.nc.Write(buf); err != nil {
+			c.ioErr = err
+			return false
+		}
+		buf = buf[:0]
+		st.Flushed()
+		return true
+	}
+	// finish hands what remains to the backend's buffer: the stream is
+	// over (no restart can follow), and the trailing messages go out
+	// with it in one write.
+	finish := func() {
+		if len(buf) > 0 {
+			c.backend.Send(rawRows(buf))
+			buf = nil
+		}
+	}
+	for max <= 0 || sent < max {
+		row, ok, err := st.Next(ctx)
+		if err != nil {
+			if errors.Is(err, sql.ErrStreamRestarted) {
+				buf, sent = buf[:0], 0
+				continue
+			}
+			finish()
+			return sent, false, sql.ToSQLError(err)
+		}
+		if !ok {
+			res.Tag = st.Tag()
+			finish()
+			return sent, false, nil
+		}
+		dr := &pgproto3.DataRow{Values: make([][]byte, len(row))}
+		for i, d := range row {
+			format := int16(0)
+			if formats != nil && i < len(formats) {
+				format = formats[i]
+			}
+			var col sql.ResultColumn
+			if i < len(res.Columns) {
+				col = res.Columns[i]
+			}
+			dr.Values[i] = encodeDatumIn(d, format, col, loc)
+		}
+		buf, err = dr.Encode(buf)
+		if err != nil {
+			st.Close(context.Background())
+			return sent, false, &sql.Error{Code: sql.CodeInternal, Msg: err.Error()}
+		}
+		sent++
+		if len(buf) >= streamFlushBytes && !flush() {
+			st.Close(context.Background())
+			return sent, false, &sql.Error{Code: sql.CodeInternal, Msg: "client connection lost"}
+		}
+	}
+	// Suspended: the rows go out with the PortalSuspended behind them,
+	// and the stream may not restart from here on.
+	finish()
+	st.Flushed()
+	return sent, true, nil
 }

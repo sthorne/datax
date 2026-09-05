@@ -5,7 +5,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sthorne/datax/pkg/kvpb"
+
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -24,6 +26,9 @@ type Activity struct {
 
 	mu    sync.Mutex
 	conns map[*conn]*connActivity
+	// active and idleTxn count the connections in those states (kept by
+	// setState; gauges publishes them).
+	active, idleTxn int
 	// counts by statement kind, cumulative since start.
 	counts    map[string]uint64
 	serFails  uint64
@@ -144,7 +149,10 @@ func (a *Activity) Sessions() []sql.SessionInfo {
 
 func (a *Activity) connClosed(c *conn) {
 	a.mu.Lock()
-	delete(a.conns, c)
+	if ca, ok := a.conns[c]; ok {
+		a.countState(ca.state, -1)
+		delete(a.conns, c)
+	}
 	a.mu.Unlock()
 	a.gauges()
 }
@@ -193,7 +201,8 @@ func (a *Activity) begin(c *conn, stmt parser.Statement, text string) *stmtToken
 	now := time.Now()
 	a.mu.Lock()
 	if ca, ok := a.conns[c]; ok {
-		ca.state, ca.since, ca.stmt, ca.kind = stateActive, now, truncateStmt(text), kind
+		a.setState(ca, stateActive)
+		ca.since, ca.stmt, ca.kind = now, truncateStmt(text), kind
 	}
 	a.mu.Unlock()
 	a.gauges()
@@ -209,7 +218,7 @@ type stmtToken struct {
 }
 
 // end records the statement's outcome and the connection's new state.
-func (t *stmtToken) end(res *sql.Result, serr *sql.Error, inTxn bool) {
+func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 	d := time.Since(t.start)
 	a := t.a
 	a.mu.Lock()
@@ -220,24 +229,20 @@ func (t *stmtToken) end(res *sql.Result, serr *sql.Error, inTxn bool) {
 			if ca.state != stateIdleInTxn && ca.txnSince.IsZero() {
 				ca.txnSince = t.start
 			}
-			ca.state = stateIdleInTxn
+			a.setState(ca, stateIdleInTxn)
 		} else {
-			ca.state = stateIdle
+			a.setState(ca, stateIdle)
 			ca.txnSince = time.Time{}
 		}
 	}
 	a.counts[t.kind]++
 	a.latencies.add(d)
-	rows := 0
-	if res != nil {
-		rows = len(res.Rows)
-	}
 	retry := serr != nil && serr.Code == sql.CodeSerializationFailure
 	if retry {
 		a.serFails++
 	}
 	if d >= a.slowThreshold {
-		ss := SlowStatement{At: t.start, Kind: t.kind, Text: truncateStmt(t.text), Duration: d.Microseconds(), Rows: rows, Retry: retry}
+		ss := SlowStatement{At: t.start, Kind: t.kind, Text: truncateStmt(t.text), Duration: d.Microseconds(), Rows: int(rows), Retry: retry}
 		if ca, ok := a.conns[t.c]; ok {
 			ss.User = ca.user
 		}
@@ -266,22 +271,41 @@ func (a *Activity) copied(rows int64) {
 }
 
 // gauges refreshes the connection-state gauges.
+// gauges publishes the connection counts. They are kept as the
+// connections change state (setState) rather than counted here: this
+// runs at every statement's start and end, and a walk of every
+// connection under the lock was 3 % of a busy gateway's CPU.
 func (a *Activity) gauges() {
-	open, active, idleTxn := 0, 0, 0
 	a.mu.Lock()
-	for _, ca := range a.conns {
-		open++
-		switch ca.state {
-		case stateActive:
-			active++
-		case stateIdleInTxn:
-			idleTxn++
-		}
-	}
+	open, active, idleTxn := len(a.conns), a.active, a.idleTxn
 	a.mu.Unlock()
-	metrics.SQLConnections.WithLabelValues("open").Set(float64(open))
-	metrics.SQLConnections.WithLabelValues("active").Set(float64(active))
-	metrics.SQLConnections.WithLabelValues("idle_in_txn").Set(float64(idleTxn))
+	connGauges.open.Set(float64(open))
+	connGauges.active.Set(float64(active))
+	connGauges.idleTxn.Set(float64(idleTxn))
+}
+
+// connGauges are the connection gauges' label handles, resolved once
+// (WithLabelValues hashes the label per call).
+var connGauges = struct{ open, active, idleTxn prometheus.Gauge }{
+	open:    metrics.SQLConnections.WithLabelValues("open"),
+	active:  metrics.SQLConnections.WithLabelValues("active"),
+	idleTxn: metrics.SQLConnections.WithLabelValues("idle_in_txn"),
+}
+
+// setState moves a connection to state, keeping the counts (under a.mu).
+func (a *Activity) setState(ca *connActivity, state string) {
+	a.countState(ca.state, -1)
+	ca.state = state
+	a.countState(state, 1)
+}
+
+func (a *Activity) countState(state string, d int) {
+	switch state {
+	case stateActive:
+		a.active += d
+	case stateIdleInTxn:
+		a.idleTxn += d
+	}
 }
 
 // SlowThreshold is the duration past which statements are recorded.
@@ -291,7 +315,8 @@ func (a *Activity) SlowThreshold() time.Duration { return a.slowThreshold }
 func (a *Activity) Summary() *kvpb.SQLSummary {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s := &kvpb.SQLSummary{Statements: make(map[string]uint64, len(a.counts)), ByUser: map[string]int{}}
+	s := &kvpb.SQLSummary{Statements: make(map[string]uint64, len(a.counts)), ByUser: map[string]int{},
+		PlanCacheHits: uint64(metrics.CounterValue(metrics.SQLPlanCacheHits)), PlanCacheMisses: uint64(metrics.CounterValue(metrics.SQLPlanCacheMisses))}
 	now := time.Now()
 	for _, ca := range a.conns {
 		s.Open++

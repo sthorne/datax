@@ -10,4 +10,4 @@ package version
 // version` prints the stamp along with the protocol version the binary
 // speaks. CHANGELOG.md at the repository root records what each release
 // carries.
-const Release = "0.34.0"
+const Release = "0.39.0"

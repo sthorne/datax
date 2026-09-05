@@ -29,14 +29,43 @@ replica. A message, a proposal, a read-index request or the store's one
 replicas (up to 64), ticks or steps each `RawNode`, and handles one Ready
 per replica. Their HardStates and entries are staged into **one Pebble
 batch and synced once** — group commit: ten ranges appending in the same
-moment cost one fsync — before any of them sends a message, satisfies a
-read-index waiter or applies committed entries; then each is advanced,
-and one that still has work is re-queued so every range gets a turn. A
-replica is never handled by two workers at once (work arriving during
-its pass only raises its flags). The scheduler's queue wait is
+moment cost one fsync — before any of them sends a message or satisfies
+a read-index waiter; then each is advanced, and one that still has work
+is re-queued so every range gets a turn. A replica is never handled by
+two workers at once (work arriving during its pass only raises its
+flags). The scheduler's queue wait is
 `datax_raft_scheduler_latency_seconds`; `datax_raft_log_syncs_total` and
 `datax_raft_readies_per_sync` show how many replicas each sync served.
 `PreVote` and `CheckQuorum` are enabled.
+
+**Pipelined apply** (issue #106). Committed entries are not applied
+inside the pass that committed them: the pass hands them to a second
+pool of **apply workers** (as many as raft workers), which drain each
+replica's queue in log order, one worker per replica at a time. A
+range's next append and sync therefore proceed while its previous
+entries apply, and a slow apply on one range never holds up the group
+commit of the others. Applying stays what it was — evaluate, then the
+MVCC effects and the applied index in one state-engine batch — and the
+proposer is answered when its entry has applied. Two things stay inside
+the pass: a Ready whose committed entries include a **conf change**
+applies them inline after draining the queue (raft learns of the change
+through `ApplyConfChange`, which must precede `Advance` admitting the
+next one), and a replica whose queue is over its bound (64 MiB of
+entries) gets no pass until an apply run drains it
+(`datax_raft_apply_backpressure_total`), so a follower whose apply falls
+behind its leader holds a bounded backlog. `datax_raft_apply_seconds` is
+the per-entry apply time and `datax_raft_entries_applied_total` /
+`datax_raft_entries_appended_total` the rates; a leader's quiescence
+check reads the replica's own applied index, since raft's advances when
+entries are handed over.
+
+**The cost of a write at apply.** Each MVCC write looks at what it lands
+on — an intent to conflict with, or the newest committed version to
+stay above — with one bounded seek at the key's MVCC prefix on an
+iterator the batch keeps for all its writes (`Batch.writeState`); an
+iterator per key, with the stack of memtable and sstable iterators
+behind it, was most of what a write cost (a 100-row one-phase commit
+applied in ~1 ms before, ~0.4 ms after).
 
 **Coalesced heartbeats and quiescence** (cluster version v12;
 `pkg/kvserver/quiesce.go`). Heartbeats are the one cost that scales with
@@ -417,6 +446,28 @@ deletes its own (unreplicated) log prefix when the command applies, at
 which point it has durably applied everything at or below the index;
 `TruncatedIndex/Term` persist atomically with the applied index, so
 restarts resume from the truncation point.
+
+On a **split store** (v13, issue #105; `pkg/kvserver/raftengine.go`) the
+log lives on a raft engine of its own and the state engine has no
+write-ahead log, so "applied" is not "durably applied": a state-engine
+write reaches disk when its memtable flushes. The truncation therefore
+applies like any command but **defers** its deletion: each replica
+remembers the pending index and deletes the entries at or below it — and
+writes the truncated state to the raft engine's own key — only once the
+state engine's flushed sequence number (Pebble's flush watermark) covers
+the batch that applied that index; the apply path and the housekeeping
+tick both check. Until then a crash could still need those entries: the
+replica restarts at its last flushed applied index and raft re-delivers
+the committed entries above it. The rare structural changes — a merge
+absorbing its RHS, a replica removed from its range, a catch-up
+snapshot replacing a state — flush the state engine before touching the
+raft engine, so the two never disagree about which replicas exist in a
+way replay cannot repair; raft state a crash orphaned on the raft engine
+is swept at startup when the state engine holds the range's tombstone,
+and kept otherwise (an RHS whose split the LHS is about to replay). A
+clean shutdown flushes the state engine, so a normal restart replays
+nothing; `datax_raft_replayed_entries_total` counts what a crash cost,
+`datax_raft_deferred_truncations_total` the truncations that landed.
 
 A dead or lagging voter no longer pins the log: a voter that needs a
 truncated entry is caught up by a raft snapshot instead (see the snapshot

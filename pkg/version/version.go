@@ -103,9 +103,18 @@ const (
 	// v11 node reads neither (it would drop the envelope and keep
 	// expecting per-range heartbeats), so both stay off until finalize.
 	V12 Version = 12
+	// V13 introduces the split store (pkg/kvserver/raftengine.go): the
+	// raft log and HardState move to their own engine and the
+	// state-machine engine drops its write-ahead log, replaying the raft
+	// log after a crash. A store migrates on its first start after the
+	// cluster finalizes v13 and records that it did; a v12 binary does
+	// not know the layout, so the store's own version gate refuses it
+	// (rule 4: the migration is the one upgrade step that cannot roll
+	// back).
+	V13 Version = 13
 
 	// Current is the newest cluster version this binary can run.
-	Current = V12
+	Current = V13
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

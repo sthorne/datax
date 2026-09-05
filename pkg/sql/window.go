@@ -552,6 +552,9 @@ func (s *Session) execWindowed(ctx context.Context, txn *kvclient.Txn, t *parser
 				out = append(out, conformTo(values[o.item][r], wp.items[o.item].typ))
 			}
 		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
+		}
 		res.Rows = append(res.Rows, out)
 	}
 	if t.Distinct {

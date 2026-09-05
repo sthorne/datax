@@ -230,6 +230,9 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
+| `datax_raft_replayed_entries_total` | jumps after a restart | the node came back from a crash (or an unflushed close) and re-applied that many committed entries from its raft log — expected after a crash, a sign the shutdown was not clean otherwise |
+| `datax_storage_bytes_written_total{engine="state",kind="wal"}` | increasing on a split store | the state engine is writing a WAL it should not have; the store did not migrate (`datax_storage_split` is 0: restart the node after the v13 finalize) |
+| `datax_sql_memory_limit_hits_total` | increasing | statements are failing with `53200`: a query sorts, aggregates or joins more than `statement_memory_limit` allows on the gateway — narrow it, add an index that delivers the order, or raise the limit for that session (`datax_sql_streamed_rows_total` vs the statement count says how much of the read traffic streams and never counts against the limit) |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
 one ping yields both the round trip and the peer's clock offset); the
@@ -268,7 +271,21 @@ shows how many shared each), `datax_quiescent_ranges` (idle ranges that
 stopped ticking and heartbeating; on a quiet cluster this approaches
 `datax_ranges`), `datax_raft_heartbeat_envelopes_total` /
 `datax_raft_heartbeats_coalesced_total` (the per-peer message rate and
-how many heartbeats each message carried).
+how many heartbeats each message carried),
+`datax_raft_entries_appended_total` / `datax_raft_entries_applied_total`
+(the log's write and apply rates; applied lagging appended for long is a
+store whose apply workers cannot keep up), `datax_raft_apply_seconds`
+(per-entry apply time — the single-range write ceiling is its inverse,
+see [Capacity planning](#capacity-planning)),
+`datax_raft_apply_backpressure_total` (raft passes deferred because a
+replica had more than 64 MiB of committed entries queued for apply — a
+follower falling behind its leader), `datax_latch_wait_seconds` (time
+requests spent waiting for a conflicting in-flight request's latch: key
+contention), `datax_sql_plan_cache_hits_total` /
+`datax_sql_plan_cache_misses_total` (prepared statements reusing their
+plan; a low hit rate under an ORM workload means statements are not
+being prepared, or schemas or statistics change constantly),
+`datax_sql_parse_cache_hits_total` (repeated simple-protocol texts).
 
 ## Everyday admin: `datax debug`
 
@@ -434,6 +451,12 @@ Rules of the road:
   healthy first, because finalize is the point of no return.
 - `datax debug upgrade` names any node still on the old binary instead of
   finalizing — nothing to time or coordinate.
+- **v13 needs one more rolling restart after finalize**: each node's next
+  start migrates its store to the split layout (the raft log on its own
+  engine under `--dir/raft`, the state engine without a WAL; see
+  [Deployment → Store layout](deployment.md#storage-profiles)). Until
+  that restart the node keeps running on one engine. A migrated store
+  refuses a v12 binary.
 
 ## Decommissioning a node
 
@@ -552,8 +575,25 @@ moves is paying the classic two-round commit — usually explicit
 
 Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
 
-- **A single range sustains roughly 8–10k inserted rows/s.** Every write
-  in a range goes through one raft group and one fsync'd log.
+- **One range's write ceiling is its apply rate, not its disk.** Every
+  write in a range goes through one raft group; its log is group-
+  committed (one fsync serves every entry that arrived during the
+  previous sync, so the disk's sync rate is rarely the limit — a few
+  thousand a second here), and its entries apply one at a time, in log
+  order, on the range's replicas. Measured below SQL on one range of one
+  node (`BenchmarkRangeWritePipeline`, 64-byte values, 16 writers):
+  single-row commits **~16k/s**, 100-row commits **~1,700/s** (~170k
+  rows/s), 1,000-row commits **~260/s** — about **4 µs of apply per
+  row** plus ~50 µs per commit, with the sync stubbed out changing the
+  numbers by under 10%. Roughly: rows/s per range ≈ 1 / (4 µs +
+  50 µs / rows-per-commit), so batch inserts of 100+ rows are within
+  15% of the ceiling and single-row commits reach a third of it.
+- **Through SQL an INSERT costs more than its KV write** — parsing,
+  encoding, the uniqueness probe (one read round trip per statement) and
+  the timestamp cache's bookkeeping — so a single range ingests roughly
+  **40k rows/s** of 100-row batched INSERTs on one node, and the SQL
+  layer's CPU, not the range, is what saturates first (`datax bench
+  ingest --server-url ... --server-profile cpu` shows where).
 - **A sequential primary key caps the whole table at that single-range
   rate**, no matter the cluster size — new keys always land in the last
   range. Use UUID keys or a [timeseries table](sql.md#timeseries-tables)

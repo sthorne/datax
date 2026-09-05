@@ -30,6 +30,11 @@ type TestCluster struct {
 	// concurrent readers using Node(i) — workloads that keep running while
 	// the test restarts nodes.
 	nodesMu sync.RWMutex
+	// raftEngines are the in-memory raft engines paired with the state
+	// engines StartWithEngines hands out (the split store, issue #105);
+	// Restart* reattaches them.
+	raftEngines  []*storage.Engine
+	stateEngines []*storage.Engine
 }
 
 // Node returns tc.Nodes[i] under the lock that StopNode and the Restart
@@ -94,7 +99,8 @@ func startCluster(t testing.TB, numNodes int, localities []string, opt func(*ser
 			t.Fatal(err)
 		}
 		cfg := server.Config{
-			MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+			MetricsRecordInterval: -1,               // off by default: tests own their range set; the metrics tests opt in
+			TruncationFlushAfter:  time.Millisecond, // a test's housekeeping call truncates at once
 			Listener:              listeners[i],
 			PGListener:            pglis,
 			Locality:              locality(t, localities, i),
@@ -133,15 +139,23 @@ func StartWithEngineOptions(t testing.TB, numNodes int, storageOpts storage.Opti
 	t.Helper()
 	clusterID := uuid.New()
 	engines := make([]*storage.Engine, numNodes)
+	raftEngines := make([]*storage.Engine, numNodes)
 	listeners := make([]net.Listener, numNodes)
 	nodeIDs := make([]base.NodeID, numNodes)
 	var nodeDescs []kvpb.NodeDescriptor
 	for i := 0; i < numNodes; i++ {
-		eng, err := storage.Open("", storageOpts)
+		stateOpts := storageOpts
+		stateOpts.DisableWAL = true
+		eng, err := storage.Open("", stateOpts)
 		if err != nil {
 			t.Fatal(err)
 		}
 		engines[i] = eng
+		raftOpts := storageOpts
+		raftOpts.Raft = true
+		if raftEngines[i], err = storage.Open("", raftOpts); err != nil {
+			t.Fatal(err)
+		}
 		lis, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -153,20 +167,23 @@ func StartWithEngineOptions(t testing.TB, numNodes int, storageOpts storage.Opti
 		})
 	}
 	range1 := cluster.Range1Descriptor(nodeIDs)
-	tc := &TestCluster{T: t}
+	tc := &TestCluster{T: t, raftEngines: raftEngines, stateEngines: engines}
 	for _, lis := range listeners {
 		tc.addrs = append(tc.addrs, lis.Addr().String())
 	}
 	t.Cleanup(func() {
-		for _, eng := range engines {
+		for i, eng := range engines {
 			_ = eng.Close()
+			_ = raftEngines[i].Close()
 		}
 	})
 	for i := 0; i < numNodes; i++ {
 		cfg := server.Config{
 			MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+			TruncationFlushAfter:  time.Millisecond,
 			Listener:              listeners[i],
 			Engine:                engines[i],
+			RaftEngine:            raftEngines[i],
 			GCInterval:            -1, // no background housekeeping
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
@@ -217,6 +234,7 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 	}
 	n, err := server.Start(server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		TruncationFlushAfter:  time.Millisecond,
 		Listener:              lis,
 		PGListener:            pglis,
 		Join:                  tc.Nodes[0].Addr(),
@@ -241,6 +259,7 @@ func (tc *TestCluster) AddNodeErr(opts ...func(*server.Config)) (*server.Node, e
 	}
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		TruncationFlushAfter:  time.Millisecond,
 		Listener:              lis,
 		Join:                  tc.Nodes[0].Addr(),
 		UpreplicationInterval: time.Second,
@@ -273,6 +292,7 @@ func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
 		Listener:              lis,
 		Engine:                eng,
+		RaftEngine:            tc.raftEngineFor(i, eng),
 		GCInterval:            -1,
 	}
 	for _, opt := range opts {
@@ -317,6 +337,7 @@ func startDiskNode(t testing.TB, dir string, bootstrap bool, join string, opts .
 	lis := listenerForDir(t, dir)
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		TruncationFlushAfter:  time.Millisecond,
 		Dir:                   dir,
 		Listener:              lis,
 		BootstrapSelf:         bootstrap,
@@ -363,6 +384,7 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
 		Listener:              lis,
 		Engine:                eng,
+		RaftEngine:            tc.raftEngineFor(i, eng),
 		GCInterval:            -1,
 	}
 	for _, opt := range opts {
@@ -407,6 +429,7 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
 		Listener:              lis,
 		Engine:                eng,
+		RaftEngine:            tc.raftEngineFor(i, eng),
 		Join:                  join,
 		GCInterval:            -1,
 	}
@@ -435,6 +458,26 @@ func (tc *TestCluster) StopAll() {
 	for i := range tc.Nodes {
 		tc.StopNode(i)
 	}
+}
+
+// RaftEngine returns node i's raft engine (StartWithEngines clusters; the
+// state engine itself on a single-engine store).
+func (tc *TestCluster) RaftEngine(i int) *storage.Engine {
+	if i < len(tc.raftEngines) && tc.raftEngines[i] != nil {
+		return tc.raftEngines[i]
+	}
+	return tc.stateEngines[i]
+}
+
+// raftEngineFor returns the raft engine paired with node i's state
+// engine, when eng is the state engine StartWithEngines created for it
+// (a test restarting a node on some other engine gets a single-engine
+// store).
+func (tc *TestCluster) raftEngineFor(i int, eng *storage.Engine) *storage.Engine {
+	if i < len(tc.raftEngines) && i < len(tc.stateEngines) && tc.stateEngines[i] == eng {
+		return tc.raftEngines[i]
+	}
+	return nil
 }
 
 // jsonUnmarshal avoids importing encoding/json in every test file.

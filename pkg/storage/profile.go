@@ -52,6 +52,16 @@ type Options struct {
 	// MemTableSize overrides the profile's memtable size (0 = the
 	// profile's); crash tests shrink it so flushes happen within seconds.
 	MemTableSize int
+	// DisableWAL opens the engine without a write-ahead log: a write is
+	// durable only once its memtable has flushed (Close flushes). The
+	// state-machine engine of a split store runs this way — its
+	// durability comes from the raft log (issue #105); FlushedSeqNum says
+	// what has reached an sstable.
+	DisableWAL bool
+	// Raft tunes the engine for the raft log of a split store: small
+	// memtables (the log is appended and truncated, never read back in
+	// bulk) so its flushes stay cheap.
+	Raft bool
 	// CacheSize is the block cache size in bytes (0 = the profile's
 	// DefaultCacheSize). The cache is shared by every engine of the
 	// process: the first engine's size holds until the last one closes.

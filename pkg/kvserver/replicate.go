@@ -323,6 +323,8 @@ func (s *Store) removeReplica(rangeID base.RangeID, desc kvpb.RangeDescriptor) {
 	_ = b.Put(keys.RangeTombstoneKey(rangeID), []byte("removed"))
 	if err := b.Commit(true); err != nil {
 		log.Warnf("%s: removing replica state: %v", rangeID, err)
+	} else if err := s.wipeRaftState(rangeID); err != nil {
+		log.Warnf("%s: removing replica raft state: %v", rangeID, err)
 	}
 	log.Infof("%s: replica and its data removed from this store", rangeID)
 	s.cfg.Events.Record("replica-removed", "%s: replica and its data removed from this store", rangeID)

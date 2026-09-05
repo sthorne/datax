@@ -45,6 +45,7 @@ const (
 // leads whose log has accumulated enough reclaimable entries. Exported for
 // tests and debug tooling; the housekeeping loop calls it each tick.
 func (s *Store) RunLogTruncationOnce(ctx context.Context) {
+	s.runDeferredTruncations()
 	s.VisitReplicas(func(r *Replica) bool {
 		if ctx.Err() != nil {
 			return false

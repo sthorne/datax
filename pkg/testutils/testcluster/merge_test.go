@@ -295,8 +295,19 @@ func TestMergeFrozenAndRecovery(t *testing.T) {
 		RequestHeader: kvpb.RequestHeader{Key: sr.Right.StartKey, EndKey: sr.Right.EndKey},
 		MergeInto:     sr.Left.RangeID,
 	})
-	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
-		t.Fatalf("subsume: %v", kerr)
+	// The split's campaign for the RHS runs asynchronously (a client
+	// reaching the RHS through routing retries NotLeader); executing on
+	// the replica directly, wait for it.
+	deadlineLead := time.Now().Add(20 * time.Second)
+	for {
+		_, kerr := rhs.Execute(ctx, sub)
+		if kerr == nil {
+			break
+		}
+		if kerr.NotLeader == nil || time.Now().After(deadlineLead) {
+			t.Fatalf("subsume: %v", kerr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Frozen: direct writes to the RHS are refused.

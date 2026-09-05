@@ -241,6 +241,10 @@ type SQLSummary struct {
 	Statements            map[string]uint64 `json:"statements,omitempty"`
 	SerializationFailures uint64            `json:"serialization_failures"`
 	CopyRows              uint64            `json:"copy_rows"`
+	// PlanCacheHits and PlanCacheMisses count statement executions that
+	// reused a session's cached plan and those planned in full.
+	PlanCacheHits   uint64 `json:"plan_cache_hits"`
+	PlanCacheMisses uint64 `json:"plan_cache_misses"`
 	// Statement latency percentiles over the node's recent ring.
 	P50Micros int64 `json:"p50_us"`
 	P99Micros int64 `json:"p99_us"`
