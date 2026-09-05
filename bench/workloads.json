@@ -11,6 +11,7 @@
     {"name": "index-join-1pct",  "args": ["index-join", "--preload", "20000", "--groups", "100", "--payload-bytes", "512", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
     {"name": "index-join-10pct", "args": ["index-join", "--preload", "20000", "--groups", "10", "--payload-bytes", "512", "--concurrency", "4", "--duration", "20s", "--seed", "1"]},
     {"name": "scan",             "args": ["scan", "--preload", "20000", "--payload-bytes", "256", "--concurrency", "4", "--duration", "20s", "--seed", "1"]},
+    {"name": "scan-200k",        "args": ["scan", "--preload", "200000", "--payload-bytes", "256", "--concurrency", "2", "--duration", "30s", "--seed", "1"]},
     {"name": "kv-50-50-1000-ranges",      "args": ["kv", "--read-pct", "50", "--preload", "10000", "--presplit", "1000", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},
     {"name": "ingest-random-1000-ranges", "args": ["ingest", "--keys", "random", "--presplit", "1000", "--batch", "100", "--payload-bytes", "256", "--concurrency", "8", "--duration", "20s", "--seed", "1"]}
   ]

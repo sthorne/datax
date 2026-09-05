@@ -178,6 +178,15 @@ var (
 	SQLCopyRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_copy_rows_total", Help: "Rows loaded through COPY FROM STDIN.",
 	})
+	SQLStreamedRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_streamed_rows_total", Help: "Result rows delivered by streaming SELECTs (pulled from KV page by page as the client reads).",
+	})
+	SQLStreamRestarts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_stream_restarts_total", Help: "Streaming SELECTs re-run from the start after a retryable error before any row reached the client.",
+	})
+	SQLMemoryLimitHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_memory_limit_hits_total", Help: "Statements refused with 53200 for exceeding statement_memory_limit.",
+	})
 
 	TableRanges = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "datax_table_ranges", Help: "Ranges covering each table's key space (refreshed with the schema browser's cache).",

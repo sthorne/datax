@@ -1400,6 +1400,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 				if !match {
 					continue
 				}
+				if err := s.chargeRow(row); err != nil {
+					return false, err
+				}
 				out = append(out, fetchedRow{key: pk, row: row})
 				if limit > 0 && int64(len(out)) == limit {
 					return false, nil
@@ -1419,53 +1422,21 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		// The plan's pinned prefix and bounds constrain the logical PK; on
 		// a sharded table (fanBuckets > 0) that is PrimaryKey[1:], and the
 		// scan runs once per bucket with the bucket value prepended.
-		pkCols := desc.PrimaryKey
-		if plan.fanBuckets > 0 {
-			pkCols = pkCols[1:]
-		}
-		buildSpan := func(prefix keys.Key) (keys.Key, keys.Key, error) {
-			for i, d := range plan.idxVals {
-				col, _ := desc.ColByID(pkCols[i])
-				var err error
-				prefix, err = rowenc.AppendKeyDatum(prefix, col.Type, d)
-				if err != nil {
-					return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
-				}
-			}
-			var fam types.Family
-			if plan.hasBounds() {
-				col, _ := desc.ColByID(pkCols[len(plan.idxVals)])
-				fam = col.Type
-			}
-			start, end, err := plan.spanBounds(prefix, fam)
-			if err != nil {
-				return nil, nil, newErrf(CodeInternal, "pk bound: %v", err)
-			}
-			return start, end, nil
+		spans, err := pkScanSpans(desc, plan)
+		if err != nil {
+			return nil, err
 		}
 		if plan.fanBuckets == 0 {
-			start, end, err := buildSpan(rowenc.PrimaryKeyPrefixFor(desc))
-			if err != nil {
-				return nil, err
-			}
-			return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+			return s.scanPrimarySpan(ctx, txn, desc, plan, spans[0].start, spans[0].end, where, params, limit)
 		}
 		runs := make([][]fetchedRow, 0, plan.fanBuckets)
-		for b := int32(0); b < plan.fanBuckets; b++ {
-			bp, err := rowenc.AppendKeyDatum(rowenc.PrimaryKeyPrefixFor(desc), types.Int, types.NewInt(int64(b)))
-			if err != nil {
-				return nil, newErrf(CodeInternal, "shard bound: %v", err)
-			}
-			start, end, err := buildSpan(bp)
-			if err != nil {
-				return nil, err
-			}
+		for _, sp := range spans {
 			// The limit is only an upper bound per span (each span alone
 			// cannot yield more result rows than the global limit); the
 			// global limit re-applies below — and, without mergeFan, the
 			// caller re-applies it after sorting when there is an ORDER
 			// BY, in which case it passes limit 0 here.
-			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+			rows, err := s.scanPrimarySpan(ctx, txn, desc, plan, sp.start, sp.end, where, params, limit)
 			if err != nil {
 				return nil, err
 			}
@@ -1560,6 +1531,9 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 		if !match {
 			continue
 		}
+		if err := s.chargeRow(row); err != nil {
+			return nil, err
+		}
 		out = append(out, fetchedRow{key: kv.Key, row: row})
 		if limit > 0 && int64(len(out)) == limit {
 			break
@@ -1650,6 +1624,11 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	// Only the statement's own select may stream; every select run
+	// underneath (WITH members, derived tables, set members, subqueries)
+	// sees the flag cleared and materializes.
+	top := s.streamTop
+	s.streamTop = false
 	if len(t.With) > 0 {
 		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
 		if err != nil {
@@ -1880,6 +1859,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			plan.reverse, plan.mergeFan = dec.reverse, dec.mergeFan
 		}
 	}
+	if s.streamable(top, desc, plan, t, needSort, corr, corrProjs) {
+		return s.newScanStream(txn, desc, plan, t, proj, t.Where, params, fetchLimit)
+	}
 	rows, err := s.executePlan(ctx, txn, desc, plan, t.Where, params, fetchLimit)
 	if err != nil {
 		return nil, err
@@ -1973,6 +1955,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if !d.Null {
 				res.Columns[projAt[i]].Type = d.Fam
 			}
+		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
 		}
 		res.Rows = append(res.Rows, out)
 	}

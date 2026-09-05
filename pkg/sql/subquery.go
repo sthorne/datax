@@ -863,6 +863,9 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 			return nil, err
 		}
 		if match {
+			if err := s.chargeRow(row); err != nil {
+				return nil, err
+			}
 			rows = append(rows, fetchedRow{row: row})
 		}
 	}
@@ -903,6 +906,9 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 				d = types.DNull
 			}
 			out[i] = d
+		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
 		}
 		res.Rows = append(res.Rows, out)
 	}

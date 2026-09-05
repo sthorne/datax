@@ -230,6 +230,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
+| `datax_sql_memory_limit_hits_total` | increasing | statements are failing with `53200`: a query sorts, aggregates or joins more than `statement_memory_limit` allows on the gateway — narrow it, add an index that delivers the order, or raise the limit for that session (`datax_sql_streamed_rows_total` vs the statement count says how much of the read traffic streams and never counts against the limit) |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
 one ping yields both the round trip and the peer's clock offset); the

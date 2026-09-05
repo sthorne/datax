@@ -783,6 +783,9 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				res.Columns[projAt[i]].Type = d.Fam
 			}
 		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
+		}
 		res.Rows = append(res.Rows, out)
 	}
 	if t.Distinct {

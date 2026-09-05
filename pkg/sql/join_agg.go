@@ -298,6 +298,9 @@ func (s *Session) execGroupedJoin(sides []joinSide, joined []joinedRow, t *parse
 		for i, ref := range refs {
 			row[catalog.ColumnID(i+1)] = jr.datum(ref)
 		}
+		if err := s.chargeRow(row); err != nil {
+			return nil, err
+		}
 		rows = append(rows, fetchedRow{row: row})
 	}
 	return s.execGroupedOver(desc, rows, sel, params)

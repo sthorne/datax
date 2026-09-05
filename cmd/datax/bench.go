@@ -49,6 +49,10 @@ type benchResult struct {
 	P50us        int64            `json:"p50_us"`
 	P95us        int64            `json:"p95_us"`
 	P99us        int64            `json:"p99_us"`
+	// FirstRowP50us / FirstRowP99us are the scan and index-join workloads'
+	// time to the first row of each result set (streaming, issue #104).
+	FirstRowP50us int64 `json:"first_row_p50_us,omitempty"`
+	FirstRowP99us int64 `json:"first_row_p99_us,omitempty"`
 	// Metrics are the server's counter deltas over the run (every plain
 	// datax_* series that moved), from --server-url or --metrics-url.
 	Metrics map[string]float64 `json:"metrics,omitempty"`
@@ -351,6 +355,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	var ops, errs, retries, rowsOut atomic.Int64
 	var latMu sync.Mutex
 	var lats []time.Duration
+	var firstLats []time.Duration // time to first row (scan, index-join)
 	var errSampleMu sync.Mutex
 	errSamples := map[string]int64{}
 	noteError := func(err error) {
@@ -565,14 +570,22 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 						}
 					}
 					_, err = conn.Exec(ctx, sb.String())
-				case "index-join":
+				case "index-join", "scan":
+					q := "SELECT k, pad FROM " + scanTable
+					if workload == "index-join" {
+						q = fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups))
+					}
 					var n int64
-					n, err = countRows(ctx, conn, fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups)))
+					var first time.Duration
+					n, first, err = countRows(ctx, conn, q)
 					rowsOut.Add(n)
-				case "scan":
-					var n int64
-					n, err = countRows(ctx, conn, "SELECT k, pad FROM "+scanTable)
-					rowsOut.Add(n)
+					if err == nil {
+						latMu.Lock()
+						if len(firstLats) < 200000 {
+							firstLats = append(firstLats, first)
+						}
+						latMu.Unlock()
+					}
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
@@ -634,6 +647,12 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		res.P50us, res.P95us, res.P99us = pct(0.50).Microseconds(), pct(0.95).Microseconds(), pct(0.99).Microseconds()
 		fmt.Printf("  latency:    p50 %s  p95 %s  p99 %s\n",
 			pct(0.50).Round(time.Microsecond), pct(0.95).Round(time.Microsecond), pct(0.99).Round(time.Microsecond))
+	}
+	if len(firstLats) > 0 {
+		sort.Slice(firstLats, func(i, j int) bool { return firstLats[i] < firstLats[j] })
+		fpct := func(p float64) time.Duration { return firstLats[int(float64(len(firstLats)-1)*p)] }
+		res.FirstRowP50us, res.FirstRowP99us = fpct(0.50).Microseconds(), fpct(0.99).Microseconds()
+		fmt.Printf("  first row:  p50 %s  p99 %s\n", fpct(0.50).Round(time.Microsecond), fpct(0.99).Round(time.Microsecond))
 	}
 	latMu.Unlock()
 	if profileDone != nil {
@@ -722,19 +741,25 @@ func execRetrying(ctx context.Context, conn *pgx.Conn, q string) error {
 	return err
 }
 
-// countRows runs a query and drains it, returning the row count (the
-// scan and index-join workloads measure result-set delivery).
-func countRows(ctx context.Context, conn *pgx.Conn, q string) (int64, error) {
+// countRows runs a query and drains it, returning the row count and the
+// time to its first row (the scan and index-join workloads measure
+// result-set delivery).
+func countRows(ctx context.Context, conn *pgx.Conn, q string) (int64, time.Duration, error) {
+	start := time.Now()
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer rows.Close()
 	var n int64
+	var first time.Duration
 	for rows.Next() {
+		if n == 0 {
+			first = time.Since(start)
+		}
 		n++
 	}
-	return n, rows.Err()
+	return n, first, rows.Err()
 }
 
 func writeJSON(path string, v any) error {
@@ -991,11 +1016,13 @@ func runBenchCompare(args []string) error {
 		{"p50 µs", func(r *benchResult) float64 { return float64(r.P50us) }, false, "%.0f"},
 		{"p95 µs", func(r *benchResult) float64 { return float64(r.P95us) }, false, "%.0f"},
 		{"p99 µs", func(r *benchResult) float64 { return float64(r.P99us) }, false, "%.0f"},
+		{"1st row p50 µs", func(r *benchResult) float64 { return float64(r.FirstRowP50us) }, false, "%.0f"},
+		{"1st row p99 µs", func(r *benchResult) float64 { return float64(r.FirstRowP99us) }, false, "%.0f"},
 		{"errors", func(r *benchResult) float64 { return float64(r.Errors) }, false, "%.0f"},
 		{"retries", func(r *benchResult) float64 { return float64(r.Retries) }, false, "%.0f"},
 	}
 	regressions := 0
-	fmt.Printf("%-24s %-9s %14s %14s %9s\n", "workload", "metric", "before", "after", "delta")
+	fmt.Printf("%-24s %-14s %14s %14s %9s\n", "workload", "metric", "before", "after", "delta")
 	for _, n := range names {
 		b, a := before[n], after[n]
 		for _, m := range metrics {
@@ -1022,7 +1049,7 @@ func runBenchCompare(args []string) error {
 					regressions++
 				}
 			}
-			fmt.Printf("%-24s %-9s %14s %14s %9s%s\n", n, m.name, fmt.Sprintf(m.fmt, bv), fmt.Sprintf(m.fmt, av), delta, flag)
+			fmt.Printf("%-24s %-14s %14s %14s %9s%s\n", n, m.name, fmt.Sprintf(m.fmt, bv), fmt.Sprintf(m.fmt, av), delta, flag)
 		}
 	}
 	fmt.Printf("\n! beyond ±%.0f%%; !! a regression (lower throughput or higher latency, errors, retries)\n", *threshold)

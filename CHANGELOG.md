@@ -8,6 +8,32 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.35.0 — unreleased
+
+### Changed
+- Streaming SELECT execution (#104). A scan-shaped `SELECT` — one
+  table, no join, aggregate, `DISTINCT`, window, set operation,
+  correlated subquery or in-memory sort — no longer materializes its
+  result on the gateway: the wire layer pulls rows from KV in pages of
+  512 as it writes them, flushing every 64 kB, so the first row leaves
+  before the last is read and a full-table `SELECT` holds one page at a
+  time. A row-limited `Execute` (JDBC fetch sizes) pulls its rows on
+  demand and a suspended portal keeps the scan open. An error after
+  rows have gone out (a bad row, a cancellation, `statement_timeout`)
+  arrives after them, as in PostgreSQL; an implicit transaction re-runs
+  the statement on a retryable error only while nothing has been
+  flushed, otherwise the `40001` is surfaced. `datax_sql_streamed_rows_total`,
+  `datax_sql_stream_restarts_total`.
+- `statement_memory_limit` (default `64MB`; `0` = none). The paths that
+  do materialize — sorts, aggregates, joins, `DISTINCT`, `WITH` members,
+  derived tables, index joins that collect their rows — charge what they
+  hold against it and fail with `53200` beyond it instead of growing
+  without bound. `SET`, `SET LOCAL`, `RESET`, `SHOW`, `pg_settings`;
+  `datax_sql_memory_limit_hits_total`.
+- `datax bench` records the time to the first row of the `scan` and
+  `index-join` workloads (`first_row_p50_us`, `first_row_p99_us`;
+  `bench compare` shows them).
+
 ## 0.34.0 — unreleased
 
 ### Changed

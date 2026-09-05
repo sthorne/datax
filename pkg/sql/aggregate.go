@@ -879,6 +879,9 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 				out = append(out, aggVals[oc.aggPos])
 			}
 		}
+		if err := s.chargeDatums(out); err != nil {
+			return nil, err
+		}
 		res.Rows = append(res.Rows, out)
 	}
 

@@ -43,8 +43,10 @@ const (
 	CodeCheckViolation         = "23514"
 	CodeForeignKeyViolation    = "23503"
 	CodeProgramLimitExceeded   = "54000"
-	CodeInvalidRegexp          = "2201B"
-	CodeInvalidParameterValue  = "22023"
+	// statement_memory_limit exceeded.
+	CodeOutOfMemory           = "53200"
+	CodeInvalidRegexp         = "2201B"
+	CodeInvalidParameterValue = "22023"
 	// DECIMAL(p,s): integer digits exceed precision−scale.
 	CodeNumericValueOutOfRange = "22003"
 	// COPY FROM STDIN.

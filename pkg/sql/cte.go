@@ -108,6 +108,9 @@ func (s *Session) relationRows(desc *catalog.TableDescriptor, where []parser.Com
 		if !ok {
 			continue
 		}
+		if err := s.chargeRow(row); err != nil {
+			return nil, err
+		}
 		out = append(out, fetchedRow{row: row})
 		if limit > 0 && int64(len(out)) >= limit {
 			break

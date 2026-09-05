@@ -209,7 +209,7 @@ type stmtToken struct {
 }
 
 // end records the statement's outcome and the connection's new state.
-func (t *stmtToken) end(res *sql.Result, serr *sql.Error, inTxn bool) {
+func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 	d := time.Since(t.start)
 	a := t.a
 	a.mu.Lock()
@@ -228,16 +228,12 @@ func (t *stmtToken) end(res *sql.Result, serr *sql.Error, inTxn bool) {
 	}
 	a.counts[t.kind]++
 	a.latencies.add(d)
-	rows := 0
-	if res != nil {
-		rows = len(res.Rows)
-	}
 	retry := serr != nil && serr.Code == sql.CodeSerializationFailure
 	if retry {
 		a.serFails++
 	}
 	if d >= a.slowThreshold {
-		ss := SlowStatement{At: t.start, Kind: t.kind, Text: truncateStmt(t.text), Duration: d.Microseconds(), Rows: rows, Retry: retry}
+		ss := SlowStatement{At: t.start, Kind: t.kind, Text: truncateStmt(t.text), Duration: d.Microseconds(), Rows: int(rows), Retry: retry}
 		if ca, ok := a.conns[t.c]; ok {
 			ss.User = ca.user
 		}

@@ -186,8 +186,11 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
 - pgx (native and `database/sql`), lib/pq, and psql work, in both simple
   and extended protocol modes, text and binary formats.
 - Prepared statements and portal suspension both work — JDBC-style fetch
-  sizes are fine. The full result is materialized server-side at the
-  first Execute and served in fetch-size chunks, so a fetch limit bounds
-  wire traffic per round trip, not server memory.
+  sizes are fine. A scan-shaped `SELECT` (one table, no sort, aggregate,
+  join, `DISTINCT` or window) streams: each fetch pulls the next rows
+  from storage, so a fetch limit bounds server memory too. Results that
+  sort, aggregate or join are materialized at the first Execute and
+  served in fetch-size chunks, under `statement_memory_limit` (`53200`
+  beyond it).
 - `sslmode=verify-full` works in secure mode with the datax CA
   ([Security](security.md)); `sslmode=disable` in insecure mode.

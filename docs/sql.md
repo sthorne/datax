@@ -458,6 +458,28 @@ exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`.
 
+**Streaming.** On a wire session a scan-shaped select — one table, a
+scan plan (full, primary-key range or index), no join, aggregate,
+DISTINCT, window, set operation, correlated conjunct or projection, no
+`FOR UPDATE`, and any ORDER BY satisfied by the access path — returns a
+`RowStream` instead of rows (`pkg/sql/stream.go`): the wire layer pulls
+one row at a time, the iterator fetches KV pages of 512 (an index scan
+pages its entries and fetches each page's primary rows in the #103
+batches), and OFFSET / LIMIT apply as rows are pulled. The stream owns
+an implicit transaction (committed when drained, rolled back on error
+or when the portal is released) or rides the session's explicit block
+(an error fails it). A retryable error re-runs the statement on a fresh
+transaction only while the wire layer has flushed nothing; the wire
+layer buffers encoded rows and writes every 64 kB, reporting the first
+write to the stream, after which an error is surfaced after the rows
+already sent. `statement_timeout` and `lock_timeout` apply to every
+pull. `EXPLAIN ANALYZE` materializes (its stage accounting needs the
+counts); internal sessions (the dashboard, the metrics recorder) never
+stream. Everything that materializes — scans collecting their rows,
+sorts, aggregates, joins, DISTINCT, WITH members, derived tables —
+charges an estimate of what it holds against `statement_memory_limit`
+(64 MiB by default) and fails with `53200` past it.
+
 Whether an ORDER BY is satisfied is decided by `orderPlan`: skipping
 columns the plan pins by equality (constants order nothing), the
 remaining terms must follow the path's natural key order — all ascending,
@@ -638,8 +660,9 @@ explicit `BEGIN ... COMMIT`.
   returns up to that many rows and `PortalSuspended`; re-Execute resumes,
   and portals live to the end of the transaction (destroyed by Sync
   outside one) — JDBC fetch-size loops work. The statement runs once at
-  the first Execute and the result is served from the materialized rows
-  (streaming resumption from KV is a possible later optimization).
+  the first Execute; a streamed result is pulled MaxRows rows per
+  Execute from the open scan, a materialized one is served from its
+  rows.
 - **Copy-in sub-protocol**: `COPY t [(cols)] FROM STDIN [WITH (FORMAT
   text|csv|binary)]` (also pgx's pre-9.0 trailing `BINARY` spelling) is
   accepted in the simple protocol, as the last statement of the query.

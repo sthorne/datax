@@ -49,7 +49,7 @@ duration, so two runs draw the same keys:
 | `ingest-random`, `ingest-sequential`, `ingest-uuid` | batched INSERTs with random integer, per-worker monotone, and UUID text keys |
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
-| `scan` | large result sets streamed through pgwire |
+| `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)

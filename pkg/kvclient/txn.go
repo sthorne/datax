@@ -195,6 +195,15 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 // timestamp, never a cached or leased current one.
 func (t *Txn) Historical() bool { return t.historical }
 
+// BumpPriority makes the transaction push harder than prev did: the
+// retry loops give each attempt one more point of conflict priority.
+func (t *Txn) BumpPriority(prev *Txn) {
+	pri := prev.proto().Priority + 1
+	t.mu.Lock()
+	t.mu.txn.Priority = pri
+	t.mu.Unlock()
+}
+
 // TestingSetPriority overrides the transaction's conflict priority.
 // Deadlock tests use equal priorities so priority-based aborts (which
 // require a strictly greater pusher) cannot fire and cycle detection is
