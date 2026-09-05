@@ -16,17 +16,36 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 )
 
+// waitForDatabases waits until the v6 catalog is ready and the gateway's
+// cluster-version mirror has caught up (the version-gated DDL — expression
+// defaults, constraints, views — reads the mirror, which starts at the
+// floor until the first heartbeat).
 func waitForDatabases(t *testing.T, ctx context.Context, s *sql.Session) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if _, serr := trySQL(ctx, s, `CREATE DATABASE IF NOT EXISTS probe_db`); serr == nil {
 			execSQL(t, ctx, s, `DROP DATABASE probe_db`)
-			return
+			break
 		} else if time.Now().After(deadline) {
 			t.Fatalf("the v6 catalog never became ready: %v", serr)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	// The mirror converges to the finalized version (Current on a fresh
+	// cluster; a test's BinaryVersionOverride otherwise).
+	for {
+		want, err := s.FinalizedClusterVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.ClusterVersion() >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the cluster-version mirror never reached %s (at %s)", want, s.ClusterVersion())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

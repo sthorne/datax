@@ -21,6 +21,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // resolveAsOf turns an AS OF SYSTEM TIME operand into a fixed timestamp:
@@ -179,6 +180,28 @@ func (s *Session) User() string { return s.user }
 
 // Database returns the session's current database.
 func (s *Session) Database() string { return s.database }
+
+// ClusterVersion is the cluster version the session's gateway observes
+// (its version-gated DDL keys off this mirror, which starts at the floor
+// and catches up with the first heartbeat).
+func (s *Session) ClusterVersion() version.Version { return s.db.ClusterVersion() }
+
+// FinalizedClusterVersion reads the replicated cluster version the
+// upgrade finalized (the value the gateway's mirror converges to).
+func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version, error) {
+	raw, err := s.db.Get(ctx, keys.ClusterVersionKey())
+	if err != nil {
+		return 0, err
+	}
+	if raw == nil {
+		return version.V1, nil
+	}
+	v, err := strconv.Atoi(string(raw))
+	if err != nil {
+		return 0, err
+	}
+	return version.Version(v), nil
+}
 
 // settings lists the session variables SHOW ALL and pg_settings report:
 // the wire's startup parameters plus the ones the session honors.
