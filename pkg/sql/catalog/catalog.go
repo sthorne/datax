@@ -59,9 +59,18 @@ type Column struct {
 	// column" stay distinguishable.
 	FillDefault bool `json:"fill_default,omitempty"`
 	// Hidden marks a system-managed column (the _shard bucket of a
-	// sharded timeseries table): invisible to SELECT *, not an INSERT
-	// target, and filled by the executor.
+	// sharded timeseries table, CREATE TABLE AS's rowid key, the shadow
+	// of an ALTER COLUMN TYPE rewrite): invisible to SELECT *, not an
+	// INSERT target, and filled by the executor.
 	Hidden bool `json:"hidden,omitempty"`
+	// Comment is COMMENT ON COLUMN's text ("" = none).
+	Comment string `json:"comment,omitempty"`
+	// RetypeFrom, on a hidden shadow column, names the column it is the
+	// retyped copy of (ALTER COLUMN TYPE, pkg/sql/retype.go): every row
+	// write derives the shadow's value from the original's, so the
+	// backfill and concurrent writers converge; the swap makes the
+	// shadow the column. Cluster version v9.
+	RetypeFrom ColumnID `json:"retype_from,omitempty"`
 }
 
 // IndexDescriptor describes a secondary index. Entries live at
@@ -73,6 +82,8 @@ type IndexDescriptor struct {
 	Name      string     `json:"name"`
 	Unique    bool       `json:"unique,omitempty"`
 	ColumnIDs []ColumnID `json:"column_ids"`
+	// Comment is COMMENT ON INDEX's text ("" = none).
+	Comment string `json:"comment,omitempty"`
 	// State is the index's lifecycle state: "" or "public" = readable;
 	// "write-only" = maintained by writers but invisible to the planner
 	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
@@ -177,6 +188,8 @@ type TableDescriptor struct {
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
+	// Comment is COMMENT ON TABLE / VIEW's text ("" = none).
+	Comment string `json:"comment,omitempty"`
 	// ViewQuery is the SELECT a view stands for, as SQL text; a
 	// descriptor carrying one is a view (cluster version v9): it owns no
 	// rows and no primary key, Columns describe the query's output, and

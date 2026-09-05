@@ -8,6 +8,22 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.23.0 — unreleased
+
+### Added
+- DDL completeness, part three (#95, closing it): `CREATE TABLE ... AS
+  query [WITH NO DATA]` (the query's shape and rows, streamed through
+  the COPY chunk path; a hidden `rowid` key unless `PRIMARY KEY (cols)`
+  is written among the column names; `SELECT ... INTO` refused with a
+  pointer), `CREATE TABLE ... (LIKE t [INCLUDING | EXCLUDING DEFAULTS |
+  CONSTRAINTS | INDEXES | COMMENTS | ALL])`, `ALTER TABLE ... ALTER
+  COLUMN c [SET DATA] TYPE t` as an online rewrite (a hidden shadow
+  column every write fills, a chunked conversion of the existing rows,
+  a swap; widening and text conversions; cluster version v9), and
+  `COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL` with
+  `obj_description`, `col_description` and `pg_description` (psql's
+  `\d+`, `\dt+`).
+
 ## 0.22.0 — unreleased
 
 ### Added

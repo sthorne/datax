@@ -32,7 +32,10 @@ const (
 // Fixed namespace (schema) OIDs, PostgreSQL's own for the two builtin
 // schemas.
 const (
-	OIDPgCatalog         = 11
+	OIDPgCatalog = 11
+	// OIDPgClass is pg_class's own OID: the classoid of relation, index
+	// and column comments in pg_description.
+	OIDPgClass           = 1259
 	OIDPublic            = 2200
 	OIDInformationSchema = 12
 )
@@ -490,6 +493,10 @@ func HiddenColumnFor(fn string) string {
 		return "__expr"
 	case "pg_get_viewdef":
 		return "__viewdef"
+	case "obj_description":
+		return "__obj_description"
+	case "col_description":
+		return "__col_description"
 	}
 	return "__" + fn
 }

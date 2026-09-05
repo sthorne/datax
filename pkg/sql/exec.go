@@ -66,6 +66,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDropIndex(ctx, txn, t)
 	case *parser.CreateView:
 		return s.execCreateView(ctx, txn, t)
+	case *parser.CommentOn:
+		return s.execCommentOn(ctx, txn, t)
 	case *parser.DropView:
 		return s.execDropView(ctx, txn, t)
 	case *parser.AlterIndex:
@@ -116,6 +118,13 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 }
 
 func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *parser.CreateTable) (*Result, error) {
+	if t.As != nil {
+		return nil, newErrf(CodeActiveTransaction, "CREATE TABLE ... AS cannot run inside a transaction block")
+	}
+	t, likeIndexes, err := s.expandLike(ctx, txn, t)
+	if err != nil {
+		return nil, err
+	}
 	dbName, bare := catalog.SplitTableName(t.Name)
 	if dbName == "" {
 		dbName = s.database
@@ -145,6 +154,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			ID: catalog.ColumnID(i + 1), Name: cd.Name, Type: cd.Type, NotNull: cd.NotNull,
 			Precision: cd.Precision, Scale: cd.Scale,
 		}
+		col.Hidden = cd.Hidden
 		if cd.Default != nil && !cd.Default.Null {
 			d, cerr := cd.Default.Coerce(cd.Type)
 			if cerr != nil {
@@ -261,7 +271,12 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
-	if owned || constrained {
+	if len(likeIndexes) > 0 {
+		if err := addLikeIndexes(desc, likeIndexes); err != nil {
+			return nil, err
+		}
+	}
+	if owned || constrained || len(likeIndexes) > 0 {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}

@@ -250,6 +250,15 @@ func (d Datum) DecimalVal() (decimal.Dec, error) {
 
 // Coerce converts d to the target family (e.g. an int literal into a FLOAT8
 // column), or errors when the conversion is lossy/invalid.
+// ConvertTo is Coerce plus the rendering conversion to TEXT (any value's
+// canonical text) — the cast ALTER COLUMN TYPE applies.
+func (d Datum) ConvertTo(target Family) (Datum, error) {
+	if !d.Null && target == String && d.Fam != String {
+		return NewString(d.Text()), nil
+	}
+	return d.Coerce(target)
+}
+
 func (d Datum) Coerce(target Family) (Datum, error) {
 	if d.Null {
 		return DNull, nil

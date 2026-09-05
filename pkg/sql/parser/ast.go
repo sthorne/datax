@@ -127,6 +127,9 @@ type ColumnDef struct {
 	// and ignored (documented).
 	Precision int32
 	Scale     int32
+	// Hidden marks a system-managed column (CREATE TABLE AS's rowid
+	// primary key); never parsed.
+	Hidden bool
 	// Constraints are the column's UNIQUE, CHECK and REFERENCES clauses,
 	// as table constraints over this one column.
 	Constraints []ConstraintDef
@@ -159,7 +162,20 @@ type CreateTable struct {
 	Name        string
 	IfNotExists bool
 	Columns     []ColumnDef
-	PrimaryKey  []string // table-level constraint (column names)
+	// Like lists the LIKE source tables of the column list, in order,
+	// each expanded into columns (and, per its options, defaults,
+	// constraints and indexes) where it was written.
+	Like []LikeClause
+	// As is CREATE TABLE ... AS query: the table takes the query's
+	// output columns (Columns then holds at most the column names to
+	// use) and, unless NoData, its rows. AsText is the query as written.
+	As     *Select
+	AsText string
+	NoData bool
+	// AsColumns are the column names given before AS (CREATE TABLE t (a,
+	// b) AS ...), positional over the query's output.
+	AsColumns  []string
+	PrimaryKey []string // table-level constraint (column names)
 	// PrimaryKeyName is an explicit CONSTRAINT name on the primary key
 	// (accepted; the primary key is always named <table>_pkey).
 	PrimaryKeyName string
@@ -168,6 +184,40 @@ type CreateTable struct {
 	// names mapping to raw literal text (e.g. timeseries=true,
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
+}
+
+// LikeClause is LIKE source [INCLUDING | EXCLUDING option ...] inside a
+// CREATE TABLE column list. The primary key is always copied (a table
+// needs one); Defaults, Constraints and Indexes follow the options
+// (INCLUDING ALL sets every one). Position is the index in Columns
+// before which the copied columns go.
+type LikeClause struct {
+	Table       string
+	Defaults    bool
+	Constraints bool
+	Indexes     bool
+	Comments    bool
+	Position    int
+}
+
+// CommentOn is COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text'
+// | NULL. Kind is "table" (views too), "index" or "column"; Column is
+// the column name for Kind "column" (Name then names the table).
+type CommentOn struct {
+	Kind   string
+	Name   string
+	Column string
+	// Text is the comment; nil removes it (IS NULL).
+	Text *string
+}
+
+// SetType is ALTER [COLUMN] c [SET DATA] TYPE t: the column and the new
+// type with its DECIMAL typmod.
+type SetType struct {
+	Column    string
+	Type      types.Family
+	Precision int32
+	Scale     int32
 }
 
 // SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an
@@ -564,6 +614,8 @@ type AlterTable struct {
 	// ALTER [COLUMN] c DROP DEFAULT (the column name).
 	SetDefault  *SetDefault
 	DropDefault string
+	// SetType is ALTER [COLUMN] c [SET DATA] TYPE t (an online rewrite).
+	SetType *SetType
 	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
 	// shards = N, the online re-shard.
 	SetOptions map[string]string
@@ -718,6 +770,7 @@ func (*ShowFunctions) stmt()       {}
 func (*CreateIndex) stmt()         {}
 func (*DropIndex) stmt()           {}
 func (*CreateView) stmt()          {}
+func (*CommentOn) stmt()           {}
 func (*DropView) stmt()            {}
 func (*AlterIndex) stmt()          {}
 func (*Truncate) stmt()            {}

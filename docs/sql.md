@@ -16,6 +16,10 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
 CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
+CREATE TABLE t [(names [, PRIMARY KEY (cols)])] AS SELECT ... [WITH [NO] DATA]   -- streamed through the COPY chunk path
+CREATE TABLE t (LIKE src [INCLUDING | EXCLUDING DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL], ...)
+ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE type       -- online rewrite: shadow column, chunked convert, swap
+COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text' | NULL
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -269,6 +273,16 @@ the materialized rows through the ordinary access path, so a view works
 wherever a table does and a view over a view expands as the member
 executes. Views record the relations they read (`ViewDepends`) for the
 drop / rename refusals; DML and physical DDL on a view are refused.
+
+`ALTER COLUMN TYPE` is the third online state machine: publish a
+hidden shadow column (`RetypeFrom` names the original; every
+`rowenc.EncodeValue` derives the shadow's value from the original's,
+so concurrent writers converge with the backfill), drain, convert the
+existing rows in chunks as of a boundary, then swap the shadow into the
+column's slot and drop the original — a failure after publish removes
+the shadow and drains. `CREATE TABLE ... AS` creates the table, drains,
+runs the query once and streams the rows through the `COPY` chunk
+path; a failure drops the table again.
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

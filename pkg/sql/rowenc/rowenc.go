@@ -182,6 +182,23 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 // PK columns are skipped (they live in the key); NULLs are omitted; columns
 // are emitted in ascending ID order (deterministic bytes for identical rows).
 func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) ([]byte, error) {
+	// An ALTER COLUMN TYPE in flight: the shadow column's value is the
+	// original's, converted — on every write, whoever writes it.
+	for _, col := range desc.Columns {
+		if col.RetypeFrom == 0 {
+			continue
+		}
+		src, ok := row[col.RetypeFrom]
+		if !ok {
+			continue
+		}
+		d, err := src.ConvertTo(col.Type)
+		if err != nil {
+			from, _ := desc.ColByID(col.RetypeFrom)
+			return nil, fmt.Errorf("column %q: value cannot convert to %s: %w", from.Name, col.Type, err)
+		}
+		row[col.ID] = d
+	}
 	ids := make([]catalog.ColumnID, 0, len(row))
 	for colID, d := range row {
 		if desc.IsPKCol(colID) {

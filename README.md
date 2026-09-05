@@ -68,7 +68,7 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   the allocator maximizes diversity across failure domains, so losing a rack
   never loses more than one replica of a range.
 - **SQL**: a deliberately small subset (DDL incl. secondary indexes,
-  ALTER TABLE with RENAME / SET DEFAULT, TRUNCATE, views, sequences, SERIAL / identity columns, expression
+  ALTER TABLE with RENAME / SET DEFAULT / online ALTER COLUMN TYPE, TRUNCATE, views, CREATE TABLE AS / LIKE, COMMENT ON, sequences, SERIAL / identity columns, expression
   defaults, CHECK / UNIQUE / FOREIGN KEY constraints with cascading
   actions, INSERT/SELECT/UPDATE/DELETE with ORDER BY — DESC via
   reverse scans — the usual scalar functions, operators and casts

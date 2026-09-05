@@ -570,8 +570,32 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
 	// and then sweep the existing rows: multi-transaction, like CREATE
 	// INDEX.
-	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil) && !s.tableExists(ctx, at.Table) {
+	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil || at.SetType != nil) && !s.tableExists(ctx, at.Table) {
 		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	// CREATE TABLE ... AS and ALTER COLUMN TYPE are multi-transaction
+	// statements too: refused in a block, admin-only.
+	if ct, ok := stmt.(*parser.CreateTable); ok && ct.As != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "CREATE TABLE ... AS cannot run inside a transaction block")
+		}
+		return s.execCreateTableAs(ctx, ct, params)
+	}
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SetType != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ALTER COLUMN TYPE cannot run inside a transaction block")
+		}
+		var aerr error
+		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			aerr = s.checkAdmin(ctx, txn)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if aerr != nil {
+			return nil, ToSQLError(aerr)
+		}
+		return s.execRetypeOnline(ctx, at)
 	}
 	if at, ok := stmt.(*parser.AlterTable); ok && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "") {
 		if s.state == StateOpen {

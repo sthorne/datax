@@ -119,7 +119,7 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "pg_encoding_to_char":
 		d := types.NewString("UTF8")
 		out.Func, out.Args, out.Lit = "", nil, &d
-	case "obj_description", "col_description", "shobj_description", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
+	case "shobj_description", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
 		d := types.DNull
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_relation_is_publishable":
@@ -143,24 +143,26 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			d := types.NewString("{" + strings.Join(elems, ",") + "}")
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
-	case "pg_get_viewdef":
-		// pg_get_viewdef(oid [, pretty]): a literal OID (psql's \d+ view)
-		// resolves to the view's stored query here; a column reference
-		// reads pg_class's hidden rendering like the functions below.
-		if len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_viewdef", "obj_description", "col_description":
+		// pg_get_viewdef(oid [, pretty]), obj_description(oid, class) and
+		// col_description(oid, attnum) on a LITERAL OID (psql's \d+)
+		// resolve from the descriptor here.
+		if literal := e.Func == "pg_get_viewdef" || e.Func == "obj_description" || e.Func == "col_description"; literal && len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
 			oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text())
 			if err != nil {
 				return e, err
 			}
 			d := types.DNull
-			if desc, rerr := catalog.ReadTable(ctx, txn, uint64(oid)); rerr == nil && desc != nil && desc.IsView() {
-				d = types.NewString(desc.ViewQuery)
+			if e.Func == "pg_get_viewdef" {
+				if desc, rerr := catalog.ReadTable(ctx, txn, uint64(oid)); rerr == nil && desc != nil && desc.IsView() {
+					d = types.NewString(desc.ViewQuery)
+				}
+			} else if text := s.descriptionOf(ctx, txn, oid, e); text != "" {
+				d = types.NewString(text)
 			}
 			out.Func, out.Args, out.Lit = "", nil, &d
 			break
 		}
-		fallthrough
-	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr":
 		// Row-dependent catalog renderings: the virtual tables carry them
 		// as hidden columns beside the OID the function takes, so the
 		// call becomes a column reference on the same row.
@@ -823,6 +825,46 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
 	}
 	return vtable.TableOID(desc), nil
+}
+
+// descriptionOf resolves obj_description(oid, class) / col_description
+// (oid, attnum) for a literal OID: a table's, an index's or a column's
+// COMMENT ("" when none).
+func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int64, e parser.Expr) string {
+	tableID, indexID := uint64(oid), uint64(0)
+	if oid>>16 != 0 {
+		tableID, indexID = uint64(oid>>16), uint64(oid&0xffff)
+	}
+	desc, err := catalog.ReadTable(ctx, txn, tableID)
+	if err != nil || desc == nil {
+		return ""
+	}
+	if indexID != 0 {
+		for _, idx := range desc.Indexes {
+			if idx.ID == indexID {
+				return idx.Comment
+			}
+		}
+		return ""
+	}
+	if e.Func == "col_description" && len(e.Args) > 1 && e.Args[1].Lit != nil {
+		n, ok := e.Args[1].Lit.I, e.Args[1].Lit.Fam == types.Int
+		if !ok {
+			return ""
+		}
+		pos := int64(0)
+		for _, c := range desc.Columns {
+			if c.Hidden {
+				continue
+			}
+			pos++
+			if pos == n {
+				return c.Comment
+			}
+		}
+		return ""
+	}
+	return desc.Comment
 }
 
 // regclassNames lists the (OID, name) of every table the session can

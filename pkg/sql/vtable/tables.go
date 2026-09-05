@@ -19,6 +19,17 @@ var pgCatalogTables = map[string]*Table{}
 var informationSchemaTables = map[string]*Table{}
 
 func pg(name string, cols []catalog.Column, rows func(ctx context.Context, env *Env) ([]Row, error)) {
+	// obj_description(x.oid, ...) rewrites to the row's hidden rendering:
+	// every catalog with an OID answers (NULL, absent from its rows,
+	// unless the generator fills it — pg_class does).
+	hasOID, hasDesc := false, false
+	for _, c := range cols {
+		hasOID = hasOID || c.Name == "oid"
+		hasDesc = hasDesc || c.Name == "__obj_description"
+	}
+	if hasOID && !hasDesc {
+		cols = append(append([]catalog.Column(nil), cols...), hidden("__obj_description"))
+	}
 	pgCatalogTables[name] = &Table{Schema: PgCatalog, Name: name, Columns: cols, Rows: rows}
 }
 
@@ -43,6 +54,14 @@ func (env *Env) currentSequences() []*catalog.SequenceDescriptor {
 		}
 	}
 	return out
+}
+
+// textOrNull renders an optional text ("" = NULL).
+func textOrNull(s string) types.Datum {
+	if s == "" {
+		return null()
+	}
+	return str(s)
 }
 
 func yesNo(b bool) string {
@@ -106,7 +125,7 @@ func init() {
 		col("relchecks", types.Int), col("relhasrules", types.Bool), col("relhastriggers", types.Bool), col("relhassubclass", types.Bool),
 		col("relrowsecurity", types.Bool), col("relforcerowsecurity", types.Bool), col("relispopulated", types.Bool),
 		col("relreplident", types.String), col("relispartition", types.Bool), col("reloftype", types.Int), col("relacl", types.String), col("reloptions", types.String),
-		col("relpartbound", types.String), hidden("__expr"), hidden("__viewdef"),
+		col("relpartbound", types.String), hidden("__expr"), hidden("__viewdef"), hidden("__obj_description"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		for _, t := range env.currentTables() {
@@ -129,30 +148,30 @@ func init() {
 			if t.IsView() {
 				rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(10), i64(0), i64(0), i64(0),
 					i64(0), types.NewFloat(-1), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(int64(len(t.VisibleColumns()))),
-					i64(0), boolean(true), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), str(t.ViewQuery)})
+					i64(0), boolean(true), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), str(t.ViewQuery), textOrNull(t.Comment)})
 				continue
 			}
 			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(10), i64(2), i64(TableOID(t)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
-				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null()})
+				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(t.Comment)})
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(10), i64(403), i64(IndexOID(t, 1)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
-				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null()})
+				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 			for _, idx := range t.Indexes {
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(10), i64(403), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
-					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null()})
+					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment)})
 			}
 		}
 		for _, sq := range env.currentSequences() {
 			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(OIDPublic), i64(0), i64(10), i64(0), i64(int64(sq.ID)), i64(0),
 				i64(1), types.NewFloat(1), i64(0), boolean(false), boolean(false), str("p"), str("S"), i64(3),
-				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null()})
+				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
 		for i, name := range Names() {
 			rows = append(rows, Row{i64(int64(1<<30) + int64(i)), str(name[len(PgCatalog)+1:]), i64(OIDPgCatalog), i64(0), i64(10), i64(0), i64(0), i64(0),
 				i64(0), types.NewFloat(0), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(0),
-				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null()})
+				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
 		return rows, nil
 	})
@@ -165,7 +184,7 @@ func init() {
 		col("atthasdef", types.Bool), col("atthasmissing", types.Bool), col("attidentity", types.String), col("attgenerated", types.String),
 		col("attisdropped", types.Bool), col("attislocal", types.Bool), col("attinhcount", types.Int), col("attcollation", types.Int), col("attacl", types.String),
 		col("attcompression", types.String), col("attoptions", types.String), col("attfdwoptions", types.String), col("attmissingval", types.String),
-		hidden("__format_type"), hidden("__indexdef"),
+		hidden("__format_type"), hidden("__indexdef"), hidden("__col_description"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		attr := func(relid int64, c *catalog.Column, n int64, indexed bool) Row {
@@ -187,7 +206,7 @@ func init() {
 			return Row{i64(relid), str(c.Name), i64(TypeOID(c.Type)), i64(-1),
 				i64(-1), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
 				boolean(ColumnDefault(c) != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
-				str(""), null(), null(), null(), str(FormatType(c)), indexdef}
+				str(""), null(), null(), null(), str(FormatType(c)), indexdef, textOrNull(c.Comment)}
 		}
 		for _, t := range env.currentTables() {
 			n := int64(0)
@@ -318,7 +337,30 @@ func init() {
 	}, empty)
 	pg("pg_description", []catalog.Column{
 		col("objoid", types.Int), col("classoid", types.Int), col("objsubid", types.Int), col("description", types.String),
-	}, empty)
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		var rows []Row
+		for _, t := range env.currentTables() {
+			if t.Comment != "" {
+				rows = append(rows, Row{i64(TableOID(t)), i64(OIDPgClass), i64(0), str(t.Comment)})
+			}
+			n := int64(0)
+			for i := range t.Columns {
+				if t.Columns[i].Hidden {
+					continue
+				}
+				n++
+				if t.Columns[i].Comment != "" {
+					rows = append(rows, Row{i64(TableOID(t)), i64(OIDPgClass), i64(n), str(t.Columns[i].Comment)})
+				}
+			}
+			for _, idx := range t.Indexes {
+				if idx.Comment != "" {
+					rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(OIDPgClass), i64(0), str(idx.Comment)})
+				}
+			}
+		}
+		return rows, nil
+	})
 	// pg_proc: the builtin functions, from the registry (aliases included,
 	// as PostgreSQL lists each name).
 	pg("pg_proc", []catalog.Column{

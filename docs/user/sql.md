@@ -73,6 +73,11 @@ ALTER TABLE t RENAME CONSTRAINT t_b_key TO b_unique;    -- a UNIQUE constraint's
 ALTER TABLE t ALTER [COLUMN] b SET DEFAULT 'y';         -- a constant or an expression (below)
 ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
 TRUNCATE [TABLE] t [, t2] [RESTART IDENTITY] [CASCADE]; -- one descriptor write, however many ranges
+ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE DECIMAL(12, 2);   -- online rewrite; widening and text conversions
+CREATE TABLE t2 (LIKE t INCLUDING ALL);                  -- columns, defaults, constraints, indexes, comments
+CREATE TABLE big AS SELECT id, qty FROM t WHERE qty > 10;          -- a hidden rowid key
+CREATE TABLE keyed (order_id, qty, PRIMARY KEY (order_id)) AS SELECT id, qty FROM t [WITH NO DATA];
+COMMENT ON TABLE t IS 'orders';  COMMENT ON COLUMN t.b IS 'body';  COMMENT ON INDEX by_b IS NULL;
 SHOW TABLES;
 ```
 
@@ -104,16 +109,63 @@ indexed and constrained: its `CHECK` expressions are rewritten to the
 new name. Sequence names (`t_id_seq`) and the primary key's name do not
 change, as in PostgreSQL.
 
+**`CREATE TABLE ... AS query`** creates the table from the query's
+output columns (names and types as Describe reports them; `(a, b) AS`
+renames them positionally) and, unless `WITH NO DATA`, fills it: the
+query runs once, at one timestamp, and its rows stream in through the
+`COPY` chunk path, a bounded transaction per chunk — so the statement
+never holds one transaction open over a million rows and cannot run
+inside a transaction block (`25001`). A table needs a primary key, so
+a `PRIMARY KEY (cols)` clause may be written among the names
+(CockroachDB's form); without one the table gets a hidden `rowid`
+column (`unique_rowid()`, invisible to `SELECT *`) — and duplicate
+query rows are all kept. Parameters (`$1`) and views in the query
+work. `SELECT ... INTO t` is refused with a pointer here.
+
+**`LIKE source`** inside a column list copies the source's columns
+(types, typmods, `NOT NULL`) where it stands; `INCLUDING DEFAULTS`
+copies the defaults (an owned sequence's `nextval` is not copied — the
+new table gets its own `SERIAL` if you declare one), `INCLUDING
+CONSTRAINTS` the `CHECK` constraints, `INCLUDING INDEXES` the `UNIQUE`
+constraints and secondary indexes (same names), `INCLUDING ALL` every
+one; `EXCLUDING` reverses an option. The primary key is copied whenever
+the statement declares none (PostgreSQL leaves it to `INCLUDING
+INDEXES`; here a table needs one). Foreign keys are never copied.
+
+**`ALTER COLUMN c TYPE t`** rewrites the column online, in the shape of
+`CREATE INDEX`: a hidden shadow column of the new type joins the
+descriptor and every write from then on fills it from the column's
+value (whichever gateway writes), the existing rows are converted in
+bounded chunks, and the shadow then takes the column's name, position,
+`NOT NULL`, default and comment while the old column is dropped. The
+conversion is the type's cast: widening (`INT8` to `DECIMAL` or
+`FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
+typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
+`BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
+typmod change rescales. A value that cannot convert fails the statement
+(`22P02`) and the column is left as it was. Narrowing conversions, the
+primary key, indexed columns, columns a constraint or view uses, and
+columns drawing from a sequence are refused (`0A000`) — drop or replace
+those first. Not inside a transaction block (`25001`); cluster version
+v9.
+
+**`COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL`**
+stores the text in the descriptor; `obj_description`,
+`col_description` and `pg_description` render it, so `psql`'s `\d+`,
+`\dt+` and `\dv+` show the descriptions. Comments survive renames,
+default changes and type rewrites.
+
 **DDL in transaction blocks.** A statement that is one descriptor
 write runs inside `BEGIN ... COMMIT` like any other and commits or rolls
 back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
 COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
-`DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, the sequence, database and
-user statements, `GRANT` / `REVOKE`. The multi-transaction statements —
-`CREATE INDEX`, `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT
-NULL`, `SET (shards = N)`, `ANALYZE` — publish, drain and sweep in
-several transactions of their own and are refused inside a block with
-`25001`.
+`DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
+`DROP VIEW`, the sequence, database and user statements, `GRANT` /
+`REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
+CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
+TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
+drain and sweep (or stream) in several transactions of their own and
+are refused inside a block with `25001`.
 
 ### Defaults, SERIAL, identity columns and sequences
 

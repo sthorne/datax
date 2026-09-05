@@ -48,8 +48,11 @@ func Parse(src string) ([]Statement, error) {
 
 type parser struct {
 	toks []token
-	i    int
-	src  string
+	// pendingPK carries a PRIMARY KEY (cols) written inside CREATE TABLE
+	// (names, PRIMARY KEY (...)) AS to the statement.
+	pendingPK []string
+	i         int
+	src       string
 }
 
 func (p *parser) peek() token { return p.toks[p.i] }
@@ -411,6 +414,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseDropTable()
 	case "truncate": // not a reserved word; lexes as an identifier
 		return p.parseTruncate()
+	case "comment": // COMMENT ON ... IS ...
+		return p.parseCommentOn()
 	case "INSERT":
 		return p.parseInsert(false)
 	case "upsert": // not a reserved word; lexes as an identifier
@@ -702,8 +707,21 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		return nil, err
 	}
 	ct.Name = name
+	// CREATE TABLE t AS query: the shape and rows of a query.
+	if p.consumeKeyword("AS") {
+		return p.finishCreateTableAs(ct)
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
+	}
+	// CREATE TABLE t (a, b [, PRIMARY KEY (a)]) AS query: bare names.
+	if save := p.i; p.peek().kind == tkIdent {
+		names, ok := p.tryBareColumnList()
+		if ok && p.consumeKeyword("AS") {
+			ct.AsColumns = names
+			return p.finishCreateTableAs(ct)
+		}
+		p.i = save
 	}
 	for {
 		cname := ""
@@ -715,6 +733,13 @@ func (p *parser) parseCreateTable() (Statement, error) {
 			cname = n
 		}
 		switch {
+		case p.consumeIdentWord("like"):
+			lc, err := p.parseLikeClause()
+			if err != nil {
+				return nil, err
+			}
+			lc.Position = len(ct.Columns)
+			ct.Like = append(ct.Like, lc)
 		case p.consumeKeyword("PRIMARY"):
 			if len(ct.PrimaryKey) > 0 {
 				return nil, p.errf("multiple primary key definitions")
@@ -811,76 +836,14 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		return def, err
 	}
 	def.Name = name
-	t := p.peek()
-	if t.kind != tkIdent && t.kind != tkKeyword {
-		return def, p.errf("expected column type, found %q", t.text)
-	}
-	p.i++
-	typeName := t.text
-	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
-	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
-		if n := p.peek(); n.kind == tkIdent {
-			p.i++
-		}
-	}
-	// TIMESTAMP WITH[OUT] TIME ZONE: absorb the trailing words.
-	if strings.EqualFold(typeName, "timestamp") {
-		if p.peekIdentSeq("with", "time", "zone") || p.peekIdentSeq("without", "time", "zone") {
-			p.i += 3
-		}
-	}
-	switch strings.ToUpper(typeName) {
-	case "SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL8", "SERIAL4", "SERIAL2":
-		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
-		typeName = "INT8"
-		def.Serial, def.NotNull = true, true
-	}
-	fam, err := types.ParseType(typeName)
+	fam, prec, scale, serial, err := p.parseColumnType()
 	if err != nil {
-		return def, p.errf("%v", err)
+		return def, err
 	}
-	def.Type = fam
-	// VARCHAR(n) / DECIMAL(p[,s]) etc.: for DECIMAL the typmod is captured
-	// and ENFORCED (precision/scale on the column descriptor); for every
-	// other type it is accepted and ignored — storage is arbitrary-length
-	// (documented).
-	if p.consumeOp("(") {
-		var mods []string
-		if p.peek().kind == tkNumber {
-			mods = append(mods, p.peek().text)
-			p.i++
-			if p.consumeOp(",") {
-				if p.peek().kind != tkNumber {
-					return def, p.errf("expected scale after ',' in type modifier")
-				}
-				mods = append(mods, p.peek().text)
-				p.i++
-			}
-		}
-		if err := p.expectOp(")"); err != nil {
-			return def, err
-		}
-		if fam == types.Decimal && len(mods) > 0 {
-			prec, perr := strconv.ParseInt(mods[0], 10, 32)
-			if perr != nil {
-				return def, p.errf("DECIMAL precision %q must be an integer", mods[0])
-			}
-			var scale int64
-			if len(mods) > 1 {
-				var serr error
-				scale, serr = strconv.ParseInt(mods[1], 10, 32)
-				if serr != nil {
-					return def, p.errf("DECIMAL scale %q must be an integer", mods[1])
-				}
-			}
-			if prec < 1 || prec > 1000 {
-				return def, p.errf("DECIMAL precision %d must be between 1 and 1000", prec)
-			}
-			if scale < 0 || scale > prec {
-				return def, p.errf("DECIMAL scale %d must be between 0 and the precision %d", scale, prec)
-			}
-			def.Precision, def.Scale = int32(prec), int32(scale)
-		}
+	def.Type, def.Precision, def.Scale = fam, prec, scale
+	if serial {
+		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
+		def.Serial, def.NotNull = true, true
 	}
 	for {
 		// A column constraint may carry its own name.
@@ -965,6 +928,82 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			return def, nil
 		}
 	}
+}
+
+// parseColumnType parses a column type with its optional typmod: the
+// family, a DECIMAL(p,s) precision and scale, and whether the type was
+// a SERIAL alias (INT8 with an owned sequence).
+func (p *parser) parseColumnType() (fam types.Family, prec, scale int32, serial bool, err error) {
+	t := p.peek()
+	if t.kind != tkIdent && t.kind != tkKeyword {
+		return 0, 0, 0, false, p.errf("expected column type, found %q", t.text)
+	}
+	p.i++
+	typeName := t.text
+	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
+	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
+		if n := p.peek(); n.kind == tkIdent {
+			p.i++
+		}
+	}
+	// TIMESTAMP WITH[OUT] TIME ZONE: absorb the trailing words.
+	if strings.EqualFold(typeName, "timestamp") {
+		if p.peekIdentSeq("with", "time", "zone") || p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
+	switch strings.ToUpper(typeName) {
+	case "SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL8", "SERIAL4", "SERIAL2":
+		typeName = "INT8"
+		serial = true
+	}
+	fam, perr := types.ParseType(typeName)
+	if perr != nil {
+		return 0, 0, 0, false, p.errf("%v", perr)
+	}
+	// VARCHAR(n) / DECIMAL(p[,s]) etc.: for DECIMAL the typmod is captured
+	// and ENFORCED (precision/scale on the column descriptor); for every
+	// other type it is accepted and ignored — storage is arbitrary-length
+	// (documented).
+	if p.consumeOp("(") {
+		var mods []string
+		if p.peek().kind == tkNumber {
+			mods = append(mods, p.peek().text)
+			p.i++
+			if p.consumeOp(",") {
+				if p.peek().kind != tkNumber {
+					return 0, 0, 0, false, p.errf("expected scale after ',' in type modifier")
+				}
+				mods = append(mods, p.peek().text)
+				p.i++
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return 0, 0, 0, false, err
+		}
+		if fam == types.Decimal && len(mods) > 0 {
+			pr, perr := strconv.ParseInt(mods[0], 10, 32)
+			if perr != nil {
+				return 0, 0, 0, false, p.errf("DECIMAL precision %q must be an integer", mods[0])
+			}
+			var sc int64
+			if len(mods) > 1 {
+				var serr error
+				sc, serr = strconv.ParseInt(mods[1], 10, 32)
+				if serr != nil {
+					return 0, 0, 0, false, p.errf("DECIMAL scale %q must be an integer", mods[1])
+				}
+			}
+			if pr < 1 || pr > 1000 {
+				return 0, 0, 0, false, p.errf("DECIMAL precision %d must be between 1 and 1000", pr)
+			}
+			if sc < 0 || sc > pr {
+				return 0, 0, 0, false, p.errf("DECIMAL scale %d must be between 0 and the precision %d", sc, pr)
+			}
+			prec, scale = int32(pr), int32(sc)
+		}
+	}
+	return fam, prec, scale, serial, nil
 }
 
 func (p *parser) peekKeyword(kw string) bool {
@@ -1711,6 +1750,9 @@ func (p *parser) parseSelect() (Statement, error) {
 			break
 		}
 	}
+	if p.consumeKeyword("INTO") {
+		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
+	}
 	if p.consumeKeyword("FROM") {
 		// FROM (SELECT ...) AS alias — a derived table.
 		derived := false
@@ -2360,7 +2402,7 @@ var caseWords = map[string]bool{"then": true, "else": true, "end": true, "when":
 var tableClauseWords = map[string]bool{
 	"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true, "natural": true, "using": true,
 	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
-	"window": true,
+	"window": true, "with": true,
 }
 
 // peekIdentSeq reports whether the next tokens are exactly this sequence of
@@ -2889,7 +2931,33 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			return nil, err
 		}
 		switch {
+		case p.consumeIdentWord("type"):
+			fam, prec, scale, serial, err := p.parseColumnType()
+			if err != nil {
+				return nil, err
+			}
+			if serial {
+				return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+			}
+			at.SetType = &SetType{Column: col, Type: fam, Precision: prec, Scale: scale}
+			if p.consumeIdentWord("using") {
+				return nil, p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
+			}
 		case p.consumeKeyword("SET"):
+			if p.consumeIdentWord("data") {
+				if !p.consumeIdentWord("type") {
+					return nil, p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
+				}
+				fam, prec, scale, serial, err := p.parseColumnType()
+				if err != nil {
+					return nil, err
+				}
+				if serial {
+					return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+				}
+				at.SetType = &SetType{Column: col, Type: fam, Precision: prec, Scale: scale}
+				break
+			}
 			if p.consumeIdentWord("default") {
 				sd, err := p.parseDefaultValue()
 				if err != nil {
@@ -2919,7 +2987,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			}
 			at.DropNotNull = col
 		default:
-			return nil, p.errf("expected SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return nil, p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
@@ -2931,6 +2999,108 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
 	}
 	return at, nil
+}
+
+// tryBareColumnList parses `a, b [, PRIMARY KEY (cols)])` — the name
+// list of CREATE TABLE (names) AS — reporting whether the list was one
+// (a type after a name means an ordinary column definition).
+func (p *parser) tryBareColumnList() ([]string, bool) {
+	var names []string
+	for {
+		if p.consumeKeyword("PRIMARY") {
+			if !p.consumeKeyword("KEY") {
+				return nil, false
+			}
+			cols, err := p.parseColumnList()
+			if err != nil {
+				return nil, false
+			}
+			p.pendingPK = cols
+		} else {
+			t := p.peek()
+			if t.kind != tkIdent {
+				return nil, false
+			}
+			p.i++
+			names = append(names, t.text)
+		}
+		if p.consumeOp(",") {
+			continue
+		}
+		if !p.consumeOp(")") {
+			return nil, false
+		}
+		return names, true
+	}
+}
+
+// finishCreateTableAs parses the query after CREATE TABLE ... AS and the
+// trailing WITH [NO] DATA, keeping the query's text.
+func (p *parser) finishCreateTableAs(ct *CreateTable) (Statement, error) {
+	if p.pendingPK != nil {
+		ct.PrimaryKey, p.pendingPK = p.pendingPK, nil
+	}
+	start := p.peek().pos
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := q.(*Select)
+	if !ok {
+		return nil, p.errf("CREATE TABLE ... AS takes a SELECT")
+	}
+	ct.As, ct.AsText = sel, strings.TrimSpace(p.src[start:p.peek().pos])
+	// WITH [NO] DATA ("with" lexes as an identifier).
+	if p.consumeIdentWord("with") {
+		if p.consumeKeyword("NOT") {
+			return nil, p.errf("expected WITH DATA or WITH NO DATA")
+		}
+		if p.consumeIdentWord("no") {
+			ct.NoData = true
+		}
+		if !p.consumeIdentWord("data") {
+			return nil, p.errf("expected DATA after WITH, found %q", p.peek().text)
+		}
+	}
+	return ct, nil
+}
+
+// parseLikeClause parses the rest of LIKE source [INCLUDING | EXCLUDING
+// DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL ...].
+func (p *parser) parseLikeClause() (LikeClause, error) {
+	var lc LikeClause
+	name, err := p.parseTableName()
+	if err != nil {
+		return lc, err
+	}
+	lc.Table = name
+	for {
+		including := p.consumeIdentWord("including")
+		if !including && !p.consumeIdentWord("excluding") {
+			return lc, nil
+		}
+		t := p.peek()
+		if t.kind != tkIdent {
+			return lc, p.errf("expected an option after INCLUDING / EXCLUDING, found %q", t.text)
+		}
+		p.i++
+		switch t.text {
+		case "all":
+			lc.Defaults, lc.Constraints, lc.Indexes, lc.Comments = including, including, including, including
+		case "defaults":
+			lc.Defaults = including
+		case "constraints":
+			lc.Constraints = including
+		case "indexes":
+			lc.Indexes = including
+		case "comments":
+			lc.Comments = including
+		case "generated", "identity", "statistics", "storage", "compression":
+			// Accepted for compatibility; nothing to copy or leave out.
+		default:
+			return lc, p.errf("unknown LIKE option %q", t.text)
+		}
+	}
 }
 
 // parseCreateView parses [CREATE] VIEW name [(cols)] AS query, keeping
@@ -2999,6 +3169,82 @@ func (p *parser) parseDefaultValue() (*SetDefault, error) {
 		return nil, p.errf("DEFAULT cannot reference columns")
 	}
 	return &SetDefault{Expr: &e}, nil
+}
+
+// parseCommentOn parses COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS
+// 'text' | NULL.
+func (p *parser) parseCommentOn() (Statement, error) {
+	p.i++ // COMMENT
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	co := &CommentOn{}
+	switch {
+	case p.consumeKeyword("TABLE"), p.consumeIdentWord("view"):
+		co.Kind = "table"
+	case p.consumeKeyword("INDEX"):
+		co.Kind = "index"
+	case p.consumeKeyword("COLUMN"):
+		co.Kind = "column"
+	default:
+		return nil, p.errf("COMMENT ON supports TABLE, VIEW, INDEX and COLUMN, found %q", p.peek().text)
+	}
+	if co.Kind == "column" {
+		// table.column, db.table.column or db.public.table.column: the
+		// last part is the column, the rest a table name.
+		first, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		parts := []string{first}
+		for p.consumeOp(".") {
+			next, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, next)
+		}
+		if len(parts) < 2 || len(parts) > 4 {
+			return nil, p.errf("COMMENT ON COLUMN takes table.column")
+		}
+		co.Column = parts[len(parts)-1]
+		tbl := parts[:len(parts)-1]
+		switch len(tbl) {
+		case 1:
+			co.Name = tbl[0]
+		case 2:
+			if tbl[0] == "public" {
+				co.Name = tbl[1]
+			} else {
+				co.Name = tbl[0] + "." + tbl[1]
+			}
+		default:
+			if tbl[1] != "public" {
+				return nil, p.errf("schema %q does not exist (public is the only schema)", tbl[1])
+			}
+			co.Name = tbl[0] + "." + tbl[2]
+		}
+	} else {
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		co.Name = name
+	}
+	if !p.consumeKeyword("IS") && !p.consumeIdentWord("is") {
+		return nil, p.errf("expected IS, found %q", p.peek().text)
+	}
+	switch t := p.peek(); {
+	case t.kind == tkKeyword && t.text == "NULL":
+		p.i++
+	case t.kind == tkString:
+		p.i++
+		text := t.text
+		co.Text = &text
+	default:
+		return nil, p.errf("expected a string or NULL after IS, found %q", t.text)
+	}
+	return co, nil
 }
 
 // parseTruncate parses TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY |
