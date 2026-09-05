@@ -242,7 +242,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			for j := i; j < i+100 && j < *preload; j++ {
 				vals = append(vals, row(j))
 			}
-			if _, err := setup.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, cols, strings.Join(vals, ", "))); err != nil && !strings.Contains(err.Error(), "duplicate") {
+			if err := execRetrying(ctx, setup, fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, cols, strings.Join(vals, ", "))); err != nil && !strings.Contains(err.Error(), "duplicate") {
 				return err
 			}
 		}
@@ -633,6 +633,25 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		fmt.Printf("  record:     %s\n", *jsonOut)
 	}
 	return res, nil
+}
+
+// execRetrying runs a setup statement, retrying transient failures (a
+// serialization conflict, a range mid-election, a node briefly
+// unreachable) with a short backoff: the preload is not what a run
+// measures, and a hiccup there must not void the run.
+func execRetrying(ctx context.Context, conn *pgx.Conn, q string) error {
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		if _, err = conn.Exec(ctx, q); err == nil || strings.Contains(err.Error(), "duplicate") {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		}
+	}
+	return err
 }
 
 // countRows runs a query and drains it, returning the row count (the

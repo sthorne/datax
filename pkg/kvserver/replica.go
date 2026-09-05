@@ -922,6 +922,14 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 			return nil, r.notLeaderError()
 		}
 		if err := r.linearizableReadIndex(ctx); err != nil {
+			if ctx.Err() == nil {
+				// The confirmation round itself timed out (a fresh range
+				// still electing, a partitioned quorum), not the caller:
+				// leadership is in doubt, so answer NotLeader and let the
+				// client re-route and retry under its own deadline instead
+				// of surfacing a one-off failure.
+				return nil, r.notLeaderError()
+			}
 			return nil, err
 		}
 		br, rerr := r.evalReadOnly(ba)

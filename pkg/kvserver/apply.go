@@ -382,7 +382,7 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				}
 				scan = storage.MVCCReverseScan
 			}
-			res, err := scan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta})
+			res, err := scan(b, req.Key, req.EndKey, readTimestamp(ba), req.MaxRows, storage.MVCCGetOptions{Txn: txnMeta, TargetBytes: scanTargetBytes})
 			if err != nil {
 				if conflicts.collect(err) {
 					continue
@@ -528,7 +528,9 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 			if req.Reverse {
 				scan = storage.MVCCReverseScan
 			}
-			res, err := scan(eng, req.Key, req.EndKey, ts, req.MaxRows, opts)
+			sopts := opts
+			sopts.TargetBytes = scanTargetBytes
+			res, err := scan(eng, req.Key, req.EndKey, ts, req.MaxRows, sopts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
@@ -585,6 +587,12 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 	}
 	return br, nil
 }
+
+// scanTargetBytes pages a scan's response: a range answers with at most
+// this many row bytes and a Resume key, so a large result crosses the
+// internode RPC in pages that fit its message limit (pkg/rpc), and the
+// client (kvclient sendScan) stitches the pages back together.
+const scanTargetBytes = 8 << 20
 
 func scanResponse(res storage.ScanResult) *kvpb.ScanResponse {
 	out := &kvpb.ScanResponse{Resume: res.Resume}

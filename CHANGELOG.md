@@ -8,6 +8,23 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.31.0 — unreleased
+
+### Fixed
+- A scan whose rows exceeded gRPC's 4 MiB default message limit never
+  came back from a range led by another node: every attempt ran into
+  the per-attempt timeout and the statement hung until the lease moved
+  (the harness's `scan` workload took 13 minutes per query on a 3-node
+  cluster). A range now pages scan responses at 8 MiB with a resume
+  key, the client stitches the pages, and the internode message limit
+  is 64 MiB in both directions.
+- A read whose leadership confirmation (the raft read index) timed out —
+  a freshly split range still electing, a briefly partitioned quorum —
+  failed the statement with `XX000: read index abandoned`. The replica
+  now answers NotLeader, so the client re-routes and retries under the
+  statement's own deadline. `datax bench` retries transient failures
+  during its preload for the same reason.
+
 ## 0.30.0 — unreleased
 
 ### Added

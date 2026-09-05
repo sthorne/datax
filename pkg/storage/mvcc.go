@@ -22,6 +22,11 @@ type MVCCGetOptions struct {
 	// (readTS, UncertaintyLimit] — the caller cannot know whether such a
 	// write causally preceded it, given bounded clock skew.
 	UncertaintyLimit hlc.Timestamp
+	// TargetBytes, when > 0, ends a scan after the row that brings the
+	// accumulated key and value bytes to or past it, with Resume set: a
+	// response never grows past a message the wire can carry (a single
+	// row larger than the target still comes back on its own).
+	TargetBytes int64
 	// Inconsistent reads never block on (or report) intents: they read the
 	// newest committed version beneath any intent. Used for meta/gossip
 	// scans where staleness is fine but stalls are not.
@@ -398,6 +403,7 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 
 	var res ScanResult
 	var intents []Intent
+	var bytes int64
 
 	ok := it.SeekGE(lower)
 	for ok {
@@ -412,7 +418,8 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 		}
 		if found && len(intents) == 0 {
 			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
-			if max > 0 && int64(len(res.KVs)) == max {
+			bytes += int64(len(cur) + len(value))
+			if max > 0 && int64(len(res.KVs)) == max || opts.TargetBytes > 0 && bytes >= opts.TargetBytes {
 				res.Resume = cur.Next()
 				return res, nil
 			}
@@ -441,6 +448,7 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 
 	var res ScanResult
 	var intents []Intent
+	var bytes int64
 
 	ok := it.SeekLT(upper)
 	for ok {
@@ -459,7 +467,8 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 		}
 		if found && len(intents) == 0 {
 			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
-			if max > 0 && int64(len(res.KVs)) == max {
+			bytes += int64(len(cur) + len(value))
+			if max > 0 && int64(len(res.KVs)) == max || opts.TargetBytes > 0 && bytes >= opts.TargetBytes {
 				res.Resume = cur
 				return res, nil
 			}

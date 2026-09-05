@@ -57,11 +57,17 @@ type Server struct {
 	secure bool
 }
 
+// MaxMessageBytes bounds one internode message in either direction:
+// gRPC's default (4 MiB) is smaller than a page of scan rows or a
+// snapshot chunk. Scan responses are paged well below it
+// (kvserver.scanTargetBytes), so a message that reaches it is a bug.
+const MaxMessageBytes = 64 << 20
+
 // NewServer returns a gRPC server with the Internode service registered.
 // A non-nil tlsCfg enables mutual TLS (the config must require and verify
 // client certificates); nil serves cleartext.
 func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *grpc.Server {
-	var opts []grpc.ServerOption
+	opts := []grpc.ServerOption{grpc.MaxRecvMsgSize(MaxMessageBytes)}
 	if tlsCfg != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
 	}
