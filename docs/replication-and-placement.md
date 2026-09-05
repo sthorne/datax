@@ -105,8 +105,13 @@ leaseholder = Raft leader.
 **Splits** happen automatically by size (v2; see below) or manually
 (`datax debug split <key>`): the split is proposed as a replicated command;
 at apply time each replica atomically writes both descriptors and creates
-the right-hand side's Raft state. No data moves, because range membership
-of a key is logical. The `/meta/` addressing records are then repaired
+the right-hand side's Raft state, and bumps the RHS's timestamp-cache
+floor to now(): the parent served reads on that span up to this moment,
+and only those at or below its closed timestamp travel in the trigger,
+so without the bump a write could land on the fresh RHS beneath a read
+already served (issue #134; the one-time push this costs a transaction
+that began before the split is a leadership change's). No data moves,
+because range membership of a key is logical. The `/meta/` addressing records are then repaired
 in one batch, after the split commits and outside its latch. Repairs
 from a split and a merge on the same key lineage can land in either
 order, so each is **ordered by descriptor generation** (cluster version

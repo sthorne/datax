@@ -11,6 +11,18 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- A split's right-hand range keeps the timestamp-cache protection for
+  reads the parent served on its span (#134). The RHS inherited the
+  parent's closed timestamp as its cache floor, which trails now() by
+  the closed-timestamp lag (3 s); reads the parent served inside that
+  window lived only in its in-memory cache, so a write at one of those
+  timestamps could land on the fresh RHS beneath a read already served
+  — a serializability violation for readers in the window. Every
+  replica now bumps the RHS's cache floor to now() as it applies the
+  split (as a merge does for an absorbed span); the one-time push this
+  costs a transaction that began before the split and writes to the RHS
+  after it is the same as a leadership change's.
+  `TestSplitKeepsServedReadsProtected`.
 - The one-phase commit path honors the transaction's commit deadline
   (#133). The deadline — a schema lease's expiration, pinned when a
   statement plans against the leased descriptor — was checked only on
