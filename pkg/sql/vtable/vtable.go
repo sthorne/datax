@@ -179,8 +179,25 @@ func DatabaseOID(d *catalog.DatabaseDescriptor) int64 {
 	return int64(d.ID)
 }
 
+// arrayTypeOIDs maps an element type's OID to its array type's.
+var arrayTypeOIDs = map[int64]int64{
+	16: 1000, 17: 1001, 21: 1005, 23: 1007, 20: 1016, 25: 1009, 1043: 1015, 1042: 1014, 701: 1022, 1700: 1231,
+	1082: 1182, 1114: 1115, 1184: 1185, 2950: 2951, 3802: 3807, 1186: 1187, 1083: 1183,
+}
+
+// ArrayTypeOID is the OID of the array type over an element type's OID.
+func ArrayTypeOID(elem int64) int64 {
+	if oid, ok := arrayTypeOIDs[elem]; ok {
+		return oid
+	}
+	return 1009
+}
+
 // TypeOID is PostgreSQL's OID for a datax type family.
 func TypeOID(f types.Family) int64 {
+	if f.IsArray() {
+		return ArrayTypeOID(TypeOID(f.Elem()))
+	}
 	switch f {
 	case types.Bool:
 		return 16
@@ -214,6 +231,11 @@ func TypeOID(f types.Family) int64 {
 // family's, refined by the modifiers (int2 21 / int4 23, varchar 1043 /
 // bpchar 1042, timestamp 1114).
 func ColumnTypeOID(c *catalog.Column) int64 {
+	if c.Type.IsArray() {
+		elem := *c
+		elem.Type = c.Type.Elem()
+		return ArrayTypeOID(ColumnTypeOID(&elem))
+	}
 	switch c.Type {
 	case types.Int:
 		switch c.Width {
@@ -246,6 +268,9 @@ func ColumnTypeName(c *catalog.Column) string {
 
 // ColumnTypeLen is pg_type.typlen for a column's declared type.
 func ColumnTypeLen(c *catalog.Column) int64 {
+	if c.Type.IsArray() {
+		return -1
+	}
 	switch ColumnTypeOID(c) {
 	case 16:
 		return 1
@@ -268,6 +293,11 @@ func ColumnTypeLen(c *catalog.Column) int64 {
 var ExtraTypeOIDs = []int64{21, 23, 1043, 1042, 1114}
 
 func typeNameOID(oid int64) string {
+	for elem, arr := range arrayTypeOIDs {
+		if arr == oid {
+			return "_" + typeNameOID(elem)
+		}
+	}
 	switch oid {
 	case 21:
 		return "int2"
@@ -295,6 +325,9 @@ func Families() []types.Family { return families }
 
 // TypeName is PostgreSQL's name for a datax type family (pg_type.typname).
 func TypeName(f types.Family) string {
+	if f.IsArray() {
+		return "_" + TypeName(f.Elem())
+	}
 	switch f {
 	case types.Bool:
 		return "bool"
@@ -327,6 +360,11 @@ func TypeName(f types.Family) string {
 // FormatType is format_type(): the SQL-standard spelling of a column's
 // type, with its typmod (numeric(p,s)).
 func FormatType(c *catalog.Column) string {
+	if c.Type.IsArray() {
+		elem := *c
+		elem.Type = c.Type.Elem()
+		return FormatType(&elem) + "[]"
+	}
 	switch c.Type {
 	case types.Bool:
 		return "boolean"
@@ -375,6 +413,11 @@ func FormatType(c *catalog.Column) string {
 // the declared modifiers (INT4, VARCHAR(20), CHAR(4), TIMESTAMP(3),
 // NUMERIC(10,2)) over the pg_type name.
 func ColumnTypeSQL(c *catalog.Column) string {
+	if c.Type.IsArray() {
+		elem := *c
+		elem.Type = c.Type.Elem()
+		return ColumnTypeSQL(&elem) + "[]"
+	}
 	switch c.Type {
 	case types.Int, types.String, types.Timestamp, types.Time:
 		return c.TypeSQL()
@@ -388,6 +431,11 @@ func ColumnTypeSQL(c *catalog.Column) string {
 
 // FormatTypeOID is format_type(oid, typmod) for a bare type OID.
 func FormatTypeOID(oid int64) string {
+	for elem, arr := range arrayTypeOIDs {
+		if arr == oid {
+			return FormatTypeOID(elem) + "[]"
+		}
+	}
 	switch oid {
 	case 21:
 		return "smallint"
@@ -542,7 +590,13 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		}
 		b.WriteString(",\n")
 	}
-	fmt.Fprintf(&b, "  %s", PrimaryKeyDef(d))
+	// A primary key of hidden columns alone (CREATE TABLE AS's rowid)
+	// is not written; the trailing comma of the last column goes with
+	// it when nothing follows.
+	var items []string
+	if pk := PrimaryKeyDef(d); pk != "PRIMARY KEY ()" {
+		items = append(items, pk)
+	}
 	owned := map[uint64]bool{} // indexes a constraint owns render as the constraint
 	for i := range d.Constraints {
 		if c := &d.Constraints[i]; c.Kind == catalog.ConstraintUnique || c.AutoIndex {
@@ -561,11 +615,18 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		for _, id := range idx.ColumnIDs {
 			cols = append(cols, columnName(d, id))
 		}
-		fmt.Fprintf(&b, ",\n  %sINDEX %s (%s)", unique, idx.Name, strings.Join(cols, ", "))
+		items = append(items, fmt.Sprintf("%sINDEX %s (%s)", unique, idx.Name, strings.Join(cols, ", ")))
 	}
 	for i := range d.Constraints {
 		c := &d.Constraints[i]
-		fmt.Fprintf(&b, ",\n  CONSTRAINT %s %s", c.Name, ConstraintDef(d, c, byID))
+		items = append(items, fmt.Sprintf("CONSTRAINT %s %s", c.Name, ConstraintDef(d, c, byID)))
+	}
+	if len(items) > 0 {
+		fmt.Fprintf(&b, "  %s", strings.Join(items, ",\n  "))
+	} else {
+		text := strings.TrimSuffix(b.String(), ",\n")
+		b.Reset()
+		b.WriteString(text)
 	}
 	b.WriteString("\n)")
 	if d.Timeseries {

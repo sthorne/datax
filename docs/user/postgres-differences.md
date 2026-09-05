@@ -44,6 +44,13 @@ syntax error or `0A000` feature not supported):
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
+- **Arrays** are one-dimensional (`INT8[][]` is `INT8[]`; a
+  multidimensional binary parameter is refused), cannot be indexed or
+  be part of a key, have no slices (`a[1:2]`) or `JSONB[]`, and a
+  subscript out of range is NULL as in PostgreSQL; `array_agg` over an
+  untyped argument yields `text[]`; `unnest` runs in `FROM` or in a
+  FROM-less select list (not beside a table's columns, and not
+  laterally), and an aggregate call takes no inner `ORDER BY`.
 - **Intervals** compare, group and index by PostgreSQL's rule (`'30
   days' = '1 month'`), but a primary key or unique index keeps `'30
   days'` and `'1 month'` as distinct keys (the stored triple is part of

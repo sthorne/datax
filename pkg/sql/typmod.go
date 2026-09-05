@@ -31,6 +31,31 @@ func exprResult(name string, typ types.Family, col catalog.Column) ResultColumn 
 	return colResult(name, col)
 }
 
+// stampDisplay sets the display hints a stored value of a column
+// carries: the declared scale of a DECIMAL(p,s), CHAR(n) padding,
+// TIMESTAMP without time zone — per element for an array column.
+func stampDisplay(col *catalog.Column, d types.Datum) types.Datum {
+	if d.Null {
+		return d
+	}
+	if col.Type.IsArray() && d.Fam.IsArray() {
+		elem := *col
+		elem.Type = col.Type.Elem()
+		out := make([]types.Datum, len(d.A))
+		for i, e := range d.A {
+			out[i] = stampDisplay(&elem, e)
+		}
+		return types.NewArray(elem.Type, out)
+	}
+	switch {
+	case col.Type == types.Decimal && col.Precision > 0 && d.Fam == types.Decimal:
+		d.Dscale = col.Scale
+	case col.Char || col.NoTZ:
+		d = col.Stamp(d)
+	}
+	return d
+}
+
 // coerceColumn brings a value to its column's family the way the
 // write path does: text into a TIMESTAMP (without time zone) column
 // parses ignoring any offset, everything else takes the family's
@@ -91,6 +116,26 @@ func pureWidening(old, new catalog.Column) bool {
 func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
 	if d.Null {
 		return d, nil
+	}
+	if col.Type.IsArray() {
+		// Element by element, under the element type with the column's
+		// modifiers.
+		out, err := col.Conform(d)
+		if err != nil {
+			return d, ToSQLError(err)
+		}
+		if out.Fam.Elem() == types.Decimal && col.Precision > 0 {
+			elem := col
+			elem.Type = types.Decimal
+			elems := make([]types.Datum, len(out.A))
+			for i, e := range out.A {
+				if elems[i], err = enforceTypmod(elem, e); err != nil {
+					return d, err
+				}
+			}
+			out = types.NewArray(types.Decimal, elems)
+		}
+		return out, nil
 	}
 	if col.Type != types.Decimal {
 		out, err := col.Conform(d)

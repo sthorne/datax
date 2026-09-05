@@ -136,11 +136,22 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			if len(res.Columns) != 1 {
 				return e, newErrf(CodeSyntaxError, "subquery must return only one column")
 			}
-			elems := make([]string, len(res.Rows))
-			for i, r := range res.Rows {
-				elems[i] = arrayElemText(r[0])
+			elem := res.Columns[0].Type
+			if elem == types.Unknown || elem.IsArray() {
+				elem = types.String
 			}
-			d := types.NewString("{" + strings.Join(elems, ",") + "}")
+			elems := make([]types.Datum, len(res.Rows))
+			for i, r := range res.Rows {
+				elems[i] = r[0]
+				if !r[0].Null && r[0].Fam != elem {
+					if c, cerr := r[0].Coerce(elem); cerr == nil {
+						elems[i] = c
+					} else {
+						elems[i] = types.NewString(r[0].Text())
+					}
+				}
+			}
+			d := types.NewArray(elem, elems)
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
 	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_viewdef", "obj_description", "col_description":
@@ -691,7 +702,22 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 
 // funcTableDesc is the one-column descriptor of a FROM table function.
 func funcTableDesc(t *parser.Select) *catalog.TableDescriptor {
-	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: types.String}}}
+	return funcTableDescOf(t, funcTableElem(*t.FuncTable))
+}
+
+func funcTableDescOf(t *parser.Select, elem types.Family) *catalog.TableDescriptor {
+	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: elem}}}
+}
+
+// funcTableElem is the element family FROM unnest(array) produces, from
+// the argument's inferred type (text when it cannot be told).
+func funcTableElem(e parser.Expr) types.Family {
+	if e.Func == "unnest" && len(e.Args) == 1 {
+		if f := exprFamily(e.Args[0], nil); f.IsArray() {
+			return f.Elem()
+		}
+	}
+	return types.String
 }
 
 // execFuncTableSelect materializes FROM unnest(array): one text row per
@@ -709,8 +735,15 @@ func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t 
 	if err != nil {
 		return nil, err
 	}
+	elem := funcTableElem(*t.FuncTable)
 	var rows [][]types.Datum
-	if !arg.Null {
+	switch {
+	case arg.Null:
+	case arg.Fam.IsArray():
+		for _, d := range arg.A {
+			rows = append(rows, []types.Datum{d})
+		}
+	default:
 		for _, el := range arrayElems(arg.Text()) {
 			d := types.NewString(el)
 			if el == "NULL" {
@@ -719,7 +752,7 @@ func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t 
 			rows = append(rows, []types.Datum{d})
 		}
 	}
-	return s.execMaterialized(ctx, txn, funcTableDesc(t), rows, t, params)
+	return s.execMaterialized(ctx, txn, funcTableDescOf(t, elem), rows, t, params)
 }
 
 // execMaterialized runs a select's pipeline (WHERE filter, grouping or

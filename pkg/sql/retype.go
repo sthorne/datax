@@ -59,6 +59,9 @@ func retypeAllowed(from, to types.Family) bool {
 	if to == types.String {
 		return true
 	}
+	if to.IsArray() {
+		return from == types.String || (from.IsArray() && retypeAllowed(from.Elem(), to.Elem()))
+	}
 	switch from {
 	case types.Int:
 		return to == types.Float || to == types.Decimal

@@ -8,6 +8,34 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.26.0 — unreleased
+
+### Added
+- Type system, part three (#96): arrays of every scalar family but
+  `JSONB` as column types (`INT8[]`, `TEXT ARRAY`, `VARCHAR(3)[]`;
+  cluster version **v10**, like `INTERVAL` and `TIME`). Literals
+  (`'{1,2}'`, `'{a,"b c",NULL}'`), `ARRAY[...]`, subscripts `a[i]`,
+  `ANY` / `ALL` and the comparison operators over arrays, `@>` / `<@` /
+  `&&`, `||` concatenation, element-wise equality and ordering (`GROUP
+  BY`, `ORDER BY`, `DISTINCT`), `unnest` (`FROM` and select list) with
+  typed rows, `array_agg` returning a real array, `array_length`,
+  `cardinality`, `array_append` / `array_prepend` / `array_cat` /
+  `array_position` / `array_remove` / `array_to_string` /
+  `string_to_array` / `array_upper` / `array_lower` / `array_ndims`,
+  `::int8[]` casts, `array(SELECT ...)` as a typed array. The wire
+  describes PostgreSQL's array OIDs (`_int8` 1016, `_text` 1009, ...)
+  and speaks the text and binary array formats in both directions, so
+  pgx scans into and binds Go slices and `WHERE id = ANY($1)` takes a
+  slice (the parameter describes as the column's array type); `pg_type`
+  carries the array types with `typelem` / `typarray`, `pg_attribute`
+  `attndims`, `information_schema.columns` `ARRAY` / `_int8`. `CREATE
+  TABLE AS`, `LIKE` and `ALTER COLUMN TYPE` from text carry arrays.
+  Arrays are not indexable and cannot be keys.
+
+### Changed
+- `array_agg` and `array(SELECT ...)` return an array type (`_int8`,
+  `_text`, ...) instead of text.
+
 ## 0.25.0 — unreleased
 
 ### Added

@@ -108,7 +108,7 @@ func (e *ValueError) Error() string { return e.Msg }
 // write path must apply (DECIMAL(p,s), an integer width, a character
 // length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
 func (c *Column) HasTypmod() bool {
-	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray()
 }
 
 // FracDigits is the declared TIMESTAMP(p) precision, when there is one.
@@ -122,7 +122,7 @@ func (c *Column) FracDigits() (int32, bool) {
 // IntWidth is the column's integer width in bytes (8 unless declared
 // narrower).
 func (c *Column) IntWidth() int32 {
-	if c.Type == types.Int && (c.Width == 2 || c.Width == 4) {
+	if (c.Type == types.Int || c.Type == types.ArrayOf(types.Int)) && (c.Width == 2 || c.Width == 4) {
 		return c.Width
 	}
 	return 8
@@ -139,6 +139,31 @@ func (c *Column) IntWidth() int32 {
 func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 	if d.Null {
 		return d, nil
+	}
+	if c.Type.IsArray() {
+		// Every element conforms to the element type (the column's
+		// modifiers apply per element); text elements coerce first.
+		if !d.Fam.IsArray() {
+			return d, nil
+		}
+		elem := *c
+		elem.Type = c.Type.Elem()
+		out := make([]types.Datum, len(d.A))
+		for i, e := range d.A {
+			if e.Null {
+				out[i] = e
+				continue
+			}
+			v, err := e.Coerce(elem.Type)
+			if err != nil {
+				return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("column %q: array element %s: %v", c.Name, e.Text(), err)}
+			}
+			if v, err = elem.Conform(v); err != nil {
+				return d, err
+			}
+			out[i] = v
+		}
+		return types.NewArray(elem.Type, out), nil
 	}
 	switch c.Type {
 	case types.Int:
@@ -223,6 +248,11 @@ func (c *Column) Stamp(d types.Datum) types.Datum {
 // TypeSQL is the column's declared type as datax spells it (INT4,
 // VARCHAR(20), CHAR(4), TIMESTAMP(3), TIMESTAMPTZ, DECIMAL(10,2)).
 func (c *Column) TypeSQL() string {
+	if c.Type.IsArray() {
+		elem := *c
+		elem.Type = c.Type.Elem()
+		return elem.TypeSQL() + "[]"
+	}
 	switch c.Type {
 	case types.Int:
 		switch c.Width {
@@ -269,6 +299,9 @@ func (c *Column) TypeSQL() string {
 // indistinguishable from none on the wire, which only loses the
 // rounding hint.
 func (c *Column) Typmod() int32 {
+	if c.Type.IsArray() {
+		return 0
+	}
 	switch c.Type {
 	case types.Decimal:
 		if c.Precision > 0 {

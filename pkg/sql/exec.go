@@ -1485,15 +1485,9 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 	// stay the comparison/storage identity.
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
-		switch {
-		case col.Precision > 0 && col.Type == types.Decimal:
+		if col.Precision > 0 || col.Char || col.NoTZ || col.Type.IsArray() {
 			if d, ok := row[col.ID]; ok && !d.Null {
-				d.Dscale = col.Scale
-				row[col.ID] = d
-			}
-		case col.Char || col.NoTZ:
-			if d, ok := row[col.ID]; ok && !d.Null {
-				row[col.ID] = col.Stamp(d)
+				row[col.ID] = stampDisplay(col, d)
 			}
 		}
 	}
@@ -1602,20 +1596,52 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return s.execFuncTableSelect(ctx, txn, t, params)
 	}
 	if t.Table == "" {
-		// FROM-less SELECT: one row of evaluated expressions.
+		// FROM-less SELECT: one row of evaluated expressions — or, with
+		// an unnest(array) among them, one row per element (the other
+		// expressions repeated; SELECT unnest($1::int8[]) expands a
+		// parameter into rows).
 		res := &Result{}
 		var row []types.Datum
-		for _, se := range t.Exprs {
+		unnestAt, unnestElems := -1, []types.Datum(nil)
+		for i, se := range t.Exprs {
 			if se.Star {
 				return nil, newErrf(CodeSyntaxError, "SELECT * requires a FROM clause")
-			}
-			d, err := evalExpr(se.Expr, nil, nil, params)
-			if err != nil {
-				return nil, err
 			}
 			name := se.Alias
 			if name == "" {
 				name = "?column?"
+			}
+			if se.Expr.Func == "unnest" && len(se.Expr.Args) == 1 && se.Expr.Cast == "" && len(se.Expr.Path) == 0 {
+				if unnestAt >= 0 {
+					return nil, newErrf(CodeFeatureNotSupported, "only one unnest() per select list is supported")
+				}
+				arr, err := evalExpr(se.Expr.Args[0], nil, nil, params)
+				if err != nil {
+					return nil, err
+				}
+				if !arr.Null && !arr.Fam.IsArray() {
+					if arr, err = arr.Coerce(types.ArrayOf(types.String)); err != nil {
+						return nil, newErrf(CodeInvalidTextRepresentation, "unnest: %v", err)
+					}
+				}
+				fam := exprFamily(se.Expr.Args[0], nil).Elem()
+				if !arr.Null && arr.Fam.Elem() != types.Unknown {
+					fam = arr.Fam.Elem()
+				}
+				if fam == types.Unknown {
+					fam = types.String
+				}
+				if name == "?column?" {
+					name = "unnest"
+				}
+				res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
+				unnestAt, unnestElems = i, arr.A
+				row = append(row, types.DNull)
+				continue
+			}
+			d, err := evalExpr(se.Expr, nil, nil, params)
+			if err != nil {
+				return nil, err
 			}
 			// Typed as described (Describe sees the expression, not the
 			// value); the value is conformed to it.
@@ -1629,7 +1655,16 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
 			row = append(row, conformTo(d, fam))
 		}
-		res.Rows = trimRows([][]types.Datum{row}, t)
+		rows := [][]types.Datum{row}
+		if unnestAt >= 0 {
+			rows = make([][]types.Datum, 0, len(unnestElems))
+			for _, e := range unnestElems {
+				r := append([]types.Datum(nil), row...)
+				r[unnestAt] = e
+				rows = append(rows, r)
+			}
+		}
+		res.Rows = trimRows(rows, t)
 		res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 		return res, nil
 	}

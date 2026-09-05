@@ -32,12 +32,16 @@ const (
 	Jsonb              // JSONB: normalized compact JSON text (in S)
 	IntervalFam        // INTERVAL: months (Mo), days (Dy) and nanoseconds (I)
 	Time               // TIME: nanoseconds since midnight (in I)
+	Array              // the base of an array family: ArrayOf(elem) = Array | elem<<8 (elements in A)
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
 // descriptors): append only, never renumber.
 
 func (f Family) String() string {
+	if f.IsArray() {
+		return f.Elem().String() + "[]"
+	}
 	switch f {
 	case Int:
 		return "INT8"
@@ -69,6 +73,28 @@ func (f Family) String() string {
 
 // ParseType resolves a SQL type name (with PostgreSQL-flavored aliases).
 func ParseType(name string) (Family, error) {
+	// INT8[] / INT8[][] / INT8 ARRAY: an array of the element type.
+	if trimmed := strings.TrimSpace(name); strings.HasSuffix(trimmed, "]") || strings.HasSuffix(strings.ToUpper(trimmed), " ARRAY") {
+		base := trimmed
+		if strings.HasSuffix(strings.ToUpper(base), " ARRAY") {
+			base = base[:len(base)-6]
+		}
+		for strings.HasSuffix(base, "]") {
+			i := strings.LastIndexByte(base, '[')
+			if i < 0 {
+				return Unknown, fmt.Errorf("unsupported type %q", name)
+			}
+			base = strings.TrimSpace(base[:i])
+		}
+		elem, err := ParseType(base)
+		if err != nil {
+			return Unknown, err
+		}
+		if elem.IsArray() {
+			return Unknown, fmt.Errorf("unsupported type %q", name)
+		}
+		return ArrayOf(elem), nil
+	}
 	switch strings.ToUpper(name) {
 	case "INT8", "INT", "INTEGER", "BIGINT", "INT4", "SMALLINT", "INT2":
 		return Int, nil
@@ -126,6 +152,9 @@ type Datum struct {
 	// I, as nanoseconds).
 	Mo int64 `json:"mo,omitempty"`
 	Dy int64 `json:"dy,omitempty"`
+	// A holds an array's elements (Fam is ArrayOf(elem)); a NULL element
+	// is a Null datum.
+	A []Datum `json:"a,omitempty"`
 }
 
 var DNull = Datum{Null: true}
@@ -301,7 +330,7 @@ func ParseJSONB(s string) (Datum, error) {
 
 // IsIndexable reports whether the family has an order-preserving key
 // encoding (usable in primary keys and indexes).
-func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown }
+func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown && !f.IsArray() }
 
 // DecimalVal parses the canonical form back out of a Decimal datum.
 func (d Datum) DecimalVal() (decimal.Dec, error) {
@@ -325,6 +354,18 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 	}
 	if d.Fam == target {
 		return d, nil
+	}
+	if target.IsArray() {
+		switch {
+		case d.Fam.IsArray():
+			return d.coerceArray(target)
+		case d.Fam == String:
+			return ParseArray(d.S, target.Elem())
+		}
+		return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
+	}
+	if d.Fam.IsArray() && target == String {
+		return NewString(d.Text()), nil
 	}
 	switch {
 	case d.Fam == Int && target == Float:
@@ -444,6 +485,24 @@ func (d Datum) Compare(o Datum) (int, error) {
 			return decimal.Cmp(dv, ov), nil
 		}
 	}
+	if d.Fam.IsArray() || o.Fam.IsArray() {
+		// An array compares with an array (a text literal coerces to
+		// the other side's family) element by element.
+		if !d.Fam.IsArray() {
+			c, err := d.Coerce(o.Fam)
+			if err != nil {
+				return 0, err
+			}
+			d = c
+		} else if o.Fam != d.Fam {
+			c, err := o.Coerce(d.Fam)
+			if err != nil {
+				return 0, err
+			}
+			o = c
+		}
+		return compareArrays(d, o)
+	}
 	if d.Fam != o.Fam {
 		return 0, fmt.Errorf("cannot compare %s with %s", d.Fam, o.Fam)
 	}
@@ -539,6 +598,9 @@ func PadTo(s string, n int32) string {
 func (d Datum) Text() string {
 	if d.Null {
 		return "" // callers render NULL specially (wire: -1 length)
+	}
+	if d.Fam.IsArray() {
+		return FormatArray(d.A)
 	}
 	switch d.Fam {
 	case Int:

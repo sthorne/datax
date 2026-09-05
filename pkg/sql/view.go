@@ -35,7 +35,7 @@ func (s *Session) requireV9(what string) error {
 // before the cluster version is finalized: an older node cannot decode
 // its rows.
 func (s *Session) requireV10(fam types.Family) error {
-	if (fam == types.IntervalFam || fam == types.Time) && s.db.ClusterVersion() < version.V10 {
+	if (fam == types.IntervalFam || fam == types.Time || fam.IsArray()) && s.db.ClusterVersion() < version.V10 {
 		return newErrf(CodeFeatureNotSupported, "%s columns need cluster version v10: finalize the upgrade with `datax debug upgrade` first", fam)
 	}
 	return nil

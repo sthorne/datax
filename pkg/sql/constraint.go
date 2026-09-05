@@ -387,6 +387,9 @@ func sampleRow(d *catalog.TableDescriptor) map[catalog.ColumnID]types.Datum {
 			v = types.NewTime(0)
 		default:
 			v = types.DNull
+			if c.Type.IsArray() {
+				v = types.NewArray(c.Type.Elem(), nil)
+			}
 		}
 		row[c.ID] = v
 	}

@@ -203,8 +203,12 @@ func init() {
 			case "by default":
 				identity = "d"
 			}
+			ndims := int64(0)
+			if c.Type.IsArray() {
+				ndims = 1
+			}
 			return Row{i64(relid), str(c.Name), i64(ColumnTypeOID(c)), i64(-1),
-				i64(ColumnTypeLen(c)), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
+				i64(ColumnTypeLen(c)), i64(n), i64(ndims), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
 				boolean(ColumnDefault(c) != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
 				str(""), null(), null(), null(), str(FormatType(c)), indexdef, textOrNull(c.Comment)}
 		}
@@ -292,6 +296,17 @@ func init() {
 			rows = append(rows, Row{i64(oid), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str(cat),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str(name + "in"), str(name + "out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
 				null(), str(FormatTypeOID(oid))})
+		}
+		// The array type of every element type: typelem points back,
+		// and the element row's typarray forward.
+		for i := range rows {
+			elem := rows[i][0].I
+			arr := ArrayTypeOID(elem)
+			rows[i][12] = i64(arr)
+			name := "_" + rows[i][1].S
+			rows = append(rows, Row{i64(arr), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str("A"),
+				boolean(true), str(","), i64(0), i64(elem), i64(0), str("array_in"), str("array_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
+				null(), str(FormatTypeOID(arr))})
 		}
 		return rows, nil
 	})
@@ -712,7 +727,11 @@ func init() {
 					case c.Type == types.String && c.MaxLen > 0:
 						maxLen = i64(int64(c.MaxLen))
 					}
-					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(FormatType(c)),
+					dataType := FormatType(c)
+					if c.Type.IsArray() {
+						dataType = "ARRAY"
+					}
+					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(dataType),
 						maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})
 				}
 			}

@@ -152,8 +152,13 @@ func (sp aggSpec) resultType() types.Family {
 			return types.Decimal
 		}
 		return sp.argType
-	case "STRING_AGG", "ARRAY_AGG":
+	case "STRING_AGG":
 		return types.String
+	case "ARRAY_AGG":
+		if sp.argType == types.Unknown || sp.argType.IsArray() {
+			return types.ArrayOf(types.String)
+		}
+		return types.ArrayOf(sp.argType)
 	case "BOOL_AND", "BOOL_OR", "EVERY":
 		return types.Bool
 	case "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "PERCENTILE_CONT":
@@ -419,12 +424,20 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 				out[i] = types.DNull
 				continue
 			}
-			elems := make([]string, len(st.vals[i]))
-			nulls := make([]bool, len(st.vals[i]))
+			elem := sp.resultType().Elem()
+			elems := make([]types.Datum, len(st.vals[i]))
 			for j, v := range st.vals[i] {
-				elems[j], nulls[j] = v.Text(), v.Null
+				if v.Null {
+					elems[j] = v
+					continue
+				}
+				c, err := v.Coerce(elem)
+				if err != nil {
+					c = types.NewString(v.Text())
+				}
+				elems[j] = c
 			}
-			out[i] = types.NewString(builtins.TextArrayLiteral(elems, nulls))
+			out[i] = types.NewArray(elem, elems)
 		case "JSON_AGG", "JSONB_AGG":
 			if len(st.vals[i]) == 0 {
 				out[i] = types.DNull
@@ -732,6 +745,11 @@ func encodeGroupKey(ds []types.Datum) string {
 			// they compare equal.
 			b = append(b, 'v')
 			b = binary.BigEndian.AppendUint64(b, uint64(d.IntervalVal().CmpValue()))
+		case d.Fam.IsArray():
+			t := d.Text()
+			b = append(b, 'a')
+			b = binary.AppendUvarint(b, uint64(len(t)))
+			b = append(b, t...)
 		case d.Fam == types.Float:
 			b = append(b, 'f')
 			b = binary.BigEndian.AppendUint64(b, math.Float64bits(d.F))

@@ -164,6 +164,13 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				if len(cmp.Path) > 0 {
 					typ = pathResultType(cmp.Path)
 				}
+				if strings.Contains(cmp.Op, " ANY") || strings.Contains(cmp.Op, " ALL") || cmp.Op == "@>" || cmp.Op == "NOT @>" || cmp.Op == "&&" || cmp.Op == "NOT &&" {
+					// = ANY($1), @> $1: the parameter is an array of the
+					// column's type (of the column's array type for @>).
+					if !typ.IsArray() && typ != types.Jsonb {
+						typ = types.ArrayOf(typ)
+					}
+				}
 				assign(cmp.Value, typ)
 				for _, v := range cmp.Values {
 					assign(v, typ)

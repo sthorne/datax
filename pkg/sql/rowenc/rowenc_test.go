@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strconv"
 	"testing"
@@ -84,7 +85,7 @@ func TestValueRoundTrip(t *testing.T) {
 			if !present {
 				t.Fatalf("iter %d col %d: value lost", iter, col.ID)
 			}
-			if gotD != want {
+			if !reflect.DeepEqual(gotD, want) {
 				t.Fatalf("iter %d col %d: %+v != %+v", iter, col.ID, gotD, want)
 			}
 		}
@@ -118,7 +119,7 @@ func TestUnknownColumnSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[3] != types.NewInt(7) {
+	if len(got) != 1 || !reflect.DeepEqual(got[3], types.NewInt(7)) {
 		t.Fatalf("unexpected decode with dropped columns: %+v", got)
 	}
 }
@@ -146,7 +147,7 @@ func TestCompositePKOrdering(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if dec[0] != vals[0] || dec[1] != vals[1] {
+		if !reflect.DeepEqual(dec[0], vals[0]) || !reflect.DeepEqual(dec[1], vals[1]) {
 			t.Fatalf("pk round trip: %+v != %+v", dec, vals)
 		}
 	}

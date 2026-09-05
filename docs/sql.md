@@ -54,7 +54,11 @@ SHOW STATS FOR t
   (a months / days / nanoseconds triple: `Datum.Mo`, `Datum.Dy`,
   `Datum.I`; compared by PostgreSQL's 30-day-month, 24-hour-day value),
   `BYTES` (alias BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases
-  NUMERIC, DEC), `JSONB` (alias JSON). The attributes are enforced on
+  NUMERIC, DEC), `JSONB` (alias JSON), and arrays of every scalar
+  family but JSONB (`types.ArrayOf(elem)`, a composite Family value
+  `Array | elem<<8` so one value names `INT8[]` wherever a family flows;
+  elements in `Datum.A`; rowenc tag 14 encodes each element with its
+  order-preserving key encoding). The attributes are enforced on
   every write by `catalog.Column.Conform` (a `ValueError` carries the
   SQLSTATE) and described by `sql.ResultColumn`, so pgwire picks the OID,
   size and rendering per described column; below cluster version v9 a
@@ -173,7 +177,8 @@ exist; outer joins and self-joins keep syntactic order),
 deferrable constraints,
 typmods on other types than DECIMAL, the integer widths, `VARCHAR(n)` /
 `CHAR(n)`, `TIMESTAMP(p)` and `TIME(p)` (parsed and ignored),
-`TIME WITH TIME ZONE`, arrays, enums,
+`TIME WITH TIME ZONE`, multidimensional arrays and array slices, indexes
+on array columns, `JSONB[]`, enums,
 JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
 inverted indexes),
 expressions over aggregates (`SUM(a) / COUNT(*)`), user-defined functions,

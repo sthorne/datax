@@ -27,6 +27,19 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		if fam == types.Unknown && e.Case.Else != nil {
 			fam = exprFamily(*e.Case.Else, colType)
 		}
+	case e.Func == "array_construct":
+		elem := types.String
+		for _, a := range e.Args {
+			if f := exprFamily(a, colType); f != types.Unknown {
+				elem = f
+				break
+			}
+		}
+		fam = types.ArrayOf(elem)
+	case e.Func == "array_subscript" && len(e.Args) == 2:
+		fam = exprFamily(e.Args[0], colType).Elem()
+	case e.Func == "array" && len(e.Args) == 1 && e.Args[0].Sub != nil:
+		fam = types.ArrayOf(types.String)
 	case e.Func != "":
 		if b, ok := builtins.Lookup(e.Func); ok {
 			args := make([]types.Family, len(e.Args))
@@ -67,6 +80,12 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 func arithFamily(op string, l, r types.Family) types.Family {
 	switch op {
 	case "||":
+		if l.IsArray() {
+			return l
+		}
+		if r.IsArray() {
+			return r
+		}
 		return types.String
 	case "^":
 		if l == types.Int && r == types.Int {

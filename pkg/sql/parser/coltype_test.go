@@ -116,3 +116,48 @@ func TestParseIntervalTimeTypes(t *testing.T) {
 		t.Fatalf("INTERVAL literal: %+v", sel.Exprs[0].Expr)
 	}
 }
+
+// TestParseArrays: array column types, the ARRAY[...] constructor,
+// subscripts, the && operator, casts to array types, and the
+// refusals (issue #96, part three).
+func TestParseArrays(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (a INT8[], b TEXT[], c INT4 ARRAY, d VARCHAR(5)[], e TIMESTAMPTZ[][], f DECIMAL(10,2)[])`).(*CreateTable)
+	want := map[string]ColumnDef{
+		"a": {Type: types.ArrayOf(types.Int)}, "b": {Type: types.ArrayOf(types.String)}, "c": {Type: types.ArrayOf(types.Int), Width: 4},
+		"d": {Type: types.ArrayOf(types.String), MaxLen: 5}, "e": {Type: types.ArrayOf(types.Timestamp)}, "f": {Type: types.ArrayOf(types.Decimal), Precision: 10, Scale: 2},
+	}
+	for _, c := range ct.Columns {
+		w := want[c.Name]
+		if c.Type != w.Type || c.Width != w.Width || c.MaxLen != w.MaxLen || c.Precision != w.Precision {
+			t.Errorf("column %s: %+v, want %+v", c.Name, c, w)
+		}
+	}
+	for _, bad := range []string{`CREATE TABLE t (a JSONB[])`, `CREATE TABLE t (a SERIAL[])`, `SELECT a[1:2] FROM t`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+	sel := parseOne(t, `SELECT ARRAY[1, 2, 3], ARRAY[]::int8[], a[1], a[i + 1]::text, ARRAY['x']::text[], '{1,2}'::int8[] FROM t WHERE a && ARRAY[1] AND b @> '{x}'`).(*Select)
+	e := sel.Exprs[0].Expr
+	if e.Func != "array_construct" || len(e.Args) != 3 || e.Args[2].Lit.I != 3 {
+		t.Fatalf("ARRAY[1, 2, 3]: %+v", e)
+	}
+	if e = sel.Exprs[1].Expr; e.Func != "array_construct" || len(e.Args) != 0 || e.Cast != "int8[]" {
+		t.Fatalf("ARRAY[]::int8[]: %+v", e)
+	}
+	if e = sel.Exprs[2].Expr; e.Func != "array_subscript" || len(e.Args) != 2 || e.Args[0].Column != "a" || e.Args[1].Lit.I != 1 {
+		t.Fatalf("a[1]: %+v", e)
+	}
+	if e = sel.Exprs[3].Expr; e.Func != "array_subscript" || e.Cast != "text" || e.Args[1].BinOp != "+" {
+		t.Fatalf("a[i + 1]::text: %+v", e)
+	}
+	if e = sel.Exprs[5].Expr; e.Cast != "int8[]" || e.Lit == nil {
+		t.Fatalf("'{1,2}'::int8[]: %+v", e)
+	}
+	if len(sel.Where) != 2 || sel.Where[0].Op != "&&" || sel.Where[0].Value.Func != "array_construct" || sel.Where[1].Op != "@>" {
+		t.Fatalf("WHERE: %+v", sel.Where)
+	}
+	if _, err := Parse(`SELECT 1 FROM t WHERE NOT (a && ARRAY[1])`); err != nil {
+		t.Fatalf("NOT &&: %v", err)
+	}
+}

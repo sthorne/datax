@@ -172,7 +172,18 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 		return d, nil
 	}
 	if strings.HasSuffix(name, "[]") {
-		return d, nil
+		fam, err := types.ParseType(name)
+		if err != nil {
+			return d, nil // an array of a type datax does not model: left as it is
+		}
+		if d.Fam == fam {
+			return d, nil
+		}
+		v, err := d.Coerce(fam)
+		if err != nil {
+			return types.Datum{}, errf(CodeInvalidText, "invalid input syntax for type %s: %v", strings.ToLower(fam.String()), err)
+		}
+		return v, nil
 	}
 	if _, err := types.ParseType(name); err != nil {
 		// Not a type datax models: leave the value as it is.

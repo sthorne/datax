@@ -1073,6 +1073,39 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 			p.i += 3
 		}
 	}
+	// T[] / T[][] / T ARRAY: an array of T (one-dimensional whatever the
+	// bracket count, as PostgreSQL ignores the declared dimensions). The
+	// modifiers (width, length, precision) apply to the elements.
+	array := false
+	for p.consumeOp("[") {
+		if p.peek().kind == tkNumber {
+			p.i++
+		}
+		if err := p.expectOp("]"); err != nil {
+			return spec, false, err
+		}
+		array = true
+	}
+	if p.consumeIdentWord("array") {
+		array = true
+		if p.consumeOp("[") {
+			if p.peek().kind == tkNumber {
+				p.i++
+			}
+			if err := p.expectOp("]"); err != nil {
+				return spec, false, err
+			}
+		}
+	}
+	if array {
+		if serial {
+			return spec, false, p.errf("SERIAL cannot be an array")
+		}
+		if fam == types.Jsonb {
+			return spec, false, p.errf("JSONB[] is not supported: store a JSON array in a JSONB column")
+		}
+		spec.Family = types.ArrayOf(fam)
+	}
 	return spec, serial, nil
 }
 
@@ -3840,7 +3873,7 @@ func (p *parser) startsPredicateSuffix() bool {
 	t := p.peek()
 	switch t.kind {
 	case tkOp:
-		return isCmpOp(t.text) || t.text == "@>"
+		return isCmpOp(t.text) || t.text == "@>" || t.text == "&&"
 	case tkIdent:
 		switch t.text {
 		case "is", "in", "between", "similar", "like", "ilike":
@@ -4046,7 +4079,7 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"IN": "NOT IN", "NOT IN": "IN",
 		"EXISTS": "NOT EXISTS", "NOT EXISTS": "EXISTS",
 		"TRUE": "FALSE", "FALSE": "TRUE",
-		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@",
+		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@", "&&": "NOT &&", "NOT &&": "&&",
 		"?": "NOT ?", "NOT ?": "?", "?|": "NOT ?|", "NOT ?|": "?|", "?&": "NOT ?&", "NOT ?&": "?&",
 		"LIKE": "NOT LIKE", "NOT LIKE": "LIKE", "ILIKE": "NOT ILIKE", "NOT ILIKE": "ILIKE",
 		"SIMILAR TO": "NOT SIMILAR TO", "NOT SIMILAR TO": "SIMILAR TO",
@@ -4117,7 +4150,7 @@ func (p *parser) parseExistsCond() (Comparison, bool, error) {
 
 func isCmpOp(op string) bool {
 	switch op {
-	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "?", "?|", "?&":
+	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&":
 		return true
 	}
 	return false
@@ -4318,6 +4351,26 @@ func (p *parser) applyCasts(e Expr) (Expr, error) {
 		return e, err
 	}
 	e = castChain(e, casts)
+	// v[i]: an array subscript (1-based; NULL when out of range). A
+	// slice v[i:j] is not supported.
+	for p.peek().kind == tkOp && p.peek().text == "[" && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "]") {
+		p.i++
+		idx, err := p.parseAddExpr()
+		if err != nil {
+			return e, err
+		}
+		if p.peek().kind == tkOp && p.peek().text == ":" {
+			return e, p.errf("array slices (v[i:j]) are not supported")
+		}
+		if err := p.expectOp("]"); err != nil {
+			return e, err
+		}
+		inner := e
+		e = Expr{Func: "array_subscript", Args: []Expr{inner, idx}}
+		if e, err = p.applyCasts(e); err != nil {
+			return e, err
+		}
+	}
 	// A -> / ->> / #> / #>> chain may follow any value ('{...}'::jsonb
 	// -> 'a', f(x) ->> 'k'); it applies to the value as cast, so a node
 	// that already carries a cast (or an operator) is wrapped.
@@ -4752,6 +4805,27 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 				return e, err
 			}
 			return p.applyCasts(castChain(e, []string{name}))
+		}
+		// ARRAY[a, b, ...]: an array value of the elements.
+		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "[" {
+			p.i += 2
+			e := Expr{Func: "array_construct"}
+			if !p.consumeOp("]") {
+				for {
+					a, err := p.parseValueOrBool()
+					if err != nil {
+						return e, err
+					}
+					e.Args = append(e.Args, a)
+					if !p.consumeOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp("]"); err != nil {
+					return e, err
+				}
+			}
+			return p.applyCasts(e)
 		}
 		// array(SELECT ...): the subquery's single column as a text array.
 		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {

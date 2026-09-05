@@ -53,6 +53,14 @@ const (
 // by the backing column's modifiers (int2 / int4, varchar / bpchar,
 // timestamp without time zone).
 func colOID(col sql.ResultColumn) uint32 {
+	if col.Type.IsArray() {
+		elem := col
+		elem.Type = col.Type.Elem()
+		if oid, ok := arrayOIDs[colOID(elem)]; ok {
+			return oid
+		}
+		return 1009
+	}
 	switch col.Type {
 	case types.Int:
 		switch col.Width {
@@ -84,7 +92,20 @@ func colSize(col sql.ResultColumn) int16 {
 	return typeSize(col.Type)
 }
 
+// arrayOIDs maps an element type's OID to its array type's.
+var arrayOIDs = map[uint32]uint32{
+	oidBool: 1000, oidBytea: 1001, oidInt2: 1005, oidInt4: 1007, oidInt8: 1016, oidText: 1009, oidVarchar: 1015, oidBpchar: 1014,
+	oidFloat8: 1022, oidNumeric: 1231, oidDate: 1182, oidTimestamp: 1115, oidTimestamptz: 1185, oidUUID: 2951, oidJsonb: 3807,
+	oidInterval: 1187, oidTime: 1183,
+}
+
 func typeOID(f types.Family) uint32 {
+	if f.IsArray() {
+		if oid, ok := arrayOIDs[typeOID(f.Elem())]; ok {
+			return oid
+		}
+		return 1009
+	}
 	switch f {
 	case types.Int:
 		return oidInt8
@@ -561,6 +582,12 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil
 	}
+	if d.Fam.IsArray() {
+		if format == 0 {
+			return []byte(d.Text())
+		}
+		return encodeBinaryArray(d, col)
+	}
 	if format == 0 {
 		switch {
 		case d.Fam == types.Timestamp && col.Type == types.Timestamp:
@@ -618,8 +645,101 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	}
 }
 
+// encodeBinaryArray renders an array in PostgreSQL's binary format:
+// ndim, a has-null flag, the element OID, then per dimension the
+// length and lower bound, then each element as a length-prefixed
+// binary value (-1 for NULL).
+func encodeBinaryArray(d types.Datum, col sql.ResultColumn) []byte {
+	elem := col
+	elem.Type = d.Fam.Elem()
+	if col.Type.IsArray() {
+		elem.Type = col.Type.Elem()
+	}
+	out := make([]byte, 0, 20+16*len(d.A))
+	if len(d.A) == 0 {
+		out = binary.BigEndian.AppendUint32(out, 0)
+		out = binary.BigEndian.AppendUint32(out, 0)
+		return binary.BigEndian.AppendUint32(out, colOID(elem))
+	}
+	hasNull := uint32(0)
+	for _, e := range d.A {
+		if e.Null {
+			hasNull = 1
+		}
+	}
+	out = binary.BigEndian.AppendUint32(out, 1)
+	out = binary.BigEndian.AppendUint32(out, hasNull)
+	out = binary.BigEndian.AppendUint32(out, colOID(elem))
+	out = binary.BigEndian.AppendUint32(out, uint32(len(d.A)))
+	out = binary.BigEndian.AppendUint32(out, 1)
+	for _, e := range d.A {
+		if e.Null {
+			out = binary.BigEndian.AppendUint32(out, 0xffffffff)
+			continue
+		}
+		v := e
+		if !elem.Type.IsArray() && v.Fam != elem.Type {
+			if c, err := v.Coerce(elem.Type); err == nil {
+				v = c
+			}
+		}
+		b := encodeDatum(v, 1, elem)
+		out = binary.BigEndian.AppendUint32(out, uint32(len(b)))
+		out = append(out, b...)
+	}
+	return out
+}
+
+// decodeBinaryArray reads PostgreSQL's binary array format into an
+// array of fam's element family (one dimension; an empty array has
+// none).
+func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
+	if len(raw) < 12 {
+		return types.Datum{}, fmt.Errorf("bad binary array header")
+	}
+	ndim := binary.BigEndian.Uint32(raw[:4])
+	raw = raw[12:]
+	elem := fam.Elem()
+	if ndim == 0 {
+		return types.NewArray(elem, nil), nil
+	}
+	if ndim != 1 {
+		return types.Datum{}, fmt.Errorf("multidimensional arrays are not supported")
+	}
+	if len(raw) < 8 {
+		return types.Datum{}, fmt.Errorf("bad binary array dimensions")
+	}
+	n := binary.BigEndian.Uint32(raw[:4])
+	raw = raw[8:]
+	elems := make([]types.Datum, 0, n)
+	for i := uint32(0); i < n; i++ {
+		if len(raw) < 4 {
+			return types.Datum{}, fmt.Errorf("bad binary array element %d", i)
+		}
+		size := int32(binary.BigEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if size < 0 {
+			elems = append(elems, types.DNull)
+			continue
+		}
+		if len(raw) < int(size) {
+			return types.Datum{}, fmt.Errorf("bad binary array element %d", i)
+		}
+		d, err := decodeBinaryParam(raw[:size], elem)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		raw = raw[size:]
+		elems = append(elems, d)
+	}
+	return types.NewArray(elem, elems), nil
+}
+
 // decodeBinaryParam decodes a binary-format parameter of a known type.
 func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
+	if fam.IsArray() {
+		return decodeBinaryArray(raw, fam)
+	}
 	switch fam {
 	case types.Int:
 		switch len(raw) {

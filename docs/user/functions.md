@@ -113,3 +113,18 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*
 
+## Arrays
+
+- `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*
+- `array_cat(any, any) → the type of argument 1` — The two arrays concatenated. *immutable, handles NULL arguments*
+- `array_length(any, int8) → int8` — The number of elements of an array (dimension 1; NULL for an empty array or another dimension). *immutable*
+- `array_lower(any, int8) → int8` — The lower bound of an array's dimension (1; NULL when empty). *immutable*
+- `array_ndims(any) → int8` — The number of dimensions of an array (1; NULL when empty). *immutable*
+- `array_position(any, any) → int8` — The 1-based position of the first element equal to the value (NULL when absent). *immutable, handles NULL arguments*
+- `array_prepend(any, any) → the type of argument 2` — The array with the value prepended. *immutable, handles NULL arguments*
+- `array_remove(any, any) → the type of argument 1` — The array without the elements equal to the value. *immutable, handles NULL arguments*
+- `array_to_string(any, text, [text]) → text` — The elements joined by the separator; NULL elements are skipped unless the third argument gives their text. *immutable, handles NULL arguments*
+- `array_upper(any, int8) → int8` — The upper bound of an array's dimension (its length; NULL when empty). *immutable*
+- `cardinality(any) → int8` — The number of elements of an array (0 for an empty one). *immutable*
+- `string_to_array(text, text, [text]) → text[]` — The text split on the separator into a text array (an empty separator yields one element; a NULL separator splits into characters); the third argument names the text that becomes NULL. *immutable, handles NULL arguments*
+

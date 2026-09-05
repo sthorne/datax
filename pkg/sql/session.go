@@ -963,6 +963,10 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	}
 	switch op {
 	case "||":
+		if l.Fam.IsArray() || r.Fam.IsArray() {
+			d, err := builtins.ConcatArrays(l, r)
+			return d, builtinErr(err)
+		}
 		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
 		// bpchar-to-text cast strips the padding.
 		return types.NewString(concatText(l) + concatText(r)), nil
@@ -1243,14 +1247,27 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			continue
 		}
 		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			rhs, err := evalExpr(cmp.Value, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if cmpType.IsArray() || lhs.Fam.IsArray() {
+				if lhs.Null || rhs.Null {
+					return false, nil
+				}
+				ok, aerr := builtins.ArrayOp("@>", lhs, rhs)
+				if aerr != nil {
+					return false, builtinErr(aerr)
+				}
+				if ok != (cmp.Op == "@>") {
+					return false, nil
+				}
+				continue
+			}
 			// JSONB containment. The left side (post-path) must be jsonb —
 			// a terminal ->> produces text and is refused.
 			if cmpType != types.Jsonb {
 				return false, newErrf(CodeFeatureNotSupported, "@> requires jsonb operands (%s is %s)", cmp.Column, cmpType)
-			}
-			rhs, err := evalExpr(cmp.Value, desc, row, params)
-			if err != nil {
-				return false, err
 			}
 			if lhs.Null || rhs.Null {
 				return false, nil // NULL operands: UNKNOWN either way
@@ -1538,6 +1555,10 @@ func conds3(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool,
 // (the key or string element exists), ?| and ?& (any / all of a text
 // array of keys exist).
 func jsonOp(op string, lhs, rhs types.Datum) (bool, error) {
+	if lhs.Fam.IsArray() || rhs.Fam.IsArray() || op == "&&" {
+		ok, err := builtins.ArrayOp(op, lhs, rhs)
+		return ok, builtinErr(err)
+	}
 	l, err := lhs.Coerce(types.Jsonb)
 	if err != nil {
 		return false, newErrf(CodeFeatureNotSupported, "%s requires a jsonb left operand (got %s)", op, lhs.Fam)
@@ -1694,7 +1715,7 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		m := re.MatchString(lhs.Text())
 		return m == !strings.HasPrefix(op, "NOT"), nil
-	case "@>", "NOT @>", "<@", "NOT <@", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
+	case "@>", "NOT @>", "<@", "NOT <@", "&&", "NOT &&", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
 		ok, err := jsonOp(strings.TrimPrefix(op, "NOT "), lhs, rhs)
 		if err != nil {
 			return false, err
@@ -1702,11 +1723,22 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		return ok == !strings.HasPrefix(op, "NOT "), nil
 	}
 	if i := strings.IndexByte(op, ' '); i >= 0 {
-		// Quantified comparison over a text array value ('{a,b}'): ANY
-		// holds when some element does, ALL when every element does.
+		// Quantified comparison over an array value (or a text array
+		// literal '{a,b}'): ANY holds when some element does, ALL when
+		// every element does.
 		base, quant := op[:i], op[i+1:]
-		for _, el := range arrayElems(rhs.Text()) {
-			ed := types.NewString(el)
+		var elems []types.Datum
+		if rhs.Fam.IsArray() {
+			elems = rhs.A
+		} else {
+			for _, el := range arrayElems(rhs.Text()) {
+				elems = append(elems, types.NewString(el))
+			}
+		}
+		for _, ed := range elems {
+			if ed.Null {
+				continue // never holds, never fails (three-valued: UNKNOWN)
+			}
 			if c, err := ed.Coerce(lhs.Fam); err == nil {
 				ed = c
 			}

@@ -103,6 +103,10 @@ func statsHashDatum(d types.Datum) uint64 {
 	var kind [1]byte
 	kind[0] = byte(d.Fam)
 	_, _ = h.Write(kind[:])
+	if d.Fam.IsArray() {
+		_, _ = h.Write([]byte(d.Text()))
+		return h.Sum64()
+	}
 	switch d.Fam {
 	case types.Int, types.Timestamp, types.Date, types.Time:
 		var b [8]byte
