@@ -1462,11 +1462,22 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		c.Derived, c.Table = nil, name
 		t = &c
 	}
+	if hasDerivedJoin(t) {
+		bound, restore, err := s.bindJoinedDerived(ctx, txn, t, params, false)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		t = bound
+	}
 	if t.LimitParam > 0 || t.OffsetParam > 0 {
 		var err error
 		if t, err = resolveLimitParams(t, params); err != nil {
 			return nil, err
 		}
+	}
+	if hasWindows(t.Exprs) {
+		return s.execWindowed(ctx, txn, t, params)
 	}
 	if res, ok := s.emptyCatalogSelect(ctx, txn, t); ok {
 		return res, nil
@@ -2097,6 +2108,23 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		c.With = nil
 		sel = &c
 	}
+	if hasDerivedJoin(sel) {
+		bound, restore, err := s.bindJoinedDerived(ctx, txn, sel, params, true)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		sel = bound
+	}
+	windowed := ""
+	if hasWindows(sel.Exprs) {
+		wp, err := windowPlanFor(sel)
+		if err != nil {
+			return nil, err
+		}
+		sel = wp.inner
+		windowed = fmt.Sprintf("; then %d window function(s) over the fetched rows", len(wp.items))
+	}
 	// Correlated conjuncts are stripped exactly as execution strips them,
 	// so the plan below describes the plannable remainder.
 	var corr []correlatedConjunct
@@ -2180,6 +2208,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if sel.Offset > 0 {
 		text += fmt.Sprintf("; offset %d applied after fetch", sel.Offset)
 	}
+	text += windowed
 	return &Result{
 		Columns: []ResultColumn{{Name: "plan", Type: types.String}},
 		Rows:    [][]types.Datum{{types.NewString(text)}},

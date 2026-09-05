@@ -8,6 +8,18 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.19.0 — unreleased
+
+### Added
+- Query shapes, part three (#94): window functions — `row_number`,
+  `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`,
+  `lead`, `first_value`, `last_value`, `nth_value` and every aggregate
+  `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE frame])`, a
+  `WINDOW` clause, window calls inside expressions and predicates
+  (`amount - lag(amount) OVER (...)`), over plain, joined and grouped
+  queries; derived tables as join members (`JOIN (SELECT ...) AS d ON
+  ...`); `EXPLAIN` notes the window stage.
+
 ## 0.18.0 — unreleased
 
 ### Added

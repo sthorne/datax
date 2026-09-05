@@ -226,11 +226,13 @@ upgrade` finalizes it): a v7 node would write rows unchecked.
 
 ```sql
 [WITH [RECURSIVE] name [(cols)] AS (query | INSERT/UPDATE/DELETE ... RETURNING ...), ...]
-SELECT * | expr [AS alias], ... FROM t [AS a] | (query) AS d
-  [JOIN t2 [AS b] ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER], CROSS,
-                                                          -- NATURAL, or "t, t2"; up to 8 tables
+SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
+  FROM t [AS a] | (query) AS d
+  [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
+                                                                    -- CROSS, NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
   [GROUP BY cols] [HAVING ...]
+  [WINDOW name AS (...), ...]
   [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
   [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
   [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY];
@@ -352,10 +354,32 @@ SELECT * | expr [AS alias], ... FROM t [AS a] | (query) AS d
   UNION [ALL] step)` iterates: the step runs against the rows the
   previous round produced until it produces none (`UNION` drops rows
   seen before), capped at 10000 rounds and a million rows (`54000`).
+- **Window functions**: `func(...) OVER ([PARTITION BY exprs] [ORDER BY
+  terms] [ROWS | RANGE frame])` in the select list, also inside an
+  expression (`amount - lag(amount) OVER (ORDER BY at)` for deltas,
+  `count(*) OVER () > 3`, in a `CASE`), and named by a `WINDOW w AS
+  (...)` clause (`OVER w`, or `OVER (w ROWS ...)` to add a frame). The
+  ranking functions `row_number`, `rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, `ntile(n)`; the offset functions `lag(x [, n [, default]])`
+  and `lead`; the value functions `first_value`, `last_value`,
+  `nth_value(x, n)`; and every aggregate (`sum`, `avg`, `count(*)`,
+  `min`, `max`, `string_agg`, `bool_and`, ...) over the row's frame. The
+  frame defaults to the partition up to the current row and its peers
+  when ordered (so `sum(x) OVER (ORDER BY at)` is a running total) and
+  to the whole partition when not; `ROWS BETWEEN n PRECEDING AND n
+  FOLLOWING` (or `UNBOUNDED`, `CURRENT ROW`) gives sliding windows;
+  `RANGE` takes only `UNBOUNDED PRECEDING | FOLLOWING` and `CURRENT ROW`
+  (peer groups). Windows compute on the gateway over the rows the query
+  fetched, after joins and grouping (`rank() OVER (ORDER BY sum(x)
+  DESC)` works on a grouped query) and before `DISTINCT`, `ORDER BY`
+  and `LIMIT`; a window aggregate is evaluated frame by frame, so a
+  wide `ROWS` frame over a large partition costs its width. `DISTINCT`,
+  `FILTER` and `WITHIN GROUP` are not accepted on a window call.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
-  derived tables `FROM (SELECT ...) AS d` — which join like tables —
-  and table functions `FROM unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
+  derived tables `FROM (SELECT ...) AS d` — which join like tables, as
+  the base or as a join member — and table functions `FROM
+  unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,

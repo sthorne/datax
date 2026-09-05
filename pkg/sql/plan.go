@@ -209,6 +209,14 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		}
 		// Every set-operation member types its own WHERE; a derived table
 		// types as a statement of its own.
+		if hasDerivedJoin(t) {
+			bound, restore, err := s.bindJoinedDerived(ctx, nil, t, nil, true)
+			if err != nil {
+				return nil, ToSQLError(err)
+			}
+			defer restore()
+			t = bound
+		}
 		for m := t; m != nil; m = m.Union {
 			if m.Derived != nil {
 				sub, err := s.PlanParams(ctx, m.Derived)
@@ -279,6 +287,28 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	}
 	switch t := stmt.(type) {
 	case *parser.Select:
+		if hasDerivedJoin(t) {
+			bound, restore, err := s.bindJoinedDerived(ctx, nil, t, nil, true)
+			if err != nil {
+				return nil, ToSQLError(err)
+			}
+			defer restore()
+			t = bound
+		}
+		if hasWindows(t.Exprs) {
+			wp, err := windowPlanFor(t)
+			if err != nil {
+				return nil, ToSQLError(err)
+			}
+			innerCols, serr := s.PlanColumns(ctx, wp.inner)
+			if serr != nil {
+				return nil, serr
+			}
+			if err := wp.windowTypes(innerCols); err != nil {
+				return nil, ToSQLError(err)
+			}
+			return wp.outputColumns(innerCols), nil
+		}
 		if t.Derived != nil && len(t.Joins) > 0 {
 			innerCols, err := s.PlanColumns(ctx, t.Derived)
 			if err != nil {

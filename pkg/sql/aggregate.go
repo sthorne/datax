@@ -20,7 +20,7 @@ import (
 
 func hasAggregates(exprs []parser.SelectExpr) bool {
 	for _, se := range exprs {
-		if se.Agg != "" {
+		if se.Agg != "" && se.Window == nil {
 			return true
 		}
 	}

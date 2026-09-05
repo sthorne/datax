@@ -1547,10 +1547,29 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.Distinct = true
 	}
 	for {
+		itemStart := p.i
 		if p.consumeOp("*") {
 			sel.Exprs = append(sel.Exprs, SelectExpr{Star: true})
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
+		} else if ok && se.Window != nil && p.continuesValue() {
+			// A window call that starts a larger expression (count(*)
+			// OVER () > 3, sum(x) OVER w * 2): parse the whole item as a
+			// value, with the call as an operand.
+			p.i = itemStart
+			e, err := p.parseValueOrBool()
+			if err != nil {
+				return nil, err
+			}
+			item := SelectExpr{Expr: e}
+			if p.consumeKeyword("AS") {
+				alias, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				item.Alias = alias
+			}
+			sel.Exprs = append(sel.Exprs, item)
 		} else if ok {
 			if p.consumeKeyword("AS") {
 				alias, err := p.expectIdent()
@@ -1674,12 +1693,25 @@ func (p *parser) parseSelect() (Statement, error) {
 				sel.Joins = append(sel.Joins, jc)
 				continue
 			}
-			jt, err := p.parseTableName()
-			if err != nil {
+			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
+			if sub, ok, err := p.parseSubquery(); err != nil {
 				return nil, err
+			} else if ok {
+				jc.Derived = sub
+				jc.Alias = p.parseOptTableAlias(false)
+				if jc.Alias == "" {
+					return nil, p.errf("subquery in FROM must have an alias")
+				}
+				jc.Table = jc.Alias
+			} else {
+				jt, err := p.parseTableName()
+				if err != nil {
+					return nil, err
+				}
+				jc.Table = jt
+				jc.Alias = p.parseOptTableAlias(false)
 			}
-			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural, Table: jt}
-			jc.Alias = p.parseOptTableAlias(false)
+			jt := jc.Table
 			if cross || jk.natural {
 				sel.Joins = append(sel.Joins, jc)
 				continue
@@ -1803,6 +1835,29 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, err
 		}
 	}
+	// WINDOW name AS (spec), ... ("window" is not a reserved word).
+	if p.consumeIdentWord("window") {
+		for {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("AS"); err != nil {
+				return nil, err
+			}
+			if t := p.peek(); t.kind != tkOp || t.text != "(" {
+				return nil, p.errf("expected ( after WINDOW %s AS, found %q", name, t.text)
+			}
+			spec, err := p.parseWindowSpec()
+			if err != nil {
+				return nil, err
+			}
+			sel.Windows = append(sel.Windows, NamedWindow{Name: name, Spec: spec})
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
 	if err := p.parseOrderLimit(sel, true); err != nil {
 		return nil, err
 	}
@@ -1884,56 +1939,11 @@ func (p *parser) parseOrderLimit(sel *Select, exprsKnown bool) error {
 		if err := p.expectKeyword("BY"); err != nil {
 			return err
 		}
-		for {
-			var oc OrderCol
-			if t := p.peek(); t.kind == tkNumber {
-				n, err := strconv.Atoi(t.text)
-				if err != nil || n < 1 || (exprsKnown && n > len(sel.Exprs)) {
-					return p.errf("ORDER BY position %s is not in the select list", t.text)
-				}
-				p.i++
-				if exprsKnown {
-					oc = OrderCol{Column: outputName(sel.Exprs[n-1])}
-				} else {
-					oc = OrderCol{Position: n}
-				}
-			} else if se, ok, err := p.parseAggExpr(); err != nil {
-				return err
-			} else if ok {
-				oc = OrderCol{Agg: &se}
-			} else {
-				// A bare (possibly qualified) name sorts by that column or
-				// output name; anything else is a computed sort key.
-				e, err := p.parseValueOrBool()
-				if err != nil {
-					return err
-				}
-				if isPlainColumn(e) {
-					oc = OrderCol{Column: e.Column}
-				} else {
-					oc = OrderCol{Expr: &e}
-				}
-			}
-			if p.consumeKeyword("DESC") {
-				oc.Desc = true
-			} else {
-				p.consumeKeyword("ASC")
-			}
-			if p.consumeIdentWord("nulls") {
-				switch {
-				case p.consumeIdentWord("first"):
-					oc.Nulls = "first"
-				case p.consumeIdentWord("last"):
-					oc.Nulls = "last"
-				default:
-					return p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
-				}
-			}
-			sel.OrderBy = append(sel.OrderBy, oc)
-			if !p.consumeOp(",") {
-				break
-			}
+		terms, err := p.parseOrderTerms(sel.Exprs, exprsKnown)
+		if err != nil {
+			return err
 		}
+		sel.OrderBy = terms
 	}
 	// LIMIT n | LIMIT ALL, OFFSET n [ROW | ROWS], FETCH {FIRST | NEXT} [n]
 	// {ROW | ROWS} ONLY — in either order, each at most once.
@@ -1991,6 +2001,64 @@ func (p *parser) parseOrderLimit(sel *Select, exprsKnown bool) error {
 			sel.Limit, sel.LimitParam = n, param
 		default:
 			return nil
+		}
+	}
+}
+
+// parseOrderTerms parses ORDER BY terms (after BY): positions (checked
+// against and rewritten to exprs' output names when exprsKnown, else
+// kept), aggregate calls, column names, or expressions, each with
+// [ASC | DESC] [NULLS FIRST | LAST].
+func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCol, error) {
+	var out []OrderCol
+	for {
+		var oc OrderCol
+		if t := p.peek(); t.kind == tkNumber {
+			n, err := strconv.Atoi(t.text)
+			if err != nil || n < 1 || (exprsKnown && n > len(exprs)) {
+				return nil, p.errf("ORDER BY position %s is not in the select list", t.text)
+			}
+			p.i++
+			if exprsKnown {
+				oc = OrderCol{Column: outputName(exprs[n-1])}
+			} else {
+				oc = OrderCol{Position: n}
+			}
+		} else if se, ok, err := p.parseAggExpr(); err != nil {
+			return nil, err
+		} else if ok {
+			oc = OrderCol{Agg: &se}
+		} else {
+			// A bare (possibly qualified) name sorts by that column or
+			// output name; anything else is a computed sort key.
+			e, err := p.parseValueOrBool()
+			if err != nil {
+				return nil, err
+			}
+			if isPlainColumn(e) {
+				oc = OrderCol{Column: e.Column}
+			} else {
+				oc = OrderCol{Expr: &e}
+			}
+		}
+		if p.consumeKeyword("DESC") {
+			oc.Desc = true
+		} else {
+			p.consumeKeyword("ASC")
+		}
+		if p.consumeIdentWord("nulls") {
+			switch {
+			case p.consumeIdentWord("first"):
+				oc.Nulls = "first"
+			case p.consumeIdentWord("last"):
+				oc.Nulls = "last"
+			default:
+				return nil, p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
+			}
+		}
+		out = append(out, oc)
+		if !p.consumeOp(",") {
+			return out, nil
 		}
 	}
 }
@@ -2256,6 +2324,12 @@ func (p *parser) parseHaving() ([]HavingCond, error) {
 	return out, nil
 }
 
+// windowNames are the window-only functions: they need an OVER clause.
+var windowNames = map[string]bool{
+	"row_number": true, "rank": true, "dense_rank": true, "percent_rank": true, "cume_dist": true, "ntile": true,
+	"lag": true, "lead": true, "first_value": true, "last_value": true, "nth_value": true,
+}
+
 var aggNames = map[string]bool{
 	"count": true, "sum": true, "avg": true, "min": true, "max": true,
 	"string_agg": true, "array_agg": true, "bool_and": true, "bool_or": true, "every": true,
@@ -2269,7 +2343,7 @@ var aggNames = map[string]bool{
 // [ASC | DESC])] [FILTER (WHERE cond)]; ok=false otherwise.
 func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	t := p.peek()
-	if t.kind != tkIdent || !aggNames[t.text] {
+	if t.kind != tkIdent || (!aggNames[t.text] && !windowNames[t.text]) {
 		return SelectExpr{}, false, nil
 	}
 	if nxt := p.toks[p.i+1]; nxt.kind != tkOp || nxt.text != "(" {
@@ -2280,7 +2354,12 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	if p.consumeIdentWord("distinct") {
 		se.AggDistinct = true
 	}
-	if p.consumeOp("*") {
+	if nt := p.peek(); nt.kind == tkOp && nt.text == ")" {
+		// row_number(), rank(), ...: no arguments.
+		if !windowNames[t.text] {
+			return se, false, p.errf("%s() requires an argument", se.Agg)
+		}
+	} else if p.consumeOp("*") {
 		if se.Agg != "COUNT" {
 			return se, false, p.errf("%s(*) is not supported", se.Agg)
 		}
@@ -2358,7 +2437,119 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		}
 		se.AggFilter = conds
 	}
+	if p.consumeIdentWord("over") {
+		spec, err := p.parseWindowSpec()
+		if err != nil {
+			return se, false, err
+		}
+		se.Window = &spec
+	} else if windowNames[t.text] {
+		return se, false, p.errf("%s() requires an OVER clause", se.Agg)
+	}
 	return se, true, nil
+}
+
+// parseWindowSpec parses what follows OVER: a window name, or
+// ([name] [PARTITION BY exprs] [ORDER BY terms] [ROWS | RANGE frame]).
+func (p *parser) parseWindowSpec() (WindowSpec, error) {
+	var spec WindowSpec
+	if t := p.peek(); t.kind == tkIdent {
+		p.i++
+		spec.Name = t.text
+		return spec, nil
+	}
+	if err := p.expectOp("("); err != nil {
+		return spec, err
+	}
+	if t := p.peek(); t.kind == tkIdent && t.text != "partition" && t.text != "rows" && t.text != "range" {
+		p.i++
+		spec.Name = t.text
+	}
+	if p.peekIdentSeq("partition") {
+		p.i++
+		if err := p.expectKeyword("BY"); err != nil {
+			return spec, err
+		}
+		for {
+			e, err := p.parseValueOrBool()
+			if err != nil {
+				return spec, err
+			}
+			spec.PartitionBy = append(spec.PartitionBy, e)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
+	if p.consumeKeyword("ORDER") {
+		if err := p.expectKeyword("BY"); err != nil {
+			return spec, err
+		}
+		terms, err := p.parseOrderTerms(nil, false)
+		if err != nil {
+			return spec, err
+		}
+		spec.OrderBy = terms
+	}
+	if p.consumeIdentWord("rows") || p.peekIdentSeq("range") {
+		mode := "ROWS"
+		if p.consumeIdentWord("range") {
+			mode = "RANGE"
+		}
+		frame := &WindowFrame{Mode: mode, End: FrameBound{Kind: "current row"}}
+		between := p.consumeIdentWord("between")
+		start, err := p.parseFrameBound()
+		if err != nil {
+			return spec, err
+		}
+		frame.Start = start
+		if between {
+			if err := p.expectKeyword("AND"); err != nil {
+				return spec, err
+			}
+			end, err := p.parseFrameBound()
+			if err != nil {
+				return spec, err
+			}
+			frame.End = end
+		}
+		spec.Frame = frame
+	}
+	if err := p.expectOp(")"); err != nil {
+		return spec, err
+	}
+	return spec, nil
+}
+
+// parseFrameBound parses UNBOUNDED PRECEDING | FOLLOWING, CURRENT ROW,
+// or n PRECEDING | FOLLOWING.
+func (p *parser) parseFrameBound() (FrameBound, error) {
+	switch {
+	case p.consumeIdentWord("unbounded"):
+		switch {
+		case p.consumeIdentWord("preceding"):
+			return FrameBound{Kind: "unbounded preceding"}, nil
+		case p.consumeIdentWord("following"):
+			return FrameBound{Kind: "unbounded following"}, nil
+		}
+		return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING after UNBOUNDED, found %q", p.peek().text)
+	case p.consumeIdentWord("current"):
+		if !p.consumeIdentWord("row") {
+			return FrameBound{}, p.errf("expected ROW after CURRENT, found %q", p.peek().text)
+		}
+		return FrameBound{Kind: "current row"}, nil
+	}
+	n, _, err := p.parseCount("frame bound")
+	if err != nil {
+		return FrameBound{}, err
+	}
+	switch {
+	case p.consumeIdentWord("preceding"):
+		return FrameBound{Kind: "preceding", Offset: n}, nil
+	case p.consumeIdentWord("following"):
+		return FrameBound{Kind: "following", Offset: n}, nil
+	}
+	return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING, found %q", p.peek().text)
 }
 
 // parseGrantRevoke parses GRANT/REVOKE ADMIN and per-table privileges.
@@ -3982,6 +4173,30 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		// their arity checked here; anything else parses and is refused
 		// at evaluation (42883), so tools get a clear "unknown function"
 		// rather than a syntax error.
+		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && (aggNames[t.text] || windowNames[t.text]) {
+			// An aggregate or window call inside an expression: a window
+			// call (with OVER) becomes a value the window stage supplies;
+			// a plain aggregate keeps its call form for the evaluator to
+			// refuse or, in HAVING/ORDER BY, the grouped paths to place.
+			se, ok, err := p.parseAggExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			if ok && se.Window != nil {
+				return p.applyCasts(Expr{Window: &se})
+			}
+			e := Expr{Func: strings.ToLower(se.Agg)}
+			switch {
+			case se.AggStar:
+				e.Args = []Expr{{Column: "*"}}
+			case se.AggCol != "":
+				e.Args = []Expr{{Column: se.AggCol}}
+			case se.AggArg != nil:
+				e.Args = []Expr{*se.AggArg}
+			}
+			e.Args = append(e.Args, se.AggArgs...)
+			return p.applyCasts(e)
+		}
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && t.text != "array" {
 			arity, isFunc := scalarFuncs[t.text]
 			if !isFunc {
@@ -4048,6 +4263,11 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 // outputName is the name a select expression is sorted by: its alias,
 // else the column it projects (a computed expression sorts as
 // "?column?", which the executor refuses with a clear error).
+// OutputName is the name a select item produces: the column for a plain
+// column reference, else the alias, else the aggregate's name, else
+// "?column?".
+func OutputName(se SelectExpr) string { return outputName(se) }
+
 func outputName(se SelectExpr) string {
 	if se.Expr.Column != "" && se.Expr.BinOp == "" && se.Expr.Func == "" && len(se.Expr.Path) == 0 {
 		return se.Expr.Column
