@@ -46,6 +46,7 @@ duration, so two runs draw the same keys:
 |---|---|
 | `kv-95-5`, `kv-50-50` | point reads and updates by primary key |
 | `bank` | contended two-row transfers in explicit transactions |
+| `hot-row` | one row updated 16 times inside each transaction: the rewrite of a transaction's own intent, whose cost grew with the depth of the chain (#162) |
 | `ingest-random`, `ingest-sequential`, `ingest-uuid` | batched INSERTs with random integer, per-worker monotone, and UUID text keys |
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |

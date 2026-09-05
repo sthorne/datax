@@ -226,6 +226,19 @@ transaction whose coordinator was already aborted (a serialization
 failure) cannot be rescued by savepoint rollback — the 40001 stands, as
 in CockroachDB.
 
+The history is bounded to what a rollback could restore (issue #162).
+Unbounded, a transaction that wrote one key K times stored K copies of
+the value and rewrote O(K²) bytes, for data only `ROLLBACK TO` reads.
+The coordinator puts `HistoryFloor` in the transaction metadata of every
+batch: negative when no savepoint is live (a rewrite keeps nothing —
+the common case), or F+1 when the oldest live savepoint is at sequence
+F (a rewrite keeps the newest entry at or below F, which that savepoint
+restores, and every entry above it, which a later savepoint the server
+does not know about might; two entries at one sequence collapse to the
+later, the only one a rollback can reach). Zero — a coordinator from
+before the field — keeps everything, so mixed versions need no gate: an
+old server ignores the field, an old client gets the old behavior.
+
 ### Parallel commits
 
 Commit latency was two sequential consensus rounds: lay the final

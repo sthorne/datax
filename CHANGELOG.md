@@ -28,6 +28,24 @@ state or the internode protocol does, and an entry below says so.
   Getter), a miss 3.66 → 3.12 µs (2.63 reused) and 12 → 3 (1); a
   1,000-row scan over 3 versions 735 → 518 µs and 8,019 → 2,016
   allocations, in reverse 1,472 → 1,252 µs.
+- A transaction's intent history is bounded to what a savepoint
+  rollback could restore (#162). Every same-epoch rewrite of a key
+  appended the superseded value to the intent's history and rewrote the
+  whole history with it, so a transaction writing one key K times
+  stored K copies and wrote O(K²) bytes — for data only
+  `ROLLBACK TO SAVEPOINT` reads. The coordinator now tells the servers,
+  in `TxnMeta.HistoryFloor` on every batch, how far back a rollback
+  could reach: with no live savepoint nothing is kept; with the oldest
+  live savepoint at sequence F, the newest entry at or below F and every
+  entry above it; two entries at one sequence collapse to the later. A
+  coordinator from before the field leaves it 0 and gets the old
+  behavior, so no cluster-version gate is needed. Measured on
+  `BenchmarkIntentRewriteDepth`: one more write to a key already
+  written 64 times in the transaction 136 → 12 µs and 45.9 KB → 1.6 KB
+  allocated, flat from depth 1 to 64 (under a savepoint taken before
+  the first write the history is kept as before). `bench/workloads.json`
+  gains `hot-row` — one row updated 16 times per transaction — for the
+  harness. `TestIntentHistoryBounded`.
 - The Pebble format version is pinned at `FormatVirtualSSTables` (16)
   instead of tracking `FormatNewest` (#166): the formats past it change
   what lands on disk (columnar blocks, value separation), and adopting

@@ -293,8 +293,8 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 				if err != nil {
 					return err
 				}
-				history = append(append([]enginepb.IntentValue(nil), meta.History...),
-					enginepb.IntentValue{Sequence: meta.Txn.Sequence, Value: val, Tombstone: tomb})
+				history = boundedHistory(meta.History,
+					enginepb.IntentValue{Sequence: meta.Txn.Sequence, Value: val, Tombstone: tomb}, txn.HistoryFloor)
 			}
 		}
 		if err := b.Delete(appendVersionSuffix(metaKey, meta.Timestamp)); err != nil {
@@ -321,6 +321,43 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 	// place on the spare capacity mvccKeyBounds left (the batch copies
 	// its keys).
 	return b.Put(appendVersionSuffix(metaKey, ts), encodeMVCCValue(value, tombstone))
+}
+
+// boundedHistory is the intent history after a same-epoch rewrite adds
+// the superseded value, keeping only what a savepoint rollback could
+// still restore (issue #162). Unbounded, a transaction writing one key
+// K times stored K copies and rewrote O(K²) bytes, for a history only
+// RollbackToSavepoint reads. A rollback to sequence S restores the
+// newest entry at or below S, so: an entry sharing its sequence with the
+// one before it makes that one unreachable (a statement writing a key
+// twice), and replaces it; with no live savepoint (floor < 0) nothing is
+// reachable; with the oldest live savepoint at F = floor-1, only the
+// newest entry at or below F is reachable among those, while every
+// entry above F may serve a later savepoint. floor 0 — a coordinator
+// from before the field — keeps everything.
+func boundedHistory(prev []enginepb.IntentValue, add enginepb.IntentValue, floor int32) []enginepb.IntentValue {
+	if floor < 0 {
+		return nil
+	}
+	history := make([]enginepb.IntentValue, 0, len(prev)+1)
+	history = append(history, prev...)
+	if n := len(history); n > 0 && history[n-1].Sequence == add.Sequence {
+		history[n-1] = add
+	} else {
+		history = append(history, add)
+	}
+	if floor == 0 {
+		return history
+	}
+	// Entries ascend by sequence. Keep the last one at or below F and
+	// everything after it.
+	first := 0
+	for i, e := range history {
+		if e.Sequence <= floor-1 {
+			first = i
+		}
+	}
+	return history[first:]
 }
 
 // MVCCRollbackIntent rolls the transaction's intent on key back to its

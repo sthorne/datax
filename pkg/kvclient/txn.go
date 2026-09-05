@@ -172,8 +172,24 @@ func (t *Txn) recordRead(start, end keys.Key) {
 func (db *DB) NewTxn(name string) *Txn {
 	t := &Txn{db: db}
 	t.mu.txn = *kvpb.NewTransaction(name, rand.Int31n(1<<20), db.clock.Now())
+	t.mu.txn.HistoryFloor = -1 // no savepoint yet: rewrites keep no history (issue #162)
 	t.mu.writes = make(map[string]struct{})
 	return t
+}
+
+// updateHistoryFloor recomputes TxnMeta.HistoryFloor from the live
+// savepoints (issue #162): the servers keep, on a rewrite of one of the
+// transaction's intents, only the superseded values a rollback to a live
+// savepoint could restore. Called with mu held whenever the savepoint
+// set changes.
+func (t *Txn) updateHistoryFloor() {
+	floor := int32(-1)
+	for _, sp := range t.mu.savepoints {
+		if floor < 0 || sp.seq+1 < floor {
+			floor = sp.seq + 1
+		}
+	}
+	t.mu.txn.HistoryFloor = floor
 }
 
 // NewHistoricalTxn begins a READ-ONLY transaction pinned at ts: every read
@@ -265,6 +281,7 @@ func (t *Txn) Savepoint(name string) error {
 		readSpans:       len(t.mu.readSpans),
 		refreshUnusable: t.mu.refreshUnusable,
 	}
+	t.updateHistoryFloor()
 	return nil
 }
 
@@ -282,6 +299,7 @@ func (t *Txn) ReleaseSavepoint(name string) error {
 			delete(t.mu.savepoints, n)
 		}
 	}
+	t.updateHistoryFloor()
 	return nil
 }
 
@@ -352,6 +370,7 @@ func (t *Txn) RollbackToSavepoint(ctx context.Context, name string) error {
 			delete(t.mu.savepoints, n)
 		}
 	}
+	t.updateHistoryFloor()
 	return nil
 }
 
