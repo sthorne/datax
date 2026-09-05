@@ -182,18 +182,27 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 			}
 			built[i], pkKeys[i] = row, key
 		}
-		existing, err := txn.GetBatch(ctx, pkKeys)
+		// One batched read for the chunk's primary keys, unique-index
+		// entries and foreign-key parents (issue #103).
+		probeKeys := make([]keys.Key, 0, len(rows)*2)
+		for i := range rows {
+			probeKeys = append(probeKeys, pkKeys[i])
+			probeKeys = appendUniqueIndexKeys(probeKeys, desc, built[i])
+			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, nil, built[i])
+		}
+		ps, err := newProbeSet(ctx, txn, probeKeys)
 		if err != nil {
 			return err
 		}
+		guard.setProbe(ps)
 		var wb kvclient.WriteBatch
 		inserted := map[string]bool{}
 		for i, r := range rows {
-			if existing[i] != nil {
+			if ps.vals[string(pkKeys[i])] != nil {
 				return ci.rowErr(r.ordinal, newErrf(CodeUniqueViolation,
 					"duplicate key value violates unique constraint on %q", desc.Name))
 			}
-			if err := insertRow(ctx, txn, desc, targets[i], r.vals, &wb, inserted, true); err != nil {
+			if err := insertRow(ctx, txn, desc, targets[i], r.vals, &wb, inserted, true, ps); err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
 			if err := guard.checkInsert(ctx, txn, built[i], inserted); err != nil {

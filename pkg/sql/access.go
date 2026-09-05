@@ -632,7 +632,7 @@ func reshardMirrorIndex(desc *catalog.TableDescriptor, i int, shadowRow map[cata
 // Unique conflicts are detected through the transaction (a racing insert's
 // intent makes the conflict visible); seen catches duplicates within one
 // statement whose writes are still buffered.
-func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool, ps *probeSet) error {
 	shadowRow, serr := reshardShadowRow(desc, row)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -653,7 +653,7 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			if seen[string(key)] {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
-			if existing, err := txn.Get(ctx, key); err != nil {
+			if existing, err := ps.get(ctx, txn, key); err != nil {
 				return err
 			} else if existing != nil {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
@@ -693,7 +693,7 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 // updateIndexEntries buffers the delete-old/put-new pair for every index
 // whose entry changed between oldRow and newRow (the primary key is
 // immutable under UPDATE, so only indexed-column changes move entries).
-func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool) error {
+func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool, ps *probeSet) error {
 	shadowOld, serr := reshardShadowRow(desc, oldRow)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -732,7 +732,7 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 				if seen[string(newKey)] {
 					return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 				}
-				if existing, err := txn.Get(ctx, newKey); err != nil {
+				if existing, err := ps.get(ctx, txn, newKey); err != nil {
 					return err
 				} else if existing != nil {
 					return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
@@ -746,6 +746,47 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 		}
 	}
 	return nil
+}
+
+// appendUniqueIndexKeys appends the row's entry keys in every unique
+// index (the keys an insert probes), for batching those probes.
+func appendUniqueIndexKeys(ks []keys.Key, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) []keys.Key {
+	for i := range desc.Indexes {
+		idx := &desc.Indexes[i]
+		if !idx.Unique {
+			continue
+		}
+		key, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+		if err == nil && !skip {
+			ks = append(ks, key)
+		}
+	}
+	return ks
+}
+
+// appendMovedUniqueIndexKeys appends the new entry keys of the unique
+// indexes whose entry changes between oldRow and newRow (the keys an
+// update probes).
+func appendMovedUniqueIndexKeys(ks []keys.Key, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum) []keys.Key {
+	for i := range desc.Indexes {
+		idx := &desc.Indexes[i]
+		if !idx.Unique {
+			continue
+		}
+		oldKey, _, oldSkip, err := rowenc.EncodeIndexEntry(desc, idx, oldRow)
+		if err != nil {
+			continue
+		}
+		newKey, _, newSkip, err := rowenc.EncodeIndexEntry(desc, idx, newRow)
+		if err != nil || newSkip {
+			continue
+		}
+		if !oldSkip && bytes.Equal(oldKey, newKey) {
+			continue
+		}
+		ks = append(ks, newKey)
+	}
+	return ks
 }
 
 func copyRow(row map[catalog.ColumnID]types.Datum) map[catalog.ColumnID]types.Datum {

@@ -8,6 +8,25 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.34.0 — unreleased
+
+### Changed
+- Batched point reads in the executor (#103). An index join fetches the
+  primary rows behind its index entries in pages of 256, each page one
+  routed batch fanned out per range, in index order (`EXPLAIN ANALYZE`
+  reports the batches); a lookup matching 1,000 entries is four round
+  trips instead of 1,000. `INSERT` builds every row first and reads all
+  its primary-key and unique-index uniqueness probes and its foreign-key
+  parent lookups in one batch (as `COPY` did for primary keys; `COPY`
+  now batches the unique-index and foreign-key probes too); `UPDATE`
+  computes every row's new values first and batches the moved
+  unique-index entries' probes and the changed keys' parent lookups;
+  `SELECT ... FOR UPDATE` locks the selected rows in one batch. Each key
+  still records its read timestamp for refresh, and a key the batch was
+  not primed with still reads on its own. Before/after on the harness in
+  the PR; the set gains `index-join-1pct` and `index-join-10pct` (200 and
+  2,000 rows per lookup).
+
 ## 0.33.0 — unreleased
 
 ### Changed

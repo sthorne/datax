@@ -48,7 +48,7 @@ duration, so two runs draw the same keys:
 | `bank` | contended two-row transfers in explicit transactions |
 | `ingest-random`, `ingest-sequential`, `ingest-uuid` | batched INSERTs with random integer, per-worker monotone, and UUID text keys |
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
-| `index-join` | secondary-index lookups fanning out to wide primary rows |
+| `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
 | `scan` | large result sets streamed through pgwire |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
