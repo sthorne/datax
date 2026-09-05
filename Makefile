@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test test-race vet fmt fmt-check proto lint all bench
+.PHONY: build test test-race vet fmt fmt-check proto lint staticcheck vulncheck all bench
 
 all: build
 
@@ -38,4 +38,15 @@ proto:
 bench: build
 	bench/run.sh
 
-lint: vet fmt-check
+# The same pinned tools CI runs (.github/workflows/ci.yaml,
+# vulncheck.yaml). GOTOOLCHAIN pins the tool build to the module's Go
+# version: `go run pkg@version` ignores the current module, so a machine
+# whose default Go is older would otherwise build the tool with that one
+# and refuse this module's code.
+staticcheck:
+	GOTOOLCHAIN=$$($(GO) env GOVERSION) $(GO) run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+vulncheck:
+	GOTOOLCHAIN=$$($(GO) env GOVERSION) $(GO) run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+lint: vet fmt-check staticcheck

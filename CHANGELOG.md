@@ -89,6 +89,18 @@ state or the internode protocol does, and an entry below says so.
   `TestOnePhaseCommitHonorsDeadline`,
   `TestOnlineCreateIndexUnderLapsedLeaseImplicit`.
 
+### Changed
+- CI runs `staticcheck` (pinned at 2025.1.1, before the suite so a
+  failure is quick; `make staticcheck` / `make lint` run the same) on
+  top of gofmt and `go vet` (#142). Its first run is the baseline: the
+  17 findings it made — 13 unused functions, fields and types, a
+  redundant `| 0`, two simplifications — are gone.
+- A `vulncheck` workflow runs `govulncheck` (pinned at v1.7.0) on every
+  push and pull request and weekly on a schedule, as a gate (#143): it
+  reports only advisories whose vulnerable symbols this module reaches,
+  and advisories appear against unchanged code, hence the timer.
+  `make vulncheck` runs it locally.
+
 ## 0.40.0 — unreleased
 
 ### Changed

@@ -652,12 +652,3 @@ func (s *Session) expandDefaults(ctx context.Context, txn *kvclient.Txn, desc *c
 	}
 	return outT, outV, nil
 }
-
-// sequenceNameFor renders a column's owned sequence, for the catalogs.
-func (s *Session) sequenceNameFor(ctx context.Context, txn *kvclient.Txn, id uint64) string {
-	d, err := catalog.ReadSequence(ctx, txn, id)
-	if err != nil {
-		return strconv.FormatUint(id, 10)
-	}
-	return d.Name
-}

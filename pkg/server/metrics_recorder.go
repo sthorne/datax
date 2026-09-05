@@ -145,11 +145,6 @@ func labelledSeries(base, label, value string) string {
 	return fmt.Sprintf("%s{%s=%s}", base, label, value)
 }
 
-type metricSample struct {
-	name  string
-	value float64
-}
-
 func (n *Node) metricsRecordInterval() time.Duration {
 	if n.cfg.MetricsRecordInterval < 0 {
 		return 0

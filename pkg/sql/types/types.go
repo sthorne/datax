@@ -614,9 +614,7 @@ func FormatTimestamp(nanos int64, noTZ bool) string {
 func FormatTimestampIn(nanos int64, loc *time.Location) string {
 	t := time.Unix(0, nanos).In(loc)
 	s := t.Format("2006-01-02 15:04:05.999999999-07:00")
-	if strings.HasSuffix(s, ":00") {
-		s = s[:len(s)-3]
-	}
+	s = strings.TrimSuffix(s, ":00")
 	return s
 }
 

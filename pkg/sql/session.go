@@ -1913,12 +1913,6 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 	return cmpHolds(op, c), nil
 }
 
-// likeToRegexp translates a LIKE pattern (% and _ wildcards, backslash
-// escapes) into an anchored regular expression.
-func likeToRegexp(pattern string) string {
-	return likeToRegexpEsc(pattern, "")
-}
-
 // escapeRune resolves a pattern's ESCAPE character: backslash by
 // default, none for parser.NoEscape.
 func escapeRune(escape string) (rune, bool) {

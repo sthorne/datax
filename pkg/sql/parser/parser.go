@@ -162,16 +162,6 @@ func (r ColumnRef) String() string {
 	return r.Column
 }
 
-// expectColumnName parses a possibly-qualified column name into its
-// single-string form.
-func (p *parser) expectColumnName() (string, error) {
-	ref, err := p.parseColumnRef()
-	if err != nil {
-		return "", err
-	}
-	return ref.String(), nil
-}
-
 // consumeIdentWord consumes the next token when it is the given
 // (lower-cased) identifier — for words that are not reserved keywords.
 func (p *parser) consumeIdentWord(word string) bool {
@@ -3835,25 +3825,6 @@ func (p *parser) parseBoolFactor() (boolNode, error) {
 	return n, nil
 }
 
-// parseConjunct parses one atomic condition as a single comparison (a
-// BETWEEN's two conjuncts pack as a one-disjunct OR).
-func (p *parser) parseConjunct() (Comparison, error) {
-	conds, negated, err := p.parseConjuncts()
-	if err != nil {
-		return Comparison{}, err
-	}
-	var cmp Comparison
-	if len(conds) == 1 {
-		cmp = conds[0]
-	} else {
-		cmp = Comparison{Op: "OR", Or: [][]Comparison{conds}}
-	}
-	if negated {
-		return negateComparison(cmp)
-	}
-	return cmp, nil
-}
-
 // continuesValue reports whether the next token extends a parenthesized
 // group into a larger value or predicate (a cast, an operator, a path
 // step, or a predicate suffix).
@@ -4308,24 +4279,6 @@ func HasSubInOr(conds []Comparison) bool {
 					return true
 				}
 			}
-		}
-	}
-	return false
-}
-
-func exprContainsSub(e Expr) bool {
-	if e.Sub != nil {
-		return true
-	}
-	if e.Left != nil && exprContainsSub(*e.Left) {
-		return true
-	}
-	if e.Right != nil && exprContainsSub(*e.Right) {
-		return true
-	}
-	for _, a := range e.Args {
-		if exprContainsSub(a) {
-			return true
 		}
 	}
 	return false

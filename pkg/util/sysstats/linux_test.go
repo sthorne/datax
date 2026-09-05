@@ -52,7 +52,7 @@ func copyFile(t *testing.T, src, dst string) {
 func TestLinuxHostFigures(t *testing.T) {
 	// The "store" lives on major 259, minor 0 (nvme0n1 in the fixture).
 	fakeStatfs := func(string) (uint64, uint64, uint64, bool) {
-		dev := uint64(259)<<8 | 0 // dev_t with major 259, minor 0
+		dev := uint64(259) << 8 // dev_t with major 259, minor 0
 		return 1 << 40, 1 << 39, dev, true
 	}
 	r := &linuxReader{procRoot: fixtureProc(t, "stat", "dev"), diskstats: "testdata/diskstats", statfs: fakeStatfs}
@@ -126,7 +126,7 @@ func TestDiskstatsMatchesDevice(t *testing.T) {
 func TestDevMajorMinor(t *testing.T) {
 	// 259:0 as the kernel encodes it: minor in the low byte and bits 20+,
 	// major in bits 8-19 and 32+.
-	dev := uint64(259)<<8 | 0
+	dev := uint64(259) << 8
 	if unixMajor(dev) != 259 || unixMinor(dev) != 0 {
 		t.Fatalf("259:0 decoded as %d:%d", unixMajor(dev), unixMinor(dev))
 	}

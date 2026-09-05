@@ -15,20 +15,6 @@ func (p *parser) consumeWord(word string) bool {
 	return false
 }
 
-// peekWord reports whether the next token is word (keyword or identifier).
-func (p *parser) peekWord(word string) bool {
-	t := p.peek()
-	return t.kind == tkKeyword && t.text == strings.ToUpper(word) || t.kind == tkIdent && t.text == strings.ToLower(word)
-}
-
-// expectWord consumes word or fails.
-func (p *parser) expectWord(word string) error {
-	if !p.consumeWord(word) {
-		return p.errf("expected %s, found %q", strings.ToUpper(word), p.peek().text)
-	}
-	return nil
-}
-
 // parseRoleName parses a role name: an identifier, or a string (some
 // tools quote role names), lower-cased unless quoted.
 func (p *parser) parseRoleName() (string, error) {

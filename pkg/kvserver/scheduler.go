@@ -519,10 +519,3 @@ func (sc *raftScheduler) stopAll() {
 		r.markStopped()
 	}
 }
-
-// queueLen reports the queue depth (for status and tests).
-func (sc *raftScheduler) queueLen() int {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return len(sc.mu.queue)
-}
