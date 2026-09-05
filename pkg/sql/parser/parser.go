@@ -284,11 +284,20 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseCreateTable()
 	case "EXPLAIN":
 		p.i++
+		analyze := false
+		// EXPLAIN ANALYZE <query> ("analyze" lexes as an identifier; a
+		// bare EXPLAIN ANALYZE t is the ANALYZE statement explained).
+		if t := p.peek(); t.kind == tkIdent && t.text == "analyze" && p.i+1 < len(p.toks) {
+			if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "SELECT" || nxt.kind == tkIdent && nxt.text == "with" || nxt.kind == tkOp && nxt.text == "(" {
+				p.i++
+				analyze = true
+			}
+		}
 		inner, err := p.parseStatement()
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{Stmt: inner}, nil
+		return &Explain{Stmt: inner, Analyze: analyze}, nil
 	case "DROP":
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
 			p.i += 2 // DROP USER

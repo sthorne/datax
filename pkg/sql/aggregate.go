@@ -847,6 +847,7 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 		res.Rows = append(res.Rows, out)
 	}
 
+	s.note("group/aggregate: %d groups from %d rows", len(res.Rows), len(rows))
 	if t.Distinct {
 		res.Rows = dedupeRowsPrefix(res.Rows, visible)
 	}

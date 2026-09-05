@@ -102,3 +102,25 @@ func TestParseQueryShapes(t *testing.T) {
 		}
 	}
 }
+
+// TestParseExplainAnalyze: EXPLAIN ANALYZE precedes a query; a bare
+// EXPLAIN ANALYZE t still explains the ANALYZE statement.
+func TestParseExplainAnalyze(t *testing.T) {
+	ex := parseOne(t, `EXPLAIN ANALYZE SELECT 1 FROM t`).(*Explain)
+	if !ex.Analyze {
+		t.Fatalf("analyze flag: %+v", ex)
+	}
+	if _, ok := ex.Stmt.(*Select); !ok {
+		t.Fatalf("inner: %T", ex.Stmt)
+	}
+	ex = parseOne(t, `EXPLAIN ANALYZE WITH q AS (SELECT 1) SELECT * FROM q`).(*Explain)
+	if !ex.Analyze || len(ex.Stmt.(*Select).With) != 1 {
+		t.Fatalf("analyze with: %+v", ex)
+	}
+	if ex := parseOne(t, `EXPLAIN SELECT 1 FROM t`).(*Explain); ex.Analyze {
+		t.Fatalf("plain explain: %+v", ex)
+	}
+	if ex := parseOne(t, `EXPLAIN ANALYZE t`).(*Explain); ex.Analyze {
+		t.Fatalf("EXPLAIN of ANALYZE: %+v", ex)
+	}
+}

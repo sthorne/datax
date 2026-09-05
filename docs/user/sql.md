@@ -250,9 +250,10 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   expression (`qty * 2 > 10`, `lower(name) = 'x'`); a value may be a
   literal, parameter, column, or scalar `(SELECT ...)`. Computed
   left-hand sides and `->`/`->>` conjuncts work in joins too (evaluated
-  on the joined row). `IN` and `EXISTS` subqueries cannot appear inside
-  `OR` (scalar ones can). `OR` conditions, `LIKE`, `ANY` and
-  path/computed conjuncts filter fetched rows — they never become index
+  on the joined row). `IN`, `EXISTS` and scalar subqueries may appear
+  inside `OR` (each is evaluated once, or per row when correlated).
+  `OR` conditions, `LIKE`, `ANY` and path/computed conjuncts filter
+  fetched rows — they never become index
   bounds, so pair them with an indexable `AND` condition on large tables.
 - **Predicates**: `[NOT] BETWEEN [SYMMETRIC] a AND b` (two conjuncts,
   so a keyed column's range becomes index bounds), `IS [NOT] TRUE |
@@ -383,7 +384,9 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,
-  memoized on the referenced values, up to 4 nesting levels.
+  memoized on the referenced values, up to 8 nesting levels. An
+  uncorrelated scalar subquery can also sort: `ORDER BY x - (SELECT
+  avg(x) FROM t)`.
 - **Set operations**: `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL]`,
   between selects, `VALUES` lists and parenthesized queries (which may
   carry their own `ORDER BY` / `LIMIT`) with the same number of
@@ -413,7 +416,24 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   prefer keyset pagination (`WHERE id > $last ORDER BY id LIMIT n`) on
   large tables. `LIMIT 0` returns no rows.
 
-Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
+Check the plan with `EXPLAIN SELECT ...` — one line naming the access
+path — or run it with `EXPLAIN ANALYZE SELECT ...`, which executes the
+statement and reports the plan line followed by every stage with its
+actual rows and time (each scan and its path, each join level, the
+group / window / set-operation and sort stages), then the output row
+count and the total time:
+
+```
+plan: nested loop inner join; outer (o): full table scan; inner (c) per outer row: point lookup on primary key
+  scan orders: full table scan; 1000 rows in 3.412 ms
+  scan customers: point lookup on primary key; 1 rows in 0.101 ms
+  ...
+  join level 1 (c, inner): 1000 rows
+  sort: 1000 joined rows in memory
+output: 1000 rows; total 41.220 ms
+```
+
+The plan-only form:
 
 ```
 point lookup on primary key

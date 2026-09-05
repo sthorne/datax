@@ -695,6 +695,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 			}
 		}
 		joined = next
+		s.note("join level %d (%s, %s): %d rows", k, sides[k].alias, joinKindName(sides[k], t.Joins[k-1]), len(joined))
 	}
 
 	// The full WHERE filters complete rows only (LEFT JOIN semantics:
@@ -729,6 +730,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		if err := sortJoinedRows(sides, joined, resolveOrderAliases(t), params); err != nil {
 			return nil, err
 		}
+		s.note("sort: %d joined rows in memory", len(joined))
 	}
 
 	res := &Result{}

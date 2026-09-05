@@ -137,11 +137,11 @@ docs/replication-and-placement.md); more recent ones fall back to leaders.
 The usable window is bounded by the closed-timestamp lag (default 3s)
 on the recent side and the GC TTL (default 25h) on the old side.
 
-Still out of scope: correlated subqueries nested past 4 levels or over
-join/derived-table shapes,
+Still out of scope: correlated subqueries nested past 8 levels or over
+set-operation shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; outer joins and self-joins keep syntactic order),
-`EXPLAIN ANALYZE`, RANGE frames with an offset,
+`EXPLAIN` options in parentheses, RANGE frames with an offset,
 deferrable constraints,
 typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
 ignored; casts apply both),

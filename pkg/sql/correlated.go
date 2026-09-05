@@ -35,7 +35,7 @@ import (
 
 // maxCorrDepth caps subquery nesting below a correlated statement: each
 // level multiplies the work of the one above.
-const maxCorrDepth = 4
+const maxCorrDepth = 8
 
 // scopeLevel is one query's name-resolution scope: a table, or (aliases
 // set) the merged sides of a join, whose descriptor carries every side's

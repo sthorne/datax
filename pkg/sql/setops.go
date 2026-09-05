@@ -109,6 +109,7 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 	}
 
+	s.note("set operation: %d member(s), %d rows", len(members), len(rows))
 	if len(t.OrderBy) > 0 {
 		// A name written after the last member was rewritten to that
 		// member's output name; map it onto the head's column at the

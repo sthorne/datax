@@ -135,6 +135,9 @@ type Session struct {
 	// rels are the statement-scoped relations (WITH members, joined
 	// derived tables) bound by name; see cte.go.
 	rels map[string]*relation
+	// explain collects each stage's actual rows and time while EXPLAIN
+	// ANALYZE runs a statement (nil otherwise).
+	explain *explainStats
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -1060,7 +1063,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			for _, disjunct := range cmp.Or {
 				for _, inner := range disjunct {
 					if inner.Sub != nil {
-						return false, newErrf(CodeFeatureNotSupported, "IN and EXISTS subqueries are not supported inside OR")
+						return false, newErrf(CodeInternal, "an IN or EXISTS subquery inside OR was not resolved before execution")
 					}
 				}
 				ok, err := matchesWhere(disjunct, desc, row, params)
