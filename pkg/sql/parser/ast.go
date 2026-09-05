@@ -58,6 +58,10 @@ type Expr struct {
 	// "regclass" ('t'::regclass resolves a table name to its OID) is kept;
 	// every other cast is absorbed.
 	Cast string `json:"cast,omitempty"`
+	// Window is a window function call used as a value inside an
+	// expression; the executor computes it as a window item and
+	// substitutes its value.
+	Window *SelectExpr `json:"window,omitempty"`
 }
 
 // CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
@@ -319,6 +323,45 @@ type SelectExpr struct {
 	AggDistinct bool
 	AggFilter   []Comparison
 	AggOrder    []OrderCol
+	// Window makes the call a window function: an aggregate computed
+	// over each row's frame, or one of the window-only functions
+	// (ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG,
+	// LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE) in Agg.
+	Window *WindowSpec
+}
+
+// windowExprDoc: Expr.Window (below) holds a window function call used
+// inside a value expression (amount - lag(amount) OVER (ORDER BY at)).
+
+// WindowSpec is an OVER clause: [name] [PARTITION BY exprs] [ORDER BY
+// terms] [frame]. Name refers to a WINDOW clause entry the spec extends
+// (or, alone, uses).
+type WindowSpec struct {
+	Name        string
+	PartitionBy []Expr
+	OrderBy     []OrderCol
+	Frame       *WindowFrame
+}
+
+// WindowFrame is ROWS | RANGE BETWEEN start AND end (end defaults to
+// CURRENT ROW).
+type WindowFrame struct {
+	Mode       string // "ROWS" or "RANGE"
+	Start, End FrameBound
+}
+
+// FrameBound is one frame edge: "unbounded preceding", "preceding" (by
+// Offset rows), "current row", "following" (by Offset rows), or
+// "unbounded following".
+type FrameBound struct {
+	Kind   string
+	Offset int64
+}
+
+// NamedWindow is one WINDOW clause entry.
+type NamedWindow struct {
+	Name string
+	Spec WindowSpec
 }
 
 // OrderCol is one ORDER BY term: an output/column name, or (Expr set) a
@@ -378,6 +421,9 @@ type JoinClause struct {
 	Natural bool
 	Table   string
 	Alias   string
+	// Derived is a subquery joined as a member (JOIN (SELECT ...) AS d
+	// ON ...); Table is empty then and Alias names it.
+	Derived *Select
 	// FuncTable is a table function joined in (FROM t, f(x) [WITH
 	// ORDINALITY] AS a(c1, c2)), with its column names; Table is empty
 	// then. Parsed for the catalog queries tools send; not executable.
@@ -425,6 +471,8 @@ type Select struct {
 	// apply to the whole union and are carried by the head select.
 	Union    *Select
 	UnionAll bool
+	// Windows are the WINDOW clause's named specifications.
+	Windows []NamedWindow
 	// SetOp is the operator between this member and Union: "UNION" (or
 	// ""), "INTERSECT" or "EXCEPT". Members form a flat list in written
 	// order; INTERSECT binds tighter than the other two, which associate

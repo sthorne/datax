@@ -287,6 +287,14 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		}
 		defer restore()
 	}
+	if hasDerivedJoin(sub) {
+		bound, restore, err := s.bindJoinedDerived(ctx, txn, sub, nil, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer restore()
+		sub = bound
+	}
 	var innerDesc *catalog.TableDescriptor
 	switch {
 	case sub.FuncTable != nil:

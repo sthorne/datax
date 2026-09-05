@@ -319,7 +319,7 @@ func stmtReferences(stmt parser.Statement, name string) bool {
 				return true
 			}
 			for _, j := range m.Joins {
-				if strings.EqualFold(j.Table, name) {
+				if strings.EqualFold(j.Table, name) || (j.Derived != nil && sel(j.Derived)) {
 					return true
 				}
 			}
@@ -346,6 +346,72 @@ func stmtReferences(stmt parser.Statement, name string) bool {
 		return strings.EqualFold(t.Table, name) || conds(t.Where)
 	case *parser.Delete:
 		return strings.EqualFold(t.Table, name) || conds(t.Where)
+	}
+	return false
+}
+
+// bindJoinedDerived binds every JOIN (SELECT ...) AS d member of t as a
+// relation named by its alias (rows when executing, columns only when
+// describing), returning t with the members referring to the relations
+// by name and a function restoring the shadowed bindings.
+func (s *Session) bindJoinedDerived(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum, describeOnly bool) (*parser.Select, func(), error) {
+	saved := map[string]*relation{}
+	restore := func() { s.restoreRelations(saved) }
+	var out *parser.Select
+	for i := range t.Joins {
+		jc := t.Joins[i]
+		if jc.Derived == nil {
+			continue
+		}
+		if out == nil {
+			c := *t
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+			out = &c
+		}
+		name := strings.ToLower(jc.Alias)
+		var cols []ResultColumn
+		var rows [][]types.Datum
+		if describeOnly {
+			c, serr := s.PlanColumns(ctx, jc.Derived)
+			if serr != nil {
+				restore()
+				return nil, nil, serr
+			}
+			cols = c
+		} else {
+			res, err := s.execSubSelect(ctx, txn, jc.Derived, params)
+			if err != nil {
+				restore()
+				return nil, nil, err
+			}
+			cols, rows = res.Columns, res.Rows
+		}
+		desc, err := relationDesc(name, cols, nil)
+		if err != nil {
+			restore()
+			return nil, nil, err
+		}
+		if prev, had := s.bindRelation(name, &relation{desc: desc, rows: rows}); had {
+			if _, seen := saved[name]; !seen {
+				saved[name] = prev
+			}
+		} else if _, seen := saved[name]; !seen {
+			saved[name] = nil
+		}
+		out.Joins[i].Derived, out.Joins[i].Table = nil, name
+	}
+	if out == nil {
+		return t, restore, nil
+	}
+	return out, restore, nil
+}
+
+// hasDerivedJoin reports whether any join member is a subquery.
+func hasDerivedJoin(t *parser.Select) bool {
+	for _, jc := range t.Joins {
+		if jc.Derived != nil {
+			return true
+		}
 	}
 	return false
 }

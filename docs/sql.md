@@ -14,11 +14,11 @@ DROP TABLE t
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
-SELECT [DISTINCT] * | col, ... | aggregates
+SELECT [DISTINCT] * | col, ... | aggregates | func() OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE frame])
     FROM t [[AS] alias] | (SELECT ...) [AS] alias
-    [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS | NATURAL] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...] | USING (cols)]
+    [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS | NATURAL] JOIN t2 | (SELECT ...) [[AS] alias] ON a.x = b.y [AND ...] | USING (cols)]
     [AS OF SYSTEM TIME 't' | AS OF SYSTEM TIME with_max_staleness('d')]
-    [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction]
+    [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction] [WINDOW name AS (...), ...]
     [UNION | INTERSECT | EXCEPT [ALL] query]
     [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
     [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE]
@@ -141,7 +141,7 @@ Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; outer joins and self-joins keep syntactic order),
-window functions, `EXPLAIN ANALYZE`,
+`EXPLAIN ANALYZE`, RANGE frames with an offset,
 deferrable constraints,
 typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
 ignored; casts apply both),
