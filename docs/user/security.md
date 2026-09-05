@@ -161,8 +161,11 @@ claims, but grants still name existing roles: create them first.
 ## HTTP endpoints in secure mode
 
 Every HTTP route requires either HTTP Basic credentials of a database
-user, or a CA-verified client certificate (CN = username). Authorization
-is per endpoint:
+user, or a CA-verified client certificate (CN = username). Both doors
+open only for a role that exists and holds `LOGIN`, exactly as on the
+SQL port: `ALTER ROLE ... NOLOGIN` or `DROP ROLE` shuts a certificate
+holder out at once, not when the certificate expires. Authorization is
+per endpoint:
 
 | Endpoint | Who |
 |---|---|

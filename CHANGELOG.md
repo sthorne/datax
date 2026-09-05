@@ -11,6 +11,16 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- HTTP client-certificate authentication checks that the certificate's
+  CommonName is a role that may log in (#138), as the SQL port always
+  did. A CA-verified certificate was accepted as its principal with no
+  role lookup, so `ALTER ROLE ... NOLOGIN` or `DROP ROLE` revoked SQL
+  and HTTP Basic access but left a certificate holder the read-only
+  HTTP endpoints until the certificate expired (five years, with no
+  revocation). A refused certificate now gets the `401` the Basic path
+  gives, Basic credentials on the same request still get their turn,
+  and the cluster's own node certificate is admitted as before.
+  `TestHTTPCertAuthChecksLogin`.
 - The SCRAM exchange no longer tells which user names exist (#137).
   Unknown users authenticated against one shared stand-in verifier, so
   the salt in `server-first` — sent before any proof — was one constant

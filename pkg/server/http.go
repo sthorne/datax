@@ -325,8 +325,23 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 		if req.TLS != nil && len(req.TLS.VerifiedChains) > 0 &&
 			len(req.TLS.VerifiedChains[0]) > 0 &&
 			req.TLS.VerifiedChains[0][0].Subject.CommonName != "" {
-			serveAs(next, w, req, httpPrincipal{User: req.TLS.VerifiedChains[0][0].Subject.CommonName, Via: "cert"})
-			return
+			cn := req.TLS.VerifiedChains[0][0].Subject.CommonName
+			// The certificate names the role; the role must exist and
+			// hold LOGIN, as on pgwire (issue #138) — so NOLOGIN or DROP
+			// ROLE closes this door too, years before the certificate
+			// expires. The cluster's own identity ("node", a reserved
+			// name with no descriptor) is admitted as it is everywhere.
+			if cn == security.NodePrincipal {
+				serveAs(next, w, req, httpPrincipal{User: cn, Via: "cert"})
+				return
+			}
+			if ok, err := n.canLogin(req.Context(), cn); err == nil && ok {
+				serveAs(next, w, req, httpPrincipal{User: cn, Via: "cert"})
+				return
+			}
+			// Refused: Basic credentials, if any, still get their turn.
+			metrics.AuthFailures.Inc()
+			log.Audit("http-auth-failure", "principal", cn, "via", "cert", "remote", req.RemoteAddr, "path", req.URL.Path)
 		}
 		user, pass, ok := req.BasicAuth()
 		if ok {
