@@ -8,12 +8,18 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 
 | Type | Aliases | Notes |
 |---|---|---|
-| `INT8` | `INT`, `INTEGER`, `BIGINT` | 64-bit |
+| `INT8` | `BIGINT` | 64-bit |
+| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
+| `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
 | `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
-| `TEXT` | `STRING`, `VARCHAR` | |
+| `TEXT` | `STRING`, `VARCHAR` | unbounded |
+| `VARCHAR(n)` | `CHARACTER VARYING(n)` | at most `n` characters: a longer value is refused (`22001`) unless the excess is spaces, which are dropped; `varchar` (OID 1043) with the typmod on the wire |
+| `CHAR(n)` | `CHARACTER(n)`; bare `CHAR` is `CHAR(1)` | fixed width: stored trimmed of trailing spaces, rendered blank-padded to `n` (`'ab'` in a `CHAR(3)` reads back as `'ab '`); `length()`, `||` and comparisons see the trimmed value; `bpchar` (OID 1042) on the wire |
 | `BOOL` | `BOOLEAN` | |
-| `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
+| `TIMESTAMP` | `TIMESTAMP WITHOUT TIME ZONE` | wall-clock time: an offset in the input is ignored (`'2024-01-02 03:04:05+05'` stores `03:04:05`) and the output carries none; `timestamp` (OID 1114) on the wire. Expressions over it (`ts + '1 day'`, `date_trunc`) and casts (`::timestamp`) are `TIMESTAMPTZ` |
+| `TIMESTAMP(p)`, `TIMESTAMPTZ(p)` | | `p` in 0–6: values round to `p` fractional digits on write (half away from zero) |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
 | `UUID` | | |
@@ -35,6 +41,24 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   number collide as duplicates). Expression and aggregate *results* are
   plain DECIMALs and render canonically (`SUM` of `9.90`s can print
   `19.8`), like PostgreSQL's rule that expressions lose the typmod.
+- The other type modifiers — the integer widths, `VARCHAR(n)` /
+  `CHAR(n)`, `TIMESTAMP` without time zone, `TIMESTAMP(p)` — apply on
+  the same paths, and a column that carries one describes with
+  PostgreSQL's OID and typmod (`\d`, `information_schema.columns`,
+  `pg_attribute`, `SHOW CREATE TABLE` spell it). Storage is unchanged
+  by them (an `INT4` is the same varint as an `INT8`; a `TIMESTAMP` the
+  same nanosecond count), so `ALTER COLUMN TYPE` between widths, lengths
+  and timestamp forms never rewrites bytes it does not have to: widening
+  (`INT2` → `INT4` → `INT8`, `VARCHAR(10)` → `VARCHAR(20)` → `TEXT`,
+  `TIMESTAMP(3)` → `TIMESTAMP`) is a descriptor write, anything else is
+  the online rewrite below, which checks every stored value. Typmods
+  on other types (`FLOAT8(3)`) are accepted and ignored. Until the
+  cluster version reaches v9 a new column keeps the earlier meaning of
+  its declaration (`INT` 64-bit, `VARCHAR(n)` unbounded, `TIMESTAMP`
+  = `TIMESTAMPTZ`), so a mixed-version cluster never carries a
+  modifier an older binary would ignore.
+- `SERIAL` is an `INT4` column (`SMALLSERIAL` `INT2`, `BIGSERIAL`
+  `INT8`) drawing from an owned sequence, as in PostgreSQL.
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
@@ -142,12 +166,17 @@ conversion is the type's cast: widening (`INT8` to `DECIMAL` or
 `FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
 typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
 `BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
-typmod change rescales. A value that cannot convert fails the statement
-(`22P02`) and the column is left as it was. Narrowing conversions, the
-primary key, indexed columns, columns a constraint or view uses, and
-columns drawing from a sequence are refused (`0A000`) — drop or replace
-those first. Not inside a transaction block (`25001`); cluster version
-v9.
+typmod change rescales, and a change of integer width, character
+length or timestamp form checks every stored value against the new
+modifier (`22003` / `22001`). A value that cannot convert fails the
+statement (`22P02`) and the column is left as it was. A modifier change
+that cannot lose a value (a wider integer, a longer `VARCHAR`, more
+timestamp digits) skips the rewrite: one descriptor write, and the
+column is not required to be free of indexes and constraints. Family
+narrowing, the primary key, indexed columns, columns a constraint or
+view uses, and columns drawing from a sequence are otherwise refused
+(`0A000`) — drop or replace those first. Not inside a transaction block
+(`25001`); cluster version v9.
 
 **`COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL`**
 stores the text in the descriptor; `obj_description`,

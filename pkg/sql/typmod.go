@@ -7,24 +7,99 @@ import (
 )
 
 // colTypmod is the wire typmod for a projected column: set only for
-// enforced DECIMAL(p,s) columns, 0 (emitted as -1) otherwise.
+// enforced typmods (DECIMAL(p,s), VARCHAR(n) / CHAR(n), TIMESTAMP(p)),
+// 0 (emitted as -1) otherwise.
 func colTypmod(col catalog.Column) int32 {
-	if col.Precision > 0 && col.Type == types.Decimal {
-		return DecimalTypmod(col.Precision, col.Scale)
-	}
-	return 0
+	return col.Typmod()
 }
 
-// enforceTypmod applies a DECIMAL(p,s) column's declared precision and
-// scale to a value about to be stored: the value is rescaled to s
-// (round-half-even), and rejected with SQLSTATE 22003 when its integer
-// digits exceed p−s — PostgreSQL semantics, including the order (9.999
-// into DECIMAL(3,2) first rounds to 10.00, then overflows). The returned
+// colResult describes an output column a table column backs directly:
+// the family with the column's type modifiers, so the wire type and
+// typmod are the column's.
+func colResult(name string, col catalog.Column) ResultColumn {
+	return ResultColumn{Name: name, Type: col.Type, Typmod: col.Typmod(),
+		Width: col.Width, MaxLen: col.MaxLen, Char: col.Char, NoTZ: col.NoTZ, TimePrecision: col.TimePrecision}
+}
+
+// exprResult describes an output column computed from col: the
+// column's modifiers carry over only while the expression keeps its
+// family (a cast or arithmetic loses them, as in PostgreSQL).
+func exprResult(name string, typ types.Family, col catalog.Column) ResultColumn {
+	if typ != col.Type {
+		return ResultColumn{Name: name, Type: typ}
+	}
+	return colResult(name, col)
+}
+
+// coerceColumn brings a value to its column's family the way the
+// write path does: text into a TIMESTAMP (without time zone) column
+// parses ignoring any offset, everything else takes the family's
+// coercion. The SQLSTATE is 22P02 for text that does not parse.
+func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
+	if !d.Null && d.Fam == types.String && col.Type == types.Timestamp && col.NoTZ {
+		n, err := types.ParseTimestampNoTZ(d.S)
+		if err != nil {
+			return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
+		}
+		return types.NewTimestamp(n), nil
+	}
+	out, err := d.Coerce(col.Type)
+	if err != nil {
+		return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
+	}
+	return out, nil
+}
+
+// pureWidening reports whether changing a column's declared type from
+// old to new keeps every stored value valid unchanged — a wider integer,
+// a longer (or unbounded) VARCHAR, a TIMESTAMP(p) gaining digits — so
+// ALTER COLUMN TYPE can rewrite the descriptor alone, in the statement's
+// transaction, with no row rewrite.
+func pureWidening(old, new catalog.Column) bool {
+	if old.Type != new.Type {
+		return false
+	}
+	switch old.Type {
+	case types.Int:
+		return new.IntWidth() >= old.IntWidth()
+	case types.String:
+		if old.Char != new.Char {
+			return false
+		}
+		return new.MaxLen == 0 || (old.MaxLen > 0 && new.MaxLen >= old.MaxLen)
+	case types.Timestamp:
+		if old.NoTZ != new.NoTZ {
+			return false
+		}
+		return new.TimePrecision == 0 || (old.TimePrecision > 0 && new.TimePrecision >= old.TimePrecision)
+	case types.Decimal:
+		return old.Precision == new.Precision && old.Scale == new.Scale
+	}
+	return true
+}
+
+// enforceTypmod applies a column's type modifiers to a value about to
+// be stored. For DECIMAL(p,s) the value is rescaled to s (round-half-
+// even), and rejected with SQLSTATE 22003 when its integer digits
+// exceed p−s — PostgreSQL semantics, including the order (9.999 into
+// DECIMAL(3,2) first rounds to 10.00, then overflows); the returned
 // datum keeps canonical text in S (identity/storage) and carries the
-// declared scale in Dscale (display). Columns without a typmod, non-
-// decimal columns, and NULLs pass through untouched.
+// declared scale in Dscale (display). The integer width, character
+// length, CHAR padding and TIMESTAMP modifiers are catalog.Column.
+// Conform's (22003 / 22001 / 22007). Columns without a typmod and NULLs
+// pass through untouched.
 func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
-	if d.Null || col.Precision == 0 || col.Type != types.Decimal || d.Fam != types.Decimal {
+	if d.Null {
+		return d, nil
+	}
+	if col.Type != types.Decimal {
+		out, err := col.Conform(d)
+		if err != nil {
+			return d, ToSQLError(err)
+		}
+		return out, nil
+	}
+	if col.Precision == 0 || d.Fam != types.Decimal {
 		return d, nil
 	}
 	v, err := decimal.Parse(d.S)

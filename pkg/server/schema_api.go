@@ -348,7 +348,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		for _, c := range d.Columns {
 			colName[c.ID] = c.Name
 			t.Columns = append(t.Columns, SchemaColumn{
-				Name: c.Name, Type: c.Type.String(), NotNull: c.NotNull, Hidden: c.Hidden,
+				Name: c.Name, Type: c.TypeSQL(), NotNull: c.NotNull, Hidden: c.Hidden,
 				Precision: c.Precision, Scale: c.Scale,
 			})
 		}

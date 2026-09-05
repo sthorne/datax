@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sthorne/datax/pkg/util/decimal"
 )
@@ -101,6 +102,16 @@ type Datum struct {
 	// canonical (trailing-zero-stripped) text that equality, grouping, and
 	// storage compare, and Dscale never participates in Compare.
 	Dscale int32 `json:"dscale,omitempty"`
+	// NoTZ is DISPLAY-ONLY: a Timestamp datum read from (or written to)
+	// a TIMESTAMP (without time zone) column renders without the UTC
+	// offset ("2026-08-30 01:02:03", not "...+00"). The value is the same
+	// UTC wall-clock nanosecond count either way; Compare ignores it.
+	NoTZ bool `json:"notz,omitempty"`
+	// Pad is DISPLAY-ONLY: a String datum read from (or written to) a
+	// CHAR(n) column renders blank-padded to n characters. S keeps the
+	// trailing-space-trimmed text that equality, grouping and storage
+	// compare.
+	Pad int32 `json:"pad,omitempty"`
 }
 
 var DNull = Datum{Null: true}
@@ -167,6 +178,41 @@ func ParseTimestamp(s string) (int64, error) {
 		}
 	}
 	return 0, fmt.Errorf("could not parse %q as TIMESTAMPTZ", s)
+}
+
+// ParseTimestampNoTZ parses a TIMESTAMP (without time zone) input: the
+// same layouts as ParseTimestamp, but an offset in the text is ignored
+// — the wall-clock fields are taken as they stand, as PostgreSQL does
+// for timestamp without time zone. Returns UTC wall-clock nanoseconds.
+func ParseTimestampNoTZ(s string) (int64, error) {
+	for _, f := range timestampFormats {
+		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
+			wall := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+			if wall.Before(minTimestamp) || !wall.Before(maxTimestamp) {
+				return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
+			}
+			return wall.UnixNano(), nil
+		}
+	}
+	return 0, fmt.Errorf("could not parse %q as TIMESTAMP", s)
+}
+
+// RoundTimestamp rounds UTC nanoseconds to p fractional second digits
+// (0 ≤ p ≤ 9; half away from zero, as PostgreSQL rounds a TIMESTAMP(p)
+// input).
+func RoundTimestamp(nanos int64, p int32) int64 {
+	if p < 0 || p >= 9 {
+		return nanos
+	}
+	unit := int64(1)
+	for i := int32(0); i < 9-p; i++ {
+		unit *= 10
+	}
+	half := unit / 2
+	if nanos >= 0 {
+		return (nanos + half) / unit * unit
+	}
+	return -((-nanos + half) / unit * unit)
 }
 
 // ParseDate parses a YYYY-MM-DD date string to days since the Unix epoch.
@@ -431,6 +477,24 @@ func cmpBool(a, b bool) int {
 }
 
 // Text renders the datum in PostgreSQL text format.
+// FormatTimestamp renders UTC nanoseconds in PostgreSQL's text form,
+// with the "+00" offset (TIMESTAMPTZ) or without it (TIMESTAMP).
+func FormatTimestamp(nanos int64, noTZ bool) string {
+	if noTZ {
+		return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999")
+	}
+	return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999-07")
+}
+
+// PadTo blank-pads s to n characters (CHAR(n) output); a longer s is
+// returned as it is.
+func PadTo(s string, n int32) string {
+	if c := int32(utf8.RuneCountInString(s)); c < n {
+		return s + strings.Repeat(" ", int(n-c))
+	}
+	return s
+}
+
 func (d Datum) Text() string {
 	if d.Null {
 		return "" // callers render NULL specially (wire: -1 length)
@@ -441,6 +505,9 @@ func (d Datum) Text() string {
 	case Float:
 		return strconv.FormatFloat(d.F, 'g', -1, 64)
 	case String:
+		if d.Pad > 0 {
+			return PadTo(d.S, d.Pad)
+		}
 		return d.S
 	case Bool:
 		if d.B {
@@ -448,8 +515,9 @@ func (d Datum) Text() string {
 		}
 		return "f"
 	case Timestamp:
-		// PostgreSQL text format: "2026-08-30 01:02:03.456+00".
-		return time.Unix(0, d.I).UTC().Format("2006-01-02 15:04:05.999999999-07")
+		// PostgreSQL text format: "2026-08-30 01:02:03.456+00"; without
+		// the offset for a TIMESTAMP (without time zone) value.
+		return FormatTimestamp(d.I, d.NoTZ)
 	case Date:
 		return time.Unix(d.I*86400, 0).UTC().Format("2006-01-02")
 	case Bytes:

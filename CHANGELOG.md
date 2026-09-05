@@ -8,6 +8,35 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.24.0 — unreleased
+
+### Added
+- Type system, part one (#96): the type modifiers a column declares
+  are enforced and described. Integer widths — `INT2` / `SMALLINT`,
+  `INT4` / `INT` / `INTEGER`, `INT8` / `BIGINT` — bound the values
+  (`22003`) and describe with PostgreSQL's OIDs (21 / 23 / 20) and
+  binary sizes, so drivers scan into `int16` / `int32`; `SERIAL` is
+  `INT4`, `SMALLSERIAL` `INT2`. `VARCHAR(n)` / `CHAR(n)` refuse a
+  longer value (`22001`; excess spaces are dropped) and `CHAR(n)` renders
+  blank-padded (`varchar` 1043 / `bpchar` 1042 with the typmod).
+  `TIMESTAMP` is now `TIMESTAMP WITHOUT TIME ZONE` (OID 1114: an input
+  offset is ignored, the output carries none), `TIMESTAMPTZ` /
+  `TIMESTAMP WITH TIME ZONE` is unchanged, and `TIMESTAMP(p)` /
+  `TIMESTAMPTZ(p)` round to `p` digits on write. `SHOW CREATE TABLE`,
+  `information_schema.columns`, `pg_attribute`, `pg_type` (five new
+  rows), `format_type`, `LIKE` and `CREATE TABLE AS` carry the
+  modifiers; `ALTER COLUMN TYPE` changes them — a widening is one
+  descriptor write, a narrowing rewrites and checks every value. Storage
+  is unchanged (the modifiers ride on the descriptor; no cluster
+  version bump); until v9 is finalized a new column keeps the earlier
+  meaning of its declaration.
+
+### Changed
+- `INT` / `INTEGER` columns are 32-bit (they were `INT8`): a value past
+  ±2³¹ into a column created from now on is `22003`. Existing columns
+  keep their width. `TIMESTAMP` columns created from now on render
+  without the `+00` offset and ignore an input offset.
+
 ## 0.23.0 — unreleased
 
 ### Added

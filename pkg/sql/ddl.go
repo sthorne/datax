@@ -293,9 +293,9 @@ func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *c
 			}
 			break
 		}
-		d, cerr := sd.Default.Coerce(col.Type)
+		d, cerr := coerceColumn(col, *sd.Default)
 		if cerr != nil {
-			return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, cerr)
+			return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, cerr.Msg)
 		}
 		d, terr := enforceTypmod(col, d)
 		if terr != nil {

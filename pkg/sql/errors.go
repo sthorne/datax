@@ -79,6 +79,10 @@ func ToSQLError(err error) *Error {
 	if errors.As(err, &se) {
 		return se
 	}
+	var ve *catalog.ValueError
+	if errors.As(err, &ve) {
+		return &Error{Code: ve.Code, Msg: ve.Msg}
+	}
 	var syn *parser.SyntaxError
 	if errors.As(err, &syn) {
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}

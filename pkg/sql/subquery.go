@@ -760,7 +760,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}
 	for _, fr := range rows {
 		out := make([]types.Datum, len(proj))

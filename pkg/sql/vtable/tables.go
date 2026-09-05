@@ -189,8 +189,8 @@ func init() {
 		var rows []Row
 		attr := func(relid int64, c *catalog.Column, n int64, indexed bool) Row {
 			typmod := int64(-1)
-			if c.Type == types.Decimal && c.Precision > 0 {
-				typmod = (int64(c.Precision)<<16 | int64(c.Scale)) + 4
+			if m := c.Typmod(); m != 0 {
+				typmod = int64(m)
 			}
 			indexdef := null()
 			if indexed {
@@ -203,8 +203,8 @@ func init() {
 			case "by default":
 				identity = "d"
 			}
-			return Row{i64(relid), str(c.Name), i64(TypeOID(c.Type)), i64(-1),
-				i64(-1), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
+			return Row{i64(relid), str(c.Name), i64(ColumnTypeOID(c)), i64(-1),
+				i64(ColumnTypeLen(c)), i64(n), i64(0), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
 				boolean(ColumnDefault(c) != ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
 				str(""), null(), null(), null(), str(FormatType(c)), indexdef, textOrNull(c.Comment)}
 		}
@@ -250,7 +250,9 @@ func init() {
 		return rows, nil
 	})
 
-	// pg_type: the ten types, with PostgreSQL's OIDs.
+	// pg_type: the ten families plus the modifier-refined types a column
+	// can declare (int2, int4, varchar, bpchar, timestamp), with
+	// PostgreSQL's OIDs.
 	pg("pg_type", []catalog.Column{
 		col("oid", types.Int), col("typname", types.String), col("typnamespace", types.Int), col("typowner", types.Int),
 		col("typlen", types.Int), col("typbyval", types.Bool), col("typtype", types.String), col("typcategory", types.String),
@@ -276,6 +278,18 @@ func init() {
 			rows = append(rows, Row{i64(TypeOID(f)), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str(cat),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str(name + "in"), str(name + "out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
 				null(), str(FormatTypeOID(TypeOID(f)))})
+		}
+		for _, oid := range ExtraTypeOIDs {
+			name, cat := typeNameOID(oid), "S"
+			switch oid {
+			case 21, 23:
+				cat = "N"
+			case 1114:
+				cat = "D"
+			}
+			rows = append(rows, Row{i64(oid), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str(cat),
+				boolean(true), str(","), i64(0), i64(0), i64(0), str(name + "in"), str(name + "out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
+				null(), str(FormatTypeOID(oid))})
 		}
 		return rows, nil
 	})
@@ -687,12 +701,17 @@ func init() {
 					if c.NotNull {
 						nullable = "NO"
 					}
-					prec, scale := null(), null()
-					if c.Type == types.Decimal && c.Precision > 0 {
+					prec, scale, maxLen := null(), null(), null()
+					switch {
+					case c.Type == types.Decimal && c.Precision > 0:
 						prec, scale = i64(int64(c.Precision)), i64(int64(c.Scale))
+					case c.Type == types.Int:
+						prec = i64(int64(c.IntWidth()) * 8)
+					case c.Type == types.String && c.MaxLen > 0:
+						maxLen = i64(int64(c.MaxLen))
 					}
 					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(FormatType(c)),
-						null(), prec, scale, str(TypeName(c.Type)), str(yesNo(c.Identity != "")), str("NEVER")})
+						maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})
 				}
 			}
 		}

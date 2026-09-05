@@ -153,12 +153,14 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col := catalog.Column{
 			ID: catalog.ColumnID(i + 1), Name: cd.Name, Type: cd.Type, NotNull: cd.NotNull,
 			Precision: cd.Precision, Scale: cd.Scale,
+			Width: cd.Width, MaxLen: cd.MaxLen, Char: cd.Char, NoTZ: cd.NoTZ, TimePrecision: cd.TimePrecision,
 		}
 		col.Hidden = cd.Hidden
+		s.stripTypeAttrs(&col)
 		if cd.Default != nil && !cd.Default.Null {
-			d, cerr := cd.Default.Coerce(cd.Type)
+			d, cerr := coerceColumn(col, *cd.Default)
 			if cerr != nil {
-				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr)
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr.Msg)
 			}
 			d, terr := enforceTypmod(col, d)
 			if terr != nil {
@@ -540,7 +542,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 				for _, p := range ret.proj {
-					res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+					res.Columns = append(res.Columns, colResult(p.name, p.col))
 				}
 				res.Rows = [][]types.Datum{}
 			}
@@ -626,9 +628,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := d.Coerce(target[i].Type)
+			d, cerr := coerceColumn(target[i], d)
 			if cerr != nil {
-				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", target[i].Name, cerr)
+				return nil, cerr
 			}
 			vals[i] = d
 		}
@@ -880,9 +882,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := d.Coerce(col.Type)
+		d, cerr := coerceColumn(col, d)
 		if cerr != nil {
-			return false, nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
+			return false, nil, cerr
 		}
 		if d.Null && col.NotNull {
 			return false, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
@@ -976,7 +978,7 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 func (r *returning) columns() []ResultColumn {
 	cols := make([]ResultColumn, len(r.proj))
 	for i, p := range r.proj {
-		cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
+		cols[i] = colResult(p.name, p.col)
 	}
 	return cols
 }
@@ -1060,10 +1062,11 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 		if d.Null && col.NotNull {
 			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
 		}
-		// DECIMAL(p,s): quantize/validate before the key encoding below —
-		// PK columns precede the (last-positioned) hidden shard column, so
-		// the shard hash and pkKey both see the stored form.
-		if col.Precision > 0 {
+		// Type modifiers (DECIMAL(p,s), widths, lengths, TIMESTAMP forms):
+		// apply before the key encoding below — PK columns precede the
+		// (last-positioned) hidden shard column, so the shard hash and
+		// pkKey both see the stored form.
+		if col.HasTypmod() {
 			ed, eerr := enforceTypmod(col, row[col.ID])
 			if eerr != nil {
 				return nil, nil, eerr
@@ -1460,15 +1463,22 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 		row[id] = pkVals[i]
 	}
 	// Stamp DECIMAL(p,s) columns with their declared display scale so
-	// projections render fixed-scale ("9.90"). After the PK overwrite, so
-	// key-decoded PK decimals are stamped too. Display-only: canonical
-	// text in S stays the comparison/storage identity.
+	// projections render fixed-scale ("9.90"), CHAR(n) columns with their
+	// padding and TIMESTAMP (without time zone) columns with the no-
+	// offset rendering. After the PK overwrite, so key-decoded PK values
+	// are stamped too. Display-only: canonical text in S / the nanos in I
+	// stay the comparison/storage identity.
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
-		if col.Precision > 0 && col.Type == types.Decimal {
+		switch {
+		case col.Precision > 0 && col.Type == types.Decimal:
 			if d, ok := row[col.ID]; ok && !d.Null {
 				d.Dscale = col.Scale
 				row[col.ID] = d
+			}
+		case col.Char || col.NoTZ:
+			if d, ok := row[col.ID]; ok && !d.Null {
+				row[col.ID] = col.Stamp(d)
 			}
 		}
 	}
@@ -1708,7 +1718,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}
 	// Output positions of the correlated subqueries (SELECT * expands to
 	// several projection columns ahead of them).
@@ -1862,9 +1872,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 					return nil, err
 				}
 			}
-			d, cerr := d.Coerce(col.Type)
+			d, cerr := coerceColumn(col, d)
 			if cerr != nil {
-				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
+				return nil, cerr
 			}
 			if d.Null && col.NotNull {
 				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
@@ -2098,11 +2108,13 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		col := catalog.Column{
 			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
 			Precision: def.Precision, Scale: def.Scale,
+			Width: def.Width, MaxLen: def.MaxLen, Char: def.Char, NoTZ: def.NoTZ, TimePrecision: def.TimePrecision,
 		}
+		s.stripTypeAttrs(&col)
 		if def.Default != nil && !def.Default.Null {
-			d, cerr := def.Default.Coerce(def.Type)
+			d, cerr := coerceColumn(col, *def.Default)
 			if cerr != nil {
-				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr)
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr.Msg)
 			}
 			d, terr := enforceTypmod(col, d)
 			if terr != nil {

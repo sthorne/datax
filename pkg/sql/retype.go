@@ -11,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // ALTER TABLE t ALTER COLUMN c TYPE new — an online rewrite in the shape
@@ -33,6 +34,20 @@ import (
 // the table as it was. The conversion is the type's cast: widening and
 // text conversions only (retypeAllowed); a column an index, constraint,
 // primary key, sequence or view depends on is refused.
+
+// stripTypeAttrs drops the type modifiers this release added (integer
+// widths, character lengths, CHAR padding, TIMESTAMP without time zone
+// and TIMESTAMP(p)) from a column about to be created while the cluster
+// version is below v9: a node still on the previous binary would ignore
+// them, so until the upgrade is finalized the column keeps the earlier
+// meaning (INT is 64-bit, VARCHAR(n) is unbounded, TIMESTAMP is
+// TIMESTAMPTZ) — the documented behavior of every release before v9.
+func (s *Session) stripTypeAttrs(col *catalog.Column) {
+	if s.db.ClusterVersion() >= version.V9 {
+		return
+	}
+	col.Width, col.MaxLen, col.Char, col.NoTZ, col.TimePrecision = 0, 0, false, false, 0
+}
 
 // retypeAllowed reports whether values of from convert to to without
 // loss (the cast may still refuse a particular value, which fails the
@@ -67,9 +82,9 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 	}
 	var shadowID, oldID catalog.ColumnID
 	var tableID uint64
-	changed := false
+	changed, widened := false, false
 	err := s.db.RunTxn(ctx, "retype-publish", func(ctx context.Context, txn *kvclient.Txn) error {
-		shadowID, oldID, tableID, changed = 0, 0, 0, false
+		shadowID, oldID, tableID, changed, widened = 0, 0, 0, false, false
 		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
@@ -82,11 +97,30 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 		if !ok || col.Hidden {
 			return newErrf(CodeUndefinedColumn, "column %q does not exist", st.Column)
 		}
-		if col.Type == st.Type && col.Precision == st.Precision && col.Scale == st.Scale {
+		target := catalog.Column{
+			Type: st.Type, Precision: st.Precision, Scale: st.Scale,
+			Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,
+		}
+		if col.Type == target.Type && col.Precision == target.Precision && col.Scale == target.Scale &&
+			col.IntWidth() == target.IntWidth() && col.MaxLen == target.MaxLen && col.Char == target.Char && col.NoTZ == target.NoTZ &&
+			col.TimePrecision == target.TimePrecision {
 			return nil // nothing to do
 		}
+		if pureWidening(col, target) {
+			// Every stored value stays valid: a descriptor write in this
+			// transaction is the whole statement (INT4 → INT8, VARCHAR(10)
+			// → VARCHAR(20) or TEXT, TIMESTAMP(3) → TIMESTAMP).
+			for i := range desc.Columns {
+				if desc.Columns[i].ID == col.ID {
+					c := &desc.Columns[i]
+					c.Width, c.MaxLen, c.Char, c.NoTZ, c.TimePrecision, c.Precision, c.Scale = target.Width, target.MaxLen, target.Char, target.NoTZ, target.TimePrecision, target.Precision, target.Scale
+				}
+			}
+			widened = true
+			return s.cat.Update(ctx, txn, desc)
+		}
 		if !retypeAllowed(col.Type, st.Type) {
-			return newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.Type, st.Type)
+			return newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.TypeSQL(), target.TypeSQL())
 		}
 		if desc.Reshard != nil {
 			return newErrf(CodeObjectInUse, "cannot alter a column of table %q while a re-shard is in progress", desc.Name)
@@ -124,10 +158,8 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 				}
 			}
 		}
-		shadow := catalog.Column{
-			ID: desc.NextColumnID, Name: fmt.Sprintf("__retype_%d", col.ID), Type: st.Type,
-			Precision: st.Precision, Scale: st.Scale, Hidden: true, RetypeFrom: col.ID,
-		}
+		shadow := target
+		shadow.ID, shadow.Name, shadow.Hidden, shadow.RetypeFrom = desc.NextColumnID, fmt.Sprintf("__retype_%d", col.ID), true, col.ID
 		desc.NextColumnID++
 		desc.Columns = append(desc.Columns, shadow)
 		shadowID, oldID, tableID, changed = shadow.ID, col.ID, desc.ID, true
@@ -136,11 +168,15 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	if !changed {
+	if !changed && !widened {
 		return &Result{Tag: "ALTER TABLE"}, nil
 	}
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
+	}
+	if widened {
+		log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.user)
+		return &Result{Tag: "ALTER TABLE"}, nil
 	}
 
 	abandon := func(cause error) (*Result, *Error) {
@@ -271,9 +307,15 @@ func (s *Session) retypeBackfill(ctx context.Context, table string, tableID uint
 				if !has {
 					continue // NULL: the shadow is NULL too
 				}
-				if _, cerr := src.ConvertTo(shadow.Type); cerr != nil {
-					old, _ := desc.ColByID(oldID)
-					return newErrf(CodeInvalidTextRepresentation, "column %q: value %s cannot convert to %s: %v", old.Name, src.Text(), shadow.Type, cerr)
+				old, _ := desc.ColByID(oldID)
+				conv, cerr := src.ConvertTo(shadow.Type)
+				if cerr != nil {
+					return newErrf(CodeInvalidTextRepresentation, "column %q: value %s cannot convert to %s: %v", old.Name, src.Text(), shadow.TypeSQL(), cerr)
+				}
+				named := shadow
+				named.Name = old.Name
+				if _, cerr := enforceTypmod(named, conv); cerr != nil {
+					return cerr
 				}
 				value, err := rowenc.EncodeValue(desc, row) // the hook derives the shadow
 				if err != nil {

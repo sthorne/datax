@@ -26,9 +26,14 @@ const (
 	oidBool        = 16
 	oidBytea       = 17
 	oidInt8        = 20
+	oidInt2        = 21
+	oidInt4        = 23
 	oidText        = 25
 	oidFloat8      = 701
+	oidBpchar      = 1042
+	oidVarchar     = 1043
 	oidDate        = 1082
+	oidTimestamp   = 1114
 	oidTimestamptz = 1184
 	oidUUID        = 2950
 	oidNumeric     = 1700
@@ -41,6 +46,41 @@ const (
 	pgEpochOffsetMicros = int64(946684800) * 1e6
 	pgEpochOffsetDays   = int64(10957)
 )
+
+// colOID is the wire type of a result column: the family's OID, refined
+// by the backing column's modifiers (int2 / int4, varchar / bpchar,
+// timestamp without time zone).
+func colOID(col sql.ResultColumn) uint32 {
+	switch col.Type {
+	case types.Int:
+		switch col.Width {
+		case 2:
+			return oidInt2
+		case 4:
+			return oidInt4
+		}
+	case types.String:
+		switch {
+		case col.Char:
+			return oidBpchar
+		case col.MaxLen > 0:
+			return oidVarchar
+		}
+	case types.Timestamp:
+		if col.NoTZ {
+			return oidTimestamp
+		}
+	}
+	return typeOID(col.Type)
+}
+
+// colSize is pg_type.typlen for a result column (-1 = variable).
+func colSize(col sql.ResultColumn) int16 {
+	if col.Type == types.Int && (col.Width == 2 || col.Width == 4) {
+		return int16(col.Width)
+	}
+	return typeSize(col.Type)
+}
 
 func typeOID(f types.Family) uint32 {
 	switch f {
@@ -463,8 +503,8 @@ func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
 		}
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
 			Name:         []byte(col.Name),
-			DataTypeOID:  typeOID(col.Type),
-			DataTypeSize: typeSize(col.Type),
+			DataTypeOID:  colOID(col),
+			DataTypeSize: colSize(col),
 			TypeModifier: typmod,
 			Format:       0,
 		})
@@ -494,22 +534,42 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 			if formats != nil && i < len(formats) {
 				format = formats[i]
 			}
-			dr.Values[i] = encodeDatum(d, format)
+			var col sql.ResultColumn
+			if i < len(res.Columns) {
+				col = res.Columns[i]
+			}
+			dr.Values[i] = encodeDatum(d, format, col)
 		}
 		c.backend.Send(dr)
 	}
 }
 
 // encodeDatum renders a datum in the requested wire format.
-func encodeDatum(d types.Datum, format int16) []byte {
+// encodeDatum renders a value in the requested format under the
+// described column: the column's width picks the binary integer size,
+// and its TIMESTAMP / CHAR(n) modifiers the text rendering (what
+// Describe promised, whatever hint the datum carries).
+func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil
 	}
 	if format == 0 {
+		switch {
+		case d.Fam == types.Timestamp && col.Type == types.Timestamp:
+			return []byte(types.FormatTimestamp(d.I, col.NoTZ))
+		case d.Fam == types.String && col.Type == types.String && !col.Char:
+			return []byte(d.S)
+		}
 		return []byte(d.Text())
 	}
 	switch d.Fam {
 	case types.Int:
+		switch col.Width {
+		case 2:
+			return binary.BigEndian.AppendUint16(nil, uint16(int16(d.I)))
+		case 4:
+			return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I)))
+		}
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I))
 	case types.Float:
 		return binary.BigEndian.AppendUint64(nil, math.Float64bits(d.F))

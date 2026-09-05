@@ -77,9 +77,20 @@ type ResultColumn struct {
 	Name string
 	Type types.Family
 	// Typmod is PostgreSQL's atttypmod for the column (0 = none, emitted
-	// as -1 on the wire). Set only when a real DECIMAL(p,s) column backs
-	// the output: ((p<<16) | (s+4)).
+	// as -1 on the wire). Set only when a real table column with a type
+	// modifier backs the output: ((p<<16) | (s+4)) for DECIMAL(p,s), n+4
+	// for VARCHAR(n) / CHAR(n), p for TIMESTAMP(p).
 	Typmod int32
+	// Width, MaxLen, Char and NoTZ carry the backing column's integer
+	// width (2 / 4, 0 = 8), character length, CHAR(n) padding and
+	// TIMESTAMP without time zone, which pick the wire type (int2 /
+	// int4 / int8, varchar / bpchar / text, timestamp / timestamptz) and
+	// its text rendering. Zero for computed columns.
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
 }
 
 // DecimalTypmod encodes a DECIMAL(p,s) declaration as PostgreSQL's
@@ -947,7 +958,9 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	}
 	switch op {
 	case "||":
-		return types.NewString(l.Text() + r.Text()), nil
+		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
+		// bpchar-to-text cast strips the padding.
+		return types.NewString(concatText(l) + concatText(r)), nil
 	case "%":
 		d, err := builtins.Mod(l, r)
 		return d, builtinErr(err)
@@ -1570,6 +1583,15 @@ func decodeJSONValue(s string) (any, error) {
 
 // builtinErr converts a builtins error into a SQL error with its
 // SQLSTATE (nil stays nil).
+// concatText renders a || operand: a padded CHAR(n) value contributes
+// its trimmed text.
+func concatText(d types.Datum) string {
+	if d.Fam == types.String {
+		return d.S
+	}
+	return d.Text()
+}
+
 func builtinErr(err error) error {
 	if err == nil {
 		return nil

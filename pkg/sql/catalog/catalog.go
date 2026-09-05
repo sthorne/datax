@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -37,7 +38,28 @@ type Column struct {
 	// rule 1).
 	Precision int32 `json:"precision,omitempty"`
 	Scale     int32 `json:"scale,omitempty"`
-	NotNull   bool  `json:"not_null,omitempty"`
+	// Width is an Int column's declared width in bytes: 2 (INT2 /
+	// SMALLINT), 4 (INT4 / INT / INTEGER) or 0 = 8 (INT8 / BIGINT).
+	// Storage is the same varint either way; the width bounds the values
+	// (22003) and picks the wire type (int2 / int4 / int8). Zero keeps the
+	// pre-existing 64-bit meaning for old descriptors.
+	Width int32 `json:"width,omitempty"`
+	// MaxLen is a String column's VARCHAR(n) / CHAR(n) length in
+	// characters (0 = unbounded TEXT); a longer value is refused (22001)
+	// unless the excess is spaces.
+	MaxLen int32 `json:"max_len,omitempty"`
+	// Char marks CHAR(n): values are stored with trailing spaces trimmed
+	// and render blank-padded to MaxLen.
+	Char bool `json:"char,omitempty"`
+	// NoTZ marks TIMESTAMP (without time zone): the value is UTC wall-
+	// clock time, an offset in the input is ignored, and the output
+	// carries no offset.
+	NoTZ bool `json:"no_tz,omitempty"`
+	// TimePrecision is TIMESTAMP(p) / TIMESTAMPTZ(p), stored as p+1 so
+	// that 0 keeps meaning "undeclared" (full precision): values round to
+	// p fractional digits on write. FracDigits decodes it.
+	TimePrecision int32 `json:"time_precision,omitempty"`
+	NotNull       bool  `json:"not_null,omitempty"`
 	// Default is the value INSERT uses when the column is omitted.
 	Default *types.Datum `json:"default,omitempty"`
 	// DefaultExpr is an expression default (SQL text: now(),
@@ -71,6 +93,184 @@ type Column struct {
 	// backfill and concurrent writers converge; the swap makes the
 	// shadow the column. Cluster version v9.
 	RetypeFrom ColumnID `json:"retype_from,omitempty"`
+}
+
+// ValueError is a value the column's declared type refuses; Code is the
+// SQLSTATE (22003 out of range, 22001 too long, 22007 bad timestamp).
+type ValueError struct {
+	Code string
+	Msg  string
+}
+
+func (e *ValueError) Error() string { return e.Msg }
+
+// HasTypmod reports whether the column carries a type modifier the
+// write path must apply (DECIMAL(p,s), an integer width, a character
+// length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
+func (c *Column) HasTypmod() bool {
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0
+}
+
+// FracDigits is the declared TIMESTAMP(p) precision, when there is one.
+func (c *Column) FracDigits() (int32, bool) {
+	if c.Type == types.Timestamp && c.TimePrecision > 0 {
+		return c.TimePrecision - 1, true
+	}
+	return 0, false
+}
+
+// IntWidth is the column's integer width in bytes (8 unless declared
+// narrower).
+func (c *Column) IntWidth() int32 {
+	if c.Type == types.Int && (c.Width == 2 || c.Width == 4) {
+		return c.Width
+	}
+	return 8
+}
+
+// Conform applies the column's type modifiers other than DECIMAL(p,s)
+// to a value about to be stored, and stamps the display hints: an
+// integer is range-checked against the width; a string is checked
+// against MaxLen (excess spaces are dropped, anything else is 22001)
+// and, for CHAR(n), trailing spaces are trimmed; a timestamp text into a
+// TIMESTAMP (without time zone) column is parsed ignoring its offset,
+// and a TIMESTAMP(p) value rounds to p digits. NULLs and columns without
+// modifiers pass through.
+func (c *Column) Conform(d types.Datum) (types.Datum, error) {
+	if d.Null {
+		return d, nil
+	}
+	switch c.Type {
+	case types.Int:
+		if d.Fam != types.Int {
+			return d, nil
+		}
+		switch c.Width {
+		case 2:
+			if d.I < -32768 || d.I > 32767 {
+				return d, &ValueError{Code: "22003", Msg: fmt.Sprintf("value %d is out of range for type smallint (column %q)", d.I, c.Name)}
+			}
+		case 4:
+			if d.I < -2147483648 || d.I > 2147483647 {
+				return d, &ValueError{Code: "22003", Msg: fmt.Sprintf("value %d is out of range for type integer (column %q)", d.I, c.Name)}
+			}
+		}
+	case types.String:
+		if d.Fam != types.String || (c.MaxLen == 0 && !c.Char) {
+			return d, nil
+		}
+		v := d.S
+		if c.MaxLen > 0 {
+			if n := int32(utf8.RuneCountInString(v)); n > c.MaxLen {
+				runes := []rune(v)
+				if strings.TrimRight(string(runes[c.MaxLen:]), " ") != "" {
+					return d, &ValueError{Code: "22001", Msg: fmt.Sprintf("value too long for type %s (column %q)", c.TypeSQL(), c.Name)}
+				}
+				v = string(runes[:c.MaxLen])
+			}
+		}
+		if c.Char {
+			v = strings.TrimRight(v, " ")
+		}
+		out := types.NewString(v)
+		if c.Char {
+			out.Pad = c.MaxLen
+		}
+		return out, nil
+	case types.Timestamp:
+		if d.Fam == types.String && c.NoTZ {
+			n, err := types.ParseTimestampNoTZ(d.S)
+			if err != nil {
+				return d, &ValueError{Code: "22007", Msg: fmt.Sprintf("column %q: %v", c.Name, err)}
+			}
+			d = types.NewTimestamp(n)
+		}
+		if d.Fam != types.Timestamp {
+			return d, nil
+		}
+		if p, ok := c.FracDigits(); ok {
+			d.I = types.RoundTimestamp(d.I, p)
+		}
+		d.NoTZ = c.NoTZ
+		return d, nil
+	}
+	return d, nil
+}
+
+// Stamp sets the display hints a stored value of this column carries
+// (CHAR padding, TIMESTAMP without time zone); identity is untouched.
+func (c *Column) Stamp(d types.Datum) types.Datum {
+	if d.Null {
+		return d
+	}
+	switch {
+	case c.Char && d.Fam == types.String:
+		d.Pad = c.MaxLen
+	case c.NoTZ && d.Fam == types.Timestamp:
+		d.NoTZ = true
+	}
+	return d
+}
+
+// TypeSQL is the column's declared type as datax spells it (INT4,
+// VARCHAR(20), CHAR(4), TIMESTAMP(3), TIMESTAMPTZ, DECIMAL(10,2)).
+func (c *Column) TypeSQL() string {
+	switch c.Type {
+	case types.Int:
+		switch c.Width {
+		case 2:
+			return "INT2"
+		case 4:
+			return "INT4"
+		}
+		return "INT8"
+	case types.String:
+		switch {
+		case c.Char:
+			return fmt.Sprintf("CHAR(%d)", c.MaxLen)
+		case c.MaxLen > 0:
+			return fmt.Sprintf("VARCHAR(%d)", c.MaxLen)
+		}
+		return "TEXT"
+	case types.Timestamp:
+		name := "TIMESTAMPTZ"
+		if c.NoTZ {
+			name = "TIMESTAMP"
+		}
+		if p, ok := c.FracDigits(); ok {
+			return fmt.Sprintf("%s(%d)", name, p)
+		}
+		return name
+	case types.Decimal:
+		if c.Precision > 0 {
+			return fmt.Sprintf("DECIMAL(%d,%d)", c.Precision, c.Scale)
+		}
+		return "DECIMAL"
+	}
+	return c.Type.String()
+}
+
+// Typmod is PostgreSQL's atttypmod for the column: ((p<<16)|s)+4 for
+// DECIMAL(p,s), n+4 for VARCHAR(n) / CHAR(n), p for TIMESTAMP(p), and
+// -1 (returned as 0) otherwise — TIMESTAMP(0)'s typmod 0 is therefore
+// indistinguishable from none on the wire, which only loses the
+// rounding hint.
+func (c *Column) Typmod() int32 {
+	switch c.Type {
+	case types.Decimal:
+		if c.Precision > 0 {
+			return c.Precision<<16 | (c.Scale + 4)
+		}
+	case types.String:
+		if c.MaxLen > 0 {
+			return c.MaxLen + 4
+		}
+	case types.Timestamp:
+		if p, ok := c.FracDigits(); ok {
+			return p
+		}
+	}
+	return 0
 }
 
 // IndexDescriptor describes a secondary index. Entries live at

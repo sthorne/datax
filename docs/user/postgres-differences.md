@@ -28,11 +28,21 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
-- **`DECIMAL(p,s)` is enforced** (rescale to `s` half-even, `22003` on
-  overflow, fixed-scale rendering), with small deviations: an invalid
-  typmod (`DECIMAL(0)`, scale > precision) is a syntax error `42601`
-  rather than PostgreSQL's `22023`; `VARCHAR(n)` and other typmods are
-  still accepted and ignored; expression/aggregate results render in
+- **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
+  half-even, `22003` on overflow, fixed-scale rendering), the integer
+  widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
+  `VARCHAR(n)` / `CHAR(n)` (`22001`), `TIMESTAMP` without time zone and
+  `TIMESTAMP(p)` — with small deviations: an invalid typmod
+  (`DECIMAL(0)`, scale > precision, `VARCHAR(0)`, `TIMESTAMP(7)`) is a
+  syntax error `42601` rather than PostgreSQL's `22023`; typmods on
+  other types (`FLOAT8(3)`) are accepted and ignored; a `CHAR(n)`
+  value is stored trimmed, so `c = 'ab  '` compares the literal with
+  its spaces (PostgreSQL trims both sides) while `c = 'ab'`, `length`
+  and `||` agree; expression results lose the modifier and describe
+  as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
+  a `TIMESTAMP` is `TIMESTAMPTZ`, `::timestamp` yields `TIMESTAMPTZ`),
+  and a bind parameter for a `TIMESTAMP` column describes as
+  `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.

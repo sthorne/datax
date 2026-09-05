@@ -66,7 +66,14 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		ct.Columns = append(ct.Columns, parser.ColumnDef{Name: name, Type: typ})
+		// A column the query takes straight from a table keeps its type
+		// modifiers (INT4, VARCHAR(20), TIMESTAMP); a computed one is bare.
+		cd := parser.ColumnDef{Name: name, Type: typ, Width: rc.Width, MaxLen: rc.MaxLen, Char: rc.Char, NoTZ: rc.NoTZ}
+		cd.TimePrecision = rc.TimePrecision
+		if typ == types.Decimal && rc.Typmod > 0 {
+			cd.Precision, cd.Scale = rc.Typmod>>16, rc.Typmod&0xffff-4
+		}
+		ct.Columns = append(ct.Columns, cd)
 	}
 	if len(ct.PrimaryKey) == 0 {
 		if seen[rowidColumn] {
@@ -192,7 +199,8 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					continue
 				}
 				byID[c.ID] = c.Name
-				def := parser.ColumnDef{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Precision: c.Precision, Scale: c.Scale}
+				def := parser.ColumnDef{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Precision: c.Precision, Scale: c.Scale,
+					Width: c.Width, MaxLen: c.MaxLen, Char: c.Char, NoTZ: c.NoTZ, TimePrecision: c.TimePrecision}
 				if lc.Defaults {
 					switch {
 					case c.DefaultExpr != "" && c.DefaultExpr != "NULL" && c.SequenceID == 0:

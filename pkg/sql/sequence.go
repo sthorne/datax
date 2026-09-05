@@ -601,9 +601,9 @@ func (s *Session) defaultValue(ctx context.Context, txn *kvclient.Txn, cd *colum
 			if err != nil {
 				return types.Datum{}, err
 			}
-			d, cerr := d.Coerce(col.Type)
+			d, cerr := coerceColumn(*col, d)
 			if cerr != nil {
-				return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "default for column %q: %v", col.Name, cerr)
+				return types.Datum{}, cerr
 			}
 			return d, nil
 		}

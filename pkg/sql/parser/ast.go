@@ -123,10 +123,17 @@ type ColumnDef struct {
 	Identity    string
 	IdentitySeq *SequenceOptions
 	// Precision/Scale carry a DECIMAL(p,s) typmod (0 precision = bare
-	// DECIMAL, unconstrained). Typmods on other types are still accepted
-	// and ignored (documented).
-	Precision int32
-	Scale     int32
+	// DECIMAL, unconstrained). Width, MaxLen, Char, NoTZ and
+	// TimePrecision are the integer width (2/4, 0 = 8), the VARCHAR(n) /
+	// CHAR(n) length, CHAR padding, TIMESTAMP without time zone and
+	// TIMESTAMP(p) as p+1 (see TypeSpec).
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
 	// Hidden marks a system-managed column (CREATE TABLE AS's rowid
 	// primary key); never parsed.
 	Hidden bool
@@ -212,12 +219,35 @@ type CommentOn struct {
 }
 
 // SetType is ALTER [COLUMN] c [SET DATA] TYPE t: the column and the new
-// type with its DECIMAL typmod.
+// type with its modifiers (the ColumnDef fields).
 type SetType struct {
-	Column    string
-	Type      types.Family
-	Precision int32
-	Scale     int32
+	Column        string
+	Type          types.Family
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
+}
+
+// TypeSpec is a parsed column type: the family and the modifiers datax
+// enforces. Width is an integer's width in bytes (2 for INT2 /
+// SMALLINT, 4 for INT4 / INT / INTEGER, 0 = 8 for INT8 / BIGINT);
+// MaxLen the VARCHAR(n) / CHAR(n) length (0 = unbounded) with Char set
+// for CHAR(n); NoTZ marks TIMESTAMP [WITHOUT TIME ZONE] as opposed to
+// TIMESTAMPTZ; Precision/Scale are DECIMAL(p,s); TimePrecision is
+// TIMESTAMP(p) stored as p+1 (0 = undeclared, so TIMESTAMP(0) is 1).
+type TypeSpec struct {
+	Family        types.Family
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
 }
 
 // SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an

@@ -206,6 +206,84 @@ func TypeOID(f types.Family) int64 {
 	return 25
 }
 
+// ColumnTypeOID is PostgreSQL's OID for a column's declared type: the
+// family's, refined by the modifiers (int2 21 / int4 23, varchar 1043 /
+// bpchar 1042, timestamp 1114).
+func ColumnTypeOID(c *catalog.Column) int64 {
+	switch c.Type {
+	case types.Int:
+		switch c.Width {
+		case 2:
+			return 21
+		case 4:
+			return 23
+		}
+	case types.String:
+		switch {
+		case c.Char:
+			return 1042
+		case c.MaxLen > 0:
+			return 1043
+		}
+	case types.Timestamp:
+		if c.NoTZ {
+			return 1114
+		}
+	}
+	return TypeOID(c.Type)
+}
+
+// ColumnTypeName is pg_type.typname for a column's declared type
+// (int2 / int4 / int8, varchar / bpchar / text, timestamp /
+// timestamptz).
+func ColumnTypeName(c *catalog.Column) string {
+	return typeNameOID(ColumnTypeOID(c))
+}
+
+// ColumnTypeLen is pg_type.typlen for a column's declared type.
+func ColumnTypeLen(c *catalog.Column) int64 {
+	switch ColumnTypeOID(c) {
+	case 16:
+		return 1
+	case 21:
+		return 2
+	case 23, 1082:
+		return 4
+	case 20, 701, 1114, 1184:
+		return 8
+	case 2950:
+		return 16
+	}
+	return -1
+}
+
+// ExtraTypeOIDs are the pg_type rows beyond the ten families: the
+// modifier-refined types a column can declare.
+var ExtraTypeOIDs = []int64{21, 23, 1043, 1042, 1114}
+
+func typeNameOID(oid int64) string {
+	switch oid {
+	case 21:
+		return "int2"
+	case 23:
+		return "int4"
+	case 1043:
+		return "varchar"
+	case 1042:
+		return "bpchar"
+	case 1114:
+		return "timestamp"
+	}
+	for _, f := range families {
+		if TypeOID(f) == oid {
+			return TypeName(f)
+		}
+	}
+	return "text"
+}
+
+var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb}
+
 // TypeName is PostgreSQL's name for a datax type family (pg_type.typname).
 func TypeName(f types.Family) string {
 	switch f {
@@ -240,11 +318,32 @@ func FormatType(c *catalog.Column) string {
 	case types.Bool:
 		return "boolean"
 	case types.Int:
+		switch c.Width {
+		case 2:
+			return "smallint"
+		case 4:
+			return "integer"
+		}
 		return "bigint"
+	case types.String:
+		switch {
+		case c.Char:
+			return fmt.Sprintf("character(%d)", c.MaxLen)
+		case c.MaxLen > 0:
+			return fmt.Sprintf("character varying(%d)", c.MaxLen)
+		}
+		return "text"
 	case types.Float:
 		return "double precision"
 	case types.Timestamp:
-		return "timestamp with time zone"
+		p := ""
+		if fd, ok := c.FracDigits(); ok {
+			p = fmt.Sprintf("(%d)", fd)
+		}
+		if c.NoTZ {
+			return "timestamp" + p + " without time zone"
+		}
+		return "timestamp" + p + " with time zone"
 	case types.Decimal:
 		if c.Precision > 0 {
 			return fmt.Sprintf("numeric(%d,%d)", c.Precision, c.Scale)
@@ -254,9 +353,36 @@ func FormatType(c *catalog.Column) string {
 	return TypeName(c.Type)
 }
 
+// ColumnTypeSQL is the column's type as SHOW CREATE TABLE spells it:
+// the declared modifiers (INT4, VARCHAR(20), CHAR(4), TIMESTAMP(3),
+// NUMERIC(10,2)) over the pg_type name.
+func ColumnTypeSQL(c *catalog.Column) string {
+	switch c.Type {
+	case types.Int, types.String, types.Timestamp:
+		return c.TypeSQL()
+	case types.Decimal:
+		if c.Precision > 0 {
+			return fmt.Sprintf("NUMERIC(%d,%d)", c.Precision, c.Scale)
+		}
+	}
+	return strings.ToUpper(TypeName(c.Type))
+}
+
 // FormatTypeOID is format_type(oid, typmod) for a bare type OID.
 func FormatTypeOID(oid int64) string {
-	for _, f := range []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb} {
+	switch oid {
+	case 21:
+		return "smallint"
+	case 23:
+		return "integer"
+	case 1043:
+		return "character varying"
+	case 1042:
+		return "character"
+	case 1114:
+		return "timestamp without time zone"
+	}
+	for _, f := range families {
 		if TypeOID(f) == oid {
 			return FormatType(&catalog.Column{Type: f})
 		}
@@ -387,10 +513,7 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		if c.Hidden {
 			continue
 		}
-		fmt.Fprintf(&b, "  %s %s", c.Name, strings.ToUpper(TypeName(c.Type)))
-		if c.Type == types.Decimal && c.Precision > 0 {
-			fmt.Fprintf(&b, "(%d,%d)", c.Precision, c.Scale)
-		}
+		fmt.Fprintf(&b, "  %s %s", c.Name, ColumnTypeSQL(&c))
 		if c.NotNull {
 			b.WriteString(" NOT NULL")
 		}

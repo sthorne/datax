@@ -192,10 +192,15 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		if !ok {
 			continue
 		}
+		from, _ := desc.ColByID(col.RetypeFrom)
 		d, err := src.ConvertTo(col.Type)
 		if err != nil {
-			from, _ := desc.ColByID(col.RetypeFrom)
 			return nil, fmt.Errorf("column %q: value cannot convert to %s: %w", from.Name, col.Type, err)
+		}
+		named := col
+		named.Name = from.Name // errors name the column being retyped, not its shadow
+		if d, err = named.Conform(d); err != nil {
+			return nil, err // a *catalog.ValueError: the caller keeps its SQLSTATE
 		}
 		row[col.ID] = d
 	}

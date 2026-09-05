@@ -836,11 +836,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		return def, err
 	}
 	def.Name = name
-	fam, prec, scale, serial, err := p.parseColumnType()
+	spec, serial, err := p.parseColumnType()
 	if err != nil {
 		return def, err
 	}
-	def.Type, def.Precision, def.Scale = fam, prec, scale
+	def.Type, def.Precision, def.Scale = spec.Family, spec.Precision, spec.Scale
+	def.Width, def.MaxLen, def.Char, def.NoTZ, def.TimePrecision = spec.Width, spec.MaxLen, spec.Char, spec.NoTZ, spec.TimePrecision
 	if serial {
 		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
 		def.Serial, def.NotNull = true, true
@@ -933,38 +934,53 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 // parseColumnType parses a column type with its optional typmod: the
 // family, a DECIMAL(p,s) precision and scale, and whether the type was
 // a SERIAL alias (INT8 with an owned sequence).
-func (p *parser) parseColumnType() (fam types.Family, prec, scale int32, serial bool, err error) {
+// setTypeOf builds the ALTER COLUMN TYPE target from a parsed type.
+func setTypeOf(col string, spec TypeSpec) *SetType {
+	return &SetType{Column: col, Type: spec.Family, Precision: spec.Precision, Scale: spec.Scale,
+		Width: spec.Width, MaxLen: spec.MaxLen, Char: spec.Char, NoTZ: spec.NoTZ, TimePrecision: spec.TimePrecision}
+}
+
+func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 	t := p.peek()
 	if t.kind != tkIdent && t.kind != tkKeyword {
-		return 0, 0, 0, false, p.errf("expected column type, found %q", t.text)
+		return spec, false, p.errf("expected column type, found %q", t.text)
 	}
 	p.i++
 	typeName := t.text
 	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
 	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
 		if n := p.peek(); n.kind == tkIdent {
+			if strings.EqualFold(typeName, "character") && strings.EqualFold(n.text, "varying") {
+				typeName = "VARCHAR"
+			}
 			p.i++
 		}
 	}
-	// TIMESTAMP WITH[OUT] TIME ZONE: absorb the trailing words.
-	if strings.EqualFold(typeName, "timestamp") {
-		if p.peekIdentSeq("with", "time", "zone") || p.peekIdentSeq("without", "time", "zone") {
-			p.i += 3
-		}
-	}
-	switch strings.ToUpper(typeName) {
-	case "SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL8", "SERIAL4", "SERIAL2":
-		typeName = "INT8"
-		serial = true
+	upper := strings.ToUpper(typeName)
+	switch upper {
+	case "SERIAL", "SERIAL4":
+		typeName, serial, spec.Width = "INT8", true, 4
+	case "BIGSERIAL", "SERIAL8":
+		typeName, serial = "INT8", true
+	case "SMALLSERIAL", "SERIAL2":
+		typeName, serial, spec.Width = "INT8", true, 2
+	case "INT", "INTEGER", "INT4":
+		spec.Width = 4
+	case "SMALLINT", "INT2":
+		spec.Width = 2
+	case "CHAR", "CHARACTER":
+		spec.Char, spec.MaxLen = true, 1
+	case "TIMESTAMP":
+		spec.NoTZ = true
 	}
 	fam, perr := types.ParseType(typeName)
 	if perr != nil {
-		return 0, 0, 0, false, p.errf("%v", perr)
+		return spec, false, p.errf("%v", perr)
 	}
-	// VARCHAR(n) / DECIMAL(p[,s]) etc.: for DECIMAL the typmod is captured
-	// and ENFORCED (precision/scale on the column descriptor); for every
-	// other type it is accepted and ignored — storage is arbitrary-length
-	// (documented).
+	spec.Family = fam
+	// The typmod: DECIMAL(p[,s]), VARCHAR(n) / CHAR(n), TIMESTAMP(p) are
+	// captured and enforced; on any other type a typmod is accepted and
+	// ignored (documented).
 	if p.consumeOp("(") {
 		var mods []string
 		if p.peek().kind == tkNumber {
@@ -972,38 +988,60 @@ func (p *parser) parseColumnType() (fam types.Family, prec, scale int32, serial 
 			p.i++
 			if p.consumeOp(",") {
 				if p.peek().kind != tkNumber {
-					return 0, 0, 0, false, p.errf("expected scale after ',' in type modifier")
+					return spec, false, p.errf("expected scale after ',' in type modifier")
 				}
 				mods = append(mods, p.peek().text)
 				p.i++
 			}
 		}
 		if err := p.expectOp(")"); err != nil {
-			return 0, 0, 0, false, err
+			return spec, false, err
 		}
-		if fam == types.Decimal && len(mods) > 0 {
+		switch {
+		case fam == types.Decimal && len(mods) > 0:
 			pr, perr := strconv.ParseInt(mods[0], 10, 32)
 			if perr != nil {
-				return 0, 0, 0, false, p.errf("DECIMAL precision %q must be an integer", mods[0])
+				return spec, false, p.errf("DECIMAL precision %q must be an integer", mods[0])
 			}
 			var sc int64
 			if len(mods) > 1 {
 				var serr error
 				sc, serr = strconv.ParseInt(mods[1], 10, 32)
 				if serr != nil {
-					return 0, 0, 0, false, p.errf("DECIMAL scale %q must be an integer", mods[1])
+					return spec, false, p.errf("DECIMAL scale %q must be an integer", mods[1])
 				}
 			}
 			if pr < 1 || pr > 1000 {
-				return 0, 0, 0, false, p.errf("DECIMAL precision %d must be between 1 and 1000", pr)
+				return spec, false, p.errf("DECIMAL precision %d must be between 1 and 1000", pr)
 			}
 			if sc < 0 || sc > pr {
-				return 0, 0, 0, false, p.errf("DECIMAL scale %d must be between 0 and the precision %d", sc, pr)
+				return spec, false, p.errf("DECIMAL scale %d must be between 0 and the precision %d", sc, pr)
 			}
-			prec, scale = int32(pr), int32(sc)
+			spec.Precision, spec.Scale = int32(pr), int32(sc)
+		case fam == types.String && (upper == "VARCHAR" || upper == "CHAR" || upper == "CHARACTER") && len(mods) == 1:
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 1 || n > 10485760 {
+				return spec, false, p.errf("length for type %s must be between 1 and 10485760", strings.ToLower(upper))
+			}
+			spec.MaxLen = int32(n)
+		case fam == types.Timestamp && len(mods) == 1:
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 0 || n > 6 {
+				return spec, false, p.errf("%s(%s) precision must be between 0 and 6", strings.ToLower(upper), mods[0])
+			}
+			spec.TimePrecision = int32(n) + 1
 		}
 	}
-	return fam, prec, scale, serial, nil
+	// TIMESTAMP [WITH | WITHOUT] TIME ZONE: the trailing words decide.
+	if fam == types.Timestamp && upper == "TIMESTAMP" {
+		if p.peekIdentSeq("with", "time", "zone") {
+			p.i += 3
+			spec.NoTZ = false
+		} else if p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
+	return spec, serial, nil
 }
 
 func (p *parser) peekKeyword(kw string) bool {
@@ -2932,14 +2970,14 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		switch {
 		case p.consumeIdentWord("type"):
-			fam, prec, scale, serial, err := p.parseColumnType()
+			spec, serial, err := p.parseColumnType()
 			if err != nil {
 				return nil, err
 			}
 			if serial {
 				return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 			}
-			at.SetType = &SetType{Column: col, Type: fam, Precision: prec, Scale: scale}
+			at.SetType = setTypeOf(col, spec)
 			if p.consumeIdentWord("using") {
 				return nil, p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
 			}
@@ -2948,14 +2986,14 @@ func (p *parser) parseAlterTable() (Statement, error) {
 				if !p.consumeIdentWord("type") {
 					return nil, p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
 				}
-				fam, prec, scale, serial, err := p.parseColumnType()
+				spec, serial, err := p.parseColumnType()
 				if err != nil {
 					return nil, err
 				}
 				if serial {
 					return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 				}
-				at.SetType = &SetType{Column: col, Type: fam, Precision: prec, Scale: scale}
+				at.SetType = setTypeOf(col, spec)
 				break
 			}
 			if p.consumeIdentWord("default") {
