@@ -201,8 +201,8 @@ func (n *Node) publishLiveness(ctx context.Context) {
 	if n.pinger != nil {
 		nd.Latency = n.pinger.Snapshot()
 	}
-	if n.pgServer != nil {
-		nd.SQL = n.pgServer.Activity().Summary()
+	if n.sqlServer() != nil {
+		nd.SQL = n.sqlServer().Activity().Summary()
 	}
 	raw, _ := json.Marshal(nd)
 	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
@@ -247,6 +247,7 @@ func (n *Node) mirrorClusterVersion(ctx context.Context) {
 		log.Warnf("persisting store cluster version: %v", err)
 	}
 	log.Infof("cluster version is now %s", version.Version(v))
+	n.ratchetStoreFormat()
 }
 
 // machineSummary condenses the latest host sample for the heartbeat.

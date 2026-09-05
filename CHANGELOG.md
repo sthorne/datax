@@ -8,6 +8,29 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.42.0 — unreleased
+
+Cluster version **v14**.
+
+### Added
+- Pebble's columnar-block sstable format (format major version 19)
+  behind cluster version v14 (#166, the first of the gated format
+  steps). Finalizing v14 ratchets both of every node's engines online,
+  within a heartbeat and with no restart; new sstables — flushes,
+  compactions — are written in the format from then on and existing
+  ones are read as they are. A fresh store bootstrapped by, or joining,
+  a v14 cluster starts there. A v13 binary bundles a Pebble that does
+  not know the format, so a store cannot go back to it after the
+  finalize (the store's version gate refuses, as for v13). The node
+  document reports `store_format`. `TestColumnarBlocksRatchet`.
+  Measured: on the storage benchmarks (100k rows, 128-byte values, a
+  store built at 19 vs 16) a point read 3.71 → 3.24 µs (hit) and
+  3.22 → 2.72 µs (miss), through a reused iterator 2.55 → 2.11 µs
+  (miss), a 1,000-row reverse scan 1.35 → 1.07 ms, a forward scan
+  unchanged; on the harness (kv-95-5, index-join, scan, hot-row,
+  ingest-random; fresh stores, two alternating rounds) every shape is at
+  parity — the read path's cost sits above the sstable blocks there.
+
 ## 0.41.0 — unreleased
 
 ### Fixed

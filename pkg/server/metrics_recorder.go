@@ -379,8 +379,8 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 	add("kv.batch_p99_us", histogramQuantile(metrics.KVBatchLatency, 0.99)*1e6)
 	add("sql.rows_scanned", counterValue(metrics.SQLRowsScanned))
 
-	if n.pgServer != nil {
-		if s := n.pgServer.Activity().Summary(); s != nil {
+	if n.sqlServer() != nil {
+		if s := n.sqlServer().Activity().Summary(); s != nil {
 			var stmts uint64
 			for _, c := range s.Statements {
 				stmts += c

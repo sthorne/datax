@@ -112,9 +112,18 @@ const (
 	// (rule 4: the migration is the one upgrade step that cannot roll
 	// back).
 	V13 Version = 13
+	// V14 introduces Pebble's columnar-block sstable format (format major
+	// version 19, FormatColumnarBlocks; issue #166): once the cluster
+	// finalizes v14, every node ratchets both of its engines to that
+	// format online — no restart — and new sstables (flushes,
+	// compactions) are written in it. A v13 binary bundles a Pebble that
+	// does not know the format, so the store's own version gate refuses
+	// it (rule 4: the ratchet cannot roll back; Pebble never lowers a
+	// store's format).
+	V14 Version = 14
 
 	// Current is the newest cluster version this binary can run.
-	Current = V13
+	Current = V14
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

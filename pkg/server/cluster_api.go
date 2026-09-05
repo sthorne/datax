@@ -128,8 +128,8 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 			if n.pinger != nil {
 				last.Latency = n.pinger.Snapshot()
 			}
-			if n.pgServer != nil {
-				last.SQL = n.pgServer.Activity().Summary()
+			if n.sqlServer() != nil {
+				last.SQL = n.sqlServer().Activity().Summary()
 			}
 		}
 	}

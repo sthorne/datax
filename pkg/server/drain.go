@@ -77,8 +77,8 @@ func (n *Node) Drain(ctx context.Context) DrainReport {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if n.pgServer != nil {
-			rep.ConnsClosed, rep.ConnsCut = n.pgServer.Drain(ctx)
+		if n.sqlServer() != nil {
+			rep.ConnsClosed, rep.ConnsCut = n.sqlServer().Drain(ctx)
 		}
 	}()
 	rep.LeasesTransferred, rep.LeasesKept = n.shedLeases(ctx)

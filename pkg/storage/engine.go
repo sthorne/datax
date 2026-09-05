@@ -257,6 +257,29 @@ func (e *Engine) Close() error {
 // flush, not at commit.
 func (e *Engine) WALDisabled() bool { return e.walDisabled }
 
+// Pebble format major versions the store moves between (issue #166):
+// FormatBase is what every store is created at and ran on before cluster
+// version v14; FormatColumnarBlocks is what v14 ratchets a store to.
+const (
+	FormatBase           = int(pebble.FormatVirtualSSTables)
+	FormatColumnarBlocks = int(pebble.FormatColumnarBlocks)
+)
+
+// Format is the store's current Pebble format major version.
+func (e *Engine) Format() int { return int(e.db.FormatMajorVersion()) }
+
+// RatchetFormat raises the store's Pebble format major version to v (a
+// no-op at or above it; Pebble never lowers one). Online and cheap: it
+// records the version in the manifest; sstables written from then on —
+// flushes and compactions — use the new format, existing ones are read
+// as they are.
+func (e *Engine) RatchetFormat(v int) error {
+	if e.Format() >= v {
+		return nil
+	}
+	return e.db.RatchetFormatMajorVersion(pebble.FormatMajorVersion(v))
+}
+
 // FlushedSeqNum is the largest sequence number durably flushed to an
 // sstable (0 until the first flush). A batch whose SeqNum is at or
 // below it has reached disk, whatever the WAL setting.
