@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // TestReadPathOptions: every profile sets the shared read-path options —
@@ -24,8 +24,10 @@ func TestReadPathOptions(t *testing.T) {
 				t.Fatalf("%s: level %d has no table bloom filter: %+v", p, i, l)
 			}
 		}
-		if opts.FormatMajorVersion != pebble.FormatNewest {
-			t.Fatalf("%s: format %s, want the newest", p, opts.FormatMajorVersion)
+		// Pinned (issue #166): the format is a deliberate choice, not
+		// whatever the bundled Pebble calls newest.
+		if opts.FormatMajorVersion != pebble.FormatVirtualSSTables {
+			t.Fatalf("%s: format %s, want %s", p, opts.FormatMajorVersion, pebble.FormatVirtualSSTables)
 		}
 		if opts.MaxOpenFiles < 1000 || opts.MaxOpenFiles > 16384 {
 			t.Fatalf("%s: max open files %d", p, opts.MaxOpenFiles)

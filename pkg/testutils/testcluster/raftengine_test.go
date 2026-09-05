@@ -89,8 +89,9 @@ func TestSplitStoreMigration(t *testing.T) {
 	if n.EngineMode() != "split" {
 		t.Fatalf("after finalize: engine mode %q", n.EngineMode())
 	}
-	if _, err := os.Stat(filepath.Join(dir, "raft", "CURRENT")); err != nil {
-		t.Fatalf("no raft engine under the store: %v", err)
+	// A Pebble store has a MANIFEST (v2 no longer writes CURRENT).
+	if m, _ := filepath.Glob(filepath.Join(dir, "raft", "MANIFEST-*")); len(m) == 0 {
+		t.Fatalf("no raft engine under the store: %s/raft has no MANIFEST", dir)
 	}
 	conn = diskSQL(t, ctx, n)
 	var count int64

@@ -98,6 +98,7 @@ func txnMetaToProto(m enginepb.TxnMeta) *rpcpb.TxnMeta {
 		MinTimestamp:   tsToProto(m.MinTimestamp),
 		Priority:       m.Priority,
 		Sequence:       m.Sequence,
+		HistoryFloor:   m.HistoryFloor,
 	}
 }
 
@@ -117,6 +118,7 @@ func txnMetaFromProto(p *rpcpb.TxnMeta) (enginepb.TxnMeta, error) {
 		MinTimestamp:   tsFromProto(p.MinTimestamp),
 		Priority:       p.Priority,
 		Sequence:       p.Sequence,
+		HistoryFloor:   p.HistoryFloor,
 	}, nil
 }
 

@@ -40,8 +40,15 @@ type TxnMeta struct {
 	MinTimestamp   *Hlc                   `protobuf:"bytes,5,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
 	Priority       int32                  `protobuf:"varint,6,opt,name=priority,proto3" json:"priority,omitempty"`
 	Sequence       int32                  `protobuf:"varint,7,opt,name=sequence,proto3" json:"sequence,omitempty"` // orders the txn's own writes (savepoints)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// history_floor tells a rewrite of the transaction's own intent how
+	// much of the superseded-value history a savepoint rollback could
+	// still need (issue #162): 0 = unknown (a coordinator from before the
+	// field; keep everything), negative = no live savepoint (keep
+	// nothing), n > 0 = the oldest live savepoint is at sequence n-1
+	// (keep the newest entry at or below it and everything above).
+	HistoryFloor  int32 `protobuf:"varint,8,opt,name=history_floor,json=historyFloor,proto3" json:"history_floor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TxnMeta) Reset() {
@@ -119,6 +126,13 @@ func (x *TxnMeta) GetPriority() int32 {
 func (x *TxnMeta) GetSequence() int32 {
 	if x != nil {
 		return x.Sequence
+	}
+	return 0
+}
+
+func (x *TxnMeta) GetHistoryFloor() int32 {
+	if x != nil {
+		return x.HistoryFloor
 	}
 	return 0
 }
@@ -4959,7 +4973,7 @@ var File_datax_v1_kv_proto protoreflect.FileDescriptor
 
 const file_datax_v1_kv_proto_rawDesc = "" +
 	"\n" +
-	"\x11datax/v1/kv.proto\x12\bdatax.v1\x1a\x18datax/v1/transport.proto\"\xe5\x01\n" +
+	"\x11datax/v1/kv.proto\x12\bdatax.v1\x1a\x18datax/v1/transport.proto\"\x8a\x02\n" +
 	"\aTxnMeta\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
@@ -4967,7 +4981,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x0fwrite_timestamp\x18\x04 \x01(\v2\r.datax.v1.HlcR\x0ewriteTimestamp\x122\n" +
 	"\rmin_timestamp\x18\x05 \x01(\v2\r.datax.v1.HlcR\fminTimestamp\x12\x1a\n" +
 	"\bpriority\x18\x06 \x01(\x05R\bpriority\x12\x1a\n" +
-	"\bsequence\x18\a \x01(\x05R\bsequence\"\xdc\x02\n" +
+	"\bsequence\x18\a \x01(\x05R\bsequence\x12#\n" +
+	"\rhistory_floor\x18\b \x01(\x05R\fhistoryFloor\"\xdc\x02\n" +
 	"\vTransaction\x12%\n" +
 	"\x04meta\x18\x01 \x01(\v2\x11.datax.v1.TxnMetaR\x04meta\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x16\n" +

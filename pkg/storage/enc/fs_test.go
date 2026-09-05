@@ -8,7 +8,7 @@ import (
 	mrand "math/rand/v2"
 	"testing"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 func testKeySet(t *testing.T) *KeySet {
@@ -26,7 +26,7 @@ func testKeySet(t *testing.T) *KeySet {
 // random offsets and compares.
 func TestEncFileRoundtrip(t *testing.T) {
 	fs := NewFS(vfs.NewMem(), testKeySet(t))
-	f, err := fs.Create("f")
+	f, err := fs.Create("f", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func (r readerAtOnly) ReadAt(p []byte, off int64) (int, error) { return r.f.Read
 // the keystream where the content left off.
 func TestOpenReadWriteAppend(t *testing.T) {
 	fs := NewFS(vfs.NewMem(), testKeySet(t))
-	f, err := fs.Create("wal")
+	f, err := fs.Create("wal", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestOpenReadWriteAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err = fs.OpenReadWrite("wal")
+	f, err = fs.OpenReadWrite("wal", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestOpenReadWriteAppend(t *testing.T) {
 	}
 
 	// OpenReadWrite on a missing/empty file takes the create path.
-	f, err = fs.OpenReadWrite("fresh")
+	f, err = fs.OpenReadWrite("fresh", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,8 +211,10 @@ func TestReuseForWrite(t *testing.T) {
 		return buf
 	}
 
-	c1 := write(func() (vfs.File, error) { return fs.Create("000001.log") }, "000001.log")
-	c2 := write(func() (vfs.File, error) { return fs.ReuseForWrite("000001.log", "000002.log") }, "000002.log")
+	c1 := write(func() (vfs.File, error) { return fs.Create("000001.log", vfs.WriteCategoryUnspecified) }, "000001.log")
+	c2 := write(func() (vfs.File, error) {
+		return fs.ReuseForWrite("000001.log", "000002.log", vfs.WriteCategoryUnspecified)
+	}, "000002.log")
 	if bytes.Equal(c1, c2) {
 		t.Fatal("ReuseForWrite reused the keystream: identical ciphertext for identical plaintext")
 	}
@@ -226,7 +228,7 @@ func TestReuseForWrite(t *testing.T) {
 func TestWrongAndUnknownKey(t *testing.T) {
 	base := vfs.NewMem()
 	fs := NewFS(base, testKeySet(t))
-	f, err := fs.Create("f")
+	f, err := fs.Create("f", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +242,7 @@ func TestWrongAndUnknownKey(t *testing.T) {
 		t.Fatal("open with unknown data key succeeded")
 	}
 
-	pf, err := base.Create("plain")
+	pf, err := base.Create("plain", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +384,7 @@ func TestLoadKeyFile(t *testing.T) {
 }
 
 func writeOSFile(path string, b []byte) error {
-	f, err := vfs.Default.Create(path)
+	f, err := vfs.Default.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}

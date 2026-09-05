@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 // The registry file seals the data keys under the store key:
@@ -179,7 +179,7 @@ func writeRegistry(base vfs.FS, dir string, storeKey []byte, reg *registryData) 
 	}
 	path := base.PathJoin(dir, RegistryName)
 	tmp := path + ".tmp"
-	f, err := base.Create(tmp)
+	f, err := base.Create(tmp, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}

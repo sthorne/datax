@@ -550,12 +550,21 @@ func TestReshardRetentionContinues(t *testing.T) {
 	}
 	execSQL(t, ctx, s, `ALTER TABLE ev SET (shards = 4)`)
 
+	// GC visits the ranges this store leads; the re-shard's fresh ranges
+	// elect their leaders asynchronously, so a pass that arrives before
+	// the campaign skips them. Passes repeat until the rows are gone.
 	time.Sleep(1200 * time.Millisecond)
-	n.Store().RunGCOnce(ctx, 24*time.Hour)
-
-	res := execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM ev`)
-	if res.Rows[0][0].I != 0 {
-		t.Fatalf("rows survived retention after re-shard: %+v", res.Rows)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		n.Store().RunGCOnce(ctx, 24*time.Hour)
+		res := execSQL(t, ctx, s, `SELECT COUNT(*) AS n FROM ev`)
+		if res.Rows[0][0].I == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rows survived retention after re-shard: %+v", res.Rows)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

@@ -53,10 +53,6 @@ func intentAboveRead(intentTS, ts, uncertaintyLimit hlc.Timestamp) bool {
 
 // mvccKeyBounds returns engine-key bounds covering exactly the metadata and
 // versions of user key k.
-func mvccKeyBounds(k keys.Key) (lower, upper []byte) {
-	return EncodeMVCCKey(k, hlc.Timestamp{}), EncodeMVCCKey(k.Next(), hlc.Timestamp{})
-}
-
 func decodeMeta(raw []byte) (enginepb.MVCCMetadata, error) {
 	var meta enginepb.MVCCMetadata
 	if err := json.Unmarshal(raw, &meta); err != nil {
@@ -80,6 +76,50 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 	metaKey, upper := mvccKeyBounds(key)
 	it := r.NewIter(metaKey, upper)
 	defer func() { _ = it.Close() }()
+	return mvccGet(it, metaKey, key, ts, opts)
+}
+
+// Getter serves point reads through one iterator, re-bounded to each
+// key (issue #163): building and tearing down a Pebble iterator is about
+// a fifth of a point read's CPU, and a batch of N Gets — an index join
+// fetching its primary rows, a statement's per-row fetches — paid it N
+// times. Over an engine the iterator keeps the view it was created with,
+// so every Get of one Getter reads one consistent state; over an indexed
+// batch each re-bound refreshes the view to include the batch's own
+// writes, as a fresh iterator would. Close releases the iterator.
+type Getter struct {
+	r  Reader
+	it Iterator
+}
+
+// NewGetter returns a Getter over r; the iterator is created by the
+// first Get.
+func NewGetter(r Reader) *Getter { return &Getter{r: r} }
+
+// Get is MVCCGet through the Getter's iterator.
+func (g *Getter) Get(key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]byte, error) {
+	metaKey, upper := mvccKeyBounds(key)
+	if g.it == nil {
+		g.it = g.r.NewIter(metaKey, upper)
+	} else {
+		g.it.SetBounds(metaKey, upper)
+	}
+	return mvccGet(g.it, metaKey, key, ts, opts)
+}
+
+// Close releases the Getter's iterator; the Getter must not be used
+// afterwards.
+func (g *Getter) Close() {
+	if g.it != nil {
+		_ = g.it.Close()
+		g.it = nil
+	}
+}
+
+// mvccGet is MVCCGet over an iterator bounded to key's engine keys;
+// metaKey is key's metadata key with spare capacity for a version
+// suffix (mvccKeyBounds).
+func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]byte, error) {
 
 	var readAt hlc.Timestamp // exact version to read (own intent); empty = normal read
 	var skipAt hlc.Timestamp // provisional version to skip (own older epoch); empty = none
@@ -111,7 +151,7 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 
 	if !readAt.IsEmpty() {
 		// Read-your-writes: return the provisional value, regardless of ts.
-		if !it.SeekGE(EncodeMVCCKey(key, readAt)) {
+		if !it.SeekGE(appendVersionSuffix(metaKey, readAt)) {
 			return nil, fmt.Errorf("intent on %s has no provisional value at %s", key, readAt)
 		}
 		_, vts, err := DecodeMVCCKey(it.Key())
@@ -132,7 +172,7 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 	// cannot order ourselves relative to it. Seek to the first version at or
 	// below the limit and check whether it is above our read timestamp.
 	if !opts.UncertaintyLimit.IsEmpty() && ts.Less(opts.UncertaintyLimit) {
-		if it.SeekGE(EncodeMVCCKey(key, opts.UncertaintyLimit)) {
+		if it.SeekGE(appendVersionSuffix(metaKey, opts.UncertaintyLimit)) {
 			for it.Valid() {
 				_, vts, err := DecodeMVCCKey(it.Key())
 				if err != nil {
@@ -151,7 +191,7 @@ func MVCCGet(r Reader, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]b
 	}
 
 	// Normal read: newest version at or below ts.
-	if !it.SeekGE(EncodeMVCCKey(key, ts)) {
+	if !it.SeekGE(appendVersionSuffix(metaKey, ts)) {
 		return nil, nil
 	}
 	for it.Valid() {
@@ -219,7 +259,7 @@ func mvccWriteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, 
 	if hasVersion && ts.LessEq(vts) {
 		return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
 	}
-	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
+	return b.Put(appendVersionSuffix(metaKey, ts), encodeMVCCValue(value, tombstone))
 }
 
 func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone bool, txn *enginepb.TxnMeta) error {
@@ -244,7 +284,7 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 		// history so a savepoint rollback can restore it; a new epoch
 		// starts fresh.
 		if meta.Txn.Epoch == txn.Epoch {
-			raw, err := b.Get(EncodeMVCCKey(key, meta.Timestamp))
+			raw, err := b.Get(appendVersionSuffix(metaKey, meta.Timestamp))
 			if err != nil {
 				return err
 			}
@@ -253,11 +293,11 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 				if err != nil {
 					return err
 				}
-				history = append(append([]enginepb.IntentValue(nil), meta.History...),
-					enginepb.IntentValue{Sequence: meta.Txn.Sequence, Value: val, Tombstone: tomb})
+				history = boundedHistory(meta.History,
+					enginepb.IntentValue{Sequence: meta.Txn.Sequence, Value: val, Tombstone: tomb}, txn.HistoryFloor)
 			}
 		}
-		if err := b.Delete(EncodeMVCCKey(key, meta.Timestamp)); err != nil {
+		if err := b.Delete(appendVersionSuffix(metaKey, meta.Timestamp)); err != nil {
 			return err
 		}
 	} else if hasVersion && ts.LessEq(vts) {
@@ -277,7 +317,47 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 			return err
 		}
 	}
-	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
+	// The version key is the metadata key plus the suffix, appended in
+	// place on the spare capacity mvccKeyBounds left (the batch copies
+	// its keys).
+	return b.Put(appendVersionSuffix(metaKey, ts), encodeMVCCValue(value, tombstone))
+}
+
+// boundedHistory is the intent history after a same-epoch rewrite adds
+// the superseded value, keeping only what a savepoint rollback could
+// still restore (issue #162). Unbounded, a transaction writing one key
+// K times stored K copies and rewrote O(K²) bytes, for a history only
+// RollbackToSavepoint reads. A rollback to sequence S restores the
+// newest entry at or below S, so: an entry sharing its sequence with the
+// one before it makes that one unreachable (a statement writing a key
+// twice), and replaces it; with no live savepoint (floor < 0) nothing is
+// reachable; with the oldest live savepoint at F = floor-1, only the
+// newest entry at or below F is reachable among those, while every
+// entry above F may serve a later savepoint. floor 0 — a coordinator
+// from before the field — keeps everything.
+func boundedHistory(prev []enginepb.IntentValue, add enginepb.IntentValue, floor int32) []enginepb.IntentValue {
+	if floor < 0 {
+		return nil
+	}
+	history := make([]enginepb.IntentValue, 0, len(prev)+1)
+	history = append(history, prev...)
+	if n := len(history); n > 0 && history[n-1].Sequence == add.Sequence {
+		history[n-1] = add
+	} else {
+		history = append(history, add)
+	}
+	if floor == 0 {
+		return history
+	}
+	// Entries ascend by sequence. Keep the last one at or below F and
+	// everything after it.
+	first := 0
+	for i, e := range history {
+		if e.Sequence <= floor-1 {
+			first = i
+		}
+	}
+	return history[first:]
 }
 
 // MVCCRollbackIntent rolls the transaction's intent on key back to its
@@ -378,15 +458,16 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 	var res ScanResult
 	var intents []Intent
 	var bytes int64
+	var prefix []byte // cur's metadata key, copied off the iterator per row
 
 	ok := it.SeekGE(lower)
 	for ok {
-		userKey, _, err := DecodeMVCCKey(it.Key())
+		userKey, vts, err := DecodeMVCCKey(it.Key())
 		if err != nil {
 			return ScanResult{}, err
 		}
-		cur := keys.Key(userKey).Clone()
-		prefix := EncodeMVCCKey(cur, hlc.Timestamp{})
+		cur := keys.Key(userKey) // DecodeMVCCKey allocated it: ours to keep
+		prefix = appendMetaKeyOf(prefix[:0], it.Key(), vts)
 		value, found, err := mvccScanKey(it, cur, prefix, ts, opts, &intents)
 		if err != nil {
 			return ScanResult{}, err
@@ -414,6 +495,18 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 // crossed in a step or two, while a hot row rewritten thousands of times
 // still costs one seek rather than a walk of every version (issue #160).
 const maxStepsBeforeSeek = 8
+
+// appendMetaKeyOf appends to buf the metadata key of the user key an
+// engine key belongs to — the engine key itself, or the engine key less
+// its version suffix when vts (its decoded version) says it is a version
+// key — so a scan gets each row's prefix by one copy off the iterator
+// instead of re-encoding the decoded key (issue #163).
+func appendMetaKeyOf(buf, engineKey []byte, vts hlc.Timestamp) []byte {
+	if !vts.IsEmpty() {
+		engineKey = engineKey[:len(engineKey)-versionSuffixLen]
+	}
+	return append(buf, engineKey...)
+}
 
 // keyPrefixOf reports whether an encoded engine key belongs to the user
 // key whose metadata key is prefix: the encoding is prefix-free, so the
@@ -471,15 +564,16 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 	var res ScanResult
 	var intents []Intent
 	var bytes int64
+	var curStart []byte // cur's metadata key, copied off the iterator per row
 
 	ok := it.SeekLT(upper)
 	for ok {
-		userKey, _, err := DecodeMVCCKey(it.Key())
+		userKey, vts, err := DecodeMVCCKey(it.Key())
 		if err != nil {
 			return ScanResult{}, err
 		}
-		cur := keys.Key(userKey).Clone()
-		curStart := EncodeMVCCKey(cur, hlc.Timestamp{})
+		cur := keys.Key(userKey) // DecodeMVCCKey allocated it: ours to keep
+		curStart = appendMetaKeyOf(curStart[:0], it.Key(), vts)
 		if !stepToKeyStart(it, curStart) {
 			break // unreachable: an engine key of cur was just observed
 		}
@@ -674,7 +768,7 @@ func MVCCCheckForWrites(r Reader, start, end keys.Key, fromTS, toTS hlc.Timestam
 		if err != nil {
 			return err
 		}
-		cur := keys.Key(userKey).Clone()
+		cur := keys.Key(userKey) // DecodeMVCCKey allocated it: ours to keep
 		var skipAt hlc.Timestamp
 		if vts.IsEmpty() {
 			meta, err := decodeMeta(it.Value())

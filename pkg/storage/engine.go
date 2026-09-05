@@ -12,11 +12,12 @@ import (
 
 	"github.com/sthorne/datax/pkg/util/faultpoint"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // Reader provides read access to an engine or batch.
@@ -44,6 +45,12 @@ type Iterator interface {
 	Next() bool
 	// Prev steps to the previous key; false at the lower bound.
 	Prev() bool
+	// SetBounds re-bounds the iterator to [lower, upper) and invalidates
+	// its position (reposition with a seek). Over an indexed batch the
+	// view is refreshed to the batch's latest writes; over an engine or
+	// snapshot the view is unchanged. The bound slices must not be
+	// modified until the iterator is closed or re-bounded again.
+	SetBounds(lower, upper []byte)
 	Valid() bool
 	Key() []byte
 	Value() []byte
@@ -101,6 +108,7 @@ func Open(dir string, o Options) (*Engine, error) {
 		opts.MemTableSize = uint64(o.MemTableSize)
 	}
 	opts.DisableWAL = o.DisableWAL
+	opts.Logger = pebbleLogger{}
 	cacheSize := o.CacheSize
 	if cacheSize <= 0 {
 		cacheSize = DefaultCacheSize(o.Profile)
@@ -116,8 +124,11 @@ func Open(dir string, o Options) (*Engine, error) {
 			e.health.inStall.Store(true)
 		},
 		WriteStallEnd: func() { e.health.inStall.Store(false) },
-		FlushBegin: func(pebble.FlushInfo) {
-			if e.explicitFlush.Load() == 0 {
+		FlushBegin: func(info pebble.FlushInfo) {
+			// The fault point means the rotation of a memtable holding
+			// writes; Pebble v2 also flushes an empty memtable as a
+			// store opens (no input bytes), which is no such moment.
+			if info.InputBytes > 0 && e.explicitFlush.Load() == 0 {
 				faultpoint.Hit("flush-begin")
 			}
 		},
@@ -126,8 +137,8 @@ func Open(dir string, o Options) (*Engine, error) {
 			// sequence number is the durability watermark.
 			var largest uint64
 			for _, t := range info.Output {
-				if t.LargestSeqNum > largest {
-					largest = t.LargestSeqNum
+				if uint64(t.LargestSeqNum) > largest {
+					largest = uint64(t.LargestSeqNum)
 				}
 			}
 			for {
@@ -267,8 +278,8 @@ func (e *Engine) WriteMetrics() WriteMetrics {
 	var w WriteMetrics
 	w.WALBytes = m.WAL.BytesWritten
 	for i := range m.Levels {
-		w.FlushedBytes += m.Levels[i].BytesFlushed
-		w.CompactedBytes += m.Levels[i].BytesCompacted
+		w.FlushedBytes += m.Levels[i].TableBytesFlushed + m.Levels[i].BlobBytesFlushed
+		w.CompactedBytes += m.Levels[i].TableBytesCompacted + m.Levels[i].BlobBytesCompacted
 	}
 	return w
 }
@@ -431,7 +442,7 @@ func (b *Batch) NewIter(lower, upper []byte) Iterator {
 	if err != nil {
 		return &errIter{err: err}
 	}
-	return &pebbleIter{it: it}
+	return &pebbleIter{it: it, refreshOnRebound: true}
 }
 
 func (b *Batch) Put(key, value []byte) error { return b.b.Set(key, value, nil) }
@@ -455,7 +466,7 @@ func (b *Batch) Commit(sync bool) error {
 	if err := b.b.Commit(opt); err != nil {
 		return err
 	}
-	b.seq = b.b.SeqNum()
+	b.seq = uint64(b.b.SeqNum())
 	return nil
 }
 
@@ -479,9 +490,32 @@ func (b *Batch) Empty() bool { return b.b.Empty() }
 // Used to ship a batch through Raft.
 func (b *Batch) Repr() []byte { return b.b.Repr() }
 
+// pebbleLogger routes Pebble's own log lines into the node's log: its
+// job chatter — flushes, compactions, the WALs found at open and their
+// replay, which Pebble v2 reports at info — at debug level, its errors
+// at error level. Pebble's default logger printed to stderr past the
+// node's structured log.
+type pebbleLogger struct{}
+
+func (pebbleLogger) Infof(format string, args ...any)  { log.Debugf(format, args...) }
+func (pebbleLogger) Errorf(format string, args ...any) { log.Errorf(format, args...) }
+func (pebbleLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args...) }
+
 type pebbleIter struct {
 	it    *pebble.Iterator
 	valid bool
+	// refreshOnRebound: the iterator reads an indexed batch, whose view
+	// only SetOptions refreshes (SetBounds keeps the view of creation).
+	refreshOnRebound bool
+}
+
+func (i *pebbleIter) SetBounds(lower, upper []byte) {
+	if i.refreshOnRebound {
+		i.it.SetOptions(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	} else {
+		i.it.SetBounds(lower, upper)
+	}
+	i.valid = false
 }
 
 func (i *pebbleIter) SeekGE(key []byte) bool { i.valid = i.it.SeekGE(key); return i.valid }
@@ -495,11 +529,12 @@ func (i *pebbleIter) Close() error           { return i.it.Close() }
 
 type errIter struct{ err error }
 
-func (i *errIter) SeekGE([]byte) bool { return false }
-func (i *errIter) SeekLT([]byte) bool { return false }
-func (i *errIter) Next() bool         { return false }
-func (i *errIter) Prev() bool         { return false }
-func (i *errIter) Valid() bool        { return false }
-func (i *errIter) Key() []byte        { return nil }
-func (i *errIter) Value() []byte      { return nil }
-func (i *errIter) Close() error       { return i.err }
+func (i *errIter) SeekGE([]byte) bool    { return false }
+func (i *errIter) SeekLT([]byte) bool    { return false }
+func (i *errIter) Next() bool            { return false }
+func (i *errIter) Prev() bool            { return false }
+func (i *errIter) SetBounds(_, _ []byte) {}
+func (i *errIter) Valid() bool           { return false }
+func (i *errIter) Key() []byte           { return nil }
+func (i *errIter) Value() []byte         { return nil }
+func (i *errIter) Close() error          { return i.err }

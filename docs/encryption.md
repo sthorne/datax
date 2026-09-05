@@ -41,11 +41,14 @@ Details that matter for correctness and confidentiality:
   recovery attack, not hygiene. The old file is removed and a fresh one
   (new IV, current data key) created. This forfeits Pebble's WAL
   recycling and is the dominant cost of encryption (see below).
-- **`Fd()` passes through**, audited against Pebble v1.1.5: the fd is
-  used only for flock, fadvise hints, fallocate and sync_file_range —
-  syscalls that never read or write file content — and hiding it costs
-  real WAL fsync latency (no preallocation). The audit must be repeated
-  on any Pebble upgrade; an fd used for mmap would read ciphertext.
+- **`Fd()` passes through**, audited against Pebble v1.1.5 and again
+  against v2.1.7 (the 0.41.0 upgrade, issue #166): the fd is used only
+  for flock, fadvise hints, fallocate and sync_file_range — syscalls
+  that never read or write file content; nothing outside Pebble's `vfs`
+  package touches it — and hiding it costs real WAL fsync latency (no
+  preallocation). The audit must be repeated on any Pebble upgrade
+  (`grep -rn '\.Fd()'` over the module, outside `vfs/` and the tests);
+  an fd used for mmap would read ciphertext.
 - `Stat` subtracts the 24-byte header; `SyncTo`/`Preallocate`/`Prefetch`
   offsets are shifted by it — Pebble's size bookkeeping sees logical
   sizes throughout.

@@ -330,6 +330,8 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 	// transaction cost n proposals, each failing on the next key after the
 	// client resolved the previous one (issue #74).
 	var conflicts intentCollector
+	getter := storage.NewGetter(b) // one iterator for the batch's Gets, refreshed past its own writes (issue #163)
+	defer getter.Close()
 	for i := range ba.Requests {
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
@@ -375,7 +377,7 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			ru.Increment = &kvpb.IncrementResponse{NewValue: v}
 		case *kvpb.GetRequest:
-			val, err := storage.MVCCGet(b, req.Key, readTimestamp(ba), storage.MVCCGetOptions{Txn: txnMeta})
+			val, err := getter.Get(req.Key, readTimestamp(ba), storage.MVCCGetOptions{Txn: txnMeta})
 			if err != nil {
 				if conflicts.collect(err) {
 					continue
@@ -542,11 +544,13 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 		opts.UncertaintyLimit = ts
 	}
 	eng := r.store.cfg.Engine
+	getter := storage.NewGetter(eng) // one iterator for every Get in the batch (issue #163)
+	defer getter.Close()
 	for i := range ba.Requests {
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
 		case *kvpb.GetRequest:
-			val, err := storage.MVCCGet(eng, req.Key, ts, opts)
+			val, err := getter.Get(req.Key, ts, opts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}

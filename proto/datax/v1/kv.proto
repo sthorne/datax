@@ -25,6 +25,13 @@ message TxnMeta {
   Hlc min_timestamp = 5;
   int32 priority = 6;
   int32 sequence = 7; // orders the txn's own writes (savepoints)
+  // history_floor tells a rewrite of the transaction's own intent how
+  // much of the superseded-value history a savepoint rollback could
+  // still need (issue #162): 0 = unknown (a coordinator from before the
+  // field; keep everything), negative = no live savepoint (keep
+  // nothing), n > 0 = the oldest live savepoint is at sequence n-1
+  // (keep the newest entry at or below it and everything above).
+  int32 history_floor = 8;
 }
 
 message Transaction {

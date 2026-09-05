@@ -131,3 +131,27 @@ func BenchmarkMVCCGet(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkMVCCGetReused: point reads through one Getter — the shape of
+// a batch of Gets on the server (issue #163).
+func BenchmarkMVCCGetReused(b *testing.B) {
+	eng := buildBenchEngine(b, 1)
+	readTS := ts(1000, 0)
+	for _, tc := range []struct {
+		name string
+		off  int
+	}{{"hit", 0}, {"miss", 1}} {
+		b.Run(tc.name, func(b *testing.B) {
+			rng := rand.New(rand.NewSource(int64(tc.off)))
+			g := NewGetter(eng)
+			defer g.Close()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := g.Get(benchKey(rng.Intn(benchRows/2)*2+tc.off), readTS, MVCCGetOptions{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -61,6 +61,13 @@ type TxnMeta struct {
 	// coordinator before each write). Savepoint rollback restores every
 	// intent to its newest state at or below the savepoint's sequence.
 	Sequence int32 `json:"seq,omitempty"`
+	// HistoryFloor bounds the intent history a rewrite keeps (issue
+	// #162): 0 = unknown (keep every entry), negative = the coordinator
+	// has no live savepoint (keep none), n > 0 = the oldest live
+	// savepoint is at sequence n-1 (keep the newest entry at or below
+	// it, and every entry above it). Set by the coordinator on every
+	// batch; a savepoint rollback is the history's only reader.
+	HistoryFloor int32 `json:"history_floor,omitempty"`
 }
 
 // IntentValue is one superseded provisional value of the SAME transaction,

@@ -73,6 +73,7 @@ type benchReadPhase struct {
 var benchWorkloads = []struct{ name, doc string }{
 	{"kv", "point reads and updates by primary key (--read-pct)"},
 	{"bank", "contended two-row transfers in explicit transactions"},
+	{"hot-row", "one row updated --updates times per transaction: the rewrite of the transaction's own intent"},
 	{"ingest", "batched INSERTs (--keys random|sequential|uuid, --batch, --payload-bytes)"},
 	{"ingest-copy", "the same rows through COPY FROM"},
 	{"timeseries", "per-series monotone timestamps (--series, --shards), then windowed reads"},
@@ -113,6 +114,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	readPct := fs.Int("read-pct", 95, "kv workload: percentage of reads")
 	preload := fs.Int("preload", 1000, "rows (kv, index-join, scan) or accounts (bank) to preload")
 	forUpdate := fs.Bool("for-update", false, "bank workload: read balances with SELECT ... FOR UPDATE")
+	updates := fs.Int("updates", 16, "hot-row workload: UPDATEs of the one row per transaction")
 	batch := fs.Int("batch", 100, "ingest workload: rows per INSERT batch")
 	payloadBytes := fs.Int("payload-bytes", 256, "ingest, index-join, scan: value size per row")
 	keys := fs.String("keys", "random", "ingest workload: key order — random (LSM stress), sequential (per-worker monotone), uuid (text keys)")
@@ -139,7 +141,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	fs.Usage = func() { benchUsage(fs) }
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return nil, fmt.Errorf("bench requires a workload: kv, bank, ingest, ingest-copy, timeseries, index-join, or scan")
+		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
@@ -150,7 +152,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		known = known || w.name == workload
 	}
 	if !known {
-		return nil, fmt.Errorf("unknown workload %q (want kv, bank, ingest, ingest-copy, timeseries, index-join, or scan)", workload)
+		return nil, fmt.Errorf("unknown workload %q (want kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan)", workload)
 	}
 	switch *keys {
 	case "random", "sequential", "uuid":
@@ -231,6 +233,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
+	hotTable := "bench_hot" + rsuffix
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
 	tsBase := time.Now().UTC().Truncate(time.Second)
@@ -244,7 +247,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	simple := true
 	switch *protocol {
 	case "auto":
-		simple = workload != "kv" && workload != "bank"
+		simple = workload != "kv" && workload != "bank" && workload != "hot-row"
 	case "simple":
 	case "extended":
 		simple = false
@@ -335,6 +338,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			return nil, err
 		}
 		if err := preloadRows(bankTable, "id, balance", func(j int) string { return fmt.Sprintf("(%d, 1000)", j) }); err != nil {
+			return nil, err
+		}
+	case "hot-row":
+		// One row updated --updates times inside one transaction: the
+		// depth of an intent's rewrite chain (issue #162).
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+hotTable+" (id INT8 PRIMARY KEY, n INT8)"); err != nil {
+			return nil, err
+		}
+		if err := split(hotTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		if err := preloadRows(hotTable, "id, n", func(j int) string { return fmt.Sprintf("(%d, 0)", j) }); err != nil {
 			return nil, err
 		}
 	case "index-join":
@@ -533,6 +548,8 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 					}
 				case "bank":
 					err = bankTransfer(ctx, conn, rng, bankTable, *preload, *forUpdate)
+				case "hot-row":
+					err = hotRowUpdates(ctx, conn, hotTable, int64(rng.Intn(*preload)), *updates)
 				case "ingest":
 					if pace != nil {
 						pace()
@@ -872,6 +889,24 @@ func counterDeltas(before, after map[string]float64) map[string]float64 {
 
 // bankTransfer moves a random amount between two random accounts in one
 // serializable transaction (the classic consistency workload).
+// hotRowUpdates increments one row n times in one transaction: every
+// UPDATE after the first rewrites the transaction's own intent, the
+// path whose cost grew with the depth of the chain before issue #162.
+func hotRowUpdates(ctx context.Context, conn *pgx.Conn, table string, id int64, n int) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	upd := "UPDATE " + table + " SET n = n + 1 WHERE id = $1"
+	for i := 0; i < n; i++ {
+		if _, err := tx.Exec(ctx, upd, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, table string, accounts int, forUpdate bool) error {
 	a, b := rng.Intn(accounts), rng.Intn(accounts)
 	if a == b {

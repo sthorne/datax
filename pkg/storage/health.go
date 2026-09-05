@@ -71,7 +71,7 @@ func (e *Engine) StorageMetrics() StorageMetrics {
 		CompactionDebtBytes: m.Compact.EstimatedDebt,
 		MemtableCount:       m.MemTable.Count,
 		MemtableBytes:       m.MemTable.Size,
-		L0Files:             int(m.Levels[0].NumFiles),
+		L0Files:             int(m.Levels[0].TablesCount),
 		L0Sublevels:         int(m.Levels[0].Sublevels),
 		WriteStalls:         e.health.stalls.Load(),
 		DiskSlowEvents:      e.health.diskSlow.Load(),

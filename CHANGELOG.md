@@ -8,6 +8,74 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.41.0 — unreleased
+
+### Fixed
+- A gateway's descriptor lease is taken in the transaction that read the
+  descriptor. Written in a separate transaction, the lease record could
+  claim a version a schema change had already superseded: a gateway
+  whose previous lease had lapsed read version 1, the change committed
+  version 2 and drained (a lapsed lease is nothing to wait for), and the
+  gateway then recorded a fresh lease at version 1 and served it from
+  its cache — `column does not exist` on the new column — for a whole
+  TTL. Found by the race suite; `TestLeaseClaimsTheVersionItRead` holds
+  a gateway between its read and its write while the change commits.
+
+### Changed
+- The MVCC read path allocates a fraction of what it did (#163). A user
+  key's two iterator bounds come out of one allocation (the upper bound
+  is the metadata key with its terminator bumped — exactly the end of
+  the key's engine keys — instead of encoding the key's successor), the
+  version keys a read seeks to are appended onto that buffer's spare
+  capacity, `encoding.EncodeBytes` and `DecodeBytes` allocate once at
+  the exact size, and a scan copies each row's prefix off the iterator
+  rather than re-encoding the decoded key (and no longer copies the
+  decoded key a second time). `storage.Getter` serves the point reads
+  of one server batch — the read path's Gets and the write path's Gets
+  and Increments — through one iterator re-bounded per key, refreshed
+  past the batch's own writes where the reader is a batch. Measured on
+  the storage benchmarks (100k rows, 128-byte values): a point read
+  4.28 → 3.60 µs and 16 → 5 allocations (2.75 µs and 3 through a
+  Getter), a miss 3.66 → 3.12 µs (2.63 reused) and 12 → 3 (1); a
+  1,000-row scan over 3 versions 735 → 518 µs and 8,019 → 2,016
+  allocations, in reverse 1,472 → 1,252 µs.
+- A transaction's intent history is bounded to what a savepoint
+  rollback could restore (#162). Every same-epoch rewrite of a key
+  appended the superseded value to the intent's history and rewrote the
+  whole history with it, so a transaction writing one key K times
+  stored K copies and wrote O(K²) bytes — for data only
+  `ROLLBACK TO SAVEPOINT` reads. The coordinator now tells the servers,
+  in `TxnMeta.HistoryFloor` on every batch, how far back a rollback
+  could reach: with no live savepoint nothing is kept; with the oldest
+  live savepoint at sequence F, the newest entry at or below F and every
+  entry above it; two entries at one sequence collapse to the later. A
+  coordinator from before the field leaves it 0 and gets the old
+  behavior, so no cluster-version gate is needed. Measured on
+  `BenchmarkIntentRewriteDepth`: one more write to a key already
+  written 64 times in the transaction 136 → 12 µs and 45.9 KB → 1.6 KB
+  allocated, flat from depth 1 to 64 (under a savepoint taken before
+  the first write the history is kept as before). `bench/workloads.json`
+  gains `hot-row` — one row updated 16 times per transaction — for the
+  harness. `TestIntentHistoryBounded`.
+- The store runs on Pebble v2 (`github.com/cockroachdb/pebble/v2`
+  v2.1.7, from v1.1.5; #166). The port is mechanical — the encrypting
+  `vfs.FS` takes the disk-write category its methods gained and returns
+  `vfs.FileInfo`, the option and metric renames, `Compact` with a
+  context — and the on-disk format stays at 16 (`FormatVirtualSSTables`,
+  the pin below; v2 opens every existing store as it is, since its
+  minimum supported format is 13). Columnar blocks (19) and value
+  separation (24) are not adopted here: each is a separate,
+  cluster-version-gated step with its own before/after. Pebble's own
+  log lines — v2 reports the WALs it finds at open and their replay at
+  info — now go through the node's log at debug level instead of to
+  stderr.
+- The Pebble format version is pinned at `FormatVirtualSSTables` (16)
+  instead of tracking `FormatNewest` (#166): the formats past it change
+  what lands on disk (columnar blocks, value separation), and adopting
+  one is a deliberate, cluster-version-gated step with its own
+  measurements, not a side effect of a dependency bump. Nothing changes
+  for existing stores (16 is what the bundled Pebble's newest is).
+
 ## 0.40.1 — unreleased
 
 ### Fixed

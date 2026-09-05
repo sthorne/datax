@@ -132,7 +132,11 @@ func TestGracefulShutdown(t *testing.T) {
 		}
 	}
 
-	dctx, dcancel := context.WithTimeout(ctx, 3*time.Second)
+	// The budget is generous: the test is about what the drain does with
+	// each connection and lease, not how fast — under a loaded machine
+	// the worker's statement in flight can take seconds to reach its
+	// boundary, and a lapsed budget cuts it instead of closing it.
+	dctx, dcancel := context.WithTimeout(ctx, 15*time.Second)
 	rep := tc.Nodes[0].Drain(dctx)
 	dcancel()
 	t.Logf("n1: %s", rep)
