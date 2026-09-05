@@ -3,9 +3,11 @@ package kvserver
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 )
 
 // Span latches serialize overlapping requests on a range while letting
@@ -115,16 +117,23 @@ func (m *latchManager) Acquire(ctx context.Context, spans []latchSpan, mode latc
 			break
 		}
 	}
+	var waitedSince time.Time
 	for {
 		m.mu.Lock()
 		conflict := m.findConflict(l)
 		if conflict == nil {
 			m.insert(l)
 			m.mu.Unlock()
+			if !waitedSince.IsZero() {
+				metrics.LatchWait.Observe(time.Since(waitedSince).Seconds())
+			}
 			return &latchGuard{m: m, l: l}, nil
 		}
 		wait := conflict.done
 		m.mu.Unlock()
+		if waitedSince.IsZero() {
+			waitedSince = time.Now()
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

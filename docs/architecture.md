@@ -47,7 +47,10 @@ moves no data**.
    sub-batches sent **in parallel** (the record-creating one first).
 4. `kvserver` on the Raft leader checks the timestamp cache, then proposes the
    write to the range's Raft group. Once a quorum has appended it, each replica
-   **applies** it: an MVCC *write intent* lands in Pebble.
+   **applies** it — on an apply worker, off the raft pass that committed
+   it, so the range's next append is already syncing meanwhile
+   (docs/replication-and-placement.md, "Pipelined apply"): an MVCC *write
+   intent* lands in Pebble.
 5. At `COMMIT`, the coordinator flips the transaction record to COMMITTED — a
    single Raft write — then asynchronously resolves intents to plain values.
    Fast paths skip stages of this: an implicit transaction stages its

@@ -201,7 +201,7 @@ func MVCCDeleteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp) error {
 
 func mvccWriteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone bool) error {
 	metaKey, upper := mvccKeyBounds(key)
-	rawMeta, err := b.Get(metaKey)
+	rawMeta, vts, hasVersion, err := b.writeState(metaKey, upper)
 	if err != nil {
 		return err
 	}
@@ -214,21 +214,9 @@ func mvccWriteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, 
 		// writes of its own, so ownership is irrelevant here.
 		return &WriteIntentError{Intents: []Intent{{Key: key.Clone(), Txn: meta.Txn}}}
 	}
-	it := b.NewIter(metaKey, upper)
-	firstVersion := append(append([]byte(nil), metaKey...), 0x00)
-	if it.SeekGE(firstVersion) {
-		_, vts, err := DecodeMVCCKey(it.Key())
-		if cerr := it.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return err
-		}
-		if ts.LessEq(vts) {
-			return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
-		}
-	} else if err := it.Close(); err != nil {
-		return err
+	// No intent: refuse to write beneath the newest committed version.
+	if hasVersion && ts.LessEq(vts) {
+		return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
 	}
 	return b.Put(EncodeMVCCKey(key, ts), encodeMVCCValue(value, tombstone))
 }
@@ -236,7 +224,7 @@ func mvccWriteCommitted(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, 
 func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone bool, txn *enginepb.TxnMeta) error {
 	metaKey, upper := mvccKeyBounds(key)
 
-	rawMeta, err := b.Get(metaKey)
+	rawMeta, vts, hasVersion, err := b.writeState(metaKey, upper)
 	if err != nil {
 		return err
 	}
@@ -271,29 +259,14 @@ func mvccWrite(b *Batch, key keys.Key, ts hlc.Timestamp, value []byte, tombstone
 		if err := b.Delete(EncodeMVCCKey(key, meta.Timestamp)); err != nil {
 			return err
 		}
-	} else {
-		// No intent. Find the newest committed version and refuse to write
-		// beneath it. (The first engine key after the metadata key is the
-		// newest version, since versions sort newest-first.)
-		it := b.NewIter(metaKey, upper)
-		firstVersion := append(append([]byte(nil), metaKey...), 0x00)
-		if it.SeekGE(firstVersion) {
-			_, vts, err := DecodeMVCCKey(it.Key())
-			if cerr := it.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				return err
-			}
-			if ts.LessEq(vts) {
-				if txn != nil {
-					return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
-				}
-				ts = vts.Next()
-			}
-		} else if err := it.Close(); err != nil {
-			return err
+	} else if hasVersion && ts.LessEq(vts) {
+		// No intent, and the newest committed version (the first engine
+		// key after the metadata key: versions sort newest-first) is at
+		// or above ts: never write beneath it.
+		if txn != nil {
+			return &WriteTooOldError{Timestamp: ts, ActualTimestamp: vts.Next()}
 		}
+		ts = vts.Next()
 	}
 
 	if txn != nil {

@@ -8,6 +8,32 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.37.0 — unreleased
+
+### Changed
+- The single-range write pipeline (#106). Measured first, one range on
+  one node below SQL (`BenchmarkRangeWritePipeline`): the ceiling was
+  the apply, not the disk — every MVCC write cost two LSM reads on a
+  fresh iterator (~10 µs a row), serialized per range inside the raft
+  pass that committed it, so a range topped out near 100k rows/s at any
+  batch size with the sync on or stubbed out. Two changes: each write
+  now finds what it lands on with one bounded seek on an iterator its
+  batch keeps (`Batch.writeState`; a 100-row commit applies in ~0.4 ms
+  instead of ~1 ms), and committed entries apply on a pool of apply
+  workers off the raft pass, so a range's next append and sync run while
+  its previous entries apply (conf changes still apply inline; a replica
+  with more than 64 MiB queued gets no pass until it drains,
+  `datax_raft_apply_backpressure_total`). One range on one node, 16
+  writers: 100-row commits 857 → 1,739/s, single-row commits 12.6k →
+  16.3k/s, 1,000-row commits 100 → 262/s. New metrics:
+  `datax_raft_entries_appended_total`, `datax_raft_entries_applied_total`,
+  `datax_raft_apply_seconds`, `datax_latch_wait_seconds`. A proposal whose
+  replica stops (shutdown, removal, a failed apply) is answered with an
+  ambiguous error instead of waiting out its context. Test-only:
+  `DATAX_TESTING_NOSYNC=1` commits the raft log unsynced for a
+  measurement. Capacity planning in `docs/user/operations.md` restates
+  the per-range ceiling from the measured costs.
+
 ## 0.36.0 — unreleased
 
 ### Changed

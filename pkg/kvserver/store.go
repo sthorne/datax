@@ -150,6 +150,14 @@ type TestingKnobs struct {
 	// that every RHS replica applied the subsume, exposing the apply-time
 	// wait to an RHS replica that never will (issue #70).
 	SkipMergeConfirmation bool
+	// SyncApply applies committed entries inside the raft pass that
+	// committed them instead of handing them to the apply workers — a
+	// test's way to make "the proposal was acknowledged" imply "every
+	// replica applied it before its next Ready".
+	SyncApply bool
+	// ApplyQueueMaxBytes overrides the bound on a replica's queue of
+	// committed entries awaiting apply (0 = the default, 64 MiB).
+	ApplyQueueMaxBytes int64
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store
@@ -420,6 +428,10 @@ func (s *Store) WaitForApplied(ctx context.Context, rangeID base.RangeID, index 
 		}
 	}
 }
+
+// TestingApplyQueueLen reports how many committed entries a replica has
+// queued for apply.
+func (s *Store) TestingApplyQueueLen(rangeID base.RangeID) int { return s.sched.applyQueueLen(rangeID) }
 
 func (s *Store) GetReplica(rangeID base.RangeID) (*Replica, bool) {
 	s.mu.Lock()

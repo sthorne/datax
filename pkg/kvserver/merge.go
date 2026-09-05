@@ -434,7 +434,14 @@ wait:
 	}
 	// Stop the RHS group before its unreplicated keys go: a live Ready
 	// handler could otherwise resurrect its HardState after our batch.
-	r.store.detachReplica(trig.Right.RangeID, r)
+	// (This apply normally runs on an apply worker, so the RHS's pass —
+	// even one grouped with this replica's — is waited out; only an
+	// inline apply is the pass itself.)
+	var from *Replica
+	if r.inlineApply.Load() {
+		from = r
+	}
+	r.store.detachReplica(trig.Right.RangeID, from)
 
 	if err := PutRangeDescriptor(b, trig.Merged); err != nil {
 		return err

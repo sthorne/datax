@@ -103,6 +103,25 @@ var (
 		Help:    "Replicas whose raft log writes shared one synced commit.",
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
 	})
+	RaftEntriesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entries_appended_total", Help: "Raft log entries written by this store (leader proposals and follower appends).",
+	})
+	RaftEntriesApplied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entries_applied_total", Help: "Committed raft entries applied to the state machine.",
+	})
+	RaftApplyLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_raft_apply_seconds",
+		Help:    "Time to apply one committed raft entry: decode, evaluate, commit to the state engine.",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
+	})
+	RaftApplyBackpressure = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_apply_backpressure_total", Help: "Raft passes deferred because the replica's queue of committed entries awaiting apply was over its bound.",
+	})
+	LatchWait = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
+		Name:    "datax_latch_wait_seconds",
+		Help:    "Time a request waited for a conflicting in-flight request's latch before it could proceed (requests that waited at all).",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
+	})
 	RaftHeartbeatsCoalesced = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_heartbeats_coalesced_total", Help: "Raft heartbeats and responses carried inside coalesced per-node envelopes (cluster v12).",
 	})

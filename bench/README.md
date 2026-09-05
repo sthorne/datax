@@ -82,6 +82,29 @@ stalls or backpressure even when throughput hides it.
   mutex and block profiles are always on at low sampling rates.
 - `go tool pprof -http=:0 server-cpu.pprof` to inspect.
 
+## The write pipeline below SQL
+
+`BenchmarkRangeWritePipeline` (`pkg/testutils/testcluster`) measures one
+range's write ceiling without SQL: one node on disk, W writers each
+committing one-phase transactions of B puts to their own keys, for B in
+1, 10, 100, 1000 and W in 1, 4, 16, 64, with the raft log's sync on and
+stubbed to a no-op (`storage.TestingNoSync`). It reports proposals per
+second, rows per second, syncs per second, entries per synced commit and
+the mean apply time per entry:
+
+```
+go test ./pkg/testutils/testcluster -run - -bench RangeWritePipeline -benchtime 3s
+```
+
+The same knob is available to a running node for a measurement (never
+in production: a crash loses acknowledged writes): `DATAX_TESTING_NOSYNC=1
+datax start ...` logs a warning and commits the raft log unsynced. The
+server-side counters `datax_raft_entries_appended_total`,
+`datax_raft_log_syncs_total`, `datax_raft_apply_seconds` and
+`datax_latch_wait_seconds` are what `--server-url` reports for a SQL run
+of the same shape (`datax bench ingest --keys sequential --batch B
+--concurrency W`).
+
 ## Nightly
 
 `.github/workflows/bench.yaml` runs the set on `main` every night on a

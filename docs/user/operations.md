@@ -271,7 +271,17 @@ shows how many shared each), `datax_quiescent_ranges` (idle ranges that
 stopped ticking and heartbeating; on a quiet cluster this approaches
 `datax_ranges`), `datax_raft_heartbeat_envelopes_total` /
 `datax_raft_heartbeats_coalesced_total` (the per-peer message rate and
-how many heartbeats each message carried).
+how many heartbeats each message carried),
+`datax_raft_entries_appended_total` / `datax_raft_entries_applied_total`
+(the log's write and apply rates; applied lagging appended for long is a
+store whose apply workers cannot keep up), `datax_raft_apply_seconds`
+(per-entry apply time — the single-range write ceiling is its inverse,
+see [Capacity planning](#capacity-planning)),
+`datax_raft_apply_backpressure_total` (raft passes deferred because a
+replica had more than 64 MiB of committed entries queued for apply — a
+follower falling behind its leader), `datax_latch_wait_seconds` (time
+requests spent waiting for a conflicting in-flight request's latch: key
+contention).
 
 ## Everyday admin: `datax debug`
 
@@ -561,8 +571,25 @@ moves is paying the classic two-round commit — usually explicit
 
 Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
 
-- **A single range sustains roughly 8–10k inserted rows/s.** Every write
-  in a range goes through one raft group and one fsync'd log.
+- **One range's write ceiling is its apply rate, not its disk.** Every
+  write in a range goes through one raft group; its log is group-
+  committed (one fsync serves every entry that arrived during the
+  previous sync, so the disk's sync rate is rarely the limit — a few
+  thousand a second here), and its entries apply one at a time, in log
+  order, on the range's replicas. Measured below SQL on one range of one
+  node (`BenchmarkRangeWritePipeline`, 64-byte values, 16 writers):
+  single-row commits **~16k/s**, 100-row commits **~1,700/s** (~170k
+  rows/s), 1,000-row commits **~260/s** — about **4 µs of apply per
+  row** plus ~50 µs per commit, with the sync stubbed out changing the
+  numbers by under 10%. Roughly: rows/s per range ≈ 1 / (4 µs +
+  50 µs / rows-per-commit), so batch inserts of 100+ rows are within
+  15% of the ceiling and single-row commits reach a third of it.
+- **Through SQL an INSERT costs more than its KV write** — parsing,
+  encoding, the uniqueness probe (one read round trip per statement) and
+  the timestamp cache's bookkeeping — so a single range ingests roughly
+  **40k rows/s** of 100-row batched INSERTs on one node, and the SQL
+  layer's CPU, not the range, is what saturates first (`datax bench
+  ingest --server-url ... --server-profile cpu` shows where).
 - **A sequential primary key caps the whole table at that single-range
   rate**, no matter the cluster size — new keys always land in the last
   range. Use UUID keys or a [timeseries table](sql.md#timeseries-tables)

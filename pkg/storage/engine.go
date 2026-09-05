@@ -4,7 +4,9 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 
 	"github.com/sthorne/datax/pkg/storage/enc"
+	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
 // Reader provides read access to an engine or batch.
@@ -79,6 +82,12 @@ var testingPebbleOptions func(*pebble.Options)
 // options (zero value = balanced profile, plaintext). If dir is empty an
 // in-memory store is used (tests, demo mode).
 func Open(dir string, o Options) (*Engine, error) {
+	testingNoSyncOnce.Do(func() {
+		if os.Getenv(testingNoSyncEnv) == "1" {
+			TestingNoSync = true
+			fmt.Fprintf(os.Stderr, "WARNING: %s=1: raft log commits are not synced; a crash loses acknowledged writes (measurement only)\n", testingNoSyncEnv)
+		}
+	})
 	e := &Engine{walDisabled: o.DisableWAL}
 	opts := &pebble.Options{}
 	e.health.gate = o.Profile.apply(opts)
@@ -201,6 +210,17 @@ func storeHasFiles(base vfs.FS, dir string) bool {
 // TestingSkipFlushOnClose makes Close skip the WAL-less engine's final
 // flush, so a test can close a store the way a crash would leave it.
 var TestingSkipFlushOnClose bool
+
+// TestingNoSync turns every synced commit into an unsynced one, so a
+// measurement can separate the disk's sync rate from the protocol's own
+// ceiling (issue #106). Durability is off while it is set: a crash loses
+// acknowledged writes. The environment variable DATAX_TESTING_NOSYNC=1
+// sets it at the first Open; a warning is logged.
+var TestingNoSync bool
+
+const testingNoSyncEnv = "DATAX_TESTING_NOSYNC"
+
+var testingNoSyncOnce sync.Once
 
 func (e *Engine) Close() error {
 	if e.walDisabled && !TestingSkipFlushOnClose {
@@ -340,6 +360,55 @@ type Batch struct {
 	b   *pebble.Batch
 	eng *Engine
 	seq uint64
+	// wit is the batch's reusable write iterator (see writeState).
+	wit *pebble.Iterator
+}
+
+// writeState is what a write to a key would land on, from one bounded
+// seek at the key's MVCC prefix [metaKey, upper): the first engine key
+// there is the intent's metadata (rawMeta != nil) or, with no intent,
+// the newest version (hasVersion, at vts) — or nothing. The seek runs on
+// one iterator the batch keeps for all its writes: creating an iterator
+// per key (the stack of memtable and sstable iterators behind it) was
+// most of what a write cost (issue #106). SetOptions refreshes the
+// iterator's view of the batch, so a key this batch already wrote is
+// seen as written.
+func (b *Batch) writeState(metaKey, upper []byte) (rawMeta []byte, vts hlc.Timestamp, hasVersion bool, err error) {
+	opts := pebble.IterOptions{LowerBound: metaKey, UpperBound: upper}
+	if b.wit == nil {
+		if b.wit, err = b.b.NewIter(&opts); err != nil {
+			return nil, hlc.Timestamp{}, false, err
+		}
+	} else {
+		b.wit.SetOptions(&opts)
+	}
+	it := b.wit
+	if !it.SeekGE(metaKey) {
+		return nil, hlc.Timestamp{}, false, it.Error()
+	}
+	if bytes.Equal(it.Key(), metaKey) {
+		v, err := it.ValueAndErr()
+		if err != nil {
+			return nil, hlc.Timestamp{}, false, err
+		}
+		return append([]byte(nil), v...), hlc.Timestamp{}, false, nil
+	}
+	_, vts, err = DecodeMVCCKey(it.Key())
+	if err != nil {
+		return nil, hlc.Timestamp{}, false, err
+	}
+	return nil, vts, true, nil
+}
+
+// closeWriteIter releases the write iterator (before the batch commits
+// or closes: the iterator borrows the batch's memory).
+func (b *Batch) closeWriteIter() error {
+	if b.wit == nil {
+		return nil
+	}
+	err := b.wit.Close()
+	b.wit = nil
+	return err
 }
 
 func (b *Batch) Get(key []byte) ([]byte, error) {
@@ -372,8 +441,11 @@ func (b *Batch) DeleteRange(start, end []byte) error { return b.b.DeleteRange(st
 // Commit applies the batch. sync=true forces an fsync before returning —
 // required for Raft state (HardState, log entries) and applied state.
 func (b *Batch) Commit(sync bool) error {
+	if err := b.closeWriteIter(); err != nil {
+		return err
+	}
 	opt := pebble.NoSync
-	if sync && !b.eng.walDisabled {
+	if sync && !b.eng.walDisabled && !TestingNoSync {
 		// Without a WAL there is nothing to sync: durability is the next
 		// flush (Engine.FlushedSeqNum), and Pebble refuses a Sync commit.
 		opt = pebble.Sync
@@ -390,7 +462,13 @@ func (b *Batch) Commit(sync bool) error {
 // durable on a WAL-less engine.
 func (b *Batch) SeqNum() uint64 { return b.seq }
 
-func (b *Batch) Close() error { return b.b.Close() }
+func (b *Batch) Close() error {
+	err := b.closeWriteIter()
+	if cerr := b.b.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // Empty reports whether nothing has been staged.
 func (b *Batch) Empty() bool { return b.b.Empty() }

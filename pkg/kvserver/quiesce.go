@@ -276,7 +276,9 @@ func (r *Replica) maybeQuiesce(rn *raft.RawNode) bool {
 		return false
 	}
 	last := r.rs.lastIndex()
-	if st.Commit != last || st.Applied != last {
+	if st.Commit != last || st.Applied != last || r.AppliedIndex() != last {
+		// (raft's applied index advances when a pass hands entries to
+		// the apply workers; the replica's own says whether they landed.)
 		r.resetIdle()
 		return false
 	}
