@@ -11,6 +11,14 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- `Stopper.Stop` returns to every caller only once the shutdown has
+  finished (#139). A concurrent second caller waited for the workers
+  only and could return while the first caller was still running the
+  closers — with the engine still open for a caller that then removed
+  the data directory or asserted on final state. A closer registered
+  after Stop had taken the closers was appended to a list nobody read
+  again, silently; it now runs at once (one registered while the
+  workers wind down runs in Stop, as before).
 - HTTP client-certificate authentication checks that the certificate's
   CommonName is a role that may log in (#138), as the SQL port always
   did. A CA-verified certificate was accepted as its principal with no
