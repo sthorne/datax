@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 func randKey(t *testing.T) []byte {
@@ -76,7 +76,7 @@ func TestSplitKeyPaths(t *testing.T) {
 // directory fsync, so a crash at any step leaves the store openable with
 // exactly one of the two keys — the old one until the rename is durable,
 // the new one after — and never neither. Simulated on the strict
-// in-memory FS, whose ResetToSyncedState discards everything not fsynced,
+// in-memory FS, whose CrashClone keeps only what was fsynced,
 // exactly as a power loss would. Issue #68.
 func TestRotateStoreKeyCrashSafety(t *testing.T) {
 	k1, k2 := randKey(t), randKey(t)
@@ -107,16 +107,16 @@ func TestRotateStoreKeyCrashSafety(t *testing.T) {
 	}
 
 	// Full rotation, then crash: the new key opens the store.
-	fs := vfs.NewStrictMem()
+	fs := vfs.NewCrashableMem()
 	initStore(fs)
-	fs.ResetToSyncedState()
+	fs = fs.CrashClone(vfs.CrashCloneCfg{}) // what survived the crash: exactly what was synced
 	if !opensWith(fs, k1) {
 		t.Fatal("initialized registry not durable after a crash")
 	}
 	if err := RotateStoreKey(fs, "store", k1, k2); err != nil {
 		t.Fatal(err)
 	}
-	fs.ResetToSyncedState()
+	fs = fs.CrashClone(vfs.CrashCloneCfg{}) // what survived the crash: exactly what was synced
 	if opensWith(fs, k1) || !opensWith(fs, k2) {
 		t.Fatalf("after a completed rotation and a crash: old opens=%v new opens=%v", opensWith(fs, k1), opensWith(fs, k2))
 	}
@@ -125,14 +125,14 @@ func TestRotateStoreKeyCrashSafety(t *testing.T) {
 	// durable): the rotation reports failure, the crash undoes the rename,
 	// and the OLD key still opens the store — the operator was told not to
 	// retire it.
-	fs = vfs.NewStrictMem()
+	fs = vfs.NewCrashableMem()
 	initStore(fs)
-	fs.ResetToSyncedState()
+	fs = fs.CrashClone(vfs.CrashCloneCfg{}) // what survived the crash: exactly what was synced
 	crashFS := &noDirSyncFS{FS: fs}
 	if err := RotateStoreKey(crashFS, "store", k1, k2); err == nil {
 		t.Fatal("rotation reported success without a durable directory entry")
 	}
-	fs.ResetToSyncedState()
+	fs = fs.CrashClone(vfs.CrashCloneCfg{}) // what survived the crash: exactly what was synced
 	if !opensWith(fs, k1) || opensWith(fs, k2) {
 		t.Fatalf("after a crash before the directory fsync: old opens=%v new opens=%v", opensWith(fs, k1), opensWith(fs, k2))
 	}
@@ -141,7 +141,7 @@ func TestRotateStoreKeyCrashSafety(t *testing.T) {
 	if err := RotateStoreKey(fs, "store", k1, k2); err != nil {
 		t.Fatal(err)
 	}
-	fs.ResetToSyncedState()
+	fs = fs.CrashClone(vfs.CrashCloneCfg{}) // what survived the crash: exactly what was synced
 	if !opensWith(fs, k2) {
 		t.Fatal("retry after the aborted rotation did not land")
 	}

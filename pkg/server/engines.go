@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"

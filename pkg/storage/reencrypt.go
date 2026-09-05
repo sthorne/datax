@@ -226,7 +226,7 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 			end = append(append([]byte(nil), t.largest...), 0)
 		}
 		before := e.compactedBytes()
-		if cerr := e.db.Compact(t.smallest, end, false); cerr != nil {
+		if cerr := e.db.Compact(context.Background(), t.smallest, end, false); cerr != nil {
 			return targeted, 0, 0, cerr
 		}
 		targeted += e.compactedBytes() - before
@@ -252,7 +252,7 @@ func (e *Engine) compactedBytes() int64 {
 	m := e.db.Metrics()
 	var total int64
 	for i := range m.Levels {
-		total += int64(m.Levels[i].BytesCompacted)
+		total += int64(m.Levels[i].TableBytesCompacted)
 	}
 	return total
 }

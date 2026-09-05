@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/storage/enc"
@@ -215,7 +215,7 @@ func TestReencryptPassMultiLevel(t *testing.T) {
 		t.Helper()
 		end := append(append([]byte(nil), hi...), 0)
 		for i := 0; i < 6; i++ {
-			if err := e.db.Compact(lo, end, false); err != nil {
+			if err := e.db.Compact(context.Background(), lo, end, false); err != nil {
 				t.Fatal(err)
 			}
 		}

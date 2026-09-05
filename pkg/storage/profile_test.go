@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // TestProfileOptions: balanced leaves Pebble's options untouched (today's
@@ -13,7 +13,7 @@ func TestProfileOptions(t *testing.T) {
 	var balanced pebble.Options
 	gate := ProfileBalanced.apply(&balanced)
 	if balanced.MemTableSize != 0 || balanced.L0CompactionThreshold != 0 ||
-		balanced.L0StopWritesThreshold != 0 || balanced.MaxConcurrentCompactions != nil {
+		balanced.L0StopWritesThreshold != 0 || balanced.CompactionConcurrencyRange != nil {
 		t.Fatalf("balanced profile touched pebble options: %+v", balanced)
 	}
 	if gate.l0Sublevels != 10 || gate.l0Files != 400 || gate.memtableBytes != 0 ||
@@ -28,7 +28,10 @@ func TestProfileOptions(t *testing.T) {
 		ingest.LBaseMaxBytes != 256<<20 || ingest.BytesPerSync != 1<<20 {
 		t.Fatalf("ingest profile options: %+v", ingest)
 	}
-	if ingest.MaxConcurrentCompactions == nil || ingest.MaxConcurrentCompactions() < 2 {
+	if ingest.CompactionConcurrencyRange == nil {
+		t.Fatal("ingest profile left the compaction concurrency at Pebble's default")
+	}
+	if _, upper := ingest.CompactionConcurrencyRange(); upper < 2 {
 		t.Fatal("ingest compaction concurrency not raised")
 	}
 	if gate.l0Sublevels != 20 || gate.l0Files != 1500 || gate.memtableBytes != 3*(64<<20) ||

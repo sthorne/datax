@@ -15,7 +15,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 // Per-file layout: a 24-byte header, then AES-256-CTR ciphertext whose
@@ -70,8 +70,8 @@ func (fs *FS) isRegistry(name string) bool {
 	return fs.FS.PathBase(name) == RegistryName
 }
 
-func (fs *FS) Create(name string) (vfs.File, error) {
-	f, err := fs.FS.Create(name)
+func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	f, err := fs.FS.Create(name, category)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +97,8 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	return ef, nil
 }
 
-func (fs *FS) OpenReadWrite(name string, opts ...vfs.OpenOption) (vfs.File, error) {
-	f, err := fs.FS.OpenReadWrite(name, opts...)
+func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ...vfs.OpenOption) (vfs.File, error) {
+	f, err := fs.FS.OpenReadWrite(name, category, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -124,16 +124,20 @@ func (fs *FS) OpenReadWrite(name string, opts ...vfs.OpenOption) (vfs.File, erro
 // key) created. This forfeits Pebble's WAL recycling (a recycled WAL's
 // fdatasync skips metadata journaling) and is the dominant write-latency
 // cost of encryption; see docs/encryption.md.
-func (fs *FS) ReuseForWrite(oldname, newname string) (vfs.File, error) {
+func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCategory) (vfs.File, error) {
 	if err := fs.FS.Remove(oldname); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return fs.Create(newname)
+	return fs.Create(newname, category)
 }
+
+// Unwrap returns the FS this one encrypts on top of (Pebble walks the
+// chain for the disk-health and category bookkeeping of the base FS).
+func (fs *FS) Unwrap() vfs.FS { return fs.FS }
 
 // Stat subtracts the header so logical sizes line up. Files smaller than a
 // header (the zero-length LOCK file, directories) are reported as-is.
-func (fs *FS) Stat(name string) (os.FileInfo, error) {
+func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	st, err := fs.FS.Stat(name)
 	if err != nil {
 		return nil, err
@@ -145,7 +149,7 @@ func (fs *FS) Stat(name string) (os.FileInfo, error) {
 }
 
 type sizedFileInfo struct {
-	os.FileInfo
+	vfs.FileInfo
 	size int64
 }
 
@@ -279,7 +283,7 @@ func (e *encFile) Preallocate(off, length int64) error {
 	return e.f.Preallocate(off+headerLen, length)
 }
 
-func (e *encFile) Stat() (os.FileInfo, error) {
+func (e *encFile) Stat() (vfs.FileInfo, error) {
 	st, err := e.f.Stat()
 	if err != nil {
 		return nil, err

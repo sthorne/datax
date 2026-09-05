@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/server"

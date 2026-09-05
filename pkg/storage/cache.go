@@ -8,7 +8,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // Block cache (issue #101). Pebble's default cache is 8 MiB; every block

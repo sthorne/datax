@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 )
 
 // Profile selects the engine's Pebble tuning. Both profiles share the
@@ -92,7 +92,6 @@ const BloomBitsPerKey = 10
 
 // applyCommon sets the read-path options every profile shares.
 func applyCommon(opts *pebble.Options) {
-	opts.Levels = make([]pebble.LevelOptions, 7)
 	for i := range opts.Levels {
 		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(BloomBitsPerKey)
 		opts.Levels[i].FilterType = pebble.TableFilter
@@ -118,7 +117,7 @@ func (p Profile) apply(opts *pebble.Options) softGate {
 		opts.L0StopWritesThreshold = 1000    // hard ceiling far above the soft gate
 		opts.LBaseMaxBytes = 256 << 20       // wider Lbase cuts L0→Lbase write amp
 		opts.BytesPerSync = 1 << 20          // smoother background writeback
-		opts.MaxConcurrentCompactions = func() int {
+		opts.CompactionConcurrencyRange = func() (int, int) {
 			n := runtime.NumCPU() / 2
 			if n < 2 {
 				n = 2
@@ -126,7 +125,7 @@ func (p Profile) apply(opts *pebble.Options) softGate {
 			if n > 6 {
 				n = 6
 			}
-			return n
+			return 1, n // one always; up to n as L0 and compaction debt grow (v1's MaxConcurrentCompactions)
 		}
 		// memtableBytes: three full memtables' worth buffered (of the four
 		// the stop threshold allows) means flushing is clearly behind.

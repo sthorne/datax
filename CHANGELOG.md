@@ -46,6 +46,18 @@ state or the internode protocol does, and an entry below says so.
   the first write the history is kept as before). `bench/workloads.json`
   gains `hot-row` — one row updated 16 times per transaction — for the
   harness. `TestIntentHistoryBounded`.
+- The store runs on Pebble v2 (`github.com/cockroachdb/pebble/v2`
+  v2.1.7, from v1.1.5; #166). The port is mechanical — the encrypting
+  `vfs.FS` takes the disk-write category its methods gained and returns
+  `vfs.FileInfo`, the option and metric renames, `Compact` with a
+  context — and the on-disk format stays at 16 (`FormatVirtualSSTables`,
+  the pin below; v2 opens every existing store as it is, since its
+  minimum supported format is 13). Columnar blocks (19) and value
+  separation (24) are not adopted here: each is a separate,
+  cluster-version-gated step with its own before/after. Pebble's own
+  log lines — v2 reports the WALs it finds at open and their replay at
+  info — now go through the node's log at debug level instead of to
+  stderr.
 - The Pebble format version is pinned at `FormatVirtualSSTables` (16)
   instead of tracking `FormatNewest` (#166): the formats past it change
   what lands on disk (columnar blocks, value separation), and adopting
