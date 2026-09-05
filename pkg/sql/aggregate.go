@@ -737,7 +737,7 @@ func encodeGroupKey(ds []types.Datum) string {
 		switch {
 		case d.Null:
 			b = append(b, 'n')
-		case d.Fam == types.Int, d.Fam == types.Timestamp, d.Fam == types.Date, d.Fam == types.Time:
+		case d.Fam == types.Int, d.Fam == types.Timestamp, d.Fam == types.Date, d.Fam == types.Time, d.Fam == types.Enum:
 			b = append(b, 'i', byte(d.Fam))
 			b = binary.BigEndian.AppendUint64(b, uint64(d.I))
 		case d.Fam == types.IntervalFam:

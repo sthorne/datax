@@ -134,6 +134,9 @@ type ColumnDef struct {
 	Char          bool
 	NoTZ          bool
 	TimePrecision int32
+	// TypeName names a user-defined type (an enum) when Type is Enum;
+	// the executor resolves it.
+	TypeName string
 	// Hidden marks a system-managed column (CREATE TABLE AS's rowid
 	// primary key); never parsed.
 	Hidden bool
@@ -230,6 +233,7 @@ type SetType struct {
 	Char          bool
 	NoTZ          bool
 	TimePrecision int32
+	TypeName      string
 }
 
 // TypeSpec is a parsed column type: the family and the modifiers datax
@@ -248,6 +252,8 @@ type TypeSpec struct {
 	Char          bool
 	NoTZ          bool
 	TimePrecision int32
+	// TypeName is the name of a user-defined type (Family Enum).
+	TypeName string
 }
 
 // SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an
@@ -289,6 +295,27 @@ type AlterSequence struct {
 
 // ShowSequences is SHOW SEQUENCES.
 type ShowSequences struct{}
+
+// CreateType is CREATE TYPE [IF NOT EXISTS] name AS ENUM ('a', 'b', ...).
+type CreateType struct {
+	Name        string
+	IfNotExists bool
+	Labels      []string
+}
+
+// AlterType is ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'
+// (appended: BEFORE / AFTER are refused at parse).
+type AlterType struct {
+	Name           string
+	AddValue       string
+	IfNotExistsVal bool
+}
+
+// DropType is DROP TYPE [IF EXISTS] name.
+type DropType struct {
+	Name     string
+	IfExists bool
+}
 
 // ShowFunctions is SHOW FUNCTIONS: the builtin function reference.
 type ShowFunctions struct{}
@@ -793,6 +820,9 @@ type SetVar struct {
 func (*CreateTable) stmt()         {}
 func (*Show) stmt()                {}
 func (*CreateSequence) stmt()      {}
+func (*CreateType) stmt()          {}
+func (*AlterType) stmt()           {}
+func (*DropType) stmt()            {}
 func (*DropSequence) stmt()        {}
 func (*AlterSequence) stmt()       {}
 func (*ShowSequences) stmt()       {}

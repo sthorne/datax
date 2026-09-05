@@ -374,6 +374,36 @@ func AllSequenceNamespaceSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// TypeDescKey holds the JSON descriptor of a user-defined type (an
+// enum) for a type ID (from the shared descriptor counter).
+func TypeDescKey(typeID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("typedesc"), typeID))
+}
+
+// TypeDescSpan covers all type descriptors.
+func TypeDescSpan() (Key, Key) {
+	p := systemKey("typedesc")
+	return p, p.PrefixEnd()
+}
+
+// TypeNamespaceKey maps a type name within a database to its ID.
+func TypeNamespaceKey(dbID uint64, name string) Key {
+	k := Key(encoding.EncodeUint64(systemKey("typens"), dbID))
+	return Key(encoding.EncodeString(k, name))
+}
+
+// TypeNamespaceSpan covers one database's type names.
+func TypeNamespaceSpan(dbID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("typens"), dbID))
+	return p, p.PrefixEnd()
+}
+
+// AllTypeNamespaceSpan covers every database's type names.
+func AllTypeNamespaceSpan() (Key, Key) {
+	p := systemKey("typens")
+	return p, p.PrefixEnd()
+}
+
 // SequenceValueKey is a sequence's counter: the last value handed out
 // (decimal, advanced with Increment outside any transaction — never
 // rolled back, as in PostgreSQL).

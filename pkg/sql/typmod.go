@@ -18,7 +18,8 @@ func colTypmod(col catalog.Column) int32 {
 // typmod are the column's.
 func colResult(name string, col catalog.Column) ResultColumn {
 	return ResultColumn{Name: name, Type: col.Type, Typmod: col.Typmod(),
-		Width: col.Width, MaxLen: col.MaxLen, Char: col.Char, NoTZ: col.NoTZ, TimePrecision: col.TimePrecision}
+		Width: col.Width, MaxLen: col.MaxLen, Char: col.Char, NoTZ: col.NoTZ, TimePrecision: col.TimePrecision,
+		EnumType: col.EnumType, EnumName: col.EnumName}
 }
 
 // exprResult describes an output column computed from col: the
@@ -61,6 +62,13 @@ func stampDisplay(col *catalog.Column, d types.Datum) types.Datum {
 // parses ignoring any offset, everything else takes the family's
 // coercion. The SQLSTATE is 22P02 for text that does not parse.
 func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
+	if !d.Null && col.Type == types.Enum {
+		v, err := col.EnumValue(d)
+		if err != nil {
+			return d, ToSQLError(err)
+		}
+		return v, nil
+	}
 	if !d.Null && d.Fam == types.String && col.Type == types.Timestamp && col.NoTZ {
 		n, err := types.ParseTimestampNoTZ(d.S)
 		if err != nil {
@@ -85,6 +93,8 @@ func pureWidening(old, new catalog.Column) bool {
 		return false
 	}
 	switch old.Type {
+	case types.Enum:
+		return old.EnumType == new.EnumType
 	case types.Int:
 		return new.IntWidth() >= old.IntWidth()
 	case types.String:

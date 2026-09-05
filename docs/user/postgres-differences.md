@@ -44,6 +44,13 @@ syntax error or `0A000` feature not supported):
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
+- **Enums** are append-only (`ADD VALUE BEFORE` / `AFTER`, `RENAME
+  VALUE`, `RENAME TO` are refused; `DROP TYPE ... CASCADE` does not
+  drop columns), have no arrays, and compare with text by label
+  (`m = 'ok'`; an order against a text literal is the labels' text
+  order — cast the literal, `m > 'ok'::mood`, for declaration order).
+  Creating, altering or dropping a type takes the admin role or
+  `CREATE` on the database.
 - **Arrays** are one-dimensional (`INT8[][]` is `INT8[]`; a
   multidimensional binary parameter is refused), cannot be indexed or
   be part of a key, have no slices (`a[1:2]`) or `JSONB[]`, and a

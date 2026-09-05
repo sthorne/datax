@@ -54,6 +54,7 @@ const (
 	// a 0 byte (NULL) or 1 + the element's order-preserving key encoding
 	// (self-delimiting for every scalar family).
 	tagArray byte = 14
+	tagEnum  byte = 15 // uvarint ordinal, uvarint length + label
 )
 
 // PrimaryKeyPrefix is the key prefix of a table's ORIGINAL primary rows
@@ -124,6 +125,11 @@ func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) 
 	switch fam {
 	case types.Int, types.Timestamp, types.Date, types.Time:
 		return keys.Key(encoding.EncodeInt64(k, d.I)), nil
+	case types.Enum:
+		// Ordered by ordinal (declaration order); the label follows so
+		// a key decodes without the type.
+		k = keys.Key(encoding.EncodeInt64(k, d.I))
+		return keys.Key(encoding.EncodeString(k, d.S)), nil
 	case types.IntervalFam:
 		// Ordered by PostgreSQL's comparison value, then the stored
 		// triple keeps distinct spellings of one length distinct keys.
@@ -157,6 +163,13 @@ func decodeKeyDatum(rest []byte, fam types.Family) ([]byte, types.Datum, error) 
 		var v int64
 		rest, v, err = encoding.DecodeInt64(rest)
 		d = types.Datum{Fam: fam, I: v}
+	case types.Enum:
+		var ord int64
+		var label string
+		if rest, ord, err = encoding.DecodeInt64(rest); err == nil {
+			rest, label, err = encoding.DecodeString(rest)
+		}
+		d = types.NewEnum(ord, label)
 	case types.IntervalFam:
 		var cmp, months, days int64
 		if rest, cmp, err = encoding.DecodeInt64(rest); err == nil {
@@ -223,8 +236,11 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 			continue
 		}
 		from, _ := desc.ColByID(col.RetypeFrom)
-		d, err := src.ConvertTo(col.Type)
-		if err != nil {
+		var d types.Datum
+		var err error
+		if col.Type == types.Enum {
+			d = src // the label converts in Conform below
+		} else if d, err = src.ConvertTo(col.Type); err != nil {
 			return nil, fmt.Errorf("column %q: value cannot convert to %s: %w", from.Name, col.Type, err)
 		}
 		named := col
@@ -303,6 +319,11 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 			out = binary.BigEndian.AppendUint64(out, uint64(d.Mo))
 			out = binary.BigEndian.AppendUint64(out, uint64(d.Dy))
 			out = binary.BigEndian.AppendUint64(out, uint64(d.I))
+		case types.Enum:
+			out = append(out, tagEnum)
+			out = encoding.EncodeUvarint(out, uint64(d.I))
+			out = encoding.EncodeUvarint(out, uint64(len(d.S)))
+			out = append(out, d.S...)
 		case types.Float:
 			out = append(out, tagFloat)
 			out = binary.BigEndian.AppendUint64(out, math.Float64bits(d.F))
@@ -419,6 +440,23 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			}
 			if known && col.Type == types.ArrayOf(elem) {
 				out[colID] = types.NewArray(elem, elems)
+			}
+		case tagEnum:
+			var ord, n uint64
+			var err error
+			if rest, ord, err = encoding.DecodeUvarint(rest); err != nil {
+				return nil, fmt.Errorf("corrupt row value: %w", err)
+			}
+			if rest, n, err = encoding.DecodeUvarint(rest); err != nil {
+				return nil, fmt.Errorf("corrupt row value: %w", err)
+			}
+			if uint64(len(rest)) < n {
+				return nil, fmt.Errorf("corrupt row value: short enum payload")
+			}
+			label := string(rest[:n])
+			rest = rest[n:]
+			if known && col.Type == types.Enum {
+				out[colID] = types.NewEnum(int64(ord), label)
 			}
 		case tagInterval:
 			if len(rest) < 24 {
@@ -625,6 +663,10 @@ func skipDatum(b []byte, fam types.Family) ([]byte, error) {
 	switch fam {
 	case types.Int, types.Timestamp, types.Date, types.Time:
 		b, _, err = encoding.DecodeInt64(b)
+	case types.Enum:
+		if b, _, err = encoding.DecodeInt64(b); err == nil {
+			b, _, err = encoding.DecodeString(b)
+		}
 	case types.IntervalFam:
 		for i := 0; i < 3 && err == nil; i++ {
 			b, _, err = encoding.DecodeInt64(b)

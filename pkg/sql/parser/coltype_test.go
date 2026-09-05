@@ -161,3 +161,42 @@ func TestParseArrays(t *testing.T) {
 		t.Fatalf("NOT &&: %v", err)
 	}
 }
+
+// TestParseEnumTypes: CREATE / ALTER / DROP TYPE and a column of a
+// user-defined type (issue #96, part four).
+func TestParseEnumTypes(t *testing.T) {
+	ct := parseOne(t, `CREATE TYPE IF NOT EXISTS mood AS ENUM ('sad', 'ok', 'happy')`).(*CreateType)
+	if ct.Name != "mood" || !ct.IfNotExists || len(ct.Labels) != 3 || ct.Labels[2] != "happy" {
+		t.Fatalf("CREATE TYPE: %+v", ct)
+	}
+	if ct = parseOne(t, `CREATE TYPE app.empty AS ENUM ()`).(*CreateType); ct.Name != "app.empty" || len(ct.Labels) != 0 {
+		t.Fatalf("empty enum: %+v", ct)
+	}
+	at := parseOne(t, `ALTER TYPE mood ADD VALUE IF NOT EXISTS 'ecstatic'`).(*AlterType)
+	if at.Name != "mood" || at.AddValue != "ecstatic" || !at.IfNotExistsVal {
+		t.Fatalf("ALTER TYPE: %+v", at)
+	}
+	dt := parseOne(t, `DROP TYPE IF EXISTS mood CASCADE`).(*DropType)
+	if dt.Name != "mood" || !dt.IfExists {
+		t.Fatalf("DROP TYPE: %+v", dt)
+	}
+	tbl := parseOne(t, `CREATE TABLE p (id INT8 PRIMARY KEY, m mood NOT NULL, n app.mood DEFAULT 'ok')`).(*CreateTable)
+	if c := tbl.Columns[1]; c.Type != types.Enum || c.TypeName != "mood" || !c.NotNull {
+		t.Fatalf("enum column: %+v", c)
+	}
+	if c := tbl.Columns[2]; c.Type != types.Enum || c.TypeName != "app.mood" || c.Default == nil || c.Default.S != "ok" {
+		t.Fatalf("qualified enum column: %+v", c)
+	}
+	al := parseOne(t, `ALTER TABLE p ALTER COLUMN n TYPE mood`).(*AlterTable)
+	if al.SetType == nil || al.SetType.Type != types.Enum || al.SetType.TypeName != "mood" {
+		t.Fatalf("ALTER COLUMN TYPE mood: %+v", al.SetType)
+	}
+	for _, bad := range []string{
+		`CREATE TYPE mood AS ENUM ('a', 'a')`, `CREATE TYPE mood AS ENUM ('')`, `CREATE TYPE mood AS (a int)`,
+		`ALTER TYPE mood ADD VALUE 'x' BEFORE 'a'`, `ALTER TYPE mood RENAME VALUE 'a' TO 'b'`, `CREATE TABLE p (m mood[])`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+}

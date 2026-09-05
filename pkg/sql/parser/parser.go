@@ -265,6 +265,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			return p.parseCreateSequence()
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			return p.parseCreateType()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
 			return p.parseCreateView(false)
 		}
@@ -347,6 +350,25 @@ func (p *parser) parseStatement() (Statement, error) {
 				p.consumeIdentWord("restrict")
 			}
 			return di, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			p.i += 2 // DROP TYPE
+			dt := &DropType{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				dt.IfExists = true
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			dt.Name = name
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return dt, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // DROP SEQUENCE
@@ -454,6 +476,9 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			return ai, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			return p.parseAlterType()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // ALTER SEQUENCE
@@ -842,6 +867,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	}
 	def.Type, def.Precision, def.Scale = spec.Family, spec.Precision, spec.Scale
 	def.Width, def.MaxLen, def.Char, def.NoTZ, def.TimePrecision = spec.Width, spec.MaxLen, spec.Char, spec.NoTZ, spec.TimePrecision
+	def.TypeName = spec.TypeName
 	if serial {
 		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
 		def.Serial, def.NotNull = true, true
@@ -946,7 +972,7 @@ var typedLiteralNames = map[string]string{"interval": "interval", "date": "date"
 // setTypeOf builds the ALTER COLUMN TYPE target from a parsed type.
 func setTypeOf(col string, spec TypeSpec) *SetType {
 	return &SetType{Column: col, Type: spec.Family, Precision: spec.Precision, Scale: spec.Scale,
-		Width: spec.Width, MaxLen: spec.MaxLen, Char: spec.Char, NoTZ: spec.NoTZ, TimePrecision: spec.TimePrecision}
+		Width: spec.Width, MaxLen: spec.MaxLen, Char: spec.Char, NoTZ: spec.NoTZ, TimePrecision: spec.TimePrecision, TypeName: spec.TypeName}
 }
 
 func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
@@ -986,7 +1012,24 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 	}
 	fam, perr := types.ParseType(typeName)
 	if perr != nil {
-		return spec, false, p.errf("%v", perr)
+		// Not a builtin type: a user-defined type (an enum) by name,
+		// optionally database-qualified, resolved by the executor.
+		if t.kind != tkIdent {
+			return spec, false, p.errf("%v", perr)
+		}
+		name := typeName
+		if p.consumeOp(".") {
+			n, err := p.expectIdent()
+			if err != nil {
+				return spec, false, err
+			}
+			name += "." + n
+		}
+		spec.Family, spec.TypeName = types.Enum, strings.ToLower(name)
+		if p.consumeOp("[") {
+			return spec, false, p.errf("arrays of enum type %s are not supported", spec.TypeName)
+		}
+		return spec, false, nil
 	}
 	spec.Family = fam
 	// The typmod: DECIMAL(p[,s]), VARCHAR(n) / CHAR(n), TIMESTAMP(p) are
@@ -1287,6 +1330,97 @@ func exprContainsColumn(e Expr) bool {
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
+// parseCreateType parses CREATE TYPE [IF NOT EXISTS] name AS ENUM
+// ('a', 'b', ...).
+func (p *parser) parseCreateType() (Statement, error) {
+	p.i += 2 // CREATE TYPE
+	ct := &CreateType{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ct.IfNotExists = true
+	}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	ct.Name = name
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	if !p.consumeIdentWord("enum") {
+		return nil, p.errf("CREATE TYPE supports AS ENUM only, found %q", p.peek().text)
+	}
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	if !p.consumeOp(")") {
+		for {
+			t := p.peek()
+			if t.kind != tkString {
+				return nil, p.errf("expected an enum label, found %q", t.text)
+			}
+			p.i++
+			if t.text == "" || len(t.text) > 63 {
+				return nil, p.errf("an enum label must be 1 to 63 characters")
+			}
+			if seen[t.text] {
+				return nil, p.errf("enum label %q listed twice", t.text)
+			}
+			seen[t.text] = true
+			ct.Labels = append(ct.Labels, t.text)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
+	return ct, nil
+}
+
+// parseAlterType parses ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'.
+func (p *parser) parseAlterType() (Statement, error) {
+	p.i += 2 // ALTER TYPE
+	at := &AlterType{}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	at.Name = name
+	if !p.consumeKeyword("ADD") || !p.consumeIdentWord("value") {
+		return nil, p.errf("ALTER TYPE supports ADD VALUE only, found %q", p.peek().text)
+	}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		at.IfNotExistsVal = true
+	}
+	t := p.peek()
+	if t.kind != tkString {
+		return nil, p.errf("expected an enum label, found %q", t.text)
+	}
+	p.i++
+	if t.text == "" || len(t.text) > 63 {
+		return nil, p.errf("an enum label must be 1 to 63 characters")
+	}
+	at.AddValue = t.text
+	if p.consumeIdentWord("before") || p.consumeIdentWord("after") {
+		return nil, p.errf("ADD VALUE BEFORE / AFTER is not supported: labels are appended in declaration order")
+	}
+	return at, nil
+}
+
 func (p *parser) parseCreateSequence() (Statement, error) {
 	p.i += 2 // CREATE SEQUENCE
 	cs := &CreateSequence{}

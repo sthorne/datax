@@ -53,6 +53,9 @@ const (
 // by the backing column's modifiers (int2 / int4, varchar / bpchar,
 // timestamp without time zone).
 func colOID(col sql.ResultColumn) uint32 {
+	if col.Type == types.Enum && col.EnumType != 0 {
+		return uint32(catalog.EnumOID(col.EnumType))
+	}
 	if col.Type.IsArray() {
 		elem := col
 		elem.Type = col.Type.Elem()
@@ -129,6 +132,8 @@ func typeOID(f types.Family) uint32 {
 		return oidInterval
 	case types.Time:
 		return oidTime
+	case types.Enum:
+		return oidText // a value without its type describes as text
 	default:
 		return oidText
 	}
@@ -641,7 +646,7 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 		// Binary time: microseconds since midnight.
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
 	default:
-		return []byte(d.Text())
+		return []byte(d.Text()) // an enum's binary form is its label
 	}
 }
 

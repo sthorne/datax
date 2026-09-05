@@ -62,6 +62,11 @@ func retypeAllowed(from, to types.Family) bool {
 	if to.IsArray() {
 		return from == types.String || (from.IsArray() && retypeAllowed(from.Elem(), to.Elem()))
 	}
+	if to == types.Enum {
+		// Text or another enum: every value's label must be a label of
+		// the new type (checked by the rewrite).
+		return from == types.String || from == types.Enum
+	}
 	switch from {
 	case types.Int:
 		return to == types.Float || to == types.Decimal
@@ -111,9 +116,12 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			Type: st.Type, Precision: st.Precision, Scale: st.Scale,
 			Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,
 		}
+		if err := s.resolveEnumColumn(ctx, txn, &target, st.TypeName); err != nil {
+			return err
+		}
 		if col.Type == target.Type && col.Precision == target.Precision && col.Scale == target.Scale &&
 			col.IntWidth() == target.IntWidth() && col.MaxLen == target.MaxLen && col.Char == target.Char && col.NoTZ == target.NoTZ &&
-			col.TimePrecision == target.TimePrecision {
+			col.TimePrecision == target.TimePrecision && col.EnumType == target.EnumType {
 			return nil // nothing to do
 		}
 		if pureWidening(col, target) {
@@ -124,6 +132,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 				if desc.Columns[i].ID == col.ID {
 					c := &desc.Columns[i]
 					c.Width, c.MaxLen, c.Char, c.NoTZ, c.TimePrecision, c.Precision, c.Scale = target.Width, target.MaxLen, target.Char, target.NoTZ, target.TimePrecision, target.Precision, target.Scale
+					c.EnumType, c.EnumName, c.EnumLabels = target.EnumType, target.EnumName, target.EnumLabels
 				}
 			}
 			widened = true
@@ -318,9 +327,12 @@ func (s *Session) retypeBackfill(ctx context.Context, table string, tableID uint
 					continue // NULL: the shadow is NULL too
 				}
 				old, _ := desc.ColByID(oldID)
-				conv, cerr := src.ConvertTo(shadow.Type)
-				if cerr != nil {
-					return newErrf(CodeInvalidTextRepresentation, "column %q: value %s cannot convert to %s: %v", old.Name, src.Text(), shadow.TypeSQL(), cerr)
+				conv := src
+				if shadow.Type != types.Enum {
+					var cerr error
+					if conv, cerr = src.ConvertTo(shadow.Type); cerr != nil {
+						return newErrf(CodeInvalidTextRepresentation, "column %q: value %s cannot convert to %s: %v", old.Name, src.Text(), shadow.TypeSQL(), cerr)
+					}
 				}
 				named := shadow
 				named.Name = old.Name

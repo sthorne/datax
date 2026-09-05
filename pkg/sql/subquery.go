@@ -219,6 +219,15 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		out.Cmp = &resolved[0]
 	}
+	if out.Cast != "" && out.Cast != "regclass" && out.Lit != nil && out.Lit.Fam == types.String {
+		// 'label'::mood — a cast to an enum type of the database.
+		if v, ok, err := s.enumLiteral(ctx, txn, out.Cast, *out.Lit); err != nil {
+			return e, err
+		} else if ok {
+			out.Cast, out.Lit = "", &v
+			return out, nil
+		}
+	}
 	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
 		// 'name'::regclass: the table's OID (a real table's, or a catalog
 		// view's), 42P01 when nothing is so named; '4'::regclass is the

@@ -33,6 +33,7 @@ const (
 	IntervalFam        // INTERVAL: months (Mo), days (Dy) and nanoseconds (I)
 	Time               // TIME: nanoseconds since midnight (in I)
 	Array              // the base of an array family: ArrayOf(elem) = Array | elem<<8 (elements in A)
+	Enum               // a user-defined enum: the label's ordinal (in I) and the label (in S)
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
@@ -67,9 +68,16 @@ func (f Family) String() string {
 		return "INTERVAL"
 	case Time:
 		return "TIME"
+	case Enum:
+		return "ENUM"
 	}
 	return "UNKNOWN"
 }
+
+// NewEnum makes an enum datum: the label's ordinal in its type and
+// the label itself. Ordinals order; labels render and compare with
+// text.
+func NewEnum(ordinal int64, label string) Datum { return Datum{Fam: Enum, I: ordinal, S: label} }
 
 // ParseType resolves a SQL type name (with PostgreSQL-flavored aliases).
 func ParseType(name string) (Family, error) {
@@ -367,6 +375,14 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 	if d.Fam.IsArray() && target == String {
 		return NewString(d.Text()), nil
 	}
+	if d.Fam == Enum && target == String {
+		return NewString(d.S), nil
+	}
+	if target == Enum {
+		// Only the column (with its labels) can make an enum value;
+		// text stays text for the write path to convert.
+		return Datum{}, fmt.Errorf("cannot use %s value as an enum without its type", d.Fam)
+	}
 	switch {
 	case d.Fam == Int && target == Float:
 		return NewFloat(float64(d.I)), nil
@@ -503,10 +519,17 @@ func (d Datum) Compare(o Datum) (int, error) {
 		}
 		return compareArrays(d, o)
 	}
+	if (d.Fam == Enum && o.Fam == String) || (d.Fam == String && o.Fam == Enum) {
+		// An enum against text: by label (equality is exact; an order
+		// between the two is the labels' text order).
+		return strings.Compare(d.S, o.S), nil
+	}
 	if d.Fam != o.Fam {
 		return 0, fmt.Errorf("cannot compare %s with %s", d.Fam, o.Fam)
 	}
 	switch d.Fam {
+	case Enum:
+		return cmpInt(d.I, o.I), nil
 	case Int, Timestamp, Date, Time:
 		return cmpInt(d.I, o.I), nil
 	case IntervalFam:
@@ -643,6 +666,8 @@ func (d Datum) Text() string {
 		return d.IntervalVal().String()
 	case Time:
 		return FormatClock(d.I)
+	case Enum:
+		return d.S
 	}
 	return ""
 }

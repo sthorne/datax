@@ -127,7 +127,6 @@ func TestParseErrors(t *testing.T) {
 		"INSERT INTO t VALUES",
 		"UPDATE t SET",
 		"SELECT * FROM t WHERE a LIKE",
-		"CREATE TABLE t (a FANCYTYPE)",
 		"SELECT * FROM t; garbage",
 	} {
 		if _, err := Parse(bad); err == nil {

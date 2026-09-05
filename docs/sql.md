@@ -53,6 +53,12 @@ SHOW STATS FOR t
   stored as p+1), `DATE`, `TIME` (nanoseconds since midnight), `INTERVAL`
   (a months / days / nanoseconds triple: `Datum.Mo`, `Datum.Dy`,
   `Datum.I`; compared by PostgreSQL's 30-day-month, 24-hour-day value),
+  enums (`CREATE TYPE ... AS ENUM`: a `TypeDescriptor` of labels under
+  `/system/typedesc/<id>` and `/system/typens/<db>/<name>`; a column of
+  the type copies the labels — `Column.EnumType`, `EnumLabels`, refreshed
+  by `ADD VALUE` with a drain — and stores the ordinal with the label,
+  rowenc tag 15, keys as ordinal then label, so nothing on a read path
+  looks the type up),
   `BYTES` (alias BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases
   NUMERIC, DEC), `JSONB` (alias JSON), and arrays of every scalar
   family but JSONB (`types.ArrayOf(elem)`, a composite Family value
@@ -178,7 +184,8 @@ deferrable constraints,
 typmods on other types than DECIMAL, the integer widths, `VARCHAR(n)` /
 `CHAR(n)`, `TIMESTAMP(p)` and `TIME(p)` (parsed and ignored),
 `TIME WITH TIME ZONE`, multidimensional arrays and array slices, indexes
-on array columns, `JSONB[]`, enums,
+on array columns, `JSONB[]`, enum `ADD VALUE BEFORE` / `AFTER` and
+`RENAME VALUE`, arrays of enums,
 JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
 inverted indexes),
 expressions over aggregates (`SUM(a) / COUNT(*)`), user-defined functions,

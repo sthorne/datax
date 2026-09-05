@@ -108,7 +108,7 @@ func statsHashDatum(d types.Datum) uint64 {
 		return h.Sum64()
 	}
 	switch d.Fam {
-	case types.Int, types.Timestamp, types.Date, types.Time:
+	case types.Int, types.Timestamp, types.Date, types.Time, types.Enum:
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], uint64(d.I))
 		_, _ = h.Write(b[:])

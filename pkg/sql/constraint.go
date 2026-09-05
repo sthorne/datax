@@ -385,6 +385,11 @@ func sampleRow(d *catalog.TableDescriptor) map[catalog.ColumnID]types.Datum {
 			v = types.NewInterval(types.Interval{Days: 1})
 		case types.Time:
 			v = types.NewTime(0)
+		case types.Enum:
+			v = types.DNull
+			if len(c.EnumLabels) > 0 {
+				v = types.NewEnum(0, c.EnumLabels[0])
+			}
 		default:
 			v = types.DNull
 			if c.Type.IsArray() {

@@ -96,6 +96,10 @@ type ResultColumn struct {
 	Char          bool
 	NoTZ          bool
 	TimePrecision int32
+	// EnumType and EnumName identify an enum column's type (the wire
+	// OID derives from the ID).
+	EnumType uint64
+	EnumName string
 }
 
 // DecimalTypmod encodes a DECIMAL(p,s) declaration as PostgreSQL's
@@ -335,6 +339,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 	}
 	env.Databases = dbs
 	if env.Sequences, err = catalog.ListSequences(ctx, txn, 0); err != nil {
+		return nil, err
+	}
+	if env.Types, err = catalog.ListTypes(ctx, txn, 0); err != nil {
 		return nil, err
 	}
 	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) { return s.sequenceValue(ctx, sd) }
@@ -1302,8 +1309,17 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			}
 			continue
 		}
-		rhs, err = rhs.Coerce(cmpType)
-		if err != nil {
+		if cmpType == types.Enum && len(cmp.Path) == 0 {
+			// A literal against an enum column: the label resolves through
+			// the column (an unknown one is 22P02, as in PostgreSQL).
+			if col, ok := desc.Col(cmp.Column); ok {
+				if v, cerr := col.EnumValue(rhs); cerr != nil {
+					return false, ToSQLError(cerr)
+				} else {
+					rhs = v
+				}
+			}
+		} else if rhs, err = rhs.Coerce(cmpType); err != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, err)
 		}
 		c, err := lhs.Compare(rhs)
@@ -1948,6 +1964,14 @@ func matchesIn(cmp parser.Comparison, cmpType types.Family, lhs types.Datum, des
 		}
 		if d.Null {
 			hasNull = true
+			continue
+		}
+		if cmpType == types.Enum {
+			// A label matches by text (Compare handles enum against text).
+			if c, err := d.Compare(lhs); err == nil && c == 0 {
+				matched = true
+				break
+			}
 			continue
 		}
 		d, cerr := d.Coerce(cmpType)

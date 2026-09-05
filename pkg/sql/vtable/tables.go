@@ -297,6 +297,14 @@ func init() {
 				boolean(true), str(","), i64(0), i64(0), i64(0), str(name + "in"), str(name + "out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
 				null(), str(FormatTypeOID(oid))})
 		}
+		// Enum types: typtype 'e', in the public schema; pg_enum carries
+		// their labels.
+		for _, t := range env.Types {
+			oid := catalog.EnumOID(t.ID)
+			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(10), i64(4), boolean(true), str("e"), str("E"),
+				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
+				null(), str(t.Name)})
+		}
 		// The array type of every element type: typelem points back,
 		// and the element row's typarray forward.
 		for i := range rows {
@@ -471,7 +479,17 @@ func init() {
 	pg("pg_shdescription", []catalog.Column{col("objoid", types.Int), col("classoid", types.Int), col("description", types.String)}, empty)
 	pg("pg_auth_members", []catalog.Column{col("roleid", types.Int), col("member", types.Int), col("grantor", types.Int), col("admin_option", types.Bool)}, empty)
 	pg("pg_depend", []catalog.Column{col("classid", types.Int), col("objid", types.Int), col("objsubid", types.Int), col("refclassid", types.Int), col("refobjid", types.Int), col("refobjsubid", types.Int), col("deptype", types.String)}, empty)
-	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)}, empty)
+	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, t := range env.Types {
+				typ := catalog.EnumOID(t.ID)
+				for i, l := range t.Labels {
+					rows = append(rows, Row{i64(typ<<8 | int64(i)), i64(typ), types.NewFloat(float64(i + 1)), str(l)})
+				}
+			}
+			return rows, nil
+		})
 	pg("pg_range", []catalog.Column{col("rngtypid", types.Int), col("rngsubtype", types.Int), col("rngmultitypid", types.Int), col("rngcollation", types.Int), col("rngsubopc", types.Int), col("rngcanonical", types.Int), col("rngsubdiff", types.Int)}, empty)
 	pg("pg_partitioned_table", []catalog.Column{col("partrelid", types.Int), col("partstrat", types.String), col("partnatts", types.Int), col("partdefid", types.Int), col("partattrs", types.String)}, empty)
 	pg("pg_sequences", []catalog.Column{col("schemaname", types.String), col("sequencename", types.String), col("sequenceowner", types.String), col("data_type", types.String), col("start_value", types.Int), col("min_value", types.Int), col("max_value", types.Int), col("increment_by", types.Int), col("cycle", types.Bool), col("cache_size", types.Int), col("last_value", types.Int)},
@@ -730,6 +748,8 @@ func init() {
 					dataType := FormatType(c)
 					if c.Type.IsArray() {
 						dataType = "ARRAY"
+					} else if c.Type == types.Enum {
+						dataType = "USER-DEFINED"
 					}
 					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(dataType),
 						maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})

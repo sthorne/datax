@@ -48,6 +48,8 @@ type Env struct {
 	Tables []*catalog.TableDescriptor
 	// Sequences holds every sequence, in every database.
 	Sequences []*catalog.SequenceDescriptor
+	// Types holds every user-defined type (enum), in every database.
+	Types []*catalog.TypeDescriptor
 	// SequenceValue reads a sequence's last value (called reports whether
 	// nextval has run); nil when the caller cannot read counters.
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
@@ -231,6 +233,9 @@ func TypeOID(f types.Family) int64 {
 // family's, refined by the modifiers (int2 21 / int4 23, varchar 1043 /
 // bpchar 1042, timestamp 1114).
 func ColumnTypeOID(c *catalog.Column) int64 {
+	if c.Type == types.Enum {
+		return catalog.EnumOID(c.EnumType)
+	}
 	if c.Type.IsArray() {
 		elem := *c
 		elem.Type = c.Type.Elem()
@@ -263,12 +268,15 @@ func ColumnTypeOID(c *catalog.Column) int64 {
 // (int2 / int4 / int8, varchar / bpchar / text, timestamp /
 // timestamptz).
 func ColumnTypeName(c *catalog.Column) string {
+	if c.Type == types.Enum {
+		return c.EnumName
+	}
 	return typeNameOID(ColumnTypeOID(c))
 }
 
 // ColumnTypeLen is pg_type.typlen for a column's declared type.
 func ColumnTypeLen(c *catalog.Column) int64 {
-	if c.Type.IsArray() {
+	if c.Type.IsArray() || c.Type == types.Enum {
 		return -1
 	}
 	switch ColumnTypeOID(c) {
@@ -360,6 +368,9 @@ func TypeName(f types.Family) string {
 // FormatType is format_type(): the SQL-standard spelling of a column's
 // type, with its typmod (numeric(p,s)).
 func FormatType(c *catalog.Column) string {
+	if c.Type == types.Enum {
+		return c.EnumName
+	}
 	if c.Type.IsArray() {
 		elem := *c
 		elem.Type = c.Type.Elem()
@@ -413,6 +424,9 @@ func FormatType(c *catalog.Column) string {
 // the declared modifiers (INT4, VARCHAR(20), CHAR(4), TIMESTAMP(3),
 // NUMERIC(10,2)) over the pg_type name.
 func ColumnTypeSQL(c *catalog.Column) string {
+	if c.Type == types.Enum {
+		return c.EnumName
+	}
 	if c.Type.IsArray() {
 		elem := *c
 		elem.Type = c.Type.Elem()
@@ -664,7 +678,7 @@ func renderDefault(d types.Datum) string {
 		return "NULL"
 	}
 	switch d.Fam {
-	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Decimal:
+	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam:
 		return "'" + strings.ReplaceAll(d.Text(), "'", "''") + "'"
 	}
 	return d.Text()

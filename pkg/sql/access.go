@@ -312,7 +312,7 @@ func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistic
 			// reference on the right-hand side) is simply unusable for
 			// bounds; the post-fetch filter evaluates it per row.
 			if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil {
-				if d, cerr := d.Coerce(col.Type); cerr == nil && !d.Null {
+				if d, cerr := coerceColumn(col, d); cerr == nil && !d.Null {
 					pc.d, pc.usable = d, true
 				}
 			}

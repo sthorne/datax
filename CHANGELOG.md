@@ -8,6 +8,24 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.27.0 — unreleased
+
+### Added
+- Type system, part four (#96, closing it): enums. `CREATE TYPE [IF NOT
+  EXISTS] name AS ENUM ('a', 'b', ...)`, `ALTER TYPE name ADD VALUE [IF
+  NOT EXISTS] 'c'` (appended; every column of the type learns the label
+  in the same statement and its tables drain, so the label is usable at
+  once on every gateway), `DROP TYPE [IF EXISTS] name` (refused while a
+  column uses it). A column of the type stores the label's ordinal with
+  the label (cluster version v10), orders by declaration in `ORDER
+  BY`, `min` / `max`, indexes and primary keys, reads and writes labels,
+  refuses an unknown one (`22P02`), takes `'a'::name` casts, `LIKE`,
+  `CREATE TABLE AS` and `ALTER COLUMN TYPE` from and to text. `pg_type`
+  (`typtype = 'e'`, an OID past the builtin range), `pg_enum`,
+  `information_schema.columns` (`USER-DEFINED`), `format_type`, `SHOW
+  CREATE TABLE`, psql's `\dT` and `\d`; the wire describes the type's
+  OID and carries labels in both formats.
+
 ## 0.26.0 — unreleased
 
 ### Added

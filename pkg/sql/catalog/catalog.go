@@ -55,6 +55,13 @@ type Column struct {
 	// clock time, an offset in the input is ignored, and the output
 	// carries no offset.
 	NoTZ bool `json:"no_tz,omitempty"`
+	// EnumType, EnumName and EnumLabels describe an enum column (Type
+	// Enum): the type descriptor's ID and name, and a copy of its labels
+	// in ordinal order (refreshed by ALTER TYPE ... ADD VALUE), so a
+	// value's label converts to its ordinal and back without a lookup.
+	EnumType   uint64   `json:"enum_type,omitempty"`
+	EnumName   string   `json:"enum_name,omitempty"`
+	EnumLabels []string `json:"enum_labels,omitempty"`
 	// TimePrecision is TIMESTAMP(p) / TIMESTAMPTZ(p), stored as p+1 so
 	// that 0 keeps meaning "undeclared" (full precision): values round to
 	// p fractional digits on write. FracDigits decodes it.
@@ -108,7 +115,25 @@ func (e *ValueError) Error() string { return e.Msg }
 // write path must apply (DECIMAL(p,s), an integer width, a character
 // length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
 func (c *Column) HasTypmod() bool {
-	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray()
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum
+}
+
+// EnumValue converts a label (or an enum datum of the type) to the
+// column's enum datum: the ordinal and the label.
+func (c *Column) EnumValue(d types.Datum) (types.Datum, error) {
+	if d.Null {
+		return d, nil
+	}
+	label := d.S
+	if d.Fam != types.String && d.Fam != types.Enum {
+		label = d.Text()
+	}
+	for i, l := range c.EnumLabels {
+		if l == label {
+			return types.NewEnum(int64(i), l), nil
+		}
+	}
+	return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("invalid input value for enum %s: %q", c.EnumName, label)}
 }
 
 // FracDigits is the declared TIMESTAMP(p) precision, when there is one.
@@ -166,6 +191,8 @@ func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 		return types.NewArray(elem.Type, out), nil
 	}
 	switch c.Type {
+	case types.Enum:
+		return c.EnumValue(d)
 	case types.Int:
 		if d.Fam != types.Int {
 			return d, nil
@@ -254,6 +281,8 @@ func (c *Column) TypeSQL() string {
 		return elem.TypeSQL() + "[]"
 	}
 	switch c.Type {
+	case types.Enum:
+		return c.EnumName
 	case types.Int:
 		switch c.Width {
 		case 2:

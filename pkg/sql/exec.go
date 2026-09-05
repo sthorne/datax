@@ -94,6 +94,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDelete(ctx, txn, t, params)
 	case *parser.ShowTables:
 		return s.execShowTables(ctx, txn, t.Database)
+	case *parser.CreateType:
+		return s.execCreateType(ctx, txn, t)
+	case *parser.AlterType:
+		return s.execAlterType(ctx, txn, t)
+	case *parser.DropType:
+		return s.execDropType(ctx, txn, t)
 	case *parser.CreateSequence:
 		return s.execCreateSequence(ctx, txn, t)
 	case *parser.AlterSequence:
@@ -158,6 +164,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col.Hidden = cd.Hidden
 		s.stripTypeAttrs(&col)
 		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if err := s.resolveEnumColumn(ctx, txn, &col, cd.TypeName); err != nil {
 			return nil, ToSQLError(err)
 		}
 		if cd.Default != nil && !cd.Default.Null {
@@ -1432,7 +1441,7 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		if err != nil {
 			continue // row-dependent value (column RHS): not a point bound
 		}
-		d, cerr := d.Coerce(col.Type)
+		d, cerr := coerceColumn(col, d)
 		if cerr != nil {
 			return nil, false, nil // un-coercible: cannot match anything via point path; fall to scan
 		}
@@ -2162,6 +2171,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		s.stripTypeAttrs(&col)
 		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if err := s.resolveEnumColumn(ctx, txn, &col, def.TypeName); err != nil {
 			return nil, ToSQLError(err)
 		}
 		if def.Default != nil && !def.Default.Null {
