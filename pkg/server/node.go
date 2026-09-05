@@ -611,6 +611,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.ensureRoleCatalog); err != nil {
+		return err
+	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err
@@ -792,6 +795,37 @@ func (n *Node) Pinger() *rpc.Pinger { return n.pinger }
 
 // Events exposes the node's event ring (tests and the API).
 func (n *Node) Events() *events.Ring { return n.events }
+
+// ensureRoleCatalog runs the v11 role migration once the cluster is at
+// v11: a cluster finalized by a node that then crashed mid-migration
+// gets the rest of its records rewritten. Idempotent; range 1's leader
+// runs it.
+func (n *Node) ensureRoleCatalog(ctx context.Context) {
+	delay := 500 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if n.readClusterVersion(ctx) < version.V11 {
+			delay = 5 * time.Second
+			continue
+		}
+		if r1, ok := n.store.GetReplica(1); !ok || !r1.IsLeader() {
+			delay = time.Second
+			continue
+		}
+		if moved, err := catalog.MigrateRoles(ctx, n.db); err != nil {
+			log.Debugf("role catalog: %v (retrying)", err)
+			delay = 2 * time.Second
+			continue
+		} else if moved > 0 {
+			log.Infof("role migration: %d record(s) rewritten as role descriptors", moved)
+		}
+		return
+	}
+}
 
 // ensureDatabaseCatalog runs the v6 catalog migration once the cluster is
 // at v6: a freshly bootstrapped cluster gets its default and system

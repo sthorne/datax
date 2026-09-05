@@ -259,8 +259,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			return p.parseUserStmt(false)
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseRoleStmt(false)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			return p.parseCreateSequence()
@@ -316,21 +316,11 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &Explain{Stmt: inner, Analyze: analyze}, nil
 	case "DROP":
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			p.i += 2 // DROP USER
-			du := &DropUser{}
-			if p.consumeKeyword("IF") {
-				if err := p.expectKeyword("EXISTS"); err != nil {
-					return nil, err
-				}
-				du.IfExists = true
-			}
-			name, err := p.expectIdent()
-			if err != nil {
-				return nil, err
-			}
-			du.Name = name
-			return du, nil
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseDropRole()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "owned" {
+			return p.parseDropOwned()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
 			p.i += 2 // DROP INDEX
@@ -449,8 +439,11 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DELETE":
 		return p.parseDelete()
 	case "ALTER":
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			return p.parseUserStmt(true)
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseRoleStmt(true)
+		}
+		if p.i+2 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "default" && p.toks[p.i+2].kind == tkIdent && p.toks[p.i+2].text == "privileges" {
+			return p.parseAlterDefaultPrivileges()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
 			p.i += 2 // ALTER INDEX
@@ -494,10 +487,24 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			as.Name = name
+			if p.consumeIdentWord("owner") {
+				return p.parseOwnerTo("sequence", name)
+			}
 			if err := p.parseSequenceOptions(&as.Options, true); err != nil {
 				return nil, err
 			}
 			return as, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			p.i += 2 // ALTER VIEW name OWNER TO role
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER VIEW supports only OWNER TO")
+			}
+			return p.parseOwnerTo("view", name)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // ALTER DATABASE name RENAME TO new
@@ -505,8 +512,11 @@ func (p *parser) parseStatement() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
+			if p.consumeIdentWord("owner") {
+				return p.parseOwnerTo("database", name)
+			}
 			if !p.consumeIdentWord("rename") {
-				return nil, p.errf("ALTER DATABASE supports only RENAME TO")
+				return nil, p.errf("ALTER DATABASE supports RENAME TO and OWNER TO")
 			}
 			if err := p.expectKeyword("TO"); err != nil {
 				return nil, err
@@ -549,6 +559,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseCopy()
 	case "grant", "revoke": // not reserved words; they lex as identifiers
 		return p.parseGrantRevoke(t.text == "revoke")
+	case "reassign": // not a reserved word; lexes as an identifier
+		return p.parseReassignOwned()
 	case "savepoint": // not a reserved word; lexes as an identifier
 		p.i++
 		name, err := p.expectIdent()
@@ -624,21 +636,42 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return &Show{Kind: "create", Table: name}, nil
 		}
-		if p.consumeIdentWord("users") || p.consumeIdentWord("roles") {
+		if p.consumeIdentWord("users") {
 			return &Show{Kind: "users"}, nil
+		}
+		if p.consumeIdentWord("roles") {
+			return &Show{Kind: "roles"}, nil
 		}
 		if p.consumeIdentWord("grants") {
 			sh := &Show{Kind: "grants"}
 			if p.consumeKeyword("ON") {
-				p.consumeKeyword("TABLE")
-				name, err := p.parseTableName()
-				if err != nil {
-					return nil, err
+				switch {
+				case p.consumeIdentWord("role"):
+					sh.OnRole = true
+					if !p.atStatementEnd() && !p.peekIdentWord("for") {
+						name, err := p.parseRoleName()
+						if err != nil {
+							return nil, err
+						}
+						sh.Role = name
+					}
+				case p.consumeIdentWord("database"):
+					name, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					sh.Database = name
+				default:
+					p.consumeKeyword("TABLE")
+					name, err := p.parseTableName()
+					if err != nil {
+						return nil, err
+					}
+					sh.Table = name
 				}
-				sh.Table = name
 			}
 			if p.consumeIdentWord("for") {
-				user, err := p.expectIdent()
+				user, err := p.parseRoleName()
 				if err != nil {
 					return nil, err
 				}
@@ -1415,6 +1448,19 @@ func (p *parser) parseSet() (Statement, error) {
 			return nil, p.errf("expected ZONE after SET TIME")
 		}
 		sv.Name = "TimeZone"
+	case p.consumeIdentWord("role"):
+		// SET [LOCAL] ROLE name | NONE (no = or TO).
+		sv.Name = "role"
+		if p.consumeIdentWord("none") {
+			sv.Reset = true
+			return sv, nil
+		}
+		name, err := p.parseRoleName()
+		if err != nil {
+			return nil, err
+		}
+		sv.Value = name
+		return sv, nil
 	case p.consumeIdentWord("names"):
 		sv.Name = "client_encoding"
 		if p.atStatementEnd() {
@@ -1532,8 +1578,11 @@ func (p *parser) parseAlterType() (Statement, error) {
 		return nil, err
 	}
 	at.Name = name
+	if p.consumeIdentWord("owner") {
+		return p.parseOwnerTo("type", name)
+	}
 	if !p.consumeKeyword("ADD") || !p.consumeIdentWord("value") {
-		return nil, p.errf("ALTER TYPE supports ADD VALUE only, found %q", p.peek().text)
+		return nil, p.errf("ALTER TYPE supports ADD VALUE and OWNER TO, found %q", p.peek().text)
 	}
 	if p.consumeKeyword("IF") {
 		if err := p.expectKeyword("NOT"); err != nil {
@@ -3082,105 +3131,6 @@ func (p *parser) parseFrameBound() (FrameBound, error) {
 	return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING, found %q", p.peek().text)
 }
 
-// parseGrantRevoke parses GRANT/REVOKE ADMIN and per-table privileges.
-func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
-	p.i++ // grant | revoke
-	gr := &GrantRevoke{Revoke: revoke}
-	linkKw := "TO"
-	if revoke {
-		linkKw = "FROM"
-	}
-
-	if p.consumeIdentWord("admin") {
-		gr.Admin = true
-		if err := p.expectKeyword(linkKw); err != nil {
-			return nil, err
-		}
-		name, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		gr.User = name
-		return gr, nil
-	}
-
-	for {
-		t := p.peek()
-		var priv string
-		switch {
-		case t.kind == tkKeyword && (t.text == "SELECT" || t.text == "INSERT" || t.text == "UPDATE" || t.text == "DELETE"):
-			priv = t.text
-			p.i++
-		case t.kind == tkIdent && t.text == "all":
-			priv = "ALL"
-			p.i++
-		case t.kind == tkKeyword && t.text == "CREATE", t.kind == tkIdent && t.text == "connect":
-			priv = strings.ToUpper(t.text)
-			p.i++
-		default:
-			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, CREATE, CONNECT, ALL), found %q", t.text)
-		}
-		gr.Privileges = append(gr.Privileges, priv)
-		if !p.consumeOp(",") {
-			break
-		}
-	}
-	if err := p.expectKeyword("ON"); err != nil {
-		return nil, err
-	}
-	if p.consumeIdentWord("database") {
-		db, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		gr.Database = db
-	} else {
-		p.consumeKeyword("TABLE")
-		table, err := p.parseTableName()
-		if err != nil {
-			return nil, err
-		}
-		gr.Table = table
-	}
-	if err := p.expectKeyword(linkKw); err != nil {
-		return nil, err
-	}
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
-	}
-	gr.User = name
-	return gr, nil
-}
-
-// parseUserStmt parses CREATE USER / ALTER USER name PASSWORD 'pw'.
-func (p *parser) parseUserStmt(alter bool) (Statement, error) {
-	p.i += 2 // CREATE|ALTER USER
-	ifNotExists := false
-	if !alter && p.consumeKeyword("IF") {
-		if err := p.expectKeyword("NOT"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKeyword("EXISTS"); err != nil {
-			return nil, err
-		}
-		ifNotExists = true
-	}
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
-	}
-	if err := p.expectKeyword("PASSWORD"); err != nil {
-		return nil, err
-	}
-	t := p.peek()
-	if t.kind != tkString {
-		return nil, p.errf("expected password string, found %q", t.text)
-	}
-	p.i++
-	return &CreateUser{Name: name, Password: t.text, Alter: alter, IfNotExists: ifNotExists}, nil
-}
-
 func (p *parser) parseAlterTable() (Statement, error) {
 	p.i++ // ALTER
 	if err := p.expectKeyword("TABLE"); err != nil {
@@ -3199,6 +3149,8 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	}
 	at.Table = name
 	switch {
+	case p.consumeIdentWord("owner"):
+		return p.parseOwnerTo("table", name)
 	case p.consumeIdentWord("rename"):
 		switch {
 		case p.consumeKeyword("TO"):

@@ -545,8 +545,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			"indexes":  {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
 			"create":   {"table_name", "create_statement"},
 			"views":    {"view_name", "definition"},
-			"users":    {"username", "is_admin"},
-			"grants":   {"database_name", "table_name", "grantee", "privilege_type"},
+			"users":    {"username", "is_admin", "member_of"},
+			"roles":    {"role_name", "can_login", "is_admin", "member_of"},
+			"grants":   {"database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable"},
 			"all":      {"name", "setting"},
 			"sessions": {"pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start"},
 		}[t.Kind]

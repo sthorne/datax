@@ -116,7 +116,7 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		for _, c := range d.Columns {
 			cols = append(cols, c.Name)
 		}
-		m := parser.CTE{Name: bare, Columns: cols, Query: sel}
+		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner)}
 		if db != "" {
 			m.Qualified = lname
 		}
@@ -351,6 +351,18 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err != nil {
 		return nil, err
 	}
+	// The creator must be able to read what the view reads (its query
+	// will run with the creator's — the owner's — privileges for every
+	// reader). expandViews checks the views it names; the tables here.
+	for _, id := range deps {
+		d, err := catalog.ReadTable(ctx, txn, id)
+		if err != nil || d == nil || d.IsView() {
+			continue
+		}
+		if err := s.checkTablePriv(ctx, txn, d, "SELECT"); err != nil {
+			return nil, err
+		}
+	}
 	expanded, err := s.expandViews(ctx, txn, t.Query)
 	if err != nil {
 		return nil, err
@@ -396,6 +408,9 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			if !existing.IsView() {
 				return nil, newErrf(CodeWrongObjectType, "%q is not a view", bare)
 			}
+			if err := s.checkTableOwner(ctx, txn, existing); err != nil {
+				return nil, err
+			}
 			if cyc, err := s.viewDependsOn(ctx, txn, deps, existing.ID); err != nil {
 				return nil, err
 			} else if cyc {
@@ -407,18 +422,21 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
-			log.Audit("view-ddl", "stmt", "CREATE OR REPLACE VIEW", "target", bare, "principal", s.user)
+			log.Audit("view-ddl", "stmt", "CREATE OR REPLACE VIEW", "target", bare, "principal", s.sessionUser, "role", s.user)
 			return &Result{Tag: "CREATE VIEW"}, nil
 		}
 	}
 	desc := &catalog.TableDescriptor{
 		Name: bare, DatabaseID: dbID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
-		ViewQuery: t.Text, ViewDepends: deps,
+		ViewQuery: t.Text, ViewDepends: deps, Owner: s.user,
+	}
+	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
+		return nil, err
 	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	log.Audit("view-ddl", "stmt", "CREATE VIEW", "target", bare, "principal", s.user)
+	log.Audit("view-ddl", "stmt", "CREATE VIEW", "target", bare, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "CREATE VIEW"}, nil
 }
 
@@ -504,7 +522,7 @@ func (s *Session) dropDependentViews(ctx context.Context, txn *kvclient.Txn, id 
 		}
 		dropped[v.ID] = true
 		s.noteDDL(v.Name)
-		log.Audit("view-ddl", "stmt", "DROP VIEW (cascade)", "target", v.Name, "principal", s.user)
+		log.Audit("view-ddl", "stmt", "DROP VIEW (cascade)", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}
 	return nil
 }
@@ -542,6 +560,9 @@ func (s *Session) execDropView(ctx context.Context, txn *kvclient.Txn, t *parser
 		if d.Virtual != "" || !d.IsView() {
 			return nil, newErrf(CodeWrongObjectType, "%q is not a view (use DROP TABLE)", name)
 		}
+		if err := s.checkTableOwner(ctx, txn, d); err != nil {
+			return nil, err
+		}
 		if in[d.ID] {
 			continue
 		}
@@ -571,7 +592,7 @@ func (s *Session) execDropView(ctx context.Context, txn *kvclient.Txn, t *parser
 			return nil, err
 		}
 		s.noteDDL(v.Name)
-		log.Audit("view-ddl", "stmt", "DROP VIEW", "target", v.Name, "principal", s.user)
+		log.Audit("view-ddl", "stmt", "DROP VIEW", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}
 	return &Result{Tag: "DROP VIEW"}, nil
 }

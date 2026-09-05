@@ -89,8 +89,6 @@ func (env *Env) currentTables() []*catalog.TableDescriptor {
 	return out
 }
 
-func ownerOf(env *Env) string { return "root" }
-
 func init() {
 	// pg_database: one row per database; encoding and locale are fixed.
 	pg("pg_database", []catalog.Column{
@@ -100,7 +98,7 @@ func init() {
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		for _, d := range env.Databases {
-			rows = append(rows, Row{i64(DatabaseOID(d)), str(d.Name), i64(10), i64(6), str("C"), str("C"), boolean(false), boolean(true), i64(-1), i64(1663), null()})
+			rows = append(rows, Row{i64(DatabaseOID(d)), str(d.Name), i64(RoleOID(catalog.OwnerOf(d.Owner))), i64(6), str("C"), str("C"), boolean(false), boolean(true), i64(-1), i64(1663), null()})
 		}
 		return rows, nil
 	})
@@ -147,25 +145,25 @@ func init() {
 				}
 			}
 			if t.IsView() {
-				rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(10), i64(0), i64(0), i64(0),
+				rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(0), i64(0), i64(0),
 					i64(0), types.NewFloat(-1), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(int64(len(t.VisibleColumns()))),
 					i64(0), boolean(true), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), str(t.ViewQuery), textOrNull(t.Comment)})
 				continue
 			}
-			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(10), i64(2), i64(TableOID(t)), i64(0),
+			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(2), i64(TableOID(t)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
 				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(t.Comment)})
-			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(10), i64(403), i64(IndexOID(t, 1)), i64(0),
+			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 			for _, idx := range t.Indexes {
-				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(10), i64(403), i64(IndexOID(t, idx.ID)), i64(0),
+				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment)})
 			}
 		}
 		for _, sq := range env.currentSequences() {
-			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(OIDPublic), i64(0), i64(10), i64(0), i64(int64(sq.ID)), i64(0),
+			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(sq.Owner))), i64(0), i64(int64(sq.ID)), i64(0),
 				i64(1), types.NewFloat(1), i64(0), boolean(false), boolean(false), str("p"), str("S"), i64(3),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
@@ -302,7 +300,7 @@ func init() {
 		// their labels.
 		for _, t := range env.Types {
 			oid := catalog.EnumOID(t.ID)
-			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(10), i64(4), boolean(true), str("e"), str("E"),
+			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
 				null(), str(t.Name)})
 		}
@@ -471,14 +469,25 @@ func init() {
 			var rows []Row
 			for _, t := range env.currentTables() {
 				if t.IsView() {
-					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str("root"), str(t.ViewQuery)})
+					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), str(t.ViewQuery)})
 				}
 			}
 			return rows, nil
 		})
 	pg("pg_matviews", []catalog.Column{col("schemaname", types.String), col("matviewname", types.String), col("matviewowner", types.String), col("ispopulated", types.Bool), col("definition", types.String)}, empty)
 	pg("pg_shdescription", []catalog.Column{col("objoid", types.Int), col("classoid", types.Int), col("description", types.String)}, empty)
-	pg("pg_auth_members", []catalog.Column{col("roleid", types.Int), col("member", types.Int), col("grantor", types.Int), col("admin_option", types.Bool)}, empty)
+	pg("pg_auth_members", []catalog.Column{col("roleid", types.Int), col("member", types.Int), col("grantor", types.Int), col("admin_option", types.Bool)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			// root's admin membership is implicit; every other edge is a
+			// stored membership.
+			rows := []Row{{i64(RoleOID(catalog.AdminRole)), i64(RoleOID(catalog.RootRole)), i64(RoleOID(catalog.RootRole)), boolean(true)}}
+			for _, r := range env.Roles {
+				for _, m := range r.MemberOf {
+					rows = append(rows, Row{i64(RoleOID(m.Role)), i64(RoleOID(r.Name)), i64(RoleOID(catalog.RootRole)), boolean(m.Admin)})
+				}
+			}
+			return rows, nil
+		})
 	pg("pg_depend", []catalog.Column{col("classid", types.Int), col("objid", types.Int), col("objsubid", types.Int), col("refclassid", types.Int), col("refobjid", types.Int), col("refobjsubid", types.Int), col("deptype", types.String)}, empty)
 	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
@@ -503,7 +512,7 @@ func init() {
 						last = i64(v)
 					}
 				}
-				rows = append(rows, Row{str(catalog.PublicSchema), str(sq.Name), str("root"), str("bigint"), i64(sq.Start), i64(sq.MinValue), i64(sq.MaxValue), i64(sq.Increment), boolean(sq.Cycle), i64(sq.Cache), last})
+				rows = append(rows, Row{str(catalog.PublicSchema), str(sq.Name), str(catalog.OwnerOf(sq.Owner)), str("bigint"), i64(sq.Start), i64(sq.MinValue), i64(sq.MaxValue), i64(sq.Increment), boolean(sq.Cycle), i64(sq.Cache), last})
 			}
 			return rows, nil
 		})
@@ -601,9 +610,14 @@ func init() {
 	}
 	roleRows := func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
-		for i, u := range env.Users {
-			admin := u == "root" || env.Admins[u]
-			rows = append(rows, Row{i64(int64(10 + i)), str(u), boolean(admin), boolean(true), boolean(admin), boolean(admin), boolean(true), boolean(false),
+		graph := catalog.NewRoleGraph(env.Roles)
+		for _, r := range env.Roles {
+			set, err := graph.Effective(r.Name)
+			if err != nil {
+				return nil, err
+			}
+			admin := set.IsAdmin()
+			rows = append(rows, Row{i64(RoleOID(r.Name)), str(r.Name), boolean(admin), boolean(!r.NoInherit), boolean(admin), boolean(admin), boolean(r.Login), boolean(false),
 				i64(-1), str("********"), null(), boolean(admin), null()})
 		}
 		return rows, nil
@@ -612,9 +626,17 @@ func init() {
 	pg("pg_user", []catalog.Column{col("usename", types.String), col("usesysid", types.Int), col("usecreatedb", types.Bool), col("usesuper", types.Bool), col("userepl", types.Bool), col("usebypassrls", types.Bool), col("passwd", types.String), col("valuntil", types.Timestamp), col("useconfig", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
-			for i, u := range env.Users {
-				admin := u == "root" || env.Admins[u]
-				rows = append(rows, Row{str(u), i64(int64(10 + i)), boolean(admin), boolean(admin), boolean(false), boolean(admin), str("********"), null(), null()})
+			graph := catalog.NewRoleGraph(env.Roles)
+			for _, r := range env.Roles {
+				if !r.Login {
+					continue
+				}
+				set, err := graph.Effective(r.Name)
+				if err != nil {
+					return nil, err
+				}
+				admin := set.IsAdmin()
+				rows = append(rows, Row{str(r.Name), i64(RoleOID(r.Name)), boolean(admin), boolean(admin), boolean(false), boolean(admin), str("********"), null(), null()})
 			}
 			return rows, nil
 		})
@@ -677,7 +699,7 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, t := range env.currentTables() {
-				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(ownerOf(env)), null(), boolean(len(t.Indexes) > 0), boolean(false), boolean(false), boolean(false)})
+				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), null(), boolean(len(t.Indexes) > 0), boolean(false), boolean(false), boolean(false)})
 			}
 			return rows, nil
 		})
@@ -950,8 +972,16 @@ func init() {
 				}
 				sort.Strings(users)
 				for _, u := range users {
+					opts := map[string]bool{}
+					for _, p := range t.GrantOptions[u] {
+						opts[p] = true
+					}
 					for _, p := range t.Privileges[u] {
-						rows = append(rows, Row{str("root"), str(u), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(p), str("NO")})
+						grantable := "NO"
+						if opts[p] {
+							grantable = "YES"
+						}
+						rows = append(rows, Row{str(catalog.OwnerOf(t.Owner)), str(u), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(p), str(grantable)})
 					}
 				}
 			}

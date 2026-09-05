@@ -103,12 +103,13 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `current_database() → text` — The session's database. *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
-- `current_user() → text` (also `session_user`) — The session's user (also session_user). *stable*
+- `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
 - `lastval() → int8` — The value nextval last returned in this session, whatever the sequence. *stable*
 - `nextval(text) → int8` — Advances the sequence and returns its next value; never rolled back. *volatile*
 - `now() → timestamptz` (also `current_timestamp`, `localtimestamp`, `statement_timestamp`, `transaction_timestamp`) — The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()). *stable*
+- `session_user() → text` — The authenticated session user (unchanged by SET ROLE). *stable*
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*

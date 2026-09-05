@@ -355,8 +355,16 @@ func ddlTableName(stmt parser.Statement) string {
 		return t.Name
 	case *parser.GrantRevoke:
 		// Table grants ride the descriptor: drain leases like any DDL so
-		// every gateway enforces the new privileges once the grant returns.
-		return t.Table
+		// every gateway enforces the new privileges once the grant returns
+		// (the executor records every table it touched in extraDDL; this
+		// covers the common single-table form).
+		if t.ObjectKind == "table" && len(t.Objects) == 1 && !t.AllInSchema {
+			return t.Objects[0]
+		}
+	case *parser.AlterOwner:
+		if t.Kind == "table" || t.Kind == "view" {
+			return t.Name
+		}
 	}
 	return ""
 }

@@ -620,13 +620,13 @@ func TestParseDatabases(t *testing.T) {
 	if sv := stmts[6].(*SetVar); sv.Name != "search_path" || sv.Value != "public" {
 		t.Fatalf("set search_path: %+v", sv)
 	}
-	if gr := stmts[7].(*GrantRevoke); gr.Database != "app" || gr.User != "bob" || len(gr.Privileges) != 2 || gr.Privileges[1] != "CREATE" {
+	if gr := stmts[7].(*GrantRevoke); gr.ObjectKind != "database" || gr.Objects[0] != "app" || gr.Grantees[0] != "bob" || len(gr.Privileges) != 2 || gr.Privileges[1] != "CREATE" {
 		t.Fatalf("grant on database: %+v", gr)
 	}
-	if gr := stmts[8].(*GrantRevoke); !gr.Revoke || gr.Database != "app" || gr.User != "public" {
+	if gr := stmts[8].(*GrantRevoke); !gr.Revoke || gr.ObjectKind != "database" || gr.Objects[0] != "app" || gr.Grantees[0] != "public" {
 		t.Fatalf("revoke from public: %+v", gr)
 	}
-	if gr := stmts[9].(*GrantRevoke); gr.Table != "app.t" || gr.Database != "" {
+	if gr := stmts[9].(*GrantRevoke); gr.ObjectKind != "table" || gr.Objects[0] != "app.t" {
 		t.Fatalf("grant on qualified table: %+v", gr)
 	}
 	if e, err := Parse(`SELECT current_database(), current_schema()`); err != nil || e[0].(*Select).Exprs[0].Expr.Func != "current_database" {

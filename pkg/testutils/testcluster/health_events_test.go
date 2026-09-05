@@ -134,7 +134,7 @@ func TestHealthAndEvents(t *testing.T) {
 	execSQL(t, ctx, sess, `CREATE USER auditee PASSWORD 'pw'`)
 	audited := false
 	for _, e := range eventsDoc(t, tc, 0, before.Latest).Events {
-		if e.Audit && e.Kind == "user-ddl" && strings.Contains(e.Summary, "auditee") {
+		if e.Audit && e.Kind == "role-ddl" && strings.Contains(e.Summary, "auditee") {
 			audited = true
 		}
 	}

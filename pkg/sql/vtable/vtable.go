@@ -15,6 +15,7 @@ package vtable
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"sort"
 	"strings"
@@ -56,17 +57,30 @@ type Env struct {
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
-	Users []string // every SQL user, root first
-	// Admins is the set of admin-role members (root is implicit).
-	Admins map[string]bool
+	// Roles holds every role (catalog.ListRoles: root first, then by
+	// name, the built-in roles included).
+	Roles []*catalog.RoleDescriptor
 	// Settings are the session variables (name → value).
 	Settings [][2]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo
 
-	User     string
-	Database string // the session's current database
-	IsAdmin  bool
+	User        string // the current role (current_user)
+	SessionUser string // the authenticated user (session_user)
+	Database    string // the session's current database
+	IsAdmin     bool
+}
+
+// RoleOID is a role's stable catalog OID (pg_roles.oid, pg_auth_members,
+// pg_class.relowner): a hash of the name in the range above every
+// descriptor OID; root is 10 as in PostgreSQL.
+func RoleOID(name string) int64 {
+	if name == catalog.RootRole {
+		return 10
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	return int64(h.Sum32()&0x3fffffff) | 0x40000000
 }
 
 // SessionInfo is one session of this node as SHOW SESSIONS and

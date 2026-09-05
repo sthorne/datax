@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"math"
 	"net"
 	"net/http"
@@ -174,7 +175,7 @@ func (n *Node) startHTTP() error {
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", n.requireMetrics(promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
@@ -310,6 +311,26 @@ func (n *Node) requireAdmin(next http.Handler) http.Handler {
 			metrics.AdminDenied.Inc()
 			log.Audit("admin-denied", "principal", p.User, "via", p.Via, "path", req.URL.Path, "remote", req.RemoteAddr)
 			http.Error(w, "admin role required", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+// requireMetrics gates /metrics on the metrics role (or admin): a scrape
+// account is a member of metrics and needs nothing else. Insecure mode
+// passes through; denials are audited.
+func (n *Node) requireMetrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if n.tlsCfgs == nil {
+			next.ServeHTTP(w, req)
+			return
+		}
+		p := principalFrom(req)
+		if !n.isMetricsPrincipal(req.Context(), p.User) {
+			metrics.AdminDenied.Inc()
+			log.Audit("admin-denied", "principal", p.User, "via", p.Via, "path", req.URL.Path, "remote", req.RemoteAddr, "needs", catalog.MetricsRole)
+			http.Error(w, "metrics role required", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, req)

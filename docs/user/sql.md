@@ -193,8 +193,8 @@ write runs inside `BEGIN ... COMMIT` like any other and commits or rolls
 back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
 COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 `DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
-`DROP VIEW`, the sequence, database and user statements, `GRANT` /
-`REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
+`DROP VIEW`, the sequence, database, role and ownership statements,
+`GRANT` / `REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
 CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
 TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
 drain and sweep (or stream) in several transactions of their own and
@@ -721,6 +721,7 @@ invalid value `22023`:
 | `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
+| `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 `SET LOCAL` and `SET TRANSACTION` apply to the current block and end
 with it (outside a block they do nothing, as in PostgreSQL). A changed
@@ -844,8 +845,12 @@ SHOW COLUMNS FROM t;            -- column_name, data_type, is_nullable, column_d
 SHOW INDEXES FROM t;            -- table_name, index_name, non_unique, seq_in_index, column_name
 SHOW CREATE TABLE t;            -- the CREATE TABLE statement that recreates t
 SHOW VIEWS;                     -- view_name, definition (SHOW CREATE VIEW v for one)
-SHOW USERS;                     -- username, is_admin
-SHOW GRANTS [ON t] [FOR user];  -- database_name, table_name, grantee, privilege_type
+SHOW USERS;                     -- username, is_admin, member_of (the login roles)
+SHOW ROLES;                     -- role_name, can_login, is_admin, member_of (every role)
+SHOW GRANTS [ON t | ON DATABASE d] [FOR role];
+                                -- database_name, schema_name, relation_name, grantee,
+                                -- privilege_type, is_grantable
+SHOW GRANTS ON ROLE [r] [FOR member];  -- role_name, member, is_admin
 SHOW DATABASES;                 -- database_name, owner
 SHOW STATS FOR t;               -- see Table statistics
 SHOW FUNCTIONS;                 -- name, signature, category, volatility, aliases, description
@@ -913,11 +918,12 @@ is stored as text). `CREATE OR REPLACE VIEW` keeps the view's identity
 and grants and may change its column set; a view cannot depend on
 itself (`42P17`).
 
-**Privileges.** Reading a view needs `SELECT` on the view *and* on the
-tables its query reads — the query runs as the reader, not as the
-view's creator (PostgreSQL runs it with the owner's rights). `GRANT` /
+**Privileges.** Reading a view needs `SELECT` on the view; its query
+runs with the view's *owner's* privileges (PostgreSQL's definer rule),
+so a reader needs no grant on the tables behind it. `GRANT` /
 `REVOKE ... ON view` work as on tables; creating a view needs the
-database's `CREATE` privilege, dropping one is for admins.
+database's `CREATE` privilege (and the creator's own access to what it
+reads), dropping one is for its owner or an admin.
 
 The catalogs show views as PostgreSQL does — `pg_class` with `relkind =
 'v'`, `pg_views`, `information_schema.tables` (`VIEW`) and
@@ -954,12 +960,15 @@ database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
-bob`. `CREATE` lets a non-admin create tables there (admins always can).
-`CONNECT` is granted to `PUBLIC` on every database, as in PostgreSQL;
-`REVOKE CONNECT ON DATABASE app FROM PUBLIC` closes it to everyone but
-admins and users holding an explicit `CONNECT` grant, checked when a
-session opens the database (the URL or `USE`). Table grants work as
-before, and take qualified names (`GRANT SELECT ON app.orders TO bob`).
+bob`. `CREATE` lets a non-admin create tables there (admins and the
+database's owner always can). `CONNECT` is granted to `PUBLIC` on every
+database, as in PostgreSQL; `REVOKE CONNECT ON DATABASE app FROM PUBLIC`
+closes it to everyone but admins, the owner and roles holding an
+explicit `CONNECT` grant, checked when a session opens the database
+(the URL or `USE`). Table grants take qualified names (`GRANT SELECT ON
+app.orders TO bob`). Roles, ownership, the schema and sequence scopes,
+`ALL TABLES IN SCHEMA`, default privileges and grant options are in
+the [security guide](security.md#roles-and-privileges).
 
 Databases arrive with cluster version v6. A cluster upgraded from an
 earlier version keeps every existing table in `datax`; `datax debug

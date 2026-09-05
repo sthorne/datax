@@ -978,7 +978,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
-	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.user)
+	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -1249,7 +1249,7 @@ func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, des
 	if indexID != 0 {
 		s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
 	}
-	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.user)
+	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 

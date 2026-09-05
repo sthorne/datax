@@ -473,10 +473,17 @@ type TableDescriptor struct {
 	// ViewDepends are the tables and views the view's query reads, by
 	// ID: dropping one of them is refused while the view exists.
 	ViewDepends []uint64 `json:"view_depends,omitempty"`
-	// Privileges maps a user name to its granted per-table privileges
-	// (SELECT/INSERT/UPDATE/DELETE, upper-cased; ALL is stored expanded).
-	// root and admin-role members bypass the map entirely.
+	// Owner is the role that owns the table or view (v11): it holds every
+	// privilege on it and may alter or drop it. Empty means root (an
+	// object that predates ownership).
+	Owner string `json:"owner,omitempty"`
+	// Privileges maps a grantee role (or "public") to its granted
+	// privileges (SELECT/INSERT/UPDATE/DELETE/TRUNCATE, upper-cased; ALL
+	// is stored expanded). root, admins and the owner bypass the map.
 	Privileges map[string][]string `json:"privileges,omitempty"`
+	// GrantOptions maps a grantee to the privileges it holds WITH GRANT
+	// OPTION (a subset of Privileges).
+	GrantOptions map[string][]string `json:"grant_options,omitempty"`
 	// Version increments on every descriptor change; gateway leases record
 	// which version they may be using (see leasing in this package).
 	Version uint64 `json:"version,omitempty"`
@@ -593,12 +600,8 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	}
 	out.InboundFKs = append([]ForeignKeyRef(nil), d.InboundFKs...)
 	out.ViewDepends = append([]uint64(nil), d.ViewDepends...)
-	if d.Privileges != nil {
-		out.Privileges = make(map[string][]string, len(d.Privileges))
-		for u, ps := range d.Privileges {
-			out.Privileges[u] = append([]string(nil), ps...)
-		}
-	}
+	out.Privileges = ClonePrivileges(d.Privileges)
+	out.GrantOptions = ClonePrivileges(d.GrantOptions)
 	if d.Reshard != nil {
 		rs := *d.Reshard
 		rs.NewIndexIDs = append([]uint64(nil), d.Reshard.NewIndexIDs...)

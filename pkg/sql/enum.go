@@ -105,7 +105,7 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 	if _, err := types.ParseType(bare); err == nil {
 		return nil, newErrf(CodeDuplicateObject, "type %q is a builtin type", bare)
 	}
-	d := &catalog.TypeDescriptor{Name: bare, DatabaseID: dbID, Labels: append([]string{}, t.Labels...)}
+	d := &catalog.TypeDescriptor{Name: bare, DatabaseID: dbID, Labels: append([]string{}, t.Labels...), Owner: s.user}
 	if err := catalog.CreateType(ctx, txn, d); err != nil {
 		var ex *catalog.ErrTypeExists
 		if t.IfNotExists && asErr(err, &ex) {
@@ -116,7 +116,7 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		return nil, ToSQLError(err)
 	}
-	log.Audit("type-ddl", "stmt", "CREATE TYPE", "target", bare, "principal", s.user)
+	log.Audit("type-ddl", "stmt", "CREATE TYPE", "target", bare, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "CREATE TYPE"}, nil
 }
 
@@ -125,7 +125,7 @@ func (s *Session) execAlterType(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
+	if err := s.checkOwner(ctx, txn, "type", d.Name, d.Owner); err != nil {
 		return nil, err
 	}
 	for _, l := range d.Labels {
@@ -167,7 +167,7 @@ func (s *Session) execAlterType(ctx context.Context, txn *kvclient.Txn, t *parse
 		}
 		s.noteDDL(s.qualifiedTableName(ctx, txn, desc))
 	}
-	log.Audit("type-ddl", "stmt", "ALTER TYPE", "target", d.Name, "label", t.AddValue, "principal", s.user)
+	log.Audit("type-ddl", "stmt", "ALTER TYPE", "target", d.Name, "label", t.AddValue, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TYPE"}, nil
 }
 
@@ -194,7 +194,7 @@ func (s *Session) execDropType(ctx context.Context, txn *kvclient.Txn, t *parser
 		}
 		return nil, err
 	}
-	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
+	if err := s.checkOwner(ctx, txn, "type", d.Name, d.Owner); err != nil {
 		return nil, err
 	}
 	tables, err := s.cat.List(ctx, txn)
@@ -211,6 +211,6 @@ func (s *Session) execDropType(ctx context.Context, txn *kvclient.Txn, t *parser
 	if err := catalog.DropType(ctx, txn, d); err != nil {
 		return nil, ToSQLError(err)
 	}
-	log.Audit("type-ddl", "stmt", "DROP TYPE", "target", d.Name, "principal", s.user)
+	log.Audit("type-ddl", "stmt", "DROP TYPE", "target", d.Name, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP TYPE"}, nil
 }

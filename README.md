@@ -106,12 +106,17 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 - **Security**: `--certs-dir` turns on mutual internode TLS and SQL TLS +
   SCRAM. Internode RPCs accept only the node certificate; the admin RPC
   authenticates operators by client certificate, and state-changing ops
-  (and the dashboard drill-down) require the admin role (`root`, or
-  `GRANT ADMIN`). Every HTTP endpoint takes HTTP Basic credentials of any
-  database user — Prometheus `basic_auth` — or a client certificate.
-  Authentication failures, denied and executed admin ops, and privilege
-  DDL are audit-logged with their principal. Insecure mode stays open,
-  like pgwire trust auth.
+  (and the dashboard drill-down) require the admin role (`root`, or a
+  member of `admin`). SQL authorization is PostgreSQL's role model:
+  roles as groups with inheritance and `SET ROLE`, object ownership,
+  grants on tables, sequences, databases and the schema (`ALL TABLES`,
+  default privileges, `GRANT OPTION`, `PUBLIC`), and the built-in
+  `admin`, `read_all`, `write_all` and `metrics` roles. Every HTTP
+  endpoint takes HTTP Basic credentials of a database user — Prometheus
+  `basic_auth` with the `metrics` role — or a client certificate.
+  Authentication failures, denied and executed admin ops, and role and
+  privilege DDL are audit-logged with their principal. Insecure mode
+  stays open, like pgwire trust auth.
 
 **User documentation** — installing, deploying, securing, and operating a
 cluster, plus the SQL reference and a differences-from-PostgreSQL guide —

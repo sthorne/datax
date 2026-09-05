@@ -148,7 +148,15 @@ func (s *Session) bindWith(ctx context.Context, txn *kvclient.Txn, with []parser
 		case cte.Recursive && stmtReferences(cte.Query, name):
 			res, err = s.execRecursiveCTE(ctx, txn, cte, name, params)
 		default:
+			// A view's query runs with its owner's privileges (definer
+			// semantics): the tables it reads are checked as the owner,
+			// the view itself was checked as the reader when it was bound.
+			savedAs := s.privAs
+			if cte.Definer != "" {
+				s.privAs = cte.Definer
+			}
 			res, err = s.execStmt(ctx, txn, cte.Query, params)
+			s.privAs = savedAs
 		}
 		if err != nil {
 			restore()

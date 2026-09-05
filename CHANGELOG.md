@@ -8,6 +8,55 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.29.0 — unreleased
+
+Cluster version **v11**: role descriptors (`/system/roles`) supersede
+the user credential records and admin markers; `datax debug upgrade`
+rewrites them at finalize.
+
+### Added
+- Roles and privilege scopes (#98): `CREATE / ALTER / DROP ROLE` and
+  `USER` (`LOGIN` / `NOLOGIN`, `PASSWORD`, `INHERIT` / `NOINHERIT`, `IN
+  ROLE`, `IF [NOT] EXISTS`; a role may change its own password), role
+  membership (`GRANT role TO role [WITH ADMIN OPTION]`, `REVOKE [ADMIN
+  OPTION FOR]`, inheritance, cycles refused), `SET [LOCAL] ROLE` /
+  `RESET ROLE` with `current_user` vs `session_user`. Ownership: tables,
+  views, sequences, types and databases record their creator, who
+  holds every privilege and alone (with admins) may alter, drop or
+  grant them; `ALTER ... OWNER TO`, `REASSIGN OWNED BY`, `DROP OWNED
+  BY`; `DROP ROLE` refuses an owner (`2BP01`) and takes the role's
+  grants and memberships with it. Scopes: `GRANT ... ON DATABASE`
+  (`CONNECT`, `CREATE`), `ON SCHEMA public` (`USAGE`, `CREATE`; `USAGE`
+  revocable from `PUBLIC`), `ON ALL TABLES | SEQUENCES IN SCHEMA
+  public`, `ON SEQUENCE` (`USAGE`, `SELECT`, `UPDATE`; `nextval` /
+  `currval` / `setval` now check them, a `SERIAL` column's sequence
+  following `INSERT` on its table), the `TRUNCATE` privilege, `WITH
+  GRANT OPTION` / `GRANT OPTION FOR`, `PUBLIC` as a grantee, `ALTER
+  DEFAULT PRIVILEGES [FOR ROLE r] [IN SCHEMA public] GRANT | REVOKE ...
+  ON TABLES | SEQUENCES`. A view's query runs with its owner's
+  privileges (definer semantics). Built-in roles `admin` (the old
+  `ADMIN` marker, `root` an implicit member), `read_all`, `write_all`,
+  `metrics` (HTTP `/metrics` only). HTTP and admin-RPC authorization
+  resolve through membership; audit records carry the session user and
+  the current role. `SHOW ROLES`, `SHOW USERS` (`member_of`), `SHOW
+  GRANTS` (`database_name, schema_name, relation_name, grantee,
+  privilege_type, is_grantable`; `ON DATABASE`, `ON ROLE`), `pg_roles`
+  (`rolcanlogin`, `rolinherit`), `pg_auth_members`, `pg_user`,
+  `information_schema.role_table_grants` (`grantor`, `is_grantable`),
+  psql's `\du`; the dashboard schema browser's user list follows.
+
+### Changed
+- `GRANT` / `REVOKE` name existing roles (`42704` otherwise) — in
+  insecure mode too. `/metrics` takes the `metrics` role (or admin)
+  instead of any user. `SHOW GRANTS` gained the schema and grantable
+  columns; `SHOW ROLES` lists every role, `SHOW USERS` the login ones.
+  `ALTER` / `DROP` of a table, view, index, sequence or type, `COMMENT
+  ON`, `CREATE INDEX` and `TRUNCATE` are for the object's owner (and
+  admins) rather than admins only; `DROP DATABASE` / `ALTER DATABASE`
+  for its owner. A caller's own context deadline during a statement
+  reports `canceling statement due to user request` (the statement
+  timeout message is reserved for `statement_timeout`).
+
 ## 0.28.0 — unreleased
 
 ### Added

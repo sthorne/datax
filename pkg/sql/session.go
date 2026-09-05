@@ -19,7 +19,6 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/decimal"
-	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -130,10 +129,20 @@ const (
 type Session struct {
 	db  *kvclient.DB
 	cat *catalog.Accessor
-	// user is the authenticated SQL user ("root" for internal sessions).
-	// In insecure/trust mode it is the client-claimed name: privileges are
-	// enforced against it, but nothing verified the identity.
-	user string
+	// sessionUser is the authenticated SQL user ("root" for internal
+	// sessions). In insecure/trust mode it is the client-claimed name:
+	// privileges are enforced against it, but nothing verified the
+	// identity. user is the current role — the session user, or the role
+	// SET ROLE selected (current_user vs session_user).
+	sessionUser string
+	user        string
+	// privAs, when set, is the role privilege checks run as instead of
+	// user: a view's owner while its query executes (cte.go).
+	privAs string
+	// roleCache holds the effective role sets resolved in roleCacheTxn
+	// (privileges.go).
+	roleCache    map[string]catalog.RoleSet
+	roleCacheTxn *kvclient.Txn
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -185,13 +194,13 @@ type Session struct {
 // NewSession creates a root session (internal components, tests, tools).
 // The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase, vars: defaultVars()}
+	return &Session{db: db, cat: cat, sessionUser: "root", user: "root", database: catalog.DefaultDatabase, vars: defaultVars()}
 }
 
 // NewSystemSession creates the node's own root session, the one that may
 // create and drop system tables (the metrics recorder's).
 func NewSystemSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase, system: true}
+	return &Session{db: db, cat: cat, sessionUser: "root", user: "root", database: catalog.DefaultDatabase, system: true, vars: defaultVars()}
 }
 
 // NewSessionForUser creates a session for an authenticated user.
@@ -199,19 +208,26 @@ func NewSessionForUser(db *kvclient.DB, cat *catalog.Accessor, user string) *Ses
 	if user == "" {
 		user = "root"
 	}
-	return &Session{db: db, cat: cat, user: user, database: catalog.DefaultDatabase}
+	return &Session{db: db, cat: cat, sessionUser: user, user: user, database: catalog.DefaultDatabase, vars: defaultVars()}
 }
 
-// SetUser rebinds the session's user (pgwire sets it after startup).
+// SetUser rebinds the session's user (pgwire sets it after startup);
+// any SET ROLE is undone.
 func (s *Session) SetUser(user string) {
 	if user == "" {
 		user = "root"
 	}
-	s.user = user
+	s.sessionUser = user
+	s.vars.role = ""
+	s.applyRole()
 }
 
-// User returns the session's SQL user.
+// User returns the session's current role (current_user): the session
+// user unless SET ROLE changed it.
 func (s *Session) User() string { return s.user }
+
+// SessionUser returns the authenticated session user (session_user).
+func (s *Session) SessionUser() string { return s.sessionUser }
 
 // Database returns the session's current database.
 func (s *Session) Database() string { return s.database }
@@ -310,7 +326,7 @@ func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
 // the tables the session may see (all of them for admins; for others,
 // the tables they hold a privilege on), statistics, users and admins.
 func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.Env, error) {
-	env := &vtable.Env{User: s.user, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Admins: map[string]bool{}}
+	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -323,17 +339,17 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 		return nil, err
 	}
 	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) { return s.sequenceValue(ctx, sd) }
-	admin, err := s.isAdmin(ctx, txn)
+	set, err := s.roleSet(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
-	env.IsAdmin = admin
+	env.IsAdmin = set.IsAdmin()
 	all, err := s.cat.List(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
 	for _, d := range all {
-		if !admin && len(d.Privileges[s.user]) == 0 {
+		if !canSeeTable(set, d) {
 			continue
 		}
 		env.Tables = append(env.Tables, d)
@@ -341,27 +357,11 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 			env.Stats[d.ID] = st
 		}
 	}
-	lo, hi := keys.UserSpan()
-	users, err := txn.Scan(ctx, lo, hi, 0)
+	roles, err := catalog.ListRoles(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
-	env.Users = []string{"root"}
-	for _, kv := range users {
-		if _, name, derr := encoding.DecodeString(kv.Key[len(lo):]); derr == nil && name != "root" {
-			env.Users = append(env.Users, name)
-		}
-	}
-	alo, ahi := keys.AdminUserSpan()
-	admins, err := txn.Scan(ctx, alo, ahi, 0)
-	if err != nil {
-		return nil, err
-	}
-	for _, kv := range admins {
-		if _, name, derr := encoding.DecodeString(kv.Key[len(alo):]); derr == nil {
-			env.Admins[name] = true
-		}
-	}
+	env.Roles = roles
 	env.Settings = s.settings()
 	if s.SessionsHook != nil {
 		env.Sessions = s.SessionsHook()
@@ -452,12 +452,21 @@ func (s *Session) Close(ctx context.Context) {
 
 // Execute runs one parsed statement with the given parameter values,
 // under the session's statement_timeout and lock_timeout.
-func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
+	s.invalidateRoles()
 	if d := s.vars.statementTimeout; d > 0 {
+		parent := ctx
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
+		defer func() {
+			// The message names the statement timeout only when it is
+			// what fired; the caller's own deadline is its request.
+			if serr != nil && serr.Code == CodeQueryCanceled && parent.Err() != nil {
+				serr = &Error{Code: CodeQueryCanceled, Msg: "canceling statement due to user request"}
+			}
+		}()
 	}
 	if d := s.vars.lockTimeout; d > 0 {
 		ctx = kvclient.WithLockTimeout(ctx, d)
@@ -591,15 +600,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ALTER COLUMN TYPE cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
 		}
 		return s.execRetypeOnline(ctx, at)
 	}
@@ -607,15 +609,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
 		}
 		switch {
 		case at.AddConstraint != nil:
@@ -631,15 +626,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
 		}
 		if _, ok := at.SetOptions["retention"]; ok {
 			res, rerr := s.execSetRetention(ctx, at)
@@ -664,15 +652,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, ci.Table); serr != nil {
+			return nil, serr
 		}
 		return s.execCreateIndexOnline(ctx, ci)
 	}

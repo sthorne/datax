@@ -85,23 +85,78 @@ datax sql --url postgres://10.0.0.1:26433/datax --certs-dir certs --user ops -e 
 without it the URL's user is used. A missing certificate is refused with
 the `datax cert create-client` command that creates it.
 
-## Users and privileges
+## Roles and privileges
+
+Authorization follows PostgreSQL's role model (cluster version v11). A
+**role** is the unit of authentication and authorization: a role with
+`LOGIN` is a user, one without is a group, and a role may be a member of
+other roles. Privileges flow along membership — a role holds what it was
+granted directly plus, unless it is `NOINHERIT`, what the roles it
+belongs to hold. Every object records its **owner** (the role that
+created it), who holds every privilege on it and alone — with admins —
+may alter, drop or grant it.
 
 ```sql
-CREATE USER analyst PASSWORD 'trustno1';
-ALTER USER analyst PASSWORD 'rotated';     -- change a password
-DROP USER analyst;
+CREATE ROLE app_readers;                                  -- a group (NOLOGIN)
+CREATE USER analyst PASSWORD 'trustno1' IN ROLE app_readers;  -- = CREATE ROLE ... LOGIN
+CREATE ROLE etl WITH LOGIN PASSWORD '...' NOINHERIT;      -- privileges only via SET ROLE
+ALTER ROLE analyst PASSWORD 'rotated';                    -- a role may change its own password
+ALTER ROLE etl NOLOGIN;                                   -- lock out; LOGIN reopens
+DROP ROLE analyst;                                        -- refused (2BP01) while it owns objects
 
-GRANT SELECT, INSERT ON users TO analyst;  -- per-table: SELECT INSERT UPDATE DELETE ALL
-REVOKE ALL ON users FROM analyst;
+GRANT app_readers TO analyst;                             -- membership
+GRANT app_readers TO lead WITH ADMIN OPTION;              -- lead may grant app_readers on
+REVOKE app_readers FROM analyst;
+SET ROLE app_readers;  SELECT current_user, session_user; RESET ROLE;
 
-GRANT ADMIN TO analyst;                    -- admin role: full access + user management
-REVOKE ADMIN FROM analyst;
+GRANT SELECT, INSERT ON users TO app_readers;             -- SELECT INSERT UPDATE DELETE TRUNCATE ALL
+GRANT ALL ON ALL TABLES IN SCHEMA public TO etl;
+GRANT SELECT ON orders TO analyst WITH GRANT OPTION;      -- analyst may pass SELECT on
+GRANT USAGE ON SEQUENCE order_ids TO etl;                 -- USAGE SELECT UPDATE
+GRANT CONNECT, CREATE ON DATABASE app TO etl;             -- CREATE: make tables there
+GRANT USAGE, CREATE ON SCHEMA public TO etl;
+REVOKE CONNECT ON DATABASE app FROM PUBLIC;               -- PUBLIC: everyone
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_readers;
+
+ALTER TABLE users OWNER TO etl;                           -- also VIEW, SEQUENCE, TYPE, DATABASE
+REASSIGN OWNED BY analyst TO etl;  DROP OWNED BY analyst;  DROP ROLE analyst;
+
+SHOW ROLES;  SHOW USERS;  SHOW GRANTS [ON t | ON DATABASE d | ON ROLE r] [FOR r];
 ```
 
-Note the syntax: `CREATE USER name PASSWORD '...'` — no `WITH`. `root` is
-always an admin. Table privileges take effect cluster-wide by the time the
-statement returns.
+The built-in roles always exist and cannot be altered or dropped:
+
+| Role | Holds |
+|---|---|
+| `admin` | everything: every privilege on every object, role and grant management, the admin HTTP and RPC surfaces. `root` is an implicit, irrevocable member; `GRANT admin TO ops` (the old `GRANT ADMIN TO ops` spelling still works) |
+| `read_all` | `SELECT` on every table, view and sequence (PostgreSQL's `pg_read_all_data`) — reporting accounts |
+| `write_all` | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` on every table (`pg_write_all_data`) — ETL accounts |
+| `metrics` | the HTTP `/metrics` endpoint, and nothing else — the Prometheus scrape account needs no table grants and cannot read data |
+
+What each statement needs: creating tables, views, sequences and types
+takes `CREATE` on the database (or on `public`), or the admin role;
+`ALTER`, `DROP`, `COMMENT ON`, `CREATE INDEX` and `GRANT` on an object
+take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
+(a pre-v11 `DELETE` grant still covers it); `nextval` takes `USAGE` on
+the sequence — a `SERIAL` column's sequence follows `INSERT` on the
+table; `CREATE DATABASE`, role management and `ANALYZE` take the admin
+role. A view's query runs with its **owner's** privileges (PostgreSQL's
+rule): a reader needs `SELECT` on the view only. `DROP ROLE` refuses a
+role that owns objects (`2BP01`); `REASSIGN OWNED` or `DROP OWNED` first.
+Its grants and memberships go with it. Grants take effect cluster-wide
+by the time the statement returns; a membership change is seen by the
+next statement everywhere.
+
+A cluster upgraded from an earlier version keeps its users and `ADMIN`
+grants: `datax debug upgrade` rewrites them as roles in the same
+finalize transaction, and until then the old statements keep working
+while the new ones (`CREATE ROLE`, `NOLOGIN`, memberships other than
+`admin`, ownership, sequence, schema, `ALL TABLES` and default-privilege
+grants, `SET ROLE`) are refused with `0A000`.
+
+Note the syntax: `CREATE USER name PASSWORD '...'` — `WITH` is optional.
+In insecure (trust) mode the session user is whatever the client
+claims, but grants still name existing roles: create them first.
 
 ## HTTP endpoints in secure mode
 
@@ -111,8 +166,9 @@ is per endpoint:
 
 | Endpoint | Who |
 |---|---|
-| `/`, `/metrics`, `/status`, `/api/cluster` | any database user (read-only) |
-| `/api/range` (cross-node drill-down) | admin role only — it fans out over internode RPC |
+| `/`, `/status`, `/api/cluster` | any database user (read-only) |
+| `/metrics` | the `metrics` role (or admin) |
+| `/api/range` (cross-node drill-down), `/api/activity` | admin role only — it fans out over internode RPC |
 
 Rejected credentials are audited (`datax_auth_failures_total`); an
 authenticated non-admin hitting an admin endpoint gets 403 and an
@@ -130,8 +186,8 @@ scrape_configs:
       - targets: ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"]
 ```
 
-(Create a dedicated low-privilege `metrics_user` — HTTP auth accepts any
-valid user, and that user needs no table grants.)
+(`CREATE USER metrics_user PASSWORD '...' IN ROLE metrics` — the role
+scrapes `/metrics` and nothing else; it cannot read data.)
 
 The browser dashboard works with the same Basic credentials — the browser
 prompts once and same-origin fetches reuse them.
@@ -160,7 +216,8 @@ The server authorizes by the certificate's CommonName: read-only ops
 state-changing ops (split, merge, rebalance, transfer-lease,
 decommission, upgrade, backup, restore, store-key rotation) and
 `node-status` (per-replica internals, the `/api/range` data source)
-require the **admin role** — `root`, or a user granted `GRANT ADMIN`.
+require the **admin role** — `root`, or a member of `admin` (`GRANT
+admin TO ops`), resolved through role membership.
 Every admin op except the read-only ones is audited with its outcome.
 In insecure mode the admin surface is open, like everything else.
 
@@ -181,11 +238,14 @@ records (`msg=audit`), each with the acting principal:
   (`datax_auth_failures_total`)
 - denied admin operations (`datax_admin_denied_total`)
 - executed state-changing admin RPCs (op, principal, target)
-- user and privilege DDL: `CREATE`/`ALTER`/`DROP USER`,
-  `GRANT`/`REVOKE` (including `GRANT ADMIN`)
+- role and privilege DDL: `CREATE`/`ALTER`/`DROP ROLE` and `USER`,
+  `GRANT`/`REVOKE` (privileges and memberships), ownership changes,
+  `ALTER DEFAULT PRIVILEGES` — each with the session user (`principal`)
+  and the current role (`role`, different after `SET ROLE`)
 - `datax debug unsafe-recover` (offline: records the OS user)
 
 ## What secure mode does not do
 
-- No column- or row-level SQL privileges — grants are per table.
+- No column- or row-level SQL privileges — grants are per table (or
+  sequence, database, schema).
 - No certificate revocation — rotate the CA to invalidate issued certs.

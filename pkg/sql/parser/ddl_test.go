@@ -76,12 +76,12 @@ func TestParseDDLCompleteness(t *testing.T) {
 	if !ci.Unique || !ci.IfNotExists || ci.Name != "by_email" || ci.Table != "users" {
 		t.Fatalf("create index if not exists: %+v", ci)
 	}
-	cu := parseOne(t, `CREATE USER IF NOT EXISTS ann PASSWORD 'pw'`).(*CreateUser)
-	if cu.Name != "ann" || !cu.IfNotExists || cu.Alter {
+	cu := parseOne(t, `CREATE USER IF NOT EXISTS ann PASSWORD 'pw'`).(*CreateRole)
+	if cu.Name != "ann" || !cu.IfNotExists || cu.Alter || !cu.IsUser || cu.Password == nil || *cu.Password != "pw" {
 		t.Fatalf("create user if not exists: %+v", cu)
 	}
-	du := parseOne(t, `DROP USER IF EXISTS ann`).(*DropUser)
-	if du.Name != "ann" || !du.IfExists {
+	du := parseOne(t, `DROP USER IF EXISTS ann`).(*DropRole)
+	if len(du.Names) != 1 || du.Names[0] != "ann" || !du.IfExists {
 		t.Fatalf("drop user if exists: %+v", du)
 	}
 	as := parseOne(t, `ALTER SEQUENCE IF EXISTS s RESTART WITH 10`).(*AlterSequence)

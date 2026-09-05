@@ -47,9 +47,13 @@ func TestCatalogViewsSmoke(t *testing.T) {
 	if _, serr := trySQL(ctx, root, `INSERT INTO pg_class VALUES (1)`); serr == nil || serr.Code != sql.CodeInsufficientPriv {
 		t.Fatalf("write to a catalog: %v", serr)
 	}
-	r = execSQL(t, ctx, root, `SELECT rolname, rolsuper FROM pg_roles`)
+	// root and the built-in roles (admin, read_all, write_all, metrics).
+	r = execSQL(t, ctx, root, `SELECT rolname, rolsuper FROM pg_roles WHERE rolcanlogin`)
 	if len(r.Rows) != 1 || r.Rows[0][0].S != "root" || !r.Rows[0][1].B {
 		t.Fatalf("pg_roles: %+v", r.Rows)
+	}
+	if r := execSQL(t, ctx, root, `SELECT rolname FROM pg_roles WHERE NOT rolcanlogin ORDER BY rolname`); len(r.Rows) != 4 || r.Rows[0][0].S != "admin" {
+		t.Fatalf("pg_roles built-ins: %+v", r.Rows)
 	}
 }
 
@@ -332,7 +336,8 @@ func TestPsqlCatalogQueries(t *testing.T) {
 	// The list commands (a view alongside the table: \dt lists tables
 	// only, \dv the view).
 	execSQL(t, ctx, root, `CREATE VIEW tv AS SELECT id, name FROM t WHERE qty > 0`)
-	want := map[string]int{`\l`: 2, `\dt`: 1, `\dv`: 1, `\di`: 3, `\du`: 2, `\dn`: 1, `\dp`: 2, `\dT`: 0}
+	// \du: root, bob, and the four built-in roles.
+	want := map[string]int{`\l`: 2, `\dt`: 1, `\dv`: 1, `\di`: 3, `\du`: 6, `\dn`: 1, `\dp`: 2, `\dT`: 0}
 	for cmd, q := range psqlListQueries {
 		if got := rowsOf(q); len(got) != want[cmd] {
 			t.Fatalf("%s: %d rows, want %d: %v", cmd, len(got), want[cmd], got)
@@ -467,7 +472,7 @@ func TestSQLSurfaceForTools(t *testing.T) {
 		t.Fatalf("SHOW USERS: %+v", r.Rows)
 	}
 	r = execSQL(t, ctx, root, `SHOW GRANTS ON t FOR bob`)
-	if len(r.Rows) != 2 || r.Rows[0][2].S != "bob" || r.Rows[0][3].S != "SELECT" || r.Rows[1][3].S != "INSERT" {
+	if len(r.Rows) != 2 || r.Rows[0][2].S != "t" || r.Rows[0][3].S != "bob" || r.Rows[0][4].S != "SELECT" || r.Rows[1][4].S != "INSERT" || r.Rows[0][5].S != "NO" {
 		t.Fatalf("SHOW GRANTS: %+v", r.Rows)
 	}
 	if r := execSQL(t, ctx, root, `SHOW GRANTS`); len(r.Rows) != 2 {

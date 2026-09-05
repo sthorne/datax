@@ -31,6 +31,10 @@ type ServerOptions struct {
 	TLS *tls.Config
 	// Auth, when set, requires SCRAM-SHA-256; nil = trust.
 	Auth Authenticator
+	// CanLogin, when set, gates the certificate path too: a CA-verified
+	// client certificate authenticates its CommonName only when that
+	// role exists and may log in (false, nil = refused).
+	CanLogin func(ctx context.Context, user string) (bool, error)
 	// SlowStatementThreshold is the duration past which a statement is
 	// kept in the slow-statement ring (0 = the default, 500 ms).
 	SlowStatementThreshold time.Duration

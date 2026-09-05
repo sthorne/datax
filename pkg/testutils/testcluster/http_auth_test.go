@@ -124,7 +124,8 @@ func TestHTTPAuthSecure(t *testing.T) {
 		t.Fatalf("unknown-user response differs from wrong-password: %q vs %q", bodyU, bodyW)
 	}
 
-	// Any valid user works — endpoints are read-only, admin not required.
+	// Any valid user reaches the read-only endpoints; /metrics takes the
+	// metrics role (or admin), so a scrape account needs no table grants.
 	conn, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
 	if err != nil {
 		t.Fatal(err)
@@ -132,10 +133,9 @@ func TestHTTPAuthSecure(t *testing.T) {
 	if _, err := conn.Exec(ctx, `CREATE USER scraper PASSWORD 'metrics-pw'`); err != nil {
 		t.Fatal(err)
 	}
-	_ = conn.Close(ctx)
 	deadline = time.Now().Add(30 * time.Second)
 	for {
-		code, _, _ := authedGet(t, client, base+"/metrics", "scraper", "metrics-pw")
+		code, _, _ := authedGet(t, client, base+"/status", "scraper", "metrics-pw")
 		if code == http.StatusOK {
 			break
 		}
@@ -143,6 +143,16 @@ func TestHTTPAuthSecure(t *testing.T) {
 			t.Fatalf("non-admin user never authenticated (last code %d)", code)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	if code, _, _ := authedGet(t, client, base+"/metrics", "scraper", "metrics-pw"); code != http.StatusForbidden {
+		t.Fatalf("/metrics without the metrics role: %d, want 403", code)
+	}
+	if _, err := conn.Exec(ctx, `GRANT metrics TO scraper`); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close(ctx)
+	if code, _, _ := authedGet(t, client, base+"/metrics", "scraper", "metrics-pw"); code != http.StatusOK {
+		t.Fatalf("/metrics with the metrics role: %d, want 200", code)
 	}
 	if code, _, _ := authedGet(t, client, base+"/metrics", "scraper", "wrong"); code != http.StatusUnauthorized {
 		t.Fatal("scraper with wrong password accepted")

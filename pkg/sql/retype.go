@@ -194,7 +194,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 		return nil, ToSQLError(err)
 	}
 	if widened {
-		log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.user)
+		log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.sessionUser, "role", s.user)
 		return &Result{Tag: "ALTER TABLE"}, nil
 	}
 
@@ -267,7 +267,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
-	log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.user)
+	log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 

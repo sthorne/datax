@@ -76,6 +76,9 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 	if catalog.IsSystemTable(desc.Name) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "index %q belongs to the cluster table %q and cannot be dropped", idx.Name, desc.Name)
 	}
+	if err := s.checkTableOwner(ctx, txn, desc); err != nil {
+		return nil, err
+	}
 	for _, c := range desc.Constraints {
 		if c.IndexID == idx.ID {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop index %q because constraint %q on table %q requires it (drop the constraint instead)", idx.Name, c.Name, desc.Name)
@@ -100,7 +103,7 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 	}
 	s.noteDDL(desc.Name)
 	s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
-	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.user)
+	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP INDEX"}, nil
 }
 
@@ -121,6 +124,9 @@ func (s *Session) execAlterIndex(ctx context.Context, txn *kvclient.Txn, t *pars
 	if catalog.IsSystemTable(desc.Name) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "index %q belongs to the cluster table %q", idx.Name, desc.Name)
 	}
+	if err := s.checkTableOwner(ctx, txn, desc); err != nil {
+		return nil, err
+	}
 	if err := checkNewIndexName(desc, t.NewName); err != nil {
 		return nil, err
 	}
@@ -135,7 +141,7 @@ func (s *Session) execAlterIndex(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, err
 	}
 	s.noteDDL(desc.Name)
-	log.Audit("index-ddl", "stmt", "ALTER INDEX RENAME", "target", desc.Name+"."+old, "to", t.NewName, "principal", s.user)
+	log.Audit("index-ddl", "stmt", "ALTER INDEX RENAME", "target", desc.Name+"."+old, "to", t.NewName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER INDEX"}, nil
 }
 
@@ -169,7 +175,7 @@ func (s *Session) execRenameTable(ctx context.Context, txn *kvclient.Txn, desc *
 	if err := s.cat.RenameTable(ctx, txn, desc, t.RenameTo); err != nil {
 		return nil, err
 	}
-	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME", "target", old, "to", t.RenameTo, "principal", s.user)
+	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME", "target", old, "to", t.RenameTo, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -225,7 +231,7 @@ func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc 
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME COLUMN", "target", desc.Name+"."+r.From, "to", r.To, "principal", s.user)
+	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME COLUMN", "target", desc.Name+"."+r.From, "to", r.To, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -257,7 +263,7 @@ func (s *Session) execRenameConstraint(ctx context.Context, txn *kvclient.Txn, d
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	log.Audit("constraint-ddl", "stmt", "RENAME CONSTRAINT", "target", desc.Name+"."+r.From, "to", r.To, "principal", s.user)
+	log.Audit("constraint-ddl", "stmt", "RENAME CONSTRAINT", "target", desc.Name+"."+r.From, "to", r.To, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -329,7 +335,7 @@ func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *c
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	log.Audit("table-ddl", "stmt", "ALTER COLUMN "+stmt, "target", desc.Name+"."+colName, "principal", s.user)
+	log.Audit("table-ddl", "stmt", "ALTER COLUMN "+stmt, "target", desc.Name+"."+colName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -358,7 +364,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		if d, ok := descs[shared.ID]; ok {
 			return d, nil
 		}
-		if err := s.checkTablePriv(ctx, txn, shared, "DELETE"); err != nil {
+		if err := s.checkTablePriv(ctx, txn, shared, "TRUNCATE"); err != nil {
 			return nil, err
 		}
 		desc := shared.Clone()
@@ -433,7 +439,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		s.noteDDL(desc.Name)
 		names = append(names, desc.Name)
 	}
-	log.Audit("table-ddl", "stmt", "TRUNCATE", "target", strings.Join(names, ","), "principal", s.user)
+	log.Audit("table-ddl", "stmt", "TRUNCATE", "target", strings.Join(names, ","), "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "TRUNCATE TABLE"}, nil
 }
 

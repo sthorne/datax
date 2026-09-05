@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/util/log"
 	"math"
 	"net"
 	"os"
@@ -469,6 +471,16 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				// the startup user authenticates without a password.
 				user := m.Parameters["user"]
 				if user != "" && c.clientCertUser() == user {
+					if c.opts.CanLogin != nil {
+						ok, err := c.opts.CanLogin(ctx, user)
+						if err != nil || !ok {
+							metrics.AuthFailures.Inc()
+							log.Audit("sql-auth-failure", "principal", user, "remote", c.nc.RemoteAddr().String(), "reason", "certificate role cannot log in")
+							c.sendError(&sql.Error{Code: "28000", Msg: fmt.Sprintf("role %q is not permitted to log in", user)})
+							_ = c.backend.Flush()
+							return fmt.Errorf("certificate role %q cannot log in", user)
+						}
+					}
 					c.backend.Send(&pgproto3.AuthenticationOk{})
 				} else if err := c.authenticateSCRAM(user); err != nil {
 					return err

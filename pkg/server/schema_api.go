@@ -398,46 +398,27 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		doc.Tables = append(doc.Tables, t)
 	}
 
-	// Users: the SCRAM records and the admin-role markers; root is an
-	// implicit admin with no marker.
-	admins := map[string]bool{"root": true}
-	if aStart, aEnd := keys.AdminUserSpan(); true {
-		if rows, err := n.db.Scan(ctx, aStart, aEnd, 0); err == nil {
-			for _, kv := range rows {
-				if name, ok := nameOfKey(kv.Key, aStart); ok {
-					admins[name] = true
-				}
+	// Users: the login roles, with admin authority resolved through
+	// membership (root is an implicit admin). Insecure mode has no
+	// verifier for root; the role still exists.
+	if roles, err := catalog.ListRoles(ctx, n.db); err == nil {
+		graph := catalog.NewRoleGraph(roles)
+		seen := false
+		for _, r := range roles {
+			if !r.Login && r.Name != catalog.RootRole {
+				continue
 			}
-		}
-	}
-	seen := map[string]bool{}
-	if uStart, uEnd := keys.UserSpan(); true {
-		if rows, err := n.db.Scan(ctx, uStart, uEnd, 0); err == nil {
-			for _, kv := range rows {
-				if name, ok := nameOfKey(kv.Key, uStart); ok {
-					seen[name] = true
-					doc.Users = append(doc.Users, SchemaUser{Name: name, Admin: admins[name]})
-				}
+			set, gerr := graph.Effective(r.Name)
+			if gerr != nil {
+				continue
 			}
+			seen = seen || r.Name == catalog.RootRole
+			doc.Users = append(doc.Users, SchemaUser{Name: r.Name, Admin: set.IsAdmin()})
 		}
-	}
-	if !seen["root"] {
-		// Insecure mode (no verifier seeded), or a secure cluster before
-		// the seed lands: root exists regardless.
-		doc.Users = append(doc.Users, SchemaUser{Name: "root", Admin: true})
+		if !seen {
+			doc.Users = append(doc.Users, SchemaUser{Name: catalog.RootRole, Admin: true})
+		}
 	}
 	sort.Slice(doc.Users, func(i, j int) bool { return doc.Users[i].Name < doc.Users[j].Name })
 	return doc, names, byID
-}
-
-// nameOfKey decodes the user name from a users or admins record key.
-func nameOfKey(k keys.Key, prefix keys.Key) (string, bool) {
-	if len(k) <= len(prefix) {
-		return "", false
-	}
-	_, name, err := encoding.DecodeString(k[len(prefix):])
-	if err != nil {
-		return "", false
-	}
-	return name, true
 }

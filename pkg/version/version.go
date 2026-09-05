@@ -87,9 +87,18 @@ const (
 	// TABLE, ADD COLUMN or ALTER COLUMN TYPE naming them is refused
 	// until finalize (rule 4).
 	V10 Version = 10
+	// V11 introduces roles (pkg/sql/catalog/role.go): role descriptors
+	// at /system/roles supersede the /system/users credential records
+	// and the /system/admins markers, which the finalize migration
+	// rewrites in one transaction. A v10 node authenticates from the
+	// old layout only, so the statements that write role descriptors
+	// (CREATE ROLE, GRANT role TO role, ownership, scoped grants) are
+	// refused until finalize; CREATE USER and GRANT ADMIN keep writing
+	// the old layout until then (rule 4).
+	V11 Version = 11
 
 	// Current is the newest cluster version this binary can run.
-	Current = V10
+	Current = V11
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

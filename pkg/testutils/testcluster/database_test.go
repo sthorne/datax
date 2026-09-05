@@ -205,7 +205,7 @@ func TestDatabases(t *testing.T) {
 	}
 	execSQL(t, ctx, root, `GRANT CONNECT ON DATABASE shop TO bob`)
 	execSQL(t, ctx, bob2, `USE shop`)
-	if _, serr := trySQL(ctx, root, `GRANT SELECT ON DATABASE shop TO bob`); serr == nil || serr.Code != sql.CodeSyntaxError {
+	if _, serr := trySQL(ctx, root, `GRANT SELECT ON DATABASE shop TO bob`); serr == nil || serr.Code != sql.CodeInvalidGrantOperation {
 		t.Fatalf("table privilege on a database: %v", serr)
 	}
 	execSQL(t, ctx, root, `GRANT SELECT ON shop.items TO bob`)

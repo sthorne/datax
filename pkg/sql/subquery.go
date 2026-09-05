@@ -90,8 +90,11 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "current_schema":
 		d := types.NewString(catalog.PublicSchema)
 		out.Func, out.Lit = "", &d
-	case "current_user", "session_user":
+	case "current_user":
 		d := types.NewString(s.user)
+		out.Func, out.Lit = "", &d
+	case "session_user":
+		d := types.NewString(s.sessionUser)
 		out.Func, out.Lit = "", &d
 	case "version":
 		d := types.NewString("PostgreSQL 14.0 datax " + version.Release)

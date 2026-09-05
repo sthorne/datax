@@ -21,6 +21,8 @@ type TypeDescriptor struct {
 	Name       string   `json:"name"`
 	DatabaseID uint64   `json:"database_id,omitempty"`
 	Labels     []string `json:"labels"`
+	// Owner is the owning role (v11; empty = root).
+	Owner string `json:"owner,omitempty"`
 }
 
 // ErrTypeNotFound / ErrTypeExists are the catalog's name errors.

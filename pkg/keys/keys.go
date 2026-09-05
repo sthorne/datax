@@ -450,6 +450,21 @@ func AdminUserSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// RoleKey holds a role's descriptor (pkg/sql/catalog.RoleDescriptor:
+// login flag, SCRAM verifier, memberships) at /system/roles/<name>.
+// Cluster version v11 supersedes the /system/users and /system/admins
+// layouts with it; the finalize migration rewrites them.
+func RoleKey(name string) Key {
+	k := systemKey("roles")
+	return Key(encoding.EncodeString(k, name))
+}
+
+// RoleSpan covers every role descriptor.
+func RoleSpan() (Key, Key) {
+	p := systemKey("roles")
+	return p, p.PrefixEnd()
+}
+
 // ---------------------------------------------------------------------------
 // Table data keys.
 

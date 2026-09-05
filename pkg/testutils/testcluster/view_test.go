@@ -179,7 +179,7 @@ func TestViews(t *testing.T) {
 	execSQL(t, ctx, s, `ROLLBACK`)
 	expectCode(`SELECT * FROM tmp`, sql.CodeUndefinedTable)
 
-	// ---- privileges: SELECT on the view and on what it reads ----
+	// ---- privileges: SELECT on the view; its query runs as the owner ----
 	execSQL(t, ctx, s, `CREATE USER alice PASSWORD 'pw12345'`)
 	aliceCat := catalog.NewAccessor()
 	if err := aliceCat.StartLeasing(tc.Nodes[0].DB(), tc.Nodes[0].Clock(), tc.Nodes[0].Stopper(), 2*time.Second); err != nil {
@@ -188,11 +188,12 @@ func TestViews(t *testing.T) {
 	alice := sql.NewSessionForUser(tc.Nodes[0].DB(), aliceCat, "alice")
 	denied(t, ctx, alice, `SELECT who FROM names`)
 	execSQL(t, ctx, s, `GRANT SELECT ON names TO alice`)
-	denied(t, ctx, alice, `SELECT who FROM names`) // the query reads customers
-	execSQL(t, ctx, s, `GRANT SELECT ON customers TO alice`)
-	if r := execSQL(t, ctx, alice, `SELECT who FROM names ORDER BY who`); rowsText(r) != "bob;cy" {
+	// Definer semantics (issue #98): the view's owner (root) reads
+	// customers on alice's behalf; alice still cannot read it directly.
+	if r := execEventually(t, ctx, alice, `SELECT who FROM names ORDER BY who`); rowsText(r) != "bob;cy" {
 		t.Fatalf("alice reads the view: %s", rowsText(r))
 	}
+	denied(t, ctx, alice, `SELECT name FROM customers`)
 	denied(t, ctx, alice, `DROP VIEW names`)
 	denied(t, ctx, alice, `CREATE VIEW mine AS SELECT who FROM names`)
 }

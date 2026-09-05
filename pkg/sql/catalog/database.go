@@ -33,24 +33,66 @@ const (
 	PublicSchema = "public"
 )
 
-// Database privileges.
+// Database and schema privileges.
 const (
 	PrivCreate  = "CREATE"
 	PrivConnect = "CONNECT"
+	PrivUsage   = "USAGE"
 )
+
+// DefaultPrivilege is one ALTER DEFAULT PRIVILEGES rule of a database:
+// when ForRole creates an object of Object's kind ("TABLES" or
+// "SEQUENCES"), Grantee receives Privileges on it.
+type DefaultPrivilege struct {
+	ForRole     string   `json:"for_role"`
+	Object      string   `json:"object"`
+	Grantee     string   `json:"grantee"`
+	Privileges  []string `json:"privileges"`
+	GrantOption bool     `json:"grant_option,omitempty"`
+}
 
 // DatabaseDescriptor describes a database.
 type DatabaseDescriptor struct {
 	ID    uint64 `json:"id"`
 	Name  string `json:"name"`
 	Owner string `json:"owner,omitempty"`
-	// Privileges maps a user to its database privileges (CREATE, CONNECT).
-	Privileges map[string][]string `json:"privileges,omitempty"`
+	// Privileges maps a grantee role to its database privileges (CREATE,
+	// CONNECT); GrantOptions the subset held WITH GRANT OPTION.
+	Privileges   map[string][]string `json:"privileges,omitempty"`
+	GrantOptions map[string][]string `json:"grant_options,omitempty"`
 	// ConnectRestricted is set by REVOKE CONNECT ... FROM PUBLIC: then only
 	// admins and users holding CONNECT may open a session on the database.
 	// PostgreSQL grants CONNECT to PUBLIC on every new database; so does
 	// this.
 	ConnectRestricted bool `json:"connect_restricted,omitempty"`
+	// SchemaPrivileges maps a grantee to its privileges on the public
+	// schema (USAGE, CREATE); SchemaGrantOptions the grant-option subset.
+	// USAGE is PUBLIC's unless UsageRestricted (REVOKE USAGE ON SCHEMA
+	// public FROM PUBLIC), after which only holders may reach the
+	// schema's objects.
+	SchemaPrivileges   map[string][]string `json:"schema_privileges,omitempty"`
+	SchemaGrantOptions map[string][]string `json:"schema_grant_options,omitempty"`
+	UsageRestricted    bool                `json:"usage_restricted,omitempty"`
+	// DefaultPrivileges are the database's ALTER DEFAULT PRIVILEGES rules.
+	DefaultPrivileges []DefaultPrivilege `json:"default_privileges,omitempty"`
+}
+
+// Clone returns a deep copy.
+func (d *DatabaseDescriptor) Clone() *DatabaseDescriptor {
+	out := *d
+	out.Privileges = ClonePrivileges(d.Privileges)
+	out.GrantOptions = ClonePrivileges(d.GrantOptions)
+	out.SchemaPrivileges = ClonePrivileges(d.SchemaPrivileges)
+	out.SchemaGrantOptions = ClonePrivileges(d.SchemaGrantOptions)
+	out.DefaultPrivileges = make([]DefaultPrivilege, len(d.DefaultPrivileges))
+	for i, dp := range d.DefaultPrivileges {
+		out.DefaultPrivileges[i] = dp
+		out.DefaultPrivileges[i].Privileges = append([]string(nil), dp.Privileges...)
+	}
+	if len(out.DefaultPrivileges) == 0 {
+		out.DefaultPrivileges = nil
+	}
+	return &out
 }
 
 // HasPrivilege reports whether user holds priv on the database.
@@ -112,6 +154,23 @@ func readDatabase(ctx context.Context, txn *kvclient.Txn, id uint64, name string
 	}
 	if raw == nil {
 		return nil, fmt.Errorf("database namespace entry for %q points at missing descriptor %d", name, id)
+	}
+	var d DatabaseDescriptor
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("corrupt database descriptor %d: %w", id, err)
+	}
+	return &d, nil
+}
+
+// ReadDatabase reads a database descriptor by ID (nil, nil for ID 0,
+// the pre-migration default database, or a missing descriptor).
+func ReadDatabase(ctx context.Context, txn *kvclient.Txn, id uint64) (*DatabaseDescriptor, error) {
+	if id == 0 {
+		return nil, nil
+	}
+	raw, err := txn.Get(ctx, keys.DatabaseDescKey(id))
+	if err != nil || raw == nil {
+		return nil, err
 	}
 	var d DatabaseDescriptor
 	if err := json.Unmarshal(raw, &d); err != nil {

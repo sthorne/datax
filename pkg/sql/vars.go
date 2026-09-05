@@ -36,6 +36,8 @@ type sessionVars struct {
 	idleInTxnTimeout  time.Duration
 	cascadeLimit      int
 	cascadeLimitIsSet bool
+	// role is SET ROLE's role ("" = none: the session user).
+	role string
 }
 
 func defaultVars() sessionVars {
@@ -54,6 +56,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"idle_in_transaction_session_timeout", "integer", "ms"},
 	{"integer_datetimes", "bool", ""},
 	{"lock_timeout", "integer", "ms"},
+	{"role", "string", ""},
 	{"search_path", "string", ""},
 	{"server_encoding", "string", ""},
 	{"server_version", "string", ""},
@@ -74,7 +77,7 @@ func canonicalVar(name string) string {
 		return "transaction_isolation"
 	case "datestyle":
 		return "DateStyle"
-	case "session_authorization", "role":
+	case "session_authorization":
 		return ""
 	}
 	for _, v := range varNames {
@@ -91,6 +94,11 @@ func (s *Session) varValue(name string) string {
 	switch name {
 	case "application_name":
 		return v.applicationName
+	case "role":
+		if v.role == "" {
+			return "none"
+		}
+		return v.role
 	case "client_encoding":
 		return v.clientEncoding
 	case "database":
@@ -234,6 +242,14 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 		vars.applicationName = ""
 		if !reset {
 			vars.applicationName = unquote(value)
+		}
+	case "role":
+		// Validated by execSetVar (it needs a transaction); NONE resets.
+		vars.role = ""
+		if !reset {
+			if v := strings.ToLower(unquote(value)); v != "none" {
+				vars.role = v
+			}
 		}
 	case "client_encoding":
 		if !reset {
@@ -381,6 +397,7 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 			s.vars = defaultVars()
 			s.localVars = nil
 			s.cascadeLimit = 0
+			s.applyRole()
 			return &Result{Tag: tag}, nil
 		}
 	}
@@ -391,6 +408,14 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 	if t.Local && s.state != StateOpen {
 		// PostgreSQL warns and applies nothing outside a block.
 		return &Result{Tag: tag}, nil
+	}
+	if name == "role" && !t.Reset {
+		role := strings.ToLower(strings.Trim(t.Value, "'\""))
+		if role != "none" {
+			if serr := s.checkSetRole(ctx, role); serr != nil {
+				return nil, serr
+			}
+		}
 	}
 	target := &s.vars
 	if t.Local || name == "transaction_read_only" && s.state == StateOpen {
@@ -403,6 +428,8 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 		return nil, ToSQLError(err)
 	}
 	switch name {
+	case "role":
+		s.applyRole()
 	case "foreign_key_cascade_limit":
 		s.cascadeLimit = s.vars.cascadeLimit
 	case "transaction_read_only":
@@ -421,6 +448,7 @@ func (s *Session) endTxnVars() {
 	if s.localVars != nil {
 		s.vars = *s.localVars
 		s.localVars = nil
+		s.applyRole()
 	}
 	s.vars.txnReadOnly = false
 }
@@ -451,7 +479,8 @@ func writeKind(stmt parser.Statement) string {
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable, *parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex,
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateType, *parser.AlterType, *parser.DropType,
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
-		*parser.CreateUser, *parser.DropUser, *parser.GrantRevoke, *parser.Truncate, *parser.CommentOn, *parser.Analyze:
+		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
+		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze:
 		return "DDL"
 	}
 	return ""

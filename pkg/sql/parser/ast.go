@@ -583,6 +583,9 @@ type CTE struct {
 	// Qualified is a second, database-qualified name the bound relation
 	// answers to (a view referenced as db.v; see pkg/sql/view.go).
 	Qualified string
+	// Definer, when set, is the role whose privileges the member's query
+	// runs with: a view's owner (pkg/sql/view.go).
+	Definer string
 }
 
 type Select struct {
@@ -724,33 +727,92 @@ type Delete struct {
 	Returning []SelectExpr
 }
 
-// CreateUser is CREATE USER / ALTER USER ... PASSWORD 'pw'.
-type CreateUser struct {
-	Name     string
-	Password string
-	Alter    bool // ALTER USER: the user must already exist
-	// IfNotExists is CREATE USER IF NOT EXISTS: an existing user is a
-	// no-op (the password is left alone).
+// CreateRole is CREATE ROLE / CREATE USER / ALTER ROLE / ALTER USER
+// (issue #98). CREATE USER is CREATE ROLE ... LOGIN; the options are
+// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT and
+// IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
+// alone; CREATE applies the default).
+type CreateRole struct {
+	Name string
+	// Alter marks ALTER ROLE / ALTER USER: the role must already exist.
+	Alter bool
+	// IfNotExists is CREATE ... IF NOT EXISTS: an existing role is a no-op.
 	IfNotExists bool
+	// IsUser marks the USER spelling (LOGIN by default).
+	IsUser bool
+	Login  *bool
+	// Password: nil = not spelled; "" = PASSWORD NULL (no password).
+	Password *string
+	Inherit  *bool
+	// InRoles are the roles the new role is made a member of (IN ROLE).
+	InRoles []string
 }
 
-// DropUser is DROP USER [IF EXISTS] name.
-type DropUser struct {
-	Name     string
+// DropRole is DROP ROLE / DROP USER [IF EXISTS] name [, ...].
+type DropRole struct {
+	Names    []string
 	IfExists bool
 }
 
-// GrantRevoke is GRANT/REVOKE: either the admin role
-// (GRANT ADMIN TO user / REVOKE ADMIN FROM user) or per-table privileges
-// (GRANT SELECT, INSERT ON t TO user / REVOKE ALL ON t FROM user).
+// GrantRevoke is GRANT / REVOKE in both forms: role membership
+// (GRANT admin TO alice [WITH ADMIN OPTION]; REVOKE [ADMIN OPTION FOR]
+// admin FROM alice) when Roles is set, and object privileges otherwise
+// (GRANT SELECT, INSERT ON t1, t2 TO alice, PUBLIC [WITH GRANT OPTION];
+// REVOKE [GRANT OPTION FOR] ALL ON ALL TABLES IN SCHEMA public FROM bob).
 type GrantRevoke struct {
-	Revoke     bool
-	Admin      bool     // admin-role form; Privileges/Table empty
-	Privileges []string // upper-cased: SELECT INSERT UPDATE DELETE ALL
-	// Database names the database for GRANT ... ON DATABASE (Table empty).
-	Database string
-	Table    string
-	User     string
+	Revoke bool
+
+	// Membership form.
+	Roles       []string
+	AdminOption bool
+
+	// Privilege form. Privileges are upper-cased (SELECT INSERT UPDATE
+	// DELETE TRUNCATE USAGE CREATE CONNECT; ALL stays "ALL"). ObjectKind
+	// is "table" (the default), "sequence", "database" or "schema";
+	// Objects the names, or — AllInSchema — every table / sequence of the
+	// public schema of the current database.
+	Privileges  []string
+	ObjectKind  string
+	Objects     []string
+	AllInSchema bool
+	// Grantees are role names, lower-cased; "public" is the pseudo-role.
+	Grantees []string
+	// GrantOption is WITH GRANT OPTION (GRANT) or GRANT OPTION FOR
+	// (REVOKE: only the option is revoked).
+	GrantOption bool
+}
+
+// AlterOwner is ALTER TABLE | VIEW | SEQUENCE | TYPE | DATABASE name
+// OWNER TO role.
+type AlterOwner struct {
+	Kind  string // table, view, sequence, type, database
+	Name  string
+	Owner string
+}
+
+// ReassignOwned is REASSIGN OWNED BY role [, ...] TO role.
+type ReassignOwned struct {
+	From []string
+	To   string
+}
+
+// DropOwned is DROP OWNED BY role [, ...] [CASCADE | RESTRICT].
+type DropOwned struct {
+	Roles   []string
+	Cascade bool
+}
+
+// AlterDefaultPrivileges is ALTER DEFAULT PRIVILEGES [FOR ROLE r [, ...]]
+// [IN SCHEMA public] GRANT privs ON TABLES | SEQUENCES TO grantee [, ...]
+// [WITH GRANT OPTION] (or REVOKE ... FROM ...). ForRoles empty means the
+// current user.
+type AlterDefaultPrivileges struct {
+	ForRoles    []string
+	Revoke      bool
+	Privileges  []string
+	ObjectKind  string // "tables" or "sequences"
+	Grantees    []string
+	GrantOption bool
 }
 
 type Begin struct{}
@@ -774,6 +836,11 @@ type Show struct {
 	Kind  string
 	Table string
 	User  string
+	// Database is SHOW GRANTS ON DATABASE d; OnRole is SHOW GRANTS ON ROLE
+	// [Role] (the membership listing).
+	Database string
+	OnRole   bool
+	Role     string
 }
 
 // Analyze collects table statistics (row count, per-column distinct
@@ -825,46 +892,50 @@ type SetVar struct {
 	Reset bool
 }
 
-func (*CreateTable) stmt()         {}
-func (*Show) stmt()                {}
-func (*CreateSequence) stmt()      {}
-func (*CreateType) stmt()          {}
-func (*AlterType) stmt()           {}
-func (*DropType) stmt()            {}
-func (*DropSequence) stmt()        {}
-func (*AlterSequence) stmt()       {}
-func (*ShowSequences) stmt()       {}
-func (*ShowFunctions) stmt()       {}
-func (*CreateIndex) stmt()         {}
-func (*DropIndex) stmt()           {}
-func (*CreateView) stmt()          {}
-func (*CommentOn) stmt()           {}
-func (*DropView) stmt()            {}
-func (*AlterIndex) stmt()          {}
-func (*Truncate) stmt()            {}
-func (*Explain) stmt()             {}
-func (*DropTable) stmt()           {}
-func (*Insert) stmt()              {}
-func (*CopyFrom) stmt()            {}
-func (*Select) stmt()              {}
-func (*Update) stmt()              {}
-func (*Delete) stmt()              {}
-func (*AlterTable) stmt()          {}
-func (*CreateUser) stmt()          {}
-func (*DropUser) stmt()            {}
-func (*GrantRevoke) stmt()         {}
-func (*Begin) stmt()               {}
-func (*Commit) stmt()              {}
-func (*Savepoint) stmt()           {}
-func (*ReleaseSavepoint) stmt()    {}
-func (*RollbackToSavepoint) stmt() {}
-func (*Rollback) stmt()            {}
-func (*ShowTables) stmt()          {}
-func (*Analyze) stmt()             {}
-func (*ShowStats) stmt()           {}
-func (*SetVar) stmt()              {}
-func (*CreateDatabase) stmt()      {}
-func (*DropDatabase) stmt()        {}
-func (*AlterDatabase) stmt()       {}
-func (*ShowDatabases) stmt()       {}
-func (*Use) stmt()                 {}
+func (*CreateTable) stmt()            {}
+func (*Show) stmt()                   {}
+func (*CreateSequence) stmt()         {}
+func (*CreateType) stmt()             {}
+func (*AlterType) stmt()              {}
+func (*DropType) stmt()               {}
+func (*DropSequence) stmt()           {}
+func (*AlterSequence) stmt()          {}
+func (*ShowSequences) stmt()          {}
+func (*ShowFunctions) stmt()          {}
+func (*CreateIndex) stmt()            {}
+func (*DropIndex) stmt()              {}
+func (*CreateView) stmt()             {}
+func (*CommentOn) stmt()              {}
+func (*DropView) stmt()               {}
+func (*AlterIndex) stmt()             {}
+func (*Truncate) stmt()               {}
+func (*Explain) stmt()                {}
+func (*DropTable) stmt()              {}
+func (*Insert) stmt()                 {}
+func (*CopyFrom) stmt()               {}
+func (*Select) stmt()                 {}
+func (*Update) stmt()                 {}
+func (*Delete) stmt()                 {}
+func (*AlterTable) stmt()             {}
+func (*CreateRole) stmt()             {}
+func (*DropRole) stmt()               {}
+func (*GrantRevoke) stmt()            {}
+func (*AlterOwner) stmt()             {}
+func (*ReassignOwned) stmt()          {}
+func (*DropOwned) stmt()              {}
+func (*AlterDefaultPrivileges) stmt() {}
+func (*Begin) stmt()                  {}
+func (*Commit) stmt()                 {}
+func (*Savepoint) stmt()              {}
+func (*ReleaseSavepoint) stmt()       {}
+func (*RollbackToSavepoint) stmt()    {}
+func (*Rollback) stmt()               {}
+func (*ShowTables) stmt()             {}
+func (*Analyze) stmt()                {}
+func (*ShowStats) stmt()              {}
+func (*SetVar) stmt()                 {}
+func (*CreateDatabase) stmt()         {}
+func (*DropDatabase) stmt()           {}
+func (*AlterDatabase) stmt()          {}
+func (*ShowDatabases) stmt()          {}
+func (*Use) stmt()                    {}

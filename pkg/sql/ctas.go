@@ -158,7 +158,7 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 	if err != nil {
 		return drop(err)
 	}
-	log.Audit("table-ddl", "stmt", "CREATE TABLE AS", "target", ct.Name, "rows", n, "principal", s.user)
+	log.Audit("table-ddl", "stmt", "CREATE TABLE AS", "target", ct.Name, "rows", n, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: fmt.Sprintf("CREATE TABLE AS %d", n)}, nil
 }
 
@@ -311,6 +311,9 @@ func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parse
 		if err != nil {
 			return nil, err
 		}
+		if err := s.checkTableOwner(ctx, txn, d); err != nil {
+			return nil, err
+		}
 		idx.Comment = text
 		desc = d
 	default:
@@ -320,6 +323,9 @@ func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parse
 		}
 		if shared.Virtual != "" {
 			return nil, newErrf(CodeInsufficientPriv, "%s is a system catalog", shared.Virtual)
+		}
+		if err := s.checkTableOwner(ctx, txn, shared); err != nil {
+			return nil, err
 		}
 		desc = shared.Clone()
 		if t.Kind == "column" {

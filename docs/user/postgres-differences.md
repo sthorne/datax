@@ -18,7 +18,8 @@ syntax error or `0A000` feature not supported):
 | `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and narrowing conversions, `COMMENT ON` objects other than tables, views, indexes and columns, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening and text conversions), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
-| Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY DEFINER` semantics (a view's query runs with the reader's privileges, not its owner's), renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, `pg_views`, `information_schema.views`, `\dv` |
+| Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
+| Column- and row-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin` |
 | Triggers, stored procedures, `LISTEN/NOTIFY` | — |
 
 ## Things that exist but behave differently
@@ -49,8 +50,8 @@ syntax error or `0A000` feature not supported):
   drop columns), have no arrays, and compare with text by label
   (`m = 'ok'`; an order against a text literal is the labels' text
   order — cast the literal, `m > 'ok'::mood`, for declaration order).
-  Creating, altering or dropping a type takes the admin role or
-  `CREATE` on the database.
+  Creating a type takes the admin role or `CREATE` on the database;
+  altering or dropping one takes its owner.
 - **Arrays** are one-dimensional (`INT8[][]` is `INT8[]`; a
   multidimensional binary parameter is refused), cannot be indexed or
   be part of a key, have no slices (`a[1:2]`) or `JSONB[]`, and a

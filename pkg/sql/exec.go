@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +38,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 			return nil, err
 		}
 	}
+	// Ownership, grants and role membership are checked by each
+	// statement's executor (privileges.go, roles.go).
 	// Views the statement names bind as leading WITH members.
 	expanded, err := s.expandViews(ctx, txn, stmt)
 	if err != nil {
@@ -74,10 +75,18 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterIndex(ctx, txn, t)
 	case *parser.Truncate:
 		return s.execTruncate(ctx, txn, t)
-	case *parser.CreateUser:
-		return s.execCreateUser(ctx, txn, t)
-	case *parser.DropUser:
-		return s.execDropUser(ctx, txn, t)
+	case *parser.CreateRole:
+		return s.execCreateRole(ctx, txn, t)
+	case *parser.DropRole:
+		return s.execDropRole(ctx, txn, t)
+	case *parser.AlterOwner:
+		return s.execAlterOwner(ctx, txn, t)
+	case *parser.ReassignOwned:
+		return s.execReassignOwned(ctx, txn, t)
+	case *parser.DropOwned:
+		return s.execDropOwned(ctx, txn, t)
+	case *parser.AlterDefaultPrivileges:
+		return s.execAlterDefaultPrivileges(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -145,7 +154,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID}
+	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, Owner: s.user}
 	if catalog.IsSystemTable(bare) {
 		desc.ID = catalog.MetricsTableID
 	}
@@ -249,6 +258,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 	}
 	desc.NextColumnID = catalog.ColumnID(len(desc.Columns) + 1)
+	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
+		return nil, err
+	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		var ex *catalog.ErrTableExists
 		if t.IfNotExists {
@@ -269,6 +281,10 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col := &desc.Columns[i]
 		sd := catalog.NewSequenceDescriptor(desc.Name+"_"+col.Name+"_seq", desc.DatabaseID)
 		sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
+		sd.Owner = desc.Owner
+		if err := s.applyDefaultPrivileges(ctx, txn, desc.DatabaseID, sd.Owner, "SEQUENCES", &sd.Privileges, &sd.GrantOptions); err != nil {
+			return nil, err
+		}
 		if cd.IdentitySeq != nil {
 			if err := applySequenceOptions(sd, cd.IdentitySeq, true); err != nil {
 				return nil, err
@@ -485,6 +501,9 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
 		if existing.IsView() {
 			return nil, newErrf(CodeWrongObjectType, "%q is a view (use DROP VIEW)", t.Name)
+		}
+		if err := s.checkTableOwner(ctx, txn, existing); err != nil {
+			return nil, err
 		}
 		if err := s.dropDependentViews(ctx, txn, existing.ID, "table "+existing.Name, t.Cascade, "DROP TABLE ..."); err != nil {
 			return nil, err
@@ -2103,6 +2122,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := mustBeReal(shared); err != nil {
 		return nil, err
 	}
+	if err := s.checkTableOwner(ctx, txn, shared); err != nil {
+		return nil, err
+	}
 	desc := shared.Clone()
 	if desc.NextColumnID == 0 {
 		var max catalog.ColumnID
@@ -2702,54 +2724,68 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return d
 		}
 		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDefWith(desc, byID))})
-	case "users":
+	case "users", "roles":
+		// SHOW USERS: the login roles; SHOW ROLES: every role, the built-in
+		// ones included.
 		env, err := s.virtualEnv(ctx, txn)
 		if err != nil {
 			return nil, err
 		}
-		cols("username", "is_admin")
-		res.Columns[1].Type = types.Bool
-		for _, u := range env.Users {
-			res.Rows = append(res.Rows, []types.Datum{str(u), types.NewBool(u == "root" || env.Admins[u])})
+		graph := catalog.NewRoleGraph(env.Roles)
+		if t.Kind == "users" {
+			cols("username", "is_admin", "member_of")
+		} else {
+			cols("role_name", "can_login", "is_admin", "member_of")
+			res.Columns[1].Type = types.Bool
 		}
-	case "grants":
-		env, err := s.virtualEnv(ctx, txn)
-		if err != nil {
-			return nil, err
-		}
-		cols("database_name", "table_name", "grantee", "privilege_type")
-		var only *catalog.TableDescriptor
-		if t.Table != "" {
-			if only, err = s.lookup(ctx, txn, t.Table); err != nil {
+		for _, r := range env.Roles {
+			if t.Kind == "users" && !r.Login {
+				continue
+			}
+			set, err := graph.Effective(r.Name)
+			if err != nil {
 				return nil, err
 			}
+			var members []string
+			for _, m := range r.MemberOf {
+				members = append(members, m.Role)
+			}
+			memberOf := strings.Join(members, ",")
+			if t.Kind == "users" {
+				res.Columns[1].Type = types.Bool
+				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(set.IsAdmin()), str(memberOf)})
+			} else {
+				res.Columns[2].Type = types.Bool
+				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(r.Login), types.NewBool(set.IsAdmin()), str(memberOf)})
+			}
 		}
-		for _, d := range env.Tables {
-			if only != nil && d.ID != only.ID {
-				continue
+	case "grants":
+		if t.OnRole {
+			cols("role_name", "member", "is_admin")
+			rows, err := s.roleGrantRows(ctx, txn, t)
+			if err != nil {
+				return nil, err
 			}
-			dbName := s.database
-			for _, db := range env.Databases {
-				if db.ID == d.DatabaseID {
-					dbName = db.Name
+			for _, r := range rows {
+				res.Rows = append(res.Rows, []types.Datum{str(r[0]), str(r[1]), str(r[2])})
+			}
+			break
+		}
+		cols("database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable")
+		rows, err := s.grantRows(ctx, txn, t)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			row := make([]types.Datum, len(r))
+			for i, v := range r {
+				if v == "" && (i == 1 || i == 2) {
+					row[i] = types.DNull
+				} else {
+					row[i] = str(v)
 				}
 			}
-			if only == nil && dbName != s.database {
-				continue
-			}
-			users := make([]string, 0, len(d.Privileges))
-			for u := range d.Privileges {
-				users = append(users, u)
-			}
-			sort.Strings(users)
-			for _, u := range users {
-				if t.User != "" && u != t.User {
-					continue
-				}
-				for _, priv := range d.Privileges[u] {
-					res.Rows = append(res.Rows, []types.Datum{str(dbName), str(d.Name), str(u), str(priv)})
-				}
-			}
+			res.Rows = append(res.Rows, row)
 		}
 	case "all":
 		cols("name", "setting")

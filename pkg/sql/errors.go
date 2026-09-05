@@ -59,6 +59,7 @@ const (
 	CodeDependentObjectsExist     = "2BP01"
 	CodeObjectInUse               = "55006"
 	CodeWrongObjectType           = "42809"
+	CodeInvalidGrantOperation     = "0LP01"
 	CodeInvalidObjectDefinition   = "42P17"
 )
 
