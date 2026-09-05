@@ -48,8 +48,19 @@ duration, so two runs draw the same keys:
 | `bank` | contended two-row transfers in explicit transactions |
 | `ingest-random`, `ingest-sequential`, `ingest-uuid` | batched INSERTs with random integer, per-worker monotone, and UUID text keys |
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
-| `index-join` | secondary-index lookups fanning out to wide primary rows |
+| `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
 | `scan` | large result sets streamed through pgwire |
+| `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
+
+`--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
+into N ranges before the run (`ALTER TABLE ... SPLIT AT` at evenly
+spaced keys; a sharded timeseries table is carved by `--shards`
+instead), so a run measures many raft groups on one store rather than
+one hot range. The housekeeping loop merges empty neighbors back
+together within minutes, so start the nodes with
+`--merge-size-threshold -1` for an idle-cluster measurement; 10,000 is
+the largest worth trying on a laptop. A record's `error_samples` lists
+the distinct error messages behind its `errors` count.
 
 `bench/run.sh` starts a fresh single-node on-disk store
 (`datax init --dir`) and a fresh in-memory 3-node cluster (`datax demo`)

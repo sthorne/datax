@@ -71,6 +71,36 @@ message RaftEnvelope {
   // receivers ignore the field (benign — they just keep leader-only
   // backpressure).
   StorageHealth health = 8;
+  // Coalesced heartbeats (cluster version v12): every leader heartbeat
+  // and follower response this node had for the receiver since its last
+  // envelope, one entry per range instead of one envelope each; message
+  // is empty then and the receiver fans them out to its replicas.
+  repeated RaftHeartbeat heartbeats = 9;
+  repeated RaftHeartbeat heartbeat_responses = 10;
+  // Closed-timestamp updates for quiescent ranges: the leader's promise
+  // that nothing at or below closed will commit, valid on a follower that
+  // still follows (from_replica, term) and has applied index.
+  repeated RaftHeartbeat closed_timestamps = 11;
+}
+
+// RaftHeartbeat is one range's MsgHeartbeat or MsgHeartbeatResp, reduced
+// to the fields raft reads from them.
+message RaftHeartbeat {
+  int64 range_id = 1;
+  uint64 to_replica = 2;
+  uint64 from_replica = 3;
+  uint64 term = 4;
+  uint64 commit = 5;
+  // quiesce: the leader is going idle (every follower holds every entry
+  // and nothing is pending); a follower that holds commit quiesces too —
+  // stops ticking, so no election timer runs — until the next message
+  // or request wakes it.
+  bool quiesce = 6;
+  // Closed-timestamp updates only: the leader's last log index when the
+  // promise was made and the closed timestamp itself.
+  uint64 index = 7;
+  int64 closed_wall = 8;
+  int32 closed_logical = 9;
 }
 
 // StorageHealth is a node's storage-health snapshot. `overloaded` is the

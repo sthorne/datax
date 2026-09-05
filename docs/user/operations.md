@@ -259,7 +259,16 @@ mixed ranges),
 bytes still under retired data keys — 0 attests re-encryption is
 complete),
 `datax_auto_splits_total` / `datax_load_splits_total` /
-`datax_range_merges_total`, `datax_gc_runs_total`.
+`datax_range_merges_total`, `datax_gc_runs_total`,
+`datax_raft_scheduler_latency_seconds` (how long replicas wait for a raft
+worker — a growing tail means the store's raft workers are saturated),
+`datax_raft_log_syncs_total` / `datax_raft_readies_per_sync` (one synced
+commit per scheduler pass however many ranges appended; the histogram
+shows how many shared each), `datax_quiescent_ranges` (idle ranges that
+stopped ticking and heartbeating; on a quiet cluster this approaches
+`datax_ranges`), `datax_raft_heartbeat_envelopes_total` /
+`datax_raft_heartbeats_coalesced_total` (the per-peer message rate and
+how many heartbeats each message carried).
 
 ## Everyday admin: `datax debug`
 
@@ -294,7 +303,10 @@ datax debug rebalance --range 5 [--from 1]
 
 Splits and merges also happen automatically (by size: 64 MiB; by load:
 sustained 500 QPS); the manual commands are for pre-splitting before a bulk
-load and for tests.
+load and for tests. From SQL, `ALTER TABLE t SPLIT AT VALUES (1000),
+(2000), ...` carves a table at primary-key tuples (a prefix of the key is
+allowed) and returns the boundaries; `datax bench ... --presplit N` uses
+it to spread a workload over N ranges from the start.
 
 Keys print as paths everywhere — logs, `datax debug`, the dashboard and
 its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range

@@ -102,6 +102,7 @@ ALTER TABLE t ALTER [COLUMN] b SET DEFAULT 'y';         -- a constant or an expr
 ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
 TRUNCATE [TABLE] t [, t2] [RESTART IDENTITY] [CASCADE]; -- one descriptor write, however many ranges
 ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE DECIMAL(12, 2);   -- online rewrite; widening and text conversions
+ALTER TABLE t SPLIT AT VALUES (1000), (2000, 'x');      -- carve ranges at primary-key tuples (a prefix allowed); returns the boundaries
 CREATE TABLE t2 (LIKE t INCLUDING ALL);                  -- columns, defaults, constraints, indexes, comments
 CREATE TABLE big AS SELECT id, qty FROM t WHERE qty > 10;          -- a hidden rowid key
 CREATE TABLE keyed (order_id, qty, PRIMARY KEY (order_id)) AS SELECT id, qty FROM t [WITH NO DATA];
@@ -198,7 +199,9 @@ COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
 TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
 drain and sweep (or stream) in several transactions of their own and
-are refused inside a block with `25001`.
+are refused inside a block with `25001`; so is `SPLIT AT`, a range
+operation rather than a descriptor write (idempotent: an existing
+boundary is fine; a sharded timeseries table is carved by shard instead).
 
 ### Defaults, SERIAL, identity columns and sequences
 
@@ -586,6 +589,15 @@ scan of index "by_city" (city = 'oslo') + primary key join
 range scan of primary key (series = 'cpu.node1', at >= 2026-08-30 10:00:00+00)
 full table scan [~5000 rows]
 ```
+
+An index scan's `primary key join` fetches the rows behind the matching
+entries in pages of 256, each page one batch fanned out to the ranges
+that hold the rows, in the index's order (`EXPLAIN ANALYZE` reports
+`index join: N primary rows fetched in B batches`), so a lookup matching
+a thousand entries is four round trips, not a thousand. The same
+batching covers a statement's other point reads: `INSERT` reads all its
+uniqueness probes and foreign-key parents at once, `UPDATE` the entries
+it moves, `SELECT ... FOR UPDATE` locks its rows in one batch.
 
 A `full table scan` on a big table is the thing to fix (add an index, or
 constrain the leading PK columns). When [table statistics](#table-statistics)

@@ -64,8 +64,8 @@ func (s *Store) RunLogTruncationOnce(ctx context.Context) {
 func (r *Replica) TruncatedIndex() uint64 { return r.rs.truncatedState().Index }
 
 func (r *Replica) maybeTruncateLog(ctx context.Context) error {
-	st := r.node.Status()
-	if st.RaftState != raft.StateLeader || len(st.Progress) == 0 {
+	st, ok := r.raftStatus()
+	if !ok || st.RaftState != raft.StateLeader || len(st.Progress) == 0 {
 		return nil
 	}
 	r.mu.Lock()

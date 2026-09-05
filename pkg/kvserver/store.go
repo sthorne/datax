@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -24,6 +25,9 @@ import (
 // by pkg/rpc.
 type RaftTransport interface {
 	SendRaftMessage(ctx context.Context, to base.NodeID, rangeID base.RangeID, m raftpb.Message) error
+	// SendRaftHeartbeats sends one envelope carrying every queued
+	// heartbeat and response for a peer node (quiesce.go).
+	SendRaftHeartbeats(ctx context.Context, to base.NodeID, beats, resps, closed []RaftHeartbeat) error
 }
 
 // StoreConfig collects a store's dependencies.
@@ -39,6 +43,12 @@ type StoreConfig struct {
 	SnapshotSender   SnapshotSender
 	Stopper          *stop.Stopper
 	RaftTickInterval time.Duration
+	// RaftWorkers is the size of the store's raft scheduler pool (0 =
+	// GOMAXPROCS; see scheduler.go).
+	RaftWorkers int
+	// DisableQuiescence keeps idle ranges ticking and heartbeating (see
+	// quiesce.go); heartbeats still travel coalesced.
+	DisableQuiescence bool
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
@@ -157,6 +167,21 @@ type Store struct {
 
 	// nodeHealth holds peers' storage-health verdicts (see node_health.go).
 	nodeHealth nodeHealthMap
+
+	// sched drives every replica's raft group (scheduler.go).
+	sched *raftScheduler
+	// hbq holds heartbeats between scheduler passes (quiesce.go).
+	hbq heartbeatQueue
+	// side is the off-log closed-timestamp transport's state
+	// (closedts.go): the group promise this store last made for its
+	// quiescent ranges, the led ranges that woke since the last round,
+	// and, as a follower, the ranges each peer node registered.
+	side struct {
+		sync.Mutex
+		groupTS atomic.Pointer[hlc.Timestamp]
+		woken   map[base.RangeID]struct{}
+		reg     map[base.NodeID]map[base.RangeID]RaftHeartbeat
+	}
 }
 
 // SetSender injects the routed KV client (once, at node startup).
@@ -181,6 +206,13 @@ func NewStore(cfg StoreConfig) *Store {
 	}
 	s := &Store{cfg: cfg}
 	s.mu.replicas = make(map[base.RangeID]*Replica)
+	s.sched = newRaftScheduler(s, cfg.RaftWorkers)
+	s.hbq.beats = make(map[base.NodeID][]RaftHeartbeat)
+	s.hbq.resps = make(map[base.NodeID][]RaftHeartbeat)
+	s.hbq.closed = make(map[base.NodeID][]RaftHeartbeat)
+	s.side.woken = make(map[base.RangeID]struct{})
+	s.side.reg = make(map[base.NodeID]map[base.RangeID]RaftHeartbeat)
+	s.side.groupTS.Store(&hlc.Timestamp{})
 	return s
 }
 
@@ -257,7 +289,7 @@ func (s *Store) LoadReplicas() error {
 		log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
 	}
 	for _, r := range loaded {
-		if err := r.startRaftLoop(); err != nil {
+		if err := r.startRaft(); err != nil {
 			return err
 		}
 	}
@@ -284,14 +316,14 @@ func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Repli
 }
 
 // startReplica adds the replica to the store (or returns the existing one)
-// and starts its raft loop.
+// and hands it to the raft scheduler.
 func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
 	r, created, err := s.addReplica(desc, replicaID, bootstrap)
 	if err != nil {
 		return nil, err
 	}
 	if created {
-		if err := r.startRaftLoop(); err != nil {
+		if err := r.startRaft(); err != nil {
 			s.mu.Lock()
 			delete(s.mu.replicas, desc.RangeID)
 			s.mu.Unlock()
@@ -302,7 +334,7 @@ func (s *Store) startReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID
 }
 
 // addReplica constructs the replica and enters it into the store map
-// WITHOUT starting its raft loop; created reports whether this call made
+// WITHOUT scheduling its raft group; created reports whether this call made
 // it (false: the store already held one, which is returned).
 func (s *Store) addReplica(desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (r *Replica, created bool, err error) {
 	s.mu.Lock()
@@ -490,7 +522,7 @@ func (s *Store) HandleRaftMessage(ctx context.Context, rangeID base.RangeID, m r
 		log.Debugf("dropping raft message for unknown %s", rangeID)
 		return
 	}
-	if err := r.stepRaftMessage(ctx, m); err != nil {
+	if err := r.stepRaftMessage(ctx, m); err != nil && err != errRaftStopped {
 		log.Warnf("%s: raft step failed: %v", rangeID, err)
 	}
 }

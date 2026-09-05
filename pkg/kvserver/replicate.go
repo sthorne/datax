@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -123,9 +124,11 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 		return kvpb.NewError(err)
 	}
 	cc := raftpb.ConfChange{Type: typ, NodeID: uint64(replicaID), Context: ctxJSON}
-	if err := r.node.ProposeConfChange(ctx, cc); err != nil {
+	r.unquiesce()
+	if err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.ProposeConfChange(cc) }); err != nil {
 		return kvpb.NewError(err)
 	}
+	r.store.sched.enqueue(r.rangeID, schedReady)
 	// Wait for the change to apply locally (the descriptor generation is
 	// bumped by the apply path).
 	for {

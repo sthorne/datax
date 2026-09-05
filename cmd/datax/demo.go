@@ -28,6 +28,7 @@ func runDemo(args []string) error {
 	baseRPC := fs.Int("rpc-port", 26257, "first internode RPC port")
 	baseHTTP := fs.Int("http-port", 0, "first observability HTTP port (0 = disabled; node i listens on port+i-1)")
 	verbose := fs.Bool("v", false, "verbose logging")
+	mergeThr := fs.Int64("merge-size-threshold", 0, "size in bytes below which a range and its right neighbor are merged back together (0 = default 16 MiB, negative = disabled)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,6 +53,7 @@ func runDemo(args []string) error {
 			PGListen:              fmt.Sprintf("127.0.0.1:%d", *basePG+i),
 			Locality:              loc,
 			UpreplicationInterval: time.Second,
+			MergeSizeThreshold:    *mergeThr,
 		}
 		if *baseHTTP > 0 {
 			cfg.HTTPListen = fmt.Sprintf("127.0.0.1:%d", *baseHTTP+i)

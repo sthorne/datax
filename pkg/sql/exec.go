@@ -494,6 +494,85 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 	}
 }
 
+// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ...: carve a
+// range boundary at each primary-key tuple (a prefix of the key is
+// allowed), so a bulk load or a benchmark spreads over many ranges from
+// the start instead of waiting for size- and load-based splits. Rows are
+// the boundaries as key paths. A sharded timeseries table's key begins
+// with its shard bucket, so it is split by shard (SET (shards = N)), not
+// here.
+func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	var desc *catalog.TableDescriptor
+	if err := s.db.RunTxn(ctx, "split-at", func(ctx context.Context, txn *kvclient.Txn) error {
+		shared, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return err
+		}
+		desc = shared
+		return nil
+	}); err != nil {
+		var nf *catalog.ErrTableNotFound
+		if t.IfExists && asErr(err, &nf) {
+			return &Result{Tag: "ALTER TABLE"}, nil
+		}
+		return nil, err
+	}
+	if err := mustBeReal(desc); err != nil {
+		return nil, err
+	}
+	if desc.ShardBuckets > 1 {
+		return nil, newErrf(CodeFeatureNotSupported, "%q is sharded: its key space is carved by shard (ALTER TABLE ... SET (shards = N)), not by primary key", desc.Name)
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	for _, tuple := range t.SplitAt {
+		if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
+			return nil, newErrf(CodeSyntaxError, "SPLIT AT: a tuple names 1 to %d primary key values (%q has %d)", len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
+		}
+		key := rowenc.PrimaryKeyPrefixFor(desc)
+		for i, e := range tuple {
+			col, _ := desc.ColByID(desc.PrimaryKey[i])
+			d, err := evalExpr(e, nil, nil, params)
+			if err != nil {
+				return nil, err
+			}
+			if d, err = col.Conform(d); err != nil {
+				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
+			}
+			if d.Null {
+				return nil, newErrf(CodeSyntaxError, "SPLIT AT: column %q: a split key cannot be NULL", col.Name)
+			}
+			if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
+				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
+			}
+		}
+		// An existing boundary is the state asked for (a re-run of a
+		// load script or a benchmark's set-up), not an error. A range
+		// frozen for a merge in flight (the housekeeping loop folding
+		// empty neighbors back together) is split once the merge lands.
+		var err error
+		for attempt := 0; attempt < 50; attempt++ {
+			if _, err = s.db.AdminSplit(ctx, key); err == nil || strings.Contains(err.Error(), "already a range boundary") {
+				err = nil
+				break
+			}
+			if !strings.Contains(err.Error(), "frozen for a merge") {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
 	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
@@ -650,6 +729,17 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
 	res := &Result{}
+	// Every row is built first, so the statement's point reads — the
+	// primary-key and unique-index uniqueness probes and the foreign-key
+	// parent lookups — go out as one batch before any row is written
+	// (issue #103); the per-row pipeline then answers from that batch.
+	type builtRow struct {
+		target []catalog.Column
+		vals   []types.Datum
+		row    map[catalog.ColumnID]types.Datum
+		key    keys.Key
+	}
+	built := make([]builtRow, 0, len(rows))
 	for _, exprRow := range rows {
 		if len(exprRow) != len(target) {
 			return nil, newErrf(CodeSyntaxError, "INSERT has %d values but %d target columns", len(exprRow), len(target))
@@ -681,16 +771,37 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		if err != nil {
 			return nil, err
 		}
+		row, key, err := buildInsertRow(desc, rowTarget, rowVals)
+		if err != nil {
+			return nil, err
+		}
+		built = append(built, builtRow{target: rowTarget, vals: rowVals, row: row, key: key})
+	}
+	var ps *probeSet
+	if len(built) > 1 {
+		probeKeys := make([]keys.Key, 0, len(built)*2)
+		for _, b := range built {
+			probeKeys = append(probeKeys, b.key)
+			probeKeys = appendUniqueIndexKeys(probeKeys, desc, b.row)
+			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, nil, b.row)
+		}
+		if ps, err = newProbeSet(ctx, txn, probeKeys); err != nil {
+			return nil, err
+		}
+		guard.setProbe(ps)
+	}
+	for _, b := range built {
+		rowTarget, rowVals := b.target, b.vals
 		var row map[catalog.ColumnID]types.Datum
 		if conflict == nil {
-			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted); err != nil {
+			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
 				return nil, err
 			}
 			if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
 				return nil, err
 			}
 		} else {
-			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard)
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps)
 			if err != nil {
 				return nil, err
 			}
@@ -809,12 +920,12 @@ func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []c
 }
 
 // insertRowReturning is insertRow, handing back the row it wrote.
-func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool) (map[catalog.ColumnID]types.Datum, error) {
+func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, ps *probeSet) (map[catalog.ColumnID]types.Datum, error) {
 	row, _, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return nil, err
 	}
-	if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, false); err != nil {
+	if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, false, ps); err != nil {
 		return nil, err
 	}
 	return row, nil
@@ -825,7 +936,7 @@ func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 // It reports whether a row was written (inserted or updated) and that
 // row. A conflict on a unique key other than the arbiter is the usual
 // unique violation, as in PostgreSQL.
-func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard) (bool, map[catalog.ColumnID]types.Datum, error) {
+func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard, ps *probeSet) (bool, map[catalog.ColumnID]types.Datum, error) {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return false, nil, err
@@ -841,7 +952,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	var oldKey keys.Key
 	var oldRow map[catalog.ColumnID]types.Datum
 	arbiter := ""
-	if existing, err := txn.Get(ctx, key); err != nil {
+	if existing, err := ps.get(ctx, txn, key); err != nil {
 		return false, nil, err
 	} else if existing != nil {
 		oldKey = key
@@ -863,7 +974,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			if skip {
 				continue
 			}
-			existing, err := txn.Get(ctx, ekey)
+			existing, err := ps.get(ctx, txn, ekey)
 			if err != nil {
 				return false, nil, err
 			}
@@ -888,7 +999,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	if oldRow == nil {
 		// No conflict: a plain insert (the PK read above already ran).
-		if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, true); err != nil {
+		if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, true, ps); err != nil {
 			return false, nil, err
 		}
 		if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
@@ -952,7 +1063,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		}
 		wb.Put(shadow, value)
 	}
-	if err := updateIndexEntries(ctx, txn, desc, oldRow, newRow, wb, inserted); err != nil {
+	if err := updateIndexEntries(ctx, txn, desc, oldRow, newRow, wb, inserted, ps); err != nil {
 		return false, nil, err
 	}
 	inserted[string(oldKey)] = true
@@ -1130,7 +1241,7 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 // when the caller already probed the key, pkKnownAbsent), value encoding,
 // the reshard shadow write, and secondary index entries — all buffered
 // into wb. vals must be positionally parallel to target.
-func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool) error {
+func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool, ps *probeSet) error {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return err
@@ -1139,7 +1250,7 @@ func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescri
 		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
 	}
 	if !pkKnownAbsent {
-		if existing, err := txn.Get(ctx, key); err != nil {
+		if existing, err := ps.get(ctx, txn, key); err != nil {
 			return err
 		} else if existing != nil {
 			return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
@@ -1159,7 +1270,7 @@ func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescri
 		}
 		wb.Put(shadow, value)
 	}
-	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted); err != nil {
+	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted, ps); err != nil {
 		return err
 	}
 	inserted[string(key)] = true
@@ -1257,34 +1368,50 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			return nil, err
 		}
 		metrics.SQLRowsScanned.Add(float64(len(kvs)))
-		var out []fetchedRow
-		for _, kv := range kvs {
+		// The primary rows behind the entries come back in pages of
+		// primaryFetchPage, each page one routed batch, in the index's
+		// order (issue #103): a lookup matching 1,000 entries is four
+		// round trips instead of 1,000.
+		pks := make([]keys.Key, len(kvs))
+		for i, kv := range kvs {
 			pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
 			if err != nil {
 				return nil, newErrf(CodeInternal, "%v", err)
 			}
-			raw, err := txn.Get(ctx, pk)
-			if err != nil {
-				return nil, err
+			pks[i] = pk
+		}
+		var out []fetchedRow
+		batches := 0
+		err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+			batches++
+			for i, raw := range raws {
+				pk := pks[first+i]
+				if raw == nil {
+					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
+				}
+				row, err := decodeFullRow(desc, pk, raw)
+				if err != nil {
+					return false, err
+				}
+				match, err := matchesWhere(where, desc, row, params)
+				if err != nil {
+					return false, err
+				}
+				if !match {
+					continue
+				}
+				out = append(out, fetchedRow{key: pk, row: row})
+				if limit > 0 && int64(len(out)) == limit {
+					return false, nil
+				}
 			}
-			if raw == nil {
-				return nil, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
-			}
-			row, err := decodeFullRow(desc, pk, raw)
-			if err != nil {
-				return nil, err
-			}
-			match, err := matchesWhere(where, desc, row, params)
-			if err != nil {
-				return nil, err
-			}
-			if !match {
-				continue
-			}
-			out = append(out, fetchedRow{key: pk, row: row})
-			if limit > 0 && int64(len(out)) == limit {
-				break
-			}
+			return true, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if s.explain != nil && len(pks) > 0 {
+			s.note("index join: %d primary rows fetched in %d batches of up to %d", len(pks), batches, primaryFetchPage)
 		}
 		return out, nil
 
@@ -1779,10 +1906,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// the transaction's read timestamp server-side (any newer committed
 		// version surfaces as a retryable conflict), so the fetch-then-lock
 		// gap cannot admit a stale read.
-		for _, fr := range rows {
-			if _, lerr := txn.GetForUpdate(ctx, fr.key); lerr != nil {
-				return nil, lerr
-			}
+		lockKeys := make([]keys.Key, len(rows))
+		for i, fr := range rows {
+			lockKeys[i] = fr.key
+		}
+		if _, lerr := txn.GetBatchForUpdate(ctx, lockKeys); lerr != nil {
+			return nil, lerr
 		}
 	}
 	if needSort {
@@ -1929,8 +2058,13 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
-	for _, fr := range rows {
+	// Every row's new values are computed first, so the statement's
+	// point reads — the moved unique-index entries and the foreign-key
+	// parents of changed columns — go out as one batch (issue #103).
+	oldRows := make([]map[catalog.ColumnID]types.Datum, len(rows))
+	for i, fr := range rows {
 		oldRow := copyRow(fr.row)
+		oldRows[i] = oldRow
 		for _, set := range t.Set {
 			col, _ := desc.Col(set.Column)
 			var d types.Datum
@@ -1963,6 +2097,23 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			}
 			fr.row[col.ID] = d
 		}
+	}
+	var ps *probeSet
+	if len(rows) > 1 {
+		var probeKeys []keys.Key
+		for i, fr := range rows {
+			probeKeys = appendMovedUniqueIndexKeys(probeKeys, desc, oldRows[i], fr.row)
+			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, oldRows[i], fr.row)
+		}
+		if len(probeKeys) > 0 {
+			if ps, err = newProbeSet(ctx, txn, probeKeys); err != nil {
+				return nil, err
+			}
+			guard.setProbe(ps)
+		}
+	}
+	for i, fr := range rows {
+		oldRow := oldRows[i]
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
@@ -1979,7 +2130,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			}
 			wb.Put(shadow, value)
 		}
-		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen); err != nil {
+		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen, ps); err != nil {
 			return nil, err
 		}
 		if ret != nil {

@@ -74,6 +74,11 @@ type Config struct {
 	// DisableLeaseReads makes every read confirm leadership with a quorum
 	// round trip (v1 behavior) instead of the leader's lease.
 	DisableLeaseReads bool
+	// RaftWorkers sizes the store's raft scheduler pool (0 = GOMAXPROCS).
+	RaftWorkers int
+	// DisableQuiescence keeps idle ranges ticking and heartbeating
+	// (kvserver/quiesce.go); the v12 coalescing of heartbeats stays on.
+	DisableQuiescence bool
 	// SplitSizeThreshold is the range size that triggers an automatic split
 	// (default 64 MiB; negative disables).
 	SplitSizeThreshold int64
@@ -459,6 +464,8 @@ func (n *Node) start() error {
 		SnapshotSender:          n.trans,
 		Stopper:                 n.stopper,
 		DisableLeaseReads:       n.cfg.DisableLeaseReads,
+		RaftWorkers:             n.cfg.RaftWorkers,
+		DisableQuiescence:       n.cfg.DisableQuiescence,
 		SplitSizeThreshold:      n.cfg.SplitSizeThreshold,
 		MergeSizeThreshold:      n.cfg.MergeSizeThreshold,
 		ClosedTimestampLag:      n.cfg.ClosedTimestampLag,
@@ -538,12 +545,13 @@ func (n *Node) start() error {
 		serverTLS = n.tlsCfgs.Server
 	}
 	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
-		Batch:    n.handleBatch,
-		Join:     n.handleJoin,
-		Admin:    n.handleAdmin,
-		Raft:     n.store.HandleRaftMessage,
-		Snapshot: n.store.ApplySnapshotStream,
-		NodeInfo: n.registry.UpsertAddress,
+		Batch:          n.handleBatch,
+		Join:           n.handleJoin,
+		Admin:          n.handleAdmin,
+		Raft:           n.store.HandleRaftMessage,
+		RaftHeartbeats: n.store.HandleRaftHeartbeats,
+		Snapshot:       n.store.ApplySnapshotStream,
+		NodeInfo:       n.registry.UpsertAddress,
 		NodeHealth: func(id base.NodeID, h *rpcpb.StorageHealth) {
 			n.store.UpdateNodeHealth(id, h.Overloaded, h.Reason)
 		},

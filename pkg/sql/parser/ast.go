@@ -690,6 +690,9 @@ type AlterTable struct {
 	// NOT NULL (the column name).
 	SetNotNull  string
 	DropNotNull string
+	// SplitAt is SPLIT AT VALUES (k, ...), (k, ...): one primary-key
+	// tuple (a prefix of the key is allowed) per range boundary to carve.
+	SplitAt [][]Expr
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.

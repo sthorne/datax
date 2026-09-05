@@ -258,17 +258,47 @@ func (t *Transport) SendRaftMessage(ctx context.Context, to base.NodeID, rangeID
 	if err != nil {
 		return err
 	}
-	localNode, localAddr := t.localInfo()
-	env := &rpcpb.RaftEnvelope{
-		RangeId:     int64(rangeID),
-		ToReplica:   m.To,
-		FromReplica: m.From,
-		FromNode:    int32(localNode),
-		FromAddr:    localAddr,
-		Now:         t.now(),
-		Message:     raw,
-		Health:      t.health(),
+	env := t.envelope()
+	env.RangeId, env.ToReplica, env.FromReplica, env.Message = int64(rangeID), m.To, m.From, raw
+	return t.enqueueRaft(to, env)
+}
+
+// SendRaftHeartbeats sends one envelope carrying a pass's heartbeats and
+// responses for a peer node (cluster v12; see kvserver/quiesce.go).
+func (t *Transport) SendRaftHeartbeats(ctx context.Context, to base.NodeID, beats, resps, closed []kvserver.RaftHeartbeat) error {
+	if t.dropTo(to) {
+		return nil
 	}
+	env := t.envelope()
+	conv := func(in []kvserver.RaftHeartbeat) []*rpcpb.RaftHeartbeat {
+		out := make([]*rpcpb.RaftHeartbeat, len(in))
+		for i, hb := range in {
+			out[i] = &rpcpb.RaftHeartbeat{
+				RangeId: int64(hb.RangeID), ToReplica: hb.To, FromReplica: hb.From, Term: hb.Term, Commit: hb.Commit, Quiesce: hb.Quiesce,
+				Index: hb.Index, ClosedWall: hb.ClosedTS.WallTime, ClosedLogical: hb.ClosedTS.Logical,
+			}
+		}
+		return out
+	}
+	env.Heartbeats, env.HeartbeatResponses, env.ClosedTimestamps = conv(beats), conv(resps), conv(closed)
+	return t.enqueueRaft(to, env)
+}
+
+// envelope starts a raft envelope with this node's identity, clock and
+// health.
+func (t *Transport) envelope() *rpcpb.RaftEnvelope {
+	localNode, localAddr := t.localInfo()
+	return &rpcpb.RaftEnvelope{
+		FromNode: int32(localNode),
+		FromAddr: localAddr,
+		Now:      t.now(),
+		Health:   t.health(),
+	}
+}
+
+// enqueueRaft hands an envelope to the destination's stream worker
+// (started on first use); a full queue drops it.
+func (t *Transport) enqueueRaft(to base.NodeID, env *rpcpb.RaftEnvelope) error {
 	t.mu.Lock()
 	q, ok := t.mu.raftQ[to]
 	if !ok {

@@ -3322,8 +3322,38 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			return nil, err
 		}
 		at.SetOptions = opts
+	case p.consumeIdentWord("split"):
+		if !p.consumeIdentWord("at") {
+			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
+		}
+		if err := p.expectKeyword("VALUES"); err != nil {
+			return nil, err
+		}
+		for {
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			var tuple []Expr
+			for {
+				e, err := p.parseValueOrColumnExpr()
+				if err != nil {
+					return nil, err
+				}
+				tuple = append(tuple, e)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			at.SplitAt = append(at.SplitAt, tuple)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET or SPLIT AT, found %q", p.peek().text)
 	}
 	return at, nil
 }

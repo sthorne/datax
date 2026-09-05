@@ -59,6 +59,17 @@ func (n *Node) startHTTP() error {
 			return float64(leaders)
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "datax_quiescent_ranges", Help: "Replicas on this node that are quiescent: idle, not ticking or heartbeating.",
+		}, func() float64 {
+			q := 0
+			for _, rs := range n.rangeStatuses() {
+				if rs.Quiescent {
+					q++
+				}
+			}
+			return float64(q)
+		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "datax_raft_log_entries", Help: "Raft log entries retained across this node's replicas.",
 		}, func() float64 {
 			var total uint64
@@ -367,12 +378,15 @@ func (n *Node) requireMetrics(next http.Handler) http.Handler {
 
 // RangeStatus is one replica's view in /status.
 type RangeStatus struct {
-	RangeID        int64  `json:"range_id"`
-	StartKey       string `json:"start_key"`
-	EndKey         string `json:"end_key"`
-	Table          string `json:"table,omitempty"`
-	Replicas       []int  `json:"replicas"`
-	Leader         bool   `json:"leader"`
+	RangeID  int64  `json:"range_id"`
+	StartKey string `json:"start_key"`
+	EndKey   string `json:"end_key"`
+	Table    string `json:"table,omitempty"`
+	Replicas []int  `json:"replicas"`
+	Leader   bool   `json:"leader"`
+	// Quiescent: the replica is asleep (no ticks, no heartbeats) until a
+	// message or request wakes it.
+	Quiescent      bool   `json:"quiescent,omitempty"`
 	AppliedIndex   uint64 `json:"applied_index"`
 	LastIndex      uint64 `json:"last_index"`
 	TruncatedIndex uint64 `json:"truncated_index"`
@@ -394,6 +408,7 @@ type NodeStatus struct {
 	Locality  string        `json:"locality,omitempty"`
 	Ranges    []RangeStatus `json:"ranges"`
 	LeaderOf  int           `json:"leader_of"`
+	Quiescent int           `json:"quiescent_ranges"`
 	LiveNodes int           `json:"live_nodes"`
 	// Machine is the node's latest host sample (CPU, memory, the store
 	// disk, network, file descriptors, Go runtime); nil before the first
@@ -411,6 +426,7 @@ func (n *Node) rangeStatuses() []RangeStatus {
 			EndKey:         n.prettyKey(desc.EndKey),
 			Table:          n.tableNameOf(desc.StartKey),
 			Leader:         r.IsLeader(),
+			Quiescent:      r.Quiescent(),
 			AppliedIndex:   r.AppliedIndex(),
 			LastIndex:      r.LastIndex(),
 			TruncatedIndex: r.TruncatedIndex(),
@@ -450,6 +466,9 @@ func (n *Node) statusSummary() NodeStatus {
 	for _, rs := range ranges {
 		if rs.Leader {
 			st.LeaderOf++
+		}
+		if rs.Quiescent {
+			st.Quiescent++
 		}
 	}
 	return st

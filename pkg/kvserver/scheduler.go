@@ -1,0 +1,339 @@
+package kvserver
+
+import (
+	"context"
+	"runtime"
+	"sync"
+	"time"
+
+	"go.etcd.io/raft/v3"
+
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/util/faultpoint"
+)
+
+// raftScheduler drives every raft group on a store from one fixed pool of
+// workers instead of a goroutine and a ticker per replica (issue #102).
+// Message receipt, proposals, read-index requests and the store ticker
+// enqueue a replica; a worker dequeues a group of them, ticks or steps
+// each RawNode, and handles one Ready per replica (persist — one synced
+// commit for the whole group — send, apply). A replica is never
+// processed by two workers at once: while a pass runs, new work only
+// raises its flags, and the worker re-queues it when the pass ends.
+type raftScheduler struct {
+	store   *Store
+	workers int
+
+	startOnce sync.Once
+	startErr  error
+
+	mu struct {
+		sync.Mutex
+		// work wakes workers (the queue grew or the scheduler stops);
+		// idle wakes stopReplica (a pass finished).
+		work, idle *sync.Cond
+		queue      []base.RangeID
+		state      map[base.RangeID]*schedState
+		stopping   bool
+	}
+}
+
+// raftSchedFlags say why a replica was enqueued.
+type raftSchedFlags uint8
+
+const (
+	// schedTick advances the group's election and heartbeat timers.
+	schedTick raftSchedFlags = 1 << iota
+	// schedReady asks for a Ready check after a step, proposal, read
+	// index, progress report or a previous pass that left work behind.
+	schedReady
+)
+
+// schedState is a replica's place in the queue.
+type schedState struct {
+	flags   raftSchedFlags
+	queued  bool
+	running bool
+	worker  int       // the worker running it
+	since   time.Time // first enqueue of the pending flags
+}
+
+func newRaftScheduler(s *Store, workers int) *raftScheduler {
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers < 2 {
+		workers = 2 // a pass that waits (a merge apply on its RHS) must not starve the RHS
+	}
+	sc := &raftScheduler{store: s, workers: workers}
+	sc.mu.work = sync.NewCond(&sc.mu.Mutex)
+	sc.mu.idle = sync.NewCond(&sc.mu.Mutex)
+	sc.mu.state = make(map[base.RangeID]*schedState)
+	return sc
+}
+
+// start launches the workers and the store ticker (once; later calls
+// return the first outcome).
+func (sc *raftScheduler) start() error {
+	sc.startOnce.Do(func() {
+		st := sc.store.cfg.Stopper
+		for i := 0; i < sc.workers; i++ {
+			w := i
+			if err := st.RunWorker(func(ctx context.Context) { sc.worker(ctx, w) }); err != nil {
+				sc.startErr = err
+				return
+			}
+		}
+		sc.startErr = st.RunWorker(sc.tickLoop)
+	})
+	return sc.startErr
+}
+
+// enqueue schedules a replica with the given flags: a queued replica
+// gains them, a running one is re-queued with them when its pass ends.
+func (sc *raftScheduler) enqueue(id base.RangeID, f raftSchedFlags) {
+	sc.mu.Lock()
+	sc.enqueueLocked(id, f, time.Now())
+	sc.mu.Unlock()
+	sc.mu.work.Signal()
+}
+
+func (sc *raftScheduler) enqueueLocked(id base.RangeID, f raftSchedFlags, now time.Time) {
+	st := sc.mu.state[id]
+	if st == nil {
+		st = &schedState{}
+		sc.mu.state[id] = st
+	}
+	if st.flags == 0 {
+		st.since = now
+	}
+	st.flags |= f
+	if !st.queued && !st.running {
+		st.queued = true
+		sc.mu.queue = append(sc.mu.queue, id)
+	}
+}
+
+// tickLoop is the store's one ticker: every RaftTickInterval it enqueues
+// a tick for every replica the store holds that is not quiescent.
+func (sc *raftScheduler) tickLoop(ctx context.Context) {
+	ticker := time.NewTicker(sc.store.cfg.RaftTickInterval)
+	defer ticker.Stop()
+	defer sc.stopAll()
+	var ids []base.RangeID
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		ids = ids[:0]
+		sc.store.mu.Lock()
+		for id, r := range sc.store.mu.replicas {
+			if !r.isQuiescent() {
+				ids = append(ids, id)
+			}
+		}
+		sc.store.mu.Unlock()
+		now := time.Now()
+		sc.mu.Lock()
+		for _, id := range ids {
+			sc.enqueueLocked(id, schedTick, now)
+		}
+		sc.mu.Unlock()
+		sc.mu.work.Broadcast()
+	}
+}
+
+// raftReadyGroupSize caps how many replicas one pass takes from the
+// queue: their log writes share one synced commit, and their applies run
+// back to back before the worker returns to the queue.
+const raftReadyGroupSize = 64
+
+// readyWork is one replica's share of a pass.
+type readyWork struct {
+	id    base.RangeID
+	st    *schedState
+	flags raftSchedFlags
+	r     *Replica
+	rd    raft.Ready
+	has   bool
+	err   error
+}
+
+// worker runs passes until the stopper stops. A pass drains up to
+// raftReadyGroupSize replicas from the queue, takes every one's Ready,
+// stages all their HardStates and entries into ONE batch and syncs it
+// once (group commit: ten ranges appending in the same moment cost one
+// fsync, not ten), then sends, applies and advances each in turn.
+func (sc *raftScheduler) worker(ctx context.Context, worker int) {
+	stop := context.AfterFunc(ctx, func() {
+		sc.mu.Lock()
+		sc.mu.stopping = true
+		sc.mu.Unlock()
+		sc.mu.work.Broadcast()
+	})
+	defer stop()
+	group := make([]readyWork, 0, raftReadyGroupSize)
+	for {
+		sc.mu.Lock()
+		for len(sc.mu.queue) == 0 && !sc.mu.stopping {
+			sc.mu.work.Wait()
+		}
+		if sc.mu.stopping {
+			sc.mu.Unlock()
+			return
+		}
+		group = group[:0]
+		now := time.Now()
+		for len(sc.mu.queue) > 0 && len(group) < raftReadyGroupSize {
+			id := sc.mu.queue[0]
+			sc.mu.queue[0] = 0
+			sc.mu.queue = sc.mu.queue[1:]
+			st := sc.mu.state[id]
+			st.queued, st.running, st.worker = false, true, worker
+			group = append(group, readyWork{id: id, st: st, flags: st.flags})
+			st.flags = 0
+			metrics.RaftSchedulerLatency.Observe(now.Sub(st.since).Seconds())
+		}
+		sc.mu.Unlock()
+
+		sc.runGroup(ctx, group)
+
+		sc.mu.Lock()
+		for i := range group {
+			w := &group[i]
+			w.st.running = false
+			if w.st.flags != 0 && w.r != nil {
+				w.st.queued = true
+				sc.mu.queue = append(sc.mu.queue, w.id)
+			} else {
+				delete(sc.mu.state, w.id)
+			}
+		}
+		sc.mu.Unlock()
+		sc.mu.idle.Broadcast()
+	}
+}
+
+// runGroup handles one pass's replicas: take, stage, one commit, finish.
+func (sc *raftScheduler) runGroup(ctx context.Context, group []readyWork) {
+	var (
+		gb       *storage.Batch
+		mustSync bool
+		staged   int
+	)
+	for i := range group {
+		w := &group[i]
+		var ok bool
+		if w.r, ok = sc.store.GetReplica(w.id); !ok {
+			continue // removed since it was queued
+		}
+		if w.rd, w.has = w.r.takeReady(w.flags); !w.has {
+			continue
+		}
+		if gb == nil {
+			gb = sc.store.cfg.Engine.NewBatch()
+		}
+		if w.err = w.r.stageReady(gb, w.rd); w.err == nil {
+			staged++
+			mustSync = mustSync || w.rd.MustSync
+		}
+	}
+	if gb != nil {
+		var commitErr error
+		if gb.Empty() {
+			_ = gb.Close()
+		} else if commitErr = gb.Commit(mustSync); commitErr == nil {
+			faultpoint.Hit("raft-append")
+			if mustSync {
+				metrics.RaftLogSyncs.Inc()
+				metrics.RaftReadiesPerSync.Observe(float64(staged))
+			}
+		}
+		if commitErr != nil {
+			for i := range group {
+				if w := &group[i]; w.has && w.err == nil {
+					w.err = commitErr
+				}
+			}
+		}
+	}
+	for i := range group {
+		w := &group[i]
+		if !w.has {
+			continue
+		}
+		metrics.RaftReadyPasses.Inc()
+		if w.err == nil && w.r.raftStopped() {
+			// Detached by a sibling's apply earlier in this pass (a merge
+			// absorbed it): its keys are gone, nothing may write them.
+			w.r.markStopped()
+			continue
+		}
+		if w.err == nil {
+			w.err = w.r.finishReady(ctx, w.rd)
+		}
+		if w.err != nil {
+			w.r.failReady(w.err)
+			continue
+		}
+		w.r.advanceReady(w.rd)
+	}
+	sc.store.sendQueuedHeartbeats(ctx)
+}
+
+// stopReplica takes a replica out of the scheduler: it waits for a pass
+// in progress on another worker to finish, then marks the raft group
+// stopped so no further pass, proposal or step touches it, and closes
+// stoppedCh. from, when set, is a replica whose own pass is doing the
+// stopping (a merge apply detaching its RHS): a pass that holds both
+// does not wait for itself — the worker skips the stopped member's
+// finish instead.
+func (sc *raftScheduler) stopReplica(r, from *Replica) {
+	sc.mu.Lock()
+	for {
+		st := sc.mu.state[r.rangeID]
+		if st == nil || !st.running {
+			break
+		}
+		if from != nil {
+			if fst := sc.mu.state[from.rangeID]; fst != nil && fst.running && fst.worker == st.worker {
+				break
+			}
+		}
+		sc.mu.idle.Wait()
+	}
+	r.raftMu.Lock()
+	r.raftMu.stopped = true
+	r.raftMu.Unlock()
+	sc.mu.Unlock()
+	r.markStopped()
+}
+
+// stopAll marks every replica's raft group stopped at shutdown. Stopper
+// workers (this one included) exit before the closers run, so no step
+// arriving over the network afterwards — a stream handler is not a
+// worker — can reach raft, which would read the log from an engine the
+// closers have shut.
+func (sc *raftScheduler) stopAll() {
+	sc.store.mu.Lock()
+	replicas := make([]*Replica, 0, len(sc.store.mu.replicas))
+	for _, r := range sc.store.mu.replicas {
+		replicas = append(replicas, r)
+	}
+	sc.store.mu.Unlock()
+	for _, r := range replicas {
+		r.stopRaftGroup()
+		r.markStopped()
+	}
+}
+
+// queueLen reports the queue depth (for status and tests).
+func (sc *raftScheduler) queueLen() int {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return len(sc.mu.queue)
+}

@@ -35,11 +35,14 @@ type SnapshotHandler func(header []byte, kvs func() ([]kvserver.SnapshotKV, erro
 type ServerHandlers struct {
 	// Batch executes a KV batch. Wire encoding (proto on the hot path,
 	// JSON from older senders) is the rpc layer's concern, not the node's.
-	Batch    func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
-	Join     PayloadHandler
-	Admin    PayloadHandler
-	Raft     func(ctx context.Context, rangeID base.RangeID, m raftpb.Message)
-	Snapshot SnapshotHandler
+	Batch func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
+	Join  PayloadHandler
+	Admin PayloadHandler
+	Raft  func(ctx context.Context, rangeID base.RangeID, m raftpb.Message)
+	// RaftHeartbeats receives a peer's coalesced heartbeats and responses
+	// (cluster v12; see kvserver/quiesce.go).
+	RaftHeartbeats func(ctx context.Context, from base.NodeID, beats, resps, closed []kvserver.RaftHeartbeat)
+	Snapshot       SnapshotHandler
 	// NodeInfo learns a peer's address from its Raft envelopes.
 	NodeInfo func(id base.NodeID, addr string)
 	// NodeHealth learns a peer's storage-health snapshot from its Raft
@@ -147,6 +150,13 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 		if s.handlers.NodeHealth != nil && env.FromNode != 0 && env.Health != nil {
 			s.handlers.NodeHealth(base.NodeID(env.FromNode), env.Health)
 		}
+		if len(env.Heartbeats) > 0 || len(env.HeartbeatResponses) > 0 || len(env.ClosedTimestamps) > 0 {
+			if s.handlers.RaftHeartbeats != nil {
+				s.handlers.RaftHeartbeats(stream.Context(), base.NodeID(env.FromNode),
+					heartbeatsOf(env.Heartbeats), heartbeatsOf(env.HeartbeatResponses), heartbeatsOf(env.ClosedTimestamps))
+			}
+			continue
+		}
 		var m raftpb.Message
 		if err := m.Unmarshal(env.Message); err != nil {
 			log.Warnf("dropping undecodable raft message: %v", err)
@@ -154,6 +164,21 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 		}
 		s.handlers.Raft(stream.Context(), base.RangeID(env.RangeId), m)
 	}
+}
+
+// heartbeatsOf converts a coalesced envelope's heartbeats.
+func heartbeatsOf(in []*rpcpb.RaftHeartbeat) []kvserver.RaftHeartbeat {
+	out := make([]kvserver.RaftHeartbeat, 0, len(in))
+	for _, hb := range in {
+		if hb == nil {
+			continue
+		}
+		out = append(out, kvserver.RaftHeartbeat{
+			RangeID: base.RangeID(hb.RangeId), To: hb.ToReplica, From: hb.FromReplica, Term: hb.Term, Commit: hb.Commit, Quiesce: hb.Quiesce,
+			Index: hb.Index, ClosedTS: hlc.Timestamp{WallTime: hb.ClosedWall, Logical: hb.ClosedLogical},
+		})
+	}
+	return out
 }
 
 // Ping answers a peer's latency probe with this node's physical clock at

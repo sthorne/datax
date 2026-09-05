@@ -507,6 +507,54 @@ func (t *Txn) GetForUpdate(ctx context.Context, key keys.Key) ([]byte, error) {
 	return br.Responses[0].Get.Value, nil
 }
 
+// GetBatchForUpdate is GetForUpdate over many keys in ONE routed batch
+// (the per-range sub-batches fan out in parallel): every key is read at
+// the transaction's read timestamp and locked with an intent, values
+// come back positionally (nil = absent, pinned by a tombstone intent).
+// SELECT ... FOR UPDATE over a scanned result locks its rows this way.
+func (t *Txn) GetBatchForUpdate(ctx context.Context, ks []keys.Key) ([][]byte, error) {
+	if len(ks) == 0 {
+		return nil, nil
+	}
+	if t.historical {
+		return nil, fmt.Errorf("cannot lock in a read-only historical transaction")
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	t.mu.txn.Sequence++
+	createRecord := false
+	if !t.mu.anchored {
+		if len(t.mu.txn.Key) == 0 {
+			t.mu.txn.Key = ks[0].Clone()
+		}
+		for _, k := range ks {
+			if keys.Key(t.mu.txn.Key).Equal(k) {
+				createRecord = true
+				break
+			}
+		}
+	}
+	txn := t.mu.txn
+	t.mu.Unlock()
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn, CreateTxnRecord: createRecord}}
+	for _, k := range ks {
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}, ForUpdate: true})
+	}
+	br, err := t.send(ctx, ba, true)
+	if err != nil {
+		return nil, err
+	}
+	vals := make([][]byte, len(ks))
+	for i, k := range ks {
+		t.recordRead(k, nil)
+		t.recordWrite(k)
+		vals[i] = br.Responses[i].Get.Value
+	}
+	return vals, nil
+}
+
 // ScanForUpdate reads [start, end) at the transaction's read timestamp and
 // locks every returned row (absent keys in the span are not locked; the
 // recorded read span still protects the gap via refresh).

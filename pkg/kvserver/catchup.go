@@ -69,7 +69,7 @@ func (r *Replica) runCatchupSnapshot(ctx context.Context, target base.NodeID, m 
 	hdr, err := r.streamSnapshot(ctx, target, desc, base.ReplicaID(m.To))
 	if err != nil {
 		log.Warnf("%s: catch-up snapshot to n%d (replica %d): %v", r.rangeID, target, m.To, err)
-		r.node.ReportSnapshot(m.To, raft.SnapshotFailure)
+		r.reportSnapshot(m.To, raft.SnapshotFailure)
 		return
 	}
 	// Forward a metadata-only MsgSnap at the position actually streamed
@@ -82,11 +82,11 @@ func (r *Replica) runCatchupSnapshot(ctx context.Context, target base.NodeID, m 
 	fm := m
 	fm.Snapshot = &snap
 	if err := r.store.cfg.Transport.SendRaftMessage(ctx, target, r.rangeID, fm); err != nil {
-		r.node.ReportSnapshot(m.To, raft.SnapshotFailure)
-		r.node.ReportUnreachable(m.To)
+		r.reportSnapshot(m.To, raft.SnapshotFailure)
+		r.reportUnreachable(m.To)
 		return
 	}
-	r.node.ReportSnapshot(m.To, raft.SnapshotFinish)
+	r.reportSnapshot(m.To, raft.SnapshotFinish)
 	metrics.CatchupSnapshots.Inc()
 	log.Infof("%s: caught up replica %d on n%d by snapshot at index %d", r.rangeID, m.To, target, hdr.AppliedIndex)
 	r.store.cfg.Events.Record("snapshot", "%s: replica %d on n%d caught up by snapshot at index %d", r.rangeID, m.To, target, hdr.AppliedIndex)
@@ -230,6 +230,7 @@ func (r *Replica) applySnapshot(snap raftpb.Snapshot) error {
 	r.mu.sizeBytes = p.h.SizeBytes
 	r.mu.Unlock()
 	r.setApplied(p.h.AppliedIndex)
+	r.noteAppliedTerm(p.h.Term)
 	log.Infof("%s: replica %d state replaced by catch-up snapshot (%d keys, applied index %d)",
 		r.rangeID, r.replicaID, p.count, p.h.AppliedIndex)
 	return nil

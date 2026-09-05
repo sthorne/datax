@@ -416,6 +416,69 @@ type rowGuard struct {
 	// st is the statement's cascade state, shared by every guard the
 	// statement creates.
 	st *cascadeState
+	// probe answers the parent lookups of primary-key foreign keys from
+	// the statement's batched read (setProbe; nil = read per row).
+	probe *probeSet
+}
+
+// setProbe installs the statement's batched read (a nil guard ignores it).
+func (g *rowGuard) setProbe(ps *probeSet) {
+	if g != nil {
+		g.probe = ps
+	}
+}
+
+// appendParentKeys appends the parent primary keys a row's foreign keys
+// will look up — for the keys that reference the parent's primary key,
+// which is what the batched read can answer; a null in the key, an
+// unchanged key on update, and a key referencing a unique index add
+// nothing (those look up per row). A nil guard appends nothing.
+func (g *rowGuard) appendParentKeys(ctx context.Context, txn *kvclient.Txn, ks []keys.Key, oldRow, row map[catalog.ColumnID]types.Datum) []keys.Key {
+	if g == nil {
+		return ks
+	}
+	for _, fk := range g.fks {
+		vals, skip, changed := fkValues(fk, oldRow, row)
+		if skip || !changed {
+			continue
+		}
+		parent, err := g.table(ctx, txn, fk.RefTable)
+		if err != nil || !sameIDs(fk.RefColumns, visiblePKIDs(parent)) {
+			continue
+		}
+		if key, err := parentPKKey(parent, fk, vals); err == nil {
+			ks = append(ks, key)
+		}
+	}
+	return ks
+}
+
+// fkValues is the row's values in the key's columns, whether any is NULL
+// (MATCH SIMPLE exempts the row) and whether any changed from oldRow
+// (nil oldRow: an insert, always changed).
+func fkValues(fk *catalog.Constraint, oldRow, row map[catalog.ColumnID]types.Datum) (vals []types.Datum, skip, changed bool) {
+	vals = make([]types.Datum, len(fk.Columns))
+	changed = oldRow == nil
+	for i, id := range fk.Columns {
+		vals[i] = rowVal(row, id)
+		if vals[i].Null {
+			skip = true
+		}
+		if oldRow != nil && datumChanged(rowVal(oldRow, id), vals[i]) {
+			changed = true
+		}
+	}
+	return vals, skip, changed
+}
+
+// parentPKKey is the parent row's primary key for a key that references
+// the parent's primary key.
+func parentPKKey(parent *catalog.TableDescriptor, fk *catalog.Constraint, vals []types.Datum) (keys.Key, error) {
+	probe := map[catalog.ColumnID]types.Datum{}
+	for i, id := range fk.RefColumns {
+		probe[id] = vals[i]
+	}
+	return pkKeyPartial(parent, probe)
 }
 
 // cascadeState is one statement's cascade bookkeeping: the remaining
@@ -600,17 +663,7 @@ func (g *rowGuard) checkForeignKeys(ctx context.Context, txn *kvclient.Txn, oldR
 		if fk.ID == exempt {
 			continue
 		}
-		vals := make([]types.Datum, len(fk.Columns))
-		skip, changed := false, oldRow == nil
-		for i, id := range fk.Columns {
-			vals[i] = rowVal(row, id)
-			if vals[i].Null {
-				skip = true
-			}
-			if oldRow != nil && datumChanged(rowVal(oldRow, id), vals[i]) {
-				changed = true
-			}
-		}
+		vals, skip, changed := fkValues(fk, oldRow, row)
 		if skip || !changed {
 			continue
 		}
@@ -618,16 +671,27 @@ func (g *rowGuard) checkForeignKeys(ctx context.Context, txn *kvclient.Txn, oldR
 		if err != nil {
 			return err
 		}
-		// A self-referencing key may point at a row this statement wrote
-		// but has not flushed yet.
-		if parent == g.desc && inserted != nil && sameIDs(fk.RefColumns, visiblePKIDs(parent)) {
-			probe := map[catalog.ColumnID]types.Datum{}
-			for i, id := range fk.RefColumns {
-				probe[id] = vals[i]
+		if sameIDs(fk.RefColumns, visiblePKIDs(parent)) {
+			key, err := parentPKKey(parent, fk, vals)
+			if err != nil {
+				return err
 			}
-			if key, err := pkKeyPartial(parent, probe); err == nil && inserted[string(key)] {
+			// A self-referencing key may point at a row this statement
+			// wrote but has not flushed yet.
+			if parent == g.desc && inserted != nil && inserted[string(key)] {
 				continue
 			}
+			// A key into the parent's primary key is one point read —
+			// answered by the statement's batched read when primed.
+			raw, err := g.probe.get(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if raw != nil {
+				continue
+			}
+			return newErrf(CodeForeignKeyViolation, "%s %q violates foreign key constraint %q: key %s is not present in table %q",
+				what, g.desc.Name, fk.Name, keyText(g.desc, fk.Columns, row), parent.Name)
 		}
 		rows, _, err := g.s.fetchRows(ctx, txn, parent, equalityConds(parent, fk.RefColumns, vals), nil, 1)
 		if err != nil {
@@ -853,7 +917,7 @@ func rewriteRow(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescript
 			}
 			wb.Put(shadow, value)
 		}
-		return newKey, updateIndexEntries(ctx, txn, d, fr.row, updated, wb, map[string]bool{})
+		return newKey, updateIndexEntries(ctx, txn, d, fr.row, updated, wb, map[string]bool{}, nil)
 	}
 	if existing, err := txn.Get(ctx, newKey); err != nil {
 		return nil, err
@@ -871,7 +935,7 @@ func rewriteRow(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescript
 		}
 		wb.Put(shadow, value)
 	}
-	return newKey, addIndexEntries(ctx, txn, d, updated, wb, map[string]bool{})
+	return newKey, addIndexEntries(ctx, txn, d, updated, wb, map[string]bool{}, nil)
 }
 
 // ---- DDL ------------------------------------------------------------

@@ -8,6 +8,97 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.34.0 — unreleased
+
+### Changed
+- Batched point reads in the executor (#103). An index join fetches the
+  primary rows behind its index entries in pages of 256, each page one
+  routed batch fanned out per range, in index order (`EXPLAIN ANALYZE`
+  reports the batches); a lookup matching 1,000 entries is four round
+  trips instead of 1,000. `INSERT` builds every row first and reads all
+  its primary-key and unique-index uniqueness probes and its foreign-key
+  parent lookups in one batch (as `COPY` did for primary keys; `COPY`
+  now batches the unique-index and foreign-key probes too); `UPDATE`
+  computes every row's new values first and batches the moved
+  unique-index entries' probes and the changed keys' parent lookups;
+  `SELECT ... FOR UPDATE` locks the selected rows in one batch. Each key
+  still records its read timestamp for refresh, and a key the batch was
+  not primed with still reads on its own. Before/after on the harness in
+  the PR; the set gains `index-join-1pct` and `index-join-10pct` (200 and
+  2,000 rows per lookup).
+- The latch manager indexes point spans by key (#108, latch part). Its
+  conflict check was a linear scan of every held latch's spans against
+  every span of the new request, allocating per comparison; with the
+  wide batches of #103 (100-key probes under the 8-way `ingest` load) it
+  reached 40% of a node's CPU and cost ingest a quarter of its throughput.
+  A point span now checks the holders under its key plus the ranged
+  holders; only ranged spans (scans, splits, merges) still scan every
+  holder, and overlap checks no longer allocate.
+
+## 0.33.0 — unreleased
+
+### Changed
+- Coalesced heartbeats and range quiescence (#102, part c; cluster
+  version **v12**). Heartbeats and their responses travel as one
+  envelope per peer node per scheduler pass instead of one each, and an
+  idle range — no proposal, read-index request or snapshot for 2 s,
+  every follower caught up and answering — stops ticking and heartbeating
+  on every replica until a message, a proposal or a client request wakes
+  it; a woken leader heartbeats at once and re-establishes follower
+  contact before its first lease read. An idle range's closed timestamp
+  now travels off the log (with the leader's term and log index, honored
+  by a follower only while it still follows that leader at that term and
+  has applied that index; in memory only), so follower reads stay fresh
+  on quiescent ranges without a raft entry and an fsync per range per
+  second — and for quiescent ranges it is grouped: one promise per
+  follower node per round covers every range registered there, so an
+  idle store publishes a few envelopes a second however many ranges it
+  holds. `/status` reports `quiescent` per range; new series
+  `datax_quiescent_ranges`, `datax_raft_quiesces_total`,
+  `datax_raft_unquiesces_total`, `datax_raft_heartbeat_envelopes_total`,
+  `datax_raft_heartbeats_coalesced_total`,
+  `datax_closed_timestamp_side_updates_total`,
+  `datax_closed_timestamp_group_updates_total`. Both stay off until
+  `datax debug upgrade` finalizes v12 (a v11 node reads neither).
+  Before/after on the harness in the PR.
+- Lease-based reads take a fast path: a leader that has committed an
+  entry in its own term answers the read index with its commit index at
+  once — what raft's lease-based read would put in the next Ready —
+  instead of a scheduler pass and a Ready per read.
+
+### Added
+- `--merge-size-threshold` on `datax start` and `datax demo` (negative
+  disables merging, e.g. to keep an empty pre-split for a benchmark).
+  `datax bench` records carry `error_samples` (the distinct messages
+  behind `errors`), and a `--presplit` run uses tables of its own
+  (`bench_kv_r1000`, ...) so it neither inherits an earlier workload's
+  rows nor collides with its keys. `ALTER TABLE ... SPLIT AT` waits out
+  a merge in flight on the range instead of failing.
+
+## 0.32.0 — unreleased
+
+### Changed
+- Store-level raft scheduler with group commit (#102, parts a and b): a
+  node's raft groups are driven by one fixed pool of workers
+  (`GOMAXPROCS`; `StoreConfig.RaftWorkers`) and one 100 ms ticker
+  instead of a goroutine and a ticker per replica. A worker takes a
+  group of queued replicas, handles one Ready each, and stages every
+  HardState and log entry into one synced Pebble batch — ten ranges
+  appending in the same moment cost one fsync, not ten — before any of
+  them sends a message or applies. New series:
+  `datax_raft_scheduler_latency_seconds`, `datax_raft_ready_passes_total`,
+  `datax_raft_log_syncs_total`, `datax_raft_readies_per_sync`. The
+  crash-consistency test kills the node at group-commit boundaries with
+  eight writers over sixteen ranges. Before/after on the harness in the PR.
+
+### Added
+- `ALTER TABLE t SPLIT AT VALUES (k, ...), ...` carves ranges at
+  primary-key tuples (a prefix of the key is allowed) and returns the
+  boundaries; idempotent, refused inside a transaction block (`25001`)
+  and on sharded timeseries tables (`0A000`, carved by shard). `datax
+  bench ... --presplit N` uses it; the checked-in set gains
+  `kv-50-50-1000-ranges` and `ingest-random-1000-ranges`.
+
 ## 0.31.0 — unreleased
 
 ### Changed

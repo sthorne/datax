@@ -37,7 +37,7 @@ func (r *Replica) adminTransferLease(ctx context.Context, req *kvpb.AdminTransfe
 			cmdTriggers{load: &loadHandoff{QPS: q, AtNanos: r.store.loadNow()}})
 	}
 
-	r.node.TransferLeadership(ctx, uint64(r.replicaID), uint64(rep.ReplicaID))
+	r.transferLeader(uint64(rep.ReplicaID))
 
 	// Raft aborts a transfer that cannot complete within one election
 	// timeout (1s at the default 100ms tick), so a bounded poll either

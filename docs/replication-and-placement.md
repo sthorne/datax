@@ -12,8 +12,8 @@ Per-replica Raft state lives in unreplicated local keys
 (`/local/r/<rangeID>/...`) in the node's shared Pebble store:
 HardState, log entries, applied index, and a copy of the descriptor.
 
-**Durability contract** (the classic etcd-raft rules, enforced in the ready
-loop):
+**Durability contract** (the classic etcd-raft rules, enforced when a
+Ready is handled):
 
 1. Persist HardState + new entries (synced batch) **before** sending any Raft
    messages from the same Ready.
@@ -21,8 +21,49 @@ loop):
    Pebble batch, so replay after a crash is idempotent (entries at or below
    the applied index are skipped).
 
-A single 200ms ticker drives all Raft groups on a node. `PreVote` and
-`CheckQuorum` are enabled.
+**The store's raft scheduler** (`pkg/kvserver/scheduler.go`) drives every
+group on a node from one fixed pool of workers (`GOMAXPROCS`;
+`StoreConfig.RaftWorkers`) instead of a goroutine and a ticker per
+replica. A message, a proposal, a read-index request or the store's one
+100 ms ticker *enqueues* a replica; a worker takes a group of queued
+replicas (up to 64), ticks or steps each `RawNode`, and handles one Ready
+per replica. Their HardStates and entries are staged into **one Pebble
+batch and synced once** — group commit: ten ranges appending in the same
+moment cost one fsync — before any of them sends a message, satisfies a
+read-index waiter or applies committed entries; then each is advanced,
+and one that still has work is re-queued so every range gets a turn. A
+replica is never handled by two workers at once (work arriving during
+its pass only raises its flags). The scheduler's queue wait is
+`datax_raft_scheduler_latency_seconds`; `datax_raft_log_syncs_total` and
+`datax_raft_readies_per_sync` show how many replicas each sync served.
+`PreVote` and `CheckQuorum` are enabled.
+
+**Coalesced heartbeats and quiescence** (cluster version v12;
+`pkg/kvserver/quiesce.go`). Heartbeats are the one cost that scales with
+the number of ranges whatever the workload, so two things make it a
+constant per peer node. A heartbeat or a heartbeat response is queued
+per destination and every scheduler pass flushes the queue as *one*
+envelope carrying every range's heartbeats (`RaftHeartbeat`: the five
+fields raft reads); the receiver fans them out. And a leader that has
+seen no proposal, read-index request or snapshot for 2 s, with every
+follower holding its whole log and having answered within the lease
+window, tells its followers it is going idle (a heartbeat with the
+`quiesce` flag) and stops ticking; a follower that holds the leader's
+commit index stops ticking too. Nothing is sent for an idle range and no
+election timer runs — a quiescent follower cannot campaign, which is
+what keeps the leader's lease reads safe once contact is re-established.
+A replica wakes on any raft message but a heartbeat response, on a
+proposal, read-index or leadership request, and on a client request
+landing on it (so a follower asked for a range whose leader is gone
+ticks, times out and campaigns). A woken leader heartbeats at once and
+its lease backstop forgets pre-sleep contact, so the first read after a
+long idle waits one round trip instead of trusting stale answers. An
+unreachable follower keeps its range awake: it is not idle, and its
+return would wake everyone anyway. `/status` reports `quiescent` per
+range; `datax_quiescent_ranges`, `datax_raft_quiesces_total`,
+`datax_raft_unquiesces_total`, `datax_raft_heartbeat_envelopes_total`
+and `datax_raft_heartbeats_coalesced_total` count the effect. Both stay
+off until the cluster finalizes v12: a v11 node reads neither.
 
 **Transport**: one gRPC bidirectional stream per node pair; each message is
 `{RangeID, To, From, opaque raftpb bytes}`. Raft messages are opaque to the
@@ -244,7 +285,7 @@ tick-rate skew.
 
 Two hardenings close the sleeping-leader gap (a GC pause, cgroup
 throttling, or VM freeze that stops the whole process): a **stall
-detector** — the raft ticker notes when a gap far exceeds its interval and
+detector** — the scheduler's tick notes when a gap far exceeds its interval and
 invalidates all pre-stall follower contact, so a leader that just woke
 cannot serve until a majority answers *again* — and a **post-evaluation
 re-check** of the backstop immediately before read results are returned,
@@ -275,6 +316,37 @@ the timestamp-cache floor to T (every later write is forwarded above it),
 releases, and proposes. A split hands the parent's closed timestamp to the
 new right-hand range so nothing can write beneath reads the parent already
 served on that span.
+
+A range whose log has not grown since its last logged promise publishes
+the next one **off the log** (v12): the same latch drain and cache bump,
+but the promise travels in the coalesced heartbeat envelope with the
+leader's term and last log index, and a follower honors it only while it
+still follows that leader at that term and has applied that index —
+raft's vote lease means no other leader can have committed anything it
+has not heard of meanwhile, which is what log order gave the replicated
+path. The value lives in memory only (never persisted or checksummed;
+a restart falls back to the last logged promise and re-learns within a
+publication interval), so an idle range keeps serving fresh follower
+reads without a raft entry, an fsync or a wake every second — which is
+what lets it stay quiescent. The first promise after new entries rides
+the log again.
+
+For **quiescent** ranges the off-log promise is grouped, so an idle
+store's publication cost is a few envelopes a second however many
+ranges it holds: a sleeping leader's term and last index cannot change,
+so it registers once per follower node (a per-range entry with an
+explicit promise), and from then on each round sends every follower
+node one group entry — "every range you hold registered from me is
+closed at T" — which the follower applies to its registry, re-validating
+each range and dropping one that fails. A range that wakes is dropped
+from the group by a per-range entry ahead of the next group promise, and
+until the followers see it the leader honors every promise they may
+still apply by forwarding its own timestamp-cache floor to the store's
+latest promise as it wakes (the promise is advanced before the woken set
+is collected, so a wake either lands in the set or bumps to the promise
+being sent). `datax_closed_timestamp_side_updates_total` counts the
+per-range entries, `datax_closed_timestamp_group_updates_total` the
+group ones.
 
 A follower serves a read-only batch pinned at a fixed timestamp exactly
 when that timestamp is at or below its closed timestamp; anything else —

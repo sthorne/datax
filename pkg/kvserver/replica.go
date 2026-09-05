@@ -94,8 +94,19 @@ type Replica struct {
 	rangeID   base.RangeID
 	replicaID base.ReplicaID
 
-	node raft.Node
-	rs   *raftStorage
+	rs *raftStorage
+
+	// raftMu guards the raft group. Held only for RawNode calls (a step,
+	// a proposal, taking or advancing a Ready) — never across Ready
+	// handling, which the store's scheduler serializes per replica
+	// (scheduler.go). stopped means the group is gone (a merge absorbed
+	// the range, the replica was removed, or its apply failed): every
+	// call refuses with errRaftStopped.
+	raftMu struct {
+		sync.Mutex
+		rn      *raft.RawNode
+		stopped bool
+	}
 
 	// tsCache is the read timestamp cache (leader-authoritative; see
 	// docs/transactions.md).
@@ -170,14 +181,39 @@ type Replica struct {
 		loadHandoff *loadHandoff
 		// checksums parks completed consistency-check results by check ID.
 		checksums map[string]checksumResult
+		// quiescent: the replica is asleep (quiesce.go) — the store ticker
+		// skips it. idleTicks counts a leader's consecutive idle ticks
+		// toward quiescing.
+		quiescent bool
+		idleTicks int
+		// sideClosedTS is a closed timestamp learned off the log
+		// (closedts.go): in memory only, never persisted or checksummed,
+		// and forgotten by a restart. closedTSLogged is the leader's last
+		// index after its last logged promise: a log that has not grown
+		// since publishes off the log.
+		sideClosedTS   hlc.Timestamp
+		closedTSLogged uint64
+		// sideRegistered names the follower nodes that hold this
+		// quiescent leader's registration in the off-log transport, so
+		// the store's group promise covers the range there; cleared on
+		// wake (closedts.go).
+		sideRegistered map[base.NodeID]bool
+		// appliedTerm is the term of the newest applied entry: a leader
+		// whose term it equals has committed an entry in its term, the
+		// condition under which raft answers a lease-based read index
+		// with its commit index (leaseReadIndex).
+		appliedTerm uint64
 	}
 
-	// quiesceCh asks the raft loop to exit without destroying data (a
-	// merge absorbed this range); stoppedCh closes when the loop is gone.
-	quiesceCh   chan struct{}
-	quiesceOnce sync.Once
-	stoppedCh   chan struct{}
+	// stoppedCh closes when the raft group is stopped for good: the
+	// scheduler will never run another pass for this replica.
+	stopOnce  sync.Once
+	stoppedCh chan struct{}
 }
+
+// errRaftStopped is returned by every raft-group call on a stopped
+// replica.
+var errRaftStopped = errors.New("raft group stopped")
 
 type readIndexResult struct {
 	idx uint64
@@ -218,8 +254,8 @@ func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *ra
 	return cfg
 }
 
-// newReplica loads or creates the replica and its Raft group; the Ready
-// loop starts with startRaftLoop, once the store holds the replica (see
+// newReplica loads or creates the replica and its Raft group; the group
+// is scheduled by startRaft, once the store holds the replica (see
 // Store.startReplica). bootstrap must be true exactly once per replica
 // lifetime — when the range is first created with its initial membership.
 func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
@@ -255,34 +291,109 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 		// the new-leader bump) and a restarted one.
 		r.tsCache.Bump([]latchSpan{wholeRangeSpan}, st.ClosedTS, uuid.Nil)
 	}
-	r.quiesceCh = make(chan struct{})
 	r.stoppedCh = make(chan struct{})
 
 	cfg := raftConfig(uint64(replicaID), st.AppliedIndex, rs, r.leaseReads)
+	rn, err := raft.NewRawNode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if bootstrap {
 		peers := make([]raft.Peer, 0, len(desc.Replicas))
 		for _, rep := range desc.Replicas {
 			peers = append(peers, raft.Peer{ID: uint64(rep.ReplicaID)})
 		}
-		r.node = raft.StartNode(cfg, peers)
-	} else {
-		r.node = raft.RestartNode(cfg)
+		if err := rn.Bootstrap(peers); err != nil {
+			return nil, err
+		}
 	}
+	r.raftMu.rn = rn
 
 	return r, nil
 }
 
-// startRaftLoop starts the replica's Ready-processing goroutine. Separate
-// from construction so a restart can load every replica before any of
-// them applies: a replayed merge looks its RHS up in the store map, and
-// an LHS loop that started before its sibling was loaded would find it
-// missing and fatal the node (issue #70).
-func (r *Replica) startRaftLoop() error {
-	if err := r.store.cfg.Stopper.RunWorker(r.raftLoop); err != nil {
-		r.node.Stop()
+// startRaft hands the replica to the store's scheduler. Separate from
+// construction so a restart can load every replica before any of them
+// applies: a replayed merge looks its RHS up in the store map, and an LHS
+// that started before its sibling was loaded would find it missing and
+// fatal the node (issue #70).
+func (r *Replica) startRaft() error {
+	if err := r.store.sched.start(); err != nil {
 		return err
 	}
+	r.store.sched.enqueue(r.rangeID, schedReady)
 	return nil
+}
+
+// withRaftGroup runs f against the raft group under raftMu, refusing once
+// the group is stopped. Callers that may have produced work (a step, a
+// proposal, a tick) enqueue the replica afterwards, outside the lock.
+func (r *Replica) withRaftGroup(f func(rn *raft.RawNode) error) error {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	if r.raftMu.stopped {
+		return errRaftStopped
+	}
+	return f(r.raftMu.rn)
+}
+
+// stopRaftGroup marks the group stopped from within its own pass.
+func (r *Replica) stopRaftGroup() {
+	r.raftMu.Lock()
+	r.raftMu.stopped = true
+	r.raftMu.Unlock()
+}
+
+// markStopped closes stoppedCh (once).
+func (r *Replica) markStopped() {
+	r.stopOnce.Do(func() { close(r.stoppedCh) })
+}
+
+// raftStatus is the group's raft status (ok=false once stopped).
+func (r *Replica) raftStatus() (st raft.Status, ok bool) {
+	err := r.withRaftGroup(func(rn *raft.RawNode) error {
+		st = rn.Status()
+		return nil
+	})
+	return st, err == nil
+}
+
+// reportUnreachable tells raft a peer could not be reached (it backs off
+// its replication to that peer).
+func (r *Replica) reportUnreachable(id uint64) {
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		rn.ReportUnreachable(id)
+		return nil
+	})
+	r.store.sched.enqueue(r.rangeID, schedReady)
+}
+
+// reportSnapshot tells raft how an out-of-band snapshot to a peer ended.
+func (r *Replica) reportSnapshot(id uint64, status raft.SnapshotStatus) {
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		rn.ReportSnapshot(id, status)
+		return nil
+	})
+	r.store.sched.enqueue(r.rangeID, schedReady)
+}
+
+// campaign starts an election for this replica.
+func (r *Replica) campaign() error {
+	r.unquiesce()
+	err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Campaign() })
+	r.store.sched.enqueue(r.rangeID, schedReady)
+	return err
+}
+
+// transferLeader asks the group's leader to hand leadership to
+// transferee; on a follower raft forwards the request to the leader.
+func (r *Replica) transferLeader(transferee uint64) {
+	r.unquiesce()
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		rn.TransferLeader(transferee)
+		return nil
+	})
+	r.store.sched.enqueue(r.rangeID, schedReady)
 }
 
 // Desc returns the replica's current view of the range descriptor.
@@ -305,7 +416,13 @@ func (r *Replica) GCThreshold() hlc.Timestamp {
 func (r *Replica) ClosedTimestamp() hlc.Timestamp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.mu.closedTS
+	ct := r.mu.closedTS.Forward(r.mu.sideClosedTS)
+	if r.mu.quiescent && len(r.mu.sideRegistered) > 0 {
+		// A registered quiescent leader is covered by the store's group
+		// promise (closedts.go).
+		ct = ct.Forward(*r.store.side.groupTS.Load())
+	}
+	return ct
 }
 
 // SizeBytes returns the range's replicated approximate data size.
@@ -397,54 +514,33 @@ func (r *Replica) notLeaderError() *kvpb.Error {
 	return e
 }
 
-// raftLoop is the replica's Ready-processing goroutine.
-func (r *Replica) raftLoop(ctx context.Context) {
-	defer close(r.stoppedCh)
-	ticker := time.NewTicker(r.store.cfg.RaftTickInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			r.node.Stop()
-			return
-		case <-r.quiesceCh:
-			// A merge absorbed this range: stop the group, keep the data
-			// (which now belongs to the merged range).
-			r.node.Stop()
-			return
-		case <-ticker.C:
-			r.noteTick()
-			r.node.Tick()
-		case rd := <-r.node.Ready():
-			err := r.handleReady(ctx, rd)
-			if err == errReplicaRemoved {
-				log.Infof("%s/%d: removed from range; shutting replica down", r.rangeID, r.replicaID)
-				r.node.Stop()
-				r.store.removeReplica(r.rangeID, r.Desc())
-				return
-			}
-			if err != nil {
-				if err == errApplyAborted {
-					// Clean shutdown interleaved with a merge apply: nothing
-					// was applied; the restart replays the entry (issue #61).
-					log.Infof("%s/%d: apply aborted by shutdown; entry replays after restart", r.rangeID, r.replicaID)
-				} else if errors.Is(err, errApplyAborted) {
-					// Aborted without a shutdown (a dead local RHS at merge
-					// apply, issue #70): nothing was applied, and this
-					// replica is out of service until the node restarts.
-					log.Warnf("%s/%d: %v", r.rangeID, r.replicaID, err)
-				} else {
-					log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
-				}
-				r.node.Stop()
-				return
-			}
-			r.node.Advance()
-		}
+// takeReady runs a tick if the pass was flagged for one and takes raft's
+// Ready if it has one. ok=false: nothing to do, or the group is stopped.
+func (r *Replica) takeReady(flags raftSchedFlags) (rd raft.Ready, ok bool) {
+	if flags&schedTick != 0 {
+		r.noteTick()
 	}
+	err := r.withRaftGroup(func(rn *raft.RawNode) error {
+		if flags&schedTick != 0 && !r.maybeQuiesce(rn) {
+			rn.Tick()
+		}
+		if rn.HasReady() {
+			rd, ok = rn.Ready(), true
+		}
+		return nil
+	})
+	if err != nil {
+		return raft.Ready{}, false
+	}
+	return rd, ok
 }
 
-func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
+// stageReady is the first half of handling a Ready: leadership
+// bookkeeping, the snapshot (installed out of band, acknowledged here),
+// and the HardState and new entries staged into b — the scheduler's
+// group batch, committed with one sync for every replica in the pass
+// before any of them sends a message (the raft durability contract).
+func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 	// 1. Track term and leadership changes. Raft keeps stepping messages
 	// while this loop works through a Ready, so a leadership interruption
 	// can complete entirely between two Readies — lost and regained, or
@@ -510,8 +606,7 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 	}
 
 	// 2. Acknowledge the snapshot (state already installed out of band),
-	// then persist HardState and new entries — synced, BEFORE sending any
-	// messages (the Raft durability contract). Snapshot first: entries in
+	// then stage HardState and new entries. Snapshot first: entries in
 	// the same Ready follow the snapshot's index, and Advance() expects the
 	// storage to already report the post-snapshot positions.
 	if !raft.IsEmptySnap(rd.Snapshot) {
@@ -519,24 +614,17 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 			return err
 		}
 	}
-	if !raft.IsEmptyHardState(rd.HardState) || len(rd.Entries) > 0 {
-		b := r.store.cfg.Engine.NewBatch()
-		if !raft.IsEmptyHardState(rd.HardState) {
-			if err := r.rs.setHardState(b, rd.HardState); err != nil {
-				_ = b.Close()
-				return err
-			}
-		}
-		if err := r.rs.append(b, rd.Entries); err != nil {
-			_ = b.Close()
+	if !raft.IsEmptyHardState(rd.HardState) {
+		if err := r.rs.setHardState(b, rd.HardState); err != nil {
 			return err
 		}
-		if err := b.Commit(true); err != nil {
-			return err
-		}
-		faultpoint.Hit("raft-append")
 	}
+	return r.rs.append(b, rd.Entries)
+}
 
+// finishReady is the second half, after the group batch is durable: send
+// the messages, satisfy read-index waiters, apply the committed entries.
+func (r *Replica) finishReady(ctx context.Context, rd raft.Ready) error {
 	// 3. Send messages.
 	r.sendRaftMessages(ctx, rd.Messages)
 
@@ -563,8 +651,53 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 	return nil
 }
 
+// advanceReady tells raft the Ready is handled and re-enqueues the
+// replica when raft has more to say, so every range gets a turn.
+func (r *Replica) advanceReady(rd raft.Ready) {
+	more := false
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		rn.Advance(rd)
+		more = rn.HasReady()
+		return nil
+	})
+	if more {
+		r.store.sched.enqueue(r.rangeID, schedReady)
+	}
+}
+
+// failReady stops the group after a Ready could not be handled: a
+// removed replica wipes its state; any other failure leaves the replica
+// in the store map with a frozen applied index until a restart.
+func (r *Replica) failReady(err error) {
+	r.stopRaftGroup()
+	if err == errReplicaRemoved {
+		log.Infof("%s/%d: removed from range; shutting replica down", r.rangeID, r.replicaID)
+		r.store.removeReplica(r.rangeID, r.Desc())
+	} else if err == errApplyAborted {
+		// Clean shutdown interleaved with a merge apply: nothing was
+		// applied; the restart replays the entry (issue #61).
+		log.Infof("%s/%d: apply aborted by shutdown; entry replays after restart", r.rangeID, r.replicaID)
+	} else if errors.Is(err, errApplyAborted) {
+		// Aborted without a shutdown (a dead local RHS at merge apply,
+		// issue #70): nothing was applied, and this replica is out of
+		// service until the node restarts.
+		log.Warnf("%s/%d: %v", r.rangeID, r.replicaID, err)
+	} else {
+		log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
+	}
+	r.markStopped()
+}
+
+// raftStopped reports whether the group has been stopped.
+func (r *Replica) raftStopped() bool {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	return r.raftMu.stopped
+}
+
 func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 	desc := r.Desc()
+	coalesce := r.store.coalescedHeartbeats()
 	for i := range msgs {
 		m := msgs[i]
 		var target base.NodeID
@@ -585,14 +718,23 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 			r.startCatchupSnapshot(target, m)
 			continue
 		}
+		if (m.Type == raftpb.MsgHeartbeat || m.Type == raftpb.MsgHeartbeatResp) && len(m.Context) == 0 && coalesce {
+			// One envelope per peer node per scheduler pass carries every
+			// range's heartbeats (quiesce.go).
+			r.store.queueHeartbeat(target, RaftHeartbeat{RangeID: r.rangeID, To: m.To, From: m.From, Term: m.Term, Commit: m.Commit},
+				m.Type == raftpb.MsgHeartbeatResp)
+			continue
+		}
 		if err := r.store.cfg.Transport.SendRaftMessage(ctx, target, r.rangeID, m); err != nil {
 			// Raft tolerates message loss; report unreachability so it backs off.
-			r.node.ReportUnreachable(m.To)
+			r.reportUnreachable(m.To)
 		}
 	}
 }
 
 // stepRaftMessage feeds an incoming message into the Raft state machine.
+// Any message but a heartbeat response wakes a quiescent replica (the
+// response to a leader's parting heartbeat must not wake it back up).
 func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 	switch m.Type {
 	case raftpb.MsgHeartbeatResp, raftpb.MsgAppResp:
@@ -601,7 +743,14 @@ func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 		r.mu.lastFollowerResp[m.From] = time.Now()
 		r.mu.Unlock()
 	}
-	return r.node.Step(ctx, m)
+	if m.Type != raftpb.MsgHeartbeatResp {
+		r.unquiesce()
+	}
+	err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Step(m) })
+	if err == nil {
+		r.store.sched.enqueue(r.rangeID, schedReady)
+	}
+	return err
 }
 
 // noteTick runs on every raft ticker fire and detects stalls: a gap far
@@ -694,12 +843,14 @@ func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cm
 		r.mu.Unlock()
 	}()
 
-	if err := r.node.Propose(ctx, data); err != nil {
+	r.unquiesce()
+	if err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Propose(data) }); err != nil {
 		if err == raft.ErrProposalDropped {
 			return nil, r.notLeaderError()
 		}
 		return nil, kvpb.NewError(err)
 	}
+	r.store.sched.enqueue(r.rangeID, schedReady)
 	select {
 	case <-ctx.Done():
 		e := kvpb.NewErrorf("%s: proposal abandoned: %v", r.rangeID, ctx.Err())
@@ -764,6 +915,11 @@ func (r *Replica) readIndexLoop() {
 // It runs under the store's lifetime (not any single caller's context) with
 // a bounded timeout; a timeout surfaces to the cohort as a retryable error.
 func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
+	if r.leaseReads {
+		if idx, ok := r.leaseReadIndex(); ok {
+			return idx, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.store.cfg.Stopper.Ctx(), 3*time.Second)
 	defer cancel()
 	rctx := uuid.NewString()
@@ -777,9 +933,14 @@ func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
 		r.mu.Unlock()
 	}()
 
-	if err := r.node.ReadIndex(ctx, []byte(rctx)); err != nil {
+	r.unquiesce()
+	if err := r.withRaftGroup(func(rn *raft.RawNode) error {
+		rn.ReadIndex([]byte(rctx))
+		return nil
+	}); err != nil {
 		return 0, kvpb.NewError(err)
 	}
+	r.store.sched.enqueue(r.rangeID, schedReady)
 	select {
 	case <-ctx.Done():
 		return 0, kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
@@ -805,6 +966,35 @@ func (r *Replica) waitApplied(ctx context.Context, idx uint64) *kvpb.Error {
 	}
 }
 
+// noteAppliedTerm records the term of the entry just applied.
+func (r *Replica) noteAppliedTerm(term uint64) {
+	r.mu.Lock()
+	if term > r.mu.appliedTerm {
+		r.mu.appliedTerm = term
+	}
+	r.mu.Unlock()
+}
+
+// leaseReadIndex is the fast path of a lease-based read index: raft's
+// ReadOnlyLeaseBased answer is the leader's commit index, given at once
+// when the leader has committed an entry in its own term — exactly what
+// raft would put in the next Ready's ReadStates, minus a scheduler pass
+// and a Ready per read. ok=false (not the leader, or no entry of this
+// term applied yet) falls back to the full round through raft.
+func (r *Replica) leaseReadIndex() (idx uint64, ok bool) {
+	r.mu.Lock()
+	appliedTerm := r.mu.appliedTerm
+	r.mu.Unlock()
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		st := rn.BasicStatus()
+		if st.RaftState == raft.StateLeader && st.Lead == uint64(r.replicaID) && st.Term == appliedTerm {
+			idx, ok = st.Commit, true
+		}
+		return nil
+	})
+	return idx, ok
+}
+
 // setApplied advances the applied index and wakes satisfied waiters.
 // Called from the apply path only.
 func (r *Replica) setApplied(idx uint64) {
@@ -828,6 +1018,19 @@ func (r *Replica) setApplied(idx uint64) {
 // read at or below the range's closed timestamp, which any replica serves
 // locally (see executeStaleRead).
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	// A stale read at or below the closed timestamp needs no leader and
+	// no wake: any replica serves it locally, a sleeping one included.
+	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) {
+		return r.executeStaleRead(ba)
+	}
+	// Any other request wakes a sleeping replica: a leader resumes
+	// heartbeating (and, for a lease read, waits for its followers'
+	// answers, which pre-sleep contact no longer stands in for); a
+	// follower resumes ticking, so if the leader the client is looking
+	// for is gone it times out and campaigns (quiesce.go).
+	if r.unquiesce() && r.isLeader() && ba.IsReadOnly() && r.leaseReads {
+		r.awaitContact(ctx, 2*time.Duration(raftElectionTicks)*r.store.cfg.RaftTickInterval)
+	}
 	if !r.isLeader() {
 		if ba.Header.StaleRead && ba.IsReadOnly() {
 			return r.executeStaleRead(ba)

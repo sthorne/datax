@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -42,9 +43,12 @@ type benchResult struct {
 	RowsPerSec float64 `json:"rows_per_sec,omitempty"`
 	Errors     int64   `json:"errors"`
 	Retries    int64   `json:"retries"`
-	P50us      int64   `json:"p50_us"`
-	P95us      int64   `json:"p95_us"`
-	P99us      int64   `json:"p99_us"`
+	// ErrorSamples counts the distinct error messages behind Errors
+	// (the first 160 characters of each; at most 8 distinct kinds).
+	ErrorSamples map[string]int64 `json:"error_samples,omitempty"`
+	P50us        int64            `json:"p50_us"`
+	P95us        int64            `json:"p95_us"`
+	P99us        int64            `json:"p99_us"`
 	// Metrics are the server's counter deltas over the run (every plain
 	// datax_* series that moved), from --server-url or --metrics-url.
 	Metrics map[string]float64 `json:"metrics,omitempty"`
@@ -120,6 +124,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
 	groups := fs.Int("groups", 1000, "index-join workload: distinct indexed values (rows per lookup = preload / groups)")
+	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	name := fs.String("name", "", "label in the JSON record (default: the workload)")
 	jsonOut := fs.String("json", "", "write the run's record to this file")
@@ -211,6 +216,16 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if *keys == "uuid" {
 		ingestTable = "bench_ingest_uuid"
 	}
+	// A pre-split run gets tables of its own (bench_kv_r1000, ...): the
+	// carve-up must start from an empty table, and a run over a table an
+	// earlier workload filled with the same seed would only collide with
+	// its own keys.
+	rsuffix := ""
+	if *presplit > 1 {
+		rsuffix = fmt.Sprintf("_r%d", *presplit)
+	}
+	ingestTable += rsuffix
+	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
 	tsBase := time.Now().UTC().Truncate(time.Second)
@@ -248,20 +263,37 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		return nil
 	}
+	split := func(table string, max int64, text bool) error {
+		return presplitTable(ctx, setup, table, *presplit, max, text)
+	}
 	switch workload {
 	case "kv":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_kv (k INT8 PRIMARY KEY, v TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"); err != nil {
 			return nil, err
 		}
-		if err := preloadRows("bench_kv", "k, v", func(j int) string { return fmt.Sprintf("(%d, 'v%d')", j, j) }); err != nil {
+		if err := split(kvTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		if err := preloadRows(kvTable, "k, v", func(j int) string { return fmt.Sprintf("(%d, 'v%d')", j, j) }); err != nil {
 			return nil, err
 		}
 	case "ingest", "ingest-copy":
-		ddl := "CREATE TABLE IF NOT EXISTS bench_ingest (k INT8 PRIMARY KEY, pad TEXT)"
+		ddl := "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k INT8 PRIMARY KEY, pad TEXT)"
 		if *keys == "uuid" {
-			ddl = "CREATE TABLE IF NOT EXISTS bench_ingest_uuid (k TEXT PRIMARY KEY, pad TEXT)"
+			ddl = "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k TEXT PRIMARY KEY, pad TEXT)"
 		}
 		if _, err := setup.Exec(ctx, ddl); err != nil {
+			return nil, err
+		}
+		switch *keys {
+		case "uuid":
+			err = split(ingestTable, 0, true)
+		case "sequential":
+			err = split(ingestTable, int64(*concurrency)<<40, false) // each worker's keys start at worker<<40
+		default:
+			err = split(ingestTable, math.MaxInt64, false)
+		}
+		if err != nil {
 			return nil, err
 		}
 	case "timeseries":
@@ -273,30 +305,44 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		if _, err := setup.Exec(ctx, ddl); err != nil {
 			return nil, err
 		}
+		if *shards == 0 {
+			if err := split(tsTable, int64(*series), false); err != nil {
+				return nil, err
+			}
+		}
 	case "bank":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_bank (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+bankTable+" (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
 			return nil, err
 		}
-		if err := preloadRows("bench_bank", "id, balance", func(j int) string { return fmt.Sprintf("(%d, 1000)", j) }); err != nil {
+		if err := split(bankTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		if err := preloadRows(bankTable, "id, balance", func(j int) string { return fmt.Sprintf("(%d, 1000)", j) }); err != nil {
 			return nil, err
 		}
 	case "index-join":
 		// A wide primary row (pad) reached through a narrow secondary
 		// index: each lookup fans out to preload/groups primary fetches.
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_ij (k INT8 PRIMARY KEY, g INT8, pad TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+ijTable+" (k INT8 PRIMARY KEY, g INT8, pad TEXT)"); err != nil {
 			return nil, err
 		}
-		if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS bench_ij_g ON bench_ij (g)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS "+ijTable+"_g ON "+ijTable+" (g)"); err != nil {
 			return nil, err
 		}
-		if err := preloadRows("bench_ij", "k, g, pad", func(j int) string { return fmt.Sprintf("(%d, %d, '%s')", j, j%*groups, pad) }); err != nil {
+		if err := split(ijTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		if err := preloadRows(ijTable, "k, g, pad", func(j int) string { return fmt.Sprintf("(%d, %d, '%s')", j, j%*groups, pad) }); err != nil {
 			return nil, err
 		}
 	case "scan":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS bench_scan (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
 			return nil, err
 		}
-		if err := preloadRows("bench_scan", "k, pad", func(j int) string { return fmt.Sprintf("(%d, '%s')", j, pad) }); err != nil {
+		if err := split(scanTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		if err := preloadRows(scanTable, "k, pad", func(j int) string { return fmt.Sprintf("(%d, '%s')", j, pad) }); err != nil {
 			return nil, err
 		}
 	}
@@ -305,6 +351,20 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	var ops, errs, retries, rowsOut atomic.Int64
 	var latMu sync.Mutex
 	var lats []time.Duration
+	var errSampleMu sync.Mutex
+	errSamples := map[string]int64{}
+	noteError := func(err error) {
+		errs.Add(1)
+		msg := err.Error()
+		if len(msg) > 160 {
+			msg = msg[:160]
+		}
+		errSampleMu.Lock()
+		if _, ok := errSamples[msg]; ok || len(errSamples) < 8 {
+			errSamples[msg]++
+		}
+		errSampleMu.Unlock()
+	}
 
 	// Ingest extras: per-interval throughput/latency reporting, a shared
 	// pacer for --rate, and storage-health counter deltas from /metrics.
@@ -442,15 +502,15 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 				case "kv":
 					if rng.Intn(100) < *readPct {
 						var v string
-						err = conn.QueryRow(ctx, fmt.Sprintf("SELECT v FROM bench_kv WHERE k = %d", rng.Intn(*preload))).Scan(&v)
+						err = conn.QueryRow(ctx, fmt.Sprintf("SELECT v FROM %s WHERE k = %d", kvTable, rng.Intn(*preload))).Scan(&v)
 						if err == pgx.ErrNoRows {
 							err = nil
 						}
 					} else {
-						_, err = conn.Exec(ctx, fmt.Sprintf("UPDATE bench_kv SET v = 'u%d' WHERE k = %d", rng.Int63(), rng.Intn(*preload)))
+						_, err = conn.Exec(ctx, fmt.Sprintf("UPDATE %s SET v = 'u%d' WHERE k = %d", kvTable, rng.Int63(), rng.Intn(*preload)))
 					}
 				case "bank":
-					err = bankTransfer(ctx, conn, rng, *preload, *forUpdate)
+					err = bankTransfer(ctx, conn, rng, bankTable, *preload, *forUpdate)
 				case "ingest":
 					if pace != nil {
 						pace()
@@ -507,18 +567,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 					_, err = conn.Exec(ctx, sb.String())
 				case "index-join":
 					var n int64
-					n, err = countRows(ctx, conn, fmt.Sprintf("SELECT k, pad FROM bench_ij WHERE g = %d", rng.Intn(*groups)))
+					n, err = countRows(ctx, conn, fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups)))
 					rowsOut.Add(n)
 				case "scan":
 					var n int64
-					n, err = countRows(ctx, conn, "SELECT k, pad FROM bench_scan")
+					n, err = countRows(ctx, conn, "SELECT k, pad FROM "+scanTable)
 					rowsOut.Add(n)
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
 						retries.Add(1)
 					} else {
-						errs.Add(1)
+						noteError(err)
 					}
 					continue
 				}
@@ -533,6 +593,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	total := ops.Load()
 	res.Ops, res.OpsPerSec = total, float64(total)/duration.Seconds()
 	res.Errors, res.Retries = errs.Load(), retries.Load()
+	errSampleMu.Lock()
+	if len(errSamples) > 0 {
+		res.ErrorSamples = errSamples
+	}
+	errSampleMu.Unlock()
 	fmt.Printf("\n%s results:\n", workload)
 	fmt.Printf("  ops:        %d (%.1f/s)\n", total, res.OpsPerSec)
 	switch {
@@ -547,6 +612,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 	fmt.Printf("  40001s:     %d\n", res.Retries)
 	fmt.Printf("  errors:     %d\n", res.Errors)
+	for msg, n := range res.ErrorSamples {
+		fmt.Printf("    %6d × %s\n", n, msg)
+	}
 	if before != nil {
 		after := scrapeCounters(httpClient, *metricsURL)
 		res.Metrics = counterDeltas(before, after)
@@ -714,6 +782,39 @@ func scrapeCounters(client *http.Client, url string) map[string]float64 {
 
 // counterDeltas returns after - before for every datax_* series that
 // moved.
+// presplitTable carves table into n ranges at evenly spaced primary
+// keys — integer keys over [0, max), text keys over the hexadecimal
+// prefixes of a uuid — through ALTER TABLE ... SPLIT AT, 100 boundaries
+// per statement. n <= 1 is a no-op.
+func presplitTable(ctx context.Context, conn *pgx.Conn, table string, n int, max int64, text bool) error {
+	if n <= 1 {
+		return nil
+	}
+	width := 1
+	for text && (1<<(4*width)) < n {
+		width++
+	}
+	var tuples []string
+	for i := 1; i < n; i++ {
+		if text {
+			tuples = append(tuples, fmt.Sprintf("('%0*x')", width, int64(i)*int64(1<<(4*width))/int64(n)))
+		} else {
+			tuples = append(tuples, fmt.Sprintf("(%d)", max/int64(n)*int64(i)))
+		}
+	}
+	fmt.Printf("pre-splitting %s into %d ranges...\n", table, n)
+	for i := 0; i < len(tuples); i += 100 {
+		end := i + 100
+		if end > len(tuples) {
+			end = len(tuples)
+		}
+		if err := execRetrying(ctx, conn, fmt.Sprintf("ALTER TABLE %s SPLIT AT VALUES %s", table, strings.Join(tuples[i:end], ", "))); err != nil {
+			return fmt.Errorf("pre-splitting %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
 func counterDeltas(before, after map[string]float64) map[string]float64 {
 	out := map[string]float64{}
 	for name, a := range after {
@@ -729,7 +830,7 @@ func counterDeltas(before, after map[string]float64) map[string]float64 {
 
 // bankTransfer moves a random amount between two random accounts in one
 // serializable transaction (the classic consistency workload).
-func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, accounts int, forUpdate bool) error {
+func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, table string, accounts int, forUpdate bool) error {
 	a, b := rng.Intn(accounts), rng.Intn(accounts)
 	if a == b {
 		b = (b + 1) % accounts
@@ -748,20 +849,20 @@ func bankTransfer(ctx context.Context, conn *pgx.Conn, rng *rand.Rand, accounts 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var balA, balB int64
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d%s", a, suffix)).Scan(&balA); err != nil {
+	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM %s WHERE id = %d%s", table, a, suffix)).Scan(&balA); err != nil {
 		return err
 	}
-	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM bench_bank WHERE id = %d%s", b, suffix)).Scan(&balB); err != nil {
+	if err := tx.QueryRow(ctx, fmt.Sprintf("SELECT balance FROM %s WHERE id = %d%s", table, b, suffix)).Scan(&balB); err != nil {
 		return err
 	}
 	amount := int64(rng.Intn(10) + 1)
 	if balA < amount {
 		return tx.Commit(ctx) // nothing to move
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE bench_bank SET balance = %d WHERE id = %d", balA-amount, a)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE %s SET balance = %d WHERE id = %d", table, balA-amount, a)); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE bench_bank SET balance = %d WHERE id = %d", balB+amount, b)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE %s SET balance = %d WHERE id = %d", table, balB+amount, b)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

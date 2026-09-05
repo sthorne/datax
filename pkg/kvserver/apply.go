@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -63,7 +64,13 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 		if err := cc.Unmarshal(ent.Data); err != nil {
 			return fmt.Errorf("corrupt conf change: %w", err)
 		}
-		state := r.node.ApplyConfChange(cc)
+		var state *raftpb.ConfState
+		if err := r.withRaftGroup(func(rn *raft.RawNode) error {
+			state = rn.ApplyConfChange(cc)
+			return nil
+		}); err != nil {
+			return err
+		}
 		r.rs.setConfStateRaw(*state)
 
 		// Membership-change conf changes carry the new descriptor; adopt it
@@ -97,6 +104,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 			r.mu.Unlock()
 		}
 		r.setApplied(ent.Index)
+		r.noteAppliedTerm(ent.Term)
 
 		if cc.Type == raftpb.ConfChangeRemoveNode && newDesc != nil {
 			if _, stillMember := newDesc.GetReplica(r.store.cfg.NodeID); !stillMember {
@@ -112,6 +120,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 				return err
 			}
 			r.setApplied(ent.Index)
+			r.noteAppliedTerm(ent.Term)
 			return nil
 		}
 		cmd, err := decodeRaftCommand(ent.Data)
@@ -124,6 +133,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 			// replays after restart.
 			return abort
 		}
+		r.noteAppliedTerm(ent.Term)
 
 		// Deliver the outcome to a local waiter, if this replica proposed it.
 		r.mu.Lock()
