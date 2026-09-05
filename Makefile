@@ -7,11 +7,14 @@ all: build
 build:
 	$(GO) build -o bin/datax ./cmd/datax
 
+# The cluster suite (pkg/testutils/testcluster) runs past go test's
+# default 10-minute per-package timeout on a small machine; the explicit
+# timeout turns a confusing mid-run kill into a run that finishes.
 test:
-	$(GO) test ./...
+	$(GO) test -timeout 30m ./...
 
 test-race:
-	$(GO) test -race -timeout 20m ./...
+	$(GO) test -race -timeout 30m ./...
 
 vet:
 	$(GO) vet ./...

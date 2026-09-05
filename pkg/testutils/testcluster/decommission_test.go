@@ -8,6 +8,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
@@ -64,11 +65,12 @@ func TestDecommissionDrainsReplicas(t *testing.T) {
 	}
 
 	// Stopping the drained node causes zero churn, even past the dead-node
-	// threshold: there is nothing left to repair.
-	_, before, err := tc.rangeCounts(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// threshold: there is nothing left to repair. The steady state is
+	// established first (issue #167): the drain's last moves may still
+	// be settling — a descriptor bump in flight when "before" is sampled
+	// would count as churn — so "before" is the generation set once it
+	// has held still for a second.
+	before := waitForStableGenerations(t, ctx, tc, time.Second, 60*time.Second)
 	tc.StopNode(lead)
 	time.Sleep(repairTestThreshold + 3*time.Second)
 	_, after, err := tc.rangeCounts(ctx)
@@ -199,4 +201,50 @@ func TestDecommissionSurvivesRestartAndCancel(t *testing.T) {
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
+}
+
+// waitForStableGenerations returns the cluster's range descriptors once
+// no range's generation has changed across two reads a window apart —
+// the allocator is quiescent — failing the test after timeout.
+func waitForStableGenerations(t *testing.T, ctx context.Context, tc *TestCluster, window, timeout time.Duration) []kvpb.RangeDescriptor {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	_, prev, err := tc.rangeCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		time.Sleep(window)
+		_, cur, err := tc.rangeCounts(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sameGenerations(prev, cur) {
+			return cur
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("range generations never settled: %v -> %v", generationsOf(prev), generationsOf(cur))
+		}
+		prev = cur
+	}
+}
+
+func sameGenerations(a, b []kvpb.RangeDescriptor) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].RangeID != b[i].RangeID || a[i].Generation != b[i].Generation {
+			return false
+		}
+	}
+	return true
+}
+
+func generationsOf(descs []kvpb.RangeDescriptor) map[base.RangeID]int64 {
+	out := make(map[base.RangeID]int64, len(descs))
+	for _, d := range descs {
+		out[d.RangeID] = int64(d.Generation)
+	}
+	return out
 }

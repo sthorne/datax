@@ -90,6 +90,17 @@ state or the internode protocol does, and an entry below says so.
   `TestOnlineCreateIndexUnderLapsedLeaseImplicit`.
 
 ### Changed
+- `TestDecommissionDrainsReplicas` asserts its steady state (#167): the
+  "no churn after stopping the drained node" check sampled the range
+  generations while the drain's last moves could still be settling, so
+  a descriptor bump in flight counted as churn (about one run in ten).
+  It now samples once the generations have held still. The other test
+  #167 names, `TestMergeFrozenAndRecovery`, already waits for the RHS
+  leader before it subsumes (since 0.35.0); the new
+  `TestSplitKeepsServedReadsProtected` had the same race and now waits
+  the same way (`waitForLeader`). `make test` and
+  `make test-race` pass `-timeout 30m`: the cluster suite outruns
+  `go test`'s default 10 minutes on a small machine.
 - CI runs `staticcheck` (pinned at 2025.1.1, before the suite so a
   failure is quick; `make staticcheck` / `make lint` run the same) on
   top of gofmt and `go vet` (#142). Its first run is the baseline: the

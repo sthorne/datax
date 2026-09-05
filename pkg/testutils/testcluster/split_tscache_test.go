@@ -7,6 +7,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -44,6 +45,13 @@ func TestSplitKeepsServedReadsProtected(t *testing.T) {
 	if !sr.Right.ContainsKey(k) {
 		t.Fatalf("k not on the RHS %v", sr.Right)
 	}
+	// The split's campaign for the RHS runs asynchronously; executing on
+	// the store directly (no routing retry), wait for its leader.
+	rhs, ok := store.GetReplica(sr.Right.RangeID)
+	if !ok {
+		t.Fatal("no RHS replica")
+	}
+	waitForLeader(t, rhs, 20*time.Second)
 	write := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: T}}
 	write.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: k}, Value: []byte("after-split")})
 	_, kerr := store.ExecuteBatch(ctx, write)
@@ -72,4 +80,18 @@ func TestSplitKeepsServedReadsProtected(t *testing.T) {
 		t.Fatalf("later write: %q, %v", v, err)
 	}
 	_ = hlc.Timestamp{}
+}
+
+// waitForLeader waits until r leads its raft group — a fresh right-hand
+// range's campaign runs asynchronously after the split applies — failing
+// the test after timeout.
+func waitForLeader(t *testing.T, r *kvserver.Replica, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !r.IsLeader() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: no leader after %s", r.Desc().RangeID, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
