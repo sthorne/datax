@@ -245,6 +245,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return sel, nil
 	}
+	if t.kind == tkIdent && t.text == "with" {
+		return p.parseWith()
+	}
 	if t.kind != tkKeyword && t.kind != tkIdent {
 		return nil, p.errf("unexpected %q", t.text)
 	}
@@ -1279,10 +1282,17 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 			return nil, p.errf("DEFAULT VALUES takes no column list")
 		}
 	}
-	if err := p.expectKeywordUnless("VALUES", ins.DefaultValues); err != nil {
+	if t := p.peek(); !ins.DefaultValues && ((t.kind == tkKeyword && t.text == "SELECT") || (t.kind == tkOp && t.text == "(") || (t.kind == tkIdent && t.text == "with")) {
+		// INSERT INTO t [(cols)] SELECT ... | (query) | WITH ... SELECT ...
+		src, err := p.parseSetMember()
+		if err != nil {
+			return nil, err
+		}
+		ins.Select = src
+	} else if err := p.expectKeywordUnless("VALUES", ins.DefaultValues); err != nil {
 		return nil, err
 	}
-	for !ins.DefaultValues {
+	for !ins.DefaultValues && ins.Select == nil {
 		if err := p.expectOp("("); err != nil {
 			return nil, err
 		}
@@ -1571,6 +1581,7 @@ func (p *parser) parseSelect() (Statement, error) {
 	}
 	if p.consumeKeyword("FROM") {
 		// FROM (SELECT ...) AS alias — a derived table.
+		derived := false
 		if sub, ok, err := p.parseSubquery(); err != nil {
 			return nil, err
 		} else if ok {
@@ -1579,7 +1590,7 @@ func (p *parser) parseSelect() (Statement, error) {
 			if sel.Alias == "" {
 				return nil, p.errf("subquery in FROM must have an alias")
 			}
-			return p.finishSelect(sel)
+			derived = true
 		}
 		// FROM [pg_catalog.]unnest(...) [AS] alias [(column)] — a
 		// set-returning function as a one-column table.
@@ -1607,14 +1618,17 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 			return p.finishSelect(sel)
 		}
-		name, err := p.parseTableName()
-		if err != nil {
-			return nil, err
+		if !derived {
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			sel.Table = name
+			sel.Alias = p.parseOptTableAlias(true)
 		}
-		sel.Table = name
-		sel.Alias = p.parseOptTableAlias(true)
 		// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
-		// words. Joins execute left-deep in syntactic order.
+		// words. Joins execute left-deep in syntactic order. A derived
+		// table joins too: it runs as a named relation.
 		for {
 			jk, join, err := p.parseJoinKind()
 			if err != nil {
@@ -2068,6 +2082,16 @@ func (p *parser) parseSetMember() (*Select, error) {
 			return nil, err
 		}
 		return stmt.(*Select), nil
+	case t.kind == tkIdent && t.text == "with":
+		stmt, err := p.parseWith()
+		if err != nil {
+			return nil, err
+		}
+		sel, ok := stmt.(*Select)
+		if !ok {
+			return nil, p.errf("a WITH used as a query must end in a SELECT")
+		}
+		return sel, nil
 	case t.kind == tkKeyword && t.text == "VALUES":
 		stmt, err := p.parseValuesQuery()
 		if err != nil {
@@ -3365,11 +3389,21 @@ func (p *parser) parseSubquery() (*Select, bool, error) {
 	if t := p.peek(); t.kind != tkOp || t.text != "(" {
 		return nil, false, nil
 	}
-	if nxt := p.toks[p.i+1]; nxt.kind != tkKeyword || nxt.text != "SELECT" {
+	nxt := p.toks[p.i+1]
+	if !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.kind == tkIdent && nxt.text == "with") {
 		return nil, false, nil
 	}
 	p.i++ // (
-	stmt, err := p.parseSelect()
+	var stmt Statement
+	var err error
+	if nxt.kind == tkIdent {
+		stmt, err = p.parseWith()
+		if _, isSel := stmt.(*Select); err == nil && !isSel {
+			return nil, false, p.errf("a WITH inside a subquery must end in a SELECT")
+		}
+	} else {
+		stmt, err = p.parseSelect()
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -3873,9 +3907,9 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			}
 			return boolValue(conds), nil
 		}
-		// A scalar subquery is "(SELECT"; anything else is grouping — of
-		// a value, or of a predicate used as a boolean value.
-		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") {
+		// A scalar subquery is "(SELECT" or "(WITH"; anything else is
+		// grouping — of a value, or of a predicate used as a boolean value.
+		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.kind == tkIdent && nxt.text == "with") {
 			p.i++
 			e, err := p.parseValueOrBool()
 			if err != nil {
@@ -4087,4 +4121,77 @@ func (p *parser) parseCase() (Expr, error) {
 func (p *parser) peekIdentWord(word string) bool {
 	t := p.peek()
 	return t.kind == tkIdent && t.text == word
+}
+
+// parseWith parses WITH [RECURSIVE] name [(cols)] AS (query) [, ...]
+// followed by the statement it scopes over (SELECT, VALUES, a
+// parenthesized query, INSERT, UPSERT, UPDATE or DELETE), attaching the
+// members to it. A member's query may itself be a WITH, a set operation,
+// or a data-modifying statement (which must return rows).
+func (p *parser) parseWith() (Statement, error) {
+	p.i++ // with
+	recursive := p.consumeIdentWord("recursive")
+	var ctes []CTE
+	for {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		cte := CTE{Name: name, Recursive: recursive}
+		if p.consumeOp("(") {
+			for {
+				col, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				cte.Columns = append(cte.Columns, col)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		q, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		switch q.(type) {
+		case *Select, *Insert, *Update, *Delete:
+		default:
+			return nil, p.errf("WITH %s: a query, INSERT, UPDATE or DELETE is required", name)
+		}
+		cte.Query = q
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		ctes = append(ctes, cte)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	stmt, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	switch t := stmt.(type) {
+	case *Select:
+		t.With = append(ctes, t.With...)
+	case *Insert:
+		t.With = append(ctes, t.With...)
+	case *Update:
+		t.With = append(ctes, t.With...)
+	case *Delete:
+		t.With = append(ctes, t.With...)
+	default:
+		return nil, p.errf("WITH must be followed by SELECT, INSERT, UPDATE or DELETE")
+	}
+	return stmt, nil
 }

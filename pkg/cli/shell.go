@@ -173,7 +173,8 @@ Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
   DROP TABLE, INSERT [ON CONFLICT ...] / UPSERT, SELECT [... AS OF SYSTEM
   TIME ...] (joins incl. RIGHT / FULL / NATURAL / USING, GROUP BY, UNION /
   INTERSECT / EXCEPT, ORDER BY ... NULLS FIRST, LIMIT / OFFSET / FETCH),
-  UPDATE, DELETE (all three take RETURNING),
+  WITH [RECURSIVE] on any of them, INSERT ... SELECT, UPDATE, DELETE (all
+  three take RETURNING),
   CREATE / ALTER / DROP SEQUENCE, SHOW SEQUENCES (SERIAL, identity
   columns and expression DEFAULTs: nextval, unique_rowid, gen_random_uuid),
   CHECK / UNIQUE / FOREIGN KEY constraints, ALTER TABLE ... ADD / DROP /

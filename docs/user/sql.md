@@ -89,6 +89,7 @@ CREATE TABLE events (
 );
 INSERT INTO orders (ref) VALUES (DEFAULT);                 -- DEFAULT as a value
 INSERT INTO orders DEFAULT VALUES RETURNING id;
+INSERT INTO archive (id, ref) SELECT id, ref FROM orders WHERE at < '2026-01-01';  -- INSERT ... SELECT
 INSERT INTO events (k, v) OVERRIDING SYSTEM VALUE VALUES (5, 'x');  -- else 428C9 for an ALWAYS column
 UPDATE orders SET retries = DEFAULT WHERE id = 1;
 
@@ -224,7 +225,8 @@ upgrade` finalizes it): a v7 node would write rows unchecked.
 ## Reading
 
 ```sql
-SELECT * | expr [AS alias], ... FROM t [AS a]
+[WITH [RECURSIVE] name [(cols)] AS (query | INSERT/UPDATE/DELETE ... RETURNING ...), ...]
+SELECT * | expr [AS alias], ... FROM t [AS a] | (query) AS d
   [JOIN t2 [AS b] ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER], CROSS,
                                                           -- NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
@@ -338,10 +340,22 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   Join select lists take columns, `*`, expressions, `->`/`->>` paths
   and subqueries; under `GROUP BY` they narrow to plain columns and
   aggregates.
+- **WITH (common table expressions)**: `WITH name [(cols)] AS (query),
+  ... SELECT ...` — also on `INSERT`, `UPDATE` and `DELETE`, and inside
+  a subquery or a set-operation member. Each member is materialized
+  once, in order (a member may read the ones before it), and then
+  reads like a table anywhere in the statement: the base table, a join
+  side, a subquery source, a set-operation member, an `INSERT` source;
+  it shadows a real table of its name for the statement. A member may
+  be a data-modifying statement with `RETURNING` (`WITH moved AS
+  (DELETE ... RETURNING *) SELECT ...`). `WITH RECURSIVE name AS (seed
+  UNION [ALL] step)` iterates: the step runs against the rows the
+  previous round produced until it produces none (`UNION` drops rows
+  seen before), capped at 10000 rounds and a million rows (`54000`).
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
-  derived tables `FROM (SELECT ...) AS d`, and table functions `FROM
-  unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
+  derived tables `FROM (SELECT ...) AS d` — which join like tables —
+  and table functions `FROM unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,

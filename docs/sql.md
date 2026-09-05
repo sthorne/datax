@@ -11,8 +11,9 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
 DROP TABLE t
-INSERT INTO t [(cols)] VALUES (v, ...), (v, ...)
+INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
+[WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
 SELECT [DISTINCT] * | col, ... | aggregates
     FROM t [[AS] alias] | (SELECT ...) [AS] alias
     [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS | NATURAL] JOIN t2 [[AS] alias] ON a.x = b.y [AND ...] | USING (cols)]
@@ -140,7 +141,7 @@ Still out of scope: correlated subqueries nested past 4 levels or over
 join/derived-table shapes,
 joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; outer joins and self-joins keep syntactic order),
-CTEs (`WITH`), window functions, `EXPLAIN ANALYZE`,
+window functions, `EXPLAIN ANALYZE`,
 deferrable constraints,
 typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
 ignored; casts apply both),
