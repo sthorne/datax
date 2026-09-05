@@ -132,6 +132,9 @@ type Session struct {
 	// seqs is the session's sequence state (value blocks, currval,
 	// lastval), created on first use.
 	seqs *seqState
+	// rels are the statement-scoped relations (WITH members, joined
+	// derived tables) bound by name; see cte.go.
+	rels map[string]*relation
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -217,6 +220,11 @@ func (s *Session) setting(name string) (string, string, bool) {
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
 	db, bare := catalog.SplitTableName(name)
+	if db == "" && len(s.rels) > 0 {
+		if r, ok := s.rels[strings.ToLower(bare)]; ok {
+			return r.desc, nil // a WITH member shadows a table of its name
+		}
+	}
 	if vtable.IsSchema(db) {
 		if vt, ok := vtable.Lookup(name); ok {
 			return vt.Descriptor(), nil
@@ -316,6 +324,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 // fetchVirtual generates a virtual table's rows and applies the WHERE
 // conjuncts (no index ever applies).
 func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if strings.HasPrefix(desc.Virtual, relationPrefix) {
+		return s.relationRows(desc, where, params, limit)
+	}
 	if desc.Virtual == "sequence" {
 		sd, err := catalog.ReadSequence(ctx, txn, desc.ID)
 		if err != nil {

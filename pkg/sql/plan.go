@@ -102,6 +102,40 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		return nil, nil
 	}
 	fams := make([]types.Family, n)
+	if with := stmtWith(stmt); len(with) > 0 {
+		// The members bind (columns only) so lookups resolve, and each
+		// member's own parameters type as in its query once it and the
+		// members before it are visible.
+		merge := func(cte parser.CTE) error {
+			sub, err := s.PlanParams(ctx, cte.Query)
+			if err != nil {
+				return err
+			}
+			for i := range sub {
+				if i < len(fams) && fams[i] == types.Unknown {
+					fams[i] = sub[i]
+				}
+			}
+			return nil
+		}
+		restore, err := s.bindWith(ctx, nil, with, nil, true, merge)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		defer restore()
+		stmt = stmtWithout(stmt)
+	}
+	if ins, ok := stmt.(*parser.Insert); ok && ins.Select != nil {
+		sub, err := s.PlanParams(ctx, ins.Select)
+		if err != nil {
+			return nil, err
+		}
+		for i := range sub {
+			if i < len(fams) && fams[i] == types.Unknown {
+				fams[i] = sub[i]
+			}
+		}
+	}
 	var assign func(e parser.Expr, fam types.Family)
 	assign = func(e parser.Expr, fam types.Family) {
 		if e.Param > 0 && fams[e.Param-1] == types.Unknown {
@@ -173,16 +207,32 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				fams[idx-1] = types.Int
 			}
 		}
-		if t.Table != "" {
-			desc, err := s.lookupForPlan(ctx, t.Table)
+		// Every set-operation member types its own WHERE; a derived table
+		// types as a statement of its own.
+		for m := t; m != nil; m = m.Union {
+			if m.Derived != nil {
+				sub, err := s.PlanParams(ctx, m.Derived)
+				if err != nil {
+					return nil, err
+				}
+				for i := range sub {
+					if i < len(fams) && fams[i] == types.Unknown {
+						fams[i] = sub[i]
+					}
+				}
+			}
+			if m.Table == "" {
+				continue
+			}
+			desc, err := s.lookupForPlan(ctx, m.Table)
 			if err != nil {
 				return nil, ToSQLError(err)
 			}
-			fromWhere(desc, t.Where)
-			if len(t.Joins) > 0 {
+			fromWhere(desc, m.Where)
+			if len(m.Joins) > 0 {
 				// Qualified references resolve against any join side.
-				if sides, jerr := s.planJoinSides(ctx, desc, t); jerr == nil {
-					for _, cmp := range t.Where {
+				if sides, jerr := s.planJoinSides(ctx, desc, m); jerr == nil {
+					for _, cmp := range m.Where {
 						if ref, rerr := resolveJoinRef(sides, cmp.Column); rerr == nil {
 							typ := ref.col.Type
 							if len(cmp.Path) > 0 {
@@ -219,8 +269,38 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
+	if with := stmtWith(stmt); len(with) > 0 {
+		restore, err := s.bindWith(ctx, nil, with, nil, true, nil)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		defer restore()
+		stmt = stmtWithout(stmt)
+	}
 	switch t := stmt.(type) {
 	case *parser.Select:
+		if t.Derived != nil && len(t.Joins) > 0 {
+			innerCols, err := s.PlanColumns(ctx, t.Derived)
+			if err != nil {
+				return nil, err
+			}
+			name := strings.ToLower(t.Alias)
+			desc, derr := relationDesc(name, innerCols, nil)
+			if derr != nil {
+				return nil, ToSQLError(derr)
+			}
+			prev, had := s.bindRelation(name, &relation{desc: desc})
+			defer func() {
+				if had {
+					s.rels[name] = prev
+				} else {
+					delete(s.rels, name)
+				}
+			}()
+			c := *t
+			c.Derived, c.Table = nil, name
+			return s.PlanColumns(ctx, &c)
+		}
 		if t.Union != nil {
 			// A set operation's output is named by its head and typed by
 			// unifying every member (the numeric families lift, anything
@@ -486,4 +566,42 @@ func (s *Session) planReturning(ctx context.Context, table string, exprs []parse
 		return nil, ToSQLError(rerr)
 	}
 	return ret.columns(), nil
+}
+
+// stmtWith is a statement's WITH list (nil for statements without one).
+func stmtWith(stmt parser.Statement) []parser.CTE {
+	switch t := stmt.(type) {
+	case *parser.Select:
+		return t.With
+	case *parser.Insert:
+		return t.With
+	case *parser.Update:
+		return t.With
+	case *parser.Delete:
+		return t.With
+	}
+	return nil
+}
+
+// stmtWithout is the statement with its WITH list detached (a copy).
+func stmtWithout(stmt parser.Statement) parser.Statement {
+	switch t := stmt.(type) {
+	case *parser.Select:
+		c := *t
+		c.With = nil
+		return &c
+	case *parser.Insert:
+		c := *t
+		c.With = nil
+		return &c
+	case *parser.Update:
+		c := *t
+		c.With = nil
+		return &c
+	case *parser.Delete:
+		c := *t
+		c.With = nil
+		return &c
+	}
+	return stmt
 }

@@ -41,8 +41,22 @@ func CountParams(stmt Statement) int {
 			}
 		}
 	}
+	var withMax func(ctes []CTE)
+	withMax = func(ctes []CTE) {
+		for _, c := range ctes {
+			if n := CountParams(c.Query); n > max {
+				max = n
+			}
+		}
+	}
 	switch t := stmt.(type) {
 	case *Insert:
+		withMax(t.With)
+		if t.Select != nil {
+			if n := CountParams(t.Select); n > max {
+				max = n
+			}
+		}
 		for _, row := range t.Rows {
 			for _, e := range row {
 				visit(e)
@@ -56,7 +70,13 @@ func CountParams(stmt Statement) int {
 		}
 		visitReturning(t.Returning)
 	case *Select:
+		withMax(t.With)
 		for m := t; m != nil; m = m.Union {
+			if m.Derived != nil {
+				if n := CountParams(m.Derived); n > max {
+					max = n
+				}
+			}
 			for _, se := range m.Exprs {
 				if !se.Star {
 					visit(se.Expr)
@@ -71,12 +91,14 @@ func CountParams(stmt Statement) int {
 			}
 		}
 	case *Update:
+		withMax(t.With)
 		for _, set := range t.Set {
 			visit(set.Value)
 		}
 		visitWhere(t.Where)
 		visitReturning(t.Returning)
 	case *Delete:
+		withMax(t.With)
 		visitWhere(t.Where)
 		visitReturning(t.Returning)
 	}

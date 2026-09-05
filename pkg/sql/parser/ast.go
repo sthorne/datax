@@ -231,9 +231,13 @@ type DropTable struct {
 }
 
 type Insert struct {
+	With    []CTE
 	Table   string
 	Columns []string // empty = all columns in order
 	Rows    [][]Expr
+	// Select is the INSERT ... SELECT source (Rows is then empty): its
+	// output rows are inserted as if written as VALUES.
+	Select *Select
 	// DefaultValues is INSERT INTO t DEFAULT VALUES (one row of defaults).
 	DefaultValues bool
 	// Overriding is OVERRIDING { SYSTEM | USER } VALUE ("system" /
@@ -387,7 +391,22 @@ type JoinClause struct {
 	Filter []Comparison
 }
 
+// CTE is one WITH member: name [(cols)] AS (query). Query is a Select
+// (or VALUES), or a data-modifying statement with RETURNING. Recursive
+// marks a WITH RECURSIVE list: a member whose query's set operation
+// refers to its own name iterates from the first member's rows.
+type CTE struct {
+	Name      string
+	Columns   []string
+	Query     Statement
+	Recursive bool
+}
+
 type Select struct {
+	// With are the statement's WITH members, materialized in order
+	// before it runs and visible to it (and to each other, in order) as
+	// relations named by the member.
+	With     []CTE
 	Distinct bool
 	Exprs    []SelectExpr
 	Table    string  // empty for FROM-less and derived-table selects
@@ -439,6 +458,7 @@ type Select struct {
 }
 
 type Update struct {
+	With      []CTE
 	Table     string
 	Set       []SetClause
 	Where     []Comparison
@@ -467,6 +487,7 @@ type AlterTable struct {
 }
 
 type Delete struct {
+	With      []CTE
 	Table     string
 	Where     []Comparison
 	Returning []SelectExpr

@@ -456,6 +456,56 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 }
 
 func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.Insert, params []types.Datum) (*Result, error) {
+	if len(t.With) > 0 {
+		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		c := *t
+		c.With = nil
+		t = &c
+	}
+	if t.Select != nil {
+		// INSERT ... SELECT: the source's rows insert as literal VALUES.
+		src, err := s.execSelect(ctx, txn, t.Select, params)
+		if err != nil {
+			return nil, err
+		}
+		c := *t
+		c.Select = nil
+		c.Rows = make([][]parser.Expr, 0, len(src.Rows))
+		for _, row := range src.Rows {
+			exprs := make([]parser.Expr, len(row))
+			for i := range row {
+				d := row[i]
+				exprs[i] = parser.Expr{Lit: &d}
+			}
+			c.Rows = append(c.Rows, exprs)
+		}
+		if len(c.Rows) == 0 {
+			desc, err := s.lookup(ctx, txn, t.Table)
+			if err != nil {
+				return nil, err
+			}
+			if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
+				return nil, err
+			}
+			res := &Result{Tag: "INSERT 0 0"}
+			if t.Returning != nil {
+				ret, err := s.returningProjection(desc, t.Table, t.Returning)
+				if err != nil {
+					return nil, err
+				}
+				for _, p := range ret.proj {
+					res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+				}
+				res.Rows = [][]types.Datum{}
+			}
+			return res, nil
+		}
+		t = &c
+	}
 	t, err := s.resolveInsertSubs(ctx, txn, t, params)
 	if err != nil {
 		return nil, err
@@ -1380,6 +1430,38 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	if len(t.With) > 0 {
+		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		c := *t
+		c.With = nil
+		t = &c
+	}
+	if t.Derived != nil && len(t.Joins) > 0 {
+		// A joined derived table runs as a relation named by its alias.
+		inner, err := s.execSubSelect(ctx, txn, t.Derived, params)
+		if err != nil {
+			return nil, err
+		}
+		name := strings.ToLower(t.Alias)
+		desc, err := relationDesc(name, inner.Columns, nil)
+		if err != nil {
+			return nil, err
+		}
+		prev, had := s.bindRelation(name, &relation{desc: desc, rows: inner.Rows})
+		defer s.restoreRelations(map[string]*relation{name: func() *relation {
+			if had {
+				return prev
+			}
+			return nil
+		}()})
+		c := *t
+		c.Derived, c.Table = nil, name
+		t = &c
+	}
 	if t.LimitParam > 0 || t.OffsetParam > 0 {
 		var err error
 		if t, err = resolveLimitParams(t, params); err != nil {
@@ -1630,6 +1712,16 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 }
 
 func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update, params []types.Datum) (*Result, error) {
+	if len(t.With) > 0 {
+		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		c := *t
+		c.With = nil
+		t = &c
+	}
 	corr, t2, err := s.splitCorrelatedUpdate(ctx, txn, t)
 	if err != nil {
 		return nil, err
@@ -1763,6 +1855,16 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 }
 
 func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*Result, error) {
+	if len(t.With) > 0 {
+		restore, err := s.bindWith(ctx, txn, t.With, params, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		c := *t
+		c.With = nil
+		t = &c
+	}
 	corr, t2, err := s.splitCorrelatedDelete(ctx, txn, t)
 	if err != nil {
 		return nil, err
@@ -1983,6 +2085,17 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	sel, ok := t.Stmt.(*parser.Select)
 	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
+	}
+	if len(sel.With) > 0 {
+		// The members bind by shape only: EXPLAIN runs nothing.
+		restore, err := s.bindWith(ctx, txn, sel.With, params, true, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		c := *sel
+		c.With = nil
+		sel = &c
 	}
 	// Correlated conjuncts are stripped exactly as execution strips them,
 	// so the plan below describes the plannable remainder.

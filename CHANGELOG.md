@@ -8,6 +8,18 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.18.0 — unreleased
+
+### Added
+- Query shapes, part two (#94): `WITH` — members materialized once, in
+  order, readable anywhere a table is (base, join side, subquery
+  source, set-operation member, `INSERT` source), with column lists,
+  on `SELECT`, `INSERT`, `UPDATE` and `DELETE` and inside subqueries;
+  data-modifying members with `RETURNING`; `WITH RECURSIVE` (seed
+  `UNION [ALL]` step, capped at 10000 rounds and a million rows);
+  `INSERT ... SELECT`; and derived tables as join sides (`FROM (SELECT
+  ...) AS d JOIN t ...`).
+
 ## 0.17.0 — unreleased
 
 ### Added

@@ -278,6 +278,15 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	if len(outers) > maxCorrDepth {
 		return nil, nil, newErrf(CodeFeatureNotSupported, "correlated subqueries nest deeper than %d levels", maxCorrDepth)
 	}
+	if len(sub.With) > 0 {
+		// The subquery's own WITH members bind by shape for the analysis
+		// (execution binds them with rows when the subquery runs).
+		restore, err := s.bindWith(ctx, txn, sub.With, nil, true, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer restore()
+	}
 	var innerDesc *catalog.TableDescriptor
 	switch {
 	case sub.FuncTable != nil:
