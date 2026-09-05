@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"encoding/json"
+	"github.com/google/uuid"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -176,12 +177,22 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 		log.Errorf("%s: starting RHS replica after split: %v", trig.Right.RangeID, err)
 		return
 	}
+	// The parent served reads on the RHS span up to this moment, and only
+	// those at or below its closed timestamp — which trails now() by the
+	// closed-timestamp lag — reached the RHS through the trigger; the rest
+	// live in the parent's in-memory timestamp cache and would be lost.
+	// So the RHS's cache floor is bumped to now(), on every replica (the
+	// cache is per-replica state, and whichever replica leads must refuse
+	// a write beneath a read the parent served), as finishMerge does for
+	// an absorbed span (issue #134). The RHS's first leader is at term 1
+	// and takes no new-leader bump of its own.
+	rhs.tsCache.Bump([]latchSpan{wholeRangeSpan}, r.store.cfg.Clock.Now(), uuid.Nil)
 	// The LHS leader campaigns for the RHS immediately: without this the
-	// RHS sits leaderless for an election timeout, and the eventual
-	// leader's timestamp-cache bump would spuriously restart transactions
-	// that began in that window. The first attempts can fail while peers
-	// have not applied the split yet (their replicas don't exist to vote),
-	// so retry briefly.
+	// RHS sits leaderless for an election timeout. (The floor bump above
+	// pushes a transaction that began before the split and writes to the
+	// RHS after it — once, the same as a leadership change would.) The
+	// first attempts can fail while peers have not applied the split yet
+	// (their replicas don't exist to vote), so retry briefly.
 	if r.isLeader() {
 		_ = r.store.cfg.Stopper.RunWorker(func(ctx context.Context) {
 			for i := 0; i < 20; i++ {

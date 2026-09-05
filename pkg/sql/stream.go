@@ -117,6 +117,14 @@ func (st *RowStream) Next(callerCtx context.Context) (row []types.Datum, ok bool
 	}
 	ctx, cancel := st.stmtCtx(callerCtx)
 	defer cancel()
+	defer func() {
+		// The statement path's panic barrier (issue #136) extends to the
+		// rows a stream produces after Execute returned: the stream ends
+		// the way it does on any error, with XX000.
+		if r := recover(); r != nil {
+			row, ok, err = nil, false, st.fail(callerCtx, st.s.recoveredPanic(r, st.stmt))
+		}
+	}()
 	for {
 		if st.limit >= 0 && st.emitted >= st.limit {
 			return nil, false, st.finish(ctx)
@@ -486,7 +494,7 @@ func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor
 		start, end := rowenc.PrimarySpanFor(desc)
 		it.spans = []keySpan{{start, end}}
 	}
-	res := &Result{Stream: &RowStream{s: s, iter: it, offset: t.Offset, limit: t.Limit}}
+	res := &Result{Stream: &RowStream{s: s, stmt: t, iter: it, offset: t.Offset, limit: t.Limit}}
 	for _, p := range proj {
 		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}

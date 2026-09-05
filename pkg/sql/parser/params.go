@@ -41,8 +41,7 @@ func CountParams(stmt Statement) int {
 			}
 		}
 	}
-	var withMax func(ctes []CTE)
-	withMax = func(ctes []CTE) {
+	withMax := func(ctes []CTE) {
 		for _, c := range ctes {
 			if n := CountParams(c.Query); n > max {
 				max = n

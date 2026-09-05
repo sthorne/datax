@@ -338,7 +338,10 @@ descriptor **versions and leases** make that cache safe across gateways:
   deadline**: it may not commit at or past it, and instead fails with a
   retryable error (`40001`; implicit statements retry transparently and
   re-plan). The server commits at exactly the write timestamp the client
-  sends, so the check is the client's. Without it, a statement that
+  sends, so the check is the client's, and it runs on both commit paths:
+  the classic EndTxn and the one-phase commit an implicit single-range
+  statement takes (issue #133 — the latter had skipped it, on the most
+  common write path). Without it, a statement that
   planned under a lease just before it expired could commit after the
   drain took its backfill boundary, and an index build would miss the
   row (issue #110).
@@ -457,6 +460,22 @@ plan bounds only ever narrow the scan. `LIMIT` is pushed into the KV scan
 exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`.
+
+**Panic barrier.** The statement path is a panic barrier (#136): a
+panic anywhere below `Session.Execute` — in the planner, the executor,
+a builtin, an encoder — becomes an internal error (`XX000`) for that
+statement, logged with its stack and counted in
+`datax_sql_statement_panics_total`; the connection goes on, and the
+transaction fails as it would on any other error (an implicit one
+rolls back, a block is failed until `ROLLBACK`). The barrier sits at
+three points: inside the transaction's retry loop (`execStmt`, so
+`RunTxn` sees an error and rolls back), around the whole statement
+(`Execute`: a `COMMIT`, a DDL finish or a session variable), and on
+every pull of a streamed result (`RowStream.Next`, after `Execute`
+returned). What Go cannot recover — a stack overflow (the parser
+bounds nesting for that, #135), out of memory — still ends the
+process, and the barrier does not hide bugs: each recovered panic is
+one to fix, with its stack in the log.
 
 **Streaming.** On a wire session a scan-shaped select — one table, a
 scan plan (full, primary-key range or index), no join, aggregate,
@@ -661,9 +680,14 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   (`datax cert create-client --user alice`, then `sslcert`/`sslkey`);
   a CN mismatch falls back to SCRAM. Verifiers — never plaintext — live
   at `/system/users/<name>`; unknown users and wrong passwords fail with
-  one uniform `28P01`, and a full dummy exchange runs for unknown users
-  so the flow leaks nothing. Cleartext startup is refused in secure
-  mode. In
+  one uniform `28P01`, and a full stand-in exchange runs for unknown
+  users so the flow leaks nothing — including the salt server-first
+  shows before anything is proven: it is derived from the user name
+  under a cluster-wide secret (`/system/auth-secret`, 32 random bytes
+  the first node that needs them writes in a transaction), so one name
+  sees one salt on every node and no salt marks the names that do not
+  exist (#137; PostgreSQL's mock authentication does the same). Cleartext
+  startup is refused in secure mode. In
   insecure mode `SSLRequest` gets `N` and authentication is trust.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is

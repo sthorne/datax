@@ -6,13 +6,6 @@ import (
 	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
-// colTypmod is the wire typmod for a projected column: set only for
-// enforced typmods (DECIMAL(p,s), VARCHAR(n) / CHAR(n), TIMESTAMP(p)),
-// 0 (emitted as -1) otherwise.
-func colTypmod(col catalog.Column) int32 {
-	return col.Typmod()
-}
-
 // colResult describes an output column a table column backs directly:
 // the family with the column's type modifiers, so the wire type and
 // typmod are the column's.

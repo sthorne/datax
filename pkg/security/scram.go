@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -116,10 +115,33 @@ func VerifyPassword(v *ScramVerifier, password string) bool {
 
 // DummyVerifier returns a shared verifier that no password can match
 // (derived once from an unusable password, then its stored key is
-// clobbered). Authentication paths run it for unknown users so the work
-// performed — and therefore the timing and the error — is identical
-// whether or not the user exists.
+// clobbered). Authentication paths that never show the client a salt
+// (HTTP Basic) run it for unknown users so the work performed — and
+// therefore the timing and the error — is identical whether or not the
+// user exists. The SCRAM exchange, which sends the salt in server-first,
+// uses MockVerifier instead.
 func DummyVerifier() *ScramVerifier { return dummyVerifier }
+
+// MockVerifier is the stand-in verifier for a user with no stored one
+// (unknown, no LOGIN, no password) on the SCRAM path, where the salt is
+// shown to the client before anything is proven (issue #137). One shared
+// stand-in would make that salt an oracle: probe a name that cannot
+// exist, then every further client-first tells whether a name is a real
+// user (any other salt) or not (the shared one). The salt is instead a
+// PRF of the user name under a secret — HMAC-SHA-256, truncated to the
+// 16 bytes MakeScramVerifier draws — so it is stable for a name across
+// handshakes and, with the same secret, across nodes, and no more
+// correlatable across names than the random salts of real users. The
+// keys are zero (nothing verifies against them, as with DummyVerifier),
+// and no PBKDF2 runs: a real user's verifier is read from storage, so
+// deriving one here would make the unknown user the slower path.
+func MockVerifier(secret []byte, user string) *ScramVerifier {
+	salt := hmacSHA256(secret, "scram-mock-salt\x00"+user)[:16]
+	return &ScramVerifier{
+		Salt: salt, Iterations: ScramIterations,
+		StoredKey: make([]byte, sha256.Size), ServerKey: make([]byte, sha256.Size),
+	}
+}
 
 var dummyVerifier = func() *ScramVerifier {
 	v, err := MakeScramVerifier("this-password-can-never-verify")
@@ -310,5 +332,3 @@ func hmacSHA256(key []byte, msg string) []byte {
 	m.Write([]byte(msg))
 	return m.Sum(nil)
 }
-
-var _ = strconv.Itoa // keep strconv for future attribute parsing

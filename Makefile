@@ -1,17 +1,20 @@
 GO ?= go
 
-.PHONY: build test test-race vet fmt fmt-check proto lint all bench
+.PHONY: build test test-race vet fmt fmt-check proto lint staticcheck vulncheck all bench
 
 all: build
 
 build:
 	$(GO) build -o bin/datax ./cmd/datax
 
+# The cluster suite (pkg/testutils/testcluster) runs past go test's
+# default 10-minute per-package timeout on a small machine; the explicit
+# timeout turns a confusing mid-run kill into a run that finishes.
 test:
-	$(GO) test ./...
+	$(GO) test -timeout 30m ./...
 
 test-race:
-	$(GO) test -race -timeout 20m ./...
+	$(GO) test -race -timeout 30m ./...
 
 vet:
 	$(GO) vet ./...
@@ -38,4 +41,15 @@ proto:
 bench: build
 	bench/run.sh
 
-lint: vet fmt-check
+# The same pinned tools CI runs (.github/workflows/ci.yaml,
+# vulncheck.yaml). GOTOOLCHAIN pins the tool build to the module's Go
+# version: `go run pkg@version` ignores the current module, so a machine
+# whose default Go is older would otherwise build the tool with that one
+# and refuse this module's code.
+staticcheck:
+	GOTOOLCHAIN=$$($(GO) env GOVERSION) $(GO) run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+vulncheck:
+	GOTOOLCHAIN=$$($(GO) env GOVERSION) $(GO) run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+lint: vet fmt-check staticcheck

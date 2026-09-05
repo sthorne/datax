@@ -418,11 +418,3 @@ func (r *Replica) replayPending() uint64 {
 	}
 	return 0
 }
-
-// engineModeString names the store's layout for status output.
-func (s *Store) engineModeString() string {
-	if s.splitEngines() {
-		return "split"
-	}
-	return "single"
-}

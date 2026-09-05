@@ -1,0 +1,29 @@
+name: vulncheck
+on:
+  push:
+    branches: [main, master, 'claude/**']
+  pull_request:
+  schedule:
+    # Weekly (issue #143): advisories appear against code that has not
+    # changed, so a push-triggered run alone misses them until the next
+    # commit.
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+
+# govulncheck reports only vulnerabilities whose symbols this module
+# reaches, so the job is a gate, not a warning. The tool is pinned; the
+# advisory database is fetched at run time, so new advisories still
+# surface against unchanged code. A reachable advisory with no fix is
+# recorded as a dated exclusion where the next person will find it
+# (this file), never as a permanently red build nobody reads.
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...

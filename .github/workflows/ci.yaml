@@ -20,5 +20,10 @@ jobs:
           if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
       - name: vet
         run: go vet ./...
+      # Pinned (issue #142): a tool release must not turn a green build
+      # red on unchanged code. Generated *.pb.go files carry the
+      # "Code generated ... DO NOT EDIT." header staticcheck skips.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
       - name: test
         run: go test -race -timeout 30m ./...

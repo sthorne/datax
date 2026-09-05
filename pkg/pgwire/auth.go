@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"time"
@@ -14,10 +15,33 @@ import (
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
-// dummyVerifier stands in for missing users so the SCRAM exchange runs to
-// completion identically whether or not the user exists — the client learns
-// only "password authentication failed".
-var dummyVerifier = security.DummyVerifier()
+// processSecret keys the stand-in verifiers for missing users when the
+// server has no cluster-wide secret to offer (ServerOptions.MockSecret
+// unset, or unavailable): random per process, so the salts a node shows
+// for names that do not exist are still per-name and stable on that
+// node for its lifetime (issue #137).
+var processSecret = func() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return b
+}()
+
+// standInVerifier is the verifier a missing user (or one with no
+// password, or one that cannot log in) authenticates against, so the
+// SCRAM exchange runs to completion identically whether or not the user
+// exists — the client learns only "password authentication failed", and
+// the salt it saw in server-first says nothing either.
+func (c *conn) standInVerifier(ctx context.Context, user string) *security.ScramVerifier {
+	secret := processSecret
+	if c.opts.MockSecret != nil {
+		if s := c.opts.MockSecret(ctx); len(s) > 0 {
+			secret = s
+		}
+	}
+	return security.MockVerifier(secret, user)
+}
 
 // clientCertUser returns the CommonName of a CA-verified client
 // certificate on the TLS session, or "" when none was presented (or it
@@ -43,7 +67,7 @@ func (c *conn) authenticateSCRAM(user string) error {
 	verifier, lookupErr := c.opts.Auth(ctx, user)
 	genuine := verifier != nil && lookupErr == nil
 	if verifier == nil {
-		verifier = dummyVerifier
+		verifier = c.standInVerifier(ctx, user)
 	}
 
 	failed := func() error {

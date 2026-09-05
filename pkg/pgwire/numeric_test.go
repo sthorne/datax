@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,39 @@ func TestPGNumericRoundTrip(t *testing.T) {
 	binary.BigEndian.PutUint16(nan[4:6], 0xC000)
 	if _, err := decodePGNumeric(nan); err == nil {
 		t.Fatal("NaN numeric accepted")
+	}
+}
+
+// TestPGNumericBounds (issue #140): weight and dscale off the wire are
+// bounded like NUMERIC(p, s) is, so an eight-byte parameter cannot
+// expand into hundreds of kilobytes of zeros; the encoder refuses what
+// the wire format cannot carry.
+func TestPGNumericBounds(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		wire []byte
+	}{
+		{"weight 32767, no digits", golden(0, 32767, false, 0)},
+		{"weight -32768", golden(0, -32768, false, 0)},
+		{"dscale 65535, no digits", golden(0, 0, false, 65535)},
+		{"weight just past the bound", golden(1, pgNumericMaxWeight+1, false, 0, 1)},
+		{"dscale just past the bound", golden(1, 0, false, pgNumericMaxDigits+1, 1)},
+	} {
+		if s, err := decodePGNumeric(c.wire); err == nil {
+			t.Fatalf("%s: decoded to %d bytes, want an error", c.name, len(s))
+		}
+	}
+	// At the bound: accepted.
+	if _, err := decodePGNumeric(golden(1, pgNumericMaxWeight, false, pgNumericMaxDigits, 1)); err != nil {
+		t.Fatalf("at the bound: %v", err)
+	}
+	if _, err := encodePGNumeric("1" + strings.Repeat("0", 1100)); err == nil {
+		t.Fatal("encoded 1,101 integer digits")
+	}
+	if _, err := encodePGNumeric("0." + strings.Repeat("0", 1000) + "1"); err == nil {
+		t.Fatal("encoded a 1,001-digit scale")
+	}
+	if _, err := encodePGNumeric("1" + strings.Repeat("0", 1000)); err != nil {
+		t.Fatalf("1,001 integer digits (weight at the bound): %v", err)
 	}
 }

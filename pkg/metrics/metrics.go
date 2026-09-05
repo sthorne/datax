@@ -207,6 +207,9 @@ var (
 	SQLCopyRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_copy_rows_total", Help: "Rows loaded through COPY FROM STDIN.",
 	})
+	SQLStatementPanics = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_sql_statement_panics_total", Help: "Panics recovered on the statement path and reported to the client as XX000: each one is a bug, with its stack in the log.",
+	})
 	SQLPlanCacheHits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_sql_plan_cache_hits_total", Help: "Statement executions that reused a session's cached plan (the descriptor, projection and access path of a single-table SELECT, UPDATE or DELETE).",
 	})

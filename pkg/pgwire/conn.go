@@ -1059,7 +1059,7 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		}
 		d, err := decodeBinaryParam(raw, fam)
 		if err != nil {
-			c.extError(&sql.Error{Code: sql.CodeInvalidParameter, Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
+			c.extError(&sql.Error{Code: sql.CodeInvalidBinaryRepresentation, Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
 			return
 		}
 		params[i] = d

@@ -20,13 +20,15 @@ type Stopper struct {
 	wg     sync.WaitGroup
 
 	mu       sync.Mutex
-	stopping bool
+	stopping bool // Stop has begun: no new workers
+	closing  bool // Stop has taken the closers: a new one runs at once
 	closers  []func()
+	done     chan struct{} // closed when Stop has finished
 }
 
 func NewStopper() *Stopper {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Stopper{ctx: ctx, cancel: cancel}
+	return &Stopper{ctx: ctx, cancel: cancel, done: make(chan struct{})}
 }
 
 // Ctx returns a context that is canceled when Stop begins.
@@ -53,24 +55,34 @@ func (s *Stopper) RunWorker(f func(ctx context.Context)) error {
 }
 
 // AddCloser registers f to run during Stop, after all workers have exited.
-// Closers run in reverse registration order.
+// Closers run in reverse registration order. A closer registered once
+// Stop has run the closers (or is running them) runs at once, on the
+// caller's goroutine: the resource it releases still needs releasing,
+// and a closer silently dropped is a leak (issue #139).
 func (s *Stopper) AddCloser(f func()) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.closing {
+		s.mu.Unlock()
+		f()
+		return
+	}
 	s.closers = append(s.closers, f)
+	s.mu.Unlock()
 }
 
 // Stop cancels the context, waits for workers, then runs closers.
-// Safe to call more than once; later calls wait for the first to finish.
+// Safe to call more than once and concurrently: every caller returns
+// only once the shutdown — closers included — has finished.
 func (s *Stopper) Stop() {
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
-		s.wg.Wait()
+		<-s.done
 		return
 	}
 	s.stopping = true
 	s.mu.Unlock()
+	defer close(s.done)
 
 	s.cancel()
 	s.wg.Wait()
@@ -78,6 +90,7 @@ func (s *Stopper) Stop() {
 	s.mu.Lock()
 	closers := s.closers
 	s.closers = nil
+	s.closing = true
 	s.mu.Unlock()
 	for i := len(closers) - 1; i >= 0; i-- {
 		closers[i]()

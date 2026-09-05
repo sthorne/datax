@@ -53,7 +53,30 @@ type parser struct {
 	pendingPK []string
 	i         int
 	src       string
+	// depth counts the nesting the recursive descent is inside (a
+	// parenthesized expression, a subquery, a derived table, a CASE — each
+	// passes through parsePrimaryExpr or parseSelect); past maxParseDepth
+	// the statement is refused with a syntax error instead of exhausting
+	// the goroutine stack, which is a fatal error no recover() catches
+	// (issue #135).
+	depth int
 }
+
+// maxParseDepth bounds statement nesting: far above any real query, far
+// below the stack budget (a level of expression descent is about ten
+// frames).
+const maxParseDepth = 1000
+
+// enter counts one level of nesting; leave undoes it.
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > maxParseDepth {
+		return p.errf("statement nests too deeply (more than %d levels)", maxParseDepth)
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
 
 func (p *parser) peek() token { return p.toks[p.i] }
 func (p *parser) errf(format string, args ...any) error {
@@ -137,16 +160,6 @@ func (r ColumnRef) String() string {
 		return r.Table + "." + r.Column
 	}
 	return r.Column
-}
-
-// expectColumnName parses a possibly-qualified column name into its
-// single-string form.
-func (p *parser) expectColumnName() (string, error) {
-	ref, err := p.parseColumnRef()
-	if err != nil {
-		return "", err
-	}
-	return ref.String(), nil
 }
 
 // consumeIdentWord consumes the next token when it is the given
@@ -238,6 +251,10 @@ func (p *parser) expectIdent() (string, error) {
 }
 
 func (p *parser) parseStatement() (Statement, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	t := p.peek()
 	if (t.kind == tkOp && t.text == "(") || (t.kind == tkKeyword && t.text == "VALUES") {
 		// (SELECT ...) [UNION ...] [ORDER BY ...]: a parenthesized query;
@@ -2116,6 +2133,10 @@ func (p *parser) parseCopyOptions(cf *CopyFrom) error {
 }
 
 func (p *parser) parseSelect() (Statement, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	p.i++ // SELECT
 	sel := &Select{Limit: -1}
 	// DISTINCT is not a reserved word — it lexes as an identifier.
@@ -3804,25 +3825,6 @@ func (p *parser) parseBoolFactor() (boolNode, error) {
 	return n, nil
 }
 
-// parseConjunct parses one atomic condition as a single comparison (a
-// BETWEEN's two conjuncts pack as a one-disjunct OR).
-func (p *parser) parseConjunct() (Comparison, error) {
-	conds, negated, err := p.parseConjuncts()
-	if err != nil {
-		return Comparison{}, err
-	}
-	var cmp Comparison
-	if len(conds) == 1 {
-		cmp = conds[0]
-	} else {
-		cmp = Comparison{Op: "OR", Or: [][]Comparison{conds}}
-	}
-	if negated {
-		return negateComparison(cmp)
-	}
-	return cmp, nil
-}
-
 // continuesValue reports whether the next token extends a parenthesized
 // group into a larger value or predicate (a cast, an operator, a path
 // step, or a predicate suffix).
@@ -4277,24 +4279,6 @@ func HasSubInOr(conds []Comparison) bool {
 					return true
 				}
 			}
-		}
-	}
-	return false
-}
-
-func exprContainsSub(e Expr) bool {
-	if e.Sub != nil {
-		return true
-	}
-	if e.Left != nil && exprContainsSub(*e.Left) {
-		return true
-	}
-	if e.Right != nil && exprContainsSub(*e.Right) {
-		return true
-	}
-	for _, a := range e.Args {
-		if exprContainsSub(a) {
-			return true
 		}
 	}
 	return false
@@ -4987,6 +4971,10 @@ var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "cur
 // builtin call, a possibly-qualified column reference (with an optional
 // ->/->> chain), or a literal/parameter/scalar subquery.
 func (p *parser) parsePrimaryExpr() (Expr, error) {
+	if err := p.enter(); err != nil {
+		return Expr{}, err
+	}
+	defer p.leave()
 	t := p.peek()
 	if t.kind == tkOp && t.text == "(" {
 		// (NOT x) / (EXISTS ...): a parenthesized boolean value.

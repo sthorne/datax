@@ -933,18 +933,6 @@ var splicedFuncs = map[string]bool{
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
 }
 
-// arrayElemText renders one datum as a text array element.
-func arrayElemText(d types.Datum) string {
-	if d.Null {
-		return "NULL"
-	}
-	t := d.Text()
-	if t == "" || strings.ContainsAny(t, ",{}\"\\ ") {
-		return "\"" + strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(t) + "\""
-	}
-	return t
-}
-
 // regclassOID resolves a regclass literal: a number is the OID itself,
 // a name the table's OID (42P01 when nothing is so named).
 func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text string) (int64, error) {

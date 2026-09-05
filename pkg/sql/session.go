@@ -344,6 +344,11 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	return d, err
 }
 
+// TestingBeforeImplicitCommit, when set, runs after an implicit
+// statement has executed and before its transaction commits — a test's
+// window to change the schema underneath a planned statement.
+var TestingBeforeImplicitCommit func()
+
 // lookupMemo caches one statement's table lookups within one transaction
 // attempt (see Session.stmtLookups).
 type lookupMemo struct {
@@ -533,6 +538,19 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// into every pull.
 		if res != nil && res.Stream != nil {
 			res.Stream.deadline, res.Stream.lockTimeout = deadline, s.vars.lockTimeout
+		}
+	}()
+	defer func() {
+		// The outer panic barrier (issue #136; execStmt has the inner one,
+		// inside the transaction's retry loop). Whatever panicked outside
+		// it — a COMMIT, a DDL finish, a session variable — fails this
+		// statement with XX000 and, in a transaction block, the block.
+		if r := recover(); r != nil {
+			res, serr = nil, s.recoveredPanic(r, stmt)
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
 		}
 	}()
 	if serr := s.readOnlyViolation(stmt); serr != nil {
@@ -857,6 +875,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		var err error
 		s.extraDDL, s.pendingWipes = nil, nil
 		res, err = s.execStmt(ctx, txn, stmt, params)
+		if err == nil && TestingBeforeImplicitCommit != nil {
+			TestingBeforeImplicitCommit()
+		}
 		return err
 	})
 	if err != nil {
@@ -1890,12 +1911,6 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		return false, err
 	}
 	return cmpHolds(op, c), nil
-}
-
-// likeToRegexp translates a LIKE pattern (% and _ wildcards, backslash
-// escapes) into an anchored regular expression.
-func likeToRegexp(pattern string) string {
-	return likeToRegexpEsc(pattern, "")
 }
 
 // escapeRune resolves a pattern's ESCAPE character: backslash by

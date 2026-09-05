@@ -35,6 +35,13 @@ type ServerOptions struct {
 	// client certificate authenticates its CommonName only when that
 	// role exists and may log in (false, nil = refused).
 	CanLogin func(ctx context.Context, user string) (bool, error)
+	// MockSecret, when set, returns the cluster-wide secret that keys
+	// the stand-in verifier for users Auth does not know (the salt in
+	// server-first is derived from the user name under it, so a name
+	// shows the same salt on every node and a shared salt never marks
+	// the names that do not exist; issue #137). nil, or an empty result,
+	// falls back to a per-process secret.
+	MockSecret func(ctx context.Context) []byte
 	// SlowStatementThreshold is the duration past which a statement is
 	// kept in the slow-statement ring (0 = the default, 500 ms).
 	SlowStatementThreshold time.Duration

@@ -35,7 +35,6 @@ type Activity struct {
 	copyRows  uint64
 	latencies latencyRing
 	slow      []SlowStatement // newest last, at most slowRingSize
-	seq       uint64
 }
 
 // connActivity is one connection's live state.

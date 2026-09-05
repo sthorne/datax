@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server"
 )
@@ -266,5 +268,94 @@ func TestHTTPAuthInsecure(t *testing.T) {
 	}
 	if p := doc.Principal; p.Secure || p.User != "" || !p.Admin {
 		t.Fatalf("insecure principal: %+v", p)
+	}
+}
+
+// TestHTTPCertAuthChecksLogin (issue #138): a client certificate opens
+// the HTTP endpoints only while its CommonName is a role that may log
+// in — NOLOGIN closes the door, LOGIN reopens it, DROP ROLE closes it
+// for good — the way pgwire's certificate path already behaved; the
+// node's own certificate is admitted throughout.
+func TestHTTPCertAuthChecksLogin(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	var root *pgx.Conn
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		root, err = connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("root could never authenticate: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	defer func() { _ = root.Close(ctx) }()
+	if _, err := root.Exec(ctx, `CREATE USER certy`); err != nil {
+		t.Fatal(err)
+	}
+	if err := security.CreateClientCert(certsDir, "certy"); err != nil {
+		t.Fatal(err)
+	}
+	certy := httpsClient(t, certsDir, "certy")
+	get := func(client *http.Client) int {
+		t.Helper()
+		code, _, _ := authedGet(t, client, base+"/status", "", "")
+		return code
+	}
+	if code := get(certy); code != http.StatusOK {
+		t.Fatalf("certificate of a LOGIN role: %d, want 200", code)
+	}
+	if _, err := root.Exec(ctx, `ALTER ROLE certy NOLOGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(certy); code != http.StatusUnauthorized {
+		t.Fatalf("certificate of a NOLOGIN role: %d, want 401", code)
+	}
+	if _, err := root.Exec(ctx, `ALTER ROLE certy LOGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(certy); code != http.StatusOK {
+		t.Fatalf("certificate after LOGIN was restored: %d, want 200", code)
+	}
+	if _, err := root.Exec(ctx, `DROP ROLE certy`); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(certy); code != http.StatusUnauthorized {
+		t.Fatalf("certificate of a dropped role: %d, want 401", code)
+	}
+	// A refused certificate does not take Basic credentials down with it.
+	if code, _, _ := authedGet(t, certy, base+"/status", "root", "topsecret"); code != http.StatusOK {
+		t.Fatalf("Basic credentials alongside a refused certificate: %d, want 200", code)
+	}
+	// A certificate whose CommonName never was a role.
+	if err := security.CreateClientCert(certsDir, "stranger"); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(httpsClient(t, certsDir, "stranger")); code != http.StatusUnauthorized {
+		t.Fatalf("certificate of a name that is no role: %d, want 401", code)
+	}
+
+	// The node certificate (the cluster's own identity, no role
+	// descriptor) still reaches the endpoints internode calls need.
+	nodeClient := httpsClient(t, certsDir, "")
+	nodeCert, err := tls.LoadX509KeyPair(filepath.Join(certsDir, security.NodeCert), filepath.Join(certsDir, security.NodeKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeClient.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{nodeCert}
+	if code, _, _ := authedGet(t, nodeClient, base+"/api/range?id=1", "", ""); code != http.StatusOK {
+		t.Fatalf("node certificate on an admin endpoint: %d, want 200", code)
 	}
 }

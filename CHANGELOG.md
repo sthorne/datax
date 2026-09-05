@@ -8,6 +8,122 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.40.1 — unreleased
+
+### Fixed
+- `Stopper.Stop` returns to every caller only once the shutdown has
+  finished (#139). A concurrent second caller waited for the workers
+  only and could return while the first caller was still running the
+  closers — with the engine still open for a caller that then removed
+  the data directory or asserted on final state. A closer registered
+  after Stop had taken the closers was appended to a list nobody read
+  again, silently; it now runs at once (one registered while the
+  workers wind down runs in Stop, as before).
+- HTTP client-certificate authentication checks that the certificate's
+  CommonName is a role that may log in (#138), as the SQL port always
+  did. A CA-verified certificate was accepted as its principal with no
+  role lookup, so `ALTER ROLE ... NOLOGIN` or `DROP ROLE` revoked SQL
+  and HTTP Basic access but left a certificate holder the read-only
+  HTTP endpoints until the certificate expired (five years, with no
+  revocation). A refused certificate now gets the `401` the Basic path
+  gives, Basic credentials on the same request still get their turn,
+  and the cluster's own node certificate is admitted as before.
+  `TestHTTPCertAuthChecksLogin`.
+- The SCRAM exchange no longer tells which user names exist (#137).
+  Unknown users authenticated against one shared stand-in verifier, so
+  the salt in `server-first` — sent before any proof — was one constant
+  for every name that is not a user and a random value for every name
+  that is: one probe of an impossible name, then one `client-first` per
+  candidate, enumerated users without a password guess. The stand-in
+  salt is now derived from the user name under a cluster-wide secret
+  (`/system/auth-secret`, created by the first node that needs it), so
+  it is stable per name across handshakes and nodes and indistinguishable
+  from a real one; authentication fails as uniformly as before, and HTTP
+  Basic, which never shows a salt, keeps the shared stand-in as a timing
+  equalizer. `TestSCRAMStandInSaltPerUser`, `TestMockVerifier`.
+- A panic on the SQL statement path no longer kills the node (#136).
+  The connection goroutine had no recover, so a bug in the planner,
+  the executor, a builtin or an encoder — reached by one statement —
+  ended the process with every connection on it. The statement path
+  is now a panic barrier: the statement fails with `XX000` (its stack
+  in the log, `datax_sql_statement_panics_total` counting it), its
+  transaction fails as on any other error, and the connection and node
+  keep serving; streamed results are covered on every pull. Stack
+  exhaustion and out-of-memory remain fatal, as Go makes them.
+  `TestStatementPanicBarrier`.
+- Binary `NUMERIC` parameters are bounded on decode (#140): `weight` and
+  `dscale` came off the wire unchecked, so an eight-byte parameter with
+  no digit groups expanded to ~200 KB of zeros per value. Both are now
+  limited to what `NUMERIC(p, s)` can hold (1,000 digits of integer part
+  or scale) and refused with `22P03` past that — the SQLSTATE every
+  undecodable binary parameter now carries, in place of `08P01`; the
+  encoder refuses the same bounds instead of wrapping the weight.
+- A statement nested more than 1,000 levels deep (parentheses,
+  subqueries, derived tables, `CASE`) is refused with a syntax error
+  (`42601`, "statement nests too deeply") instead of exhausting the
+  goroutine stack — a fatal error that took the node and every
+  connection on it down, reachable by any client with a ~240 KB
+  statement (#135). One depth counter in the parser covers every
+  recursive production.
+- A split's right-hand range keeps the timestamp-cache protection for
+  reads the parent served on its span (#134). The RHS inherited the
+  parent's closed timestamp as its cache floor, which trails now() by
+  the closed-timestamp lag (3 s); reads the parent served inside that
+  window lived only in its in-memory cache, so a write at one of those
+  timestamps could land on the fresh RHS beneath a read already served
+  — a serializability violation for readers in the window. Every
+  replica now bumps the RHS's cache floor to now() as it applies the
+  split (as a merge does for an absorbed span); the one-time push this
+  costs a transaction that began before the split and writes to the RHS
+  after it is the same as a leadership change's.
+  `TestSplitKeepsServedReadsProtected`.
+- The one-phase commit path honors the transaction's commit deadline
+  (#133). The deadline — a schema lease's expiration, pinned when a
+  statement plans against the leased descriptor — was checked only on
+  the classic commit path; the one-phase path every implicit
+  single-range `INSERT`, `UPDATE` and `DELETE` takes skipped it, so a
+  statement planned under a lease an index build had since drained could
+  commit past the drain and leave a row the index never saw. The check
+  now runs inside that path's retry loop too (a refresh moves the write
+  timestamp, and the moved timestamp is what commits).
+  `TestOnePhaseCommitHonorsDeadline`,
+  `TestOnlineCreateIndexUnderLapsedLeaseImplicit`.
+
+### Changed
+- `TestDecommissionDrainsReplicas` asserts its steady state (#167): the
+  "no churn after stopping the drained node" check sampled the range
+  generations while the drain's last moves could still be settling, so
+  a descriptor bump in flight counted as churn (about one run in ten).
+  It now samples once the generations have held still. The other test
+  #167 names, `TestMergeFrozenAndRecovery`, already waits for the RHS
+  leader before it subsumes (since 0.35.0); the new
+  `TestSplitKeepsServedReadsProtected` had the same race and now waits
+  the same way (`waitForLeader`). The crash tests' child node inherits
+  its listeners from the parent instead of binding ports the parent
+  picked and released a process start earlier — a race with the
+  packages testing alongside, whose nodes and clients take ephemeral
+  ports on the same loopback, that killed the child on "address
+  already in use" before it served (one CI run in a few); a child that
+  fails to serve now has its log quoted in the failure. `make test` and
+  `make test-race` pass `-timeout 30m`: the cluster suite outruns
+  `go test`'s default 10 minutes on a small machine.
+- CI runs `staticcheck` (pinned at 2025.1.1, before the suite so a
+  failure is quick; `make staticcheck` / `make lint` run the same) on
+  top of gofmt and `go vet` (#142). Its first run is the baseline: the
+  17 findings it made — 13 unused functions, fields and types, a
+  redundant `| 0`, two simplifications — are gone.
+- A `vulncheck` workflow runs `govulncheck` (pinned at v1.7.0) on every
+  push and pull request and weekly on a schedule, as a gate (#143): it
+  reports only advisories whose vulnerable symbols this module reaches,
+  and advisories appear against unchanged code, hence the timer.
+  `make vulncheck` runs it locally. Its first run found three reachable
+  advisories — GO-2026-6061 and GO-2026-4762 in `google.golang.org/grpc`
+  v1.71.0 (the HTTP/2 transport server, an authorization bypass via
+  the `:path` header), GO-2026-5970 in `golang.org/x/text` v0.29.0 (an
+  infinite loop in normalization, reached from SASLprep) — so gRPC
+  moves to v1.82.1 and x/text to v0.39.0 (with `x/net` v0.53.0 and
+  `x/sync` v0.21.0 as they require).
+
 ## 0.40.0 — unreleased
 
 ### Changed
