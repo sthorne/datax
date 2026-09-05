@@ -168,6 +168,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 			fromWhere(desc, oc.Where)
 		}
 	case *parser.Select:
+		for _, idx := range []int{t.LimitParam, t.OffsetParam} {
+			if idx > 0 && fams[idx-1] == types.Unknown {
+				fams[idx-1] = types.Int
+			}
+		}
 		if t.Table != "" {
 			desc, err := s.lookupForPlan(ctx, t.Table)
 			if err != nil {
@@ -217,10 +222,30 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	switch t := stmt.(type) {
 	case *parser.Select:
 		if t.Union != nil {
-			// A union's output is shaped by its head.
+			// A set operation's output is named by its head and typed by
+			// unifying every member (the numeric families lift, anything
+			// else meets as text).
 			head := *t
-			head.Union, head.OrderBy, head.Limit = nil, nil, -1
-			return s.PlanColumns(ctx, &head)
+			head.Union, head.OrderBy, head.Limit, head.Offset = nil, nil, -1, 0
+			cols, err := s.PlanColumns(ctx, &head)
+			if err != nil {
+				return nil, err
+			}
+			for m := t.Union; m != nil; m = m.Union {
+				one := *m
+				one.Union = nil
+				mc, err := s.PlanColumns(ctx, &one)
+				if err != nil {
+					return nil, err
+				}
+				if len(mc) != len(cols) {
+					return nil, newErrf(CodeSyntaxError, "each set operation member must have the same number of columns")
+				}
+				for i := range cols {
+					cols[i].Type = unifyFamily(cols[i].Type, mc[i].Type)
+				}
+			}
+			return cols, nil
 		}
 		if t.Derived != nil || t.FuncTable != nil {
 			var desc *catalog.TableDescriptor
@@ -414,7 +439,14 @@ func (s *Session) planJoinSides(ctx context.Context, baseDesc *catalog.TableDesc
 		}
 		inner[i] = d
 	}
-	return makeJoinSides(baseDesc, inner, t)
+	sides, err := makeJoinSides(baseDesc, inner, t)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := expandUsing(sides, t); err != nil {
+		return nil, err
+	}
+	return sides, nil
 }
 
 // maskSubqueryExprs returns t with every select-list expression that

@@ -569,9 +569,14 @@ type havingRef struct {
 // groupedQuery is the resolved shape of a grouped/aggregate SELECT.
 type groupedQuery struct {
 	groupCols []catalog.Column
-	specs     []aggSpec // projected aggregates first, then HAVING-only ones
+	specs     []aggSpec // projected aggregates first, then HAVING/ORDER BY-only ones
 	outs      []groupedOut
 	having    []havingRef
+	// hidden are ORDER BY keys the output does not carry (an aggregate
+	// call, an unprojected grouping column), computed after outs and
+	// dropped after the sort; order is the ORDER BY rewritten onto them.
+	hidden []groupedOut
+	order  []parser.OrderCol
 }
 
 // resolveGrouped resolves the select list, GROUP BY, and HAVING of a
@@ -617,6 +622,50 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 			col, _ := desc.Col(se.Expr.Column)
 			gq.outs = append(gq.outs, groupedOut{name: name, typ: col.Type, groupPos: pos, aggPos: -1})
 		}
+	}
+
+	// ORDER BY terms the output does not carry — an aggregate call, or a
+	// grouping column that is not projected — become hidden sort keys:
+	// computed with the group, sorted by, then dropped.
+	gq.order = append([]parser.OrderCol(nil), t.OrderBy...)
+	outName := func(name string) bool {
+		for _, oc := range gq.outs {
+			if oc.name == name {
+				return true
+			}
+		}
+		return false
+	}
+	for i, oc := range t.OrderBy {
+		hidden := groupedOut{name: fmt.Sprintf("__order%d", i), groupPos: -1, aggPos: -1}
+		switch {
+		case oc.Agg != nil:
+			sp, err := resolveAggSpec(desc, *oc.Agg)
+			if err != nil {
+				return nil, err
+			}
+			for j := range gq.specs {
+				if sameSpec(gq.specs[j], sp) {
+					hidden.aggPos = j
+					break
+				}
+			}
+			if hidden.aggPos < 0 {
+				hidden.aggPos = len(gq.specs)
+				gq.specs = append(gq.specs, sp)
+			}
+			hidden.typ = sp.resultType()
+		case oc.Column != "" && !outName(oc.Column):
+			pos, ok := groupIdx[oc.Column]
+			if !ok {
+				continue // an unknown name: the sorter reports it
+			}
+			hidden.groupPos, hidden.typ = pos, gq.groupCols[pos].Type
+		default:
+			continue
+		}
+		gq.hidden = append(gq.hidden, hidden)
+		gq.order[i] = parser.OrderCol{Column: hidden.name, Desc: oc.Desc, Nulls: oc.Nulls}
 	}
 
 	for _, hc := range t.Having {
@@ -757,6 +806,10 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 	for _, oc := range gq.outs {
 		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ})
 	}
+	for _, oc := range gq.hidden {
+		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ})
+	}
+	visible := len(gq.outs)
 	for _, k := range order {
 		g := groups[k]
 		aggVals, err := g.st.finish(gq.specs, params)
@@ -783,28 +836,32 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 		if !keep {
 			continue
 		}
-		out := make([]types.Datum, len(gq.outs))
-		for i, oc := range gq.outs {
+		out := make([]types.Datum, 0, len(res.Columns))
+		for _, oc := range append(append([]groupedOut(nil), gq.outs...), gq.hidden...) {
 			if oc.groupPos >= 0 {
-				out[i] = g.key[oc.groupPos]
+				out = append(out, g.key[oc.groupPos])
 			} else {
-				out[i] = aggVals[oc.aggPos]
+				out = append(out, aggVals[oc.aggPos])
 			}
 		}
 		res.Rows = append(res.Rows, out)
 	}
 
 	if t.Distinct {
-		res.Rows = dedupeRows(res.Rows)
+		res.Rows = dedupeRowsPrefix(res.Rows, visible)
 	}
-	if len(t.OrderBy) > 0 {
-		if err := sortResultRows(res.Columns, res.Rows, t.OrderBy); err != nil {
+	if len(gq.order) > 0 {
+		if err := sortResultRows(res.Columns, res.Rows, gq.order, params); err != nil {
 			return nil, err
 		}
 	}
-	if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
-		res.Rows = res.Rows[:t.Limit]
+	if len(gq.hidden) > 0 {
+		res.Columns = res.Columns[:visible]
+		for i := range res.Rows {
+			res.Rows[i] = res.Rows[i][:visible]
+		}
 	}
+	res.Rows = trimRows(res.Rows, t)
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
 }
@@ -850,10 +907,21 @@ func compareDatum(lhs types.Datum, op string, value parser.Expr, params []types.
 // dedupeRows removes duplicate output rows, keeping first occurrences in
 // order (SELECT DISTINCT).
 func dedupeRows(rows [][]types.Datum) [][]types.Datum {
+	return dedupeRowsPrefix(rows, -1)
+}
+
+// dedupeRowsPrefix is dedupeRows keyed on the first n datums of each row
+// (every datum when n is negative): hidden sort keys do not distinguish
+// rows.
+func dedupeRowsPrefix(rows [][]types.Datum, n int) [][]types.Datum {
 	seen := map[string]bool{}
 	out := rows[:0]
 	for _, r := range rows {
-		k := encodeGroupKey(r)
+		key := r
+		if n >= 0 && n < len(r) {
+			key = r[:n]
+		}
+		k := encodeGroupKey(key)
 		if seen[k] {
 			continue
 		}
@@ -866,11 +934,25 @@ func dedupeRows(rows [][]types.Datum) [][]types.Datum {
 // sortResultRows sorts output rows by result-column names (grouped and
 // DISTINCT selects order by what they produce, not by table columns). NULL
 // ordering matches sortRows: NULLS LAST ascending, NULLS FIRST descending.
-func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.OrderCol) error {
+func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.OrderCol, params []types.Datum) error {
 	idx := make([]int, len(order))
+	var desc *catalog.TableDescriptor
 	for i, oc := range order {
-		if oc.Expr != nil {
-			return newErrf(CodeFeatureNotSupported, "ORDER BY expressions are not supported with GROUP BY, DISTINCT aggregates, or UNION")
+		switch {
+		case oc.Agg != nil:
+			return newErrf(CodeGrouping, "aggregate functions in ORDER BY require GROUP BY or an aggregated select list")
+		case oc.Expr != nil:
+			idx[i] = -1
+			if desc == nil {
+				desc = derivedDesc("", cols)
+			}
+			continue
+		case oc.Position > 0:
+			if oc.Position > len(cols) {
+				return newErrf(CodeUndefinedColumn, "ORDER BY position %d is not in the select list", oc.Position)
+			}
+			idx[i] = oc.Position - 1
+			continue
 		}
 		found := -1
 		for j, c := range cols {
@@ -884,15 +966,44 @@ func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.Or
 		}
 		idx[i] = found
 	}
-	var sortErr error
-	sort.SliceStable(rows, func(a, b int) bool {
+	// Sort keys: the referenced output values, or expressions over the
+	// output columns evaluated once per row.
+	keys := make([][]types.Datum, len(rows))
+	for r, row := range rows {
+		keys[r] = make([]types.Datum, len(order))
+		var env map[catalog.ColumnID]types.Datum
 		for i, oc := range order {
-			da, db := rows[a][idx[i]], rows[b][idx[i]]
+			if idx[i] >= 0 {
+				keys[r][i] = row[idx[i]]
+				continue
+			}
+			if env == nil {
+				env = make(map[catalog.ColumnID]types.Datum, len(row))
+				for j, d := range row {
+					env[catalog.ColumnID(j+1)] = d
+				}
+			}
+			d, err := evalExpr(*oc.Expr, desc, env, params)
+			if err != nil {
+				return err
+			}
+			keys[r][i] = d
+		}
+	}
+	perm := make([]int, len(rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	var sortErr error
+	sort.SliceStable(perm, func(a, b int) bool {
+		ka, kb := keys[perm[a]], keys[perm[b]]
+		for i, oc := range order {
+			da, db := ka[i], kb[i]
 			if da.Null || db.Null {
 				if da.Null == db.Null {
 					continue
 				}
-				return db.Null != oc.Desc
+				return da.Null == nullsFirst(oc)
 			}
 			c, err := da.Compare(db)
 			if err != nil {
@@ -914,7 +1025,24 @@ func sortResultRows(cols []ResultColumn, rows [][]types.Datum, order []parser.Or
 	if sortErr != nil {
 		return newErrf(CodeInternal, "ORDER BY: %v", sortErr)
 	}
+	sorted := make([][]types.Datum, len(rows))
+	for i, p := range perm {
+		sorted[i] = rows[p]
+	}
+	copy(rows, sorted)
 	return nil
+}
+
+// nullsFirst reports where a term's NULLs sort: as written (NULLS FIRST
+// | LAST), else PostgreSQL's default — last ascending, first descending.
+func nullsFirst(oc parser.OrderCol) bool {
+	switch oc.Nulls {
+	case "first":
+		return true
+	case "last":
+		return false
+	}
+	return oc.Desc
 }
 
 // ---------------------------------------------------------------------------
@@ -947,8 +1075,11 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 		return orderDecision{satisfied: true}
 	}
 	for _, oc := range order {
-		if oc.Expr != nil {
+		if oc.Expr != nil || oc.Agg != nil || oc.Position > 0 {
 			return orderDecision{} // computed keys always sort in memory
+		}
+		if oc.Nulls != "" && (oc.Nulls == "first") != oc.Desc {
+			return orderDecision{} // the key order puts NULLs the other way
 		}
 	}
 
@@ -1021,6 +1152,17 @@ func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.O
 		if oc.Expr != nil {
 			continue
 		}
+		if oc.Agg != nil {
+			return newErrf(CodeGrouping, "aggregate functions in ORDER BY require GROUP BY or an aggregated select list")
+		}
+		if oc.Position > 0 {
+			visible := desc.VisibleColumns()
+			if oc.Position > len(visible) {
+				return newErrf(CodeUndefinedColumn, "ORDER BY position %d is not in the select list", oc.Position)
+			}
+			cols[i] = visible[oc.Position-1]
+			continue
+		}
 		col, ok := desc.Col(oc.Column)
 		if !ok {
 			return newErrf(CodeUndefinedColumn, "column %q does not exist", oc.Column)
@@ -1061,8 +1203,7 @@ func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.O
 				if da.Null == db.Null {
 					continue
 				}
-				// ASC: NULLS LAST → null sorts after; DESC: NULLS FIRST.
-				return db.Null != oc.Desc
+				return da.Null == nullsFirst(oc)
 			}
 			c, err := da.Compare(db)
 			if err != nil {

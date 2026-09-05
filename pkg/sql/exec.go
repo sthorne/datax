@@ -864,7 +864,7 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 	if exprs == nil {
 		return nil, nil
 	}
-	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...)}
+	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...), Limit: -1}
 	stripTableAlias(sel)
 	for _, se := range sel.Exprs {
 		if se.Agg != "" {
@@ -1380,6 +1380,12 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
+	if t.LimitParam > 0 || t.OffsetParam > 0 {
+		var err error
+		if t, err = resolveLimitParams(t, params); err != nil {
+			return nil, err
+		}
+	}
 	if res, ok := s.emptyCatalogSelect(ctx, txn, t); ok {
 		return res, nil
 	}
@@ -1389,7 +1395,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 	}
 	if t.Union != nil {
-		return s.execUnion(ctx, txn, t, params)
+		return s.execSetOps(ctx, txn, t, params)
 	}
 	// Correlated conjuncts leave the WHERE clause before eager subquery
 	// resolution and access planning ever see them; they come back as a
@@ -1459,8 +1465,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
 			row = append(row, conformTo(d, fam))
 		}
-		res.Rows = [][]types.Datum{row}
-		res.Tag = "SELECT 1"
+		res.Rows = trimRows([][]types.Datum{row}, t)
+		res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 		return res, nil
 	}
 
@@ -1495,7 +1501,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// With ORDER BY the limit applies only after sorting (unless the access
 	// path already delivers the requested order); with DISTINCT only after
 	// deduplication.
-	fetchLimit := t.Limit
+	fetchLimit := keepCount(t)
 	if t.Distinct || len(corr) > 0 {
 		// A correlated filter runs after the fetch, so the fetch itself
 		// must not stop early; the limit re-applies to the survivors.
@@ -1537,8 +1543,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			}
 		}
 		rows = kept
-		if !needSort && !t.Distinct && t.Limit > 0 && int64(len(rows)) > t.Limit {
-			rows = rows[:t.Limit]
+		if !needSort && !t.Distinct {
+			rows = cutRows(rows, keepCount(t))
 		}
 	}
 	if t.ForUpdate {
@@ -1556,8 +1562,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		if err := sortRows(desc, rows, order, params); err != nil {
 			return nil, err
 		}
-		if !t.Distinct && t.Limit > 0 && int64(len(rows)) > t.Limit {
-			rows = rows[:t.Limit]
+		if !t.Distinct {
+			rows = cutRows(rows, keepCount(t))
 		}
 	}
 	res := &Result{}
@@ -1615,12 +1621,10 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	if t.Distinct {
 		// Degenerate grouping over the projection: keep first occurrences
-		// (rows are already in the requested order), then apply the limit.
+		// (rows are already in the requested order).
 		res.Rows = dedupeRows(res.Rows)
-		if t.Limit > 0 && int64(len(res.Rows)) > t.Limit {
-			res.Rows = res.Rows[:t.Limit]
-		}
 	}
+	res.Rows = trimRows(res.Rows, t)
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
 }
@@ -2060,6 +2064,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			text += "; limit pushed into scan"
 		}
 	}
+	if sel.Offset > 0 {
+		text += fmt.Sprintf("; offset %d applied after fetch", sel.Offset)
+	}
 	return &Result{
 		Columns: []ResultColumn{{Name: "plan", Type: types.String}},
 		Rows:    [][]types.Datum{{types.NewString(text)}},
@@ -2222,60 +2229,6 @@ func (s *Session) emptyCatalogSelect(ctx context.Context, txn *kvclient.Txn, t *
 // execUnion runs each member of a UNION [ALL] chain and concatenates the
 // results (UNION removes duplicate rows). Column names come from the
 // head; ORDER BY names resolve against the head's output columns, then
-// positionally through the last member's.
-func (s *Session) execUnion(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
-	head := *t
-	head.Union, head.OrderBy, head.Limit = nil, nil, -1
-	res, err := s.execSelect(ctx, txn, &head, params)
-	if err != nil {
-		return nil, err
-	}
-	tail, err := s.execSelect(ctx, txn, t.Union, params)
-	if err != nil {
-		return nil, err
-	}
-	if len(tail.Columns) != len(res.Columns) {
-		return nil, newErrf(CodeSyntaxError, "each UNION query must have the same number of columns")
-	}
-	rows := append(res.Rows, tail.Rows...)
-	if !t.UnionAll {
-		rows = dedupeRows(rows)
-	}
-	if len(t.OrderBy) > 0 {
-		order := append([]parser.OrderCol(nil), t.OrderBy...)
-		for i, oc := range order {
-			if oc.Expr != nil {
-				continue // sortResultRows reports it
-			}
-			known := false
-			for _, c := range res.Columns {
-				if c.Name == oc.Column {
-					known = true
-					break
-				}
-			}
-			if known {
-				continue
-			}
-			for j, c := range tail.Columns {
-				if c.Name == oc.Column {
-					order[i].Column = res.Columns[j].Name
-					break
-				}
-			}
-		}
-		if err := sortResultRows(res.Columns, rows, order); err != nil {
-			return nil, err
-		}
-	}
-	if t.Limit > 0 && int64(len(rows)) > t.Limit {
-		rows = rows[:t.Limit]
-	}
-	res.Rows = rows
-	res.Tag = fmt.Sprintf("SELECT %d", len(rows))
-	return res, nil
-}
-
 // resolveOrderAliases maps ORDER BY names that name an output column
 // (SELECT x AS nsp ... ORDER BY nsp) onto what that output computes: the
 // underlying column, or the expression itself. Output names take
@@ -2490,4 +2443,82 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 	}
 	res.Tag = fmt.Sprintf("SHOW %d", len(res.Rows))
 	return res, nil
+}
+
+// resolveLimitParams returns t with LIMIT $n / OFFSET $n resolved from
+// the parameters (on a copy; the statement may be cached): NULL is no
+// limit / no offset, as in PostgreSQL, and a negative count is refused.
+func resolveLimitParams(t *parser.Select, params []types.Datum) (*parser.Select, error) {
+	c := *t
+	count := func(idx int, clause, code string) (int64, bool, error) {
+		if idx > len(params) {
+			return 0, false, newErrf(CodeSyntaxError, "%s: parameter $%d was not supplied", clause, idx)
+		}
+		d := params[idx-1]
+		if d.Null {
+			return 0, false, nil
+		}
+		v, err := d.Coerce(types.Int)
+		if err != nil {
+			return 0, false, newErrf(CodeInvalidTextRepresentation, "%s count %q is not an integer", clause, d.Text())
+		}
+		if v.I < 0 {
+			return 0, false, newErrf(code, "%s must not be negative", clause)
+		}
+		return v.I, true, nil
+	}
+	if t.LimitParam > 0 {
+		v, set, err := count(t.LimitParam, "LIMIT", "2201W")
+		if err != nil {
+			return nil, err
+		}
+		c.Limit, c.LimitParam = -1, 0
+		if set {
+			c.Limit = v
+		}
+	}
+	if t.OffsetParam > 0 {
+		v, set, err := count(t.OffsetParam, "OFFSET", "2201X")
+		if err != nil {
+			return nil, err
+		}
+		c.Offset, c.OffsetParam = 0, 0
+		if set {
+			c.Offset = v
+		}
+	}
+	return &c, nil
+}
+
+// keepCount is how many leading rows a stage must keep for the query's
+// LIMIT and OFFSET to apply after it (0 = every row).
+func keepCount(t *parser.Select) int64 {
+	if t.Limit < 0 {
+		return 0
+	}
+	return t.Limit + t.Offset
+}
+
+// cutRows keeps the first keep rows (all when keep is 0).
+func cutRows[T any](rows []T, keep int64) []T {
+	if keep > 0 && int64(len(rows)) > keep {
+		return rows[:keep]
+	}
+	return rows
+}
+
+// trimRows applies the query's OFFSET, then its LIMIT (LIMIT 0 keeps
+// nothing; -1 is no limit).
+func trimRows[T any](rows []T, t *parser.Select) []T {
+	if t.Offset > 0 {
+		if int64(len(rows)) <= t.Offset {
+			rows = rows[:0]
+		} else {
+			rows = rows[t.Offset:]
+		}
+	}
+	if t.Limit >= 0 && int64(len(rows)) > t.Limit {
+		rows = rows[:t.Limit]
+	}
+	return rows
 }

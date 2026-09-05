@@ -56,12 +56,20 @@ func CountParams(stmt Statement) int {
 		}
 		visitReturning(t.Returning)
 	case *Select:
-		for _, se := range t.Exprs {
-			if !se.Star {
-				visit(se.Expr)
+		for m := t; m != nil; m = m.Union {
+			for _, se := range m.Exprs {
+				if !se.Star {
+					visit(se.Expr)
+				}
+			}
+			visitWhere(m.Where)
+			if m.LimitParam > max {
+				max = m.LimitParam
+			}
+			if m.OffsetParam > max {
+				max = m.OffsetParam
 			}
 		}
-		visitWhere(t.Where)
 	case *Update:
 		for _, set := range t.Set {
 			visit(set.Value)

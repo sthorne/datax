@@ -225,11 +225,13 @@ upgrade` finalizes it): a v7 node would write rows unchecked.
 
 ```sql
 SELECT * | expr [AS alias], ... FROM t [AS a]
-  [JOIN t2 [AS b] ON b.x = a.y [AND ...]]       -- INNER, LEFT [OUTER], CROSS or "t, t2"; up to 8 tables
+  [JOIN t2 [AS b] ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER], CROSS,
+                                                          -- NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
   [GROUP BY cols] [HAVING ...]
-  [UNION [ALL] SELECT ...]
-  [ORDER BY col | expr [ASC|DESC], ...] [LIMIT n];
+  [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
+  [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
+  [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY];
 ```
 
 - **WHERE** supports full boolean logic: `AND`, `OR`, `NOT`, and
@@ -318,18 +320,23 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
 - **Joins** execute left-deep in the order written — until
   [statistics](#table-statistics) exist for every joined table, at which
   point INNER joins are automatically reordered to drive from the
-  cheapest side (`EXPLAIN` says `join reordered by cost`; LEFT joins,
+  cheapest side (`EXPLAIN` says `join reordered by cost`; outer joins,
   self-joins, cross joins and joins with correlated subqueries or ON
   filters always keep the written order). `ON` is a boolean expression
   (parentheses welcome) that must include at least one equality between
   a column of the newly joined table and one from an earlier table; its
   other conjuncts (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN
-  (...)`) are join conditions, evaluated per candidate match — a LEFT
-  JOIN NULL-extends when they fail, unlike a `WHERE` filter. `CROSS
-  JOIN` and the comma form `FROM a, b WHERE a.x = b.y` are cross
-  products filtered by `WHERE`. Join select lists take columns, `*`,
-  expressions (`o.qty * 2`, rendered as text), `->`/`->>` paths and
-  subqueries; under `GROUP BY` they narrow to plain columns and
+  (...)`) are join conditions, evaluated per candidate match — an outer
+  join NULL-extends when they fail, unlike a `WHERE` filter. `LEFT`
+  keeps the earlier sides' unmatched rows, `RIGHT` the joined table's
+  (appended after the lookups, NULL on every earlier side), `FULL` both.
+  `JOIN ... USING (c)` and `NATURAL JOIN` (every column name the sides
+  share; a cross join when none) equate the named columns, show each
+  once in `*`, resolve it unqualified without ambiguity, and read it as
+  `COALESCE` across an outer join. `CROSS JOIN` and the comma form
+  `FROM a, b WHERE a.x = b.y` are cross products filtered by `WHERE`.
+  Join select lists take columns, `*`, expressions, `->`/`->>` paths
+  and subqueries; under `GROUP BY` they narrow to plain columns and
   aggregates.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
@@ -339,15 +346,34 @@ SELECT * | expr [AS alias], ... FROM t [AS a]
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,
   memoized on the referenced values, up to 4 nesting levels.
-- **UNION [ALL]** concatenates selects with the same number of columns
-  (`UNION` removes duplicate rows); a trailing `ORDER BY` / `LIMIT`
-  applies to the whole result, by output name or position.
-- **ORDER BY** takes result-column names, output aliases, positions, or
-  expressions (`ORDER BY lower(name), qty > 3`); sorts in memory unless
-  the access path already delivers the order — ascending along the key,
-  descending via a reverse scan, and on sharded timeseries tables either
-  direction via a K-way merge of the per-bucket scans (`ORDER BY ts DESC
-  LIMIT n` dashboards stop early instead of scanning everything).
+- **Set operations**: `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL]`,
+  between selects, `VALUES` lists and parenthesized queries (which may
+  carry their own `ORDER BY` / `LIMIT`) with the same number of
+  columns. PostgreSQL's precedence: `INTERSECT` binds tighter, the
+  others associate left to right. The distinct forms remove duplicates;
+  `INTERSECT ALL` keeps the smaller count of a row, `EXCEPT ALL`
+  subtracts the right side's count. Column names come from the first
+  member and each column's type from all of them (`1 UNION 2.5` is
+  DECIMAL; a text member makes the column text). A trailing `ORDER BY`
+  / `LIMIT` / `OFFSET` applies to the whole result, by output name or
+  position. Every member materializes on the gateway, capped at a
+  million rows in flight (`54000`).
+- **ORDER BY** takes result-column names, output aliases, positions,
+  expressions (`ORDER BY lower(name), qty > 3`, `n * -1` over an
+  alias) and, in a grouped query, aggregate calls (`ORDER BY count(*)
+  DESC`, whether or not they are selected) and grouping columns; `NULLS
+  FIRST | LAST` overrides the default placement (last ascending, first
+  descending). It sorts in memory unless the access path already
+  delivers the order — ascending along the key, descending via a
+  reverse scan, and on sharded timeseries tables either direction via a
+  K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
+  dashboards stop early instead of scanning everything).
+- **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
+  FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
+  rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when
+  the limit is pushed down), so deep pagination costs the whole prefix:
+  prefer keyset pagination (`WHERE id > $last ORDER BY id LIMIT n`) on
+  large tables. `LIMIT 0` returns no rows.
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access path:
 
