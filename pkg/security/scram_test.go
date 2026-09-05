@@ -1,6 +1,7 @@
 package security
 
 import (
+	"bytes"
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"encoding/base64"
@@ -242,6 +243,38 @@ func TestVerifyPassword(t *testing.T) {
 	for _, pw := range []string{"this-password-can-never-verify", "", "x"} {
 		if VerifyPassword(d, pw) {
 			t.Fatalf("dummy verifier accepted %q", pw)
+		}
+	}
+}
+
+// TestMockVerifier (issue #137): the stand-in verifier for a user that
+// does not exist has a salt derived from the name under the secret —
+// stable per name and secret, distinct across names and across secrets,
+// shaped like a real one (16 bytes, the standard iteration count) — and
+// no password verifies against it.
+func TestMockVerifier(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	a, a2, b := MockVerifier(secret, "alice"), MockVerifier(secret, "alice"), MockVerifier(secret, "bob")
+	if !bytes.Equal(a.Salt, a2.Salt) {
+		t.Fatal("the same name under the same secret produced different salts")
+	}
+	if bytes.Equal(a.Salt, b.Salt) {
+		t.Fatal("two names produced the same salt")
+	}
+	other := MockVerifier([]byte("another secret entirely, 32 bytes!"), "alice")
+	if bytes.Equal(a.Salt, other.Salt) {
+		t.Fatal("two secrets produced the same salt for one name")
+	}
+	real, err := MakeScramVerifier("pencil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Salt) != len(real.Salt) || a.Iterations != real.Iterations {
+		t.Fatalf("stand-in shape: %d-byte salt, %d iterations; real: %d, %d", len(a.Salt), a.Iterations, len(real.Salt), real.Iterations)
+	}
+	for _, pw := range []string{"", "alice", "this-password-can-never-verify"} {
+		if VerifyPassword(a, pw) {
+			t.Fatalf("stand-in verifier accepted %q", pw)
 		}
 	}
 }

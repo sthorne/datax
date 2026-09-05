@@ -11,6 +11,18 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- The SCRAM exchange no longer tells which user names exist (#137).
+  Unknown users authenticated against one shared stand-in verifier, so
+  the salt in `server-first` — sent before any proof — was one constant
+  for every name that is not a user and a random value for every name
+  that is: one probe of an impossible name, then one `client-first` per
+  candidate, enumerated users without a password guess. The stand-in
+  salt is now derived from the user name under a cluster-wide secret
+  (`/system/auth-secret`, created by the first node that needs it), so
+  it is stable per name across handshakes and nodes and indistinguishable
+  from a real one; authentication fails as uniformly as before, and HTTP
+  Basic, which never shows a salt, keeps the shared stand-in as a timing
+  equalizer. `TestSCRAMStandInSaltPerUser`, `TestMockVerifier`.
 - A panic on the SQL statement path no longer kills the node (#136).
   The connection goroutine had no recover, so a bug in the planner,
   the executor, a builtin or an encoder — reached by one statement —

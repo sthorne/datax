@@ -298,6 +298,10 @@ type Node struct {
 	cat     *catalog.Accessor
 	catOnce sync.Once
 	catErr  error
+	// authSecret is the cluster's authentication secret
+	// (keys.AuthSecretKey), read or created on first use and cached.
+	authSecretMu sync.Mutex
+	authSecret   []byte
 	// metricsReady is set once the datax_metrics table is known to exist;
 	// metricsPaused holds the recorder off while a restore runs.
 	metricsReady  atomic.Bool

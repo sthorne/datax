@@ -260,6 +260,12 @@ func NodeRegistrySpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// AuthSecretKey holds the cluster's authentication secret: 32 random
+// bytes, created by the first node that needs them (a transaction, so
+// one value wins), keying the stand-in SCRAM salts for users that do not
+// exist (issue #137). Never shown to a client.
+func AuthSecretKey() Key { return systemKey("auth-secret") }
+
 // NodeIDGenKey is the counter for allocating node IDs.
 func NodeIDGenKey() Key { return systemKey("idgen", "node") }
 

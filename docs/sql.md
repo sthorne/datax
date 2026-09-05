@@ -680,9 +680,14 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   (`datax cert create-client --user alice`, then `sslcert`/`sslkey`);
   a CN mismatch falls back to SCRAM. Verifiers — never plaintext — live
   at `/system/users/<name>`; unknown users and wrong passwords fail with
-  one uniform `28P01`, and a full dummy exchange runs for unknown users
-  so the flow leaks nothing. Cleartext startup is refused in secure
-  mode. In
+  one uniform `28P01`, and a full stand-in exchange runs for unknown
+  users so the flow leaks nothing — including the salt server-first
+  shows before anything is proven: it is derived from the user name
+  under a cluster-wide secret (`/system/auth-secret`, 32 random bytes
+  the first node that needs them writes in a transaction), so one name
+  sees one salt on every node and no salt marks the names that do not
+  exist (#137; PostgreSQL's mock authentication does the same). Cleartext
+  startup is refused in secure mode. In
   insecure mode `SSLRequest` gets `N` and authentication is trust.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is

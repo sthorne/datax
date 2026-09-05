@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"github.com/sthorne/datax/pkg/cluster"
@@ -58,6 +59,7 @@ func (n *Node) startSQL() error {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier
 		opts.CanLogin = n.canLogin
+		opts.MockSecret = n.mockSecret
 		if n.cfg.RootPassword != "" {
 			if err := n.stopper.RunWorker(n.seedRootUser); err != nil {
 				return err
@@ -96,6 +98,46 @@ func (n *Node) lookupVerifier(ctx context.Context, user string) (*security.Scram
 		return nil, err
 	}
 	return security.UnmarshalVerifier(r.Verifier)
+}
+
+// mockSecret returns the cluster's authentication secret, the key under
+// which the wire layer derives the stand-in SCRAM salt for a user that
+// does not exist (issue #137): read from keys.AuthSecretKey on first
+// use, created there — in a transaction, so concurrent first users on
+// different nodes settle on one value — when the cluster has none yet
+// (a cluster bootstrapped before the key existed). nil when the read
+// fails; the wire layer then uses a per-process secret until the next
+// attempt succeeds.
+func (n *Node) mockSecret(ctx context.Context) []byte {
+	n.authSecretMu.Lock()
+	defer n.authSecretMu.Unlock()
+	if n.authSecret != nil {
+		return n.authSecret
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var secret []byte
+	err := n.db.RunTxn(ctx, "auth-secret", func(ctx context.Context, txn *kvclient.Txn) error {
+		raw, err := txn.Get(ctx, keys.AuthSecretKey())
+		if err != nil {
+			return err
+		}
+		if len(raw) > 0 {
+			secret = raw
+			return nil
+		}
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return err
+		}
+		return txn.Put(ctx, keys.AuthSecretKey(), secret)
+	})
+	if err != nil {
+		log.Warnf("reading the cluster's authentication secret: %v (stand-in SCRAM salts are per node until it can be read)", err)
+		return nil
+	}
+	n.authSecret = secret
+	return secret
 }
 
 // canLogin reports whether a role exists and may open a session (the
