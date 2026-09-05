@@ -33,6 +33,9 @@ type serverFlags struct {
 	cacheSize     string
 	encKeyPath    string
 	loadSplit     float64
+	mergeThr      int64
+	raftWorkers   int
+	quiescence    bool
 	shedFactor    float64
 	consistInt    time.Duration
 	bytesThr      int64
@@ -58,6 +61,9 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
+	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
+	f.fs.BoolVar(&f.quiescence, "raft-quiescence", true, "let idle ranges stop ticking and heartbeating (cluster version v12)")
+	f.fs.Int64Var(&f.mergeThr, "merge-size-threshold", 0, "size in bytes below which a range and its right neighbor are merged back together (0 = default 16 MiB, negative = disabled; disable to keep an empty pre-split, e.g. for a benchmark)")
 	f.fs.Float64Var(&f.shedFactor, "lease-shed-factor", 0, "leader-QPS multiple of the cluster mean at which a node sheds hot leases (0 = default 1.5)")
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
@@ -87,6 +93,9 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		StorageCacheSize:        cacheSize,
 		EncKeyPath:              f.encKeyPath,
 		LoadSplitThreshold:      f.loadSplit,
+		MergeSizeThreshold:      f.mergeThr,
+		RaftWorkers:             f.raftWorkers,
+		DisableQuiescence:       !f.quiescence,
 		LeaseShedFactor:         f.shedFactor,
 		ConsistencyInterval:     f.consistInt,
 		SlowStatementThreshold:  f.slowStmt,

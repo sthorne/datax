@@ -15,6 +15,7 @@ import (
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/version"
 )
 
@@ -95,6 +96,23 @@ func TestQuiescence(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitAllQuiescent(t, tc, rid, 30*time.Second)
+
+	// Asleep, every replica's closed timestamp keeps advancing through
+	// the off-log group promise (follower reads stay fresh), and nobody
+	// wakes for it.
+	before := map[int]hlc.Timestamp{}
+	for i, r := range replicasOf(tc, rid) {
+		before[i] = r.ClosedTimestamp()
+	}
+	time.Sleep(3 * time.Second)
+	for i, r := range replicasOf(tc, rid) {
+		if !r.Quiescent() {
+			t.Fatalf("n%d woke while idle", i+1)
+		}
+		if adv := r.ClosedTimestamp().WallTime - before[i].WallTime; adv < int64(2*time.Second) {
+			t.Fatalf("n%d: closed timestamp advanced %s in 3 s while quiescent (before %s, now %s)", i+1, time.Duration(adv), before[i], r.ClosedTimestamp())
+		}
+	}
 
 	// A write wakes the range and is applied everywhere; a read after the
 	// range slept again is served (the leader re-establishes contact

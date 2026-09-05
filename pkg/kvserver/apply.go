@@ -104,6 +104,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 			r.mu.Unlock()
 		}
 		r.setApplied(ent.Index)
+		r.noteAppliedTerm(ent.Term)
 
 		if cc.Type == raftpb.ConfChangeRemoveNode && newDesc != nil {
 			if _, stillMember := newDesc.GetReplica(r.store.cfg.NodeID); !stillMember {
@@ -119,6 +120,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 				return err
 			}
 			r.setApplied(ent.Index)
+			r.noteAppliedTerm(ent.Term)
 			return nil
 		}
 		cmd, err := decodeRaftCommand(ent.Data)
@@ -131,6 +133,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 			// replays after restart.
 			return abort
 		}
+		r.noteAppliedTerm(ent.Term)
 
 		// Deliver the outcome to a local waiter, if this replica proposed it.
 		r.mu.Lock()

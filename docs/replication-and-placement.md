@@ -331,6 +331,23 @@ reads without a raft entry, an fsync or a wake every second — which is
 what lets it stay quiescent. The first promise after new entries rides
 the log again.
 
+For **quiescent** ranges the off-log promise is grouped, so an idle
+store's publication cost is a few envelopes a second however many
+ranges it holds: a sleeping leader's term and last index cannot change,
+so it registers once per follower node (a per-range entry with an
+explicit promise), and from then on each round sends every follower
+node one group entry — "every range you hold registered from me is
+closed at T" — which the follower applies to its registry, re-validating
+each range and dropping one that fails. A range that wakes is dropped
+from the group by a per-range entry ahead of the next group promise, and
+until the followers see it the leader honors every promise they may
+still apply by forwarding its own timestamp-cache floor to the store's
+latest promise as it wakes (the promise is advanced before the woken set
+is collected, so a wake either lands in the set or bumps to the promise
+being sent). `datax_closed_timestamp_side_updates_total` counts the
+per-range entries, `datax_closed_timestamp_group_updates_total` the
+group ones.
+
 A follower serves a read-only batch pinned at a fixed timestamp exactly
 when that timestamp is at or below its closed timestamp; anything else —
 including any unresolved intent it encounters (only the leader can push) —

@@ -546,8 +546,25 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 			}
 		}
 		// An existing boundary is the state asked for (a re-run of a
-		// load script or a benchmark's set-up), not an error.
-		if _, err := s.db.AdminSplit(ctx, key); err != nil && !strings.Contains(err.Error(), "already a range boundary") {
+		// load script or a benchmark's set-up), not an error. A range
+		// frozen for a merge in flight (the housekeeping loop folding
+		// empty neighbors back together) is split once the merge lands.
+		var err error
+		for attempt := 0; attempt < 50; attempt++ {
+			if _, err = s.db.AdminSplit(ctx, key); err == nil || strings.Contains(err.Error(), "already a range boundary") {
+				err = nil
+				break
+			}
+			if !strings.Contains(err.Error(), "frozen for a merge") {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if err != nil {
 			return nil, err
 		}
 		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})

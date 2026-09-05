@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -45,6 +46,9 @@ type StoreConfig struct {
 	// RaftWorkers is the size of the store's raft scheduler pool (0 =
 	// GOMAXPROCS; see scheduler.go).
 	RaftWorkers int
+	// DisableQuiescence keeps idle ranges ticking and heartbeating (see
+	// quiesce.go); heartbeats still travel coalesced.
+	DisableQuiescence bool
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
@@ -168,6 +172,16 @@ type Store struct {
 	sched *raftScheduler
 	// hbq holds heartbeats between scheduler passes (quiesce.go).
 	hbq heartbeatQueue
+	// side is the off-log closed-timestamp transport's state
+	// (closedts.go): the group promise this store last made for its
+	// quiescent ranges, the led ranges that woke since the last round,
+	// and, as a follower, the ranges each peer node registered.
+	side struct {
+		sync.Mutex
+		groupTS atomic.Pointer[hlc.Timestamp]
+		woken   map[base.RangeID]struct{}
+		reg     map[base.NodeID]map[base.RangeID]RaftHeartbeat
+	}
 }
 
 // SetSender injects the routed KV client (once, at node startup).
@@ -196,6 +210,9 @@ func NewStore(cfg StoreConfig) *Store {
 	s.hbq.beats = make(map[base.NodeID][]RaftHeartbeat)
 	s.hbq.resps = make(map[base.NodeID][]RaftHeartbeat)
 	s.hbq.closed = make(map[base.NodeID][]RaftHeartbeat)
+	s.side.woken = make(map[base.RangeID]struct{})
+	s.side.reg = make(map[base.NodeID]map[base.RangeID]RaftHeartbeat)
+	s.side.groupTS.Store(&hlc.Timestamp{})
 	return s
 }
 

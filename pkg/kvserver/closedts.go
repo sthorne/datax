@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"go.etcd.io/raft/v3"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -80,7 +81,58 @@ func (s *Store) StartClosedTimestamps() error {
 	})
 }
 
+// publishClosedTimestamps is one publication round over the ranges this
+// store leads. An awake range whose log grew since its last logged
+// promise proposes the promise (publishClosedTimestamp); an awake one
+// whose log did not sends it off the log per range
+// (publishClosedTimestampSide); the QUIESCENT ranges share ONE group
+// promise per follower node (the off-log transport, below), so an idle
+// store's publication cost is a few envelopes a second however many
+// ranges it holds.
+//
+// The off-log transport for quiescent ranges. A quiescent leader has no
+// write in flight (any would have woken it first) and its log and term
+// cannot change while it sleeps, so its promise is the same tuple every
+// round. It REGISTERS once per follower node — a per-range entry with the
+// term, the last index and an explicit promise made under the usual
+// latch drain and cache bump — and thereafter the store's round sends
+// each follower node one GROUP entry, "every range you hold registered
+// from me is closed at T", which the follower applies to its registry,
+// re-validating each range (same leader and term, applied index) and
+// dropping one that fails. A range that wakes is dropped: its wake goes
+// out as a per-range entry in the same envelope, ahead of the group
+// promise, and until the followers see it the leader honors every group
+// promise it may still be applying by forwarding its own timestamp-cache
+// floor to the store's latest promise on wake (unquiesce) — the promise
+// is advanced before the woken set is collected, so a wake either lands
+// in the set or bumps to the promise being sent.
 func (s *Store) publishClosedTimestamps(ctx context.Context, lag time.Duration) {
+	target := s.cfg.Clock.Now().AddNanos(-lag.Nanoseconds())
+	coalesced := s.coalescedHeartbeats()
+	var woken map[base.RangeID]struct{}
+	if coalesced {
+		// Promise first, then collect the wakes (see above).
+		s.side.Lock()
+		if s.side.groupTS.Load().Less(target) {
+			t := target
+			s.side.groupTS.Store(&t)
+		}
+		woken, s.side.woken = s.side.woken, make(map[base.RangeID]struct{})
+		s.side.Unlock()
+	}
+	for id := range woken {
+		r, ok := s.GetReplica(id)
+		if !ok {
+			continue
+		}
+		self := uint64(r.replicaID)
+		for _, rep := range r.Desc().Replicas {
+			if uint64(rep.ReplicaID) != self {
+				s.queueClosedTimestamp(rep.NodeID, RaftHeartbeat{RangeID: id, To: uint64(rep.ReplicaID), From: self})
+			}
+		}
+	}
+	dests := map[base.NodeID]struct{}{}
 	s.VisitReplicas(func(r *Replica) bool {
 		if err := ctx.Err(); err != nil {
 			return false
@@ -88,13 +140,16 @@ func (s *Store) publishClosedTimestamps(ctx context.Context, lag time.Duration) 
 		if !r.isLeader() || r.isFrozen() {
 			return true
 		}
-		target := s.cfg.Clock.Now().AddNanos(-lag.Nanoseconds())
+		if coalesced && r.isQuiescent() {
+			r.registerClosedTimestamp(ctx, target, dests)
+			return true
+		}
 		if !r.ClosedTimestamp().Less(target) {
 			return true
 		}
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		var err error
-		if r.closedTimestampNeedsLog() || !s.coalescedHeartbeats() {
+		if r.closedTimestampNeedsLog() || !coalesced {
 			err = r.publishClosedTimestamp(pctx, target)
 		} else {
 			err = r.publishClosedTimestampSide(pctx, target)
@@ -105,7 +160,125 @@ func (s *Store) publishClosedTimestamps(ctx context.Context, lag time.Duration) 
 		cancel()
 		return true
 	})
+	for to := range dests {
+		s.queueClosedTimestamp(to, RaftHeartbeat{ClosedTS: target})
+	}
+	if len(dests) > 0 {
+		metrics.ClosedTimestampGroupUpdates.Add(float64(len(dests)))
+	}
 	s.sendQueuedHeartbeats(ctx)
+}
+
+// registerClosedTimestamp enrolls a quiescent leader with any follower
+// node that does not hold its registration yet (a per-range promise made
+// like the awake side path), and names every follower node in dests so
+// the round's group promise reaches it.
+func (r *Replica) registerClosedTimestamp(ctx context.Context, target hlc.Timestamp, dests map[base.NodeID]struct{}) {
+	r.mu.Lock()
+	desc := r.mu.desc
+	var missing []kvpb.ReplicaDescriptor
+	for _, rep := range desc.Replicas {
+		if uint64(rep.ReplicaID) == uint64(r.replicaID) {
+			continue
+		}
+		dests[rep.NodeID] = struct{}{}
+		if !r.mu.sideRegistered[rep.NodeID] {
+			missing = append(missing, rep)
+		}
+	}
+	r.mu.Unlock()
+	if len(missing) == 0 {
+		return
+	}
+	var st raft.BasicStatus
+	if err := r.withRaftGroup(func(rn *raft.RawNode) error {
+		st = rn.BasicStatus()
+		return nil
+	}); err != nil || st.RaftState != raft.StateLeader {
+		return
+	}
+	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchShared)
+	if gerr != nil {
+		return
+	}
+	r.tsCache.Bump([]latchSpan{wholeRangeSpan}, target, uuid.Nil)
+	guard.Release()
+	index := r.rs.lastIndex()
+	r.mu.Lock()
+	if !r.mu.quiescent {
+		// Woken meanwhile: the wake is queued for the next round; a
+		// registration now would outlive it.
+		r.mu.Unlock()
+		return
+	}
+	if r.mu.sideClosedTS.Less(target) {
+		r.mu.sideClosedTS = target
+	}
+	if r.mu.sideRegistered == nil {
+		r.mu.sideRegistered = make(map[base.NodeID]bool)
+	}
+	for _, rep := range missing {
+		r.mu.sideRegistered[rep.NodeID] = true
+	}
+	r.mu.Unlock()
+	self := uint64(r.replicaID)
+	for _, rep := range missing {
+		r.store.queueClosedTimestamp(rep.NodeID, RaftHeartbeat{
+			RangeID: r.rangeID, To: uint64(rep.ReplicaID), From: self, Term: st.Term, Index: index, ClosedTS: target,
+		})
+	}
+	metrics.ClosedTimestampSideUpdates.Add(float64(len(missing)))
+}
+
+// handleClosedTimestamps applies a peer node's off-log entries, in order:
+// a per-range entry with a promise registers (or refreshes) the range
+// and applies it; one without a promise is a wake and drops the
+// registration; one with no range is the group promise for every range
+// still registered from that node.
+func (s *Store) handleClosedTimestamps(from base.NodeID, closed []RaftHeartbeat) {
+	s.side.Lock()
+	reg := s.side.reg[from]
+	if reg == nil {
+		reg = make(map[base.RangeID]RaftHeartbeat)
+		s.side.reg[from] = reg
+	}
+	s.side.Unlock()
+	for _, hb := range closed {
+		switch {
+		case hb.RangeID == 0:
+			s.side.Lock()
+			ids := make([]base.RangeID, 0, len(reg))
+			for id := range reg {
+				ids = append(ids, id)
+			}
+			s.side.Unlock()
+			for _, id := range ids {
+				s.side.Lock()
+				entry, ok := reg[id]
+				s.side.Unlock()
+				if !ok {
+					continue
+				}
+				entry.ClosedTS = hb.ClosedTS
+				r, live := s.GetReplica(id)
+				if !live || !r.acceptClosedTimestamp(entry) {
+					s.side.Lock()
+					delete(reg, id)
+					s.side.Unlock()
+				}
+			}
+		case hb.ClosedTS.IsEmpty():
+			s.side.Lock()
+			delete(reg, hb.RangeID)
+			s.side.Unlock()
+		default:
+			if r, ok := s.GetReplica(hb.RangeID); ok && r.acceptClosedTimestamp(hb) && hb.Index > 0 {
+				s.side.Lock()
+				reg[hb.RangeID] = hb
+				s.side.Unlock()
+			}
+		}
+	}
 }
 
 // publishClosedTimestampSide closes a range whose log has not grown since
@@ -157,7 +330,7 @@ func (r *Replica) publishClosedTimestampSide(ctx context.Context, target hlc.Tim
 // leader can have committed anything this replica has not heard of while
 // it still follows this one), and this replica has applied everything
 // up to the index the promise was made at.
-func (r *Replica) acceptClosedTimestamp(hb RaftHeartbeat) {
+func (r *Replica) acceptClosedTimestamp(hb RaftHeartbeat) bool {
 	valid := false
 	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
 		st := rn.BasicStatus()
@@ -165,13 +338,17 @@ func (r *Replica) acceptClosedTimestamp(hb RaftHeartbeat) {
 		return nil
 	})
 	if !valid {
-		return
+		return false
 	}
 	r.mu.Lock()
-	if r.mu.appliedIndex >= hb.Index && !r.mu.frozen && r.mu.sideClosedTS.Less(hb.ClosedTS) {
+	defer r.mu.Unlock()
+	if r.mu.appliedIndex < hb.Index || r.mu.frozen {
+		return false
+	}
+	if r.mu.sideClosedTS.Less(hb.ClosedTS) {
 		r.mu.sideClosedTS = hb.ClosedTS
 	}
-	r.mu.Unlock()
+	return true
 }
 
 // publishClosedTimestamp closes the range at target: after it returns

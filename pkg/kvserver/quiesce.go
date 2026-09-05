@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
@@ -142,10 +144,8 @@ func (s *Store) sendQueuedHeartbeats(ctx context.Context) {
 // HandleRaftHeartbeats fans a peer's coalesced heartbeats and responses
 // out to their replicas.
 func (s *Store) HandleRaftHeartbeats(ctx context.Context, from base.NodeID, beats, resps, closed []RaftHeartbeat) {
-	for _, hb := range closed {
-		if r, ok := s.GetReplica(hb.RangeID); ok {
-			r.acceptClosedTimestamp(hb)
-		}
+	if len(closed) > 0 {
+		s.handleClosedTimestamps(from, closed)
 	}
 	for _, hb := range beats {
 		r, ok := s.GetReplica(hb.RangeID)
@@ -222,6 +222,8 @@ func (r *Replica) unquiesce() (was bool) {
 		r.mu.contactFloor = now
 		r.mu.lastTickAt = now
 	}
+	registered := len(r.mu.sideRegistered) > 0
+	r.mu.sideRegistered = nil
 	leader := r.mu.leader == uint64(r.replicaID)
 	r.mu.Unlock()
 	if !was {
@@ -229,6 +231,21 @@ func (r *Replica) unquiesce() (was bool) {
 	}
 	metrics.RaftUnquiesces.Inc()
 	if leader {
+		// The off-log closed-timestamp transport (closedts.go): the
+		// followers drop this range from the group promise on the next
+		// round, and until then every group promise they may apply is
+		// honored here by forwarding the timestamp-cache floor to it —
+		// noted as woken BEFORE reading the promise, so a round that
+		// advances the promise either sees the wake or is covered by
+		// the bump.
+		if registered {
+			r.store.side.Lock()
+			r.store.side.woken[r.rangeID] = struct{}{}
+			r.store.side.Unlock()
+		}
+		if gt := *r.store.side.groupTS.Load(); !gt.IsEmpty() {
+			r.tsCache.Bump([]latchSpan{wholeRangeSpan}, gt, uuid.Nil)
+		}
 		// A local MsgBeat makes raft broadcast heartbeats now instead of
 		// at its next heartbeat tick; the local-thread From is what
 		// RawNode.Step accepts for a local message.
@@ -242,13 +259,13 @@ func (r *Replica) unquiesce() (was bool) {
 
 // maybeQuiesce runs on a leader's tick, under raftMu with raft's status
 // in hand, before the tick is applied: after quiesceAfterTicks idle
-// ticks with nothing pending and every follower caught up and answering,
-// it tells the followers to sleep and reports true so the tick is
-// skipped. The follower contact requirement means an unreachable
-// follower keeps the range awake: it is not idle, and its return would
-// wake everyone anyway.
+// ticks with nothing pending and every follower caught up and having
+// answered within that period, it tells the followers to sleep and
+// reports true so the tick is skipped. The follower contact requirement
+// means an unreachable follower keeps the range awake: it is not idle,
+// and its return would wake everyone anyway.
 func (r *Replica) maybeQuiesce(rn *raft.RawNode) bool {
-	if !r.store.coalescedHeartbeats() || rn.HasReady() {
+	if r.store.cfg.DisableQuiescence || !r.store.coalescedHeartbeats() || rn.HasReady() {
 		r.resetIdle()
 		return false
 	}
@@ -264,7 +281,12 @@ func (r *Replica) maybeQuiesce(rn *raft.RawNode) bool {
 		return false
 	}
 	full := rn.Status()
-	window := time.Duration(raftElectionTicks)*r.store.cfg.RaftTickInterval - r.store.cfg.Clock.MaxOffset()
+	// A follower counts as answering if it did within the idle period
+	// itself: the point is not to sleep on an unreachable follower, and
+	// the lease-read window would be too strict on a loaded store, where
+	// heartbeat responses lag and every range that stays awake for it
+	// adds to the load (the strict window still governs lease reads).
+	window := quiesceAfterTicks * r.store.cfg.RaftTickInterval
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()

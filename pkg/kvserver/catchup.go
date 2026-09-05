@@ -230,6 +230,7 @@ func (r *Replica) applySnapshot(snap raftpb.Snapshot) error {
 	r.mu.sizeBytes = p.h.SizeBytes
 	r.mu.Unlock()
 	r.setApplied(p.h.AppliedIndex)
+	r.noteAppliedTerm(p.h.Term)
 	log.Infof("%s: replica %d state replaced by catch-up snapshot (%d keys, applied index %d)",
 		r.rangeID, r.replicaID, p.count, p.h.AppliedIndex)
 	return nil

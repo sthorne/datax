@@ -193,6 +193,16 @@ type Replica struct {
 		// since publishes off the log.
 		sideClosedTS   hlc.Timestamp
 		closedTSLogged uint64
+		// sideRegistered names the follower nodes that hold this
+		// quiescent leader's registration in the off-log transport, so
+		// the store's group promise covers the range there; cleared on
+		// wake (closedts.go).
+		sideRegistered map[base.NodeID]bool
+		// appliedTerm is the term of the newest applied entry: a leader
+		// whose term it equals has committed an entry in its term, the
+		// condition under which raft answers a lease-based read index
+		// with its commit index (leaseReadIndex).
+		appliedTerm uint64
 	}
 
 	// stoppedCh closes when the raft group is stopped for good: the
@@ -406,7 +416,13 @@ func (r *Replica) GCThreshold() hlc.Timestamp {
 func (r *Replica) ClosedTimestamp() hlc.Timestamp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.mu.closedTS.Forward(r.mu.sideClosedTS)
+	ct := r.mu.closedTS.Forward(r.mu.sideClosedTS)
+	if r.mu.quiescent && len(r.mu.sideRegistered) > 0 {
+		// A registered quiescent leader is covered by the store's group
+		// promise (closedts.go).
+		ct = ct.Forward(*r.store.side.groupTS.Load())
+	}
+	return ct
 }
 
 // SizeBytes returns the range's replicated approximate data size.
@@ -899,6 +915,11 @@ func (r *Replica) readIndexLoop() {
 // It runs under the store's lifetime (not any single caller's context) with
 // a bounded timeout; a timeout surfaces to the cohort as a retryable error.
 func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
+	if r.leaseReads {
+		if idx, ok := r.leaseReadIndex(); ok {
+			return idx, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.store.cfg.Stopper.Ctx(), 3*time.Second)
 	defer cancel()
 	rctx := uuid.NewString()
@@ -943,6 +964,35 @@ func (r *Replica) waitApplied(ctx context.Context, idx uint64) *kvpb.Error {
 	case <-ch:
 		return nil
 	}
+}
+
+// noteAppliedTerm records the term of the entry just applied.
+func (r *Replica) noteAppliedTerm(term uint64) {
+	r.mu.Lock()
+	if term > r.mu.appliedTerm {
+		r.mu.appliedTerm = term
+	}
+	r.mu.Unlock()
+}
+
+// leaseReadIndex is the fast path of a lease-based read index: raft's
+// ReadOnlyLeaseBased answer is the leader's commit index, given at once
+// when the leader has committed an entry in its own term — exactly what
+// raft would put in the next Ready's ReadStates, minus a scheduler pass
+// and a Ready per read. ok=false (not the leader, or no entry of this
+// term applied yet) falls back to the full round through raft.
+func (r *Replica) leaseReadIndex() (idx uint64, ok bool) {
+	r.mu.Lock()
+	appliedTerm := r.mu.appliedTerm
+	r.mu.Unlock()
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		st := rn.BasicStatus()
+		if st.RaftState == raft.StateLeader && st.Lead == uint64(r.replicaID) && st.Term == appliedTerm {
+			idx, ok = st.Commit, true
+		}
+		return nil
+	})
+	return idx, ok
 }
 
 // setApplied advances the applied index and wakes satisfied waiters.

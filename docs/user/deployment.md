@@ -128,6 +128,9 @@ losing the store — back it up separately from the data. Details in
 | Flag | Default | Effect |
 |---|---|---|
 | `--load-split-threshold` | 500 | sustained per-range QPS that triggers a load-based split (negative disables) |
+| `--raft-workers` | one per CPU | workers driving the node's raft groups (the store scheduler's pool) |
+| `--raft-quiescence` | true | let idle ranges stop ticking and heartbeating (cluster version v12); `false` keeps v11's steady heartbeats |
+| `--merge-size-threshold` | 16 MiB | size below which a range and its right neighbor are merged back together (negative disables; `datax demo` takes it too — disable it to keep an empty pre-split for a benchmark) |
 | `--lease-shed-factor` | 1.5 | leader-QPS multiple of the cluster mean at which a node sheds hot leases |
 | `--rebalance-bytes-threshold` | 64 MiB | replica-byte spread that triggers byte-weighted replica moves (negative disables) |
 

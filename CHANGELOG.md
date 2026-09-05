@@ -23,13 +23,30 @@ state or the internode protocol does, and an entry below says so.
   by a follower only while it still follows that leader at that term and
   has applied that index; in memory only), so follower reads stay fresh
   on quiescent ranges without a raft entry and an fsync per range per
-  second. `/status` reports `quiescent` per range; new series
+  second — and for quiescent ranges it is grouped: one promise per
+  follower node per round covers every range registered there, so an
+  idle store publishes a few envelopes a second however many ranges it
+  holds. `/status` reports `quiescent` per range; new series
   `datax_quiescent_ranges`, `datax_raft_quiesces_total`,
   `datax_raft_unquiesces_total`, `datax_raft_heartbeat_envelopes_total`,
   `datax_raft_heartbeats_coalesced_total`,
-  `datax_closed_timestamp_side_updates_total`. Both stay off until
+  `datax_closed_timestamp_side_updates_total`,
+  `datax_closed_timestamp_group_updates_total`. Both stay off until
   `datax debug upgrade` finalizes v12 (a v11 node reads neither).
   Before/after on the harness in the PR.
+- Lease-based reads take a fast path: a leader that has committed an
+  entry in its own term answers the read index with its commit index at
+  once — what raft's lease-based read would put in the next Ready —
+  instead of a scheduler pass and a Ready per read.
+
+### Added
+- `--merge-size-threshold` on `datax start` and `datax demo` (negative
+  disables merging, e.g. to keep an empty pre-split for a benchmark).
+  `datax bench` records carry `error_samples` (the distinct messages
+  behind `errors`), and a `--presplit` run uses tables of its own
+  (`bench_kv_r1000`, ...) so it neither inherits an earlier workload's
+  rows nor collides with its keys. `ALTER TABLE ... SPLIT AT` waits out
+  a merge in flight on the range instead of failing.
 
 ## 0.32.0 — unreleased
 
