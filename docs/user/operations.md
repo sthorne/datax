@@ -479,6 +479,25 @@ heavy loaders to the `ingest`
 nodes. Retention GC and re-shard backfills compete for the same LSM budget
 — schedule bulk loads away from them.
 
+## Profiles
+
+Every node serves Go's `net/http/pprof` under `/debug/pprof/` on its HTTP
+port, gated on the admin role in secure mode like the other drill-downs
+(a profile exposes statement text and key bytes). Mutex and block
+profiles are always on at low sampling rates (1 in 100 contended mutex
+events; blocking events of 10 ms and up), so contention is visible
+without a restart.
+
+```sh
+datax debug profile --kind cpu --seconds 30 --url http://10.0.0.1:8080 --certs-dir certs --user ops
+datax debug profile --kind heap|allocs|mutex|block|goroutine --url ...
+datax debug profile --kind trace --seconds 5 --url ...
+go tool pprof -http=:0 cpu.pprof
+```
+
+`datax bench ... --server-url http://10.0.0.1:8080 --server-profile cpu`
+pulls the node's CPU profile for exactly a benchmark run's duration.
+
 ## Benchmarking
 
 `datax bench` drives a running cluster over pgwire:
@@ -486,13 +505,28 @@ nodes. Retention GC and re-shard backfills compete for the same LSM budget
 ```sh
 datax bench kv --url ... --concurrency 16 --read-pct 95 --duration 30s
 datax bench bank [--for-update]           # contended transfers
-datax bench ingest --batch 100 --payload-bytes 256 [--rate N] [--metrics-url ...]
+datax bench ingest --keys random|sequential|uuid --batch 100 --payload-bytes 256 [--rate N]
 datax bench timeseries --series 1000 --shards 8
+datax bench index-join --preload 20000 --groups 1000   # secondary-index fan-out to wide rows
+datax bench scan --preload 20000                        # large result sets through pgwire
 ```
 
-`ingest` writes random keys (LSM stress); `timeseries` writes per-series
-monotone timestamps — the hot-tail shape — and is the honest way to compare
-`--shards` settings.
+`ingest` writes batches of keys (random for LSM stress); `timeseries`
+writes per-series monotone timestamps — the hot-tail shape — and is the
+honest way to compare `--shards` settings. Every run takes `--seed`
+(fixed by default, so two runs draw the same keys), `--json out.json`
+for a record with throughput, p50/p95/p99, errors, retries and the
+deltas of every server counter that moved (`--server-url` or
+`--metrics-url`), and `--cpuprofile` / `--memprofile` / `--trace` for
+the client.
+
+`make bench` runs the checked-in set (`bench/workloads.json`: the kv
+mixes, bank, three ingest key orders, timeseries, index-join, scan)
+against a fresh single-node store and a fresh 3-node local cluster and
+writes a record per workload; `datax bench compare BEFORE AFTER` prints
+the deltas and flags anything beyond ±5 %. `bench/README.md` says how a
+PR records its before/after; a nightly workflow runs the set on `main`
+and keeps the records as an artifact.
 
 Two counters show which commit fast path your workload rides:
 `datax_one_phase_commits_total` (single-range implicit transactions — one

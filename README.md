@@ -184,7 +184,10 @@ for encryption at rest, and `--storage-profile ingest` on append-heavy
 nodes. `datax sql` is a built-in client for scripts; `datax backup` /
 `datax restore` and `datax debug` cover day-2 operations
 ([operations guide](docs/user/operations.md)).
-Benchmark with `datax bench kv|bank|ingest`; on the in-process demo the kv
+Benchmark with `datax bench` (the kv mixes, bank, ingest, timeseries,
+index-join and scan workloads; `make bench` runs the checked-in set and
+`datax bench compare` diffs two runs — see `bench/README.md`; profiles
+via `datax debug profile`). On the in-process demo the kv
 workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
 ## Scope

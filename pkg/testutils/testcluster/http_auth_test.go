@@ -157,6 +157,13 @@ func TestHTTPAuthSecure(t *testing.T) {
 	if code, _, _ := authedGet(t, client, base+"/metrics", "scraper", "wrong"); code != http.StatusUnauthorized {
 		t.Fatal("scraper with wrong password accepted")
 	}
+	// Profiles are admin-only (issue #100): they expose statement text.
+	if code, _, _ := authedGet(t, client, base+"/debug/pprof/goroutine", "scraper", "metrics-pw"); code != http.StatusForbidden {
+		t.Fatalf("/debug/pprof/ as a non-admin: %d, want 403", code)
+	}
+	if code, body, _ := authedGet(t, client, base+"/debug/pprof/goroutine?debug=1", "root", "topsecret"); code != http.StatusOK || !strings.Contains(body, "goroutine") {
+		t.Fatalf("/debug/pprof/ as root: %d", code)
+	}
 
 	// /api/cluster tells the caller who it is signed in as and whether it
 	// holds the admin role, so the dashboard can show it and explain a

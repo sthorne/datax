@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/pprof"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -190,6 +191,15 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
 	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
+	// Profiles (issue #100): net/http/pprof under /debug/pprof/, admin-gated
+	// like the drill-downs — a profile exposes statement text and key
+	// bytes. `datax debug profile` fetches one; `datax bench
+	// --server-profile` pulls a CPU profile for a run.
+	mux.Handle("/debug/pprof/", n.requireAdmin(http.HandlerFunc(pprof.Index)))
+	mux.Handle("/debug/pprof/cmdline", n.requireAdmin(http.HandlerFunc(pprof.Cmdline)))
+	mux.Handle("/debug/pprof/profile", n.requireAdmin(http.HandlerFunc(pprof.Profile)))
+	mux.Handle("/debug/pprof/symbol", n.requireAdmin(http.HandlerFunc(pprof.Symbol)))
+	mux.Handle("/debug/pprof/trace", n.requireAdmin(http.HandlerFunc(pprof.Trace)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
 	mux.HandleFunc("/api/node", n.serveNodeAPI)
@@ -346,6 +356,7 @@ type RangeStatus struct {
 	Replicas       []int  `json:"replicas"`
 	Leader         bool   `json:"leader"`
 	AppliedIndex   uint64 `json:"applied_index"`
+	LastIndex      uint64 `json:"last_index"`
 	TruncatedIndex uint64 `json:"truncated_index"`
 	SizeBytes      int64  `json:"size_bytes"`
 	// QPS is the leader-local measured request rate (~0 on followers).
@@ -383,6 +394,7 @@ func (n *Node) rangeStatuses() []RangeStatus {
 			Table:          n.tableNameOf(desc.StartKey),
 			Leader:         r.IsLeader(),
 			AppliedIndex:   r.AppliedIndex(),
+			LastIndex:      r.LastIndex(),
 			TruncatedIndex: r.TruncatedIndex(),
 			SizeBytes:      r.SizeBytes(),
 			QPS:            math.Round(r.QPS()*10) / 10,

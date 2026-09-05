@@ -168,7 +168,7 @@ is per endpoint:
 |---|---|
 | `/`, `/status`, `/api/cluster` | any database user (read-only) |
 | `/metrics` | the `metrics` role (or admin) |
-| `/api/range` (cross-node drill-down), `/api/activity` | admin role only — it fans out over internode RPC |
+| `/api/range` (cross-node drill-down), `/api/activity`, `/debug/pprof/` | admin role only — the drill-downs fan out over internode RPC; a profile exposes statement text and key bytes |
 
 Rejected credentials are audited (`datax_auth_failures_total`); an
 authenticated non-admin hitting an admin endpoint gets 403 and an

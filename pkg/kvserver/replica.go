@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/sthorne/datax/pkg/util/faultpoint"
 	"sync"
 	"time"
 
@@ -315,6 +316,16 @@ func (r *Replica) SizeBytes() int64 {
 }
 
 // AppliedIndex returns the highest applied raft log index.
+// LastIndex is the raft log's last index (0 when unreadable): with
+// AppliedIndex, the gap a restart has left to replay.
+func (r *Replica) LastIndex() uint64 {
+	idx, err := r.rs.LastIndex()
+	if err != nil {
+		return 0
+	}
+	return idx
+}
+
 func (r *Replica) AppliedIndex() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -523,6 +534,7 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 		if err := b.Commit(true); err != nil {
 			return err
 		}
+		faultpoint.Hit("raft-append")
 	}
 
 	// 3. Send messages.
@@ -546,6 +558,7 @@ func (r *Replica) handleReady(ctx context.Context, rd raft.Ready) error {
 		if err := r.applyEntry(ctx, ent); err != nil {
 			return err
 		}
+		faultpoint.Hit("raft-apply")
 	}
 	return nil
 }

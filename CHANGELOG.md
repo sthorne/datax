@@ -8,6 +8,33 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.30.0 — unreleased
+
+### Added
+- Profiling and benchmark harness (#100): `net/http/pprof` under
+  `/debug/pprof/` on the HTTP port (admin-gated), mutex and block
+  profiling always on at low rates, `datax debug profile --kind
+  cpu|heap|allocs|mutex|block|goroutine|trace`. `datax bench` gains
+  `--seed` (fixed by default), `--json` records (throughput, p50/p95/p99,
+  errors, retries, the server counter deltas), `--cpuprofile` /
+  `--memprofile` / `--trace` for the client, `--server-url` and
+  `--server-profile cpu` for the node, `--keys
+  random|sequential|uuid` for ingest, and the `index-join` and `scan`
+  workloads. The checked-in set `bench/workloads.json`, `make bench`
+  (a fresh single node and a fresh 3-node cluster), `datax bench run`,
+  `datax bench compare BEFORE AFTER` (±5 % flags), a nightly workflow
+  that keeps `main`'s records, `bench/README.md`. A crash-consistency
+  helper (`pkg/testutils/crash`: a child node killed with SIGKILL at a
+  fault point — `pkg/util/faultpoint`: after the raft log sync, after
+  an entry applies, as a memtable flush begins — or from outside, then
+  restarted; every acknowledged write present, applied index caught up
+  with the log) with `TestCrashConsistency`; `/status` reports each
+  range's `last_index`.
+
+### Fixed
+- `datax bench` keys are `INT8` again: `INT` became 32-bit in 0.24.0,
+  so the ingest workloads' random keys were refused.
+
 ## 0.29.0 — unreleased
 
 Cluster version **v11**: role descriptors (`/system/roles`) supersede

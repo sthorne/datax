@@ -5,6 +5,7 @@ package storage
 
 import (
 	"fmt"
+	"github.com/sthorne/datax/pkg/util/faultpoint"
 	"sync"
 
 	"github.com/cockroachdb/pebble"
@@ -68,6 +69,9 @@ func Open(dir string, o Options) (*Engine, error) {
 	e := &Engine{}
 	opts := &pebble.Options{}
 	e.health.gate = o.Profile.apply(opts)
+	if o.MemTableSize > 0 {
+		opts.MemTableSize = uint64(o.MemTableSize)
+	}
 	if testingPebbleOptions != nil {
 		testingPebbleOptions(opts)
 	}
@@ -77,6 +81,7 @@ func Open(dir string, o Options) (*Engine, error) {
 			e.health.inStall.Store(true)
 		},
 		WriteStallEnd: func() { e.health.inStall.Store(false) },
+		FlushBegin:    func(pebble.FlushInfo) { faultpoint.Hit("flush-begin") },
 		DiskSlow:      func(pebble.DiskSlowInfo) { e.health.diskSlow.Add(1) },
 		BackgroundError: func(err error) {
 			e.health.bgErrors.Add(1)

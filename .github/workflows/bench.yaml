@@ -1,0 +1,39 @@
+name: bench
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_scale:
+        description: multiply every workload's duration
+        default: '1'
+
+# Nightly, not per PR: hosted runners are noisy, so this is a trend line
+# that catches a regression within a day when a PR skipped its own
+# before/after (bench/README.md), not a gate.
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build -o bin/datax ./cmd/datax
+      - name: run the workload set
+        env:
+          OUT: bench-results/nightly
+          DURATION_SCALE: ${{ github.event.inputs.duration_scale || '1' }}
+        run: bench/run.sh
+      - name: summary
+        run: |
+          for f in bench-results/nightly/*/*.json; do
+            printf '%s: ' "$f"; jq -r '"\(.ops_per_sec) ops/s p50 \(.p50_us)us p99 \(.p99_us)us errors \(.errors)"' "$f"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-results/nightly
+          retention-days: 90

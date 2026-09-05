@@ -43,6 +43,9 @@ type Options struct {
 	// EncryptionKey is the 32-byte store key for encryption at rest; nil
 	// opens the store in plaintext.
 	EncryptionKey []byte
+	// MemTableSize overrides the profile's memtable size (0 = the
+	// profile's); crash tests shrink it so flushes happen within seconds.
+	MemTableSize int
 }
 
 // softGate holds the profile's backpressure thresholds: when the engine

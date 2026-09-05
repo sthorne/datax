@@ -2,3 +2,4 @@
 *.test
 /data*/
 /datax
+bench-results/
