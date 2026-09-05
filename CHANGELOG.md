@@ -8,6 +8,20 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.38.0 — unreleased
+
+### Changed
+- The timestamp cache is indexed by key (#108, with the latch index that
+  landed in 0.34.0). A generation holds its point reads in a map — one
+  entry per key, the newest read of it — and only its ranged reads in a
+  slice, so a point write looks its keys up instead of scanning every
+  entry against every span: a 100-key write against two full generations
+  takes ~2 µs instead of ~1.5 ms, which was a quarter of a leader's CPU
+  under batched ingest (each INSERT's uniqueness probes put one entry per
+  row in the cache). Generations hold 4,096 entries (1,024 before) and a
+  key read repeatedly costs one, so a hot key set no longer rotates the
+  cache — and rotation is what briefly pushes every writer on the range.
+
 ## 0.37.0 — unreleased
 
 ### Changed
