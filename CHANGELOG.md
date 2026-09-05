@@ -110,7 +110,13 @@ state or the internode protocol does, and an entry below says so.
   push and pull request and weekly on a schedule, as a gate (#143): it
   reports only advisories whose vulnerable symbols this module reaches,
   and advisories appear against unchanged code, hence the timer.
-  `make vulncheck` runs it locally.
+  `make vulncheck` runs it locally. Its first run found three reachable
+  advisories — GO-2026-6061 and GO-2026-4762 in `google.golang.org/grpc`
+  v1.71.0 (the HTTP/2 transport server, an authorization bypass via
+  the `:path` header), GO-2026-5970 in `golang.org/x/text` v0.29.0 (an
+  infinite loop in normalization, reached from SASLprep) — so gRPC
+  moves to v1.82.1 and x/text to v0.39.0 (with `x/net` v0.53.0 and
+  `x/sync` v0.21.0 as they require).
 
 ## 0.40.0 — unreleased
 
