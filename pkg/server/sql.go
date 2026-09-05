@@ -2,6 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"github.com/sthorne/datax/pkg/cluster"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/version"
 	"net"
 	"time"
 
@@ -32,10 +37,27 @@ func (n *Node) startSQL() error {
 	if err != nil {
 		return err
 	}
-	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold}
+	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold, NodeID: int32(n.ident.NodeID)}
+	opts.Forward = func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error) {
+		addr, err := n.registry.Resolve(base.NodeID(node))
+		if err != nil {
+			return false, nil // no such node: no such session
+		}
+		var resp cluster.AdminResponse
+		if err := n.trans.Call(ctx, addr, "admin", cluster.AdminRequest{Op: "cancel-query", PID: pid, Secret: secret, Terminate: terminate}, &resp); err != nil {
+			return false, err
+		}
+		if resp.Error != "" {
+			return false, errors.New(resp.Error)
+		}
+		var found bool
+		_ = json.Unmarshal(resp.Status, &found)
+		return found, nil
+	}
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier
+		opts.CanLogin = n.canLogin
 		if n.cfg.RootPassword != "" {
 			if err := n.stopper.RunWorker(n.seedRootUser); err != nil {
 				return err
@@ -65,14 +87,25 @@ func (n *Node) catalogAccessor() (*catalog.Accessor, error) {
 	return n.cat, n.catErr
 }
 
-// lookupVerifier reads a user's stored SCRAM verifier (nil, nil = no such
-// user; the wire layer reports failures uniformly).
+// lookupVerifier reads a role's stored SCRAM verifier (nil, nil = no such
+// role, a role that cannot log in, or one without a password; the wire
+// layer reports every failure uniformly).
 func (n *Node) lookupVerifier(ctx context.Context, user string) (*security.ScramVerifier, error) {
-	raw, err := n.db.Get(ctx, keys.UserKey(user))
-	if err != nil || raw == nil {
+	r, err := catalog.LookupRole(ctx, n.db, user)
+	if err != nil || r == nil || !r.Login || len(r.Verifier) == 0 {
 		return nil, err
 	}
-	return security.UnmarshalVerifier(raw)
+	return security.UnmarshalVerifier(r.Verifier)
+}
+
+// canLogin reports whether a role exists and may open a session (the
+// certificate path, which needs no password).
+func (n *Node) canLogin(ctx context.Context, user string) (bool, error) {
+	r, err := catalog.LookupRole(ctx, n.db, user)
+	if err != nil || r == nil {
+		return false, err
+	}
+	return r.Login, nil
 }
 
 // seedRootUser writes root's verifier at startup if none exists yet (the
@@ -81,17 +114,34 @@ func (n *Node) lookupVerifier(ctx context.Context, user string) (*security.Scram
 func (n *Node) seedRootUser(ctx context.Context) {
 	for {
 		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		raw, err := n.db.Get(wctx, keys.UserKey("root"))
-		if err == nil && raw != nil {
+		existing, err := catalog.LookupRole(wctx, n.db, catalog.RootRole)
+		if err == nil && existing != nil && len(existing.Verifier) > 0 {
 			cancel()
-			return // already seeded
+			return // already seeded (either layout)
 		}
 		if err == nil {
 			v, verr := security.MakeScramVerifier(n.cfg.RootPassword)
 			if verr == nil {
 				enc, merr := security.MarshalVerifier(v)
 				if merr == nil {
-					if perr := n.db.Put(wctx, keys.UserKey("root"), enc); perr == nil {
+					// A cluster at v11 gets a role descriptor; an older one
+					// the credential record a pre-role node can read.
+					var perr error
+					if n.readClusterVersion(wctx) >= version.V11 {
+						perr = n.db.RunTxn(wctx, "seed-root", func(ctx context.Context, txn *kvclient.Txn) error {
+							d := &catalog.RoleDescriptor{Name: catalog.RootRole, Login: true}
+							if cur, err := catalog.LookupRole(ctx, txn, catalog.RootRole); err != nil {
+								return err
+							} else if cur != nil && !cur.Legacy {
+								d = cur.Clone() // keep memberships written before the seed
+							}
+							d.Login, d.Verifier = true, enc
+							return catalog.PutRole(ctx, txn, d)
+						})
+					} else {
+						perr = n.db.Put(wctx, keys.UserKey(catalog.RootRole), enc)
+					}
+					if perr == nil {
 						cancel()
 						log.Infof("seeded root user credential")
 						return

@@ -8,12 +8,22 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 
 | Type | Aliases | Notes |
 |---|---|---|
-| `INT8` | `INT`, `INTEGER`, `BIGINT` | 64-bit |
+| `INT8` | `BIGINT` | 64-bit |
+| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
+| `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
 | `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
-| `TEXT` | `STRING`, `VARCHAR` | |
+| `TEXT` | `STRING`, `VARCHAR` | unbounded |
+| `VARCHAR(n)` | `CHARACTER VARYING(n)` | at most `n` characters: a longer value is refused (`22001`) unless the excess is spaces, which are dropped; `varchar` (OID 1043) with the typmod on the wire |
+| `CHAR(n)` | `CHARACTER(n)`; bare `CHAR` is `CHAR(1)` | fixed width: stored trimmed of trailing spaces, rendered blank-padded to `n` (`'ab'` in a `CHAR(3)` reads back as `'ab '`); `length()`, `||` and comparisons see the trimmed value; `bpchar` (OID 1042) on the wire |
 | `BOOL` | `BOOLEAN` | |
-| `TIMESTAMPTZ` | `TIMESTAMP [WITH TIME ZONE]` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
+| `TIMESTAMP` | `TIMESTAMP WITHOUT TIME ZONE` | wall-clock time: an offset in the input is ignored (`'2024-01-02 03:04:05+05'` stores `03:04:05`) and the output carries none; `timestamp` (OID 1114) on the wire. Expressions over it (`ts + '1 day'`, `date_trunc`) and casts (`::timestamp`) are `TIMESTAMPTZ` |
+| `TIMESTAMP(p)`, `TIMESTAMPTZ(p)` | | `p` in 0–6: values round to `p` fractional digits on write (half away from zero) |
+| `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
+| `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
+| enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
+| `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
 | `UUID` | | |
@@ -35,6 +45,24 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   number collide as duplicates). Expression and aggregate *results* are
   plain DECIMALs and render canonically (`SUM` of `9.90`s can print
   `19.8`), like PostgreSQL's rule that expressions lose the typmod.
+- The other type modifiers — the integer widths, `VARCHAR(n)` /
+  `CHAR(n)`, `TIMESTAMP` without time zone, `TIMESTAMP(p)` — apply on
+  the same paths, and a column that carries one describes with
+  PostgreSQL's OID and typmod (`\d`, `information_schema.columns`,
+  `pg_attribute`, `SHOW CREATE TABLE` spell it). Storage is unchanged
+  by them (an `INT4` is the same varint as an `INT8`; a `TIMESTAMP` the
+  same nanosecond count), so `ALTER COLUMN TYPE` between widths, lengths
+  and timestamp forms never rewrites bytes it does not have to: widening
+  (`INT2` → `INT4` → `INT8`, `VARCHAR(10)` → `VARCHAR(20)` → `TEXT`,
+  `TIMESTAMP(3)` → `TIMESTAMP`) is a descriptor write, anything else is
+  the online rewrite below, which checks every stored value. Typmods
+  on other types (`FLOAT8(3)`) are accepted and ignored. Until the
+  cluster version reaches v9 a new column keeps the earlier meaning of
+  its declaration (`INT` 64-bit, `VARCHAR(n)` unbounded, `TIMESTAMP`
+  = `TIMESTAMPTZ`), so a mixed-version cluster never carries a
+  modifier an older binary would ignore.
+- `SERIAL` is an `INT4` column (`SMALLSERIAL` `INT2`, `BIGSERIAL`
+  `INT8`) drawing from an owned sequence, as in PostgreSQL.
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
@@ -62,14 +90,115 @@ CREATE TABLE t (
 CREATE TABLE IF NOT EXISTS t (...);
 DROP TABLE [IF EXISTS] t;
 
-CREATE [UNIQUE] INDEX by_b ON t (b);       -- online: no write outage
-ALTER TABLE t ADD COLUMN d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
-ALTER TABLE t DROP COLUMN d;               -- refused for PK/indexed columns
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
+ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
+ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
+ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK/indexed columns
+ALTER TABLE t RENAME TO t2;                             -- foreign keys and sequences follow (they use IDs)
+ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints on the column are rewritten
+ALTER TABLE t RENAME CONSTRAINT t_b_key TO b_unique;    -- a UNIQUE constraint's index renames with it
+ALTER TABLE t ALTER [COLUMN] b SET DEFAULT 'y';         -- a constant or an expression (below)
+ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
+TRUNCATE [TABLE] t [, t2] [RESTART IDENTITY] [CASCADE]; -- one descriptor write, however many ranges
+ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE DECIMAL(12, 2);   -- online rewrite; widening and text conversions
+CREATE TABLE t2 (LIKE t INCLUDING ALL);                  -- columns, defaults, constraints, indexes, comments
+CREATE TABLE big AS SELECT id, qty FROM t WHERE qty > 10;          -- a hidden rowid key
+CREATE TABLE keyed (order_id, qty, PRIMARY KEY (order_id)) AS SELECT id, qty FROM t [WITH NO DATA];
+COMMENT ON TABLE t IS 'orders';  COMMENT ON COLUMN t.b IS 'body';  COMMENT ON INDEX by_b IS NULL;
 SHOW TABLES;
 ```
 
 `CREATE INDEX` backfills online in bounded chunks, like PostgreSQL's
 `CREATE INDEX CONCURRENTLY`; it cannot run inside an explicit transaction.
+`DROP INDEX` names the index alone (it is found on whichever table of
+the database carries it); an index a `UNIQUE` constraint owns is
+refused (`2BP01`) — drop the constraint. The index disappears from the
+schema at once and its entries are reclaimed after the statement's
+transaction commits and every gateway has adopted the change.
+
+`TRUNCATE` is a descriptor change, not a delete: the table (and each of
+its indexes) moves to a fresh keyspace, so it costs the same for a
+million rows spanning many ranges as for ten, and it is transactional
+(`ROLLBACK` brings the rows back). The old rows stay on disk for `AS OF
+SYSTEM TIME` reads below the truncation until the re-shard janitor
+reclaims them after the historical window (the GC TTL). A table another
+table references through a foreign key is refused unless the
+referencing table is truncated in the same statement — `CASCADE` adds
+every referencing table, transitively. `RESTART IDENTITY` resets the
+sequences the table's `SERIAL` / identity columns own to their `START`.
+Non-admins need the `DELETE` privilege on every table.
+
+`RENAME` moves the name entry; the table's ID (the OID the catalogs
+show) is unchanged, so foreign keys, owned sequences and grants follow.
+Another gateway sees the new name as soon as the statement returns and
+the old name no longer resolves (`42P01`). A renamed column stays
+indexed and constrained: its `CHECK` expressions are rewritten to the
+new name. Sequence names (`t_id_seq`) and the primary key's name do not
+change, as in PostgreSQL.
+
+**`CREATE TABLE ... AS query`** creates the table from the query's
+output columns (names and types as Describe reports them; `(a, b) AS`
+renames them positionally) and, unless `WITH NO DATA`, fills it: the
+query runs once, at one timestamp, and its rows stream in through the
+`COPY` chunk path, a bounded transaction per chunk — so the statement
+never holds one transaction open over a million rows and cannot run
+inside a transaction block (`25001`). A table needs a primary key, so
+a `PRIMARY KEY (cols)` clause may be written among the names
+(CockroachDB's form); without one the table gets a hidden `rowid`
+column (`unique_rowid()`, invisible to `SELECT *`) — and duplicate
+query rows are all kept. Parameters (`$1`) and views in the query
+work. `SELECT ... INTO t` is refused with a pointer here.
+
+**`LIKE source`** inside a column list copies the source's columns
+(types, typmods, `NOT NULL`) where it stands; `INCLUDING DEFAULTS`
+copies the defaults (an owned sequence's `nextval` is not copied — the
+new table gets its own `SERIAL` if you declare one), `INCLUDING
+CONSTRAINTS` the `CHECK` constraints, `INCLUDING INDEXES` the `UNIQUE`
+constraints and secondary indexes (same names), `INCLUDING ALL` every
+one; `EXCLUDING` reverses an option. The primary key is copied whenever
+the statement declares none (PostgreSQL leaves it to `INCLUDING
+INDEXES`; here a table needs one). Foreign keys are never copied.
+
+**`ALTER COLUMN c TYPE t`** rewrites the column online, in the shape of
+`CREATE INDEX`: a hidden shadow column of the new type joins the
+descriptor and every write from then on fills it from the column's
+value (whichever gateway writes), the existing rows are converted in
+bounded chunks, and the shadow then takes the column's name, position,
+`NOT NULL`, default and comment while the old column is dropped. The
+conversion is the type's cast: widening (`INT8` to `DECIMAL` or
+`FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
+typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
+`BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
+typmod change rescales, and a change of integer width, character
+length or timestamp form checks every stored value against the new
+modifier (`22003` / `22001`). A value that cannot convert fails the
+statement (`22P02`) and the column is left as it was. A modifier change
+that cannot lose a value (a wider integer, a longer `VARCHAR`, more
+timestamp digits) skips the rewrite: one descriptor write, and the
+column is not required to be free of indexes and constraints. Family
+narrowing, the primary key, indexed columns, columns a constraint or
+view uses, and columns drawing from a sequence are otherwise refused
+(`0A000`) — drop or replace those first. Not inside a transaction block
+(`25001`); cluster version v9.
+
+**`COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL`**
+stores the text in the descriptor; `obj_description`,
+`col_description` and `pg_description` render it, so `psql`'s `\d+`,
+`\dt+` and `\dv+` show the descriptions. Comments survive renames,
+default changes and type rewrites.
+
+**DDL in transaction blocks.** A statement that is one descriptor
+write runs inside `BEGIN ... COMMIT` like any other and commits or rolls
+back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
+COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
+`DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
+`DROP VIEW`, the sequence, database, role and ownership statements,
+`GRANT` / `REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
+CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
+TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
+drain and sweep (or stream) in several transactions of their own and
+are refused inside a block with `25001`.
 
 ### Defaults, SERIAL, identity columns and sequences
 
@@ -87,6 +216,7 @@ CREATE TABLE events (
   d INT8 GENERATED BY DEFAULT AS IDENTITY,
   v TEXT
 );
+ALTER TABLE orders ALTER COLUMN who SET DEFAULT lower(current_user);  -- change a default later
 INSERT INTO orders (ref) VALUES (DEFAULT);                 -- DEFAULT as a value
 INSERT INTO orders DEFAULT VALUES RETURNING id;
 INSERT INTO archive (id, ref) SELECT id, ref FROM orders WHERE at < '2026-01-01';  -- INSERT ... SELECT
@@ -109,6 +239,14 @@ immutable and stable [builtin functions](functions.md) (`now()`,
 `random()` — but not other columns or subqueries. Volatile functions are evaluated **per row**: a 100-row
 `INSERT` draws 100 sequence values. `now()` and `current_user` are fixed
 for the statement.
+
+`ALTER COLUMN ... SET DEFAULT` takes the same constants and expressions
+and applies to rows inserted from then on; `DROP DEFAULT` makes an
+omitted column NULL. A column added by `ALTER TABLE ... ADD COLUMN ...
+DEFAULT` fills the rows that predate it from that original constant on
+read, and keeps doing so whatever its default becomes later: changing
+the default changes new inserts, never the old rows. An identity
+column's default is its sequence and cannot be set (`42601`).
 
 `SERIAL` (`SMALLSERIAL`, `BIGSERIAL`) and identity columns create a
 sequence named `<table>_<column>_seq` owned by the column: it is dropped
@@ -163,6 +301,7 @@ ALTER TABLE orders VALIDATE CONSTRAINT qty_small;
 ALTER TABLE orders ADD UNIQUE (code);                                     -- an online unique index build
 ALTER TABLE orders ADD FOREIGN KEY (cust) REFERENCES customers;
 ALTER TABLE orders DROP CONSTRAINT [IF EXISTS] qty_small;
+ALTER TABLE orders RENAME CONSTRAINT qty_small TO qty_bounded;
 ALTER TABLE orders ALTER COLUMN region SET NOT NULL;                      -- sweeps existing rows first
 ALTER TABLE orders ALTER COLUMN region DROP NOT NULL;
 DROP TABLE customers CASCADE;                    -- also drops the foreign keys that reference it
@@ -212,8 +351,8 @@ validates the existing rows in bounded chunks; a violation removes the
 constraint again. `NOT VALID` skips the sweep (the catalogs show
 `convalidated = false`); `VALIDATE CONSTRAINT` runs it later. Like
 `CREATE INDEX`, these cannot run inside a transaction block. `DROP
-CONSTRAINT`, `DROP NOT NULL` and `CREATE TABLE` constraints are
-ordinary transactional DDL. Dropping a column a constraint uses, or a
+CONSTRAINT`, `RENAME CONSTRAINT`, `DROP NOT NULL` and `CREATE TABLE`
+constraints are ordinary transactional DDL. Dropping a column a constraint uses, or a
 table a foreign key references, is refused (`2BP01`) until the
 constraint is dropped or `DROP TABLE ... CASCADE` drops the keys with
 it. `ADD COLUMN` takes no constraint: add the column, then the
@@ -265,9 +404,13 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
   parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
   always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), date arithmetic (`date + 1`, `date - date` in days,
-  `timestamp + '2 hours'`, `timestamp - '1 month'` — intervals are
-  text and month steps clamp to the end of the month), text
+  `22003`), date and time arithmetic (`date + 1`, `date - date` in
+  days, `timestamp ± interval` and `date ± interval` on the calendar
+  with month steps clamped to the end of the month, `timestamp -
+  timestamp` an `INTERVAL`, `interval ± interval`, `interval * 2`,
+  `interval / 2`, `time ± interval` wrapping at midnight, `time - time`,
+  `date + time` a timestamp; the interval operand may be a value,
+  `INTERVAL '2 hours'` or plain text `'2 hours'`), text
   concatenation `||` (any operand renders as text), `CASE` (simple and
   searched), `CAST(x AS type)` and `x::type` — **performed**, in every
   position, with PostgreSQL's text forms and error codes (`'abc'::int`
@@ -287,7 +430,9 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   trigonometric functions, ...), date and time (`now()`,
   `current_timestamp`, `current_date`, `date_trunc`, `date_part` /
   `extract(field FROM x)`, `to_char`, `to_timestamp`, `to_date`,
-  `make_date`, `make_timestamp`, `age`, `justify_hours`), JSON
+  `make_date`, `make_timestamp`, `make_time`, `make_interval`, `age`,
+  `extract` over intervals and times, `justify_hours`, `justify_days`,
+  `justify_interval`), JSON
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
@@ -543,6 +688,63 @@ transaction is poisoned (`25P02`) until `ROLLBACK` — or
 
 Deadlocks are detected and broken automatically (one victim gets `40001`).
 
+## Session settings
+
+```sql
+SET statement_timeout = '5s';                 -- 57014 when a statement runs longer
+SET lock_timeout = 200;                       -- ms: 55P03 instead of waiting on a live intent
+SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is rolled back, the connection ended
+SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ output rendered in the zone
+SET application_name = 'billing';             -- shown by pg_stat_activity / SHOW SESSIONS
+SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / ROLLBACK
+SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
+SET default_transaction_read_only = on;       -- every transaction, until reset
+RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
+SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;
+```
+
+`SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
+`SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`, `RESET name`, `RESET
+ALL` and `SHOW name` work over these variables — every one of them is
+honored or reports its real value; an unknown variable is `42704`, an
+invalid value `22023`:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `statement_timeout` | ms, or `'5s'`, `'1min'`, `'500ms'`; `0` = none | a statement past it is cancelled: `57014`, its transaction block failed |
+| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`) |
+| `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
+| `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |
+| `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
+| `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
+| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY` and DDL with `25006` |
+| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
+| `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
+| `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
+| `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
+
+`SET LOCAL` and `SET TRANSACTION` apply to the current block and end
+with it (outside a block they do nothing, as in PostgreSQL). A changed
+`application_name`, `TimeZone`, `DateStyle` or `client_encoding` is
+announced to the client with `ParameterStatus`, as PostgreSQL does.
+
+**Cancellation.** Every connection gets a process ID and a secret
+(`BackendKeyData`); `psql`'s Ctrl-C, a driver's context cancellation
+(pgx) and every pool's cancel path send a `CancelRequest`, which stops
+the statement in flight with `57014` and rolls its transaction back.
+The process ID names the node in its high bits, so a cancel that lands
+on another node behind a load balancer is forwarded there. `SELECT
+pg_backend_pid()` reports a session's ID; an admin cancels another
+session with `pg_cancel_backend(pid)` or ends it with
+`pg_terminate_backend(pid)` (`57P01`), on any node of the cluster.
+
+**Sessions.** `SHOW SESSIONS` and `pg_stat_activity` list the serving
+node's sessions (pid, user, database, `application_name`, client
+address, state, the statement in flight or the last one, when the
+connection, the block and the statement began); each node keeps its
+own registry, so a cluster-wide view is the union over nodes (the
+dashboard's activity view, `/api/activity`).
+
 ## Historical and follower reads
 
 ```sql
@@ -607,7 +809,8 @@ CREATE TABLE metrics (
 
 - `shards` (2–256): rows spread over that many hash buckets, each its own
   range — inserts scale across nodes instead of hammering one tail.
-- `retention` (`30d`, `12h`, ...): rows older than this are garbage
+- `retention` (`30d`, `12h`, or interval text such as `'7 days'`; a
+  month counts 30 days): rows older than this are garbage
   collected automatically.
 - Queries are unchanged — `WHERE series = '...' AND at >= ...` fans out
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:
@@ -641,8 +844,13 @@ SHOW TABLES [FROM db];          -- table_name
 SHOW COLUMNS FROM t;            -- column_name, data_type, is_nullable, column_default, indices
 SHOW INDEXES FROM t;            -- table_name, index_name, non_unique, seq_in_index, column_name
 SHOW CREATE TABLE t;            -- the CREATE TABLE statement that recreates t
-SHOW USERS;                     -- username, is_admin
-SHOW GRANTS [ON t] [FOR user];  -- database_name, table_name, grantee, privilege_type
+SHOW VIEWS;                     -- view_name, definition (SHOW CREATE VIEW v for one)
+SHOW USERS;                     -- username, is_admin, member_of (the login roles)
+SHOW ROLES;                     -- role_name, can_login, is_admin, member_of (every role)
+SHOW GRANTS [ON t | ON DATABASE d] [FOR role];
+                                -- database_name, schema_name, relation_name, grantee,
+                                -- privilege_type, is_grantable
+SHOW GRANTS ON ROLE [r] [FOR member];  -- role_name, member, is_admin
 SHOW DATABASES;                 -- database_name, owner
 SHOW STATS FOR t;               -- see Table statistics
 SHOW FUNCTIONS;                 -- name, signature, category, volatility, aliases, description
@@ -654,16 +862,16 @@ SHOW server_version;            -- one setting (SHOW TIME ZONE, SHOW search_path
 The PostgreSQL catalogs are there too, as read-only virtual tables over
 the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
-`pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`,
+`pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
 `pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`
 (and empty stand-ins for the catalogs of features datax lacks —
 policies, publications, extensions, functions, triggers, ...), plus
-`information_schema.schemata`, `tables`, `columns`,
+`information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
-This is what makes `psql`'s `\d`, `\dt`, `\di`, `\du`, `\l`, `\dn`, `\dp`
+This is what makes `psql`'s `\d`, `\dt`, `\dv`, `\di`, `\du`, `\l`, `\dn`, `\dp`
 and friends, and ORM schema introspection, work unmodified — see
 [Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).
 
@@ -675,6 +883,53 @@ their metrics into it (see the operations guide's "Metrics history").
 on it are refused. Admins may read and delete from it and set its
 `retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
 another user read it, and no grant lets a non-admin write to it.
+
+## Views
+
+```sql
+CREATE VIEW big_orders AS SELECT id, cust, qty FROM orders WHERE qty > 100;
+CREATE OR REPLACE VIEW big_orders (id, customer, qty) AS SELECT id, cust, qty FROM orders WHERE qty > 50;
+SELECT customer, count(*) FROM big_orders GROUP BY customer;   -- reads like a table
+CREATE VIEW top AS SELECT customer FROM big_orders GROUP BY customer HAVING count(*) > 3;  -- a view over a view
+SHOW VIEWS;                       -- view_name, definition
+SHOW CREATE VIEW big_orders;
+DROP VIEW [IF EXISTS] top [, ...] [CASCADE];
+```
+
+A view stores its query as written and runs it when a statement names
+it: the view's rows are materialized for the statement — once, however
+many times the statement names it — and it then reads anywhere a table
+does: the base of a `SELECT`, a join side, a subquery, a set-operation
+member, an `INSERT ... SELECT` source, inside `WITH`. A view over a
+view expands the same way. A view's query is any `SELECT` (joins,
+grouping, `WITH`, window functions, set operations) without
+parameters, `AS OF SYSTEM TIME` or `FOR UPDATE`; the optional column
+list renames its output. Views are read-only (`42809` on `INSERT`,
+`UPDATE`, `DELETE`, `COPY`, `ALTER TABLE`, `CREATE INDEX`, `TRUNCATE`).
+`SELECT *` in a view sees a column added to the base table later
+(PostgreSQL freezes the list at creation).
+
+**Dependencies.** A view records the tables and views it reads. `DROP
+TABLE` / `DROP VIEW` refuse (`2BP01`) while a view depends on the
+relation unless `CASCADE`, which drops the dependent views too;
+`RENAME TO`, `RENAME COLUMN` and `DROP COLUMN` on a table a view reads
+are refused the same way (drop or replace the view first — its query
+is stored as text). `CREATE OR REPLACE VIEW` keeps the view's identity
+and grants and may change its column set; a view cannot depend on
+itself (`42P17`).
+
+**Privileges.** Reading a view needs `SELECT` on the view; its query
+runs with the view's *owner's* privileges (PostgreSQL's definer rule),
+so a reader needs no grant on the tables behind it. `GRANT` /
+`REVOKE ... ON view` work as on tables; creating a view needs the
+database's `CREATE` privilege (and the creator's own access to what it
+reads), dropping one is for its owner or an admin.
+
+The catalogs show views as PostgreSQL does — `pg_class` with `relkind =
+'v'`, `pg_views`, `information_schema.tables` (`VIEW`) and
+`information_schema.views`, `pg_attribute` for their columns — so
+`psql`'s `\dv` and `\d view` work. Views need **cluster version v9**
+(`0A000` until `datax debug upgrade` finalizes it).
 
 ## Databases
 
@@ -699,17 +954,21 @@ DROP DATABASE shop CASCADE;   -- ... unless CASCADE drops them too
 A connection starts in the database its URL names (`postgres://.../app`);
 an unknown one is refused with SQLSTATE `3D000`, as in PostgreSQL. An
 unqualified table name resolves in the session's current database;
-`db.table` reaches another database. `SHOW TABLES` and `ANALYZE` (with no
-table) act on the current database. `datax` and `system` cannot be
+`db.table` reaches another database. `SHOW TABLES` (tables only; `SHOW
+VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
+database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
-bob`. `CREATE` lets a non-admin create tables there (admins always can).
-`CONNECT` is granted to `PUBLIC` on every database, as in PostgreSQL;
-`REVOKE CONNECT ON DATABASE app FROM PUBLIC` closes it to everyone but
-admins and users holding an explicit `CONNECT` grant, checked when a
-session opens the database (the URL or `USE`). Table grants work as
-before, and take qualified names (`GRANT SELECT ON app.orders TO bob`).
+bob`. `CREATE` lets a non-admin create tables there (admins and the
+database's owner always can). `CONNECT` is granted to `PUBLIC` on every
+database, as in PostgreSQL; `REVOKE CONNECT ON DATABASE app FROM PUBLIC`
+closes it to everyone but admins, the owner and roles holding an
+explicit `CONNECT` grant, checked when a session opens the database
+(the URL or `USE`). Table grants take qualified names (`GRANT SELECT ON
+app.orders TO bob`). Roles, ownership, the schema and sequence scopes,
+`ALL TABLES IN SCHEMA`, default privileges and grant options are in
+the [security guide](security.md#roles-and-privileges).
 
 Databases arrive with cluster version v6. A cluster upgraded from an
 earlier version keeps every existing table in `datax`; `datax debug

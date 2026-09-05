@@ -79,6 +79,9 @@ type backupManifest struct {
 	Tables    []backupTable `json:"tables"`
 	Users     []backupKV    `json:"users"`
 	Admins    []backupKV    `json:"admins"`
+	// Roles are the v11 role descriptors (login roles, groups, their
+	// memberships and verifiers); Users and Admins the pre-v11 records.
+	Roles []backupKV `json:"roles,omitempty"`
 	// Databases are the database descriptors and their name entries (v6);
 	// a manifest without them restores every table into the flat layout,
 	// which the catalog migration then moves under the default database.
@@ -256,6 +259,10 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 	if man.Admins, err = collectRaw(aStart, aEnd); err != nil {
 		return nil, err
 	}
+	rStart, rEnd := keys.RoleSpan()
+	if man.Roles, err = collectRaw(rStart, rEnd); err != nil {
+		return nil, err
+	}
 	dStart, dEnd := keys.DatabaseDescSpan()
 	if man.Databases, err = collectRaw(dStart, dEnd); err != nil {
 		return nil, err
@@ -343,7 +350,7 @@ func backupSummary(path string, man *backupManifest) *cluster.BackupSummary {
 		ClusterID:   man.ClusterID,
 		EndTSNanos:  man.EndTS.WallTime,
 		Incremental: !man.BaseTS.IsEmpty(),
-		Users:       len(man.Users),
+		Users:       len(man.Users) + len(man.Roles),
 	}
 	for _, t := range man.Tables {
 		sum.Tables = append(sum.Tables, cluster.BackupTableSummary{
@@ -432,6 +439,9 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 			wb.Put(keys.Key(kv.Key), kv.Value)
 		}
 		for _, kv := range final.Admins {
+			wb.Put(keys.Key(kv.Key), kv.Value)
+		}
+		for _, kv := range final.Roles {
 			wb.Put(keys.Key(kv.Key), kv.Value)
 		}
 		return txn.RunBatch(ctx, &wb)
@@ -526,7 +536,7 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 
 	// Verification: a fresh full export of every restored table, hashed the
 	// same way — the caller compares against the source's checksums.
-	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users)}
+	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users) + len(final.Roles)}
 	verifyTS := n.clock.Now()
 	for _, t := range final.Tables {
 		h := sha256.New()

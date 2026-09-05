@@ -48,8 +48,11 @@ func Parse(src string) ([]Statement, error) {
 
 type parser struct {
 	toks []token
-	i    int
-	src  string
+	// pendingPK carries a PRIMARY KEY (cols) written inside CREATE TABLE
+	// (names, PRIMARY KEY (...)) AS to the statement.
+	pendingPK []string
+	i         int
+	src       string
 }
 
 func (p *parser) peek() token { return p.toks[p.i] }
@@ -256,11 +259,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			return p.parseUserStmt(false)
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseRoleStmt(false)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			return p.parseCreateSequence()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			return p.parseCreateType()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			return p.parseCreateView(false)
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "OR" {
+			p.i += 2 // CREATE OR
+			if !p.consumeIdentWord("replace") || !p.peekIdentWord("view") {
+				return nil, p.errf("expected REPLACE VIEW after CREATE OR, found %q", p.peek().text)
+			}
+			p.i-- // parseCreateView consumes one token, then VIEW
+			return p.parseCreateView(true)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // CREATE DATABASE
@@ -299,13 +316,49 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &Explain{Stmt: inner, Analyze: analyze}, nil
 	case "DROP":
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			p.i += 2 // DROP USER
-			name, err := p.expectIdent()
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseDropRole()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "owned" {
+			return p.parseDropOwned()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
+			p.i += 2 // DROP INDEX
+			di := &DropIndex{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				di.IfExists = true
+			}
+			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
-			return &DropUser{Name: name}, nil
+			di.Name = name
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return di, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			p.i += 2 // DROP TYPE
+			dt := &DropType{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				dt.IfExists = true
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			dt.Name = name
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return dt, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // DROP SEQUENCE
@@ -322,6 +375,32 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			ds.Name = name
 			return ds, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			p.i += 2 // DROP VIEW
+			dv := &DropView{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				dv.IfExists = true
+			}
+			for {
+				name, err := p.parseTableName()
+				if err != nil {
+					return nil, err
+				}
+				dv.Names = append(dv.Names, name)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if p.consumeIdentWord("cascade") {
+				dv.Cascade = true
+			} else {
+				p.consumeIdentWord("restrict")
+			}
+			return dv, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // DROP DATABASE
@@ -345,6 +424,10 @@ func (p *parser) parseStatement() (Statement, error) {
 			return dd, nil
 		}
 		return p.parseDropTable()
+	case "truncate": // not a reserved word; lexes as an identifier
+		return p.parseTruncate()
+	case "comment": // COMMENT ON ... IS ...
+		return p.parseCommentOn()
 	case "INSERT":
 		return p.parseInsert(false)
 	case "upsert": // not a reserved word; lexes as an identifier
@@ -356,21 +439,72 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DELETE":
 		return p.parseDelete()
 	case "ALTER":
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" {
-			return p.parseUserStmt(true)
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+			return p.parseRoleStmt(true)
+		}
+		if p.i+2 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "default" && p.toks[p.i+2].kind == tkIdent && p.toks[p.i+2].text == "privileges" {
+			return p.parseAlterDefaultPrivileges()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
+			p.i += 2 // ALTER INDEX
+			ai := &AlterIndex{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				ai.IfExists = true
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			ai.Name = name
+			if !p.consumeIdentWord("rename") {
+				return nil, p.errf("ALTER INDEX supports only RENAME TO")
+			}
+			if err := p.expectKeyword("TO"); err != nil {
+				return nil, err
+			}
+			if ai.NewName, err = p.expectIdent(); err != nil {
+				return nil, err
+			}
+			return ai, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+			return p.parseAlterType()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
 			p.i += 2 // ALTER SEQUENCE
 			as := &AlterSequence{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				as.IfExists = true
+			}
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
 			as.Name = name
+			if p.consumeIdentWord("owner") {
+				return p.parseOwnerTo("sequence", name)
+			}
 			if err := p.parseSequenceOptions(&as.Options, true); err != nil {
 				return nil, err
 			}
 			return as, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+			p.i += 2 // ALTER VIEW name OWNER TO role
+			name, err := p.parseTableName()
+			if err != nil {
+				return nil, err
+			}
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER VIEW supports only OWNER TO")
+			}
+			return p.parseOwnerTo("view", name)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
 			p.i += 2 // ALTER DATABASE name RENAME TO new
@@ -378,8 +512,11 @@ func (p *parser) parseStatement() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
+			if p.consumeIdentWord("owner") {
+				return p.parseOwnerTo("database", name)
+			}
 			if !p.consumeIdentWord("rename") {
-				return nil, p.errf("ALTER DATABASE supports only RENAME TO")
+				return nil, p.errf("ALTER DATABASE supports RENAME TO and OWNER TO")
 			}
 			if err := p.expectKeyword("TO"); err != nil {
 				return nil, err
@@ -422,6 +559,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseCopy()
 	case "grant", "revoke": // not reserved words; they lex as identifiers
 		return p.parseGrantRevoke(t.text == "revoke")
+	case "reassign": // not a reserved word; lexes as an identifier
+		return p.parseReassignOwned()
 	case "savepoint": // not a reserved word; lexes as an identifier
 		p.i++
 		name, err := p.expectIdent()
@@ -470,6 +609,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.consumeIdentWord("functions") {
 			return &ShowFunctions{}, nil
 		}
+		if p.consumeIdentWord("views") {
+			return &Show{Kind: "views"}, nil
+		}
 		if p.consumeIdentWord("columns") || p.consumeIdentWord("indexes") || p.consumeIdentWord("index") {
 			kind := "columns"
 			if p.toks[p.i-1].text != "columns" {
@@ -485,28 +627,51 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &Show{Kind: kind, Table: name}, nil
 		}
 		if p.consumeKeyword("CREATE") {
-			p.consumeKeyword("TABLE")
+			if !p.consumeKeyword("TABLE") {
+				p.consumeIdentWord("view")
+			}
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
 			return &Show{Kind: "create", Table: name}, nil
 		}
-		if p.consumeIdentWord("users") || p.consumeIdentWord("roles") {
+		if p.consumeIdentWord("users") {
 			return &Show{Kind: "users"}, nil
+		}
+		if p.consumeIdentWord("roles") {
+			return &Show{Kind: "roles"}, nil
 		}
 		if p.consumeIdentWord("grants") {
 			sh := &Show{Kind: "grants"}
 			if p.consumeKeyword("ON") {
-				p.consumeKeyword("TABLE")
-				name, err := p.parseTableName()
-				if err != nil {
-					return nil, err
+				switch {
+				case p.consumeIdentWord("role"):
+					sh.OnRole = true
+					if !p.atStatementEnd() && !p.peekIdentWord("for") {
+						name, err := p.parseRoleName()
+						if err != nil {
+							return nil, err
+						}
+						sh.Role = name
+					}
+				case p.consumeIdentWord("database"):
+					name, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					sh.Database = name
+				default:
+					p.consumeKeyword("TABLE")
+					name, err := p.parseTableName()
+					if err != nil {
+						return nil, err
+					}
+					sh.Table = name
 				}
-				sh.Table = name
 			}
 			if p.consumeIdentWord("for") {
-				user, err := p.expectIdent()
+				user, err := p.parseRoleName()
 				if err != nil {
 					return nil, err
 				}
@@ -516,6 +681,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		if p.consumeIdentWord("all") {
 			return &Show{Kind: "all"}, nil
+		}
+		if p.consumeIdentWord("sessions") {
+			return &Show{Kind: "sessions"}, nil
 		}
 		// SHOW STATS FOR <table>: read-only statistics view.
 		if p.consumeIdentWord("stats") {
@@ -544,25 +712,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &SetVar{Name: "show:" + strings.Join(words, "_")}, nil
 	case "SET":
-		// SET [SESSION|LOCAL] name = value / SET ... TO ...: the value is
-		// kept for the variables the session honors (database), the rest
-		// are accepted and ignored.
+		return p.parseSet()
+	case "reset": // not a reserved word; lexes as an identifier
 		p.i++
-		p.consumeKeyword("SESSION")
-		p.consumeKeyword("LOCAL")
+		sv := &SetVar{Reset: true}
+		if p.consumeIdentWord("all") {
+			return sv, nil
+		}
+		if p.consumeIdentWord("time") {
+			if !p.consumeIdentWord("zone") {
+				return nil, p.errf("expected ZONE after RESET TIME")
+			}
+			sv.Name = "TimeZone"
+			return sv, nil
+		}
 		name, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
-		sv := &SetVar{Name: name}
-		if p.consumeOp("=") || p.consumeKeyword("TO") {
-			if t := p.peek(); t.kind == tkIdent || t.kind == tkString || t.kind == tkNumber {
-				sv.Value = t.text
-			}
-		}
-		for !p.atStatementEnd() {
-			p.i++
-		}
+		sv.Name = name
 		return sv, nil
 	case "use": // not a reserved word; lexes as an identifier
 		p.i++
@@ -600,8 +768,21 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		return nil, err
 	}
 	ct.Name = name
+	// CREATE TABLE t AS query: the shape and rows of a query.
+	if p.consumeKeyword("AS") {
+		return p.finishCreateTableAs(ct)
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
+	}
+	// CREATE TABLE t (a, b [, PRIMARY KEY (a)]) AS query: bare names.
+	if save := p.i; p.peek().kind == tkIdent {
+		names, ok := p.tryBareColumnList()
+		if ok && p.consumeKeyword("AS") {
+			ct.AsColumns = names
+			return p.finishCreateTableAs(ct)
+		}
+		p.i = save
 	}
 	for {
 		cname := ""
@@ -613,6 +794,13 @@ func (p *parser) parseCreateTable() (Statement, error) {
 			cname = n
 		}
 		switch {
+		case p.consumeIdentWord("like"):
+			lc, err := p.parseLikeClause()
+			if err != nil {
+				return nil, err
+			}
+			lc.Position = len(ct.Columns)
+			ct.Like = append(ct.Like, lc)
 		case p.consumeKeyword("PRIMARY"):
 			if len(ct.PrimaryKey) > 0 {
 				return nil, p.errf("multiple primary key definitions")
@@ -709,76 +897,16 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		return def, err
 	}
 	def.Name = name
-	t := p.peek()
-	if t.kind != tkIdent && t.kind != tkKeyword {
-		return def, p.errf("expected column type, found %q", t.text)
-	}
-	p.i++
-	typeName := t.text
-	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
-	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
-		if n := p.peek(); n.kind == tkIdent {
-			p.i++
-		}
-	}
-	// TIMESTAMP WITH[OUT] TIME ZONE: absorb the trailing words.
-	if strings.EqualFold(typeName, "timestamp") {
-		if p.peekIdentSeq("with", "time", "zone") || p.peekIdentSeq("without", "time", "zone") {
-			p.i += 3
-		}
-	}
-	switch strings.ToUpper(typeName) {
-	case "SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL8", "SERIAL4", "SERIAL2":
-		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
-		typeName = "INT8"
-		def.Serial, def.NotNull = true, true
-	}
-	fam, err := types.ParseType(typeName)
+	spec, serial, err := p.parseColumnType()
 	if err != nil {
-		return def, p.errf("%v", err)
+		return def, err
 	}
-	def.Type = fam
-	// VARCHAR(n) / DECIMAL(p[,s]) etc.: for DECIMAL the typmod is captured
-	// and ENFORCED (precision/scale on the column descriptor); for every
-	// other type it is accepted and ignored — storage is arbitrary-length
-	// (documented).
-	if p.consumeOp("(") {
-		var mods []string
-		if p.peek().kind == tkNumber {
-			mods = append(mods, p.peek().text)
-			p.i++
-			if p.consumeOp(",") {
-				if p.peek().kind != tkNumber {
-					return def, p.errf("expected scale after ',' in type modifier")
-				}
-				mods = append(mods, p.peek().text)
-				p.i++
-			}
-		}
-		if err := p.expectOp(")"); err != nil {
-			return def, err
-		}
-		if fam == types.Decimal && len(mods) > 0 {
-			prec, perr := strconv.ParseInt(mods[0], 10, 32)
-			if perr != nil {
-				return def, p.errf("DECIMAL precision %q must be an integer", mods[0])
-			}
-			var scale int64
-			if len(mods) > 1 {
-				var serr error
-				scale, serr = strconv.ParseInt(mods[1], 10, 32)
-				if serr != nil {
-					return def, p.errf("DECIMAL scale %q must be an integer", mods[1])
-				}
-			}
-			if prec < 1 || prec > 1000 {
-				return def, p.errf("DECIMAL precision %d must be between 1 and 1000", prec)
-			}
-			if scale < 0 || scale > prec {
-				return def, p.errf("DECIMAL scale %d must be between 0 and the precision %d", scale, prec)
-			}
-			def.Precision, def.Scale = int32(prec), int32(scale)
-		}
+	def.Type, def.Precision, def.Scale = spec.Family, spec.Precision, spec.Scale
+	def.Width, def.MaxLen, def.Char, def.NoTZ, def.TimePrecision = spec.Width, spec.MaxLen, spec.Char, spec.NoTZ, spec.TimePrecision
+	def.TypeName = spec.TypeName
+	if serial {
+		// An owned sequence with DEFAULT nextval(...); NOT NULL implied.
+		def.Serial, def.NotNull = true, true
 	}
 	for {
 		// A column constraint may carry its own name.
@@ -821,18 +949,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			// A constant stays a literal default; anything else (a
 			// call, arithmetic) is an expression default ("default" is
 			// not a reserved word).
-			e, err := p.parseValueOrColumnExpr()
+			sd, err := p.parseDefaultValue()
 			if err != nil {
 				return def, err
 			}
-			if e.Lit != nil && e.BinOp == "" && e.Cast == "" {
-				def.Default = e.Lit
-			} else {
-				if e.Column != "" || exprContainsColumn(e) {
-					return def, p.errf("DEFAULT cannot reference columns")
-				}
-				def.DefaultExpr = &e
-			}
+			def.Default, def.DefaultExpr = sd.Default, sd.Expr
 		case p.peekIdentWord("generated"):
 			// GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]
 			p.i++
@@ -870,6 +991,201 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			return def, nil
 		}
 	}
+}
+
+// parseColumnType parses a column type with its optional typmod: the
+// family, a DECIMAL(p,s) precision and scale, and whether the type was
+// a SERIAL alias (INT8 with an owned sequence).
+// intervalFieldWords are the INTERVAL field qualifiers.
+var intervalFieldWords = map[string]bool{"year": true, "month": true, "day": true, "hour": true, "minute": true, "second": true, "to": true}
+
+// typedLiteralNames are the type names that may prefix a string
+// literal (INTERVAL '1 day', DATE '2024-01-01', TIME '10:00',
+// TIMESTAMP '...', TIMESTAMPTZ '...'), each parsed as a cast of the
+// literal.
+var typedLiteralNames = map[string]string{"interval": "interval", "date": "date", "time": "time", "timestamp": "timestamptz", "timestamptz": "timestamptz"}
+
+// setTypeOf builds the ALTER COLUMN TYPE target from a parsed type.
+func setTypeOf(col string, spec TypeSpec) *SetType {
+	return &SetType{Column: col, Type: spec.Family, Precision: spec.Precision, Scale: spec.Scale,
+		Width: spec.Width, MaxLen: spec.MaxLen, Char: spec.Char, NoTZ: spec.NoTZ, TimePrecision: spec.TimePrecision, TypeName: spec.TypeName}
+}
+
+func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
+	t := p.peek()
+	if t.kind != tkIdent && t.kind != tkKeyword {
+		return spec, false, p.errf("expected column type, found %q", t.text)
+	}
+	p.i++
+	typeName := t.text
+	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
+	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
+		if n := p.peek(); n.kind == tkIdent {
+			if strings.EqualFold(typeName, "character") && strings.EqualFold(n.text, "varying") {
+				typeName = "VARCHAR"
+			}
+			p.i++
+		}
+	}
+	upper := strings.ToUpper(typeName)
+	switch upper {
+	case "SERIAL", "SERIAL4":
+		typeName, serial, spec.Width = "INT8", true, 4
+	case "BIGSERIAL", "SERIAL8":
+		typeName, serial = "INT8", true
+	case "SMALLSERIAL", "SERIAL2":
+		typeName, serial, spec.Width = "INT8", true, 2
+	case "INT", "INTEGER", "INT4":
+		spec.Width = 4
+	case "SMALLINT", "INT2":
+		spec.Width = 2
+	case "CHAR", "CHARACTER":
+		spec.Char, spec.MaxLen = true, 1
+	case "TIMESTAMP":
+		spec.NoTZ = true
+	case "TIMETZ":
+		return spec, false, p.errf("TIME WITH TIME ZONE is not supported: use TIME (the offset of an input is ignored) or TIMESTAMPTZ")
+	}
+	fam, perr := types.ParseType(typeName)
+	if perr != nil {
+		// Not a builtin type: a user-defined type (an enum) by name,
+		// optionally database-qualified, resolved by the executor.
+		if t.kind != tkIdent {
+			return spec, false, p.errf("%v", perr)
+		}
+		name := typeName
+		if p.consumeOp(".") {
+			n, err := p.expectIdent()
+			if err != nil {
+				return spec, false, err
+			}
+			name += "." + n
+		}
+		spec.Family, spec.TypeName = types.Enum, strings.ToLower(name)
+		if p.consumeOp("[") {
+			return spec, false, p.errf("arrays of enum type %s are not supported", spec.TypeName)
+		}
+		return spec, false, nil
+	}
+	spec.Family = fam
+	// The typmod: DECIMAL(p[,s]), VARCHAR(n) / CHAR(n), TIMESTAMP(p) are
+	// captured and enforced; on any other type a typmod is accepted and
+	// ignored (documented).
+	if p.consumeOp("(") {
+		var mods []string
+		if p.peek().kind == tkNumber {
+			mods = append(mods, p.peek().text)
+			p.i++
+			if p.consumeOp(",") {
+				if p.peek().kind != tkNumber {
+					return spec, false, p.errf("expected scale after ',' in type modifier")
+				}
+				mods = append(mods, p.peek().text)
+				p.i++
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return spec, false, err
+		}
+		switch {
+		case fam == types.Decimal && len(mods) > 0:
+			pr, perr := strconv.ParseInt(mods[0], 10, 32)
+			if perr != nil {
+				return spec, false, p.errf("DECIMAL precision %q must be an integer", mods[0])
+			}
+			var sc int64
+			if len(mods) > 1 {
+				var serr error
+				sc, serr = strconv.ParseInt(mods[1], 10, 32)
+				if serr != nil {
+					return spec, false, p.errf("DECIMAL scale %q must be an integer", mods[1])
+				}
+			}
+			if pr < 1 || pr > 1000 {
+				return spec, false, p.errf("DECIMAL precision %d must be between 1 and 1000", pr)
+			}
+			if sc < 0 || sc > pr {
+				return spec, false, p.errf("DECIMAL scale %d must be between 0 and the precision %d", sc, pr)
+			}
+			spec.Precision, spec.Scale = int32(pr), int32(sc)
+		case fam == types.String && (upper == "VARCHAR" || upper == "CHAR" || upper == "CHARACTER") && len(mods) == 1:
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 1 || n > 10485760 {
+				return spec, false, p.errf("length for type %s must be between 1 and 10485760", strings.ToLower(upper))
+			}
+			spec.MaxLen = int32(n)
+		case (fam == types.Timestamp || fam == types.Time) && len(mods) == 1:
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 0 || n > 6 {
+				return spec, false, p.errf("%s(%s) precision must be between 0 and 6", strings.ToLower(upper), mods[0])
+			}
+			spec.TimePrecision = int32(n) + 1
+		}
+	}
+	// TIME [WITHOUT TIME ZONE]; TIME WITH TIME ZONE is refused.
+	if fam == types.Time {
+		if p.peekIdentSeq("with", "time", "zone") {
+			return spec, false, p.errf("TIME WITH TIME ZONE is not supported: use TIME (the offset of an input is ignored) or TIMESTAMPTZ")
+		}
+		if p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
+	// INTERVAL fields (YEAR TO MONTH, DAY TO SECOND, ...) are accepted
+	// and ignored: every interval stores the full triple.
+	if fam == types.IntervalFam {
+		for {
+			t := p.peek()
+			if (t.kind == tkIdent || t.kind == tkKeyword) && intervalFieldWords[strings.ToLower(t.text)] {
+				p.i++
+				continue
+			}
+			break
+		}
+	}
+	// TIMESTAMP [WITH | WITHOUT] TIME ZONE: the trailing words decide.
+	if fam == types.Timestamp && upper == "TIMESTAMP" {
+		if p.peekIdentSeq("with", "time", "zone") {
+			p.i += 3
+			spec.NoTZ = false
+		} else if p.peekIdentSeq("without", "time", "zone") {
+			p.i += 3
+		}
+	}
+	// T[] / T[][] / T ARRAY: an array of T (one-dimensional whatever the
+	// bracket count, as PostgreSQL ignores the declared dimensions). The
+	// modifiers (width, length, precision) apply to the elements.
+	array := false
+	for p.consumeOp("[") {
+		if p.peek().kind == tkNumber {
+			p.i++
+		}
+		if err := p.expectOp("]"); err != nil {
+			return spec, false, err
+		}
+		array = true
+	}
+	if p.consumeIdentWord("array") {
+		array = true
+		if p.consumeOp("[") {
+			if p.peek().kind == tkNumber {
+				p.i++
+			}
+			if err := p.expectOp("]"); err != nil {
+				return spec, false, err
+			}
+		}
+	}
+	if array {
+		if serial {
+			return spec, false, p.errf("SERIAL cannot be an array")
+		}
+		if fam == types.Jsonb {
+			return spec, false, p.errf("JSONB[] is not supported: store a JSON array in a JSONB column")
+		}
+		spec.Family = types.ArrayOf(fam)
+	}
+	return spec, serial, nil
 }
 
 func (p *parser) peekKeyword(kw string) bool {
@@ -1050,6 +1366,248 @@ func exprContainsColumn(e Expr) bool {
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
+// parseSet parses SET [SESSION | LOCAL] name {TO | =} value [, ...], SET
+// TIME ZONE value, SET NAMES value, SET [SESSION CHARACTERISTICS AS]
+// TRANSACTION characteristics.
+func (p *parser) parseSet() (Statement, error) {
+	p.i++ // SET
+	sv := &SetVar{}
+	characteristics := false
+	if p.consumeKeyword("SESSION") {
+		if p.consumeIdentWord("characteristics") {
+			if !p.consumeKeyword("AS") || !p.consumeKeyword("TRANSACTION") {
+				return nil, p.errf("expected AS TRANSACTION after SET SESSION CHARACTERISTICS")
+			}
+			characteristics = true
+		}
+	} else if p.consumeKeyword("LOCAL") {
+		sv.Local = true
+	}
+	if characteristics || p.consumeKeyword("TRANSACTION") {
+		// [ISOLATION LEVEL x] [READ ONLY | READ WRITE] [[NOT] DEFERRABLE]:
+		// the read-only flag is what the session honors; the isolation
+		// level is accepted (serializable is the only one), the rest
+		// ignored. A transaction-scoped SET applies to the block.
+		if !characteristics {
+			sv.Local = true
+		}
+		var readOnly, isolation string
+		for !p.atStatementEnd() {
+			switch {
+			case p.consumeIdentWord("isolation"):
+				if !p.consumeIdentWord("level") {
+					return nil, p.errf("expected LEVEL after ISOLATION")
+				}
+				var words []string
+				for !p.atStatementEnd() {
+					t := p.peek()
+					if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
+						break
+					}
+					words = append(words, strings.ToLower(t.text))
+					p.i++
+					if len(words) == 2 {
+						break
+					}
+				}
+				if len(words) == 1 && words[0] != "serializable" {
+					return nil, p.errf("expected an isolation level, found %q", words[0])
+				}
+				isolation = strings.Join(words, " ")
+			case p.peekIdentSeq("read", "only"):
+				p.i += 2
+				readOnly = "on"
+			case p.peekIdentSeq("read", "write"):
+				p.i += 2
+				readOnly = "off"
+			case p.consumeKeyword("NOT"):
+				if !p.consumeIdentWord("deferrable") {
+					return nil, p.errf("expected DEFERRABLE after NOT")
+				}
+			case p.consumeIdentWord("deferrable"):
+			case p.consumeOp(","):
+			default:
+				return nil, p.errf("unexpected %q in SET TRANSACTION", p.peek().text)
+			}
+		}
+		switch {
+		case readOnly != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_read_only", readOnly
+		case readOnly != "":
+			sv.Name, sv.Value = "transaction_read_only", readOnly
+		case isolation != "":
+			sv.Name, sv.Value = "transaction_isolation", isolation
+		default:
+			return nil, p.errf("SET TRANSACTION needs a characteristic (READ ONLY, READ WRITE, ISOLATION LEVEL ...)")
+		}
+		return sv, nil
+	}
+	switch {
+	case p.consumeIdentWord("time"):
+		if !p.consumeIdentWord("zone") {
+			return nil, p.errf("expected ZONE after SET TIME")
+		}
+		sv.Name = "TimeZone"
+	case p.consumeIdentWord("role"):
+		// SET [LOCAL] ROLE name | NONE (no = or TO).
+		sv.Name = "role"
+		if p.consumeIdentWord("none") {
+			sv.Reset = true
+			return sv, nil
+		}
+		name, err := p.parseRoleName()
+		if err != nil {
+			return nil, err
+		}
+		sv.Value = name
+		return sv, nil
+	case p.consumeIdentWord("names"):
+		sv.Name = "client_encoding"
+		if p.atStatementEnd() {
+			sv.Value = "UTF8"
+			return sv, nil
+		}
+	default:
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		sv.Name = name
+		if !p.consumeOp("=") && !p.consumeKeyword("TO") {
+			return nil, p.errf("expected = or TO after SET %s, found %q", name, p.peek().text)
+		}
+	}
+	// The value: DEFAULT, or one or more literals / identifiers / numbers
+	// (a list joins with ", ": search_path, DateStyle).
+	if p.consumeKeyword("DEFAULT") || p.consumeIdentWord("default") {
+		sv.Reset = true
+		return sv, nil
+	}
+	var parts []string
+	for {
+		t := p.peek()
+		switch t.kind {
+		case tkIdent, tkKeyword, tkString, tkNumber:
+			parts = append(parts, t.text)
+			p.i++
+		case tkOp:
+			if t.text == "-" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber {
+				parts = append(parts, "-"+p.toks[p.i+1].text)
+				p.i += 2
+			} else if t.text == "+" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber {
+				parts = append(parts, "+"+p.toks[p.i+1].text)
+				p.i += 2
+			} else {
+				return nil, p.errf("unexpected %q in SET value", t.text)
+			}
+		default:
+			return nil, p.errf("expected a value after SET %s, found %q", sv.Name, t.text)
+		}
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if !p.atStatementEnd() {
+		return nil, p.errf("unexpected %q after SET value", p.peek().text)
+	}
+	sv.Value = strings.Join(parts, ", ")
+	return sv, nil
+}
+
+// parseCreateType parses CREATE TYPE [IF NOT EXISTS] name AS ENUM
+// ('a', 'b', ...).
+func (p *parser) parseCreateType() (Statement, error) {
+	p.i += 2 // CREATE TYPE
+	ct := &CreateType{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ct.IfNotExists = true
+	}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	ct.Name = name
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	if !p.consumeIdentWord("enum") {
+		return nil, p.errf("CREATE TYPE supports AS ENUM only, found %q", p.peek().text)
+	}
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	if !p.consumeOp(")") {
+		for {
+			t := p.peek()
+			if t.kind != tkString {
+				return nil, p.errf("expected an enum label, found %q", t.text)
+			}
+			p.i++
+			if t.text == "" || len(t.text) > 63 {
+				return nil, p.errf("an enum label must be 1 to 63 characters")
+			}
+			if seen[t.text] {
+				return nil, p.errf("enum label %q listed twice", t.text)
+			}
+			seen[t.text] = true
+			ct.Labels = append(ct.Labels, t.text)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
+	return ct, nil
+}
+
+// parseAlterType parses ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'.
+func (p *parser) parseAlterType() (Statement, error) {
+	p.i += 2 // ALTER TYPE
+	at := &AlterType{}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	at.Name = name
+	if p.consumeIdentWord("owner") {
+		return p.parseOwnerTo("type", name)
+	}
+	if !p.consumeKeyword("ADD") || !p.consumeIdentWord("value") {
+		return nil, p.errf("ALTER TYPE supports ADD VALUE and OWNER TO, found %q", p.peek().text)
+	}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		at.IfNotExistsVal = true
+	}
+	t := p.peek()
+	if t.kind != tkString {
+		return nil, p.errf("expected an enum label, found %q", t.text)
+	}
+	p.i++
+	if t.text == "" || len(t.text) > 63 {
+		return nil, p.errf("an enum label must be 1 to 63 characters")
+	}
+	at.AddValue = t.text
+	if p.consumeIdentWord("before") || p.consumeIdentWord("after") {
+		return nil, p.errf("ADD VALUE BEFORE / AFTER is not supported: labels are appended in declaration order")
+	}
+	return at, nil
+}
+
 func (p *parser) parseCreateSequence() (Statement, error) {
 	p.i += 2 // CREATE SEQUENCE
 	cs := &CreateSequence{}
@@ -1187,6 +1745,15 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	}
 	if err := p.expectKeyword("INDEX"); err != nil {
 		return nil, err
+	}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ci.IfNotExists = true
 	}
 	name, err := p.expectIdent()
 	if err != nil {
@@ -1606,6 +2173,9 @@ func (p *parser) parseSelect() (Statement, error) {
 		if !p.consumeOp(",") {
 			break
 		}
+	}
+	if p.consumeKeyword("INTO") {
+		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
 	}
 	if p.consumeKeyword("FROM") {
 		// FROM (SELECT ...) AS alias — a derived table.
@@ -2256,7 +2826,7 @@ var caseWords = map[string]bool{"then": true, "else": true, "end": true, "when":
 var tableClauseWords = map[string]bool{
 	"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true, "natural": true, "using": true,
 	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
-	"window": true,
+	"window": true, "with": true,
 }
 
 // peekIdentSeq reports whether the next tokens are exactly this sequence of
@@ -2561,106 +3131,46 @@ func (p *parser) parseFrameBound() (FrameBound, error) {
 	return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING, found %q", p.peek().text)
 }
 
-// parseGrantRevoke parses GRANT/REVOKE ADMIN and per-table privileges.
-func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
-	p.i++ // grant | revoke
-	gr := &GrantRevoke{Revoke: revoke}
-	linkKw := "TO"
-	if revoke {
-		linkKw = "FROM"
-	}
-
-	if p.consumeIdentWord("admin") {
-		gr.Admin = true
-		if err := p.expectKeyword(linkKw); err != nil {
-			return nil, err
-		}
-		name, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		gr.User = name
-		return gr, nil
-	}
-
-	for {
-		t := p.peek()
-		var priv string
-		switch {
-		case t.kind == tkKeyword && (t.text == "SELECT" || t.text == "INSERT" || t.text == "UPDATE" || t.text == "DELETE"):
-			priv = t.text
-			p.i++
-		case t.kind == tkIdent && t.text == "all":
-			priv = "ALL"
-			p.i++
-		case t.kind == tkKeyword && t.text == "CREATE", t.kind == tkIdent && t.text == "connect":
-			priv = strings.ToUpper(t.text)
-			p.i++
-		default:
-			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, CREATE, CONNECT, ALL), found %q", t.text)
-		}
-		gr.Privileges = append(gr.Privileges, priv)
-		if !p.consumeOp(",") {
-			break
-		}
-	}
-	if err := p.expectKeyword("ON"); err != nil {
-		return nil, err
-	}
-	if p.consumeIdentWord("database") {
-		db, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		gr.Database = db
-	} else {
-		p.consumeKeyword("TABLE")
-		table, err := p.parseTableName()
-		if err != nil {
-			return nil, err
-		}
-		gr.Table = table
-	}
-	if err := p.expectKeyword(linkKw); err != nil {
-		return nil, err
-	}
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
-	}
-	gr.User = name
-	return gr, nil
-}
-
-// parseUserStmt parses CREATE USER / ALTER USER name PASSWORD 'pw'.
-func (p *parser) parseUserStmt(alter bool) (Statement, error) {
-	p.i += 2 // CREATE|ALTER USER
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
-	}
-	if err := p.expectKeyword("PASSWORD"); err != nil {
-		return nil, err
-	}
-	t := p.peek()
-	if t.kind != tkString {
-		return nil, p.errf("expected password string, found %q", t.text)
-	}
-	p.i++
-	return &CreateUser{Name: name, Password: t.text, Alter: alter}, nil
-}
-
 func (p *parser) parseAlterTable() (Statement, error) {
 	p.i++ // ALTER
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
+	at := &AlterTable{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		at.IfExists = true
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
-	at := &AlterTable{Table: name}
+	at.Table = name
 	switch {
+	case p.consumeIdentWord("owner"):
+		return p.parseOwnerTo("table", name)
+	case p.consumeIdentWord("rename"):
+		switch {
+		case p.consumeKeyword("TO"):
+			if at.RenameTo, err = p.expectIdent(); err != nil {
+				return nil, err
+			}
+		case p.consumeKeyword("CONSTRAINT"):
+			r, err := p.parseRename()
+			if err != nil {
+				return nil, err
+			}
+			at.RenameConstraint = r
+		default:
+			p.consumeKeyword("COLUMN")
+			r, err := p.parseRename()
+			if err != nil {
+				return nil, err
+			}
+			at.RenameCol = r
+		}
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
@@ -2688,6 +3198,15 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		p.consumeKeyword("COLUMN")
+		if p.consumeKeyword("IF") {
+			if err := p.expectKeyword("NOT"); err != nil {
+				return nil, err
+			}
+			if err := p.expectKeyword("EXISTS"); err != nil {
+				return nil, err
+			}
+			at.AddColIfNotExists = true
+		}
 		def, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
@@ -2709,11 +3228,20 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		p.consumeKeyword("COLUMN")
+		if p.consumeKeyword("IF") {
+			if err := p.expectKeyword("EXISTS"); err != nil {
+				return nil, err
+			}
+			at.DropColIfExists = true
+		}
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
 		at.DropCol = col
+		if !p.consumeIdentWord("cascade") {
+			p.consumeIdentWord("restrict")
+		}
 	case p.consumeIdentWord("validate"):
 		if err := p.expectKeyword("CONSTRAINT"); err != nil {
 			return nil, err
@@ -2730,24 +3258,63 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			return nil, err
 		}
 		switch {
-		case p.consumeKeyword("SET"):
-			if err := p.expectKeyword("NOT"); err != nil {
+		case p.consumeIdentWord("type"):
+			spec, serial, err := p.parseColumnType()
+			if err != nil {
 				return nil, err
+			}
+			if serial {
+				return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+			}
+			at.SetType = setTypeOf(col, spec)
+			if p.consumeIdentWord("using") {
+				return nil, p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
+			}
+		case p.consumeKeyword("SET"):
+			if p.consumeIdentWord("data") {
+				if !p.consumeIdentWord("type") {
+					return nil, p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
+				}
+				spec, serial, err := p.parseColumnType()
+				if err != nil {
+					return nil, err
+				}
+				if serial {
+					return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+				}
+				at.SetType = setTypeOf(col, spec)
+				break
+			}
+			if p.consumeIdentWord("default") {
+				sd, err := p.parseDefaultValue()
+				if err != nil {
+					return nil, err
+				}
+				sd.Column = col
+				at.SetDefault = sd
+				break
+			}
+			if err := p.expectKeyword("NOT"); err != nil {
+				return nil, p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
 				return nil, err
 			}
 			at.SetNotNull = col
 		case p.consumeKeyword("DROP"):
+			if p.consumeIdentWord("default") {
+				at.DropDefault = col
+				break
+			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, err
+				return nil, p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
 				return nil, err
 			}
 			at.DropNotNull = col
 		default:
-			return nil, p.errf("expected SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return nil, p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
@@ -2756,9 +3323,290 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.SetOptions = opts
 	default:
-		return nil, p.errf("expected ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT or SET, found %q", p.peek().text)
 	}
 	return at, nil
+}
+
+// tryBareColumnList parses `a, b [, PRIMARY KEY (cols)])` — the name
+// list of CREATE TABLE (names) AS — reporting whether the list was one
+// (a type after a name means an ordinary column definition).
+func (p *parser) tryBareColumnList() ([]string, bool) {
+	var names []string
+	for {
+		if p.consumeKeyword("PRIMARY") {
+			if !p.consumeKeyword("KEY") {
+				return nil, false
+			}
+			cols, err := p.parseColumnList()
+			if err != nil {
+				return nil, false
+			}
+			p.pendingPK = cols
+		} else {
+			t := p.peek()
+			if t.kind != tkIdent {
+				return nil, false
+			}
+			p.i++
+			names = append(names, t.text)
+		}
+		if p.consumeOp(",") {
+			continue
+		}
+		if !p.consumeOp(")") {
+			return nil, false
+		}
+		return names, true
+	}
+}
+
+// finishCreateTableAs parses the query after CREATE TABLE ... AS and the
+// trailing WITH [NO] DATA, keeping the query's text.
+func (p *parser) finishCreateTableAs(ct *CreateTable) (Statement, error) {
+	if p.pendingPK != nil {
+		ct.PrimaryKey, p.pendingPK = p.pendingPK, nil
+	}
+	start := p.peek().pos
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := q.(*Select)
+	if !ok {
+		return nil, p.errf("CREATE TABLE ... AS takes a SELECT")
+	}
+	ct.As, ct.AsText = sel, strings.TrimSpace(p.src[start:p.peek().pos])
+	// WITH [NO] DATA ("with" lexes as an identifier).
+	if p.consumeIdentWord("with") {
+		if p.consumeKeyword("NOT") {
+			return nil, p.errf("expected WITH DATA or WITH NO DATA")
+		}
+		if p.consumeIdentWord("no") {
+			ct.NoData = true
+		}
+		if !p.consumeIdentWord("data") {
+			return nil, p.errf("expected DATA after WITH, found %q", p.peek().text)
+		}
+	}
+	return ct, nil
+}
+
+// parseLikeClause parses the rest of LIKE source [INCLUDING | EXCLUDING
+// DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL ...].
+func (p *parser) parseLikeClause() (LikeClause, error) {
+	var lc LikeClause
+	name, err := p.parseTableName()
+	if err != nil {
+		return lc, err
+	}
+	lc.Table = name
+	for {
+		including := p.consumeIdentWord("including")
+		if !including && !p.consumeIdentWord("excluding") {
+			return lc, nil
+		}
+		t := p.peek()
+		if t.kind != tkIdent {
+			return lc, p.errf("expected an option after INCLUDING / EXCLUDING, found %q", t.text)
+		}
+		p.i++
+		switch t.text {
+		case "all":
+			lc.Defaults, lc.Constraints, lc.Indexes, lc.Comments = including, including, including, including
+		case "defaults":
+			lc.Defaults = including
+		case "constraints":
+			lc.Constraints = including
+		case "indexes":
+			lc.Indexes = including
+		case "comments":
+			lc.Comments = including
+		case "generated", "identity", "statistics", "storage", "compression":
+			// Accepted for compatibility; nothing to copy or leave out.
+		default:
+			return lc, p.errf("unknown LIKE option %q", t.text)
+		}
+	}
+}
+
+// parseCreateView parses [CREATE] VIEW name [(cols)] AS query, keeping
+// the query's source text (the view stores it as written).
+func (p *parser) parseCreateView(orReplace bool) (Statement, error) {
+	p.i++ // CREATE (or the REPLACE slot)
+	if !p.consumeIdentWord("view") {
+		return nil, p.errf("expected VIEW, found %q", p.peek().text)
+	}
+	cv := &CreateView{OrReplace: orReplace}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	cv.Name = name
+	if p.peek().kind == tkOp && p.peek().text == "(" {
+		if cv.Columns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	start := p.peek().pos
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := q.(*Select)
+	if !ok {
+		return nil, p.errf("a view's query must be a SELECT")
+	}
+	cv.Query = sel
+	cv.Text = strings.TrimSpace(p.src[start:p.peek().pos])
+	return cv, nil
+}
+
+// parseRename parses `old TO new`.
+func (p *parser) parseRename() (*Rename, error) {
+	from, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, err
+	}
+	to, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	return &Rename{From: from, To: to}, nil
+}
+
+// parseDefaultValue parses the value after DEFAULT: a constant stays a
+// literal default, anything else (a call, arithmetic) is an expression
+// default; columns cannot be referenced.
+func (p *parser) parseDefaultValue() (*SetDefault, error) {
+	e, err := p.parseValueOrColumnExpr()
+	if err != nil {
+		return nil, err
+	}
+	if e.Lit != nil && e.BinOp == "" && e.Cast == "" {
+		return &SetDefault{Default: e.Lit}, nil
+	}
+	if e.Column != "" || exprContainsColumn(e) {
+		return nil, p.errf("DEFAULT cannot reference columns")
+	}
+	return &SetDefault{Expr: &e}, nil
+}
+
+// parseCommentOn parses COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS
+// 'text' | NULL.
+func (p *parser) parseCommentOn() (Statement, error) {
+	p.i++ // COMMENT
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	co := &CommentOn{}
+	switch {
+	case p.consumeKeyword("TABLE"), p.consumeIdentWord("view"):
+		co.Kind = "table"
+	case p.consumeKeyword("INDEX"):
+		co.Kind = "index"
+	case p.consumeKeyword("COLUMN"):
+		co.Kind = "column"
+	default:
+		return nil, p.errf("COMMENT ON supports TABLE, VIEW, INDEX and COLUMN, found %q", p.peek().text)
+	}
+	if co.Kind == "column" {
+		// table.column, db.table.column or db.public.table.column: the
+		// last part is the column, the rest a table name.
+		first, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		parts := []string{first}
+		for p.consumeOp(".") {
+			next, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, next)
+		}
+		if len(parts) < 2 || len(parts) > 4 {
+			return nil, p.errf("COMMENT ON COLUMN takes table.column")
+		}
+		co.Column = parts[len(parts)-1]
+		tbl := parts[:len(parts)-1]
+		switch len(tbl) {
+		case 1:
+			co.Name = tbl[0]
+		case 2:
+			if tbl[0] == "public" {
+				co.Name = tbl[1]
+			} else {
+				co.Name = tbl[0] + "." + tbl[1]
+			}
+		default:
+			if tbl[1] != "public" {
+				return nil, p.errf("schema %q does not exist (public is the only schema)", tbl[1])
+			}
+			co.Name = tbl[0] + "." + tbl[2]
+		}
+	} else {
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		co.Name = name
+	}
+	if !p.consumeKeyword("IS") && !p.consumeIdentWord("is") {
+		return nil, p.errf("expected IS, found %q", p.peek().text)
+	}
+	switch t := p.peek(); {
+	case t.kind == tkKeyword && t.text == "NULL":
+		p.i++
+	case t.kind == tkString:
+		p.i++
+		text := t.text
+		co.Text = &text
+	default:
+		return nil, p.errf("expected a string or NULL after IS, found %q", t.text)
+	}
+	return co, nil
+}
+
+// parseTruncate parses TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY |
+// CONTINUE IDENTITY] [CASCADE | RESTRICT].
+func (p *parser) parseTruncate() (Statement, error) {
+	p.i++ // TRUNCATE
+	p.consumeKeyword("TABLE")
+	tr := &Truncate{}
+	for {
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		tr.Tables = append(tr.Tables, name)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	switch {
+	case p.consumeIdentWord("restart"):
+		if !p.consumeIdentWord("identity") {
+			return nil, p.errf("expected IDENTITY after RESTART, found %q", p.peek().text)
+		}
+		tr.RestartIdentity = true
+	case p.consumeIdentWord("continue"):
+		if !p.consumeIdentWord("identity") {
+			return nil, p.errf("expected IDENTITY after CONTINUE, found %q", p.peek().text)
+		}
+	}
+	if p.consumeIdentWord("cascade") {
+		tr.Cascade = true
+	} else {
+		p.consumeIdentWord("restrict")
+	}
+	return tr, nil
 }
 
 func (p *parser) parseUpdate() (Statement, error) {
@@ -3249,7 +4097,7 @@ func (p *parser) startsPredicateSuffix() bool {
 	t := p.peek()
 	switch t.kind {
 	case tkOp:
-		return isCmpOp(t.text) || t.text == "@>"
+		return isCmpOp(t.text) || t.text == "@>" || t.text == "&&"
 	case tkIdent:
 		switch t.text {
 		case "is", "in", "between", "similar", "like", "ilike":
@@ -3455,7 +4303,7 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"IN": "NOT IN", "NOT IN": "IN",
 		"EXISTS": "NOT EXISTS", "NOT EXISTS": "EXISTS",
 		"TRUE": "FALSE", "FALSE": "TRUE",
-		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@",
+		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@", "&&": "NOT &&", "NOT &&": "&&",
 		"?": "NOT ?", "NOT ?": "?", "?|": "NOT ?|", "NOT ?|": "?|", "?&": "NOT ?&", "NOT ?&": "?&",
 		"LIKE": "NOT LIKE", "NOT LIKE": "LIKE", "ILIKE": "NOT ILIKE", "NOT ILIKE": "ILIKE",
 		"SIMILAR TO": "NOT SIMILAR TO", "NOT SIMILAR TO": "SIMILAR TO",
@@ -3526,7 +4374,7 @@ func (p *parser) parseExistsCond() (Comparison, bool, error) {
 
 func isCmpOp(op string) bool {
 	switch op {
-	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "?", "?|", "?&":
+	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&":
 		return true
 	}
 	return false
@@ -3727,6 +4575,26 @@ func (p *parser) applyCasts(e Expr) (Expr, error) {
 		return e, err
 	}
 	e = castChain(e, casts)
+	// v[i]: an array subscript (1-based; NULL when out of range). A
+	// slice v[i:j] is not supported.
+	for p.peek().kind == tkOp && p.peek().text == "[" && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "]") {
+		p.i++
+		idx, err := p.parseAddExpr()
+		if err != nil {
+			return e, err
+		}
+		if p.peek().kind == tkOp && p.peek().text == ":" {
+			return e, p.errf("array slices (v[i:j]) are not supported")
+		}
+		if err := p.expectOp("]"); err != nil {
+			return e, err
+		}
+		inner := e
+		e = Expr{Func: "array_subscript", Args: []Expr{inner, idx}}
+		if e, err = p.applyCasts(e); err != nil {
+			return e, err
+		}
+	}
 	// A -> / ->> / #> / #>> chain may follow any value ('{...}'::jsonb
 	// -> 'a', f(x) ->> 'k'); it applies to the value as cast, so a node
 	// that already carries a cast (or an operator) is wrapped.
@@ -4070,7 +4938,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
-	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1,
+	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
@@ -4123,6 +4991,15 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		}
 		return p.parseValueExpr()
 	}
+	if t.kind == tkIdent || t.kind == tkKeyword {
+		// Typed literals: INTERVAL '1 day', DATE '2024-01-01', ... — a
+		// cast of the string.
+		if cast, ok := typedLiteralNames[strings.ToLower(t.text)]; ok && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkString {
+			d := types.NewString(p.toks[p.i+1].text)
+			p.i += 2
+			return p.applyCasts(Expr{Lit: &d, Cast: cast})
+		}
+	}
 	if t.kind == tkIdent {
 		// CASE expressions ("case" is not a reserved word).
 		if t.text == "case" {
@@ -4152,6 +5029,27 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 				return e, err
 			}
 			return p.applyCasts(castChain(e, []string{name}))
+		}
+		// ARRAY[a, b, ...]: an array value of the elements.
+		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "[" {
+			p.i += 2
+			e := Expr{Func: "array_construct"}
+			if !p.consumeOp("]") {
+				for {
+					a, err := p.parseValueOrBool()
+					if err != nil {
+						return e, err
+					}
+					e.Args = append(e.Args, a)
+					if !p.consumeOp(",") {
+						break
+					}
+				}
+				if err := p.expectOp("]"); err != nil {
+					return e, err
+				}
+			}
+			return p.applyCasts(e)
 		}
 		// array(SELECT ...): the subquery's single column as a text array.
 		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {

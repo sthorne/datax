@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -102,6 +103,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		return nil, nil
 	}
 	fams := make([]types.Family, n)
+	if expanded, err := s.expandViews(ctx, nil, stmt); err != nil {
+		return nil, ToSQLError(err)
+	} else {
+		stmt = expanded
+	}
 	if with := stmtWith(stmt); len(with) > 0 {
 		// The members bind (columns only) so lookups resolve, and each
 		// member's own parameters type as in its query once it and the
@@ -159,6 +165,13 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 				if len(cmp.Path) > 0 {
 					typ = pathResultType(cmp.Path)
 				}
+				if strings.Contains(cmp.Op, " ANY") || strings.Contains(cmp.Op, " ALL") || cmp.Op == "@>" || cmp.Op == "NOT @>" || cmp.Op == "&&" || cmp.Op == "NOT &&" {
+					// = ANY($1), @> $1: the parameter is an array of the
+					// column's type (of the column's array type for @>).
+					if !typ.IsArray() && typ != types.Jsonb {
+						typ = types.ArrayOf(typ)
+					}
+				}
 				assign(cmp.Value, typ)
 				for _, v := range cmp.Values {
 					assign(v, typ)
@@ -206,6 +219,41 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 			if idx > 0 && fams[idx-1] == types.Unknown {
 				fams[idx-1] = types.Int
 			}
+		}
+		// A parameter that is a function's argument takes the declared
+		// family (pg_cancel_backend($1) binds an integer).
+		var fromCalls func(e parser.Expr)
+		fromCalls = func(e parser.Expr) {
+			if e.Func != "" {
+				for i, a := range e.Args {
+					fam := types.Unknown
+					switch e.Func {
+					case "pg_cancel_backend", "pg_terminate_backend":
+						fam = types.Int
+					case "pg_sleep":
+						fam = types.Float
+					default:
+						if b, ok := builtins.Lookup(e.Func); ok {
+							if f := b.ArgFamily(i); f != builtins.Any {
+								fam = f
+							}
+						}
+					}
+					if fam != types.Unknown && a.Param > 0 && fams[a.Param-1] == types.Unknown {
+						fams[a.Param-1] = fam
+					}
+					fromCalls(a)
+				}
+			}
+			if e.Left != nil {
+				fromCalls(*e.Left)
+			}
+			if e.Right != nil {
+				fromCalls(*e.Right)
+			}
+		}
+		for _, se := range t.Exprs {
+			fromCalls(se.Expr)
 		}
 		// Every set-operation member types its own WHERE; a derived table
 		// types as a statement of its own.
@@ -277,6 +325,11 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
+	expanded, err := s.expandViews(ctx, nil, stmt)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	stmt = expanded
 	if with := stmtWith(stmt); len(with) > 0 {
 		restore, err := s.bindWith(ctx, nil, with, nil, true, nil)
 		if err != nil {
@@ -386,7 +439,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
+				cols[i] = colResult(p.name, p.col)
 			}
 			return cols, nil
 		}
@@ -446,7 +499,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = ResultColumn{Name: p.name, Type: p.typ, Typmod: colTypmod(p.ref.col)}
+				cols[i] = exprResult(p.name, p.typ, p.ref.col)
 			}
 			return cols, nil
 		}
@@ -469,7 +522,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		cols := make([]ResultColumn, len(proj))
 		for i, p := range proj {
-			cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
+			cols[i] = colResult(p.name, p.col)
 		}
 		return cols, nil
 
@@ -488,16 +541,25 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 
 	case *parser.Show:
 		names := map[string][]string{
-			"columns": {"column_name", "data_type", "is_nullable", "column_default", "indices"},
-			"indexes": {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
-			"create":  {"table_name", "create_statement"},
-			"users":   {"username", "is_admin"},
-			"grants":  {"database_name", "table_name", "grantee", "privilege_type"},
-			"all":     {"name", "setting"},
+			"columns":  {"column_name", "data_type", "is_nullable", "column_default", "indices"},
+			"indexes":  {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
+			"create":   {"table_name", "create_statement"},
+			"views":    {"view_name", "definition"},
+			"users":    {"username", "is_admin", "member_of"},
+			"roles":    {"role_name", "can_login", "is_admin", "member_of"},
+			"grants":   {"database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable"},
+			"all":      {"name", "setting"},
+			"sessions": {"pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start"},
 		}[t.Kind]
 		cols := make([]ResultColumn, len(names))
 		for i, n := range names {
 			cols[i] = ResultColumn{Name: n, Type: types.String}
+		}
+		if t.Kind == "sessions" {
+			cols[0].Type = types.Int
+			for i := 7; i < 10; i++ {
+				cols[i].Type = types.Timestamp
+			}
 		}
 		return cols, nil
 

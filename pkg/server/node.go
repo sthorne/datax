@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,19 @@ type Config struct {
 	// server records the statement for the dashboard's slow list (0 =
 	// 500 ms).
 	SlowStatementThreshold time.Duration
+	// MutexProfileFraction and BlockProfileRate set the runtime's
+	// contention sampling so mutex and block profiles are always
+	// available from /debug/pprof/ (0 = the defaults, 1 in 100 contended
+	// mutex events and blocking events of 10 ms or more; negative
+	// disables). Process-wide: the first node started sets them.
+	MutexProfileFraction int
+	BlockProfileRate     time.Duration
+	// StorageMemTableSize overrides the storage profile's memtable size
+	// (0 = the profile's). Crash-consistency tests shrink it.
+	StorageMemTableSize int
+	// StorageCacheSize is the block cache size in bytes (0 = the
+	// profile's share of the machine's memory; --cache-size).
+	StorageCacheSize int64
 	// CertsDir enables secure mode: mutual TLS between nodes, TLS +
 	// SCRAM-SHA-256 authentication on the SQL listener. Empty = insecure
 	// (cleartext, trust auth).
@@ -282,6 +296,7 @@ type Node struct {
 
 // Start boots the node and returns once it is serving.
 func Start(cfg Config) (*Node, error) {
+	enableProfiling(cfg)
 	n := &Node{cfg: cfg, stopper: stop.NewStopper()}
 	if err := n.start(); err != nil {
 		n.stopper.Stop()
@@ -327,7 +342,7 @@ func (n *Node) start() error {
 	}
 	n.engine = n.cfg.Engine
 	if n.engine == nil {
-		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey})
+		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey, MemTableSize: n.cfg.StorageMemTableSize, CacheSize: n.cfg.StorageCacheSize})
 		if err != nil {
 			return err
 		}
@@ -611,6 +626,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.ensureRoleCatalog); err != nil {
+		return err
+	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
 	if err := n.startHTTP(); err != nil {
 		return err
@@ -792,6 +810,59 @@ func (n *Node) Pinger() *rpc.Pinger { return n.pinger }
 
 // Events exposes the node's event ring (tests and the API).
 func (n *Node) Events() *events.Ring { return n.events }
+
+var profilingOnce sync.Once
+
+// enableProfiling turns on the runtime's contention sampling at low
+// rates (issue #100), once per process.
+func enableProfiling(cfg Config) {
+	profilingOnce.Do(func() {
+		frac, rate := cfg.MutexProfileFraction, cfg.BlockProfileRate
+		if frac == 0 {
+			frac = 100
+		}
+		if rate == 0 {
+			rate = 10 * time.Millisecond
+		}
+		if frac > 0 {
+			runtime.SetMutexProfileFraction(frac)
+		}
+		if rate > 0 {
+			runtime.SetBlockProfileRate(int(rate))
+		}
+	})
+}
+
+// ensureRoleCatalog runs the v11 role migration once the cluster is at
+// v11: a cluster finalized by a node that then crashed mid-migration
+// gets the rest of its records rewritten. Idempotent; range 1's leader
+// runs it.
+func (n *Node) ensureRoleCatalog(ctx context.Context) {
+	delay := 500 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if n.readClusterVersion(ctx) < version.V11 {
+			delay = 5 * time.Second
+			continue
+		}
+		if r1, ok := n.store.GetReplica(1); !ok || !r1.IsLeader() {
+			delay = time.Second
+			continue
+		}
+		if moved, err := catalog.MigrateRoles(ctx, n.db); err != nil {
+			log.Debugf("role catalog: %v (retrying)", err)
+			delay = 2 * time.Second
+			continue
+		} else if moved > 0 {
+			log.Infof("role migration: %d record(s) rewritten as role descriptors", moved)
+		}
+		return
+	}
+}
 
 // ensureDatabaseCatalog runs the v6 catalog migration once the cluster is
 // at v6: a freshly bootstrapped cluster gets its default and system

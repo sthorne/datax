@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +30,7 @@ type serverFlags struct {
 	rootPw        string
 	httpListen    string
 	profile       string
+	cacheSize     string
 	encKeyPath    string
 	loadSplit     float64
 	shedFactor    float64
@@ -52,6 +55,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
 	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
+	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.Float64Var(&f.shedFactor, "lease-shed-factor", 0, "leader-QPS multiple of the cluster mean at which a node sheds hot leases (0 = default 1.5)")
@@ -73,9 +77,14 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	if err != nil {
 		return server.Config{}, err
 	}
+	cacheSize, err := parseBytes(f.cacheSize)
+	if err != nil {
+		return server.Config{}, fmt.Errorf("--cache-size: %v", err)
+	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
 		StorageProfile:          prof,
+		StorageCacheSize:        cacheSize,
 		EncKeyPath:              f.encKeyPath,
 		LoadSplitThreshold:      f.loadSplit,
 		LeaseShedFactor:         f.shedFactor,
@@ -96,6 +105,33 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		RootPassword:            f.rootPw,
 		HTTPListen:              f.httpListen,
 	}, nil
+}
+
+// parseBytes reads a byte count with an optional unit: 1073741824, 1GiB,
+// 1GB, 512MiB, 64M ("" = 0).
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("%q is not a byte count", s)
+	}
+	n, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a byte count", s)
+	}
+	unit := strings.ToLower(strings.TrimSpace(s[i:]))
+	mult := map[string]float64{"": 1, "b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10, "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20, "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30, "t": 1 << 40, "tb": 1 << 40, "tib": 1 << 40}
+	m, ok := mult[unit]
+	if !ok {
+		return 0, fmt.Errorf("unknown unit %q in %q", unit, s)
+	}
+	return int64(n * m), nil
 }
 
 // metricsRecordInterval maps the flag (0 = off) onto the config's

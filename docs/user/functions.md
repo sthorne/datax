@@ -69,14 +69,17 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 ## Date and time
 
-- `age(any, [any]) → text` — The interval from the second timestamp (today's midnight when omitted) to the first, in years, months, days and time. *stable*
+- `age(any, [any]) → interval` — The interval from the second timestamp (today's midnight when omitted) to the first, in years, months, days and time. *stable*
 - `clock_timestamp() → timestamptz` — The wall clock at the moment of the call (now() is the statement's start, the same for every row). *volatile*
 - `date_trunc(text, any) → timestamptz` — The timestamp truncated to the field: millennium, century, decade, year, quarter, month, week, day, hour, minute, second, milliseconds. *immutable*
 - `extract(text, any) → decimal` (also `date_part`) — A field of a date or timestamp (also extract(field FROM x)): year, quarter, month, week, day, doy, dow, isodow, hour, minute, second, milliseconds, microseconds, epoch, century, decade, millennium. *immutable*
 - `isfinite(any) → bool` — Whether a date or timestamp is finite (always true: datax has no infinities). *immutable*
-- `justify_hours(text) → text` — Rewrites an interval's hours beyond 24 as days. *immutable*
+- `justify_days(any) → interval` — Rewrites an interval's days beyond 30 as months. *immutable*
+- `justify_hours(any) → interval` — Rewrites an interval's hours beyond 24 as days. *immutable*
+- `justify_interval(any) → interval` — Rewrites an interval with justify_days and justify_hours, then aligns the signs of its parts. *immutable*
 - `make_date(int8, int8, int8) → date` — A date from year, month and day. *immutable*
-- `make_interval([int8], [int8], [int8], [int8], [int8], [int8], [any]) → text` — An interval from years, months, weeks, days, hours, minutes and seconds (as text: datax has no interval type yet). *immutable*
+- `make_interval([int8], [int8], [int8], [int8], [int8], [int8], [any]) → interval` — An interval from years, months, weeks, days, hours, minutes and seconds. *immutable*
+- `make_time(int8, int8, any) → time` — A time from hour, minute and seconds. *immutable*
 - `make_timestamp(int8, int8, int8, int8, int8, any) → timestamptz` (also `make_timestamptz`) — A timestamp from year, month, day, hour, minute and seconds. *immutable*
 - `to_char(any, text) → text` — Formats a timestamp or date (YYYY, YY, MM, Mon, Month, DD, Dy, Day, HH24, HH12, MI, SS, MS, US, AM, TZ, ...) or a number (9, 0, ., ,, FM, S) with a pattern. *immutable*
 - `to_date(text, text) → date` — Parses text with a to_char date pattern into a date. *immutable*
@@ -100,13 +103,29 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `current_database() → text` — The session's database. *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
-- `current_user() → text` (also `session_user`) — The session's user (also session_user). *stable*
+- `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
 - `lastval() → int8` — The value nextval last returned in this session, whatever the sequence. *stable*
 - `nextval(text) → int8` — Advances the sequence and returns its next value; never rolled back. *volatile*
 - `now() → timestamptz` (also `current_timestamp`, `localtimestamp`, `statement_timestamp`, `transaction_timestamp`) — The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()). *stable*
+- `session_user() → text` — The authenticated session user (unchanged by SET ROLE). *stable*
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*
+
+## Arrays
+
+- `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*
+- `array_cat(any, any) → the type of argument 1` — The two arrays concatenated. *immutable, handles NULL arguments*
+- `array_length(any, int8) → int8` — The number of elements of an array (dimension 1; NULL for an empty array or another dimension). *immutable*
+- `array_lower(any, int8) → int8` — The lower bound of an array's dimension (1; NULL when empty). *immutable*
+- `array_ndims(any) → int8` — The number of dimensions of an array (1; NULL when empty). *immutable*
+- `array_position(any, any) → int8` — The 1-based position of the first element equal to the value (NULL when absent). *immutable, handles NULL arguments*
+- `array_prepend(any, any) → the type of argument 2` — The array with the value prepended. *immutable, handles NULL arguments*
+- `array_remove(any, any) → the type of argument 1` — The array without the elements equal to the value. *immutable, handles NULL arguments*
+- `array_to_string(any, text, [text]) → text` — The elements joined by the separator; NULL elements are skipped unless the third argument gives their text. *immutable, handles NULL arguments*
+- `array_upper(any, int8) → int8` — The upper bound of an array's dimension (its length; NULL when empty). *immutable*
+- `cardinality(any) → int8` — The number of elements of an array (0 for an empty one). *immutable*
+- `string_to_array(text, text, [text]) → text[]` — The text split on the separator into a text array (an empty separator yields one element; a NULL separator splits into characters); the third argument names the text that becomes NULL. *immutable, handles NULL arguments*
 

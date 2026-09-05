@@ -103,10 +103,18 @@ func statsHashDatum(d types.Datum) uint64 {
 	var kind [1]byte
 	kind[0] = byte(d.Fam)
 	_, _ = h.Write(kind[:])
+	if d.Fam.IsArray() {
+		_, _ = h.Write([]byte(d.Text()))
+		return h.Sum64()
+	}
 	switch d.Fam {
-	case types.Int, types.Timestamp, types.Date:
+	case types.Int, types.Timestamp, types.Date, types.Time, types.Enum:
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], uint64(d.I))
+		_, _ = h.Write(b[:])
+	case types.IntervalFam:
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(d.IntervalVal().CmpValue()))
 		_, _ = h.Write(b[:])
 	case types.Float:
 		var b [8]byte
@@ -197,6 +205,9 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 			if derr != nil {
 				return derr
 			}
+			if derr := mustBeReal(d); derr != nil {
+				return derr
+			}
 			descs = []*catalog.TableDescriptor{d}
 			return nil
 		}
@@ -208,7 +219,11 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 		if lerr != nil {
 			return lerr
 		}
-		descs = all
+		for _, d := range all {
+			if !d.IsView() {
+				descs = append(descs, d)
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, ToSQLError(err)

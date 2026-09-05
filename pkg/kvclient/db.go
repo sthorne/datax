@@ -688,18 +688,22 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
-		if len(sr.Resume) > 0 {
-			out.Resume = sr.Resume
-			return out, nil
-		}
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {
-				if end.Less(req.EndKey) {
+				switch {
+				case len(sr.Resume) > 0:
+					out.Resume = sr.Resume
+				case end.Less(req.EndKey):
 					out.Resume = end
 				}
 				return out, nil
 			}
+		}
+		if len(sr.Resume) > 0 {
+			// The range paged its answer by bytes: the rest of it next.
+			cur = sr.Resume
+			continue
 		}
 		cur = end
 	}
@@ -758,18 +762,23 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
-		if len(sr.Resume) > 0 {
-			out.Resume = sr.Resume
-			return out, nil
-		}
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {
-				if req.Key.Less(segStart) {
+				switch {
+				case len(sr.Resume) > 0:
+					out.Resume = sr.Resume
+				case req.Key.Less(segStart):
 					out.Resume = segStart
 				}
 				return out, nil
 			}
+		}
+		if len(sr.Resume) > 0 {
+			// The range paged its answer by bytes: the rest of it (below
+			// the resume key, exclusive) next.
+			curEnd = sr.Resume
+			continue
 		}
 		curEnd = segStart
 	}

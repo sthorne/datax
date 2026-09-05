@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test test-race vet fmt fmt-check proto lint all
+.PHONY: build test test-race vet fmt fmt-check proto lint all bench
 
 all: build
 
@@ -31,5 +31,11 @@ fmt-check:
 # Generated code is committed, so users never need this.
 proto:
 	buf generate
+
+# Run the checked-in workload set against a fresh single node and a fresh
+# 3-node local cluster; records land under bench-results/<timestamp>/.
+# See bench/README.md for recording a before/after.
+bench: build
+	bench/run.sh
 
 lint: vet fmt-check

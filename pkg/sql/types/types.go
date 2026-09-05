@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sthorne/datax/pkg/util/decimal"
 )
@@ -18,23 +19,30 @@ import (
 type Family int
 
 const (
-	Unknown   Family = iota
-	Int              // INT8
-	Float            // FLOAT8
-	String           // TEXT
-	Bool             // BOOL
-	Timestamp        // TIMESTAMPTZ: UTC nanoseconds since the Unix epoch (in I)
-	Date             // DATE: days since the Unix epoch (in I)
-	Bytes            // BYTES/BYTEA: raw bytes (in S)
-	Uuid             // UUID: 16 raw bytes (in S)
-	Decimal          // DECIMAL/NUMERIC: canonical decimal string (in S)
-	Jsonb            // JSONB: normalized compact JSON text (in S)
+	Unknown     Family = iota
+	Int                // INT8
+	Float              // FLOAT8
+	String             // TEXT
+	Bool               // BOOL
+	Timestamp          // TIMESTAMPTZ: UTC nanoseconds since the Unix epoch (in I)
+	Date               // DATE: days since the Unix epoch (in I)
+	Bytes              // BYTES/BYTEA: raw bytes (in S)
+	Uuid               // UUID: 16 raw bytes (in S)
+	Decimal            // DECIMAL/NUMERIC: canonical decimal string (in S)
+	Jsonb              // JSONB: normalized compact JSON text (in S)
+	IntervalFam        // INTERVAL: months (Mo), days (Dy) and nanoseconds (I)
+	Time               // TIME: nanoseconds since midnight (in I)
+	Array              // the base of an array family: ArrayOf(elem) = Array | elem<<8 (elements in A)
+	Enum               // a user-defined enum: the label's ordinal (in I) and the label (in S)
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
 // descriptors): append only, never renumber.
 
 func (f Family) String() string {
+	if f.IsArray() {
+		return f.Elem().String() + "[]"
+	}
 	switch f {
 	case Int:
 		return "INT8"
@@ -56,12 +64,45 @@ func (f Family) String() string {
 		return "DECIMAL"
 	case Jsonb:
 		return "JSONB"
+	case IntervalFam:
+		return "INTERVAL"
+	case Time:
+		return "TIME"
+	case Enum:
+		return "ENUM"
 	}
 	return "UNKNOWN"
 }
 
+// NewEnum makes an enum datum: the label's ordinal in its type and
+// the label itself. Ordinals order; labels render and compare with
+// text.
+func NewEnum(ordinal int64, label string) Datum { return Datum{Fam: Enum, I: ordinal, S: label} }
+
 // ParseType resolves a SQL type name (with PostgreSQL-flavored aliases).
 func ParseType(name string) (Family, error) {
+	// INT8[] / INT8[][] / INT8 ARRAY: an array of the element type.
+	if trimmed := strings.TrimSpace(name); strings.HasSuffix(trimmed, "]") || strings.HasSuffix(strings.ToUpper(trimmed), " ARRAY") {
+		base := trimmed
+		if strings.HasSuffix(strings.ToUpper(base), " ARRAY") {
+			base = base[:len(base)-6]
+		}
+		for strings.HasSuffix(base, "]") {
+			i := strings.LastIndexByte(base, '[')
+			if i < 0 {
+				return Unknown, fmt.Errorf("unsupported type %q", name)
+			}
+			base = strings.TrimSpace(base[:i])
+		}
+		elem, err := ParseType(base)
+		if err != nil {
+			return Unknown, err
+		}
+		if elem.IsArray() {
+			return Unknown, fmt.Errorf("unsupported type %q", name)
+		}
+		return ArrayOf(elem), nil
+	}
 	switch strings.ToUpper(name) {
 	case "INT8", "INT", "INTEGER", "BIGINT", "INT4", "SMALLINT", "INT2":
 		return Int, nil
@@ -83,6 +124,10 @@ func ParseType(name string) (Family, error) {
 		return Decimal, nil
 	case "JSONB", "JSON":
 		return Jsonb, nil
+	case "INTERVAL":
+		return IntervalFam, nil
+	case "TIME":
+		return Time, nil
 	}
 	return Unknown, fmt.Errorf("unsupported type %q", name)
 }
@@ -101,6 +146,23 @@ type Datum struct {
 	// canonical (trailing-zero-stripped) text that equality, grouping, and
 	// storage compare, and Dscale never participates in Compare.
 	Dscale int32 `json:"dscale,omitempty"`
+	// NoTZ is DISPLAY-ONLY: a Timestamp datum read from (or written to)
+	// a TIMESTAMP (without time zone) column renders without the UTC
+	// offset ("2026-08-30 01:02:03", not "...+00"). The value is the same
+	// UTC wall-clock nanosecond count either way; Compare ignores it.
+	NoTZ bool `json:"notz,omitempty"`
+	// Pad is DISPLAY-ONLY: a String datum read from (or written to) a
+	// CHAR(n) column renders blank-padded to n characters. S keeps the
+	// trailing-space-trimmed text that equality, grouping and storage
+	// compare.
+	Pad int32 `json:"pad,omitempty"`
+	// Mo and Dy are an INTERVAL's months and days (its clock part is in
+	// I, as nanoseconds).
+	Mo int64 `json:"mo,omitempty"`
+	Dy int64 `json:"dy,omitempty"`
+	// A holds an array's elements (Fam is ArrayOf(elem)); a NULL element
+	// is a Null datum.
+	A []Datum `json:"a,omitempty"`
 }
 
 var DNull = Datum{Null: true}
@@ -167,6 +229,41 @@ func ParseTimestamp(s string) (int64, error) {
 		}
 	}
 	return 0, fmt.Errorf("could not parse %q as TIMESTAMPTZ", s)
+}
+
+// ParseTimestampNoTZ parses a TIMESTAMP (without time zone) input: the
+// same layouts as ParseTimestamp, but an offset in the text is ignored
+// — the wall-clock fields are taken as they stand, as PostgreSQL does
+// for timestamp without time zone. Returns UTC wall-clock nanoseconds.
+func ParseTimestampNoTZ(s string) (int64, error) {
+	for _, f := range timestampFormats {
+		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
+			wall := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+			if wall.Before(minTimestamp) || !wall.Before(maxTimestamp) {
+				return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
+			}
+			return wall.UnixNano(), nil
+		}
+	}
+	return 0, fmt.Errorf("could not parse %q as TIMESTAMP", s)
+}
+
+// RoundTimestamp rounds UTC nanoseconds to p fractional second digits
+// (0 ≤ p ≤ 9; half away from zero, as PostgreSQL rounds a TIMESTAMP(p)
+// input).
+func RoundTimestamp(nanos int64, p int32) int64 {
+	if p < 0 || p >= 9 {
+		return nanos
+	}
+	unit := int64(1)
+	for i := int32(0); i < 9-p; i++ {
+		unit *= 10
+	}
+	half := unit / 2
+	if nanos >= 0 {
+		return (nanos + half) / unit * unit
+	}
+	return -((-nanos + half) / unit * unit)
 }
 
 // ParseDate parses a YYYY-MM-DD date string to days since the Unix epoch.
@@ -241,7 +338,7 @@ func ParseJSONB(s string) (Datum, error) {
 
 // IsIndexable reports whether the family has an order-preserving key
 // encoding (usable in primary keys and indexes).
-func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown }
+func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown && !f.IsArray() }
 
 // DecimalVal parses the canonical form back out of a Decimal datum.
 func (d Datum) DecimalVal() (decimal.Dec, error) {
@@ -250,12 +347,41 @@ func (d Datum) DecimalVal() (decimal.Dec, error) {
 
 // Coerce converts d to the target family (e.g. an int literal into a FLOAT8
 // column), or errors when the conversion is lossy/invalid.
+// ConvertTo is Coerce plus the rendering conversion to TEXT (any value's
+// canonical text) — the cast ALTER COLUMN TYPE applies.
+func (d Datum) ConvertTo(target Family) (Datum, error) {
+	if !d.Null && target == String && d.Fam != String {
+		return NewString(d.Text()), nil
+	}
+	return d.Coerce(target)
+}
+
 func (d Datum) Coerce(target Family) (Datum, error) {
 	if d.Null {
 		return DNull, nil
 	}
 	if d.Fam == target {
 		return d, nil
+	}
+	if target.IsArray() {
+		switch {
+		case d.Fam.IsArray():
+			return d.coerceArray(target)
+		case d.Fam == String:
+			return ParseArray(d.S, target.Elem())
+		}
+		return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
+	}
+	if d.Fam.IsArray() && target == String {
+		return NewString(d.Text()), nil
+	}
+	if d.Fam == Enum && target == String {
+		return NewString(d.S), nil
+	}
+	if target == Enum {
+		// Only the column (with its labels) can make an enum value;
+		// text stays text for the write path to convert.
+		return Datum{}, fmt.Errorf("cannot use %s value as an enum without its type", d.Fam)
 	}
 	switch {
 	case d.Fam == Int && target == Float:
@@ -318,6 +444,31 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		return NewFloat(v.Float64()), nil
 	case d.Fam == String && target == Jsonb:
 		return ParseJSONB(d.S)
+	case d.Fam == String && target == IntervalFam:
+		iv, err := ParseInterval(d.S)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewInterval(iv), nil
+	case d.Fam == String && target == Time:
+		n, err := ParseTime(d.S)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTime(n), nil
+	case d.Fam == Timestamp && target == Time:
+		t := time.Unix(0, d.I).UTC()
+		return NewTime(int64(t.Hour())*int64(time.Hour) + int64(t.Minute())*int64(time.Minute) + int64(t.Second())*int64(time.Second) + int64(t.Nanosecond())), nil
+	case d.Fam == IntervalFam && target == Time:
+		// PostgreSQL's interval → time cast keeps the clock part modulo
+		// a day.
+		n := d.I % NanosPerDay
+		if n < 0 {
+			n += NanosPerDay
+		}
+		return NewTime(n), nil
+	case d.Fam == Time && target == IntervalFam:
+		return NewInterval(Interval{Nanos: d.I}), nil
 	}
 	return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 }
@@ -350,12 +501,39 @@ func (d Datum) Compare(o Datum) (int, error) {
 			return decimal.Cmp(dv, ov), nil
 		}
 	}
+	if d.Fam.IsArray() || o.Fam.IsArray() {
+		// An array compares with an array (a text literal coerces to
+		// the other side's family) element by element.
+		if !d.Fam.IsArray() {
+			c, err := d.Coerce(o.Fam)
+			if err != nil {
+				return 0, err
+			}
+			d = c
+		} else if o.Fam != d.Fam {
+			c, err := o.Coerce(d.Fam)
+			if err != nil {
+				return 0, err
+			}
+			o = c
+		}
+		return compareArrays(d, o)
+	}
+	if (d.Fam == Enum && o.Fam == String) || (d.Fam == String && o.Fam == Enum) {
+		// An enum against text: by label (equality is exact; an order
+		// between the two is the labels' text order).
+		return strings.Compare(d.S, o.S), nil
+	}
 	if d.Fam != o.Fam {
 		return 0, fmt.Errorf("cannot compare %s with %s", d.Fam, o.Fam)
 	}
 	switch d.Fam {
-	case Int, Timestamp, Date:
+	case Enum:
 		return cmpInt(d.I, o.I), nil
+	case Int, Timestamp, Date, Time:
+		return cmpInt(d.I, o.I), nil
+	case IntervalFam:
+		return cmpInt(d.IntervalVal().CmpValue(), o.IntervalVal().CmpValue()), nil
 	case Float:
 		return cmpFloat(d.F, o.F), nil
 	case String, Bytes, Uuid:
@@ -422,9 +600,41 @@ func cmpBool(a, b bool) int {
 }
 
 // Text renders the datum in PostgreSQL text format.
+// FormatTimestamp renders UTC nanoseconds in PostgreSQL's text form,
+// with the "+00" offset (TIMESTAMPTZ) or without it (TIMESTAMP).
+func FormatTimestamp(nanos int64, noTZ bool) string {
+	if noTZ {
+		return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999")
+	}
+	return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999-07")
+}
+
+// FormatTimestampIn renders UTC nanoseconds in loc, PostgreSQL style:
+// the offset as "-05" for whole hours, "+05:30" otherwise.
+func FormatTimestampIn(nanos int64, loc *time.Location) string {
+	t := time.Unix(0, nanos).In(loc)
+	s := t.Format("2006-01-02 15:04:05.999999999-07:00")
+	if strings.HasSuffix(s, ":00") {
+		s = s[:len(s)-3]
+	}
+	return s
+}
+
+// PadTo blank-pads s to n characters (CHAR(n) output); a longer s is
+// returned as it is.
+func PadTo(s string, n int32) string {
+	if c := int32(utf8.RuneCountInString(s)); c < n {
+		return s + strings.Repeat(" ", int(n-c))
+	}
+	return s
+}
+
 func (d Datum) Text() string {
 	if d.Null {
 		return "" // callers render NULL specially (wire: -1 length)
+	}
+	if d.Fam.IsArray() {
+		return FormatArray(d.A)
 	}
 	switch d.Fam {
 	case Int:
@@ -432,6 +642,9 @@ func (d Datum) Text() string {
 	case Float:
 		return strconv.FormatFloat(d.F, 'g', -1, 64)
 	case String:
+		if d.Pad > 0 {
+			return PadTo(d.S, d.Pad)
+		}
 		return d.S
 	case Bool:
 		if d.B {
@@ -439,8 +652,9 @@ func (d Datum) Text() string {
 		}
 		return "f"
 	case Timestamp:
-		// PostgreSQL text format: "2026-08-30 01:02:03.456+00".
-		return time.Unix(0, d.I).UTC().Format("2006-01-02 15:04:05.999999999-07")
+		// PostgreSQL text format: "2026-08-30 01:02:03.456+00"; without
+		// the offset for a TIMESTAMP (without time zone) value.
+		return FormatTimestamp(d.I, d.NoTZ)
 	case Date:
 		return time.Unix(d.I*86400, 0).UTC().Format("2006-01-02")
 	case Bytes:
@@ -459,6 +673,12 @@ func (d Datum) Text() string {
 		return d.S // canonical text IS the wire text
 	case Jsonb:
 		return d.S // normalized text IS the wire text
+	case IntervalFam:
+		return d.IntervalVal().String()
+	case Time:
+		return FormatClock(d.I)
+	case Enum:
+		return d.S
 	}
 	return ""
 }

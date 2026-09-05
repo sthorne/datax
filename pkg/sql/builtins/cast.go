@@ -92,6 +92,30 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			}
 			return v, nil
 		}
+	case "interval":
+		switch d.Fam {
+		case types.IntervalFam:
+			return d, nil
+		case types.String, types.Time:
+			iv, err := toInterval(d)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			return types.NewInterval(iv), nil
+		}
+	case "time", "time without time zone", "time with time zone", "timetz":
+		switch d.Fam {
+		case types.Time:
+			return d, nil
+		case types.String:
+			v, err := d.Coerce(types.Time)
+			if err != nil {
+				return types.Datum{}, errf(CodeInvalidDatetime, "%v", err)
+			}
+			return v, nil
+		case types.Timestamp, types.IntervalFam:
+			return d.Coerce(types.Time)
+		}
 	case "date":
 		switch d.Fam {
 		case types.Date:
@@ -143,12 +167,23 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 		}
 		return ToJSONB(d)
 	case "regclass", "name", "oid", "regtype", "regnamespace", "regproc", "regprocedure", "regrole", "regoper", "regoperator",
-		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring", "interval", "time", "timetz",
+		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring",
 		"aclitem", "pg_node_tree", "pg_lsn", "unknown", "any", "anyelement", "anyarray", "record", "void":
 		return d, nil
 	}
 	if strings.HasSuffix(name, "[]") {
-		return d, nil
+		fam, err := types.ParseType(name)
+		if err != nil {
+			return d, nil // an array of a type datax does not model: left as it is
+		}
+		if d.Fam == fam {
+			return d, nil
+		}
+		v, err := d.Coerce(fam)
+		if err != nil {
+			return types.Datum{}, errf(CodeInvalidText, "invalid input syntax for type %s: %v", strings.ToLower(fam.String()), err)
+		}
+		return v, nil
 	}
 	if _, err := types.ParseType(name); err != nil {
 		// Not a type datax models: leave the value as it is.
@@ -382,6 +417,8 @@ func CastFamily(typ string, in types.Family) types.Family {
 		return types.Float
 	case "timestamp with time zone", "timestamp without time zone":
 		return types.Timestamp
+	case "time without time zone", "time with time zone", "timetz":
+		return types.Time
 	}
 	if f, err := types.ParseType(name); err == nil {
 		return f

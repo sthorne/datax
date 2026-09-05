@@ -3,7 +3,6 @@ package sql
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -54,7 +53,7 @@ func (s *Session) execCreateDatabase(ctx context.Context, txn *kvclient.Txn, t *
 		}
 		return nil, err
 	}
-	log.Audit("database-ddl", "stmt", "CREATE DATABASE", "target", t.Name, "principal", s.user)
+	log.Audit("database-ddl", "stmt", "CREATE DATABASE", "target", t.Name, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "CREATE DATABASE"}, nil
 }
 
@@ -81,6 +80,9 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 		}
 		return nil, ToSQLError(err)
 	}
+	if err := s.checkOwner(ctx, txn, "database", db.Name, db.Owner); err != nil {
+		return nil, err
+	}
 	tables, err := s.cat.ListIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
@@ -99,7 +101,7 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 	if err := s.cat.DropDatabase(ctx, txn, db); err != nil {
 		return nil, err
 	}
-	log.Audit("database-ddl", "stmt", "DROP DATABASE", "target", t.Name, "tables", len(tables), "principal", s.user)
+	log.Audit("database-ddl", "stmt", "DROP DATABASE", "target", t.Name, "tables", len(tables), "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP DATABASE"}, nil
 }
 
@@ -114,13 +116,16 @@ func (s *Session) execAlterDatabase(ctx context.Context, txn *kvclient.Txn, t *p
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
+	if err := s.checkOwner(ctx, txn, "database", db.Name, db.Owner); err != nil {
+		return nil, err
+	}
 	if err := s.cat.RenameDatabase(ctx, txn, db, t.NewName); err != nil {
 		return nil, err
 	}
 	if s.database == t.Name {
 		s.database = t.NewName
 	}
-	log.Audit("database-ddl", "stmt", "ALTER DATABASE RENAME", "target", t.Name, "to", t.NewName, "principal", s.user)
+	log.Audit("database-ddl", "stmt", "ALTER DATABASE RENAME", "target", t.Name, "to", t.NewName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER DATABASE"}, nil
 }
 
@@ -155,15 +160,12 @@ func (s *Session) UseDatabase(ctx context.Context, name string) *Error {
 			return err
 		}
 		db = d
-		if s.user == "root" || !d.ConnectRestricted || d.HasPrivilege(s.user, catalog.PrivConnect) {
-			return nil
-		}
-		ok, err := s.isAdmin(ctx, txn)
+		ok, err := s.databasePrivAllowed(ctx, txn, d, catalog.PrivConnect)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return newErrf(CodeInsufficientPriv, "permission denied for database %q: CONNECT was revoked from PUBLIC and %q holds no grant", name, s.user)
+			return newErrf(CodeInsufficientPriv, "permission denied for database %q: CONNECT was revoked from PUBLIC and %q holds no grant", name, s.actor())
 		}
 		return nil
 	})
@@ -176,65 +178,4 @@ func (s *Session) UseDatabase(ctx context.Context, name string) *Error {
 	}
 	s.database = db.Name
 	return nil
-}
-
-// execGrantRevokeDatabase applies GRANT/REVOKE CREATE | CONNECT | ALL ON
-// DATABASE db TO user | PUBLIC. Only CONNECT has a PUBLIC form (the
-// default everyone has, revocable); CREATE is per user.
-func (s *Session) execGrantRevokeDatabase(ctx context.Context, txn *kvclient.Txn, t *parser.GrantRevoke, tag string) (*Result, error) {
-	if err := s.requireV6(ctx, txn); err != nil {
-		return nil, err
-	}
-	set := map[string]bool{}
-	for _, p := range t.Privileges {
-		switch p {
-		case "ALL":
-			set[catalog.PrivCreate], set[catalog.PrivConnect] = true, true
-		case catalog.PrivCreate, catalog.PrivConnect:
-			set[p] = true
-		default:
-			return nil, newErrf(CodeSyntaxError, "%s is not a database privilege (database privileges: CREATE, CONNECT, ALL)", p)
-		}
-	}
-	db, err := catalog.LookupDatabase(ctx, txn, t.Database)
-	if err != nil {
-		return nil, ToSQLError(err)
-	}
-	if db.ID == 0 {
-		return nil, errBeforeV6()
-	}
-	if t.User == "public" {
-		if set[catalog.PrivCreate] {
-			return nil, newErrf(CodeFeatureNotSupported, "CREATE cannot be granted to PUBLIC; grant it to a user")
-		}
-		db.ConnectRestricted = t.Revoke
-	} else {
-		if db.Privileges == nil {
-			db.Privileges = map[string][]string{}
-		}
-		cur := map[string]bool{}
-		for _, p := range db.Privileges[t.User] {
-			cur[p] = true
-		}
-		for p := range set {
-			cur[p] = !t.Revoke
-		}
-		var next []string
-		for p, on := range cur {
-			if on {
-				next = append(next, p)
-			}
-		}
-		sort.Strings(next)
-		if len(next) == 0 {
-			delete(db.Privileges, t.User)
-		} else {
-			db.Privileges[t.User] = next
-		}
-	}
-	if err := s.cat.UpdateDatabase(ctx, txn, db); err != nil {
-		return nil, err
-	}
-	log.Audit("privilege-ddl", "stmt", tag, "privileges", fmt.Sprint(t.Privileges), "database", t.Database, "target", t.User, "principal", s.user)
-	return &Result{Tag: tag}, nil
 }

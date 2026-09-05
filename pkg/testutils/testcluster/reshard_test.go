@@ -3,6 +3,7 @@ package testcluster
 import (
 	"context"
 	"fmt"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -314,7 +315,18 @@ func TestReshardWithSecondaryIndexes(t *testing.T) {
 	}
 	for name, id := range oldIndexIDs {
 		lo, hi := keys.TableIndexSpan(desc.ID, id)
-		rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+		// A raw (non-transactional) scan reports an intent instead of
+		// resolving it; the writer's last commit may still be resolving
+		// its old-layout intents asynchronously, so give that a moment.
+		var rows []kvpb.KeyValue
+		var err error
+		for deadline := time.Now().Add(20 * time.Second); ; {
+			rows, err = tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+			if err == nil || !strings.Contains(err.Error(), "write intents") || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}

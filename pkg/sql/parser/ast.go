@@ -123,10 +123,23 @@ type ColumnDef struct {
 	Identity    string
 	IdentitySeq *SequenceOptions
 	// Precision/Scale carry a DECIMAL(p,s) typmod (0 precision = bare
-	// DECIMAL, unconstrained). Typmods on other types are still accepted
-	// and ignored (documented).
-	Precision int32
-	Scale     int32
+	// DECIMAL, unconstrained). Width, MaxLen, Char, NoTZ and
+	// TimePrecision are the integer width (2/4, 0 = 8), the VARCHAR(n) /
+	// CHAR(n) length, CHAR padding, TIMESTAMP without time zone and
+	// TIMESTAMP(p) as p+1 (see TypeSpec).
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
+	// TypeName names a user-defined type (an enum) when Type is Enum;
+	// the executor resolves it.
+	TypeName string
+	// Hidden marks a system-managed column (CREATE TABLE AS's rowid
+	// primary key); never parsed.
+	Hidden bool
 	// Constraints are the column's UNIQUE, CHECK and REFERENCES clauses,
 	// as table constraints over this one column.
 	Constraints []ConstraintDef
@@ -159,7 +172,20 @@ type CreateTable struct {
 	Name        string
 	IfNotExists bool
 	Columns     []ColumnDef
-	PrimaryKey  []string // table-level constraint (column names)
+	// Like lists the LIKE source tables of the column list, in order,
+	// each expanded into columns (and, per its options, defaults,
+	// constraints and indexes) where it was written.
+	Like []LikeClause
+	// As is CREATE TABLE ... AS query: the table takes the query's
+	// output columns (Columns then holds at most the column names to
+	// use) and, unless NoData, its rows. AsText is the query as written.
+	As     *Select
+	AsText string
+	NoData bool
+	// AsColumns are the column names given before AS (CREATE TABLE t (a,
+	// b) AS ...), positional over the query's output.
+	AsColumns  []string
+	PrimaryKey []string // table-level constraint (column names)
 	// PrimaryKeyName is an explicit CONSTRAINT name on the primary key
 	// (accepted; the primary key is always named <table>_pkey).
 	PrimaryKeyName string
@@ -168,6 +194,66 @@ type CreateTable struct {
 	// names mapping to raw literal text (e.g. timeseries=true,
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
+}
+
+// LikeClause is LIKE source [INCLUDING | EXCLUDING option ...] inside a
+// CREATE TABLE column list. The primary key is always copied (a table
+// needs one); Defaults, Constraints and Indexes follow the options
+// (INCLUDING ALL sets every one). Position is the index in Columns
+// before which the copied columns go.
+type LikeClause struct {
+	Table       string
+	Defaults    bool
+	Constraints bool
+	Indexes     bool
+	Comments    bool
+	Position    int
+}
+
+// CommentOn is COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text'
+// | NULL. Kind is "table" (views too), "index" or "column"; Column is
+// the column name for Kind "column" (Name then names the table).
+type CommentOn struct {
+	Kind   string
+	Name   string
+	Column string
+	// Text is the comment; nil removes it (IS NULL).
+	Text *string
+}
+
+// SetType is ALTER [COLUMN] c [SET DATA] TYPE t: the column and the new
+// type with its modifiers (the ColumnDef fields).
+type SetType struct {
+	Column        string
+	Type          types.Family
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
+	TypeName      string
+}
+
+// TypeSpec is a parsed column type: the family and the modifiers datax
+// enforces. Width is an integer's width in bytes (2 for INT2 /
+// SMALLINT, 4 for INT4 / INT / INTEGER, 0 = 8 for INT8 / BIGINT);
+// MaxLen the VARCHAR(n) / CHAR(n) length (0 = unbounded) with Char set
+// for CHAR(n); NoTZ marks TIMESTAMP [WITHOUT TIME ZONE] as opposed to
+// TIMESTAMPTZ; Precision/Scale are DECIMAL(p,s); TimePrecision is
+// TIMESTAMP(p) stored as p+1 (0 = undeclared, so TIMESTAMP(0) is 1).
+type TypeSpec struct {
+	Family        types.Family
+	Precision     int32
+	Scale         int32
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
+	// TypeName is the name of a user-defined type (Family Enum).
+	TypeName string
 }
 
 // SequenceOptions are the options of CREATE / ALTER SEQUENCE and of an
@@ -200,24 +286,69 @@ type DropSequence struct {
 	IfExists bool
 }
 
-// AlterSequence is ALTER SEQUENCE name [options | RESTART [WITH n]].
+// AlterSequence is ALTER SEQUENCE [IF EXISTS] name [options | RESTART [WITH n]].
 type AlterSequence struct {
-	Name    string
-	Options SequenceOptions
+	Name     string
+	IfExists bool
+	Options  SequenceOptions
 }
 
 // ShowSequences is SHOW SEQUENCES.
 type ShowSequences struct{}
 
+// CreateType is CREATE TYPE [IF NOT EXISTS] name AS ENUM ('a', 'b', ...).
+type CreateType struct {
+	Name        string
+	IfNotExists bool
+	Labels      []string
+}
+
+// AlterType is ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'
+// (appended: BEFORE / AFTER are refused at parse).
+type AlterType struct {
+	Name           string
+	AddValue       string
+	IfNotExistsVal bool
+}
+
+// DropType is DROP TYPE [IF EXISTS] name.
+type DropType struct {
+	Name     string
+	IfExists bool
+}
+
 // ShowFunctions is SHOW FUNCTIONS: the builtin function reference.
 type ShowFunctions struct{}
 
-// CreateIndex is CREATE [UNIQUE] INDEX name ON table (cols).
+// CreateIndex is CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols).
 type CreateIndex struct {
-	Unique  bool
-	Name    string
-	Table   string
-	Columns []string
+	Unique      bool
+	IfNotExists bool
+	Name        string
+	Table       string
+	Columns     []string
+}
+
+// DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on
+// whichever table of the database carries it.
+type DropIndex struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterIndex is ALTER INDEX [IF EXISTS] [db.]name RENAME TO new.
+type AlterIndex struct {
+	Name     string
+	NewName  string
+	IfExists bool
+}
+
+// Truncate is TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE
+// IDENTITY] [CASCADE | RESTRICT].
+type Truncate struct {
+	Tables          []string
+	RestartIdentity bool
+	Cascade         bool
 }
 
 // Explain wraps a statement whose access plan should be described instead
@@ -449,6 +580,12 @@ type CTE struct {
 	Columns   []string
 	Query     Statement
 	Recursive bool
+	// Qualified is a second, database-qualified name the bound relation
+	// answers to (a view referenced as db.v; see pkg/sql/view.go).
+	Qualified string
+	// Definer, when set, is the role whose privileges the member's query
+	// runs with: a view's owner (pkg/sql/view.go).
+	Definer string
 }
 
 type Select struct {
@@ -516,11 +653,29 @@ type Update struct {
 	Returning []SelectExpr
 }
 
-// AlterTable is ALTER TABLE t ADD [COLUMN] def | DROP [COLUMN] name.
+// AlterTable is ALTER TABLE [IF EXISTS] t <action>: one of the fields
+// below is set.
 type AlterTable struct {
-	Table   string
-	AddCol  *ColumnDef // set for ADD COLUMN
-	DropCol string     // set for DROP COLUMN
+	Table string
+	// IfExists makes a missing table a no-op.
+	IfExists bool
+	AddCol   *ColumnDef // set for ADD COLUMN
+	DropCol  string     // set for DROP COLUMN
+	// AddColIfNotExists / DropColIfExists are ADD COLUMN IF NOT EXISTS /
+	// DROP COLUMN IF EXISTS: an existing / missing column is a no-op.
+	AddColIfNotExists bool
+	DropColIfExists   bool
+	// RenameTo is RENAME TO new; RenameCol and RenameConstraint are
+	// RENAME [COLUMN] a TO b and RENAME CONSTRAINT a TO b.
+	RenameTo         string
+	RenameCol        *Rename
+	RenameConstraint *Rename
+	// SetDefault is ALTER [COLUMN] c SET DEFAULT value; DropDefault is
+	// ALTER [COLUMN] c DROP DEFAULT (the column name).
+	SetDefault  *SetDefault
+	DropDefault string
+	// SetType is ALTER [COLUMN] c [SET DATA] TYPE t (an online rewrite).
+	SetType *SetType
 	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
 	// shards = N, the online re-shard.
 	SetOptions map[string]string
@@ -537,6 +692,34 @@ type AlterTable struct {
 	DropNotNull string
 }
 
+// CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
+type CreateView struct {
+	Name      string
+	Columns   []string
+	OrReplace bool
+	Query     *Select
+	// Text is the query's SQL as written; the view stores it.
+	Text string
+}
+
+// DropView is DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
+type DropView struct {
+	Names    []string
+	IfExists bool
+	Cascade  bool
+}
+
+// Rename is an old name and its replacement.
+type Rename struct{ From, To string }
+
+// SetDefault is a column's new default: a constant (Default) or an
+// expression (Expr), exactly as a column definition carries them.
+type SetDefault struct {
+	Column  string
+	Default *types.Datum
+	Expr    *Expr
+}
+
 type Delete struct {
 	With      []CTE
 	Table     string
@@ -544,29 +727,92 @@ type Delete struct {
 	Returning []SelectExpr
 }
 
-// CreateUser is CREATE USER / ALTER USER ... PASSWORD 'pw'.
-type CreateUser struct {
-	Name     string
-	Password string
-	Alter    bool // ALTER USER: the user must already exist
-}
-
-// DropUser is DROP USER name.
-type DropUser struct {
+// CreateRole is CREATE ROLE / CREATE USER / ALTER ROLE / ALTER USER
+// (issue #98). CREATE USER is CREATE ROLE ... LOGIN; the options are
+// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT and
+// IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
+// alone; CREATE applies the default).
+type CreateRole struct {
 	Name string
+	// Alter marks ALTER ROLE / ALTER USER: the role must already exist.
+	Alter bool
+	// IfNotExists is CREATE ... IF NOT EXISTS: an existing role is a no-op.
+	IfNotExists bool
+	// IsUser marks the USER spelling (LOGIN by default).
+	IsUser bool
+	Login  *bool
+	// Password: nil = not spelled; "" = PASSWORD NULL (no password).
+	Password *string
+	Inherit  *bool
+	// InRoles are the roles the new role is made a member of (IN ROLE).
+	InRoles []string
 }
 
-// GrantRevoke is GRANT/REVOKE: either the admin role
-// (GRANT ADMIN TO user / REVOKE ADMIN FROM user) or per-table privileges
-// (GRANT SELECT, INSERT ON t TO user / REVOKE ALL ON t FROM user).
+// DropRole is DROP ROLE / DROP USER [IF EXISTS] name [, ...].
+type DropRole struct {
+	Names    []string
+	IfExists bool
+}
+
+// GrantRevoke is GRANT / REVOKE in both forms: role membership
+// (GRANT admin TO alice [WITH ADMIN OPTION]; REVOKE [ADMIN OPTION FOR]
+// admin FROM alice) when Roles is set, and object privileges otherwise
+// (GRANT SELECT, INSERT ON t1, t2 TO alice, PUBLIC [WITH GRANT OPTION];
+// REVOKE [GRANT OPTION FOR] ALL ON ALL TABLES IN SCHEMA public FROM bob).
 type GrantRevoke struct {
-	Revoke     bool
-	Admin      bool     // admin-role form; Privileges/Table empty
-	Privileges []string // upper-cased: SELECT INSERT UPDATE DELETE ALL
-	// Database names the database for GRANT ... ON DATABASE (Table empty).
-	Database string
-	Table    string
-	User     string
+	Revoke bool
+
+	// Membership form.
+	Roles       []string
+	AdminOption bool
+
+	// Privilege form. Privileges are upper-cased (SELECT INSERT UPDATE
+	// DELETE TRUNCATE USAGE CREATE CONNECT; ALL stays "ALL"). ObjectKind
+	// is "table" (the default), "sequence", "database" or "schema";
+	// Objects the names, or — AllInSchema — every table / sequence of the
+	// public schema of the current database.
+	Privileges  []string
+	ObjectKind  string
+	Objects     []string
+	AllInSchema bool
+	// Grantees are role names, lower-cased; "public" is the pseudo-role.
+	Grantees []string
+	// GrantOption is WITH GRANT OPTION (GRANT) or GRANT OPTION FOR
+	// (REVOKE: only the option is revoked).
+	GrantOption bool
+}
+
+// AlterOwner is ALTER TABLE | VIEW | SEQUENCE | TYPE | DATABASE name
+// OWNER TO role.
+type AlterOwner struct {
+	Kind  string // table, view, sequence, type, database
+	Name  string
+	Owner string
+}
+
+// ReassignOwned is REASSIGN OWNED BY role [, ...] TO role.
+type ReassignOwned struct {
+	From []string
+	To   string
+}
+
+// DropOwned is DROP OWNED BY role [, ...] [CASCADE | RESTRICT].
+type DropOwned struct {
+	Roles   []string
+	Cascade bool
+}
+
+// AlterDefaultPrivileges is ALTER DEFAULT PRIVILEGES [FOR ROLE r [, ...]]
+// [IN SCHEMA public] GRANT privs ON TABLES | SEQUENCES TO grantee [, ...]
+// [WITH GRANT OPTION] (or REVOKE ... FROM ...). ForRoles empty means the
+// current user.
+type AlterDefaultPrivileges struct {
+	ForRoles    []string
+	Revoke      bool
+	Privileges  []string
+	ObjectKind  string // "tables" or "sequences"
+	Grantees    []string
+	GrantOption bool
 }
 
 type Begin struct{}
@@ -583,13 +829,18 @@ type RollbackToSavepoint struct{ Name string }
 type ShowTables struct{ Database string }
 
 // Show is one of the introspection statements: SHOW COLUMNS FROM t, SHOW
-// INDEXES FROM t, SHOW CREATE TABLE t, SHOW USERS, SHOW GRANTS [ON t]
-// [FOR user], SHOW ALL. Kind is "columns", "indexes", "create", "users",
+// INDEXES FROM t, SHOW CREATE TABLE | VIEW t, SHOW VIEWS, SHOW USERS, SHOW
+// GRANTS [ON t] [FOR user], SHOW ALL. Kind is "columns", "indexes", "create", "views", "users",
 // "grants", or "all".
 type Show struct {
 	Kind  string
 	Table string
 	User  string
+	// Database is SHOW GRANTS ON DATABASE d; OnRole is SHOW GRANTS ON ROLE
+	// [Role] (the membership listing).
+	Database string
+	OnRole   bool
+	Role     string
 }
 
 // Analyze collects table statistics (row count, per-column distinct
@@ -625,45 +876,66 @@ type ShowDatabases struct{}
 // Use is USE name (CockroachDB syntax for SET database = name).
 type Use struct{ Name string }
 
-// SetVar is `SET name = value` / `SET SESSION ...`: parsed and ignored
-// (clients send these at startup).
+// SetVar is SET [SESSION | LOCAL] name {TO | =} value, RESET name (Reset,
+// or RESET ALL with an empty Name), SET TIME ZONE x, SET NAMES x, SET
+// [SESSION CHARACTERISTICS AS] TRANSACTION ..., and SHOW name (Name
+// "show:name"). The session honors every variable it knows and refuses
+// the rest (42704).
 type SetVar struct {
 	Name string
-	// Value is the literal or identifier after = / TO, when there is one.
+	// Value is the literal, identifier, number or comma-joined list after
+	// = / TO ("DEFAULT" resets).
 	Value string
+	// Local marks SET LOCAL (the block's end restores the value).
+	Local bool
+	// Reset marks RESET name / RESET ALL.
+	Reset bool
 }
 
-func (*CreateTable) stmt()         {}
-func (*Show) stmt()                {}
-func (*CreateSequence) stmt()      {}
-func (*DropSequence) stmt()        {}
-func (*AlterSequence) stmt()       {}
-func (*ShowSequences) stmt()       {}
-func (*ShowFunctions) stmt()       {}
-func (*CreateIndex) stmt()         {}
-func (*Explain) stmt()             {}
-func (*DropTable) stmt()           {}
-func (*Insert) stmt()              {}
-func (*CopyFrom) stmt()            {}
-func (*Select) stmt()              {}
-func (*Update) stmt()              {}
-func (*Delete) stmt()              {}
-func (*AlterTable) stmt()          {}
-func (*CreateUser) stmt()          {}
-func (*DropUser) stmt()            {}
-func (*GrantRevoke) stmt()         {}
-func (*Begin) stmt()               {}
-func (*Commit) stmt()              {}
-func (*Savepoint) stmt()           {}
-func (*ReleaseSavepoint) stmt()    {}
-func (*RollbackToSavepoint) stmt() {}
-func (*Rollback) stmt()            {}
-func (*ShowTables) stmt()          {}
-func (*Analyze) stmt()             {}
-func (*ShowStats) stmt()           {}
-func (*SetVar) stmt()              {}
-func (*CreateDatabase) stmt()      {}
-func (*DropDatabase) stmt()        {}
-func (*AlterDatabase) stmt()       {}
-func (*ShowDatabases) stmt()       {}
-func (*Use) stmt()                 {}
+func (*CreateTable) stmt()            {}
+func (*Show) stmt()                   {}
+func (*CreateSequence) stmt()         {}
+func (*CreateType) stmt()             {}
+func (*AlterType) stmt()              {}
+func (*DropType) stmt()               {}
+func (*DropSequence) stmt()           {}
+func (*AlterSequence) stmt()          {}
+func (*ShowSequences) stmt()          {}
+func (*ShowFunctions) stmt()          {}
+func (*CreateIndex) stmt()            {}
+func (*DropIndex) stmt()              {}
+func (*CreateView) stmt()             {}
+func (*CommentOn) stmt()              {}
+func (*DropView) stmt()               {}
+func (*AlterIndex) stmt()             {}
+func (*Truncate) stmt()               {}
+func (*Explain) stmt()                {}
+func (*DropTable) stmt()              {}
+func (*Insert) stmt()                 {}
+func (*CopyFrom) stmt()               {}
+func (*Select) stmt()                 {}
+func (*Update) stmt()                 {}
+func (*Delete) stmt()                 {}
+func (*AlterTable) stmt()             {}
+func (*CreateRole) stmt()             {}
+func (*DropRole) stmt()               {}
+func (*GrantRevoke) stmt()            {}
+func (*AlterOwner) stmt()             {}
+func (*ReassignOwned) stmt()          {}
+func (*DropOwned) stmt()              {}
+func (*AlterDefaultPrivileges) stmt() {}
+func (*Begin) stmt()                  {}
+func (*Commit) stmt()                 {}
+func (*Savepoint) stmt()              {}
+func (*ReleaseSavepoint) stmt()       {}
+func (*RollbackToSavepoint) stmt()    {}
+func (*Rollback) stmt()               {}
+func (*ShowTables) stmt()             {}
+func (*Analyze) stmt()                {}
+func (*ShowStats) stmt()              {}
+func (*SetVar) stmt()                 {}
+func (*CreateDatabase) stmt()         {}
+func (*DropDatabase) stmt()           {}
+func (*AlterDatabase) stmt()          {}
+func (*ShowDatabases) stmt()          {}
+func (*Use) stmt()                    {}

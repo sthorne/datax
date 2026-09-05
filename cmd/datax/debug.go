@@ -1,26 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	osuser "os/user"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/pebble/vfs"
 
 	"github.com/sthorne/datax/pkg/base"
-	"github.com/sthorne/datax/pkg/cli"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
-	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -223,62 +218,26 @@ Re-run with --yes to proceed`)
 func runDebugStatus(args []string) error {
 	fs := flag.NewFlagSet("debug status", flag.ContinueOnError)
 	url := fs.String("url", "http://127.0.0.1:8080/status", "a node's /status URL")
-	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification")
-	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
-	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir)")
-	timeout := connectTimeoutFlag(fs)
+	hf := addHTTPClientFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	client := &http.Client{}
-	tlsCfg := &tls.Config{}
-	if *certsDir != "" {
-		var err error
-		if tlsCfg, err = security.LoadClientTLS(*certsDir, *certUser); err != nil {
-			return err
-		}
-	}
-	tlsCfg.InsecureSkipVerify = *insecureTLS
-	if *certsDir != "" || *insecureTLS {
-		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
-	}
-	kind := "http"
-	if *certsDir != "" {
-		kind = "http, TLS with client certificate"
-	}
-	// The document is small; fetch it whole under the connect timeout (the
-	// request context ends with the connect phase, so the body must be
-	// read inside it).
-	var body []byte
-	err := cli.Connect(context.Background(), nil, *url, kind, *timeout, func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, "GET", *url, nil)
-		if err != nil {
-			return err
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode != http.StatusOK {
-			return cli.ConnectedError{Err: fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))}
-		}
-		return nil
-	})
+	client, kind, err := hf.client()
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.Write(body)
+	// The document is small; fetch it whole under the connect timeout.
+	var body bytes.Buffer
+	if err := httpFetch(client, kind, *url, *hf.timeout, *hf.timeout, &body); err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(body.Bytes())
 	return err
 }
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|metadata|unsafe-recover|rotate-enc-key|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -290,6 +249,8 @@ func runDebug(args []string) error {
 		return runDebugUnsafeRecover(rest)
 	case "rotate-enc-key":
 		return runDebugRotateEncKey(rest)
+	case "profile":
+		return runDebugProfile(rest)
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")

@@ -159,10 +159,11 @@ func (t *Transport) Dial(nodeID base.NodeID) (*grpc.ClientConn, error) {
 // DialAddr opens a raw connection to an address (used for joins, before the
 // registry knows any node IDs). tlsCfg nil dials cleartext.
 func DialAddr(addr string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
+	sizes := grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessageBytes), grpc.MaxCallSendMsgSize(MaxMessageBytes))
 	if tlsCfg != nil {
-		return grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+		return grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)), sizes)
 	}
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), sizes)
 }
 
 // Probe establishes and immediately closes a connection to addr — the TCP

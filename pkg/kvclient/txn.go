@@ -354,6 +354,39 @@ func (t *Txn) proto() *kvpb.Transaction {
 	return &txn
 }
 
+// LockTimeoutError is the wait on a live conflicting transaction
+// exceeding the lock timeout the context carries (WithLockTimeout).
+type LockTimeoutError struct {
+	Waited time.Duration
+}
+
+func (e *LockTimeoutError) Error() string {
+	return fmt.Sprintf("lock timeout after %s waiting on a conflicting transaction", e.Waited)
+}
+
+// IsLockTimeout reports whether err is (or wraps) a LockTimeoutError.
+func IsLockTimeout(err error) bool {
+	var lt *LockTimeoutError
+	return errors.As(err, &lt)
+}
+
+type lockTimeoutKey struct{}
+
+// WithLockTimeout bounds how long operations under ctx wait on a live
+// conflicting intent before failing with a LockTimeoutError (0 = the
+// default budget only).
+func WithLockTimeout(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, lockTimeoutKey{}, d)
+}
+
+func lockTimeoutFrom(ctx context.Context) time.Duration {
+	d, _ := ctx.Value(lockTimeoutKey{}).(time.Duration)
+	return d
+}
+
 // conflictBudget bounds how long an operation waits on a live conflicting
 // transaction before surfacing a retryable error to the client. With
 // deadlock detection (cycles are found and broken in a few poll rounds),
@@ -631,6 +664,10 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 			t.publishWait(ctx, &pending.Txn)
 			if derr := t.detectDeadlock(ctx, pending); derr != nil {
 				return nil, derr // self chosen as deadlock victim
+			}
+			if lt := lockTimeoutFrom(ctx); lt > 0 && waited >= lt {
+				t.publishWait(ctx, nil)
+				return nil, &LockTimeoutError{Waited: waited}
 			}
 			if waited >= conflictBudget {
 				t.publishWait(ctx, nil)

@@ -208,6 +208,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_storage_backpressure_total` | increasing | writes are being shed — `datax_storage_backpressure_cause_total{cause=leader\|debt\|follower}` says which limit; see [Backpressure](#backpressure) |
 | `datax_storage_write_stalls_total` | increasing at all | Pebble hard-stalled writes; you're past backpressure |
 | `datax_storage_l0_sublevels` / `datax_storage_l0_files` | sustained ≥ 10 / ≥ 400 | compaction falling behind |
+| `datax_storage_block_cache_hits_total` / `_misses_total` | hit rate under ~90 % on a read-heavy node | the block cache is smaller than the read working set: `--cache-size` (the dashboard's storage section shows the rate and `datax_storage_bloom_hits_total` / `_misses_total`, the share of point reads the bloom filters answered) |
 | `datax_storage_compaction_debt_bytes` | growing without bound | ingest exceeds compaction budget |
 | `datax_storage_debt_gate` | 1 for long stretches | the compaction-debt gate is latched (writes shed with `cause=debt` until debt halves) |
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
@@ -224,7 +225,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
 | `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
-| `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard) |
+| `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard). `SET idle_in_transaction_session_timeout` (per session, or in the application's connection setup) ends such a connection and releases its intents; `SELECT pg_cancel_backend(pid)` / `pg_terminate_backend(pid)` with the pid from `pg_stat_activity` does it by hand, and `SET lock_timeout` bounds how long the blocked writers wait ([Session settings](sql.md#session-settings)) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
@@ -479,6 +480,25 @@ heavy loaders to the `ingest`
 nodes. Retention GC and re-shard backfills compete for the same LSM budget
 — schedule bulk loads away from them.
 
+## Profiles
+
+Every node serves Go's `net/http/pprof` under `/debug/pprof/` on its HTTP
+port, gated on the admin role in secure mode like the other drill-downs
+(a profile exposes statement text and key bytes). Mutex and block
+profiles are always on at low sampling rates (1 in 100 contended mutex
+events; blocking events of 10 ms and up), so contention is visible
+without a restart.
+
+```sh
+datax debug profile --kind cpu --seconds 30 --url http://10.0.0.1:8080 --certs-dir certs --user ops
+datax debug profile --kind heap|allocs|mutex|block|goroutine --url ...
+datax debug profile --kind trace --seconds 5 --url ...
+go tool pprof -http=:0 cpu.pprof
+```
+
+`datax bench ... --server-url http://10.0.0.1:8080 --server-profile cpu`
+pulls the node's CPU profile for exactly a benchmark run's duration.
+
 ## Benchmarking
 
 `datax bench` drives a running cluster over pgwire:
@@ -486,13 +506,28 @@ nodes. Retention GC and re-shard backfills compete for the same LSM budget
 ```sh
 datax bench kv --url ... --concurrency 16 --read-pct 95 --duration 30s
 datax bench bank [--for-update]           # contended transfers
-datax bench ingest --batch 100 --payload-bytes 256 [--rate N] [--metrics-url ...]
+datax bench ingest --keys random|sequential|uuid --batch 100 --payload-bytes 256 [--rate N]
 datax bench timeseries --series 1000 --shards 8
+datax bench index-join --preload 20000 --groups 1000   # secondary-index fan-out to wide rows
+datax bench scan --preload 20000                        # large result sets through pgwire
 ```
 
-`ingest` writes random keys (LSM stress); `timeseries` writes per-series
-monotone timestamps — the hot-tail shape — and is the honest way to compare
-`--shards` settings.
+`ingest` writes batches of keys (random for LSM stress); `timeseries`
+writes per-series monotone timestamps — the hot-tail shape — and is the
+honest way to compare `--shards` settings. Every run takes `--seed`
+(fixed by default, so two runs draw the same keys), `--json out.json`
+for a record with throughput, p50/p95/p99, errors, retries and the
+deltas of every server counter that moved (`--server-url` or
+`--metrics-url`), and `--cpuprofile` / `--memprofile` / `--trace` for
+the client.
+
+`make bench` runs the checked-in set (`bench/workloads.json`: the kv
+mixes, bank, three ingest key orders, timeseries, index-join, scan)
+against a fresh single-node store and a fresh 3-node local cluster and
+writes a record per workload; `datax bench compare BEFORE AFTER` prints
+the deltas and flags anything beyond ±5 %. `bench/README.md` says how a
+PR records its before/after; a nightly workflow runs the set on `main`
+and keeps the records as an artifact.
 
 Two counters show which commit fast path your workload rides:
 `datax_one_phase_commits_total` (single-range implicit transactions — one

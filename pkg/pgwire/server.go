@@ -31,9 +31,18 @@ type ServerOptions struct {
 	TLS *tls.Config
 	// Auth, when set, requires SCRAM-SHA-256; nil = trust.
 	Auth Authenticator
+	// CanLogin, when set, gates the certificate path too: a CA-verified
+	// client certificate authenticates its CommonName only when that
+	// role exists and may log in (false, nil = refused).
+	CanLogin func(ctx context.Context, user string) (bool, error)
 	// SlowStatementThreshold is the duration past which a statement is
 	// kept in the slow-statement ring (0 = the default, 500 ms).
 	SlowStatementThreshold time.Duration
+	// NodeID is encoded in every process ID this server hands out, so a
+	// CancelRequest that lands elsewhere is forwarded here; Forward
+	// carries one to the node a process ID names (nil: local only).
+	NodeID  int32
+	Forward func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error)
 }
 
 // Server accepts SQL client connections.
@@ -50,6 +59,7 @@ type Server struct {
 	// connection has been asked to finish.
 	draining atomic.Bool
 	act      *Activity
+	cancel   *cancelRegistry
 }
 
 // Activity exposes the server's client accounting.
@@ -57,7 +67,7 @@ func (s *Server) Activity() *Activity { return s.act }
 
 // Serve starts accepting connections on lis (returns immediately).
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
-	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold)}
+	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold), cancel: newCancelRegistry()}
 	stopper.AddCloser(func() { _ = lis.Close() })
 	go s.acceptLoop()
 	return s
@@ -80,6 +90,11 @@ func (s *Server) acceptLoop() {
 		}
 		c := newConn(nc, s.db, s.cat, s.opts)
 		c.act = s.act
+		c.srv = s
+		s.cancel.register(c, s.opts.NodeID)
+		c.session.BackendPID = c.pid
+		c.session.BackendControl = s.backendControl
+		c.session.SessionsHook = s.act.Sessions
 		s.mu.Lock()
 		s.conns[nc] = c
 		s.mu.Unlock()
@@ -88,9 +103,10 @@ func (s *Server) acceptLoop() {
 				s.mu.Lock()
 				delete(s.conns, nc)
 				s.mu.Unlock()
+				s.cancel.unregister(c)
 				_ = nc.Close()
 			}()
-			s.act.connOpened(c, nc.RemoteAddr().String())
+			s.act.connOpened(c, nc.RemoteAddr().String(), c.pid)
 			defer s.act.connClosed(c)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

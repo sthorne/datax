@@ -1,0 +1,13 @@
+{
+  "workloads": [
+    {"name": "kv-95-5",          "args": ["kv", "--read-pct", "95", "--preload", "10000", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},
+    {"name": "kv-50-50",         "args": ["kv", "--read-pct", "50", "--preload", "10000", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},
+    {"name": "bank",             "args": ["bank", "--preload", "1000", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},
+    {"name": "ingest-random",    "args": ["ingest", "--keys", "random", "--batch", "100", "--payload-bytes", "256", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
+    {"name": "ingest-sequential","args": ["ingest", "--keys", "sequential", "--batch", "100", "--payload-bytes", "256", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
+    {"name": "ingest-uuid",      "args": ["ingest", "--keys", "uuid", "--batch", "100", "--payload-bytes", "256", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
+    {"name": "timeseries",       "args": ["timeseries", "--series", "1000", "--shards", "8", "--batch", "100", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
+    {"name": "index-join",       "args": ["index-join", "--preload", "20000", "--groups", "1000", "--payload-bytes", "512", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},
+    {"name": "scan",             "args": ["scan", "--preload", "20000", "--payload-bytes", "256", "--concurrency", "4", "--duration", "20s", "--seed", "1"]}
+  ]
+}

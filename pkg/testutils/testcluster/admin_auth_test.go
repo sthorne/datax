@@ -162,7 +162,7 @@ func TestAdminRPCAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = c.Close(ctx)
-	if !rec.has("privilege-ddl", "GRANT", "ADMIN", "bob") {
+	if !rec.has("privilege-ddl", "GRANT", "admin", "bob") {
 		t.Fatalf("no privilege-ddl audit record for GRANT ADMIN; got %v", rec.events)
 	}
 	if resp := call("bob", cluster.AdminRequest{Op: "split", Key: keys.TableDataPrefix(971)}); resp.Error != "" {

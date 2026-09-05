@@ -19,8 +19,8 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/decimal"
-	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // resolveAsOf turns an AS OF SYSTEM TIME operand into a fixed timestamp:
@@ -59,7 +59,12 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 func resolveMaxStaleness(operand string, now, localClosed hlc.Timestamp) (hlc.Timestamp, error) {
 	d, err := time.ParseDuration(operand)
 	if err != nil {
-		return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration", operand)
+		// Interval text ('10 seconds', '1 minute'; a day is 24 hours).
+		iv, ierr := types.ParseInterval(operand)
+		if ierr != nil {
+			return hlc.Timestamp{}, fmt.Errorf("cannot interpret %q as a duration", operand)
+		}
+		d = time.Duration(iv.CmpValue())
 	}
 	if d <= 0 {
 		return hlc.Timestamp{}, fmt.Errorf("max staleness %q must be a positive duration", operand)
@@ -76,9 +81,24 @@ type ResultColumn struct {
 	Name string
 	Type types.Family
 	// Typmod is PostgreSQL's atttypmod for the column (0 = none, emitted
-	// as -1 on the wire). Set only when a real DECIMAL(p,s) column backs
-	// the output: ((p<<16) | (s+4)).
+	// as -1 on the wire). Set only when a real table column with a type
+	// modifier backs the output: ((p<<16) | (s+4)) for DECIMAL(p,s), n+4
+	// for VARCHAR(n) / CHAR(n), p for TIMESTAMP(p).
 	Typmod int32
+	// Width, MaxLen, Char and NoTZ carry the backing column's integer
+	// width (2 / 4, 0 = 8), character length, CHAR(n) padding and
+	// TIMESTAMP without time zone, which pick the wire type (int2 /
+	// int4 / int8, varchar / bpchar / text, timestamp / timestamptz) and
+	// its text rendering. Zero for computed columns.
+	Width         int32
+	MaxLen        int32
+	Char          bool
+	NoTZ          bool
+	TimePrecision int32
+	// EnumType and EnumName identify an enum column's type (the wire
+	// OID derives from the ID).
+	EnumType uint64
+	EnumName string
 }
 
 // DecimalTypmod encodes a DECIMAL(p,s) declaration as PostgreSQL's
@@ -109,10 +129,20 @@ const (
 type Session struct {
 	db  *kvclient.DB
 	cat *catalog.Accessor
-	// user is the authenticated SQL user ("root" for internal sessions).
-	// In insecure/trust mode it is the client-claimed name: privileges are
-	// enforced against it, but nothing verified the identity.
-	user string
+	// sessionUser is the authenticated SQL user ("root" for internal
+	// sessions). In insecure/trust mode it is the client-claimed name:
+	// privileges are enforced against it, but nothing verified the
+	// identity. user is the current role — the session user, or the role
+	// SET ROLE selected (current_user vs session_user).
+	sessionUser string
+	user        string
+	// privAs, when set, is the role privilege checks run as instead of
+	// user: a view's owner while its query executes (cte.go).
+	privAs string
+	// roleCache holds the effective role sets resolved in roleCacheTxn
+	// (privileges.go).
+	roleCache    map[string]catalog.RoleSet
+	roleCacheTxn *kvclient.Txn
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -120,6 +150,21 @@ type Session struct {
 	// the only one allowed to create or drop a system table.
 	system bool
 
+	// vars are the session variables (SET / RESET / SHOW); localVars
+	// holds the session's values while a transaction block's SET LOCAL
+	// overrides them; txnStartedReadOnly marks a block begun under
+	// default_transaction_read_only.
+	vars               sessionVars
+	localVars          *sessionVars
+	txnStartedReadOnly bool
+	// BackendPID is the wire's process ID for this session (0 for an
+	// internal one); BackendControl cancels (or terminates) another
+	// session by PID for pg_cancel_backend / pg_terminate_backend, and
+	// SessionsHook lists this node's sessions for SHOW SESSIONS and
+	// pg_stat_activity. The SQL server sets them.
+	BackendPID     int32
+	BackendControl func(pid int32, terminate bool) (bool, error)
+	SessionsHook   func() []SessionInfo
 	// cascadeLimit is SET foreign_key_cascade_limit (0 = the default);
 	// pendingWipes are indexes dropped by statements of this session
 	// whose entries are reclaimed once the statement commits.
@@ -149,13 +194,13 @@ type Session struct {
 // NewSession creates a root session (internal components, tests, tools).
 // The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase}
+	return &Session{db: db, cat: cat, sessionUser: "root", user: "root", database: catalog.DefaultDatabase, vars: defaultVars()}
 }
 
 // NewSystemSession creates the node's own root session, the one that may
 // create and drop system tables (the metrics recorder's).
 func NewSystemSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase, system: true}
+	return &Session{db: db, cat: cat, sessionUser: "root", user: "root", database: catalog.DefaultDatabase, system: true, vars: defaultVars()}
 }
 
 // NewSessionForUser creates a session for an authenticated user.
@@ -163,58 +208,50 @@ func NewSessionForUser(db *kvclient.DB, cat *catalog.Accessor, user string) *Ses
 	if user == "" {
 		user = "root"
 	}
-	return &Session{db: db, cat: cat, user: user, database: catalog.DefaultDatabase}
+	return &Session{db: db, cat: cat, sessionUser: user, user: user, database: catalog.DefaultDatabase, vars: defaultVars()}
 }
 
-// SetUser rebinds the session's user (pgwire sets it after startup).
+// SetUser rebinds the session's user (pgwire sets it after startup);
+// any SET ROLE is undone.
 func (s *Session) SetUser(user string) {
 	if user == "" {
 		user = "root"
 	}
-	s.user = user
+	s.sessionUser = user
+	s.vars.role = ""
+	s.applyRole()
 }
 
-// User returns the session's SQL user.
+// User returns the session's current role (current_user): the session
+// user unless SET ROLE changed it.
 func (s *Session) User() string { return s.user }
+
+// SessionUser returns the authenticated session user (session_user).
+func (s *Session) SessionUser() string { return s.sessionUser }
 
 // Database returns the session's current database.
 func (s *Session) Database() string { return s.database }
 
-// settings lists the session variables SHOW ALL and pg_settings report:
-// the wire's startup parameters plus the ones the session honors.
-func (s *Session) settings() [][2]string {
-	return [][2]string{
-		{"application_name", ""},
-		{"client_encoding", "UTF8"},
-		{"database", s.database},
-		{"DateStyle", "ISO"},
-		{"foreign_key_cascade_limit", strconv.Itoa(s.fkCascadeLimit())},
-		{"integer_datetimes", "on"},
-		{"search_path", catalog.PublicSchema},
-		{"server_encoding", "UTF8"},
-		{"server_version", "14.0 datax"},
-		{"standard_conforming_strings", "on"},
-		{"TimeZone", "UTC"},
-		{"transaction_isolation", "serializable"},
-	}
-}
+// ClusterVersion is the cluster version the session's gateway observes
+// (its version-gated DDL keys off this mirror, which starts at the floor
+// and catches up with the first heartbeat).
+func (s *Session) ClusterVersion() version.Version { return s.db.ClusterVersion() }
 
-// setting resolves a SHOW name (case-insensitively; SHOW TIME ZONE and
-// SHOW TRANSACTION ISOLATION LEVEL by their spelled-out forms) to the
-// setting's canonical name and value.
-func (s *Session) setting(name string) (string, string, bool) {
-	switch strings.ToLower(name) {
-	case "time_zone":
-		name = "TimeZone"
-	case "transaction_isolation_level":
-		name = "transaction_isolation"
+// FinalizedClusterVersion reads the replicated cluster version the
+// upgrade finalized (the value the gateway's mirror converges to).
+func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version, error) {
+	raw, err := s.db.Get(ctx, keys.ClusterVersionKey())
+	if err != nil {
+		return 0, err
 	}
-	for _, kv := range s.settings() {
-		if strings.EqualFold(kv[0], name) {
-			return kv[0], kv[1], true
-		}
+	if raw == nil {
+		return version.V1, nil
 	}
-	return "", "", false
+	v, err := strconv.Atoi(string(raw))
+	if err != nil {
+		return 0, err
+	}
+	return version.Version(v), nil
 }
 
 // lookup resolves a table name: a virtual catalog table (pg_catalog.x,
@@ -223,9 +260,17 @@ func (s *Session) setting(name string) (string, string, bool) {
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
 	db, bare := catalog.SplitTableName(name)
-	if db == "" && len(s.rels) > 0 {
-		if r, ok := s.rels[strings.ToLower(bare)]; ok {
-			return r.desc, nil // a WITH member shadows a table of its name
+	if len(s.rels) > 0 {
+		if db == "" {
+			if r, ok := s.rels[strings.ToLower(bare)]; ok {
+				return r.desc, nil // a WITH member shadows a table of its name
+			}
+		} else {
+			for _, r := range s.rels {
+				if r.alias != "" && r.alias == strings.ToLower(name) {
+					return r.desc, nil // a view referenced by its qualified name
+				}
+			}
 		}
 	}
 	if vtable.IsSchema(db) {
@@ -234,7 +279,17 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		}
 		return nil, &catalog.ErrTableNotFound{Name: name}
 	}
-	d, err := s.cat.LookupIn(ctx, txn, s.database, name)
+	// A descriptor this transaction's DDL wrote is read through the
+	// transaction and never cached: the cache is shared with other
+	// sessions on the gateway and must not carry uncommitted state, and
+	// a rollback must not leave the phantom behind.
+	var d *catalog.TableDescriptor
+	var err error
+	if s.state == StateOpen && s.ddlTouched(name) {
+		d, err = s.cat.LookupFreshIn(ctx, txn, s.database, name)
+	} else {
+		d, err = s.cat.LookupIn(ctx, txn, s.database, name)
+	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -271,7 +326,7 @@ func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
 // the tables the session may see (all of them for admins; for others,
 // the tables they hold a privilege on), statistics, users and admins.
 func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.Env, error) {
-	env := &vtable.Env{User: s.user, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Admins: map[string]bool{}}
+	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -280,18 +335,21 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 	if env.Sequences, err = catalog.ListSequences(ctx, txn, 0); err != nil {
 		return nil, err
 	}
+	if env.Types, err = catalog.ListTypes(ctx, txn, 0); err != nil {
+		return nil, err
+	}
 	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) { return s.sequenceValue(ctx, sd) }
-	admin, err := s.isAdmin(ctx, txn)
+	set, err := s.roleSet(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
-	env.IsAdmin = admin
+	env.IsAdmin = set.IsAdmin()
 	all, err := s.cat.List(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
 	for _, d := range all {
-		if !admin && len(d.Privileges[s.user]) == 0 {
+		if !canSeeTable(set, d) {
 			continue
 		}
 		env.Tables = append(env.Tables, d)
@@ -299,28 +357,15 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 			env.Stats[d.ID] = st
 		}
 	}
-	lo, hi := keys.UserSpan()
-	users, err := txn.Scan(ctx, lo, hi, 0)
+	roles, err := catalog.ListRoles(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
-	env.Users = []string{"root"}
-	for _, kv := range users {
-		if _, name, derr := encoding.DecodeString(kv.Key[len(lo):]); derr == nil && name != "root" {
-			env.Users = append(env.Users, name)
-		}
-	}
-	alo, ahi := keys.AdminUserSpan()
-	admins, err := txn.Scan(ctx, alo, ahi, 0)
-	if err != nil {
-		return nil, err
-	}
-	for _, kv := range admins {
-		if _, name, derr := encoding.DecodeString(kv.Key[len(alo):]); derr == nil {
-			env.Admins[name] = true
-		}
-	}
+	env.Roles = roles
 	env.Settings = s.settings()
+	if s.SessionsHook != nil {
+		env.Sessions = s.SessionsHook()
+	}
 	return env, nil
 }
 
@@ -405,9 +450,30 @@ func (s *Session) Close(ctx context.Context) {
 	s.state = StateIdle
 }
 
-// Execute runs one parsed statement with the given parameter values.
-func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+// Execute runs one parsed statement with the given parameter values,
+// under the session's statement_timeout and lock_timeout.
+func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
+	s.invalidateRoles()
+	if d := s.vars.statementTimeout; d > 0 {
+		parent := ctx
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+		defer func() {
+			// The message names the statement timeout only when it is
+			// what fired; the caller's own deadline is its request.
+			if serr != nil && serr.Code == CodeQueryCanceled && parent.Err() != nil {
+				serr = &Error{Code: CodeQueryCanceled, Msg: "canceling statement due to user request"}
+			}
+		}()
+	}
+	if d := s.vars.lockTimeout; d > 0 {
+		ctx = kvclient.WithLockTimeout(ctx, d)
+	}
+	if serr := s.readOnlyViolation(stmt); serr != nil {
+		return nil, serr
+	}
 	// A failed transaction accepts only ROLLBACK (or COMMIT, which also
 	// rolls back) — and ROLLBACK TO SAVEPOINT, which escapes the failed
 	// state by restoring the savepoint (PostgreSQL semantics).
@@ -431,6 +497,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		}
 		s.txn = s.db.NewTxn("sql")
 		s.state = StateOpen
+		s.txnStartedReadOnly = s.vars.defaultReadOnly
 		return &Result{Tag: "BEGIN"}, nil
 
 	case *parser.Commit:
@@ -440,11 +507,14 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		err := s.txn.Commit(ctx)
 		s.txn = nil
 		s.state = StateIdle
+		s.endTxnVars()
 		pending := s.pendingDDL
-		s.pendingDDL = nil
 		if err != nil {
+			s.forgetDDL()
+			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 			return nil, ToSQLError(err)
 		}
+		s.pendingDDL = nil
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
@@ -491,19 +561,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			}
 			return &Result{Columns: []ResultColumn{{Name: name, Type: types.String}}, Rows: [][]types.Datum{{types.NewString(value)}}, Tag: "SHOW"}, nil
 		}
-		if t.Name == "database" {
-			if serr := s.UseDatabase(ctx, t.Value); serr != nil {
-				return nil, serr
-			}
-		}
-		if t.Name == "foreign_key_cascade_limit" {
-			n, err := strconv.Atoi(strings.Trim(t.Value, "'"))
-			if err != nil || n < 1 {
-				return nil, newErrf(CodeInvalidParameterValue, "foreign_key_cascade_limit must be a positive integer, not %q", t.Value)
-			}
-			s.cascadeLimit = n
-		}
-		return &Result{Tag: "SET"}, nil
+		return s.execSetVar(ctx, t)
 	case *parser.Use:
 		if serr := s.UseDatabase(ctx, t.Name); serr != nil {
 			return nil, serr
@@ -527,19 +585,32 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
 	// and then sweep the existing rows: multi-transaction, like CREATE
 	// INDEX.
+	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil || at.SetType != nil) && !s.tableExists(ctx, at.Table) {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	// CREATE TABLE ... AS and ALTER COLUMN TYPE are multi-transaction
+	// statements too: refused in a block, admin-only.
+	if ct, ok := stmt.(*parser.CreateTable); ok && ct.As != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "CREATE TABLE ... AS cannot run inside a transaction block")
+		}
+		return s.execCreateTableAs(ctx, ct, params)
+	}
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SetType != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ALTER COLUMN TYPE cannot run inside a transaction block")
+		}
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
+		}
+		return s.execRetypeOnline(ctx, at)
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "") {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
 		}
 		switch {
 		case at.AddConstraint != nil:
@@ -555,15 +626,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
 		}
 		if _, ok := at.SetOptions["retention"]; ok {
 			res, rerr := s.execSetRetention(ctx, at)
@@ -588,15 +652,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
 		}
-		var aerr error
-		if err := s.db.RunTxn(ctx, "admin-check", func(ctx context.Context, txn *kvclient.Txn) error {
-			aerr = s.checkAdmin(ctx, txn)
-			return nil
-		}); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if aerr != nil {
-			return nil, ToSQLError(aerr)
+		if serr := s.checkTableOwnerNoTxn(ctx, ci.Table); serr != nil {
+			return nil, serr
 		}
 		return s.execCreateIndexOnline(ctx, ci)
 	}
@@ -725,8 +782,34 @@ func (s *Session) rollback(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
+	s.endTxnVars()
+	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.state = StateIdle
+}
+
+// ddlTouched reports whether the open transaction's DDL changed name.
+func (s *Session) ddlTouched(name string) bool {
+	_, bare := catalog.SplitTableName(name)
+	for _, lists := range [][]string{s.pendingDDL, s.extraDDL} {
+		for _, n := range lists {
+			if _, b := catalog.SplitTableName(n); strings.EqualFold(b, bare) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// forgetDDL drops the cache entries of the tables the transaction's DDL
+// touched (a rollback, or a failed commit): what the cache holds for
+// them may be the transaction's own uncommitted view.
+func (s *Session) forgetDDL() {
+	for _, lists := range [][]string{s.pendingDDL, s.extraDDL} {
+		for _, n := range lists {
+			s.cat.Invalidate(n)
+		}
+	}
 }
 
 // evalExpr evaluates an expression given an optional row context.
@@ -852,7 +935,13 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	}
 	switch op {
 	case "||":
-		return types.NewString(l.Text() + r.Text()), nil
+		if l.Fam.IsArray() || r.Fam.IsArray() {
+			d, err := builtins.ConcatArrays(l, r)
+			return d, builtinErr(err)
+		}
+		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
+		// bpchar-to-text cast strips the padding.
+		return types.NewString(concatText(l) + concatText(r)), nil
 	case "%":
 		d, err := builtins.Mod(l, r)
 		return d, builtinErr(err)
@@ -1130,14 +1219,27 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			continue
 		}
 		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			rhs, err := evalExpr(cmp.Value, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if cmpType.IsArray() || lhs.Fam.IsArray() {
+				if lhs.Null || rhs.Null {
+					return false, nil
+				}
+				ok, aerr := builtins.ArrayOp("@>", lhs, rhs)
+				if aerr != nil {
+					return false, builtinErr(aerr)
+				}
+				if ok != (cmp.Op == "@>") {
+					return false, nil
+				}
+				continue
+			}
 			// JSONB containment. The left side (post-path) must be jsonb —
 			// a terminal ->> produces text and is refused.
 			if cmpType != types.Jsonb {
 				return false, newErrf(CodeFeatureNotSupported, "@> requires jsonb operands (%s is %s)", cmp.Column, cmpType)
-			}
-			rhs, err := evalExpr(cmp.Value, desc, row, params)
-			if err != nil {
-				return false, err
 			}
 			if lhs.Null || rhs.Null {
 				return false, nil // NULL operands: UNKNOWN either way
@@ -1172,8 +1274,17 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			}
 			continue
 		}
-		rhs, err = rhs.Coerce(cmpType)
-		if err != nil {
+		if cmpType == types.Enum && len(cmp.Path) == 0 {
+			// A literal against an enum column: the label resolves through
+			// the column (an unknown one is 22P02, as in PostgreSQL).
+			if col, ok := desc.Col(cmp.Column); ok {
+				if v, cerr := col.EnumValue(rhs); cerr != nil {
+					return false, ToSQLError(cerr)
+				} else {
+					rhs = v
+				}
+			}
+		} else if rhs, err = rhs.Coerce(cmpType); err != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, err)
 		}
 		c, err := lhs.Compare(rhs)
@@ -1425,6 +1536,10 @@ func conds3(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool,
 // (the key or string element exists), ?| and ?& (any / all of a text
 // array of keys exist).
 func jsonOp(op string, lhs, rhs types.Datum) (bool, error) {
+	if lhs.Fam.IsArray() || rhs.Fam.IsArray() || op == "&&" {
+		ok, err := builtins.ArrayOp(op, lhs, rhs)
+		return ok, builtinErr(err)
+	}
 	l, err := lhs.Coerce(types.Jsonb)
 	if err != nil {
 		return false, newErrf(CodeFeatureNotSupported, "%s requires a jsonb left operand (got %s)", op, lhs.Fam)
@@ -1475,6 +1590,15 @@ func decodeJSONValue(s string) (any, error) {
 
 // builtinErr converts a builtins error into a SQL error with its
 // SQLSTATE (nil stays nil).
+// concatText renders a || operand: a padded CHAR(n) value contributes
+// its trimmed text.
+func concatText(d types.Datum) string {
+	if d.Fam == types.String {
+		return d.S
+	}
+	return d.Text()
+}
+
 func builtinErr(err error) error {
 	if err == nil {
 		return nil
@@ -1572,7 +1696,7 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		m := re.MatchString(lhs.Text())
 		return m == !strings.HasPrefix(op, "NOT"), nil
-	case "@>", "NOT @>", "<@", "NOT <@", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
+	case "@>", "NOT @>", "<@", "NOT <@", "&&", "NOT &&", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
 		ok, err := jsonOp(strings.TrimPrefix(op, "NOT "), lhs, rhs)
 		if err != nil {
 			return false, err
@@ -1580,11 +1704,22 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		return ok == !strings.HasPrefix(op, "NOT "), nil
 	}
 	if i := strings.IndexByte(op, ' '); i >= 0 {
-		// Quantified comparison over a text array value ('{a,b}'): ANY
-		// holds when some element does, ALL when every element does.
+		// Quantified comparison over an array value (or a text array
+		// literal '{a,b}'): ANY holds when some element does, ALL when
+		// every element does.
 		base, quant := op[:i], op[i+1:]
-		for _, el := range arrayElems(rhs.Text()) {
-			ed := types.NewString(el)
+		var elems []types.Datum
+		if rhs.Fam.IsArray() {
+			elems = rhs.A
+		} else {
+			for _, el := range arrayElems(rhs.Text()) {
+				elems = append(elems, types.NewString(el))
+			}
+		}
+		for _, ed := range elems {
+			if ed.Null {
+				continue // never holds, never fails (three-valued: UNKNOWN)
+			}
 			if c, err := ed.Coerce(lhs.Fam); err == nil {
 				ed = c
 			}
@@ -1794,6 +1929,14 @@ func matchesIn(cmp parser.Comparison, cmpType types.Family, lhs types.Datum, des
 		}
 		if d.Null {
 			hasNull = true
+			continue
+		}
+		if cmpType == types.Enum {
+			// A label matches by text (Compare handles enum against text).
+			if c, err := d.Compare(lhs); err == nil && c == 0 {
+				matched = true
+				break
+			}
 			continue
 		}
 		d, cerr := d.Coerce(cmpType)

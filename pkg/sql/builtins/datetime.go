@@ -3,7 +3,6 @@ package builtins
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,207 +12,34 @@ import (
 
 const catTime = "Date and time"
 
-// Interval is a PostgreSQL-style interval: months and days are kept
-// apart from the clock part because their length varies (adding one
-// month to January 31 lands on February 28).
-type Interval struct {
-	Months int64
-	Days   int64
-	Nanos  int64
-}
+// Interval is the INTERVAL value (types.Interval): months and days kept
+// apart from the clock part.
+type Interval = types.Interval
 
-var intervalUnitRE = regexp.MustCompile(`(?i)^([+-]?\d+(?:\.\d+)?)\s*([a-z]+)$`)
-
-// ParseInterval reads PostgreSQL's verbose interval syntax: "1 day",
-// "2 hours 30 minutes", "1 year 2 months", "3 weeks", "-1 day",
-// "1 day 02:03:04", "02:03:04", "1.5 hours", and the ISO 8601 form
-// "P1Y2M3DT4H5M6S".
+// ParseInterval reads PostgreSQL's interval syntaxes (types.ParseInterval)
+// and reports a failure as 22007.
 func ParseInterval(s string) (Interval, error) {
-	var iv Interval
-	text := strings.TrimSpace(s)
-	if text == "" {
-		return iv, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q", s)
-	}
-	if strings.HasPrefix(strings.ToUpper(text), "P") {
-		return parseISOInterval(text)
-	}
-	fields := strings.Fields(text)
-	sign := int64(1)
-	for i := 0; i < len(fields); i++ {
-		f := fields[i]
-		if strings.EqualFold(f, "ago") && i == len(fields)-1 {
-			iv.Months, iv.Days, iv.Nanos = -iv.Months, -iv.Days, -iv.Nanos
-			break
-		}
-		if strings.Contains(f, ":") {
-			n, err := parseClock(f)
-			if err != nil {
-				return iv, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q", s)
-			}
-			iv.Nanos += sign * n
-			continue
-		}
-		// "2 hours" as two fields, or "2hours" / "2h" as one.
-		num, unit := f, ""
-		if m := intervalUnitRE.FindStringSubmatch(f); m != nil {
-			num, unit = m[1], m[2]
-		} else if i+1 < len(fields) {
-			unit = fields[i+1]
-			i++
-		}
-		if unit == "" {
-			return iv, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q", s)
-		}
-		q, err := strconv.ParseFloat(num, 64)
-		if err != nil {
-			return iv, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q", s)
-		}
-		if q < 0 {
-			sign = -1
-		}
-		if err := iv.add(q, unit); err != nil {
-			return iv, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q (%v)", s, err)
-		}
+	iv, err := types.ParseInterval(s)
+	if err != nil {
+		return iv, errf(CodeInvalidDatetime, "%v", err)
 	}
 	return iv, nil
 }
 
-func parseClock(f string) (int64, error) {
-	neg := strings.HasPrefix(f, "-")
-	f = strings.TrimPrefix(strings.TrimPrefix(f, "-"), "+")
-	parts := strings.Split(f, ":")
-	if len(parts) < 2 || len(parts) > 3 {
-		return 0, fmt.Errorf("bad clock")
-	}
-	var n int64
-	units := []int64{int64(time.Hour), int64(time.Minute), int64(time.Second)}
-	for i, p := range parts {
-		v, err := strconv.ParseFloat(p, 64)
-		if err != nil {
-			return 0, err
-		}
-		n += int64(math.Round(v * float64(units[i])))
-	}
-	if neg {
-		n = -n
-	}
-	return n, nil
-}
+// AddInterval shifts a timestamp by sign × an interval (Interval.AddTo).
+func AddInterval(t time.Time, iv Interval, sign int64) time.Time { return iv.AddTo(t, sign) }
 
-func (iv *Interval) add(q float64, unit string) error {
-	u := strings.ToLower(strings.TrimSuffix(unit, "s"))
-	switch u {
-	case "millennium", "millennia":
-		iv.Months += int64(q * 12000)
-	case "century", "centurie", "c":
-		iv.Months += int64(q * 1200)
-	case "decade", "dec":
-		iv.Months += int64(q * 120)
-	case "year", "yr", "y":
-		iv.Months += int64(q * 12)
-	case "month", "mon":
-		iv.Months += int64(q)
-		iv.Days += int64((q - math.Trunc(q)) * 30)
-	case "week", "w":
-		iv.Days += int64(q * 7)
-	case "day", "d":
-		whole := math.Trunc(q)
-		iv.Days += int64(whole)
-		iv.Nanos += int64((q - whole) * 24 * float64(time.Hour))
-	case "hour", "hr", "h":
-		iv.Nanos += int64(q * float64(time.Hour))
-	case "minute", "min", "m":
-		iv.Nanos += int64(q * float64(time.Minute))
-	case "second", "sec", "":
-		iv.Nanos += int64(q * float64(time.Second))
-	case "millisecond", "msec", "ms":
-		iv.Nanos += int64(q * float64(time.Millisecond))
-	case "microsecond", "usec", "us":
-		iv.Nanos += int64(q * float64(time.Microsecond))
-	default:
-		return fmt.Errorf("unknown unit %q", unit)
+// toInterval reads an INTERVAL argument, or text in interval syntax.
+func toInterval(d types.Datum) (Interval, error) {
+	switch d.Fam {
+	case types.IntervalFam:
+		return d.IntervalVal(), nil
+	case types.String:
+		return ParseInterval(d.S)
+	case types.Time:
+		return Interval{Nanos: d.I}, nil
 	}
-	return nil
-}
-
-var isoRE = regexp.MustCompile(`(?i)^P(?:(-?\d+)Y)?(?:(-?\d+)M)?(?:(-?\d+)W)?(?:(-?\d+)D)?(?:T(?:(-?\d+)H)?(?:(-?\d+)M)?(?:(-?\d+(?:\.\d+)?)S)?)?$`)
-
-func parseISOInterval(s string) (Interval, error) {
-	m := isoRE.FindStringSubmatch(s)
-	if m == nil {
-		return Interval{}, errf(CodeInvalidDatetime, "invalid input syntax for type interval: %q", s)
-	}
-	var iv Interval
-	get := func(i int) float64 {
-		if m[i] == "" {
-			return 0
-		}
-		v, _ := strconv.ParseFloat(m[i], 64)
-		return v
-	}
-	iv.Months = int64(get(1))*12 + int64(get(2))
-	iv.Days = int64(get(3))*7 + int64(get(4))
-	iv.Nanos = int64(get(5)*float64(time.Hour) + get(6)*float64(time.Minute) + get(7)*float64(time.Second))
-	return iv, nil
-}
-
-// String renders the interval as PostgreSQL does: "1 year 2 mons 3
-// days 04:05:06".
-func (iv Interval) String() string {
-	var parts []string
-	years, months := iv.Months/12, iv.Months%12
-	if years != 0 {
-		parts = append(parts, plural(years, "year"))
-	}
-	if months != 0 {
-		parts = append(parts, plural(months, "mon"))
-	}
-	if iv.Days != 0 {
-		parts = append(parts, plural(iv.Days, "day"))
-	}
-	if iv.Nanos != 0 || len(parts) == 0 {
-		n := iv.Nanos
-		sign := ""
-		if n < 0 {
-			sign, n = "-", -n
-		}
-		h := n / int64(time.Hour)
-		n -= h * int64(time.Hour)
-		mi := n / int64(time.Minute)
-		n -= mi * int64(time.Minute)
-		sec := n / int64(time.Second)
-		n -= sec * int64(time.Second)
-		clock := fmt.Sprintf("%s%02d:%02d:%02d", sign, h, mi, sec)
-		if n != 0 {
-			clock += strings.TrimRight(fmt.Sprintf(".%09d", n), "0")
-		}
-		parts = append(parts, clock)
-	}
-	return strings.Join(parts, " ")
-}
-
-func plural(n int64, unit string) string {
-	if n == 1 {
-		return fmt.Sprintf("%d %s", n, unit)
-	}
-	return fmt.Sprintf("%d %ss", n, unit)
-}
-
-// AddInterval shifts a timestamp by an interval: months on the
-// calendar with the day clamped to the target month's length (January
-// 31 + 1 month is February 29, not March 2), then days, then the clock
-// part.
-func AddInterval(t time.Time, iv Interval, sign int64) time.Time {
-	if m := sign * iv.Months; m != 0 {
-		y, mo, d := t.Date()
-		total := int64(y)*12 + int64(mo) - 1 + m
-		ny, nm := int(total/12), time.Month(total%12+1)
-		if last := time.Date(ny, nm+1, 0, 0, 0, 0, 0, time.UTC).Day(); d > last {
-			d = last
-		}
-		t = time.Date(ny, nm, d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
-	}
-	return t.AddDate(0, 0, int(sign*iv.Days)).Add(time.Duration(sign * iv.Nanos))
+	return Interval{}, errf(CodeUndefined, "function does not exist for argument type %s", strings.ToLower(d.Fam.String()))
 }
 
 // Between is the interval from a to b as age() computes it: whole
@@ -250,47 +76,81 @@ func dateDatum(t time.Time) types.Datum {
 	return types.NewDate(floorDiv(t.UTC().Unix(), 86400))
 }
 
-// DateArith evaluates l op r when a side is a date or timestamp:
-// ± an interval (text), date ± days, date − date (days), timestamp −
-// timestamp (an interval, as text). ok is false when the operands are
-// not a date/time shape.
+// DateArith evaluates l op r when a side is a date, timestamp, time or
+// interval: timestamp / date ± interval (an INTERVAL value or text),
+// date ± days, date − date (days), timestamp − timestamp and time − time
+// (intervals), interval ± interval, interval × / number, time ±
+// interval (wrapping at midnight), date + time (a timestamp). ok is
+// false when the operands are not a date/time shape.
 func DateArith(l types.Datum, op string, r types.Datum) (types.Datum, bool, error) {
 	temporal := func(d types.Datum) bool { return d.Fam == types.Timestamp || d.Fam == types.Date }
-	if !temporal(l) && !temporal(r) {
+	isNum := func(d types.Datum) bool { return d.Fam == types.Int || d.Fam == types.Float || d.Fam == types.Decimal }
+	if !temporal(l) && !temporal(r) && l.Fam != types.IntervalFam && r.Fam != types.IntervalFam && l.Fam != types.Time && r.Fam != types.Time {
 		return types.Datum{}, false, nil
 	}
-	if op != "+" && op != "-" {
+	if op != "+" && op != "-" && op != "*" && op != "/" {
 		return types.Datum{}, false, nil
 	}
-	// interval + date/timestamp commutes.
-	if !temporal(l) && op == "+" {
+	sign := int64(1)
+	if op == "-" {
+		sign = -1
+	}
+	// interval + date/timestamp/time and number × interval commute.
+	if (!temporal(l) && l.Fam != types.Time && l.Fam != types.IntervalFam && op == "+") ||
+		(l.Fam != types.IntervalFam && r.Fam == types.IntervalFam && op == "*") ||
+		(l.Fam == types.IntervalFam && (r.Fam == types.Time || temporal(r)) && op == "+") {
 		l, r = r, l
 	}
 	switch {
+	case l.Fam == types.IntervalFam && r.Fam == types.IntervalFam && (op == "+" || op == "-"):
+		iv := r.IntervalVal()
+		if op == "-" {
+			iv = iv.Neg()
+		}
+		return types.NewInterval(l.IntervalVal().Add(iv)), true, nil
+	case l.Fam == types.IntervalFam && isNum(r) && (op == "*" || op == "/"):
+		f, err := numeric(r)
+		if err != nil {
+			return types.Datum{}, true, err
+		}
+		if op == "/" {
+			if f == 0 {
+				return types.Datum{}, true, errf(CodeDivisionByZero, "division by zero")
+			}
+			f = 1 / f
+		}
+		return types.NewInterval(l.IntervalVal().Scale(f)), true, nil
+	case l.Fam == types.Time && r.Fam == types.Time && op == "-":
+		return types.NewInterval(Interval{Nanos: l.I - r.I}), true, nil
+	case l.Fam == types.Time && (r.Fam == types.IntervalFam || r.Fam == types.String) && (op == "+" || op == "-"):
+		iv, err := toInterval(r)
+		if err != nil {
+			return types.Datum{}, true, err
+		}
+		n := (l.I + sign*iv.Nanos) % types.NanosPerDay
+		if n < 0 {
+			n += types.NanosPerDay
+		}
+		return types.NewTime(n), true, nil
+	case l.Fam == types.Date && r.Fam == types.Time && op == "+":
+		return types.NewTimestamp(l.I*types.NanosPerDay + r.I), true, nil
 	case l.Fam == types.Date && r.Fam == types.Date && op == "-":
 		return types.NewInt(l.I - r.I), true, nil
 	case l.Fam == types.Timestamp && temporal(r) && op == "-", l.Fam == types.Date && r.Fam == types.Timestamp && op == "-":
 		lt, rt := temporalTime(l), temporalTime(r)
 		d := lt.Sub(rt)
 		days := int64(d / (24 * time.Hour))
-		return types.NewString(Interval{Days: days, Nanos: int64(d - time.Duration(days)*24*time.Hour)}.String()), true, nil
-	case l.Fam == types.Date && r.Fam == types.Int:
-		if op == "-" {
-			return types.NewDate(l.I - r.I), true, nil
-		}
-		return types.NewDate(l.I + r.I), true, nil
-	case temporal(l) && r.Fam == types.String:
-		iv, err := ParseInterval(r.S)
+		return types.NewInterval(Interval{Days: days, Nanos: int64(d - time.Duration(days)*24*time.Hour)}), true, nil
+	case l.Fam == types.Date && r.Fam == types.Int && (op == "+" || op == "-"):
+		return types.NewDate(l.I + sign*r.I), true, nil
+	case temporal(l) && (r.Fam == types.String || r.Fam == types.IntervalFam) && (op == "+" || op == "-"):
+		iv, err := toInterval(r)
 		if err != nil {
 			return types.Datum{}, true, err
 		}
-		sign := int64(1)
-		if op == "-" {
-			sign = -1
-		}
 		// date ± interval is a timestamp, as in PostgreSQL.
-		return tsDatum(AddInterval(temporalTime(l), iv, sign)), true, nil
-	case temporal(l) && (r.Fam == types.Int || r.Fam == types.Float || r.Fam == types.Decimal) && l.Fam == types.Timestamp:
+		return tsDatum(iv.AddTo(temporalTime(l), sign)), true, nil
+	case temporal(l) && isNum(r) && l.Fam == types.Timestamp:
 		return types.Datum{}, true, errf(CodeUndefined, "operator does not exist: timestamptz %s %s", op, strings.ToLower(r.Fam.String()))
 	}
 	return types.Datum{}, true, errf(CodeUndefined, "operator does not exist: %s %s %s", strings.ToLower(l.Fam.String()), op, strings.ToLower(r.Fam.String()))
@@ -336,6 +196,12 @@ func init() {
 		Doc:     "A field of a date or timestamp (also extract(field FROM x)): year, quarter, month, week, day, doy, dow, isodow, hour, minute, second, milliseconds, microseconds, epoch, century, decade, millennium.",
 		Aliases: []string{"date_part"},
 		Fn: func(a []types.Datum) (types.Datum, error) {
+			switch a[1].Fam {
+			case types.IntervalFam:
+				return extractInterval(a[0].S, a[1].IntervalVal())
+			case types.Time:
+				return extractInterval(a[0].S, Interval{Nanos: a[1].I})
+			}
 			t, _, err := toTime(a[1])
 			if err != nil {
 				return types.Datum{}, err
@@ -432,7 +298,7 @@ func init() {
 			}
 			return tsDatum(t), nil
 		}})
-	register(&Builtin{Name: "age", Args: []types.Family{Any, Any}, MinArgs: 1, Ret: types.String, Vol: Stable, Category: catTime,
+	register(&Builtin{Name: "age", Args: []types.Family{Any, Any}, MinArgs: 1, Ret: types.IntervalFam, Vol: Stable, Category: catTime,
 		Doc: "The interval from the second timestamp (today's midnight when omitted) to the first, in years, months, days and time.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			to, _, err := toTime(a[0])
@@ -448,7 +314,7 @@ func init() {
 				now := time.Now().UTC()
 				from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 			}
-			return types.NewString(Between(to, from).String()), nil
+			return types.NewInterval(Between(to, from)), nil
 		}})
 	register(&Builtin{Name: "to_timestamp", Args: []types.Family{Any, types.String}, MinArgs: 1, Ret: types.Timestamp, Category: catTime,
 		Doc: "to_timestamp(seconds) converts a Unix epoch; to_timestamp(text, format) parses with the to_char patterns (YYYY, MM, DD, HH24, MI, SS, ...).",
@@ -511,8 +377,8 @@ func init() {
 			}
 			return tsDatum(t), nil
 		}})
-	register(&Builtin{Name: "make_interval", Args: []types.Family{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, Any}, MinArgs: 0, Ret: types.String, Category: catTime,
-		Doc: "An interval from years, months, weeks, days, hours, minutes and seconds (as text: datax has no interval type yet).",
+	register(&Builtin{Name: "make_interval", Args: []types.Family{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, Any}, MinArgs: 0, Ret: types.IntervalFam, Category: catTime,
+		Doc: "An interval from years, months, weeks, days, hours, minutes and seconds.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			get := func(i int) int64 {
 				if i < len(a) {
@@ -528,22 +394,49 @@ func init() {
 				}
 				iv.Nanos += int64(s * 1e9)
 			}
-			return types.NewString(iv.String()), nil
+			return types.NewInterval(iv), nil
 		}})
 	register(&Builtin{Name: "clock_timestamp", Args: nil, Ret: types.Timestamp, Vol: Volatile, Category: catTime,
 		Doc: "The wall clock at the moment of the call (now() is the statement's start, the same for every row).",
 		Fn:  func([]types.Datum) (types.Datum, error) { return tsDatum(time.Now()), nil }})
-	register(&Builtin{Name: "justify_hours", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.String, Category: catTime,
+	register(&Builtin{Name: "justify_hours", Args: []types.Family{Any}, MinArgs: 1, Ret: types.IntervalFam, Category: catTime,
 		Doc: "Rewrites an interval's hours beyond 24 as days.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
-			iv, err := ParseInterval(a[0].S)
+			iv, err := toInterval(a[0])
 			if err != nil {
 				return types.Datum{}, err
 			}
-			day := int64(24 * time.Hour)
-			iv.Days += iv.Nanos / day
-			iv.Nanos %= day
-			return types.NewString(iv.String()), nil
+			return types.NewInterval(iv.JustifyHours()), nil
+		}})
+	register(&Builtin{Name: "justify_days", Args: []types.Family{Any}, MinArgs: 1, Ret: types.IntervalFam, Category: catTime,
+		Doc: "Rewrites an interval's days beyond 30 as months.",
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			iv, err := toInterval(a[0])
+			if err != nil {
+				return types.Datum{}, err
+			}
+			return types.NewInterval(iv.JustifyDays()), nil
+		}})
+	register(&Builtin{Name: "justify_interval", Args: []types.Family{Any}, MinArgs: 1, Ret: types.IntervalFam, Category: catTime,
+		Doc: "Rewrites an interval with justify_days and justify_hours, then aligns the signs of its parts.",
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			iv, err := toInterval(a[0])
+			if err != nil {
+				return types.Datum{}, err
+			}
+			return types.NewInterval(iv.Justify()), nil
+		}})
+	register(&Builtin{Name: "make_time", Args: []types.Family{types.Int, types.Int, Any}, MinArgs: 3, Ret: types.Time, Category: catTime,
+		Doc: "A time from hour, minute and seconds.",
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			sec, err := numeric(a[2])
+			if err != nil {
+				return types.Datum{}, err
+			}
+			if a[0].I < 0 || a[0].I > 23 || a[1].I < 0 || a[1].I > 59 || sec < 0 || sec >= 60 {
+				return types.Datum{}, errf(CodeDatetimeField, "time field value out of range: %d:%d:%v", a[0].I, a[1].I, sec)
+			}
+			return types.NewTime(a[0].I*int64(time.Hour) + a[1].I*int64(time.Minute) + int64(math.Round(sec*1e9))), nil
 		}})
 	register(&Builtin{Name: "isfinite", Args: []types.Family{Any}, MinArgs: 1, Ret: types.Bool, Category: catTime,
 		Doc: "Whether a date or timestamp is finite (always true: datax has no infinities).",
@@ -551,6 +444,44 @@ func init() {
 }
 
 func i64Dec(i int64) types.Datum { return types.NewDecimal(strconv.FormatInt(i, 10)) }
+
+// extractInterval is extract(field FROM interval) (and FROM time, as an
+// interval of its clock part): the field of the stored triple, as
+// PostgreSQL reports it (days are not folded into months, nor hours
+// into days).
+func extractInterval(field string, iv Interval) (types.Datum, error) {
+	clock := iv.Nanos
+	sec := clock % int64(time.Minute)
+	switch strings.ToLower(field) {
+	case "millennium", "millennia":
+		return i64Dec(iv.Months / 12000), nil
+	case "century", "centuries":
+		return i64Dec(iv.Months / 1200), nil
+	case "decade", "decades":
+		return i64Dec(iv.Months / 120), nil
+	case "year", "years", "y":
+		return i64Dec(iv.Months / 12), nil
+	case "quarter":
+		return i64Dec((iv.Months%12)/3 + 1), nil
+	case "month", "months", "mon":
+		return i64Dec(iv.Months % 12), nil
+	case "day", "days", "d":
+		return i64Dec(iv.Days), nil
+	case "hour", "hours", "h":
+		return i64Dec(clock / int64(time.Hour)), nil
+	case "minute", "minutes", "min", "m":
+		return i64Dec((clock % int64(time.Hour)) / int64(time.Minute)), nil
+	case "second", "seconds", "sec", "s":
+		return decimalText(float64(sec) / 1e9), nil
+	case "milliseconds", "millisecond", "ms":
+		return decimalText(float64(sec) / 1e6), nil
+	case "microseconds", "microsecond", "us":
+		return i64Dec(sec / 1000), nil
+	case "epoch":
+		return decimalText(float64(iv.Months)*30*86400 + float64(iv.Days)*86400 + float64(clock)/1e9), nil
+	}
+	return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for extract over an interval", field)
+}
 
 // ---- to_char / to_timestamp patterns ---------------------------------
 

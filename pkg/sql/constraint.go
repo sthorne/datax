@@ -381,8 +381,20 @@ func sampleRow(d *catalog.TableDescriptor) map[catalog.ColumnID]types.Datum {
 			v = types.NewDate(0)
 		case types.Jsonb:
 			v = types.NewJsonb("{}")
+		case types.IntervalFam:
+			v = types.NewInterval(types.Interval{Days: 1})
+		case types.Time:
+			v = types.NewTime(0)
+		case types.Enum:
+			v = types.DNull
+			if len(c.EnumLabels) > 0 {
+				v = types.NewEnum(0, c.EnumLabels[0])
+			}
 		default:
 			v = types.DNull
+			if c.Type.IsArray() {
+				v = types.NewArray(c.Type.Elem(), nil)
+			}
 		}
 		row[c.ID] = v
 	}
@@ -966,7 +978,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
-	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.user)
+	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -1237,7 +1249,7 @@ func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, des
 	if indexID != 0 {
 		s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
 	}
-	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.user)
+	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 

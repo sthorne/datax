@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -37,7 +38,35 @@ type Column struct {
 	// rule 1).
 	Precision int32 `json:"precision,omitempty"`
 	Scale     int32 `json:"scale,omitempty"`
-	NotNull   bool  `json:"not_null,omitempty"`
+	// Width is an Int column's declared width in bytes: 2 (INT2 /
+	// SMALLINT), 4 (INT4 / INT / INTEGER) or 0 = 8 (INT8 / BIGINT).
+	// Storage is the same varint either way; the width bounds the values
+	// (22003) and picks the wire type (int2 / int4 / int8). Zero keeps the
+	// pre-existing 64-bit meaning for old descriptors.
+	Width int32 `json:"width,omitempty"`
+	// MaxLen is a String column's VARCHAR(n) / CHAR(n) length in
+	// characters (0 = unbounded TEXT); a longer value is refused (22001)
+	// unless the excess is spaces.
+	MaxLen int32 `json:"max_len,omitempty"`
+	// Char marks CHAR(n): values are stored with trailing spaces trimmed
+	// and render blank-padded to MaxLen.
+	Char bool `json:"char,omitempty"`
+	// NoTZ marks TIMESTAMP (without time zone): the value is UTC wall-
+	// clock time, an offset in the input is ignored, and the output
+	// carries no offset.
+	NoTZ bool `json:"no_tz,omitempty"`
+	// EnumType, EnumName and EnumLabels describe an enum column (Type
+	// Enum): the type descriptor's ID and name, and a copy of its labels
+	// in ordinal order (refreshed by ALTER TYPE ... ADD VALUE), so a
+	// value's label converts to its ordinal and back without a lookup.
+	EnumType   uint64   `json:"enum_type,omitempty"`
+	EnumName   string   `json:"enum_name,omitempty"`
+	EnumLabels []string `json:"enum_labels,omitempty"`
+	// TimePrecision is TIMESTAMP(p) / TIMESTAMPTZ(p), stored as p+1 so
+	// that 0 keeps meaning "undeclared" (full precision): values round to
+	// p fractional digits on write. FracDigits decodes it.
+	TimePrecision int32 `json:"time_precision,omitempty"`
+	NotNull       bool  `json:"not_null,omitempty"`
 	// Default is the value INSERT uses when the column is omitted.
 	Default *types.Datum `json:"default,omitempty"`
 	// DefaultExpr is an expression default (SQL text: now(),
@@ -59,9 +88,264 @@ type Column struct {
 	// column" stay distinguishable.
 	FillDefault bool `json:"fill_default,omitempty"`
 	// Hidden marks a system-managed column (the _shard bucket of a
-	// sharded timeseries table): invisible to SELECT *, not an INSERT
-	// target, and filled by the executor.
+	// sharded timeseries table, CREATE TABLE AS's rowid key, the shadow
+	// of an ALTER COLUMN TYPE rewrite): invisible to SELECT *, not an
+	// INSERT target, and filled by the executor.
 	Hidden bool `json:"hidden,omitempty"`
+	// Comment is COMMENT ON COLUMN's text ("" = none).
+	Comment string `json:"comment,omitempty"`
+	// RetypeFrom, on a hidden shadow column, names the column it is the
+	// retyped copy of (ALTER COLUMN TYPE, pkg/sql/retype.go): every row
+	// write derives the shadow's value from the original's, so the
+	// backfill and concurrent writers converge; the swap makes the
+	// shadow the column. Cluster version v9.
+	RetypeFrom ColumnID `json:"retype_from,omitempty"`
+}
+
+// ValueError is a value the column's declared type refuses; Code is the
+// SQLSTATE (22003 out of range, 22001 too long, 22007 bad timestamp).
+type ValueError struct {
+	Code string
+	Msg  string
+}
+
+func (e *ValueError) Error() string { return e.Msg }
+
+// HasTypmod reports whether the column carries a type modifier the
+// write path must apply (DECIMAL(p,s), an integer width, a character
+// length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
+func (c *Column) HasTypmod() bool {
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum
+}
+
+// EnumValue converts a label (or an enum datum of the type) to the
+// column's enum datum: the ordinal and the label.
+func (c *Column) EnumValue(d types.Datum) (types.Datum, error) {
+	if d.Null {
+		return d, nil
+	}
+	label := d.S
+	if d.Fam != types.String && d.Fam != types.Enum {
+		label = d.Text()
+	}
+	for i, l := range c.EnumLabels {
+		if l == label {
+			return types.NewEnum(int64(i), l), nil
+		}
+	}
+	return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("invalid input value for enum %s: %q", c.EnumName, label)}
+}
+
+// FracDigits is the declared TIMESTAMP(p) precision, when there is one.
+func (c *Column) FracDigits() (int32, bool) {
+	if (c.Type == types.Timestamp || c.Type == types.Time) && c.TimePrecision > 0 {
+		return c.TimePrecision - 1, true
+	}
+	return 0, false
+}
+
+// IntWidth is the column's integer width in bytes (8 unless declared
+// narrower).
+func (c *Column) IntWidth() int32 {
+	if (c.Type == types.Int || c.Type == types.ArrayOf(types.Int)) && (c.Width == 2 || c.Width == 4) {
+		return c.Width
+	}
+	return 8
+}
+
+// Conform applies the column's type modifiers other than DECIMAL(p,s)
+// to a value about to be stored, and stamps the display hints: an
+// integer is range-checked against the width; a string is checked
+// against MaxLen (excess spaces are dropped, anything else is 22001)
+// and, for CHAR(n), trailing spaces are trimmed; a timestamp text into a
+// TIMESTAMP (without time zone) column is parsed ignoring its offset,
+// and a TIMESTAMP(p) value rounds to p digits. NULLs and columns without
+// modifiers pass through.
+func (c *Column) Conform(d types.Datum) (types.Datum, error) {
+	if d.Null {
+		return d, nil
+	}
+	if c.Type.IsArray() {
+		// Every element conforms to the element type (the column's
+		// modifiers apply per element); text elements coerce first.
+		if !d.Fam.IsArray() {
+			return d, nil
+		}
+		elem := *c
+		elem.Type = c.Type.Elem()
+		out := make([]types.Datum, len(d.A))
+		for i, e := range d.A {
+			if e.Null {
+				out[i] = e
+				continue
+			}
+			v, err := e.Coerce(elem.Type)
+			if err != nil {
+				return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("column %q: array element %s: %v", c.Name, e.Text(), err)}
+			}
+			if v, err = elem.Conform(v); err != nil {
+				return d, err
+			}
+			out[i] = v
+		}
+		return types.NewArray(elem.Type, out), nil
+	}
+	switch c.Type {
+	case types.Enum:
+		return c.EnumValue(d)
+	case types.Int:
+		if d.Fam != types.Int {
+			return d, nil
+		}
+		switch c.Width {
+		case 2:
+			if d.I < -32768 || d.I > 32767 {
+				return d, &ValueError{Code: "22003", Msg: fmt.Sprintf("value %d is out of range for type smallint (column %q)", d.I, c.Name)}
+			}
+		case 4:
+			if d.I < -2147483648 || d.I > 2147483647 {
+				return d, &ValueError{Code: "22003", Msg: fmt.Sprintf("value %d is out of range for type integer (column %q)", d.I, c.Name)}
+			}
+		}
+	case types.String:
+		if d.Fam != types.String || (c.MaxLen == 0 && !c.Char) {
+			return d, nil
+		}
+		v := d.S
+		if c.MaxLen > 0 {
+			if n := int32(utf8.RuneCountInString(v)); n > c.MaxLen {
+				runes := []rune(v)
+				if strings.TrimRight(string(runes[c.MaxLen:]), " ") != "" {
+					return d, &ValueError{Code: "22001", Msg: fmt.Sprintf("value too long for type %s (column %q)", c.TypeSQL(), c.Name)}
+				}
+				v = string(runes[:c.MaxLen])
+			}
+		}
+		if c.Char {
+			v = strings.TrimRight(v, " ")
+		}
+		out := types.NewString(v)
+		if c.Char {
+			out.Pad = c.MaxLen
+		}
+		return out, nil
+	case types.Timestamp:
+		if d.Fam == types.String && c.NoTZ {
+			n, err := types.ParseTimestampNoTZ(d.S)
+			if err != nil {
+				return d, &ValueError{Code: "22007", Msg: fmt.Sprintf("column %q: %v", c.Name, err)}
+			}
+			d = types.NewTimestamp(n)
+		}
+		if d.Fam != types.Timestamp {
+			return d, nil
+		}
+		if p, ok := c.FracDigits(); ok {
+			d.I = types.RoundTimestamp(d.I, p)
+		}
+		d.NoTZ = c.NoTZ
+		return d, nil
+	case types.Time:
+		if d.Fam != types.Time {
+			return d, nil
+		}
+		if p, ok := c.FracDigits(); ok {
+			d.I = types.RoundTimestamp(d.I, p)
+		}
+		return d, nil
+	}
+	return d, nil
+}
+
+// Stamp sets the display hints a stored value of this column carries
+// (CHAR padding, TIMESTAMP without time zone); identity is untouched.
+func (c *Column) Stamp(d types.Datum) types.Datum {
+	if d.Null {
+		return d
+	}
+	switch {
+	case c.Char && d.Fam == types.String:
+		d.Pad = c.MaxLen
+	case c.NoTZ && d.Fam == types.Timestamp:
+		d.NoTZ = true
+	}
+	return d
+}
+
+// TypeSQL is the column's declared type as datax spells it (INT4,
+// VARCHAR(20), CHAR(4), TIMESTAMP(3), TIMESTAMPTZ, DECIMAL(10,2)).
+func (c *Column) TypeSQL() string {
+	if c.Type.IsArray() {
+		elem := *c
+		elem.Type = c.Type.Elem()
+		return elem.TypeSQL() + "[]"
+	}
+	switch c.Type {
+	case types.Enum:
+		return c.EnumName
+	case types.Int:
+		switch c.Width {
+		case 2:
+			return "INT2"
+		case 4:
+			return "INT4"
+		}
+		return "INT8"
+	case types.String:
+		switch {
+		case c.Char:
+			return fmt.Sprintf("CHAR(%d)", c.MaxLen)
+		case c.MaxLen > 0:
+			return fmt.Sprintf("VARCHAR(%d)", c.MaxLen)
+		}
+		return "TEXT"
+	case types.Timestamp:
+		name := "TIMESTAMPTZ"
+		if c.NoTZ {
+			name = "TIMESTAMP"
+		}
+		if p, ok := c.FracDigits(); ok {
+			return fmt.Sprintf("%s(%d)", name, p)
+		}
+		return name
+	case types.Time:
+		if p, ok := c.FracDigits(); ok {
+			return fmt.Sprintf("TIME(%d)", p)
+		}
+		return "TIME"
+	case types.Decimal:
+		if c.Precision > 0 {
+			return fmt.Sprintf("DECIMAL(%d,%d)", c.Precision, c.Scale)
+		}
+		return "DECIMAL"
+	}
+	return c.Type.String()
+}
+
+// Typmod is PostgreSQL's atttypmod for the column: ((p<<16)|s)+4 for
+// DECIMAL(p,s), n+4 for VARCHAR(n) / CHAR(n), p for TIMESTAMP(p), and
+// -1 (returned as 0) otherwise — TIMESTAMP(0)'s typmod 0 is therefore
+// indistinguishable from none on the wire, which only loses the
+// rounding hint.
+func (c *Column) Typmod() int32 {
+	if c.Type.IsArray() {
+		return 0
+	}
+	switch c.Type {
+	case types.Decimal:
+		if c.Precision > 0 {
+			return c.Precision<<16 | (c.Scale + 4)
+		}
+	case types.String:
+		if c.MaxLen > 0 {
+			return c.MaxLen + 4
+		}
+	case types.Timestamp, types.Time:
+		if p, ok := c.FracDigits(); ok {
+			return p
+		}
+	}
+	return 0
 }
 
 // IndexDescriptor describes a secondary index. Entries live at
@@ -73,6 +357,8 @@ type IndexDescriptor struct {
 	Name      string     `json:"name"`
 	Unique    bool       `json:"unique,omitempty"`
 	ColumnIDs []ColumnID `json:"column_ids"`
+	// Comment is COMMENT ON INDEX's text ("" = none).
+	Comment string `json:"comment,omitempty"`
 	// State is the index's lifecycle state: "" or "public" = readable;
 	// "write-only" = maintained by writers but invisible to the planner
 	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
@@ -177,10 +463,27 @@ type TableDescriptor struct {
 	// NextColumnID is the next column ID to allocate; never reused, so a
 	// dropped-then-re-added column gets a fresh ID and old bytes stay dead.
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
-	// Privileges maps a user name to its granted per-table privileges
-	// (SELECT/INSERT/UPDATE/DELETE, upper-cased; ALL is stored expanded).
-	// root and admin-role members bypass the map entirely.
+	// Comment is COMMENT ON TABLE / VIEW's text ("" = none).
+	Comment string `json:"comment,omitempty"`
+	// ViewQuery is the SELECT a view stands for, as SQL text; a
+	// descriptor carrying one is a view (cluster version v9): it owns no
+	// rows and no primary key, Columns describe the query's output, and
+	// a statement that names it runs the query (pkg/sql/view.go).
+	ViewQuery string `json:"view_query,omitempty"`
+	// ViewDepends are the tables and views the view's query reads, by
+	// ID: dropping one of them is refused while the view exists.
+	ViewDepends []uint64 `json:"view_depends,omitempty"`
+	// Owner is the role that owns the table or view (v11): it holds every
+	// privilege on it and may alter or drop it. Empty means root (an
+	// object that predates ownership).
+	Owner string `json:"owner,omitempty"`
+	// Privileges maps a grantee role (or "public") to its granted
+	// privileges (SELECT/INSERT/UPDATE/DELETE/TRUNCATE, upper-cased; ALL
+	// is stored expanded). root, admins and the owner bypass the map.
 	Privileges map[string][]string `json:"privileges,omitempty"`
+	// GrantOptions maps a grantee to the privileges it holds WITH GRANT
+	// OPTION (a subset of Privileges).
+	GrantOptions map[string][]string `json:"grant_options,omitempty"`
 	// Version increments on every descriptor change; gateway leases record
 	// which version they may be using (see leasing in this package).
 	Version uint64 `json:"version,omitempty"`
@@ -263,6 +566,10 @@ func (d *TableDescriptor) VisibleColumns() []Column {
 	return out
 }
 
+// IsView reports whether the descriptor is a view (it carries a query
+// and no rows).
+func (d *TableDescriptor) IsView() bool { return d.ViewQuery != "" }
+
 // Index returns the secondary index with the given name.
 func (d *TableDescriptor) Index(name string) (IndexDescriptor, bool) {
 	for _, idx := range d.Indexes {
@@ -292,12 +599,9 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		}
 	}
 	out.InboundFKs = append([]ForeignKeyRef(nil), d.InboundFKs...)
-	if d.Privileges != nil {
-		out.Privileges = make(map[string][]string, len(d.Privileges))
-		for u, ps := range d.Privileges {
-			out.Privileges[u] = append([]string(nil), ps...)
-		}
-	}
+	out.ViewDepends = append([]uint64(nil), d.ViewDepends...)
+	out.Privileges = ClonePrivileges(d.Privileges)
+	out.GrantOptions = ClonePrivileges(d.GrantOptions)
 	if d.Reshard != nil {
 		rs := *d.Reshard
 		rs.NewIndexIDs = append([]uint64(nil), d.Reshard.NewIndexIDs...)
@@ -733,6 +1037,34 @@ func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 		return err
 	}
 	a.Invalidate(d.Name)
+	return nil
+}
+
+// RenameTable moves a table's name entry and rewrites its descriptor
+// under the new name (bumping the version, like Update). The ID is
+// unchanged, so every reference by ID — foreign keys, owned sequences,
+// gateway leases — still holds; a gateway caching the old name drops
+// that entry at its next renewal (the old name resolves to nothing).
+func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor, newName string) error {
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newName, a.isDefaultID(d.DatabaseID))
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return &ErrTableExists{Name: newName}
+	}
+	oldName := d.Name
+	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, oldName)); err != nil {
+		return err
+	}
+	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newName), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+		return err
+	}
+	d.Name = newName
+	if err := a.Update(ctx, txn, d); err != nil {
+		return err
+	}
+	a.Invalidate(oldName)
 	return nil
 }
 

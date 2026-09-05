@@ -41,9 +41,14 @@ const backfillChunkSize = 64
 func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateIndex) (*Result, *Error) {
 	// Step 1: publish write-only.
 	var indexID uint64
+	exists := false
 	err := s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
+		exists = false
 		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
+			return err
+		}
+		if err := mustBeReal(shared); err != nil {
 			return err
 		}
 		desc := shared.Clone()
@@ -56,8 +61,12 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		if t.Name == "primary" {
 			return newErrf(CodeSyntaxError, "index name %q is reserved", t.Name)
 		}
-		if _, exists := desc.Index(t.Name); exists {
-			return newErrf(CodeSyntaxError, "index %q already exists", t.Name)
+		if _, taken := desc.Index(t.Name); taken {
+			if t.IfNotExists {
+				exists = true
+				return nil
+			}
+			return newErrf(CodeDuplicateObject, "index %q already exists", t.Name)
 		}
 		var colIDs []catalog.ColumnID
 		seenCol := map[catalog.ColumnID]bool{}
@@ -89,6 +98,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	})
 	if err != nil {
 		return nil, ToSQLError(err)
+	}
+	if exists {
+		return &Result{Tag: "CREATE INDEX"}, nil
 	}
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
@@ -327,13 +339,32 @@ func ddlTableName(stmt parser.Statement) string {
 	case *parser.CreateTable:
 		return t.Name
 	case *parser.AlterTable:
+		if t.RenameTo != "" {
+			// The drain looks the table up by name: the new one.
+			if q, _ := catalog.SplitTableName(t.Table); q != "" {
+				return q + "." + t.RenameTo
+			}
+			return t.RenameTo
+		}
 		return t.Table
 	case *parser.DropTable:
 		return t.Name
+	case *parser.CreateView:
+		return t.Name
+	case *parser.CommentOn:
+		return t.Name
 	case *parser.GrantRevoke:
 		// Table grants ride the descriptor: drain leases like any DDL so
-		// every gateway enforces the new privileges once the grant returns.
-		return t.Table
+		// every gateway enforces the new privileges once the grant returns
+		// (the executor records every table it touched in extraDDL; this
+		// covers the common single-table form).
+		if t.ObjectKind == "table" && len(t.Objects) == 1 && !t.AllInSchema {
+			return t.Objects[0]
+		}
+	case *parser.AlterOwner:
+		if t.Kind == "table" || t.Kind == "view" {
+			return t.Name
+		}
 	}
 	return ""
 }

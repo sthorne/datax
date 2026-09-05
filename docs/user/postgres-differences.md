@@ -11,13 +11,16 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `INTERVAL` as a type (intervals are text: `ts + '2 hours'`); expressions over aggregates (`SUM(a) / COUNT(*)`); window functions; user-defined functions | compute client-side or in a derived table |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
-| `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER TABLE ... ALTER COLUMN SET DEFAULT`, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns and expression defaults **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
+| `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
+| `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and narrowing conversions, `COMMENT ON` objects other than tables, views, indexes and columns, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening and text conversions), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
-| Views, triggers, stored procedures, `LISTEN/NOTIFY` | — |
+| Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
+| Column- and row-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin` |
+| Triggers, stored procedures, `LISTEN/NOTIFY` | — |
 
 ## Things that exist but behave differently
 
@@ -26,12 +29,42 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
-- **`DECIMAL(p,s)` is enforced** (rescale to `s` half-even, `22003` on
-  overflow, fixed-scale rendering), with small deviations: an invalid
-  typmod (`DECIMAL(0)`, scale > precision) is a syntax error `42601`
-  rather than PostgreSQL's `22023`; `VARCHAR(n)` and other typmods are
-  still accepted and ignored; expression/aggregate results render in
+- **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
+  half-even, `22003` on overflow, fixed-scale rendering), the integer
+  widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
+  `VARCHAR(n)` / `CHAR(n)` (`22001`), `TIMESTAMP` without time zone and
+  `TIMESTAMP(p)` — with small deviations: an invalid typmod
+  (`DECIMAL(0)`, scale > precision, `VARCHAR(0)`, `TIMESTAMP(7)`) is a
+  syntax error `42601` rather than PostgreSQL's `22023`; typmods on
+  other types (`FLOAT8(3)`) are accepted and ignored; a `CHAR(n)`
+  value is stored trimmed, so `c = 'ab  '` compares the literal with
+  its spaces (PostgreSQL trims both sides) while `c = 'ab'`, `length`
+  and `||` agree; expression results lose the modifier and describe
+  as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
+  a `TIMESTAMP` is `TIMESTAMPTZ`, `::timestamp` yields `TIMESTAMPTZ`),
+  and a bind parameter for a `TIMESTAMP` column describes as
+  `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
+- **Enums** are append-only (`ADD VALUE BEFORE` / `AFTER`, `RENAME
+  VALUE`, `RENAME TO` are refused; `DROP TYPE ... CASCADE` does not
+  drop columns), have no arrays, and compare with text by label
+  (`m = 'ok'`; an order against a text literal is the labels' text
+  order — cast the literal, `m > 'ok'::mood`, for declaration order).
+  Creating a type takes the admin role or `CREATE` on the database;
+  altering or dropping one takes its owner.
+- **Arrays** are one-dimensional (`INT8[][]` is `INT8[]`; a
+  multidimensional binary parameter is refused), cannot be indexed or
+  be part of a key, have no slices (`a[1:2]`) or `JSONB[]`, and a
+  subscript out of range is NULL as in PostgreSQL; `array_agg` over an
+  untyped argument yields `text[]`; `unnest` runs in `FROM` or in a
+  FROM-less select list (not beside a table's columns, and not
+  laterally), and an aggregate call takes no inner `ORDER BY`.
+- **Intervals** compare, group and index by PostgreSQL's rule (`'30
+  days' = '1 month'`), but a primary key or unique index keeps `'30
+  days'` and `'1 month'` as distinct keys (the stored triple is part of
+  the key); `extract` on an interval reports the stored fields
+  unjustified, as in PostgreSQL. A `TIME` input's offset is ignored;
+  `TIME WITH TIME ZONE` is refused at parse (`42601`).
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
 - **JSONB**: `->`/`->>` extraction (single-table queries and joins;
@@ -93,11 +126,17 @@ syntax error or `0A000` feature not supported):
   cheap historical/follower reads, including bounded staleness:
   `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
   the local replicas can serve within the bound.
-- **`SET x = y`** is parsed and ignored (drivers send these at startup);
-  `SHOW x` answers for the settings datax has (`SHOW ALL` lists them) and
-  is SQLSTATE `42704` otherwise. `server_version` reports a
-  PostgreSQL-14-compatible string, so `psql` and drivers use their
-  PostgreSQL-14 query flavors.
+- **`SET x = y`** honors the variables datax has ([Session
+  settings](sql.md#session-settings): the timeouts, `TimeZone`,
+  `application_name`, `search_path`, the read-only and isolation
+  characteristics, `DateStyle` and `client_encoding` in their supported
+  values) and refuses an unknown one with `42704` (an invalid value is
+  `22023`), where PostgreSQL knows hundreds more. `transaction_isolation`
+  accepts every level and `SHOW` reports `serializable`, the only one
+  there is. `server_version` reports a PostgreSQL-14-compatible string,
+  so `psql` and drivers use their PostgreSQL-14 query flavors.
+  `pg_stat_activity` and `SHOW SESSIONS` list the serving node's
+  sessions only.
 
 ## Errors you should know
 

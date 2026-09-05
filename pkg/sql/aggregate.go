@@ -89,7 +89,8 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 			return sp, newErrf(CodeSyntaxError, "%s() takes a key and a value", strings.ToLower(sp.fn))
 		}
 	case "SUM", "AVG", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
-		if sp.argType != types.Unknown && sp.argType != types.Int && sp.argType != types.Float && sp.argType != types.Decimal {
+		if sp.argType != types.Unknown && sp.argType != types.Int && sp.argType != types.Float && sp.argType != types.Decimal &&
+			!(sp.argType == types.IntervalFam && (se.Agg == "SUM" || se.Agg == "AVG")) {
 			return sp, newErrf(CodeFeatureNotSupported, "%s over %s is not supported", se.Agg, sp.argType)
 		}
 	case "MIN", "MAX":
@@ -142,14 +143,22 @@ func (sp aggSpec) resultType() types.Family {
 		if sp.argType == types.Decimal || sp.argType == types.Int {
 			return types.Decimal // exact, quantized to 6 fractional digits
 		}
+		if sp.argType == types.IntervalFam {
+			return types.IntervalFam
+		}
 		return types.Float
 	case "SUM":
 		if sp.argType == types.Unknown {
 			return types.Decimal
 		}
 		return sp.argType
-	case "STRING_AGG", "ARRAY_AGG":
+	case "STRING_AGG":
 		return types.String
+	case "ARRAY_AGG":
+		if sp.argType == types.Unknown || sp.argType.IsArray() {
+			return types.ArrayOf(types.String)
+		}
+		return types.ArrayOf(sp.argType)
 	case "BOOL_AND", "BOOL_OR", "EVERY":
 		return types.Bool
 	case "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "PERCENTILE_CONT":
@@ -168,8 +177,9 @@ type aggState struct {
 	counts []int64
 	sumI   []int64
 	sumF   []float64
-	sumD   []decimal.Dec // exact register for DECIMAL SUM/AVG
-	best   []types.Datum // MIN/MAX candidate; zero = none yet
+	sumD   []decimal.Dec    // exact register for DECIMAL SUM/AVG
+	sumIv  []types.Interval // INTERVAL SUM/AVG
+	best   []types.Datum    // MIN/MAX candidate; zero = none yet
 	seen   []bool
 	// vals collects the inputs of the aggregates that need them all
 	// (string_agg, array_agg, the json ones, percentiles, stddev);
@@ -187,6 +197,7 @@ func newAggState(n int) *aggState {
 		sumI:     make([]int64, n),
 		sumF:     make([]float64, n),
 		sumD:     make([]decimal.Dec, n),
+		sumIv:    make([]types.Interval, n),
 		best:     make([]types.Datum, n),
 		seen:     make([]bool, n),
 		vals:     make([][]types.Datum, n),
@@ -305,6 +316,8 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 					return newErrf(CodeInternal, "%s: %v", sp.name, err)
 				}
 				st.sumD[i] = decimal.Add(st.sumD[i], v)
+			case types.IntervalFam:
+				st.sumIv[i] = st.sumIv[i].Add(d.IntervalVal())
 			default:
 				f, err := d.Coerce(types.Float)
 				if err != nil {
@@ -353,6 +366,8 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 				out[i] = types.NewInt(st.sumI[i])
 			case sp.argType == types.Decimal, sp.argType == types.Unknown:
 				out[i] = types.NewDecimal(st.sumD[i].String())
+			case sp.argType == types.IntervalFam:
+				out[i] = types.NewInterval(st.sumIv[i])
 			default:
 				out[i] = types.NewFloat(st.sumF[i])
 			}
@@ -360,6 +375,8 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			switch {
 			case st.counts[i] == 0:
 				out[i] = types.DNull
+			case sp.argType == types.IntervalFam:
+				out[i] = types.NewInterval(st.sumIv[i].Scale(1 / float64(st.counts[i])))
 			case sp.argType == types.Decimal || sp.argType == types.Int:
 				q, err := decimal.DivQuantize(st.sumD[i], decimal.FromInt(st.counts[i]), 6)
 				if err != nil {
@@ -407,12 +424,20 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 				out[i] = types.DNull
 				continue
 			}
-			elems := make([]string, len(st.vals[i]))
-			nulls := make([]bool, len(st.vals[i]))
+			elem := sp.resultType().Elem()
+			elems := make([]types.Datum, len(st.vals[i]))
 			for j, v := range st.vals[i] {
-				elems[j], nulls[j] = v.Text(), v.Null
+				if v.Null {
+					elems[j] = v
+					continue
+				}
+				c, err := v.Coerce(elem)
+				if err != nil {
+					c = types.NewString(v.Text())
+				}
+				elems[j] = c
 			}
-			out[i] = types.NewString(builtins.TextArrayLiteral(elems, nulls))
+			out[i] = types.NewArray(elem, elems)
 		case "JSON_AGG", "JSONB_AGG":
 			if len(st.vals[i]) == 0 {
 				out[i] = types.DNull
@@ -712,9 +737,19 @@ func encodeGroupKey(ds []types.Datum) string {
 		switch {
 		case d.Null:
 			b = append(b, 'n')
-		case d.Fam == types.Int, d.Fam == types.Timestamp, d.Fam == types.Date:
+		case d.Fam == types.Int, d.Fam == types.Timestamp, d.Fam == types.Date, d.Fam == types.Time, d.Fam == types.Enum:
 			b = append(b, 'i', byte(d.Fam))
 			b = binary.BigEndian.AppendUint64(b, uint64(d.I))
+		case d.Fam == types.IntervalFam:
+			// Equal intervals ('30 days', '1 month') are one group, as
+			// they compare equal.
+			b = append(b, 'v')
+			b = binary.BigEndian.AppendUint64(b, uint64(d.IntervalVal().CmpValue()))
+		case d.Fam.IsArray():
+			t := d.Text()
+			b = append(b, 'a')
+			b = binary.AppendUvarint(b, uint64(len(t)))
+			b = append(b, t...)
 		case d.Fam == types.Float:
 			b = append(b, 'f')
 			b = binary.BigEndian.AppendUint64(b, math.Float64bits(d.F))

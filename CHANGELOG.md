@@ -8,6 +8,303 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.31.0 — unreleased
+
+### Changed
+- Pebble tuning (#101): every store gets a block cache sized from the
+  machine's memory (25 % capped at 8 GiB for `balanced`, 10 % capped at
+  2 GiB for `ingest`; `--cache-size`; one cache per process, shared by
+  every engine and released when the last closes), bloom filters
+  (10 bits per key) on every level, the newest sstable format the
+  bundled Pebble supports, and an open-file budget of half the process's
+  descriptor limit (1000–16384) instead of Pebble's 8 MiB cache, no
+  filters and 1000 files. `StorageMetrics`, `/metrics`
+  (`datax_storage_block_cache_{bytes,size_bytes,hits_total,misses_total}`,
+  `datax_storage_bloom_{hits,misses}_total`), the metrics table
+  (`store.block_cache_*`, `store.bloom_*`) and the dashboard's storage
+  section show the cache hit rate and bloom utility. Before/after on the
+  harness in the PR.
+
+### Fixed
+- A scan whose rows exceeded gRPC's 4 MiB default message limit never
+  came back from a range led by another node: every attempt ran into
+  the per-attempt timeout and the statement hung until the lease moved
+  (the harness's `scan` workload took 13 minutes per query on a 3-node
+  cluster). A range now pages scan responses at 8 MiB with a resume
+  key, the client stitches the pages, and the internode message limit
+  is 64 MiB in both directions.
+- A read whose leadership confirmation (the raft read index) timed out —
+  a freshly split range still electing, a briefly partitioned quorum —
+  failed the statement with `XX000: read index abandoned`. The replica
+  now answers NotLeader, so the client re-routes and retries under the
+  statement's own deadline. `datax bench` retries transient failures
+  during its preload for the same reason.
+
+## 0.30.0 — unreleased
+
+### Added
+- Profiling and benchmark harness (#100): `net/http/pprof` under
+  `/debug/pprof/` on the HTTP port (admin-gated), mutex and block
+  profiling always on at low rates, `datax debug profile --kind
+  cpu|heap|allocs|mutex|block|goroutine|trace`. `datax bench` gains
+  `--seed` (fixed by default), `--json` records (throughput, p50/p95/p99,
+  errors, retries, the server counter deltas), `--cpuprofile` /
+  `--memprofile` / `--trace` for the client, `--server-url` and
+  `--server-profile cpu` for the node, `--keys
+  random|sequential|uuid` for ingest, and the `index-join` and `scan`
+  workloads. The checked-in set `bench/workloads.json`, `make bench`
+  (a fresh single node and a fresh 3-node cluster), `datax bench run`,
+  `datax bench compare BEFORE AFTER` (±5 % flags), a nightly workflow
+  that keeps `main`'s records, `bench/README.md`. A crash-consistency
+  helper (`pkg/testutils/crash`: a child node killed with SIGKILL at a
+  fault point — `pkg/util/faultpoint`: after the raft log sync, after
+  an entry applies, as a memtable flush begins — or from outside, then
+  restarted; every acknowledged write present, applied index caught up
+  with the log) with `TestCrashConsistency`; `/status` reports each
+  range's `last_index`.
+
+### Fixed
+- `datax bench` keys are `INT8` again: `INT` became 32-bit in 0.24.0,
+  so the ingest workloads' random keys were refused.
+
+## 0.29.0 — unreleased
+
+Cluster version **v11**: role descriptors (`/system/roles`) supersede
+the user credential records and admin markers; `datax debug upgrade`
+rewrites them at finalize.
+
+### Added
+- Roles and privilege scopes (#98): `CREATE / ALTER / DROP ROLE` and
+  `USER` (`LOGIN` / `NOLOGIN`, `PASSWORD`, `INHERIT` / `NOINHERIT`, `IN
+  ROLE`, `IF [NOT] EXISTS`; a role may change its own password), role
+  membership (`GRANT role TO role [WITH ADMIN OPTION]`, `REVOKE [ADMIN
+  OPTION FOR]`, inheritance, cycles refused), `SET [LOCAL] ROLE` /
+  `RESET ROLE` with `current_user` vs `session_user`. Ownership: tables,
+  views, sequences, types and databases record their creator, who
+  holds every privilege and alone (with admins) may alter, drop or
+  grant them; `ALTER ... OWNER TO`, `REASSIGN OWNED BY`, `DROP OWNED
+  BY`; `DROP ROLE` refuses an owner (`2BP01`) and takes the role's
+  grants and memberships with it. Scopes: `GRANT ... ON DATABASE`
+  (`CONNECT`, `CREATE`), `ON SCHEMA public` (`USAGE`, `CREATE`; `USAGE`
+  revocable from `PUBLIC`), `ON ALL TABLES | SEQUENCES IN SCHEMA
+  public`, `ON SEQUENCE` (`USAGE`, `SELECT`, `UPDATE`; `nextval` /
+  `currval` / `setval` now check them, a `SERIAL` column's sequence
+  following `INSERT` on its table), the `TRUNCATE` privilege, `WITH
+  GRANT OPTION` / `GRANT OPTION FOR`, `PUBLIC` as a grantee, `ALTER
+  DEFAULT PRIVILEGES [FOR ROLE r] [IN SCHEMA public] GRANT | REVOKE ...
+  ON TABLES | SEQUENCES`. A view's query runs with its owner's
+  privileges (definer semantics). Built-in roles `admin` (the old
+  `ADMIN` marker, `root` an implicit member), `read_all`, `write_all`,
+  `metrics` (HTTP `/metrics` only). HTTP and admin-RPC authorization
+  resolve through membership; audit records carry the session user and
+  the current role. `SHOW ROLES`, `SHOW USERS` (`member_of`), `SHOW
+  GRANTS` (`database_name, schema_name, relation_name, grantee,
+  privilege_type, is_grantable`; `ON DATABASE`, `ON ROLE`), `pg_roles`
+  (`rolcanlogin`, `rolinherit`), `pg_auth_members`, `pg_user`,
+  `information_schema.role_table_grants` (`grantor`, `is_grantable`),
+  psql's `\du`; the dashboard schema browser's user list follows.
+
+### Changed
+- `GRANT` / `REVOKE` name existing roles (`42704` otherwise) — in
+  insecure mode too. `/metrics` takes the `metrics` role (or admin)
+  instead of any user. `SHOW GRANTS` gained the schema and grantable
+  columns; `SHOW ROLES` lists every role, `SHOW USERS` the login ones.
+  `ALTER` / `DROP` of a table, view, index, sequence or type, `COMMENT
+  ON`, `CREATE INDEX` and `TRUNCATE` are for the object's owner (and
+  admins) rather than admins only; `DROP DATABASE` / `ALTER DATABASE`
+  for its owner. A caller's own context deadline during a statement
+  reports `canceling statement due to user request` (the statement
+  timeout message is reserved for `statement_timeout`).
+
+## 0.28.0 — unreleased
+
+### Added
+- Session and wire (#97): query cancellation works — every connection
+  gets a process ID (the node in its high bits) and a secret, a
+  `CancelRequest` (psql's Ctrl-C, pgx's context cancellation, pools)
+  stops the statement in flight with `57014` and rolls its transaction
+  back, and one landing on another node is forwarded over the internode
+  admin RPC. `statement_timeout` (`57014`), `lock_timeout` (`55P03`
+  instead of waiting the conflict budget out on a live intent),
+  `idle_in_transaction_session_timeout` (`25P03`, the idle block rolled
+  back and its intents released). Honored variables with `SET` / `SET
+  LOCAL` / `RESET` / `RESET ALL` / `SHOW` / `SHOW ALL` / `pg_settings`:
+  `application_name` (the startup parameter too; shown by the activity
+  views), `TimeZone` (TIMESTAMPTZ text output rendered in the zone),
+  `search_path`, `DateStyle`, `client_encoding`,
+  `default_transaction_read_only` / `transaction_read_only` / `SET
+  TRANSACTION READ ONLY` (`25006` on a write), `transaction_isolation`
+  (every level accepted, `SHOW` says serializable), `SET SESSION
+  CHARACTERISTICS AS TRANSACTION ...`, `SET TIME ZONE`, `SET NAMES`;
+  changed reported parameters are announced with `ParameterStatus`.
+  `pg_backend_pid()` is real; `pg_cancel_backend(pid)` /
+  `pg_terminate_backend(pid)` (admin, any node); `SHOW SESSIONS` and
+  `pg_stat_activity` list the node's sessions; `pg_sleep(seconds)`.
+
+### Changed
+- `SET` of an unknown variable is `42704` (it was silently accepted);
+  an invalid value is `22023`.
+
+## 0.27.0 — unreleased
+
+### Added
+- Type system, part four (#96, closing it): enums. `CREATE TYPE [IF NOT
+  EXISTS] name AS ENUM ('a', 'b', ...)`, `ALTER TYPE name ADD VALUE [IF
+  NOT EXISTS] 'c'` (appended; every column of the type learns the label
+  in the same statement and its tables drain, so the label is usable at
+  once on every gateway), `DROP TYPE [IF EXISTS] name` (refused while a
+  column uses it). A column of the type stores the label's ordinal with
+  the label (cluster version v10), orders by declaration in `ORDER
+  BY`, `min` / `max`, indexes and primary keys, reads and writes labels,
+  refuses an unknown one (`22P02`), takes `'a'::name` casts, `LIKE`,
+  `CREATE TABLE AS` and `ALTER COLUMN TYPE` from and to text. `pg_type`
+  (`typtype = 'e'`, an OID past the builtin range), `pg_enum`,
+  `information_schema.columns` (`USER-DEFINED`), `format_type`, `SHOW
+  CREATE TABLE`, psql's `\dT` and `\d`; the wire describes the type's
+  OID and carries labels in both formats.
+
+## 0.26.0 — unreleased
+
+### Added
+- Type system, part three (#96): arrays of every scalar family but
+  `JSONB` as column types (`INT8[]`, `TEXT ARRAY`, `VARCHAR(3)[]`;
+  cluster version **v10**, like `INTERVAL` and `TIME`). Literals
+  (`'{1,2}'`, `'{a,"b c",NULL}'`), `ARRAY[...]`, subscripts `a[i]`,
+  `ANY` / `ALL` and the comparison operators over arrays, `@>` / `<@` /
+  `&&`, `||` concatenation, element-wise equality and ordering (`GROUP
+  BY`, `ORDER BY`, `DISTINCT`), `unnest` (`FROM` and select list) with
+  typed rows, `array_agg` returning a real array, `array_length`,
+  `cardinality`, `array_append` / `array_prepend` / `array_cat` /
+  `array_position` / `array_remove` / `array_to_string` /
+  `string_to_array` / `array_upper` / `array_lower` / `array_ndims`,
+  `::int8[]` casts, `array(SELECT ...)` as a typed array. The wire
+  describes PostgreSQL's array OIDs (`_int8` 1016, `_text` 1009, ...)
+  and speaks the text and binary array formats in both directions, so
+  pgx scans into and binds Go slices and `WHERE id = ANY($1)` takes a
+  slice (the parameter describes as the column's array type); `pg_type`
+  carries the array types with `typelem` / `typarray`, `pg_attribute`
+  `attndims`, `information_schema.columns` `ARRAY` / `_int8`. `CREATE
+  TABLE AS`, `LIKE` and `ALTER COLUMN TYPE` from text carry arrays.
+  Arrays are not indexable and cannot be keys.
+
+### Changed
+- `array_agg` and `array(SELECT ...)` return an array type (`_int8`,
+  `_text`, ...) instead of text.
+
+## 0.25.0 — unreleased
+
+### Added
+- Type system, part two (#96): `INTERVAL` and `TIME` as column types
+  (cluster version **v10**: a v9 node cannot decode their rows, so a
+  column of either is refused until the upgrade is finalized). An
+  interval is PostgreSQL's months / days / clock triple: every input
+  form (verbose, `'2h30m'`, `'... ago'`, SQL standard `'1-2 3
+  04:05:06'`, ISO 8601), the `INTERVAL '...'` / `DATE '...'` / `TIME
+  '...'` / `TIMESTAMP '...'` typed literals, PostgreSQL's rendering and
+  comparison rule, `timestamp - timestamp` and `age()` now return an
+  interval (they were text), `interval ± interval`, `interval * / n`,
+  `time ± interval`, `time - time`, `date + time`, `extract` over
+  intervals and times, `justify_hours` / `justify_days` /
+  `justify_interval`, `make_interval` / `make_time`, `sum` / `avg` /
+  `min` / `max` over intervals, indexes and primary keys on both,
+  `interval` (1186) / `time` (1083) text and binary wire codecs (pgx's
+  `pgtype.Interval`, `time.Duration`, `pgtype.Time`), `pg_type` rows,
+  `ALTER COLUMN TYPE` from text. The timeseries `retention` option and
+  `with_max_staleness` accept interval text.
+
+### Changed
+- `timestamp - timestamp`, `age()`, `make_interval()` and
+  `justify_hours()` return `INTERVAL` (OID 1186) instead of text.
+
+## 0.24.0 — unreleased
+
+### Added
+- Type system, part one (#96): the type modifiers a column declares
+  are enforced and described. Integer widths — `INT2` / `SMALLINT`,
+  `INT4` / `INT` / `INTEGER`, `INT8` / `BIGINT` — bound the values
+  (`22003`) and describe with PostgreSQL's OIDs (21 / 23 / 20) and
+  binary sizes, so drivers scan into `int16` / `int32`; `SERIAL` is
+  `INT4`, `SMALLSERIAL` `INT2`. `VARCHAR(n)` / `CHAR(n)` refuse a
+  longer value (`22001`; excess spaces are dropped) and `CHAR(n)` renders
+  blank-padded (`varchar` 1043 / `bpchar` 1042 with the typmod).
+  `TIMESTAMP` is now `TIMESTAMP WITHOUT TIME ZONE` (OID 1114: an input
+  offset is ignored, the output carries none), `TIMESTAMPTZ` /
+  `TIMESTAMP WITH TIME ZONE` is unchanged, and `TIMESTAMP(p)` /
+  `TIMESTAMPTZ(p)` round to `p` digits on write. `SHOW CREATE TABLE`,
+  `information_schema.columns`, `pg_attribute`, `pg_type` (five new
+  rows), `format_type`, `LIKE` and `CREATE TABLE AS` carry the
+  modifiers; `ALTER COLUMN TYPE` changes them — a widening is one
+  descriptor write, a narrowing rewrites and checks every value. Storage
+  is unchanged (the modifiers ride on the descriptor; no cluster
+  version bump); until v9 is finalized a new column keeps the earlier
+  meaning of its declaration.
+
+### Changed
+- `INT` / `INTEGER` columns are 32-bit (they were `INT8`): a value past
+  ±2³¹ into a column created from now on is `22003`. Existing columns
+  keep their width. `TIMESTAMP` columns created from now on render
+  without the `+00` offset and ignore an input offset.
+
+## 0.23.0 — unreleased
+
+### Added
+- DDL completeness, part three (#95, closing it): `CREATE TABLE ... AS
+  query [WITH NO DATA]` (the query's shape and rows, streamed through
+  the COPY chunk path; a hidden `rowid` key unless `PRIMARY KEY (cols)`
+  is written among the column names; `SELECT ... INTO` refused with a
+  pointer), `CREATE TABLE ... (LIKE t [INCLUDING | EXCLUDING DEFAULTS |
+  CONSTRAINTS | INDEXES | COMMENTS | ALL])`, `ALTER TABLE ... ALTER
+  COLUMN c [SET DATA] TYPE t` as an online rewrite (a hidden shadow
+  column every write fills, a chunked conversion of the existing rows,
+  a swap; widening and text conversions; cluster version v9), and
+  `COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL` with
+  `obj_description`, `col_description` and `pg_description` (psql's
+  `\d+`, `\dt+`).
+
+## 0.22.0 — unreleased
+
+### Added
+- DDL completeness, part two (#95): views. `CREATE [OR REPLACE] VIEW
+  name [(cols)] AS query` stores the query; a statement that names the
+  view runs it and reads the rows like a table (as a base, join side,
+  subquery, set-operation member, `INSERT ... SELECT` source, inside
+  `WITH`; a view over a view expands the same way). `DROP VIEW [IF
+  EXISTS] ... [CASCADE]`; `DROP TABLE`, `DROP VIEW`, `RENAME TO`,
+  `RENAME COLUMN` and `DROP COLUMN` refuse (`2BP01`) while a view
+  depends on the relation unless `CASCADE` drops the views; DML and
+  physical DDL on a view are `42809`. `SHOW VIEWS`, `SHOW CREATE VIEW`,
+  `pg_class` (`relkind = 'v'`), `pg_views`, `information_schema.tables`
+  and `.views`, the dashboard's schema browser, psql's `\dv` and `\d
+  view`. Reading a view needs `SELECT` on the view and on the tables
+  its query reads. Cluster version **v9**: `CREATE VIEW` is refused
+  until `datax debug upgrade` finalizes it.
+
+## 0.21.0 — unreleased
+
+### Added
+- DDL completeness, part one (#95): `DROP INDEX [IF EXISTS]` (the
+  index leaves the schema at once; its entries are reclaimed after the
+  commit and lease drain), `ALTER INDEX ... RENAME TO`, `ALTER TABLE
+  ... RENAME TO / RENAME [COLUMN] / RENAME CONSTRAINT` (foreign keys,
+  sequences and grants follow the table's ID; `CHECK` expressions are
+  rewritten for a renamed column; a `UNIQUE` constraint and its index
+  rename together), `ALTER TABLE ... ALTER COLUMN SET DEFAULT | DROP
+  DEFAULT` (constants and expressions; a fill-on-read column keeps
+  filling its old rows from the original constant), `TRUNCATE [TABLE] t
+  [, ...] [RESTART IDENTITY] [CASCADE]` as a transactional layout swap
+  (one descriptor write for any table size; the old layout serves `AS OF
+  SYSTEM TIME` until the re-shard janitor reclaims it; referencing
+  tables refused without `CASCADE`), and `IF [NOT] EXISTS` on `ALTER
+  TABLE`, `ADD COLUMN`, `DROP COLUMN`, `CREATE INDEX`, `ALTER INDEX`,
+  `ALTER SEQUENCE`, `CREATE USER` and `DROP USER`. The reference
+  documents which DDL runs inside a transaction block (every
+  single-descriptor-write statement) and which is refused (`25001`: the
+  multi-transaction online statements).
+
+### Changed
+- `CREATE INDEX` on a taken name and `ADD COLUMN` on a taken name report
+  `42710` (duplicate object) instead of `42601`.
+
 ## 0.20.0 — unreleased
 
 ### Added

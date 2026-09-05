@@ -85,6 +85,11 @@ var metricSeriesDefs = []MetricSeries{
 	{Name: "store.compaction_debt", Kind: SeriesGauge, Unit: "bytes", Group: "storage", Help: "estimated compaction debt"},
 	{Name: "store.memtable_bytes", Kind: SeriesGauge, Unit: "bytes", Group: "storage", Help: "memtables in memory"},
 	{Name: "store.write_stalls", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "Pebble write stalls"},
+	{Name: "store.block_cache_bytes", Kind: SeriesGauge, Unit: "bytes", Group: "storage", Help: "block cache in use"},
+	{Name: "store.block_cache_hits", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "block cache hits"},
+	{Name: "store.block_cache_misses", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "block cache misses"},
+	{Name: "store.bloom_hits", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "point reads a bloom filter skipped"},
+	{Name: "store.bloom_misses", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "point reads the bloom filters passed through"},
 	{Name: "store.debt_gated", Kind: SeriesGauge, Unit: "", Group: "storage", Help: "1 while the compaction-debt gate is latched"},
 	{Name: "storage.backpressure", Kind: SeriesCounter, Unit: "", Group: "storage", Help: "writes shed under backpressure"},
 
@@ -327,6 +332,11 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 		add("store.l0_sublevels", float64(sm.L0Sublevels))
 		add("store.compaction_debt", float64(sm.CompactionDebtBytes))
 		add("store.memtable_bytes", float64(sm.MemtableBytes))
+		add("store.block_cache_bytes", float64(sm.BlockCacheBytes))
+		add("store.block_cache_hits", float64(sm.BlockCacheHits))
+		add("store.block_cache_misses", float64(sm.BlockCacheMisses))
+		add("store.bloom_hits", float64(sm.FilterHits))
+		add("store.bloom_misses", float64(sm.FilterMisses))
 		add("store.write_stalls", float64(sm.WriteStalls))
 		gated := 0.0
 		if n.engine.DebtGated() {

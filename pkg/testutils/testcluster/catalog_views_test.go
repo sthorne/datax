@@ -47,9 +47,13 @@ func TestCatalogViewsSmoke(t *testing.T) {
 	if _, serr := trySQL(ctx, root, `INSERT INTO pg_class VALUES (1)`); serr == nil || serr.Code != sql.CodeInsufficientPriv {
 		t.Fatalf("write to a catalog: %v", serr)
 	}
-	r = execSQL(t, ctx, root, `SELECT rolname, rolsuper FROM pg_roles`)
+	// root and the built-in roles (admin, read_all, write_all, metrics).
+	r = execSQL(t, ctx, root, `SELECT rolname, rolsuper FROM pg_roles WHERE rolcanlogin`)
 	if len(r.Rows) != 1 || r.Rows[0][0].S != "root" || !r.Rows[0][1].B {
 		t.Fatalf("pg_roles: %+v", r.Rows)
+	}
+	if r := execSQL(t, ctx, root, `SELECT rolname FROM pg_roles WHERE NOT rolcanlogin ORDER BY rolname`); len(r.Rows) != 4 || r.Rows[0][0].S != "admin" {
+		t.Fatalf("pg_roles built-ins: %+v", r.Rows)
 	}
 }
 
@@ -158,6 +162,18 @@ FROM pg_catalog.pg_class c
      LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
      LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
 WHERE c.relkind IN ('r','p','')
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname <> 'information_schema'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 1,2;`,
+	`\dv`: `SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('v','')
       AND n.nspname <> 'pg_catalog'
       AND n.nspname !~ '^pg_toast'
       AND n.nspname <> 'information_schema'
@@ -317,8 +333,11 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		}
 	}
 
-	// The list commands.
-	want := map[string]int{`\l`: 2, `\dt`: 1, `\di`: 3, `\du`: 2, `\dn`: 1, `\dp`: 1, `\dT`: 0}
+	// The list commands (a view alongside the table: \dt lists tables
+	// only, \dv the view).
+	execSQL(t, ctx, root, `CREATE VIEW tv AS SELECT id, name FROM t WHERE qty > 0`)
+	// \du: root, bob, and the four built-in roles.
+	want := map[string]int{`\l`: 2, `\dt`: 1, `\dv`: 1, `\di`: 3, `\du`: 6, `\dn`: 1, `\dp`: 2, `\dT`: 0}
 	for cmd, q := range psqlListQueries {
 		if got := rowsOf(q); len(got) != want[cmd] {
 			t.Fatalf("%s: %d rows, want %d: %v", cmd, len(got), want[cmd], got)
@@ -332,10 +351,16 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		t.Log("psql not installed; skipping the end-to-end run")
 		return
 	}
-	for _, cmd := range []string{`\l`, `\dt`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
+	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
 		out, err := runPsql(ctx, psql, url, cmd)
 		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
+		}
+		if cmd == `\dv` && !strings.Contains(out, "tv") {
+			t.Fatalf("psql \\dv lacks the view:\n%s", out)
+		}
+		if cmd == `\d+ tv` && !strings.Contains(out, "SELECT id, name FROM t WHERE qty > 0") {
+			t.Fatalf("psql \\d+ tv lacks the definition:\n%s", out)
 		}
 		if cmd == `\d t` {
 			for _, s := range []string{`"t_pkey" PRIMARY KEY, btree (id)`, `"t_name" UNIQUE CONSTRAINT, btree (name)`, `"t_qty" btree (qty)`, `qty    | bigint |           |          | 0`} {
@@ -447,7 +472,7 @@ func TestSQLSurfaceForTools(t *testing.T) {
 		t.Fatalf("SHOW USERS: %+v", r.Rows)
 	}
 	r = execSQL(t, ctx, root, `SHOW GRANTS ON t FOR bob`)
-	if len(r.Rows) != 2 || r.Rows[0][2].S != "bob" || r.Rows[0][3].S != "SELECT" || r.Rows[1][3].S != "INSERT" {
+	if len(r.Rows) != 2 || r.Rows[0][2].S != "t" || r.Rows[0][3].S != "bob" || r.Rows[0][4].S != "SELECT" || r.Rows[1][4].S != "INSERT" || r.Rows[0][5].S != "NO" {
 		t.Fatalf("SHOW GRANTS: %+v", r.Rows)
 	}
 	if r := execSQL(t, ctx, root, `SHOW GRANTS`); len(r.Rows) != 2 {

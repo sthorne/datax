@@ -153,6 +153,10 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 		return nil, ToSQLError(err)
 	}
 	d := catalog.NewSequenceDescriptor(bare, dbID)
+	d.Owner = s.user
+	if err := s.applyDefaultPrivileges(ctx, txn, dbID, d.Owner, "SEQUENCES", &d.Privileges, &d.GrantOptions); err != nil {
+		return nil, err
+	}
 	if err := applySequenceOptions(d, &t.Options, true); err != nil {
 		return nil, err
 	}
@@ -175,16 +179,19 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 		}
 		return nil, ToSQLError(err)
 	}
-	log.Audit("sequence-ddl", "stmt", "CREATE SEQUENCE", "target", bare, "principal", s.user)
+	log.Audit("sequence-ddl", "stmt", "CREATE SEQUENCE", "target", bare, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "CREATE SEQUENCE"}, nil
 }
 
 func (s *Session) execAlterSequence(ctx context.Context, txn *kvclient.Txn, t *parser.AlterSequence) (*Result, error) {
 	d, err := s.lookupSequence(ctx, txn, t.Name)
 	if err != nil {
+		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedTable && t.IfExists {
+			return &Result{Tag: "ALTER SEQUENCE"}, nil
+		}
 		return nil, err
 	}
-	if err := s.checkSequencePriv(ctx, txn, d); err != nil {
+	if err := s.checkSequenceOwner(ctx, txn, d); err != nil {
 		return nil, err
 	}
 	if err := applySequenceOptions(d, &t.Options, false); err != nil {
@@ -214,7 +221,7 @@ func (s *Session) execDropSequence(ctx context.Context, txn *kvclient.Txn, t *pa
 		}
 		return nil, err
 	}
-	if err := s.checkSequencePriv(ctx, txn, d); err != nil {
+	if err := s.checkSequenceOwner(ctx, txn, d); err != nil {
 		return nil, err
 	}
 	if d.OwnerTable != 0 {
@@ -228,28 +235,20 @@ func (s *Session) execDropSequence(ctx context.Context, txn *kvclient.Txn, t *pa
 		return nil, err
 	}
 	s.dropSeqBlock(d.ID)
-	log.Audit("sequence-ddl", "stmt", "DROP SEQUENCE", "target", d.Name, "principal", s.user)
+	log.Audit("sequence-ddl", "stmt", "DROP SEQUENCE", "target", d.Name, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP SEQUENCE"}, nil
 }
 
-// checkSequencePriv: admins, and the owner table's writers, may alter or
-// drop a sequence; an unowned sequence takes an admin.
-func (s *Session) checkSequencePriv(ctx context.Context, txn *kvclient.Txn, d *catalog.SequenceDescriptor) error {
-	admin, err := s.isAdmin(ctx, txn)
-	if err != nil {
-		return err
-	}
-	if admin {
-		return nil
-	}
+// checkSequenceOwner: the sequence's owner (or an admin) may alter or
+// drop it; a sequence a column owns follows its table's owner.
+func (s *Session) checkSequenceOwner(ctx context.Context, txn *kvclient.Txn, d *catalog.SequenceDescriptor) error {
+	owner := d.Owner
 	if d.OwnerTable != 0 {
-		if owner, err := catalog.ReadTable(ctx, txn, d.OwnerTable); err == nil && owner != nil {
-			if err := s.checkTablePriv(ctx, txn, owner, "INSERT"); err == nil {
-				return nil
-			}
+		if t, err := catalog.ReadTable(ctx, txn, d.OwnerTable); err == nil && t != nil {
+			owner = t.Owner
 		}
 	}
-	return newErrf(CodeInsufficientPriv, "permission denied for sequence %q", d.Name)
+	return s.checkOwner(ctx, txn, "sequence", d.Name, owner)
 }
 
 func (s *Session) execShowSequences(ctx context.Context, txn *kvclient.Txn) (*Result, error) {
@@ -309,6 +308,9 @@ func (s *Session) sequenceValue(ctx context.Context, d *catalog.SequenceDescript
 func (s *Session) nextval(ctx context.Context, txn *kvclient.Txn, name string) (int64, error) {
 	d, err := s.lookupSequence(ctx, txn, name)
 	if err != nil {
+		return 0, err
+	}
+	if err := s.checkSequencePriv(ctx, txn, d, catalog.PrivUsage); err != nil {
 		return 0, err
 	}
 	seqBlocks.Lock()
@@ -382,6 +384,9 @@ func (s *Session) currval(ctx context.Context, txn *kvclient.Txn, name string) (
 	if err != nil {
 		return 0, err
 	}
+	if err := s.checkSequencePriv(ctx, txn, d, "SELECT"); err != nil {
+		return 0, err
+	}
 	v, ok := s.seq().currval[d.ID]
 	if !ok {
 		return 0, newErrf(CodeObjectNotInState, "currval of sequence %q is not yet defined in this session", d.Name)
@@ -401,6 +406,9 @@ func (s *Session) lastvalFn() (int64, error) {
 func (s *Session) setval(ctx context.Context, txn *kvclient.Txn, name string, v int64, isCalled bool) (int64, error) {
 	d, err := s.lookupSequence(ctx, txn, name)
 	if err != nil {
+		return 0, err
+	}
+	if err := s.checkSequencePriv(ctx, txn, d, "UPDATE"); err != nil {
 		return 0, err
 	}
 	if v < d.MinValue || v > d.MaxValue {
@@ -598,9 +606,9 @@ func (s *Session) defaultValue(ctx context.Context, txn *kvclient.Txn, cd *colum
 			if err != nil {
 				return types.Datum{}, err
 			}
-			d, cerr := d.Coerce(col.Type)
+			d, cerr := coerceColumn(*col, d)
 			if cerr != nil {
-				return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "default for column %q: %v", col.Name, cerr)
+				return types.Datum{}, cerr
 			}
 			return d, nil
 		}

@@ -10,7 +10,16 @@ transactions — all over the standard PostgreSQL wire protocol.
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
+ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN] a TO b | RENAME CONSTRAINT a TO b
+    | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
+TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
+CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
+CREATE TABLE t [(names [, PRIMARY KEY (cols)])] AS SELECT ... [WITH [NO] DATA]   -- streamed through the COPY chunk path
+CREATE TABLE t (LIKE src [INCLUDING | EXCLUDING DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL], ...)
+ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE type       -- online rewrite: shadow column, chunked convert, swap
+COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text' | NULL
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -32,15 +41,40 @@ ANALYZE [t]                             -- collect table statistics (admin; not 
 SHOW STATS FOR t
 ```
 
-- Types: `INT8` (aliases INT, INTEGER, BIGINT), `FLOAT8` (DOUBLE PRECISION),
-  `TEXT` (aliases STRING, VARCHAR), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
-  (alias TIMESTAMP [WITH TIME ZONE]; UTC nanoseconds internally,
-  microsecond precision on the binary wire), `DATE`, `BYTES` (alias
-  BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases NUMERIC, DEC),
-  `JSONB` (alias JSON). String literals coerce into the
-  new types (`WHERE at >= '2026-08-30 02:00:00Z'` becomes a key bound),
-  and all but JSONB are usable in primary keys and indexes via
-  order-preserving encodings (JSONB has no ordering and refuses with
+- Types: `INT8` (BIGINT), `INT4` (INT, INTEGER) and `INT2` (SMALLINT) —
+  one `Int` family, the width a column attribute (`catalog.Column.Width`)
+  that bounds values and picks the wire OID; `FLOAT8` (DOUBLE PRECISION),
+  `TEXT` (aliases STRING, VARCHAR) with `VARCHAR(n)` / `CHAR(n)` as
+  attributes (`MaxLen`, `Char`), `BOOL` (BOOLEAN), `TIMESTAMPTZ`
+  (TIMESTAMP WITH TIME ZONE; UTC nanoseconds internally, microsecond
+  precision on the binary wire) and `TIMESTAMP` without time zone
+  (attribute `NoTZ`: the same nanoseconds, rendered without an offset,
+  an input offset ignored), `TIMESTAMP(p)` / `TIME(p)` (`TimePrecision`,
+  stored as p+1), `DATE`, `TIME` (nanoseconds since midnight), `INTERVAL`
+  (a months / days / nanoseconds triple: `Datum.Mo`, `Datum.Dy`,
+  `Datum.I`; compared by PostgreSQL's 30-day-month, 24-hour-day value),
+  enums (`CREATE TYPE ... AS ENUM`: a `TypeDescriptor` of labels under
+  `/system/typedesc/<id>` and `/system/typens/<db>/<name>`; a column of
+  the type copies the labels — `Column.EnumType`, `EnumLabels`, refreshed
+  by `ADD VALUE` with a drain — and stores the ordinal with the label,
+  rowenc tag 15, keys as ordinal then label, so nothing on a read path
+  looks the type up),
+  `BYTES` (alias BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases
+  NUMERIC, DEC), `JSONB` (alias JSON), and arrays of every scalar
+  family but JSONB (`types.ArrayOf(elem)`, a composite Family value
+  `Array | elem<<8` so one value names `INT8[]` wherever a family flows;
+  elements in `Datum.A`; rowenc tag 14 encodes each element with its
+  order-preserving key encoding). The attributes are enforced on
+  every write by `catalog.Column.Conform` (a `ValueError` carries the
+  SQLSTATE) and described by `sql.ResultColumn`, so pgwire picks the OID,
+  size and rendering per described column; below cluster version v9 a
+  new column drops them (the earlier meaning), and INTERVAL / TIME
+  columns need v10 (their rowenc tags 12 and 13 are unknown to v9).
+  String literals coerce into the new types (`WHERE at >= '2026-08-30
+  02:00:00Z'` becomes a key bound), and all but JSONB are usable in
+  primary keys and indexes via order-preserving encodings (an interval
+  key is its comparison value followed by the months and days; JSONB
+  has no ordering and refuses with
   `0A000`).
 - DECIMAL is exact arbitrary-precision arithmetic (`math/big` coefficient
   × 10^exp). Non-integer numeric literals are DECIMAL, as in PostgreSQL —
@@ -61,10 +95,14 @@ SHOW STATS FOR t
   memo identity are untouched — while the datum carries the declared
   scale as a display-only field: `Text()` pads to it (`9.90`), and the
   binary NUMERIC encoder derives its `dscale` from that padded render.
-  RowDescription reports the typmod (`(p<<16)|(s+4)`) for enforced
-  columns. Precision/scale live on the column descriptor as append-only
-  `omitempty` JSON fields (zero = bare DECIMAL, the pre-existing
-  meaning), so old descriptors and rolling upgrades are unaffected.
+  RowDescription reports the typmod (`(p<<16)|(s+4)`; `n+4` for
+  `VARCHAR(n)` / `CHAR(n)`, `p` for `TIMESTAMP(p)`) for enforced
+  columns. Precision/scale and the other attributes live on the column
+  descriptor as append-only `omitempty` JSON fields (zero = the
+  pre-existing meaning), so old descriptors and rolling upgrades are
+  unaffected. `CHAR(n)` stores its value trimmed and stamps a display
+  pad (`Datum.Pad`), `TIMESTAMP` without time zone a display flag
+  (`Datum.NoTZ`), both like `Dscale`: never part of identity.
 - JSONB stores normalized text (sorted object keys, compact, duplicate
   keys last-wins). Numbers pass through `json.Number`, so integer
   fidelity is preserved on ingest; equality compares normalized text, and
@@ -143,12 +181,14 @@ joins beyond 8 tables (INNER joins are cost-reordered when statistics
 exist; outer joins and self-joins keep syntactic order),
 `EXPLAIN` options in parentheses, RANGE frames with an offset,
 deferrable constraints,
-typmod enforcement beyond DECIMAL on columns (`VARCHAR(n)` parsed and
-ignored; casts apply both),
+typmods on other types than DECIMAL, the integer widths, `VARCHAR(n)` /
+`CHAR(n)`, `TIMESTAMP(p)` and `TIME(p)` (parsed and ignored),
+`TIME WITH TIME ZONE`, multidimensional arrays and array slices, indexes
+on array columns, `JSONB[]`, enum `ADD VALUE BEFORE` / `AFTER` and
+`RENAME VALUE`, arrays of enums,
 JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
 inverted indexes),
-expressions over aggregates (`SUM(a) / COUNT(*)`), window functions, an
-INTERVAL type (intervals are text), user-defined functions,
+expressions over aggregates (`SUM(a) / COUNT(*)`), user-defined functions,
 DEFAULT expressions that reference other columns.
 
 ### Expressions and builtins
@@ -241,6 +281,39 @@ Table descriptors are JSON documents stored in system keys (range 1):
   the `CREATE INDEX` shape: publish (unvalidated), drain lease
   adoption, backfill the index, sweep the existing rows in chunks as of
   a boundary, mark validated.
+
+`TRUNCATE` reuses the re-shard's layout swap: the descriptor moves the
+primary rows and every secondary index to fresh index IDs in one write
+and records the superseded layout in `RetiredLayouts`, where the
+re-shard janitor reclaims it after the keep window — so a truncation
+costs one descriptor write whatever the table's size or range count,
+rolls back with its transaction, and keeps `AS OF SYSTEM TIME` reads
+below it working meanwhile. `DROP INDEX` removes the index from the
+descriptor and queues its keyspace for the same chunked wipe `DROP
+CONSTRAINT` uses, run after the commit and the lease drain. `RENAME TO`
+moves the namespace entry (the descriptor ID, and so every by-ID
+reference, is unchanged); a gateway caching the old name drops that
+entry at its next lease renewal, which the statement's drain waits for.
+
+A view is a table descriptor carrying its query's text and no rows
+(`ViewQuery`, cluster version v9). Before a statement runs — or is
+described — every view it names is bound as a leading implicit `WITH`
+member (pkg/sql/view.go over the relation machinery of pkg/sql/cte.go):
+the view's query executes once as the member and the statement reads
+the materialized rows through the ordinary access path, so a view works
+wherever a table does and a view over a view expands as the member
+executes. Views record the relations they read (`ViewDepends`) for the
+drop / rename refusals; DML and physical DDL on a view are refused.
+
+`ALTER COLUMN TYPE` is the third online state machine: publish a
+hidden shadow column (`RetypeFrom` names the original; every
+`rowenc.EncodeValue` derives the shadow's value from the original's,
+so concurrent writers converge with the backfill), drain, convert the
+existing rows in chunks as of a boundary, then swap the shadow into the
+column's slot and drop the original — a failure after publish removes
+the shadow and drains. `CREATE TABLE ... AS` creates the table, drains,
+runs the query once and streams the rows through the `COPY` chunk
+path; a failure drops the table again.
 
 DDL runs inside a normal transaction. Each gateway caches descriptors;
 descriptor **versions and leases** make that cache safe across gateways:

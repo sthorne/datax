@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -89,15 +90,97 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "current_schema":
 		d := types.NewString(catalog.PublicSchema)
 		out.Func, out.Lit = "", &d
-	case "current_user", "session_user":
+	case "current_user":
 		d := types.NewString(s.user)
+		out.Func, out.Lit = "", &d
+	case "session_user":
+		d := types.NewString(s.sessionUser)
 		out.Func, out.Lit = "", &d
 	case "version":
 		d := types.NewString("PostgreSQL 14.0 datax " + version.Release)
 		out.Func, out.Lit = "", &d
 	case "pg_backend_pid":
-		d := types.NewInt(0)
+		d := types.NewInt(int64(s.BackendPID))
 		out.Func, out.Lit = "", &d
+	case "current_setting":
+		// current_setting(name [, missing_ok]): the variable's value; an
+		// unknown name is 42704 unless missing_ok, then NULL.
+		if len(e.Args) < 1 || len(e.Args) > 2 {
+			return e, newErrf(CodeSyntaxError, "current_setting() takes a name and an optional missing_ok")
+		}
+		nameArg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		missingOK := false
+		if len(e.Args) == 2 {
+			m, err := evalExpr(e.Args[1], nil, nil, params)
+			if err != nil {
+				return e, err
+			}
+			missingOK = !m.Null && m.B
+		}
+		_, value, ok := s.setting(nameArg.Text())
+		var d types.Datum
+		switch {
+		case ok:
+			d = types.NewString(value)
+		case missingOK:
+			d = types.DNull
+		default:
+			return e, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", nameArg.Text())
+		}
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_sleep":
+		// pg_sleep(seconds): waits, honoring cancellation and the
+		// statement timeout.
+		if len(e.Args) != 1 {
+			return e, newErrf(CodeSyntaxError, "pg_sleep() takes one argument")
+		}
+		arg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		secs, err := arg.Coerce(types.Float)
+		if err != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "pg_sleep: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return e, ctx.Err()
+		case <-time.After(time.Duration(secs.F * float64(time.Second))):
+		}
+		d := types.NewString("")
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_cancel_backend", "pg_terminate_backend":
+		// Admin-only: cancel (or terminate) another session of this
+		// cluster by its wire PID.
+		if len(e.Args) != 1 {
+			return e, newErrf(CodeSyntaxError, "%s() takes one argument", e.Func)
+		}
+		admin, err := s.isAdmin(ctx, txn)
+		if err != nil {
+			return e, err
+		}
+		if !admin {
+			return e, newErrf(CodeInsufficientPriv, "permission denied: %s() needs the admin role", e.Func)
+		}
+		arg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		pid, err := arg.Coerce(types.Int)
+		if err != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "%s: %v", e.Func, err)
+		}
+		ok := false
+		if s.BackendControl != nil {
+			if ok, err = s.BackendControl(int32(pid.I), e.Func == "pg_terminate_backend"); err != nil {
+				return e, newErrf(CodeInternal, "%s: %v", e.Func, err)
+			}
+		}
+		d := types.NewBool(ok)
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_get_userbyid":
 		// Every object is owned by root (there is no ownership yet).
 		d := types.NewString("root")
@@ -119,7 +202,7 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	case "pg_encoding_to_char":
 		d := types.NewString("UTF8")
 		out.Func, out.Args, out.Lit = "", nil, &d
-	case "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
+	case "shobj_description", "pg_get_statisticsobjdef_columns", "pg_get_triggerdef":
 		d := types.DNull
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_relation_is_publishable":
@@ -136,14 +219,44 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			if len(res.Columns) != 1 {
 				return e, newErrf(CodeSyntaxError, "subquery must return only one column")
 			}
-			elems := make([]string, len(res.Rows))
-			for i, r := range res.Rows {
-				elems[i] = arrayElemText(r[0])
+			elem := res.Columns[0].Type
+			if elem == types.Unknown || elem.IsArray() {
+				elem = types.String
 			}
-			d := types.NewString("{" + strings.Join(elems, ",") + "}")
+			elems := make([]types.Datum, len(res.Rows))
+			for i, r := range res.Rows {
+				elems[i] = r[0]
+				if !r[0].Null && r[0].Fam != elem {
+					if c, cerr := r[0].Coerce(elem); cerr == nil {
+						elems[i] = c
+					} else {
+						elems[i] = types.NewString(r[0].Text())
+					}
+				}
+			}
+			d := types.NewArray(elem, elems)
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
-	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr":
+	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_viewdef", "obj_description", "col_description":
+		// pg_get_viewdef(oid [, pretty]), obj_description(oid, class) and
+		// col_description(oid, attnum) on a LITERAL OID (psql's \d+)
+		// resolve from the descriptor here.
+		if literal := e.Func == "pg_get_viewdef" || e.Func == "obj_description" || e.Func == "col_description"; literal && len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+			oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text())
+			if err != nil {
+				return e, err
+			}
+			d := types.DNull
+			if e.Func == "pg_get_viewdef" {
+				if desc, rerr := catalog.ReadTable(ctx, txn, uint64(oid)); rerr == nil && desc != nil && desc.IsView() {
+					d = types.NewString(desc.ViewQuery)
+				}
+			} else if text := s.descriptionOf(ctx, txn, oid, e); text != "" {
+				d = types.NewString(text)
+			}
+			out.Func, out.Args, out.Lit = "", nil, &d
+			break
+		}
 		// Row-dependent catalog renderings: the virtual tables carry them
 		// as hidden columns beside the OID the function takes, so the
 		// call becomes a column reference on the same row.
@@ -188,6 +301,15 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			return e, err
 		}
 		out.Cmp = &resolved[0]
+	}
+	if out.Cast != "" && out.Cast != "regclass" && out.Lit != nil && out.Lit.Fam == types.String {
+		// 'label'::mood — a cast to an enum type of the database.
+		if v, ok, err := s.enumLiteral(ctx, txn, out.Cast, *out.Lit); err != nil {
+			return e, err
+		} else if ok {
+			out.Cast, out.Lit = "", &v
+			return out, nil
+		}
 	}
 	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
 		// 'name'::regclass: the table's OID (a real table's, or a catalog
@@ -672,7 +794,22 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 
 // funcTableDesc is the one-column descriptor of a FROM table function.
 func funcTableDesc(t *parser.Select) *catalog.TableDescriptor {
-	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: types.String}}}
+	return funcTableDescOf(t, funcTableElem(*t.FuncTable))
+}
+
+func funcTableDescOf(t *parser.Select, elem types.Family) *catalog.TableDescriptor {
+	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: elem}}}
+}
+
+// funcTableElem is the element family FROM unnest(array) produces, from
+// the argument's inferred type (text when it cannot be told).
+func funcTableElem(e parser.Expr) types.Family {
+	if e.Func == "unnest" && len(e.Args) == 1 {
+		if f := exprFamily(e.Args[0], nil); f.IsArray() {
+			return f.Elem()
+		}
+	}
+	return types.String
 }
 
 // execFuncTableSelect materializes FROM unnest(array): one text row per
@@ -690,8 +827,15 @@ func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t 
 	if err != nil {
 		return nil, err
 	}
+	elem := funcTableElem(*t.FuncTable)
 	var rows [][]types.Datum
-	if !arg.Null {
+	switch {
+	case arg.Null:
+	case arg.Fam.IsArray():
+		for _, d := range arg.A {
+			rows = append(rows, []types.Datum{d})
+		}
+	default:
 		for _, el := range arrayElems(arg.Text()) {
 			d := types.NewString(el)
 			if el == "NULL" {
@@ -700,7 +844,7 @@ func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t 
 			rows = append(rows, []types.Datum{d})
 		}
 	}
-	return s.execMaterialized(ctx, txn, funcTableDesc(t), rows, t, params)
+	return s.execMaterialized(ctx, txn, funcTableDescOf(t, elem), rows, t, params)
 }
 
 // execMaterialized runs a select's pipeline (WHERE filter, grouping or
@@ -741,7 +885,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}
 	for _, fr := range rows {
 		out := make([]types.Datum, len(proj))
@@ -775,7 +919,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
-	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
+	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
@@ -806,6 +950,46 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
 	}
 	return vtable.TableOID(desc), nil
+}
+
+// descriptionOf resolves obj_description(oid, class) / col_description
+// (oid, attnum) for a literal OID: a table's, an index's or a column's
+// COMMENT ("" when none).
+func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int64, e parser.Expr) string {
+	tableID, indexID := uint64(oid), uint64(0)
+	if oid>>16 != 0 {
+		tableID, indexID = uint64(oid>>16), uint64(oid&0xffff)
+	}
+	desc, err := catalog.ReadTable(ctx, txn, tableID)
+	if err != nil || desc == nil {
+		return ""
+	}
+	if indexID != 0 {
+		for _, idx := range desc.Indexes {
+			if idx.ID == indexID {
+				return idx.Comment
+			}
+		}
+		return ""
+	}
+	if e.Func == "col_description" && len(e.Args) > 1 && e.Args[1].Lit != nil {
+		n, ok := e.Args[1].Lit.I, e.Args[1].Lit.Fam == types.Int
+		if !ok {
+			return ""
+		}
+		pos := int64(0)
+		for _, c := range desc.Columns {
+			if c.Hidden {
+				continue
+			}
+			pos++
+			if pos == n {
+				return c.Comment
+			}
+		}
+		return ""
+	}
+	return desc.Comment
 }
 
 // regclassNames lists the (OID, name) of every table the session can

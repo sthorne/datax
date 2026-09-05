@@ -132,6 +132,7 @@ func TestPrivileges(t *testing.T) {
 	// Admin role: full DDL + grant rights, revocable at runtime.
 	execSQL(t, ctx, root, `GRANT ADMIN TO alice`)
 	execEventually(t, ctx, alice, `CREATE TABLE hers (id INT PRIMARY KEY)`)
+	execSQL(t, ctx, alice, `CREATE USER bob PASSWORD 'pw12345'`)
 	execSQL(t, ctx, alice, `GRANT SELECT ON hers TO bob`)
 	execSQL(t, ctx, root, `REVOKE ADMIN FROM alice`)
 	// Barrier: dropping a nonexistent user is side-effect-free — "does not
@@ -164,6 +165,9 @@ func TestPrivilegesOverPgwire(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := rootConn.Exec(ctx, `INSERT INTO secrets VALUES (1, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootConn.Exec(ctx, `CREATE USER bob PASSWORD 'pw12345'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := rootConn.Exec(ctx, `GRANT SELECT ON secrets TO bob`); err != nil {

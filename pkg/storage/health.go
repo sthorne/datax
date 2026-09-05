@@ -23,6 +23,17 @@ type StorageMetrics struct {
 	WriteStalls         int64 // cumulative Pebble write-stall events
 	DiskSlowEvents      int64 // cumulative slow-disk events
 	BackgroundErrors    int64 // cumulative background (compaction/flush) errors
+	// Block cache (shared by the process's engines): bytes and blocks
+	// held, cumulative hits and misses — the hit rate is how an operator
+	// sizes --cache-size.
+	BlockCacheBytes  int64
+	BlockCacheCount  int64
+	BlockCacheHits   int64
+	BlockCacheMisses int64
+	// Bloom filters: cumulative reads a filter answered without a data
+	// block (hits) and reads it could not (misses).
+	FilterHits   int64
+	FilterMisses int64
 }
 
 // health carries the engine's event counters and cached metrics snapshot.
@@ -65,6 +76,12 @@ func (e *Engine) StorageMetrics() StorageMetrics {
 		WriteStalls:         e.health.stalls.Load(),
 		DiskSlowEvents:      e.health.diskSlow.Load(),
 		BackgroundErrors:    e.health.bgErrors.Load(),
+		BlockCacheBytes:     m.BlockCache.Size,
+		BlockCacheCount:     m.BlockCache.Count,
+		BlockCacheHits:      m.BlockCache.Hits,
+		BlockCacheMisses:    m.BlockCache.Misses,
+		FilterHits:          m.Filter.Hits,
+		FilterMisses:        m.Filter.Misses,
 	}
 	e.health.snapshot.Store(&s)
 	e.updateDebtGate(s.CompactionDebtBytes)

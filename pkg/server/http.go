@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"math"
 	"net"
 	"net/http"
+	"net/http/pprof"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -142,6 +144,24 @@ func (n *Node) startHTTP() error {
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "datax_storage_write_stalls_total", Help: "Pebble hard write-stall events on this store.",
 			}, func() float64 { return float64(eng.StorageMetrics().WriteStalls) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_block_cache_bytes", Help: "Bytes held by the block cache (shared by the process's engines).",
+			}, func() float64 { return float64(eng.StorageMetrics().BlockCacheBytes) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_storage_block_cache_size_bytes", Help: "The block cache's configured size (--cache-size or the profile's share of memory).",
+			}, func() float64 { return float64(eng.CacheSize()) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_block_cache_hits_total", Help: "Block cache hits; with misses, the hit rate that sizes --cache-size.",
+			}, func() float64 { return float64(eng.StorageMetrics().BlockCacheHits) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_block_cache_misses_total", Help: "Block cache misses.",
+			}, func() float64 { return float64(eng.StorageMetrics().BlockCacheMisses) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_bloom_hits_total", Help: "Point reads a bloom filter answered without reading a data block.",
+			}, func() float64 { return float64(eng.StorageMetrics().FilterHits) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "datax_storage_bloom_misses_total", Help: "Point reads the bloom filters could not answer (the key may be present).",
+			}, func() float64 { return float64(eng.StorageMetrics().FilterMisses) }),
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "datax_storage_disk_slow_total", Help: "Slow-disk events reported by Pebble.",
 			}, func() float64 { return float64(eng.StorageMetrics().DiskSlowEvents) }),
@@ -174,7 +194,7 @@ func (n *Node) startHTTP() error {
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", n.requireMetrics(promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
@@ -189,6 +209,15 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
 	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
+	// Profiles (issue #100): net/http/pprof under /debug/pprof/, admin-gated
+	// like the drill-downs — a profile exposes statement text and key
+	// bytes. `datax debug profile` fetches one; `datax bench
+	// --server-profile` pulls a CPU profile for a run.
+	mux.Handle("/debug/pprof/", n.requireAdmin(http.HandlerFunc(pprof.Index)))
+	mux.Handle("/debug/pprof/cmdline", n.requireAdmin(http.HandlerFunc(pprof.Cmdline)))
+	mux.Handle("/debug/pprof/profile", n.requireAdmin(http.HandlerFunc(pprof.Profile)))
+	mux.Handle("/debug/pprof/symbol", n.requireAdmin(http.HandlerFunc(pprof.Symbol)))
+	mux.Handle("/debug/pprof/trace", n.requireAdmin(http.HandlerFunc(pprof.Trace)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
 	mux.HandleFunc("/api/node", n.serveNodeAPI)
@@ -316,6 +345,26 @@ func (n *Node) requireAdmin(next http.Handler) http.Handler {
 	})
 }
 
+// requireMetrics gates /metrics on the metrics role (or admin): a scrape
+// account is a member of metrics and needs nothing else. Insecure mode
+// passes through; denials are audited.
+func (n *Node) requireMetrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if n.tlsCfgs == nil {
+			next.ServeHTTP(w, req)
+			return
+		}
+		p := principalFrom(req)
+		if !n.isMetricsPrincipal(req.Context(), p.User) {
+			metrics.AdminDenied.Inc()
+			log.Audit("admin-denied", "principal", p.User, "via", p.Via, "path", req.URL.Path, "remote", req.RemoteAddr, "needs", catalog.MetricsRole)
+			http.Error(w, "metrics role required", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
 // RangeStatus is one replica's view in /status.
 type RangeStatus struct {
 	RangeID        int64  `json:"range_id"`
@@ -325,6 +374,7 @@ type RangeStatus struct {
 	Replicas       []int  `json:"replicas"`
 	Leader         bool   `json:"leader"`
 	AppliedIndex   uint64 `json:"applied_index"`
+	LastIndex      uint64 `json:"last_index"`
 	TruncatedIndex uint64 `json:"truncated_index"`
 	SizeBytes      int64  `json:"size_bytes"`
 	// QPS is the leader-local measured request rate (~0 on followers).
@@ -362,6 +412,7 @@ func (n *Node) rangeStatuses() []RangeStatus {
 			Table:          n.tableNameOf(desc.StartKey),
 			Leader:         r.IsLeader(),
 			AppliedIndex:   r.AppliedIndex(),
+			LastIndex:      r.LastIndex(),
 			TruncatedIndex: r.TruncatedIndex(),
 			SizeBytes:      r.SizeBytes(),
 			QPS:            math.Round(r.QPS()*10) / 10,

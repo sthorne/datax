@@ -127,7 +127,6 @@ func TestParseErrors(t *testing.T) {
 		"INSERT INTO t VALUES",
 		"UPDATE t SET",
 		"SELECT * FROM t WHERE a LIKE",
-		"CREATE TABLE t (a FANCYTYPE)",
 		"SELECT * FROM t; garbage",
 	} {
 		if _, err := Parse(bad); err == nil {
@@ -621,13 +620,13 @@ func TestParseDatabases(t *testing.T) {
 	if sv := stmts[6].(*SetVar); sv.Name != "search_path" || sv.Value != "public" {
 		t.Fatalf("set search_path: %+v", sv)
 	}
-	if gr := stmts[7].(*GrantRevoke); gr.Database != "app" || gr.User != "bob" || len(gr.Privileges) != 2 || gr.Privileges[1] != "CREATE" {
+	if gr := stmts[7].(*GrantRevoke); gr.ObjectKind != "database" || gr.Objects[0] != "app" || gr.Grantees[0] != "bob" || len(gr.Privileges) != 2 || gr.Privileges[1] != "CREATE" {
 		t.Fatalf("grant on database: %+v", gr)
 	}
-	if gr := stmts[8].(*GrantRevoke); !gr.Revoke || gr.Database != "app" || gr.User != "public" {
+	if gr := stmts[8].(*GrantRevoke); !gr.Revoke || gr.ObjectKind != "database" || gr.Objects[0] != "app" || gr.Grantees[0] != "public" {
 		t.Fatalf("revoke from public: %+v", gr)
 	}
-	if gr := stmts[9].(*GrantRevoke); gr.Table != "app.t" || gr.Database != "" {
+	if gr := stmts[9].(*GrantRevoke); gr.ObjectKind != "table" || gr.Objects[0] != "app.t" {
 		t.Fatalf("grant on qualified table: %+v", gr)
 	}
 	if e, err := Parse(`SELECT current_database(), current_schema()`); err != nil || e[0].(*Select).Exprs[0].Expr.Func != "current_database" {
@@ -798,7 +797,7 @@ func TestParseConstraints(t *testing.T) {
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p ON DELETE SET DEFAULT)`,
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p MATCH FULL)`,
 		`ALTER TABLE t ADD PRIMARY KEY (a)`,
-		`ALTER TABLE t ALTER COLUMN a SET DEFAULT 1`,
+		`ALTER TABLE t ALTER COLUMN a SET TYPE INT8`,
 	} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("%q parsed", bad)

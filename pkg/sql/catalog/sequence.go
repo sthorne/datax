@@ -32,6 +32,12 @@ type SequenceDescriptor struct {
 	// (SERIAL, identity, OWNED BY); dropped with it.
 	OwnerTable  uint64   `json:"owner_table,omitempty"`
 	OwnerColumn ColumnID `json:"owner_column,omitempty"`
+	// Owner is the owning role (v11; empty = root). Privileges maps a
+	// grantee to USAGE / SELECT / UPDATE; GrantOptions the grant-option
+	// subset.
+	Owner        string              `json:"owner,omitempty"`
+	Privileges   map[string][]string `json:"privileges,omitempty"`
+	GrantOptions map[string][]string `json:"grant_options,omitempty"`
 }
 
 // DefaultSequenceCache is the block a gateway takes per Increment.

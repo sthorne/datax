@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -681,5 +682,69 @@ func TestMVCCRollbackThenCommit(t *testing.T) {
 	resolve(t, eng, "k", txn, enginepb.COMMITTED, ts(12, 0))
 	if v := mustGet(t, eng, "k", ts(20, 0), MVCCGetOptions{}); string(v) != "keep" {
 		t.Fatalf("committed value after rollback: got %q, want keep", v)
+	}
+}
+
+// TestMVCCScanTargetBytes: a byte target pages a scan (forward and
+// reverse) after the row that reaches it, with a resume key that
+// continues exactly where the page ended; a row larger than the target
+// still comes back on its own.
+func TestMVCCScanTargetBytes(t *testing.T) {
+	eng := openTestEngine(t)
+	val := string(make([]byte, 100))
+	for i := 0; i < 20; i++ {
+		mustPut(t, eng, fmt.Sprintf("k%02d", i), ts(10, 0), val, nil)
+	}
+	read := ts(20, 0)
+	var all []KeyValue
+	start := keys.Key("k")
+	for pages := 0; ; pages++ {
+		res, err := MVCCScan(eng, start, keys.Key("l"), read, 0, MVCCGetOptions{TargetBytes: 350})
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, res.KVs...)
+		if len(res.Resume) == 0 {
+			// Five full pages, then the empty page the last resume key
+			// leads to (a full page cannot know it was the last).
+			if pages != 5 || len(res.KVs) != 0 {
+				t.Fatalf("%d forward pages (last with %d rows), want 6", pages+1, len(res.KVs))
+			}
+			break
+		}
+		if len(res.KVs) != 4 {
+			t.Fatalf("page %d holds %d rows, want 4 (350 bytes at 103 each)", pages, len(res.KVs))
+		}
+		start = res.Resume
+	}
+	if len(all) != 20 || string(all[0].Key) != "k00" || string(all[19].Key) != "k19" {
+		t.Fatalf("stitched forward pages: %d rows", len(all))
+	}
+	all = nil
+	end := keys.Key("l")
+	for {
+		res, err := MVCCReverseScan(eng, keys.Key("k"), end, read, 0, MVCCGetOptions{TargetBytes: 350})
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, res.KVs...)
+		if len(res.Resume) == 0 {
+			break
+		}
+		end = res.Resume
+	}
+	if len(all) != 20 || string(all[0].Key) != "k19" || string(all[19].Key) != "k00" {
+		t.Fatalf("stitched reverse pages: %d rows", len(all))
+	}
+	// One oversized row is a page of its own.
+	mustPut(t, eng, "k05", ts(15, 0), string(make([]byte, 1000)), nil)
+	res, err := MVCCScan(eng, keys.Key("k05"), keys.Key("l"), read, 0, MVCCGetOptions{TargetBytes: 350})
+	if err != nil || len(res.KVs) != 1 || string(res.Resume) != "k05\x00" {
+		t.Fatalf("oversized row page: %d rows, resume %q, %v", len(res.KVs), res.Resume, err)
+	}
+	// MaxRows still wins when it comes first.
+	res, err = MVCCScan(eng, keys.Key("k"), keys.Key("l"), read, 2, MVCCGetOptions{TargetBytes: 1 << 20})
+	if err != nil || len(res.KVs) != 2 || string(res.Resume) != "k01\x00" {
+		t.Fatalf("max rows: %d rows, resume %q, %v", len(res.KVs), res.Resume, err)
 	}
 }

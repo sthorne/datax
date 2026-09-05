@@ -1,0 +1,202 @@
+package parser
+
+import (
+	"testing"
+
+	"github.com/sthorne/datax/pkg/sql/types"
+)
+
+// TestParseColumnTypeSpec: the type modifiers datax enforces (issue #96)
+// — integer widths, VARCHAR(n) / CHAR(n), TIMESTAMP with and without
+// time zone and TIMESTAMP(p) — land on the column definition; the
+// SERIAL variants pick their width; invalid modifiers are refused.
+func TestParseColumnTypeSpec(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (
+		a INT, b INTEGER, c INT4, d SMALLINT, e INT2, f INT8, g BIGINT,
+		h VARCHAR(20), i CHARACTER VARYING(5), j CHAR(3), k CHARACTER(2), l CHAR, m VARCHAR, n TEXT,
+		o TIMESTAMP, p TIMESTAMP WITHOUT TIME ZONE, q TIMESTAMPTZ, r TIMESTAMP WITH TIME ZONE,
+		s TIMESTAMP(3), u TIMESTAMPTZ(0), v TIMESTAMP(6) WITH TIME ZONE,
+		w SERIAL, x BIGSERIAL, y SMALLSERIAL, z DECIMAL(10,2)
+	)`).(*CreateTable)
+	want := map[string]ColumnDef{
+		"a": {Type: types.Int, Width: 4}, "b": {Type: types.Int, Width: 4}, "c": {Type: types.Int, Width: 4},
+		"d": {Type: types.Int, Width: 2}, "e": {Type: types.Int, Width: 2},
+		"f": {Type: types.Int}, "g": {Type: types.Int},
+		"h": {Type: types.String, MaxLen: 20}, "i": {Type: types.String, MaxLen: 5},
+		"j": {Type: types.String, MaxLen: 3, Char: true}, "k": {Type: types.String, MaxLen: 2, Char: true},
+		"l": {Type: types.String, MaxLen: 1, Char: true}, "m": {Type: types.String}, "n": {Type: types.String},
+		"o": {Type: types.Timestamp, NoTZ: true}, "p": {Type: types.Timestamp, NoTZ: true},
+		"q": {Type: types.Timestamp}, "r": {Type: types.Timestamp},
+		"s": {Type: types.Timestamp, NoTZ: true, TimePrecision: 4}, "u": {Type: types.Timestamp, TimePrecision: 1},
+		"v": {Type: types.Timestamp, TimePrecision: 7},
+		"w": {Type: types.Int, Width: 4, Serial: true, NotNull: true}, "x": {Type: types.Int, Serial: true, NotNull: true},
+		"y": {Type: types.Int, Width: 2, Serial: true, NotNull: true},
+		"z": {Type: types.Decimal, Precision: 10, Scale: 2},
+	}
+	if len(ct.Columns) != len(want) {
+		t.Fatalf("%d columns, want %d", len(ct.Columns), len(want))
+	}
+	for _, c := range ct.Columns {
+		w := want[c.Name]
+		if c.Type != w.Type || c.Width != w.Width || c.MaxLen != w.MaxLen || c.Char != w.Char || c.NoTZ != w.NoTZ ||
+			c.Precision != w.Precision || c.Scale != w.Scale || c.Serial != w.Serial || c.TimePrecision != w.TimePrecision {
+			t.Errorf("column %s: %+v, want %+v", c.Name, c, w)
+		}
+	}
+
+	// ALTER COLUMN TYPE carries the same spec.
+	at := parseOne(t, `ALTER TABLE t ALTER COLUMN a SET DATA TYPE VARCHAR(8)`).(*AlterTable)
+	if st := at.SetType; st == nil || st.Type != types.String || st.MaxLen != 8 || st.Char {
+		t.Fatalf("SET DATA TYPE VARCHAR(8): %+v", at.SetType)
+	}
+	at = parseOne(t, `ALTER TABLE t ALTER a TYPE TIMESTAMP(2)`).(*AlterTable)
+	if st := at.SetType; st == nil || st.Type != types.Timestamp || !st.NoTZ || st.TimePrecision != 3 {
+		t.Fatalf("TYPE TIMESTAMP(2): %+v", at.SetType)
+	}
+
+	// Typmods on other types are still accepted and ignored.
+	ct = parseOne(t, `CREATE TABLE t (a FLOAT8(3), b BYTEA(9))`).(*CreateTable)
+	if ct.Columns[0].Precision != 0 || ct.Columns[0].TimePrecision != 0 || ct.Columns[1].MaxLen != 0 {
+		t.Fatalf("ignored typmods: %+v", ct.Columns)
+	}
+
+	for _, bad := range []string{
+		`CREATE TABLE t (a VARCHAR(0))`,
+		`CREATE TABLE t (a CHAR(-1))`,
+		`CREATE TABLE t (a TIMESTAMP(7))`,
+		`CREATE TABLE t (a TIMESTAMPTZ(10))`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+}
+
+// TestParseIntervalTimeTypes: the INTERVAL and TIME column types (issue
+// #96, part two), their modifiers, the typed literals INTERVAL '...' /
+// DATE '...' / TIME '...' / TIMESTAMP '...', and the refusals.
+func TestParseIntervalTimeTypes(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (a INTERVAL, b INTERVAL DAY TO SECOND, c TIME, d TIME WITHOUT TIME ZONE, e TIME(3), f INTERVAL YEAR TO MONTH)`).(*CreateTable)
+	want := map[string]ColumnDef{
+		"a": {Type: types.IntervalFam}, "b": {Type: types.IntervalFam}, "f": {Type: types.IntervalFam},
+		"c": {Type: types.Time}, "d": {Type: types.Time}, "e": {Type: types.Time, TimePrecision: 4},
+	}
+	for _, c := range ct.Columns {
+		w := want[c.Name]
+		if c.Type != w.Type || c.TimePrecision != w.TimePrecision {
+			t.Errorf("column %s: %+v, want %+v", c.Name, c, w)
+		}
+	}
+	for _, bad := range []string{`CREATE TABLE t (a TIME WITH TIME ZONE)`, `CREATE TABLE t (a TIMETZ)`, `CREATE TABLE t (a TIME(9))`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+
+	sel := parseOne(t, `SELECT INTERVAL '1 day', DATE '2024-01-02', TIME '10:00', TIMESTAMP '2024-01-02 03:04:05', TIMESTAMPTZ '2024-01-02 03:04:05Z', now() - INTERVAL '2 hours', INTERVAL '1 hour'::text`).(*Select)
+	casts := []string{"interval", "date", "time", "timestamptz", "timestamptz", "", "text"}
+	for i, c := range casts {
+		e := sel.Exprs[i].Expr
+		switch i {
+		case 5:
+			if e.Right == nil || e.Right.Cast != "interval" || e.Right.Lit == nil || e.Right.Lit.S != "2 hours" {
+				t.Errorf("now() - INTERVAL '2 hours': %+v", e)
+			}
+			continue
+		case 6:
+			if e.Left == nil || e.Left.Cast != "interval" {
+				t.Fatalf("INTERVAL '1 hour'::text: %+v", e)
+			}
+		}
+		if e.Cast != c {
+			t.Errorf("expression %d: cast %q, want %q (%+v)", i+1, e.Cast, c, e)
+		}
+	}
+	if sel.Exprs[0].Expr.Lit == nil || sel.Exprs[0].Expr.Lit.S != "1 day" {
+		t.Fatalf("INTERVAL literal: %+v", sel.Exprs[0].Expr)
+	}
+}
+
+// TestParseArrays: array column types, the ARRAY[...] constructor,
+// subscripts, the && operator, casts to array types, and the
+// refusals (issue #96, part three).
+func TestParseArrays(t *testing.T) {
+	ct := parseOne(t, `CREATE TABLE t (a INT8[], b TEXT[], c INT4 ARRAY, d VARCHAR(5)[], e TIMESTAMPTZ[][], f DECIMAL(10,2)[])`).(*CreateTable)
+	want := map[string]ColumnDef{
+		"a": {Type: types.ArrayOf(types.Int)}, "b": {Type: types.ArrayOf(types.String)}, "c": {Type: types.ArrayOf(types.Int), Width: 4},
+		"d": {Type: types.ArrayOf(types.String), MaxLen: 5}, "e": {Type: types.ArrayOf(types.Timestamp)}, "f": {Type: types.ArrayOf(types.Decimal), Precision: 10, Scale: 2},
+	}
+	for _, c := range ct.Columns {
+		w := want[c.Name]
+		if c.Type != w.Type || c.Width != w.Width || c.MaxLen != w.MaxLen || c.Precision != w.Precision {
+			t.Errorf("column %s: %+v, want %+v", c.Name, c, w)
+		}
+	}
+	for _, bad := range []string{`CREATE TABLE t (a JSONB[])`, `CREATE TABLE t (a SERIAL[])`, `SELECT a[1:2] FROM t`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+	sel := parseOne(t, `SELECT ARRAY[1, 2, 3], ARRAY[]::int8[], a[1], a[i + 1]::text, ARRAY['x']::text[], '{1,2}'::int8[] FROM t WHERE a && ARRAY[1] AND b @> '{x}'`).(*Select)
+	e := sel.Exprs[0].Expr
+	if e.Func != "array_construct" || len(e.Args) != 3 || e.Args[2].Lit.I != 3 {
+		t.Fatalf("ARRAY[1, 2, 3]: %+v", e)
+	}
+	if e = sel.Exprs[1].Expr; e.Func != "array_construct" || len(e.Args) != 0 || e.Cast != "int8[]" {
+		t.Fatalf("ARRAY[]::int8[]: %+v", e)
+	}
+	if e = sel.Exprs[2].Expr; e.Func != "array_subscript" || len(e.Args) != 2 || e.Args[0].Column != "a" || e.Args[1].Lit.I != 1 {
+		t.Fatalf("a[1]: %+v", e)
+	}
+	if e = sel.Exprs[3].Expr; e.Func != "array_subscript" || e.Cast != "text" || e.Args[1].BinOp != "+" {
+		t.Fatalf("a[i + 1]::text: %+v", e)
+	}
+	if e = sel.Exprs[5].Expr; e.Cast != "int8[]" || e.Lit == nil {
+		t.Fatalf("'{1,2}'::int8[]: %+v", e)
+	}
+	if len(sel.Where) != 2 || sel.Where[0].Op != "&&" || sel.Where[0].Value.Func != "array_construct" || sel.Where[1].Op != "@>" {
+		t.Fatalf("WHERE: %+v", sel.Where)
+	}
+	if _, err := Parse(`SELECT 1 FROM t WHERE NOT (a && ARRAY[1])`); err != nil {
+		t.Fatalf("NOT &&: %v", err)
+	}
+}
+
+// TestParseEnumTypes: CREATE / ALTER / DROP TYPE and a column of a
+// user-defined type (issue #96, part four).
+func TestParseEnumTypes(t *testing.T) {
+	ct := parseOne(t, `CREATE TYPE IF NOT EXISTS mood AS ENUM ('sad', 'ok', 'happy')`).(*CreateType)
+	if ct.Name != "mood" || !ct.IfNotExists || len(ct.Labels) != 3 || ct.Labels[2] != "happy" {
+		t.Fatalf("CREATE TYPE: %+v", ct)
+	}
+	if ct = parseOne(t, `CREATE TYPE app.empty AS ENUM ()`).(*CreateType); ct.Name != "app.empty" || len(ct.Labels) != 0 {
+		t.Fatalf("empty enum: %+v", ct)
+	}
+	at := parseOne(t, `ALTER TYPE mood ADD VALUE IF NOT EXISTS 'ecstatic'`).(*AlterType)
+	if at.Name != "mood" || at.AddValue != "ecstatic" || !at.IfNotExistsVal {
+		t.Fatalf("ALTER TYPE: %+v", at)
+	}
+	dt := parseOne(t, `DROP TYPE IF EXISTS mood CASCADE`).(*DropType)
+	if dt.Name != "mood" || !dt.IfExists {
+		t.Fatalf("DROP TYPE: %+v", dt)
+	}
+	tbl := parseOne(t, `CREATE TABLE p (id INT8 PRIMARY KEY, m mood NOT NULL, n app.mood DEFAULT 'ok')`).(*CreateTable)
+	if c := tbl.Columns[1]; c.Type != types.Enum || c.TypeName != "mood" || !c.NotNull {
+		t.Fatalf("enum column: %+v", c)
+	}
+	if c := tbl.Columns[2]; c.Type != types.Enum || c.TypeName != "app.mood" || c.Default == nil || c.Default.S != "ok" {
+		t.Fatalf("qualified enum column: %+v", c)
+	}
+	al := parseOne(t, `ALTER TABLE p ALTER COLUMN n TYPE mood`).(*AlterTable)
+	if al.SetType == nil || al.SetType.Type != types.Enum || al.SetType.TypeName != "mood" {
+		t.Fatalf("ALTER COLUMN TYPE mood: %+v", al.SetType)
+	}
+	for _, bad := range []string{
+		`CREATE TYPE mood AS ENUM ('a', 'a')`, `CREATE TYPE mood AS ENUM ('')`, `CREATE TYPE mood AS (a int)`,
+		`ALTER TYPE mood ADD VALUE 'x' BEFORE 'a'`, `ALTER TYPE mood RENAME VALUE 'a' TO 'b'`, `CREATE TABLE p (m mood[])`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed, want an error", bad)
+		}
+	}
+}

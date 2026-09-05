@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +29,23 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
 			return nil, err
 		}
+	} else if cv, ok := stmt.(*parser.CreateView); ok {
+		if err := s.checkCreateInDatabase(ctx, txn, cv.Name); err != nil {
+			return nil, err
+		}
 	} else if requiresAdmin(stmt) {
 		if err := s.checkAdmin(ctx, txn); err != nil {
 			return nil, err
 		}
 	}
+	// Ownership, grants and role membership are checked by each
+	// statement's executor (privileges.go, roles.go).
+	// Views the statement names bind as leading WITH members.
+	expanded, err := s.expandViews(ctx, txn, stmt)
+	if err != nil {
+		return nil, err
+	}
+	stmt = expanded
 	switch t := stmt.(type) {
 	case *parser.GrantRevoke:
 		return s.execGrantRevoke(ctx, txn, t)
@@ -52,10 +63,30 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execExplain(ctx, txn, t, params)
 	case *parser.AlterTable:
 		return s.execAlterTable(ctx, txn, t)
-	case *parser.CreateUser:
-		return s.execCreateUser(ctx, txn, t)
-	case *parser.DropUser:
-		return s.execDropUser(ctx, txn, t)
+	case *parser.DropIndex:
+		return s.execDropIndex(ctx, txn, t)
+	case *parser.CreateView:
+		return s.execCreateView(ctx, txn, t)
+	case *parser.CommentOn:
+		return s.execCommentOn(ctx, txn, t)
+	case *parser.DropView:
+		return s.execDropView(ctx, txn, t)
+	case *parser.AlterIndex:
+		return s.execAlterIndex(ctx, txn, t)
+	case *parser.Truncate:
+		return s.execTruncate(ctx, txn, t)
+	case *parser.CreateRole:
+		return s.execCreateRole(ctx, txn, t)
+	case *parser.DropRole:
+		return s.execDropRole(ctx, txn, t)
+	case *parser.AlterOwner:
+		return s.execAlterOwner(ctx, txn, t)
+	case *parser.ReassignOwned:
+		return s.execReassignOwned(ctx, txn, t)
+	case *parser.DropOwned:
+		return s.execDropOwned(ctx, txn, t)
+	case *parser.AlterDefaultPrivileges:
+		return s.execAlterDefaultPrivileges(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -72,6 +103,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDelete(ctx, txn, t, params)
 	case *parser.ShowTables:
 		return s.execShowTables(ctx, txn, t.Database)
+	case *parser.CreateType:
+		return s.execCreateType(ctx, txn, t)
+	case *parser.AlterType:
+		return s.execAlterType(ctx, txn, t)
+	case *parser.DropType:
+		return s.execDropType(ctx, txn, t)
 	case *parser.CreateSequence:
 		return s.execCreateSequence(ctx, txn, t)
 	case *parser.AlterSequence:
@@ -96,6 +133,13 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 }
 
 func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *parser.CreateTable) (*Result, error) {
+	if t.As != nil {
+		return nil, newErrf(CodeActiveTransaction, "CREATE TABLE ... AS cannot run inside a transaction block")
+	}
+	t, likeIndexes, err := s.expandLike(ctx, txn, t)
+	if err != nil {
+		return nil, err
+	}
 	dbName, bare := catalog.SplitTableName(t.Name)
 	if dbName == "" {
 		dbName = s.database
@@ -110,7 +154,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID}
+	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, Owner: s.user}
 	if catalog.IsSystemTable(bare) {
 		desc.ID = catalog.MetricsTableID
 	}
@@ -124,11 +168,20 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col := catalog.Column{
 			ID: catalog.ColumnID(i + 1), Name: cd.Name, Type: cd.Type, NotNull: cd.NotNull,
 			Precision: cd.Precision, Scale: cd.Scale,
+			Width: cd.Width, MaxLen: cd.MaxLen, Char: cd.Char, NoTZ: cd.NoTZ, TimePrecision: cd.TimePrecision,
+		}
+		col.Hidden = cd.Hidden
+		s.stripTypeAttrs(&col)
+		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if err := s.resolveEnumColumn(ctx, txn, &col, cd.TypeName); err != nil {
+			return nil, ToSQLError(err)
 		}
 		if cd.Default != nil && !cd.Default.Null {
-			d, cerr := cd.Default.Coerce(cd.Type)
+			d, cerr := coerceColumn(col, *cd.Default)
 			if cerr != nil {
-				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr)
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", cd.Name, cerr.Msg)
 			}
 			d, terr := enforceTypmod(col, d)
 			if terr != nil {
@@ -205,6 +258,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 	}
 	desc.NextColumnID = catalog.ColumnID(len(desc.Columns) + 1)
+	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
+		return nil, err
+	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		var ex *catalog.ErrTableExists
 		if t.IfNotExists {
@@ -225,6 +281,10 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		col := &desc.Columns[i]
 		sd := catalog.NewSequenceDescriptor(desc.Name+"_"+col.Name+"_seq", desc.DatabaseID)
 		sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
+		sd.Owner = desc.Owner
+		if err := s.applyDefaultPrivileges(ctx, txn, desc.DatabaseID, sd.Owner, "SEQUENCES", &sd.Privileges, &sd.GrantOptions); err != nil {
+			return nil, err
+		}
 		if cd.IdentitySeq != nil {
 			if err := applySequenceOptions(sd, cd.IdentitySeq, true); err != nil {
 				return nil, err
@@ -241,7 +301,12 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
-	if owned || constrained {
+	if len(likeIndexes) > 0 {
+		if err := addLikeIndexes(desc, likeIndexes); err != nil {
+			return nil, err
+		}
+	}
+	if owned || constrained || len(likeIndexes) > 0 {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}
@@ -332,14 +397,26 @@ func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string,
 	return nil
 }
 
-// parseRetention parses a duration like 90d, 36h, 30m, or 45s into
-// seconds.
+// parseRetention parses a duration like 90d, 36h, 30m, or 45s — or any
+// interval text ('7 days', '1 month 12 hours'; a month counts 30 days)
+// — into seconds.
 func parseRetention(s string) (int64, error) {
 	if len(s) < 2 {
-		return 0, fmt.Errorf("want <number><d|h|m|s>, got %q", s)
+		return 0, fmt.Errorf("want <number><d|h|m|s> or an interval, got %q", s)
 	}
 	n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
-	if err != nil || n <= 0 {
+	if err != nil {
+		iv, ierr := types.ParseInterval(s)
+		if ierr != nil {
+			return 0, fmt.Errorf("want <number><d|h|m|s> or an interval, got %q", s)
+		}
+		secs := iv.CmpValue() / int64(time.Second)
+		if secs <= 0 {
+			return 0, fmt.Errorf("retention %q must be positive", s)
+		}
+		return secs, nil
+	}
+	if n <= 0 {
 		return 0, fmt.Errorf("want a positive number before the unit in %q", s)
 	}
 	var mult int64
@@ -422,6 +499,15 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
 	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
+		if existing.IsView() {
+			return nil, newErrf(CodeWrongObjectType, "%q is a view (use DROP VIEW)", t.Name)
+		}
+		if err := s.checkTableOwner(ctx, txn, existing); err != nil {
+			return nil, err
+		}
+		if err := s.dropDependentViews(ctx, txn, existing.ID, "table "+existing.Name, t.Cascade, "DROP TABLE ..."); err != nil {
+			return nil, err
+		}
 		if err := s.dropTableConstraints(ctx, txn, existing, t.Cascade); err != nil {
 			return nil, err
 		}
@@ -499,7 +585,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 				for _, p := range ret.proj {
-					res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+					res.Columns = append(res.Columns, colResult(p.name, p.col))
 				}
 				res.Rows = [][]types.Datum{}
 			}
@@ -585,9 +671,9 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := d.Coerce(target[i].Type)
+			d, cerr := coerceColumn(target[i], d)
 			if cerr != nil {
-				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", target[i].Name, cerr)
+				return nil, cerr
 			}
 			vals[i] = d
 		}
@@ -839,9 +925,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := d.Coerce(col.Type)
+		d, cerr := coerceColumn(col, d)
 		if cerr != nil {
-			return false, nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
+			return false, nil, cerr
 		}
 		if d.Null && col.NotNull {
 			return false, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
@@ -935,7 +1021,7 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 func (r *returning) columns() []ResultColumn {
 	cols := make([]ResultColumn, len(r.proj))
 	for i, p := range r.proj {
-		cols[i] = ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)}
+		cols[i] = colResult(p.name, p.col)
 	}
 	return cols
 }
@@ -1019,10 +1105,11 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 		if d.Null && col.NotNull {
 			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
 		}
-		// DECIMAL(p,s): quantize/validate before the key encoding below —
-		// PK columns precede the (last-positioned) hidden shard column, so
-		// the shard hash and pkKey both see the stored form.
-		if col.Precision > 0 {
+		// Type modifiers (DECIMAL(p,s), widths, lengths, TIMESTAMP forms):
+		// apply before the key encoding below — PK columns precede the
+		// (last-positioned) hidden shard column, so the shard hash and
+		// pkKey both see the stored form.
+		if col.HasTypmod() {
 			ed, eerr := enforceTypmod(col, row[col.ID])
 			if eerr != nil {
 				return nil, nil, eerr
@@ -1373,7 +1460,7 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		if err != nil {
 			continue // row-dependent value (column RHS): not a point bound
 		}
-		d, cerr := d.Coerce(col.Type)
+		d, cerr := coerceColumn(col, d)
 		if cerr != nil {
 			return nil, false, nil // un-coercible: cannot match anything via point path; fall to scan
 		}
@@ -1419,15 +1506,16 @@ func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (m
 		row[id] = pkVals[i]
 	}
 	// Stamp DECIMAL(p,s) columns with their declared display scale so
-	// projections render fixed-scale ("9.90"). After the PK overwrite, so
-	// key-decoded PK decimals are stamped too. Display-only: canonical
-	// text in S stays the comparison/storage identity.
+	// projections render fixed-scale ("9.90"), CHAR(n) columns with their
+	// padding and TIMESTAMP (without time zone) columns with the no-
+	// offset rendering. After the PK overwrite, so key-decoded PK values
+	// are stamped too. Display-only: canonical text in S / the nanos in I
+	// stay the comparison/storage identity.
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
-		if col.Precision > 0 && col.Type == types.Decimal {
+		if col.Precision > 0 || col.Char || col.NoTZ || col.Type.IsArray() {
 			if d, ok := row[col.ID]; ok && !d.Null {
-				d.Dscale = col.Scale
-				row[col.ID] = d
+				row[col.ID] = stampDisplay(col, d)
 			}
 		}
 	}
@@ -1536,20 +1624,52 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return s.execFuncTableSelect(ctx, txn, t, params)
 	}
 	if t.Table == "" {
-		// FROM-less SELECT: one row of evaluated expressions.
+		// FROM-less SELECT: one row of evaluated expressions — or, with
+		// an unnest(array) among them, one row per element (the other
+		// expressions repeated; SELECT unnest($1::int8[]) expands a
+		// parameter into rows).
 		res := &Result{}
 		var row []types.Datum
-		for _, se := range t.Exprs {
+		unnestAt, unnestElems := -1, []types.Datum(nil)
+		for i, se := range t.Exprs {
 			if se.Star {
 				return nil, newErrf(CodeSyntaxError, "SELECT * requires a FROM clause")
-			}
-			d, err := evalExpr(se.Expr, nil, nil, params)
-			if err != nil {
-				return nil, err
 			}
 			name := se.Alias
 			if name == "" {
 				name = "?column?"
+			}
+			if se.Expr.Func == "unnest" && len(se.Expr.Args) == 1 && se.Expr.Cast == "" && len(se.Expr.Path) == 0 {
+				if unnestAt >= 0 {
+					return nil, newErrf(CodeFeatureNotSupported, "only one unnest() per select list is supported")
+				}
+				arr, err := evalExpr(se.Expr.Args[0], nil, nil, params)
+				if err != nil {
+					return nil, err
+				}
+				if !arr.Null && !arr.Fam.IsArray() {
+					if arr, err = arr.Coerce(types.ArrayOf(types.String)); err != nil {
+						return nil, newErrf(CodeInvalidTextRepresentation, "unnest: %v", err)
+					}
+				}
+				fam := exprFamily(se.Expr.Args[0], nil).Elem()
+				if !arr.Null && arr.Fam.Elem() != types.Unknown {
+					fam = arr.Fam.Elem()
+				}
+				if fam == types.Unknown {
+					fam = types.String
+				}
+				if name == "?column?" {
+					name = "unnest"
+				}
+				res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
+				unnestAt, unnestElems = i, arr.A
+				row = append(row, types.DNull)
+				continue
+			}
+			d, err := evalExpr(se.Expr, nil, nil, params)
+			if err != nil {
+				return nil, err
 			}
 			// Typed as described (Describe sees the expression, not the
 			// value); the value is conformed to it.
@@ -1563,7 +1683,16 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
 			row = append(row, conformTo(d, fam))
 		}
-		res.Rows = trimRows([][]types.Datum{row}, t)
+		rows := [][]types.Datum{row}
+		if unnestAt >= 0 {
+			rows = make([][]types.Datum, 0, len(unnestElems))
+			for _, e := range unnestElems {
+				r := append([]types.Datum(nil), row...)
+				r[unnestAt] = e
+				rows = append(rows, r)
+			}
+		}
+		res.Rows = trimRows(rows, t)
 		res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 		return res, nil
 	}
@@ -1667,7 +1796,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.col.Type, Typmod: colTypmod(p.col)})
+		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}
 	// Output positions of the correlated subqueries (SELECT * expands to
 	// several projection columns ahead of them).
@@ -1821,9 +1950,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 					return nil, err
 				}
 			}
-			d, cerr := d.Coerce(col.Type)
+			d, cerr := coerceColumn(col, d)
 			if cerr != nil {
-				return nil, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, cerr)
+				return nil, cerr
 			}
 			if d.Null && col.NotNull {
 				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
@@ -1972,6 +2101,9 @@ func mustBeReal(desc *catalog.TableDescriptor) error {
 	if desc.Virtual != "" {
 		return newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be modified", desc.Virtual)
 	}
+	if desc.IsView() {
+		return newErrf(CodeWrongObjectType, "%q is a view", desc.Name)
+	}
 	return nil
 }
 
@@ -1981,9 +2113,16 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		var nf *catalog.ErrTableNotFound
+		if t.IfExists && asErr(err, &nf) {
+			return &Result{Tag: "ALTER TABLE"}, nil
+		}
 		return nil, err
 	}
 	if err := mustBeReal(shared); err != nil {
+		return nil, err
+	}
+	if err := s.checkTableOwner(ctx, txn, shared); err != nil {
 		return nil, err
 	}
 	desc := shared.Clone()
@@ -2001,6 +2140,16 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 	case t.DropConstraint != "":
 		return s.execDropConstraint(ctx, txn, desc, t)
+	case t.RenameTo != "":
+		return s.execRenameTable(ctx, txn, desc, t)
+	case t.RenameCol != nil:
+		return s.execRenameColumn(ctx, txn, desc, t.RenameCol)
+	case t.RenameConstraint != nil:
+		return s.execRenameConstraint(ctx, txn, desc, t.RenameConstraint)
+	case t.SetDefault != nil:
+		return s.execSetDefault(ctx, txn, desc, t.SetDefault.Column, t.SetDefault)
+	case t.DropDefault != "":
+		return s.execSetDefault(ctx, txn, desc, t.DropDefault, nil)
 	case t.DropNotNull != "":
 		col, ok := desc.Col(t.DropNotNull)
 		if !ok {
@@ -2032,16 +2181,27 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN ... NOT NULL requires a DEFAULT (existing rows need a value)")
 		}
 		if _, exists := desc.Col(def.Name); exists {
-			return nil, newErrf(CodeSyntaxError, "column %q already exists", def.Name)
+			if t.AddColIfNotExists {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
+			return nil, newErrf(CodeDuplicateObject, "column %q already exists", def.Name)
 		}
 		col := catalog.Column{
 			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
 			Precision: def.Precision, Scale: def.Scale,
+			Width: def.Width, MaxLen: def.MaxLen, Char: def.Char, NoTZ: def.NoTZ, TimePrecision: def.TimePrecision,
+		}
+		s.stripTypeAttrs(&col)
+		if err := s.requireV10(col.Type); err != nil {
+			return nil, ToSQLError(err)
+		}
+		if err := s.resolveEnumColumn(ctx, txn, &col, def.TypeName); err != nil {
+			return nil, ToSQLError(err)
 		}
 		if def.Default != nil && !def.Default.Null {
-			d, cerr := def.Default.Coerce(def.Type)
+			d, cerr := coerceColumn(col, *def.Default)
 			if cerr != nil {
-				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr)
+				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr.Msg)
 			}
 			d, terr := enforceTypmod(col, d)
 			if terr != nil {
@@ -2056,11 +2216,17 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		desc.NextColumnID++
 	case t.DropCol != "":
 		col, ok := desc.Col(t.DropCol)
-		if !ok {
+		if !ok || col.Hidden {
+			if t.DropColIfExists {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
 			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropCol)
 		}
 		if desc.IsPKCol(col.ID) {
 			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
+		}
+		if err := s.refuseIfViewed(ctx, txn, desc, "drop column "+t.DropCol); err != nil {
+			return nil, err
 		}
 		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
 			return nil, err
@@ -2089,7 +2255,7 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			}
 		}
 	default:
-		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires ADD or DROP COLUMN")
+		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires an action (ADD, DROP, RENAME, ALTER COLUMN, SET)")
 	}
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
@@ -2239,6 +2405,9 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 	}
 	res := &Result{Columns: []ResultColumn{{Name: "table_name", Type: types.String}}}
 	for _, d := range descs {
+		if d.IsView() {
+			continue // SHOW VIEWS
+		}
 		res.Rows = append(res.Rows, []types.Datum{types.NewString(d.Name)})
 	}
 	res.Tag = fmt.Sprintf("SHOW TABLES %d", len(res.Rows))
@@ -2515,6 +2684,21 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 				}
 			}
 		}
+	case "views":
+		db, err := s.cat.Database(ctx, txn, s.database)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		descs, err := s.cat.ListIn(ctx, txn, db)
+		if err != nil {
+			return nil, err
+		}
+		cols("view_name", "definition")
+		for _, d := range descs {
+			if d.IsView() {
+				res.Rows = append(res.Rows, []types.Datum{str(d.Name), str(d.ViewQuery)})
+			}
+		}
 	case "create":
 		desc, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
@@ -2522,6 +2706,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		}
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
+		}
+		if desc.IsView() {
+			cols("table_name", "create_statement")
+			res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(CreateViewDef(desc))})
+			break
 		}
 		if err := mustBeReal(desc); err != nil {
 			return nil, err
@@ -2535,60 +2724,82 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return d
 		}
 		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDefWith(desc, byID))})
-	case "users":
+	case "users", "roles":
+		// SHOW USERS: the login roles; SHOW ROLES: every role, the built-in
+		// ones included.
 		env, err := s.virtualEnv(ctx, txn)
 		if err != nil {
 			return nil, err
 		}
-		cols("username", "is_admin")
-		res.Columns[1].Type = types.Bool
-		for _, u := range env.Users {
-			res.Rows = append(res.Rows, []types.Datum{str(u), types.NewBool(u == "root" || env.Admins[u])})
+		graph := catalog.NewRoleGraph(env.Roles)
+		if t.Kind == "users" {
+			cols("username", "is_admin", "member_of")
+		} else {
+			cols("role_name", "can_login", "is_admin", "member_of")
+			res.Columns[1].Type = types.Bool
 		}
-	case "grants":
-		env, err := s.virtualEnv(ctx, txn)
-		if err != nil {
-			return nil, err
-		}
-		cols("database_name", "table_name", "grantee", "privilege_type")
-		var only *catalog.TableDescriptor
-		if t.Table != "" {
-			if only, err = s.lookup(ctx, txn, t.Table); err != nil {
+		for _, r := range env.Roles {
+			if t.Kind == "users" && !r.Login {
+				continue
+			}
+			set, err := graph.Effective(r.Name)
+			if err != nil {
 				return nil, err
 			}
+			var members []string
+			for _, m := range r.MemberOf {
+				members = append(members, m.Role)
+			}
+			memberOf := strings.Join(members, ",")
+			if t.Kind == "users" {
+				res.Columns[1].Type = types.Bool
+				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(set.IsAdmin()), str(memberOf)})
+			} else {
+				res.Columns[2].Type = types.Bool
+				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(r.Login), types.NewBool(set.IsAdmin()), str(memberOf)})
+			}
 		}
-		for _, d := range env.Tables {
-			if only != nil && d.ID != only.ID {
-				continue
+	case "grants":
+		if t.OnRole {
+			cols("role_name", "member", "is_admin")
+			rows, err := s.roleGrantRows(ctx, txn, t)
+			if err != nil {
+				return nil, err
 			}
-			dbName := s.database
-			for _, db := range env.Databases {
-				if db.ID == d.DatabaseID {
-					dbName = db.Name
+			for _, r := range rows {
+				res.Rows = append(res.Rows, []types.Datum{str(r[0]), str(r[1]), str(r[2])})
+			}
+			break
+		}
+		cols("database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable")
+		rows, err := s.grantRows(ctx, txn, t)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			row := make([]types.Datum, len(r))
+			for i, v := range r {
+				if v == "" && (i == 1 || i == 2) {
+					row[i] = types.DNull
+				} else {
+					row[i] = str(v)
 				}
 			}
-			if only == nil && dbName != s.database {
-				continue
-			}
-			users := make([]string, 0, len(d.Privileges))
-			for u := range d.Privileges {
-				users = append(users, u)
-			}
-			sort.Strings(users)
-			for _, u := range users {
-				if t.User != "" && u != t.User {
-					continue
-				}
-				for _, priv := range d.Privileges[u] {
-					res.Rows = append(res.Rows, []types.Datum{str(dbName), str(d.Name), str(u), str(priv)})
-				}
-			}
+			res.Rows = append(res.Rows, row)
 		}
 	case "all":
 		cols("name", "setting")
 		for _, kv := range s.settings() {
 			res.Rows = append(res.Rows, []types.Datum{str(kv[0]), str(kv[1])})
 		}
+	case "sessions":
+		// This node's sessions (each node keeps its own registry).
+		cols("pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start")
+		res.Columns[0].Type = types.Int
+		for i := 7; i < 10; i++ {
+			res.Columns[i].Type = types.Timestamp
+		}
+		res.Rows = s.sessionRows()
 	default:
 		return nil, newErrf(CodeInternal, "unknown SHOW form %q", t.Kind)
 	}

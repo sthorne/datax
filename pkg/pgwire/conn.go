@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/util/log"
 	"math"
 	"net"
 	"os"
@@ -26,13 +28,20 @@ const (
 	oidBool        = 16
 	oidBytea       = 17
 	oidInt8        = 20
+	oidInt2        = 21
+	oidInt4        = 23
 	oidText        = 25
 	oidFloat8      = 701
+	oidBpchar      = 1042
+	oidVarchar     = 1043
 	oidDate        = 1082
+	oidTimestamp   = 1114
 	oidTimestamptz = 1184
 	oidUUID        = 2950
 	oidNumeric     = 1700
 	oidJsonb       = 3802
+	oidTime        = 1083
+	oidInterval    = 1186
 )
 
 // pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
@@ -42,7 +51,66 @@ const (
 	pgEpochOffsetDays   = int64(10957)
 )
 
+// colOID is the wire type of a result column: the family's OID, refined
+// by the backing column's modifiers (int2 / int4, varchar / bpchar,
+// timestamp without time zone).
+func colOID(col sql.ResultColumn) uint32 {
+	if col.Type == types.Enum && col.EnumType != 0 {
+		return uint32(catalog.EnumOID(col.EnumType))
+	}
+	if col.Type.IsArray() {
+		elem := col
+		elem.Type = col.Type.Elem()
+		if oid, ok := arrayOIDs[colOID(elem)]; ok {
+			return oid
+		}
+		return 1009
+	}
+	switch col.Type {
+	case types.Int:
+		switch col.Width {
+		case 2:
+			return oidInt2
+		case 4:
+			return oidInt4
+		}
+	case types.String:
+		switch {
+		case col.Char:
+			return oidBpchar
+		case col.MaxLen > 0:
+			return oidVarchar
+		}
+	case types.Timestamp:
+		if col.NoTZ {
+			return oidTimestamp
+		}
+	}
+	return typeOID(col.Type)
+}
+
+// colSize is pg_type.typlen for a result column (-1 = variable).
+func colSize(col sql.ResultColumn) int16 {
+	if col.Type == types.Int && (col.Width == 2 || col.Width == 4) {
+		return int16(col.Width)
+	}
+	return typeSize(col.Type)
+}
+
+// arrayOIDs maps an element type's OID to its array type's.
+var arrayOIDs = map[uint32]uint32{
+	oidBool: 1000, oidBytea: 1001, oidInt2: 1005, oidInt4: 1007, oidInt8: 1016, oidText: 1009, oidVarchar: 1015, oidBpchar: 1014,
+	oidFloat8: 1022, oidNumeric: 1231, oidDate: 1182, oidTimestamp: 1115, oidTimestamptz: 1185, oidUUID: 2951, oidJsonb: 3807,
+	oidInterval: 1187, oidTime: 1183,
+}
+
 func typeOID(f types.Family) uint32 {
+	if f.IsArray() {
+		if oid, ok := arrayOIDs[typeOID(f.Elem())]; ok {
+			return oid
+		}
+		return 1009
+	}
 	switch f {
 	case types.Int:
 		return oidInt8
@@ -62,6 +130,12 @@ func typeOID(f types.Family) uint32 {
 		return oidNumeric
 	case types.Jsonb:
 		return oidJsonb
+	case types.IntervalFam:
+		return oidInterval
+	case types.Time:
+		return oidTime
+	case types.Enum:
+		return oidText // a value without its type describes as text
 	default:
 		return oidText
 	}
@@ -69,8 +143,10 @@ func typeOID(f types.Family) uint32 {
 
 func typeSize(f types.Family) int16 {
 	switch f {
-	case types.Int, types.Float, types.Timestamp:
+	case types.Int, types.Float, types.Timestamp, types.Time:
 		return 8
+	case types.IntervalFam:
+		return 16
 	case types.Bool:
 		return 1
 	case types.Date:
@@ -118,8 +194,14 @@ type conn struct {
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
 	// act is the server's client accounting (nil in unit tests that build
-	// a conn without a server).
+	// a conn without a server); srv the server (nil likewise).
 	act *Activity
+	srv *Server
+	// pid and secret are the connection's BackendKeyData; stmtCancel
+	// (under mu) cancels the statement in flight.
+	pid        int32
+	secret     uint32
+	stmtCancel context.CancelFunc
 
 	// mu guards st, the connection's phase as seen by Server.Drain: the
 	// connection goroutine records when it is idle (waiting for the next
@@ -199,12 +281,32 @@ func isTimeout(err error) bool {
 // execute runs one statement through the session with activity
 // accounting around it.
 func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum) (*sql.Result, *sql.Error) {
-	if c.act == nil {
-		return c.session.Execute(ctx, stmt, params)
+	ctx, done := c.beginStatement(ctx)
+	defer done()
+	_, isSet := stmt.(*parser.SetVar)
+	var before [][2]string
+	if isSet {
+		before = c.session.ReportedParams()
 	}
-	tok := c.act.begin(c, stmt, text)
-	res, serr := c.session.Execute(ctx, stmt, params)
-	tok.end(res, serr, c.session.State() == sql.StateOpen)
+	var res *sql.Result
+	var serr *sql.Error
+	if c.act == nil {
+		res, serr = c.session.Execute(ctx, stmt, params)
+	} else {
+		tok := c.act.begin(c, stmt, text)
+		res, serr = c.session.Execute(ctx, stmt, params)
+		tok.end(res, serr, c.session.State() == sql.StateOpen)
+		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
+	}
+	if isSet && serr == nil {
+		// A changed reported parameter (application_name, TimeZone, ...)
+		// is announced, as PostgreSQL's GUC_REPORT does.
+		for i, kv := range c.session.ReportedParams() {
+			if i < len(before) && before[i][1] != kv[1] {
+				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
+			}
+		}
+	}
 	return res, serr
 }
 
@@ -230,10 +332,27 @@ func (c *conn) run(ctx context.Context) error {
 			c.goodbye()
 			return nil
 		}
+		// Idle inside a transaction block past
+		// idle_in_transaction_session_timeout: the block is rolled back
+		// (its intents released) and the connection ends with 25P03.
+		idleArmed := false
+		if d := c.session.IdleInTransactionTimeout(); boundary && d > 0 && c.session.State() != sql.StateIdle {
+			_ = c.nc.SetReadDeadline(time.Now().Add(d))
+			idleArmed = true
+		}
 		msg, err := c.backend.Receive()
+		if idleArmed {
+			_ = c.nc.SetReadDeadline(time.Time{})
+		}
 		if goodbye := c.setIdle(false); err != nil {
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
+				return nil
+			}
+			if idleArmed && isTimeout(err) {
+				c.session.Close(context.Background())
+				c.backend.Send(idleInTxnTimeout)
+				_ = c.backend.Flush()
 				return nil
 			}
 			return err
@@ -352,6 +471,16 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				// the startup user authenticates without a password.
 				user := m.Parameters["user"]
 				if user != "" && c.clientCertUser() == user {
+					if c.opts.CanLogin != nil {
+						ok, err := c.opts.CanLogin(ctx, user)
+						if err != nil || !ok {
+							metrics.AuthFailures.Inc()
+							log.Audit("sql-auth-failure", "principal", user, "remote", c.nc.RemoteAddr().String(), "reason", "certificate role cannot log in")
+							c.sendError(&sql.Error{Code: "28000", Msg: fmt.Sprintf("role %q is not permitted to log in", user)})
+							_ = c.backend.Flush()
+							return fmt.Errorf("certificate role %q cannot log in", user)
+						}
+					}
 					c.backend.Send(&pgproto3.AuthenticationOk{})
 				} else if err := c.authenticateSCRAM(user); err != nil {
 					return err
@@ -386,11 +515,18 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			} {
 				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
-			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}})
+			if app := m.Parameters["application_name"]; app != "" {
+				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
+			}
+			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: uint32(c.pid), SecretKey: binary.BigEndian.AppendUint32(nil, c.secret)})
 			c.sendReady()
 			return c.backend.Flush()
 		case *pgproto3.CancelRequest:
-			return nil // out-of-band cancel: not supported, just close
+			// An out-of-band cancel: this connection carries nothing else.
+			if c.srv != nil && len(m.SecretKey) >= 4 {
+				c.srv.handleCancelRequest(int32(m.ProcessID), binary.BigEndian.Uint32(m.SecretKey[:4]))
+			}
+			return nil
 		default:
 			return fmt.Errorf("unexpected startup message %T", msg)
 		}
@@ -463,8 +599,8 @@ func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
 		}
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
 			Name:         []byte(col.Name),
-			DataTypeOID:  typeOID(col.Type),
-			DataTypeSize: typeSize(col.Type),
+			DataTypeOID:  colOID(col),
+			DataTypeSize: colSize(col),
 			TypeModifier: typmod,
 			Format:       0,
 		})
@@ -494,22 +630,58 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 			if formats != nil && i < len(formats) {
 				format = formats[i]
 			}
-			dr.Values[i] = encodeDatum(d, format)
+			var col sql.ResultColumn
+			if i < len(res.Columns) {
+				col = res.Columns[i]
+			}
+			dr.Values[i] = encodeDatumIn(d, format, col, c.session.TimeZone())
 		}
 		c.backend.Send(dr)
 	}
 }
 
 // encodeDatum renders a datum in the requested wire format.
-func encodeDatum(d types.Datum, format int16) []byte {
+// encodeDatum renders a value in the requested format under the
+// described column: the column's width picks the binary integer size,
+// and its TIMESTAMP / CHAR(n) modifiers the text rendering (what
+// Describe promised, whatever hint the datum carries).
+// encodeDatumIn is encodeDatum with the session's time zone: a
+// TIMESTAMPTZ renders in it in text format (the binary form is UTC
+// microseconds whatever the zone).
+func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, loc *time.Location) []byte {
+	if format == 0 && !d.Null && d.Fam == types.Timestamp && !col.NoTZ && !d.NoTZ && loc != nil && loc != time.UTC {
+		return []byte(types.FormatTimestampIn(d.I, loc))
+	}
+	return encodeDatum(d, format, col)
+}
+
+func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil
 	}
+	if d.Fam.IsArray() {
+		if format == 0 {
+			return []byte(d.Text())
+		}
+		return encodeBinaryArray(d, col)
+	}
 	if format == 0 {
+		switch {
+		case d.Fam == types.Timestamp && col.Type == types.Timestamp:
+			return []byte(types.FormatTimestamp(d.I, col.NoTZ))
+		case d.Fam == types.String && col.Type == types.String && !col.Char:
+			return []byte(d.S)
+		}
 		return []byte(d.Text())
 	}
 	switch d.Fam {
 	case types.Int:
+		switch col.Width {
+		case 2:
+			return binary.BigEndian.AppendUint16(nil, uint16(int16(d.I)))
+		case 4:
+			return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I)))
+		}
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I))
 	case types.Float:
 		return binary.BigEndian.AppendUint64(nil, math.Float64bits(d.F))
@@ -537,13 +709,114 @@ func encodeDatum(d types.Datum, format int16) []byte {
 	case types.Jsonb:
 		// Binary jsonb: version byte 1 + the UTF-8 text.
 		return append([]byte{1}, d.S...)
+	case types.IntervalFam:
+		// Binary interval: microseconds (int64), days (int32), months (int32).
+		out := binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
+		out = binary.BigEndian.AppendUint32(out, uint32(int32(d.Dy)))
+		return binary.BigEndian.AppendUint32(out, uint32(int32(d.Mo)))
+	case types.Time:
+		// Binary time: microseconds since midnight.
+		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
 	default:
-		return []byte(d.Text())
+		return []byte(d.Text()) // an enum's binary form is its label
 	}
+}
+
+// encodeBinaryArray renders an array in PostgreSQL's binary format:
+// ndim, a has-null flag, the element OID, then per dimension the
+// length and lower bound, then each element as a length-prefixed
+// binary value (-1 for NULL).
+func encodeBinaryArray(d types.Datum, col sql.ResultColumn) []byte {
+	elem := col
+	elem.Type = d.Fam.Elem()
+	if col.Type.IsArray() {
+		elem.Type = col.Type.Elem()
+	}
+	out := make([]byte, 0, 20+16*len(d.A))
+	if len(d.A) == 0 {
+		out = binary.BigEndian.AppendUint32(out, 0)
+		out = binary.BigEndian.AppendUint32(out, 0)
+		return binary.BigEndian.AppendUint32(out, colOID(elem))
+	}
+	hasNull := uint32(0)
+	for _, e := range d.A {
+		if e.Null {
+			hasNull = 1
+		}
+	}
+	out = binary.BigEndian.AppendUint32(out, 1)
+	out = binary.BigEndian.AppendUint32(out, hasNull)
+	out = binary.BigEndian.AppendUint32(out, colOID(elem))
+	out = binary.BigEndian.AppendUint32(out, uint32(len(d.A)))
+	out = binary.BigEndian.AppendUint32(out, 1)
+	for _, e := range d.A {
+		if e.Null {
+			out = binary.BigEndian.AppendUint32(out, 0xffffffff)
+			continue
+		}
+		v := e
+		if !elem.Type.IsArray() && v.Fam != elem.Type {
+			if c, err := v.Coerce(elem.Type); err == nil {
+				v = c
+			}
+		}
+		b := encodeDatum(v, 1, elem)
+		out = binary.BigEndian.AppendUint32(out, uint32(len(b)))
+		out = append(out, b...)
+	}
+	return out
+}
+
+// decodeBinaryArray reads PostgreSQL's binary array format into an
+// array of fam's element family (one dimension; an empty array has
+// none).
+func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
+	if len(raw) < 12 {
+		return types.Datum{}, fmt.Errorf("bad binary array header")
+	}
+	ndim := binary.BigEndian.Uint32(raw[:4])
+	raw = raw[12:]
+	elem := fam.Elem()
+	if ndim == 0 {
+		return types.NewArray(elem, nil), nil
+	}
+	if ndim != 1 {
+		return types.Datum{}, fmt.Errorf("multidimensional arrays are not supported")
+	}
+	if len(raw) < 8 {
+		return types.Datum{}, fmt.Errorf("bad binary array dimensions")
+	}
+	n := binary.BigEndian.Uint32(raw[:4])
+	raw = raw[8:]
+	elems := make([]types.Datum, 0, n)
+	for i := uint32(0); i < n; i++ {
+		if len(raw) < 4 {
+			return types.Datum{}, fmt.Errorf("bad binary array element %d", i)
+		}
+		size := int32(binary.BigEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if size < 0 {
+			elems = append(elems, types.DNull)
+			continue
+		}
+		if len(raw) < int(size) {
+			return types.Datum{}, fmt.Errorf("bad binary array element %d", i)
+		}
+		d, err := decodeBinaryParam(raw[:size], elem)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		raw = raw[size:]
+		elems = append(elems, d)
+	}
+	return types.NewArray(elem, elems), nil
 }
 
 // decodeBinaryParam decodes a binary-format parameter of a known type.
 func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
+	if fam.IsArray() {
+		return decodeBinaryArray(raw, fam)
+	}
 	switch fam {
 	case types.Int:
 		switch len(raw) {
@@ -599,6 +872,20 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.Datum{}, fmt.Errorf("bad binary jsonb version")
 		}
 		return types.ParseJSONB(string(raw[1:]))
+	case types.IntervalFam:
+		if len(raw) != 16 {
+			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
+		}
+		return types.NewInterval(types.Interval{
+			Nanos:  int64(binary.BigEndian.Uint64(raw[:8])) * 1000,
+			Days:   int64(int32(binary.BigEndian.Uint32(raw[8:12]))),
+			Months: int64(int32(binary.BigEndian.Uint32(raw[12:16]))),
+		}), nil
+	case types.Time:
+		if len(raw) != 8 {
+			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
+		}
+		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}

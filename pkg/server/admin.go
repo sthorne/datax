@@ -35,6 +35,7 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 // Everything else changes cluster state or exposes per-replica internals:
 // admin role required.
 var adminReadOnlyOps = map[string]bool{
+	"cancel-query":     true, // the secret (or the caller's admin check) gates it
 	"ranges":           true,
 	"nodes":            true,
 	"collect-checksum": true,
@@ -68,8 +69,18 @@ func (n *Node) isAdminPrincipal(ctx context.Context, cn string) bool {
 	if cn == "" {
 		return false
 	}
-	v, err := n.db.Get(ctx, keys.AdminUserKey(cn))
-	return err == nil && v != nil
+	ok, err := catalog.IsMember(ctx, n.db, cn, catalog.AdminRole)
+	return err == nil && ok
+}
+
+// isMetricsPrincipal reports whether an identity may scrape /metrics:
+// admins, and members of the built-in metrics role.
+func (n *Node) isMetricsPrincipal(ctx context.Context, cn string) bool {
+	if n.isAdminPrincipal(ctx, cn) {
+		return true
+	}
+	ok, err := catalog.IsMember(ctx, n.db, cn, catalog.MetricsRole)
+	return err == nil && ok
 }
 
 func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
@@ -223,6 +234,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
 
+	case "cancel-query":
+		// A query cancel forwarded from the node a CancelRequest landed
+		// on (or pg_cancel_backend run there): the connection lives here.
+		found := false
+		if n.pgServer != nil {
+			found = n.pgServer.CancelLocal(req.PID, req.Secret, req.Terminate)
+		}
+		raw, _ := json.Marshal(found)
+		return cluster.AdminResponse{Status: raw}
+
 	case "node-detail":
 		// This node's /api/node document, for another node's dashboard
 		// (/api/node?id=N fans out under the node identity; admin-only
@@ -325,6 +346,16 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 		} else if moved > 0 {
 			log.Infof("catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
 			n.events.Record("upgrade", "catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
+		}
+	}
+	if target >= version.V11 {
+		// The v11 role migration: credential records and admin markers
+		// become role descriptors. Idempotent (ensureRoleCatalog).
+		if moved, err := catalog.MigrateRoles(ctx, n.db); err != nil {
+			return cluster.AdminResponse{Error: fmt.Sprintf("cluster version is %s but the role migration failed: %v (rerun the upgrade)", target, err)}
+		} else if moved > 0 {
+			log.Infof("role migration: %d record(s) rewritten as role descriptors", moved)
+			n.events.Record("upgrade", "role migration: %d record(s) rewritten as role descriptors", moved)
 		}
 	}
 	n.mirrorClusterVersion(ctx)

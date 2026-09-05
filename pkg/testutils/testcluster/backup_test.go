@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -158,8 +157,8 @@ func TestBackupRestore(t *testing.T) {
 		t.Fatalf("metrics rows: %+v", res.Rows)
 	}
 	// The user's verifier row and grant came across.
-	if v, err := tc2.Nodes[0].DB().Get(ctx, keys.UserKey("analyst")); err != nil || v == nil {
-		t.Fatalf("analyst user not restored: %v %v", v, err)
+	if r, err := catalog.LookupRole(ctx, tc2.Nodes[0].DB(), "analyst"); err != nil || r == nil || !r.Login || len(r.Verifier) == 0 {
+		t.Fatalf("analyst user not restored: %+v %v", r, err)
 	}
 	// The SERIAL column's sequence came across with its counter: a new
 	// row draws a value past everything the source handed out, and the

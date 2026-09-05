@@ -414,6 +414,9 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			}
 			continue
 		}
+		if cmpType == types.Enum {
+			cmpType = rhs.Fam // an enum compares with a label by text
+		}
 		rhs, cerr := rhs.Coerce(cmpType)
 		if cerr != nil {
 			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, cerr)
@@ -735,7 +738,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, ResultColumn{Name: p.name, Type: p.typ, Typmod: colTypmod(p.ref.col)})
+		res.Columns = append(res.Columns, exprResult(p.name, p.typ, p.ref.col))
 	}
 	// Output positions of the correlated expressions (a star ahead of
 	// them expands to every side's visible columns).
