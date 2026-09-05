@@ -10,6 +10,21 @@ state or the internode protocol does, and an entry below says so.
 
 ## 0.31.0 — unreleased
 
+### Changed
+- Pebble tuning (#101): every store gets a block cache sized from the
+  machine's memory (25 % capped at 8 GiB for `balanced`, 10 % capped at
+  2 GiB for `ingest`; `--cache-size`; one cache per process, shared by
+  every engine and released when the last closes), bloom filters
+  (10 bits per key) on every level, the newest sstable format the
+  bundled Pebble supports, and an open-file budget of half the process's
+  descriptor limit (1000–16384) instead of Pebble's 8 MiB cache, no
+  filters and 1000 files. `StorageMetrics`, `/metrics`
+  (`datax_storage_block_cache_{bytes,size_bytes,hits_total,misses_total}`,
+  `datax_storage_bloom_{hits,misses}_total`), the metrics table
+  (`store.block_cache_*`, `store.bloom_*`) and the dashboard's storage
+  section show the cache hit rate and bloom utility. Before/after on the
+  harness in the PR.
+
 ### Fixed
 - A scan whose rows exceeded gRPC's 4 MiB default message limit never
   came back from a range led by another node: every attempt ran into

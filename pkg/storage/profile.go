@@ -5,17 +5,23 @@ import (
 	"runtime"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 )
 
-// Profile selects the engine's Pebble tuning. The balanced profile sets no
-// options at all — Pebble's defaults, exactly datax's historical behavior —
-// so the default profile can never regress existing workloads. The ingest
-// profile trades read amplification and memory for sustained write
-// throughput.
+// Profile selects the engine's Pebble tuning. Both profiles share the
+// read-path settings every store wants (issue #101): a block cache sized
+// from the machine's memory, bloom filters on every level (a missing-key
+// point read — the common case on datax's write path: uniqueness probes,
+// intent lookups — skips the levels that cannot hold the key), the newest
+// sstable format the pinned Pebble supports, and an open-file budget from
+// the descriptor limit. The balanced profile leaves the flush and
+// compaction shape at Pebble's defaults; the ingest profile trades read
+// amplification and memory for sustained write throughput.
 type Profile string
 
 const (
-	// ProfileBalanced is the default: Pebble's own defaults, untouched.
+	// ProfileBalanced is the default: Pebble's flush and compaction
+	// defaults, with the shared read-path settings.
 	ProfileBalanced Profile = "balanced"
 	// ProfileIngest tunes for sustained high-rate keyed writes: larger and
 	// more numerous memtables (fewer, bigger flushes), eager L0 compaction
@@ -46,6 +52,10 @@ type Options struct {
 	// MemTableSize overrides the profile's memtable size (0 = the
 	// profile's); crash tests shrink it so flushes happen within seconds.
 	MemTableSize int
+	// CacheSize is the block cache size in bytes (0 = the profile's
+	// DefaultCacheSize). The cache is shared by every engine of the
+	// process: the first engine's size holds until the last one closes.
+	CacheSize int64
 }
 
 // softGate holds the profile's backpressure thresholds: when the engine
@@ -67,8 +77,23 @@ type softGate struct {
 	debtLow  uint64
 }
 
+// BloomBitsPerKey is the filter density: ~1 % false positives.
+const BloomBitsPerKey = 10
+
+// applyCommon sets the read-path options every profile shares.
+func applyCommon(opts *pebble.Options) {
+	opts.Levels = make([]pebble.LevelOptions, 7)
+	for i := range opts.Levels {
+		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(BloomBitsPerKey)
+		opts.Levels[i].FilterType = pebble.TableFilter
+	}
+	opts.FormatMajorVersion = pebble.FormatNewest
+	opts.MaxOpenFiles = maxOpenFiles()
+}
+
 // apply sets the profile's Pebble options and returns its soft gate.
 func (p Profile) apply(opts *pebble.Options) softGate {
+	applyCommon(opts)
 	switch p {
 	case ProfileIngest:
 		opts.MemTableSize = 64 << 20         // absorb bursts; fewer, larger flushes
@@ -96,8 +121,9 @@ func (p Profile) apply(opts *pebble.Options) softGate {
 		return softGate{l0Sublevels: 20, l0Files: 1500, memtableBytes: 3 * (64 << 20),
 			debtHigh: 8 << 30, debtLow: 4 << 30}
 	default:
-		// Balanced: leave every Pebble option at its default; no memtable
-		// criterion (tiny default memtables make byte thresholds twitchy).
+		// Balanced: the flush and compaction shape at Pebble's defaults; no
+		// memtable criterion (tiny default memtables make byte thresholds
+		// twitchy).
 		return softGate{l0Sublevels: 10, l0Files: 400,
 			debtHigh: 2 << 30, debtLow: 1 << 30}
 	}

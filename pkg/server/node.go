@@ -91,6 +91,9 @@ type Config struct {
 	// StorageMemTableSize overrides the storage profile's memtable size
 	// (0 = the profile's). Crash-consistency tests shrink it.
 	StorageMemTableSize int
+	// StorageCacheSize is the block cache size in bytes (0 = the
+	// profile's share of the machine's memory; --cache-size).
+	StorageCacheSize int64
 	// CertsDir enables secure mode: mutual TLS between nodes, TLS +
 	// SCRAM-SHA-256 authentication on the SQL listener. Empty = insecure
 	// (cleartext, trust auth).
@@ -339,7 +342,7 @@ func (n *Node) start() error {
 	}
 	n.engine = n.cfg.Engine
 	if n.engine == nil {
-		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey, MemTableSize: n.cfg.StorageMemTableSize})
+		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey, MemTableSize: n.cfg.StorageMemTableSize, CacheSize: n.cfg.StorageCacheSize})
 		if err != nil {
 			return err
 		}

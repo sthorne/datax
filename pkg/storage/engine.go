@@ -55,6 +55,8 @@ type Engine struct {
 	encKeys *enc.KeySet
 	encMu   sync.Mutex // serializes registry reseals
 	reenc   reencStatusCache
+	// cacheHeld: this engine holds a reference on the shared block cache.
+	cacheHeld bool
 }
 
 // testingPebbleOptions, when set, adjusts the Pebble options after the
@@ -72,6 +74,12 @@ func Open(dir string, o Options) (*Engine, error) {
 	if o.MemTableSize > 0 {
 		opts.MemTableSize = uint64(o.MemTableSize)
 	}
+	cacheSize := o.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = DefaultCacheSize(o.Profile)
+	}
+	opts.Cache = acquireCache(cacheSize)
+	e.cacheHeld = true
 	if testingPebbleOptions != nil {
 		testingPebbleOptions(opts)
 	}
@@ -102,6 +110,7 @@ func Open(dir string, o Options) (*Engine, error) {
 	opts.FS = fs
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
+		releaseCache()
 		return nil, err
 	}
 	e.db = db
@@ -152,7 +161,18 @@ func storeHasFiles(base vfs.FS, dir string) bool {
 	return false
 }
 
-func (e *Engine) Close() error { return e.db.Close() }
+func (e *Engine) Close() error {
+	err := e.db.Close()
+	if e.cacheHeld {
+		e.cacheHeld = false
+		releaseCache()
+	}
+	return err
+}
+
+// CacheSize is the block cache the engine shares with the process's
+// other engines, in bytes.
+func (e *Engine) CacheSize() int64 { return SharedCacheSize() }
 
 // Flush synchronously flushes memtables to disk. Used by tests.
 func (e *Engine) Flush() error { return e.db.Flush() }

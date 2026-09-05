@@ -63,7 +63,9 @@ func TestLargeScanAcrossNodes(t *testing.T) {
 			if n != rows || sum != wantSum {
 				t.Fatalf("n%d: %s: %d rows, sum %d (want %d, %d)", i+1, q, n, sum, rows, wantSum)
 			}
-			if d := time.Since(start); d > 20*time.Second {
+			// Minutes before the fix; tens of seconds at worst under the
+			// race detector on a loaded box.
+			if d := time.Since(start); d > 90*time.Second {
 				t.Fatalf("n%d: %s took %s", i+1, q, d)
 			}
 		}

@@ -5,9 +5,21 @@ datax opens its Pebble store with a per-node tuning **profile**
 
 ## Profiles
 
-- **balanced** (default): Pebble's own defaults, untouched — exactly the
-  historical behavior, so the default can never regress an existing
-  workload.
+Both profiles share the read-path settings (issue #101): a block cache
+sized from the machine's memory (balanced: 25 % capped at 8 GiB; ingest:
+10 % capped at 2 GiB; `--cache-size` overrides; one cache per process,
+shared by every engine, released when the last closes), bloom filters at
+10 bits per key on every level (a missing-key point read — the
+uniqueness probe and the intent lookup on every write — skips the levels
+that cannot hold the key), `FormatMajorVersion` at the newest the bundled
+Pebble supports, and `MaxOpenFiles` at half the descriptor limit
+(1000–16384). Block sizes and per-level compression are left at
+Pebble's defaults for now — not measured in this pass; zstd on the
+bottom level would trade CPU the write path needs for space.
+
+- **balanced** (default): Pebble's own flush and compaction defaults —
+  the historical shape, so the default never regresses an existing
+  write workload.
 - **ingest**: tuned for sustained high-rate keyed writes:
 
   | Option | balanced (Pebble default) | ingest |

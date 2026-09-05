@@ -381,9 +381,10 @@ const TILE_SERIES = {
   "file descriptors": "node.open_fds", "go runtime": "go.goroutines",
   "L0 files": "store.l0_files", "L0 sublevels": "store.l0_sublevels", "compaction debt": "store.compaction_debt",
   "memtables": "store.memtable_bytes", "write stalls": "store.write_stalls",
+  "block cache": "store.block_cache_bytes", "cache hits": "store.block_cache_hits", "bloom hits": "store.bloom_hits",
   "connections": "sql.connections", "statements/s": "sql.statements", "40001/s": "sql.serialization_failures", "worst p99": "sql.p99_us",
 };
-const TILE_RATE = { "write stalls": 1, "statements/s": 1, "40001/s": 1 };
+const TILE_RATE = { "write stalls": 1, "statements/s": 1, "40001/s": 1, "cache hits": 1, "bloom hits": 1 };
 let tileHist = {}; // series -> number[] from the table (this node, last 15 minutes)
 function tile(label, value, histName, histVal) {
   let sp = "";
@@ -514,7 +515,15 @@ function storageTiles(s) {
     tile("compaction debt", fmtBytes(s.CompactionDebtBytes || 0), "debt", s.CompactionDebtBytes || 0) +
     tile("memtables", (s.MemtableCount ?? 0) + " (" + fmtBytes(s.MemtableBytes || 0) + ")") +
     tile("write stalls", s.WriteStalls ?? 0) +
-    tile("disk slow events", s.DiskSlowEvents ?? 0);
+    tile("disk slow events", s.DiskSlowEvents ?? 0) +
+    tile("block cache", fmtBytes(s.BlockCacheBytes || 0) + " · " + pctOf(s.BlockCacheHits, s.BlockCacheMisses) + " hit") +
+    tile("bloom filters", pctOf(s.FilterHits, s.FilterMisses) + " of point reads skipped");
+}
+// pctOf renders hits / (hits + misses) as a percentage ("–" before any read).
+function pctOf(hits, misses) {
+  const h = hits || 0, m = misses || 0;
+  if (h + m === 0) return "–";
+  return (100 * h / (h + m)).toFixed(1) + "%";
 }
 // Schema browser: /api/schema is fetched on the same 3s cadence as the
 // cluster document; the filter box narrows the table list and both range

@@ -55,8 +55,20 @@ logical clocks, so ordinary skew below the limit is handled transparently.
 
 | Profile | Use when | Trade-off |
 |---|---|---|
-| `balanced` (default) | mixed read/write workloads | Pebble defaults; write-heavy loads accumulate compaction debt and throughput sags |
+| `balanced` (default) | mixed read/write workloads | Pebble's flush and compaction defaults; write-heavy loads accumulate compaction debt and throughput sags |
 | `ingest` | sustained bulk loading | bigger memtables, earlier/more parallel compaction — measured ~10.2k rows/s steady vs ~8k declining on `balanced` for the batched-ingest benchmark, with better read p99 |
+
+Both profiles share the read-path settings every store wants: a block
+cache sized from the machine's memory (25 % capped at 8 GiB for
+`balanced`, 10 % capped at 2 GiB for `ingest`; `--cache-size 2GiB`
+overrides it — watch `datax_storage_block_cache_hits_total` against
+`_misses_total` to size it), bloom filters on every level (a point read
+for a key that is not there — the uniqueness probe on every `INSERT`,
+the intent lookup before every write — skips the levels that cannot hold
+it), the newest sstable format the bundled Pebble supports, and an
+open-file budget of half the process's descriptor limit (1000 to
+16384). The cache is one per process, shared by every store the process
+opens.
 
 The profile is per-node and can differ across restarts. Watch
 `datax_storage_l0_files` / `datax_storage_compaction_debt_bytes` (see

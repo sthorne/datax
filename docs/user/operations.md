@@ -208,6 +208,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_storage_backpressure_total` | increasing | writes are being shed — `datax_storage_backpressure_cause_total{cause=leader\|debt\|follower}` says which limit; see [Backpressure](#backpressure) |
 | `datax_storage_write_stalls_total` | increasing at all | Pebble hard-stalled writes; you're past backpressure |
 | `datax_storage_l0_sublevels` / `datax_storage_l0_files` | sustained ≥ 10 / ≥ 400 | compaction falling behind |
+| `datax_storage_block_cache_hits_total` / `_misses_total` | hit rate under ~90 % on a read-heavy node | the block cache is smaller than the read working set: `--cache-size` (the dashboard's storage section shows the rate and `datax_storage_bloom_hits_total` / `_misses_total`, the share of point reads the bloom filters answered) |
 | `datax_storage_compaction_debt_bytes` | growing without bound | ingest exceeds compaction budget |
 | `datax_storage_debt_gate` | 1 for long stretches | the compaction-debt gate is latched (writes shed with `cause=debt` until debt halves) |
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
