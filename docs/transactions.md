@@ -30,6 +30,21 @@ A transactional write lays down a **write intent**:
 - a small metadata record at the bare key: `{txnID, epoch, timestamp, ...}`
 - the provisional value, stored as a normal version at the txn's write ts.
 
+The metadata record and the transaction record are protobuf-encoded from
+cluster version v14 (issue #141; JSON before it — `encoding/json` was
+about 45 % of the intent path, a 5 µs decode per intent read or rewrite).
+The coordinator flags each transaction (`TxnMeta.BinaryMeta`) when the
+cluster is at v14, the flag rides in every command so every replica
+encodes alike (replicas must stay byte-identical for the consistency
+checker), and a reader tells the encodings apart by the first byte —
+JSON opens with `{`, a protobuf record with its first field's tag
+(`storage.DecodeMVCCMetadata`, `kvpb.UnmarshalTxnRecord`; every reader,
+GC included, goes through them) — so intents and records laid down before
+the finalize are read, resolved and eventually reclaimed by the v14 code
+for as long as they live. Measured: decode 4.5 → 0.6 µs,
+encode 0.85 → 0.65 µs, an intent laid down, rewritten and read back
+13.9 → 6.2 µs; the record is well under half the size.
+
 Because the metadata key sorts immediately before all versions, a single seek
 finds "intent, then newest version". A scan walks from there with `Next`:
 the newest version at or below its timestamp, then across the key's

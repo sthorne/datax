@@ -175,9 +175,12 @@ roll back, so finalize v13 only once the upgraded cluster looks healthy.
 Finalizing v14 needs no restart: within a heartbeat every node moves both
 of its engines to Pebble's columnar-block sstable format (format major
 version 19) online, and new sstables — flushes, compactions — use it
-from then on. A v13 binary bundles a Pebble that does not know the
-format, so, as with v13, a node cannot go back to it after the finalize;
-`datax debug nodes` shows each store's format (`store_format`).
+from then on; transactions begun after the finalize also store their
+intents and records in a compact binary encoding, while the ones from
+before are read as they are until they resolve. A v13 binary bundles a
+Pebble that does not know the format, so, as with v13, a node cannot go
+back to it after the finalize; `datax debug nodes` shows each store's
+format (`store_format`).
 
 ## Checklist for production deployments
 

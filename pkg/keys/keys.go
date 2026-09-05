@@ -189,6 +189,18 @@ func TransactionKey(anchor Key, txnID uuid.UUID) Key {
 	return append(k, txnID[:]...)
 }
 
+// IsTransactionKey reports whether k has the shape TransactionKey builds:
+// the addressed prefix, an encoded anchor, "txn" and a 16-byte ID. Readers
+// of the range-local addressed span use it to pick out transaction records
+// before decoding them.
+func IsTransactionKey(k Key) bool {
+	if !bytes.HasPrefix(k, localAddressedPrefix) {
+		return false
+	}
+	tail, _, err := encoding.DecodeBytes(k[len(localAddressedPrefix):])
+	return err == nil && len(tail) == 3+16 && string(tail[:3]) == "txn"
+}
+
 // Addr returns the global key a key is addressed by: global keys address
 // themselves; range-local addressed keys address their embedded global key.
 // Unreplicated local keys are not addressable.

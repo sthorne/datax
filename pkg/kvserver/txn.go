@@ -1,7 +1,6 @@
 package kvserver
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -30,15 +29,17 @@ func loadTxnRecord(r storage.Reader, key keys.Key) (*kvpb.Transaction, error) {
 	if err != nil || raw == nil {
 		return nil, err
 	}
-	var txn kvpb.Transaction
-	if err := json.Unmarshal(raw, &txn); err != nil {
+	// Two encodings (issue #141): JSON before cluster version v14,
+	// protobuf from it; kvpb.UnmarshalTxnRecord tells them apart.
+	txn, err := kvpb.UnmarshalTxnRecord(raw)
+	if err != nil {
 		return nil, fmt.Errorf("corrupt transaction record at %s: %w", key, err)
 	}
-	return &txn, nil
+	return txn, nil
 }
 
 func putTxnRecord(w storage.Writer, key keys.Key, txn *kvpb.Transaction) error {
-	raw, err := json.Marshal(txn)
+	raw, err := kvpb.MarshalTxnRecord(txn)
 	if err != nil {
 		return err
 	}
