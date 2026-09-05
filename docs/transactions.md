@@ -31,7 +31,13 @@ A transactional write lays down a **write intent**:
 - the provisional value, stored as a normal version at the txn's write ts.
 
 Because the metadata key sorts immediately before all versions, a single seek
-finds "intent, then newest version".
+finds "intent, then newest version". A scan walks from there with `Next`:
+the newest version at or below its timestamp, then across the key's
+remaining versions onto the next row (a reverse scan steps back with
+`Prev`), and seeks only past a chain of more than eight versions (issue
+#160 — a seek per row and another per version lookup had been half of a
+scan's time; versions are told apart by their encoded suffix, without
+decoding the user key per version).
 
 Rules:
 
