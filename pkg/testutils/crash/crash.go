@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -205,6 +206,30 @@ func (n *Node) Status() ([]RangeStatus, error) {
 		return nil, err
 	}
 	return doc.Ranges, nil
+}
+
+// Metric reads one plain series from the node's /metrics page (0 when
+// absent or unreadable).
+func (n *Node) Metric(name string) float64 {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(n.HTTPURL() + "/metrics")
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, name+" ") {
+			var v float64
+			if _, err := fmt.Sscanf(strings.TrimPrefix(line, name+" "), "%g", &v); err == nil {
+				return v
+			}
+		}
+	}
+	return 0
 }
 
 // WaitApplied waits until every range's applied index has caught up with

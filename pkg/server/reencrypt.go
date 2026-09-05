@@ -8,6 +8,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
 )
@@ -60,6 +61,20 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 	if err := n.engine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
 	}
+	if n.raftEngine != nil {
+		// The raft engine's registry is sealed under the same store key.
+		// On disk it lives under the state engine's directory and the
+		// reseal above already covered it (enc.RotateStoreKey rotates a
+		// store's raft subdirectory with it); an engine elsewhere (an
+		// in-memory pair) is rotated here. A crash between the two
+		// reseals is repaired at the next start by matching each
+		// engine's registry against the candidate keys.
+		if err := n.raftEngine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
+			if _, merr := n.raftEngine.MatchStoreKey([][]byte{req.NewStoreKey}); merr != nil {
+				return cluster.AdminResponse{Error: "state engine rotated but the raft engine did not: " + err.Error() + "; rerun the rotation with the same keys"}
+			}
+		}
+	}
 	// Future artifact seals (metadata backup) must use the new key; swap it
 	// and re-seal the backup now rather than waiting a heartbeat, so no
 	// old-key artifact outlives the rotation.
@@ -98,6 +113,13 @@ func (n *Node) reportKeyFilesAfterRotation(newKey []byte) {
 
 func (n *Node) reencryptionStatus() *cluster.ReencryptionStatus {
 	remaining, files, sweepErr := n.engine.ReencryptionStatus()
+	if n.raftEngine != nil {
+		r2, f2, err2 := n.raftEngine.ReencryptionStatus()
+		remaining, files = remaining+r2, files+f2
+		if sweepErr == nil {
+			sweepErr = err2
+		}
+	}
 	n.reencMu.Lock()
 	defer n.reencMu.Unlock()
 	st := &cluster.ReencryptionStatus{
@@ -144,8 +166,21 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 	// attempted spans the run: a file a compaction left in place is not
 	// retried, so the files behind it get their turn (see ReencryptPass).
 	attempted := map[uint64]bool{}
+	engines := []*storage.Engine{n.engine}
+	if n.raftEngine != nil {
+		engines = append(engines, n.raftEngine)
+	}
 	for pass := 0; pass < reencryptMaxPasses; pass++ {
-		targeted, remaining, files, err := n.engine.ReencryptPass(ctx, reencryptPassBytes, attempted)
+		var targeted, remaining int64
+		var files int
+		var err error
+		for _, eng := range engines {
+			t, r, f, perr := eng.ReencryptPass(ctx, reencryptPassBytes, attempted)
+			targeted, remaining, files = targeted+t, remaining+r, files+f
+			if perr != nil && err == nil {
+				err = perr
+			}
+		}
 		if targeted > 0 {
 			metrics.ReencryptionRewritten.Add(float64(targeted))
 			n.reencMu.Lock()

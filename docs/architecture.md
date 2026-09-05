@@ -75,7 +75,11 @@ These are the load-bearing rules; tests assert them.
 1. **Raft durability order**: HardState and log entries are synced to Pebble
    *before* any outbound Raft message that acknowledges them. Applied state and
    the applied index are written in one atomic batch, so crash-recovery replay
-   is idempotent.
+   is idempotent. On a **split store** (v13, issue #105) the log has its own
+   engine and the state engine runs without a write-ahead log: what a crash
+   takes from the state engine's memtable is replayed from the log, whose
+   truncation waits for the state engine to flush past the entries it removes
+   (see [replication-and-placement.md](replication-and-placement.md#raft-log-truncation)).
 2. **Linearizable reads**: only via ReadIndex on the leader. On leadership
    acquisition the timestamp cache floor is bumped to `now()`, because a new
    leader cannot know what reads the old leader served. The one non-leader

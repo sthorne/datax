@@ -42,7 +42,7 @@ func fillLog(ctx context.Context, t *testing.T, n *server.Node, tableID uint64, 
 // TestLogTruncation: after enough writes, the leader proposes a truncation
 // and every replica physically drops its log prefix while staying live.
 func TestLogTruncation(t *testing.T) {
-	tc, engines := StartWithEngines(t, 3)
+	tc, _ := StartWithEngines(t, 3)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -67,19 +67,22 @@ func TestLogTruncation(t *testing.T) {
 		t.Fatalf("truncated only through %d; want >= 256", truncIdx)
 	}
 
-	// Every replica applies the truncation and physically drops the prefix.
+	// Every replica applies the truncation and physically drops the
+	// prefix — on the split store once its own housekeeping has flushed
+	// the state engine past the applies the prefix covered.
 	for i, n := range tc.Nodes {
 		r, ok := n.Store().GetReplica(1)
 		if !ok {
 			t.Fatalf("node %d has no replica of range 1", i+1)
 		}
 		for r.TruncatedIndex() < truncIdx {
+			n.Store().RunLogTruncationOnce(ctx)
 			if time.Now().After(deadline) {
 				t.Fatalf("node %d never applied the truncation (at %d, want %d)", i+1, r.TruncatedIndex(), truncIdx)
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if first := firstLogIndex(t, engines[i]); first <= truncIdx {
+		if first := firstLogIndex(t, tc.RaftEngine(i)); first <= truncIdx {
 			t.Fatalf("node %d: log entry %d still on disk; truncated through %d", i+1, first, truncIdx)
 		}
 	}
@@ -134,12 +137,19 @@ func TestLogTruncationRestart(t *testing.T) {
 	defer cancel()
 
 	fillLog(ctx, t, n, 722, 400)
-	n.Store().RunLogTruncationOnce(ctx)
 	rep, _ := n.Store().GetReplica(1)
-	truncIdx := rep.TruncatedIndex()
-	if truncIdx < 256 {
-		t.Fatalf("truncated only through %d; want >= 256", truncIdx)
+	// The truncation applies asynchronously and, on the split store,
+	// lands once the state engine has flushed (the housekeeping call
+	// forces that in tests).
+	deadline := time.Now().Add(15 * time.Second)
+	for rep.TruncatedIndex() < 256 {
+		n.Store().RunLogTruncationOnce(ctx)
+		if time.Now().After(deadline) {
+			t.Fatalf("truncated only through %d; want >= 256", rep.TruncatedIndex())
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	truncIdx := rep.TruncatedIndex()
 	k := keys.TableDataPrefix(722)
 	if err := n.DB().Put(ctx, k, []byte("persist")); err != nil {
 		t.Fatal(err)

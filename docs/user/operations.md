@@ -230,6 +230,8 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
+| `datax_raft_replayed_entries_total` | jumps after a restart | the node came back from a crash (or an unflushed close) and re-applied that many committed entries from its raft log — expected after a crash, a sign the shutdown was not clean otherwise |
+| `datax_storage_bytes_written_total{engine="state",kind="wal"}` | increasing on a split store | the state engine is writing a WAL it should not have; the store did not migrate (`datax_storage_split` is 0: restart the node after the v13 finalize) |
 | `datax_sql_memory_limit_hits_total` | increasing | statements are failing with `53200`: a query sorts, aggregates or joins more than `statement_memory_limit` allows on the gateway — narrow it, add an index that delivers the order, or raise the limit for that session (`datax_sql_streamed_rows_total` vs the statement count says how much of the read traffic streams and never counts against the limit) |
 
 Each node also pings every peer every 2 seconds (the NTP exchange, so
@@ -435,6 +437,12 @@ Rules of the road:
   healthy first, because finalize is the point of no return.
 - `datax debug upgrade` names any node still on the old binary instead of
   finalizing — nothing to time or coordinate.
+- **v13 needs one more rolling restart after finalize**: each node's next
+  start migrates its store to the split layout (the raft log on its own
+  engine under `--dir/raft`, the state engine without a WAL; see
+  [Deployment → Store layout](deployment.md#storage-profiles)). Until
+  that restart the node keeps running on one engine. A migrated store
+  refuses a v12 binary.
 
 ## Decommissioning a node
 

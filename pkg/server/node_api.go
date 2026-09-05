@@ -46,7 +46,12 @@ type NodeDetail struct {
 	Settings map[string]string `json:"settings,omitempty"`
 	Status   *NodeStatus       `json:"status,omitempty"`
 
-	Storage         *storage.StorageMetrics     `json:"storage,omitempty"`
+	Storage *storage.StorageMetrics `json:"storage,omitempty"`
+	// EngineMode is "split" when the raft log has its own engine and the
+	// state engine runs without a WAL (issue #105), "single" otherwise;
+	// RaftStorage is the raft engine's snapshot when split.
+	EngineMode      string                      `json:"engine_mode,omitempty"`
+	RaftStorage     *storage.StorageMetrics     `json:"raft_storage,omitempty"`
 	DebtGated       bool                        `json:"debt_gated,omitempty"`
 	DebtGateEntries int64                       `json:"debt_gate_entries,omitempty"`
 	Overloaded      bool                        `json:"overloaded,omitempty"`
@@ -94,6 +99,11 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 	if n.engine != nil {
 		sm := n.engine.StorageMetrics()
 		d.Storage = &sm
+		d.EngineMode = n.engineMode()
+		if n.raftEngine != nil {
+			rm := n.raftEngine.StorageMetrics()
+			d.RaftStorage = &rm
+		}
 		d.DebtGated = n.engine.DebtGated()
 		d.DebtGateEntries = n.engine.DebtGateEntries()
 		d.Overloaded, d.OverloadReason = n.engine.Overloaded()

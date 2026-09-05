@@ -5,8 +5,10 @@ package storage
 
 import (
 	"fmt"
-	"github.com/sthorne/datax/pkg/util/faultpoint"
 	"sync"
+	"sync/atomic"
+
+	"github.com/sthorne/datax/pkg/util/faultpoint"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
@@ -57,6 +59,15 @@ type Engine struct {
 	reenc   reencStatusCache
 	// cacheHeld: this engine holds a reference on the shared block cache.
 	cacheHeld bool
+	// walDisabled: the engine runs without a WAL (see Options.DisableWAL);
+	// flushedSeq is the largest sequence number an sstable holds, i.e.
+	// what is durable.
+	walDisabled bool
+	flushedSeq  atomic.Uint64
+	// explicitFlush is set around Engine.Flush: a flush datax asked for
+	// (a split store's structural points, shutdown) is not the memtable
+	// rotation the flush-begin fault point means to catch.
+	explicitFlush atomic.Int32
 }
 
 // testingPebbleOptions, when set, adjusts the Pebble options after the
@@ -68,12 +79,17 @@ var testingPebbleOptions func(*pebble.Options)
 // options (zero value = balanced profile, plaintext). If dir is empty an
 // in-memory store is used (tests, demo mode).
 func Open(dir string, o Options) (*Engine, error) {
-	e := &Engine{}
+	e := &Engine{walDisabled: o.DisableWAL}
 	opts := &pebble.Options{}
 	e.health.gate = o.Profile.apply(opts)
+	if o.Raft {
+		opts.MemTableSize = 16 << 20
+		opts.MemTableStopWritesThreshold = 4
+	}
 	if o.MemTableSize > 0 {
 		opts.MemTableSize = uint64(o.MemTableSize)
 	}
+	opts.DisableWAL = o.DisableWAL
 	cacheSize := o.CacheSize
 	if cacheSize <= 0 {
 		cacheSize = DefaultCacheSize(o.Profile)
@@ -89,8 +105,29 @@ func Open(dir string, o Options) (*Engine, error) {
 			e.health.inStall.Store(true)
 		},
 		WriteStallEnd: func() { e.health.inStall.Store(false) },
-		FlushBegin:    func(pebble.FlushInfo) { faultpoint.Hit("flush-begin") },
-		DiskSlow:      func(pebble.DiskSlowInfo) { e.health.diskSlow.Add(1) },
+		FlushBegin: func(pebble.FlushInfo) {
+			if e.explicitFlush.Load() == 0 {
+				faultpoint.Hit("flush-begin")
+			}
+		},
+		FlushEnd: func(info pebble.FlushInfo) {
+			// Memtables flush in order, so the newest output's largest
+			// sequence number is the durability watermark.
+			var largest uint64
+			for _, t := range info.Output {
+				if t.LargestSeqNum > largest {
+					largest = t.LargestSeqNum
+				}
+			}
+			for {
+				cur := e.flushedSeq.Load()
+				if largest <= cur || e.flushedSeq.CompareAndSwap(cur, largest) {
+					break
+				}
+			}
+			faultpoint.Hit("flush-end")
+		},
+		DiskSlow: func(pebble.DiskSlowInfo) { e.health.diskSlow.Add(1) },
 		BackgroundError: func(err error) {
 			e.health.bgErrors.Add(1)
 		},
@@ -161,7 +198,19 @@ func storeHasFiles(base vfs.FS, dir string) bool {
 	return false
 }
 
+// TestingSkipFlushOnClose makes Close skip the WAL-less engine's final
+// flush, so a test can close a store the way a crash would leave it.
+var TestingSkipFlushOnClose bool
+
 func (e *Engine) Close() error {
+	if e.walDisabled && !TestingSkipFlushOnClose {
+		// Without a WAL the memtable is the only copy of recent writes: a
+		// clean shutdown persists them so the restart has nothing to
+		// replay. A crash skips this, and the raft log replays the rest.
+		if err := e.Flush(); err != nil {
+			return err
+		}
+	}
 	err := e.db.Close()
 	if e.cacheHeld {
 		e.cacheHeld = false
@@ -170,12 +219,48 @@ func (e *Engine) Close() error {
 	return err
 }
 
+// WALDisabled reports whether the engine runs without a write-ahead log
+// (Options.DisableWAL): committed writes become durable at the next
+// flush, not at commit.
+func (e *Engine) WALDisabled() bool { return e.walDisabled }
+
+// FlushedSeqNum is the largest sequence number durably flushed to an
+// sstable (0 until the first flush). A batch whose SeqNum is at or
+// below it has reached disk, whatever the WAL setting.
+func (e *Engine) FlushedSeqNum() uint64 { return e.flushedSeq.Load() }
+
+// WriteMetrics is what the engine has written since it opened: WAL
+// bytes, bytes flushed from memtables, bytes written by compactions.
+type WriteMetrics struct {
+	WALBytes       uint64
+	FlushedBytes   uint64
+	CompactedBytes uint64
+}
+
+// WriteMetrics reads the engine's cumulative write counters (the write
+// amplification an operator watches: WAL + flushed + compacted per
+// logical byte).
+func (e *Engine) WriteMetrics() WriteMetrics {
+	m := e.db.Metrics()
+	var w WriteMetrics
+	w.WALBytes = m.WAL.BytesWritten
+	for i := range m.Levels {
+		w.FlushedBytes += m.Levels[i].BytesFlushed
+		w.CompactedBytes += m.Levels[i].BytesCompacted
+	}
+	return w
+}
+
 // CacheSize is the block cache the engine shares with the process's
 // other engines, in bytes.
 func (e *Engine) CacheSize() int64 { return SharedCacheSize() }
 
 // Flush synchronously flushes memtables to disk. Used by tests.
-func (e *Engine) Flush() error { return e.db.Flush() }
+func (e *Engine) Flush() error {
+	e.explicitFlush.Add(1)
+	defer e.explicitFlush.Add(-1)
+	return e.db.Flush()
+}
 
 func (e *Engine) Get(key []byte) ([]byte, error) {
 	v, closer, err := e.db.Get(key)
@@ -212,7 +297,7 @@ func (e *Engine) Delete(key []byte) error {
 // batch itself (required by MVCC read-modify-write sequences), and atomic on
 // Commit.
 func (e *Engine) NewBatch() *Batch {
-	return &Batch{b: e.db.NewIndexedBatch()}
+	return &Batch{b: e.db.NewIndexedBatch(), eng: e}
 }
 
 // NewSnapshot returns a consistent point-in-time read view. Range snapshots
@@ -252,7 +337,9 @@ func (s *Snapshot) Close() error { return s.s.Close() }
 
 // Batch is an atomic, indexed write batch.
 type Batch struct {
-	b *pebble.Batch
+	b   *pebble.Batch
+	eng *Engine
+	seq uint64
 }
 
 func (b *Batch) Get(key []byte) ([]byte, error) {
@@ -286,11 +373,22 @@ func (b *Batch) DeleteRange(start, end []byte) error { return b.b.DeleteRange(st
 // required for Raft state (HardState, log entries) and applied state.
 func (b *Batch) Commit(sync bool) error {
 	opt := pebble.NoSync
-	if sync {
+	if sync && !b.eng.walDisabled {
+		// Without a WAL there is nothing to sync: durability is the next
+		// flush (Engine.FlushedSeqNum), and Pebble refuses a Sync commit.
 		opt = pebble.Sync
 	}
-	return b.b.Commit(opt)
+	if err := b.b.Commit(opt); err != nil {
+		return err
+	}
+	b.seq = b.b.SeqNum()
+	return nil
 }
+
+// SeqNum is the sequence number the batch committed at (0 before
+// Commit); compare with Engine.FlushedSeqNum to learn whether it is
+// durable on a WAL-less engine.
+func (b *Batch) SeqNum() uint64 { return b.seq }
 
 func (b *Batch) Close() error { return b.b.Close() }
 

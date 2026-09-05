@@ -8,6 +8,35 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.36.0 — unreleased
+
+### Changed
+- The split store (#105; cluster version **v13**). A store's raft state —
+  every replica's HardState, log entries and truncated state — moves to
+  a raft engine of its own under `--dir/raft`, and the state-machine
+  engine under `--dir` runs without a write-ahead log: a replicated write
+  reaches disk once, through the synced group-committed raft log, instead
+  of twice. What a crash takes from the state engine's memtable is
+  replayed from the log (`datax_raft_replayed_entries_total`); a clean
+  shutdown flushes first. Log truncation is deferred until the state
+  engine has flushed past the entries it removes
+  (`datax_raft_deferred_truncations_total`; a truncation pending past
+  30 s has the housekeeping tick flush for it,
+  `datax_raft_truncation_flushes_total`); merges, replica removals and
+  catch-up snapshots flush before touching the raft engine; raft state
+  orphaned by a crash is swept at startup. A store created by a
+  v13 binary or joining a v13 cluster is split from the start; an older
+  store migrates on its first start after the finalize and then refuses
+  a v12 binary (the one upgrade step that cannot roll back). Both
+  engines are encrypted, rotated and re-encrypted together.
+  `datax_storage_split`, `datax_storage_bytes_written_total{engine,kind}`;
+  `/api/node` reports `engine_mode` and the raft engine's metrics. On
+  the harness's single node, batched ingest writes about half as many
+  bytes to disk per row (balanced profile: 7.5× → 3.5× of the row
+  bytes with sequential keys, 14.2× → 6.9× with UUID keys) at 16–19 %
+  more rows per second; the ingest profile goes 3.2× → 2.3× and
+  6.2× → 4.1× at 3–5 % more.
+
 ## 0.35.0 — unreleased
 
 ### Changed

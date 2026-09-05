@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/events"
@@ -35,9 +36,14 @@ type StoreConfig struct {
 	NodeID base.NodeID
 	// Events, when set, receives the store's operational events (splits,
 	// merges, snapshots) for the dashboard's feed.
-	Events           *events.Ring
-	StoreID          base.StoreID
+	Events  *events.Ring
+	StoreID base.StoreID
+	// Engine holds the state machine (replicated data, descriptors,
+	// applied state); RaftEngine, when set, holds the raft log and
+	// HardState instead of Engine, and Engine may then run without a WAL
+	// (raftengine.go, issue #105).
 	Engine           *storage.Engine
+	RaftEngine       *storage.Engine
 	Clock            *hlc.Clock
 	Transport        RaftTransport
 	SnapshotSender   SnapshotSender
@@ -49,6 +55,12 @@ type StoreConfig struct {
 	// DisableQuiescence keeps idle ranges ticking and heartbeating (see
 	// quiesce.go); heartbeats still travel coalesced.
 	DisableQuiescence bool
+	// TruncationFlushAfter bounds how long a split store's deferred log
+	// truncation waits for the state engine to flush on its own: a
+	// pending truncation older than this makes the housekeeping tick
+	// flush the state engine (0 = 30 s; negative = never, the log then
+	// waits for a natural flush).
+	TruncationFlushAfter time.Duration
 	// DisableLeaseReads reverts ReadIndex to full quorum round trips
 	// (raft's ReadOnlySafe) instead of leader leases.
 	DisableLeaseReads bool
@@ -216,9 +228,14 @@ func NewStore(cfg StoreConfig) *Store {
 	return s
 }
 
-func (s *Store) NodeID() base.NodeID   { return s.cfg.NodeID }
-func (s *Store) StoreID() base.StoreID { return s.cfg.StoreID }
-func (s *Store) Clock() *hlc.Clock     { return s.cfg.Clock }
+func (s *Store) NodeID() base.NodeID { return s.cfg.NodeID }
+
+// Engine is the store's state-machine engine; RaftEngine the engine
+// holding raft state (the same one on a single-engine store).
+func (s *Store) Engine() *storage.Engine     { return s.cfg.Engine }
+func (s *Store) RaftEngine() *storage.Engine { return s.raftEngine() }
+func (s *Store) StoreID() base.StoreID       { return s.cfg.StoreID }
+func (s *Store) Clock() *hlc.Clock           { return s.cfg.Clock }
 
 // LoadLocalRangeDescriptors scans a store for every persisted range
 // descriptor. Exported for offline recovery tooling as well as startup.
@@ -268,11 +285,15 @@ func LoadLocalRangeDescriptors(eng *storage.Engine) ([]kvpb.RangeDescriptor, err
 // started first could replay a merge before its RHS existed and fatal
 // the node.
 func (s *Store) LoadReplicas() error {
+	if err := s.sweepOrphanRaftState(); err != nil {
+		return err
+	}
 	descs, err := LoadLocalRangeDescriptors(s.cfg.Engine)
 	if err != nil {
 		return err
 	}
 	var loaded []*Replica
+	var replay uint64
 	for _, desc := range descs {
 		rep, ok := desc.GetReplica(s.cfg.NodeID)
 		if !ok {
@@ -286,7 +307,15 @@ func (s *Store) LoadReplicas() error {
 		if created {
 			loaded = append(loaded, r)
 		}
-		log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
+		if n := r.replayPending(); n > 0 {
+			replay += n
+			log.Infof("%s: restarted replica %d [%s, %s); replaying %d committed entries the state engine had not flushed", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey, n)
+		} else {
+			log.Infof("%s: restarted replica %d [%s, %s)", desc.RangeID, rep.ReplicaID, desc.StartKey, desc.EndKey)
+		}
+	}
+	if replay > 0 {
+		metrics.RaftReplayedEntries.Add(float64(replay))
 	}
 	for _, r := range loaded {
 		if err := r.startRaft(); err != nil {
@@ -311,6 +340,13 @@ func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Repli
 	}
 	if err := b.Commit(true); err != nil {
 		return nil, err
+	}
+	if bootstrap {
+		// A bootstrapped range's descriptor is the store's root: on a
+		// WAL-less state engine make it durable before raft starts.
+		if err := s.flushState(); err != nil {
+			return nil, err
+		}
 	}
 	return s.startReplica(desc, rep.ReplicaID, bootstrap)
 }

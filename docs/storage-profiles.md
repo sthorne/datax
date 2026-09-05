@@ -103,14 +103,19 @@ Known limitation: the debt thresholds are first-cut constants (chosen
 conservatively — well past where a healthy store's debt cycles); tune
 with production data.
 
-## WAL cost note (measurement first)
+## WAL cost note (resolved by the split store)
 
-State-machine apply batches already commit **unsynced**
-(`pkg/kvserver/apply.go` — durability comes from the raft log, which is
-synced in `handleReady`), but they still pay WAL write bandwidth for
-every applied command, roughly doubling ingest write amplification. A
-WAL bypass for the state machine would need the raft state split into
-its own synced store; deferred until the numbers below justify it.
+State-machine apply batches commit **unsynced** (`pkg/kvserver/apply.go`
+— durability comes from the raft log, which the scheduler syncs), but
+on a single-engine store they still paid WAL write bandwidth for every
+applied command, roughly doubling ingest write amplification. From
+cluster version v13 the store is split (issue #105): the raft log has an
+engine of its own and the state engine runs with `DisableWAL`, replaying
+the log after a crash (see docs/replication-and-placement.md, "Raft log
+truncation", for the durability model). The raft engine keeps a small
+memtable (16 MiB) since the log is appended and truncated, never read
+in bulk. `datax_storage_bytes_written_total{engine,kind}` shows each
+engine's WAL, flush and compaction bytes.
 
 ## Numbers (16 workers, 100-row batches, 256 B values, single node, 60s)
 

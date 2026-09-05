@@ -168,6 +168,15 @@ type Replica struct {
 		// pendingInstall is a staged incoming snapshot awaiting raft's
 		// restore (committed by applySnapshot). See catchup.go.
 		pendingInstall *pendingSnapshot
+		// Split stores (raftengine.go): applySeqs pairs recent applied
+		// indexes with their batches' sequence numbers, durableApplied
+		// is the highest one the state engine has flushed, and
+		// pendingTrunc is an applied TruncateLog whose raft-side deletion
+		// waits for that flush.
+		applySeqs      []appliedSeq
+		durableApplied uint64
+		pendingTrunc   truncatedState
+		pendingSince   time.Time
 		// frozen: a Subsume applied — the range refuses traffic pending a
 		// merge into mergedInto (see merge.go). Mirrors replicaState.
 		frozen     bool
@@ -259,7 +268,7 @@ func raftConfig(id uint64, applied uint64, st raft.Storage, leaseReads bool) *ra
 // Store.startReplica). bootstrap must be true exactly once per replica
 // lifetime — when the range is first created with its initial membership.
 func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, bootstrap bool) (*Replica, error) {
-	rs, err := newRaftStorage(s.cfg.Engine, desc.RangeID, desc)
+	rs, err := newRaftStorage(s.raftEngine(), s.cfg.Engine, desc.RangeID, desc)
 	if err != nil {
 		return nil, err
 	}

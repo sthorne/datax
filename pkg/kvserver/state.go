@@ -75,14 +75,42 @@ func putReplicaState(w storage.Writer, rangeID base.RangeID, st replicaState) er
 	return w.Put(keys.RaftAppliedStateKey(rangeID), raw)
 }
 
-type truncatedState struct{ Index, Term uint64 }
+type truncatedState struct {
+	Index uint64 `json:"index"`
+	Term  uint64 `json:"term,omitempty"`
+}
 
-func loadTruncatedState(eng *storage.Engine, rangeID base.RangeID) (truncatedState, error) {
-	st, err := loadReplicaState(eng, rangeID)
+// loadTruncatedState reads the log's truncation point: from the raft
+// engine's own key on a split store (written with the deletion it
+// describes), else from the applied state.
+func loadTruncatedState(raftEng, stateEng *storage.Engine, rangeID base.RangeID) (truncatedState, error) {
+	if raftEng != stateEng {
+		raw, err := raftEng.Get(keys.RaftTruncatedStateKey(rangeID))
+		if err != nil {
+			return truncatedState{}, err
+		}
+		if raw != nil {
+			var ts truncatedState
+			if err := json.Unmarshal(raw, &ts); err != nil {
+				return truncatedState{}, fmt.Errorf("corrupt truncated state for %s: %w", rangeID, err)
+			}
+			return ts, nil
+		}
+	}
+	st, err := loadReplicaState(stateEng, rangeID)
 	if err != nil {
 		return truncatedState{}, err
 	}
 	return truncatedState{Index: st.TruncatedIndex, Term: st.TruncatedTerm}, nil
+}
+
+// putTruncatedState writes the raft engine's truncated-state key.
+func putTruncatedState(w storage.Writer, rangeID base.RangeID, ts truncatedState) error {
+	raw, err := json.Marshal(ts)
+	if err != nil {
+		return err
+	}
+	return w.Put(keys.RaftTruncatedStateKey(rangeID), raw)
 }
 
 // loadRangeDescriptor reads a replica's local descriptor copy.

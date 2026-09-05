@@ -86,6 +86,15 @@ var (
 	RaftReadyPasses = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_ready_passes_total", Help: "Raft Readies (one replica's persist, send and apply) handled by the store's scheduler workers.",
 	})
+	RaftDeferredTruncations = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_deferred_truncations_total", Help: "Log truncations performed on the raft engine once the state engine had flushed past them (split stores).",
+	})
+	RaftTruncationFlushes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_truncation_flushes_total", Help: "State-engine flushes the housekeeping tick forced so that a log truncation pending past its bound could proceed (split stores).",
+	})
+	RaftReplayedEntries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_replayed_entries_total", Help: "Committed log entries re-applied at startup because the state engine had not flushed them before the last shutdown.",
+	})
 	RaftLogSyncs = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_log_syncs_total", Help: "Synced commits of raft log entries and HardStates: one per scheduler pass, however many replicas the pass grouped.",
 	})

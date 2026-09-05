@@ -75,6 +75,23 @@ The profile is per-node and can differ across restarts. Watch
 [Operations](operations.md)) to tell when `ingest` is warranted. Details in
 [docs/storage-profiles.md](../storage-profiles.md).
 
+**Store layout.** From cluster version v13 a store is two Pebble engines:
+the state machine directly under `--dir`, running without a write-ahead
+log, and the raft log under `--dir/raft`, with one. Every replicated
+write then reaches disk once — through the synced, group-committed raft
+log — instead of twice (the log and the state engine's WAL), which is
+what the raft log's durability guarantee makes safe: whatever a crash
+takes from the state engine's memtable is replayed from the log on the
+next start (a clean shutdown flushes it, so a normal restart replays
+nothing). Both directories share the block cache, the profile and the
+encryption key; back up, move or size the store as the one directory it
+is. A store created by a v13 binary, or joining a v13 cluster, is laid
+out this way from the start; an older store migrates on its first start
+after the cluster finalizes v13 (see [Upgrading](#upgrading-a-running-cluster)).
+`datax_storage_split` is 1 on a split store, and
+`datax_storage_bytes_written_total{engine,kind}` shows what each engine
+writes.
+
 ## Encryption at rest
 
 Give the node a 32-byte key file (raw or hex) and everything it writes to
@@ -146,6 +163,14 @@ every node is upgraded, finalize deliberately with `datax debug upgrade`.
 Before finalize you can roll any node back; after it, never. Full
 procedure and rules: [Operations → Rolling
 upgrades](operations.md#rolling-upgrades).
+
+Upgrading to v13 has one extra step: after the finalize, restart each
+node once more (rolling, as before). That restart migrates the node's
+store to the split layout above — its raft state moves to `--dir/raft`,
+bounded by the log size that truncation keeps small, and the state
+engine drops its WAL. The migration records itself in the store, which a
+v12 binary then refuses to open: it is the one upgrade step that cannot
+roll back, so finalize v13 only once the upgraded cluster looks healthy.
 
 ## Checklist for production deployments
 

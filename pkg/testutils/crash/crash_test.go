@@ -201,6 +201,16 @@ func TestCrashConsistency(t *testing.T) {
 			t.Logf("%s: node died after %d acknowledged writes", sc.name, len(acked))
 			n.Restart("")
 			verifyAcked(t, n, acked)
+			// The store is split (issue #105): the state engine kept
+			// nothing the crash caught in its memtable, so the restart
+			// replayed committed entries from the raft log — except
+			// after a flush-triggered kill, where little or nothing may
+			// remain to replay.
+			if replayed := n.Metric("datax_raft_replayed_entries_total"); replayed == 0 && sc.name != "flush-begin" {
+				t.Fatalf("%s: the restart replayed no committed entries from the raft log", sc.name)
+			} else {
+				t.Logf("%s: the restart replayed %.0f committed entries", sc.name, replayed)
+			}
 			// A second crash on the reopened store, then a clean restart
 			// (fresh keys: the crash may have made the next key durable
 			// without acknowledging it).

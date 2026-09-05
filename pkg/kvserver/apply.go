@@ -160,7 +160,11 @@ func (r *Replica) persistAppliedIndex(idx uint64) error {
 		_ = b.Close()
 		return err
 	}
-	return b.Commit(false)
+	if err := b.Commit(false); err != nil {
+		return err
+	}
+	r.noteAppliedSeq(idx, b.SeqNum())
+	return nil
 }
 
 func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
@@ -266,12 +270,22 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		// Failing to commit the state machine is not recoverable.
 		log.Fatalf("%s: applying entry %d: %v", r.rangeID, idx, err)
 	}
+	r.noteAppliedSeq(idx, b.SeqNum())
 	r.setApplied(idx)
 	if aerr == nil && cmd.Split != nil {
 		r.finishSplit(cmd.Split)
 	}
 	if aerr == nil && cmd.Merge != nil {
 		r.finishMerge(cmd.Merge)
+		// The RHS's state-machine side is in the batch above; its raft
+		// state goes once that is durable (a no-op on a single engine,
+		// whose batch covered the whole range-local prefix).
+		if err := r.store.wipeRaftState(cmd.Merge.Right.RangeID); err != nil {
+			log.Warnf("%s: removing merged %s's raft state: %v", r.rangeID, cmd.Merge.Right.RangeID, err)
+		}
+	}
+	if err := r.maybeTruncateDeferredLocked(); err != nil {
+		log.Warnf("%s: deferred log truncation: %v", r.rangeID, err)
 	}
 	if cmd.Load != nil {
 		r.mu.Lock()
@@ -475,10 +489,14 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			ru.GC = &kvpb.GCResponse{}
 		case *kvpb.TruncateLogRequest:
 			// Applying this entry means everything at or below it — Index
-			// included — is durably applied here, so the local log prefix is
-			// no longer needed. The new truncated state is persisted by
-			// stageAppliedIndex in this same batch.
-			if err := r.rs.stageTruncate(b, req.Index, req.Term); err != nil {
+			// included — is applied here. With a WAL that is durable, so
+			// the local log prefix goes in this same batch (the new
+			// truncated state is persisted by stageAppliedIndex with it).
+			// On a split store the deletion waits until the state engine
+			// has flushed past this index (raftengine.go).
+			if r.store.splitEngines() {
+				r.notePendingTruncate(req.Index, req.Term)
+			} else if err := r.rs.stageTruncate(b, req.Index, req.Term); err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.TruncateLog = &kvpb.TruncateLogResponse{}

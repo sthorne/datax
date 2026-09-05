@@ -235,7 +235,7 @@ func (sc *raftScheduler) runGroup(ctx context.Context, group []readyWork) {
 			continue
 		}
 		if gb == nil {
-			gb = sc.store.cfg.Engine.NewBatch()
+			gb = sc.store.raftEngine().NewBatch()
 		}
 		if w.err = w.r.stageReady(gb, w.rd); w.err == nil {
 			staged++

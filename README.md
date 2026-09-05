@@ -44,7 +44,9 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
 
 - **Storage**: [Pebble](https://github.com/cockroachdb/pebble) LSM with
   multi-version concurrency control. Every value is versioned by a hybrid
-  logical clock (HLC) timestamp. Per-node tuning profiles
+  logical clock (HLC) timestamp. The raft log has its own engine and the
+  state machine runs without a write-ahead log, replaying the log after a
+  crash (a replicated write reaches disk once). Per-node tuning profiles
   (`--storage-profile balanced|ingest`); **encryption at rest**
   (`--enc-key`: per-file data keys sealed under a store key, online store-key
   rotation with the new key staged beside the old — `--enc-key old.key,new.key`

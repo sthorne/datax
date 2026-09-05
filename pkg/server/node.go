@@ -93,6 +93,10 @@ type Config struct {
 	// disables). Process-wide: the first node started sets them.
 	MutexProfileFraction int
 	BlockProfileRate     time.Duration
+	// TruncationFlushAfter bounds how long a split store's deferred log
+	// truncation waits for a natural state-engine flush before the
+	// housekeeping tick forces one (0 = 30 s; negative = never).
+	TruncationFlushAfter time.Duration
 	// StorageMemTableSize overrides the storage profile's memtable size
 	// (0 = the profile's). Crash-consistency tests shrink it.
 	StorageMemTableSize int
@@ -183,8 +187,12 @@ type Config struct {
 	BinaryVersionOverride version.Version
 
 	// Test hooks.
-	TestingKnobs    kvserver.TestingKnobs
+	TestingKnobs kvserver.TestingKnobs
+	// Engine injects the state engine (tests: in-memory); RaftEngine,
+	// with it, injects a raft engine so the store runs split. With
+	// Engine set the node never opens or migrates a store itself.
 	Engine          *storage.Engine
+	RaftEngine      *storage.Engine
 	Listener        net.Listener
 	PGListener      net.Listener
 	HTTPListener    net.Listener
@@ -215,17 +223,22 @@ const (
 )
 
 type Node struct {
-	cfg      Config
-	tlsCfgs  *security.TLSConfigs // nil in insecure mode
-	stopper  *stop.Stopper
-	clock    *hlc.Clock
-	engine   *storage.Engine
-	registry *cluster.Registry
-	trans    *rpc.Transport
-	store    *kvserver.Store
-	db       *kvclient.DB
-	ident    cluster.StoreIdent
-	addr     string
+	cfg     Config
+	tlsCfgs *security.TLSConfigs // nil in insecure mode
+	stopper *stop.Stopper
+	clock   *hlc.Clock
+	engine  *storage.Engine
+	// raftEngine holds the raft log when the store is split (engines.go);
+	// raftEncKey is its store key when a rotation left it sealed under a
+	// different candidate than the state engine.
+	raftEngine *storage.Engine
+	raftEncKey []byte
+	registry   *cluster.Registry
+	trans      *rpc.Transport
+	store      *kvserver.Store
+	db         *kvclient.DB
+	ident      cluster.StoreIdent
+	addr       string
 	// joinRange1 carries the routing bootstrap from a join response until
 	// the DB exists to seed.
 	joinRange1 kvpb.RangeDescriptor
@@ -344,14 +357,25 @@ func (n *Node) start() error {
 		if len(paths) > 1 {
 			log.Infof("store encryption key: %s matches the store (%d key files given)", paths[idx], len(paths))
 		}
+		n.matchRaftEncKey(candidates)
 	}
-	n.engine = n.cfg.Engine
+	n.engine, n.raftEngine = n.cfg.Engine, n.cfg.RaftEngine
 	if n.engine == nil {
-		n.engine, err = storage.Open(n.cfg.Dir, storage.Options{Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey, MemTableSize: n.cfg.StorageMemTableSize, CacheSize: n.cfg.StorageCacheSize})
-		if err != nil {
+		if err := n.openEngines(); err != nil {
 			return err
 		}
+		// Both close after the store's raft groups have stopped (no
+		// append can follow); the state engine's shutdown flush is what
+		// makes the next start need no replay.
 		n.stopper.AddCloser(func() { _ = n.engine.Close() })
+		n.stopper.AddCloser(func() {
+			if n.raftEngine != nil {
+				_ = n.raftEngine.Close()
+			}
+		})
+	}
+	if n.raftEngine != nil {
+		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
 	}
 
 	lis := n.cfg.Listener
@@ -459,6 +483,8 @@ func (n *Node) start() error {
 		Events:                  n.events,
 		StoreID:                 n.ident.StoreID,
 		Engine:                  n.engine,
+		RaftEngine:              n.raftEngine,
+		TruncationFlushAfter:    n.cfg.TruncationFlushAfter,
 		Clock:                   n.clock,
 		Transport:               n.trans,
 		SnapshotSender:          n.trans,
@@ -773,6 +799,18 @@ func (n *Node) join() error {
 	if err := cluster.WriteStoreIdent(n.engine, n.ident); err != nil {
 		return err
 	}
+	if cv := version.Version(resp.ClusterVersion); cv > 0 {
+		n.clusterVersion.Store(int64(cv))
+		if err := n.persistStoreClusterVersion([]byte(fmt.Sprintf("%d", int(cv)))); err != nil {
+			return err
+		}
+		if cv >= version.V13 {
+			// A fresh store joining a v13 cluster is split from the start.
+			if err := n.activateSplitStore(); err != nil {
+				return fmt.Errorf("activating the split store: %w", err)
+			}
+		}
+	}
 	for _, nd := range resp.Nodes {
 		n.registry.Upsert(nd)
 	}
@@ -786,6 +824,13 @@ func (n *Node) join() error {
 
 // Stop shuts the node down gracefully.
 func (n *Node) Stop() { n.stopper.Stop() }
+
+// EngineMode reports the store layout: "split" (the raft log on its own
+// engine, the state engine without a WAL) or "single".
+func (n *Node) EngineMode() string { return n.engineMode() }
+
+// ClusterVersion is the finalized cluster version this node has observed.
+func (n *Node) ClusterVersion() version.Version { return version.Version(n.clusterVersion.Load()) }
 
 // Accessors used by tests, the CLI, and later phases.
 func (n *Node) NodeID() base.NodeID { return n.ident.NodeID }

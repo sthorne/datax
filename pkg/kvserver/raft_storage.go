@@ -23,7 +23,8 @@ import (
 // The log is truncated by replicated TruncateLog commands (see truncate.go);
 // FirstIndex is the truncation point plus one.
 type raftStorage struct {
-	eng     *storage.Engine
+	eng     *storage.Engine // the raft engine (the state engine on a single-engine store)
+	split   bool            // raft state lives on its own engine
 	rangeID base.RangeID
 
 	mu struct {
@@ -40,12 +41,12 @@ type raftStorage struct {
 	}
 }
 
-func newRaftStorage(eng *storage.Engine, rangeID base.RangeID, desc kvpb.RangeDescriptor) (*raftStorage, error) {
-	rs := &raftStorage{eng: eng, rangeID: rangeID}
+func newRaftStorage(raftEng, stateEng *storage.Engine, rangeID base.RangeID, desc kvpb.RangeDescriptor) (*raftStorage, error) {
+	rs := &raftStorage{eng: raftEng, split: raftEng != stateEng, rangeID: rangeID}
 	rs.setConfState(desc)
 
 	// Recover truncated state and last index from disk.
-	ts, err := loadTruncatedState(eng, rangeID)
+	ts, err := loadTruncatedState(raftEng, stateEng, rangeID)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +296,16 @@ func (rs *raftStorage) stageTruncate(b *storage.Batch, index, term uint64) error
 	rs.mu.truncated.index, rs.mu.truncated.term = index, term
 	rs.mu.Unlock()
 	return nil
+}
+
+// stageTruncatedState writes the current truncation point to the raft
+// engine's own key (split stores: the applied state's copy is only a
+// hint there, since the deletion it describes happens later).
+func (rs *raftStorage) stageTruncatedState(b *storage.Batch) error {
+	if !rs.split {
+		return nil
+	}
+	return putTruncatedState(b, rs.rangeID, rs.truncatedState())
 }
 
 func (rs *raftStorage) setHardState(b *storage.Batch, hs raftpb.HardState) error {

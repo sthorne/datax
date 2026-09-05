@@ -102,6 +102,15 @@ func StoreClusterVersionKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-cluster-version")...)
 }
 
+// StoreRaftEngineKey marks a store whose raft state lives on its own
+// engine (issue #105): set when the store migrates, never cleared. A
+// binary that does not know the key cannot open such a store correctly,
+// which the cluster-version gate prevents (the store's cluster version is
+// raised to v13 with the marker).
+func StoreRaftEngineKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-raft-engine")...)
+}
+
 // ---------------------------------------------------------------------------
 // Replica-local, unreplicated Raft state, per range.
 
@@ -126,6 +135,32 @@ func RaftLogPrefix(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID,
 // RaftAppliedStateKey stores the applied index (and later, stats), written
 // atomically with every application batch.
 func RaftAppliedStateKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "as") }
+
+// RaftTruncatedStateKey stores the raft log's truncation point (index and
+// term) on a split store's raft engine, written atomically with the
+// deletion of the entries at or below it (issue #105). On a single-engine
+// store the truncated state lives in the applied state instead.
+func RaftTruncatedStateKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "ts") }
+
+// IsRaftEngineKey reports whether a replica-local key belongs on the raft
+// engine of a split store: the HardState, the log entries and the
+// truncated state. Everything else under the range-local prefix (the
+// descriptor copy, the applied state, the tombstone) is state-machine
+// state.
+func IsRaftEngineKey(k Key) bool {
+	pre := len(localUnreplicatedPrefix) + 1 + 8 // prefix, 'r', range ID
+	if len(k) < pre || k[len(localUnreplicatedPrefix)] != 'r' {
+		return false
+	}
+	suffix := k[pre:]
+	switch {
+	case string(suffix) == "hs", string(suffix) == "ts":
+		return true
+	case len(suffix) == 3+8 && string(suffix[:3]) == "log":
+		return true
+	}
+	return false
+}
 
 // RangeDescriptorKey stores this replica's copy of the range descriptor.
 func RangeDescriptorKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "desc") }

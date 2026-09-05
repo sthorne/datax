@@ -418,6 +418,28 @@ which point it has durably applied everything at or below the index;
 `TruncatedIndex/Term` persist atomically with the applied index, so
 restarts resume from the truncation point.
 
+On a **split store** (v13, issue #105; `pkg/kvserver/raftengine.go`) the
+log lives on a raft engine of its own and the state engine has no
+write-ahead log, so "applied" is not "durably applied": a state-engine
+write reaches disk when its memtable flushes. The truncation therefore
+applies like any command but **defers** its deletion: each replica
+remembers the pending index and deletes the entries at or below it — and
+writes the truncated state to the raft engine's own key — only once the
+state engine's flushed sequence number (Pebble's flush watermark) covers
+the batch that applied that index; the apply path and the housekeeping
+tick both check. Until then a crash could still need those entries: the
+replica restarts at its last flushed applied index and raft re-delivers
+the committed entries above it. The rare structural changes — a merge
+absorbing its RHS, a replica removed from its range, a catch-up
+snapshot replacing a state — flush the state engine before touching the
+raft engine, so the two never disagree about which replicas exist in a
+way replay cannot repair; raft state a crash orphaned on the raft engine
+is swept at startup when the state engine holds the range's tombstone,
+and kept otherwise (an RHS whose split the LHS is about to replay). A
+clean shutdown flushes the state engine, so a normal restart replays
+nothing; `datax_raft_replayed_entries_total` counts what a crash cost,
+`datax_raft_deferred_truncations_total` the truncations that landed.
+
 A dead or lagging voter no longer pins the log: a voter that needs a
 truncated entry is caught up by a raft snapshot instead (see the snapshot
 section above), so the log stops growing during an outage and a returning

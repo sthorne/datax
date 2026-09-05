@@ -176,6 +176,9 @@ type JoinResponse struct {
 	Nodes     []kvpb.NodeDescriptor `json:"nodes"`
 	Range1    kvpb.RangeDescriptor  `json:"range1"`
 	Error     string                `json:"error,omitempty"`
+	// ClusterVersion is the finalized cluster version the joiner starts
+	// under (0 from a node that predates the field).
+	ClusterVersion int `json:"cluster_version,omitempty"`
 }
 
 // Registry is the in-memory view of cluster membership, fed by joins and

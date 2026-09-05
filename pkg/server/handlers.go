@@ -71,9 +71,10 @@ func (n *Node) serveJoin(ctx context.Context, req cluster.JoinRequest) cluster.J
 	n.registry.Upsert(nd)
 
 	resp := cluster.JoinResponse{
-		ClusterID: n.ident.ClusterID,
-		NodeID:    nd.NodeID,
-		Nodes:     append(n.registry.All(), nd),
+		ClusterID:      n.ident.ClusterID,
+		NodeID:         nd.NodeID,
+		Nodes:          append(n.registry.All(), nd),
+		ClusterVersion: int(n.clusterVersion.Load()),
 	}
 	if r1, ok := n.store.GetReplica(1); ok {
 		resp.Range1 = r1.Desc()
@@ -242,7 +243,7 @@ func (n *Node) mirrorClusterVersion(ctx context.Context) {
 		return
 	}
 	n.clusterVersion.Store(int64(v))
-	if err := n.engine.Put(keys.StoreClusterVersionKey(), raw); err != nil {
+	if err := n.persistStoreClusterVersion(raw); err != nil {
 		log.Warnf("persisting store cluster version: %v", err)
 	}
 	log.Infof("cluster version is now %s", version.Version(v))

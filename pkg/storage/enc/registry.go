@@ -238,8 +238,27 @@ func RotateStoreKey(base vfs.FS, dir string, oldKey, newKey []byte) error {
 	if err := json.Unmarshal(plain, &reg); err != nil {
 		return fmt.Errorf("corrupt key registry: %w", err)
 	}
-	return writeRegistry(base, dir, newKey, &reg)
+	if err := writeRegistry(base, dir, newKey, &reg); err != nil {
+		return err
+	}
+	// A split store keeps its raft engine under dir/raft with a registry
+	// of its own, sealed under the same store key: rotate it too, so one
+	// key opens the whole store. (A registry already under newKey — a
+	// rerun after an interrupted rotation — is left alone.)
+	raftDir := base.PathJoin(dir, RaftSubdir)
+	if RegistryExists(base, raftDir) {
+		if _, err := MatchStoreKey(base, raftDir, [][]byte{newKey}); err == nil {
+			return nil
+		}
+		if err := RotateStoreKey(base, raftDir, oldKey, newKey); err != nil {
+			return fmt.Errorf("the raft engine's registry (%s): %w", raftDir, err)
+		}
+	}
+	return nil
 }
+
+// RaftSubdir is the raft engine's directory under a split store.
+const RaftSubdir = "raft"
 
 // MatchStoreKey picks, from candidate store keys, the one that unseals the
 // key registry in dir and returns its index. Without a registry (a store
