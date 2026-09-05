@@ -35,12 +35,19 @@ type Activity struct {
 
 // connActivity is one connection's live state.
 type connActivity struct {
+	pid    int32
 	user   string
+	db     string
+	app    string
 	remote string
 	state  string // idle | active | idle_in_txn
 	since  time.Time
-	stmt   string // the statement in flight (truncated), while active
-	kind   string
+	opened time.Time
+	// txnSince is when the open transaction block began (zero outside).
+	txnSince time.Time
+	stmt     string // the statement in flight (truncated), while active
+	last     string // the last statement (pg_stat_activity's query when idle)
+	kind     string
 }
 
 const (
@@ -95,11 +102,44 @@ func newActivity(slow time.Duration) *Activity {
 	return &Activity{slowThreshold: slow, conns: make(map[*conn]*connActivity), counts: make(map[string]uint64)}
 }
 
-func (a *Activity) connOpened(c *conn, remote string) {
+func (a *Activity) connOpened(c *conn, remote string, pid int32) {
 	a.mu.Lock()
-	a.conns[c] = &connActivity{remote: remote, state: stateIdle, since: time.Now()}
+	now := time.Now()
+	a.conns[c] = &connActivity{pid: pid, remote: remote, state: stateIdle, since: now, opened: now}
 	a.mu.Unlock()
 	a.gauges()
+}
+
+// setSession records the connection's current database and
+// application_name after a statement.
+func (a *Activity) setSession(c *conn, db, app string) {
+	a.mu.Lock()
+	if ca, ok := a.conns[c]; ok {
+		ca.db, ca.app = db, app
+	}
+	a.mu.Unlock()
+}
+
+// Sessions lists this node's sessions for SHOW SESSIONS and
+// pg_stat_activity.
+func (a *Activity) Sessions() []sql.SessionInfo {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]sql.SessionInfo, 0, len(a.conns))
+	for _, ca := range a.conns {
+		si := sql.SessionInfo{PID: ca.pid, User: ca.user, Database: ca.db, Application: ca.app, ClientAddr: ca.remote, BackendStart: ca.opened, XactStart: ca.txnSince}
+		switch ca.state {
+		case stateActive:
+			si.State, si.Query, si.QueryStart = "active", ca.stmt, ca.since
+		case stateIdleInTxn:
+			si.State, si.Query = "idle in transaction", ca.last
+		default:
+			si.State, si.Query = "idle", ca.last
+		}
+		out = append(out, si)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
+	return out
 }
 
 func (a *Activity) connClosed(c *conn) {
@@ -174,12 +214,16 @@ func (t *stmtToken) end(res *sql.Result, serr *sql.Error, inTxn bool) {
 	a := t.a
 	a.mu.Lock()
 	if ca, ok := a.conns[t.c]; ok {
-		ca.stmt, ca.kind = "", ""
+		ca.last, ca.stmt, ca.kind = ca.stmt, "", ""
 		ca.since = time.Now()
 		if inTxn {
+			if ca.state != stateIdleInTxn && ca.txnSince.IsZero() {
+				ca.txnSince = t.start
+			}
 			ca.state = stateIdleInTxn
 		} else {
 			ca.state = stateIdle
+			ca.txnSince = time.Time{}
 		}
 	}
 	a.counts[t.kind]++

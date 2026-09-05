@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"github.com/sthorne/datax/pkg/cluster"
 	"net"
 	"time"
 
@@ -32,7 +35,23 @@ func (n *Node) startSQL() error {
 	if err != nil {
 		return err
 	}
-	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold}
+	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold, NodeID: int32(n.ident.NodeID)}
+	opts.Forward = func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error) {
+		addr, err := n.registry.Resolve(base.NodeID(node))
+		if err != nil {
+			return false, nil // no such node: no such session
+		}
+		var resp cluster.AdminResponse
+		if err := n.trans.Call(ctx, addr, "admin", cluster.AdminRequest{Op: "cancel-query", PID: pid, Secret: secret, Terminate: terminate}, &resp); err != nil {
+			return false, err
+		}
+		if resp.Error != "" {
+			return false, errors.New(resp.Error)
+		}
+		var found bool
+		_ = json.Unmarshal(resp.Status, &found)
+		return found, nil
+	}
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier

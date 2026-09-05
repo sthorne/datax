@@ -192,8 +192,14 @@ type conn struct {
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
 	// act is the server's client accounting (nil in unit tests that build
-	// a conn without a server).
+	// a conn without a server); srv the server (nil likewise).
 	act *Activity
+	srv *Server
+	// pid and secret are the connection's BackendKeyData; stmtCancel
+	// (under mu) cancels the statement in flight.
+	pid        int32
+	secret     uint32
+	stmtCancel context.CancelFunc
 
 	// mu guards st, the connection's phase as seen by Server.Drain: the
 	// connection goroutine records when it is idle (waiting for the next
@@ -273,12 +279,32 @@ func isTimeout(err error) bool {
 // execute runs one statement through the session with activity
 // accounting around it.
 func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum) (*sql.Result, *sql.Error) {
-	if c.act == nil {
-		return c.session.Execute(ctx, stmt, params)
+	ctx, done := c.beginStatement(ctx)
+	defer done()
+	_, isSet := stmt.(*parser.SetVar)
+	var before [][2]string
+	if isSet {
+		before = c.session.ReportedParams()
 	}
-	tok := c.act.begin(c, stmt, text)
-	res, serr := c.session.Execute(ctx, stmt, params)
-	tok.end(res, serr, c.session.State() == sql.StateOpen)
+	var res *sql.Result
+	var serr *sql.Error
+	if c.act == nil {
+		res, serr = c.session.Execute(ctx, stmt, params)
+	} else {
+		tok := c.act.begin(c, stmt, text)
+		res, serr = c.session.Execute(ctx, stmt, params)
+		tok.end(res, serr, c.session.State() == sql.StateOpen)
+		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
+	}
+	if isSet && serr == nil {
+		// A changed reported parameter (application_name, TimeZone, ...)
+		// is announced, as PostgreSQL's GUC_REPORT does.
+		for i, kv := range c.session.ReportedParams() {
+			if i < len(before) && before[i][1] != kv[1] {
+				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
+			}
+		}
+	}
 	return res, serr
 }
 
@@ -304,10 +330,27 @@ func (c *conn) run(ctx context.Context) error {
 			c.goodbye()
 			return nil
 		}
+		// Idle inside a transaction block past
+		// idle_in_transaction_session_timeout: the block is rolled back
+		// (its intents released) and the connection ends with 25P03.
+		idleArmed := false
+		if d := c.session.IdleInTransactionTimeout(); boundary && d > 0 && c.session.State() != sql.StateIdle {
+			_ = c.nc.SetReadDeadline(time.Now().Add(d))
+			idleArmed = true
+		}
 		msg, err := c.backend.Receive()
+		if idleArmed {
+			_ = c.nc.SetReadDeadline(time.Time{})
+		}
 		if goodbye := c.setIdle(false); err != nil {
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
+				return nil
+			}
+			if idleArmed && isTimeout(err) {
+				c.session.Close(context.Background())
+				c.backend.Send(idleInTxnTimeout)
+				_ = c.backend.Flush()
 				return nil
 			}
 			return err
@@ -460,11 +503,18 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			} {
 				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
-			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}})
+			if app := m.Parameters["application_name"]; app != "" {
+				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
+			}
+			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: uint32(c.pid), SecretKey: binary.BigEndian.AppendUint32(nil, c.secret)})
 			c.sendReady()
 			return c.backend.Flush()
 		case *pgproto3.CancelRequest:
-			return nil // out-of-band cancel: not supported, just close
+			// An out-of-band cancel: this connection carries nothing else.
+			if c.srv != nil && len(m.SecretKey) >= 4 {
+				c.srv.handleCancelRequest(int32(m.ProcessID), binary.BigEndian.Uint32(m.SecretKey[:4]))
+			}
+			return nil
 		default:
 			return fmt.Errorf("unexpected startup message %T", msg)
 		}
@@ -572,7 +622,7 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 			if i < len(res.Columns) {
 				col = res.Columns[i]
 			}
-			dr.Values[i] = encodeDatum(d, format, col)
+			dr.Values[i] = encodeDatumIn(d, format, col, c.session.TimeZone())
 		}
 		c.backend.Send(dr)
 	}
@@ -583,6 +633,16 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 // described column: the column's width picks the binary integer size,
 // and its TIMESTAMP / CHAR(n) modifiers the text rendering (what
 // Describe promised, whatever hint the datum carries).
+// encodeDatumIn is encodeDatum with the session's time zone: a
+// TIMESTAMPTZ renders in it in text format (the binary form is UTC
+// microseconds whatever the zone).
+func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, loc *time.Location) []byte {
+	if format == 0 && !d.Null && d.Fam == types.Timestamp && !col.NoTZ && !d.NoTZ && loc != nil && loc != time.UTC {
+		return []byte(types.FormatTimestampIn(d.I, loc))
+	}
+	return encodeDatum(d, format, col)
+}
+
 func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil

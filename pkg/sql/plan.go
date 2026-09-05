@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -218,6 +219,41 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 			if idx > 0 && fams[idx-1] == types.Unknown {
 				fams[idx-1] = types.Int
 			}
+		}
+		// A parameter that is a function's argument takes the declared
+		// family (pg_cancel_backend($1) binds an integer).
+		var fromCalls func(e parser.Expr)
+		fromCalls = func(e parser.Expr) {
+			if e.Func != "" {
+				for i, a := range e.Args {
+					fam := types.Unknown
+					switch e.Func {
+					case "pg_cancel_backend", "pg_terminate_backend":
+						fam = types.Int
+					case "pg_sleep":
+						fam = types.Float
+					default:
+						if b, ok := builtins.Lookup(e.Func); ok {
+							if f := b.ArgFamily(i); f != builtins.Any {
+								fam = f
+							}
+						}
+					}
+					if fam != types.Unknown && a.Param > 0 && fams[a.Param-1] == types.Unknown {
+						fams[a.Param-1] = fam
+					}
+					fromCalls(a)
+				}
+			}
+			if e.Left != nil {
+				fromCalls(*e.Left)
+			}
+			if e.Right != nil {
+				fromCalls(*e.Right)
+			}
+		}
+		for _, se := range t.Exprs {
+			fromCalls(se.Expr)
 		}
 		// Every set-operation member types its own WHERE; a derived table
 		// types as a statement of its own.
@@ -505,17 +541,24 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 
 	case *parser.Show:
 		names := map[string][]string{
-			"columns": {"column_name", "data_type", "is_nullable", "column_default", "indices"},
-			"indexes": {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
-			"create":  {"table_name", "create_statement"},
-			"views":   {"view_name", "definition"},
-			"users":   {"username", "is_admin"},
-			"grants":  {"database_name", "table_name", "grantee", "privilege_type"},
-			"all":     {"name", "setting"},
+			"columns":  {"column_name", "data_type", "is_nullable", "column_default", "indices"},
+			"indexes":  {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
+			"create":   {"table_name", "create_statement"},
+			"views":    {"view_name", "definition"},
+			"users":    {"username", "is_admin"},
+			"grants":   {"database_name", "table_name", "grantee", "privilege_type"},
+			"all":      {"name", "setting"},
+			"sessions": {"pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start"},
 		}[t.Kind]
 		cols := make([]ResultColumn, len(names))
 		for i, n := range names {
 			cols[i] = ResultColumn{Name: n, Type: types.String}
+		}
+		if t.Kind == "sessions" {
+			cols[0].Type = types.Int
+			for i := 7; i < 10; i++ {
+				cols[i].Type = types.Timestamp
+			}
 		}
 		return cols, nil
 

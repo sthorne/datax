@@ -162,6 +162,10 @@ func (b *Builtin) ArityText() string {
 }
 
 // argFamily is the family expected at position i.
+// ArgFamily is the declared family of the i-th argument (Any when
+// unconstrained; the variadic tail's family past the declared list).
+func (b *Builtin) ArgFamily(i int) types.Family { return b.argFamily(i) }
+
 func (b *Builtin) argFamily(i int) types.Family {
 	if i < len(b.Args) {
 		return b.Args[i]

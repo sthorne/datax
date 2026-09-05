@@ -3,6 +3,7 @@
 package sql
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -50,6 +51,9 @@ const (
 	CodeInvalidTextRepresentation = "22P02"
 	CodeBadCopyFormat             = "22P04"
 	CodeQueryCanceled             = "57014"
+	CodeLockNotAvailable          = "55P03"
+	CodeIdleInTransactionTimeout  = "25P03"
+	CodeReadOnlyTransaction       = "25006"
 	CodeInvalidCatalogName        = "3D000"
 	CodeDuplicateDatabase         = "42P04"
 	CodeDependentObjectsExist     = "2BP01"
@@ -89,6 +93,15 @@ func ToSQLError(err error) *Error {
 	}
 	if kvclient.IsRetryable(err) {
 		return &Error{Code: CodeSerializationFailure, Msg: "restart transaction: " + err.Error()}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &Error{Code: CodeQueryCanceled, Msg: "canceling statement due to statement timeout"}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &Error{Code: CodeQueryCanceled, Msg: "canceling statement due to user request"}
+	}
+	if kvclient.IsLockTimeout(err) {
+		return &Error{Code: CodeLockNotAvailable, Msg: "canceling statement due to lock timeout"}
 	}
 	var nf *catalog.ErrTableNotFound
 	if errors.As(err, &nf) {

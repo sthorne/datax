@@ -35,6 +35,7 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 // Everything else changes cluster state or exposes per-replica internals:
 // admin role required.
 var adminReadOnlyOps = map[string]bool{
+	"cancel-query":     true, // the secret (or the caller's admin check) gates it
 	"ranges":           true,
 	"nodes":            true,
 	"collect-checksum": true,
@@ -222,6 +223,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			return cluster.AdminResponse{Error: "store is not encrypted"}
 		}
 		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
+
+	case "cancel-query":
+		// A query cancel forwarded from the node a CancelRequest landed
+		// on (or pg_cancel_backend run there): the connection lives here.
+		found := false
+		if n.pgServer != nil {
+			found = n.pgServer.CancelLocal(req.PID, req.Secret, req.Terminate)
+		}
+		raw, _ := json.Marshal(found)
+		return cluster.AdminResponse{Status: raw}
 
 	case "node-detail":
 		// This node's /api/node document, for another node's dashboard

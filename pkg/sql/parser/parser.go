@@ -649,6 +649,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.consumeIdentWord("all") {
 			return &Show{Kind: "all"}, nil
 		}
+		if p.consumeIdentWord("sessions") {
+			return &Show{Kind: "sessions"}, nil
+		}
 		// SHOW STATS FOR <table>: read-only statistics view.
 		if p.consumeIdentWord("stats") {
 			if !p.consumeIdentWord("for") {
@@ -676,25 +679,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &SetVar{Name: "show:" + strings.Join(words, "_")}, nil
 	case "SET":
-		// SET [SESSION|LOCAL] name = value / SET ... TO ...: the value is
-		// kept for the variables the session honors (database), the rest
-		// are accepted and ignored.
+		return p.parseSet()
+	case "reset": // not a reserved word; lexes as an identifier
 		p.i++
-		p.consumeKeyword("SESSION")
-		p.consumeKeyword("LOCAL")
+		sv := &SetVar{Reset: true}
+		if p.consumeIdentWord("all") {
+			return sv, nil
+		}
+		if p.consumeIdentWord("time") {
+			if !p.consumeIdentWord("zone") {
+				return nil, p.errf("expected ZONE after RESET TIME")
+			}
+			sv.Name = "TimeZone"
+			return sv, nil
+		}
 		name, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
-		sv := &SetVar{Name: name}
-		if p.consumeOp("=") || p.consumeKeyword("TO") {
-			if t := p.peek(); t.kind == tkIdent || t.kind == tkString || t.kind == tkNumber {
-				sv.Value = t.text
-			}
-		}
-		for !p.atStatementEnd() {
-			p.i++
-		}
+		sv.Name = name
 		return sv, nil
 	case "use": // not a reserved word; lexes as an identifier
 		p.i++
@@ -1330,6 +1333,141 @@ func exprContainsColumn(e Expr) bool {
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
+// parseSet parses SET [SESSION | LOCAL] name {TO | =} value [, ...], SET
+// TIME ZONE value, SET NAMES value, SET [SESSION CHARACTERISTICS AS]
+// TRANSACTION characteristics.
+func (p *parser) parseSet() (Statement, error) {
+	p.i++ // SET
+	sv := &SetVar{}
+	characteristics := false
+	if p.consumeKeyword("SESSION") {
+		if p.consumeIdentWord("characteristics") {
+			if !p.consumeKeyword("AS") || !p.consumeKeyword("TRANSACTION") {
+				return nil, p.errf("expected AS TRANSACTION after SET SESSION CHARACTERISTICS")
+			}
+			characteristics = true
+		}
+	} else if p.consumeKeyword("LOCAL") {
+		sv.Local = true
+	}
+	if characteristics || p.consumeKeyword("TRANSACTION") {
+		// [ISOLATION LEVEL x] [READ ONLY | READ WRITE] [[NOT] DEFERRABLE]:
+		// the read-only flag is what the session honors; the isolation
+		// level is accepted (serializable is the only one), the rest
+		// ignored. A transaction-scoped SET applies to the block.
+		if !characteristics {
+			sv.Local = true
+		}
+		var readOnly, isolation string
+		for !p.atStatementEnd() {
+			switch {
+			case p.consumeIdentWord("isolation"):
+				if !p.consumeIdentWord("level") {
+					return nil, p.errf("expected LEVEL after ISOLATION")
+				}
+				var words []string
+				for !p.atStatementEnd() {
+					t := p.peek()
+					if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
+						break
+					}
+					words = append(words, strings.ToLower(t.text))
+					p.i++
+					if len(words) == 2 {
+						break
+					}
+				}
+				if len(words) == 1 && words[0] != "serializable" {
+					return nil, p.errf("expected an isolation level, found %q", words[0])
+				}
+				isolation = strings.Join(words, " ")
+			case p.peekIdentSeq("read", "only"):
+				p.i += 2
+				readOnly = "on"
+			case p.peekIdentSeq("read", "write"):
+				p.i += 2
+				readOnly = "off"
+			case p.consumeKeyword("NOT"):
+				if !p.consumeIdentWord("deferrable") {
+					return nil, p.errf("expected DEFERRABLE after NOT")
+				}
+			case p.consumeIdentWord("deferrable"):
+			case p.consumeOp(","):
+			default:
+				return nil, p.errf("unexpected %q in SET TRANSACTION", p.peek().text)
+			}
+		}
+		switch {
+		case readOnly != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_read_only", readOnly
+		case readOnly != "":
+			sv.Name, sv.Value = "transaction_read_only", readOnly
+		case isolation != "":
+			sv.Name, sv.Value = "transaction_isolation", isolation
+		default:
+			return nil, p.errf("SET TRANSACTION needs a characteristic (READ ONLY, READ WRITE, ISOLATION LEVEL ...)")
+		}
+		return sv, nil
+	}
+	switch {
+	case p.consumeIdentWord("time"):
+		if !p.consumeIdentWord("zone") {
+			return nil, p.errf("expected ZONE after SET TIME")
+		}
+		sv.Name = "TimeZone"
+	case p.consumeIdentWord("names"):
+		sv.Name = "client_encoding"
+		if p.atStatementEnd() {
+			sv.Value = "UTF8"
+			return sv, nil
+		}
+	default:
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		sv.Name = name
+		if !p.consumeOp("=") && !p.consumeKeyword("TO") {
+			return nil, p.errf("expected = or TO after SET %s, found %q", name, p.peek().text)
+		}
+	}
+	// The value: DEFAULT, or one or more literals / identifiers / numbers
+	// (a list joins with ", ": search_path, DateStyle).
+	if p.consumeKeyword("DEFAULT") || p.consumeIdentWord("default") {
+		sv.Reset = true
+		return sv, nil
+	}
+	var parts []string
+	for {
+		t := p.peek()
+		switch t.kind {
+		case tkIdent, tkKeyword, tkString, tkNumber:
+			parts = append(parts, t.text)
+			p.i++
+		case tkOp:
+			if t.text == "-" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber {
+				parts = append(parts, "-"+p.toks[p.i+1].text)
+				p.i += 2
+			} else if t.text == "+" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber {
+				parts = append(parts, "+"+p.toks[p.i+1].text)
+				p.i += 2
+			} else {
+				return nil, p.errf("unexpected %q in SET value", t.text)
+			}
+		default:
+			return nil, p.errf("expected a value after SET %s, found %q", sv.Name, t.text)
+		}
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if !p.atStatementEnd() {
+		return nil, p.errf("unexpected %q after SET value", p.peek().text)
+	}
+	sv.Value = strings.Join(parts, ", ")
+	return sv, nil
+}
+
 // parseCreateType parses CREATE TYPE [IF NOT EXISTS] name AS ENUM
 // ('a', 'b', ...).
 func (p *parser) parseCreateType() (Statement, error) {
@@ -4848,7 +4986,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
-	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1,
+	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,

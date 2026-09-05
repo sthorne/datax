@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -96,8 +97,87 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		d := types.NewString("PostgreSQL 14.0 datax " + version.Release)
 		out.Func, out.Lit = "", &d
 	case "pg_backend_pid":
-		d := types.NewInt(0)
+		d := types.NewInt(int64(s.BackendPID))
 		out.Func, out.Lit = "", &d
+	case "current_setting":
+		// current_setting(name [, missing_ok]): the variable's value; an
+		// unknown name is 42704 unless missing_ok, then NULL.
+		if len(e.Args) < 1 || len(e.Args) > 2 {
+			return e, newErrf(CodeSyntaxError, "current_setting() takes a name and an optional missing_ok")
+		}
+		nameArg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		missingOK := false
+		if len(e.Args) == 2 {
+			m, err := evalExpr(e.Args[1], nil, nil, params)
+			if err != nil {
+				return e, err
+			}
+			missingOK = !m.Null && m.B
+		}
+		_, value, ok := s.setting(nameArg.Text())
+		var d types.Datum
+		switch {
+		case ok:
+			d = types.NewString(value)
+		case missingOK:
+			d = types.DNull
+		default:
+			return e, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", nameArg.Text())
+		}
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_sleep":
+		// pg_sleep(seconds): waits, honoring cancellation and the
+		// statement timeout.
+		if len(e.Args) != 1 {
+			return e, newErrf(CodeSyntaxError, "pg_sleep() takes one argument")
+		}
+		arg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		secs, err := arg.Coerce(types.Float)
+		if err != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "pg_sleep: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return e, ctx.Err()
+		case <-time.After(time.Duration(secs.F * float64(time.Second))):
+		}
+		d := types.NewString("")
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_cancel_backend", "pg_terminate_backend":
+		// Admin-only: cancel (or terminate) another session of this
+		// cluster by its wire PID.
+		if len(e.Args) != 1 {
+			return e, newErrf(CodeSyntaxError, "%s() takes one argument", e.Func)
+		}
+		admin, err := s.isAdmin(ctx, txn)
+		if err != nil {
+			return e, err
+		}
+		if !admin {
+			return e, newErrf(CodeInsufficientPriv, "permission denied: %s() needs the admin role", e.Func)
+		}
+		arg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		pid, err := arg.Coerce(types.Int)
+		if err != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "%s: %v", e.Func, err)
+		}
+		ok := false
+		if s.BackendControl != nil {
+			if ok, err = s.BackendControl(int32(pid.I), e.Func == "pg_terminate_backend"); err != nil {
+				return e, newErrf(CodeInternal, "%s: %v", e.Func, err)
+			}
+		}
+		d := types.NewBool(ok)
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_get_userbyid":
 		// Every object is owned by root (there is no ownership yet).
 		d := types.NewString("root")
@@ -836,7 +916,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
-	"version": true, "pg_backend_pid": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
+	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,

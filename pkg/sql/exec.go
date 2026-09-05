@@ -2756,6 +2756,14 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		for _, kv := range s.settings() {
 			res.Rows = append(res.Rows, []types.Datum{str(kv[0]), str(kv[1])})
 		}
+	case "sessions":
+		// This node's sessions (each node keeps its own registry).
+		cols("pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start")
+		res.Columns[0].Type = types.Int
+		for i := 7; i < 10; i++ {
+			res.Columns[i].Type = types.Timestamp
+		}
+		res.Rows = s.sessionRows()
 	default:
 		return nil, newErrf(CodeInternal, "unknown SHOW form %q", t.Kind)
 	}

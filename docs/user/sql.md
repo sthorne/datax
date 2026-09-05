@@ -688,6 +688,62 @@ transaction is poisoned (`25P02`) until `ROLLBACK` — or
 
 Deadlocks are detected and broken automatically (one victim gets `40001`).
 
+## Session settings
+
+```sql
+SET statement_timeout = '5s';                 -- 57014 when a statement runs longer
+SET lock_timeout = 200;                       -- ms: 55P03 instead of waiting on a live intent
+SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is rolled back, the connection ended
+SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ output rendered in the zone
+SET application_name = 'billing';             -- shown by pg_stat_activity / SHOW SESSIONS
+SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / ROLLBACK
+SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
+SET default_transaction_read_only = on;       -- every transaction, until reset
+RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
+SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;
+```
+
+`SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
+`SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`, `RESET name`, `RESET
+ALL` and `SHOW name` work over these variables — every one of them is
+honored or reports its real value; an unknown variable is `42704`, an
+invalid value `22023`:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `statement_timeout` | ms, or `'5s'`, `'1min'`, `'500ms'`; `0` = none | a statement past it is cancelled: `57014`, its transaction block failed |
+| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`) |
+| `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
+| `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |
+| `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
+| `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
+| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY` and DDL with `25006` |
+| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
+| `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
+| `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
+
+`SET LOCAL` and `SET TRANSACTION` apply to the current block and end
+with it (outside a block they do nothing, as in PostgreSQL). A changed
+`application_name`, `TimeZone`, `DateStyle` or `client_encoding` is
+announced to the client with `ParameterStatus`, as PostgreSQL does.
+
+**Cancellation.** Every connection gets a process ID and a secret
+(`BackendKeyData`); `psql`'s Ctrl-C, a driver's context cancellation
+(pgx) and every pool's cancel path send a `CancelRequest`, which stops
+the statement in flight with `57014` and rolls its transaction back.
+The process ID names the node in its high bits, so a cancel that lands
+on another node behind a load balancer is forwarded there. `SELECT
+pg_backend_pid()` reports a session's ID; an admin cancels another
+session with `pg_cancel_backend(pid)` or ends it with
+`pg_terminate_backend(pid)` (`57P01`), on any node of the cluster.
+
+**Sessions.** `SHOW SESSIONS` and `pg_stat_activity` list the serving
+node's sessions (pid, user, database, `application_name`, client
+address, state, the statement in flight or the last one, when the
+connection, the block and the statement began); each node keeps its
+own registry, so a cluster-wide view is the union over nodes (the
+dashboard's activity view, `/api/activity`).
+
 ## Historical and follower reads
 
 ```sql

@@ -151,7 +151,8 @@ func sessionFuncFamily(name string) types.Family {
 		return types.Int
 	case "gen_random_uuid", "uuid_generate_v4":
 		return types.Uuid
-	case "pg_table_is_visible", "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible", "pg_relation_is_publishable":
+	case "pg_table_is_visible", "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible", "pg_relation_is_publishable",
+		"pg_cancel_backend", "pg_terminate_backend":
 		return types.Bool
 	}
 	return types.String

@@ -809,12 +809,20 @@ type ShowDatabases struct{}
 // Use is USE name (CockroachDB syntax for SET database = name).
 type Use struct{ Name string }
 
-// SetVar is `SET name = value` / `SET SESSION ...`: parsed and ignored
-// (clients send these at startup).
+// SetVar is SET [SESSION | LOCAL] name {TO | =} value, RESET name (Reset,
+// or RESET ALL with an empty Name), SET TIME ZONE x, SET NAMES x, SET
+// [SESSION CHARACTERISTICS AS] TRANSACTION ..., and SHOW name (Name
+// "show:name"). The session honors every variable it knows and refuses
+// the rest (42704).
 type SetVar struct {
 	Name string
-	// Value is the literal or identifier after = / TO, when there is one.
+	// Value is the literal, identifier, number or comma-joined list after
+	// = / TO ("DEFAULT" resets).
 	Value string
+	// Local marks SET LOCAL (the block's end restores the value).
+	Local bool
+	// Reset marks RESET name / RESET ALL.
+	Reset bool
 }
 
 func (*CreateTable) stmt()         {}

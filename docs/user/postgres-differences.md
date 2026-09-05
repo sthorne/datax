@@ -125,11 +125,17 @@ syntax error or `0A000` feature not supported):
   cheap historical/follower reads, including bounded staleness:
   `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
   the local replicas can serve within the bound.
-- **`SET x = y`** is parsed and ignored (drivers send these at startup);
-  `SHOW x` answers for the settings datax has (`SHOW ALL` lists them) and
-  is SQLSTATE `42704` otherwise. `server_version` reports a
-  PostgreSQL-14-compatible string, so `psql` and drivers use their
-  PostgreSQL-14 query flavors.
+- **`SET x = y`** honors the variables datax has ([Session
+  settings](sql.md#session-settings): the timeouts, `TimeZone`,
+  `application_name`, `search_path`, the read-only and isolation
+  characteristics, `DateStyle` and `client_encoding` in their supported
+  values) and refuses an unknown one with `42704` (an invalid value is
+  `22023`), where PostgreSQL knows hundreds more. `transaction_isolation`
+  accepts every level and `SHOW` reports `serializable`, the only one
+  there is. `server_version` reports a PostgreSQL-14-compatible string,
+  so `psql` and drivers use their PostgreSQL-14 query flavors.
+  `pg_stat_activity` and `SHOW SESSIONS` list the serving node's
+  sessions only.
 
 ## Errors you should know
 

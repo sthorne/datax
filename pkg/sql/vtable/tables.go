@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -623,10 +624,53 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, kv := range env.Settings {
-				rows = append(rows, Row{str(kv[0]), str(kv[1]), null(), str("Client Connection Defaults"), str(kv[0]), str("user"), str("string"), str("default"), str(kv[1]), str(kv[1])})
+				vartype, unit := "string", null()
+				switch kv[0] {
+				case "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout":
+					vartype, unit = "integer", str("ms")
+				case "foreign_key_cascade_limit":
+					vartype = "integer"
+				case "default_transaction_read_only", "transaction_read_only", "integer_datetimes", "standard_conforming_strings":
+					vartype = "bool"
+				}
+				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str("default"), str(kv[1]), str(kv[1])})
 			}
 			return rows, nil
 		})
+	// pg_stat_activity: this node's sessions (each node keeps its own
+	// registry).
+	pg("pg_stat_activity", []catalog.Column{
+		col("datid", types.Int), col("datname", types.String), col("pid", types.Int), col("usesysid", types.Int), col("usename", types.String),
+		col("application_name", types.String), col("client_addr", types.String), col("client_hostname", types.String), col("client_port", types.Int),
+		col("backend_start", types.Timestamp), col("xact_start", types.Timestamp), col("query_start", types.Timestamp), col("state_change", types.Timestamp),
+		col("wait_event_type", types.String), col("wait_event", types.String), col("state", types.String), col("backend_xid", types.Int), col("backend_xmin", types.Int),
+		col("query", types.String), col("backend_type", types.String),
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		var rows []Row
+		ts := func(t time.Time) types.Datum {
+			if t.IsZero() {
+				return null()
+			}
+			return types.NewTimestamp(t.UnixNano())
+		}
+		for _, si := range env.Sessions {
+			datid := null()
+			for _, d := range env.Databases {
+				if d.Name == si.Database {
+					datid = i64(DatabaseOID(d))
+				}
+			}
+			addr, port := si.ClientAddr, null()
+			if i := strings.LastIndexByte(addr, ':'); i > 0 {
+				if p, err := strconv.Atoi(addr[i+1:]); err == nil {
+					addr, port = addr[:i], i64(int64(p))
+				}
+			}
+			rows = append(rows, Row{datid, str(si.Database), i64(int64(si.PID)), i64(10), str(si.User), str(si.Application), str(addr), null(), port,
+				ts(si.BackendStart), ts(si.XactStart), ts(si.QueryStart), null(), null(), null(), str(si.State), null(), null(), str(si.Query), str("client backend")})
+		}
+		return rows, nil
+	})
 
 	// pg_tables / pg_indexes: the convenience views.
 	pg("pg_tables", []catalog.Column{col("schemaname", types.String), col("tablename", types.String), col("tableowner", types.String), col("tablespace", types.String), col("hasindexes", types.Bool), col("hasrules", types.Bool), col("hastriggers", types.Bool), col("rowsecurity", types.Bool)},

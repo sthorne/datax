@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -60,10 +61,27 @@ type Env struct {
 	Admins map[string]bool
 	// Settings are the session variables (name → value).
 	Settings [][2]string
+	// Sessions are this node's SQL sessions (pg_stat_activity).
+	Sessions []SessionInfo
 
 	User     string
 	Database string // the session's current database
 	IsAdmin  bool
+}
+
+// SessionInfo is one session of this node as SHOW SESSIONS and
+// pg_stat_activity report it.
+type SessionInfo struct {
+	PID          int32
+	User         string
+	Database     string
+	Application  string
+	ClientAddr   string
+	State        string // active | idle | idle in transaction
+	Query        string
+	BackendStart time.Time
+	QueryStart   time.Time
+	XactStart    time.Time
 }
 
 // Row is one virtual row, by column position.

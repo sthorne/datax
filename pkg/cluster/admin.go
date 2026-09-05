@@ -38,6 +38,11 @@ type AdminRequest struct {
 	// Version is the target for upgrade-cluster (0 = the serving node's
 	// binary version).
 	Version int `json:"version,omitempty"`
+	// PID, Secret and Terminate route a query cancel (cancel-query) to
+	// the node whose SQL connection the process ID names.
+	PID       int32  `json:"pid,omitempty"`
+	Secret    uint32 `json:"secret,omitempty"`
+	Terminate bool   `json:"terminate,omitempty"`
 	// Store-key rotation (rotate-store-key): the node's current store key
 	// (verified against the on-disk registry) and its replacement. Carried
 	// over mutual TLS in secure mode; never logged.

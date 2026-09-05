@@ -141,6 +141,21 @@ type Session struct {
 	// the only one allowed to create or drop a system table.
 	system bool
 
+	// vars are the session variables (SET / RESET / SHOW); localVars
+	// holds the session's values while a transaction block's SET LOCAL
+	// overrides them; txnStartedReadOnly marks a block begun under
+	// default_transaction_read_only.
+	vars               sessionVars
+	localVars          *sessionVars
+	txnStartedReadOnly bool
+	// BackendPID is the wire's process ID for this session (0 for an
+	// internal one); BackendControl cancels (or terminates) another
+	// session by PID for pg_cancel_backend / pg_terminate_backend, and
+	// SessionsHook lists this node's sessions for SHOW SESSIONS and
+	// pg_stat_activity. The SQL server sets them.
+	BackendPID     int32
+	BackendControl func(pid int32, terminate bool) (bool, error)
+	SessionsHook   func() []SessionInfo
 	// cascadeLimit is SET foreign_key_cascade_limit (0 = the default);
 	// pendingWipes are indexes dropped by statements of this session
 	// whose entries are reclaimed once the statement commits.
@@ -170,7 +185,7 @@ type Session struct {
 // NewSession creates a root session (internal components, tests, tools).
 // The catalog accessor is shared per node.
 func NewSession(db *kvclient.DB, cat *catalog.Accessor) *Session {
-	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase}
+	return &Session{db: db, cat: cat, user: "root", database: catalog.DefaultDatabase, vars: defaultVars()}
 }
 
 // NewSystemSession creates the node's own root session, the one that may
@@ -221,43 +236,6 @@ func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version,
 		return 0, err
 	}
 	return version.Version(v), nil
-}
-
-// settings lists the session variables SHOW ALL and pg_settings report:
-// the wire's startup parameters plus the ones the session honors.
-func (s *Session) settings() [][2]string {
-	return [][2]string{
-		{"application_name", ""},
-		{"client_encoding", "UTF8"},
-		{"database", s.database},
-		{"DateStyle", "ISO"},
-		{"foreign_key_cascade_limit", strconv.Itoa(s.fkCascadeLimit())},
-		{"integer_datetimes", "on"},
-		{"search_path", catalog.PublicSchema},
-		{"server_encoding", "UTF8"},
-		{"server_version", "14.0 datax"},
-		{"standard_conforming_strings", "on"},
-		{"TimeZone", "UTC"},
-		{"transaction_isolation", "serializable"},
-	}
-}
-
-// setting resolves a SHOW name (case-insensitively; SHOW TIME ZONE and
-// SHOW TRANSACTION ISOLATION LEVEL by their spelled-out forms) to the
-// setting's canonical name and value.
-func (s *Session) setting(name string) (string, string, bool) {
-	switch strings.ToLower(name) {
-	case "time_zone":
-		name = "TimeZone"
-	case "transaction_isolation_level":
-		name = "transaction_isolation"
-	}
-	for _, kv := range s.settings() {
-		if strings.EqualFold(kv[0], name) {
-			return kv[0], kv[1], true
-		}
-	}
-	return "", "", false
 }
 
 // lookup resolves a table name: a virtual catalog table (pg_catalog.x,
@@ -385,6 +363,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 		}
 	}
 	env.Settings = s.settings()
+	if s.SessionsHook != nil {
+		env.Sessions = s.SessionsHook()
+	}
 	return env, nil
 }
 
@@ -469,9 +450,21 @@ func (s *Session) Close(ctx context.Context) {
 	s.state = StateIdle
 }
 
-// Execute runs one parsed statement with the given parameter values.
+// Execute runs one parsed statement with the given parameter values,
+// under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
 	s.stmtNow = 0
+	if d := s.vars.statementTimeout; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	if d := s.vars.lockTimeout; d > 0 {
+		ctx = kvclient.WithLockTimeout(ctx, d)
+	}
+	if serr := s.readOnlyViolation(stmt); serr != nil {
+		return nil, serr
+	}
 	// A failed transaction accepts only ROLLBACK (or COMMIT, which also
 	// rolls back) — and ROLLBACK TO SAVEPOINT, which escapes the failed
 	// state by restoring the savepoint (PostgreSQL semantics).
@@ -495,6 +488,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		}
 		s.txn = s.db.NewTxn("sql")
 		s.state = StateOpen
+		s.txnStartedReadOnly = s.vars.defaultReadOnly
 		return &Result{Tag: "BEGIN"}, nil
 
 	case *parser.Commit:
@@ -504,6 +498,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		err := s.txn.Commit(ctx)
 		s.txn = nil
 		s.state = StateIdle
+		s.endTxnVars()
 		pending := s.pendingDDL
 		if err != nil {
 			s.forgetDDL()
@@ -557,19 +552,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			}
 			return &Result{Columns: []ResultColumn{{Name: name, Type: types.String}}, Rows: [][]types.Datum{{types.NewString(value)}}, Tag: "SHOW"}, nil
 		}
-		if t.Name == "database" {
-			if serr := s.UseDatabase(ctx, t.Value); serr != nil {
-				return nil, serr
-			}
-		}
-		if t.Name == "foreign_key_cascade_limit" {
-			n, err := strconv.Atoi(strings.Trim(t.Value, "'"))
-			if err != nil || n < 1 {
-				return nil, newErrf(CodeInvalidParameterValue, "foreign_key_cascade_limit must be a positive integer, not %q", t.Value)
-			}
-			s.cascadeLimit = n
-		}
-		return &Result{Tag: "SET"}, nil
+		return s.execSetVar(ctx, t)
 	case *parser.Use:
 		if serr := s.UseDatabase(ctx, t.Name); serr != nil {
 			return nil, serr
@@ -818,6 +801,7 @@ func (s *Session) rollback(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
+	s.endTxnVars()
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.state = StateIdle

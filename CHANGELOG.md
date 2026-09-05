@@ -8,6 +8,35 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.28.0 — unreleased
+
+### Added
+- Session and wire (#97): query cancellation works — every connection
+  gets a process ID (the node in its high bits) and a secret, a
+  `CancelRequest` (psql's Ctrl-C, pgx's context cancellation, pools)
+  stops the statement in flight with `57014` and rolls its transaction
+  back, and one landing on another node is forwarded over the internode
+  admin RPC. `statement_timeout` (`57014`), `lock_timeout` (`55P03`
+  instead of waiting the conflict budget out on a live intent),
+  `idle_in_transaction_session_timeout` (`25P03`, the idle block rolled
+  back and its intents released). Honored variables with `SET` / `SET
+  LOCAL` / `RESET` / `RESET ALL` / `SHOW` / `SHOW ALL` / `pg_settings`:
+  `application_name` (the startup parameter too; shown by the activity
+  views), `TimeZone` (TIMESTAMPTZ text output rendered in the zone),
+  `search_path`, `DateStyle`, `client_encoding`,
+  `default_transaction_read_only` / `transaction_read_only` / `SET
+  TRANSACTION READ ONLY` (`25006` on a write), `transaction_isolation`
+  (every level accepted, `SHOW` says serializable), `SET SESSION
+  CHARACTERISTICS AS TRANSACTION ...`, `SET TIME ZONE`, `SET NAMES`;
+  changed reported parameters are announced with `ParameterStatus`.
+  `pg_backend_pid()` is real; `pg_cancel_backend(pid)` /
+  `pg_terminate_backend(pid)` (admin, any node); `SHOW SESSIONS` and
+  `pg_stat_activity` list the node's sessions; `pg_sleep(seconds)`.
+
+### Changed
+- `SET` of an unknown variable is `42704` (it was silently accepted);
+  an invalid value is `22023`.
+
 ## 0.27.0 — unreleased
 
 ### Added

@@ -609,6 +609,17 @@ func FormatTimestamp(nanos int64, noTZ bool) string {
 	return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999-07")
 }
 
+// FormatTimestampIn renders UTC nanoseconds in loc, PostgreSQL style:
+// the offset as "-05" for whole hours, "+05:30" otherwise.
+func FormatTimestampIn(nanos int64, loc *time.Location) string {
+	t := time.Unix(0, nanos).In(loc)
+	s := t.Format("2006-01-02 15:04:05.999999999-07:00")
+	if strings.HasSuffix(s, ":00") {
+		s = s[:len(s)-3]
+	}
+	return s
+}
+
 // PadTo blank-pads s to n characters (CHAR(n) output); a longer s is
 // returned as it is.
 func PadTo(s string, n int32) string {
