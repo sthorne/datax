@@ -16,6 +16,14 @@ import (
 const (
 	pgNumericPos = 0x0000
 	pgNumericNeg = 0x4000
+
+	// pgNumericMaxDigits bounds a value's integer digits and its scale,
+	// as PostgreSQL's NUMERIC(p, s) does (1,000 each): weight and dscale
+	// come off the wire unchecked otherwise, and an eight-byte parameter
+	// with no digit groups would otherwise expand to ~200 KB of zeros
+	// (issue #140).
+	pgNumericMaxDigits = 1000
+	pgNumericMaxWeight = pgNumericMaxDigits/4 + 1
 )
 
 // encodePGNumeric converts a canonical decimal string (as produced by
@@ -63,6 +71,9 @@ func encodePGNumeric(s string) ([]byte, error) {
 	if len(groups) == 0 {
 		weight = 0
 	}
+	if weight > pgNumericMaxWeight || weight < -pgNumericMaxWeight || dscale > pgNumericMaxDigits {
+		return nil, fmt.Errorf("decimal %q exceeds the wire format's bounds (%d digits of integer part or scale)", s, pgNumericMaxDigits)
+	}
 	out := make([]byte, 0, 8+2*len(groups))
 	out = binary.BigEndian.AppendUint16(out, uint16(len(groups)))
 	out = binary.BigEndian.AppendUint16(out, uint16(int16(weight)))
@@ -99,6 +110,12 @@ func decodePGNumeric(raw []byte) (string, error) {
 	case pgNumericPos, pgNumericNeg:
 	default:
 		return "", fmt.Errorf("unsupported numeric sign 0x%04x (NaN?)", sign)
+	}
+	if weight > pgNumericMaxWeight || weight < -pgNumericMaxWeight {
+		return "", fmt.Errorf("binary numeric weight %d out of range (at most %d digits of integer part)", weight, pgNumericMaxDigits)
+	}
+	if dscale > pgNumericMaxDigits {
+		return "", fmt.Errorf("binary numeric scale %d out of range (at most %d)", dscale, pgNumericMaxDigits)
 	}
 	group := func(i int) int {
 		if i < 0 || i >= ndigits {

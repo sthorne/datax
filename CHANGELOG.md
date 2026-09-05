@@ -11,6 +11,13 @@ state or the internode protocol does, and an entry below says so.
 ## 0.40.1 — unreleased
 
 ### Fixed
+- Binary `NUMERIC` parameters are bounded on decode (#140): `weight` and
+  `dscale` came off the wire unchecked, so an eight-byte parameter with
+  no digit groups expanded to ~200 KB of zeros per value. Both are now
+  limited to what `NUMERIC(p, s)` can hold (1,000 digits of integer part
+  or scale) and refused with `22P03` past that — the SQLSTATE every
+  undecodable binary parameter now carries, in place of `08P01`; the
+  encoder refuses the same bounds instead of wrapping the weight.
 - A statement nested more than 1,000 levels deep (parentheses,
   subqueries, derived tables, `CASE`) is refused with a syntax error
   (`42601`, "statement nests too deeply") instead of exhausting the
