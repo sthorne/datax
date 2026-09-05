@@ -324,7 +324,13 @@ descriptor **versions and leases** make that cache safe across gateways:
   may serve from its cache only while the lease is unexpired (TTL 10s by
   default, configurable in the server config). A background
   loop renews leases at TTL/3 by re-reading the descriptor, which is also
-  how a gateway adopts new versions.
+  how a gateway adopts new versions. The lease is written in the same
+  serializable transaction that read the descriptor, so a record can
+  never claim a version a schema change has already superseded: written
+  in a separate transaction, a gateway whose previous lease had lapsed
+  could read version 1, let the change commit version 2 and drain past
+  it (a lapsed lease is nothing to wait for), and then record — and
+  serve for a TTL — version 1.
 - After a DDL statement's transaction commits, the issuing session
   **drains**: it waits until every live (unexpired) lease on the descriptor
   is at the new version or later. Expired leases cannot be used, so a

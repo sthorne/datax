@@ -102,18 +102,18 @@ func presplit(t *testing.T, n *Node, start, step, ranges int) {
 	defer cancel()
 	conn, err := pgx.Connect(ctx, n.URL())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; child log ends:\n%s", err, n.logTail())
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS acked (k INT8 PRIMARY KEY, pad TEXT)`); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; child log ends:\n%s", err, n.logTail())
 	}
 	var tuples []string
 	for i := 1; i < ranges; i++ {
 		tuples = append(tuples, fmt.Sprintf("(%d)", start+i*step))
 	}
 	if _, err := conn.Exec(ctx, "ALTER TABLE acked SPLIT AT VALUES "+strings.Join(tuples, ", ")); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; child log ends:\n%s", err, n.logTail())
 	}
 }
 

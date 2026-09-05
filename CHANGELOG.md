@@ -10,6 +10,17 @@ state or the internode protocol does, and an entry below says so.
 
 ## 0.41.0 — unreleased
 
+### Fixed
+- A gateway's descriptor lease is taken in the transaction that read the
+  descriptor. Written in a separate transaction, the lease record could
+  claim a version a schema change had already superseded: a gateway
+  whose previous lease had lapsed read version 1, the change committed
+  version 2 and drained (a lapsed lease is nothing to wait for), and the
+  gateway then recorded a fresh lease at version 1 and served it from
+  its cache — `column does not exist` on the new column — for a whole
+  TTL. Found by the race suite; `TestLeaseClaimsTheVersionItRead` holds
+  a gateway between its read and its write while the change commits.
+
 ### Changed
 - The MVCC read path allocates a fraction of what it did (#163). A user
   key's two iterator bounds come out of one allocation (the upper bound

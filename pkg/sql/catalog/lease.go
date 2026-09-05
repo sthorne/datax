@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,19 +103,9 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 // (nil when dropped).
 func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescriptor, error) {
 	dbID, bare := splitCacheKey(name)
-	var desc *TableDescriptor
-	err := a.db.RunTxn(ctx, "lease-refresh", func(ctx context.Context, txn *kvclient.Txn) error {
-		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
-		var nf *ErrTableNotFound
-		if errors.As(err, &nf) {
-			desc = nil
-			return nil
-		}
-		desc = d
-		return err
-	})
+	desc, exp, err := a.acquireLease(ctx, dbID, bare, name)
 	if err != nil {
-		return nil, err
+		return nil, err // keep the old (still-live) cache entry
 	}
 	if desc == nil {
 		a.mu.Lock()
@@ -126,29 +117,73 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		}
 		return nil, nil
 	}
-	exp, err := a.writeLease(ctx, desc)
-	if err != nil {
-		return desc, err // keep the old (still-live) cache entry
-	}
 	a.mu.Lock()
 	a.cache[name] = &cachedDesc{desc: desc, expiration: exp}
 	a.mu.Unlock()
 	return desc, nil
 }
 
-// writeLease records that this gateway may use desc at its version until
-// the returned expiration (HLC wall nanos) — the one value both the
-// lease record and the cache entry carry.
-func (a *Accessor) writeLease(ctx context.Context, desc *TableDescriptor) (int64, error) {
-	exp := a.clock.Now().WallTime + a.ttl.Nanoseconds()
-	raw, err := json.Marshal(descLease{Version: desc.Version, Expiration: exp})
-	if err != nil {
-		return 0, err
+// testingBeforeLeaseWrite, when set, runs inside a lease transaction
+// between the descriptor read and the lease write — a test's way to hold
+// a gateway there while a schema change commits and drains. Atomic: the
+// renewal loops of a running cluster read it while a test sets it.
+var testingBeforeLeaseWrite atomic.Pointer[func(a *Accessor, name string)]
+
+// SetTestingBeforeLeaseWrite installs (or, with nil, removes) the hook.
+func SetTestingBeforeLeaseWrite(f func(a *Accessor, name string)) {
+	if f == nil {
+		testingBeforeLeaseWrite.Store(nil)
+		return
 	}
-	if err := a.db.Put(ctx, keys.DescLeaseKey(desc.ID, a.gateway), raw); err != nil {
-		return 0, err
-	}
-	return exp, nil
+	testingBeforeLeaseWrite.Store(&f)
+}
+
+// acquireLease reads a table's descriptor and records this gateway's lease
+// on it — at that version, until the returned expiration (HLC wall nanos;
+// the one value the lease record and the cache entry carry) — in ONE
+// serializable transaction. Read in one transaction and written in
+// another, the record could claim a version that had already been
+// superseded: a gateway that read version 1, then wrote its lease after
+// a schema change committed version 2 and drained (finding this gateway's
+// previous lease lapsed, nothing to wait for), served version 1 from its
+// cache for a whole TTL. In one transaction the write cannot commit over
+// a descriptor that changed since the read: the transaction restarts and
+// reads the new version. A dropped table returns a nil descriptor.
+func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, exp int64, err error) {
+	err = a.db.RunTxn(ctx, "lease-acquire", func(ctx context.Context, txn *kvclient.Txn) error {
+		desc, exp = nil, 0
+		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
+		var nf *ErrTableNotFound
+		if errors.As(err, &nf) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if hook := testingBeforeLeaseWrite.Load(); hook != nil {
+			(*hook)(a, name)
+		}
+		e := a.clock.Now().WallTime + a.ttl.Nanoseconds()
+		raw, err := json.Marshal(descLease{Version: d.Version, Expiration: e})
+		if err != nil {
+			return err
+		}
+		// The write rides in the deferred batch and commits in one phase
+		// with EndTxn — one raft append, what the plain Put cost — rather
+		// than as an intent, a commit and a resolution. The read before it
+		// is still validated at commit: a commit pushed past a scan of the
+		// lease span (the drain's) refreshes the descriptor read, and a
+		// changed descriptor fails the refresh.
+		txn.EnablePipelining()
+		var wb kvclient.WriteBatch
+		wb.Put(keys.DescLeaseKey(d.ID, a.gateway), raw)
+		if err := txn.RunBatch(ctx, &wb); err != nil {
+			return err
+		}
+		desc, exp = d, e
+		return nil
+	})
+	return desc, exp, err
 }
 
 // FinishDDL runs after a schema change on name commits: it adopts the new

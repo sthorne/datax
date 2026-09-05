@@ -3,6 +3,7 @@ package testcluster
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -231,4 +232,63 @@ func TestCreateIndexRefusedInTxnBlock(t *testing.T) {
 	}
 	execSQL(t, ctx, s, `ROLLBACK`)
 	execSQL(t, ctx, s, `CREATE INDEX by_v ON tb (v)`)
+}
+
+// TestLeaseClaimsTheVersionItRead: a gateway whose lease on a table has
+// lapsed takes a new one while a schema change commits. The lease record
+// used to be written outside the transaction that read the descriptor, so
+// the gateway could read version 1, the schema change commit version 2
+// and drain (the lapsed lease was nothing to wait for), and the gateway
+// then record a fresh lease at version 1 and serve it from its cache for
+// a whole TTL. The lease is now taken in the transaction that read the
+// descriptor: a write over a changed descriptor cannot commit, the
+// transaction restarts, and the lease claims the version it read.
+func TestLeaseClaimsTheVersionItRead(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const ttl = 500 * time.Millisecond
+	sA := leasedSession(t, tc, 0, ttl)
+	sB, catB := leasedSessionWithAccessor(t, tc, 1, ttl)
+	execSQL(t, ctx, sA, `CREATE TABLE items (id INT PRIMARY KEY, v INT)`)
+	execSQL(t, ctx, sA, `INSERT INTO items VALUES (1, 10)`)
+	execSQL(t, ctx, sB, `SELECT v FROM items WHERE id = 1`) // B leases version 1
+
+	// B's renewal stops and its lease lapses.
+	catB.TestingPauseRenewal(true)
+	time.Sleep(ttl + 200*time.Millisecond)
+
+	// B's next statement misses its lapsed cache entry, reads the
+	// descriptor (version 1) and parks in its lease transaction before
+	// the write.
+	var once sync.Once
+	entered, hold := make(chan struct{}), make(chan struct{})
+	catalog.SetTestingBeforeLeaseWrite(func(a *catalog.Accessor, _ string) {
+		if a == catB {
+			once.Do(func() { close(entered) })
+			<-hold
+		}
+	})
+	defer catalog.SetTestingBeforeLeaseWrite(nil)
+	done := make(chan *sql.Error, 1)
+	go func() {
+		_, serr := trySQL(ctx, sB, `SELECT v FROM items WHERE id = 1`)
+		done <- serr
+	}()
+	<-entered
+
+	// A's schema change commits version 2 and drains at once: B holds no
+	// live lease to wait for.
+	execSQL(t, ctx, sA, `ALTER TABLE items ADD COLUMN note TEXT`)
+	close(hold)
+	if serr := <-done; serr != nil {
+		t.Fatalf("B's read: [%s] %s", serr.Code, serr.Msg)
+	}
+
+	// B's lease, and so its cache, carry version 2: the new column is
+	// there. A lease at version 1 would answer 42703 for a whole TTL.
+	if _, serr := trySQL(ctx, sB, `SELECT note FROM items WHERE id = 1`); serr != nil {
+		t.Fatalf("B serves a superseded version after taking a fresh lease: [%s] %s", serr.Code, serr.Msg)
+	}
 }

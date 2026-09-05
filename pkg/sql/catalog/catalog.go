@@ -775,13 +775,19 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	}
 	entry := &cachedDesc{desc: d}
 	if a.leasing {
-		exp, err := a.writeLease(ctx, d)
-		if err != nil {
+		// The lease is taken in its own transaction, with the descriptor
+		// it covers read there (acquireLease): the cache holds what the
+		// lease record claims. This statement keeps d, the version its
+		// own transaction read — if that is older than the leased one,
+		// its read of the descriptor conflicts with the schema change
+		// at commit, as any stale read does.
+		ld, exp, err := a.acquireLease(ctx, dbID, name, key)
+		if err != nil || ld == nil {
 			// Without a lease the cache may not be trusted beyond this
 			// statement; return the descriptor uncached.
 			return d, nil
 		}
-		entry.expiration = exp
+		entry = &cachedDesc{desc: ld, expiration: exp}
 	}
 	a.mu.Lock()
 	a.cache[key] = entry
