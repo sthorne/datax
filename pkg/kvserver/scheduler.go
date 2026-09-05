@@ -117,10 +117,11 @@ func (sc *raftScheduler) enqueueLocked(id base.RangeID, f raftSchedFlags, now ti
 }
 
 // tickLoop is the store's one ticker: every RaftTickInterval it enqueues
-// a tick for every replica the store holds.
+// a tick for every replica the store holds that is not quiescent.
 func (sc *raftScheduler) tickLoop(ctx context.Context) {
 	ticker := time.NewTicker(sc.store.cfg.RaftTickInterval)
 	defer ticker.Stop()
+	defer sc.stopAll()
 	var ids []base.RangeID
 	for {
 		select {
@@ -130,8 +131,10 @@ func (sc *raftScheduler) tickLoop(ctx context.Context) {
 		}
 		ids = ids[:0]
 		sc.store.mu.Lock()
-		for id := range sc.store.mu.replicas {
-			ids = append(ids, id)
+		for id, r := range sc.store.mu.replicas {
+			if !r.isQuiescent() {
+				ids = append(ids, id)
+			}
 		}
 		sc.store.mu.Unlock()
 		now := time.Now()
@@ -279,6 +282,7 @@ func (sc *raftScheduler) runGroup(ctx context.Context, group []readyWork) {
 		}
 		w.r.advanceReady(w.rd)
 	}
+	sc.store.sendQueuedHeartbeats(ctx)
 }
 
 // stopReplica takes a replica out of the scheduler: it waits for a pass
@@ -307,6 +311,24 @@ func (sc *raftScheduler) stopReplica(r, from *Replica) {
 	r.raftMu.Unlock()
 	sc.mu.Unlock()
 	r.markStopped()
+}
+
+// stopAll marks every replica's raft group stopped at shutdown. Stopper
+// workers (this one included) exit before the closers run, so no step
+// arriving over the network afterwards — a stream handler is not a
+// worker — can reach raft, which would read the log from an engine the
+// closers have shut.
+func (sc *raftScheduler) stopAll() {
+	sc.store.mu.Lock()
+	replicas := make([]*Replica, 0, len(sc.store.mu.replicas))
+	for _, r := range sc.store.mu.replicas {
+		replicas = append(replicas, r)
+	}
+	sc.store.mu.Unlock()
+	for _, r := range replicas {
+		r.stopRaftGroup()
+		r.markStopped()
+	}
 }
 
 // queueLen reports the queue depth (for status and tests).

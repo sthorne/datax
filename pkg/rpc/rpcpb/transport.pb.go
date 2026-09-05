@@ -220,9 +220,19 @@ type RaftEnvelope struct {
 	// follower health into their write path with no extra traffic. Old
 	// receivers ignore the field (benign — they just keep leader-only
 	// backpressure).
-	Health        *StorageHealth `protobuf:"bytes,8,opt,name=health,proto3" json:"health,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Health *StorageHealth `protobuf:"bytes,8,opt,name=health,proto3" json:"health,omitempty"`
+	// Coalesced heartbeats (cluster version v12): every leader heartbeat
+	// and follower response this node had for the receiver since its last
+	// envelope, one entry per range instead of one envelope each; message
+	// is empty then and the receiver fans them out to its replicas.
+	Heartbeats         []*RaftHeartbeat `protobuf:"bytes,9,rep,name=heartbeats,proto3" json:"heartbeats,omitempty"`
+	HeartbeatResponses []*RaftHeartbeat `protobuf:"bytes,10,rep,name=heartbeat_responses,json=heartbeatResponses,proto3" json:"heartbeat_responses,omitempty"`
+	// Closed-timestamp updates for quiescent ranges: the leader's promise
+	// that nothing at or below closed will commit, valid on a follower that
+	// still follows (from_replica, term) and has applied index.
+	ClosedTimestamps []*RaftHeartbeat `protobuf:"bytes,11,rep,name=closed_timestamps,json=closedTimestamps,proto3" json:"closed_timestamps,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RaftEnvelope) Reset() {
@@ -311,6 +321,143 @@ func (x *RaftEnvelope) GetHealth() *StorageHealth {
 	return nil
 }
 
+func (x *RaftEnvelope) GetHeartbeats() []*RaftHeartbeat {
+	if x != nil {
+		return x.Heartbeats
+	}
+	return nil
+}
+
+func (x *RaftEnvelope) GetHeartbeatResponses() []*RaftHeartbeat {
+	if x != nil {
+		return x.HeartbeatResponses
+	}
+	return nil
+}
+
+func (x *RaftEnvelope) GetClosedTimestamps() []*RaftHeartbeat {
+	if x != nil {
+		return x.ClosedTimestamps
+	}
+	return nil
+}
+
+// RaftHeartbeat is one range's MsgHeartbeat or MsgHeartbeatResp, reduced
+// to the fields raft reads from them.
+type RaftHeartbeat struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	RangeId     int64                  `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
+	ToReplica   uint64                 `protobuf:"varint,2,opt,name=to_replica,json=toReplica,proto3" json:"to_replica,omitempty"`
+	FromReplica uint64                 `protobuf:"varint,3,opt,name=from_replica,json=fromReplica,proto3" json:"from_replica,omitempty"`
+	Term        uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	Commit      uint64                 `protobuf:"varint,5,opt,name=commit,proto3" json:"commit,omitempty"`
+	// quiesce: the leader is going idle (every follower holds every entry
+	// and nothing is pending); a follower that holds commit quiesces too —
+	// stops ticking, so no election timer runs — until the next message
+	// or request wakes it.
+	Quiesce bool `protobuf:"varint,6,opt,name=quiesce,proto3" json:"quiesce,omitempty"`
+	// Closed-timestamp updates only: the leader's last log index when the
+	// promise was made and the closed timestamp itself.
+	Index         uint64 `protobuf:"varint,7,opt,name=index,proto3" json:"index,omitempty"`
+	ClosedWall    int64  `protobuf:"varint,8,opt,name=closed_wall,json=closedWall,proto3" json:"closed_wall,omitempty"`
+	ClosedLogical int32  `protobuf:"varint,9,opt,name=closed_logical,json=closedLogical,proto3" json:"closed_logical,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RaftHeartbeat) Reset() {
+	*x = RaftHeartbeat{}
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RaftHeartbeat) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RaftHeartbeat) ProtoMessage() {}
+
+func (x *RaftHeartbeat) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RaftHeartbeat.ProtoReflect.Descriptor instead.
+func (*RaftHeartbeat) Descriptor() ([]byte, []int) {
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *RaftHeartbeat) GetRangeId() int64 {
+	if x != nil {
+		return x.RangeId
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetToReplica() uint64 {
+	if x != nil {
+		return x.ToReplica
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetFromReplica() uint64 {
+	if x != nil {
+		return x.FromReplica
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetCommit() uint64 {
+	if x != nil {
+		return x.Commit
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetQuiesce() bool {
+	if x != nil {
+		return x.Quiesce
+	}
+	return false
+}
+
+func (x *RaftHeartbeat) GetIndex() uint64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetClosedWall() int64 {
+	if x != nil {
+		return x.ClosedWall
+	}
+	return 0
+}
+
+func (x *RaftHeartbeat) GetClosedLogical() int32 {
+	if x != nil {
+		return x.ClosedLogical
+	}
+	return 0
+}
+
 // StorageHealth is a node's storage-health snapshot. `overloaded` is the
 // sender's own soft-gate verdict against its storage profile (the numbers
 // are advisory detail — the receiver never re-judges them, so profiles
@@ -333,7 +480,7 @@ type StorageHealth struct {
 
 func (x *StorageHealth) Reset() {
 	*x = StorageHealth{}
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -345,7 +492,7 @@ func (x *StorageHealth) String() string {
 func (*StorageHealth) ProtoMessage() {}
 
 func (x *StorageHealth) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[4]
+	mi := &file_datax_v1_transport_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -358,7 +505,7 @@ func (x *StorageHealth) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageHealth.ProtoReflect.Descriptor instead.
 func (*StorageHealth) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{4}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *StorageHealth) GetOverloaded() bool {
@@ -418,7 +565,7 @@ type RaftAck struct {
 
 func (x *RaftAck) Reset() {
 	*x = RaftAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -430,7 +577,7 @@ func (x *RaftAck) String() string {
 func (*RaftAck) ProtoMessage() {}
 
 func (x *RaftAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[5]
+	mi := &file_datax_v1_transport_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -443,7 +590,7 @@ func (x *RaftAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAck.ProtoReflect.Descriptor instead.
 func (*RaftAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{5}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
 }
 
 type Payload struct {
@@ -460,7 +607,7 @@ type Payload struct {
 
 func (x *Payload) Reset() {
 	*x = Payload{}
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -472,7 +619,7 @@ func (x *Payload) String() string {
 func (*Payload) ProtoMessage() {}
 
 func (x *Payload) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[6]
+	mi := &file_datax_v1_transport_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -485,7 +632,7 @@ func (x *Payload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Payload.ProtoReflect.Descriptor instead.
 func (*Payload) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{6}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Payload) GetJson() []byte {
@@ -522,7 +669,7 @@ type SnapshotChunk struct {
 
 func (x *SnapshotChunk) Reset() {
 	*x = SnapshotChunk{}
-	mi := &file_datax_v1_transport_proto_msgTypes[7]
+	mi := &file_datax_v1_transport_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -534,7 +681,7 @@ func (x *SnapshotChunk) String() string {
 func (*SnapshotChunk) ProtoMessage() {}
 
 func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[7]
+	mi := &file_datax_v1_transport_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -547,7 +694,7 @@ func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
 func (*SnapshotChunk) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{7}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SnapshotChunk) GetHeaderJson() []byte {
@@ -581,7 +728,7 @@ type SnapshotKV struct {
 
 func (x *SnapshotKV) Reset() {
 	*x = SnapshotKV{}
-	mi := &file_datax_v1_transport_proto_msgTypes[8]
+	mi := &file_datax_v1_transport_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -593,7 +740,7 @@ func (x *SnapshotKV) String() string {
 func (*SnapshotKV) ProtoMessage() {}
 
 func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[8]
+	mi := &file_datax_v1_transport_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -606,7 +753,7 @@ func (x *SnapshotKV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotKV.ProtoReflect.Descriptor instead.
 func (*SnapshotKV) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{8}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SnapshotKV) GetKey() []byte {
@@ -631,7 +778,7 @@ type SnapshotAck struct {
 
 func (x *SnapshotAck) Reset() {
 	*x = SnapshotAck{}
-	mi := &file_datax_v1_transport_proto_msgTypes[9]
+	mi := &file_datax_v1_transport_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -643,7 +790,7 @@ func (x *SnapshotAck) String() string {
 func (*SnapshotAck) ProtoMessage() {}
 
 func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_transport_proto_msgTypes[9]
+	mi := &file_datax_v1_transport_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -656,7 +803,7 @@ func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotAck.ProtoReflect.Descriptor instead.
 func (*SnapshotAck) Descriptor() ([]byte, []int) {
-	return file_datax_v1_transport_proto_rawDescGZIP(), []int{9}
+	return file_datax_v1_transport_proto_rawDescGZIP(), []int{10}
 }
 
 var File_datax_v1_transport_proto protoreflect.FileDescriptor
@@ -674,7 +821,7 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\x03now\x18\x03 \x01(\v2\r.datax.v1.HlcR\x03now\"<\n" +
 	"\x03Hlc\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
-	"\alogical\x18\x02 \x01(\x05R\alogical\"\x91\x02\n" +
+	"\alogical\x18\x02 \x01(\x05R\alogical\"\xda\x03\n" +
 	"\fRaftEnvelope\x12\x19\n" +
 	"\brange_id\x18\x01 \x01(\x03R\arangeId\x12\x1d\n" +
 	"\n" +
@@ -684,7 +831,25 @@ const file_datax_v1_transport_proto_rawDesc = "" +
 	"\amessage\x18\x05 \x01(\fR\amessage\x12\x1f\n" +
 	"\x03now\x18\x06 \x01(\v2\r.datax.v1.HlcR\x03now\x12\x1b\n" +
 	"\tfrom_addr\x18\a \x01(\tR\bfromAddr\x12/\n" +
-	"\x06health\x18\b \x01(\v2\x17.datax.v1.StorageHealthR\x06health\"\xfd\x01\n" +
+	"\x06health\x18\b \x01(\v2\x17.datax.v1.StorageHealthR\x06health\x127\n" +
+	"\n" +
+	"heartbeats\x18\t \x03(\v2\x17.datax.v1.RaftHeartbeatR\n" +
+	"heartbeats\x12H\n" +
+	"\x13heartbeat_responses\x18\n" +
+	" \x03(\v2\x17.datax.v1.RaftHeartbeatR\x12heartbeatResponses\x12D\n" +
+	"\x11closed_timestamps\x18\v \x03(\v2\x17.datax.v1.RaftHeartbeatR\x10closedTimestamps\"\x90\x02\n" +
+	"\rRaftHeartbeat\x12\x19\n" +
+	"\brange_id\x18\x01 \x01(\x03R\arangeId\x12\x1d\n" +
+	"\n" +
+	"to_replica\x18\x02 \x01(\x04R\ttoReplica\x12!\n" +
+	"\ffrom_replica\x18\x03 \x01(\x04R\vfromReplica\x12\x12\n" +
+	"\x04term\x18\x04 \x01(\x04R\x04term\x12\x16\n" +
+	"\x06commit\x18\x05 \x01(\x04R\x06commit\x12\x18\n" +
+	"\aquiesce\x18\x06 \x01(\bR\aquiesce\x12\x14\n" +
+	"\x05index\x18\a \x01(\x04R\x05index\x12\x1f\n" +
+	"\vclosed_wall\x18\b \x01(\x03R\n" +
+	"closedWall\x12%\n" +
+	"\x0eclosed_logical\x18\t \x01(\x05R\rclosedLogical\"\xfd\x01\n" +
 	"\rStorageHealth\x12\x1e\n" +
 	"\n" +
 	"overloaded\x18\x01 \x01(\bR\n" +
@@ -730,44 +895,48 @@ func file_datax_v1_transport_proto_rawDescGZIP() []byte {
 	return file_datax_v1_transport_proto_rawDescData
 }
 
-var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_datax_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_datax_v1_transport_proto_goTypes = []any{
 	(*PingRequest)(nil),   // 0: datax.v1.PingRequest
 	(*PingResponse)(nil),  // 1: datax.v1.PingResponse
 	(*Hlc)(nil),           // 2: datax.v1.Hlc
 	(*RaftEnvelope)(nil),  // 3: datax.v1.RaftEnvelope
-	(*StorageHealth)(nil), // 4: datax.v1.StorageHealth
-	(*RaftAck)(nil),       // 5: datax.v1.RaftAck
-	(*Payload)(nil),       // 6: datax.v1.Payload
-	(*SnapshotChunk)(nil), // 7: datax.v1.SnapshotChunk
-	(*SnapshotKV)(nil),    // 8: datax.v1.SnapshotKV
-	(*SnapshotAck)(nil),   // 9: datax.v1.SnapshotAck
+	(*RaftHeartbeat)(nil), // 4: datax.v1.RaftHeartbeat
+	(*StorageHealth)(nil), // 5: datax.v1.StorageHealth
+	(*RaftAck)(nil),       // 6: datax.v1.RaftAck
+	(*Payload)(nil),       // 7: datax.v1.Payload
+	(*SnapshotChunk)(nil), // 8: datax.v1.SnapshotChunk
+	(*SnapshotKV)(nil),    // 9: datax.v1.SnapshotKV
+	(*SnapshotAck)(nil),   // 10: datax.v1.SnapshotAck
 }
 var file_datax_v1_transport_proto_depIdxs = []int32{
 	2,  // 0: datax.v1.PingRequest.now:type_name -> datax.v1.Hlc
 	2,  // 1: datax.v1.PingResponse.now:type_name -> datax.v1.Hlc
 	2,  // 2: datax.v1.RaftEnvelope.now:type_name -> datax.v1.Hlc
-	4,  // 3: datax.v1.RaftEnvelope.health:type_name -> datax.v1.StorageHealth
-	2,  // 4: datax.v1.Payload.now:type_name -> datax.v1.Hlc
-	8,  // 5: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
-	2,  // 6: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
-	3,  // 7: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
-	6,  // 8: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
-	6,  // 9: datax.v1.Internode.Join:input_type -> datax.v1.Payload
-	6,  // 10: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
-	7,  // 11: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
-	0,  // 12: datax.v1.Internode.Ping:input_type -> datax.v1.PingRequest
-	5,  // 13: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
-	6,  // 14: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
-	6,  // 15: datax.v1.Internode.Join:output_type -> datax.v1.Payload
-	6,  // 16: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
-	9,  // 17: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
-	1,  // 18: datax.v1.Internode.Ping:output_type -> datax.v1.PingResponse
-	13, // [13:19] is the sub-list for method output_type
-	7,  // [7:13] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	5,  // 3: datax.v1.RaftEnvelope.health:type_name -> datax.v1.StorageHealth
+	4,  // 4: datax.v1.RaftEnvelope.heartbeats:type_name -> datax.v1.RaftHeartbeat
+	4,  // 5: datax.v1.RaftEnvelope.heartbeat_responses:type_name -> datax.v1.RaftHeartbeat
+	4,  // 6: datax.v1.RaftEnvelope.closed_timestamps:type_name -> datax.v1.RaftHeartbeat
+	2,  // 7: datax.v1.Payload.now:type_name -> datax.v1.Hlc
+	9,  // 8: datax.v1.SnapshotChunk.kvs:type_name -> datax.v1.SnapshotKV
+	2,  // 9: datax.v1.SnapshotChunk.now:type_name -> datax.v1.Hlc
+	3,  // 10: datax.v1.Internode.RaftMessages:input_type -> datax.v1.RaftEnvelope
+	7,  // 11: datax.v1.Internode.Batch:input_type -> datax.v1.Payload
+	7,  // 12: datax.v1.Internode.Join:input_type -> datax.v1.Payload
+	7,  // 13: datax.v1.Internode.Admin:input_type -> datax.v1.Payload
+	8,  // 14: datax.v1.Internode.Snapshot:input_type -> datax.v1.SnapshotChunk
+	0,  // 15: datax.v1.Internode.Ping:input_type -> datax.v1.PingRequest
+	6,  // 16: datax.v1.Internode.RaftMessages:output_type -> datax.v1.RaftAck
+	7,  // 17: datax.v1.Internode.Batch:output_type -> datax.v1.Payload
+	7,  // 18: datax.v1.Internode.Join:output_type -> datax.v1.Payload
+	7,  // 19: datax.v1.Internode.Admin:output_type -> datax.v1.Payload
+	10, // 20: datax.v1.Internode.Snapshot:output_type -> datax.v1.SnapshotAck
+	1,  // 21: datax.v1.Internode.Ping:output_type -> datax.v1.PingResponse
+	16, // [16:22] is the sub-list for method output_type
+	10, // [10:16] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_transport_proto_init() }
@@ -781,7 +950,7 @@ func file_datax_v1_transport_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_transport_proto_rawDesc), len(file_datax_v1_transport_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

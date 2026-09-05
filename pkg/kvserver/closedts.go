@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.etcd.io/raft/v3"
 
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
@@ -92,12 +93,85 @@ func (s *Store) publishClosedTimestamps(ctx context.Context, lag time.Duration) 
 			return true
 		}
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := r.publishClosedTimestamp(pctx, target); err != nil {
+		var err error
+		if r.closedTimestampNeedsLog() || !s.coalescedHeartbeats() {
+			err = r.publishClosedTimestamp(pctx, target)
+		} else {
+			err = r.publishClosedTimestampSide(pctx, target)
+		}
+		if err != nil {
 			log.Debugf("%s: closed timestamp publication failed: %v", r.rangeID, err)
 		}
 		cancel()
 		return true
 	})
+	s.sendQueuedHeartbeats(ctx)
+}
+
+// publishClosedTimestampSide closes a range whose log has not grown since
+// the last logged promise, without appending or waking it: the same
+// latch drain and cache bump as the log path make the promise, and it
+// travels to the followers in the next coalesced envelope instead of a
+// raft command (quiesce.go). A follower honors it only while it still
+// follows this leader at this term and has applied the index the promise
+// was made at — raft's vote lease means no other leader can have
+// committed anything it has not heard of while it still follows this
+// one, which is what log order gave the replicated path. The value lives
+// in memory only (sideClosedTS), so the replicated state stays
+// byte-identical across replicas and a restart falls back to the last
+// logged promise (re-learned within a publication interval). The first
+// promise after new entries rides the log again.
+func (r *Replica) publishClosedTimestampSide(ctx context.Context, target hlc.Timestamp) error {
+	st, ok := r.raftStatus()
+	if !ok || st.RaftState != raft.StateLeader {
+		return nil
+	}
+	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchShared)
+	if gerr != nil {
+		return gerr
+	}
+	r.tsCache.Bump([]latchSpan{wholeRangeSpan}, target, uuid.Nil)
+	guard.Release()
+	index := r.rs.lastIndex()
+	r.mu.Lock()
+	if r.mu.sideClosedTS.Less(target) {
+		r.mu.sideClosedTS = target
+	}
+	desc := r.mu.desc
+	r.mu.Unlock()
+	self := uint64(r.replicaID)
+	for _, rep := range desc.Replicas {
+		if uint64(rep.ReplicaID) == self {
+			continue
+		}
+		r.store.queueClosedTimestamp(rep.NodeID, RaftHeartbeat{
+			RangeID: r.rangeID, To: uint64(rep.ReplicaID), From: self, Term: st.Term, Index: index, ClosedTS: target,
+		})
+	}
+	metrics.ClosedTimestampSideUpdates.Inc()
+	return nil
+}
+
+// acceptClosedTimestamp adopts a leader's off-log promise when it still
+// applies here: same leader and term (raft's vote lease means no other
+// leader can have committed anything this replica has not heard of while
+// it still follows this one), and this replica has applied everything
+// up to the index the promise was made at.
+func (r *Replica) acceptClosedTimestamp(hb RaftHeartbeat) {
+	valid := false
+	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
+		st := rn.BasicStatus()
+		valid = st.RaftState == raft.StateFollower && st.Term == hb.Term && st.Lead == hb.From
+		return nil
+	})
+	if !valid {
+		return
+	}
+	r.mu.Lock()
+	if r.mu.appliedIndex >= hb.Index && !r.mu.frozen && r.mu.sideClosedTS.Less(hb.ClosedTS) {
+		r.mu.sideClosedTS = hb.ClosedTS
+	}
+	r.mu.Unlock()
 }
 
 // publishClosedTimestamp closes the range at target: after it returns
@@ -117,7 +191,24 @@ func (r *Replica) publishClosedTimestamp(ctx context.Context, target hlc.Timesta
 	if kerr != nil {
 		return kerr
 	}
+	idx := r.rs.lastIndex()
+	r.mu.Lock()
+	r.mu.closedTSLogged = idx
+	r.mu.Unlock()
 	return nil
+}
+
+// closedTimestampNeedsLog reports whether the next promise must ride the
+// log: only when entries were appended since the last logged promise. A
+// range with nothing new in its log publishes off the log instead
+// (publishClosedTimestampSide) — no entry, no fsync, no wake — which is
+// what lets an idle range stay quiescent while its followers keep
+// serving fresh stale reads.
+func (r *Replica) closedTimestampNeedsLog() bool {
+	idx := r.rs.lastIndex()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return idx != r.mu.closedTSLogged
 }
 
 // executeStaleRead serves a read-only batch pinned at a fixed timestamp on

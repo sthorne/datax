@@ -181,6 +181,13 @@ func (rs *raftStorage) Term(i uint64) (uint64, error) {
 	return ent.Term, nil
 }
 
+// lastIndex is the newest entry's index (LastIndex without the error).
+func (rs *raftStorage) lastIndex() uint64 {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.mu.lastIndex
+}
+
 // LastIndex implements raft.Storage.
 func (rs *raftStorage) LastIndex() (uint64, error) {
 	rs.mu.Lock()

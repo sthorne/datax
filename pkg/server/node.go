@@ -538,12 +538,13 @@ func (n *Node) start() error {
 		serverTLS = n.tlsCfgs.Server
 	}
 	grpcServer := rpc.NewServer(n.clock, rpc.ServerHandlers{
-		Batch:    n.handleBatch,
-		Join:     n.handleJoin,
-		Admin:    n.handleAdmin,
-		Raft:     n.store.HandleRaftMessage,
-		Snapshot: n.store.ApplySnapshotStream,
-		NodeInfo: n.registry.UpsertAddress,
+		Batch:          n.handleBatch,
+		Join:           n.handleJoin,
+		Admin:          n.handleAdmin,
+		Raft:           n.store.HandleRaftMessage,
+		RaftHeartbeats: n.store.HandleRaftHeartbeats,
+		Snapshot:       n.store.ApplySnapshotStream,
+		NodeInfo:       n.registry.UpsertAddress,
 		NodeHealth: func(id base.NodeID, h *rpcpb.StorageHealth) {
 			n.store.UpdateNodeHealth(id, h.Overloaded, h.Reason)
 		},

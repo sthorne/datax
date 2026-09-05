@@ -54,7 +54,11 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   compaction-debt gate with hysteresis.
 - **Replication**: the keyspace is split into **ranges**; each range is an
   independent [etcd Raft](https://github.com/etcd-io/raft) consensus group
-  (multi-raft). Writes commit only once a quorum has them on disk.
+  (multi-raft). Writes commit only once a quorum has them on disk. A
+  store-level scheduler drives every group from a fixed worker pool with
+  one synced commit per pass (group commit), heartbeats travel coalesced
+  per peer node, and idle ranges quiesce — so per-range costs stay flat
+  at thousands of ranges.
 - **Transactions**: CockroachDB-style — write intents plus a transaction
   record whose single atomic flip commits the whole transaction, no matter how
   many ranges it touched. Serializable isolation. Multi-range writes fan

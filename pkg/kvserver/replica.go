@@ -181,6 +181,18 @@ type Replica struct {
 		loadHandoff *loadHandoff
 		// checksums parks completed consistency-check results by check ID.
 		checksums map[string]checksumResult
+		// quiescent: the replica is asleep (quiesce.go) — the store ticker
+		// skips it. idleTicks counts a leader's consecutive idle ticks
+		// toward quiescing.
+		quiescent bool
+		idleTicks int
+		// sideClosedTS is a closed timestamp learned off the log
+		// (closedts.go): in memory only, never persisted or checksummed,
+		// and forgotten by a restart. closedTSLogged is the leader's last
+		// index after its last logged promise: a log that has not grown
+		// since publishes off the log.
+		sideClosedTS   hlc.Timestamp
+		closedTSLogged uint64
 	}
 
 	// stoppedCh closes when the raft group is stopped for good: the
@@ -357,6 +369,7 @@ func (r *Replica) reportSnapshot(id uint64, status raft.SnapshotStatus) {
 
 // campaign starts an election for this replica.
 func (r *Replica) campaign() error {
+	r.unquiesce()
 	err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Campaign() })
 	r.store.sched.enqueue(r.rangeID, schedReady)
 	return err
@@ -365,6 +378,7 @@ func (r *Replica) campaign() error {
 // transferLeader asks the group's leader to hand leadership to
 // transferee; on a follower raft forwards the request to the leader.
 func (r *Replica) transferLeader(transferee uint64) {
+	r.unquiesce()
 	_ = r.withRaftGroup(func(rn *raft.RawNode) error {
 		rn.TransferLeader(transferee)
 		return nil
@@ -392,7 +406,7 @@ func (r *Replica) GCThreshold() hlc.Timestamp {
 func (r *Replica) ClosedTimestamp() hlc.Timestamp {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.mu.closedTS
+	return r.mu.closedTS.Forward(r.mu.sideClosedTS)
 }
 
 // SizeBytes returns the range's replicated approximate data size.
@@ -491,7 +505,7 @@ func (r *Replica) takeReady(flags raftSchedFlags) (rd raft.Ready, ok bool) {
 		r.noteTick()
 	}
 	err := r.withRaftGroup(func(rn *raft.RawNode) error {
-		if flags&schedTick != 0 {
+		if flags&schedTick != 0 && !r.maybeQuiesce(rn) {
 			rn.Tick()
 		}
 		if rn.HasReady() {
@@ -667,6 +681,7 @@ func (r *Replica) raftStopped() bool {
 
 func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 	desc := r.Desc()
+	coalesce := r.store.coalescedHeartbeats()
 	for i := range msgs {
 		m := msgs[i]
 		var target base.NodeID
@@ -687,6 +702,13 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 			r.startCatchupSnapshot(target, m)
 			continue
 		}
+		if (m.Type == raftpb.MsgHeartbeat || m.Type == raftpb.MsgHeartbeatResp) && len(m.Context) == 0 && coalesce {
+			// One envelope per peer node per scheduler pass carries every
+			// range's heartbeats (quiesce.go).
+			r.store.queueHeartbeat(target, RaftHeartbeat{RangeID: r.rangeID, To: m.To, From: m.From, Term: m.Term, Commit: m.Commit},
+				m.Type == raftpb.MsgHeartbeatResp)
+			continue
+		}
 		if err := r.store.cfg.Transport.SendRaftMessage(ctx, target, r.rangeID, m); err != nil {
 			// Raft tolerates message loss; report unreachability so it backs off.
 			r.reportUnreachable(m.To)
@@ -695,6 +717,8 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 }
 
 // stepRaftMessage feeds an incoming message into the Raft state machine.
+// Any message but a heartbeat response wakes a quiescent replica (the
+// response to a leader's parting heartbeat must not wake it back up).
 func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 	switch m.Type {
 	case raftpb.MsgHeartbeatResp, raftpb.MsgAppResp:
@@ -702,6 +726,9 @@ func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 		r.mu.Lock()
 		r.mu.lastFollowerResp[m.From] = time.Now()
 		r.mu.Unlock()
+	}
+	if m.Type != raftpb.MsgHeartbeatResp {
+		r.unquiesce()
 	}
 	err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Step(m) })
 	if err == nil {
@@ -800,6 +827,7 @@ func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cm
 		r.mu.Unlock()
 	}()
 
+	r.unquiesce()
 	if err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.Propose(data) }); err != nil {
 		if err == raft.ErrProposalDropped {
 			return nil, r.notLeaderError()
@@ -884,6 +912,7 @@ func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
 		r.mu.Unlock()
 	}()
 
+	r.unquiesce()
 	if err := r.withRaftGroup(func(rn *raft.RawNode) error {
 		rn.ReadIndex([]byte(rctx))
 		return nil
@@ -939,6 +968,19 @@ func (r *Replica) setApplied(idx uint64) {
 // read at or below the range's closed timestamp, which any replica serves
 // locally (see executeStaleRead).
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	// A stale read at or below the closed timestamp needs no leader and
+	// no wake: any replica serves it locally, a sleeping one included.
+	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) {
+		return r.executeStaleRead(ba)
+	}
+	// Any other request wakes a sleeping replica: a leader resumes
+	// heartbeating (and, for a lease read, waits for its followers'
+	// answers, which pre-sleep contact no longer stands in for); a
+	// follower resumes ticking, so if the leader the client is looking
+	// for is gone it times out and campaigns (quiesce.go).
+	if r.unquiesce() && r.isLeader() && ba.IsReadOnly() && r.leaseReads {
+		r.awaitContact(ctx, 2*time.Duration(raftElectionTicks)*r.store.cfg.RaftTickInterval)
+	}
 	if !r.isLeader() {
 		if ba.Header.StaleRead && ba.IsReadOnly() {
 			return r.executeStaleRead(ba)

@@ -24,6 +24,9 @@ import (
 // by pkg/rpc.
 type RaftTransport interface {
 	SendRaftMessage(ctx context.Context, to base.NodeID, rangeID base.RangeID, m raftpb.Message) error
+	// SendRaftHeartbeats sends one envelope carrying every queued
+	// heartbeat and response for a peer node (quiesce.go).
+	SendRaftHeartbeats(ctx context.Context, to base.NodeID, beats, resps, closed []RaftHeartbeat) error
 }
 
 // StoreConfig collects a store's dependencies.
@@ -163,6 +166,8 @@ type Store struct {
 
 	// sched drives every replica's raft group (scheduler.go).
 	sched *raftScheduler
+	// hbq holds heartbeats between scheduler passes (quiesce.go).
+	hbq heartbeatQueue
 }
 
 // SetSender injects the routed KV client (once, at node startup).
@@ -188,6 +193,9 @@ func NewStore(cfg StoreConfig) *Store {
 	s := &Store{cfg: cfg}
 	s.mu.replicas = make(map[base.RangeID]*Replica)
 	s.sched = newRaftScheduler(s, cfg.RaftWorkers)
+	s.hbq.beats = make(map[base.NodeID][]RaftHeartbeat)
+	s.hbq.resps = make(map[base.NodeID][]RaftHeartbeat)
+	s.hbq.closed = make(map[base.NodeID][]RaftHeartbeat)
 	return s
 }
 
@@ -497,7 +505,7 @@ func (s *Store) HandleRaftMessage(ctx context.Context, rangeID base.RangeID, m r
 		log.Debugf("dropping raft message for unknown %s", rangeID)
 		return
 	}
-	if err := r.stepRaftMessage(ctx, m); err != nil {
+	if err := r.stepRaftMessage(ctx, m); err != nil && err != errRaftStopped {
 		log.Warnf("%s: raft step failed: %v", rangeID, err)
 	}
 }

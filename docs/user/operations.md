@@ -264,7 +264,11 @@ complete),
 worker — a growing tail means the store's raft workers are saturated),
 `datax_raft_log_syncs_total` / `datax_raft_readies_per_sync` (one synced
 commit per scheduler pass however many ranges appended; the histogram
-shows how many shared each).
+shows how many shared each), `datax_quiescent_ranges` (idle ranges that
+stopped ticking and heartbeating; on a quiet cluster this approaches
+`datax_ranges`), `datax_raft_heartbeat_envelopes_total` /
+`datax_raft_heartbeats_coalesced_total` (the per-peer message rate and
+how many heartbeats each message carried).
 
 ## Everyday admin: `datax debug`
 

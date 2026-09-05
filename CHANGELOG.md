@@ -8,6 +8,29 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.33.0 — unreleased
+
+### Changed
+- Coalesced heartbeats and range quiescence (#102, part c; cluster
+  version **v12**). Heartbeats and their responses travel as one
+  envelope per peer node per scheduler pass instead of one each, and an
+  idle range — no proposal, read-index request or snapshot for 2 s,
+  every follower caught up and answering — stops ticking and heartbeating
+  on every replica until a message, a proposal or a client request wakes
+  it; a woken leader heartbeats at once and re-establishes follower
+  contact before its first lease read. An idle range's closed timestamp
+  now travels off the log (with the leader's term and log index, honored
+  by a follower only while it still follows that leader at that term and
+  has applied that index; in memory only), so follower reads stay fresh
+  on quiescent ranges without a raft entry and an fsync per range per
+  second. `/status` reports `quiescent` per range; new series
+  `datax_quiescent_ranges`, `datax_raft_quiesces_total`,
+  `datax_raft_unquiesces_total`, `datax_raft_heartbeat_envelopes_total`,
+  `datax_raft_heartbeats_coalesced_total`,
+  `datax_closed_timestamp_side_updates_total`. Both stay off until
+  `datax debug upgrade` finalizes v12 (a v11 node reads neither).
+  Before/after on the harness in the PR.
+
 ## 0.32.0 — unreleased
 
 ### Changed

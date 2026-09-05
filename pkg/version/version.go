@@ -96,9 +96,16 @@ const (
 	// refused until finalize; CREATE USER and GRANT ADMIN keep writing
 	// the old layout until then (rule 4).
 	V11 Version = 11
+	// V12 introduces coalesced raft heartbeats and range quiescence
+	// (pkg/kvserver/scheduler.go, quiesce.go): a leader sends one
+	// RaftEnvelope per peer node carrying every range's heartbeat, and a
+	// quiescing leader's heartbeat carries a flag its followers act on. A
+	// v11 node reads neither (it would drop the envelope and keep
+	// expecting per-range heartbeats), so both stay off until finalize.
+	V12 Version = 12
 
 	// Current is the newest cluster version this binary can run.
-	Current = V11
+	Current = V12
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

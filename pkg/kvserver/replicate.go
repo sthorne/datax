@@ -124,6 +124,7 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 		return kvpb.NewError(err)
 	}
 	cc := raftpb.ConfChange{Type: typ, NodeID: uint64(replicaID), Context: ctxJSON}
+	r.unquiesce()
 	if err := r.withRaftGroup(func(rn *raft.RawNode) error { return rn.ProposeConfChange(cc) }); err != nil {
 		return kvpb.NewError(err)
 	}

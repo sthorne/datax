@@ -94,6 +94,21 @@ var (
 		Help:    "Replicas whose raft log writes shared one synced commit.",
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
 	})
+	RaftHeartbeatsCoalesced = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_heartbeats_coalesced_total", Help: "Raft heartbeats and responses carried inside coalesced per-node envelopes (cluster v12).",
+	})
+	RaftHeartbeatEnvelopes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_heartbeat_envelopes_total", Help: "Coalesced heartbeat envelopes sent (one per peer node per scheduler pass with heartbeats pending).",
+	})
+	RaftQuiesces = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_quiesces_total", Help: "Replicas that went quiescent (stopped ticking and heartbeating while idle).",
+	})
+	RaftUnquiesces = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_unquiesces_total", Help: "Quiescent replicas woken by a message, a proposal or a request.",
+	})
+	ClosedTimestampSideUpdates = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_closed_timestamp_side_updates_total", Help: "Closed timestamps published for quiescent ranges off the raft log (in the coalesced heartbeat envelope).",
+	})
 	FollowerReads = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_follower_reads_total", Help: "Stale reads served by non-leader replicas at their closed timestamp.",
 	})

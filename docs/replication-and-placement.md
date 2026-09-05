@@ -38,6 +38,33 @@ its pass only raises its flags). The scheduler's queue wait is
 `datax_raft_readies_per_sync` show how many replicas each sync served.
 `PreVote` and `CheckQuorum` are enabled.
 
+**Coalesced heartbeats and quiescence** (cluster version v12;
+`pkg/kvserver/quiesce.go`). Heartbeats are the one cost that scales with
+the number of ranges whatever the workload, so two things make it a
+constant per peer node. A heartbeat or a heartbeat response is queued
+per destination and every scheduler pass flushes the queue as *one*
+envelope carrying every range's heartbeats (`RaftHeartbeat`: the five
+fields raft reads); the receiver fans them out. And a leader that has
+seen no proposal, read-index request or snapshot for 2 s, with every
+follower holding its whole log and having answered within the lease
+window, tells its followers it is going idle (a heartbeat with the
+`quiesce` flag) and stops ticking; a follower that holds the leader's
+commit index stops ticking too. Nothing is sent for an idle range and no
+election timer runs — a quiescent follower cannot campaign, which is
+what keeps the leader's lease reads safe once contact is re-established.
+A replica wakes on any raft message but a heartbeat response, on a
+proposal, read-index or leadership request, and on a client request
+landing on it (so a follower asked for a range whose leader is gone
+ticks, times out and campaigns). A woken leader heartbeats at once and
+its lease backstop forgets pre-sleep contact, so the first read after a
+long idle waits one round trip instead of trusting stale answers. An
+unreachable follower keeps its range awake: it is not idle, and its
+return would wake everyone anyway. `/status` reports `quiescent` per
+range; `datax_quiescent_ranges`, `datax_raft_quiesces_total`,
+`datax_raft_unquiesces_total`, `datax_raft_heartbeat_envelopes_total`
+and `datax_raft_heartbeats_coalesced_total` count the effect. Both stay
+off until the cluster finalizes v12: a v11 node reads neither.
+
 **Transport**: one gRPC bidirectional stream per node pair; each message is
 `{RangeID, To, From, opaque raftpb bytes}`. Raft messages are opaque to the
 transport.
@@ -289,6 +316,20 @@ the timestamp-cache floor to T (every later write is forwarded above it),
 releases, and proposes. A split hands the parent's closed timestamp to the
 new right-hand range so nothing can write beneath reads the parent already
 served on that span.
+
+A range whose log has not grown since its last logged promise publishes
+the next one **off the log** (v12): the same latch drain and cache bump,
+but the promise travels in the coalesced heartbeat envelope with the
+leader's term and last log index, and a follower honors it only while it
+still follows that leader at that term and has applied that index —
+raft's vote lease means no other leader can have committed anything it
+has not heard of meanwhile, which is what log order gave the replicated
+path. The value lives in memory only (never persisted or checksummed;
+a restart falls back to the last logged promise and re-learns within a
+publication interval), so an idle range keeps serving fresh follower
+reads without a raft entry, an fsync or a wake every second — which is
+what lets it stay quiescent. The first promise after new entries rides
+the log again.
 
 A follower serves a read-only batch pinned at a fixed timestamp exactly
 when that timestamp is at or below its closed timestamp; anything else —
