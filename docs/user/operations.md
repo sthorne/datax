@@ -7,36 +7,61 @@ serves, on that address:
 
 - **`/`** — a self-contained web UI that reports the **cluster**, not
   the node that served the page (the header names that node as
-  provenance, `served by n1 · region=r1`). The overview's tiles are the
+  provenance, `served by n1 · region=r1`). Eight views sit behind one
+  persistent nav, each a real route: **overview** (`#/`), **nodes**
+  (`#/nodes`, and each node's page at `#/node/N`), **data** (`#/data`),
+  **sql** (`#/sql`), **schema** (`#/schema`), **metrics**
+  (`#/metrics`), **ops** (`#/ops`) and **security** (`#/security`).
+  Three controls in the header cross every view: a **node scope** (the
+  whole cluster, or one named node) that the node-scoped panels —
+  statements, the event ring, audit — read instead of assuming the
+  serving node, and which they name rather than leaving it to be
+  guessed; a **time range** shared by every chart on the page; and
+  **jump to** (`⌘K` or `Ctrl-K`), which resolves `n3`, `r128`, a table
+  name or a locality like `rack=b` to the right view, and which is the
+  practical navigation once a cluster has more ranges than fit on a
+  screen. The scope, the range, each view's filter and an open range
+  drill-down are all in the URL, so a view is a link worth sharing, and
+  each view remembers where it was scrolled to.
+
+  The overview's tiles are the
   cluster rollup summed over every live node's heartbeat — QPS, data,
   ranges and replicas, leases, connections (by state and top users),
   statements and `40001` per second, the worst p99 and the node that owns
   it — each with the count of contributing nodes beside it when a node
   is down, so a smaller number is never mistaken for a quieter cluster.
   Below them: a problems panel (every finding of the health checks
-  below, colored by severity, each linking to the section that shows the
-  figure; a green line when there are none), one card per node (status,
-  locality, CPU, load, memory, free space on the store's disk, file
-  descriptors — colored and marked `!`/`!!` when they deserve a look —
-  leases, data, QPS, connections, heartbeat age) opening that node's
-  page, SQL activity per node (connections by state with the oldest idle
-  transaction, statements per second by kind, `40001` rate, latency
-  percentiles; for admins the serving node's statements in flight and
-  its slowest recent ones), a network matrix (every node's round trip to
-  every other, with clock offsets judged against `--max-offset`; on a
-  narrow screen a worst-pairs list instead), a schema browser (every
-  table with its columns, primary key, indexes, time-series options,
-  grants, statistics and their age, and range footprint; the users for
-  admins; a filter box that narrows the tables and the range list, which
-  names the table each range belongs to), and the cluster's range table
-  with replica placement. A **Metrics view** (`/#/metrics`) charts any
-  of the series the cluster records about itself over the last 15
-  minutes to 7 days, one chart per series with one line per node, from
-  the `datax_metrics` table described under [Metrics
+  below, colored by severity, each linking to the **view** that shows
+  the figure; a green line when there are none), one card per node
+  (status, locality, CPU, load, memory, free space on the store's disk,
+  file descriptors — colored and marked `!`/`!!` when they deserve a
+  look — leases, data, QPS, connections, heartbeat age) opening that
+  node's page, and the newest operations the cluster has performed on
+  itself.
+
+  The other views hold the rest. **nodes**: every node's row with the
+  same figures, filterable by locality or address, plus the network
+  matrix (each node's round trip to every other, with clock offsets
+  judged against `--max-offset`; on a narrow screen a worst-pairs list
+  instead). **data**: the cluster's ranges with replica placement,
+  filterable by table or range id. **sql**: connections by state with
+  the oldest idle transaction, statements per second by kind, `40001`
+  rate and latency percentiles per node, with the scoped node's
+  statements in flight and its slowest recent ones (admin). **schema**:
+  every table with its columns, primary key, indexes, time-series
+  options, grants, statistics and their age, and range footprint.
+  **ops**: the scoped node's event ring with a kind filter. **security**:
+  how the cluster authenticates, who is signed in and by what, the users
+  and their roles, and the audit records separated from the operational
+  ones. **metrics** charts any of the series the cluster records about
+  itself over the header's time range, one chart per series with one
+  line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from
-  that table. Each node's **page** (`/#/node/N`, from its card or the
-  header) holds everything that describes that one node: identity
+  that table.
+
+  Each node's **page** (`#/node/N`, from its card, the nodes view or
+  jump-to) holds everything that describes that one node: identity
   (address, locality, release and protocol version, the cluster version
   it has mirrored, uptime), its machine tiles (disk and network
   throughput, Go runtime, uptime), its last 15 minutes of CPU, QPS,
@@ -50,7 +75,8 @@ serves, on that address:
   admins also see the audit stream). The cluster ranges table drills
   down: a click, or Enter on a focused row, fetches every holding node's
   view of the range (leader, applied index, size, QPS, closed timestamp)
-  over internode RPC, so any node's dashboard can inspect any range.
+  over internode RPC, so any node's dashboard can inspect any range —
+  and the open range is in the URL, so the drill-down is shareable too.
 
   The page is usable from a keyboard (a skip link, a focus ring on every
   control, real links and controls where a mouse was once required),

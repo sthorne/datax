@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/server/ui"
 )
 
 // startWithHTTP is StartWithEngines plus an HTTP listener per node.
@@ -216,6 +217,27 @@ func TestUIServed(t *testing.T) {
 
 	if strings.Contains(body, "__CONSOLE_VERSION__") {
 		t.Fatal("the served page still carries the console version placeholder")
+	}
+	// The console is assembled from its script files at startup (issue
+	// #151): every one of them is in the page the node serves, and the
+	// seam they were spliced into is gone.
+	if strings.Contains(body, "__CONSOLE_SCRIPTS__") {
+		t.Fatal("the served page still carries the console script placeholder")
+	}
+	names, err := ui.ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if !strings.Contains(body, "// ==== "+name+" ====") {
+			t.Fatalf("the served console is missing %s", name)
+		}
+	}
+	// Every route the nav offers resolves to a container in the page.
+	for _, view := range []string{"overview", "nodes", "node", "data", "sql", "schema", "metrics", "ops", "security"} {
+		if n := strings.Count(body, `<main id="view-`+view+`"`); n != 1 {
+			t.Fatalf("the served console has %d containers for the %s view, want 1", n, view)
+		}
 	}
 	// The page is served with its digest as ETag (issue #146): a reload
 	// with the same version is a 304, the version the page carries is

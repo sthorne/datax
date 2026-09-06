@@ -6,8 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/sthorne/datax/pkg/sql/catalog"
-	"github.com/sthorne/datax/pkg/storage"
+	"fmt"
 	"math"
 	"net"
 	"net/http"
@@ -24,6 +23,8 @@ import (
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server/ui"
+	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/sysstats"
 )
@@ -277,7 +278,7 @@ func (n *Node) startHTTP() error {
 	mux.HandleFunc("/api/events", n.serveEventsAPI)
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
-	page, uerr := ui.FS.ReadFile("index.html")
+	page, uerr := renderConsolePage()
 	if uerr != nil {
 		return uerr
 	}
@@ -637,4 +638,43 @@ const consoleVersionPlaceholder = "__CONSOLE_VERSION__"
 func consoleVersionOf(page []byte) string {
 	sum := sha256.Sum256(page)
 	return hex.EncodeToString(sum[:8])
+}
+
+// consoleScriptsPlaceholder is the token in index.html that the
+// console's script files replace.
+const consoleScriptsPlaceholder = "__CONSOLE_SCRIPTS__"
+
+// renderConsolePage assembles the served console: the shell with its
+// script files concatenated in, in the order ui.ScriptFiles gives (issue
+// #151). A file that the embed directive names but that is missing
+// fails the build; one that is present but empty, or a shell that lost
+// its placeholder, fails here rather than serving a blank console.
+func renderConsolePage() ([]byte, error) {
+	shell, err := ui.FS.ReadFile("index.html")
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Contains(shell, []byte(consoleScriptsPlaceholder)) {
+		return nil, fmt.Errorf("the console shell has no %s placeholder", consoleScriptsPlaceholder)
+	}
+	names, err := ui.ScriptFiles()
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("the console has no script files")
+	}
+	var script bytes.Buffer
+	for _, name := range names {
+		body, err := ui.FS.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		if len(bytes.TrimSpace(body)) == 0 {
+			return nil, fmt.Errorf("console script %s is empty", name)
+		}
+		fmt.Fprintf(&script, "\n// ==== %s ====\n", name)
+		script.Write(body)
+	}
+	return bytes.Replace(shell, []byte(consoleScriptsPlaceholder), script.Bytes(), 1), nil
 }

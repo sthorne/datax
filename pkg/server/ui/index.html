@@ -200,29 +200,209 @@
   .chart details th, .chart details td { padding: 2px 8px; }
   .chart .empty { color: var(--text-3); font-size: 12px; padding: 60px 0; text-align: center; }
   select.filter { font-size: 13px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); margin-left: 12px; }
+  /* Persistent nav and the cross-cutting controls (issue #151). */
+  header { flex-wrap: wrap; }
+  header nav { display: flex; gap: 2px; flex-wrap: wrap; font-size: 13px; }
+  header nav a { color: var(--text-2); text-decoration: none; padding: 3px 9px; border-radius: 6px; }
+  header nav a:hover { background: color-mix(in srgb, var(--border) 35%, transparent); }
+  header nav a.current { background: color-mix(in srgb, var(--border) 50%, transparent); color: var(--text); font-weight: 600; }
+  .controls-hdr { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); }
+  .controls-hdr select, .controls-hdr button {
+    font: inherit; font-size: 12px; padding: 3px 7px; border-radius: 6px;
+    color: var(--text); background: var(--panel); border: 1px solid var(--border);
+  }
+  .controls-hdr button { cursor: pointer; }
+  .controls-hdr button:hover { border-color: var(--text-3); }
+  kbd {
+    font: inherit; font-size: 11px; padding: 0 4px; border-radius: 4px;
+    border: 1px solid var(--border); color: var(--text-3);
+  }
+  /* Jump to (⌘K): resolve n3, r128, a table or a locality to a route. */
+  #jump {
+    position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.35);
+    display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh;
+  }
+  #jump .box { width: min(560px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,.28); overflow: hidden; }
+  #jump input { font: inherit; width: 100%; padding: 12px 14px; border: 0; border-bottom: 1px solid var(--border); background: transparent; color: var(--text); }
+  #jump ul { list-style: none; margin: 0; padding: 4px; max-height: 46vh; overflow-y: auto; }
+  #jump li { padding: 7px 10px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+  #jump li.on, #jump li:hover { background: color-mix(in srgb, var(--series-1) 16%, transparent); }
+  #jump .hint { padding: 6px 12px 8px; font-size: 12px; color: var(--text-3); border-top: 1px solid var(--border); }
+  /* The view a node-scoped panel is showing, stated rather than assumed. */
+  .scoped { font-size: 12px; color: var(--text-3); margin: 0 0 8px; }
 </style>
 </head>
 <body>
-<a class="skip" href="#view-main">skip to content</a>
+<a class="skip" href="#main-views">skip to content</a>
 <div id="insecure-banner" role="status"></div>
 <header>
   <h1>datax</h1>
+  <nav id="nav" aria-label="views"></nav>
+  <span class="controls-hdr">
+    <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
+    <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
+    <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
+  </span>
   <span class="sub" id="hdr-node">connecting…</span>
   <details class="user" id="hdr-user"><summary id="hdr-user-summary" title="who this page is signed in as"></summary><div class="menu" id="hdr-user-menu"></div></details>
-  <nav><a href="#/" id="nav-main" class="current">overview</a><a href="#/metrics" id="nav-metrics">metrics</a></nav>
   <span class="stale" id="hdr-stale" role="status">● stale — last update failed</span>
-  <span class="stale" id="hdr-reload" style="display:none" title="the node now serves a newer console than this tab runs">● a newer console is available — <a href="#" onclick="location.reload(); return false">reload</a></span>
 </header>
+<div id="jump" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-label="jump to">
+    <input id="jump-input" placeholder="n3 · r128 · a table name · rack=b" aria-controls="jump-results" autocomplete="off" spellcheck="false">
+    <ul id="jump-results" role="listbox" aria-label="matches"></ul>
+    <div class="hint">Enter opens · Esc closes</div>
+  </div>
+</div>
+<div id="main-views">
+<main id="view-overview" hidden>
+  <div class="err" id="cluster-err"></div>
+  <div id="problems" aria-live="polite" title="checks run on this node every few seconds from data it already holds"></div>
+
+  <section>
+    <h2>Cluster</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section id="sec-nodes">
+    <h2>Nodes</h2>
+    <div class="strip" id="nodes"></div>
+    <p class="muted" id="nodes-note"></p>
+  </section>
+
+  <section id="sec-recent">
+    <h2>Operations in flight</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="recent-ops"></tbody>
+    </table></div>
+    <p class="muted" id="recent-ops-note"></p>
+  </section>
+</main>
+<main id="view-nodes" hidden>
+  <section>
+    <h2>Nodes <input id="node-filter" type="search" placeholder="filter by locality or address" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
+        <th class="num" title="host CPU busy, all cores">cpu</th>
+        <th class="num" title="one-minute load average / cores">load</th>
+        <th class="num" title="host memory in use / total">memory</th>
+        <th class="num" title="free space on the store's filesystem">disk free</th>
+        <th class="num" title="open file descriptors / soft limit">fds</th>
+        <th class="num" title="ranges this node leads">leases</th>
+        <th class="num">heartbeat</th></tr></thead>
+      <tbody id="nodes-table"></tbody>
+    </table></div>
+    <p class="muted" id="nodes-table-note"></p>
+  </section>
+
+  <section id="sec-network">
+    <h2>Network</h2>
+    <div class="tablewrap wide-only"><table id="latency"></table></div>
+    <div class="tablewrap narrow-only"><table class="cards">
+      <caption class="sr-only">Network: worst pairs</caption>
+      <thead><tr><th scope="col">pair</th><th scope="col" class="num">round trip</th><th scope="col" class="num">clock offset</th></tr></thead>
+      <tbody id="latency-worst"></tbody>
+    </table></div>
+    <p class="muted" id="latency-note"></p>
+  </section>
+</main>
+<main id="view-data" hidden>
+  <section id="sec-cluster-ranges">
+    <h2>Ranges <input id="data-filter" type="search" placeholder="filter by table or range id" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
+      <tbody id="cluster-ranges"></tbody>
+    </table></div>
+    <p class="muted" id="cluster-range-hint"></p>
+  </section>
+</main>
+<main id="view-sql" hidden>
+  <section>
+    <h2>SQL</h2>
+    <div class="tiles" id="sql-tiles"></div>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>node</th>
+        <th class="num" title="open connections (active running a statement / idle inside an open transaction)">connections</th>
+        <th class="num" title="longest an open transaction has been idle; its intents block other writers">oldest idle txn</th>
+        <th class="num" title="statements per second over the last poll interval">stmt/s</th>
+        <th>mix</th>
+        <th class="num" title="statements that ended in SQLSTATE 40001 per second">40001/s</th>
+        <th class="num" title="statement latency percentiles over the node's recent ring">p50 / p99</th></tr></thead>
+      <tbody id="sql-nodes"></tbody>
+    </table></div>
+    <p class="muted" id="sql-note"></p>
+  </section>
+  <section>
+    <h2>Statements</h2>
+    <p class="scoped" id="sql-scope"></p>
+    <div id="sql-detail" hidden>
+      <div class="tablewrap"><table>
+        <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
+        <tbody id="sql-statements"></tbody>
+      </table></div>
+    </div>
+  </section>
+</main>
+<main id="view-schema" hidden>
+  <section id="sec-schema">
+    <h2>Schema <input id="schema-filter" type="search" placeholder="filter tables" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>table</th><th>columns</th><th>primary key</th><th>indexes</th>
+        <th class="num" title="from the table's statistics (ANALYZE or the background sampler)">rows</th>
+        <th class="num" title="how old the statistics are">stats age</th>
+        <th class="num" title="ranges covering the table cluster-wide">ranges</th>
+        <th class="num" title="bytes held by this node's replicas of the table (exact when this node holds every replica)">local size</th>
+        <th>grants</th></tr></thead>
+      <tbody id="schema"></tbody>
+    </table></div>
+    <p class="muted" id="schema-note"></p>
+  </section>
+</main>
 <main id="view-metrics" hidden>
   <section>
     <h2>Metrics</h2>
     <div class="controls">
-      <span class="seg" id="range-picker"></span>
       <label><input type="checkbox" id="compare-toggle"> one chart per node</label>
       <span class="muted" id="metrics-note"></span>
     </div>
     <div class="charts" id="charts"></div>
     <details id="series-details"><summary class="muted" id="series-summary">choose series</summary><div id="series-picker"></div></details>
+  </section>
+</main>
+<main id="view-ops" hidden>
+  <section id="sec-events">
+    <h2>Operations <select class="filter" id="events-filter" title="show one kind of event"><option value="">all kinds</option></select></h2>
+    <p class="scoped" id="ops-scope"></p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table></div>
+    <p class="muted" id="events-note"></p>
+  </section>
+</main>
+<main id="view-security" hidden>
+  <section>
+    <h2>Authentication</h2>
+    <div class="tiles" id="sec-auth"></div>
+    <p class="muted" id="sec-auth-note"></p>
+  </section>
+  <section>
+    <h2>Users and roles</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>user</th><th>role</th></tr></thead>
+      <tbody id="users"></tbody>
+    </table></div>
+    <p class="muted" id="users-note"></p>
+  </section>
+  <section>
+    <h2>Audit</h2>
+    <p class="scoped" id="audit-scope"></p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="audit"></tbody>
+    </table></div>
+    <p class="muted" id="audit-note"></p>
   </section>
 </main>
 <main id="view-node" hidden>
@@ -232,7 +412,7 @@
     <div class="tiles ident" id="node-ident"></div>
   </section>
   <section><h2>Machine</h2><div class="tiles" id="node-machine"></div><p class="muted" id="node-machine-note"></p></section>
-  <section><h2>Recent history</h2><div class="charts" id="node-charts"></div><p class="muted">the last 15 minutes from the datax_metrics table; <a href="#/metrics" id="node-metrics-link">chart more on the Metrics view</a></p></section>
+  <section><h2>Recent history</h2><div class="charts" id="node-charts"></div><p class="muted">from the <code>datax_metrics</code> table over the header's time range; <a href="#/metrics" id="node-metrics-link">chart more on the Metrics view</a></p></section>
   <section><h2>Storage</h2><div class="tiles" id="node-storage"></div><p class="muted" id="node-storage-note"></p></section>
   <section>
     <h2>Ranges (replicas on this node)</h2>
@@ -268,22 +448,6 @@
       <tbody id="node-events"></tbody>
     </table></div>
   </section>
-</main>
-<main id="view-main">
-  <div class="err" id="cluster-err"></div>
-  <div id="problems" aria-live="polite" title="checks run on this node every few seconds from data it already holds"></div>
-
-  <section>
-    <h2>Cluster</h2>
-    <div class="tiles" id="tiles"></div>
-  </section>
-
-  <section id="sec-nodes">
-    <h2>Nodes</h2>
-    <div class="strip" id="nodes"></div>
-    <p class="muted" id="nodes-note"></p>
-  </section>
-
   <section>
     <h2>SQL</h2>
     <div class="tiles" id="node-sql"></div>
@@ -312,1134 +476,7 @@
     </table></div>
   </section>
 </main>
-<main id="view-main">
-  <div class="err" id="cluster-err"></div>
-  <div id="problems" title="checks run on this node every few seconds from data it already holds"></div>
-
-  <section>
-    <h2>Cluster</h2>
-    <div class="tiles" id="tiles"></div>
-  </section>
-
-  <section id="sec-nodes">
-    <h2>Nodes</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
-        <th class="num" title="host CPU busy, all cores">cpu</th>
-        <th class="num" title="one-minute load average / cores">load</th>
-        <th class="num" title="host memory in use / total">memory</th>
-        <th class="num" title="free space on the store's filesystem">disk free</th>
-        <th class="num" title="open file descriptors / soft limit">fds</th>
-        <th class="num">heartbeat</th></tr></thead>
-      <tbody id="nodes"></tbody>
-    </table></div>
-  </section>
-
-  <section>
-    <h2>SQL</h2>
-    <div class="tiles" id="sql-tiles"></div>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th>node</th>
-        <th class="num" title="open connections (active running a statement / idle inside an open transaction)">connections</th>
-        <th class="num" title="longest an open transaction has been idle; its intents block other writers">oldest idle txn</th>
-        <th class="num" title="statements per second over the last poll interval">stmt/s</th>
-        <th>mix</th>
-        <th class="num" title="statements that ended in SQLSTATE 40001 per second">40001/s</th>
-        <th class="num" title="statement latency percentiles over the node's recent ring">p50 / p99</th></tr></thead>
-      <tbody id="sql-nodes"></tbody>
-    </table></div>
-    <p class="muted" id="sql-note"></p>
-    <div id="sql-detail" hidden>
-      <p class="muted">statements on this node (admin): in flight, then the slowest recent ones</p>
-      <div class="tablewrap"><table>
-        <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
-        <tbody id="sql-statements"></tbody>
-      </table></div>
-    </div>
-  </section>
-
-  <section id="sec-network">
-    <h2>Network</h2>
-    <div class="tablewrap wide-only"><table id="latency"></table></div>
-    <div class="tablewrap narrow-only"><table class="cards">
-      <caption class="sr-only">Network: worst pairs</caption>
-      <thead><tr><th scope="col">pair</th><th scope="col" class="num">round trip</th><th scope="col" class="num">clock offset</th></tr></thead>
-      <tbody id="latency-worst"></tbody>
-    </table></div>
-    <p class="muted" id="latency-note"></p>
-  </section>
-
-  <section id="sec-schema">
-    <h2>Schema <input id="schema-filter" type="search" placeholder="filter tables and ranges" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th>table</th><th>columns</th><th>primary key</th><th>indexes</th>
-        <th class="num" title="from the table's statistics (ANALYZE or the background sampler)">rows</th>
-        <th class="num" title="how old the statistics are">stats age</th>
-        <th class="num" title="ranges covering the table cluster-wide">ranges</th>
-        <th class="num" title="bytes held by this node's replicas of the table (exact when this node holds every replica)">local size</th>
-        <th>grants</th></tr></thead>
-      <tbody id="schema"></tbody>
-    </table></div>
-    <p class="muted" id="schema-note"></p>
-    <div class="tablewrap" id="users-wrap" hidden><table>
-      <thead><tr><th>user</th><th>role</th></tr></thead>
-      <tbody id="users"></tbody>
-    </table></div>
-  </section>
-
-  <section id="sec-cluster-ranges">
-    <h2>Ranges (cluster)</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
-      <tbody id="cluster-ranges"></tbody>
-    </table></div>
-    <p class="muted" id="cluster-range-hint">click a range for its per-replica detail from every holding node (admin role)</p>
-  </section>
-
-</main>
-<script>
-// CONSOLE_VERSION is stamped by the node when it serves the page.
-const CONSOLE_VERSION = "__CONSOLE_VERSION__";
-"use strict";
-// Read-only dashboard: polls /api/cluster every 3s and renders in place.
-// Sparkline history lives only in this tab.
-const HISTORY = 40;
-const hist = {}; // name -> number[]
-function pushHist(name, v) {
-  const h = hist[name] || (hist[name] = []);
-  h.push(v);
-  if (h.length > HISTORY) h.shift();
-  return h;
-}
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-}
-// setHTML replaces an element's markup only when it changed, and never
-// under an interaction (issue #148): while the element holds the text
-// selection, the focused element or an open disclosure, the new markup
-// waits and lands when the interaction ends.
-function interacting(el) {
-  if (el.contains(document.activeElement) && document.activeElement !== document.body) return true;
-  if (el.querySelector("details[open]")) return true;
-  const sel = window.getSelection();
-  return !!(sel && !sel.isCollapsed && sel.anchorNode && el.contains(sel.anchorNode));
-}
-const pendingHTML = new Map();
-function setHTML(el, html) {
-  if (el.__html === html) { pendingHTML.delete(el); return false; }
-  if (interacting(el)) { pendingHTML.set(el, html); return false; }
-  el.innerHTML = html; el.__html = html; pendingHTML.delete(el);
-  return true;
-}
-function flushPendingHTML() { for (const [el, html] of [...pendingHTML]) setHTML(el, html); }
-// renderKeyed reconciles a container's children by identity: items are
-// {key, html} with html the child's full markup carrying data-key; a
-// child whose markup is unchanged is left alone (its selection, focus
-// and open disclosures with it), a changed one is replaced unless it is
-// under an interaction (then it waits for the next pass), a new one is
-// created, a vanished one removed, and the order follows items. An item
-// with html null keeps whatever element already exists under its key
-// (the range drill-down's detail row, filled in by its own fetch).
-const keyedTpl = document.createElement("template");
-function renderKeyed(container, items) {
-  const existing = new Map();
-  for (const el of container.children) if (el.dataset.key !== undefined) existing.set(el.dataset.key, el);
-  const kept = new Set();
-  let i = 0;
-  for (const it of items) {
-    let el = existing.get(it.key);
-    if (it.html === null) { if (!el) continue; }
-    else if (!el) { keyedTpl.innerHTML = it.html; el = keyedTpl.content.firstElementChild; el.__html = it.html; existing.set(it.key, el); }
-    else if (el.__html !== it.html && !interacting(el)) { keyedTpl.innerHTML = it.html; const fresh = keyedTpl.content.firstElementChild; fresh.__html = it.html; el.replaceWith(fresh); el = fresh; existing.set(it.key, el); }
-    kept.add(it.key);
-    const at = container.children[i];
-    if (at !== el) container.insertBefore(el, at || null);
-    i++;
-  }
-  for (const [k, el] of existing) if (!kept.has(k) && !interacting(el)) el.remove();
-}
-function renderTiles(el, html) {
-  keyedTpl.innerHTML = html;
-  renderKeyed(el, [...keyedTpl.content.children].map(c => ({ key: c.dataset.key, html: c.outerHTML })));
-}
-document.addEventListener("selectionchange", () => { const sel = window.getSelection(); if (!sel || sel.isCollapsed) setTimeout(flushPendingHTML, 0); });
-document.addEventListener("focusout", () => setTimeout(flushPendingHTML, 0));
-document.addEventListener("toggle", () => setTimeout(flushPendingHTML, 0), true);
-// a11yTables gives every table a caption (its section's heading, for
-// screen readers) and column scope on its headers (issue #149).
-function a11yTables(root) {
-  for (const table of (root || document).querySelectorAll("table")) {
-    if (!table.caption) {
-      const h2 = table.closest("section")?.querySelector("h2");
-      if (h2) { const c = table.createCaption(); c.className = "sr-only"; c.textContent = h2.textContent.trim(); }
-    }
-    for (const th of table.querySelectorAll("thead th")) if (!th.hasAttribute("scope")) th.setAttribute("scope", "col");
-  }
-}
-function pct(v) { return (v === undefined || v === null) ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + "%"; }
-function fmtDuration(sec) {
-  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${Math.floor(sec % 60)}s`;
-}
-// Nodes-table cells: colored when a figure is worth a look. Disk free
-// goes amber under 15% and red under 5%; load above the core count and
-// fds past 80% of the limit likewise.
-// warn colours a figure worth a look and adds a text cue (colour is
-// never the only carrier): "!" for a warning, "!!" for a critical one.
-function warn(level, text) { return level ? `<span class="st ${level}">${text}<span class="cue" aria-label="${level === "down" ? "critical" : "warning"}">${level === "down" ? " !!" : " !"}</span></span>` : text; }
-function loadCell(load1, cores) {
-  const ratio = load1 / cores;
-  return warn(ratio > 2 ? "down" : ratio > 1 ? "draining" : "", (load1 ?? 0).toFixed(2));
-}
-function memCell(m) {
-  const used = m.mem_total - m.mem_available, frac = used / m.mem_total;
-  return warn(frac > 0.95 ? "down" : frac > 0.85 ? "draining" : "", fmtBytes(used) + " / " + fmtBytes(m.mem_total));
-}
-function diskCell(m) {
-  const frac = m.disk_free / m.disk_total;
-  return warn(frac < 0.05 ? "down" : frac < 0.15 ? "draining" : "", fmtBytes(m.disk_free) + " (" + Math.round(frac * 100) + "%)");
-}
-function fdCell(m) {
-  const frac = m.open_fds / m.fd_limit;
-  return warn(frac > 0.95 ? "down" : frac > 0.8 ? "draining" : "", m.open_fds + " / " + m.fd_limit);
-}
-function fmtBytes(b) {
-  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(1) + " GiB";
-  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + " MiB";
-  if (b >= 1 << 10) return (b / (1 << 10)).toFixed(1) + " KiB";
-  return Math.round(b) + " B";
-}
-function fmtAgo(ms) {
-  if (ms < 1500) return "now";
-  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
-  return Math.round(ms / 60000) + "m ago";
-}
-function spark(h) {
-  if (h.length < 2) return "";
-  const max = Math.max(...h, 1e-9), w = 100, ht = 26;
-  const pts = h.map((v, i) =>
-    (i * w / (h.length - 1)).toFixed(1) + "," + (ht - 2 - v / max * (ht - 4)).toFixed(1)
-  ).join(" ");
-  return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="recent trend"><polyline points="${pts}"/></svg>`;
-}
-// Tiles link to the same figure charted over time (the Metrics view);
-// their sparkline is the last 15 minutes from the datax_metrics table
-// when the recorder has data, else this tab's own memory of the polls.
-const TILE_SERIES = {
-  "this node QPS": "node.leader_qps", "this node data": "node.replica_bytes",
-  "host cpu": "node.cpu_percent", "load": "node.load1", "memory": "node.mem_available", "process": "node.rss",
-  "disk free": "store.disk_free", "disk i/o": "store.disk_write_bps", "network": "node.net_rx_bps",
-  "file descriptors": "node.open_fds", "go runtime": "go.goroutines",
-  "L0 files": "store.l0_files", "L0 sublevels": "store.l0_sublevels", "compaction debt": "store.compaction_debt",
-  "memtables": "store.memtable_bytes", "write stalls": "store.write_stalls",
-  "block cache": "store.block_cache_bytes", "cache hits": "store.block_cache_hits", "bloom hits": "store.bloom_hits",
-  "connections": "sql.connections", "statements/s": "sql.statements", "40001/s": "sql.serialization_failures", "worst p99": "sql.p99_us",
-};
-const TILE_RATE = { "write stalls": 1, "statements/s": 1, "40001/s": 1, "cache hits": 1, "bloom hits": 1 };
-let tileHist = {}; // series -> number[] from the table (this node, last 15 minutes)
-function tile(label, value, histName, histVal) {
-  let sp = "";
-  const series = TILE_SERIES[label];
-  if (series && tileHist[series] && tileHist[series].length > 1) sp = spark(tileHist[series]);
-  else if (histName !== undefined) sp = spark(pushHist(histName, histVal));
-  const body = `<div class="label">${esc(label)}</div><div class="value">${value}</div>${sp}`;
-  if (!series) return `<div class="tile" data-key="${esc(label)}">${body}</div>`;
-  return `<a class="tile" data-key="${esc(label)}" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time">${body}</a>`;
-}
-async function pollTileHistory() {
-  try {
-    const names = [...new Set(Object.values(TILE_SERIES))];
-    const me = lastCluster ? lastCluster.node_id : null;
-    if (!me) return;
-    const resp = await fetch(`/api/metrics?series=${names.join(",")}&node=${me}&since=15m&rate=1`, { cache: "no-store" });
-    if (!resp.ok) { tileHist = {}; return; }
-    const d = await resp.json();
-    const h = {};
-    for (const s of d.series || []) { const pts = (s.nodes || {})[String(me)]; if (pts && pts.length > 1) h[s.name] = pts.map(p => p[1]); }
-    tileHist = h;
-  } catch (err) { tileHist = {}; }
-}
-function statusCell(n) {
-  if (!n.live) return `<span class="st down"><span class="dot"></span>down</span>`;
-  if (n.shutting_down) return `<span class="st draining"><span class="dot"></span>stopping</span>`;
-  if (n.draining) return `<span class="st draining"><span class="dot"></span>draining</span>`;
-  return `<span class="st live"><span class="dot"></span>live</span>`;
-}
-// who is the signed-in principal from the last /api/cluster document
-// (null until the first poll). In insecure mode there is no identity and
-// every viewer is treated as admin.
-let who = null;
-// The identity block (issue #158): who this page is signed in as, how,
-// and — for a session — the way out. A cluster that authenticates nobody
-// says so across the top of the page rather than in a grey aside.
-const VIA_NAMES = { session: "signed in with a password", basic: "HTTP Basic credentials", cert: "client certificate" };
-function renderPrincipal(p) {
-  who = p || null;
-  const el = document.getElementById("hdr-user");
-  const banner = document.getElementById("insecure-banner");
-  if (!who) { el.hidden = true; return; }
-  el.hidden = false;
-  if (!who.secure) {
-    banner.style.display = "block";
-    setHTML(banner, `<b>Insecure mode.</b> This cluster authenticates nobody: anyone who can reach this port has full access, and so does anyone who can reach the SQL port. Start the nodes with a certificate directory to change that.`);
-    setHTML(document.getElementById("hdr-user-summary"), `<span class="muted">no sign-in</span>`);
-    setHTML(document.getElementById("hdr-user-menu"), `<div class="muted">This cluster runs in insecure mode; there is no identity to show and nothing to sign out of.</div>`);
-    return;
-  }
-  banner.style.display = "none";
-  setHTML(document.getElementById("hdr-user-summary"),
-    `${esc(who.user || "?")}${who.admin ? `<span class="role">admin</span>` : ""} ▾`);
-  const lapses = who.session_expires_at_unix_ms
-    ? `<dt>session</dt><dd>ends ${fmtDuration(Math.max(0, (who.session_expires_at_unix_ms - Date.now()) / 1000))} from now</dd>` : "";
-  setHTML(document.getElementById("hdr-user-menu"),
-    `<dl><dt>user</dt><dd>${esc(who.user || "?")}</dd>
-      <dt>signed in by</dt><dd>${esc(VIA_NAMES[who.via] || who.via || "?")}</dd>
-      <dt>roles</dt><dd>${who.admin ? "admin" : "no admin role"}</dd>${lapses}</dl>` +
-    (who.via === "session"
-      ? `<button type="button" id="btn-signout">Sign out</button><button type="button" id="btn-switch">Sign in as someone else</button>`
-      : `<div class="muted">This page authenticates by ${esc(VIA_NAMES[who.via] || "credentials")}, which the browser holds rather than this page. To use a different identity, sign in with a password from the <a href="/api/logout-then-login" id="lnk-login">sign-in page</a>.</div>`));
-  const signOut = async (andBack) => {
-    try { await fetch("/api/logout", { method: "POST" }); } catch (err) { /* the reload tells the story */ }
-    location.href = andBack ? "/?next=" + encodeURIComponent(location.pathname + location.hash) : "/";
-  };
-  document.getElementById("btn-signout")?.addEventListener("click", () => signOut(false));
-  document.getElementById("btn-switch")?.addEventListener("click", () => signOut(true));
-  document.getElementById("lnk-login")?.addEventListener("click", ev => { ev.preventDefault(); signOut(false); });
-}
-function canDrillDown() { return !who || who.admin; }
-function drillDownRefusal() {
-  if (!who || !who.secure || !who.user) return "admin role required for cross-node drill-down";
-  const otherUser = who.via === "session"
-    ? `, or sign out and sign in as <code>root</code> from the user menu`
-    : `, or sign in as <code>root</code>`;
-  return `signed in as ${esc(who.user)}: the admin role is required for cross-node drill-down. ` +
-    `Grant it with <code>GRANT ADMIN TO ${esc(who.user)}</code>${otherUser}.`;
-}
-// The overview reports the cluster (issue #145): the rollup the node
-// computed over every live node's heartbeat, and one card per node.
-// Which node served the page is provenance in the header, not the
-// subject; its own sections live on its node page.
-let rollupPrev = null; // {at, statements, retries} for statement rates
-function contrib(r, n) { return n < r.live_nodes ? ` <span class="muted">(${n} of ${r.live_nodes} live nodes)</span>` : ""; }
-function render(d) {
-  const loc = d.local && d.local.locality;
-  document.getElementById("hdr-node").innerHTML =
-    `served by <a href="#/node/${d.node_id}" title="this node's page">n${d.node_id}</a>` + (loc ? " · " + esc(loc) : "") + (d.local.address ? ` <span class="muted">${esc(d.local.address)}</span>` : "");
-  renderPrincipal(d.principal);
-  const r = d.rollup || {};
-  const now = Date.now();
-  let stmtRate = null, retryRate = null;
-  if (rollupPrev && now > rollupPrev.at && r.statements >= rollupPrev.statements) {
-    const dt = (now - rollupPrev.at) / 1000;
-    stmtRate = (r.statements - rollupPrev.statements) / dt;
-    retryRate = (r.serialization_failures - rollupPrev.retries) / dt;
-  }
-  rollupPrev = { at: now, statements: r.statements || 0, retries: r.serialization_failures || 0 };
-  const users = Object.entries(r.connections_by_user || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([u, c]) => `${esc(u)} ${c}`).join(", ");
-  renderTiles(document.getElementById("tiles"),
-    tile("live nodes", (r.live_nodes ?? 0) + " / " + (r.nodes ?? (d.nodes || []).length)) +
-    tile("cluster QPS", Math.round(r.qps || 0) + contrib(r, r.contributing), "qps", r.qps || 0) +
-    tile("cluster data", fmtBytes(r.data_bytes || 0) + contrib(r, r.contributing), "bytes", r.data_bytes || 0) +
-    tile("ranges", (r.ranges ?? 0) + ` <span class="muted">· ${r.replicas ?? 0} replicas</span>`) +
-    tile("leases", (r.leases ?? 0) + contrib(r, r.contributing)) +
-    tile("connections", `${r.connections ?? 0} <span class="muted">(${r.active ?? 0} active, ${r.idle_in_txn ?? 0} idle in txn${users ? "; " + users : ""})</span>` + contrib(r, r.sql_contributing)) +
-    tile("statements/s", stmtRate === null ? "…" : stmtRate.toFixed(1) + contrib(r, r.sql_contributing), "stmt", stmtRate || 0) +
-    tile("40001/s", retryRate === null ? "…" : retryRate.toFixed(2), "retry", retryRate || 0) +
-    tile("worst p99", r.worst_p99_node ? `${(r.worst_p99_us / 1000).toFixed(1)} ms <span class="muted">(n${r.worst_p99_node})</span>` : "—", "p99", (r.worst_p99_us || 0) / 1000));
-
-  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
-  renderKeyed(document.getElementById("nodes"), nodes.map(n => {
-    const m = n.machine;
-    return { key: "n" + n.node_id, html: `<a class="card" data-key="n${n.node_id}" href="#/node/${n.node_id}" title="open n${n.node_id}'s page">
-    <div class="head"><b>n${n.node_id}</b> ${statusCell(n)} <span class="muted">${esc(n.locality || "no locality")}</span></div>
-    <div class="row">${m ? `cpu <b>${pct(m.cpu_percent)}</b> · load <b>${m.cores ? loadCell(m.load1, m.cores) : "—"}</b> · memory <b>${m.mem_total ? memCell(m) : "—"}</b>` : `<span class="muted">no machine summary (older binary?)</span>`}</div>
-    <div class="row">${m ? `disk free <b>${m.disk_total ? diskCell(m) : "in-memory store"}</b> · fds <b>${m.fd_limit ? fdCell(m) : "—"}</b>` : ""}</div>
-    <div class="row">leads <b>${n.leader_count || 0}</b> · <b>${fmtBytes(n.replica_bytes || 0)}</b> · <b>${Math.round(n.leader_qps || 0)}</b> qps${n.sql ? ` · <b>${n.sql.open}</b> connections` : ""} · heartbeat ${fmtAgo(n.heartbeat_ago_ms)}</div>
-    <div class="row muted key">${esc(n.address)}</div>
-  </a>` }; }));
-  const dead = nodes.filter(n => !n.live).length;
-  document.getElementById("nodes-note").textContent = "figures from each node's heartbeat" + (dead ? `; ${dead} node${dead > 1 ? "s" : ""} down — excluded from the cluster totals above` : "");
-  renderNetwork(d);
-  renderSQL(d);
-  renderClusterRanges(d.ranges || []);
-  const errBox = document.getElementById("cluster-err");
-  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
-  else errBox.style.display = "none";
-}
-function rangeRow(r, leaderLabel, extra) {
-  return `<tr data-key="r${r.range_id}">
-    <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
-    <td class="key">${spanText(r)}</td>
-    <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
-    <td>${r.leader ? leaderLabel : ""}</td>
-    <td class="num">${fmtBytes(r.size_bytes)}</td>
-    <td class="num">${r.qps ? r.qps.toFixed(0) : "0"}</td>
-    <td class="num">${r.applied_index}</td>${extra ? `<td class="num">${esc(extra(r))}</td>` : ""}
-  </tr>`;
-}
-function machineTiles(lm) {
-  return tile("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? " (" + pct(lm.iowait_percent) + " iowait)" : ""), "cpu", lm.cpu_percent) +
-      tile("load", lm.cores ? (lm.load1 ?? 0).toFixed(2) + " / " + lm.cores + " cores" : "—") +
-      tile("memory", lm.mem_total ? fmtBytes(lm.mem_total - lm.mem_available) + " / " + fmtBytes(lm.mem_total) : "—") +
-      tile("process", fmtBytes(lm.rss || 0) + " rss · " + pct(lm.process_cpu_percent) + " cpu") +
-      tile("disk free", lm.disk_total ? fmtBytes(lm.disk_free) + " / " + fmtBytes(lm.disk_total) : "in-memory store", "diskfree", lm.disk_free || 0) +
-      tile("disk i/o", lm.disk_total ? fmtBytes(lm.disk_read_bytes_ps || 0) + "/s r · " + fmtBytes(lm.disk_write_bytes_ps || 0) + "/s w · " + pct(lm.disk_busy_percent) + " busy" : "—", "diskw", lm.disk_write_bytes_ps || 0) +
-      tile("network", fmtBytes(lm.net_rx_bytes_ps || 0) + "/s in · " + fmtBytes(lm.net_tx_bytes_ps || 0) + "/s out", "net", (lm.net_rx_bytes_ps || 0) + (lm.net_tx_bytes_ps || 0)) +
-      tile("file descriptors", lm.fd_limit ? lm.open_fds + " / " + lm.fd_limit : "—") +
-      tile("go runtime", lm.goroutines + " goroutines · " + fmtBytes(lm.heap_in_use || 0) + " heap · gc p99 " + (lm.gc_pause_p99_ns / 1e6).toFixed(1) + " ms") +
-      tile("uptime", fmtDuration(lm.process_uptime_seconds ?? lm.uptime_seconds ?? 0));
-}
-function storageTiles(s) {
-  return tile("L0 files", s.l0_files ?? 0) +
-    tile("L0 sublevels", s.l0_sublevels ?? 0) +
-    tile("compaction debt", fmtBytes(s.compaction_debt_bytes || 0), "debt", s.compaction_debt_bytes || 0) +
-    tile("memtables", (s.memtable_count ?? 0) + " (" + fmtBytes(s.memtable_bytes || 0) + ")") +
-    tile("write stalls", s.write_stalls ?? 0) +
-    tile("disk slow events", s.disk_slow_events ?? 0) +
-    tile("block cache", fmtBytes(s.block_cache_bytes || 0) + " · " + pctOf(s.block_cache_hits, s.block_cache_misses) + " hit") +
-    tile("bloom filters", pctOf(s.filter_hits, s.filter_misses) + " of point reads skipped");
-}
-// pctOf renders hits / (hits + misses) as a percentage ("–" before any read).
-function pctOf(hits, misses) {
-  const h = hits || 0, m = misses || 0;
-  if (h + m === 0) return "–";
-  return (100 * h / (h + m)).toFixed(1) + "%";
-}
-// Schema browser: /api/schema is fetched on the same 3s cadence as the
-// cluster document; the filter box narrows the table list and both range
-// tables (ranges carry the table their start key belongs to).
-let schemaFilter = "";
-function matchesFilter(r) {
-  if (!schemaFilter) return true;
-  return (r.table || "").toLowerCase().includes(schemaFilter) || ("r" + r.range_id).includes(schemaFilter);
-}
-document.getElementById("schema-filter").addEventListener("input", e => {
-  schemaFilter = e.target.value.trim().toLowerCase();
-  if (lastCluster) render(lastCluster);
-  if (lastSchema) renderSchema(lastSchema);
-});
-let lastCluster = null, lastSchema = null;
-function fmtRetention(sec) {
-  if (sec % 86400 === 0) return (sec / 86400) + "d";
-  if (sec % 3600 === 0) return (sec / 3600) + "h";
-  return sec + "s";
-}
-function renderSchema(d) {
-  lastSchema = d;
-  const tbody = document.getElementById("schema");
-  const tables = (d.tables || []).filter(t => !schemaFilter || t.name.toLowerCase().includes(schemaFilter));
-  renderKeyed(tbody, tables.map(t => {
-    const cols = (t.columns || []).filter(c => !c.hidden);
-    const hiddenNames = new Set((t.columns || []).filter(c => c.hidden).map(c => c.name));
-    const pk = (t.primary_key || []).filter(n => !hiddenNames.has(n));
-    const colList = cols.map(c => `${c.name} ${c.type}${c.precision ? `(${c.precision},${c.scale})` : ""}${c.not_null ? " not null" : ""}`).join("\n");
-    const idx = (t.indexes || []).map(i => `${i.unique ? "unique " : ""}${esc(i.name)} (${(i.columns || []).map(esc).join(", ")})${i.state === "write-only" ? ' <span class="st draining">building</span>' : ""}`).join("<br>");
-    const ts = t.view ? `<div class="muted" style="font-size:12px" title="${esc(t.definition || "")}">view</div>` : t.timeseries ? `<div class="muted" style="font-size:12px">timeseries${t.retention_seconds ? " · retention " + fmtRetention(t.retention_seconds) : ""}${t.shards ? " · " + t.shards + " shards" : ""}</div>` : "";
-    const st = t.stats;
-    const rows = t.view ? "—" : st ? st.row_count.toLocaleString() : `<span class="muted">not analyzed</span>`;
-    const age = st ? (st.stale ? `<span class="st draining">${fmtAgo(st.age_seconds * 1000)}</span>` : fmtAgo(st.age_seconds * 1000)) : "—";
-    const grants = Object.entries(t.privileges || {}).map(([u, p]) => `${esc(u)}: ${p.map(esc).join(",").toLowerCase()}`).join("<br>") || `<span class="muted">admins only</span>`;
-    const key = (t.database || "") + "." + t.name;
-    return { key, html: `<tr data-key="${esc(key)}">
-      <td data-label="table"><b>${esc(t.database && t.database !== "datax" ? t.database + "." + t.name : t.name)}</b>${ts}</td>
-      <td data-label="columns" title="${esc(colList)}">${cols.length}</td>
-      <td class="key" data-label="primary key" title="${hiddenNames.size ? "led by the hidden shard column" : ""}">${pk.map(esc).join(", ")}</td>
-      <td data-label="indexes">${idx || "—"}</td>
-      <td class="num" data-label="rows">${rows}</td>
-      <td class="num" data-label="stats age">${age}</td>
-      <td class="num" data-label="ranges">${t.ranges}</td>
-      <td class="num" data-label="local size" title="${t.local_replicas} local replicas, ${t.leaders_here} led here">${fmtBytes(t.local_bytes || 0)}</td>
-      <td data-label="grants">${grants}</td>
-    </tr>` };
-  }));
-  const note = document.getElementById("schema-note");
-  note.textContent = (d.tables || []).length
-    ? `${(d.tables || []).length} tables in the one namespace (the connection URL's database name is accepted and ignored); local size counts this node's replicas only`
-    : (d.principal && d.principal.secure && !d.principal.admin ? "no tables granted to " + d.principal.user : "no tables yet");
-  const uw = document.getElementById("users-wrap");
-  if (d.users && d.users.length) {
-    uw.hidden = false;
-    renderKeyed(document.getElementById("users"), d.users.map(u => ({ key: u.name, html: `<tr data-key="${esc(u.name)}"><td>${esc(u.name)}</td><td>${u.admin ? '<span class="role">admin</span>' : "user"}</td></tr>` })));
-  } else uw.hidden = true;
-}
-async function pollSchema() {
-  const resp = await fetch("/api/schema", { cache: "no-store" });
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  renderSchema(await resp.json());
-}
-// SQL activity: connection states and statement counters from every
-// node's heartbeat (live for the serving node). Counters are cumulative,
-// so rates are differences between consecutive polls.
-const sqlPrev = new Map(); // node_id → {at, total, retries}
-function sumStatements(st) { return Object.values(st || {}).reduce((a, b) => a + b, 0); }
-function renderSQL(d) {
-  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
-  const now = Date.now();
-  let open = 0, active = 0, idleTxn = 0, stmtRate = 0, retryRate = 0, p99 = 0, p99Node = null, oldest = 0;
-  const rows = nodes.map(n => {
-    const q = n.sql;
-    if (!q) return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}"><td>n${n.node_id}</td><td colspan="6" class="muted">no SQL summary (older binary?)</td></tr>` };
-    open += q.open; active += q.active; idleTxn += q.idle_in_txn;
-    if ((q.oldest_idle_txn_ms || 0) > oldest) oldest = q.oldest_idle_txn_ms;
-    if (q.p99_us > p99) { p99 = q.p99_us; p99Node = n.node_id; }
-    const total = sumStatements(q.statements), prev = sqlPrev.get(n.node_id);
-    let rate = null, rrate = null;
-    if (prev && now > prev.at && total >= prev.total) {
-      const dt = (now - prev.at) / 1000;
-      rate = (total - prev.total) / dt;
-      rrate = (q.serialization_failures - prev.retries) / dt;
-      stmtRate += rate; retryRate += rrate;
-    }
-    sqlPrev.set(n.node_id, { at: now, total, retries: q.serialization_failures });
-    const mix = Object.entries(q.statements || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 4)
-      .map(([k, v]) => `${esc(k)} ${Math.round(100 * v / Math.max(total, 1))}%`).join(" · ");
-    const idle = q.oldest_idle_txn_ms ? warn(q.oldest_idle_txn_ms > 60000 ? "down" : q.oldest_idle_txn_ms > 10000 ? "draining" : "", fmtAgo(q.oldest_idle_txn_ms)) : "—";
-    return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}">
-      <td data-label="node">n${n.node_id}</td>
-      <td class="num" data-label="connections">${q.open} <span class="muted">(${q.active} / ${q.idle_in_txn})</span></td>
-      <td class="num" data-label="oldest idle txn">${idle}</td>
-      <td class="num" data-label="stmt/s">${rate === null ? "…" : rate.toFixed(1)}</td>
-      <td data-label="mix">${mix || "—"}</td>
-      <td class="num" data-label="40001/s">${rrate === null ? "…" : rrate.toFixed(2)}</td>
-      <td class="num" data-label="p50 / p99">${(q.p50_us / 1000).toFixed(1)} / ${(q.p99_us / 1000).toFixed(1)} ms</td>
-    </tr>` };
-  });
-  renderKeyed(document.getElementById("sql-nodes"), rows);
-  renderTiles(document.getElementById("sql-tiles"),
-    tile("connections", `${open} (${active} active, ${idleTxn} idle in txn)`) +
-    tile("statements/s", stmtRate.toFixed(1), "stmt", stmtRate) +
-    tile("40001/s", retryRate.toFixed(2), "retry", retryRate) +
-    tile("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms (n${p99Node})` : "—", "p99", p99 / 1000) +
-    tile("oldest idle txn", oldest ? fmtAgo(oldest) : "none"));
-  document.getElementById("sql-note").textContent = "rates are differences between polls; kinds: select, insert, update, delete, copy, txn (BEGIN/COMMIT/ROLLBACK/savepoints), ddl";
-}
-async function pollActivity() {
-  const box = document.getElementById("sql-detail");
-  const refuse = () => { box.hidden = false; setHTML(document.getElementById("sql-statements"), `<tr><td colspan="6" class="note">statements need the admin role — ${drillDownRefusal()}</td></tr>`); };
-  if (!canDrillDown()) { refuse(); return; }
-  const resp = await fetch("/api/activity", { cache: "no-store" });
-  if (resp.status === 403) { refuse(); return; }
-  if (!resp.ok) { box.hidden = true; throw new Error("HTTP " + resp.status); }
-  {
-    const a = await resp.json();
-    box.hidden = false;
-    const rows = [];
-    for (const st of a.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
-      <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}</td></tr>`);
-    for (const st of a.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
-      <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
-    setHTML(document.getElementById("sql-statements"), rows.join("") ||
-      `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${a.slow_threshold_ms} ms recently</td></tr>`);
-  }
-}
-// The network matrix: each row is one node's measured round trip to
-// every other node (from its heartbeat; the serving node's row is live),
-// colored by RTT, with that node's clock offset to each peer on hover
-// and the worst offset in the last column, judged against --max-offset.
-function fmtRTT(us) { return us < 1000 ? (us / 1000).toFixed(2) + " ms" : us < 100000 ? (us / 1000).toFixed(1) + " ms" : Math.round(us / 1000) + " ms"; }
-function fmtOffset(us) { const ms = us / 1000; return (ms >= 0 ? "+" : "") + (Math.abs(ms) < 10 ? ms.toFixed(2) : ms.toFixed(0)) + " ms"; }
-function renderNetwork(d) {
-  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
-  const table = document.getElementById("latency");
-  const note = document.getElementById("latency-note");
-  if (nodes.length < 2) { setHTML(table, ""); setHTML(document.getElementById("latency-worst"), ""); note.textContent = "one node: nothing to measure"; return; }
-  const maxOff = (d.max_offset_ms || 0) * 1000; // µs
-  // The worst pairs — unreachable first, then the slowest round trips
-  // and the largest clock offsets — for narrow screens, where an n×n
-  // matrix does not fit (and the better view past ~10 nodes anywhere).
-  const pairs = [];
-  for (const from of nodes) for (const l of from.latency || []) pairs.push({ from: from.node_id, to: l.peer, l });
-  pairs.sort((a, b) => (b.l.reachable ? 0 : 1) - (a.l.reachable ? 0 : 1) || (b.l.rtt_us || 0) - (a.l.rtt_us || 0));
-  const worstOff = pairs.filter(p => p.l.reachable).sort((a, b) => Math.abs(b.l.offset_us) - Math.abs(a.l.offset_us)).slice(0, 3);
-  const shown = [...new Set([...pairs.slice(0, 5), ...worstOff])];
-  setHTML(document.getElementById("latency-worst"), shown.map(p => `<tr data-key="${p.from}-${p.to}">
-    <td data-label="pair">n${p.from} → n${p.to}</td>
-    <td class="num" data-label="round trip">${p.l.reachable ? fmtRTT(p.l.rtt_us) : `<span class="st down">✕ unreachable</span>`}</td>
-    <td class="num" data-label="clock offset">${p.l.reachable ? fmtOffset(p.l.offset_us) : "—"}</td>
-  </tr>`).join("") || `<tr><td colspan="3" class="muted">no measurements yet</td></tr>`);
-  let html = `<thead><tr><th>from \\ to</th>` + nodes.map(n => `<th class="num">n${n.node_id}</th>`).join("") +
-    `<th class="num" title="largest clock offset this node measured to any peer, vs the tolerated --max-offset">clock offset</th></tr></thead><tbody>`;
-  for (const from of nodes) {
-    const row = new Map((from.latency || []).map(l => [l.peer, l]));
-    let worst = null;
-    html += `<tr><td>n${from.node_id}</td>`;
-    for (const to of nodes) {
-      if (to.node_id === from.node_id) { html += `<td class="num muted">—</td>`; continue; }
-      const l = row.get(to.node_id);
-      if (!l) { html += `<td class="num muted" title="no measurement yet">·</td>`; continue; }
-      if (!l.reachable) { html += `<td class="num"><span class="st down">✕ unreachable</span></td>`; continue; }
-      if (worst === null || Math.abs(l.offset_us) > Math.abs(worst)) worst = l.offset_us;
-      const lvl = l.rtt_us < 2000 ? "live" : l.rtt_us < 20000 ? "draining" : "down";
-      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtAgo(l.age_ms)}"><span class="st ${lvl}">${fmtRTT(l.rtt_us)}</span></td>`;
-    }
-    if (worst === null) html += `<td class="num muted">—</td>`;
-    else {
-      const a = Math.abs(worst);
-      const lvl = maxOff && a >= maxOff ? "down" : maxOff && a >= maxOff / 2 ? "draining" : "";
-      html += `<td class="num">${lvl ? `<span class="st ${lvl}">${fmtOffset(worst)}</span>` : fmtOffset(worst)}</td>`;
-    }
-    html += `</tr>`;
-  }
-  if (setHTML(table, html + "</tbody>")) a11yTables(table.parentElement);
-  note.textContent = "round trip from row node to column node (smoothed; hover for p99 and clock offset); pinged every 2s" +
-    (d.max_offset_ms ? `; clock offsets are judged against the tolerated ${d.max_offset_ms} ms` : "");
-}
-// Cross-node drill-down: clicking a cluster range fetches /api/range?id=N
-// (admin role) — every holding node's view of that range over internode
-// RPC. The open detail row survives the 3s re-render (cached HTML) and is
-// refreshed only on click.
-// spanText renders a range's span: keys are already human-readable
-// (/table/orders/primary/42); inside a labeled table the table part is
-// dropped so the row reads "orders · /primary/42 → /primary/99".
-function spanText(r) {
-  let s = r.start_key || "", e = r.end_key || "";
-  if (r.table) {
-    const p = "/table/" + r.table;
-    const trim = k => k === p ? "/" : (k.startsWith(p + "/") ? k.slice(p.length) : k);
-    s = trim(s); e = trim(e);
-    return `<b>${esc(r.table)}</b> · ${esc(s)} → ${esc(e)}`;
-  }
-  return `${esc(s)} → ${esc(e)}`;
-}
-let openRange = null;
-function renderClusterRanges(ranges) {
-  const admin = canDrillDown();
-  const hint = document.getElementById("cluster-range-hint");
-  setHTML(hint, admin
-    ? "click a range, or focus it and press Enter, for its per-replica detail from every holding node (admin role)"
-    : `per-replica detail needs the admin role — ${drillDownRefusal()}`);
-  const items = [];
-  for (const r of ranges.filter(matchesFilter).slice().sort((a, b) => a.range_id - b.range_id)) {
-    items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
-      <td>r${r.range_id}</td>
-      <td class="key">${spanText(r)}</td>
-      <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
-    </tr>` });
-    // The open detail row is its own element, filled by its fetch and
-    // left alone by re-renders (its identity survives them).
-    if (r.range_id === openRange) items.push({ key: "d" + r.range_id, html: null });
-  }
-  renderKeyed(document.getElementById("cluster-ranges"), items);
-}
-{
-  const tbody = document.getElementById("cluster-ranges");
-  const rangeOf = ev => { const tr = ev.target.closest("tr.clickable"); return tr && tbody.contains(tr) ? Number(tr.dataset.range) : null; };
-  tbody.addEventListener("click", ev => { const id = rangeOf(ev); if (id !== null && !ev.target.closest("tr.detailrow")) toggleRangeDetail(id); });
-  tbody.addEventListener("keydown", ev => { if (ev.key !== "Enter" && ev.key !== " ") return; const id = rangeOf(ev); if (id !== null) { ev.preventDefault(); toggleRangeDetail(id); } });
-}
-function detailRowFor(id) {
-  const tbody = document.getElementById("cluster-ranges");
-  let el = tbody.querySelector(`tr[data-key="d${id}"]`);
-  if (!el) {
-    el = document.createElement("tr");
-    el.className = "detailrow"; el.dataset.key = "d" + id;
-    el.innerHTML = `<td class="detail" colspan="3"></td>`;
-    const row = tbody.querySelector(`tr[data-key="r${id}"]`);
-    if (row) row.after(el); else tbody.appendChild(el);
-  }
-  return el.firstElementChild;
-}
-async function toggleRangeDetail(id) {
-  if (openRange === id) {
-    openRange = null;
-    document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${id}"]`)?.remove();
-    if (lastCluster) render(lastCluster);
-    return;
-  }
-  if (openRange !== null) document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${openRange}"]`)?.remove();
-  openRange = id;
-  if (lastCluster) render(lastCluster);
-  const cell = detailRowFor(id);
-  cell.innerHTML = `<div class="note">loading r${id}…</div>`;
-  try {
-    const resp = await fetch("/api/range?id=" + id, { cache: "no-store" });
-    if (resp.status === 403) {
-      cell.innerHTML = `<div class="note">${drillDownRefusal()}</div>`;
-    } else if (!resp.ok) {
-      cell.innerHTML = `<div class="note">error: HTTP ${resp.status}</div>`;
-    } else {
-      const d = await resp.json();
-      cell.innerHTML = `<table>
-        <caption class="sr-only">Range r${id}: per-replica detail</caption>
-        <thead><tr><th scope="col">node</th><th scope="col">status</th><th scope="col">locality</th><th scope="col">leader</th>
-          <th scope="col" class="num">applied</th><th scope="col" class="num">size</th><th scope="col" class="num">qps</th>
-          <th scope="col">closed ts</th></tr></thead>
-        <tbody>` + (d.replicas || []).map(rep => {
-          if (rep.error) return `<tr><td>n${rep.node_id}</td>
-            <td>${statusCell({ live: rep.live })}</td>
-            <td>${esc(rep.locality || "—")}</td>
-            <td colspan="5" class="key">${esc(rep.error)}</td></tr>`;
-          const s = rep.status || {};
-          return `<tr>
-            <td>n${rep.node_id}</td>
-            <td>${statusCell({ live: rep.live })}</td>
-            <td>${esc(rep.locality || "—")}</td>
-            <td>${s.leader ? "★ leader" : ""}</td>
-            <td class="num">${s.applied_index ?? ""}</td>
-            <td class="num">${fmtBytes(s.size_bytes || 0)}</td>
-            <td class="num">${s.qps ? s.qps.toFixed(0) : "0"}</td>
-            <td class="key">${esc(s.closed_timestamp || "—")}</td>
-          </tr>`;
-        }).join("") + `</tbody></table>`;
-    }
-  } catch (err) {
-    cell.innerHTML = `<div class="note">error: ${esc(err.message || err)}</div>`;
-  }
-}
-// Problems panel: from the overview's health section. Rows link to the
-// dashboard section that shows the underlying figure.
-const SECTION_NAMES = { nodes: "nodes", network: "network", schema: "schema", "cluster-ranges": "ranges", storage: "this node's storage", events: "this node's events" };
-// Sections that describe the serving node live on its node page (#145).
-const NODE_SECTIONS = { storage: true, events: true };
-// renderHealth draws the problems panel from a /api/health document (the
-// overview poll carries one), and puts the cluster's severity where an
-// operator with thirty tabs can see it (issue #150): the favicon takes
-// the colour of the worst open problem — steady, never animated — and
-// the title carries the count: "(2) datax — n1".
-const SEVERITY_RANK = { critical: 3, warning: 2, info: 1 };
-let lastSeverity = null;
-function renderHealth(h) {
-  const box = document.getElementById("problems");
-  const probs = h.problems || [];
-  if (!probs.length) {
-    renderKeyed(box, [{ key: "ok", html: `<span class="ok" data-key="ok">✓ no problems found (${h.checks} checks)</span>` }]);
-  } else {
-    renderKeyed(box, probs.map(p => ({ key: p.check + ":" + p.summary, html: `<div class="problem ${esc(p.severity)}" data-key="${esc(p.check + ":" + p.summary)}">
-      <span class="sev">${esc(p.severity)}</span>
-      <span class="check">${esc(p.check)}</span>
-      <span>${esc(p.summary)}</span>
-      ${p.section ? `<a href="${NODE_SECTIONS[p.section] && lastCluster ? "#/node/" + lastCluster.node_id : "#sec-" + esc(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} ${NODE_SECTIONS[p.section] ? "→" : "↓"}</a>` : ""}
-    </div>` })));
-  }
-  const worst = probs.reduce((w, p) => (SEVERITY_RANK[p.severity] || 0) > (SEVERITY_RANK[w] || 0) ? p.severity : w, "");
-  const open = probs.filter(p => p.severity !== "info").length;
-  const node = lastCluster ? "n" + lastCluster.node_id : "";
-  document.title = (open ? `(${open}) ` : "") + "datax" + (node ? " — " + node : "");
-  if (worst !== lastSeverity) {
-    lastSeverity = worst;
-    const css = getComputedStyle(document.documentElement);
-    drawFavicon((worst === "critical" ? css.getPropertyValue("--critical") : worst === "warning" ? css.getPropertyValue("--warning") : css.getPropertyValue("--good")).trim() || "#8a897f");
-  }
-}
-// drawFavicon paints a disc of the given colour into the tab icon — on a
-// canvas, so the page embeds no asset and references no URL. A
-// half-opacity outline reads on light and dark browser chrome alike.
-function drawFavicon(fill) {
-  const c = document.createElement("canvas");
-  c.width = c.height = 32;
-  const g = c.getContext("2d");
-  if (!g) return;
-  g.beginPath(); g.arc(16, 16, 13, 0, 2 * Math.PI);
-  g.fillStyle = fill; g.fill();
-  g.lineWidth = 2; g.strokeStyle = "rgba(0,0,0,.35)"; g.stroke();
-  try { document.getElementById("favicon").href = c.toDataURL("image/png"); } catch (err) { /* no canvas: keep the default icon */ }
-}
-drawFavicon("#8a897f");
-function healthUnavailable(err) {
-  setHTML(document.getElementById("problems"), `<span class="muted">health checks unavailable: ${esc(err)}</span>`);
-}
-// ---- Metrics view: /#/metrics?series=a,b&range=1h&nodes=1,2&rate=1&compare=1 ----
-// Charts the datax_metrics table through /api/metrics: one chart per
-// series with one line per node (categorical slots 1-8 by node ID; a
-// ninth node or beyond draws in gray), y from zero for gauges, a
-// crosshair readout with every node's exact value at that time, and a
-// gap where a node recorded nothing (a restart is a gap, not a fall to
-// zero). Counters are charted as rates.
-const RANGES = ["15m", "1h", "6h", "24h", "7d"];
-const RANGE_SECONDS = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
-const DEFAULT_SERIES = ["node.leader_qps", "node.cpu_percent", "sql.statements", "store.compaction_debt"];
-const mv = { range: "1h", series: [], nodes: null, rate: true, compare: false, catalog: null, data: null };
-function nodeColor(id) { id = Number(id); return id >= 1 && id <= 8 ? `var(--series-${id})` : "var(--text-3)"; }
-function parseRoute() {
-  const h = location.hash.replace(/^#\/?/, "");
-  const q = h.indexOf("?");
-  const path = q < 0 ? h : h.slice(0, q);
-  const node = path.match(/^node\/(\d+)$/);
-  const view = path === "metrics" ? "metrics" : node ? "node" : "main";
-  return { view, node: node ? Number(node[1]) : 0, params: new URLSearchParams(q < 0 ? "" : h.slice(q + 1)) };
-}
-function route() {
-  const r = parseRoute();
-  document.getElementById("view-main").hidden = r.view !== "main";
-  document.getElementById("view-metrics").hidden = r.view !== "metrics";
-  document.getElementById("view-node").hidden = r.view !== "node";
-  document.getElementById("nav-main").classList.toggle("current", r.view !== "metrics");
-  document.getElementById("nav-metrics").classList.toggle("current", r.view === "metrics");
-  if (r.view === "node") { nv.id = r.node; nv.chartsAt = 0; }
-  if (r.view === "metrics") {
-    const p = r.params;
-    if (p.get("series")) mv.series = p.get("series").split(",").filter(Boolean);
-    if (mv.series.length === 0) mv.series = DEFAULT_SERIES.slice();
-    if (p.get("range") && RANGE_SECONDS[p.get("range")]) mv.range = p.get("range");
-    mv.nodes = p.get("nodes") ? p.get("nodes").split(",").filter(Boolean) : null;
-    mv.compare = p.get("compare") === "1";
-    mv.rate = p.get("rate") !== "0";
-    document.getElementById("compare-toggle").checked = mv.compare;
-    loadCatalog().then(renderPickers);
-  }
-  // One place starts and stops every poll: the view's tasks run (the
-  // first pass at once), everything else stops.
-  applySchedule(r.view);
-}
-function pushRoute() {
-  const p = new URLSearchParams();
-  p.set("series", mv.series.join(","));
-  p.set("range", mv.range);
-  if (mv.nodes) p.set("nodes", mv.nodes.join(","));
-  if (mv.compare) p.set("compare", "1");
-  if (!mv.rate) p.set("rate", "0");
-  history.replaceState(null, "", "#/metrics?" + p.toString());
-}
-async function loadCatalog() {
-  if (mv.catalog) return;
-  try {
-    const resp = await fetch("/api/metrics", { cache: "no-store" });
-    if (resp.ok) mv.catalog = await resp.json();
-  } catch (err) { /* rendered as unavailable below */ }
-}
-// The picker lists every series the recorder writes, grouped; a
-// labelled series expands to the label values this node knows.
-function seriesChoices() {
-  const out = [];
-  if (!mv.catalog) return out;
-  for (const def of mv.catalog.series || []) {
-    if (!def.label) { out.push({ name: def.name, def }); continue; }
-    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def });
-  }
-  return out;
-}
-function renderPickers() {
-  const rp = document.getElementById("range-picker");
-  rp.innerHTML = RANGES.map(r => `<button data-range="${r}" class="${r === mv.range ? "on" : ""}">${r}</button>`).join("");
-  rp.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { mv.range = b.dataset.range; renderPickers(); pushRoute(); fetchMetrics(); }));
-  const sp = document.getElementById("series-picker");
-  const choices = seriesChoices();
-  const groups = new Map();
-  for (const c of choices) { if (!groups.has(c.def.group)) groups.set(c.def.group, []); groups.get(c.def.group).push(c); }
-  let html = "";
-  for (const [g, items] of groups) {
-    html += `<h4>${esc(g)}</h4>` + items.map(c => `<label><input type="checkbox" value="${esc(c.name)}" ${mv.series.includes(c.name) ? "checked" : ""}> ${esc(c.name)} <span class="h">${esc(c.def.kind === "counter" ? "rate" : c.def.unit || "")}</span></label>`).join("");
-  }
-  sp.innerHTML = html || `<span class="muted">${mv.catalog ? "no series" : "the metrics catalog is unavailable"}</span>`;
-  document.getElementById("series-summary").textContent = `choose series (${mv.series.length} of ${choices.length} selected)`;
-  document.getElementById("series-details").open = mv.series.length === 0;
-  sp.querySelectorAll("input").forEach(cb => cb.addEventListener("change", () => {
-    mv.series = [...sp.querySelectorAll("input:checked")].map(x => x.value);
-    pushRoute(); fetchMetrics();
-  }));
-  const note = document.getElementById("metrics-note");
-  if (mv.catalog && !mv.catalog.enabled) note.textContent = "recording is disabled on this node (--metrics-record-interval 0)";
-  else if (mv.catalog && !mv.catalog.ready) note.textContent = "the datax_metrics table does not exist yet: recording starts once the cluster has finalized v5";
-  else if (mv.catalog) note.textContent = `from the datax_metrics table, recorded every ${mv.catalog.interval_seconds}s per node; the same data by SQL: SELECT at, value FROM datax_metrics WHERE node = 1 AND name = '…' ORDER BY at`;
-}
-async function fetchMetrics() {
-  const box = document.getElementById("charts");
-  if (mv.series.length === 0) { box.innerHTML = `<div class="muted">pick a series above</div>`; return; }
-  try {
-    const p = new URLSearchParams({ series: mv.series.join(","), since: RANGE_SECONDS[mv.range] + "s" });
-    if (mv.rate) p.set("rate", "1");
-    if (mv.nodes) p.set("node", mv.nodes.join(","));
-    const resp = await fetch("/api/metrics?" + p.toString(), { cache: "no-store" });
-    if (!resp.ok) {
-      const e = await resp.json().catch(() => ({}));
-      box.innerHTML = `<div class="err" style="display:block">${esc(e.error || ("HTTP " + resp.status))}</div>`;
-      return;
-    }
-    mv.data = await resp.json();
-    renderCharts();
-  } catch (err) {
-    box.innerHTML = `<div class="err" style="display:block">metrics unavailable: ${esc(err.message || err)}</div>`;
-  }
-}
-function fmtUnit(v, unit) {
-  if (v === null || v === undefined) return "—";
-  switch (unit) {
-    case "bytes": return fmtBytes(Math.max(0, v));
-    case "bytes/s": return fmtBytes(Math.max(0, v)) + "/s";
-    case "percent": return pct(v);
-    case "us": return Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + " ms" : v.toFixed(0) + " µs";
-    case "us/s": return (v / 1000).toFixed(1) + " ms/s";
-    case "/s": return v.toFixed(v < 10 ? 2 : 0) + "/s";
-    default: return Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
-  }
-}
-function fmtTime(ms, long) {
-  const d = new Date(ms), hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0");
-  return long ? `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}` : `${hh}:${mm}`;
-}
-function renderCharts() {
-  const box = document.getElementById("charts");
-  box.classList.toggle("compare", mv.compare);
-  box.innerHTML = "";
-  const d = mv.data;
-  for (const s of d.series || []) {
-    const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
-    if (mv.compare && ids.length > 1) {
-      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d));
-    } else {
-      box.appendChild(chart(s, s.nodes || {}, "", d));
-    }
-  }
-  if (!box.children.length) box.innerHTML = `<div class="muted">nothing to chart</div>`;
-}
-// chart builds one panel: inline SVG, recessive grid, 2px lines, a
-// legend of node line-keys, the crosshair tooltip, and a table view.
-function chart(s, nodes, suffix, win) {
-  const el = document.createElement("div");
-  el.className = "chart";
-  const unit = s.rate ? (s.unit || "/s") : s.unit;
-  const ids = Object.keys(nodes).sort((a, b) => a - b);
-  const W = 800, H = 200, L = 58, R = 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
-  const from = win.from_ms, to = win.to_ms, step = win.step_ms;
-  let min = 0, max = 0, any = false;
-  for (const id of ids) for (const p of nodes[id]) { any = true; if (p[1] > max) max = p[1]; if (p[1] < min) min = p[1]; }
-  if (max === min) max = min + 1;
-  max = max + (max - min) * 0.05;
-  const x = t => L + (t - from) / (to - from) * PW;
-  const y = v => T + (max - v) / (max - min) * PH;
-  const label = (id) => id === "0" ? "cluster" : "n" + id;
-  let title = `<div class="title"><b>${esc(s.name)}${esc(suffix)}</b><span>${esc(s.rate ? "per second" : unit || "")}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span></div>`;
-  if (!any) { el.innerHTML = title + `<div class="empty">no samples in this range</div>`; return el; }
-  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(s.name)} over time"><g class="grid">`;
-  const ticks = 4;
-  for (let i = 0; i <= ticks; i++) {
-    const v = min + (max - min) * i / ticks, yy = y(v).toFixed(1);
-    svg += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}"/>`;
-  }
-  svg += `</g><g class="axis">`;
-  for (let i = 0; i <= ticks; i++) {
-    const v = min + (max - min) * i / ticks;
-    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtUnit(v, unit))}</text>`;
-  }
-  const long = to - from > 36 * 3600 * 1000;
-  for (let i = 0; i <= 4; i++) {
-    const t = from + (to - from) * i / 4;
-    svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fmtTime(t, long))}</text>`;
-  }
-  svg += `</g>`;
-  for (const id of ids) {
-    let dpath = "", prev = null;
-    for (const p of nodes[id]) {
-      const gap = prev !== null && p[0] - prev > 2 * step;
-      dpath += (prev === null || gap ? "M" : "L") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1);
-      prev = p[0];
-    }
-    svg += `<path class="line" stroke="${nodeColor(id)}" d="${dpath}"/>`;
-  }
-  svg += `<line class="xhair" y1="${T}" y2="${T + PH}"/>`;
-  for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;
-  svg += `<rect class="hit" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
-  let legend = ids.length > 1 ? `<div class="legend">` + ids.map(id => `<span><i style="background:${nodeColor(id)}"></i>${label(id)}</span>`).join("") + `</div>` : "";
-  let table = `<details><summary>as a table</summary><div class="tablewrap"><table><thead><tr><th>time</th>` + ids.map(id => `<th class="num">${label(id)}</th>`).join("") + `</tr></thead><tbody>`;
-  const times = [...new Set(ids.flatMap(id => nodes[id].map(p => p[0])))].sort((a, b) => b - a).slice(0, 30);
-  const byT = {}; for (const id of ids) { byT[id] = new Map(nodes[id].map(p => [p[0], p[1]])); }
-  for (const t of times) table += `<tr><td>${esc(fmtTime(t, true))}</td>` + ids.map(id => `<td class="num">${esc(byT[id].has(t) ? fmtUnit(byT[id].get(t), unit) : "—")}</td>`).join("") + `</tr>`;
-  table += `</tbody></table></div></details>`;
-  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + table;
-  // Crosshair: snap to the nearest bucket; the readout lists every node.
-  const svgEl = el.querySelector("svg"), hit = el.querySelector(".hit"), xh = el.querySelector(".xhair"), tip = el.querySelector(".tip");
-  const dots = {}; el.querySelectorAll(".dot").forEach(c => dots[c.dataset.node] = c);
-  hit.addEventListener("pointermove", ev => {
-    const r = svgEl.getBoundingClientRect();
-    const px = (ev.clientX - r.left) / r.width * W;
-    let t = from + Math.round((px - L) / PW * (to - from) / step) * step;
-    t = Math.max(from, Math.min(to, t));
-    xh.setAttribute("x1", x(t)); xh.setAttribute("x2", x(t)); xh.style.display = "block";
-    tip.replaceChildren();
-    const tt = document.createElement("div"); tt.className = "t"; tt.textContent = fmtTime(t, true); tip.appendChild(tt);
-    for (const id of ids) {
-      const v = byT[id].get(t);
-      const dot = dots[id];
-      if (v === undefined) { dot.style.display = "none"; continue; }
-      dot.setAttribute("cx", x(t)); dot.setAttribute("cy", y(v)); dot.style.display = "block";
-      const row = document.createElement("div"); row.className = "r";
-      const k = document.createElement("span"); const key = document.createElement("i"); key.style.cssText = `display:inline-block;width:12px;height:2px;margin-right:5px;vertical-align:middle;background:${nodeColor(id)}`;
-      k.appendChild(key); k.appendChild(document.createTextNode(label(id)));
-      const b = document.createElement("b"); b.textContent = fmtUnit(v, unit);
-      row.appendChild(b); row.appendChild(k); tip.appendChild(row);
-    }
-    tip.style.display = "block";
-    const left = (ev.clientX - r.left) + 14, flip = left + 160 > r.width;
-    tip.style.left = flip ? (ev.clientX - r.left - 14 - tip.offsetWidth) + "px" : left + "px";
-    tip.style.top = (ev.clientY - r.top + 20) + "px";
-  });
-  hit.addEventListener("pointerleave", () => { xh.style.display = "none"; tip.style.display = "none"; for (const id of ids) dots[id].style.display = "none"; });
-  return el;
-}
-// ---- Node detail: /#/node/N ----
-// /api/node?id=N is the node's own document when N is the serving node,
-// else fetched from N over the internode RPC (admin role). Its recent
-// history is the last 15 minutes from the datax_metrics table.
-const nv = { id: 0, chartsAt: 0 };
-const NODE_CHART_SERIES = ["node.cpu_percent", "node.leader_qps", "sql.statements", "kv.batch_p99_us"];
-async function pollNode() {
-  const id = nv.id;
-  const errBox = document.getElementById("node-err");
-  document.getElementById("node-title").textContent = `Node n${id}`;
-  document.getElementById("node-metrics-link").href = `#/metrics?nodes=${id}&range=1h`;
-  try {
-    const resp = await fetch("/api/node?id=" + id, { cache: "no-store" });
-    const d = await resp.json();
-    if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
-    renderNode(d);
-    if (Date.now() - nv.chartsAt > 30000) { nv.chartsAt = Date.now(); pollNodeCharts(id); }
-  } catch (err) {
-    errBox.style.display = "block";
-    errBox.innerHTML = /admin role/.test(err.message) ? drillDownRefusal() : esc(err.message || err);
-    if (!/admin role/.test(err.message)) throw err;
-  }
-}
-function renderNode(d) {
-  const errBox = document.getElementById("node-err");
-  if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
-  else errBox.style.display = "none";
-  const st = d.status || {};
-  renderTiles(document.getElementById("node-ident"),
-    tile("status", (d.live ? (d.draining ? "draining" : "live") : "down") + (d.heartbeat_ago_ms ? " · heartbeat " + fmtAgo(d.heartbeat_ago_ms) : "")) +
-    tile("address", d.address || "—") +
-    tile("sql", d.sql_address || "—") +
-    tile("locality", d.locality || "—") +
-    tile("version", (d.release ? "v" + d.release + " · " : "") + "protocol v" + (d.binary_version || 1) + (d.cluster_version ? " · cluster v" + d.cluster_version : "")) +
-    tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—") +
-    tile("replicas", (st.ranges || []).length + (st.leader_of !== undefined ? " · leads " + st.leader_of : "")));
-  const lm = st.machine;
-  if (lm) renderTiles(document.getElementById("node-machine"), machineTiles(lm)); else setHTML(document.getElementById("node-machine"), `<span class="muted">no machine sample</span>`);
-  document.getElementById("node-machine-note").textContent = lm && (lm.unavailable || []).length ? "not available on this platform: " + lm.unavailable.join(", ") : "";
-  renderTiles(document.getElementById("node-storage"), storageTiles(d.storage || {}) +
-    tile("debt gate", d.debt_gated ? "latched" : "open" + (d.debt_gate_entries ? " · " + d.debt_gate_entries + " entries" : "")) +
-    tile("overload", d.overloaded ? "shedding: " + (d.overload_reason || "") : "no") +
-    tile("encryption", d.encrypted ? (d.reencryption && d.reencryption.active ? "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left" : "encrypted at rest") : "plaintext") +
-    (d.store_prefix_bloom ? tile("prefix bloom filters", d.prefix_bloom_rewrite && d.prefix_bloom_rewrite.remaining_files ? `rewriting ${d.prefix_bloom_rewrite.remaining_files} legacy tables` : "on") : ""));
-  document.getElementById("node-storage-note").textContent = d.reencryption && d.reencryption.sweep_error ? "re-encryption sweep error: " + d.reencryption.sweep_error : "";
-  const ranges = (st.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
-  renderKeyed(document.getElementById("node-ranges"), ranges.length
-    ? ranges.map(r => ({ key: "r" + r.range_id, html: rangeRow(r, "this node", x => String(Math.max(0, (x.applied_index || 0) - (x.truncated_index || 0)))) }))
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="8" class="muted">no replicas</td></tr>` }]);
-  const q = d.sql;
-  renderTiles(document.getElementById("node-sql"), q
-    ? tile("connections", `${q.open} (${q.active} active, ${q.idle_in_txn} idle in txn)`) +
-      tile("statements", Object.values(q.statements || {}).reduce((a, b) => a + b, 0) + " total") +
-      tile("40001", q.serialization_failures + " total") +
-      tile("plan cache", (q.plan_cache_hits + q.plan_cache_misses) ? `${(100 * q.plan_cache_hits / (q.plan_cache_hits + q.plan_cache_misses)).toFixed(0)}% hits (${q.plan_cache_hits} / ${q.plan_cache_hits + q.plan_cache_misses})` : "no statements planned") +
-      tile("p50 / p99", `${(q.p50_us / 1000).toFixed(1)} / ${(q.p99_us / 1000).toFixed(1)} ms`)
-    : `<span class="muted">no SQL listener</span>`);
-  const act = d.activity, box = document.getElementById("node-activity");
-  if (act) {
-    box.hidden = false;
-    const rows = [];
-    for (const s of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(s.text)}</td></tr>`);
-    for (const s of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}</td></tr>`);
-    setHTML(document.getElementById("node-statements"), rows.join("") || `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently</td></tr>`);
-    document.getElementById("node-sql-note").textContent = "";
-  } else {
-    box.hidden = true;
-    document.getElementById("node-sql-note").textContent = q ? "statements in flight and slow statements need the admin role" : "";
-  }
-  renderKeyed(document.getElementById("node-latency"), (d.latency || []).slice().sort((a, b) => a.peer - b.peer).map(l => ({ key: "n" + l.peer, html: `<tr data-key="n${l.peer}">
-    <td>n${l.peer}</td>
-    <td class="num">${l.reachable ? fmtRTT(l.rtt_us) : "—"}</td>
-    <td class="num">${l.reachable ? fmtRTT(l.p99_us) : "—"}</td>
-    <td class="num">${l.reachable ? fmtOffset(l.offset_us) : "—"}</td>
-    <td>${l.reachable ? `<span class="st live"><span class="dot"></span>yes</span>` : `<span class="st down"><span class="dot"></span>no</span>`}</td>
-    <td class="num">${l.age_ms >= 0 ? fmtAgo(l.age_ms) : "never"}</td>
-  </tr>` })).concat((d.latency || []).length ? [] : [{ key: "none", html: `<tr data-key="none"><td colspan="6" class="muted">no peers measured</td></tr>` }]));
-  renderKeyed(document.getElementById("node-settings"), Object.entries(d.settings || {}).sort().map(([k, v]) => ({ key: k, html: `<tr data-key="${esc(k)}"><td>${esc(k)}</td><td class="key">${esc(v)}</td></tr>` })));
-  const evs = (d.events || []).slice().reverse();
-  renderKeyed(document.getElementById("node-events"), evs.length
-    ? evs.map(e => ({ key: String(e.seq), html: `<tr data-key="${e.seq}">
-    <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
-    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
-    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
-  </tr>` }))
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
-}
-async function pollNodeCharts(id) {
-  const box = document.getElementById("node-charts");
-  try {
-    const resp = await fetch(`/api/metrics?series=${NODE_CHART_SERIES.join(",")}&node=${id}&since=15m&rate=1`, { cache: "no-store" });
-    if (!resp.ok) { const e = await resp.json().catch(() => ({})); box.innerHTML = `<span class="muted">${esc(e.error || "history unavailable")}</span>`; return; }
-    const d = await resp.json();
-    box.innerHTML = "";
-    for (const s of d.series || []) box.appendChild(chart(s, s.nodes || {}, "", d));
-  } catch (err) { box.innerHTML = `<span class="muted">history unavailable: ${esc(err.message || err)}</span>`; }
-}
-// ---- Polling: one scheduler owns every periodic fetch (issue #147) ----
-// A task names the views that need it and its interval; route() hands
-// the scheduler the current view and it starts what that view needs (a
-// first fetch at once) and stops the rest, so the Metrics view fetches
-// no schema and no statements. A hidden tab polls nothing and fetches
-// everything once the moment it is shown. A failing fetch backs off
-// exponentially (capped at a minute) and the header says so: how long
-// since the last good update, and when the next try is.
-const sched = { tasks: new Map(), view: "main", visible: document.visibilityState !== "hidden" };
-function task(name, fn, every, views) { sched.tasks.set(name, { name, fn, every, views: new Set(views), timer: null, failures: 0, running: false, next: 0, lastOK: 0, lastErr: "" }); }
-function armTask(t) {
-  clearTimeout(t.timer); t.timer = null;
-  if (!sched.visible || !t.views.has(sched.view)) return;
-  const delay = t.failures ? Math.min(t.every * 2 ** t.failures, 60000) : t.every;
-  t.next = Date.now() + delay;
-  t.timer = setTimeout(() => runTask(t), delay);
-}
-async function runTask(t) {
-  if (t.running) return;
-  clearTimeout(t.timer); t.timer = null;
-  t.running = true;
-  try { await t.fn(); t.failures = 0; t.lastOK = Date.now(); t.lastErr = ""; }
-  catch (err) { t.failures++; t.lastErr = err && err.message || String(err); }
-  finally { t.running = false; armTask(t); renderStaleness(); }
-}
-function runNow(name) { const t = sched.tasks.get(name); if (t) runTask(t); }
-function applySchedule(view) {
-  sched.view = view;
-  for (const t of sched.tasks.values()) {
-    if (!t.views.has(view) || !sched.visible) { clearTimeout(t.timer); t.timer = null; continue; }
-    if (!t.timer && !t.running) runTask(t);
-  }
-}
-document.addEventListener("visibilitychange", () => {
-  sched.visible = document.visibilityState !== "hidden";
-  applySchedule(sched.view);
-});
-// The header's staleness pill: the view's primary task decides.
-const PRIMARY_TASK = { main: "overview", node: "node", metrics: "metrics" };
-function renderStaleness() {
-  const t = sched.tasks.get(PRIMARY_TASK[sched.view]);
-  const el = document.getElementById("hdr-stale");
-  if (!t || !t.failures) { el.style.display = "none"; return; }
-  const since = t.lastOK ? fmtAgo(Date.now() - t.lastOK) + " ago" : "never";
-  const retry = Math.max(0, Math.round((t.next - Date.now()) / 1000));
-  el.textContent = `● stale — last updated ${since} · retrying in ${retry}s` + (t.lastErr ? ` (${t.lastErr})` : "");
-  el.style.display = "inline";
-}
-setInterval(renderStaleness, 1000);
-// The overview: one document — the cluster, the health problems and the
-// event tail — instead of a request per section.
-async function pollOverview() {
-  const resp = await fetch("/api/overview", { cache: "no-store" });
-  // The session lapsed (or the role lost LOGIN) while the page was
-  // open: the server has already cleared the cookie, so a reload lands
-  // on the sign-in page rather than polling 401s forever (issue #158).
-  if (resp.status === 401) { location.reload(); return; }
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  const d = await resp.json();
-  lastCluster = d.cluster;
-  render(d.cluster);
-  if (d.health) renderHealth(d.health); else healthUnavailable((d.errors || {}).health || "no health section");
-  // The node serves a newer console than this tab runs (a rolling
-  // upgrade under a long-lived tab): offer a reload, once.
-  if (d.cluster.console_version && d.cluster.console_version !== CONSOLE_VERSION)
-    document.getElementById("hdr-reload").style.display = "inline";
-}
-task("overview", pollOverview, 3000, ["main"]);
-task("schema", pollSchema, 10000, ["main"]);
-task("activity", pollActivity, 3000, ["main"]);
-task("tileHistory", pollTileHistory, 30000, ["main"]);
-task("node", pollNode, 5000, ["node"]);
-task("metrics", fetchMetrics, 15000, ["metrics"]);
-window.addEventListener("hashchange", route);
-document.getElementById("compare-toggle").addEventListener("change", ev => { mv.compare = ev.target.checked; pushRoute(); renderCharts(); });
-a11yTables();
-route();
-</script>
+</div>
+<script>__CONSOLE_SCRIPTS__</script>
 </body>
 </html>

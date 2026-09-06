@@ -8,6 +8,36 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.46.0 — unreleased
+
+### Fixed
+- The console showed the overview's sections underneath every other
+  view, and the node page's own SQL, network, settings and events
+  sections on the overview instead of on the node page: 0.44.0 shipped
+  two `<main id="view-main">` containers, and the router could only ever
+  hide the first (#151).
+
+### Added
+- The console is eight views behind one persistent nav, each a real
+  route (#151): overview, nodes, data, sql, schema, metrics, ops and
+  security, with each node's page at `#/node/N`. Three controls cross
+  every view from the header — a **node scope** the node-scoped panels
+  (statements, the event ring, audit) read instead of assuming the
+  serving node, and which they name rather than leaving it to be
+  guessed; a **time range** shared by every chart; and **jump to**
+  (`⌘K`), resolving `n3`, `r128`, a table name or `rack=b` to the right
+  view. The scope, the range, each view's filter and an open range
+  drill-down all live in the URL, so a view is a link worth sharing, and
+  each view remembers its scroll position. Health findings now link to
+  the view that shows the figure: they used to link to `#sec-*` anchors,
+  which the router read as an unknown route and resolved to the
+  overview, stopping the other views' polls on the way.
+- The console's script is kept as one file per view plus a shared core
+  under `pkg/server/ui/js`, assembled into the single page the node
+  serves (#151). No build step and no second request: the page stays
+  self-contained for airgapped nodes. A missing, empty or misordered
+  script file fails the build or a test rather than blanking the
+  console.
 ## 0.45.0 — unreleased
 
 ### Added
