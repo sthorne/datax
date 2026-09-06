@@ -273,8 +273,10 @@ type Node struct {
 	rewriteRewritten   int64
 	prefixBloomNoticed atomic.Bool
 
-	// consoleVersion digests the embedded console page (http.go).
+	// consoleVersion digests the embedded console page (http.go);
+	// loginPage is the rendered sign-in page (session.go).
 	consoleVersion string
+	loginPage      []byte
 
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and

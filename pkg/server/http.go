@@ -266,6 +266,12 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/debug/pprof/trace", n.requireAdmin(http.HandlerFunc(pprof.Trace)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
 	mux.HandleFunc("/api/overview", n.serveOverviewAPI)
+	// The console's front door (issue #158). Both are reached before
+	// authentication (httpAuth exempts them): signing in is how a
+	// principal is established, and signing out of a session that has
+	// already lapsed must still clear the cookie.
+	mux.HandleFunc("/api/login", n.serveLogin)
+	mux.HandleFunc("/api/logout", n.serveLogout)
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
 	mux.HandleFunc("/api/node", n.serveNodeAPI)
 	mux.HandleFunc("/api/events", n.serveEventsAPI)
@@ -282,6 +288,9 @@ func (n *Node) startHTTP() error {
 	// console against the new API (issue #146). It is also the page's
 	// ETag, so a reload after an upgrade fetches the new page and one
 	// before it is a 304.
+	if err := n.renderLoginPage(); err != nil {
+		return err
+	}
 	n.consoleVersion = consoleVersionOf(page)
 	page = bytes.ReplaceAll(page, []byte(consoleVersionPlaceholder), []byte(n.consoleVersion))
 	etag := `"` + n.consoleVersion + `"`
@@ -354,6 +363,14 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// The sign-in endpoints are the way a principal is established,
+		// so they run ahead of the check (issue #158). They authenticate
+		// their own callers: /api/login verifies the password it is
+		// given, and /api/logout only clears the caller's own cookie.
+		if req.URL.Path == "/api/login" || req.URL.Path == "/api/logout" {
+			next.ServeHTTP(w, req)
+			return
+		}
 		// A CA-verified client certificate authenticates by CommonName.
 		// The TLS config uses VerifyClientCertIfGiven, so VerifiedChains —
 		// not the mere presence of TLS state — is the test.
@@ -378,6 +395,22 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			metrics.AuthFailures.Inc()
 			log.Audit("http-auth-failure", "principal", cn, "via", "cert", "remote", req.RemoteAddr, "path", req.URL.Path)
 		}
+		// A session cookie, which a person gets from the login page. It
+		// sits behind the certificate (a certificate is the stronger
+		// claim and the one machines use) and ahead of Basic, so a
+		// signed-in browser stops replaying a password on every poll.
+		if p, present := n.sessionPrincipal(req); present {
+			if p.User != "" {
+				serveAs(next, w, req, p)
+				return
+			}
+			// Present but not valid: expired, forged, or a role that may
+			// no longer sign in (sessionPrincipal audited which). Clear
+			// it so the browser stops sending it, then fall through —
+			// Basic credentials or a certificate may still carry this
+			// request.
+			clearSessionCookie(w)
+		}
 		user, pass, ok := req.BasicAuth()
 		if ok {
 			ctx := req.Context()
@@ -396,6 +429,14 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			// round-trip is normal browser flow, not an auth failure).
 			metrics.AuthFailures.Inc()
 			log.Audit("http-auth-failure", "principal", user, "remote", req.RemoteAddr, "path", req.URL.Path)
+		}
+		// A browser navigation gets the login page; anything scripted
+		// gets the challenge it has always got, so Prometheus, curl and
+		// `datax debug` are unaffected (issue #158). The test is the
+		// Accept header, never the user agent.
+		if wantsHTML(req) {
+			n.serveLoginPage(w, req)
+			return
 		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="datax"`)
 		http.Error(w, "authentication required", http.StatusUnauthorized)

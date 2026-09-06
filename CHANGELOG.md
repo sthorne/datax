@@ -8,6 +8,31 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.45.0 — unreleased
+
+### Added
+- The console has a front door (#158). An unauthenticated browser
+  navigation now gets a sign-in page instead of the browser's own
+  credential dialog: it names the cluster, node, locality and version
+  actually reached, says whether the cluster is secure, and explains
+  that the credentials are database credentials. `POST /api/login`
+  verifies them through the same path HTTP Basic uses and sets a session
+  cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 12 hours);
+  `POST /api/logout` and the console's new user menu — who you are, how
+  you got in, which roles you hold — clear it. The cookie is a signed
+  token carrying no password and needing no session store, keyed from
+  the cluster's authentication secret, so any node accepts a token any
+  other minted; roles are still resolved per request, so revoking
+  `LOGIN` or admin takes effect at once rather than at expiry. Sign-ins,
+  sign-outs and every refused or lapsed token are audited. Machine
+  clients are untouched: `curl`, Prometheus and `datax debug` still get
+  the `WWW-Authenticate` challenge (the doors are told apart by
+  `Accept`, never by user agent), and HTTP Basic and client certificates
+  authenticate every route exactly as before.
+- The console states insecure mode across the top of the page rather
+  than in a grey aside: a cluster that authenticates nobody says so
+  (#158).
+
 ## 0.44.0 — unreleased
 
 The console umbrella (#144), first batch.

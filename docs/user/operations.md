@@ -120,15 +120,19 @@ serves, on that address:
   root and admins see every table and the user list; another user sees
   the tables it holds a grant on. Rebuilt at most every 5 s per node.
 
-In secure mode all of it requires HTTP Basic credentials of any database
-user, or a client certificate; `/api/range`, `/api/activity` and
-another node's `/api/node` additionally require the admin role ([Security](security.md)). The dashboard header shows who it
-is signed in as and how (`signed in as ops (basic)`, with an **admin**
-badge when the role is held); without the role the cluster ranges are
-not clickable and the note under them says which user is signed in and
-how to proceed (`GRANT ADMIN TO ops`, or sign in as `root` from a private
-window, since browsers cache Basic credentials per site). `/api/cluster`
-carries the same identity in its `principal` field.
+In secure mode an unauthenticated browser gets a sign-in page, and the
+console's user menu shows who you are, how you got in, which roles you
+hold, and signs you out — the credentials are the database credentials
+`datax sql` uses (see [Security → Signing in to the
+console](security.md#signing-in-to-the-console)). Scripted clients are
+unaffected: HTTP Basic credentials of any database user, or a client
+certificate, authenticate every route as before. `/api/range`,
+`/api/activity` and another node's `/api/node` additionally require the
+admin role ([Security](security.md)). Without that role the cluster
+ranges are not clickable and the note under them says which user is
+signed in and how to proceed (`GRANT ADMIN TO ops`, or sign out and back
+in as `root`). `/api/cluster` carries the same identity in its
+`principal` field, with the session's expiry when there is one.
 
 ## Health checks
 

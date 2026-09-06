@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — datax</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --panel: #ffffff; --border: #e4e3df;
+    --text: #0b0b0b; --text-2: #52514e; --text-3: #8a897f;
+    --series-1: #2a78d6; --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19; --panel: #232322; --border: #3a3936;
+      --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
+      --series-1: #3987e5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 24px 16px; background: var(--surface); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { width: 100%; max-width: 420px; }
+  h1 { font-size: 17px; margin: 0 0 2px; letter-spacing: .02em; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px 20px; }
+  form { margin-top: 16px; display: grid; gap: 12px; }
+  label { display: grid; gap: 4px; font-size: 12px; color: var(--text-2); }
+  input {
+    font: inherit; padding: 8px 10px; border-radius: 6px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 8px 12px; border-radius: 6px; cursor: pointer;
+    color: #fff; background: var(--series-1); border: 1px solid transparent;
+  }
+  button[disabled] { opacity: .6; cursor: progress; }
+  :focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  .muted { color: var(--text-3); }
+  dl { margin: 14px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
+  dt { color: var(--text-3); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .err, .banner {
+    margin-top: 14px; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+    border: 1px solid var(--border); border-left-width: 4px;
+  }
+  .err { border-left-color: var(--critical); }
+  .banner { border-left-color: var(--warning); }
+  .note { margin-top: 14px; font-size: 12px; color: var(--text-3); }
+  code { font-family: ui-monospace, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>datax</h1>
+    <div class="muted" id="sub">sign in</div>
+    <div id="insecure" class="banner" hidden>
+      This cluster runs in <b>insecure mode</b>: it authenticates nobody and
+      anyone who can reach this port has full access. There is nothing to sign
+      in to. <a href="/">Open the console</a>.
+    </div>
+    <form id="form">
+      <label>Database user
+        <input id="user" name="user" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      </label>
+      <label>Password
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+    <div id="error" class="err" role="alert" hidden></div>
+    <p class="note" id="hint">
+      These are <b>database</b> credentials — the same user and password
+      <code>datax sql</code> connects with. <code>root</code> is the bootstrap
+      user of a secure cluster. Some users are authenticated by client
+      certificate instead and have no password; a browser presenting a
+      CA-signed certificate is signed in without this form. See
+      <code>docs/user/security.md</code>.
+    </p>
+    <dl id="context"></dl>
+  </div>
+</main>
+<script>
+"use strict";
+// The node injects what it knows about itself here when it serves the
+// page; an operator behind a load balancer needs to see which node and
+// which cluster they actually reached before they type a password.
+const CTX = __LOGIN_CONTEXT__;
+const errBox = document.getElementById("error");
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+function showError(msg) { errBox.textContent = msg; errBox.hidden = false; }
+(function renderContext() {
+  const rows = [
+    ["cluster", CTX.cluster_id],
+    ["node", CTX.node_id ? "n" + CTX.node_id : ""],
+    ["locality", CTX.locality],
+    ["address", CTX.address],
+    ["version", CTX.release ? "v" + CTX.release : ""],
+    ["mode", CTX.secure ? "secure (TLS, authenticated)" : "insecure"],
+  ].filter(([, v]) => v);
+  document.getElementById("context").innerHTML =
+    rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  if (!CTX.secure) {
+    document.getElementById("insecure").hidden = false;
+    document.getElementById("form").hidden = true;
+    document.getElementById("hint").hidden = true;
+    document.getElementById("sub").textContent = "no authentication configured";
+  }
+})();
+document.getElementById("form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  errBox.hidden = true;
+  const button = document.getElementById("submit");
+  button.disabled = true;
+  try {
+    const resp = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user: document.getElementById("user").value,
+        password: document.getElementById("password").value,
+      }),
+    });
+    const d = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      // Back to wherever the operator was headed, or the overview.
+      const next = new URLSearchParams(location.search).get("next");
+      location.href = next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+      return;
+    }
+    showError(d.error || ("sign-in failed: HTTP " + resp.status));
+  } catch (err) {
+    showError("sign-in failed: " + (err && err.message || err));
+  } finally {
+    button.disabled = false;
+  }
+});
+document.getElementById("user").focus();
+</script>
+</body>
+</html>

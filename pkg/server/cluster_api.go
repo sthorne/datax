@@ -69,10 +69,14 @@ type ClusterPrincipal struct {
 	// and Via are empty and Admin is true (trust, like everything else).
 	Secure bool `json:"secure"`
 	// User is the authenticated database user; Via is how it
-	// authenticated: "basic" (HTTP Basic credentials) or "cert" (a
-	// CA-verified client certificate).
+	// authenticated: "basic" (HTTP Basic credentials), "cert" (a
+	// CA-verified client certificate), or "session" (the console's
+	// sign-in cookie, issue #158).
 	User string `json:"user,omitempty"`
 	Via  string `json:"via,omitempty"`
+	// SessionExpiresAt is when the sign-in cookie lapses, for a console
+	// that wants to prompt before it does; absent for the other doors.
+	SessionExpiresAt int64 `json:"session_expires_at_unix_ms,omitempty"`
 	// Admin reports whether User holds the admin role (root, an admin-role
 	// member, or the node identity), which the range drill-down requires.
 	Admin bool `json:"admin"`
@@ -275,12 +279,18 @@ func (n *Node) clusterPrincipal(req *http.Request) ClusterPrincipal {
 		return ClusterPrincipal{Secure: false, Admin: true}
 	}
 	p := principalFrom(req)
-	return ClusterPrincipal{
+	cp := ClusterPrincipal{
 		Secure: true,
 		User:   p.User,
 		Via:    p.Via,
 		Admin:  n.isAdminPrincipal(req.Context(), p.User),
 	}
+	if p.Via == "session" {
+		if exp := sessionExpiry(req); !exp.IsZero() {
+			cp.SessionExpiresAt = exp.UnixMilli()
+		}
+	}
+	return cp
 }
 
 // rangeListTimeout bounds the /meta scan behind the dashboard's range
