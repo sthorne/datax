@@ -119,7 +119,7 @@ func TestContentionAttribution(t *testing.T) {
 	found := false
 	for _, sh := range after.RetryShapes {
 		total += sh.Count
-		if strings.Contains(sh.Shape, "UPDATE accounts SET balance = balance - ? WHERE id = ?") {
+		if strings.Contains(sh.Shape, "UPDATE accounts SET balance = (balance - ?) WHERE id = ?") {
 			found = true
 			if sh.Count == 0 {
 				t.Fatalf("shape listed with no failures: %+v", sh)
@@ -134,6 +134,20 @@ func TestContentionAttribution(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the conflicting UPDATE is not among the shapes: %+v", after.RetryShapes)
+	}
+	// Both writes are the same shape, so the two orders of the race
+	// collapse onto one row. Other shapes may also carry failures — a
+	// transaction can be told to retry at COMMIT rather than at the
+	// statement that conflicted — so this asserts the UPDATE is ONE row,
+	// not that it is the only row.
+	updates := 0
+	for _, sh := range after.RetryShapes {
+		if strings.HasPrefix(sh.Shape, "UPDATE accounts") {
+			updates++
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("the two orders of one shape should be one row, got %d: %+v", updates, after.RetryShapes)
 	}
 	if total+after.RetryShapesOther != after.Summary.SerializationFailures {
 		t.Fatalf("the attribution does not add up to the count: %d attributed + %d overflow != %d counted",

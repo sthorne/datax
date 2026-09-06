@@ -323,6 +323,9 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 		rows, serr = emit(ctx, res)
 	}
 	if tok != nil {
+		// The rows this statement read, taken (and reset) here so the
+		// next statement on this session is not charged for them.
+		tok.scanned = c.session.TakeScanned()
 		tok.end(rows, serr, c.session.State() == sql.StateOpen)
 		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
 	}

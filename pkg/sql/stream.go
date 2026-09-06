@@ -360,6 +360,7 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 			return false, err
 		}
 		metrics.SQLRowsScanned.Add(float64(len(kvs)))
+		it.s.AddScanned(int64(len(kvs)))
 		if int64(len(kvs)) < page {
 			it.active = false // the span is exhausted with this page
 		} else if it.reverse {

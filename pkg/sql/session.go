@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -119,6 +120,14 @@ type Result struct {
 	Stream *RowStream
 }
 
+// AddScanned records KV rows read while executing the current
+// statement (issue #157).
+func (s *Session) AddScanned(n int64) { s.scanned.Add(n) }
+
+// TakeScanned returns the rows scanned since the last call and resets
+// the counter, so each statement is charged its own reads.
+func (s *Session) TakeScanned() int64 { return s.scanned.Swap(0) }
+
 // TxnState is the session's transaction status, mirrored into the wire
 // protocol's ReadyForQuery byte.
 type TxnState int
@@ -133,6 +142,12 @@ const (
 type Session struct {
 	db  *kvclient.DB
 	cat *catalog.Accessor
+	// scanned counts the KV rows this session's current statement has
+	// read, so the cost of a full scan is attributable to the statement
+	// shape that caused it rather than only to a cluster-wide counter
+	// (issue #157). Read and reset by the wire layer at statement end;
+	// atomic because a statement's execution may fan out.
+	scanned atomic.Int64
 	// sessionUser is the authenticated SQL user ("root" for internal
 	// sessions). In insecure/trust mode it is the client-claimed name:
 	// privileges are enforced against it, but nothing verified the

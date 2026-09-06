@@ -1411,6 +1411,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			return nil, err
 		}
 		metrics.SQLRowsScanned.Add(float64(len(kvs)))
+		s.AddScanned(int64(len(kvs)))
 		// The primary rows behind the entries come back in pages of
 		// primaryFetchPage, each page one routed batch, in the index's
 		// order (issue #103): a lookup matching 1,000 entries is four
@@ -1561,6 +1562,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 		return nil, err
 	}
 	metrics.SQLRowsScanned.Add(float64(len(kvs)))
+	s.AddScanned(int64(len(kvs)))
 	var out []fetchedRow
 	for _, kv := range kvs {
 		row, err := decodeFullRow(desc, kv.Key, kv.Value)

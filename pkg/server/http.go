@@ -262,6 +262,12 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/api/range", n.requireAdmin(http.HandlerFunc(n.serveRangeAPI)))
 	mux.HandleFunc("/api/schema", n.serveSchemaAPI)
 	mux.Handle("/api/activity", n.requireAdmin(http.HandlerFunc(n.serveActivityAPI)))
+	// The statement list and its plans carry representative statement
+	// text, which can hold data: the same gate as /api/activity, and the
+	// fan-out below it runs under the node identity like /api/node's
+	// (issue #157).
+	mux.Handle("/api/statements", n.requireAdmin(http.HandlerFunc(n.serveStatementsAPI)))
+	mux.Handle("/api/explain", n.requireAdmin(http.HandlerFunc(n.serveExplainAPI)))
 	// Profiles (issue #100): net/http/pprof under /debug/pprof/, admin-gated
 	// like the drill-downs — a profile exposes statement text and key
 	// bytes. `datax debug profile` fetches one; `datax bench
@@ -630,11 +636,25 @@ type ActivityStatus struct {
 	RetryShapesOther uint64              `json:"retry_shapes_other,omitempty"`
 	RetriesByUser    map[string]uint64   `json:"retries_by_user,omitempty"`
 	IdleTxns         []pgwire.IdleTxn    `json:"idle_txns"`
+
+	// Statements is this node's fingerprint accounting: the heaviest
+	// statement shapes by total time (issue #157). StatementsEvicted
+	// counts shapes dropped to keep the table bounded, so the list can
+	// say it is a window over the busiest shapes rather than every
+	// shape that ever ran. Representative statement text, so it stays
+	// behind this document's admin gate.
+	Statements        []pgwire.StatementStat `json:"statements"`
+	StatementsEvicted uint64                 `json:"statements_evicted,omitempty"`
 }
 
 // retryShapeLimit bounds the hot list this document carries. What falls
 // off the end is added to RetryShapesOther rather than dropped.
 const retryShapeLimit = 20
+
+// statementLimit bounds the shapes one node reports. The cluster view
+// re-ranks the union, so each node sends its own heaviest rather than
+// everything it holds.
+const statementLimit = 50
 
 func (n *Node) serveActivityAPI(w http.ResponseWriter, req *http.Request) {
 	doc := n.activityStatus()

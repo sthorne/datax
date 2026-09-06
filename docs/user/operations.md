@@ -63,6 +63,18 @@ serves, on that address:
   the oldest idle transaction, statements per second by kind, `40001`
   rate and latency percentiles per node, with the scoped node's
   statements in flight and its slowest recent ones (admin). It also
+  lists the **statement shapes** the cluster runs, grouped by the form
+  the parser normalises each statement to — literals and parameters
+  replaced, so every execution of one query is one row — ranked by total
+  time, because a statement taking 8 ms that runs forty thousand times
+  an hour costs more than a slow one run rarely and never appears among
+  the slowest. Each row carries executions, mean latency, rows returned
+  and rows scanned (far more scanned than returned is a scan), and
+  retries; expanding one shows each node's own percentiles, the tables
+  it touches, a representative statement, and an `EXPLAIN` of it —
+  described, never run. The tables are per node and bounded: what a node
+  drops to stay within its bound is counted, and the view says so rather
+  than implying the list is every shape that ever ran. It also
   carries the transactions the cluster is running: commit, abort and
   retry rates over the header's range from the recorded series, and KV
   batch latency charted beside statement latency, which is what tells a
@@ -191,6 +203,14 @@ serves, on that address:
   node's document is fetched from that node over the internode RPC and
   needs the admin role (403 otherwise). Statement text and audit
   events are included only for admins.
+- **`/api/statements`** — JSON: the statement shapes the cluster ran,
+  unioned from every node over the internode RPC and re-ranked by total
+  time; each entry carries the summable figures plus each node's own row
+  with its percentiles (there is no p99 of two p99s, so they are not
+  summed). **`/api/explain?fingerprint=`** plans one shape's stored
+  representative statement — `EXPLAIN`, never `EXPLAIN ANALYZE`, and the
+  text comes from the node's own accounting, never from the request.
+  Both need the admin role: a representative statement can carry data.
 - **`/api/metrics`** — JSON: without parameters, the catalog of recorded
   series and the label values this node knows; with
   `?series=a,b&node=1,2&since=1h&step=30s&rate=1`, aligned `[t, v]`
