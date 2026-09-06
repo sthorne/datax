@@ -39,6 +39,13 @@ type Writer interface {
 // next positioning call.
 type Iterator interface {
 	SeekGE(key []byte) bool
+	// SeekPrefixGE is SeekGE confined to the engine keys sharing key's
+	// MVCC prefix — a user key's metadata key and versions (issue
+	// #161): over an engine in prefix mode the sstable bloom filters
+	// are consulted for the prefix and Next stays within it; over an
+	// engine not in prefix mode it is a plain SeekGE. Reposition with
+	// a seek before iterating beyond the prefix.
+	SeekPrefixGE(key []byte) bool
 	// SeekLT positions at the LARGEST key strictly below key (reverse
 	// scans walk user keys backwards with it).
 	SeekLT(key []byte) bool
@@ -69,6 +76,9 @@ type Engine struct {
 	encKeys *enc.KeySet
 	encMu   sync.Mutex // serializes registry reseals
 	reenc   reencStatusCache
+	// filterRewrite caches the sweep for tables still carrying whole-key
+	// filters (rewrite.go).
+	filterRewrite reencStatusCache
 	// cacheHeld: this engine holds a reference on the shared block cache.
 	cacheHeld bool
 	// walDisabled: the engine runs without a WAL (see Options.DisableWAL);
@@ -80,6 +90,9 @@ type Engine struct {
 	// (a split store's structural points, shutdown) is not the memtable
 	// rotation the flush-begin fault point means to catch.
 	explicitFlush atomic.Int32
+	// prefixBloom: the engine runs the MVCC comparer and prefix bloom
+	// filters (Options.PrefixBloom, comparer.go).
+	prefixBloom bool
 }
 
 // testingPebbleOptions, when set, adjusts the Pebble options after the
@@ -97,9 +110,13 @@ func Open(dir string, o Options) (*Engine, error) {
 			fmt.Fprintf(os.Stderr, "WARNING: %s=1: raft log commits are not synced; a crash loses acknowledged writes (measurement only)\n", testingNoSyncEnv)
 		}
 	})
-	e := &Engine{walDisabled: o.DisableWAL}
+	e := &Engine{walDisabled: o.DisableWAL, prefixBloom: o.PrefixBloom}
 	opts := &pebble.Options{}
 	e.health.gate = o.Profile.apply(opts)
+	applyKeySchemas(opts, false)
+	if o.PrefixBloom {
+		applyPrefixBloom(opts)
+	}
 	if o.Raft {
 		opts.MemTableSize = 16 << 20
 		opts.MemTableStopWritesThreshold = 4
@@ -268,6 +285,18 @@ const (
 // Format is the store's current Pebble format major version.
 func (e *Engine) Format() int { return int(e.db.FormatMajorVersion()) }
 
+// PrefixBloom reports whether the engine runs in prefix mode (issue
+// #161): the MVCC comparer, and bloom filters over user-key prefixes
+// that point reads consult.
+func (e *Engine) PrefixBloom() bool { return e.prefixBloom }
+
+// FilterMetrics returns Pebble's running counts of bloom filter
+// consultations that admitted a table (hits) and excluded one (misses).
+func (e *Engine) FilterMetrics() (hits, misses int64) {
+	m := e.db.Metrics()
+	return m.Filter.Hits, m.Filter.Misses
+}
+
 // RatchetFormat raises the store's Pebble format major version to v (a
 // no-op at or above it; Pebble never lowers one). Online and cheap: it
 // records the version in the manifest; sstables written from then on —
@@ -332,11 +361,11 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 }
 
 func (e *Engine) NewIter(lower, upper []byte) Iterator {
-	it, err := e.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	it, err := e.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper, UseL6Filters: e.prefixBloom && prefixL6Filters})
 	if err != nil {
 		return &errIter{err: err}
 	}
-	return &pebbleIter{it: it}
+	return &pebbleIter{it: it, prefix: e.prefixBloom}
 }
 
 // Put writes directly (non-batched). Prefer batches for anything that must
@@ -360,12 +389,13 @@ func (e *Engine) NewBatch() *Batch {
 // are captured through one of these so the applied index and the data it
 // covers are mutually consistent.
 func (e *Engine) NewSnapshot() *Snapshot {
-	return &Snapshot{s: e.db.NewSnapshot()}
+	return &Snapshot{s: e.db.NewSnapshot(), prefix: e.prefixBloom}
 }
 
 // Snapshot is a consistent read view of the engine.
 type Snapshot struct {
-	s *pebble.Snapshot
+	s      *pebble.Snapshot
+	prefix bool
 }
 
 func (s *Snapshot) Get(key []byte) ([]byte, error) {
@@ -382,11 +412,11 @@ func (s *Snapshot) Get(key []byte) ([]byte, error) {
 }
 
 func (s *Snapshot) NewIter(lower, upper []byte) Iterator {
-	it, err := s.s.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	it, err := s.s.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper, UseL6Filters: s.prefix && prefixL6Filters})
 	if err != nil {
 		return &errIter{err: err}
 	}
-	return &pebbleIter{it: it}
+	return &pebbleIter{it: it, prefix: s.prefix}
 }
 
 func (s *Snapshot) Close() error { return s.s.Close() }
@@ -410,7 +440,7 @@ type Batch struct {
 // iterator's view of the batch, so a key this batch already wrote is
 // seen as written.
 func (b *Batch) writeState(metaKey, upper []byte) (rawMeta []byte, vts hlc.Timestamp, hasVersion bool, err error) {
-	opts := pebble.IterOptions{LowerBound: metaKey, UpperBound: upper}
+	opts := pebble.IterOptions{LowerBound: metaKey, UpperBound: upper, UseL6Filters: b.eng.prefixBloom && prefixL6Filters}
 	if b.wit == nil {
 		if b.wit, err = b.b.NewIter(&opts); err != nil {
 			return nil, hlc.Timestamp{}, false, err
@@ -419,7 +449,15 @@ func (b *Batch) writeState(metaKey, upper []byte) (rawMeta []byte, vts hlc.Times
 		b.wit.SetOptions(&opts)
 	}
 	it := b.wit
-	if !it.SeekGE(metaKey) {
+	// In prefix mode the seek asks the bloom filters about the key's
+	// prefix (issue #161); the versions share it, so nothing is hidden.
+	var found bool
+	if b.eng.prefixBloom {
+		found = it.SeekPrefixGE(metaKey)
+	} else {
+		found = it.SeekGE(metaKey)
+	}
+	if !found {
 		return nil, hlc.Timestamp{}, false, it.Error()
 	}
 	if bytes.Equal(it.Key(), metaKey) {
@@ -461,11 +499,11 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 }
 
 func (b *Batch) NewIter(lower, upper []byte) Iterator {
-	it, err := b.b.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	it, err := b.b.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper, UseL6Filters: b.eng.prefixBloom && prefixL6Filters})
 	if err != nil {
 		return &errIter{err: err}
 	}
-	return &pebbleIter{it: it, refreshOnRebound: true}
+	return &pebbleIter{it: it, refreshOnRebound: true, prefix: b.eng.prefixBloom}
 }
 
 func (b *Batch) Put(key, value []byte) error { return b.b.Set(key, value, nil) }
@@ -530,11 +568,14 @@ type pebbleIter struct {
 	// refreshOnRebound: the iterator reads an indexed batch, whose view
 	// only SetOptions refreshes (SetBounds keeps the view of creation).
 	refreshOnRebound bool
+	// prefix: the engine runs the MVCC comparer, so SeekPrefixGE may
+	// consult the prefix bloom filters; otherwise it is a SeekGE.
+	prefix bool
 }
 
 func (i *pebbleIter) SetBounds(lower, upper []byte) {
 	if i.refreshOnRebound {
-		i.it.SetOptions(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+		i.it.SetOptions(&pebble.IterOptions{LowerBound: lower, UpperBound: upper, UseL6Filters: i.prefix && prefixL6Filters})
 	} else {
 		i.it.SetBounds(lower, upper)
 	}
@@ -542,6 +583,14 @@ func (i *pebbleIter) SetBounds(lower, upper []byte) {
 }
 
 func (i *pebbleIter) SeekGE(key []byte) bool { i.valid = i.it.SeekGE(key); return i.valid }
+func (i *pebbleIter) SeekPrefixGE(key []byte) bool {
+	if i.prefix {
+		i.valid = i.it.SeekPrefixGE(key)
+	} else {
+		i.valid = i.it.SeekGE(key)
+	}
+	return i.valid
+}
 func (i *pebbleIter) SeekLT(key []byte) bool { i.valid = i.it.SeekLT(key); return i.valid }
 func (i *pebbleIter) Next() bool             { i.valid = i.it.Next(); return i.valid }
 func (i *pebbleIter) Prev() bool             { i.valid = i.it.Prev(); return i.valid }
@@ -552,12 +601,13 @@ func (i *pebbleIter) Close() error           { return i.it.Close() }
 
 type errIter struct{ err error }
 
-func (i *errIter) SeekGE([]byte) bool    { return false }
-func (i *errIter) SeekLT([]byte) bool    { return false }
-func (i *errIter) Next() bool            { return false }
-func (i *errIter) Prev() bool            { return false }
-func (i *errIter) SetBounds(_, _ []byte) {}
-func (i *errIter) Valid() bool           { return false }
-func (i *errIter) Key() []byte           { return nil }
-func (i *errIter) Value() []byte         { return nil }
-func (i *errIter) Close() error          { return i.err }
+func (i *errIter) SeekGE([]byte) bool       { return false }
+func (i *errIter) SeekPrefixGE([]byte) bool { return false }
+func (i *errIter) SeekLT([]byte) bool       { return false }
+func (i *errIter) Next() bool               { return false }
+func (i *errIter) Prev() bool               { return false }
+func (i *errIter) SetBounds(_, _ []byte)    {}
+func (i *errIter) Valid() bool              { return false }
+func (i *errIter) Key() []byte              { return nil }
+func (i *errIter) Value() []byte            { return nil }
+func (i *errIter) Close() error             { return i.err }

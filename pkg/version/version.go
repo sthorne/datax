@@ -127,9 +127,18 @@ const (
 	// JSON records of earlier transactions stay readable for as long as
 	// they live.
 	V14 Version = 14
+	// V15 introduces prefix bloom filters (issue #161, pkg/storage
+	// comparer.go): a store at v15 opens with the MVCC comparer, whose
+	// Split lets Pebble's bloom filters answer point reads by user key,
+	// writes its filters and columnar key schema under names that carry
+	// the change, and reads the tables from before as they are. The
+	// comparer is fixed at open, so a running node switches at its next
+	// restart; a v14 binary does not know the new key schema, so the
+	// store's version gate refuses it (rule 4).
+	V15 Version = 15
 
 	// Current is the newest cluster version this binary can run.
-	Current = V14
+	Current = V15
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

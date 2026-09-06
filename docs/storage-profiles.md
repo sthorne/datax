@@ -10,8 +10,10 @@ sized from the machine's memory (balanced: 25 % capped at 8 GiB; ingest:
 10 % capped at 2 GiB; `--cache-size` overrides; one cache per process,
 shared by every engine, released when the last closes), bloom filters at
 10 bits per key on every level (a missing-key point read — the
-uniqueness probe and the intent lookup on every write — skips the levels
-that cannot hold the key), `FormatMajorVersion` pinned at
+uniqueness probe and the intent lookup on every write — skips the
+sstables that cannot hold the key; consulted for a user key, rather
+than for one exact engine key, from cluster version v15 — see [Prefix
+bloom filters](#prefix-bloom-filters)), `FormatMajorVersion` pinned at
 `FormatVirtualSSTables` (16 — what every store is created at; the
 engine is Pebble v2 since 0.41.0, whose newest is 24, so the pin is what
 keeps a dependency bump from switching the on-disk format as a side
@@ -42,6 +44,40 @@ bottom level would trade CPU the write path needs for space.
   write-stall ceiling raised far above the soft backpressure gate below,
   so datax sheds load with retryable errors long before Pebble would
   freeze every write on the store.
+
+## Prefix bloom filters
+
+Pebble consults an sstable's bloom filter only on a prefix seek, and
+only for the part of the key its comparer's `Split` returns. Until
+cluster version v15 datax had no `Split`, so the filters #101
+configured hashed whole engine keys and only the exact-key probes of
+`Engine.Get` ever asked them; a version read of K — a seek to K's
+metadata key, then to a version — walked every level's sstables (issue
+#161). From v15 a store opens with the MVCC comparer
+(`pkg/storage/comparer.go`): `Split` cuts an engine key at the
+terminator of the user key's encoding in O(1) — no key-format change —
+so K's metadata key and every version of K share one prefix, the point
+reads of `MVCCGet`, the `Getter` and the write path's intent probe are
+prefix seeks, and a filter rules out the sstables that hold nothing of
+K at all. The filters of L6 are consulted too (Pebble skips them by
+default); the store's bulk rests there and the reads that gain most are
+misses.
+
+The comparer keeps Pebble's default name and ordering (the name is
+stamped in the MANIFEST and every table and promises the ordering,
+which is unchanged). What `Split` leaves on disk is versioned by name:
+the filter policy (`datax.mvcc-prefix-bloom`; a filter under another
+name is not consulted, so a whole-key filter is never asked a prefix
+question) and the columnar key schema (`datax.mvcc.v1`; the old schema
+stays registered, and each schema's seeker splits keys with the
+comparer it was built with, so tables from either mode read under
+either). A store therefore switches with no rewrite and no downtime
+beyond the restart, and the tables written before are rewritten in the
+background by the same bounded manual compactions re-encryption uses
+(`prefix_bloom_rewrite` in the node document,
+`datax_prefix_bloom_remaining_bytes`). `datax_storage_bloom_hits_total`
+and `_misses_total` count, from then on, the point reads the filters
+answered and the ones they had to admit.
 
 ## Storage health metrics
 

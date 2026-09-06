@@ -27,14 +27,22 @@ import (
 // a v13 binary, or joining a v13 cluster, is split from the start.
 
 // stateOptions are the state engine's options; disableWAL for a split
-// store.
-func (n *Node) stateOptions(disableWAL bool) storage.Options {
+// store, prefixBloom for a store at cluster version v15 (issue #161).
+func (n *Node) stateOptions(disableWAL, prefixBloom bool) storage.Options {
 	return storage.Options{
 		Profile: n.cfg.StorageProfile, EncryptionKey: n.encKey,
 		MemTableSize: n.cfg.StorageMemTableSize, CacheSize: n.cfg.StorageCacheSize,
-		DisableWAL: disableWAL,
+		DisableWAL: disableWAL, PrefixBloom: prefixBloom,
 	}
 }
+
+// prefixBloomFor reports whether a store at cluster version cv runs in
+// prefix mode (issue #161): from v15 on. The comparer is fixed at open,
+// so the decision is made where the state engine is (re)opened — at
+// start from the store's own version copy, and for a fresh store from
+// the version it is born at — and a running node that observes the
+// finalize switches at its next restart (ratchetStoreFormat says so).
+func prefixBloomFor(cv version.Version) bool { return cv >= version.V15 }
 
 // raftOptions are the raft engine's options: the store's profile and
 // encryption, a small memtable (Options.Raft).
@@ -57,7 +65,7 @@ func (n *Node) raftDir() string {
 // openEngines opens the store: single-engine, or split when the store
 // says so, migrating it first when the cluster version calls for it.
 func (n *Node) openEngines() error {
-	state, err := storage.Open(n.cfg.Dir, n.stateOptions(false))
+	state, err := storage.Open(n.cfg.Dir, n.stateOptions(false, false))
 	if err != nil {
 		return err
 	}
@@ -66,35 +74,41 @@ func (n *Node) openEngines() error {
 		_ = state.Close()
 		return err
 	}
-	if !split {
-		_, initialized, err := cluster.ReadStoreIdent(state)
-		if err != nil {
+	_, initialized, err := cluster.ReadStoreIdent(state)
+	if err != nil {
+		_ = state.Close()
+		return err
+	}
+	stored, err := readStoreClusterVersion(state)
+	if err != nil {
+		_ = state.Close()
+		return err
+	}
+	fresh := !initialized && (n.cfg.BootstrapSelf || n.cfg.StaticBootstrap != nil)
+	if !split && ((initialized && stored >= version.V13) || (fresh && n.binaryVersion() >= version.V13)) {
+		if err := n.migrateToSplitStore(state, stored); err != nil {
 			_ = state.Close()
 			return err
 		}
-		stored, err := readStoreClusterVersion(state)
-		if err != nil {
-			_ = state.Close()
-			return err
-		}
-		fresh := !initialized && (n.cfg.BootstrapSelf || n.cfg.StaticBootstrap != nil)
-		if (initialized && stored >= version.V13) || (fresh && n.binaryVersion() >= version.V13) {
-			if err := n.migrateToSplitStore(state, stored); err != nil {
-				_ = state.Close()
-				return err
-			}
-			split = true
-		}
+		split = true
 	}
 	if !split {
 		n.engine = state
 		return nil
 	}
-	// Reopen the state engine without its WAL and open the raft engine.
+	// The version the store runs at: its own copy, or for a store this
+	// binary is about to bootstrap the binary's (a joiner learns its
+	// cluster's version after the join, see activateSplitStore).
+	cv := stored
+	if fresh {
+		cv = n.binaryVersion()
+	}
+	// Reopen the state engine without its WAL — and in prefix mode when
+	// the version calls for it — and open the raft engine.
 	if err := state.Close(); err != nil {
 		return err
 	}
-	if n.engine, err = storage.Open(n.cfg.Dir, n.stateOptions(true)); err != nil {
+	if n.engine, err = storage.Open(n.cfg.Dir, n.stateOptions(true, prefixBloomFor(cv))); err != nil {
 		return err
 	}
 	if n.raftEngine, err = storage.Open(n.raftDir(), n.raftOptions()); err != nil {
@@ -158,7 +172,8 @@ func (n *Node) activateSplitStore() error {
 	if err := n.engine.Close(); err != nil {
 		return err
 	}
-	if n.engine, err = storage.Open(n.cfg.Dir, n.stateOptions(true)); err != nil {
+	cv := version.Version(n.clusterVersion.Load())
+	if n.engine, err = storage.Open(n.cfg.Dir, n.stateOptions(true, prefixBloomFor(cv))); err != nil {
 		return err
 	}
 	if n.raftEngine, err = storage.Open(n.raftDir(), n.raftOptions()); err != nil {
@@ -219,6 +234,13 @@ func (n *Node) ratchetStoreFormat() {
 			log.Infof("store Pebble format %d → %d (cluster version %s: columnar blocks)", was, e.Format(), version.Version(n.clusterVersion.Load()))
 		}
 	}
+	// Prefix mode (v15) is a property of the open, not of the store:
+	// say so once when the version arrives while the engine runs
+	// without it.
+	if prefixBloomFor(version.Version(n.clusterVersion.Load())) && !n.engine.PrefixBloom() && n.prefixBloomNoticed.CompareAndSwap(false, true) {
+		log.Infof("cluster version %s: the store switches to prefix bloom filters at this node's next restart (issue #161)", version.Version(n.clusterVersion.Load()))
+		n.events.Record("upgrade", "the store switches to prefix bloom filters at this node's next restart")
+	}
 }
 
 // adoptBootstrapVersion records, on a store this binary just bootstrapped,
@@ -235,6 +257,9 @@ func (n *Node) adoptBootstrapVersion() error {
 	n.ratchetStoreFormat()
 	return nil
 }
+
+// storePrefixBloom reports whether the state engine runs in prefix mode.
+func (n *Node) storePrefixBloom() bool { return n.engine != nil && n.engine.PrefixBloom() }
 
 // storeFormat is the state engine's Pebble format for status output.
 func (n *Node) storeFormat() int {

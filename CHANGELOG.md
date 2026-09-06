@@ -8,6 +8,51 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.43.0 — unreleased
+
+Cluster version **v15**.
+
+### Added
+- Prefix bloom filters (#161). Pebble consults a bloom filter only on
+  a prefix seek and only for what the comparer's `Split` returns; with
+  no `Split`, the filters #101 configured hashed whole engine keys and
+  the MVCC read path — a seek to a key's metadata key, then to a
+  version — never asked them. From cluster version v15 a store opens
+  with the MVCC comparer, whose O(1) `Split` cuts an engine key at the
+  terminator of the user key's encoding (no key-format change), the
+  point reads and the write path's intent probe are prefix seeks, and
+  a filter rules out the sstables that hold nothing of the key. The
+  comparer keeps Pebble's name and ordering; the filter policy and the
+  columnar key schema carry new names, so the tables from before read
+  as they are (their filters unconsulted, never asked a prefix
+  question) and are rewritten in the background by the re-encryption
+  pass's machinery (`prefix_bloom_rewrite`, `store_prefix_bloom` in the
+  node document; `datax_prefix_bloom_remaining_bytes`,
+  `datax_prefix_bloom_rewritten_bytes_total`). The comparer is fixed at
+  open, so a node switches at its first restart after the finalize
+  (logged); a v14 binary does not know the key schema and the store's
+  version gate refuses it. A point read that finds no intent and whose
+  newest version is visible now returns it from the first seek.
+  Measured on the storage benchmarks (100k rows, 128-byte values, the
+  rows compacted to L6 as a store's bulk is): a point read of an absent
+  key 3.18 → 1.90 µs, through a reused iterator 2.07 → 0.84 µs (the
+  filters exclude 1.98 tables per read); a present key 3.49 → 3.87 µs
+  and 2.13 → 2.36 µs — the one filter probe of the table that holds it,
+  which is why the filters of L6 are consulted (Pebble's default skips
+  them: without them a miss costs 4.2 µs here, more than before). On the
+  harness (fresh stores, 20 s, two alternating rounds) `ingest-random`
+  328 / 321 → 375 / 365 rows·100/s (+14 %: every batch's uniqueness
+  probes are misses), `kv-95-5` 26.5k / 27.2k → 25.6k / 26.3k ops/s
+  (−3.5 %: its reads all find their key, and pay the probe), `hot-row`,
+  `bank` and `scan` at parity.
+
+### Fixed
+- Re-encryption and the table rewrite above seed a file with a
+  tombstone so a lone file is rewritten rather than moved; Pebble v2's
+  manual compaction no longer flushes the memtable first (v1 did), so
+  the seed stayed in memory and single files were moved with their
+  retired key. The pass now flushes the seed before compacting.
+
 ## 0.42.0 — unreleased
 
 Cluster version **v14**.

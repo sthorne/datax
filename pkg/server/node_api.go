@@ -53,14 +53,20 @@ type NodeDetail struct {
 	EngineMode string `json:"engine_mode,omitempty"`
 	// StoreFormat is the state engine's Pebble format major version (16
 	// before cluster version v14, 19 from it: columnar blocks).
-	StoreFormat     int                         `json:"store_format,omitempty"`
-	RaftStorage     *storage.StorageMetrics     `json:"raft_storage,omitempty"`
-	DebtGated       bool                        `json:"debt_gated,omitempty"`
-	DebtGateEntries int64                       `json:"debt_gate_entries,omitempty"`
-	Overloaded      bool                        `json:"overloaded,omitempty"`
-	OverloadReason  string                      `json:"overload_reason,omitempty"`
-	Encrypted       bool                        `json:"encrypted,omitempty"`
-	Reencryption    *cluster.ReencryptionStatus `json:"reencryption,omitempty"`
+	StoreFormat int `json:"store_format,omitempty"`
+	// StorePrefixBloom is true when the state engine runs with the MVCC
+	// comparer and prefix bloom filters (cluster version v15, issue
+	// #161); PrefixBloomRewrite reports the background rewrite of the
+	// sstables written before that, in the shape of Reencryption.
+	StorePrefixBloom   bool                        `json:"store_prefix_bloom,omitempty"`
+	PrefixBloomRewrite *cluster.ReencryptionStatus `json:"prefix_bloom_rewrite,omitempty"`
+	RaftStorage        *storage.StorageMetrics     `json:"raft_storage,omitempty"`
+	DebtGated          bool                        `json:"debt_gated,omitempty"`
+	DebtGateEntries    int64                       `json:"debt_gate_entries,omitempty"`
+	Overloaded         bool                        `json:"overloaded,omitempty"`
+	OverloadReason     string                      `json:"overload_reason,omitempty"`
+	Encrypted          bool                        `json:"encrypted,omitempty"`
+	Reencryption       *cluster.ReencryptionStatus `json:"reencryption,omitempty"`
 
 	Latency  []kvpb.PeerLatency `json:"latency,omitempty"`
 	SQL      *kvpb.SQLSummary   `json:"sql,omitempty"`
@@ -104,6 +110,10 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		d.Storage = &sm
 		d.EngineMode = n.engineMode()
 		d.StoreFormat = n.storeFormat()
+		d.StorePrefixBloom = n.storePrefixBloom()
+		if d.StorePrefixBloom {
+			d.PrefixBloomRewrite = n.filterRewriteStatus()
+		}
 		if n.raftEngine != nil {
 			rm := n.raftEngine.StorageMetrics()
 			d.RaftStorage = &rm

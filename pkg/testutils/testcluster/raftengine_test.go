@@ -350,3 +350,118 @@ func TestColumnarBlocksRatchet(t *testing.T) {
 		t.Fatalf("a fresh v14 store: format %d", fresh.StoreFormat())
 	}
 }
+
+// TestPrefixBloomFollowsClusterVersion (issue #161): a v14 store under
+// the v15 binary runs without prefix mode until the cluster finalizes
+// v15, still without it until the node restarts (the comparer is fixed
+// at open), and with it from the next start — serving the same rows,
+// its legacy tables rewritten in the background. A fresh v15 store is
+// in prefix mode from the start.
+func TestPrefixBloomFollowsClusterVersion(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	asV14 := func(c *server.Config) { c.BinaryVersionOverride = version.V14 }
+
+	n := startDiskNode(t, dir, true, "", withPG, asV14)
+	if n.StorePrefixBloom() {
+		t.Fatal("a v14 store opened in prefix mode")
+	}
+	conn := diskSQL(t, ctx, n)
+	if _, err := conn.Exec(ctx, `CREATE TABLE t (k INT8 PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		if _, err := conn.Exec(ctx, `INSERT INTO t VALUES ($1, $2)`, int64(i), fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = conn.Close(ctx)
+	n.Stop()
+
+	// The v15 binary on a v14 cluster: no prefix mode; after the finalize
+	// still none until a restart.
+	n = startDiskNode(t, dir, false, "", withPG)
+	if n.StorePrefixBloom() {
+		t.Fatal("before finalize: prefix mode")
+	}
+	resp := adminCall(t, ctx, n.Addr(), cluster.AdminRequest{Op: "upgrade-cluster", Version: int(version.V15)})
+	if resp.Error != "" {
+		t.Fatalf("finalize v15: %+v", resp)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for n.ClusterVersion() != version.V15 {
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster version after finalize: %s", n.ClusterVersion())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n.StorePrefixBloom() {
+		t.Fatal("prefix mode switched on without a restart")
+	}
+	conn = diskSQL(t, ctx, n)
+	for i := 300; i < 600; i++ {
+		if _, err := conn.Exec(ctx, `INSERT INTO t VALUES ($1, $2)`, int64(i), fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = conn.Close(ctx)
+	n.Stop()
+
+	n = startDiskNode(t, dir, false, "", withPG)
+	defer n.Stop()
+	if !n.StorePrefixBloom() {
+		t.Fatal("after a restart at v15: no prefix mode")
+	}
+	conn = diskSQL(t, ctx, n)
+	defer func() { _ = conn.Close(ctx) }()
+	var count int64
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM t`).Scan(&count); err != nil || count != 600 {
+		t.Fatalf("rows under prefix mode: %d, %v", count, err)
+	}
+	var v string
+	if err := conn.QueryRow(ctx, `SELECT v FROM t WHERE k = 123`).Scan(&v); err != nil || v != "v123" {
+		t.Fatalf("point read under prefix mode: %q, %v", v, err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM t WHERE k = 100000`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("absent key under prefix mode: %d, %v", count, err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO t VALUES (123, 'dup')`); err == nil {
+		t.Fatal("a duplicate key was accepted under prefix mode")
+	}
+	// The legacy tables are rewritten in the background.
+	deadline = time.Now().Add(60 * time.Second)
+	for n.PrefixBloomRewriteRemaining() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("legacy tables remaining after the rewrite: %d", n.PrefixBloomRewriteRemaining())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM t`).Scan(&count); err != nil || count != 600 {
+		t.Fatalf("rows after the rewrite: %d, %v", count, err)
+	}
+
+	// A fresh store bootstrapped by a v15 binary is in prefix mode, and
+	// restarts (its first open at start is a plain one).
+	freshDir := t.TempDir()
+	fresh := startDiskNode(t, freshDir, true, "", withPG)
+	if !fresh.StorePrefixBloom() {
+		t.Fatal("a fresh v15 store is not in prefix mode")
+	}
+	fconn := diskSQL(t, ctx, fresh)
+	if _, err := fconn.Exec(ctx, `CREATE TABLE f (k INT8 PRIMARY KEY, v TEXT); INSERT INTO f VALUES (1, 'one')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = fconn.Close(ctx)
+	fresh.Stop()
+	fresh = startDiskNode(t, freshDir, false, "", withPG)
+	defer fresh.Stop()
+	if !fresh.StorePrefixBloom() {
+		t.Fatal("the fresh v15 store restarted without prefix mode")
+	}
+	fconn = diskSQL(t, ctx, fresh)
+	defer func() { _ = fconn.Close(ctx) }()
+	if err := fconn.QueryRow(ctx, `SELECT v FROM f WHERE k = 1`).Scan(&v); err != nil || v != "one" {
+		t.Fatalf("after the restart: %q, %v", v, err)
+	}
+}
