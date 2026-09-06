@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -43,7 +44,15 @@ func buildBenchEngine(b *testing.B, versionsPerKey int) *Engine {
 		testingPebbleOptions = func(o *pebble.Options) { o.FormatMajorVersion = pebble.FormatMajorVersion(f) }
 		b.Cleanup(func() { testingPebbleOptions = nil })
 	}
-	eng, err := Open(b.TempDir(), Options{})
+	// DATAX_BENCH_PREFIX_BLOOM=1 opens the store in prefix mode (cluster
+	// version v15, issue #161) for a filter A/B.
+	prefix := os.Getenv("DATAX_BENCH_PREFIX_BLOOM") == "1"
+	// DATAX_BENCH_L6_FILTERS=0 leaves L6 tables' filters unconsulted.
+	if os.Getenv("DATAX_BENCH_L6_FILTERS") == "0" {
+		prefixL6Filters = false
+		b.Cleanup(func() { prefixL6Filters = true })
+	}
+	eng, err := Open(b.TempDir(), Options{PrefixBloom: prefix})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -75,6 +84,13 @@ func buildBenchEngine(b *testing.B, versionsPerKey int) *Engine {
 	_ = batch.Close()
 	if err := eng.Flush(); err != nil {
 		b.Fatal(err)
+	}
+	// DATAX_BENCH_COMPACT=1 moves the rows to L6, where a store's bulk
+	// rests (Pebble skips L6 filters unless asked; prefixL6Filters).
+	if os.Getenv("DATAX_BENCH_COMPACT") == "1" {
+		if err := eng.db.Compact(context.Background(), []byte{0}, []byte{0xff, 0xff}, false); err != nil {
+			b.Fatal(err)
+		}
 	}
 	return eng
 }
@@ -124,7 +140,7 @@ func BenchmarkMVCCGet(b *testing.B) {
 	b.Run("hit", func(b *testing.B) {
 		rng := rand.New(rand.NewSource(1))
 		b.ReportAllocs()
-		b.ResetTimer()
+		defer reportFilterUse(b, eng)()
 		for i := 0; i < b.N; i++ {
 			if _, err := MVCCGet(eng, benchKey(rng.Intn(benchRows/2)*2), readTS, MVCCGetOptions{}); err != nil {
 				b.Fatal(err)
@@ -134,13 +150,27 @@ func BenchmarkMVCCGet(b *testing.B) {
 	b.Run("miss", func(b *testing.B) {
 		rng := rand.New(rand.NewSource(3))
 		b.ReportAllocs()
-		b.ResetTimer()
+		defer reportFilterUse(b, eng)()
 		for i := 0; i < b.N; i++ {
 			if _, err := MVCCGet(eng, benchKey(rng.Intn(benchRows/2)*2+1), readTS, MVCCGetOptions{}); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
+}
+
+// reportFilterUse reports Pebble's bloom filter consultations per
+// operation — tables excluded ("filtered/op") and tables the filter
+// admitted ("admitted/op") — over the timed section (issue #161).
+func reportFilterUse(b *testing.B, eng *Engine) func() {
+	h0, m0 := eng.FilterMetrics()
+	b.ResetTimer()
+	return func() {
+		b.StopTimer()
+		h1, m1 := eng.FilterMetrics()
+		b.ReportMetric(float64(h1-h0)/float64(b.N), "filtered/op")
+		b.ReportMetric(float64(m1-m0)/float64(b.N), "admitted/op")
+	}
 }
 
 // BenchmarkMVCCGetReused: point reads through one Getter — the shape of
@@ -157,7 +187,7 @@ func BenchmarkMVCCGetReused(b *testing.B) {
 			g := NewGetter(eng)
 			defer g.Close()
 			b.ReportAllocs()
-			b.ResetTimer()
+			defer reportFilterUse(b, eng)()
 			for i := 0; i < b.N; i++ {
 				if _, err := g.Get(benchKey(rng.Intn(benchRows/2)*2+tc.off), readTS, MVCCGetOptions{}); err != nil {
 					b.Fatal(err)

@@ -266,6 +266,12 @@ type Node struct {
 	reencMu        sync.Mutex
 	reencActive    bool
 	reencRewritten int64
+	// Background rewrite of the tables written before prefix mode (see
+	// rewrite.go); prefixBloomNoticed: the next-restart notice was logged.
+	rewriteMu          sync.Mutex
+	rewriteActive      bool
+	rewriteRewritten   int64
+	prefixBloomNoticed atomic.Bool
 
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and
@@ -674,6 +680,7 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
 		return err
 	}
+	n.maybeStartFilterRewrite()
 	if err := n.stopper.RunWorker(n.ensureRoleCatalog); err != nil {
 		return err
 	}
@@ -846,6 +853,20 @@ func (n *Node) EngineMode() string { return n.engineMode() }
 
 // StoreFormat is the state engine's Pebble format major version.
 func (n *Node) StoreFormat() int { return n.storeFormat() }
+
+// StorePrefixBloom reports whether the state engine runs with the MVCC
+// comparer and prefix bloom filters (cluster version v15, issue #161).
+func (n *Node) StorePrefixBloom() bool { return n.storePrefixBloom() }
+
+// PrefixBloomRewriteRemaining is the number of live sstables of the state
+// engine still carrying whole-key filters (tests).
+func (n *Node) PrefixBloomRewriteRemaining() int {
+	if n.engine == nil {
+		return 0
+	}
+	_, files, _ := n.engine.FilterRewriteStatus()
+	return files
+}
 
 // RaftStoreFormat is the raft engine's Pebble format major version (0
 // on a single-engine store).

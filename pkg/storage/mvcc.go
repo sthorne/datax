@@ -158,7 +158,11 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 	var readAt hlc.Timestamp // exact version to read (own intent); empty = normal read
 	var skipAt hlc.Timestamp // provisional version to skip (own older epoch); empty = none
 
-	if it.SeekGE(metaKey) && bytes.Equal(it.Key(), metaKey) {
+	// Prefix seeks throughout (issue #161): the metadata key and every
+	// version of key share one MVCC prefix, so each seek asks the bloom
+	// filters whether an sstable holds anything of key at all.
+	metaFound := it.SeekPrefixGE(metaKey) && bytes.Equal(it.Key(), metaKey)
+	if metaFound {
 		meta, err := decodeMeta(it.Value())
 		if err != nil {
 			return nil, err
@@ -183,9 +187,28 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 		}
 	}
 
+	if !metaFound && it.Valid() {
+		// No intent: the seek left the iterator on key's newest version.
+		// When that version is at or below ts it is the answer — nothing
+		// newer exists, so no uncertain version can either — and the
+		// version seek below (a second filter consultation in prefix
+		// mode, issue #161) is spared.
+		_, vts, err := DecodeMVCCKey(it.Key())
+		if err != nil {
+			return nil, err
+		}
+		if vts.LessEq(ts) {
+			data, tombstone, err := decodeMVCCValue(it.Value())
+			if err != nil || tombstone {
+				return nil, err
+			}
+			return append([]byte(nil), data...), nil
+		}
+	}
+
 	if !readAt.IsEmpty() {
 		// Read-your-writes: return the provisional value, regardless of ts.
-		if !it.SeekGE(appendVersionSuffix(metaKey, readAt)) {
+		if !it.SeekPrefixGE(appendVersionSuffix(metaKey, readAt)) {
 			return nil, fmt.Errorf("intent on %s has no provisional value at %s", key, readAt)
 		}
 		_, vts, err := DecodeMVCCKey(it.Key())
@@ -206,7 +229,7 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 	// cannot order ourselves relative to it. Seek to the first version at or
 	// below the limit and check whether it is above our read timestamp.
 	if !opts.UncertaintyLimit.IsEmpty() && ts.Less(opts.UncertaintyLimit) {
-		if it.SeekGE(appendVersionSuffix(metaKey, opts.UncertaintyLimit)) {
+		if it.SeekPrefixGE(appendVersionSuffix(metaKey, opts.UncertaintyLimit)) {
 			for it.Valid() {
 				_, vts, err := DecodeMVCCKey(it.Key())
 				if err != nil {
@@ -225,7 +248,7 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 	}
 
 	// Normal read: newest version at or below ts.
-	if !it.SeekGE(appendVersionSuffix(metaKey, ts)) {
+	if !it.SeekPrefixGE(appendVersionSuffix(metaKey, ts)) {
 		return nil, nil
 	}
 	for it.Valid() {

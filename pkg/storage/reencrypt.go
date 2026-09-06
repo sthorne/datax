@@ -61,6 +61,33 @@ type reencStatusCache struct {
 
 const reencStatusTTL = 10 * time.Second
 
+// record stores a fresh reading.
+func (c *reencStatusCache) record(bytes int64, files int) {
+	c.mu.Lock()
+	c.at, c.bytes, c.files, c.lastErr = time.Now(), bytes, files, nil
+	c.mu.Unlock()
+}
+
+// status serves the cached reading while it is fresh, else re-sweeps
+// with sweep; a failed sweep returns the previous reading with the error.
+func (c *reencStatusCache) status(sweep func() ([]staleTable, error)) (remainingBytes int64, remainingFiles int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.at.IsZero() && time.Since(c.at) < reencStatusTTL {
+		return c.bytes, c.files, c.lastErr
+	}
+	stale, err := sweep()
+	if err != nil {
+		c.sweepErrs++
+		c.lastErr = err
+		return c.bytes, c.files, err // serve the previous reading
+	}
+	c.at = time.Now()
+	c.lastErr = nil
+	c.bytes, c.files = sumStale(stale)
+	return c.bytes, c.files, nil
+}
+
 // staleTable is one live sstable still encrypted under a retired key.
 type staleTable struct {
 	fileNum  uint64
@@ -110,25 +137,7 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 // no sweep has ever succeeded); callers must not treat a status carrying
 // an error as an attestation.
 func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int, err error) {
-	e.reenc.mu.Lock()
-	defer e.reenc.mu.Unlock()
-	if !e.reenc.at.IsZero() && time.Since(e.reenc.at) < reencStatusTTL {
-		return e.reenc.bytes, e.reenc.files, e.reenc.lastErr
-	}
-	stale, err := e.staleTables()
-	if err != nil {
-		e.reenc.sweepErrs++
-		e.reenc.lastErr = err
-		return e.reenc.bytes, e.reenc.files, err // serve the previous reading
-	}
-	e.reenc.at = time.Now()
-	e.reenc.lastErr = nil
-	e.reenc.bytes, e.reenc.files = 0, 0
-	for _, t := range stale {
-		e.reenc.bytes += int64(t.size)
-		e.reenc.files++
-	}
-	return e.reenc.bytes, e.reenc.files, nil
+	return e.reenc.status(e.staleTables)
 }
 
 // ReencryptPass compacts up to maxBytes (0 = unlimited) of stale-key
@@ -191,9 +200,25 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	if targeted, err = e.compactStale(ctx, stale, maxBytes, attempted); err != nil {
+		return targeted, 0, 0, err
+	}
+	stale, err = e.staleTables()
+	if err != nil {
+		return targeted, 0, 0, err
+	}
+	remainingBytes, remainingFiles = sumStale(stale)
+	e.reenc.record(remainingBytes, remainingFiles)
+	return targeted, remainingBytes, remainingFiles, nil
+}
+
+// compactStale rewrites up to maxBytes (0 = unlimited) of the given
+// live sstables through manual compactions, as ReencryptPass describes;
+// files in attempted are skipped and every file targeted is added to it.
+func (e *Engine) compactStale(ctx context.Context, stale []staleTable, maxBytes int64, attempted map[uint64]bool) (targeted int64, err error) {
 	for _, t := range stale {
 		if err := ctx.Err(); err != nil {
-			return targeted, 0, 0, err
+			return targeted, err
 		}
 		if maxBytes > 0 && targeted >= maxBytes {
 			break
@@ -211,14 +236,19 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 			// natural churn have to retire those).
 			if bytes.Compare(seed, t.largest) <= 0 {
 				if derr := e.db.Delete(seed, nil); derr != nil {
-					return targeted, 0, 0, derr
+					return targeted, derr
+				}
+				// Pebble v2's Compact no longer flushes an overlapping
+				// memtable first (v1 did): without this flush the seed
+				// stays in memory and a lone file is moved, not rewritten.
+				if ferr := e.db.Flush(); ferr != nil {
+					return targeted, ferr
 				}
 			}
 		}
 		// The span: the file's own bounds below L0, the narrowest overlapping
 		// one — smallest through the seed — for an L0 file (Compact's end is
-		// inclusive in this Pebble). The call flushes the overlapping
-		// memtable (our seed) first.
+		// inclusive in this Pebble).
 		var end []byte
 		if t.level == 0 {
 			end = append(append([]byte(nil), t.smallest...), 0)
@@ -227,22 +257,20 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 		}
 		before := e.compactedBytes()
 		if cerr := e.db.Compact(context.Background(), t.smallest, end, false); cerr != nil {
-			return targeted, 0, 0, cerr
+			return targeted, cerr
 		}
 		targeted += e.compactedBytes() - before
 	}
-	stale, err = e.staleTables()
-	if err != nil {
-		return targeted, 0, 0, err
-	}
+	return targeted, nil
+}
+
+// sumStale totals a sweep's bytes and files.
+func sumStale(stale []staleTable) (bytes int64, files int) {
 	for _, t := range stale {
-		remainingBytes += int64(t.size)
-		remainingFiles++
+		bytes += int64(t.size)
+		files++
 	}
-	e.reenc.mu.Lock()
-	e.reenc.at, e.reenc.bytes, e.reenc.files, e.reenc.lastErr = time.Now(), remainingBytes, remainingFiles, nil
-	e.reenc.mu.Unlock()
-	return targeted, remainingBytes, remainingFiles, nil
+	return bytes, files
 }
 
 // compactedBytes is the running total of bytes Pebble has written through

@@ -249,6 +249,9 @@ var (
 	ReencryptionRewritten = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_reencryption_rewritten_bytes_total", Help: "Bytes of stale-key sstables rewritten under the active data key by background re-encryption passes.",
 	})
+	PrefixBloomRewritten = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_prefix_bloom_rewritten_bytes_total", Help: "Bytes of sstables carrying whole-key bloom filters rewritten with prefix filters by the background pass after a store entered prefix mode (cluster version v15, issue #161).",
+	})
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})

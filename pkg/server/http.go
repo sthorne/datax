@@ -218,6 +218,14 @@ func (n *Node) startHTTP() error {
 				return float64(remaining)
 			}))
 		}
+		if eng.PrefixBloom() {
+			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_prefix_bloom_remaining_bytes", Help: "Live sstable bytes still carrying whole-key bloom filters after the store entered prefix mode (0 = every point read can be answered by the filters; cluster version v15, issue #161).",
+			}, func() float64 {
+				remaining, _, _ := eng.FilterRewriteStatus()
+				return float64(remaining)
+			}))
+		}
 	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 

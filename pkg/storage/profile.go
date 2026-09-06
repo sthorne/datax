@@ -66,6 +66,14 @@ type Options struct {
 	// DefaultCacheSize). The cache is shared by every engine of the
 	// process: the first engine's size holds until the last one closes.
 	CacheSize int64
+	// PrefixBloom opens the engine in prefix mode (issue #161,
+	// comparer.go): the MVCC comparer, bloom filters over user-key
+	// prefixes that point reads consult, and the columnar key schema
+	// that goes with the comparer. Fixed for the life of the open; a
+	// store's tables written without it stay readable and are rewritten
+	// in the background (FilterRewritePass). The server sets it from
+	// cluster version v15 on.
+	PrefixBloom bool
 }
 
 // softGate holds the profile's backpressure thresholds: when the engine

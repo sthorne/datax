@@ -46,7 +46,14 @@ encode 0.85 → 0.65 µs, an intent laid down, rewritten and read back
 13.9 → 6.2 µs; the record is well under half the size.
 
 Because the metadata key sorts immediately before all versions, a single seek
-finds "intent, then newest version". A scan walks from there with `Next`:
+finds "intent, then newest version" — and a point read that finds no
+intent and a newest version at or below its timestamp is done there.
+From cluster version v15 a point read's seeks are prefix seeks (issue
+#161, [storage profiles → prefix bloom
+filters](storage-profiles.md#prefix-bloom-filters)): the metadata key and
+every version of a key share one prefix under the engine's comparer, so
+each seek asks the sstables' bloom filters whether they hold anything of
+the key at all. A scan walks from there with `Next`:
 the newest version at or below its timestamp, then across the key's
 remaining versions onto the next row (a reverse scan steps back with
 `Prev`), and seeks only past a chain of more than eight versions (issue

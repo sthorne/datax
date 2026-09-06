@@ -182,6 +182,21 @@ Pebble that does not know the format, so, as with v13, a node cannot go
 back to it after the finalize; `datax debug nodes` shows each store's
 format (`store_format`).
 
+Upgrading to v15 is "finalize, then restart", like v13: a store at v15
+opens with prefix bloom filters — Pebble's filters answer point reads
+by user key, so a read of a key that is not there (the uniqueness probe
+of every `INSERT`, the intent lookup before every write) skips the
+sstables that hold nothing of it — and the switch is a property of how
+the store is opened, so each node picks it up at its next restart after
+the finalize (the node logs that it will, and `datax debug nodes` shows
+`store_prefix_bloom`). Until a node restarts it serves exactly as at
+v14. After the switch the node rewrites the sstables written before it
+in the background, paced like re-encryption, so the cold bulk of the
+store gains the filters too (`prefix_bloom_rewrite` in the node
+document, `datax_prefix_bloom_remaining_bytes` on `/metrics`); reads are
+correct throughout, merely without the skip on tables not yet rewritten.
+A v14 binary cannot open a store that has run at v15.
+
 ## Checklist for production deployments
 
 - One `datax` process per machine, `--dir` on its own disk (NVMe strongly
