@@ -225,6 +225,11 @@ const (
 type Node struct {
 	cfg     Config
 	tlsCfgs *security.TLSConfigs // nil in insecure mode
+	// certs reports what TLS material this node loaded and which client
+	// identities have presented certificates to it (issue #156). Never
+	// nil, so callers need no insecure-mode branch: in insecure mode it
+	// simply holds nothing.
+	certs   *certTracker
 	stopper *stop.Stopper
 	clock   *hlc.Clock
 	engine  *storage.Engine
@@ -304,6 +309,10 @@ type Node struct {
 	pinger *rpc.Pinger
 	// schema caches the schema browser's document (see schema_api.go).
 	schema schemaCache
+	// capacity caches the disk-fill forecasts (see capacity.go): they
+	// read a day of samples per node, which is not work to repeat on a
+	// console poll.
+	capacity capacityCache
 	// rangeList is the last /meta listing served to the dashboard.
 	rangeList rangeListCache
 	// events is the node's operational event ring (see health_api.go).
@@ -432,6 +441,9 @@ func (n *Node) start() error {
 			return fmt.Errorf("loading TLS certificates: %w", err)
 		}
 		n.trans.SetTLS(n.tlsCfgs.Client)
+		n.certs = newCertTracker(n.tlsCfgs.Certs)
+	} else {
+		n.certs = newCertTracker(nil)
 	}
 
 	// Identity: read from disk, or establish via bootstrap/join.

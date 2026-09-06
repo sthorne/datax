@@ -196,9 +196,15 @@ type ClusterStatus struct {
 	Rollup ClusterRollup `json:"rollup"`
 	// Replication buckets the ranges by replication state and projects
 	// what the loss of each failure domain would cost (issue #152).
-	Replication ClusterReplication      `json:"replication"`
-	Local       NodeStatus              `json:"local"`
-	Storage     *storage.StorageMetrics `json:"storage,omitempty"`
+	Replication ClusterReplication `json:"replication"`
+	// Capacity is the per-store disk-fill forecast (issue #156), fitted
+	// over the recorded free-space window and refreshed in the
+	// background. A store with no meaningful trend is present with
+	// filling=false and a reason, so the console can say why there is no
+	// number instead of showing an empty cell.
+	Capacity []Forecast              `json:"capacity"`
+	Local    NodeStatus              `json:"local"`
+	Storage  *storage.StorageMetrics `json:"storage,omitempty"`
 	// Error carries a partial-data note (e.g. the meta scan failed during
 	// startup or a partition); the rest of the document is still valid.
 	Error string `json:"error,omitempty"`
@@ -217,7 +223,12 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 	now := n.clock.Now().WallTime
 	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
+	forecasts := n.capacityForecasts()
+	if forecasts == nil {
+		forecasts = []Forecast{}
+	}
 	doc := ClusterStatus{
+		Capacity:       forecasts,
 		Now:            now / int64(time.Millisecond),
 		NodeID:         int(n.ident.NodeID),
 		ConsoleVersion: n.consoleVersion,

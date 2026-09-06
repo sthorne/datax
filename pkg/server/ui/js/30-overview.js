@@ -91,13 +91,46 @@ function renderNodesTable(d) {
       <td class="num" data-label="load">${m && m.cores ? loadCell(m.load1, m.cores) : "—"}</td>
       <td class="num" data-label="memory">${m && m.mem_total ? memCell(m) : "—"}</td>
       <td class="num" data-label="disk free">${m && m.disk_total ? diskCell(m) : "—"}</td>
+      <td class="num" data-label="fills in">${fillsInCell(capacityFor(d, n.node_id))}</td>
       <td class="num" data-label="fds">${m && m.fd_limit ? fdCell(m) : "—"}</td>
       <td class="num" data-label="leases">${n.leader_count || 0}</td>
       <td class="num" data-label="heartbeat">${fmtAgo(n.heartbeat_ago_ms)}</td>
     </tr>` };
-  }) : [{ key: "none", html: `<tr data-key="none"><td colspan="11" class="muted">no node matches ${esc(nodeFilter)}</td></tr>` }]);
+  }) : [{ key: "none", html: `<tr data-key="none"><td colspan="12" class="muted">no node matches ${esc(nodeFilter)}</td></tr>` }]);
+  const filling = (d.capacity || []).filter(f => f.filling).length;
   document.getElementById("nodes-table-note").textContent =
-    nodeFilter ? `filtered to ${nodes.length} of ${(d.nodes || []).length} nodes` : "";
+    (nodeFilter ? `filtered to ${nodes.length} of ${(d.nodes || []).length} nodes · ` : "") +
+    ("\"fills in\" is fitted over the recorded free-space history; it is blank where free space is flat, rising, or too noisy to be a trend — "
+      + "hover it for the reason. " + (filling ? `${filling} store${filling === 1 ? " is" : "s are"} filling.` : "No store is on course to fill."));
+}
+
+// ---- Capacity forecast (issue #156) ------------------------------
+//
+// Free space was a point reading: amber under 15%, red under 5%. By the
+// time it is amber the question is "how long have I got".
+//
+// The fit is the server's (it reads the recorded series); this only
+// renders it, and renders an absent forecast as absent. A projection is
+// a straight line through the recent past, so it is shown to one
+// significant figure and never dressed up as a date.
+function capacityFor(d, id) { return (d.capacity || []).find(f => f.node_id === id); }
+
+function fmtFillDays(days) {
+  if (days < 1) return Math.round(days * 24) + "h";
+  if (days < 10) return days.toFixed(1) + "d";
+  if (days > 365) return "> 1y";
+  return Math.round(days) + "d";
+}
+
+function fillsInCell(f) {
+  if (!f) return `<span class="muted" title="no forecast for this store yet">—</span>`;
+  if (!f.filling) {
+    return `<span class="muted" title="${esc(f.reason || "this store is not filling")}">—</span>`;
+  }
+  const level = f.days_to_full <= 3 ? "down" : f.days_to_full <= 14 ? "draining" : "";
+  const title = `growing ${fmtBytes(Math.max(0, f.growth_bytes_per_day))}/day, fitted over ${Math.round(f.window_hours)}h `
+    + `of readings (fit ${f.fit.toFixed(2)}); a straight line through the recent past, not a promise`;
+  return `<span title="${esc(title)}">${warn(level, fmtFillDays(f.days_to_full))}</span>`;
 }
 function rangeRow(r, leaderLabel, extra) {
   return `<tr data-key="r${r.range_id}">

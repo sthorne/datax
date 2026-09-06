@@ -268,6 +268,36 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string) (*Metric
 	return res, http.StatusOK, nil
 }
 
+// rawSeries reads one node's samples of one series over a window,
+// undownsampled and in time order. The capacity forecast (issue #156)
+// fits a line through these, which downsampled buckets would flatten;
+// everything else goes through metricsQuery.
+func (n *Node) rawSeries(ctx context.Context, name string, node int64, from, to time.Time) ([]tsample, error) {
+	sess, err := n.systemSession()
+	if err != nil {
+		return nil, err
+	}
+	stmts, err := parser.Parse("SELECT at, value FROM " + catalog.MetricsTableName +
+		" WHERE node = $1 AND name = $2 AND at >= $3 AND at < $4 ORDER BY at LIMIT " + strconv.Itoa(metricsScanLimit))
+	if err != nil {
+		return nil, err
+	}
+	r, serr := sess.Execute(ctx, stmts[0], []types.Datum{
+		types.NewInt(node), types.NewString(name),
+		types.NewTimestamp(from.UnixNano()), types.NewTimestamp(to.UnixNano())})
+	if serr != nil {
+		return nil, serr
+	}
+	pts := make([]tsample, 0, len(r.Rows))
+	for _, row := range r.Rows {
+		if len(row) != 2 || row[0].Null || row[1].Null {
+			continue
+		}
+		pts = append(pts, tsample{t: row[0].I, v: row[1].F})
+	}
+	return pts, nil
+}
+
 type tsample struct {
 	t int64 // unix nanoseconds
 	v float64

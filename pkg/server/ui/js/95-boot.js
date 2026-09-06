@@ -87,6 +87,10 @@ task("overview", pollOverview, 3000, ["overview", "nodes", "data", "sql", "ops",
 task("schema", pollSchema, 10000, ["schema", "data", "security"]);
 task("activity", pollActivity, 3000, ["sql"]);
 task("scopedEvents", pollScopedEvents, 5000, ["ops", "security", "overview"]);
+// The security document (issue #156): certificates, roles, connections
+// by authentication method and the store's encryption state. Slower than
+// the cluster poll — none of it changes between one second and the next.
+task("security", pollSecurity, 10000, ["security"]);
 task("tileHistory", pollTileHistory, 30000, ["overview"]);
 task("node", pollNode, 5000, ["node"]);
 task("metrics", fetchMetrics, 15000, ["metrics"]);

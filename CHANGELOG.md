@@ -8,6 +8,64 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.52.0 — unreleased
+
+### Added
+- **Certificate expiry, reported three ways** (#156). `--certs-dir`
+  turns on mutual internode TLS and SQL TLS, and nothing said when any
+  of it was about to stop working — although the dates were sitting in
+  certificates the node had already parsed. Silently expiring node
+  certificates are a well-known way to lose a cluster.
+
+  `/metrics` now carries `datax_cert_expiry_seconds{kind,subject}`, so
+  an alert fires whether or not anyone opens the console; the health
+  checks warn thirty days out and turn critical at seven, naming what
+  the lapse would cost rather than only that it is coming; and the
+  console's `#/security` view lists the material with its dates, soonest
+  first. An insecure cluster publishes no series rather than one
+  asserting that nothing expires.
+
+- **A capacity forecast** (#156). Free space was a point reading — amber
+  under 15%, red under 5% — and by the time it was amber the question
+  was "how long have I got", which nothing could answer.
+
+  The recorded `store.disk_free` series is now fitted per store and the
+  nodes table gains a **fills in** column beside the free-space figure,
+  with the growth rate and the fit's quality on hover. A store on course
+  to fill within a fortnight becomes a health problem and within three
+  days a critical one.
+
+  A forecast is only offered where the series has one to give: a flat or
+  rising series says "not filling", a series too short or too noisy to
+  fit says which, and neither is dressed up as a number. The fit is
+  cached and refreshed in the background, so a console poll never waits
+  on a day of samples.
+
+- **A security view worth the name** (#156). Security state was
+  scattered: audit records rode the general event ring behind an amber
+  outline, the signed-in principal was in the header, and users were a
+  small table appended to the schema section. Nothing answered "who can
+  reach this cluster and how".
+
+  `#/security` now reads from a new `/api/security`: the certificates
+  and their expiry, every role with what it effectively holds through
+  membership (built-in roles included, and NOINHERIT marked as what it
+  is), who is connected and by which method — client certificate, SCRAM,
+  or trusted in insecure mode — this node's authentication failures and
+  denied admin operations, and the store's encryption state with any
+  re-encryption still to do.
+
+  The gate follows the data rather than the panel: certificate expiry
+  and role membership are operational and open to any authenticated
+  user, while the per-user connection breakdown and the client
+  certificates this node has been shown name people, and travel with the
+  audit records behind the admin gate.
+
+### Fixed
+- The console's users table listed logins and an admin flag; it now
+  lists roles with their membership resolved, so "why is this an admin"
+  is answerable without walking the graph by hand (#156).
+
 ## 0.51.0 — unreleased
 
 ### Added

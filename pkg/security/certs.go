@@ -159,6 +159,29 @@ func writeCert(path string, der []byte) error {
 	return os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644)
 }
 
+// CertInfo is one loaded certificate's identity and validity window.
+//
+// Silently expiring node certificates are a well-known way to lose a
+// cluster, so the node reports what it loaded rather than leaving the
+// dates in files nobody looks at (issue #156). It is taken from the
+// certificates parsed at load time — nothing re-reads the certificate
+// directory to answer a console poll or a metrics scrape.
+type CertInfo struct {
+	// Kind is "ca", "node" or "client", the role the certificate plays.
+	Kind      string    `json:"kind"`
+	Subject   string    `json:"subject"`
+	Issuer    string    `json:"issuer,omitempty"`
+	NotBefore time.Time `json:"not_before"`
+	NotAfter  time.Time `json:"not_after"`
+}
+
+// Expired reports whether the certificate is outside its validity window
+// at t. A certificate that is not yet valid is as unusable as an expired
+// one, so both answer true.
+func (c CertInfo) Expired(t time.Time) bool {
+	return t.After(c.NotAfter) || t.Before(c.NotBefore)
+}
+
 // TLSConfigs bundles a node's TLS material for its three roles.
 type TLSConfigs struct {
 	// Server authenticates internode gRPC servers and REQUIRES a
@@ -171,7 +194,27 @@ type TLSConfigs struct {
 	// certificate whose CommonName is the SQL user (optional — hence
 	// VerifyClientCertIfGiven).
 	PGServer *tls.Config
+	// Certs describes what was loaded: the cluster CA and this node's
+	// certificate. Kept here so expiry can be reported from the material
+	// already in memory (issue #156).
+	Certs []CertInfo
 }
+
+// certInfo describes a parsed certificate.
+func certInfo(kind string, c *x509.Certificate) CertInfo {
+	return CertInfo{
+		Kind:      kind,
+		Subject:   c.Subject.CommonName,
+		Issuer:    c.Issuer.CommonName,
+		NotBefore: c.NotBefore,
+		NotAfter:  c.NotAfter,
+	}
+}
+
+// CertInfoFrom describes a peer certificate the server was presented —
+// a client certificate on the HTTP or SQL listener. Exported so the
+// server can report the identities reaching it without re-parsing PEM.
+func CertInfoFrom(c *x509.Certificate) CertInfo { return certInfo("client", c) }
 
 // LoadClientTLS loads a client TLS configuration from certsDir: the
 // cluster CA as the trust root plus client.<user>.crt/.key as the
@@ -214,7 +257,26 @@ func LoadNodeTLS(certsDir string) (*TLSConfigs, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading node cert pair: %w", err)
 	}
+	// The CA is otherwise only a trust root in the pool, and the node's
+	// leaf may not be parsed by LoadX509KeyPair; parse both here so the
+	// dates travel with the configuration they belong to.
+	var certs []CertInfo
+	if block, _ := pem.Decode(caPEM); block != nil {
+		if ca, cerr := x509.ParseCertificate(block.Bytes); cerr == nil {
+			certs = append(certs, certInfo("ca", ca))
+		}
+	}
+	if len(pair.Certificate) > 0 {
+		leaf := pair.Leaf
+		if leaf == nil {
+			leaf, _ = x509.ParseCertificate(pair.Certificate[0])
+		}
+		if leaf != nil {
+			certs = append(certs, certInfo("node", leaf))
+		}
+	}
 	return &TLSConfigs{
+		Certs: certs,
 		Server: &tls.Config{
 			Certificates: []tls.Certificate{pair},
 			ClientCAs:    pool,

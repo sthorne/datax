@@ -380,6 +380,26 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			Summary: fmt.Sprintf("%d authentication failures or denied admin operations in the last %s on this node", int(authDelta), window.Truncate(time.Second))})
 	}
 
+	// Capacity: a store on course to fill, from the recorded free-space
+	// series (issue #156). The forecasts are cached and refreshed in the
+	// background, so this check reads whatever the last fit produced
+	// rather than querying a day of samples on every poll.
+	doc.Checks++
+	for _, p := range capacityProblems(n.capacityForecasts()) {
+		add(p)
+	}
+
+	// Certificates: an expiring one is a scheduled outage, so it is
+	// reported before it happens (issue #156). Insecure clusters have
+	// no certificates and the check finds nothing rather than being
+	// skipped, so the count still says it ran.
+	doc.Checks++
+	certs, _ := n.certs.all()
+	for _, p := range certProblems(certs, now) {
+		p.Node = int(n.ident.NodeID)
+		add(p)
+	}
+
 	// Statistics: tables with stale or missing statistics (info).
 	doc.Checks++
 	// From the cached schema document, refreshed in the background: the

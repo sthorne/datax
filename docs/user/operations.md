@@ -78,6 +78,14 @@ serves, on that address:
   across the cluster. **schema**:
   every table with its columns, primary key, indexes, time-series
   options, grants, statistics and their age, and range footprint.
+  The **nodes** table adds a **fills in** column beside free space: how
+  long the store has at its recent rate, fitted over the recorded
+  free-space history. It is blank where free space is flat, rising, or
+  too noisy to be a trend — a projection is only offered where the
+  series has one to give, and hovering the cell says why there is none.
+  A store on course to fill within a fortnight becomes a health problem,
+  and within three days a critical one.
+
   **ops**: the operations in flight and the ones that have finished,
   above the scoped node's event ring with a kind filter. A long-running
   operation — a backup, a restore, a re-encryption, a node's drain —
@@ -88,9 +96,15 @@ serves, on that address:
   bounded, so an operation whose start has already aged out of it is
   listed by its end alone and claims no duration rather than inventing
   one. **security**:
-  how the cluster authenticates, who is signed in and by what, the users
-  and their roles, and the audit records separated from the operational
-  ones. **metrics** charts any of the series the cluster records about
+  how the cluster authenticates, who is signed in and by what, the
+  certificates this node loaded with their expiry dates, the roles and
+  what each one effectively holds through membership, who is connected
+  and by which method, the store's encryption state and any
+  re-encryption still to do, and the audit records separated from the
+  operational ones. Certificate expiry and role membership are open to
+  any authenticated user; the per-user connection breakdown and the
+  client certificates this node has been shown need the admin role, as
+  the audit records do. **metrics** charts any of the series the cluster records about
   itself over the header's time range, one chart per series with one
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
@@ -324,6 +338,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
+| `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
