@@ -2,6 +2,8 @@ package ui
 
 import (
 	"bytes"
+	"errors"
+	"html"
 	"regexp"
 	"strings"
 	"testing"
@@ -140,6 +142,9 @@ func TestHiddenAttributeWins(t *testing.T) {
 var allowedDisplayOnHidden = map[string]bool{
 	// The jump dialog centres its box with flex when shown.
 	"jump": true,
+	// So does the help panel, for the same reason — and safely for the
+	// same reason: the [hidden] override outranks both.
+	"help": true,
 }
 
 var (
@@ -293,3 +298,222 @@ var (
 	tileQualRule = regexp.MustCompile(`\.tile\s+\.value\s+\.muted\s*\{[^}]*display\s*:\s*block`)
 	tileLongRule = regexp.MustCompile(`\.tile\s+\.value\.long\s*\{[^}]*font-size`)
 )
+
+// ---- Help: every term on the page explains itself ----
+//
+// The console is full of precise, opaque words — "compaction debt",
+// "bare majority", "40001/s", "stats age". Each is explained by an entry
+// in the glossary, keyed by the term as it is written on screen, so a
+// column that says "leases" is explained without anyone wiring it up.
+//
+// These tests are what makes "everything on the page" true rather than
+// aspirational: a new column or section whose word is not in the
+// glossary fails the build, and an entry that stops matching anything on
+// the page is reported as dead rather than left to rot.
+
+// TestEveryTermOnThePageIsExplained walks the terms the page actually
+// shows — table headings, section titles and tile labels — and requires
+// each to resolve.
+func TestEveryTermOnThePageIsExplained(t *testing.T) {
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms, err := pageTerms()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(terms) < 100 {
+		t.Fatalf("found only %d terms on the page; the extractor is broken, not the glossary", len(terms))
+	}
+	for _, term := range terms {
+		if g.lookup(term.view, term.text) == "" {
+			t.Errorf("%s: nothing explains %q (from %s). Add it to HELP in js/12-help.js — "+
+				"key it %q if it means something different here than elsewhere",
+				term.where, term.text, term.where, term.view+"/"+term.text)
+		}
+	}
+}
+
+// TestHelpEntriesSaySomething: an entry that only restates its label
+// costs a click to learn nothing, which is worse than no entry at all.
+func TestHelpEntriesSaySomething(t *testing.T) {
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.entries) < 100 {
+		t.Fatalf("the glossary has %d entries; the parser is broken", len(g.entries))
+	}
+	for key, text := range g.entries {
+		if len(text) < 30 {
+			t.Errorf("HELP[%q] is %d characters (%q): too short to add anything the label does not already say",
+				key, len(text), text)
+		}
+		if !strings.HasSuffix(strings.TrimSpace(text), ".") {
+			t.Errorf("HELP[%q] does not end in a full stop: %q", key, text)
+		}
+	}
+}
+
+// TestHelpGlossaryHasNoDeadEntries: an entry matching nothing on the
+// page is either a term that was renamed or one that never existed, and
+// either way the reader will never see it.
+func TestHelpGlossaryHasNoDeadEntries(t *testing.T) {
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms, err := pageTerms()
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := map[string]bool{}
+	for _, term := range terms {
+		if key := g.matched(term.view, term.text); key != "" {
+			used[key] = true
+		}
+	}
+	for key := range g.entries {
+		if used[key] || helpKeysNotOnAPage[key] {
+			continue
+		}
+		t.Errorf("HELP[%q] matches nothing on the page: either the term was renamed and the "+
+			"entry needs its new key, or the entry is for something that is no longer shown", key)
+	}
+}
+
+// helpKeysNotOnAPage are entries that explain a control in the header or
+// a term the page writes in prose rather than as a heading, so the term
+// extractor below will never see them.
+var helpKeysNotOnAPage = map[string]bool{
+	"scope": true, "range": true, "jump to": true,
+	"compare": true, "annotate": true, "filter": true,
+}
+
+type glossary struct{ entries map[string]string }
+
+// lookup mirrors helpFor in js/12-help.js: the view's own reading of the
+// word, then the word, then the word without the parenthetical that
+// qualifies it, then the generated-term patterns.
+func (g glossary) lookup(view, term string) string {
+	if key := g.matched(view, term); key != "" {
+		return g.entries[key]
+	}
+	if generatedTerm.MatchString(term) {
+		return "pattern"
+	}
+	return ""
+}
+
+// matched returns the glossary key a term resolves to, or "".
+func (g glossary) matched(view, term string) string {
+	bare := strings.TrimSpace(parenthetical.ReplaceAllString(term, ""))
+	for _, key := range []string{view + "/" + term, term, view + "/" + bare, bare} {
+		if _, ok := g.entries[key]; ok {
+			return key
+		}
+	}
+	return ""
+}
+
+var (
+	// The glossary is a flat object of "key": "text" pairs, one per line.
+	helpEntry = regexp.MustCompile(`(?m)^\s{2}"([^"]+)":\s*"((?:[^"\\]|\\.)*)",\s*$`)
+	// Terms the page generates rather than writes: one column per node,
+	// one row per range.
+	generatedTerm = regexp.MustCompile(`^[nr]\d+$`)
+	parenthetical = regexp.MustCompile(`\s*\([^)]*\)\s*$`)
+)
+
+func loadGlossary() (glossary, error) {
+	src, err := FS.ReadFile("js/12-help.js")
+	if err != nil {
+		return glossary{}, err
+	}
+	// Only the object literal, so a "key": "value" pair inside a comment
+	// or a later function is not read as an entry.
+	text := string(src)
+	start := strings.Index(text, "const HELP = {")
+	if start < 0 {
+		return glossary{}, errors.New("js/12-help.js has no HELP glossary")
+	}
+	end := strings.Index(text[start:], "\n};")
+	if end < 0 {
+		return glossary{}, errors.New("js/12-help.js: the HELP glossary is not closed")
+	}
+	entries := map[string]string{}
+	for _, m := range helpEntry.FindAllStringSubmatch(text[start:start+end], -1) {
+		entries[m[1]] = strings.ReplaceAll(m[2], `\"`, `"`)
+	}
+	return glossary{entries: entries}, nil
+}
+
+type pageTerm struct{ view, text, where string }
+
+// pageTerms collects what the reader sees a label for: every table
+// heading and section title in the markup, every heading the scripts
+// generate, and every tile label.
+func pageTerms() ([]pageTerm, error) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		return nil, err
+	}
+	var terms []pageTerm
+	add := func(view, raw, where string) {
+		if t := normalizeTerm(raw); t != "" {
+			terms = append(terms, pageTerm{view: view, text: t, where: where})
+		}
+	}
+	// The markup, view by view: a term is read the way its view means it.
+	for _, part := range viewSplit.FindAllStringSubmatch(string(page), -1) {
+		view, body := part[1], part[2]
+		for _, m := range headingRE.FindAllStringSubmatch(body, -1) {
+			add(view, m[2], "index.html #/"+view)
+		}
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		// A heading the script writes. Its view is not knowable here, so
+		// it has to resolve without one.
+		for _, m := range headingRE.FindAllStringSubmatch(string(src), -1) {
+			add("", m[2], name)
+		}
+		for _, m := range tileLabel.FindAllStringSubmatch(string(src), -1) {
+			add("", m[1], name)
+		}
+	}
+	return terms, nil
+}
+
+var (
+	viewSplit = regexp.MustCompile(`(?s)<main id="view-([a-z]+)"(.*?)</main>`)
+	headingRE = regexp.MustCompile(`(?s)<(th|h2)\b[^>]*>(.*?)</(?:th|h2)>`)
+	tileLabel = regexp.MustCompile(`\btile\("([^"]+)"`)
+	// Controls and screen-reader text live inside a heading without being
+	// part of the term: "Statement shapes" is the heading and the sort
+	// <select> beside it is not.
+	inlineControl = regexp.MustCompile(`(?s)<(select|button|input|label)\b.*?</(?:select|button|input|label)>`)
+	anyTag        = regexp.MustCompile(`<[^>]*>`)
+	spaces        = regexp.MustCompile(`\s+`)
+)
+
+// normalizeTerm reduces a heading to its glossary key the same way
+// normTerm and labelText do in the browser.
+func normalizeTerm(raw string) string {
+	raw = inlineControl.ReplaceAllString(raw, " ")
+	raw = anyTag.ReplaceAllString(raw, " ")
+	raw = html.UnescapeString(raw)
+	// A template hole is a value, not a term.
+	if strings.Contains(raw, "${") {
+		return ""
+	}
+	return strings.TrimSpace(spaces.ReplaceAllString(strings.ToLower(raw), " "))
+}

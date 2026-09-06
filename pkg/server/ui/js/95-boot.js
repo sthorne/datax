@@ -149,4 +149,5 @@ document.getElementById("annotate-kinds").addEventListener("change", renderChart
 
 a11yTables();
 wireControls();
+wireHelpControls();
 route();
