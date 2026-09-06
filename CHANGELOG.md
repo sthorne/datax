@@ -8,6 +8,36 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.53.1 — unreleased
+
+### Fixed
+- **The console was unusable: the jump-to dialog covered the page from
+  first paint.** Its markup carries the `hidden` attribute and every
+  script that shows and hides it reads `.hidden`, but the stylesheet said
+  `#jump { display: flex }` — and an id selector outranks the user
+  agent's `[hidden] { display: none }`. The attribute did nothing, so a
+  `position: fixed; inset: 0` overlay sat on top of the console
+  swallowing every click while the code believed it was hidden. Pressing
+  Escape and Enter appeared to toggle it without ever dismissing it.
+
+  Fixed at the root: `[hidden] { display: none !important }` makes the
+  attribute authoritative for every element that uses it, rather than
+  patching the one selector that happened to outrank it.
+
+  Two smaller faults in the same dialog, both of which made it feel
+  undismissable:
+
+  - Escape only closed it while the keyboard was inside its input; it now
+    closes from anywhere.
+  - Closing returned the keyboard to the button that opens it, so the
+    next Enter reopened it. It now returns focus to wherever the reader
+    was before it opened.
+
+  A regression test asserts the override is present and fails without
+  it — this was invisible to every existing test, because the server
+  serves the same bytes either way and a DOM assertion on an element's
+  text passes whether or not something is covering it.
+
 ## 0.53.0 — unreleased
 
 ### Added

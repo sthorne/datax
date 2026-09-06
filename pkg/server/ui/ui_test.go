@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -82,3 +83,66 @@ func TestScriptFilesAssemble(t *testing.T) {
 		}
 	}
 }
+
+// TestHiddenAttributeWins: an element that ships with the hidden
+// attribute must actually be hidden.
+//
+// The jump dialog shipped covering the whole page from first paint. Its
+// markup carried `hidden` and every script that shows and hides it reads
+// `.hidden`, but the stylesheet said `#jump { display: flex }` — and an
+// id selector (1,0,0) outranks the user agent's `[hidden] { display:
+// none }` (0,1,0). The overlay is `position: fixed; inset: 0`, so it
+// swallowed every click on the console while the code believed it was
+// gone.
+//
+// Nothing caught it: the server serves the same bytes either way, and a
+// DOM test that reads an element's text passes whether or not the
+// element is on top of the page. So this asserts the invariant in the
+// stylesheet itself.
+func TestHiddenAttributeWins(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+
+	// The override that makes the attribute authoritative regardless of
+	// what any other rule sets.
+	if !hiddenOverride.MatchString(css) {
+		t.Fatal("index.html has no `[hidden] { display: none !important }` rule: any id or class rule " +
+			"that sets display will leave a `hidden` element on screen while the scripts believe it is hidden")
+	}
+
+	// And every element that ships hidden is named, so a reviewer can
+	// see which elements depend on the rule above.
+	ids := hiddenElement.FindAllStringSubmatch(css, -1)
+	if len(ids) == 0 {
+		t.Fatal("no element ships with the hidden attribute; this test is watching nothing")
+	}
+	for _, m := range ids {
+		id := m[1]
+		// A rule that sets display on this element's id is exactly the
+		// shape of the original bug. It is legal now that the override
+		// exists, but it is worth failing on so the next person adds
+		// the element to the list deliberately rather than by accident.
+		rule := regexp.MustCompile(`(?s)#` + regexp.QuoteMeta(id) + `\s*\{[^}]*\bdisplay\s*:`)
+		if rule.MatchString(css) && !allowedDisplayOnHidden[id] {
+			t.Errorf("#%s ships with the hidden attribute and has a rule setting display on its id. "+
+				"That outranks [hidden] on its own; it works only because of the !important override. "+
+				"If that is intended, add %q to allowedDisplayOnHidden with a reason", id, id)
+		}
+	}
+}
+
+// allowedDisplayOnHidden lists elements that ship hidden AND carry an id
+// rule setting display, each because its shown state needs a layout the
+// element cannot get any other way.
+var allowedDisplayOnHidden = map[string]bool{
+	// The jump dialog centres its box with flex when shown.
+	"jump": true,
+}
+
+var (
+	hiddenOverride = regexp.MustCompile(`\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important`)
+	hiddenElement  = regexp.MustCompile(`<[a-z]+[^>]*\bid="([a-zA-Z0-9_-]+)"[^>]*\bhidden\b`)
+)

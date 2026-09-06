@@ -134,8 +134,17 @@ function renderJump() {
   })));
   return items;
 }
+// jumpReturn is where the keyboard was before the dialog opened, so
+// closing puts it back. Returning it to the opener instead — which is
+// what this did — means Esc lands the keyboard on a button and the very
+// next Enter reopens the dialog, which reads as a dialog that will not
+// go away.
+let jumpReturn = null;
+function jumpOpen() { return !document.getElementById("jump").hidden; }
 function openJump() {
+  if (jumpOpen()) return;
   const box = document.getElementById("jump");
+  jumpReturn = document.activeElement;
   box.hidden = false;
   jumpSelected = 0;
   const input = document.getElementById("jump-input");
@@ -145,7 +154,12 @@ function openJump() {
 }
 function closeJump() {
   document.getElementById("jump").hidden = true;
-  document.getElementById("jump-open").focus();
+  const back = jumpReturn && document.contains(jumpReturn) ? jumpReturn : document.body;
+  jumpReturn = null;
+  // Blur first: focusing body is a no-op in some browsers, and leaving
+  // the keyboard on the opener is what caused the reopen loop.
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  if (back instanceof HTMLElement && back !== document.body) back.focus();
 }
 function wireJump() {
   const input = document.getElementById("jump-input");
@@ -170,7 +184,11 @@ function wireJump() {
     if (it) { closeJump(); go(it.path, it.params); }
   });
   document.addEventListener("keydown", ev => {
-    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openJump(); }
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openJump(); return; }
+    // Escape closes it wherever the keyboard happens to be. Binding this
+    // to the input alone left the dialog undismissable by keyboard the
+    // moment focus was anywhere else.
+    if (ev.key === "Escape" && jumpOpen()) { ev.preventDefault(); closeJump(); }
   });
 }
 
