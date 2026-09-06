@@ -8,6 +8,45 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.49.0 — unreleased
+
+### Added
+- **Replication status and a failure-domain view** in the console
+  (#152). Rack-aware placement is the product's headline claim and the
+  console could not show whether it was holding: localities were a text
+  column, and the health checks reported one example range each.
+
+  `#/data` now opens with every range bucketed by replication state —
+  healthy, under-replicated, over-replicated, no quorum, undiverse —
+  each bucket expanding to its ranges. A range is measured against its
+  own target replica count, so a database carrying a placement policy
+  (#176) is judged by that policy rather than the cluster default, and
+  counted once in its worst state.
+
+  Below it, a **failure domain** table: per locality tier value, the
+  nodes, replicas and leases it holds, and what losing the whole domain
+  would cost — the ranges that would drop below a majority, and the
+  ranges that would survive with no margin left. That is the question
+  asked before every maintenance window, and it was previously
+  answerable only by hand from the range list.
+
+  And **range hotspots**, the heaviest and largest ranges each node
+  advertises in its heartbeat. QPS there is the leader's own rate over
+  the ranges it leads; it is not summed across nodes, and the view says
+  so rather than implying a cluster total.
+
+  The whole section is computed from the range descriptors and the node
+  registry the serving node already holds — no fan-out, so it answers
+  from a partitioned node like everything else on the page — and it is
+  computed on the server rather than in the page, because it is a
+  contract every node must agree on: two nodes reading the same
+  descriptors bucket them identically, which is what the new
+  `testcluster` test holds them to.
+
+  `/api/cluster` gains a `replication` section and per-node
+  `hot_ranges` / `big_ranges` (straight from the heartbeats the
+  allocator already reads).
+
 ## 0.48.1 — unreleased
 
 ### Fixed

@@ -308,6 +308,40 @@
   </section>
 </main>
 <main id="view-data" hidden>
+  <section id="sec-replication">
+    <h2>Replication</h2>
+    <div class="tiles" id="repl-tiles"></div>
+    <div id="repl-bucket-detail" hidden>
+      <div class="tablewrap"><table>
+        <thead><tr><th scope="col">range</th><th scope="col">span</th><th scope="col">replicas</th></tr></thead>
+        <tbody id="repl-bucket-ranges"></tbody>
+      </table></div>
+      <p class="muted" id="repl-bucket-note"></p>
+    </div>
+    <p class="muted" id="repl-note"></p>
+  </section>
+  <section id="sec-failure-domains">
+    <h2>Failure domains</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">domain</th>
+        <th scope="col" class="num" title="nodes in this domain, and how many are live">nodes</th>
+        <th scope="col" class="num" title="replicas this domain currently holds">replicas</th>
+        <th scope="col" class="num" title="ranges this domain currently leads (leader = leaseholder)">leases</th>
+        <th scope="col" class="num" title="ranges that would drop below a majority of replicas if this whole domain were lost at once">loses quorum</th>
+        <th scope="col" class="num" title="ranges that would survive losing this domain with no margin: one further failure would finish them">bare majority</th></tr></thead>
+      <tbody id="repl-domains"></tbody>
+    </table></div>
+    <p class="muted" id="repl-domain-note"></p>
+  </section>
+  <section id="sec-hot-ranges">
+    <h2>Range hotspots</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">range</th><th scope="col">span</th><th scope="col">leader</th>
+        <th scope="col" class="num">qps</th><th scope="col" class="num">size</th></tr></thead>
+      <tbody id="repl-hot"></tbody>
+    </table></div>
+    <p class="muted" id="repl-hot-note"></p>
+  </section>
   <section id="sec-cluster-ranges">
     <h2>Ranges <input id="data-filter" type="search" placeholder="filter by table or range id" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
     <div class="tablewrap"><table>

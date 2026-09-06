@@ -43,8 +43,23 @@ serves, on that address:
   same figures, filterable by locality or address, plus the network
   matrix (each node's round trip to every other, with clock offsets
   judged against `--max-offset`; on a narrow screen a worst-pairs list
-  instead). **data**: the cluster's ranges with replica placement,
-  filterable by table or range id. **sql**: connections by state with
+  instead). **data**: replication status, failure domains,
+  range hotspots and the cluster's ranges with replica placement,
+  filterable by table or range id. The replication tiles bucket every
+  range by state — healthy, under-replicated, over-replicated, no
+  quorum, undiverse — measured against each range's own target replica
+  count, so a database with a placement policy is judged by its policy
+  and not by the cluster default; selecting a bucket lists its ranges.
+  The **failure domains** table is what rack-aware placement is for:
+  per locality tier value, the nodes, replicas and leases it holds, and
+  what its loss would cost — how many ranges would drop below a
+  majority, and how many would survive with no margin left, which is
+  the question asked before a maintenance window. **Range hotspots**
+  lists the heaviest and largest ranges each node advertises; QPS there
+  is the leader's own measurement of ranges it leads and is never
+  summed across nodes. All of it is computed from the range descriptors
+  and the nodes' declared localities that the page already fetches, so
+  it costs no fan-out and answers from a partitioned node. **sql**: connections by state with
   the oldest idle transaction, statements per second by kind, `40001`
   rate and latency percentiles per node, with the scoped node's
   statements in flight and its slowest recent ones (admin). **schema**:
