@@ -122,6 +122,131 @@ func TestMVCCSplitProperties(t *testing.T) {
 	}
 }
 
+// legacySeparators returns the index-block separators Pebble's DEFAULT
+// comparer would write between k's engine keys: it truncates a key
+// wherever the bytes allow, with no notion of a suffix to respect. A
+// store upgraded to v15 is full of them, and prefix mode reads those
+// tables as they are, so Split has to cope with a valid prefix followed
+// by a PARTIAL suffix — a shape datax itself never writes, which is why
+// the corpora built from EncodeMVCCKey alone never covered it (#178).
+func legacySeparators(k keys.Key) [][]byte {
+	meta, _ := mvccKeyBounds(k)
+	var out [][]byte
+	for _, ts := range []hlc.Timestamp{
+		{WallTime: 1}, {WallTime: -1, Logical: -1}, {WallTime: 0x0100, Logical: 1},
+	} {
+		v := EncodeMVCCKey(k, ts)
+		// Every truncation of the version suffix, down to the bare
+		// prefix: Pebble's Separator stops at the first byte that lets
+		// it separate, so any of these can end up in an index block.
+		for cut := len(meta); cut <= len(v); cut++ {
+			out = append(out, append([]byte(nil), v[:cut]...))
+		}
+	}
+	return out
+}
+
+// TestMVCCSplitLegacySeparators is the regression test for #178: Split
+// must agree with Compare on the separators older tables carry.
+//
+// The property is Pebble's, and the assertion comparer enforces it at
+// runtime under -race: when two keys' prefixes differ, their order must
+// be the order of their prefixes. It broke because a truncated
+// separator was called its own prefix, making its "prefix" a strict
+// extension of the prefix of the very keys it separates.
+func TestMVCCSplitLegacySeparators(t *testing.T) {
+	var all [][]byte
+	for _, u := range []string{"a", "ab", "k", "\x00", "\xff", "a\x00b"} {
+		k := append(keys.TablePrefix.Clone(), u...)
+		_, own, suffixed := splitShapeKeys(k)
+		all = append(all, own...)
+		all = append(all, suffixed...)
+		all = append(all, legacySeparators(k)...)
+	}
+	cmp := MVCCComparer.Compare
+	prefixOf := func(k []byte) []byte { return k[:mvccSplit(k)] }
+	for _, a := range all {
+		for _, b := range all {
+			pa, pb := prefixOf(a), prefixOf(b)
+			c, pc := cmp(a, b), cmp(pa, pb)
+			// Differing prefixes must decide the order.
+			if pc != 0 && ((pc < 0) != (c < 0) || (pc > 0) != (c > 0)) {
+				t.Fatalf("Compare(%x, %x) = %d but Compare(prefixes %x, %x) = %d", a, b, c, pa, pb, pc)
+			}
+			if pc == 0 && c != MVCCComparer.ComparePointSuffixes(a[len(pa):], b[len(pb):]) {
+				t.Fatalf("%x vs %x: equal prefixes but the suffixes order differently", a, b)
+			}
+		}
+	}
+	// No prefix may strictly extend another: that is the shape that
+	// breaks the property above, and the terminator rule forbids it.
+	for _, a := range all {
+		for _, b := range all {
+			pa, pb := prefixOf(a), prefixOf(b)
+			if len(pa) < len(pb) && bytes.HasPrefix(pb, pa) && len(pa) < len(a) {
+				t.Fatalf("prefix %x (of %x) is a strict extension of prefix %x (of a suffixed key %x)", pb, b, pa, a)
+			}
+		}
+	}
+}
+
+// tailSplit is the Split shipped in 0.43.0, which decided the boundary
+// from the key's tail (#178).
+func tailSplit(k []byte) int {
+	n := len(k)
+	if n == 0 || k[0] == localPrefixByte {
+		return n
+	}
+	switch {
+	case n >= 14 && k[n-14] == 0 && k[n-13] == 1:
+		return n - versionSuffixLen
+	case n >= 15 && k[n-15] == 0 && k[n-14] == 1:
+		return n - versionSuffixLen - 1
+	case n >= 3 && k[n-3] == 0 && k[n-2] == 1:
+		return n - 1
+	}
+	return n
+}
+
+// TestMVCCSplitReadsExistingTables is why mvccKeySchemaName does not
+// change with the #178 fix. A columnar table stores its keys already
+// split, so a store written at v15 is only readable under the same
+// schema name if the new Split agrees with the old one on every key
+// datax writes. It does: the two differ only on the shapes datax never
+// writes — the truncated separators Pebble's default comparer left in
+// tables from before prefix mode — and those live in index blocks,
+// which the fix reads correctly for the first time.
+func TestMVCCSplitReadsExistingTables(t *testing.T) {
+	agree, differ := 0, 0
+	for _, u := range []string{"", "a", "ab", "k", "\x00", "\xff", "a\x00b", "\x00\x01", "\xff\xff\xff\xff\xff\xff\xff\xff"} {
+		k := append(keys.TablePrefix.Clone(), u...)
+		_, own, suffixed := splitShapeKeys(k)
+		for _, ek := range append(append([][]byte(nil), own...), suffixed...) {
+			if mvccSplit(ek) != tailSplit(ek) {
+				t.Fatalf("engine key %x: split %d, the shipped Split said %d — a v15 table would not read back",
+					ek, mvccSplit(ek), tailSplit(ek))
+			}
+			agree++
+		}
+		// The separators are the shapes that must differ; that
+		// difference is the fix.
+		for _, sep := range legacySeparators(k) {
+			if mvccSplit(sep) != tailSplit(sep) {
+				differ++
+			}
+		}
+	}
+	for _, lk := range [][]byte{keys.RaftLogKey(1, 7), keys.RaftHardStateKey(1), keys.StoreClusterVersionKey()} {
+		if mvccSplit(lk) != tailSplit(lk) {
+			t.Fatalf("local key %x: split %d, the shipped Split said %d", lk, mvccSplit(lk), tailSplit(lk))
+		}
+		agree++
+	}
+	if agree == 0 || differ == 0 {
+		t.Fatalf("expected agreement on written keys (%d) and disagreement on legacy separators (%d)", agree, differ)
+	}
+}
+
 // TestMVCCSeparatorSuccessor: index keys are prefix keys strictly
 // between (or above) what they separate, and the immediate successor of
 // a prefix is the next prefix key.
@@ -162,14 +287,36 @@ func TestMVCCSeparatorSuccessor(t *testing.T) {
 		if mvccSplit(is) != len(is) || c.Compare(p, is) >= 0 {
 			t.Fatalf("immediate successor of %x = %x", p, is)
 		}
-		if bytes.Equal(a, p) && !bytes.HasPrefix(is, p) {
-			t.Fatalf("immediate successor of %x = %x does not extend it", p, is)
+		// What NextPrefix needs: every key sharing the prefix sorts
+		// below it. It does NOT need to extend the prefix, and since
+		// #178 it cannot — a terminated prefix has no prefix-key
+		// extensions, because its own terminator stays the first one.
+		for _, k := range ks {
+			if bytes.Equal(k[:mvccSplit(k)], p) && c.Compare(k, is) >= 0 {
+				t.Fatalf("%x shares the prefix %x but does not sort below its successor %x", k, p, is)
+			}
 		}
 	}
-	// The immediate successor of a metadata key is not the seed shape.
+	// The immediate successor of a metadata key increments the
+	// terminator: appending anything would leave the terminator in
+	// place and so would not be a prefix key at all (#178). Nothing is
+	// representable in between — the only keys above esc(K) 0x00 0x01
+	// and below esc(K) 0x00 0x02 extend the former, and those all split
+	// back to it.
 	meta := EncodeMVCCKey(keys.Key("k"), hlc.Timestamp{})
-	if is := c.ImmediateSuccessor(nil, meta); !bytes.Equal(is, append(append([]byte(nil), meta...), 0, 0)) {
-		t.Fatalf("immediate successor of a metadata key: %x", is)
+	want := append([]byte(nil), meta...)
+	want[len(want)-1] = 2
+	is := c.ImmediateSuccessor(nil, meta)
+	if !bytes.Equal(is, want) {
+		t.Fatalf("immediate successor of a metadata key: %x, want %x", is, want)
+	}
+	if mvccSplit(is) != len(is) {
+		t.Fatalf("immediate successor %x is not a prefix key", is)
+	}
+	// The old seed-shaped answer is no longer a prefix key, which is
+	// what made the append loop non-terminating.
+	if seed := append(append([]byte(nil), meta...), 0, 0); mvccSplit(seed) == len(seed) {
+		t.Fatalf("%x should split back to the metadata key", seed)
 	}
 }
 

@@ -55,8 +55,8 @@ configured hashed whole engine keys and only the exact-key probes of
 metadata key, then to a version — walked every level's sstables (issue
 #161). From v15 a store opens with the MVCC comparer
 (`pkg/storage/comparer.go`): `Split` cuts an engine key at the
-terminator of the user key's encoding in O(1) — no key-format change —
-so K's metadata key and every version of K share one prefix, the point
+terminator of the user key's encoding — no key-format change — so K's
+metadata key and every version of K share one prefix, the point
 reads of `MVCCGet`, the `Getter` and the write path's intent probe are
 prefix seeks, and a filter rules out the sstables that hold nothing of
 K at all. The filters of L6 are consulted too (Pebble skips them by
@@ -71,7 +71,19 @@ name is not consulted, so a whole-key filter is never asked a prefix
 question) and the columnar key schema (`datax.mvcc.v1`; the old schema
 stays registered, and each schema's seeker splits keys with the
 comparer it was built with, so tables from either mode read under
-either). A store therefore switches with no rewrite and no downtime
+either). `Split` finds the terminator by searching from the left rather than
+reading it off the tail. The tail is unambiguous only for keys datax
+writes: an index-block separator in a table from before prefix mode is
+a valid prefix followed by the first few bytes of a timestamp, since
+Pebble's default comparer truncated it with no suffix to respect.
+Cutting such a key at a fixed offset — or calling its whole length its
+prefix — puts it out of order with the keys it separates, and a point
+read can then walk past the block holding the key (#178). Searching
+from the left is exact because the escaping (`pkg/util/encoding`) maps
+a `0x00` in the user key to `0x00 0xff`, so the first `0x00 0x01` is
+always the terminator; the cost is under the noise floor of a read.
+
+A store therefore switches with no rewrite and no downtime
 beyond the restart, and the tables written before are rewritten in the
 background by the same bounded manual compactions re-encryption uses
 (`prefix_bloom_rewrite` in the node document,

@@ -8,6 +8,42 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.48.1 — unreleased
+
+### Fixed
+- A point read could miss a key that is there, on any table written
+  before cluster version v15 (#178). `mvccSplit` decided the prefix
+  boundary from the key's tail, which is ambiguous for a key datax did
+  not write: an index-block separator in a pre-v15 table is a valid
+  prefix followed by the *first few bytes* of a timestamp, because
+  Pebble's default comparer truncated it with no suffix to respect.
+  Reading such a key's whole length as its prefix made that "prefix" a
+  strict extension of the prefix of the very keys it separates, so the
+  two ordered one way whole and the other way by prefix — and
+  `SeekPrefixGE` could then walk a legacy table's index to the wrong
+  block and report the key absent.
+
+  `Split` now finds the boundary by searching for the first `0x00 0x01`
+  from the left. The escaping guarantees that is the terminator (a
+  `0x00` in the user key becomes `0x00 0xff`), and it makes the prefixes
+  prefix-free, which is the property `Compare` needs: a key whose prefix
+  extended another's would carry that other terminator and be cut there
+  instead. Under `-race` — where Pebble compiles in its assertion
+  comparer — the old rule panicked instead of answering wrongly, which
+  is how this surfaced; a non-race `go test ./...` never showed it.
+
+  Existing stores need no rewrite and the key schema keeps its name: the
+  two rules agree on every key datax writes, and differ only on the
+  separators older tables already carry.
+- `Comparer.ImmediateSuccessor` no longer loops forever (#178). It
+  appended `0x00` until the result was its own prefix, which under the
+  corrected `Split` never happens — a terminated prefix has no prefix-key
+  extensions, because its own terminator stays the first one. The
+  smallest prefix key above `esc(K) 0x00 0x01` is `esc(K) 0x00 0x02`, so
+  it increments the terminator rather than extending the key. Pebble asks
+  only for "the smallest prefix key larger than a"; nothing relied on the
+  successor extending its prefix.
+
 ## 0.48.0 — unreleased
 
 **Cluster protocol v16.** A database descriptor may carry a replica

@@ -34,7 +34,7 @@ import (
 // tables from before lose nothing but the filter skip, and
 // FilterRewritePass rewrites them in the background.
 //
-// The Split is O(1). Every engine key is one of
+// Every engine key datax writes is one of
 //
 //	local key                 0x01 ...                      (raw)
 //	metadata key              esc(K) 0x00 0x01
@@ -42,13 +42,28 @@ import (
 //	re-encryption seeds       <version or metadata key> 0x00
 //
 // and esc(K) never contains 0x00 0x01 (a 0x00 in K is escaped to
-// 0x00 0xff, see pkg/util/encoding), so the terminator's position is
-// decidable from the tail: 12 bytes before the end for a version key,
-// 13 for a version seed, one for a metadata seed, and otherwise the key
-// is its own prefix (metadata key, bound, separator). The checks run in
-// that order — a version key's timestamp may itself end in 0x00 0x01.
+// 0x00 0xff, see pkg/util/encoding). So the prefix ends at the FIRST
+// 0x00 0x01, and Split finds it by searching from the left.
+//
+// It does not decide from the tail (issue #178). The tail is ambiguous
+// for a key datax did not write: an index-block separator in a table
+// from before prefix mode is a valid prefix followed by the first few
+// bytes of a timestamp, because Pebble's default comparer truncated it
+// with no suffix to respect. Reading such a key's whole length as its
+// prefix — or cutting a fixed 12 bytes off a partial suffix — makes its
+// "prefix" a strict extension of the prefix of the keys it separates,
+// which contradicts Compare: the two keys then order one way whole and
+// the other way by prefix. Pebble's assertion comparer panics on that
+// under -race, and in a release build SeekPrefixGE can walk a legacy
+// table's index to the wrong block and report a key absent.
+//
+// Searching from the left is what makes the prefixes prefix-free, which
+// is the property Compare needs: if one prefix strictly extended
+// another, the longer key would carry the shorter one's terminator and
+// so would have been cut there instead.
+//
 // Local keys are their own prefix by fiat; their raw layouts (a range
-// ID's big-endian bytes) could otherwise match the tail tests.
+// ID's big-endian bytes) could otherwise contain 0x00 0x01.
 
 // mvccPrefixBloomName names the filter policy of prefix mode: the same
 // bloom filter as before, under a name that tells a reader its hashes
@@ -69,21 +84,21 @@ var prefixL6Filters = true
 // localPrefixByte is keys.LocalPrefix's byte (asserted by TestMVCCSplit).
 const localPrefixByte = 0x01
 
+// mvccTerminator ends the escaped user key of every engine key that has
+// one. esc(K) cannot contain it, so its first occurrence is the prefix
+// boundary.
+var mvccTerminator = []byte{0, 1}
+
 // mvccSplit is MVCCComparer's Split.
 func mvccSplit(k []byte) int {
-	n := len(k)
-	if n == 0 || k[0] == localPrefixByte {
-		return n
+	if len(k) == 0 || k[0] == localPrefixByte {
+		return len(k)
 	}
-	switch {
-	case n >= 14 && k[n-14] == 0 && k[n-13] == 1:
-		return n - versionSuffixLen
-	case n >= 15 && k[n-15] == 0 && k[n-14] == 1:
-		return n - versionSuffixLen - 1
-	case n >= 3 && k[n-3] == 0 && k[n-2] == 1:
-		return n - 1
+	if i := bytes.Index(k, mvccTerminator); i >= 0 {
+		return i + len(mvccTerminator)
 	}
-	return n
+	// A bound or a separator with no terminator at all: its own prefix.
+	return len(k)
 }
 
 // mvccSeparator shortens within the prefix only, so index keys are
@@ -114,18 +129,25 @@ func mvccSuccessor(dst, a []byte) []byte {
 	return dst
 }
 
-// mvccImmediateSuccessor appends zero bytes to the prefix until the
-// result is its own prefix: a metadata key plus one 0x00 has the shape
-// of a seed, so it is a suffixed key, not the next prefix key.
+// mvccImmediateSuccessor is the smallest prefix key above a.
+//
+// Nothing appended to a terminated prefix is a prefix key — the
+// terminator it already carries stays the first one, so Split keeps
+// cutting there — which is why this increments the terminator instead
+// of extending the key. esc(K) 0x00 0x02 carries no terminator, so it
+// is its own prefix; it sorts above every version of K (whose next byte
+// is 0x01) and below every longer prefix, so nothing lies between.
+//
+// A prefix with no terminator (a bound, a local key) has an immediate
+// successor in the ordinary way: append 0x00.
 func mvccImmediateSuccessor(dst, a []byte) []byte {
-	n := len(dst)
-	dst = append(dst, a...)
-	for {
-		dst = append(dst, 0)
-		if k := dst[n:]; mvccSplit(k) == len(k) {
-			return dst
-		}
+	n := len(a)
+	if n >= 2 && a[n-2] == 0 && a[n-1] == mvccTerminator[1] {
+		dst = append(dst, a...)
+		dst[len(dst)-1] = mvccTerminator[1] + 1
+		return dst
 	}
+	return append(append(dst, a...), 0)
 }
 
 // MVCCComparer is the engine comparer of prefix mode: Pebble's default
