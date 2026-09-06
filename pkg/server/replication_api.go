@@ -2,6 +2,8 @@ package server
 
 import (
 	"sort"
+	"strconv"
+	"time"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -233,4 +235,11 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 		return out.Domains[i].Value < out.Domains[j].Value
 	})
 	return out
+}
+
+// newOpID mints an id pairing the two ends of a long-running operation
+// in the event ring (issue #153). Node-local and short: the pairing only
+// has to be unique within one node's ring.
+func newOpID() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }

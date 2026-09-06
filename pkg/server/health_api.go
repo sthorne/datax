@@ -448,19 +448,124 @@ type EventsStatus struct {
 	NodeID int            `json:"node_id"`
 	Latest uint64         `json:"latest_seq"`
 	Events []events.Event `json:"events"`
+	// Operations pairs the ring's start/end records into the operations
+	// the cluster is running on itself, in flight first (issue #153).
+	Operations []Operation `json:"operations,omitempty"`
+	// OldestMs is the timestamp of the oldest record the ring still
+	// holds. A caller asking for a window that reaches further back
+	// than this is seeing the ring's limit, not a quiet cluster, and
+	// the console says so rather than implying nothing happened
+	// (issue #155).
+	OldestMs int64 `json:"oldest_unix_ms,omitempty"`
+}
+
+// Operation is one long-running thing the cluster is doing to itself,
+// derived from the ring's paired records (issue #153). The ring stays
+// the audit trail; this is a reading of it, not a job store — an
+// operation whose start has aged out of the ring simply stops being
+// reported, which is why StartedMs is always the record's own time.
+type Operation struct {
+	Kind    string `json:"kind"`
+	Op      string `json:"op"`
+	Summary string `json:"summary"`
+	// StartedMs and, once it ends, EndedMs and Outcome. Running is the
+	// question the flat log could not answer.
+	StartedMs int64  `json:"started_unix_ms"`
+	EndedMs   int64  `json:"ended_unix_ms,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
+	Running   bool   `json:"running,omitempty"`
+	// ElapsedMs is how long it ran, or has been running so far. Progress
+	// that cannot be known is shown as elapsed time, never as a bar with
+	// a number nobody measured.
+	ElapsedMs int64 `json:"elapsed_ms"`
+}
+
+// operationsFrom pairs the ring's start/end records by (kind, op).
+// Running operations come first, newest start first; then the completed
+// ones, newest end first.
+func operationsFrom(evs []events.Event, nowMs int64) []Operation {
+	type key struct{ kind, op string }
+	idx := map[key]int{}
+	var out []Operation
+	for _, ev := range evs {
+		if ev.Op == "" {
+			continue
+		}
+		k := key{ev.Kind, ev.Op}
+		switch ev.Phase {
+		case events.PhaseStart:
+			if _, seen := idx[k]; seen {
+				continue
+			}
+			idx[k] = len(out)
+			out = append(out, Operation{
+				Kind: ev.Kind, Op: ev.Op, Summary: ev.Summary,
+				StartedMs: ev.At.UnixMilli(), Running: true,
+			})
+		case events.PhaseEnd:
+			i, seen := idx[k]
+			if !seen {
+				// The start aged out of the ring: report the end alone
+				// rather than dropping it, with no elapsed time to
+				// claim.
+				out = append(out, Operation{
+					Kind: ev.Kind, Op: ev.Op, Summary: ev.Summary,
+					EndedMs: ev.At.UnixMilli(), Outcome: ev.Outcome,
+				})
+				continue
+			}
+			out[i].EndedMs = ev.At.UnixMilli()
+			out[i].Outcome = ev.Outcome
+			out[i].Summary = ev.Summary
+			out[i].Running = false
+		}
+	}
+	for i := range out {
+		switch {
+		case out[i].Running:
+			out[i].ElapsedMs = nowMs - out[i].StartedMs
+		case out[i].StartedMs > 0:
+			out[i].ElapsedMs = out[i].EndedMs - out[i].StartedMs
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		if out[a].Running != out[b].Running {
+			return out[a].Running
+		}
+		if out[a].Running {
+			return out[a].StartedMs > out[b].StartedMs
+		}
+		return out[a].EndedMs > out[b].EndedMs
+	})
+	return out
 }
 
 func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
-	since, _ := strconv.ParseUint(req.URL.Query().Get("since"), 10, 64)
-	limit, _ := strconv.Atoi(req.URL.Query().Get("limit"))
+	q := req.URL.Query()
+	since, _ := strconv.ParseUint(q.Get("since"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 || limit > events.RingSize {
 		limit = 200
 	}
 	p := n.clusterPrincipal(req)
-	doc := EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq(), Events: n.events.Recent(since, limit, p.Admin)}
+	doc := EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq()}
+	// A time window (?from=unix_ms) instead of a tail: what the metrics
+	// charts need to annotate the range they are drawing (issue #155).
+	// The ring is a ring, so the answer also carries how far back it
+	// reaches.
+	if fromMs, err := strconv.ParseInt(q.Get("from"), 10, 64); err == nil && fromMs > 0 {
+		evs, oldest := n.events.Since(time.UnixMilli(fromMs), limit, p.Admin)
+		doc.Events = evs
+		if !oldest.IsZero() {
+			doc.OldestMs = oldest.UnixMilli()
+		}
+	} else {
+		doc.Events = n.events.Recent(since, limit, p.Admin)
+	}
 	if doc.Events == nil {
 		doc.Events = []events.Event{}
 	}
+	doc.Operations = operationsFrom(n.events.Recent(0, 0, p.Admin), n.clock.Now().WallTime/int64(time.Millisecond))
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

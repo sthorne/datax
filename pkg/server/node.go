@@ -262,6 +262,12 @@ type Node struct {
 	// reseal, encKey swap, and metadata-backup reseal (issue #66).
 	rotateMu sync.Mutex
 
+	// drainOps pairs the two ends of each node's decommission in the
+	// event ring (issue #153): the id opened when this allocator first
+	// saw the node draining, closed when its last replica moves off.
+	drainMu  sync.Mutex
+	drainOps map[base.NodeID]string
+
 	// Background re-encryption state (see reencrypt.go).
 	reencMu        sync.Mutex
 	reencActive    bool

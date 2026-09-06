@@ -189,10 +189,22 @@ func hashLiveRecord(h hash.Hash, rec kvpb.ExportRecord) {
 }
 
 // RunBackup executes a backup to dest on this node's filesystem.
-func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaintext, includeMetrics bool) (*cluster.BackupSummary, error) {
+func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaintext, includeMetrics bool) (_ *cluster.BackupSummary, err error) {
 	if n.cfg.EncKeyPath != "" && !allowPlaintext {
 		return nil, fmt.Errorf("the store is encrypted but backup files are written in plaintext; pass --allow-plaintext to proceed")
 	}
+	// A backup is long enough to be worth watching while it runs
+	// (issue #153): the start is recorded here and the end below, under
+	// one op id, so the operations view can show it in flight with an
+	// elapsed time rather than only as a row that appears when it is
+	// already over.
+	opID := newOpID()
+	n.events.RecordStart("backup", opID, "backup to %s started", dest)
+	defer func() {
+		if err != nil {
+			n.events.RecordEnd("backup", opID, "failed", "backup to %s failed: %v", dest, err)
+		}
+	}()
 	var baseTS hlc.Timestamp
 	if basePath != "" {
 		base, err := readBackupManifest(basePath)
@@ -224,7 +236,7 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 	// (tiny; makes every chain element self-describing for the schema).
 	descStart, descEnd := keys.TableDescSpan()
 	var descs []backupTable
-	err := n.exportAll(ctx, descStart, descEnd, hlc.Timestamp{}, endTS, func(rec kvpb.ExportRecord) error {
+	err = n.exportAll(ctx, descStart, descEnd, hlc.Timestamp{}, endTS, func(rec kvpb.ExportRecord) error {
 		if rec.Deleted {
 			return nil
 		}
@@ -313,7 +325,7 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		log.Infof("backup: table %s (id %d): %d records, %d live bytes", bt.Name, bt.ID, bt.Records, bt.Bytes)
 	}
 
-	n.events.Record("backup", "backup written to %s: %d tables", dest, len(descs))
+	n.events.RecordEnd("backup", opID, "ok", "backup written to %s: %d tables", dest, len(descs))
 	// Manifest last, atomically: its presence marks the backup complete.
 	raw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -363,10 +375,17 @@ func backupSummary(path string, man *backupManifest) *cluster.BackupSummary {
 // RunRestore applies a backup chain (full first, then incrementals in
 // order) into this — empty — cluster, then re-exports each table and
 // reports fresh checksums for verification against the source.
-func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSummary, error) {
+func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.BackupSummary, err error) {
 	if len(srcs) == 0 {
 		return nil, fmt.Errorf("restore requires at least one backup directory")
 	}
+	opID := newOpID()
+	n.events.RecordStart("restore", opID, "restore from %d backup(s) started", len(srcs))
+	defer func() {
+		if err != nil {
+			n.events.RecordEnd("restore", opID, "failed", "restore failed: %v", err)
+		}
+	}()
 	mans := make([]*backupManifest, len(srcs))
 	for i, src := range srcs {
 		man, err := readBackupManifest(src)
@@ -559,7 +578,7 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (*cluster.BackupSu
 		log.Infof("restore: table %s (id %d): %d live records restored", t.Name, t.ID, records)
 	}
 	log.Infof("restore: applied %d records from %d backup(s)", applied, len(srcs))
-	n.events.Record("restore", "restore applied %d records from %d backup(s)", applied, len(srcs))
+	n.events.RecordEnd("restore", opID, "ok", "restore applied %d records from %d backup(s)", applied, len(srcs))
 	return sum, nil
 }
 

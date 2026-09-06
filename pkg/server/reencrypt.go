@@ -158,7 +158,16 @@ func (n *Node) serveReencrypt(cluster.AdminRequest) cluster.AdminResponse {
 }
 
 func (n *Node) reencryptWorker(ctx context.Context) {
+	// A sweep runs for as long as the store's retired-key bytes take to
+	// rewrite, so it is recorded as an operation with two ends rather
+	// than only announcing itself when it finishes (issue #153).
+	opID := newOpID()
+	n.events.RecordStart("re-encryption", opID, "re-encryption sweep started")
+	done := false
 	defer func() {
+		if !done {
+			n.events.RecordEnd("re-encryption", opID, "stopped", "re-encryption sweep stopped before every retired-key file was rewritten")
+		}
 		n.reencMu.Lock()
 		n.reencActive = false
 		n.reencMu.Unlock()
@@ -193,7 +202,8 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 		}
 		if remaining == 0 {
 			log.Infof("re-encryption complete: no live sstable under a retired data key")
-			n.events.Record("re-encryption", "re-encryption complete: no live sstable under a retired data key")
+			n.events.RecordEnd("re-encryption", opID, "ok", "re-encryption complete: no live sstable under a retired data key")
+			done = true
 			return
 		}
 		if targeted == 0 {
