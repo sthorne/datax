@@ -205,8 +205,11 @@ func TestUIServed(t *testing.T) {
 	if re := regexp.MustCompile(`(https?:)?//[a-zA-Z0-9.-]+\.[a-z]{2,}`); re.MatchString(body) {
 		t.Fatalf("dashboard references an external host: %q", re.FindString(body))
 	}
+	// The one <link> is the favicon slot, which the page paints itself on
+	// a canvas (issue #150): it carries no href in the served page.
+	stripped := strings.Replace(body, `<link rel="icon" id="favicon">`, "", 1)
 	for _, tag := range []string{"<script src=", "<link ", "@import", "url("} {
-		if strings.Contains(body, tag) {
+		if strings.Contains(stripped, tag) {
 			t.Fatalf("dashboard loads an external asset via %q", tag)
 		}
 	}
@@ -322,5 +325,53 @@ func TestClusterRollup(t *testing.T) {
 			t.Fatalf("rollups after n3 stopped: %+v / %+v", r0, r1)
 		}
 		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// TestOverviewAPI (issue #147): /api/overview carries what the overview
+// draws — the cluster document, the health problems and the event tail
+// — with the same figures the individual endpoints report, a
+// per-section error map (empty here), and the events tail bounded by
+// ?limit.
+func TestOverviewAPI(t *testing.T) {
+	tc := startWithHTTP(t, 3)
+	addr := tc.Nodes[0].HTTPAddr()
+	code, ctype, body := httpGet(t, "http://"+addr+"/api/overview?limit=5")
+	if code != 200 || !strings.Contains(ctype, "application/json") {
+		t.Fatalf("/api/overview: %d %s", code, ctype)
+	}
+	var ov server.OverviewStatus
+	if err := json.Unmarshal([]byte(body), &ov); err != nil {
+		t.Fatal(err)
+	}
+	if ov.Errors == nil || len(ov.Errors) != 0 {
+		t.Fatalf("errors: %v", ov.Errors)
+	}
+	if ov.Health == nil || ov.Events == nil {
+		t.Fatalf("missing sections: %s", body)
+	}
+	var cl server.ClusterStatus
+	_, _, cbody := httpGet(t, "http://"+addr+"/api/cluster")
+	if err := json.Unmarshal([]byte(cbody), &cl); err != nil {
+		t.Fatal(err)
+	}
+	if ov.Cluster.NodeID != cl.NodeID || len(ov.Cluster.Nodes) != len(cl.Nodes) || ov.Cluster.Rollup.Ranges != cl.Rollup.Ranges || ov.Cluster.Rollup.Replicas != cl.Rollup.Replicas || ov.Cluster.ConsoleVersion != cl.ConsoleVersion {
+		t.Fatalf("overview cluster section differs from /api/cluster:\n%+v\n%+v", ov.Cluster.Rollup, cl.Rollup)
+	}
+	var h server.HealthStatus
+	_, _, hbody := httpGet(t, "http://"+addr+"/api/health")
+	if err := json.Unmarshal([]byte(hbody), &h); err != nil {
+		t.Fatal(err)
+	}
+	if ov.Health.Checks != h.Checks || ov.Health.NodeID != h.NodeID {
+		t.Fatalf("overview health section differs from /api/health: %d checks vs %d", ov.Health.Checks, h.Checks)
+	}
+	var ev server.EventsStatus
+	_, _, ebody := httpGet(t, "http://"+addr+"/api/events")
+	if err := json.Unmarshal([]byte(ebody), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ov.Events.Latest > ev.Latest || len(ov.Events.Events) > 5 {
+		t.Fatalf("overview events: latest %d (endpoint %d), %d events with limit 5", ov.Events.Latest, ev.Latest, len(ov.Events.Events))
 	}
 }

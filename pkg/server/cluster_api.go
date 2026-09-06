@@ -191,6 +191,16 @@ type ClusterStatus struct {
 }
 
 func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
+	doc := n.clusterDoc(req)
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(doc)
+}
+
+// clusterDoc assembles the /api/cluster document (also the cluster
+// section of /api/overview).
+func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 	now := n.clock.Now().WallTime
 	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	doc := ClusterStatus{
@@ -255,10 +265,7 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 		doc.Storage = &m
 	}
 	doc.Rollup = rollup(doc.Nodes, doc.Ranges)
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(doc)
+	return doc
 }
 
 // clusterPrincipal describes the request's authenticated caller for the

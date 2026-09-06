@@ -265,6 +265,7 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/debug/pprof/symbol", n.requireAdmin(http.HandlerFunc(pprof.Symbol)))
 	mux.Handle("/debug/pprof/trace", n.requireAdmin(http.HandlerFunc(pprof.Trace)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
+	mux.HandleFunc("/api/overview", n.serveOverviewAPI)
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
 	mux.HandleFunc("/api/node", n.serveNodeAPI)
 	mux.HandleFunc("/api/events", n.serveEventsAPI)

@@ -38,6 +38,28 @@ The console umbrella (#144), first batch.
   health — live only on that page now; the header says which node served
   the page, as provenance. Health findings about the serving node's
   storage or events link to its page.
+- `GET /api/overview` (#147): the cluster document, the health problems
+  and the tail of the event ring in one document — what the overview
+  draws, one request per poll instead of one per section — with a
+  per-section `errors` map, so a section that cannot be produced is
+  absent and named rather than failing the request; the individual
+  endpoints stay. The console runs every poll through one scheduler:
+  each view starts only the fetches it shows (the Metrics view fetches
+  no schema and no statements), a hidden tab polls nothing and fetches
+  everything once when shown, a failing fetch backs off exponentially
+  (capped at a minute), and the header says how long since the last good
+  update and when the next try is.
+- The console's favicon takes the colour of the worst open health
+  problem and the title carries the count — `(2) datax — n1` — so a
+  cluster gone critical shows in the tab strip and the window switcher
+  without switching to it; steady, never animated (#150).
+- The console is usable on a keyboard, with a screen reader and on a
+  phone (#149): a skip link, a visible focus ring on every control,
+  range rows as real controls (Tab, Enter or Space), captions and column
+  scope on every table, the problems panel as a live region, a text cue
+  beside every colour-coded figure, a fluid container instead of a fixed
+  width, and below 640 px the wide tables become one card per row and the
+  network matrix a worst-pairs list.
 - `datax_node_load5` and `datax_node_load15` on `/metrics`, beside
   `datax_node_load1` (#146).
 - The console notices a rolling upgrade under a long-lived tab (#146):
@@ -48,6 +70,14 @@ The console umbrella (#144), first batch.
   new page and one before it is a 304.
 
 ### Fixed
+- The console no longer destroys the page every three seconds (#148):
+  a render replaces an element's markup only when it changed and never
+  while it holds the text selection, the focused element or an open
+  disclosure (the new markup lands when the interaction ends), and the
+  tables keep their rows by identity across polls, so a range key can be
+  selected and copied, an open drill-down or disclosure stays open and
+  keyboard focus survives a refresh; the range drill-down's cached-HTML
+  workaround is gone.
 - The console's SQL statements panel explains a 403 from
   `/api/activity` the way the range drill-down does — the signed-in user
   and the `GRANT` that fixes it — instead of hiding (#146).
