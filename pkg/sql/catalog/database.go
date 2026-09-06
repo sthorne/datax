@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 )
@@ -75,11 +76,18 @@ type DatabaseDescriptor struct {
 	UsageRestricted    bool                `json:"usage_restricted,omitempty"`
 	// DefaultPrivileges are the database's ALTER DEFAULT PRIVILEGES rules.
 	DefaultPrivileges []DefaultPrivilege `json:"default_privileges,omitempty"`
+	// Placement is where this database's replicas may live and how many
+	// there are (issue #176); the zero value means the cluster default
+	// replication factor and any node. Set by CREATE DATABASE ... WITH
+	// and ALTER DATABASE ... SET, read by the allocator through the
+	// range's table, and gated on cluster version v16.
+	Placement base.PlacementPolicy `json:"placement,omitzero"`
 }
 
 // Clone returns a deep copy.
 func (d *DatabaseDescriptor) Clone() *DatabaseDescriptor {
 	out := *d
+	out.Placement = d.Placement.Clone()
 	out.Privileges = ClonePrivileges(d.Privileges)
 	out.GrantOptions = ClonePrivileges(d.GrantOptions)
 	out.SchemaPrivileges = ClonePrivileges(d.SchemaPrivileges)

@@ -881,6 +881,7 @@ SHOW GRANTS [ON t | ON DATABASE d] [FOR role];
                                 -- privilege_type, is_grantable
 SHOW GRANTS ON ROLE [r] [FOR member];  -- role_name, member, is_admin
 SHOW DATABASES;                 -- database_name, owner
+SHOW PLACEMENT [FOR DATABASE d]; -- database_name, replicas, constraints, source
 SHOW STATS FOR t;               -- see Table statistics
 SHOW FUNCTIONS;                 -- name, signature, category, volatility, aliases, description
 SHOW ALL;                       -- every session setting
@@ -1005,4 +1006,47 @@ upgrade` finalizes v6 and moves the catalog entries in one transaction,
 after which `CREATE DATABASE` works. Row data never moves: a table's
 database is a catalog fact, and backups carry the database catalog along
 with the tables.
+
+### Region-restricted replication
+
+A database can say where its replicas may live and how many there are.
+The allocator then honours that for every range of every table in it:
+
+```sql
+CREATE DATABASE eu WITH (replicas = 3, constraints = ('region=eu-west-1', 'region=eu-central-1'));
+ALTER DATABASE eu SET (constraints = ('region=eu-west-1'));  -- narrow it
+ALTER DATABASE eu SET (replicas = 5);                        -- constraints untouched
+ALTER DATABASE eu SET (constraints = ());                    -- lift the restriction
+SHOW PLACEMENT FOR DATABASE eu;
+SHOW PLACEMENT;                                              -- the session's own database
+```
+
+`constraints` is a **disjunction** of locality tiers a node declares
+with `--locality`: a replica may live on any node carrying **any one**
+of them, so naming two regions means "either of these". `replicas`
+overrides the cluster replication factor for this database alone; it
+must be odd (a majority of an even count tolerates no more failures than
+the odd count below it) and at most 9. An option an `ALTER` does not
+name is left as it was, and an empty constraint list is how a
+restriction is lifted — there is no separate `RESET`.
+
+Writing a policy moves no data: the allocator converges the ranges onto
+nodes the policy admits over the following passes, one range at a time,
+and `SHOW PLACEMENT` reports the count it will actually use, so a
+database with no policy shows the cluster default and says so.
+
+If **no live node** satisfies a policy, the allocator does nothing — it
+never places a replica outside a region you named, and it never drops
+one to satisfy a policy. The data stays where it is and the health API
+reports `placement-unsatisfiable`; `placement-misplaced` marks the
+window while replicas are still being moved home. Asking for more
+replicas than the admitted nodes can hold (three replicas, two nodes in
+the region) is a legal policy that simply cannot converge until a node
+joins there.
+
+Placement needs cluster version v16 and the database's ownership (or
+admin). The mechanics — how a range finds its policy, why a policy
+splits its tables into their own ranges, and what each allocator pass
+does with it — are in
+[replication and placement](../replication-and-placement.md#region-restricted-replication-per-database-placement).
 

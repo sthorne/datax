@@ -583,6 +583,96 @@ projection check and the absolute floors. `--lease-shed-factor` and
 `--rebalance-bytes-threshold` tune the triggers (negative bytes
 threshold disables byte moves).
 
+## Region-restricted replication (per-database placement)
+
+Rack-aware placement above answers "spread these replicas as widely as
+possible". A **placement policy** answers a different question: "keep
+this database's data in these places, and only these". It is a property
+of a database, inherited by its tables, applied to every range of those
+tables:
+
+```sql
+CREATE DATABASE eu WITH (replicas = 3, constraints = ('region=eu-west-1', 'region=eu-central-1'));
+ALTER DATABASE eu SET (constraints = ('region=eu-west-1'));
+ALTER DATABASE eu SET (replicas = 5);          -- the constraints are left alone
+ALTER DATABASE eu SET (constraints = ());      -- lift the restriction
+SHOW PLACEMENT FOR DATABASE eu;
+```
+
+- **`constraints`** is a **disjunction**: a replica may live on any node
+  whose locality carries any one of the listed `key=value` tiers. Naming
+  two regions means "either of these", which is how a policy spans a
+  pair of regions without pinning to one.
+- **`replicas`** overrides the cluster's replication factor for this
+  database alone. It must be odd (a majority of an even count tolerates
+  no more failures than the odd count below it) and at most 9.
+- An option not named by an `ALTER` is left as it was, so the replica
+  count and the constraints are set independently. `constraints = ()` is
+  how a restriction is lifted; there is no separate `RESET`.
+- `SHOW PLACEMENT` (bare, for the session's database, or
+  `FOR DATABASE name`) reports the count the allocator will actually
+  use, so a database with no policy of its own shows the cluster default
+  and says where that number came from.
+
+Writing a policy needs cluster version **v16** and the database's
+ownership (or admin). It is a catalog fact: the statement moves no data.
+
+### How a range finds its policy
+
+A range belongs to the table its start key names, a table belongs to a
+database, and the database carries the policy. Every node keeps that
+table → policy map beside its schema cache (`pkg/server/placement.go`),
+rebuilt by the same catalog scan that names ranges for the console, so
+the allocator resolves a policy with a map lookup rather than a catalog
+read on every tick. A range that resolves to nothing — a system range, a
+meta range, a table whose database has no policy, or anything at all
+before the first catalog scan lands — gets the zero policy, which is
+exactly the pre-v16 behaviour: the cluster default factor, any node.
+
+### What the allocator does with it
+
+Every pass that chooses a node consults the policy
+(`placement.AllocateTargetFor`): candidates the policy does not admit are
+dropped **first**, and the diversity score is then maximized within what
+is left. A database pinned to one region still spreads its replicas
+across that region's racks. Up-replication, dead-node repair, decommission
+drain and both rebalancing passes all use it, and all use the policy's
+replica count in place of the cluster default.
+
+One pass is new. **Placement enforcement** moves a replica that a policy
+does not admit onto a node that does — add, transfer if leading, remove,
+one range per tick, and only while the range is otherwise healthy. It is
+what makes `ALTER DATABASE ... SET` take effect on data that already
+exists: a range whose replicas are merely in the wrong region is not
+short a replica, has no dead one and is not on an overloaded node, so no
+other pass would ever touch it. It runs after repair and drain and ahead
+of the load passes: a replica in the wrong region is wrong, a replica on
+a busy node is merely expensive.
+
+### When a policy cannot be met
+
+If no live node satisfies the policy, the allocator **does nothing** —
+it never places a replica outside a region an operator named, and it
+never drops a replica to satisfy one. The data stays where it is and the
+condition is reported instead:
+
+- `placement-unsatisfiable` (critical) — a range names a placement no
+  live node satisfies. Typically a region's nodes are all down, or a
+  constraint names a locality tier no node declares.
+- `placement-misplaced` (warning) — replicas are outside the policy but
+  a home exists; the enforcement pass is moving them, one per pass.
+
+Both appear in `/api/health` and on the console's health view. The
+counter `datax_placement_replicas_moved_total` tracks the moves.
+
+A policy asking for more replicas than the admitted set can hold (three
+replicas, two nodes in the region) is a stored, legal policy that simply
+cannot converge: the range keeps its third replica outside the region and
+reports `placement-unsatisfiable` until a node joins there. That is the
+deliberate choice — a policy is a restriction on where data may live, and
+the allocator would rather leave a replica in the wrong place, loudly,
+than move data somewhere the operator excluded.
+
 ## Replica consistency checking
 
 Replicas of a range are byte-identical by construction: they apply the

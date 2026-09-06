@@ -8,6 +8,87 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.48.0 — unreleased
+
+**Cluster protocol v16.** A database descriptor may carry a replica
+placement policy. A v15 node reads the descriptor but not the policy, so
+it would allocate replicas anywhere and undo the placement a v16 node
+just made; the DDL that writes a policy is refused until the cluster
+finalizes v16 with `datax debug upgrade`. Nothing else changes: a
+descriptor written before v16 reads the same at either version.
+
+### Added
+- **Region-restricted replication** (#176). A database can say where its
+  replicas may live and how many there are, and the allocator honours it
+  for every range of that database's tables:
+
+  ```sql
+  CREATE DATABASE eu WITH (replicas = 3, constraints = ('region=eu-west-1', 'region=eu-central-1'));
+  ALTER DATABASE eu SET (constraints = ('region=eu-west-1'));
+  ALTER DATABASE eu SET (replicas = 5);      -- constraints untouched
+  ALTER DATABASE eu SET (constraints = ());  -- lift the restriction
+  SHOW PLACEMENT FOR DATABASE eu;
+  ```
+
+  `constraints` is a disjunction — a replica may live on any node whose
+  locality carries any one of the listed `key=value` tiers — so naming
+  two regions means "either of these". `replicas` overrides the cluster
+  replication factor for that database alone; it must be odd and at most
+  9. An option an `ALTER` does not name is left as it was, so the count
+  and the constraints are set independently, and an empty constraint
+  list is how a restriction is lifted.
+
+  Up-replication, dead-node repair, decommission drain and both
+  rebalancing passes now allocate within the policy, maximizing failure-
+  domain diversity inside what the policy admits — a database pinned to
+  one region still spreads across that region's racks. A new pass moves
+  replicas that a policy no longer admits onto nodes that do, one range
+  per tick, which is what makes `ALTER DATABASE ... SET` take effect on
+  data that already exists.
+
+  Writing a policy splits its tables into their own ranges and stops
+  those ranges merging with neighbours under a different policy: a range
+  inherits a policy only when it lies wholly inside one table, since a
+  range straddling two tables could belong to two databases asking for
+  different things.
+- Two health findings and a counter for placement (#176):
+  `placement-unsatisfiable` (critical) when no live node satisfies a
+  range's policy, `placement-misplaced` (warning) while the allocator is
+  still moving replicas home, and
+  `datax_placement_replicas_moved_total`. When a policy cannot be met the
+  allocator does nothing rather than placing a replica outside a region
+  an operator named — the finding is how that is reported.
+- `SHOW PLACEMENT [FOR DATABASE name]` reports the replica count the
+  allocator will actually use, so a database with no policy of its own
+  shows the cluster default and says where the number came from (#176).
+
+## 0.47.0 — unreleased
+
+### Fixed
+- `datax sql` could not edit a statement once it spanned lines (#175).
+  The shell composed a multi-line statement by calling a single-line
+  editor once per line, so by the time the cursor reached column 0 of a
+  continuation line the line above was already gone and backspace simply
+  stopped. The whole statement is now the editor's buffer: backspace at
+  the start of a line joins it to the one above and leaves the cursor at
+  the join, forward delete at the end of a line pulls the next one up,
+  and the arrows move through the statement rather than within one line
+  of it.
+
+### Added
+- `Ctrl+←` and `Ctrl+→` move by a word in `datax sql` (#175). They did
+  nothing before: the editor decoded `ESC [ 1 ; 3 C/D`, which is
+  Alt+arrow, and had no case for `ESC [ 1 ; 5 C/D`, which is what
+  Ctrl+arrow sends in every common terminal. `Alt+←`/`Alt+→`, `Alt-b`/
+  `Alt-f` and `Ctrl+Alt+arrow` are accepted as the same motion, and a
+  word is a SQL identifier part, so `Ctrl+←` through
+  `orders.customer_id` stops at each half.
+- The shell keeps its history, `Ctrl-A/E/K/U/W`, `Ctrl-L` and `Ctrl-D`,
+  and gains `Ctrl-C` to abandon the statement being typed without
+  leaving, `Alt+Backspace` and `Ctrl+Delete` for word-wise deletion, and
+  bracketed paste — a pasted multi-line statement lands as text instead
+  of running itself a line at a time (#175).
+
 ## 0.46.0 — unreleased
 
 ### Fixed

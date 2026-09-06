@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/metrics"
@@ -133,6 +134,11 @@ type schemaCache struct {
 	// descs keeps the descriptors too, so range spans render with table,
 	// index and typed key values (rowenc.PrettyKey).
 	descs map[uint64]*catalog.TableDescriptor
+	// placement is the replica placement policy each table inherits from
+	// its database (issue #176), built by the same catalog scan. A table
+	// whose database carries no policy is absent, which is the same
+	// answer as the zero policy: the cluster default, any node.
+	placement map[uint64]base.PlacementPolicy
 	// refreshing marks a background rebuild in flight (see refreshSchema).
 	refreshing bool
 }
@@ -185,12 +191,13 @@ func (n *Node) schemaDoc(ctx context.Context) *SchemaStatus {
 func (n *Node) rebuildSchema(ctx context.Context) *SchemaStatus {
 	ctx, cancel := context.WithTimeout(ctx, schemaBuildTimeout)
 	defer cancel()
-	doc, names, descs := n.buildSchemaDoc(ctx)
+	doc, names, descs, policies := n.buildSchemaDoc(ctx)
 	n.schema.mu.Lock()
 	n.schema.doc, n.schema.at = doc, time.Now()
 	if doc.Error == "" || n.schema.name == nil {
 		n.schema.name = names
 		n.schema.descs = descs
+		n.schema.placement = policies
 		// Lend the names to the key printer, so this process's log lines
 		// name tables too (every node of a cluster knows the same names).
 		keys.SetTableNamer(func(id uint64) (string, bool) {
@@ -294,13 +301,15 @@ func tableIDOfKey(k keys.Key) (uint64, bool) {
 	return id, true
 }
 
-func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string, map[uint64]*catalog.TableDescriptor) {
+func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string, map[uint64]*catalog.TableDescriptor, map[uint64]base.PlacementPolicy) {
 	doc := &SchemaStatus{NodeID: int(n.ident.NodeID)}
 	names := map[uint64]string{}
 	byID := map[uint64]*catalog.TableDescriptor{}
+	policies := map[uint64]base.PlacementPolicy{}
 
 	var descs []*catalog.TableDescriptor
 	dbNames := map[uint64]string{0: catalog.DefaultDatabase}
+	dbPolicy := map[uint64]base.PlacementPolicy{}
 	err := n.db.RunTxn(ctx, "schema-api", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		descs, err = catalog.NewAccessor().List(ctx, txn)
@@ -313,12 +322,15 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 		for _, db := range dbs {
 			dbNames[db.ID] = db.Name
+			if !db.Placement.IsZero() {
+				dbPolicy[db.ID] = db.Placement.Clone()
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		doc.Error = "catalog listing unavailable: " + err.Error()
-		return doc, names, byID
+		return doc, names, byID, policies
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].Name < descs[j].Name })
 
@@ -344,6 +356,9 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 		names[d.ID] = d.Name
 		byID[d.ID] = d
+		if p, ok := dbPolicy[d.DatabaseID]; ok {
+			policies[d.ID] = p
+		}
 		colName := map[catalog.ColumnID]string{}
 		for _, c := range d.Columns {
 			colName[c.ID] = c.Name
@@ -420,5 +435,5 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 	}
 	sort.Slice(doc.Users, func(i, j int) bool { return doc.Users[i].Name < doc.Users[j].Name })
-	return doc, names, byID
+	return doc, names, byID, policies
 }

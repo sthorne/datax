@@ -3,13 +3,16 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Database statements (issue #88): CREATE / DROP / ALTER ... RENAME /
@@ -46,6 +49,16 @@ func (s *Session) execCreateDatabase(ctx context.Context, txn *kvclient.Txn, t *
 		return nil, newErrf(CodeSyntaxError, "%q is not a valid database name", t.Name)
 	}
 	d := &catalog.DatabaseDescriptor{Name: t.Name, Owner: s.user}
+	if t.Placement != nil {
+		if err := s.requireV16(); err != nil {
+			return nil, err
+		}
+		policy, err := placementFromOptions(base.PlacementPolicy{}, t.Placement)
+		if err != nil {
+			return nil, err
+		}
+		d.Placement = policy
+	}
 	if err := s.cat.CreateDatabase(ctx, txn, d); err != nil {
 		var ex *catalog.ErrDatabaseExists
 		if t.IfNotExists && asErr(err, &ex) {
@@ -106,6 +119,9 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 }
 
 func (s *Session) execAlterDatabase(ctx context.Context, txn *kvclient.Txn, t *parser.AlterDatabase) (*Result, error) {
+	if t.Placement != nil {
+		return s.execAlterDatabasePlacement(ctx, txn, t)
+	}
 	if err := s.requireV6(ctx, txn); err != nil {
 		return nil, err
 	}
@@ -178,4 +194,161 @@ func (s *Session) UseDatabase(ctx context.Context, name string) *Error {
 	}
 	s.database = db.Name
 	return nil
+}
+
+// Replica placement (issue #176). A database may carry a policy — a
+// replica count and a set of locality constraints — that the allocator
+// honours for every range of its tables. The policy is a catalog fact
+// like a privilege: nothing moves when it is written; the replication
+// queue notices at its next pass and converges the ranges onto nodes
+// the policy admits.
+
+// requireV16 gates the DDL that writes a policy. A v15 node reads the
+// descriptor but not the policy field, so it would keep allocating
+// replicas anywhere and undo the placement a v16 node just made.
+func (s *Session) requireV16() error {
+	if s.db.ClusterVersion() < version.V16 {
+		return newErrf(CodeFeatureNotSupported, "replica placement needs cluster version v16: finalize the upgrade with `datax debug upgrade` first")
+	}
+	return nil
+}
+
+// placementFromOptions folds an option list onto the policy a database
+// already carries: an option the operator did not name is left alone,
+// which is what lets ALTER change a replica count without restating the
+// constraints. An empty constraint list clears them.
+func placementFromOptions(cur base.PlacementPolicy, o *parser.PlacementOptions) (base.PlacementPolicy, error) {
+	out := cur.Clone()
+	if o.SetReplicas {
+		out.Replicas = o.Replicas
+	}
+	if o.SetConstraints {
+		out.Constraints = nil
+		for _, raw := range o.Constraints {
+			c, err := base.ParseConstraint(raw)
+			if err != nil {
+				return base.PlacementPolicy{}, newErrf(CodeInvalidParameter, "%s", err)
+			}
+			out.Constraints = append(out.Constraints, c)
+		}
+	}
+	out = out.Normalize()
+	if err := out.Validate(); err != nil {
+		return base.PlacementPolicy{}, newErrf(CodeInvalidParameter, "%s", err)
+	}
+	return out, nil
+}
+
+// execAlterDatabasePlacement is ALTER DATABASE name SET (...).
+func (s *Session) execAlterDatabasePlacement(ctx context.Context, txn *kvclient.Txn, t *parser.AlterDatabase) (*Result, error) {
+	if err := s.requireV6(ctx, txn); err != nil {
+		return nil, err
+	}
+	if err := s.requireV16(); err != nil {
+		return nil, err
+	}
+	db, err := catalog.LookupDatabase(ctx, txn, t.Name)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	if err := s.checkOwner(ctx, txn, "database", db.Name, db.Owner); err != nil {
+		return nil, err
+	}
+	policy, err := placementFromOptions(db.Placement, t.Placement)
+	if err != nil {
+		return nil, err
+	}
+	if policy.Equal(db.Placement) {
+		return &Result{Tag: "ALTER DATABASE"}, nil
+	}
+	d := db.Clone()
+	d.Placement = policy
+	if err := s.cat.UpdateDatabase(ctx, txn, d); err != nil {
+		return nil, err
+	}
+	// Carve the database's existing tables into their own ranges, so the
+	// policy has ranges to apply to (see presplitPlacement). Lifting a
+	// policy needs no splits: the boundaries simply stop being barriers
+	// and the merge pass folds the ranges back together on its own.
+	if !policy.IsZero() {
+		tables, err := s.cat.ListIn(ctx, txn, d)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range tables {
+			s.splitTableOut(ctx, t.ID)
+		}
+	}
+	log.Audit("database-ddl", "stmt", "ALTER DATABASE SET PLACEMENT", "target", t.Name, "placement", policy.String(), "principal", s.sessionUser, "role", s.user)
+	return &Result{Tag: "ALTER DATABASE"}, nil
+}
+
+// presplitPlacement carves a table into its own ranges when its database
+// carries a placement policy. A range inherits a policy only when it
+// lies wholly inside one table's key space — a range straddling two
+// tables could belong to two databases asking for different things — so
+// without these boundaries a small database would share one range with
+// its neighbours and no policy would apply to it at all.
+//
+// The splits are best effort and idempotent: an existing boundary is the
+// state asked for, and a failure costs a placement that applies at the
+// next size split rather than a failed statement.
+func (s *Session) presplitPlacement(ctx context.Context, txn *kvclient.Txn, dbName string, desc *catalog.TableDescriptor) {
+	if desc == nil || desc.ID == 0 || dbName == "" {
+		return
+	}
+	db, err := catalog.LookupDatabase(ctx, txn, dbName)
+	if err != nil || db.Placement.IsZero() {
+		return
+	}
+	s.splitTableOut(ctx, desc.ID)
+}
+
+func (s *Session) splitTableOut(ctx context.Context, tableID uint64) {
+	lo, hi := keys.TableDataSpan(tableID)
+	for _, k := range []keys.Key{lo, hi} {
+		if _, err := s.db.AdminSplit(ctx, k); err != nil {
+			log.Debugf("placement pre-split at %s: %v", k, err)
+		}
+	}
+}
+
+// execShowPlacement renders one database's policy, or the session's own
+// database when the statement names none. The replica count shown is
+// the one the allocator will use, so a database with no policy of its
+// own reports the cluster default rather than a blank.
+func (s *Session) execShowPlacement(ctx context.Context, txn *kvclient.Txn, t *parser.ShowPlacement) (*Result, error) {
+	name := t.Database
+	if name == "" {
+		name = s.database
+	}
+	if name == "" {
+		name = catalog.DefaultDatabase
+	}
+	db, err := catalog.LookupDatabase(ctx, txn, name)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	res := &Result{Columns: []ResultColumn{
+		{Name: "database_name", Type: types.String},
+		{Name: "replicas", Type: types.Int},
+		{Name: "constraints", Type: types.String},
+		{Name: "source", Type: types.String},
+	}}
+	source := "cluster default"
+	if !db.Placement.IsZero() {
+		source = "database policy"
+	}
+	constraints := "any node"
+	if cs := db.Placement.ConstraintStrings(); len(cs) > 0 {
+		constraints = strings.Join(cs, ", ")
+	}
+	res.Rows = append(res.Rows, []types.Datum{
+		types.NewString(db.Name),
+		types.NewInt(int64(db.Placement.ReplicasOr(base.DefaultReplicationFactor))),
+		types.NewString(constraints),
+		types.NewString(source),
+	})
+	res.Tag = "SHOW PLACEMENT 1"
+	return res, nil
 }

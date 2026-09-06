@@ -313,6 +313,14 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			cd.Name = name
+			withKW := p.consumeIdentWord("with")
+			if withKW || (p.peek().kind == tkOp && p.peek().text == "(") {
+				opts, err := p.parsePlacementOptions()
+				if err != nil {
+					return nil, err
+				}
+				cd.Placement = opts
+			}
 			return cd, nil
 		}
 		return p.parseCreateTable()
@@ -532,8 +540,15 @@ func (p *parser) parseStatement() (Statement, error) {
 			if p.consumeIdentWord("owner") {
 				return p.parseOwnerTo("database", name)
 			}
+			if p.consumeKeyword("SET") {
+				opts, err := p.parsePlacementOptions()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterDatabase{Name: name, Placement: opts}, nil
+			}
 			if !p.consumeIdentWord("rename") {
-				return nil, p.errf("ALTER DATABASE supports RENAME TO and OWNER TO")
+				return nil, p.errf("ALTER DATABASE supports RENAME TO, OWNER TO and SET (placement)")
 			}
 			if err := p.expectKeyword("TO"); err != nil {
 				return nil, err
@@ -619,6 +634,21 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		if p.consumeIdentWord("databases") {
 			return &ShowDatabases{}, nil
+		}
+		if p.consumeIdentWord("placement") {
+			// SHOW PLACEMENT [FOR DATABASE name]; bare, the session's own.
+			sp := &ShowPlacement{}
+			if p.consumeIdentWord("for") {
+				if !p.consumeIdentWord("database") {
+					return nil, p.errf("SHOW PLACEMENT FOR takes DATABASE")
+				}
+				name, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				sp.Database = name
+			}
+			return sp, nil
 		}
 		if p.consumeIdentWord("sequences") {
 			return &ShowSequences{}, nil
@@ -864,6 +894,93 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		ct.Options = opts
 	}
 	return ct, nil
+}
+
+// parsePlacementOptions parses the placement option list of
+// CREATE DATABASE ... WITH (...) and ALTER DATABASE ... SET (...):
+//
+//	(replicas = 5, constraints = ('region=eu-west-1', 'region=eu-north-1'))
+//
+// Either option may be given alone, in either order, at most once. A
+// single constraint may be written without the parentheses, and an
+// empty list clears the constraints, which is how an operator lifts a
+// restriction without a RESET clause of its own.
+func (p *parser) parsePlacementOptions() (*PlacementOptions, error) {
+	// The parentheses are optional: `WITH (replicas = 3)` matches
+	// CREATE TABLE's option list, `WITH replicas = 3` reads the way an
+	// operator writes it. Both mean the same thing.
+	parens := p.consumeOp("(")
+	opts := &PlacementOptions{}
+	for {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		switch strings.ToLower(name) {
+		case "replicas", "replication_factor", "num_replicas":
+			if opts.SetReplicas {
+				return nil, p.errf("duplicate placement option %q", name)
+			}
+			t := p.peek()
+			if t.kind != tkNumber {
+				return nil, p.errf("replicas takes a number, found %q", t.text)
+			}
+			n, err := strconv.Atoi(t.text)
+			if err != nil {
+				return nil, p.errf("replicas takes a whole number, found %q", t.text)
+			}
+			p.i++
+			opts.Replicas, opts.SetReplicas = n, true
+		case "constraints":
+			if opts.SetConstraints {
+				return nil, p.errf("duplicate placement option %q", name)
+			}
+			opts.SetConstraints = true
+			if opts.Constraints == nil {
+				opts.Constraints = []string{}
+			}
+			if !p.consumeOp("(") {
+				t := p.peek()
+				if t.kind != tkString {
+					return nil, p.errf("constraints takes a quoted 'key=value' or a list of them, found %q", t.text)
+				}
+				p.i++
+				opts.Constraints = append(opts.Constraints, t.text)
+				break
+			}
+			for !p.consumeOp(")") {
+				t := p.peek()
+				if t.kind != tkString {
+					return nil, p.errf("constraints takes quoted 'key=value' strings, found %q", t.text)
+				}
+				p.i++
+				opts.Constraints = append(opts.Constraints, t.text)
+				if !p.consumeOp(",") {
+					if err := p.expectOp(")"); err != nil {
+						return nil, err
+					}
+					break
+				}
+			}
+		default:
+			return nil, p.errf("unknown placement option %q: expected replicas or constraints", name)
+		}
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if parens {
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
+	if !opts.SetReplicas && !opts.SetConstraints {
+		return nil, p.errf("placement needs at least one of replicas or constraints")
+	}
+	return opts, nil
 }
 
 // parseOptionList parses a parenthesized option list: ( name = value, ... ).

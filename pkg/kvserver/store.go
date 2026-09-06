@@ -97,6 +97,15 @@ type StoreConfig struct {
 	// the default for a span that also holds non-retention data (never
 	// delete early from a mixed range).
 	RetentionOverride func(start, end keys.Key) (ttl time.Duration, expire, ok bool)
+
+	// MergeBarrier, when set, labels a key span with the replica
+	// placement policy governing it (issue #176); two adjacent ranges
+	// merge only when their labels match. Merging a policied table's
+	// range into a neighbour under a different policy would produce a
+	// range no policy governs — the allocator would then place its
+	// replicas anywhere and the data would drift out of the region an
+	// operator pinned it to.
+	MergeBarrier func(start, end keys.Key) string
 	// RowExpiry, when set, provides ROW-LEVEL retention for ranges that
 	// only PARTIALLY overlap retention tables (where RetentionOverride
 	// must keep the conservative max TTL and can never expire whole

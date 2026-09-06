@@ -240,8 +240,12 @@ func (n *Node) rebalanceBytesOnce(ctx context.Context) bool {
 	sort.Slice(big, func(i, j int) bool { return big[i].Bytes > big[j].Bytes })
 	for _, br := range big {
 		desc, ok := byID[br.RangeID]
-		if !ok || len(desc.Replicas) < base.DefaultReplicationFactor || !allReplicasLive(desc, live) {
+		policy := n.placementOf(desc)
+		if !ok || len(desc.Replicas) < policy.ReplicasOr(base.DefaultReplicationFactor) || !allReplicasLive(desc, live) {
 			continue
+		}
+		if !policy.Satisfies(live[dst].Locality) {
+			continue // a byte move must not push a replica outside its policy
 		}
 		if _, holds := desc.GetReplica(src); !holds {
 			continue // stale advertisement
@@ -273,12 +277,16 @@ func (n *Node) rebalanceBytesOnce(ctx context.Context) bool {
 	return false
 }
 
-// RunRebalanceOnce drives one balancing decision — count move, lease
-// shed, or byte move, in that priority — and reports which (or "" for
-// none). Deterministic test hook; production runs the same chain from the
+// RunRebalanceOnce drives one balancing decision — placement move, count
+// move, lease shed, or byte move, in that priority — and reports which
+// (or "" for none). The placement pass is a no-op on a cluster where no
+// database carries a policy, which is every cluster until one is set. Deterministic test hook; production runs the same chain from the
 // allocator tick. The caller is responsible for invoking it on the
 // current range-1 leader.
 func (n *Node) RunRebalanceOnce(ctx context.Context) string {
+	if n.enforcePlacementOnce(ctx) {
+		return "placement"
+	}
 	if n.rebalanceOnce(ctx) {
 		return "rebalance"
 	}

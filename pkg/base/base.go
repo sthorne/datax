@@ -33,6 +33,13 @@ func (r ReplicaID) String() string { return fmt.Sprintf("replica%d", int32(r)) }
 // the cluster has enough nodes.
 const DefaultReplicationFactor = 3
 
+// MaxReplicationFactor bounds a per-database placement policy's replica
+// count (issue #176). Beyond this a range costs more in raft traffic and
+// commit latency than the extra copies are worth, and a typo — REPLICAS
+// = 30 on a three-node cluster — should be refused rather than leaving
+// every range permanently under-replicated.
+const MaxReplicationFactor = 9
+
 // DefaultMaxClockOffset bounds tolerated physical clock skew between nodes.
 const DefaultMaxClockOffset = 500 * time.Millisecond
 

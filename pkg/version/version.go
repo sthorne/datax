@@ -136,9 +136,20 @@ const (
 	// restart; a v14 binary does not know the new key schema, so the
 	// store's version gate refuses it (rule 4).
 	V15 Version = 15
+	// V16 introduces per-database replica placement (issue #176): a
+	// database descriptor may carry a PlacementPolicy — a replica count
+	// and a set of locality constraints — and the allocator honours it
+	// when it up-replicates, repairs, rebalances and decommissions the
+	// ranges of that database's tables. A v15 node reads the descriptor
+	// but not the policy field, so it would allocate replicas anywhere
+	// and undo the placement a v16 node just made; the DDL that writes a
+	// policy is therefore refused until finalize (rule 4). The field
+	// itself is omitempty, so a descriptor written before v16 reads the
+	// same at either version.
+	V16 Version = 16
 
 	// Current is the newest cluster version this binary can run.
-	Current = V15
+	Current = V16
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

@@ -182,6 +182,8 @@ section the dashboard row links to:
 | `quorum-lost` | critical | a range has fewer live replicas than a majority; it cannot serve until a node returns (ranges) |
 | `under-replicated` | warning | a range has fewer live replicas than its replication factor (ranges) |
 | `diversity` | warning | a range's replicas share a locality tier they could spread across (ranges) |
+| `placement-unsatisfiable` | critical | a range names a database placement policy that no live node satisfies; the data stays where it is until such a node joins (ranges) |
+| `placement-misplaced` | warning | a range holds a replica outside its database's placement policy; the allocator moves them home one per pass (ranges) |
 | `meta-unavailable` | critical | the serving node cannot read the `/meta` range list, so it cannot route (ranges) |
 | `backpressure`, `debt-gate`, `write-stalls`, `storage-errors` | warning / critical | the storage counters in the table below are moving over the last five minutes (storage) |
 | `follower-overloaded` | warning | a node reports itself overloaded and writes to the ranges it replicates are being shed (storage) |
@@ -279,6 +281,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
+| `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 | `datax_store_disk_bytes{kind="free"}` | < 15% of `kind="total"` | the store's disk is filling; Pebble needs headroom to compact (a full disk is a hard stall) |

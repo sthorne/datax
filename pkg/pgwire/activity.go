@@ -167,7 +167,7 @@ func (a *Activity) setUser(c *conn, user string) {
 // statementKind classifies a parsed statement for counting.
 func statementKind(stmt parser.Statement) string {
 	switch stmt.(type) {
-	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases, *parser.ShowSequences, *parser.ShowFunctions:
+	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases, *parser.ShowSequences, *parser.ShowFunctions, *parser.ShowPlacement:
 		return "select"
 	case *parser.Insert:
 		return "insert"

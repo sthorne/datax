@@ -24,6 +24,20 @@ type Candidate struct {
 // must be filtered out by the caller (or are skipped here defensively).
 // Returns false when no candidate is eligible.
 func AllocateTarget(existing []kvpb.NodeDescriptor, candidates []Candidate) (base.NodeID, bool) {
+	return AllocateTargetFor(base.PlacementPolicy{}, existing, candidates)
+}
+
+// AllocateTargetFor is AllocateTarget under a placement policy (issue
+// #176): candidates the policy does not admit are dropped, and the
+// diversity score is then maximized WITHIN what is left — so a database
+// pinned to one region still spreads its replicas across that region's
+// racks rather than piling them onto one.
+//
+// A policy no candidate satisfies returns false, exactly as too few
+// nodes does. The caller reports that as an unmet policy rather than
+// quietly widening it: placing a replica outside a region the operator
+// named is the one thing this must never do.
+func AllocateTargetFor(policy base.PlacementPolicy, existing []kvpb.NodeDescriptor, candidates []Candidate) (base.NodeID, bool) {
 	held := make(map[base.NodeID]bool, len(existing))
 	for _, nd := range existing {
 		held[nd.NodeID] = true
@@ -36,6 +50,9 @@ func AllocateTarget(existing []kvpb.NodeDescriptor, candidates []Candidate) (bas
 	var best *scored
 	for _, c := range candidates {
 		if held[c.Node.NodeID] {
+			continue
+		}
+		if !policy.Satisfies(c.Node.Locality) {
 			continue
 		}
 		s := scored{id: c.Node.NodeID, score: diversityScore(c.Node, existing), ranges: c.RangeCount}
@@ -121,4 +138,41 @@ func RebalanceKeepsDiversity(existing []kvpb.NodeDescriptor, remove base.NodeID,
 	}
 	after = append(after, add)
 	return SetDiversity(after) >= SetDiversity(existing)
+}
+
+// SatisfyingNodes returns the members of nodes a policy admits — what a
+// caller needs to tell "this range is under-replicated" from "this
+// policy cannot be met by the cluster as it stands".
+func SatisfyingNodes(policy base.PlacementPolicy, nodes []kvpb.NodeDescriptor) []kvpb.NodeDescriptor {
+	if len(policy.Constraints) == 0 {
+		return nodes
+	}
+	out := make([]kvpb.NodeDescriptor, 0, len(nodes))
+	for _, nd := range nodes {
+		if policy.Satisfies(nd.Locality) {
+			out = append(out, nd)
+		}
+	}
+	return out
+}
+
+// Misplaced returns the replicas of a range sitting on nodes the policy
+// does not admit: the ones a constrained database needs moved. localities
+// maps a node to its locality; a node the caller has never heard from is
+// left alone rather than assumed to be in violation.
+func Misplaced(policy base.PlacementPolicy, replicas []base.NodeID, localities map[base.NodeID]base.Locality) []base.NodeID {
+	if len(policy.Constraints) == 0 {
+		return nil
+	}
+	var out []base.NodeID
+	for _, id := range replicas {
+		l, known := localities[id]
+		if !known {
+			continue
+		}
+		if !policy.Satisfies(l) {
+			out = append(out, id)
+		}
+	}
+	return out
 }

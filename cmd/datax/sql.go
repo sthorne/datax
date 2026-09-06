@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -52,18 +53,19 @@ func runSQL(args []string) error {
 
 	fmt.Printf("datax sql shell (connected to %s as %s)\n", cli.SQLTarget(cfg), cfg.User)
 	fmt.Println(`Type SQL statements terminated by ';'; \? for help, \q to quit.`)
-	return shellLoop(ctx, conn, newLineReader())
+	return shellLoop(ctx, conn, newStatementReader())
 }
 
-// lineReader reads one line of input with a prompt: a line editor with
-// history when stdin and stdout are a terminal, a plain scanner for piped
-// input. io.EOF ends the input.
-type lineReader interface {
-	ReadLine(prompt string) (string, error)
+// statementReader reads one whole statement: the multi-line editor when
+// stdin and stdout are a terminal, a plain scanner accumulating lines for
+// piped input. io.EOF ends the input; cli.ErrInterrupted abandons the
+// statement in progress and leaves the shell running.
+type statementReader interface {
+	ReadStatement() (string, error)
 	Close()
 }
 
-func newLineReader() lineReader {
+func newStatementReader() statementReader {
 	if cli.IsTerminal(os.Stdin) && cli.IsTerminal(os.Stdout) {
 		if r, err := newTermReader(); err == nil {
 			return r
@@ -74,29 +76,50 @@ func newLineReader() lineReader {
 	return &scanReader{sc: sc}
 }
 
+// scanReader accumulates piped lines until the statement is complete.
+// There is no editing to do, so it needs no terminal and no raw mode.
 type scanReader struct{ sc *bufio.Scanner }
 
-func (r *scanReader) ReadLine(prompt string) (string, error) {
-	fmt.Print(prompt)
-	if !r.sc.Scan() {
-		fmt.Println()
-		if err := r.sc.Err(); err != nil {
-			return "", err
+func (r *scanReader) ReadStatement() (string, error) {
+	var buf strings.Builder
+	for {
+		if buf.Len() == 0 {
+			fmt.Print("datax> ")
+		} else {
+			fmt.Print("    -> ")
 		}
-		return "", io.EOF
+		if !r.sc.Scan() {
+			fmt.Println()
+			if err := r.sc.Err(); err != nil {
+				return "", err
+			}
+			if buf.Len() > 0 {
+				return "", io.EOF // an unfinished statement is discarded
+			}
+			return "", io.EOF
+		}
+		if buf.Len() > 0 {
+			buf.WriteString("\n")
+		}
+		buf.WriteString(r.sc.Text())
+		if cli.StatementComplete(buf.String()) {
+			return buf.String(), nil
+		}
 	}
-	return r.sc.Text(), nil
 }
 
 func (r *scanReader) Close() {}
 
-// termReader is golang.org/x/term's editor over the terminal in raw mode.
-// Raw mode is entered only while a line is being read and left before a
-// statement runs, so results and errors print normally. History is
-// cli.History, persisted to the history file.
+// termReader is the shell's own multi-line editor (pkg/cli, issue #175)
+// over the terminal in raw mode. Raw mode is entered only while a
+// statement is being read and left before it runs, so results and errors
+// print normally. x/term is still what puts the terminal in raw mode and
+// reports its size; the editing, the key decoding and the history are
+// ours, because a single-line editor cannot join a line to the one above
+// it and does not decode Ctrl+arrow.
 type termReader struct {
 	fd   int
-	t    *term.Terminal
+	ed   *cli.Editor
 	hist *cli.History
 }
 
@@ -105,33 +128,27 @@ func newTermReader() (*termReader, error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "history: %v (continuing without it)\n", err)
 	}
-	t := term.NewTerminal(struct {
-		io.Reader
-		io.Writer
-	}{os.Stdin, os.Stdout}, "")
-	t.History = hist
-	// Without a known size the editor wraps every character; assume the
-	// classic 80x24 when the terminal will not say.
-	w, h, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || w <= 0 || h <= 0 {
-		w, h = 80, 24
-	}
-	_ = t.SetSize(w, h)
-	return &termReader{fd: int(os.Stdin.Fd()), t: t, hist: hist}, nil
+	ed := cli.NewEditor(os.Stdin, os.Stdout)
+	ed.History = hist
+	ed.Complete = cli.StatementComplete
+	return &termReader{fd: int(os.Stdin.Fd()), ed: ed, hist: hist}, nil
 }
 
-func (r *termReader) ReadLine(prompt string) (string, error) {
+func (r *termReader) ReadStatement() (string, error) {
 	state, err := term.MakeRaw(r.fd)
 	if err != nil {
 		return "", err
 	}
-	r.t.SetPrompt(prompt)
-	line, err := r.t.ReadLine()
-	_ = term.Restore(r.fd, state)
-	if err == io.EOF {
-		fmt.Println() // leave the prompt line before the shell's last word
+	// The width is read per statement so a resized window takes effect
+	// without restarting the shell.
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		r.ed.Width = w
+	} else {
+		r.ed.Width = 80
 	}
-	return line, err
+	text, err := r.ed.ReadStatement()
+	_ = term.Restore(r.fd, state)
+	return text, err
 }
 
 func (r *termReader) Close() {
@@ -140,46 +157,36 @@ func (r *termReader) Close() {
 	}
 }
 
-// shellLoop is the read-eval-print loop over any lineReader: statements
-// accumulate until a ';', meta-commands act on a line of their own, and
-// end of input cancels a statement in progress before it ends the shell.
-func shellLoop(ctx context.Context, conn *pgx.Conn, in lineReader) error {
+// shellLoop is the read-eval-print loop over any statementReader. The
+// reader hands back a whole statement — the editor composes it across as
+// many lines as it takes — and meta-commands are recognised before it is
+// sent to the server.
+func shellLoop(ctx context.Context, conn *pgx.Conn, in statementReader) error {
 	defer in.Close()
-	var buf strings.Builder
-	prompt := "datax> "
 	for {
-		line, err := in.ReadLine(prompt)
-		if err == io.EOF {
-			if buf.Len() > 0 {
-				buf.Reset()
-				prompt = "datax> "
-				continue
-			}
+		stmtText, err := in.ReadStatement()
+		if errors.Is(err, cli.ErrInterrupted) {
+			continue // ^C abandons the statement, not the shell
+		}
+		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if buf.Len() == 0 {
-			switch cli.MetaCommand(line) {
-			case cli.MetaQuit:
-				return nil
-			case cli.MetaHelp:
-				fmt.Print(cli.HelpText)
-				continue
-			case cli.MetaTables:
-				line = "SHOW TABLES;"
-			}
-		}
-		buf.WriteString(line)
-		buf.WriteString("\n")
-		if !strings.HasSuffix(strings.TrimSpace(buf.String()), ";") {
-			prompt = "    -> "
+		trimmed := strings.TrimSpace(stmtText)
+		if trimmed == "" {
 			continue
 		}
-		stmtText := buf.String()
-		buf.Reset()
-		prompt = "datax> "
+		switch cli.MetaCommand(trimmed) {
+		case cli.MetaQuit:
+			return nil
+		case cli.MetaHelp:
+			fmt.Print(cli.HelpText)
+			continue
+		case cli.MetaTables:
+			stmtText = "SHOW TABLES;"
+		}
 		if err := runOne(ctx, conn, stmtText); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}

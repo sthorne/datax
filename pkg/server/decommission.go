@@ -150,7 +150,7 @@ func (n *Node) drainOnce(ctx context.Context) {
 					candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
 				}
 			}
-			target, ok := placement.AllocateTarget(survivors, candidates)
+			target, ok := placement.AllocateTargetFor(n.placementOf(desc), survivors, candidates)
 			if !ok {
 				log.Warnf("%s: no target to drain n%d onto; replica stays until a node joins", desc.RangeID, dn.NodeID)
 				continue

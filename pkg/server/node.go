@@ -523,6 +523,7 @@ func (n *Node) start() error {
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
 		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
+		MergeBarrier:            n.placementBarrier,
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
 		WaitForApplication:      n.waitForApplication,

@@ -854,10 +854,26 @@ type Analyze struct{ Table string }
 // ShowStats renders the stored statistics for a table (read-only).
 type ShowStats struct{ Table string }
 
-// CreateDatabase is CREATE DATABASE [IF NOT EXISTS] name.
+// PlacementOptions is the option list of CREATE DATABASE ... WITH (...)
+// and ALTER DATABASE ... SET (...) — issue #176. It carries the text an
+// operator wrote; the executor turns it into a base.PlacementPolicy, so
+// the parser stays free of placement semantics. SetReplicas and
+// SetConstraints distinguish an option that was named from one that was
+// left alone, which is what lets ALTER change a replica count without
+// disturbing the constraints.
+type PlacementOptions struct {
+	Replicas       int
+	SetReplicas    bool
+	Constraints    []string
+	SetConstraints bool
+}
+
+// CreateDatabase is
+// CREATE DATABASE [IF NOT EXISTS] name [WITH] (placement options).
 type CreateDatabase struct {
 	Name        string
 	IfNotExists bool
+	Placement   *PlacementOptions
 }
 
 // DropDatabase is DROP DATABASE [IF EXISTS] name [CASCADE | RESTRICT].
@@ -867,11 +883,17 @@ type DropDatabase struct {
 	Cascade  bool
 }
 
-// AlterDatabase is ALTER DATABASE name RENAME TO new.
+// AlterDatabase is ALTER DATABASE name RENAME TO new, or
+// ALTER DATABASE name SET (placement options) when Placement is set.
 type AlterDatabase struct {
-	Name    string
-	NewName string
+	Name      string
+	NewName   string
+	Placement *PlacementOptions
 }
+
+// ShowPlacement is SHOW PLACEMENT FOR DATABASE name — the policy a
+// database carries and what the cluster resolves it to.
+type ShowPlacement struct{ Database string }
 
 // ShowDatabases is SHOW DATABASES.
 type ShowDatabases struct{}
@@ -938,6 +960,7 @@ func (*Analyze) stmt()                {}
 func (*ShowStats) stmt()              {}
 func (*SetVar) stmt()                 {}
 func (*CreateDatabase) stmt()         {}
+func (*ShowPlacement) stmt()          {}
 func (*DropDatabase) stmt()           {}
 func (*AlterDatabase) stmt()          {}
 func (*ShowDatabases) stmt()          {}
