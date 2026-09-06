@@ -23,7 +23,7 @@ function render(d) {
     case "overview": renderOverview(d); break;
     case "nodes": renderNodesTable(d); renderNetwork(d); break;
     case "sql": renderSQL(d); break;
-    case "data": renderClusterRanges(d.ranges || []); break;
+    case "data": renderReplication(d); renderClusterRanges(d.ranges || []); break;
     case "security": renderSecurity(d); break;
   }
 }

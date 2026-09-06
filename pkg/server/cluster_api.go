@@ -45,6 +45,13 @@ type ClusterNode struct {
 	// SQL is the node's SQL activity summary from its heartbeat (live for
 	// the serving node).
 	SQL *kvpb.SQLSummary `json:"sql,omitempty"`
+	// HotRanges are the node's heaviest mature leaseholders by QPS and
+	// BigRanges its largest replicas by bytes, top-K each, straight from
+	// the heartbeat the allocator already reads (issue #152). QPS is
+	// leader-local, so these are the LEADER's own measurement of ranges
+	// it leads — not a cluster total, and the console says so.
+	HotRanges []kvpb.HotRange `json:"hot_ranges,omitempty"`
+	BigRanges []kvpb.HotRange `json:"big_ranges,omitempty"`
 }
 
 // ClusterRange is one cluster-wide range descriptor (from /meta — every
@@ -186,9 +193,12 @@ type ClusterStatus struct {
 	Nodes     []ClusterNode    `json:"nodes"`
 	Ranges    []ClusterRange   `json:"ranges"`
 	// Rollup sums the live nodes' figures (issue #145).
-	Rollup  ClusterRollup           `json:"rollup"`
-	Local   NodeStatus              `json:"local"`
-	Storage *storage.StorageMetrics `json:"storage,omitempty"`
+	Rollup ClusterRollup `json:"rollup"`
+	// Replication buckets the ranges by replication state and projects
+	// what the loss of each failure domain would cost (issue #152).
+	Replication ClusterReplication      `json:"replication"`
+	Local       NodeStatus              `json:"local"`
+	Storage     *storage.StorageMetrics `json:"storage,omitempty"`
 	// Error carries a partial-data note (e.g. the meta scan failed during
 	// startup or a partition); the rest of the document is still valid.
 	Error string `json:"error,omitempty"`
@@ -231,6 +241,8 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 			Machine:      nd.Machine,
 			Latency:      nd.Latency,
 			SQL:          nd.SQL,
+			HotRanges:    nd.HotRanges,
+			BigRanges:    nd.BigRanges,
 		})
 		if nd.NodeID == n.ident.NodeID {
 			last := &doc.Nodes[len(doc.Nodes)-1]
@@ -269,6 +281,7 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 		doc.Storage = &m
 	}
 	doc.Rollup = rollup(doc.Nodes, doc.Ranges)
+	doc.Replication = n.replicationStatus(descs, doc.Nodes)
 	return doc
 }
 
