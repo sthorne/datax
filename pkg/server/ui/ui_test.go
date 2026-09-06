@@ -146,3 +146,150 @@ var (
 	hiddenOverride = regexp.MustCompile(`\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important`)
 	hiddenElement  = regexp.MustCompile(`<[a-z]+[^>]*\bid="([a-zA-Z0-9_-]+)"[^>]*\bhidden\b`)
 )
+
+// TestScriptsOnlyTouchElementsThatExist: a script that reads an element
+// the markup does not have throws, and in a poll that stops the console
+// updating.
+//
+// #hdr-reload was referenced by the overview poll and was not in the
+// page. It fires only when the node serves a newer console than the tab
+// is running — a rolling upgrade — so the console froze at "last updated
+// never" exactly while the cluster was changing under it.
+func TestScriptsOnlyTouchElementsThatExist(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markup := string(page)
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An element may also be created by a script and then read back, so
+	// the scripts' own generated markup counts as a definition.
+	var all strings.Builder
+	all.WriteString(markup)
+	sources := map[string]string{}
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[name] = string(src)
+		all.WriteString(string(src))
+	}
+	defined := all.String()
+	for _, name := range names {
+		src := sources[name]
+		for _, m := range getByID.FindAllStringSubmatch(src, -1) {
+			id := m[1]
+			// Optional chaining says the caller expects it to be absent.
+			if strings.Contains(src, `getElementById("`+id+`")?.`) {
+				continue
+			}
+			if !strings.Contains(defined, `id="`+id+`"`) && !strings.Contains(defined, `id=\"`+id+`\"`) {
+				t.Errorf("%s reads getElementById(%q), which neither index.html nor any script creates: "+
+					"the call returns null and the next property access throws", name, id)
+			}
+		}
+	}
+}
+
+// getByID matches a literal getElementById("...") — the calls whose
+// target can be checked against the markup. Computed ids are skipped.
+var getByID = regexp.MustCompile(`getElementById\("([a-zA-Z0-9_-]+)"\)`)
+
+// TestNodeViewFetchesTheNodeInTheRoute: the node page asked the server
+// for node 0 on every visit.
+//
+// The view's cache object declared `id: 0` and nothing ever assigned the
+// route's node to it, so the poll built "/api/node?id=0" — which the
+// server is right to reject with a 400 — and the page rendered "Node n0"
+// above the error. No server-side test could see it: the node serves the
+// same bytes either way, and the wrong id is chosen in the browser.
+func TestNodeViewFetchesTheNodeInTheRoute(t *testing.T) {
+	src, err := FS.ReadFile("js/90-node.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := funcBody(string(src), "async function pollNode()")
+	if body == "" {
+		t.Fatal("js/90-node.js has no pollNode")
+	}
+	// The call, not the comment above it that quotes the same path.
+	fetchAt := strings.Index(body, `fetch("/api/node?id=`)
+	if fetchAt < 0 {
+		t.Fatal("pollNode does not fetch /api/node?id=")
+	}
+	if !strings.Contains(body[:fetchAt], "ui.node") {
+		t.Error("pollNode reaches /api/node?id= without reading ui.node: " +
+			"the route is what says which node the page is showing, so a cached " +
+			"id that nothing assigns fetches node 0 and the server returns 400")
+	}
+}
+
+// funcBody returns the text between the braces of the declaration
+// starting with header, or "" if it is not there. It counts braces, so a
+// nested block does not end the function early; strings and comments
+// holding an unbalanced brace would, and none of the console's do.
+func funcBody(src, header string) string {
+	i := strings.Index(src, header)
+	if i < 0 {
+		return ""
+	}
+	open := strings.Index(src[i:], "{")
+	if open < 0 {
+		return ""
+	}
+	depth := 0
+	for j := i + open; j < len(src); j++ {
+		switch src[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return src[i+open+1 : j]
+			}
+		}
+	}
+	return ""
+}
+
+// TestTileQualifiersAreNotHeadlines: a tile is a label, one figure and
+// sometimes a qualifier, and the qualifier must not be set at the
+// figure's size.
+//
+// It used to run on after the figure inside the same 22px line, so
+// "connections" read "0 (0 active, 0 idle in txn) (0 of 2 live nodes)"
+// as four lines of headline type — taller than its card, spilling over
+// what came below it, and stretching every other tile in its grid row to
+// match.
+func TestTileQualifiersAreNotHeadlines(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+	if !tileQualRule.MatchString(css) {
+		t.Error("index.html has no rule setting a tile value's qualifier " +
+			"(.tile .value .muted) on its own line at a smaller size")
+	}
+	if !tileLongRule.MatchString(css) {
+		t.Error("index.html has no .tile .value.long rule: tile() marks a value " +
+			"that is a phrase rather than a figure, and without the rule it is " +
+			"still set at the figure's size")
+	}
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(core), `class="value${valueClass(value)}"`) {
+		t.Error("js/10-core.js: tile() no longer classifies long values, so the " +
+			"CSS rule above can never apply")
+	}
+}
+
+var (
+	tileQualRule = regexp.MustCompile(`\.tile\s+\.value\s+\.muted\s*\{[^}]*display\s*:\s*block`)
+	tileLongRule = regexp.MustCompile(`\.tile\s+\.value\.long\s*\{[^}]*font-size`)
+)

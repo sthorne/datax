@@ -35,6 +35,11 @@
   header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
   header .sub { color: var(--text-2); font-size: 13px; }
   header .stale { color: var(--critical); font-size: 13px; margin-left: auto; display: none; }
+  header .reload {
+    font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--series-1); background: var(--panel); color: var(--text);
+  }
+  header .reload:hover { background: color-mix(in srgb, var(--series-1) 14%, var(--panel)); }
   /* The user menu (issue #158): who you are, how you got in, and the
      way out. A <details> so it needs no JavaScript to open or close. */
   header .user { margin-left: auto; position: relative; font-size: 13px; }
@@ -75,13 +80,26 @@
   tr[tabindex]:focus-visible td { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
   section { margin-top: 22px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 8px; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  /* A tile is a label, one figure, and — sometimes — a qualifier. Every
+     part gets its own line, because they used to share one: the
+     qualifier ran on after the figure at the figure's own 22px, so
+     "0 (0 active, 0 idle in txn) (0 of 2 live nodes)" wrapped to four
+     lines of headline type and spilled past the card's bottom edge onto
+     whatever came next. A qualifier is now a 12px line under the
+     figure, so a tile is two or three short lines whatever it holds. */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(190px, 100%), 1fr)); gap: 10px; }
   .tile {
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px 12px 8px;
+    padding: 10px 12px 8px; overflow: hidden;
   }
   .tile .label { font-size: 12px; color: var(--text-2); }
-  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; line-height: 1.25; }
+  /* A value that is a phrase rather than a figure — "v0.53.1 · protocol
+     v2 · cluster v16" — reads at a size that fits the box instead of
+     wrapping into a paragraph of headline type. tile() decides by
+     length, so a value that grows long in the field is handled too. */
+  .tile .value.long { font-size: 14px; font-weight: 500; line-height: 1.45; }
+  .tile .value .muted { display: block; font-size: 12px; font-weight: 400; line-height: 1.35; margin-top: 3px; }
   .tiles.ident .value { font-size: 15px; word-break: break-all; }
   .tile svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
   .tile polyline { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
@@ -170,11 +188,15 @@
   .seg button.on { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--text); }
   #series-details { margin-top: 14px; }
   #series-details summary { cursor: pointer; font-size: 13px; }
-  #series-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; font-size: 13px; margin: 6px 0 14px; }
+  #series-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr)); gap: 4px 16px; font-size: 13px; margin: 6px 0 14px; }
   #series-picker h4 { grid-column: 1 / -1; margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); }
   #series-picker label { display: flex; gap: 6px; align-items: baseline; cursor: pointer; }
   #series-picker label span.h { color: var(--text-3); font-size: 12px; }
-  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 14px; }
+  /* min() so the track can fall below its ideal width on a narrow
+     screen: a bare minmax(460px, 1fr) keeps a 460px track at a 360px
+     viewport, which widened the whole document and left every view
+     with a chart scrolling sideways. */
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr)); gap: 14px; }
   .charts.compare { grid-template-columns: 1fr; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
   .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
@@ -256,6 +278,12 @@
   <span class="sub" id="hdr-node">connecting…</span>
   <details class="user" id="hdr-user"><summary id="hdr-user-summary" title="who this page is signed in as"></summary><div class="menu" id="hdr-user-menu"></div></details>
   <span class="stale" id="hdr-stale" role="status">● stale — last update failed</span>
+  <!-- Offered when the node starts serving a newer console than this tab
+       is running (a rolling upgrade under a long-lived tab). The script
+       reveals it; it must exist in the markup, or the poll that reveals
+       it throws and the page stops updating exactly when the cluster is
+       changing under it. -->
+  <button type="button" class="reload" id="hdr-reload" hidden>a newer console is available — reload</button>
 </header>
 <div id="jump" hidden>
   <div class="box" role="dialog" aria-modal="true" aria-label="jump to">
@@ -579,33 +607,6 @@
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th><th class="num" title="entries kept in the raft log since the last truncation">log</th></tr></thead>
       <tbody id="node-ranges"></tbody>
-    </table></div>
-  </section>
-  <section>
-    <h2>SQL</h2>
-    <div class="tiles" id="node-sql"></div>
-    <div id="node-activity" hidden><div class="tablewrap"><table>
-      <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
-      <tbody id="node-statements"></tbody>
-    </table></div></div>
-    <p class="muted" id="node-sql-note"></p>
-  </section>
-  <section>
-    <h2>Network (this node's row)</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>peer</th><th class="num">round trip</th><th class="num">p99</th><th class="num">clock offset</th><th>reachable</th><th class="num">measured</th></tr></thead>
-      <tbody id="node-latency"></tbody>
-    </table></div>
-  </section>
-  <section>
-    <h2>Settings</h2>
-    <div class="tablewrap"><table><tbody id="node-settings"></tbody></table></div>
-  </section>
-  <section>
-    <h2>Recent events</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
-      <tbody id="node-events"></tbody>
     </table></div>
   </section>
   <section>

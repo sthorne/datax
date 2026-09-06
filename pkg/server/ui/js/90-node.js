@@ -5,7 +5,21 @@
 const nv = { id: 0, chartsAt: 0 };
 const NODE_CHART_SERIES = ["node.cpu_percent", "node.leader_qps", "sql.statements", "kv.batch_p99_us"];
 async function pollNode() {
-  const id = nv.id;
+  // The node to show is the one in the route. nv.id was never assigned
+  // from it, so every visit asked for /api/node?id=0 — a 400 — and the
+  // page read "Node n0" above an error. The route is the single source
+  // of truth for which node this view is; nv only caches across polls.
+  const id = ui.node;
+  if (id !== nv.id) {
+    nv.id = id;
+    nv.chartsAt = 0; // a different node's history, so refetch it now
+  }
+  if (!id) {
+    document.getElementById("node-err").style.display = "block";
+    document.getElementById("node-err").textContent =
+      "no node in the address: open a node from the nodes table, or use #/node/1";
+    return;
+  }
   const errBox = document.getElementById("node-err");
   document.getElementById("node-title").textContent = `Node n${id}`;
   document.getElementById("node-metrics-link").href = routeTo("metrics", { nodes: String(id) });
