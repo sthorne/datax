@@ -23,6 +23,21 @@ The console umbrella (#144), first batch.
   same change.
 
 ### Added
+- The console reports the cluster, not the node that served the page
+  (#145). `/api/cluster` carries a `rollup` summed over the live nodes'
+  heartbeats — QPS, data, leases, ranges and replicas, connections (by
+  state and by user), statements and serialization failures (the page
+  differences polls for rates), the worst p99 and the node that owns it
+  — with the count of contributing nodes beside each sum, so a node that
+  is down shows as a smaller count rather than a smaller figure; the same
+  numbers come out whichever node is asked (`TestClusterRollup`). The
+  overview's tiles are the rollup, the node table is a strip of cards
+  (status, locality, cpu, load, memory, disk headroom, fds, leases, data,
+  qps, connections) linking to each node's page, and the sections that
+  described the serving node — its replicas, events, machine and storage
+  health — live only on that page now; the header says which node served
+  the page, as provenance. Health findings about the serving node's
+  storage or events link to its page.
 - `datax_node_load5` and `datax_node_load15` on `/metrics`, beside
   `datax_node_load1` (#146).
 - The console notices a rolling upgrade under a long-lived tab (#146):

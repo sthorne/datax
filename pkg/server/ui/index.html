@@ -99,6 +99,13 @@
   header nav { display: flex; gap: 10px; font-size: 13px; }
   header nav a { color: var(--text-2); text-decoration: none; padding: 2px 8px; border-radius: 6px; }
   header nav a.current { background: color-mix(in srgb, var(--border) 50%, transparent); color: var(--text); }
+  .strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+  .card { display: block; text-decoration: none; color: inherit; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--panel); }
+  .card:hover { border-color: var(--text-3); }
+  .card .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .card .head b { font-size: 15px; }
+  .card .row { font-size: 12px; color: var(--text-2); margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .card .row b { color: var(--text); font-weight: 600; }
   a.tile { text-decoration: none; color: inherit; display: block; }
   a.tile:hover { border-color: var(--text-3); }
   .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 8px 0 14px; font-size: 13px; }
@@ -216,6 +223,49 @@
 
   <section id="sec-nodes">
     <h2>Nodes</h2>
+    <div class="strip" id="nodes"></div>
+    <p class="muted" id="nodes-note"></p>
+  </section>
+
+  <section>
+    <h2>SQL</h2>
+    <div class="tiles" id="node-sql"></div>
+    <div id="node-activity" hidden><div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
+      <tbody id="node-statements"></tbody>
+    </table></div></div>
+    <p class="muted" id="node-sql-note"></p>
+  </section>
+  <section>
+    <h2>Network (this node's row)</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>peer</th><th class="num">round trip</th><th class="num">p99</th><th class="num">clock offset</th><th>reachable</th><th class="num">measured</th></tr></thead>
+      <tbody id="node-latency"></tbody>
+    </table></div>
+  </section>
+  <section>
+    <h2>Settings</h2>
+    <div class="tablewrap"><table><tbody id="node-settings"></tbody></table></div>
+  </section>
+  <section>
+    <h2>Recent events</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
+      <tbody id="node-events"></tbody>
+    </table></div>
+  </section>
+</main>
+<main id="view-main">
+  <div class="err" id="cluster-err"></div>
+  <div id="problems" title="checks run on this node every few seconds from data it already holds"></div>
+
+  <section>
+    <h2>Cluster</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section id="sec-nodes">
+    <h2>Nodes</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
         <th class="num" title="host CPU busy, all cores">cpu</th>
@@ -275,15 +325,6 @@
     </table></div>
   </section>
 
-  <section>
-    <h2>Ranges (local replicas, this node)</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th></tr></thead>
-      <tbody id="ranges"></tbody>
-    </table></div>
-    <p class="muted" id="cluster-range-note"></p>
-  </section>
-
   <section id="sec-cluster-ranges">
     <h2>Ranges (cluster)</h2>
     <div class="tablewrap"><table>
@@ -293,25 +334,6 @@
     <p class="muted" id="cluster-range-hint">click a range for its per-replica detail from every holding node (admin role)</p>
   </section>
 
-  <section id="sec-events">
-    <h2>Events (this node) <select class="filter" id="events-filter" title="show one kind of event"><option value="">all kinds</option></select></h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
-      <tbody id="events"></tbody>
-    </table></div>
-    <p class="muted" id="events-note"></p>
-  </section>
-
-  <section>
-    <h2>Machine (this node)</h2>
-    <div class="tiles" id="machine"></div>
-    <p class="muted" id="machine-note"></p>
-  </section>
-
-  <section id="sec-storage">
-    <h2>Storage health</h2>
-    <div class="tiles" id="storage"></div>
-  </section>
 </main>
 <script>
 // CONSOLE_VERSION is stamped by the node when it serves the page.
@@ -436,55 +458,53 @@ function drillDownRefusal() {
     `Grant it with <code>GRANT ADMIN TO ${esc(who.user)}</code>, or sign in as root ` +
     `(open a private window to be prompted for credentials again).`;
 }
+// The overview reports the cluster (issue #145): the rollup the node
+// computed over every live node's heartbeat, and one card per node.
+// Which node served the page is provenance in the header, not the
+// subject; its own sections live on its node page.
+let rollupPrev = null; // {at, statements, retries} for statement rates
+function contrib(r, n) { return n < r.live_nodes ? ` <span class="muted">(${n} of ${r.live_nodes} live nodes)</span>` : ""; }
 function render(d) {
-  document.getElementById("hdr-node").textContent =
-    "node n" + d.node_id + " · " + (d.local.address || "");
+  const loc = d.local && d.local.locality;
+  document.getElementById("hdr-node").innerHTML =
+    `served by <a href="#/node/${d.node_id}" title="this node's page">n${d.node_id}</a>` + (loc ? " · " + esc(loc) : "") + (d.local.address ? ` <span class="muted">${esc(d.local.address)}</span>` : "");
   renderPrincipal(d.principal);
-  const liveCount = (d.nodes || []).filter(n => n.live).length;
-  const totalQPS = (d.local.ranges || []).reduce((s, r) => s + (r.qps || 0), 0);
-  const totalBytes = (d.local.ranges || []).reduce((s, r) => s + (r.size_bytes || 0), 0);
+  const r = d.rollup || {};
+  const now = Date.now();
+  let stmtRate = null, retryRate = null;
+  if (rollupPrev && now > rollupPrev.at && r.statements >= rollupPrev.statements) {
+    const dt = (now - rollupPrev.at) / 1000;
+    stmtRate = (r.statements - rollupPrev.statements) / dt;
+    retryRate = (r.serialization_failures - rollupPrev.retries) / dt;
+  }
+  rollupPrev = { at: now, statements: r.statements || 0, retries: r.serialization_failures || 0 };
+  const users = Object.entries(r.connections_by_user || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([u, c]) => `${esc(u)} ${c}`).join(", ");
   document.getElementById("tiles").innerHTML =
-    tile("live nodes", liveCount + " / " + (d.nodes || []).length) +
-    tile("cluster ranges", (d.ranges || []).length || (d.local.ranges || []).length) +
-    tile("this node leads", d.local.leader_of) +
-    tile("this node QPS", Math.round(totalQPS), "qps", totalQPS) +
-    tile("this node data", fmtBytes(totalBytes), "bytes", totalBytes);
+    tile("live nodes", (r.live_nodes ?? 0) + " / " + (r.nodes ?? (d.nodes || []).length)) +
+    tile("cluster QPS", Math.round(r.qps || 0) + contrib(r, r.contributing), "qps", r.qps || 0) +
+    tile("cluster data", fmtBytes(r.data_bytes || 0) + contrib(r, r.contributing), "bytes", r.data_bytes || 0) +
+    tile("ranges", (r.ranges ?? 0) + ` <span class="muted">· ${r.replicas ?? 0} replicas</span>`) +
+    tile("leases", (r.leases ?? 0) + contrib(r, r.contributing)) +
+    tile("connections", `${r.connections ?? 0} <span class="muted">(${r.active ?? 0} active, ${r.idle_in_txn ?? 0} idle in txn${users ? "; " + users : ""})</span>` + contrib(r, r.sql_contributing)) +
+    tile("statements/s", stmtRate === null ? "…" : stmtRate.toFixed(1) + contrib(r, r.sql_contributing), "stmt", stmtRate || 0) +
+    tile("40001/s", retryRate === null ? "…" : retryRate.toFixed(2), "retry", retryRate || 0) +
+    tile("worst p99", r.worst_p99_node ? `${(r.worst_p99_us / 1000).toFixed(1)} ms <span class="muted">(n${r.worst_p99_node})</span>` : "—", "p99", (r.worst_p99_us || 0) / 1000);
 
-  document.getElementById("nodes").innerHTML = (d.nodes || []).map(n => {
+  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
+  document.getElementById("nodes").innerHTML = nodes.map(n => {
     const m = n.machine;
-    return `<tr class="clickable" data-node="${n.node_id}" title="open n${n.node_id}'s detail page">
-    <td>n${n.node_id}</td>
-    <td>${statusCell(n)}</td>
-    <td class="key">${esc(n.address)}</td>
-    <td>${esc(n.locality || "—")}</td>
-    <td class="num">${m ? pct(m.cpu_percent) : "—"}</td>
-    <td class="num">${m && m.cores ? loadCell(m.load1, m.cores) : "—"}</td>
-    <td class="num">${m && m.mem_total ? memCell(m) : "—"}</td>
-    <td class="num">${m && m.disk_total ? diskCell(m) : "—"}</td>
-    <td class="num">${m && m.fd_limit ? fdCell(m) : "—"}</td>
-    <td class="num">${fmtAgo(n.heartbeat_ago_ms)}</td>
-  </tr>`; }).join("");
-
-  document.querySelectorAll("#nodes tr.clickable").forEach(tr => tr.addEventListener("click", () => { location.hash = "#/node/" + tr.dataset.node; }));
+    return `<a class="card" href="#/node/${n.node_id}" title="open n${n.node_id}'s page">
+    <div class="head"><b>n${n.node_id}</b> ${statusCell(n)} <span class="muted">${esc(n.locality || "no locality")}</span></div>
+    <div class="row">${m ? `cpu <b>${pct(m.cpu_percent)}</b> · load <b>${m.cores ? loadCell(m.load1, m.cores) : "—"}</b> · memory <b>${m.mem_total ? memCell(m) : "—"}</b>` : `<span class="muted">no machine summary (older binary?)</span>`}</div>
+    <div class="row">${m ? `disk free <b>${m.disk_total ? diskCell(m) : "in-memory store"}</b> · fds <b>${m.fd_limit ? fdCell(m) : "—"}</b>` : ""}</div>
+    <div class="row">leads <b>${n.leader_count || 0}</b> · <b>${fmtBytes(n.replica_bytes || 0)}</b> · <b>${Math.round(n.leader_qps || 0)}</b> qps${n.sql ? ` · <b>${n.sql.open}</b> connections` : ""} · heartbeat ${fmtAgo(n.heartbeat_ago_ms)}</div>
+    <div class="row muted key">${esc(n.address)}</div>
+  </a>`; }).join("");
+  const dead = nodes.filter(n => !n.live).length;
+  document.getElementById("nodes-note").textContent = "figures from each node's heartbeat" + (dead ? `; ${dead} node${dead > 1 ? "s" : ""} down — excluded from the cluster totals above` : "");
   renderNetwork(d);
   renderSQL(d);
-
-  const lm = d.local && d.local.machine;
-  if (lm) {
-    document.getElementById("machine").innerHTML = machineTiles(lm);
-    const un = lm.unavailable || [];
-    document.getElementById("machine-note").textContent = un.length
-      ? "not available on this platform: " + un.join(", ")
-      : "sampled every 5s; rates are averages over the interval";
-  }
-  const local = (d.local.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
-  document.getElementById("ranges").innerHTML = local.filter(matchesFilter).map(r => rangeRow(r, "this node")).join("");
-  const clusterN = (d.ranges || []).length;
-  document.getElementById("cluster-range-note").textContent = clusterN
-    ? "cluster-wide: " + clusterN + " ranges (★ = led by this node; qps is the leader's local rate)"
-    : "";
   renderClusterRanges(d.ranges || []);
-  document.getElementById("storage").innerHTML = storageTiles(d.storage || {});
   const errBox = document.getElementById("cluster-err");
   if (d.error) { errBox.style.display = "block"; errBox.textContent = "partial data — " + d.error; }
   else errBox.style.display = "none";
@@ -778,7 +798,9 @@ async function toggleRangeDetail(id) {
 }
 // Problems panel: /api/health on the same cadence. Rows link to the
 // dashboard section that shows the underlying figure.
-const SECTION_NAMES = { nodes: "nodes", network: "network", schema: "schema", "cluster-ranges": "ranges", storage: "storage", events: "events" };
+const SECTION_NAMES = { nodes: "nodes", network: "network", schema: "schema", "cluster-ranges": "ranges", storage: "this node's storage", events: "this node's events" };
+// Sections that describe the serving node live on its node page (#145).
+const NODE_SECTIONS = { storage: true, events: true };
 async function pollHealth() {
   const box = document.getElementById("problems");
   try {
@@ -794,47 +816,12 @@ async function pollHealth() {
       <span class="sev">${esc(p.severity)}</span>
       <span class="check">${esc(p.check)}</span>
       <span>${esc(p.summary)}</span>
-      ${p.section ? `<a href="#sec-${esc(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} ↓</a>` : ""}
+      ${p.section ? `<a href="${NODE_SECTIONS[p.section] && lastCluster ? "#/node/" + lastCluster.node_id : "#sec-" + esc(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} ${NODE_SECTIONS[p.section] ? "→" : "↓"}</a>` : ""}
     </div>`).join("");
   } catch (err) {
     box.innerHTML = `<span class="muted">health checks unavailable: ${esc(err.message || err)}</span>`;
   }
 }
-// Events: the first poll loads the recent ring, later polls tail from
-// the last sequence seen; the kind filter is applied on render. Audit
-// rows arrive only for admins (the server filters).
-const EVENTS_MAX = 300;
-let eventsSeen = 0, eventsAll = [], eventsKinds = new Set();
-function renderEvents() {
-  const sel = document.getElementById("events-filter");
-  const want = sel.value;
-  const opts = [`<option value="">all kinds</option>`].concat([...eventsKinds].sort().map(k => `<option value="${esc(k)}"${k === want ? " selected" : ""}>${esc(k)}</option>`));
-  if (sel.options.length !== opts.length) sel.innerHTML = opts.join("");
-  const rows = eventsAll.filter(e => !want || e.kind === want).slice().reverse().map(e => `<tr>
-    <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
-    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
-    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
-  </tr>`);
-  document.getElementById("events").innerHTML = rows.join("") ||
-    `<tr><td colspan="3" class="muted">${want ? "no " + esc(want) + " events" : "nothing recorded yet"}</td></tr>`;
-  document.getElementById("events-note").textContent =
-    `${eventsAll.length} recent events on this node (splits, merges, rebalances, repairs, snapshots, backups, upgrades)` +
-    (canDrillDown() ? "; audit records (auth failures, admin operations, privilege DDL) are outlined in amber" : "; audit records need the admin role");
-}
-async function pollEvents() {
-  try {
-    const resp = await fetch("/api/events?since=" + eventsSeen + (eventsSeen ? "" : "&limit=" + EVENTS_MAX), { cache: "no-store" });
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const d = await resp.json();
-    for (const e of d.events || []) { eventsAll.push(e); eventsKinds.add(e.kind); }
-    if (eventsAll.length > EVENTS_MAX) eventsAll = eventsAll.slice(eventsAll.length - EVENTS_MAX);
-    eventsSeen = Math.max(eventsSeen, d.latest_seq || 0);
-    renderEvents();
-  } catch (err) {
-    document.getElementById("events-note").textContent = "events unavailable: " + (err.message || err);
-  }
-}
-document.getElementById("events-filter").addEventListener("change", renderEvents);
 // ---- Metrics view: /#/metrics?series=a,b&range=1h&nodes=1,2&rate=1&compare=1 ----
 // Charts the datax_metrics table through /api/metrics: one chart per
 // series with one line per node (categorical slots 1-8 by node ID; a
@@ -1173,14 +1160,12 @@ async function poll() {
 poll().then(pollTileHistory);
 pollSchema();
 pollHealth();
-pollEvents();
 route();
 setTimeout(pollActivity, 500);
 setInterval(poll, 3000);
 setInterval(pollSchema, 3000);
 setInterval(pollActivity, 3000);
 setInterval(pollHealth, 3000);
-setInterval(pollEvents, 3000);
 setInterval(pollTileHistory, 30000);
 </script>
 </body>

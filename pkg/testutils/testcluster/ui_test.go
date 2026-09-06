@@ -243,3 +243,84 @@ func TestUIServed(t *testing.T) {
 		t.Fatalf("/metrics: %d", code)
 	}
 }
+
+// TestClusterRollup (issue #145): every node's /api/cluster carries the
+// same cluster rollup — the figures are summed over the live nodes'
+// heartbeats, not taken from the node that served the page — and once a
+// node falls outside the liveness grace window its figures leave the
+// totals and the contributing-node count drops with it.
+func TestClusterRollup(t *testing.T) {
+	// Two heartbeat intervals: a peer's row is as old as the last tick
+	// that carried it, so a tighter window flaps.
+	const grace = 6 * time.Second
+	listeners := make([]net.Listener, 3)
+	for i := range listeners {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = lis
+	}
+	i := 0
+	tc, _ := StartWithEngines(t, 3, func(c *server.Config) {
+		c.HTTPListener = listeners[i]
+		c.LivenessGrace = grace
+		c.DeadNodeThreshold = 2 * grace
+		i++
+	})
+	rollupOf := func(n *server.Node) server.ClusterRollup {
+		t.Helper()
+		_, _, body := httpGet(t, "http://"+n.HTTPAddr()+"/api/cluster")
+		var doc server.ClusterStatus
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		return doc.Rollup
+	}
+	// Convergence: every node's registry has every heartbeat, and every
+	// range has a leader (leases == ranges).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		rs := []server.ClusterRollup{rollupOf(tc.Nodes[0]), rollupOf(tc.Nodes[1]), rollupOf(tc.Nodes[2])}
+		ok := true
+		for _, r := range rs {
+			// (These nodes run no SQL server, so no heartbeat carries a
+			// SQL summary and the SQL sums cover no node.)
+			if r.Nodes != 3 || r.LiveNodes != 3 || r.Contributing != 3 || r.SQLContributing != 0 || r.Ranges == 0 || r.Leases != r.Ranges || r.Replicas != 3*r.Ranges || r.DataBytes <= 0 {
+				ok = false
+			}
+		}
+		// The structural figures agree exactly; the byte and QPS sums
+		// are each node's view of the others' latest heartbeats, which
+		// differ by a heartbeat's growth, so they are only required to
+		// cover every node (Contributing above).
+		for _, r := range rs[1:] {
+			if r.Ranges != rs[0].Ranges || r.Replicas != rs[0].Replicas || r.Leases != rs[0].Leases {
+				ok = false
+			}
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rollups did not converge: %+v", rs)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// n3 goes away: after the grace window the survivors' totals cover
+	// two contributing nodes and say so.
+	tc.Nodes[2].Stop()
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		r0, r1 := rollupOf(tc.Nodes[0]), rollupOf(tc.Nodes[1])
+		if r0.Nodes == 3 && r0.LiveNodes == 2 && r0.Contributing == 2 &&
+			r1.LiveNodes == 2 && r1.Contributing == 2 && r0.DataBytes > 0 && r1.DataBytes > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rollups after n3 stopped: %+v / %+v", r0, r1)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
