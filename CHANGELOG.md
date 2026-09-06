@@ -8,6 +8,33 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.47.0 — unreleased
+
+### Fixed
+- `datax sql` could not edit a statement once it spanned lines (#175).
+  The shell composed a multi-line statement by calling a single-line
+  editor once per line, so by the time the cursor reached column 0 of a
+  continuation line the line above was already gone and backspace simply
+  stopped. The whole statement is now the editor's buffer: backspace at
+  the start of a line joins it to the one above and leaves the cursor at
+  the join, forward delete at the end of a line pulls the next one up,
+  and the arrows move through the statement rather than within one line
+  of it.
+
+### Added
+- `Ctrl+←` and `Ctrl+→` move by a word in `datax sql` (#175). They did
+  nothing before: the editor decoded `ESC [ 1 ; 3 C/D`, which is
+  Alt+arrow, and had no case for `ESC [ 1 ; 5 C/D`, which is what
+  Ctrl+arrow sends in every common terminal. `Alt+←`/`Alt+→`, `Alt-b`/
+  `Alt-f` and `Ctrl+Alt+arrow` are accepted as the same motion, and a
+  word is a SQL identifier part, so `Ctrl+←` through
+  `orders.customer_id` stops at each half.
+- The shell keeps its history, `Ctrl-A/E/K/U/W`, `Ctrl-L` and `Ctrl-D`,
+  and gains `Ctrl-C` to abandon the statement being typed without
+  leaving, `Alt+Backspace` and `Ctrl+Delete` for word-wise deletion, and
+  bracketed paste — a pasted multi-line statement lands as text instead
+  of running itself a line at a time (#175).
+
 ## 0.46.0 — unreleased
 
 ### Fixed

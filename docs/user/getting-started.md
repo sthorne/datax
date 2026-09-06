@@ -62,13 +62,31 @@ There is also a built-in shell:
 ./datax sql -url postgres://10.0.0.1:26433/datax -certs-dir certs -user root   # secure cluster
 ```
 
-In the shell, the up and down arrows recall earlier lines (history is
-kept in `~/.datax_sql_history`, or the file named by
-`$DATAX_SQL_HISTORY`; the last 1000 lines), `\?` or `help` prints the
+A statement may span as many lines as it needs and stays editable the
+whole time: the whole statement is the editor's buffer, not one line at
+a time. Backspace at the start of a continuation line joins it to the
+line above, and forward delete at the end of a line pulls the next one
+up, so a typo three lines back is reachable.
+
+| Keys | |
+|---|---|
+| `Ctrl+←` / `Ctrl+→` | move by a word (`Alt+←`/`Alt+→` and `Alt-b`/`Alt-f` do the same) |
+| `←` `→` | move by a character, across line boundaries |
+| `↑` `↓` | move between the statement's lines; past the first or last, recall history |
+| `Home` / `End`, `Ctrl-A` / `Ctrl-E` | start and end of the line |
+| `Ctrl-W`, `Alt+Backspace` | delete the word before the cursor |
+| `Ctrl-K` / `Ctrl-U` | delete to the end / start of the line |
+| `Ctrl-C` | abandon the statement being typed, keep the shell |
+| `Ctrl-D` | leave (on an empty prompt) |
+| `Ctrl-L` | clear the screen |
+
+History is kept in `~/.datax_sql_history`, or the file named by
+`$DATAX_SQL_HISTORY`; the last 1000 statements. `\?` or `help` prints the
 keys, meta-commands and statement families, `\dt` lists tables, and
-`\q` (or Ctrl-D) leaves. A statement may span lines until its `;`.
-Piped input (`datax sql < script.sql`) is read line by line without the
-editor.
+`\q` (or Ctrl-D) leaves. Pasting a multi-line statement pastes it, rather
+than running it a line at a time, on terminals that bracket a paste.
+Piped input (`datax sql < script.sql`) accumulates lines to the same
+rule without the editor.
 
 While a connection is being established the shell reports what it is
 doing on stderr (`still connecting to 10.0.0.1:26433 (sql) ... 5s`), and

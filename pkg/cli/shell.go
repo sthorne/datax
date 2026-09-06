@@ -154,13 +154,23 @@ func MetaCommand(line string) string {
 const HelpText = `datax sql shell
 
 Type SQL statements terminated by ';'. A statement may span lines; the
-prompt changes to '    ->' until the ';'.
+prompt changes to '    ->' until the ';'. The whole statement stays
+editable, so backspace at the start of a continuation line joins it to
+the line above.
 
 Keys (interactive terminal):
-  Up / Down      recall earlier lines (history is kept in ` + "`~/.datax_sql_history`" + `,
-                 or $DATAX_SQL_HISTORY; the last 1000 lines)
-  Left / Right, Home / End, Ctrl-A / Ctrl-E, Ctrl-W, Ctrl-U   edit the line
-  Ctrl-D         quit (while typing a multi-line statement: cancel it)
+  Ctrl-Left / Ctrl-Right    move by a word (Alt-Left / Alt-Right, Alt-b / Alt-f too)
+  Left / Right              move by a character, across line boundaries
+  Up / Down                 move between the statement's lines; past the first
+                            or last, recall history (kept in ` + "`~/.datax_sql_history`" + `,
+                            or $DATAX_SQL_HISTORY; the last 1000 statements)
+  Home / End, Ctrl-A / Ctrl-E   start and end of the line
+  Backspace / Delete        delete a character, joining lines at either edge
+  Ctrl-W, Alt-Backspace     delete the word before the cursor
+  Ctrl-K / Ctrl-U           delete to the end / start of the line
+  Ctrl-L                    clear the screen
+  Ctrl-C                    abandon the statement being typed
+  Ctrl-D                    quit (on an empty prompt)
 
 Meta-commands:
   \?  \h  help   this text
@@ -195,3 +205,24 @@ Statements: CREATE DATABASE, DROP DATABASE [CASCADE], SHOW DATABASES, USE db,
 Command line: datax sql -e "<statement>" runs one statement and exits;
   -url, -certs-dir and -user pick the cluster and the identity.
 `
+
+// StatementComplete is the shell's rule for whether Enter runs what has
+// been typed or opens another line (issue #175): a statement ends at a
+// semicolon, and a meta-command is a line of its own. Blank input is
+// "complete" so Enter on an empty prompt just gives a fresh one rather
+// than growing the buffer.
+//
+// The semicolon test is the naive one — a ';' inside a string literal
+// ends the statement here as it always has — because the shell has no
+// parser and guessing wrongly in the other direction would strand the
+// user in a statement they cannot finish.
+func StatementComplete(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return true
+	}
+	if !strings.Contains(trimmed, "\n") && MetaCommand(trimmed) != MetaNone {
+		return true
+	}
+	return strings.HasSuffix(trimmed, ";")
+}
