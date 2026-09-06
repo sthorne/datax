@@ -8,6 +8,44 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.50.0 — unreleased
+
+### Added
+- **An operations timeline** on the console's `#/ops` view (#153). The
+  event ring recorded instants, so a decommission that started twenty
+  minutes ago and one that finished last week read identically: a
+  timestamp, a kind, a summary. A rebalance storm looked like a quiet
+  afternoon with a lot of old rows in it.
+
+  An event may now carry an operation id, a phase and an outcome, and
+  four long-running operations record both ends under one id — backup,
+  restore, re-encryption sweeps and decommission drains. The view splits
+  them into **in flight**, with how long each has been running, and
+  **recently completed**, with its outcome and duration. Progress that
+  cannot be measured is shown as elapsed time, never as a bar with a
+  number nobody measured.
+
+  The ring stays the audit trail it is: the pairing is a label on the
+  records and the view is derived from it, not a job store. An operation
+  whose start has already aged out of the ring is still listed, with no
+  duration claimed for it.
+- **Cluster events marked on the metrics charts** (#155). "Why did p99
+  jump at 14:20" was a two-window investigation — read the chart on
+  `#/metrics`, scroll the event log on `#/ops`, match timestamps by eye —
+  although both sets are on the same page and the same clock.
+
+  Charts now carry a tick per event in the window they draw, hovering to
+  the kind, time and summary, drawn beneath the data lines so a mark
+  never obscures the line it explains. Structural kinds (splits, merges,
+  rebalances, repairs, decommissions, restarts, upgrades) are marked by
+  default, with a control for every kind or none: a layer that draws
+  three hundred marks is noise.
+
+  `/api/events` grows a time window (`?from=`) and answers with the
+  timestamp of the oldest record the ring still holds. A chart drawing a
+  seven-day window over a ring covering two hours says so, rather than
+  implying five quiet days.
+
 ## 0.49.0 — unreleased
 
 ### Added

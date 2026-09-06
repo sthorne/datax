@@ -72,6 +72,10 @@ type NodeDetail struct {
 	SQL      *kvpb.SQLSummary   `json:"sql,omitempty"`
 	Activity *ActivityStatus    `json:"activity,omitempty"`
 	Events   []events.Event     `json:"events"`
+	// Operations is this node's ring read as long-running work rather
+	// than instants (issue #153), so the console's ops view says what
+	// the SCOPED node is doing rather than what the serving node is.
+	Operations []Operation `json:"operations"`
 }
 
 // localNodeDetail assembles this node's document. Statement text and
@@ -92,6 +96,7 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		Release:        version.Release,
 		Status:         &st,
 		Events:         []events.Event{},
+		Operations:     []Operation{},
 	}
 	if st.Machine != nil {
 		d.UptimeSeconds = st.Machine.ProcessUp
@@ -141,6 +146,10 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		if d.Events == nil {
 			d.Events = []events.Event{}
 		}
+		// Paired over the whole ring, not the tail this document
+		// carries, so an operation that started before that tail is
+		// still reported as running.
+		d.Operations = operationsFrom(n.events.Recent(0, 0, admin), n.clock.Now().WallTime/int64(time.Millisecond))
 	}
 	return d
 }
@@ -184,7 +193,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 		_ = enc.Encode(map[string]string{"error": "the admin role is required to inspect another node"})
 		return
 	}
-	doc := NodeDetail{NodeID: int(id), Events: []events.Event{}}
+	doc := NodeDetail{NodeID: int(id), Events: []events.Event{}, Operations: []Operation{}}
 	nd, ok := n.registry.Get(id)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)

@@ -107,6 +107,7 @@ func (n *Node) drainOnce(ctx context.Context) {
 			}
 		}
 	}
+	n.noteDrainProgress(ctx, draining, live)
 	if len(draining) == 0 {
 		return
 	}
@@ -165,5 +166,45 @@ func (n *Node) drainOnce(ctx context.Context) {
 			rangeCount[target]++
 			break // one move per draining node per tick
 		}
+	}
+}
+
+// noteDrainProgress opens a decommission operation in the event ring the
+// first time this allocator sees a node draining, and closes it when the
+// node's last replica has moved off (issue #153). A flat log of per-range
+// moves cannot say whether a decommission is still running; this can.
+//
+// Only the allocator (the range-1 leader) runs this, so the pairing lands
+// once rather than once per node. A leadership change mid-drain re-opens
+// the operation on the new allocator, which is the honest reading: this
+// node has been watching it from then.
+func (n *Node) noteDrainProgress(ctx context.Context, draining []kvpb.NodeDescriptor, live map[base.NodeID]kvpb.NodeDescriptor) {
+	n.drainMu.Lock()
+	defer n.drainMu.Unlock()
+	if n.drainOps == nil {
+		n.drainOps = map[base.NodeID]string{}
+	}
+	stillDraining := map[base.NodeID]bool{}
+	for _, nd := range draining {
+		stillDraining[nd.NodeID] = true
+		if _, open := n.drainOps[nd.NodeID]; !open {
+			op := newOpID()
+			n.drainOps[nd.NodeID] = op
+			n.events.RecordStart("decommission", op, "n%d is draining: moving its replicas off", nd.NodeID)
+		}
+	}
+	// A node that stopped draining either finished or was cancelled;
+	// either way the operation is over and says which.
+	for id, op := range n.drainOps {
+		if stillDraining[id] {
+			// Finished while still flagged: no replicas left to move.
+			if st := n.decommissionStatus(ctx, id, true); st.Error == "" && st.RemainingReplicas == 0 {
+				n.events.RecordEnd("decommission", op, "ok", "n%d drained: no replicas remain on it", id)
+				delete(n.drainOps, id)
+			}
+			continue
+		}
+		n.events.RecordEnd("decommission", op, "cancelled", "n%d is no longer draining", id)
+		delete(n.drainOps, id)
 	}
 }
