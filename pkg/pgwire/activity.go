@@ -42,6 +42,12 @@ type Activity struct {
 	retryShapes   map[string]*retryShape
 	retryOther    uint64
 	retriesByUser map[string]uint64
+
+	// stmts groups executions by the shape the parser normalises them
+	// to (issue #157). It has its own lock: the shape table is written
+	// on every statement and read only by the console, and there is no
+	// reason for that to contend with the connection map.
+	stmts *statements
 }
 
 // retryShape is one statement shape's running count of 40001s.
@@ -163,7 +169,8 @@ func newActivity(slow time.Duration) *Activity {
 		slow = DefaultSlowStatementThreshold
 	}
 	return &Activity{slowThreshold: slow, conns: make(map[*conn]*connActivity), counts: make(map[string]uint64),
-		retryShapes: make(map[string]*retryShape), retriesByUser: make(map[string]uint64)}
+		retryShapes: make(map[string]*retryShape), retriesByUser: make(map[string]uint64),
+		stmts: newStatements()}
 }
 
 func (a *Activity) connOpened(c *conn, remote string, pid int32) {
@@ -294,7 +301,7 @@ func (a *Activity) begin(c *conn, stmt parser.Statement, text string) *stmtToken
 	}
 	a.mu.Unlock()
 	a.gauges()
-	return &stmtToken{a: a, c: c, kind: kind, text: text, start: now}
+	return &stmtToken{a: a, c: c, kind: kind, text: text, start: now, shape: parser.Fingerprint(stmt)}
 }
 
 type stmtToken struct {
@@ -303,6 +310,13 @@ type stmtToken struct {
 	kind  string
 	text  string
 	start time.Time
+	// shape is the statement's fingerprint, computed once from the
+	// parsed statement (issue #157). Carried here so the accounting at
+	// end() never has to re-derive a shape from text.
+	shape parser.Shape
+	// scanned is the KV rows the statement read, taken from the session
+	// at end() so a full scan is charged to the shape that caused it.
+	scanned int64
 }
 
 // end records the statement's outcome and the connection's new state.
@@ -344,6 +358,9 @@ func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 		}
 	}
 	a.mu.Unlock()
+	// Charged to the shape, outside a.mu: the shape table has its own
+	// lock and no reason to contend with the connection map.
+	a.stmts.record(t.shape, t.kind, t.text, d, rows, t.scanned, serr != nil, retry)
 	metrics.SQLStatements.WithLabelValues(t.kind).Inc()
 	metrics.SQLStatementLatency.Observe(d.Seconds())
 	if retry {
@@ -511,7 +528,13 @@ func (a *Activity) recordRetryLocked(t *stmtToken) {
 		user = ca.user
 	}
 	a.retriesByUser[user]++
-	shape := Fingerprint(t.text)
+	// The same shape the fingerprint accounting uses (issue #157): the
+	// hot list and the statement list must agree about what one shape
+	// is, or the two panels contradict each other on the same page.
+	shape := t.shape.Text
+	if shape == "" {
+		shape = truncateStmt(t.text)
+	}
 	rs := a.retryShapes[shape]
 	if rs == nil {
 		// Past the bound, the failure is still counted — in one
@@ -594,4 +617,19 @@ func (a *Activity) IdleTxns() []IdleTxn {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].IdleMillis > out[j].IdleMillis })
 	return out
+}
+
+// Statements is the fingerprint accounting: the heaviest shapes by total
+// time, and how many shapes were evicted to stay within the bound
+// (issue #157). Representative statement text, so admin-gated.
+func (a *Activity) Statements(limit int) ([]StatementStat, uint64) {
+	return a.stmts.Top(limit)
+}
+
+// StatementText returns the representative statement recorded for a
+// fingerprint, for the console's EXPLAIN. Empty when the shape is no
+// longer held — a bounded table forgets, and the caller says so rather
+// than explaining a statement it invented.
+func (a *Activity) StatementText(fingerprint string) string {
+	return a.stmts.Representative(fingerprint)
 }

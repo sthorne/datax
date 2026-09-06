@@ -406,6 +406,29 @@
     </table></div>
     <p class="muted" id="idle-note"></p>
   </section>
+  <section id="sec-fingerprints">
+    <h2>Statement shapes
+      <select class="filter" id="stmt-sort" title="what to rank the shapes by">
+        <option value="total">by total time</option>
+        <option value="count">by executions</option>
+        <option value="mean">by mean latency</option>
+        <option value="scanned">by rows scanned</option>
+      </select>
+    </h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr>
+        <th scope="col" class="num" title="the share of the cluster's measured statement time this shape accounts for">total time</th>
+        <th scope="col" class="num">executions</th>
+        <th scope="col" class="num" title="total time divided by executions">mean</th>
+        <th scope="col" class="num" title="KV rows read; far above rows returned means a scan">rows scanned</th>
+        <th scope="col" class="num">rows returned</th>
+        <th scope="col" class="num" title="statements of this shape that ended in 40001">retries</th>
+        <th scope="col">statement shape</th></tr></thead>
+      <tbody id="stmt-shapes"></tbody>
+    </table></div>
+    <p class="muted" id="stmt-note"></p>
+    <div id="stmt-detail" hidden></div>
+  </section>
   <section>
     <h2>Statements</h2>
     <p class="scoped" id="sql-scope"></p>

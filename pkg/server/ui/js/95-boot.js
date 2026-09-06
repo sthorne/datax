@@ -98,6 +98,10 @@ task("metrics", fetchMetrics, 15000, ["metrics"]);
 // writes every 10s by default: polling it faster would redraw the same
 // samples (issue #154).
 task("txnCharts", pollTxnCharts, 15000, ["sql"]);
+// The statement shapes (issue #157): a cluster fan-out, so it polls
+// slowly — cumulative counters do not change meaningfully in three
+// seconds, and every poll asks every node.
+task("statements", pollStatements, 10000, ["sql"]);
 
 window.addEventListener("hashchange", route);
 document.getElementById("compare-toggle").addEventListener("change", ev => {
@@ -121,6 +125,16 @@ document.getElementById("node-filter").addEventListener("input", ev => {
   if (lastCluster) renderNodesTable(lastCluster);
 });
 document.getElementById("events-filter").addEventListener("change", renderOps);
+// The shape list re-ranks what it already has rather than re-fetching.
+document.getElementById("stmt-sort").addEventListener("change", renderStatementShapes);
+// One delegated listener for the whole shapes section: the rows are
+// replaced by renderKeyed, so per-row listeners would not survive a poll.
+document.getElementById("sec-fingerprints").addEventListener("click", ev => {
+  const open = ev.target.closest(".stmt-open");
+  if (open) { ev.preventDefault(); renderStatementDetail(open.dataset.fp); return; }
+  if (ev.target.id === "stmt-explain") { explainShape(ev.target.dataset.fp); return; }
+  if (ev.target.id === "stmt-close") { stmtOpen = null; document.getElementById("stmt-detail").hidden = true; }
+});
 document.getElementById("annotate-toggle").addEventListener("change", renderCharts);
 document.getElementById("annotate-kinds").addEventListener("change", renderCharts);
 

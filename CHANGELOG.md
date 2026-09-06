@@ -8,6 +8,57 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.53.0 — unreleased
+
+### Added
+- **Statement fingerprints: the shapes that cost the most** (#157). The
+  console could show what was running now and what was slow recently,
+  per node. Neither answered the question that drives optimisation work:
+  which statement shape costs this cluster the most. A statement taking
+  8 ms that runs forty thousand times an hour never enters a
+  slow-statement ring, and is usually the thing worth fixing.
+
+  Executions are now grouped by shape and counted: how often, how long in
+  total, how long typically, how many rows returned and — the figure a
+  cluster-wide counter could never attribute — how many rows *read*. Far
+  more scanned than returned is a full scan, and it is now visible
+  whether or not it is also slow.
+
+  `#/sql` lists the shapes ranked by total time, sortable by executions,
+  mean latency and rows scanned, each expanding to its per-node
+  statistics, the tables it touches, a representative statement, and an
+  `EXPLAIN` of it — closing the loop from "this is expensive" to "here is
+  why". The plan is described, never run: `EXPLAIN`, not `EXPLAIN
+  ANALYZE`, and the text comes from the node's own accounting rather than
+  from the request, so the endpoint cannot run a statement of the
+  caller's choosing.
+
+  The normalisation walks the parsed statement, not the text it came
+  from. That is the difference between correct and approximately correct:
+  a lexer cannot tell a literal from an identifier that looks like one,
+  cannot see through a comment or a cast, and cannot tell that two texts
+  differing in whitespace, keyword case and parenthesisation are one
+  query.
+
+  Per-node tables are bounded by an LRU with an explicit cap — a client
+  that inlines its parameters can generate unbounded shapes, and an
+  accounting table that grows with what clients send is a leak with a
+  nice name. What is dropped is counted, and the view says the list is a
+  window over the busiest shapes rather than every shape that ever ran.
+
+  Only summable figures are summed across nodes. There is no p99 of two
+  p99s, so percentiles stay with the node that measured them.
+
+  `/api/statements` and `/api/explain` need the admin role, alongside the
+  rest of the statement surface: a representative statement can carry
+  data.
+
+### Changed
+- The retry hot list from #154 now groups by the same AST-derived shape
+  as the statement list, so the two panels on `#/sql` cannot disagree
+  about what one shape is. The lexical normaliser it shipped with is
+  gone (#157).
+
 ## 0.52.0 — unreleased
 
 ### Added

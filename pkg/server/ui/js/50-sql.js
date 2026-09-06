@@ -289,3 +289,146 @@ function refuseContention() {
   document.getElementById("retry-note").textContent = "the retry rate above needs no role; the statements behind it carry data, so they are gated";
   document.getElementById("idle-note").textContent = "";
 }
+
+// ---- Statement shapes (issue #157) --------------------------------
+//
+// The panels above show what is running now and what was slow recently.
+// Neither answers which statement shape costs this cluster the most —
+// and a statement that takes 8ms and runs forty thousand times an hour,
+// never slow enough for a ring, is usually the thing worth fixing.
+//
+// This lists the shapes by total time, which is the figure that says
+// where the cluster's time actually goes. The grouping is the server's
+// (from the parsed statement, not from text), and so is the ranking; the
+// sort control re-ranks what arrived rather than re-fetching.
+let stmtDoc = null, stmtOpen = null;
+
+async function pollStatements() {
+  const resp = await fetch("/api/statements", { cache: "no-store" });
+  if (resp.status === 403) { stmtDoc = null; renderStatementShapes(); return; }
+  if (!resp.ok) { stmtDoc = null; renderStatementShapes(); throw new Error("HTTP " + resp.status); }
+  stmtDoc = await resp.json();
+  renderStatementShapes();
+}
+
+const STMT_SORTS = {
+  total: s => s.total_us,
+  count: s => s.count,
+  mean: s => s.mean_us,
+  scanned: s => s.rows_scanned,
+};
+
+function fmtMicros(us) {
+  if (!us) return "0";
+  if (us < 1000) return Math.round(us) + " µs";
+  if (us < 1000000) return (us / 1000).toFixed(1) + " ms";
+  if (us < 60000000) return (us / 1000000).toFixed(1) + " s";
+  return (us / 60000000).toFixed(1) + " min";
+}
+
+function fmtCount(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n ?? 0);
+}
+
+function renderStatementShapes() {
+  const body = document.getElementById("stmt-shapes");
+  const note = document.getElementById("stmt-note");
+  if (!stmtDoc) {
+    setHTML(body, `<tr><td colspan="7" class="note">statement shapes need the admin role — ${drillDownRefusal()}</td></tr>`);
+    note.textContent = "a shape's representative statement can carry data, so the list is gated with the rest of the statement surface";
+    document.getElementById("stmt-detail").hidden = true;
+    return;
+  }
+  const key = STMT_SORTS[document.getElementById("stmt-sort").value] || STMT_SORTS.total;
+  const rows = (stmtDoc.statements || []).slice().sort((a, b) => key(b) - key(a));
+  // The share is of the time this list accounts for, not of wall-clock:
+  // saying "12% of the cluster" would be a figure nothing measured.
+  const total = rows.reduce((a, s) => a + (s.total_us || 0), 0);
+  renderKeyed(body, rows.length ? rows.map(s => {
+    // Rows scanned far above rows returned is the signature of a scan,
+    // which is the thing this view exists to make visible.
+    const scanRatio = s.rows_returned > 0 ? s.rows_scanned / s.rows_returned : 0;
+    const scanLevel = scanRatio >= 100 ? "down" : scanRatio >= 10 ? "draining" : "";
+    return {
+      key: s.fingerprint, html: `<tr data-key="${esc(s.fingerprint)}" class="stmt-row" data-fp="${esc(s.fingerprint)}">
+      <td class="num" data-label="total time">${fmtMicros(s.total_us)}${total ? ` <span class="muted">${Math.round(100 * s.total_us / total)}%</span>` : ""}</td>
+      <td class="num" data-label="executions">${fmtCount(s.count)}</td>
+      <td class="num" data-label="mean">${fmtMicros(s.mean_us)}</td>
+      <td class="num" data-label="rows scanned">${warn(scanLevel, fmtCount(s.rows_scanned))}</td>
+      <td class="num" data-label="rows returned">${fmtCount(s.rows_returned)}</td>
+      <td class="num" data-label="retries">${s.retries ? warn("draining", fmtCount(s.retries)) : "0"}</td>
+      <td class="key" style="max-width:none;white-space:normal"><a href="#" class="stmt-open" data-fp="${esc(s.fingerprint)}">${esc(s.shape)}</a></td>
+    </tr>` };
+  }) : [{ key: "none", html: `<tr data-key="none"><td colspan="7" class="muted">no statements recorded yet</td></tr>` }]);
+
+  const parts = [`grouped by the shape the parser normalises each statement to — literals and parameters replaced, so every execution of one query is one row.`];
+  parts.push(`Ranked by total time, because a fast statement run often costs more than a slow one run rarely; the percentage is of the time these ${rows.length} shapes account for, not of wall-clock.`);
+  if (stmtDoc.nodes < stmtDoc.nodes_asked) {
+    parts.push(`${stmtDoc.nodes} of ${stmtDoc.nodes_asked} nodes answered, so these totals are partial${(stmtDoc.errors || []).length ? ": " + stmtDoc.errors.join("; ") : ""}.`);
+  } else {
+    parts.push(`Summed across all ${stmtDoc.nodes} node${stmtDoc.nodes === 1 ? "" : "s"}.`);
+  }
+  if (stmtDoc.evicted) {
+    parts.push(`Each node keeps a bounded table and has dropped ${fmtCount(stmtDoc.evicted)} least-recently-run shape(s), so this is a window over the busiest, not every shape that ever ran.`);
+  }
+  note.textContent = parts.join(" ");
+  if (stmtOpen) renderStatementDetail(stmtOpen);
+}
+
+// A shape expands to its per-node statistics — percentiles live here
+// because there is no p99 of two p99s — its representative statement,
+// and the tables it touches.
+function renderStatementDetail(fp) {
+  const box = document.getElementById("stmt-detail");
+  const s = (stmtDoc && (stmtDoc.statements || []).find(x => x.fingerprint === fp));
+  if (!s) { box.hidden = true; stmtOpen = null; return; }
+  stmtOpen = fp;
+  box.hidden = false;
+  const perNode = (s.per_node || []).map(n => `<tr>
+    <td>n${n.node_id}</td><td class="num">${fmtCount(n.count)}</td>
+    <td class="num">${fmtMicros(n.total_us)}</td><td class="num">${fmtMicros(n.mean_us)}</td>
+    <td class="num">${fmtMicros(n.p50_us)}</td><td class="num">${fmtMicros(n.p99_us)}</td>
+    <td class="num">${fmtMicros(n.max_us)}</td><td class="num">${fmtCount(n.rows_scanned)}</td>
+    <td class="when" title="${esc(n.last_at)}">${fmtAgo(Date.now() - Date.parse(n.last_at))}</td></tr>`).join("");
+  setHTML(box, `<div class="panel">
+    <div class="row"><b>${esc(s.shape)}</b></div>
+    <div class="row muted">${esc(s.kind || "")}${(s.tables || []).length ? " · touches " + s.tables.map(esc).join(", ") : ""} · fingerprint ${esc(s.fingerprint)}</div>
+    <div class="tablewrap"><table>
+      <thead><tr><th scope="col">node</th><th scope="col" class="num">executions</th>
+        <th scope="col" class="num">total</th><th scope="col" class="num">mean</th>
+        <th scope="col" class="num">p50</th><th scope="col" class="num">p99</th>
+        <th scope="col" class="num">max</th><th scope="col" class="num">rows scanned</th>
+        <th scope="col">last</th></tr></thead>
+      <tbody>${perNode || `<tr><td colspan="9" class="muted">no per-node detail</td></tr>`}</tbody>
+    </table></div>
+    <p class="muted">percentiles are each node's own: there is no p99 of two p99s, so they are not summed.</p>
+    <div class="row"><b>representative statement</b></div>
+    <pre class="key" style="white-space:pre-wrap">${esc(s.representative || "—")}</pre>
+    <div class="row"><button id="stmt-explain" data-fp="${esc(s.fingerprint)}">explain this statement</button>
+      <button id="stmt-close">close</button></div>
+    <div id="stmt-plan"></div>
+  </div>`);
+}
+
+// EXPLAIN closes the loop from "this shape is expensive" to "here is
+// why". The server plans its own stored representative and never runs
+// it: EXPLAIN, never EXPLAIN ANALYZE.
+async function explainShape(fp) {
+  const out = document.getElementById("stmt-plan");
+  out.innerHTML = `<span class="muted">planning…</span>`;
+  try {
+    const resp = await fetch("/api/explain?fingerprint=" + encodeURIComponent(fp), { cache: "no-store" });
+    const d = await resp.json().catch(() => ({}));
+    if (!resp.ok || d.error) {
+      out.innerHTML = `<div class="note">${esc(d.error || ("HTTP " + resp.status))}</div>`;
+      return;
+    }
+    out.innerHTML = `<pre class="key" style="white-space:pre-wrap">${esc((d.plan || []).join("\n") || "no plan returned")}</pre>`
+      + `<p class="muted">the plan for the statement above, on n${stmtDoc ? stmtDoc.node_id : "?"} — described, not run</p>`;
+  } catch (err) {
+    out.innerHTML = `<div class="note">${esc(err.message || String(err))}</div>`;
+  }
+}
