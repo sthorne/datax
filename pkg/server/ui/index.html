@@ -217,6 +217,16 @@
     font: inherit; font-size: 11px; padding: 0 4px; border-radius: 4px;
     border: 1px solid var(--border); color: var(--text-3);
   }
+  /* The hidden attribute must win. A rule that sets display on an id or
+     a class outranks the user agent's [hidden] { display: none } — an id
+     selector scores 1,0,0 against its 0,1,0 — so an element carrying the
+     attribute stays on screen while every script that reads .hidden
+     believes it is gone. That is how the jump dialog shipped covering
+     the whole page from first paint: #jump sets display:flex, so
+     hidden did nothing and a fixed, inset-0 overlay swallowed every
+     click. One declaration removes the whole class of bug rather than
+     the one instance of it. */
+  [hidden] { display: none !important; }
   /* Jump to (⌘K): resolve n3, r128, a table or a locality to a route. */
   #jump {
     position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.35);
