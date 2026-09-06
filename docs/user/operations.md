@@ -62,7 +62,20 @@ serves, on that address:
   it costs no fan-out and answers from a partitioned node. **sql**: connections by state with
   the oldest idle transaction, statements per second by kind, `40001`
   rate and latency percentiles per node, with the scoped node's
-  statements in flight and its slowest recent ones (admin). **schema**:
+  statements in flight and its slowest recent ones (admin). It also
+  carries the transactions the cluster is running: commit, abort and
+  retry rates over the header's range from the recorded series, and KV
+  batch latency charted beside statement latency, which is what tells a
+  slow statement from a slow cluster. A retry rate does not say what to
+  change, so beneath it are the statement shapes producing the `40001`s
+  — the statements with their literals replaced, counted per shape and
+  per user since the node started — and the sessions sitting inside an
+  open transaction, with the user, the client, the application, how long
+  they have been idle and the statement they last ran, because their
+  intents block every other writer to those keys. The rates need no role;
+  the shapes and the sessions carry statement text and stay behind the
+  admin gate. Both are the scoped node's own counts and are not summed
+  across the cluster. **schema**:
   every table with its columns, primary key, indexes, time-series
   options, grants, statistics and their age, and range footprint.
   **ops**: the operations in flight and the ones that have finished,

@@ -8,6 +8,50 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.51.0 — unreleased
+
+### Added
+- **Transactions and contention on the console's `#/sql` view** (#154).
+  A serializable database lives and dies on retries, and the console had
+  no transactions section: `txn.commits`, `txn.aborts`, `txn.retries` and
+  `kv.batch_p99_us` were recorded every interval and reachable only by
+  knowing to pick them out of the metrics picker. The one
+  transaction-shaped figure on the page was a `40001/s` column.
+
+  The view now opens the four series over the header's time range, one
+  line per node, with tiles for the cluster's commit, abort and retry
+  rates and the share of work being redone. KV batch latency is charted
+  beside statement latency, which is what tells a slow statement from a
+  slow cluster; the two latency tiles name the worst node rather than
+  averaging, because there is no p99 of two p99s.
+
+  A rate does not say what to change, so two panels say who and what.
+  **The retry hot list** attributes every serialization failure to the
+  statement shape that produced it — the statement with its literals
+  replaced, so a retry storm is one row rather than a thousand — and to
+  the user who ran it. **Idle in transaction** lists the sessions holding
+  an open transaction with the user, the client, the application, how
+  long they have been idle, how long the block has been open, and the
+  statement they last ran: "oldest idle transaction: 3m" named nobody to
+  talk to.
+
+  The split follows the data, not the panel: rates are not sensitive and
+  need no role, while statement shapes and sessions carry data and stay
+  behind the admin gate that already covers `/api/activity`. Both new
+  panels are one node's own counts and say so; nothing here is summed
+  across the cluster.
+
+  The shape table is bounded, and failures past the bound are counted in
+  an overflow total rather than dropped or allowed to grow the map
+  without limit.
+
+### Fixed
+- Charts drawn outside the metrics view no longer carry that view's
+  event marks. The marks come from a fetch `#/metrics` makes for its own
+  window, so a node page or the new transactions charts could show
+  whichever window that view last looked at. Annotation is now something
+  a chart asks for (#155 follow-up).
+
 ## 0.50.0 — unreleased
 
 ### Added

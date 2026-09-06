@@ -35,6 +35,20 @@ type Activity struct {
 	copyRows  uint64
 	latencies latencyRing
 	slow      []SlowStatement // newest last, at most slowRingSize
+	// Serialization failures attributed to what produced them (issue
+	// #154): 40001s by statement shape and by user, cumulative since
+	// the node started. retryOther counts the failures whose shape
+	// arrived after retryShapeMax distinct ones were already known.
+	retryShapes   map[string]*retryShape
+	retryOther    uint64
+	retriesByUser map[string]uint64
+}
+
+// retryShape is one statement shape's running count of 40001s.
+type retryShape struct {
+	count  uint64
+	lastAt time.Time
+	users  map[string]uint64
 }
 
 // connActivity is one connection's live state.
@@ -65,6 +79,12 @@ const (
 	stmtTextLimit = 200
 	// latencyRingSize bounds the durations kept for the percentiles.
 	latencyRingSize = 1024
+	// retryShapeMax bounds the distinct statement shapes counted for the
+	// retry hot list. Past it, further shapes are counted in one
+	// overflow total rather than growing the map without limit — a
+	// console panel is not worth an unbounded allocation on the
+	// statement path.
+	retryShapeMax = 200
 	// DefaultSlowStatementThreshold is the duration past which a
 	// statement is recorded in the slow ring.
 	DefaultSlowStatementThreshold = 500 * time.Millisecond
@@ -97,13 +117,46 @@ type ConnectionInfo struct {
 	Remote string `json:"remote"`
 	State  string `json:"state"`
 	Since  int64  `json:"since_ms"` // how long in this state
+	// Where it came from, for telling one application apart from
+	// another when contention is usually one of them (issue #154).
+	Database    string `json:"database,omitempty"`
+	Application string `json:"application,omitempty"`
+}
+
+// IdleTxn is one connection sitting inside an open transaction: the
+// state whose write intents block every other writer to those keys.
+// A duration alone does not say who to talk to, so this carries the
+// user, the client, the application, and the last statement the
+// session ran (issue #154). Statement text, so admin-gated.
+type IdleTxn struct {
+	PID         int32  `json:"pid"`
+	User        string `json:"user"`
+	Remote      string `json:"remote"`
+	Database    string `json:"database,omitempty"`
+	Application string `json:"application,omitempty"`
+	// IdleMillis is how long it has been idle in this state; TxnMillis
+	// how long the whole transaction block has been open. They differ
+	// when the session did some work and then stopped.
+	IdleMillis int64  `json:"idle_ms"`
+	TxnMillis  int64  `json:"txn_ms,omitempty"`
+	Last       string `json:"last,omitempty"`
+}
+
+// RetryShape is one statement shape's share of this node's
+// serialization failures, cumulative since the node started.
+type RetryShape struct {
+	Shape  string            `json:"shape"`
+	Count  uint64            `json:"count"`
+	LastAt time.Time         `json:"last_at"`
+	Users  map[string]uint64 `json:"users,omitempty"`
 }
 
 func newActivity(slow time.Duration) *Activity {
 	if slow <= 0 {
 		slow = DefaultSlowStatementThreshold
 	}
-	return &Activity{slowThreshold: slow, conns: make(map[*conn]*connActivity), counts: make(map[string]uint64)}
+	return &Activity{slowThreshold: slow, conns: make(map[*conn]*connActivity), counts: make(map[string]uint64),
+		retryShapes: make(map[string]*retryShape), retriesByUser: make(map[string]uint64)}
 }
 
 func (a *Activity) connOpened(c *conn, remote string, pid int32) {
@@ -239,6 +292,7 @@ func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 	retry := serr != nil && serr.Code == sql.CodeSerializationFailure
 	if retry {
 		a.serFails++
+		a.recordRetryLocked(t)
 	}
 	if d >= a.slowThreshold {
 		ss := SlowStatement{At: t.start, Kind: t.kind, Text: truncateStmt(t.text), Duration: d.Microseconds(), Rows: int(rows), Retry: retry}
@@ -346,7 +400,8 @@ func (a *Activity) Connections() []ConnectionInfo {
 	now := time.Now()
 	out := make([]ConnectionInfo, 0, len(a.conns))
 	for _, ca := range a.conns {
-		out = append(out, ConnectionInfo{User: ca.user, Remote: ca.remote, State: ca.state, Since: now.Sub(ca.since).Milliseconds()})
+		out = append(out, ConnectionInfo{User: ca.user, Remote: ca.remote, State: ca.state,
+			Since: now.Sub(ca.since).Milliseconds(), Database: ca.db, Application: ca.app})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Since > out[j].Since })
 	return out
@@ -408,4 +463,99 @@ func (r *latencyRing) percentiles() (p50, p99 int64) {
 		return vals[idx].Microseconds()
 	}
 	return at(50), at(99)
+}
+
+// recordRetryLocked attributes one serialization failure to the shape
+// and the user that produced it (issue #154). Called with a.mu held,
+// from the statement path, so it does no allocation past the first
+// sighting of a shape and stops growing at retryShapeMax.
+func (a *Activity) recordRetryLocked(t *stmtToken) {
+	user := ""
+	if ca, ok := a.conns[t.c]; ok {
+		user = ca.user
+	}
+	a.retriesByUser[user]++
+	shape := Fingerprint(t.text)
+	rs := a.retryShapes[shape]
+	if rs == nil {
+		// Past the bound, the failure is still counted — in one
+		// overflow total, so the hot list says "and N more" rather
+		// than quietly dropping them.
+		if len(a.retryShapes) >= retryShapeMax {
+			a.retryOther++
+			return
+		}
+		rs = &retryShape{users: map[string]uint64{}}
+		a.retryShapes[shape] = rs
+	}
+	rs.count++
+	rs.lastAt = t.start
+	rs.users[user]++
+}
+
+// RetryShapes is the retry hot list, heaviest first, with the number of
+// failures whose shape did not fit the bounded table (admin view).
+func (a *Activity) RetryShapes(limit int) (out []RetryShape, other uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out = make([]RetryShape, 0, len(a.retryShapes))
+	for shape, rs := range a.retryShapes {
+		users := make(map[string]uint64, len(rs.users))
+		for u, c := range rs.users {
+			users[u] = c
+		}
+		out = append(out, RetryShape{Shape: shape, Count: rs.count, LastAt: rs.lastAt, Users: users})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Shape < out[j].Shape
+	})
+	other = a.retryOther
+	if limit > 0 && len(out) > limit {
+		// What falls off the end is still counted, for the same reason
+		// the overflow total exists.
+		for _, rs := range out[limit:] {
+			other += rs.Count
+		}
+		out = out[:limit]
+	}
+	return out, other
+}
+
+// RetriesByUser is this node's serialization failures by the user whose
+// statement hit them; contention is usually one application, so this is
+// most of the diagnosis. Not statement text, but it names users, so it
+// travels with the rest of the admin view.
+func (a *Activity) RetriesByUser() map[string]uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]uint64, len(a.retriesByUser))
+	for u, c := range a.retriesByUser {
+		out[u] = c
+	}
+	return out
+}
+
+// IdleTxns lists the connections idle inside an open transaction,
+// longest-open first (admin view).
+func (a *Activity) IdleTxns() []IdleTxn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	out := make([]IdleTxn, 0, a.idleTxn)
+	for _, ca := range a.conns {
+		if ca.state != stateIdleInTxn {
+			continue
+		}
+		it := IdleTxn{PID: ca.pid, User: ca.user, Remote: ca.remote, Database: ca.db, Application: ca.app,
+			IdleMillis: now.Sub(ca.since).Milliseconds(), Last: ca.last}
+		if !ca.txnSince.IsZero() {
+			it.TxnMillis = now.Sub(ca.txnSince).Milliseconds()
+		}
+		out = append(out, it)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IdleMillis > out[j].IdleMillis })
+	return out
 }

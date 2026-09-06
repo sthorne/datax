@@ -237,7 +237,8 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 
 // activityStatus builds the /api/activity document.
 func (n *Node) activityStatus() ActivityStatus {
-	doc := ActivityStatus{NodeID: int(n.ident.NodeID), Connections: []pgwire.ConnectionInfo{}, Active: []pgwire.ActiveStatement{}, Slow: []pgwire.SlowStatement{}}
+	doc := ActivityStatus{NodeID: int(n.ident.NodeID), Connections: []pgwire.ConnectionInfo{}, Active: []pgwire.ActiveStatement{},
+		Slow: []pgwire.SlowStatement{}, RetryShapes: []pgwire.RetryShape{}, IdleTxns: []pgwire.IdleTxn{}}
 	if n.sqlServer() != nil {
 		act := n.sqlServer().Activity()
 		doc.Summary = act.Summary()
@@ -245,6 +246,15 @@ func (n *Node) activityStatus() ActivityStatus {
 		doc.Active = act.Active()
 		doc.Slow = act.Slow()
 		doc.SlowThresholdMillis = act.SlowThreshold().Milliseconds()
+		shapes, other := act.RetryShapes(retryShapeLimit)
+		if shapes != nil {
+			doc.RetryShapes = shapes
+		}
+		doc.RetryShapesOther = other
+		doc.RetriesByUser = act.RetriesByUser()
+		if idle := act.IdleTxns(); idle != nil {
+			doc.IdleTxns = idle
+		}
 	}
 	return doc
 }

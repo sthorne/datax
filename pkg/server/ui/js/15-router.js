@@ -219,7 +219,9 @@ function wireControls() {
   document.getElementById("range-picker-global").addEventListener("change", ev => {
     ui.range = ev.target.value;
     pushRoute();
-    if (ui.view === "metrics") { runNow("metrics"); } else if (ui.view === "node") { nv.chartsAt = 0; runNow("node"); }
+    if (ui.view === "metrics") { runNow("metrics"); }
+    else if (ui.view === "node") { nv.chartsAt = 0; runNow("node"); }
+    else if (ui.view === "sql") { runNow("txnCharts"); }
   });
   wireJump();
 }
