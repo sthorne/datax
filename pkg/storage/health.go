@@ -14,26 +14,28 @@ import (
 const metricsTTL = time.Second
 
 // StorageMetrics is a point-in-time snapshot of engine write-path health.
+// It is published as JSON (/status, /api/cluster, /api/node) in
+// snake_case, like the rest of those documents (issue #146).
 type StorageMetrics struct {
-	L0Files             int
-	L0Sublevels         int
-	CompactionDebtBytes uint64
-	MemtableCount       int64
-	MemtableBytes       uint64
-	WriteStalls         int64 // cumulative Pebble write-stall events
-	DiskSlowEvents      int64 // cumulative slow-disk events
-	BackgroundErrors    int64 // cumulative background (compaction/flush) errors
+	L0Files             int    `json:"l0_files"`
+	L0Sublevels         int    `json:"l0_sublevels"`
+	CompactionDebtBytes uint64 `json:"compaction_debt_bytes"`
+	MemtableCount       int64  `json:"memtable_count"`
+	MemtableBytes       uint64 `json:"memtable_bytes"`
+	WriteStalls         int64  `json:"write_stalls"`      // cumulative Pebble write-stall events
+	DiskSlowEvents      int64  `json:"disk_slow_events"`  // cumulative slow-disk events
+	BackgroundErrors    int64  `json:"background_errors"` // cumulative background (compaction/flush) errors
 	// Block cache (shared by the process's engines): bytes and blocks
 	// held, cumulative hits and misses — the hit rate is how an operator
 	// sizes --cache-size.
-	BlockCacheBytes  int64
-	BlockCacheCount  int64
-	BlockCacheHits   int64
-	BlockCacheMisses int64
+	BlockCacheBytes  int64 `json:"block_cache_bytes"`
+	BlockCacheCount  int64 `json:"block_cache_count"`
+	BlockCacheHits   int64 `json:"block_cache_hits"`
+	BlockCacheMisses int64 `json:"block_cache_misses"`
 	// Bloom filters: cumulative reads a filter answered without a data
 	// block (hits) and reads it could not (misses).
-	FilterHits   int64
-	FilterMisses int64
+	FilterHits   int64 `json:"filter_hits"`
+	FilterMisses int64 `json:"filter_misses"`
 }
 
 // health carries the engine's event counters and cached metrics snapshot.

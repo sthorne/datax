@@ -26,8 +26,12 @@ type Sample struct {
 	CPUPercent    float64 `json:"cpu_percent"`
 	IowaitPercent float64 `json:"iowait_percent"`
 	Cores         int     `json:"cores"`
-	// Load averages, as /proc/loadavg reports them.
-	Load1, Load5, Load15 float64
+	// Load averages, as /proc/loadavg reports them (JSON snake_case
+	// like every other field — and like kvpb.MachineSummary's load1,
+	// which is this figure as the heartbeat carries it; issue #146).
+	Load1  float64 `json:"load1"`
+	Load5  float64 `json:"load5"`
+	Load15 float64 `json:"load15"`
 
 	// Host memory in bytes (MemTotal and MemAvailable as the kernel
 	// defines them); RSS is this process's resident set.

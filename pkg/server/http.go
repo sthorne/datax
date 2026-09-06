@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/storage"
@@ -9,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -108,6 +112,12 @@ func (n *Node) startHTTP() error {
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_node_load1", Help: "One-minute load average.",
 			}, func() float64 { return latest().Load1 }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_node_load5", Help: "Five-minute load average.",
+			}, func() float64 { return latest().Load5 }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "datax_node_load15", Help: "Fifteen-minute load average.",
+			}, func() float64 { return latest().Load15 }),
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_node_cores", Help: "Logical CPUs on the host.",
 			}, func() float64 { return float64(latest().Cores) }),
@@ -264,9 +274,25 @@ func (n *Node) startHTTP() error {
 	if uerr != nil {
 		return uerr
 	}
+	// The console's version is a digest of the page as this binary
+	// embeds it: the page carries it, every /api/cluster document
+	// carries it, and the page offers a reload when they differ — a tab
+	// left open across a rolling upgrade otherwise keeps running the old
+	// console against the new API (issue #146). It is also the page's
+	// ETag, so a reload after an upgrade fetches the new page and one
+	// before it is a 304.
+	n.consoleVersion = consoleVersionOf(page)
+	page = bytes.ReplaceAll(page, []byte(consoleVersionPlaceholder), []byte(n.consoleVersion))
+	etag := `"` + n.consoleVersion + `"`
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/" {
 			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "no-cache")
+		if strings.Contains(req.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -559,4 +585,14 @@ func (c *writtenCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	set("state", c.node.engine)
 	set("raft", c.node.raftEngine)
+}
+
+// consoleVersionPlaceholder is the token in index.html the served page
+// has replaced by its version.
+const consoleVersionPlaceholder = "__CONSOLE_VERSION__"
+
+// consoleVersionOf digests the embedded page.
+func consoleVersionOf(page []byte) string {
+	sum := sha256.Sum256(page)
+	return hex.EncodeToString(sum[:8])
 }

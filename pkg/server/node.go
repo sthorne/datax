@@ -273,6 +273,9 @@ type Node struct {
 	rewriteRewritten   int64
 	prefixBloomNoticed atomic.Bool
 
+	// consoleVersion digests the embedded console page (http.go).
+	consoleVersion string
+
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and
 	// refreshed by the heartbeat loop from the replicated row.

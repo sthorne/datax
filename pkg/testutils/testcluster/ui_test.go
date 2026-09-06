@@ -34,6 +34,27 @@ func startWithHTTP(t *testing.T, numNodes int) *TestCluster {
 	return tc
 }
 
+// httpDo performs one request with the given headers and returns the
+// response (its body drained and closed).
+func httpDo(t *testing.T, method, url string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp
+}
+
 func httpGet(t *testing.T, url string) (int, string, string) {
 	t.Helper()
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -68,6 +89,23 @@ func TestClusterAPI(t *testing.T) {
 		}
 		if doc.NodeID != i+1 {
 			t.Fatalf("node %d reports node_id %d", i+1, doc.NodeID)
+		}
+		// Published JSON names (issue #146): the machine sample's load
+		// averages and the storage snapshot are snake_case like the rest
+		// of the document — asserted on the raw body so a dropped tag
+		// fails rather than silently renaming a field.
+		for _, key := range []string{`"load1"`, `"load5"`, `"load15"`, `"l0_files"`, `"compaction_debt_bytes"`, `"block_cache_hits"`, `"filter_hits"`, `"console_version"`} {
+			if !strings.Contains(body, key) {
+				t.Fatalf("node %d /api/cluster lacks %s", i+1, key)
+			}
+		}
+		for _, key := range []string{`"Load1"`, `"L0Files"`, `"CompactionDebtBytes"`} {
+			if strings.Contains(body, key) {
+				t.Fatalf("node %d /api/cluster still carries the Go-cased %s", i+1, key)
+			}
+		}
+		if doc.ConsoleVersion == "" {
+			t.Fatalf("node %d: no console_version", i+1)
 		}
 		if len(doc.Nodes) != 3 {
 			t.Fatalf("node %d sees %d nodes", i+1, len(doc.Nodes))
@@ -142,7 +180,7 @@ func TestClusterAPI(t *testing.T) {
 	// /metrics exports the host figures next to the standard Go and
 	// process collectors.
 	_, _, body := httpGet(t, "http://"+tc.Nodes[0].HTTPAddr()+"/metrics")
-	for _, want := range []string{"datax_node_cpu_percent{scope=\"host\"}", "datax_node_memory_bytes{kind=\"available\"}", "datax_node_load1", "datax_process_fd_limit", "go_goroutines", "process_open_fds"} {
+	for _, want := range []string{"datax_node_cpu_percent{scope=\"host\"}", "datax_node_memory_bytes{kind=\"available\"}", "datax_node_load1", "datax_node_load5", "datax_node_load15", "datax_process_fd_limit", "go_goroutines", "process_open_fds"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/metrics lacks %s", want)
 		}
@@ -171,6 +209,28 @@ func TestUIServed(t *testing.T) {
 		if strings.Contains(body, tag) {
 			t.Fatalf("dashboard loads an external asset via %q", tag)
 		}
+	}
+
+	if strings.Contains(body, "__CONSOLE_VERSION__") {
+		t.Fatal("the served page still carries the console version placeholder")
+	}
+	// The page is served with its digest as ETag (issue #146): a reload
+	// with the same version is a 304, the version the page carries is
+	// the one /api/cluster reports, and the tab can tell an upgrade.
+	resp := httpDo(t, "GET", "http://"+addr+"/", nil)
+	etag := resp.Header.Get("ETag")
+	if etag == "" || resp.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("/: ETag %q, Cache-Control %q", etag, resp.Header.Get("Cache-Control"))
+	}
+	if !strings.Contains(body, `const CONSOLE_VERSION = `+etag) {
+		t.Fatalf("the page does not carry its ETag %s as CONSOLE_VERSION", etag)
+	}
+	_, _, cbody := httpGet(t, "http://"+addr+"/api/cluster")
+	if !strings.Contains(cbody, `"console_version": `+etag) {
+		t.Fatalf("/api/cluster does not report console_version %s", etag)
+	}
+	if resp := httpDo(t, "GET", "http://"+addr+"/", map[string]string{"If-None-Match": etag}); resp.StatusCode != 304 {
+		t.Fatalf("/ with If-None-Match %s: %d, want 304", etag, resp.StatusCode)
 	}
 
 	if code, _, _ := httpGet(t, "http://"+addr+"/nope"); code != 404 {

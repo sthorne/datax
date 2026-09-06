@@ -8,6 +8,40 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.44.0 — unreleased
+
+The console umbrella (#144), first batch.
+
+### Changed
+- Two published JSON names in `/status`, `/api/cluster` and `/api/node`
+  (#146): the machine sample's load averages are `load1`, `load5`,
+  `load15` (they were the untagged `Load1`, and the other two were not
+  exposed), matching the heartbeat's `load1`; and the storage snapshot
+  (`storage`, `raft_storage`) is snake_case throughout (`l0_files`,
+  `compaction_debt_bytes`, `block_cache_hits`, ...) instead of Go-cased.
+  Anything that read the old spellings must move; the console did in the
+  same change.
+
+### Added
+- `datax_node_load5` and `datax_node_load15` on `/metrics`, beside
+  `datax_node_load1` (#146).
+- The console notices a rolling upgrade under a long-lived tab (#146):
+  the page and every `/api/cluster` document carry `console_version`, a
+  digest of the page the node embeds, and the tab offers a reload when
+  they differ; the page is served with that digest as its `ETag` and
+  `Cache-Control: no-cache`, so a reload after an upgrade fetches the
+  new page and one before it is a 304.
+
+### Fixed
+- The console's SQL statements panel explains a 403 from
+  `/api/activity` the way the range drill-down does — the signed-in user
+  and the `GRANT` that fixes it — instead of hiding (#146).
+- The heartbeat's machine summary is checked to be a projection of the
+  node's sample (`TestMachineSummaryProjectsTheSample`): every summary
+  field exists in the sample under the same JSON name and is copied, so
+  the console reads one shape and a figure cannot exist in only one
+  (#146).
+
 ## 0.43.0 — unreleased
 
 Cluster version **v15**.

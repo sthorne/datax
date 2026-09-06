@@ -85,6 +85,10 @@ type ClusterStatus struct {
 	// MaxOffsetMs is the clock skew the cluster tolerates (--max-offset);
 	// measured offsets are judged against it.
 	MaxOffsetMs int64 `json:"max_offset_ms"`
+	// ConsoleVersion is the digest of the console page this node serves;
+	// the page compares it with its own and offers a reload when they
+	// differ (issue #146).
+	ConsoleVersion string `json:"console_version,omitempty"`
 	// Principal is per request: the caller's identity, not cluster state.
 	Principal ClusterPrincipal        `json:"principal"`
 	Nodes     []ClusterNode           `json:"nodes"`
@@ -100,10 +104,11 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 	now := n.clock.Now().WallTime
 	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	doc := ClusterStatus{
-		Now:       now / int64(time.Millisecond),
-		NodeID:    int(n.ident.NodeID),
-		Principal: n.clusterPrincipal(req),
-		Local:     n.statusSummary(),
+		Now:            now / int64(time.Millisecond),
+		NodeID:         int(n.ident.NodeID),
+		ConsoleVersion: n.consoleVersion,
+		Principal:      n.clusterPrincipal(req),
+		Local:          n.statusSummary(),
 	}
 	doc.MaxOffsetMs = n.clock.MaxOffset().Milliseconds()
 	grace := n.livenessGrace().Nanoseconds()
