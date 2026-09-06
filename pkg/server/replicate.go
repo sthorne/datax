@@ -58,16 +58,27 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 		if !ok || !r1.IsLeader() {
 			continue
 		}
+		// The allocator resolves a range's placement policy through the
+		// schema cache (pkg/server/placement.go), so keep it fresh. The
+		// refresh is a background rebuild that never blocks this tick; a
+		// policy written a moment ago takes effect a tick or two later,
+		// which is the same latency every other catalog change has here.
+		n.refreshSchema()
 		wctx, cancel := context.WithTimeout(ctx, interval*4)
 		n.upreplicateOnce(wctx)
 		n.repairDeadOnce(wctx)
 		n.drainOnce(wctx)
-		// The balancing passes run in strict priority and perform at most
-		// ONE op per tick between them: acting on load statistics that a
-		// just-performed move has already invalidated only causes churn.
-		if !n.rebalanceOnce(wctx) {
-			if !n.shedLeaseOnce(wctx) {
-				n.rebalanceBytesOnce(wctx)
+		// Moving a replica onto a node its policy admits outranks load:
+		// a replica in the wrong region is wrong, a replica on a busy
+		// node is merely expensive.
+		if !n.enforcePlacementOnce(wctx) {
+			// The balancing passes run in strict priority and perform at most
+			// ONE op per tick between them: acting on load statistics that a
+			// just-performed move has already invalidated only causes churn.
+			if !n.rebalanceOnce(wctx) {
+				if !n.shedLeaseOnce(wctx) {
+					n.rebalanceBytesOnce(wctx)
+				}
 			}
 		}
 		cancel()
@@ -104,7 +115,9 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 	}
 
 	for _, desc := range descs {
-		if len(desc.Replicas) >= base.DefaultReplicationFactor {
+		policy := n.placementOf(desc)
+		want := policy.ReplicasOr(base.DefaultReplicationFactor)
+		if len(desc.Replicas) >= want {
 			continue
 		}
 		var existing []kvpb.NodeDescriptor
@@ -124,12 +137,12 @@ func (n *Node) upreplicateOnce(ctx context.Context) {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
 			}
 		}
-		target, ok := placement.AllocateTarget(existing, candidates)
+		target, ok := placement.AllocateTargetFor(policy, existing, candidates)
 		if !ok {
-			continue // not enough distinct live nodes yet
+			continue // not enough distinct live nodes the policy admits
 		}
-		log.Infof("upreplicating %s (%d/%d replicas) to n%d", desc.RangeID, len(desc.Replicas), base.DefaultReplicationFactor, target)
-		n.events.Record("upreplicate", "%s has %d of %d replicas: adding one on n%d", desc.RangeID, len(desc.Replicas), base.DefaultReplicationFactor, target)
+		log.Infof("upreplicating %s (%d/%d replicas) to n%d", desc.RangeID, len(desc.Replicas), want, target)
+		n.events.Record("upreplicate", "%s has %d of %d replicas: adding one on n%d", desc.RangeID, len(desc.Replicas), want, target)
 		if _, err := n.db.AdminChangeReplicas(ctx, desc.StartKey, target, 0); err != nil {
 			log.Warnf("upreplicating %s to n%d: %v", desc.RangeID, target, err)
 			continue
@@ -206,9 +219,9 @@ func (n *Node) repairDeadOnce(ctx context.Context) {
 				candidates = append(candidates, placement.Candidate{Node: nd, RangeCount: rangeCount[nd.NodeID]})
 			}
 		}
-		target, ok := placement.AllocateTarget(survivors, candidates)
+		target, ok := placement.AllocateTargetFor(n.placementOf(desc), survivors, candidates)
 		if !ok {
-			continue // no spare live node to repair onto
+			continue // no spare live node the policy admits to repair onto
 		}
 		log.Infof("repairing %s: replacing dead n%d with n%d", desc.RangeID, deadNode, target)
 		n.events.Record("dead-node-repair", "%s: replacing the replica on dead n%d with one on n%d", desc.RangeID, deadNode, target)
@@ -264,7 +277,7 @@ func (n *Node) rebalanceOnce(ctx context.Context) bool {
 	// A range left over-replicated by a crashed add-then-remove is repaired
 	// first (one per tick), before load is considered.
 	for _, desc := range descs {
-		if len(desc.Replicas) <= base.DefaultReplicationFactor || !allReplicasLive(desc, live) {
+		if len(desc.Replicas) <= n.placementOf(desc).ReplicasOr(base.DefaultReplicationFactor) || !allReplicasLive(desc, live) {
 			continue
 		}
 		var existing []kvpb.NodeDescriptor
@@ -311,10 +324,14 @@ func (n *Node) rebalanceOnce(ctx context.Context) bool {
 	// Any node at the maximum count may donate — if the fullest node's
 	// replicas are all diversity-pinned, an equally full peer can still move.
 	for _, desc := range descs {
-		if len(desc.Replicas) < base.DefaultReplicationFactor || !allReplicasLive(desc, live) {
+		if len(desc.Replicas) < n.placementOf(desc).ReplicasOr(base.DefaultReplicationFactor) || !allReplicasLive(desc, live) {
 			continue
 		}
 		if _, onDst := desc.GetReplica(dst); onDst {
+			continue
+		}
+		// A load move must not push a replica outside its policy.
+		if !n.placementOf(desc).Satisfies(live[dst].Locality) {
 			continue
 		}
 		var existing []kvpb.NodeDescriptor

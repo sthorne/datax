@@ -138,6 +138,14 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 		// range GCs at one TTL and adopts the max of both GC thresholds, so
 		// absorbing a short-retention neighbor could instantly put the
 		// long-retention side's recent history below the threshold.
+		// Never merge across a placement boundary: the merged range would
+		// fall under no policy at all (a range must lie wholly inside one
+		// table to inherit its database's placement).
+		if !redrive && s.cfg.MergeBarrier != nil {
+			if s.cfg.MergeBarrier(desc.StartKey, desc.EndKey) != s.cfg.MergeBarrier(rhsDesc.StartKey, rhsDesc.EndKey) {
+				return true
+			}
+		}
 		if !redrive && s.cfg.RetentionOverride != nil {
 			lt, lexp, lok := s.cfg.RetentionOverride(desc.StartKey, desc.EndKey)
 			rt, rexp, rok := s.cfg.RetentionOverride(rhsDesc.StartKey, rhsDesc.EndKey)

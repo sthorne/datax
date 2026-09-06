@@ -14,6 +14,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/placement"
 	"github.com/sthorne/datax/pkg/util/events"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
@@ -185,7 +186,41 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		}
 		under, noQuorum, undiverse := 0, 0, 0
 		var underEx, quorumEx, divEx base.RangeID
+		// Placement (issue #176): a range whose replicas sit outside the
+		// policy its database names, and a policy no live node can
+		// satisfy — the allocator leaves that data where it is rather
+		// than widening the policy, so it has to be said out loud.
+		misplaced, unsatisfiable := 0, 0
+		var misEx, unsatEx base.RangeID
+		var unsatPolicy string
+		nodeLocalities := map[base.NodeID]base.Locality{}
+		for _, nd := range nodes {
+			nodeLocalities[nd.NodeID] = nd.Locality
+		}
 		for _, d := range descs {
+			policy := n.placementOf(d)
+			if len(policy.Constraints) > 0 {
+				var ids []base.NodeID
+				for _, rep := range d.Replicas {
+					ids = append(ids, rep.NodeID)
+				}
+				if len(placement.Misplaced(policy, ids, nodeLocalities)) > 0 {
+					anyHome := false
+					for _, nd := range nodes {
+						if live[nd.NodeID] && policy.Satisfies(nd.Locality) {
+							anyHome = true
+							break
+						}
+					}
+					if anyHome {
+						misplaced++
+						misEx = d.RangeID
+					} else {
+						unsatisfiable++
+						unsatEx, unsatPolicy = d.RangeID, policy.String()
+					}
+				}
+			}
 			liveReps, seen := 0, map[string]bool{}
 			dup := false
 			for _, rep := range d.Replicas {
@@ -200,14 +235,15 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 					seen[loc] = true
 				}
 			}
+			want := policy.ReplicasOr(base.DefaultReplicationFactor)
 			if liveReps*2 <= len(d.Replicas) {
 				noQuorum++
 				quorumEx = d.RangeID
-			} else if len(d.Replicas) < base.DefaultReplicationFactor || liveReps < base.DefaultReplicationFactor {
+			} else if len(d.Replicas) < want || liveReps < want {
 				under++
 				underEx = d.RangeID
 			}
-			if dup && len(localities) >= base.DefaultReplicationFactor && len(d.Replicas) >= base.DefaultReplicationFactor {
+			if dup && len(localities) >= want && len(d.Replicas) >= want {
 				undiverse++
 				divEx = d.RangeID
 			}
@@ -223,6 +259,14 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		if undiverse > 0 {
 			add(Problem{Severity: SeverityWarning, Check: "diversity", Range: int64(divEx), Section: "cluster-ranges",
 				Summary: fmt.Sprintf("%d range(s) keep two replicas in one locality although %d localities exist (e.g. %s); a rack failure could cost two", undiverse, len(localities), divEx)})
+		}
+		if unsatisfiable > 0 {
+			add(Problem{Severity: SeverityCritical, Check: "placement-unsatisfiable", Range: int64(unsatEx), Section: "cluster-ranges",
+				Summary: fmt.Sprintf("%d range(s) name a placement no live node satisfies (e.g. %s wants %s): the data stays where it is until such a node joins", unsatisfiable, unsatEx, unsatPolicy)})
+		}
+		if misplaced > 0 {
+			add(Problem{Severity: SeverityWarning, Check: "placement-misplaced", Range: int64(misEx), Section: "cluster-ranges",
+				Summary: fmt.Sprintf("%d range(s) hold a replica outside their database's placement policy (e.g. %s); the allocator moves them one per pass", misplaced, misEx)})
 		}
 	} else {
 		add(Problem{Severity: SeverityWarning, Check: "meta-unavailable", Section: "cluster-ranges",

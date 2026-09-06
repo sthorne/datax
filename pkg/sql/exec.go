@@ -80,6 +80,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterDatabase(ctx, txn, t)
 	case *parser.ShowDatabases:
 		return s.execShowDatabases(ctx, txn)
+	case *parser.ShowPlacement:
+		return s.execShowPlacement(ctx, txn, t)
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
 	case *parser.Explain:
@@ -335,6 +337,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 	}
 	s.presplitTimeseries(ctx, desc)
+	s.presplitPlacement(ctx, txn, dbName, desc)
 	return &Result{Tag: "CREATE TABLE"}, nil
 }
 
