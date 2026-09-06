@@ -519,11 +519,15 @@ func (c *conn) handleStartup(ctx context.Context) error {
 						}
 					}
 					c.backend.Send(&pgproto3.AuthenticationOk{})
+					c.srv.Activity().setAuthVia(c, "cert")
 				} else if err := c.authenticateSCRAM(user); err != nil {
 					return err
+				} else {
+					c.srv.Activity().setAuthVia(c, "scram")
 				}
 			} else {
 				c.backend.Send(&pgproto3.AuthenticationOk{}) // trust auth
+				c.srv.Activity().setAuthVia(c, "trust")
 			}
 			// Privileges are enforced against this identity. In trust mode
 			// it is client-claimed (nothing verified it) — documented.

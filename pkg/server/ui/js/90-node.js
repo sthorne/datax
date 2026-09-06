@@ -35,7 +35,15 @@ function renderNode(d) {
     tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—") +
     tile("replicas", (st.ranges || []).length + (st.leader_of !== undefined ? " · leads " + st.leader_of : "")));
   const lm = st.machine;
-  if (lm) renderTiles(document.getElementById("node-machine"), machineTiles(lm)); else setHTML(document.getElementById("node-machine"), `<span class="muted">no machine sample</span>`);
+  // The forecast rides the cluster document, so this page shows it for
+  // whichever node it is (issue #156). It is a tile next to the point
+  // reading it explains, not a separate section.
+  const cap = lastCluster ? capacityFor(lastCluster, d.node_id) : null;
+  const capTile = cap && cap.filling
+    ? tile("fills in", fmtFillDays(cap.days_to_full) + ` <span class="muted">at ${fmtBytes(Math.max(0, cap.growth_bytes_per_day))}/day</span>`)
+    : tile("fills in", `<span class="muted">${esc(cap ? (cap.reason || "not filling") : "no forecast yet")}</span>`);
+  if (lm) renderTiles(document.getElementById("node-machine"), machineTiles(lm) + capTile);
+  else setHTML(document.getElementById("node-machine"), `<span class="muted">no machine sample</span>`);
   document.getElementById("node-machine-note").textContent = lm && (lm.unavailable || []).length ? "not available on this platform: " + lm.unavailable.join(", ") : "";
   renderTiles(document.getElementById("node-storage"), storageTiles(d.storage || {}) +
     tile("debt gate", d.debt_gated ? "latched" : "open" + (d.debt_gate_entries ? " · " + d.debt_gate_entries + " entries" : "")) +

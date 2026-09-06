@@ -288,6 +288,7 @@
         <th class="num" title="one-minute load average / cores">load</th>
         <th class="num" title="host memory in use / total">memory</th>
         <th class="num" title="free space on the store's filesystem">disk free</th>
+        <th class="num" title="how long until the store fills at its recent rate; blank where free space is not trending">fills in</th>
         <th class="num" title="open file descriptors / soft limit">fds</th>
         <th class="num" title="ranges this node leads">leases</th>
         <th class="num">heartbeat</th></tr></thead>
@@ -485,10 +486,38 @@
     <div class="tiles" id="sec-auth"></div>
     <p class="muted" id="sec-auth-note"></p>
   </section>
+  <section id="sec-certs">
+    <h2>Certificates</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">kind</th><th scope="col">subject</th><th scope="col">issuer</th>
+        <th scope="col" class="num">expires</th><th scope="col">on</th></tr></thead>
+      <tbody id="certs"></tbody>
+    </table></div>
+    <p class="muted" id="certs-note"></p>
+  </section>
+  <section id="sec-connections">
+    <h2>Who is connected</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">user</th><th scope="col">how they authenticated</th>
+        <th scope="col" class="num">connections</th></tr></thead>
+      <tbody id="sec-conns"></tbody>
+    </table></div>
+    <p class="muted" id="sec-conns-note"></p>
+  </section>
+  <section id="sec-encryption">
+    <h2>Encryption at rest</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">store</th><th scope="col">state</th>
+        <th scope="col" class="num" title="live sstable bytes still under a retired key">re-encryption</th></tr></thead>
+      <tbody id="sec-stores"></tbody>
+    </table></div>
+    <p class="muted" id="sec-stores-note"></p>
+  </section>
   <section>
     <h2>Users and roles</h2>
     <div class="tablewrap"><table>
-      <thead><tr><th>user</th><th>role</th></tr></thead>
+      <thead><tr><th scope="col">role</th><th scope="col">may log in</th>
+        <th scope="col">member of</th><th scope="col">effectively holds</th></tr></thead>
       <tbody id="users"></tbody>
     </table></div>
     <p class="muted" id="users-note"></p>

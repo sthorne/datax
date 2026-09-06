@@ -58,6 +58,10 @@ type connActivity struct {
 	db     string
 	app    string
 	remote string
+	// via is how the connection authenticated: "cert", "scram", or
+	// "trust" in insecure mode (issue #156). Recorded because "who is
+	// connected" and "how did they get in" are one question.
+	via    string
 	state  string // idle | active | idle_in_txn
 	since  time.Time
 	opened time.Time
@@ -121,6 +125,9 @@ type ConnectionInfo struct {
 	// another when contention is usually one of them (issue #154).
 	Database    string `json:"database,omitempty"`
 	Application string `json:"application,omitempty"`
+	// Via is how this connection authenticated: "cert", "scram", or
+	// "trust" in insecure mode (issue #156).
+	Via string `json:"via,omitempty"`
 }
 
 // IdleTxn is one connection sitting inside an open transaction: the
@@ -215,6 +222,35 @@ func (a *Activity) setUser(c *conn, user string) {
 		ca.user = user
 	}
 	a.mu.Unlock()
+}
+
+// setAuthVia records how the connection authenticated (issue #156).
+func (a *Activity) setAuthVia(c *conn, via string) {
+	a.mu.Lock()
+	if ca, ok := a.conns[c]; ok {
+		ca.via = via
+	}
+	a.mu.Unlock()
+}
+
+// ByAuth counts this node's connections by user and authentication
+// method: contention and compromise are both usually one identity, and
+// "who is connected and how did they get in" is one question.
+func (a *Activity) ByAuth() map[string]map[string]int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := map[string]map[string]int{}
+	for _, ca := range a.conns {
+		via := ca.via
+		if via == "" {
+			via = "unknown"
+		}
+		if out[ca.user] == nil {
+			out[ca.user] = map[string]int{}
+		}
+		out[ca.user][via]++
+	}
+	return out
 }
 
 // statementKind classifies a parsed statement for counting.
@@ -401,7 +437,7 @@ func (a *Activity) Connections() []ConnectionInfo {
 	out := make([]ConnectionInfo, 0, len(a.conns))
 	for _, ca := range a.conns {
 		out = append(out, ConnectionInfo{User: ca.user, Remote: ca.remote, State: ca.state,
-			Since: now.Sub(ca.since).Milliseconds(), Database: ca.db, Application: ca.app})
+			Since: now.Sub(ca.since).Milliseconds(), Database: ca.db, Application: ca.app, Via: ca.via})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Since > out[j].Since })
 	return out

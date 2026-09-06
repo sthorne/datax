@@ -107,9 +107,123 @@ function renderOps() {
 // security view instead of mixed into the operational timeline.
 const AUDIT_KINDS = new Set(["key-rotation"]);
 
+// secDoc is the last /api/security document (issue #156). It is fetched
+// on its own cadence, so the parts of the view drawn from the cluster
+// poll and the parts drawn from it redraw independently.
+let secDoc = null;
+
+// pollSecurity fetches the security document. It is not admin-gated as a
+// whole: what a certificate expires belongs to any authenticated user,
+// and the server filters out what names people.
+async function pollSecurity() {
+  const resp = await fetch("/api/security", { cache: "no-store" });
+  if (!resp.ok) { secDoc = null; renderSecurityDoc(); throw new Error("HTTP " + resp.status); }
+  secDoc = await resp.json();
+  renderSecurityDoc();
+}
+
+// certRow: the expiry, and what its lapse would cost. A certificate is
+// only interesting for when it stops working, so that is the column the
+// eye lands on and the one that is coloured.
+// SQL_VIA_NAMES names the SQL wire's authentication methods, which are
+// not the HTTP ones (VIA_NAMES): a SQL client presents a certificate or
+// runs SCRAM, or, in insecure mode, is simply believed.
+const SQL_VIA_NAMES = {
+  cert: "client certificate", scram: "SCRAM password", trust: "trusted (insecure mode)",
+  unknown: "not recorded (connected before this node started tracking)",
+};
+const CERT_MEANS = {
+  ca: "every node authenticates against this CA; its lapse stops the cluster",
+  node: "this node cannot reach its peers or serve SQL without it",
+  client: "this identity can no longer authenticate by certificate",
+};
+
+function certRow(c) {
+  const left = Date.parse(c.not_after) - Date.now();
+  const days = left / 86400000;
+  const level = left <= 0 ? "down" : days <= 7 ? "down" : days <= 30 ? "draining" : "";
+  const when = left <= 0 ? "expired" : days < 1 ? Math.round(days * 24) + "h" : Math.round(days) + "d";
+  return {
+    key: c.kind + "/" + c.subject, html: `<tr data-key="${esc(c.kind + "/" + c.subject)}">
+    <td data-label="kind"><span class="kind">${esc(c.kind)}</span></td>
+    <td class="key" data-label="subject">${esc(c.subject || "—")}</td>
+    <td class="key" data-label="issuer">${esc(c.issuer || "—")}</td>
+    <td class="num" data-label="expires" title="${esc(CERT_MEANS[c.kind] || "")}">${warn(level, when)}</td>
+    <td class="when" data-label="on" title="${esc(c.not_after)}">${esc(new Date(c.not_after).toLocaleDateString())}</td>
+  </tr>` };
+}
+
+// renderSecurityDoc draws the parts that come from /api/security.
+function renderSecurityDoc() {
+  const d = secDoc;
+  // Soonest expiry first across both lists: the server sorts each, but
+  // the one to act on is the nearest whichever list it came from.
+  const certs = d ? (d.certificates || []).concat(d.client_certs || [])
+    .sort((a, b) => Date.parse(a.not_after) - Date.parse(b.not_after)) : [];
+  renderKeyed(document.getElementById("certs"), certs.length ? certs.map(certRow)
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="5" class="muted">${d && !d.secure
+        ? "this cluster runs without certificates: start the nodes with a certificate directory to change that"
+        : "no certificates reported"}</td></tr>` }]);
+  document.getElementById("certs-note").textContent = !d ? "" : (d.secure
+    ? `the material n${d.node_id} loaded, soonest expiry first — the same dates /metrics publishes as datax_cert_expiry_seconds, so an alert fires without anyone opening this page. `
+      + `Health warns 30 days out and turns critical at 7.`
+      + (d.client_certs ? ` Client rows are the identities that have presented a certificate to n${d.node_id}: what has been connecting, not a directory of what could${d.client_certs_full ? ", and the list is full, so it is a sample" : ""}.`
+        : " Client certificates presented to this node need the admin role.")
+    : "insecure mode: nothing to expire, and nothing authenticating either");
+
+  const conns = d && d.connections;
+  renderKeyed(document.getElementById("sec-conns"), conns && conns.length
+    ? conns.map(c => ({ key: c.user || "(none)", html: `<tr data-key="${esc(c.user || "(none)")}">
+      <td data-label="user">${esc(c.user || "—")}</td>
+      <td data-label="how they authenticated">${Object.entries(c.via || {}).sort((a, b) => b[1] - a[1])
+        .map(([v, n]) => `${esc(SQL_VIA_NAMES[v] || v)} ${n}`).join(" · ") || "—"}</td>
+      <td class="num" data-label="connections">${c.total}</td>
+    </tr>` }))
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${d && d.principal && !d.principal.admin
+        ? "the per-user breakdown needs the admin role" : "nobody is connected to this node"}</td></tr>` }]);
+  document.getElementById("sec-conns-note").textContent = !d ? "" :
+    `n${d.node_id}'s own connections — each node accepts its own, so this is not a cluster total. `
+    + `${Math.round(d.auth_failures)} authentication failure(s) and ${Math.round(d.admin_denied)} denied admin operation(s) on this node since it started.`;
+
+  const stores = d ? (d.stores || []) : [];
+  renderKeyed(document.getElementById("sec-stores"), stores.length
+    ? stores.map(st => {
+      const re = st.reencryption;
+      const progress = !st.encrypted ? "—"
+        : re && re.remaining_bytes > 0 ? warn("draining", fmtBytes(re.remaining_bytes) + " still on a retired key")
+          : re && re.sweep_error ? warn("down", esc(re.sweep_error))
+            : "every live sstable on the active key";
+      return {
+        key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
+        <td data-label="store">n${st.node_id}</td>
+        <td data-label="state">${st.encrypted ? `<span class="st live"><span class="dot"></span>encrypted</span>`
+            : `<span class="st draining"><span class="dot"></span>plaintext</span>`}</td>
+        <td class="num" data-label="re-encryption">${progress}</td>
+      </tr>` };
+    })
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">no store reported</td></tr>` }]);
+  document.getElementById("sec-stores-note").textContent = !d ? "" :
+    `n${d.node_id}'s own store — each node's is on its own page, because asking every node would be a fan-out this view does not make`;
+
+  const roles = d ? (d.roles || []) : [];
+  renderKeyed(document.getElementById("users"), roles.length
+    ? roles.map(r => ({ key: r.name, html: `<tr data-key="${esc(r.name)}">
+      <td data-label="role">${esc(r.name)}${r.builtin ? ' <span class="muted">built-in</span>' : ""}${r.admin ? ' <span class="role">admin</span>' : ""}</td>
+      <td data-label="may log in">${r.builtin ? '<span class="muted">no — built-in roles are groups</span>' : r.login ? "yes" : "no"}</td>
+      <td data-label="member of">${(r.member_of || []).map(esc).join(" · ") || "—"}</td>
+      <td data-label="effectively holds">${(r.effective || []).map(esc).join(" · ") || "—"}${r.no_inherit ? ' <span class="muted">(NOINHERIT: reachable with SET ROLE, not held)</span>' : ""}</td>
+    </tr>` }))
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">no roles reported</td></tr>` }]);
+  document.getElementById("users-note").textContent = !d ? "" :
+    "privileges flow along membership: a role holds what it was granted plus, unless it is NOINHERIT, what the roles it belongs to hold. "
+    + "Managed with GRANT and REVOKE on the SQL port; the console never mutates."
+    + (d.error ? " " + d.error : "");
+}
+
 // renderSecurity: how the cluster authenticates, who may sign in, and
-// the audit stream. Certificate expiry and per-node encryption state
-// arrive with #156; what is here is what the endpoints already carry.
+// the audit stream. The certificate, connection, encryption and role
+// panels are drawn by renderSecurityDoc from /api/security (issue #156);
+// this draws what rides the cluster poll.
 function renderSecurity(d) {
   const p = d.principal || {};
   renderTiles(document.getElementById("sec-auth"),
@@ -120,14 +234,6 @@ function renderSecurity(d) {
   document.getElementById("sec-auth-note").textContent = p.secure
     ? "every HTTP route takes a session cookie, HTTP Basic credentials, or a client certificate; all three need a role that exists and holds LOGIN"
     : "this cluster authenticates nobody: start the nodes with a certificate directory to change that";
-
-  const users = (lastSchema && lastSchema.users) || [];
-  renderKeyed(document.getElementById("users"), users.length
-    ? users.map(u => ({ key: u.name, html: `<tr data-key="${esc(u.name)}"><td>${esc(u.name)}</td><td>${u.admin ? '<span class="role">admin</span>' : "user"}</td></tr>` }))
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="2" class="muted">${p.secure && !p.admin ? "the user list needs the admin role" : "no users yet"}</td></tr>` }]);
-  document.getElementById("users-note").textContent = users.length
-    ? "roles and grants are managed with GRANT and REVOKE on the SQL port; the console never mutates"
-    : "";
 
   const audit = eventsAll.filter(e => e.audit || AUDIT_KINDS.has(e.kind)).slice().reverse();
   renderKeyed(document.getElementById("audit"), audit.length ? audit.map(eventRow)

@@ -238,6 +238,12 @@ func (n *Node) startHTTP() error {
 			}))
 		}
 	}
+	// Certificate expiry (issue #156): registered only in secure mode,
+	// so an insecure cluster reports no series rather than a series
+	// asserting nothing expires.
+	if n.tlsCfgs != nil {
+		nodeReg.MustRegister(newCertExpiryCollector(n))
+	}
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()
@@ -266,6 +272,13 @@ func (n *Node) startHTTP() error {
 	mux.Handle("/debug/pprof/symbol", n.requireAdmin(http.HandlerFunc(pprof.Symbol)))
 	mux.Handle("/debug/pprof/trace", n.requireAdmin(http.HandlerFunc(pprof.Trace)))
 	mux.HandleFunc("/api/health", n.serveHealthAPI)
+	// /api/security is not gated as a whole (issue #156): certificate
+	// expiry and role membership are operational and belong to any
+	// authenticated user. What names people — the per-user connection
+	// breakdown and the client certificates observed — is filtered out
+	// of the document for a non-admin, the way the event ring already
+	// filters audit records.
+	mux.HandleFunc("/api/security", n.serveSecurityAPI)
 	mux.HandleFunc("/api/overview", n.serveOverviewAPI)
 	// The console's front door (issue #158). Both are reached before
 	// authentication (httpAuth exempts them): signing in is how a
@@ -379,6 +392,9 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			len(req.TLS.VerifiedChains[0]) > 0 &&
 			req.TLS.VerifiedChains[0][0].Subject.CommonName != "" {
 			cn := req.TLS.VerifiedChains[0][0].Subject.CommonName
+			// What reached this node, expiry included, is worth
+			// reporting whether or not the role check below admits it.
+			n.certs.observeClient(req.TLS.VerifiedChains[0][0])
 			// The certificate names the role; the role must exist and
 			// hold LOGIN, as on pgwire (issue #138) — so NOLOGIN or DROP
 			// ROLE closes this door too, years before the certificate
