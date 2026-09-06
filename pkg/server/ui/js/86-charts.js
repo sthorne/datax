@@ -145,16 +145,22 @@ function renderCharts() {
   for (const s of d.series || []) {
     const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
     if (mv.compare && ids.length > 1) {
-      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d));
+      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d, { annotate: true }));
     } else {
-      box.appendChild(chart(s, s.nodes || {}, "", d));
+      box.appendChild(chart(s, s.nodes || {}, "", d, { annotate: true }));
     }
   }
   if (!box.children.length) box.innerHTML = `<div class="muted">nothing to chart</div>`;
 }
 // chart builds one panel: inline SVG, recessive grid, 2px lines, a
 // legend of node line-keys, the crosshair tooltip, and a table view.
-function chart(s, nodes, suffix, win) {
+//
+// opts.annotate marks the events in the window (issue #155). It is off
+// unless asked for, because the marks come from a fetch the metrics
+// view makes: a chart drawn elsewhere would otherwise carry whichever
+// window that view last looked at, which is worse than no marks.
+function chart(s, nodes, suffix, win, opts) {
+  const annotate = !!(opts && opts.annotate);
   const el = document.createElement("div");
   el.className = "chart";
   const unit = s.rate ? (s.unit || "/s") : s.unit;
@@ -189,7 +195,9 @@ function chart(s, nodes, suffix, win) {
   svg += `</g>`;
   // Annotations go in before the data: a mark explains a line, so it
   // must never be drawn over one.
-  const marks = annotationMarks(from, to, x, T, PH, ann.node ? nodeColor(String(ann.node)) : "var(--text-3)");
+  const marks = annotate
+    ? annotationMarks(from, to, x, T, PH, ann.node ? nodeColor(String(ann.node)) : "var(--text-3)")
+    : { svg: "", count: 0 };
   svg += marks.svg;
   for (const id of ids) {
     let dpath = "", prev = null;
@@ -210,13 +218,13 @@ function chart(s, nodes, suffix, win) {
   for (const t of times) table += `<tr><td>${esc(fmtTime(t, true))}</td>` + ids.map(id => `<td class="num">${esc(byT[id].has(t) ? fmtUnit(byT[id].get(t), unit) : "—")}</td>`).join("") + `</tr>`;
   table += `</tbody></table></div></details>`;
   let annNote = "";
-  if (marks.count) {
+  if (annotate && marks.count) {
     annNote = `<div class="muted annnote">${marks.count} event${marks.count === 1 ? "" : "s"} marked` +
       (ann.node ? ` from n${ann.node}'s ring` : "") +
       (ann.oldestMs && ann.oldestMs > from
         ? ` — the ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}, so anything earlier in this window is unmarked rather than absent`
         : "") + `</div>`;
-  } else if (ann.oldestMs && ann.oldestMs > from) {
+  } else if (annotate && ann.oldestMs && ann.oldestMs > from) {
     annNote = `<div class="muted annnote">the event ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}; earlier in this window is unmarked rather than quiet</div>`;
   }
   el.innerHTML = title + svg + legend + `<div class="tip"></div>` + annNote + table;

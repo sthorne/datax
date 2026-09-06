@@ -90,6 +90,10 @@ task("scopedEvents", pollScopedEvents, 5000, ["ops", "security", "overview"]);
 task("tileHistory", pollTileHistory, 30000, ["overview"]);
 task("node", pollNode, 5000, ["node"]);
 task("metrics", fetchMetrics, 15000, ["metrics"]);
+// The transactions charts read the metrics table, which the recorder
+// writes every 10s by default: polling it faster would redraw the same
+// samples (issue #154).
+task("txnCharts", pollTxnCharts, 15000, ["sql"]);
 
 window.addEventListener("hashchange", route);
 document.getElementById("compare-toggle").addEventListener("change", ev => {

@@ -367,6 +367,44 @@
     </table></div>
     <p class="muted" id="sql-note"></p>
   </section>
+  <section id="sec-txn">
+    <h2>Transactions</h2>
+    <div class="tiles" id="txn-tiles"></div>
+    <div class="charts" id="txn-charts"></div>
+    <p class="muted" id="txn-note"></p>
+  </section>
+  <section id="sec-txn-users">
+    <h2>By user</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">user</th>
+        <th scope="col" class="num" title="open connections held by this user, across every node">connections</th>
+        <th scope="col" class="num" title="serialization failures this user's statements hit, on the scoped node only">40001s</th></tr></thead>
+      <tbody id="txn-users"></tbody>
+    </table></div>
+    <p class="muted" id="txn-users-note"></p>
+  </section>
+  <section id="sec-retries">
+    <h2>Retry hot list</h2>
+    <p class="scoped" id="retry-scope"></p>
+    <div class="tablewrap"><table>
+      <thead><tr><th scope="col" class="num">40001s</th><th scope="col">users</th>
+        <th scope="col">last</th><th scope="col">statement shape</th></tr></thead>
+      <tbody id="retry-shapes"></tbody>
+    </table></div>
+    <p class="muted" id="retry-note"></p>
+  </section>
+  <section id="sec-idle-txns">
+    <h2>Idle in transaction</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th scope="col" class="num">pid</th><th scope="col">user</th><th scope="col">client</th>
+        <th scope="col">application</th>
+        <th scope="col" class="num" title="how long it has been sitting idle in this state">idle</th>
+        <th scope="col" class="num" title="how long the whole transaction block has been open">txn open</th>
+        <th scope="col">last statement</th></tr></thead>
+      <tbody id="idle-txns"></tbody>
+    </table></div>
+    <p class="muted" id="idle-note"></p>
+  </section>
   <section>
     <h2>Statements</h2>
     <p class="scoped" id="sql-scope"></p>

@@ -596,7 +596,29 @@ type ActivityStatus struct {
 	// SlowThresholdMillis is the duration past which statements land in
 	// Slow.
 	SlowThresholdMillis int64 `json:"slow_threshold_ms"`
+
+	// Contention (issue #154). A serializable database lives and dies
+	// on retries, and a 40001 rate on its own says nothing about what
+	// to change. RetryShapes attributes this node's serialization
+	// failures to the statement shapes that produced them, heaviest
+	// first, with RetryShapesOther counting those past the bound;
+	// RetriesByUser breaks them down by user, because contention is
+	// usually one application. IdleTxns lists the sessions sitting
+	// inside an open transaction, whose intents block other writers.
+	//
+	// All of it names statement text or users, so it stays behind the
+	// same admin gate as the rest of this document. The rate figures
+	// the console draws beside it come from /api/metrics, which is not
+	// gated: a rate is not sensitive, a statement is.
+	RetryShapes      []pgwire.RetryShape `json:"retry_shapes"`
+	RetryShapesOther uint64              `json:"retry_shapes_other,omitempty"`
+	RetriesByUser    map[string]uint64   `json:"retries_by_user,omitempty"`
+	IdleTxns         []pgwire.IdleTxn    `json:"idle_txns"`
 }
+
+// retryShapeLimit bounds the hot list this document carries. What falls
+// off the end is added to RetryShapesOther rather than dropped.
+const retryShapeLimit = 20
 
 func (n *Node) serveActivityAPI(w http.ResponseWriter, req *http.Request) {
 	doc := n.activityStatus()
