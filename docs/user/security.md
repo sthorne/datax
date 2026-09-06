@@ -7,7 +7,7 @@ datax runs in one of two modes, decided by whether nodes are started with
 |---|---|---|
 | Internode RPC | plaintext | mutual TLS |
 | SQL wire | plaintext, any username accepted (trust) | TLS + SCRAM-SHA-256 password auth, or client-certificate auth |
-| HTTP endpoints | open | HTTP Basic (any database user) or client certificate; `/api/range` admin-only |
+| HTTP endpoints | open | a signed-in browser session, HTTP Basic (any database user), or client certificate; `/api/range` admin-only |
 | Admin RPCs (`datax debug`, backup/restore) | open | client certificate; state-changing ops require the admin role |
 | SQL privileges | statements accepted but identity is unverified | enforced per user via `GRANT`/`REVOKE` |
 
@@ -160,12 +160,13 @@ claims, but grants still name existing roles: create them first.
 
 ## HTTP endpoints in secure mode
 
-Every HTTP route requires either HTTP Basic credentials of a database
-user, or a CA-verified client certificate (CN = username). Both doors
-open only for a role that exists and holds `LOGIN`, exactly as on the
-SQL port: `ALTER ROLE ... NOLOGIN` or `DROP ROLE` shuts a certificate
-holder out at once, not when the certificate expires. Authorization is
-per endpoint:
+Every HTTP route requires one of three doors: a CA-verified client
+certificate (CN = username), HTTP Basic credentials of a database user,
+or the session cookie a person gets by signing in to the console. All
+three open only for a role that exists and holds `LOGIN`, exactly as on
+the SQL port: `ALTER ROLE ... NOLOGIN` or `DROP ROLE` shuts a
+certificate holder — or a signed-in browser — out at once, not when the
+certificate or the session expires. Authorization is per endpoint:
 
 | Endpoint | Who |
 |---|---|
@@ -192,8 +193,39 @@ scrape_configs:
 (`CREATE USER metrics_user PASSWORD '...' IN ROLE metrics` — the role
 scrapes `/metrics` and nothing else; it cannot read data.)
 
-The browser dashboard works with the same Basic credentials — the browser
-prompts once and same-origin fetches reuse them.
+### Signing in to the console
+
+An unauthenticated browser navigation gets a sign-in page rather than
+the browser's own credential dialog; anything scripted — `curl`,
+Prometheus, `datax debug` — still gets the `WWW-Authenticate` challenge
+it always got, and HTTP Basic keeps working everywhere. The two are told
+apart by the `Accept` header, never by the user agent.
+
+The credentials are database credentials, the same pair `datax sql`
+connects with. `POST /api/login` verifies them and sets a session
+cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, path `/`, 12 hours);
+`POST /api/logout`, or **Sign out** in the console's user menu, clears
+it. Both are `POST` and require a JSON content type, which with
+`SameSite=Strict` is what stops another origin driving either.
+
+The cookie is a signed token — user, issue time, expiry, and a MAC under
+a key every node derives from the cluster's authentication secret. It
+carries no password and needs no session store, so a token minted by one
+node is accepted by every other with nothing replicated between them.
+What it asserts is identity only: roles are resolved per request from
+the catalog, so revoking `LOGIN` or the admin role takes effect at once
+rather than at expiry. Being stateless it cannot be revoked
+individually — signing out ends the session on that browser, and
+rotating the cluster's authentication secret invalidates every
+outstanding token at once. The 12-hour TTL is what bounds a stolen
+cookie's life.
+
+A browser that presents a CA-signed client certificate is signed in by
+it and never sees the form. A user with no password (certificate-only)
+cannot sign in with one, and the refusal says so without confirming
+whether any particular name exists: unknown user, wrong password and
+certificate-only user are one message, and the endpoint burns the same
+work on each.
 
 ## Admin RPCs in secure mode
 
@@ -237,8 +269,11 @@ are both refused.
 Security-relevant actions are written to the node log as structured
 records (`msg=audit`), each with the acting principal:
 
-- authentication failures — SQL (SCRAM) and HTTP Basic
+- authentication failures — SQL (SCRAM), HTTP Basic, a refused
+  console sign-in, and a session cookie that is expired, tampered with,
+  or names a role that may no longer log in
   (`datax_auth_failures_total`)
+- console sign-ins and sign-outs (`http-login`, `http-logout`)
 - denied admin operations (`datax_admin_denied_total`)
 - executed state-changing admin RPCs (op, principal, target)
 - role and privilege DDL: `CREATE`/`ALTER`/`DROP ROLE` and `USER`,

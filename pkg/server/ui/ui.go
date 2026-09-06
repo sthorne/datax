@@ -8,5 +8,5 @@ import "embed"
 
 // FS holds the dashboard page.
 //
-//go:embed index.html
+//go:embed index.html login.html
 var FS embed.FS
