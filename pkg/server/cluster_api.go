@@ -78,6 +78,94 @@ type ClusterPrincipal struct {
 	Admin bool `json:"admin"`
 }
 
+// ClusterRollup is the cluster-level summary of the /api/cluster
+// document (issue #145): the load figures every node's heartbeat carries
+// (kvpb.NodeDescriptor), summed over the LIVE nodes so that the same
+// numbers come out whichever node serves the page — the serving node is
+// provenance, not the subject. Contributing says how many nodes a sum
+// covers, so a node that is down (or on a binary that advertises no
+// figures) shows as a smaller count beside the figure rather than as a
+// smaller figure with no explanation.
+type ClusterRollup struct {
+	Nodes     int `json:"nodes"`
+	LiveNodes int `json:"live_nodes"`
+	// Contributing is the number of live nodes whose figures the load
+	// sums below cover; SQLContributing the number whose heartbeat
+	// carried a SQL summary (a node on an older binary carries none).
+	Contributing    int `json:"contributing"`
+	SQLContributing int `json:"sql_contributing"`
+	// QPS sums the nodes' leader-local request rates; DataBytes their
+	// replica bytes; Leases the ranges they lead.
+	QPS       float64 `json:"qps"`
+	DataBytes int64   `json:"data_bytes"`
+	Leases    int     `json:"leases"`
+	// Ranges and Replicas come from the cluster's range descriptors
+	// (every range, not just the serving node's).
+	Ranges   int `json:"ranges"`
+	Replicas int `json:"replicas"`
+	// SQL: connections by state and by user, cumulative statements and
+	// serialization failures (the page differences consecutive
+	// documents for rates), the worst p99 and the node that owns it, and
+	// the longest an open transaction has been idle anywhere.
+	Connections           int               `json:"connections"`
+	Active                int               `json:"active"`
+	IdleInTxn             int               `json:"idle_in_txn"`
+	ConnectionsByUser     map[string]int    `json:"connections_by_user,omitempty"`
+	Statements            uint64            `json:"statements"`
+	StatementsByKind      map[string]uint64 `json:"statements_by_kind,omitempty"`
+	SerializationFailures uint64            `json:"serialization_failures"`
+	WorstP99Micros        int64             `json:"worst_p99_us"`
+	WorstP99Node          int               `json:"worst_p99_node,omitempty"`
+	OldestIdleTxnMillis   int64             `json:"oldest_idle_txn_ms,omitempty"`
+}
+
+// rollup sums the live nodes' heartbeat figures and the range listing.
+func rollup(nodes []ClusterNode, ranges []ClusterRange) ClusterRollup {
+	r := ClusterRollup{Nodes: len(nodes), Ranges: len(ranges)}
+	for _, cr := range ranges {
+		r.Replicas += len(cr.Replicas)
+	}
+	for _, n := range nodes {
+		if !n.Live {
+			continue
+		}
+		r.LiveNodes++
+		r.Contributing++
+		r.QPS += n.LeaderQPS
+		r.DataBytes += n.ReplicaBytes
+		r.Leases += n.LeaderCount
+		q := n.SQL
+		if q == nil {
+			continue
+		}
+		r.SQLContributing++
+		r.Connections += q.Open
+		r.Active += q.Active
+		r.IdleInTxn += q.IdleInTxn
+		for user, c := range q.ByUser {
+			if r.ConnectionsByUser == nil {
+				r.ConnectionsByUser = map[string]int{}
+			}
+			r.ConnectionsByUser[user] += c
+		}
+		for kind, c := range q.Statements {
+			if r.StatementsByKind == nil {
+				r.StatementsByKind = map[string]uint64{}
+			}
+			r.StatementsByKind[kind] += c
+			r.Statements += c
+		}
+		r.SerializationFailures += q.SerializationFailures
+		if q.P99Micros > r.WorstP99Micros {
+			r.WorstP99Micros, r.WorstP99Node = q.P99Micros, n.NodeID
+		}
+		if q.OldestIdleTxnMillis > r.OldestIdleTxnMillis {
+			r.OldestIdleTxnMillis = q.OldestIdleTxnMillis
+		}
+	}
+	return r
+}
+
 // ClusterStatus is the /api/cluster document.
 type ClusterStatus struct {
 	Now    int64 `json:"now_unix_ms"`
@@ -85,25 +173,42 @@ type ClusterStatus struct {
 	// MaxOffsetMs is the clock skew the cluster tolerates (--max-offset);
 	// measured offsets are judged against it.
 	MaxOffsetMs int64 `json:"max_offset_ms"`
+	// ConsoleVersion is the digest of the console page this node serves;
+	// the page compares it with its own and offers a reload when they
+	// differ (issue #146).
+	ConsoleVersion string `json:"console_version,omitempty"`
 	// Principal is per request: the caller's identity, not cluster state.
-	Principal ClusterPrincipal        `json:"principal"`
-	Nodes     []ClusterNode           `json:"nodes"`
-	Ranges    []ClusterRange          `json:"ranges"`
-	Local     NodeStatus              `json:"local"`
-	Storage   *storage.StorageMetrics `json:"storage,omitempty"`
+	Principal ClusterPrincipal `json:"principal"`
+	Nodes     []ClusterNode    `json:"nodes"`
+	Ranges    []ClusterRange   `json:"ranges"`
+	// Rollup sums the live nodes' figures (issue #145).
+	Rollup  ClusterRollup           `json:"rollup"`
+	Local   NodeStatus              `json:"local"`
+	Storage *storage.StorageMetrics `json:"storage,omitempty"`
 	// Error carries a partial-data note (e.g. the meta scan failed during
 	// startup or a partition); the rest of the document is still valid.
 	Error string `json:"error,omitempty"`
 }
 
 func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
+	doc := n.clusterDoc(req)
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(doc)
+}
+
+// clusterDoc assembles the /api/cluster document (also the cluster
+// section of /api/overview).
+func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 	now := n.clock.Now().WallTime
 	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	doc := ClusterStatus{
-		Now:       now / int64(time.Millisecond),
-		NodeID:    int(n.ident.NodeID),
-		Principal: n.clusterPrincipal(req),
-		Local:     n.statusSummary(),
+		Now:            now / int64(time.Millisecond),
+		NodeID:         int(n.ident.NodeID),
+		ConsoleVersion: n.consoleVersion,
+		Principal:      n.clusterPrincipal(req),
+		Local:          n.statusSummary(),
 	}
 	doc.MaxOffsetMs = n.clock.MaxOffset().Milliseconds()
 	grace := n.livenessGrace().Nanoseconds()
@@ -159,10 +264,8 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 		m := n.engine.StorageMetrics()
 		doc.Storage = &m
 	}
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(doc)
+	doc.Rollup = rollup(doc.Nodes, doc.Ranges)
+	return doc
 }
 
 // clusterPrincipal describes the request's authenticated caller for the

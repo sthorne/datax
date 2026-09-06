@@ -202,6 +202,11 @@ func TestHTTPAuthSecure(t *testing.T) {
 	if code, body, _ := authedGet(t, client, base+"/api/node", "scraper", "metrics-pw"); code != http.StatusOK || !strings.Contains(body, `"node_id": 1`) {
 		t.Fatalf("/api/node (self) as non-admin: %d %s", code, body)
 	}
+	// Statement text is admin-only too; the refusal names the reason so
+	// the console can explain it (issue #146).
+	if code, body, _ := authedGet(t, client, base+"/api/activity", "scraper", "metrics-pw"); code != http.StatusForbidden || !strings.Contains(body, "admin role required") {
+		t.Fatalf("/api/activity as non-admin: %d %q, want 403 naming the admin role", code, body)
+	}
 	if code, body, _ := authedGet(t, client, base+"/api/node?id=2", "root", "topsecret"); code != http.StatusOK || !strings.Contains(body, `"node_id": 2`) {
 		t.Fatalf("/api/node?id=2 as root: %d %s", code, body)
 	}

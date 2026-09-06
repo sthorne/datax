@@ -8,6 +8,85 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.44.0 — unreleased
+
+The console umbrella (#144), first batch.
+
+### Changed
+- Two published JSON names in `/status`, `/api/cluster` and `/api/node`
+  (#146): the machine sample's load averages are `load1`, `load5`,
+  `load15` (they were the untagged `Load1`, and the other two were not
+  exposed), matching the heartbeat's `load1`; and the storage snapshot
+  (`storage`, `raft_storage`) is snake_case throughout (`l0_files`,
+  `compaction_debt_bytes`, `block_cache_hits`, ...) instead of Go-cased.
+  Anything that read the old spellings must move; the console did in the
+  same change.
+
+### Added
+- The console reports the cluster, not the node that served the page
+  (#145). `/api/cluster` carries a `rollup` summed over the live nodes'
+  heartbeats — QPS, data, leases, ranges and replicas, connections (by
+  state and by user), statements and serialization failures (the page
+  differences polls for rates), the worst p99 and the node that owns it
+  — with the count of contributing nodes beside each sum, so a node that
+  is down shows as a smaller count rather than a smaller figure; the same
+  numbers come out whichever node is asked (`TestClusterRollup`). The
+  overview's tiles are the rollup, the node table is a strip of cards
+  (status, locality, cpu, load, memory, disk headroom, fds, leases, data,
+  qps, connections) linking to each node's page, and the sections that
+  described the serving node — its replicas, events, machine and storage
+  health — live only on that page now; the header says which node served
+  the page, as provenance. Health findings about the serving node's
+  storage or events link to its page.
+- `GET /api/overview` (#147): the cluster document, the health problems
+  and the tail of the event ring in one document — what the overview
+  draws, one request per poll instead of one per section — with a
+  per-section `errors` map, so a section that cannot be produced is
+  absent and named rather than failing the request; the individual
+  endpoints stay. The console runs every poll through one scheduler:
+  each view starts only the fetches it shows (the Metrics view fetches
+  no schema and no statements), a hidden tab polls nothing and fetches
+  everything once when shown, a failing fetch backs off exponentially
+  (capped at a minute), and the header says how long since the last good
+  update and when the next try is.
+- The console's favicon takes the colour of the worst open health
+  problem and the title carries the count — `(2) datax — n1` — so a
+  cluster gone critical shows in the tab strip and the window switcher
+  without switching to it; steady, never animated (#150).
+- The console is usable on a keyboard, with a screen reader and on a
+  phone (#149): a skip link, a visible focus ring on every control,
+  range rows as real controls (Tab, Enter or Space), captions and column
+  scope on every table, the problems panel as a live region, a text cue
+  beside every colour-coded figure, a fluid container instead of a fixed
+  width, and below 640 px the wide tables become one card per row and the
+  network matrix a worst-pairs list.
+- `datax_node_load5` and `datax_node_load15` on `/metrics`, beside
+  `datax_node_load1` (#146).
+- The console notices a rolling upgrade under a long-lived tab (#146):
+  the page and every `/api/cluster` document carry `console_version`, a
+  digest of the page the node embeds, and the tab offers a reload when
+  they differ; the page is served with that digest as its `ETag` and
+  `Cache-Control: no-cache`, so a reload after an upgrade fetches the
+  new page and one before it is a 304.
+
+### Fixed
+- The console no longer destroys the page every three seconds (#148):
+  a render replaces an element's markup only when it changed and never
+  while it holds the text selection, the focused element or an open
+  disclosure (the new markup lands when the interaction ends), and the
+  tables keep their rows by identity across polls, so a range key can be
+  selected and copied, an open drill-down or disclosure stays open and
+  keyboard focus survives a refresh; the range drill-down's cached-HTML
+  workaround is gone.
+- The console's SQL statements panel explains a 403 from
+  `/api/activity` the way the range drill-down does — the signed-in user
+  and the `GRANT` that fixes it — instead of hiding (#146).
+- The heartbeat's machine summary is checked to be a projection of the
+  node's sample (`TestMachineSummaryProjectsTheSample`): every summary
+  field exists in the sample under the same JSON name and is copied, so
+  the console reads one shape and a figure cannot exist in only one
+  (#146).
+
 ## 0.43.0 — unreleased
 
 Cluster version **v15**.

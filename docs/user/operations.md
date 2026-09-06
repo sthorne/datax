@@ -5,54 +5,88 @@
 Start nodes with `--http-listen` (or `demo -http-port`) and each node
 serves, on that address:
 
-- **`/`** — a self-contained web UI: node liveness, per-node leader/QPS/byte
-  load, each node's host figures (CPU, load, memory, free space on the
-  store's disk, file descriptors — colored when they deserve a look), the
-  serving node's full machine picture (disk and network throughput, Go
-  runtime, uptime), a network matrix (every node's round trip to every
-  other, with clock offsets judged against `--max-offset`), a schema
-  browser (every table with its columns, primary key, indexes,
-  time-series options, grants, statistics and their age, and range
-  footprint; the users for admins; a filter box that narrows the tables
-  and both range lists, which name the table each range belongs to), SQL
-  activity (connections by state with the oldest idle transaction,
-  statements per second by kind, `40001` rate, latency percentiles per
-  node; for admins the serving node's statements in flight and its
-  slowest recent ones), a problems panel at the top (every finding of
-  the health checks below, colored by severity, each linking to the
-  section that shows the figure; a green line when there are none), an
-  events feed (the serving node's recent splits, merges, rebalances,
-  lease sheds, repairs, snapshots, backups, upgrades, key rotations and
-  consistency failures, newest first, with a kind filter; admins also
-  see the audit stream), range tables with replica placement, storage
-  health, and a **Metrics view** (`/#/metrics`) that charts any of the
-  series the cluster records about itself over the last 15 minutes to 7
-  days, one chart per series with one line per node, from the
-  `datax_metrics` table described under [Metrics history](#metrics-history);
-  every tile on the overview links to its own series charted, and the
-  tiles' sparklines are the last 15 minutes from that table. Clicking a
-  node in the Nodes table opens its **detail page** (`/#/node/N`):
-  identity (address, locality, release and protocol version, the
-  cluster version it has mirrored, uptime), its machine tiles, its
-  last 15 minutes of CPU, QPS, statements and KV latency, storage
-  (engine figures, the debt gate, the overload verdict, encryption and
-  re-encryption progress), the replicas it holds with their raft log
-  depth, its SQL summary (and, for admins, its statements in flight and
-  slow statements), its row of the network matrix, its settings, and
-  its recent events. The cluster
-  ranges table drills down: clicking a range fetches every holding node's
-  view of it (leader, applied index, size, QPS, closed timestamp) over
-  internode RPC, so any node's dashboard can inspect any range.
+- **`/`** — a self-contained web UI that reports the **cluster**, not
+  the node that served the page (the header names that node as
+  provenance, `served by n1 · region=r1`). The overview's tiles are the
+  cluster rollup summed over every live node's heartbeat — QPS, data,
+  ranges and replicas, leases, connections (by state and top users),
+  statements and `40001` per second, the worst p99 and the node that owns
+  it — each with the count of contributing nodes beside it when a node
+  is down, so a smaller number is never mistaken for a quieter cluster.
+  Below them: a problems panel (every finding of the health checks
+  below, colored by severity, each linking to the section that shows the
+  figure; a green line when there are none), one card per node (status,
+  locality, CPU, load, memory, free space on the store's disk, file
+  descriptors — colored and marked `!`/`!!` when they deserve a look —
+  leases, data, QPS, connections, heartbeat age) opening that node's
+  page, SQL activity per node (connections by state with the oldest idle
+  transaction, statements per second by kind, `40001` rate, latency
+  percentiles; for admins the serving node's statements in flight and
+  its slowest recent ones), a network matrix (every node's round trip to
+  every other, with clock offsets judged against `--max-offset`; on a
+  narrow screen a worst-pairs list instead), a schema browser (every
+  table with its columns, primary key, indexes, time-series options,
+  grants, statistics and their age, and range footprint; the users for
+  admins; a filter box that narrows the tables and the range list, which
+  names the table each range belongs to), and the cluster's range table
+  with replica placement. A **Metrics view** (`/#/metrics`) charts any
+  of the series the cluster records about itself over the last 15
+  minutes to 7 days, one chart per series with one line per node, from
+  the `datax_metrics` table described under [Metrics
+  history](#metrics-history); every tile on the overview links to its own
+  series charted, and the tiles' sparklines are the last 15 minutes from
+  that table. Each node's **page** (`/#/node/N`, from its card or the
+  header) holds everything that describes that one node: identity
+  (address, locality, release and protocol version, the cluster version
+  it has mirrored, uptime), its machine tiles (disk and network
+  throughput, Go runtime, uptime), its last 15 minutes of CPU, QPS,
+  statements and KV latency, its storage (engine figures, the debt gate,
+  the overload verdict, encryption, re-encryption and prefix-filter
+  rewrite progress), the replicas it holds with their raft log depth, its
+  SQL summary (and, for admins, its statements in flight and slow
+  statements), its row of the network matrix, its settings, and its
+  recent events (splits, merges, rebalances, lease sheds, repairs,
+  snapshots, backups, upgrades, key rotations, consistency failures;
+  admins also see the audit stream). The cluster ranges table drills
+  down: a click, or Enter on a focused row, fetches every holding node's
+  view of the range (leader, applied index, size, QPS, closed timestamp)
+  over internode RPC, so any node's dashboard can inspect any range.
+
+  The page is usable from a keyboard (a skip link, a focus ring on every
+  control, real links and controls where a mouse was once required),
+  reads properly with a screen reader (captions and column scope on
+  every table, the problems panel as a live region), and fits a phone
+  (the wide tables become one card per row). Its favicon takes the
+  colour of the worst open health problem and its title carries the
+  count — `(2) datax — n1` — so a cluster gone critical shows in the tab
+  strip without switching to it. It polls only what the current view
+  shows, stops polling while the tab is hidden and refreshes the moment
+  it is shown, backs off when a node stops answering (the header says how
+  long since the last good update and when it retries), and notices a
+  rolling upgrade under a long-lived tab: when the node's console differs
+  from the one the tab runs, the header offers a reload. A table cell can
+  be selected and copied — the page patches what changed rather than
+  rebuilding itself every poll, and never under a selection, focus or an
+  open disclosure.
+- **`/api/overview`** — JSON: what the overview draws, in one document —
+  the `/api/cluster` document, the `/api/health` problems and the tail of
+  `/api/events` (`?limit=`, default 50) — with an `errors` map naming any
+  section that could not be produced (the cluster document's own
+  partial-data note is mirrored there), so one slow subsystem degrades a
+  section rather than failing the request.
 - **`/metrics`** — Prometheus text format.
 - **`/status`** — JSON: this node's identity, locality, and every range it
   holds (leader, applied index, size, QPS, closed timestamp — the newest
   fixed timestamp the replica can serve follower reads at).
   `datax debug status --url ...` pretty-prints it.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
-  liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges).
-  A node that cannot reach the meta range (a partition) still answers
-  within a couple of seconds, with the last range list it fetched and an
-  `error` saying how old it is.
+  liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges,
+  and the `rollup` summed over the live nodes with the count of nodes
+  each sum covers; `console_version` is the digest of the console page
+  this node serves, also the page's `ETag`). A node that cannot reach
+  the meta range (a partition) still answers within a couple of
+  seconds, with the last range list it fetched and an `error` saying how
+  old it is.
 - **`/api/range?id=N`** — JSON: the cross-node drill-down document behind
   the range detail view. Admin role required in secure mode.
 - **`/api/activity`** — JSON: this node's SQL connections, statements in
@@ -218,7 +252,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 | `datax_store_disk_bytes{kind="free"}` | < 15% of `kind="total"` | the store's disk is filling; Pebble needs headroom to compact (a full disk is a hard stall) |
-| `datax_node_cpu_percent{scope="host"}` / `datax_node_load1` vs `datax_node_cores` | sustained > 80% / load > cores | the node is CPU-bound; check `scope="process"` to see whether datax or something else is using it |
+| `datax_node_cpu_percent{scope="host"}` / `datax_node_load1` (`load5`, `load15` for the trend) vs `datax_node_cores` | sustained > 80% / load > cores | the node is CPU-bound; check `scope="process"` to see whether datax or something else is using it |
 | `process_open_fds` vs `datax_process_fd_limit` | > 80% | raise the limit (`ulimit -n`); Pebble holds one descriptor per open sstable |
 | `datax_node_memory_bytes{kind="available"}` | < 10% of `kind="total"` | the host is running out of memory; the block cache and memtables are the usual tenants |
 | `datax_clock_offset_seconds{peer}` | \|offset\| > half of `--max-offset` (0.25 s by default) | a node's clock is drifting; past the tolerance the node refuses the peer's timestamps and exits — fix NTP now (the node also logs a warning at this point) |
