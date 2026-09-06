@@ -398,6 +398,11 @@
     <h2>Metrics</h2>
     <div class="controls">
       <label><input type="checkbox" id="compare-toggle"> one chart per node</label>
+      <label><input type="checkbox" id="annotate-toggle" checked> mark events</label>
+      <select class="filter" id="annotate-kinds" title="which event kinds to mark on the charts">
+        <option value="">structural events</option>
+        <option value="*">every kind</option>
+      </select>
       <span class="muted" id="metrics-note"></span>
     </div>
     <div class="charts" id="charts"></div>
@@ -405,6 +410,27 @@
   </section>
 </main>
 <main id="view-ops" hidden>
+  <section id="sec-ops-running">
+    <h2>In flight</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">operation</th><th scope="col">what</th>
+        <th scope="col" class="num" title="how long it has been running">elapsed</th>
+        <th scope="col">started</th></tr></thead>
+      <tbody id="ops-running"></tbody>
+    </table></div>
+    <p class="muted" id="ops-running-note"></p>
+  </section>
+  <section id="sec-ops-done">
+    <h2>Recently completed</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th scope="col">operation</th><th scope="col">what</th>
+        <th scope="col">outcome</th>
+        <th scope="col" class="num" title="how long it took">took</th>
+        <th scope="col">finished</th></tr></thead>
+      <tbody id="ops-done"></tbody>
+    </table></div>
+    <p class="muted" id="ops-done-note"></p>
+  </section>
   <section id="sec-events">
     <h2>Operations <select class="filter" id="events-filter" title="show one kind of event"><option value="">all kinds</option></select></h2>
     <p class="scoped" id="ops-scope"></p>
@@ -511,6 +537,11 @@
   </section>
 </main>
 </div>
+<style>
+.chart .annotations line.ann { stroke-width: 1; stroke-dasharray: 3 3; opacity: .38; }
+.chart .annhit:hover + line.ann, .chart .annotations:hover line.ann { opacity: .6; }
+.chart .annnote { margin: 4px 0 0; font-size: 12px; }
+</style>
 <script>__CONSOLE_SCRIPTS__</script>
 </body>
 </html>

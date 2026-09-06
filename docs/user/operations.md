@@ -65,7 +65,16 @@ serves, on that address:
   statements in flight and its slowest recent ones (admin). **schema**:
   every table with its columns, primary key, indexes, time-series
   options, grants, statistics and their age, and range footprint.
-  **ops**: the scoped node's event ring with a kind filter. **security**:
+  **ops**: the operations in flight and the ones that have finished,
+  above the scoped node's event ring with a kind filter. A long-running
+  operation — a backup, a restore, a re-encryption, a node's drain —
+  records both of its ends in the ring, so the view pairs them and shows
+  the elapsed time of the ones still running and the duration and
+  outcome of the ones that finished. Elapsed time is a figure, not a
+  progress bar: nothing here knows how much work is left. The ring is
+  bounded, so an operation whose start has already aged out of it is
+  listed by its end alone and claims no duration rather than inventing
+  one. **security**:
   how the cluster authenticates, who is signed in and by what, the users
   and their roles, and the audit records separated from the operational
   ones. **metrics** charts any of the series the cluster records about
@@ -73,7 +82,14 @@ serves, on that address:
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from
-  that table.
+  that table. The charts can mark the events that explain a change in
+  shape: a dashed line at each event in the window, the structural kinds
+  (splits, merges, rebalances, lease transfers, repairs, restarts,
+  upgrades) by default and any other kind on request. The marks come
+  from the serving node's event ring, which is bounded and per node, and
+  the chart says so: when the ring does not reach back to the start of
+  the window, a note gives the oldest event it holds, so an unmarked
+  stretch reads as unknown rather than as quiet.
 
   Each node's **page** (`#/node/N`, from its card, the nodes view or
   jump-to) holds everything that describes that one node: identity

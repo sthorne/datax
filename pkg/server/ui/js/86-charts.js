@@ -51,6 +51,10 @@ async function fetchMetrics() {
       return;
     }
     mv.data = await resp.json();
+    // The marks come from the same window the charts draw, fetched
+    // alongside rather than after, so a chart never renders once bare
+    // and then again annotated (issue #155).
+    await fetchAnnotations(mv.data.from_ms || (Date.now() - RANGE_SECONDS[ui.range] * 1000));
     renderCharts();
   } catch (err) {
     box.innerHTML = `<div class="err" style="display:block">metrics unavailable: ${esc(err.message || err)}</div>`;
@@ -72,6 +76,67 @@ function fmtTime(ms, long) {
   const d = new Date(ms), hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0");
   return long ? `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}` : `${hh}:${mm}`;
 }
+// ---- Chart annotations (issue #155) ----
+// "Why did p99 jump at 14:20" was a two-window investigation: read the
+// chart here, scroll the event log there, match timestamps by eye. Both
+// data sets are on the same page and the same clock; these are the marks
+// that put them on the same axis.
+//
+// Structural kinds by default. An annotation layer that draws 300 marks
+// is noise, so the ones that explain a step change lead and the rest are
+// opt-in.
+const STRUCTURAL_KINDS = new Set(["split", "auto-split", "load-split", "merge", "rebalance",
+  "byte-rebalance", "dead-node-repair", "decommission", "shutdown", "upgrade", "placement"]);
+// annotations: {events, oldestMs, node} for the window last fetched.
+let ann = { events: [], oldestMs: 0, node: 0 };
+
+// annotationKindsSelected: the structural default, every kind (null, so
+// a kind the console has never heard of is still marked rather than
+// silently dropped), or none when the layer is switched off.
+function annotationKindsSelected() {
+  const on = document.getElementById("annotate-toggle");
+  if (on && !on.checked) return new Set();
+  return document.getElementById("annotate-kinds")?.value === "*" ? null : STRUCTURAL_KINDS;
+}
+
+// fetchAnnotations pulls the event window behind the charts.
+//
+// An event ring is per node, and this asks the SERVING node's — the one
+// with the window form and with how far back it reaches. The charts
+// themselves are cluster-wide, so the marks are one node's account of
+// what the cluster did, and the note under each chart says whose rather
+// than leaving it to be assumed.
+async function fetchAnnotations(fromMs) {
+  try {
+    const resp = await fetch(`/api/events?from=${Math.floor(fromMs)}&limit=500`, { cache: "no-store" });
+    if (!resp.ok) { ann.events = []; return; }
+    const d = await resp.json();
+    ann.events = (d.events || []).filter(e => !e.audit);
+    ann.oldestMs = d.oldest_unix_ms || 0;
+    ann.node = d.node_id || 0;
+  } catch (err) { ann.events = []; }
+}
+
+// annotationLayer draws the marks for one chart's window, plus the
+// hover targets. Returns SVG.
+function annotationMarks(from, to, x, T, PH, colour) {
+  const kinds = annotationKindsSelected();
+  const marks = ann.events.filter(e => {
+    const t = Date.parse(e.at);
+    return (kinds === null || kinds.has(e.kind)) && t >= from && t <= to;
+  });
+  if (!marks.length) return { svg: "", count: 0 };
+  let svg = `<g class="annotations">`;
+  for (const e of marks) {
+    const t = Date.parse(e.at);
+    const xx = x(t).toFixed(1);
+    const title = `${e.kind} · ${fmtTime(t, true)}\n${e.summary}`;
+    svg += `<line class="ann" x1="${xx}" x2="${xx}" y1="${T}" y2="${T + PH}" stroke="${colour}"/>`;
+    svg += `<rect class="annhit" x="${(Number(xx) - 4).toFixed(1)}" y="${T}" width="8" height="${PH}" fill="transparent"><title>${esc(title)}</title></rect>`;
+  }
+  return { svg: svg + `</g>`, count: marks.length };
+}
+
 function renderCharts() {
   const box = document.getElementById("charts");
   box.classList.toggle("compare", mv.compare);
@@ -122,6 +187,10 @@ function chart(s, nodes, suffix, win) {
     svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fmtTime(t, long))}</text>`;
   }
   svg += `</g>`;
+  // Annotations go in before the data: a mark explains a line, so it
+  // must never be drawn over one.
+  const marks = annotationMarks(from, to, x, T, PH, ann.node ? nodeColor(String(ann.node)) : "var(--text-3)");
+  svg += marks.svg;
   for (const id of ids) {
     let dpath = "", prev = null;
     for (const p of nodes[id]) {
@@ -140,7 +209,17 @@ function chart(s, nodes, suffix, win) {
   const byT = {}; for (const id of ids) { byT[id] = new Map(nodes[id].map(p => [p[0], p[1]])); }
   for (const t of times) table += `<tr><td>${esc(fmtTime(t, true))}</td>` + ids.map(id => `<td class="num">${esc(byT[id].has(t) ? fmtUnit(byT[id].get(t), unit) : "—")}</td>`).join("") + `</tr>`;
   table += `</tbody></table></div></details>`;
-  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + table;
+  let annNote = "";
+  if (marks.count) {
+    annNote = `<div class="muted annnote">${marks.count} event${marks.count === 1 ? "" : "s"} marked` +
+      (ann.node ? ` from n${ann.node}'s ring` : "") +
+      (ann.oldestMs && ann.oldestMs > from
+        ? ` — the ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}, so anything earlier in this window is unmarked rather than absent`
+        : "") + `</div>`;
+  } else if (ann.oldestMs && ann.oldestMs > from) {
+    annNote = `<div class="muted annnote">the event ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}; earlier in this window is unmarked rather than quiet</div>`;
+  }
+  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + annNote + table;
   // Crosshair: snap to the nearest bucket; the readout lists every node.
   const svgEl = el.querySelector("svg"), hit = el.querySelector(".hit"), xh = el.querySelector(".xhair"), tip = el.querySelector(".tip");
   const dots = {}; el.querySelectorAll(".dot").forEach(c => dots[c.dataset.node] = c);

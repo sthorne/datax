@@ -24,6 +24,59 @@ function ingestEvents(nodeID, events, latest) {
   if (eventsAll.length > EVENTS_MAX) eventsAll = eventsAll.slice(eventsAll.length - EVENTS_MAX);
 }
 
+// Operations (issue #153): the long-running things the cluster is doing
+// to itself, paired from the ring's start/end records by the server. The
+// flat log below stays as the audit trail it is; this is the reading of
+// it that says what is RUNNING, which a list of instants cannot.
+let opsAll = [];
+function ingestOperations(ops) { opsAll = ops || []; }
+
+// fmtElapsed renders a duration in ms at a useful resolution: seconds
+// while an operation is young, minutes and hours once it is not.
+function fmtElapsed(ms) {
+  if (!ms || ms < 0) return "—";
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return sec + "s";
+  return fmtDuration(sec);
+}
+
+function opRow(o, running) {
+  const key = o.kind + "/" + o.op;
+  // Progress that cannot be known is elapsed time, never a bar with a
+  // number nobody measured.
+  const when = running
+    ? `<td class="when" title="${esc(new Date(o.started_unix_ms).toISOString())}">${fmtAgo(Date.now() - o.started_unix_ms)}</td>`
+    : `<td class="when" title="${esc(new Date(o.ended_unix_ms).toISOString())}">${fmtAgo(Date.now() - o.ended_unix_ms)}</td>`;
+  const outcome = running ? "" :
+    `<td>${o.outcome === "ok"
+      ? `<span class="st live"><span class="dot"></span>ok</span>`
+      : `<span class="st draining"><span class="dot"></span>${esc(o.outcome || "ended")}</span>`}</td>`;
+  const took = running
+    ? `<td class="num">${fmtElapsed(o.elapsed_ms)}</td>`
+    : `<td class="num">${o.started_unix_ms ? fmtElapsed(o.elapsed_ms) : `<span class="muted" title="this operation's start is older than the event ring, so how long it took is not known">—</span>`}</td>`;
+  return { key, html: `<tr data-key="${esc(key)}">
+    <td><span class="kind">${esc(o.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal">${esc(o.summary)}</td>
+    ${running ? took + when : outcome + took + when}
+  </tr>` };
+}
+
+function renderOperations() {
+  const who = "n" + (eventsNode || "?");
+  const running = opsAll.filter(o => o.running);
+  const done = opsAll.filter(o => !o.running);
+  renderKeyed(document.getElementById("ops-running"), running.length
+    ? running.map(o => opRow(o, true))
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">nothing long-running on ${esc(who)} right now</td></tr>` }]);
+  setHTML(document.getElementById("ops-running-note"),
+    `backups, restores, re-encryption sweeps and decommission drains record both of their ends, so one still going shows here with how long it has been going, as reported by ${esc(who)}. Progress that cannot be measured is shown as elapsed time rather than as a bar with a number nobody measured.`);
+  renderKeyed(document.getElementById("ops-done"), done.length
+    ? done.map(o => opRow(o, false))
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="5" class="muted">none finished within ${esc(who)}'s event ring</td></tr>` }]);
+  setHTML(document.getElementById("ops-done-note"),
+    "derived from the event ring below, which stays the audit trail it is: an operation whose start has already aged out of the ring is still listed, with no duration claimed for it.");
+}
+
 function eventRow(e) {
   return { key: String(e.seq || (e.at + e.summary)), html: `<tr data-key="${esc(String(e.seq || (e.at + e.summary)))}">
     <td class="when" title="${esc(e.at)}">${fmtAgo(Date.now() - Date.parse(e.at))}</td>
@@ -35,6 +88,7 @@ function eventRow(e) {
 // renderOps draws the operations view: what the cluster is doing to
 // itself, newest first, with the audit stream left to the security view.
 function renderOps() {
+  renderOperations();
   const sel = document.getElementById("events-filter");
   const want = sel.value;
   const kinds = [...eventsKinds].filter(k => !AUDIT_KINDS.has(k)).sort();
@@ -104,12 +158,13 @@ async function pollScopedEvents() {
   const resp = await fetch("/api/node?id=" + id, { cache: "no-store" });
   const d = await resp.json().catch(() => ({}));
   if (resp.status === 403) {
-    eventsNode = id; eventsAll = []; eventsKinds = new Set();
+    eventsNode = id; eventsAll = []; eventsKinds = new Set(); opsAll = [];
     setHTML(document.getElementById("events"), `<tr><td colspan="3" class="note">${drillDownRefusal()}</td></tr>`);
     return;
   }
   if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
   ingestEvents(id, d.events, 0);
+  ingestOperations(d.operations);
   if (ui.view === "ops") renderOps();
   if (ui.view === "security" && lastCluster) renderSecurity(lastCluster);
 }

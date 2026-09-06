@@ -68,7 +68,10 @@ async function pollOverview() {
   // The serving node's event ring rides with the cluster document; the
   // ops, security and overview views all read it (a scoped node other
   // than this one is fetched separately, see pollScopedEvents).
-  if (d.events && scopeIsServing()) ingestEvents(d.events.node_id, d.events.events, d.events.latest_seq);
+  if (d.events && scopeIsServing()) {
+    ingestEvents(d.events.node_id, d.events.events, d.events.latest_seq);
+    ingestOperations(d.events.operations);
+  }
   if (ui.view === "ops") renderOps();
   if (ui.view === "overview") renderRecentOps();
   if (ui.view === "security") renderSecurity(d.cluster);
@@ -110,6 +113,8 @@ document.getElementById("node-filter").addEventListener("input", ev => {
   if (lastCluster) renderNodesTable(lastCluster);
 });
 document.getElementById("events-filter").addEventListener("change", renderOps);
+document.getElementById("annotate-toggle").addEventListener("change", renderCharts);
+document.getElementById("annotate-kinds").addEventListener("change", renderCharts);
 
 a11yTables();
 wireControls();
