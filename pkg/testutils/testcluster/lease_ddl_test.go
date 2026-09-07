@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -10,9 +11,39 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/rowenc"
 )
+
+// unindexedRows names the primary keys that have no entry in idx, so a
+// count mismatch reports which rows were missed rather than only how
+// many.
+func unindexedRows(t *testing.T, desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, rows, entries []kvpb.KeyValue) []string {
+	t.Helper()
+	indexed := map[string]bool{}
+	for _, e := range entries {
+		pk, err := rowenc.IndexEntryPrimaryKey(desc, idx, e.Key, e.Value)
+		if err != nil {
+			t.Fatalf("decoding index entry %s: %v", e.Key, err)
+		}
+		indexed[string(pk)] = true
+	}
+	var missing []string
+	for _, kv := range rows {
+		if indexed[string(kv.Key)] {
+			continue
+		}
+		pkVals, err := rowenc.DecodePK(desc, kv.Key)
+		if err != nil || len(pkVals) == 0 {
+			missing = append(missing, kv.Key.String())
+			continue
+		}
+		missing = append(missing, pkVals[0].Text())
+	}
+	return missing
+}
 
 // leasedSession builds a session backed by its own leased accessor — its own
 // gateway identity — on the given node. Two of these are two gateways as far
@@ -156,8 +187,13 @@ func TestOnlineCreateIndexUnderConcurrentWrites(t *testing.T) {
 	// resolving its intents asynchronously (parallel commits finalize after
 	// control returns), and only the transactional read path pushes them.
 	lo, hi := keys.TableIndexSpan(desc.ID, idx.ID)
+	plo, phi := rowenc.PrimarySpanFor(desc)
 	reader := tc.Nodes[0].DB().NewTxn("index-count")
 	entries, err := reader.Scan(ctx, lo, hi, 0)
+	var rowKVs []kvpb.KeyValue
+	if err == nil {
+		rowKVs, err = reader.Scan(ctx, plo, phi, 0)
+	}
 	_ = reader.Rollback(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +202,13 @@ func TestOnlineCreateIndexUnderConcurrentWrites(t *testing.T) {
 		t.Fatalf("full scan sees %d rows, expected %d", len(rows.Rows), total)
 	}
 	if len(entries) != total {
-		t.Fatalf("index has %d entries for %d rows — writes were missed during the online build", len(entries), total)
+		// Name the rows that have no entry. Which they are is the whole
+		// diagnosis: an id below 1000 was present before the build began
+		// and the backfill missed it; one at or above 1000 was written by
+		// the concurrent gateway, and that gateway failed to maintain the
+		// index for it.
+		t.Fatalf("index has %d entries for %d rows — no index entry for id %v; writes were missed during the online build",
+			len(entries), total, unindexedRows(t, desc, &idx, rowKVs, entries))
 	}
 
 	// Both gateways plan with the now-public index, and index reads agree
@@ -291,4 +333,84 @@ func TestLeaseClaimsTheVersionItRead(t *testing.T) {
 	if _, serr := trySQL(ctx, sB, `SELECT note FROM items WHERE id = 1`); serr != nil {
 		t.Fatalf("B serves a superseded version after taking a fresh lease: [%s] %s", serr.Code, serr.Msg)
 	}
+}
+
+// TestDrainWaitsOutADescriptorHandedToAStatement (issue #185): a gateway
+// adopting a new descriptor version does not mean it has stopped using
+// the old one.
+//
+// A statement is pinned to the descriptor it planned against, and when
+// that came from the lease cache it was never read inside the statement's
+// own transaction — so nothing but its commit deadline, the cache entry's
+// expiration, stops it committing later. The renewal loop meanwhile
+// publishes the new version within a third of a TTL, which used to end
+// the drain. CREATE INDEX would then take its backfill boundary while a
+// statement planned under the pre-index descriptor could still commit
+// above it: a row in the table and no entry in the new index.
+//
+// The drain must therefore outlast the entry that was handed out, not
+// merely the version that was published.
+func TestDrainWaitsOutADescriptorHandedToAStatement(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const ttl = 2 * time.Second
+	sA := leasedSession(t, tc, 0, ttl)
+	sB := leasedSession(t, tc, 0, ttl)
+
+	execSQL(t, ctx, sA, `CREATE TABLE kv (id INT PRIMARY KEY, v INT)`)
+	execSQL(t, ctx, sA, `INSERT INTO kv VALUES (1, 1), (2, 2)`)
+	// Both gateways read the table twice: the first statement fills each
+	// cache, the second is served from it — which is the case with no
+	// protection but the deadline, and so the case the drain must wait
+	// for.
+	for i := 0; i < 2; i++ {
+		execSQL(t, ctx, sA, `SELECT id FROM kv WHERE id = 1`)
+		execSQL(t, ctx, sB, `SELECT id FROM kv WHERE id = 1`)
+	}
+
+	// The latest moment a statement holding the current descriptor could
+	// still commit: no drain may finish before it.
+	desc := lookupDescriptor(t, ctx, tc.Nodes[0].DB(), "kv")
+	mustOutlast := maxLeaseExpiration(t, ctx, tc, desc.ID)
+	if mustOutlast == 0 {
+		t.Fatal("no lease records for the table; the gateways are not leasing")
+	}
+
+	execSQL(t, ctx, sA, `CREATE INDEX by_v ON kv (v)`)
+
+	if now := tc.Nodes[0].Clock().Now().WallTime; now < mustOutlast {
+		t.Fatalf("CREATE INDEX drained %s before the descriptor it superseded stopped being usable: "+
+			"a statement holding that descriptor can still commit, and its row would reach no index",
+			time.Duration(mustOutlast-now))
+	}
+}
+
+// maxLeaseExpiration is the latest expiration among the live lease records
+// on descID — the last moment any gateway's current descriptor could still
+// back a committing statement.
+func maxLeaseExpiration(t *testing.T, ctx context.Context, tc *TestCluster, descID uint64) int64 {
+	t.Helper()
+	lo, hi := keys.DescLeaseSpan(descID)
+	rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var max int64
+	for _, kv := range rows {
+		// The record's own shape, read as data: this test is about the
+		// contract the drain honours, not the struct that carries it.
+		var l struct {
+			Version    uint64 `json:"version"`
+			Expiration int64  `json:"expiration"`
+		}
+		if json.Unmarshal(kv.Value, &l) != nil {
+			continue
+		}
+		if l.Expiration > max {
+			max = l.Expiration
+		}
+	}
+	return max
 }

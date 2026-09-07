@@ -8,6 +8,94 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.54.1 — unreleased
+
+### Fixed
+- **`CREATE INDEX` could finish with a row in the table and no entry in
+  the index** (#185). A silent correctness bug: a query planned onto the
+  new index would miss a row that exists.
+
+  An online index build publishes the index write-only, waits until every
+  gateway's descriptor lease has adopted it, and only then takes the
+  boundary timestamp its backfill scans at — everything committed after
+  the boundary is supposed to be the work of writers that maintain the
+  index themselves.
+
+  The drain was asking the wrong question. It waited for every gateway to
+  have *adopted* the new version, which is not the same as no gateway
+  still *using* the old one. A statement is pinned to the descriptor it
+  planned against, and one served from a gateway's lease cache never read
+  that descriptor inside its own transaction — so nothing but its commit
+  deadline, the cache entry's expiration, stops it committing later. The
+  renewal loop publishes the new version within a third of a TTL, which
+  ended the drain while a statement holding the pre-index descriptor
+  still had two thirds of a TTL to run. Its insert committed above the
+  backfill boundary, maintaining no index, and the backfill had already
+  passed.
+
+  A gateway now publishes, alongside the version it has adopted, the
+  expiration of the entry it handed out for the version before it, and
+  the drain waits for that too. Since a statement's commit deadline is
+  exactly that expiration, once it passes nothing anywhere can still
+  commit against the old schema. Measured on the reported test: 6
+  failures in 250 runs before, 0 in 250 after, and the rows that went
+  missing were always ones the concurrent gateway wrote — never ones the
+  backfill scanned.
+
+  The cost is that a schema change waits out the superseded entry, up to
+  one TTL, whenever a gateway served that descriptor from cache within
+  the last renewal interval. Draining is what makes an online schema
+  change safe; this was the part of it that was missing.
+
+  `TestDrainWaitsOutADescriptorHandedToAStatement` pins the rule and
+  fails on the old code every run rather than one in forty, which is what
+  the race was worth as a test before. The count mismatch in
+  `TestOnlineCreateIndexUnderConcurrentWrites` now also names the rows
+  that have no entry — whether they are rows the backfill scanned or rows
+  a concurrent gateway wrote is the whole diagnosis, and it was the first
+  thing this needed and did not have.
+
+  The longer drain also exposed a test that was relying on timing:
+  `TestDatabases` read `/api/schema` immediately after creating a table
+  and expected to see it. That document is rebuilt at most once every
+  five seconds by design, so the browser was never a live view of the
+  catalog; the test now polls for the table instead of assuming it. No
+  product behaviour changed there.
+
+- **Load splits were biased toward whatever was sampled last** (#186).
+  A range that is hot but not large splits at a sampled key chosen to
+  divide its traffic evenly. The chooser ranked candidates by the raw
+  difference between the traffic seen either side of each — but a sample
+  counts only what arrives after it enters the reservoir, and reservoir
+  sampling replaces slots throughout the window, so two candidates can
+  have observed amounts that differ by three orders of magnitude.
+
+  A slot filled near the end of the window might hold `left=3, right=2`:
+  an imbalance of one, unbeatable by any well-observed key, on five
+  observations of a key carrying a fifth of the traffic. The guard
+  against a fully one-sided sample did not catch it — a handful of
+  requests either side is enough to pass it.
+
+  Candidates are now ranked by the *share* of traffic either side rather
+  than the difference, which is what makes samples with different
+  observation counts comparable at all, and a sample must have seen a
+  hundred requests before its balance is believed. A hundred holds the
+  standard error of the observed share at or below five points, enough to
+  tell a key near the traffic median from one at 80/20. Below it the
+  caller falls back to the byte midpoint, which is honest about knowing
+  nothing rather than acting on a share measured from almost nothing.
+
+  A range only reaches the chooser after a full window sustained above
+  the load threshold — thousands of requests at the default — so nothing
+  is excluded in ordinary operation.
+
+  `TestChooseSplitKeyBalances` now scores the chosen key against the
+  distribution that was actually sent instead of asserting a prefix
+  letter. That is the property the code is for, and it turned out the old
+  assertion was not only flaky but too weak: on the old chooser the
+  strengthened test also fails on splits that put 70% or 30% of the
+  traffic on one side, which the letter check accepted.
+
 ## 0.54.0 — unreleased
 
 ### Added

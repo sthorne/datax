@@ -1,6 +1,7 @@
 package kvserver
 
 import (
+	"math"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -156,29 +157,62 @@ func (l *replicaLoad) qps() (float64, bool) {
 	return rate, l.rotations >= 1
 }
 
-// chooseSplitKey returns the sampled key that best balances observed
-// traffic (minimizing |left − right|), clamped strictly inside
-// (desc.StartKey, desc.EndKey). Nil when no sample splits the traffic —
-// e.g. every request hits one key — and the caller falls back to the byte
-// midpoint.
+// minSplitObservations is how much traffic a sample must have seen, both
+// sides summed, before its balance is worth believing.
+//
+// A sample counts only the traffic that arrives after it enters the
+// reservoir, and reservoir sampling replaces slots throughout the
+// window, so two samples can have seen amounts that differ by three
+// orders of magnitude. A slot filled near the end of the window may hold
+// left=3, right=2 — five observations of a key carrying a fifth of the
+// traffic, and the best-looking candidate by any measure that does not
+// divide the count out.
+//
+// A hundred observations holds the standard error of the observed share
+// at or below five points, which separates a key near the traffic median
+// from one at 80/20 with room to spare. Under that a sample is not wrong,
+// only uninformative, and the byte midpoint the caller falls back to is
+// more honest than a share measured from nothing.
+//
+// A range only reaches the chooser once it is sustained above the load
+// threshold for a full window — thousands of requests at the default —
+// so this excludes nothing in ordinary operation. Under a threshold set
+// low enough that a window carries fewer than a hundred requests, the
+// first passes do fall back to the midpoint; the reservoir is not
+// cleared between windows, so samples keep accumulating and load-based
+// choice resumes once there is enough traffic to have measured.
+const minSplitObservations = 100
+
+// chooseSplitKey returns the sampled key whose observed traffic split is
+// closest to even, clamped strictly inside (desc.StartKey, desc.EndKey).
+// Nil when no sample is both well enough observed and genuinely
+// two-sided — every request on one key, or a window too young for any
+// sample to have seen minSplitObservations — and the caller falls back to
+// the byte midpoint.
 func (l *replicaLoad) chooseSplitKey(desc kvpb.RangeDescriptor) keys.Key {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var best keys.Key
-	var bestImbalance int64 = -1
+	bestImbalance := math.Inf(1)
 	for i := range l.samples {
 		s := &l.samples[i]
 		if s.left == 0 || s.right == 0 {
 			continue // splitting here would leave one cold half
 		}
+		total := s.left + s.right
+		if total < minSplitObservations {
+			continue // too little traffic seen for its balance to mean anything
+		}
 		if s.key.Compare(desc.StartKey) <= 0 || s.key.Compare(desc.EndKey) >= 0 {
 			continue
 		}
-		imbalance := s.left - s.right
-		if imbalance < 0 {
-			imbalance = -imbalance
-		}
-		if bestImbalance < 0 || imbalance < bestImbalance {
+		// The share of traffic either side, not the raw difference:
+		// samples that have observed different amounts of traffic are
+		// only comparable once the count is divided out. Ranking by the
+		// difference made the least-observed candidate win, which is
+		// uncorrelated with where the traffic median actually is.
+		imbalance := math.Abs(float64(s.left-s.right)) / float64(total)
+		if imbalance < bestImbalance {
 			bestImbalance = imbalance
 			best = s.key
 		}

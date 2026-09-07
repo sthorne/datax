@@ -726,6 +726,12 @@ type cachedDesc struct {
 	// (zero = forever, an unleased accessor). Transactions that plan
 	// against the entry take it as their commit deadline.
 	expiration int64
+	// priorExpiration rides with the entry so a later acquisition can
+	// keep publishing a drain that has not finished yet; handedOut says
+	// a statement took this entry and so may still be committing under
+	// it. See Accessor.priorToDrain (issue #185).
+	priorExpiration int64
+	handedOut       bool
 }
 
 func NewAccessor() *Accessor {
@@ -764,9 +770,17 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
 	if c, ok := a.cache[key]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
+		// This statement plans against a descriptor it did not read in
+		// its own transaction, so its only bound is the deadline below.
+		// Mark the entry: until it expires, a drain that sees this
+		// gateway adopt a newer version must still wait for this
+		// statement (issue #185).
+		c.handedOut = true
+		desc := c.desc
+		exp := c.expiration
 		a.mu.Unlock()
-		pinDeadline(txn, c.expiration)
-		return c.desc, nil
+		pinDeadline(txn, exp)
+		return desc, nil
 	}
 	a.mu.Unlock()
 	d, err := lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
@@ -781,13 +795,16 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 		// own transaction read — if that is older than the leased one,
 		// its read of the descriptor conflicts with the schema change
 		// at commit, as any stale read does.
-		ld, exp, err := a.acquireLease(ctx, dbID, name, key)
+		ld, info, err := a.acquireLease(ctx, dbID, name, key)
 		if err != nil || ld == nil {
 			// Without a lease the cache may not be trusted beyond this
-			// statement; return the descriptor uncached.
+			// statement; return the descriptor uncached. d was read
+			// inside txn, so a schema change committing after that read
+			// fails the transaction's refresh — the deadline is what the
+			// CACHED path needs, and this path did not take one.
 			return d, nil
 		}
-		entry = &cachedDesc{desc: ld, expiration: exp}
+		entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration}
 	}
 	a.mu.Lock()
 	a.cache[key] = entry
