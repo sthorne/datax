@@ -163,8 +163,14 @@ function certRow(c) {
 function renderSecurityDoc() {
   const d = secDoc;
   // The refusal counts arrive with this document, so redraw the tile row
-  // that shows them rather than waiting for the next cluster poll.
-  if (document.getElementById("sec-auth")) renderAuthTiles(lastCluster);
+  // that shows them rather than waiting for the next cluster poll — but
+  // only once the cluster document exists. Without that guard this
+  // renderer, which can run first (both polls are registered for this
+  // view, and the error path calls it directly), would draw the
+  // principal tiles from nothing and claim "insecure — no
+  // authentication" on a secure cluster: the same defect this row was
+  // just fixed for, with the documents the other way round.
+  if (lastCluster) renderAuthTiles(lastCluster, secDoc);
   // Soonest expiry first across both lists: the server sorts each, but
   // the one to act on is the nearest whichever list it came from.
   const certs = d ? (d.certificates || []).concat(d.client_certs || [])
@@ -244,7 +250,7 @@ function renderSecurityDoc() {
 function authThrottleText(d) {
   // Only /api/security carries these, so say so rather than reporting a
   // confident "none" from a document that never had them.
-  if (!d) return "—" + qual(" waiting for /api/security");
+  if (!d) return "—" + qual(" waiting for this node's security document");
   const rl = Math.round(d.auth_throttled_rate_limit || 0);
   const vf = Math.round(d.auth_throttled_verify_full || 0);
   if (!rl && !vf) return "none" + qual(" since this node started");
@@ -261,7 +267,7 @@ function authThrottleText(d) {
 // the counts off the cluster document rendered "none" under every
 // condition, including while the node was refusing hundreds a second
 // (issue #203 review).
-function renderAuthTiles(cluster) {
+function renderAuthTiles(cluster, sec) {
   const p = (cluster && cluster.principal) || {};
   renderTiles(document.getElementById("sec-auth"),
     tile("mode", p.secure ? "secure" : "insecure — no authentication") +
@@ -273,12 +279,12 @@ function renderAuthTiles(cluster) {
     // A tile rather than a third clause on the connections sentence:
     // it is an authentication figure, not a connections one, and a tile
     // label is a term the glossary can explain.
-    tileHTML("refused before verification", authThrottleText(secDoc)));
+    tileHTML("refused before verification", authThrottleText(sec)));
 }
 
 function renderSecurity(d) {
   const p = d.principal || {};
-  renderAuthTiles(d);
+  renderAuthTiles(d, secDoc);
   document.getElementById("sec-auth-note").textContent = p.secure
     ? "every HTTP route takes a session cookie, HTTP Basic credentials, or a client certificate; all three need a role that exists and holds LOGIN"
     : "this cluster authenticates nobody: start the nodes with a certificate directory to change that";
