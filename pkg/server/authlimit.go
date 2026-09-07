@@ -203,6 +203,9 @@ func sourceKey(remoteAddr string) string {
 // verify-full refusal says this node is already doing as much password
 // hashing at once as it permits — the first is someone else's problem
 // to stop, the second is this node's ceiling (issue #203).
+// These are the label values metrics.AuthThrottleCauses pre-creates at
+// registration; a new cause has to be added there too, or its series
+// appears only once it first fires.
 const (
 	throttleRateLimit  = "rate-limit"
 	throttleVerifyFull = "verify-full"

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"html"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -743,3 +744,117 @@ func TestTableDetailTermsAreInTheGlossary(t *testing.T) {
 		}
 	}
 }
+
+// TestSecurityFiguresReadTheDocumentThatCarriesThem (issue #203 review):
+// the Security view is fed by two documents — the cluster poll, which
+// carries who you are signed in as, and /api/security, which carries
+// this node's own counters — and a figure read from the wrong one is
+// silently zero rather than visibly broken.
+//
+// That is not hypothetical: the "refused before verification" tile was
+// merged reading auth_throttled_rate_limit off the cluster document,
+// which has no such field, so it rendered "none" while the node refused
+// hundreds a second. Nothing caught it because every test asserted on
+// the API documents and none on the page.
+//
+// The invariant: a helper that reads a field only SecurityStatus has
+// must be handed secDoc, never a caller's parameter. Checking the
+// argument rather than the reading function's own body is the point —
+// the bad read was one call away from the renderer that made it.
+func TestSecurityFiguresReadTheDocumentThatCarriesThem(t *testing.T) {
+	securityOnly, err := securityOnlyFields()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(securityOnly) < 3 {
+		t.Fatalf("found %d fields unique to SecurityStatus; the extractor is broken, not the console", len(securityOnly))
+	}
+	src, err := FS.ReadFile("js/92-ops.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+
+	// Helpers that read a security-only field off their own parameter.
+	readers := map[string]string{} // function name -> the field it reads
+	for _, m := range jsFuncDecl.FindAllStringSubmatch(body, -1) {
+		name, param := m[1], m[2]
+		if param == "" {
+			continue // takes no document; reads a global, which is fine
+		}
+		fn := funcBody(body, m[0])
+		for field := range securityOnly {
+			if strings.Contains(fn, param+"."+field) {
+				readers[name] = field
+			}
+		}
+	}
+	if len(readers) == 0 {
+		t.Skip("no helper reads a security-only field off a parameter; nothing to check")
+	}
+	for name, field := range readers {
+		// Search the body with declarations removed, so "function f(d)"
+		// is not mistaken for a call to f.
+		calls := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\(([A-Za-z_$][A-Za-z0-9_$.]*)\)`)
+		found := false
+		for _, c := range calls.FindAllStringSubmatch(jsFuncDecl.ReplaceAllString(body, "function _("), -1) {
+			found = true
+			if arg := c[1]; arg != "secDoc" {
+				t.Errorf("%s reads %s, which only /api/security carries, but is called as %s(%s). "+
+					"The cluster document has no such field, so the figure renders as zero under every condition. "+
+					"Pass secDoc.", name, field, name, arg)
+			}
+		}
+		if !found {
+			t.Errorf("%s reads the security document but is never called", name)
+		}
+	}
+}
+
+// securityOnlyFields are the JSON field names SecurityStatus has and
+// ClusterStatus does not — the ones that are zero if read off the wrong
+// document.
+func securityOnlyFields() (map[string]bool, error) {
+	sec, err := structJSONFields("../security_api.go", "SecurityStatus")
+	if err != nil {
+		return nil, err
+	}
+	cluster, err := structJSONFields("../cluster_api.go", "ClusterStatus")
+	if err != nil {
+		return nil, err
+	}
+	only := map[string]bool{}
+	for f := range sec {
+		if !cluster[f] {
+			only[f] = true
+		}
+	}
+	return only, nil
+}
+
+func structJSONFields(path, name string) (map[string]bool, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	text := string(src)
+	start := strings.Index(text, "type "+name+" struct {")
+	if start < 0 {
+		return nil, errors.New(path + ": no type " + name)
+	}
+	end := strings.Index(text[start:], "\n}")
+	if end < 0 {
+		return nil, errors.New(path + ": type " + name + " is not closed")
+	}
+	fields := map[string]bool{}
+	for _, m := range jsonTag.FindAllStringSubmatch(text[start:start+end], -1) {
+		fields[m[1]] = true
+	}
+	return fields, nil
+}
+
+var (
+	// A top-level function declaration and its first parameter, if any.
+	jsFuncDecl = regexp.MustCompile(`(?m)^function ([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$]*)?`)
+	jsonTag    = regexp.MustCompile("`json:\"([a-z0-9_]+)")
+)

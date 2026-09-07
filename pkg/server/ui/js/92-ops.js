@@ -162,6 +162,9 @@ function certRow(c) {
 // renderSecurityDoc draws the parts that come from /api/security.
 function renderSecurityDoc() {
   const d = secDoc;
+  // The refusal counts arrive with this document, so redraw the tile row
+  // that shows them rather than waiting for the next cluster poll.
+  if (document.getElementById("sec-auth")) renderAuthTiles(lastCluster);
   // Soonest expiry first across both lists: the server sorts each, but
   // the one to act on is the nearest whichever list it came from.
   const certs = d ? (d.certificates || []).concat(d.client_certs || [])
@@ -239,8 +242,11 @@ function renderSecurityDoc() {
 // reports a rate, because a lifetime total is amber forever after one
 // bad afternoon.
 function authThrottleText(d) {
-  const rl = Math.round((d && d.auth_throttled_rate_limit) || 0);
-  const vf = Math.round((d && d.auth_throttled_verify_full) || 0);
+  // Only /api/security carries these, so say so rather than reporting a
+  // confident "none" from a document that never had them.
+  if (!d) return "—" + qual(" waiting for /api/security");
+  const rl = Math.round(d.auth_throttled_rate_limit || 0);
+  const vf = Math.round(d.auth_throttled_verify_full || 0);
   if (!rl && !vf) return "none" + qual(" since this node started");
   const parts = [];
   if (rl) parts.push(rl + " rate-limited");
@@ -248,8 +254,15 @@ function authThrottleText(d) {
   return String(rl + vf) + qual(" since this node started · " + parts.join(" · "));
 }
 
-function renderSecurity(d) {
-  const p = d.principal || {};
+// renderAuthTiles draws the Authentication row, which is the one place
+// on this page fed by BOTH documents: who you are signed in as rides the
+// cluster poll, and the refusal counts exist only on /api/security. It
+// is therefore called from both renderers rather than from one — reading
+// the counts off the cluster document rendered "none" under every
+// condition, including while the node was refusing hundreds a second
+// (issue #203 review).
+function renderAuthTiles(cluster) {
+  const p = (cluster && cluster.principal) || {};
   renderTiles(document.getElementById("sec-auth"),
     tile("mode", p.secure ? "secure" : "insecure — no authentication") +
     tile("signed in as", p.secure ? (p.user || "?") : "everyone is root") +
@@ -260,7 +273,12 @@ function renderSecurity(d) {
     // A tile rather than a third clause on the connections sentence:
     // it is an authentication figure, not a connections one, and a tile
     // label is a term the glossary can explain.
-    tileHTML("refused before verification", authThrottleText(d)));
+    tileHTML("refused before verification", authThrottleText(secDoc)));
+}
+
+function renderSecurity(d) {
+  const p = d.principal || {};
+  renderAuthTiles(d);
   document.getElementById("sec-auth-note").textContent = p.secure
     ? "every HTTP route takes a session cookie, HTTP Basic credentials, or a client certificate; all three need a role that exists and holds LOGIN"
     : "this cluster authenticates nobody: start the nodes with a certificate directory to change that";

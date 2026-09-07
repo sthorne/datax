@@ -284,6 +284,23 @@ var (
 	})
 )
 
+// AuthThrottleCauses are the labels AuthThrottled is counted by; see the
+// metric's own comment for what each means.
+var AuthThrottleCauses = []string{"rate-limit", "verify-full"}
+
+func init() {
+	// A labelled counter has no children until something asks for one, so
+	// a node that has refused nothing would emit no
+	// datax_auth_throttled_total line at all — turning an existing alert
+	// on it from 0 into no-data, which is a different thing and usually a
+	// louder one. Touching both children at registration keeps the series
+	// present from the first scrape, the way the unlabelled counter it
+	// replaced was (issue #203 review).
+	for _, cause := range AuthThrottleCauses {
+		AuthThrottled.WithLabelValues(cause)
+	}
+}
+
 // CounterValue reads a counter's current value (for status summaries;
 // Prometheus counters expose it only through their wire form).
 func CounterValue(c prometheus.Counter) float64 {

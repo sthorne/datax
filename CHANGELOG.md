@@ -42,7 +42,11 @@ state or the internode protocol does, and an entry below says so.
   returns one series per cause where it returned a single series, so an
   existing alert, recording rule or single-stat panel needs
   `sum(datax_auth_throttled_total)` (or `sum by (cause) (…)` to keep the
-  split) to read as it did before.
+  split) to read as it did before. Both children are created at
+  registration, so the series is still present at `0` from the first
+  scrape rather than appearing only once a refusal happens — a labelled
+  counter otherwise turns an alert on an idle node from `0` into
+  no-data.
 
 ## 0.55.0 — unreleased
 
