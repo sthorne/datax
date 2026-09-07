@@ -217,6 +217,9 @@ type conn struct {
 	// a conn without a server); srv the server (nil likewise).
 	act *Activity
 	srv *Server
+	// authDeadline is when startup's socket deadline expires (zero once
+	// startup is over); the verifier lookup is bounded by it too.
+	authDeadline time.Time
 	// pid and secret are the connection's BackendKeyData; stmtCancel
 	// (under mu) cancels the statement in flight.
 	pid        int32
@@ -354,10 +357,30 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 	}
 }
 
+// errCancelServed ends a connection that carried a CancelRequest: it
+// never authenticates and carries nothing else, so it does not go on to
+// the message loop (where it would sit, unauthenticated and now past its
+// deadline, until the client closed it).
+var errCancelServed = errors.New("cancel request served")
+
+// authTimeout is the startup deadline in force (zero = none).
+func (c *conn) authTimeout() time.Duration {
+	switch {
+	case c.opts.AuthTimeout < 0:
+		return 0
+	case c.opts.AuthTimeout == 0:
+		return DefaultAuthTimeout
+	}
+	return c.opts.AuthTimeout
+}
+
 func (c *conn) run(ctx context.Context) error {
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
-	if err := c.handleStartup(ctx); err != nil {
+	if err := c.startup(ctx); err != nil {
+		if errors.Is(err, errCancelServed) {
+			return nil
+		}
 		return err
 	}
 	boundary := true // the next message starts a new protocol cycle
@@ -471,6 +494,35 @@ func (c *conn) run(ctx context.Context) error {
 	}
 }
 
+// startup runs handleStartup under the authentication deadline (issue
+// #212): a connection that sends nothing, or stalls anywhere in the
+// exchange — between SSLRequest and the TLS handshake, between the
+// server-first and the client's final — is closed at the deadline
+// instead of being parked with its goroutines, session and registry
+// entry. The deadline is on writes too, so a peer that stops reading
+// the server's half is cut the same way. It is set on the raw socket
+// and cleared on whatever c.nc is afterwards (the tls.Conn forwards to
+// the socket underneath), and the pre-authentication slot the accept
+// loop took is released however startup ends.
+func (c *conn) startup(ctx context.Context) error {
+	if c.srv != nil {
+		defer c.srv.pendingDone()
+	}
+	if d := c.authTimeout(); d > 0 {
+		c.authDeadline = time.Now().Add(d)
+		_ = c.nc.SetDeadline(c.authDeadline)
+	}
+	err := c.handleStartup(ctx)
+	_ = c.nc.SetDeadline(time.Time{})
+	c.authDeadline = time.Time{}
+	if err != nil && isTimeout(err) {
+		metrics.SQLPreAuthClosed.WithLabelValues(metrics.PreAuthHandshakeTimeout).Inc()
+		log.Audit("sql-preauth-closed", "remote", c.nc.RemoteAddr().String(), "cause", metrics.PreAuthHandshakeTimeout)
+		return fmt.Errorf("startup not completed within %s", c.authTimeout())
+	}
+	return err
+}
+
 func (c *conn) handleStartup(ctx context.Context) error {
 	for {
 		msg, err := c.backend.ReceiveStartupMessage()
@@ -581,7 +633,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			if c.srv != nil && len(m.SecretKey) >= 4 {
 				c.srv.handleCancelRequest(int32(m.ProcessID), binary.BigEndian.Uint32(m.SecretKey[:4]))
 			}
-			return nil
+			return errCancelServed
 		default:
 			return fmt.Errorf("unexpected startup message %T", msg)
 		}

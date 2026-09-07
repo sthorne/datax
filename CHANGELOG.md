@@ -108,6 +108,60 @@ state or the internode protocol does, and an entry below says so.
   apart. Nothing can fix a binary that is already running, so the
   practical consequence is operational: roll promptly, and do not leave
   a half-upgraded cluster sitting.
+- **The SQL port has pre-authentication bounds** (#212). #195 bounded
+  password guessing at `/api/login` and HTTP Basic and left the SQL
+  port unmetered — the door an attacker would choose, against the same
+  verifiers. And the handshake itself was unbounded: a connection that
+  sent nothing, or stalled between the server's SCRAM challenge and the
+  client's final, was held indefinitely with its goroutines, session
+  and cancel-registry entry, and nothing capped how many of those one
+  peer could open.
+
+  Three bounds now. **The guessing budget is one budget for every
+  door**: the SQL listener consults the same per-source and
+  per-(source, account) buckets `/api/login` spends, before the verifier
+  lookup, and refuses with a FATAL 28000 that names no user — the
+  budget is a function of what the source has already done, never of
+  whether the name exists. The SQL door asks before the exchange and
+  charges only a failure, so a pool opening more connections than the
+  burst at once, every one with the right password, is never refused.
+  What that order gives up is the bound on how many guesses can be in
+  flight together — every one that asked before the first failure
+  landed runs, up to the connection cap below — and not what they
+  cost: each is charged when it lands, into debt, so a wave of forty
+  puts its source forty seconds from its next attempt and buys nothing
+  over the same guesses one at a time. The debt is floored at ten
+  minutes or the pre-authentication cap below, whichever is deeper —
+  derived from the cap in force, so raising the cap never lets a wave
+  be wider than the floor — and an address is never held for longer
+  than that after the guessing stops (a node with the cap removed has
+  no floor, and the flag says so).
+  **An authentication deadline** (`--auth-timeout`, default 60 s,
+  PostgreSQL's `authentication_timeout`) closes a connection that has
+  not reached ReadyForQuery, wherever in the handshake it stalled; the
+  same setting is the HTTP server's `ReadHeaderTimeout`, which it had
+  none of. **A cap on connections in the pre-authentication state**
+  (`--sql-max-pending-auth`, default 512) refuses at accept, with a
+  FATAL 53300 and before anything is allocated for the connection,
+  rather than accepting and holding; a client refused mid-SSLRequest
+  sees the refusal as a failed TLS negotiation, which is the price of
+  refusing before a TLS handshake this node would otherwise pay for.
+
+  New: `datax_sql_preauth_closed_total{cause="handshake-timeout"|
+  "pending-full"}` and the `sql-preauth-closed` audit record; SQL
+  rate-limit refusals count under the existing
+  `datax_auth_throttled_total{cause="rate-limit"}` and `auth-throttled`
+  (path `sql`), and reach `/api/security` and the health check with
+  the HTTP ones.
+
+  Two limits to know. **The bound is per node**: the limiter is
+  in-memory on each node, so the per-account figure is 5 + 1/s *per
+  node* — a nine-node cluster gives a guesser who spreads across it
+  nine times that. #195 left cluster-wide backoff out deliberately
+  and it stays out; the figure is stated so it is not discovered. And
+  as with #211, **no cluster version, and the roll is a window**: an
+  un-upgraded node has no bound at all on its SQL port, so for the
+  duration of the roll an attacker simply picks one. Roll promptly.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a

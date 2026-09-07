@@ -38,7 +38,10 @@ func (n *Node) startSQL() error {
 	if err != nil {
 		return err
 	}
-	opts := pgwire.ServerOptions{SlowStatementThreshold: n.cfg.SlowStatementThreshold, NodeID: int32(n.ident.NodeID)}
+	opts := pgwire.ServerOptions{
+		SlowStatementThreshold: n.cfg.SlowStatementThreshold, NodeID: int32(n.ident.NodeID),
+		AuthTimeout: n.cfg.AuthTimeout, MaxPendingAuth: n.cfg.SQLMaxPendingAuth,
+	}
 	opts.Forward = func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error) {
 		addr, err := n.registry.Resolve(base.NodeID(node))
 		if err != nil {
@@ -60,6 +63,7 @@ func (n *Node) startSQL() error {
 		opts.Auth = n.lookupVerifier
 		opts.CanLogin = n.canLogin
 		opts.MockSecret = n.mockSecret
+		opts.AuthLimiter = sqlAuthLimiter{n.authLimit}
 		if n.cfg.RootPassword != "" {
 			if err := n.stopper.RunWorker(n.seedRootUser); err != nil {
 				return err

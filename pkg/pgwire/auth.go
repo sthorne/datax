@@ -67,6 +67,26 @@ func (c *conn) clientCertUser() string {
 func (c *conn) authenticateSCRAM(user string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if !c.authDeadline.IsZero() {
+		// Bounded by the connection's own deadline as well, so a lookup
+		// never outlives the connection it was for.
+		var cancelAt context.CancelFunc
+		ctx, cancelAt = context.WithDeadline(ctx, c.authDeadline)
+		defer cancelAt()
+	}
+	source := c.nc.RemoteAddr().String()
+
+	// Ahead of the lookup, not after it (issue #212): the budget is the
+	// same one /api/login spends, and this is the door an attacker would
+	// otherwise choose for being unmetered. A refusal answers the same
+	// whoever was asked for — the budget is a function of what this
+	// source has already done, never of whether the name exists.
+	if c.opts.AuthLimiter != nil && !c.opts.AuthLimiter.Budget(source, user) {
+		metrics.AuthThrottled.WithLabelValues(throttleRateLimit).Inc()
+		log.Audit("auth-throttled", "remote", source, "path", "sql", "cause", throttleRateLimit)
+		c.sendFatal("28000", "too many authentication attempts from this address; try again later")
+		return fmt.Errorf("authentication attempt from %s refused: rate limit", source)
+	}
 
 	verifier, lookupErr := c.opts.Auth(ctx, user)
 	genuine := verifier != nil && lookupErr == nil
@@ -86,8 +106,11 @@ func (c *conn) authenticateSCRAM(user string) error {
 	}
 
 	failed := func() error {
+		if c.opts.AuthLimiter != nil {
+			c.opts.AuthLimiter.Failed(source, user)
+		}
 		metrics.AuthFailures.Inc()
-		log.Audit("sql-auth-failure", "principal", user, "remote", c.nc.RemoteAddr().String())
+		log.Audit("sql-auth-failure", "principal", user, "remote", source)
 		c.sendError(&sql.Error{Code: "28P01", Msg: fmt.Sprintf("password authentication failed for user %q", user)})
 		_ = c.backend.Flush()
 		return fmt.Errorf("authentication failed for %q", user)
@@ -155,7 +178,21 @@ func (c *conn) authenticateSCRAM(user string) error {
 	if err != nil || !genuine {
 		return failed()
 	}
+	if c.opts.AuthLimiter != nil {
+		c.opts.AuthLimiter.Succeeded(source, user)
+	}
 	c.backend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte(serverFinal)})
 	c.backend.Send(&pgproto3.AuthenticationOk{})
 	return nil
+}
+
+// throttleRateLimit is the AuthThrottled cause the SQL door shares with
+// the HTTP ones: one source asking too often. It is one of
+// metrics.AuthThrottleCauses.
+const throttleRateLimit = "rate-limit"
+
+// sendFatal sends a FATAL error and flushes: the connection is ending.
+func (c *conn) sendFatal(code, msg string) {
+	c.backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: code, Message: msg})
+	_ = c.backend.Flush()
 }

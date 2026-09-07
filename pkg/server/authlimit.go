@@ -1,11 +1,13 @@
 package server
 
 import (
+	"math"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -61,7 +63,34 @@ const (
 	// without bound. An attacker rotating source addresses to evict
 	// entries still meets the in-flight cap below.
 	authLimiterMax = 4096
+	// authDebtMin is the least far below zero a bucket may go. The SQL
+	// door charges a failure after the exchange (spend), so a wave of
+	// guesses that all began before any had failed is charged in full
+	// when they land, and the source then waits a second for every one
+	// of them — which is what makes a wave cost exactly what the same
+	// guesses would cost one at a time (issue #212). A floor shallower
+	// than the widest wave the node admits would be a discount on every
+	// wave: a source could repeat one the moment the floor refilled. So
+	// the floor in force is the deeper of this and the pre-authentication
+	// connection cap (debtFloor), by construction rather than by keeping
+	// two constants in step; what this constant sets is how long a shared
+	// address can be held after the guessing stops, wherever the cap is
+	// at or below it.
+	authDebtMin = float64(10 * time.Minute / authRefill)
 )
+
+// debtFloor is how far below zero a bucket may go on a node whose
+// pre-authentication cap is maxPending (0 = no cap): the widest wave the
+// node can admit, or authDebtMin, whichever is deeper. With no cap a
+// wave is bounded only by descriptors, and so is the debt — an operator
+// who removes the cap removes the bound on how long a guessing address
+// is held, and the flag says so.
+func debtFloor(maxPending int) float64 {
+	if maxPending <= 0 {
+		return math.Inf(1)
+	}
+	return math.Max(authDebtMin, float64(maxPending))
+}
 
 // authVerifyInFlight caps concurrent password verifications. Four is
 // enough that ordinary sign-ins never queue and small enough that
@@ -74,6 +103,8 @@ type authLimiter struct {
 	buckets map[string]*authBucket
 	verify  chan struct{} // the in-flight cap, as a semaphore
 	nowFn   func() time.Time
+	// debtMax is the floor (debtFloor), set once at construction.
+	debtMax float64
 }
 
 type authBucket struct {
@@ -82,11 +113,14 @@ type authBucket struct {
 	seen   time.Time // for eviction
 }
 
-func newAuthLimiter() *authLimiter {
+// newAuthLimiter builds the limiter for a node whose pre-authentication
+// cap is maxPending (as configured: 0 = the default, negative = none).
+func newAuthLimiter(maxPending int) *authLimiter {
 	return &authLimiter{
 		buckets: map[string]*authBucket{},
 		verify:  make(chan struct{}, authVerifyInFlight),
 		nowFn:   time.Now,
+		debtMax: debtFloor(pgwire.EffectiveMaxPendingAuth(maxPending)),
 	}
 }
 
@@ -108,13 +142,24 @@ func (l *authLimiter) take(key string, burst float64) bool {
 	now := l.nowFn()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	b := l.bucketLocked(key, burst, now)
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// bucketLocked returns key's bucket, refilled for the time that has
+// passed (capped at the burst) and created at the burst if new. Caller
+// holds l.mu.
+func (l *authLimiter) bucketLocked(key string, burst float64, now time.Time) *authBucket {
 	b, ok := l.buckets[key]
 	if !ok {
 		l.evictLocked()
 		b = &authBucket{tokens: burst, last: now}
 		l.buckets[key] = b
 	}
-	// Refill for the time that has passed, capped at the burst.
 	if d := now.Sub(b.last); d > 0 {
 		b.tokens += d.Seconds() * (1 / authRefill.Seconds())
 		if b.tokens > burst {
@@ -123,12 +168,56 @@ func (l *authLimiter) take(key string, burst float64) bool {
 		b.last = now
 	}
 	b.seen = now
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
+	return b
 }
+
+// budget reports whether source has an attempt left against user,
+// spending nothing; spend charges one failed attempt to both buckets.
+// The pair is what the SQL door uses (issue #212): it asks before the
+// SCRAM exchange and charges after a failure, rather than charging on
+// the attempt as allow does, so that a pool opening many connections
+// with the right password at once — none of which will fail — is not
+// refused. What that order gives up is the bound on how many guesses
+// can be in flight together: every one that asked before the first
+// failure landed runs, up to the pre-authentication connection cap.
+// What it does not give up is what they cost — each is charged when it
+// lands, into debt, so the wave buys nothing over the same guesses one
+// at a time (see authDebtMax).
+//
+// A bucket goes below zero when a wave lands (debtFloor).
+func (l *authLimiter) budget(source, user string) bool {
+	src := sourceKey(source)
+	now := l.nowFn()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bucketLocked("s\x00"+src, authBurst, now).tokens >= 1 &&
+		l.bucketLocked("a\x00"+src+"\x00"+user, authAccountBurst, now).tokens >= 1
+}
+
+func (l *authLimiter) spend(source, user string) {
+	src := sourceKey(source)
+	now := l.nowFn()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key, burst := range map[string]float64{
+		"s\x00" + src:                 authBurst,
+		"a\x00" + src + "\x00" + user: authAccountBurst,
+	} {
+		b := l.bucketLocked(key, burst, now)
+		if b.tokens--; b.tokens < -l.debtMax {
+			b.tokens = -l.debtMax
+		}
+	}
+}
+
+// sqlAuthLimiter is the node's limiter as the SQL listener sees it
+// (pgwire cannot import this package): the same buckets /api/login and
+// Basic spend, so guessing gains nothing by changing port.
+type sqlAuthLimiter struct{ l *authLimiter }
+
+func (a sqlAuthLimiter) Budget(source, user string) bool { return a.l.budget(source, user) }
+func (a sqlAuthLimiter) Failed(source, user string)      { a.l.spend(source, user) }
+func (a sqlAuthLimiter) Succeeded(source, user string)   { a.l.succeeded(source, user) }
 
 // evictLocked drops the least recently used entries when the map is
 // full. Caller holds l.mu.
@@ -218,4 +307,16 @@ const (
 func (n *Node) authThrottled(source, user, path, cause string) {
 	metrics.AuthThrottled.WithLabelValues(cause).Inc()
 	log.Audit("auth-throttled", "remote", source, "path", path, "cause", cause)
+}
+
+// authTimeout is the handshake deadline in force (0 = none), the
+// pgwire default when the configuration leaves it unset.
+func (n *Node) authTimeout() time.Duration {
+	switch {
+	case n.cfg.AuthTimeout < 0:
+		return 0
+	case n.cfg.AuthTimeout == 0:
+		return pgwire.DefaultAuthTimeout
+	}
+	return n.cfg.AuthTimeout
 }

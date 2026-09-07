@@ -334,7 +334,12 @@ func (n *Node) startHTTP() error {
 		_, _ = w.Write(page)
 	})
 
-	srv := &http.Server{Handler: n.httpAuth(mux)}
+	// ReadHeaderTimeout is the HTTP port's half of the authentication
+	// deadline (issue #212): a peer that opens a connection and sends its
+	// headers slowly, or never, is closed at it rather than holding the
+	// connection. Bodies and responses are not bounded by it — the
+	// console's long polls are unaffected.
+	srv := &http.Server{Handler: n.httpAuth(mux), ReadHeaderTimeout: n.authTimeout()}
 	if n.tlsCfgs != nil {
 		srv.TLSConfig = n.tlsCfgs.PGServer.Clone()
 		go func() {

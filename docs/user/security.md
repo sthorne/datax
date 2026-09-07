@@ -273,6 +273,16 @@ records (`msg=audit`), each with the acting principal:
   console sign-in, and a session cookie that is expired, tampered with,
   or names a role that may no longer log in
   (`datax_auth_failures_total`)
+- attempts refused before any password was checked
+  (`auth-throttled`, with the door — `path` — and the cause, never the
+  username; `datax_auth_throttled_total`), and SQL connections closed
+  before authentication completed (`sql-preauth-closed`: a handshake
+  that did not finish within `--auth-timeout`, or one refused because
+  the node held `--sql-max-pending-auth` unauthenticated connections
+  already — a client refused that way sees a FATAL `53300`, or, if it
+  was mid-`SSLRequest`, a failed TLS negotiation: pgx reports "server
+  refused TLS connection", and this record is what says why;
+  `datax_sql_preauth_closed_total`)
 - console sign-ins and sign-outs (`http-login`, `http-logout`)
 - denied admin operations (`datax_admin_denied_total`)
 - executed state-changing admin RPCs (op, principal, target)
