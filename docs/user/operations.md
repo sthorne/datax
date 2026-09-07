@@ -514,6 +514,10 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   is opened, and a symlink or a directory at the manifest's or a data
   file's name is refused without being followed, so a directory prepared
   by someone else cannot point the node at a path of their choosing.
+  The system records a backup carries (users, roles, databases,
+  sequences) are written back only to the key spans backup collected
+  them from; a manifest carrying any other key — the cluster's
+  authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
   included — and must chain within the MVCC GC window (25h by default): an
   older base is refused with "incremental base too old". Take a fresh full

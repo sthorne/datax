@@ -59,6 +59,23 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Restore writes only the keys a backup collects** (#238, found in
+  #237's review). A backup carries five groups of raw system records —
+  users, admins, roles, databases, sequences — each collected from a
+  named key span, and restore wrote every key back verbatim, with no
+  check that it lay in the span it was collected from. So a crafted
+  manifest could have restore write any key in the cluster, as the node,
+  inside its own transaction: the authentication secret, which lies
+  outside every span a backup collects and so appears in no legitimate
+  backup, would have handed whoever wrote the manifest the console's
+  session signing key — a forged `root` session, with no password and
+  no certificate — on a cluster whose operator had chosen to trust the
+  backup's *data*. Each group is now held to the spans backup reads it
+  from, when the manifest is read, so both readers refuse it before
+  anything is applied; databases and sequences legitimately mix spans
+  (descriptors and names, and counters) and are held to their sets.
+  Backups written by any release restore unchanged: nothing a backup
+  writes lies outside the spans it was read from.
 - **A query cancel is authorized on the node that acts on it** (#211).
   `CancelLocal` read a zero secret as "the caller is trusted, skip the
   check" — an in-band sentinel on a value that arrives from the network,

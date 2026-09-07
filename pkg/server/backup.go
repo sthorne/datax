@@ -440,7 +440,52 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 				dir, t.File, t.ID, want)
 		}
 	}
+	if err := checkManifestKeys(dir, &man); err != nil {
+		return nil, err
+	}
 	return &man, nil
+}
+
+// checkManifestKeys holds a manifest's raw key/value groups — users,
+// admins, roles, databases, sequences — to the key spans backup collects
+// each from. Restore writes those keys back verbatim, so a crafted
+// manifest could otherwise have it write any key in the cluster, as the
+// node, inside restore's own transaction: the authentication secret
+// (keys.AuthSecretKey, outside every span a backup collects, so no
+// legitimate backup carries it) would hand the console's session
+// signing key to whoever wrote the manifest (issue #238). Checked when
+// the manifest is read, like the file names, so both readers refuse it
+// before anything is applied. Databases and sequences legitimately mix
+// spans — descriptors and names, and counters — so each group is held
+// to the set backup reads for it, not to one span.
+func checkManifestKeys(dir string, man *backupManifest) error {
+	for _, g := range []struct {
+		name  string
+		kvs   []backupKV
+		spans [][2]keys.Key
+	}{
+		{"users", man.Users, [][2]keys.Key{spanOf(keys.UserSpan())}},
+		{"admins", man.Admins, [][2]keys.Key{spanOf(keys.AdminUserSpan())}},
+		{"roles", man.Roles, [][2]keys.Key{spanOf(keys.RoleSpan())}},
+		{"databases", man.Databases, [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}},
+		{"sequences", man.Sequences, [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())}},
+	} {
+		for _, kv := range g.kvs {
+			if !inAnySpan(keys.Key(kv.Key), g.spans) {
+				return fmt.Errorf("%s: manifest's %s carries the key %s, which a datax backup never collects there", dir, g.name, keys.Key(kv.Key))
+			}
+		}
+	}
+	return nil
+}
+
+func inAnySpan(k keys.Key, spans [][2]keys.Key) bool {
+	for _, s := range spans {
+		if k.Compare(s[0]) >= 0 && k.Compare(s[1]) < 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func backupSummary(path string, man *backupManifest) *cluster.BackupSummary {
