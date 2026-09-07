@@ -123,6 +123,15 @@ func (n *Node) serveLogin(w http.ResponseWriter, req *http.Request) {
 		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
 		return
 	}
+	// And the verification budget, which a success does not refund: a
+	// caller holding a valid credential costs this node a derivation per
+	// sign-in like anyone else (issue #221).
+	if !n.authLimit.allowVerify(req.RemoteAddr) {
+		n.authLimit.unspend(req.RemoteAddr, lr.User)
+		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path, throttleVerifyRate)
+		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
+		return
+	}
 	if !n.authLimit.acquireVerify() {
 		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path, throttleVerifyFull)
 		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)

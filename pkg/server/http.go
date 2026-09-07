@@ -453,6 +453,14 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
 			return
 		}
+		if ok && !n.authLimit.allowVerify(req.RemoteAddr) {
+			// Every Basic request is a verification, right password or
+			// not, and a right one refunds nothing here (issue #221).
+			n.authLimit.unspend(req.RemoteAddr, user)
+			n.authThrottled(req.RemoteAddr, user, req.URL.Path, throttleVerifyRate)
+			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
+			return
+		}
 		if ok && !n.authLimit.acquireVerify() {
 			n.authThrottled(req.RemoteAddr, user, req.URL.Path, throttleVerifyFull)
 			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)

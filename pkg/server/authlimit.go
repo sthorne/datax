@@ -97,6 +97,30 @@ func debtFloor(maxPending int) float64 {
 // verification cannot take every core.
 const authVerifyInFlight = 4
 
+// The verification budget (issue #221). The attempt buckets above are
+// refunded by a success — they must be, or a legitimate user sharing an
+// address with a guessing loop is locked out — and that refund made
+// success a reset button: a caller holding any one valid credential was
+// exempt from the bound altogether, at 470 derivations a second on the
+// machine the issue was measured on, with only the in-flight cap left
+// between it and the node's cores. What that bound is meant to hold is
+// the cost, and the cost of a verification is the same whether or not
+// the password was right. So a third bucket, per source, spent by every
+// verification the HTTP doors run and refunded by nothing.
+//
+// Sized against how the doors are used, not against a person: HTTP
+// Basic re-verifies on every request, so a scraper, a script or a
+// support bundle spends it at its request rate. A hundred in a burst
+// and twenty a second sustained is far above any of those and far
+// below what it takes to pin a core (a derivation is under a
+// millisecond). Nothing on the SQL door spends it: SCRAM's server side
+// holds the stored key and runs no derivation, so there is no cost
+// there to bound.
+const (
+	authVerifyBurst = 100
+	authVerifyRate  = 20 // tokens a second
+)
+
 // authLimiter is a token bucket per key with a bounded, LRU-evicted map.
 type authLimiter struct {
 	mu      sync.Mutex
@@ -109,9 +133,13 @@ type authLimiter struct {
 
 type authBucket struct {
 	tokens float64
+	rate   float64 // tokens a second
 	last   time.Time
 	seen   time.Time // for eviction
 }
+
+// authRate is the attempt buckets' refill, in tokens a second.
+var authRate = 1 / authRefill.Seconds()
 
 // newAuthLimiter builds the limiter for a node whose pre-authentication
 // cap is maxPending (as configured: 0 = the default, negative = none).
@@ -139,10 +167,15 @@ func (l *authLimiter) allow(source, user string) bool {
 }
 
 func (l *authLimiter) take(key string, burst float64) bool {
+	return l.takeAt(key, burst, authRate)
+}
+
+// takeAt is take for a bucket refilling at rate tokens a second.
+func (l *authLimiter) takeAt(key string, burst, rate float64) bool {
 	now := l.nowFn()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	b := l.bucketLocked(key, burst, now)
+	b := l.bucketLocked(key, burst, rate, now)
 	if b.tokens < 1 {
 		return false
 	}
@@ -150,18 +183,47 @@ func (l *authLimiter) take(key string, burst float64) bool {
 	return true
 }
 
+// allowVerify reports whether source may have one more password
+// verified, spending one from its verification budget if so. Asked
+// after allow and before the verification runs, whatever the outcome
+// will be; nothing refunds it (issue #221).
+func (l *authLimiter) allowVerify(source string) bool {
+	return l.takeAt("v\x00"+sourceKey(source), authVerifyBurst, authVerifyRate)
+}
+
+// unspend returns the attempt allow charged when the verification it
+// admitted was refused by the verification budget instead: nothing was
+// checked, so nothing was attempted. Without it a credential re-sent
+// too often would spend its attempt budget on refusals that never
+// verified, and from the sixth on be refused as rate-limit — reported
+// as guessing, which it is not, and which calls for a different
+// response (issue #221).
+func (l *authLimiter) unspend(source, user string) {
+	src := sourceKey(source)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key, burst := range map[string]float64{
+		"s\x00" + src:                 authBurst,
+		"a\x00" + src + "\x00" + user: authAccountBurst,
+	} {
+		if b, ok := l.buckets[key]; ok && b.tokens < burst {
+			b.tokens = math.Min(burst, b.tokens+1)
+		}
+	}
+}
+
 // bucketLocked returns key's bucket, refilled for the time that has
 // passed (capped at the burst) and created at the burst if new. Caller
 // holds l.mu.
-func (l *authLimiter) bucketLocked(key string, burst float64, now time.Time) *authBucket {
+func (l *authLimiter) bucketLocked(key string, burst, rate float64, now time.Time) *authBucket {
 	b, ok := l.buckets[key]
 	if !ok {
 		l.evictLocked()
-		b = &authBucket{tokens: burst, last: now}
+		b = &authBucket{tokens: burst, rate: rate, last: now}
 		l.buckets[key] = b
 	}
 	if d := now.Sub(b.last); d > 0 {
-		b.tokens += d.Seconds() * (1 / authRefill.Seconds())
+		b.tokens += d.Seconds() * b.rate
 		if b.tokens > burst {
 			b.tokens = burst
 		}
@@ -190,8 +252,8 @@ func (l *authLimiter) budget(source, user string) bool {
 	now := l.nowFn()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.bucketLocked("s\x00"+src, authBurst, now).tokens >= 1 &&
-		l.bucketLocked("a\x00"+src+"\x00"+user, authAccountBurst, now).tokens >= 1
+	return l.bucketLocked("s\x00"+src, authBurst, authRate, now).tokens >= 1 &&
+		l.bucketLocked("a\x00"+src+"\x00"+user, authAccountBurst, authRate, now).tokens >= 1
 }
 
 func (l *authLimiter) spend(source, user string) {
@@ -203,7 +265,7 @@ func (l *authLimiter) spend(source, user string) {
 		"s\x00" + src:                 authBurst,
 		"a\x00" + src + "\x00" + user: authAccountBurst,
 	} {
-		b := l.bucketLocked(key, burst, now)
+		b := l.bucketLocked(key, burst, authRate, now)
 		if b.tokens--; b.tokens < -l.debtMax {
 			b.tokens = -l.debtMax
 		}
@@ -260,6 +322,11 @@ func (l *authLimiter) releaseVerify() { <-l.verify }
 // budget, and is slowed to the refill rate until the guessing stops.
 // That is the cost of the key, and the in-flight cap is what holds when
 // the key means nothing at all.
+//
+// What it does not refund is the verification budget (allowVerify): a
+// success was a verification like any other and cost the same, and
+// refunding it here is what let a credential-holder verify without
+// bound (issue #221).
 func (l *authLimiter) succeeded(source, user string) {
 	src := sourceKey(source)
 	now := l.nowFn()
@@ -286,17 +353,21 @@ func sourceKey(remoteAddr string) string {
 	return remoteAddr
 }
 
-// The two ways an attempt is refused before any verification runs. They
-// are counted apart because they call for different actions: a
-// rate-limit refusal names one source asking too often, and a
-// verify-full refusal says this node is already doing as much password
-// hashing at once as it permits — the first is someone else's problem
-// to stop, the second is this node's ceiling (issue #203).
+// The three ways an attempt is refused before any verification runs.
+// They are counted apart because they call for different actions: a
+// rate-limit refusal names one source asking too often, a verify-rate
+// refusal one source having passwords checked too often — a valid
+// credential re-sent on every request, which is a client to change,
+// not an attacker — and a verify-full refusal says this node is already
+// doing as much password hashing at once as it permits — the first two
+// are someone else's problem to stop, the third is this node's ceiling
+// (issues #203, #221).
 // These are the label values metrics.AuthThrottleCauses pre-creates at
 // registration; a new cause has to be added there too, or its series
 // appears only once it first fires.
 const (
 	throttleRateLimit  = "rate-limit"
+	throttleVerifyRate = "verify-rate"
 	throttleVerifyFull = "verify-full"
 )
 

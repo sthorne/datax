@@ -744,9 +744,9 @@ func TestLoginIsRateLimited(t *testing.T) {
 	if sec.ThrottledRateLimit == 0 {
 		t.Error("the rate-limit cause is zero after the limiter refused: the two causes are not being counted apart")
 	}
-	if sec.AuthThrottled != sec.ThrottledRateLimit+sec.ThrottledVerifyFull {
-		t.Errorf("total %v is not the sum of its causes (%v + %v)",
-			sec.AuthThrottled, sec.ThrottledRateLimit, sec.ThrottledVerifyFull)
+	if sec.AuthThrottled != sec.ThrottledRateLimit+sec.ThrottledVerifyRate+sec.ThrottledVerifyFull {
+		t.Errorf("total %v is not the sum of its causes (%v + %v + %v)",
+			sec.AuthThrottled, sec.ThrottledRateLimit, sec.ThrottledVerifyRate, sec.ThrottledVerifyFull)
 	}
 }
 
@@ -955,12 +955,23 @@ func TestVerifyCapIsCountedApart(t *testing.T) {
 
 	// Several loopback sources, each with its own burst, all released at
 	// once so their verifications overlap.
+	//
+	// The wave has to land inside one verification's hold on the cap — a
+	// verifier lookup and a derivation, a few milliseconds. A TLS
+	// handshake per request spreads it far wider than that, so the cap
+	// was only ever filled when the machine happened to be slow at the
+	// right moment: on one loaded run, sixty seconds of waves were
+	// refused as rate-limit and none at the cap. So every connection is
+	// opened, with nothing that spends any budget, before the wave, and
+	// kept (the transport's default keeps two a host); the wave itself is
+	// then a write on a warm socket.
 	var clients []*http.Client
 	for i := 2; i <= 9; i++ {
-		clients = append(clients, httpsClientFrom(t, certsDir, "", fmt.Sprintf("127.0.0.%d", i)))
+		c := httpsClientFrom(t, certsDir, "", fmt.Sprintf("127.0.0.%d", i))
+		c.Transport.(*http.Transport).MaxIdleConnsPerHost = authVerifyProbePerSource
+		clients = append(clients, c)
 	}
-	deadline = time.Now().Add(60 * time.Second)
-	for {
+	each := func(do func(c *http.Client)) {
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		for _, c := range clients {
@@ -969,12 +980,30 @@ func TestVerifyCapIsCountedApart(t *testing.T) {
 				go func(c *http.Client) {
 					defer wg.Done()
 					<-start
-					attempt(c)
+					do(c)
 				}(c)
 			}
 		}
 		close(start)
 		wg.Wait()
+	}
+	each(func(c *http.Client) {
+		resp, err := c.Get(base + "/status") // no credentials: 401 before any limiter is asked
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	})
+
+	// Each wave spends every source's attempt burst; the next has what
+	// refilled meanwhile, one attempt a source a second, which is still
+	// twice the cap when eight land together. The pause is also what
+	// keeps the poll below — a Basic request, so a verification — inside
+	// its own source's verification budget (issue #221).
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		each(attempt)
 
 		code, body, _ := authedGet(t, client, base+"/api/security", "root", "topsecret")
 		if code != http.StatusOK {
@@ -986,18 +1015,19 @@ func TestVerifyCapIsCountedApart(t *testing.T) {
 		}
 		if sec.ThrottledVerifyFull > 0 {
 			// And it is counted as its own cause, not folded into the
-			// other one or into the total alone.
-			if sec.AuthThrottled != sec.ThrottledRateLimit+sec.ThrottledVerifyFull {
-				t.Errorf("total %v is not the sum of its causes (%v + %v)",
-					sec.AuthThrottled, sec.ThrottledRateLimit, sec.ThrottledVerifyFull)
+			// others or into the total alone.
+			if sec.AuthThrottled != sec.ThrottledRateLimit+sec.ThrottledVerifyRate+sec.ThrottledVerifyFull {
+				t.Errorf("total %v is not the sum of its causes (%v + %v + %v)",
+					sec.AuthThrottled, sec.ThrottledRateLimit, sec.ThrottledVerifyRate, sec.ThrottledVerifyFull)
 			}
 			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no refusal was attributed to the verification cap after repeated concurrent bursts "+
-				"(rate-limited %v, verify-full %v): the cap is either never reached or not labelled apart",
-				sec.ThrottledRateLimit, sec.ThrottledVerifyFull)
+				"(rate-limited %v, verify-rate %v, verify-full %v): the cap is either never reached or not labelled apart",
+				sec.ThrottledRateLimit, sec.ThrottledVerifyRate, sec.ThrottledVerifyFull)
 		}
+		time.Sleep(time.Second)
 	}
 }
 

@@ -258,14 +258,16 @@ var (
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})
-	// Labelled by cause because the two refusals mean different things:
+	// Labelled by cause because the refusals mean different things:
 	// "rate-limit" is one source (or one source and account) asking too
-	// often, and "verify-full" is this node already running as many
-	// password verifications as it allows at once — one caller
-	// misbehaving against the node at its ceiling (issue #203).
+	// often, "verify-rate" one source having passwords verified too
+	// often whatever the outcome (a valid credential re-sent on every
+	// request; issue #221), and "verify-full" is this node already
+	// running as many password verifications as it allows at once —
+	// callers misbehaving against the node at its ceiling (issue #203).
 	AuthThrottled = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_auth_throttled_total",
-		Help: "Authentication attempts refused before any password verification ran (issue #195), by cause: rate-limit (the per-source/per-account limiter), verify-full (the concurrent-verification cap).",
+		Help: "Authentication attempts refused before any password verification ran (issue #195), by cause: rate-limit (the per-source/per-account attempt limiter), verify-rate (the per-source verification budget, spent by every verification whatever its outcome), verify-full (the concurrent-verification cap).",
 	}, []string{"cause"})
 	// The SQL listener's two connection-level bounds (issue #212), apart
 	// from AuthThrottled because neither is an authentication attempt:
@@ -295,7 +297,7 @@ var (
 
 // AuthThrottleCauses are the labels AuthThrottled is counted by; see the
 // metric's own comment for what each means.
-var AuthThrottleCauses = []string{"rate-limit", "verify-full"}
+var AuthThrottleCauses = []string{"rate-limit", "verify-rate", "verify-full"}
 
 // The labels SQLPreAuthClosed is counted by.
 const (
@@ -311,7 +313,7 @@ func init() {
 	// a node that has refused nothing would emit no
 	// datax_auth_throttled_total line at all — turning an existing alert
 	// on it from 0 into no-data, which is a different thing and usually a
-	// louder one. Touching both children at registration keeps the series
+	// louder one. Touching every child at registration keeps the series
 	// present from the first scrape, the way the unlabelled counter it
 	// replaced was (issue #203 review).
 	for _, cause := range AuthThrottleCauses {

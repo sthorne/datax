@@ -96,6 +96,7 @@ type counterSamples struct {
 	// split would put a lifetime total inside a sentence about the last
 	// five minutes, which is the confusion this check exists to avoid.
 	throttleRL []sample
+	throttleVR []sample
 	throttleVF []sample
 	bgErrors   int64
 }
@@ -406,19 +407,21 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	// asking too often and this node at its verification ceiling call
 	// for different actions.
 	doc.Checks++
-	var rlDelta, vfDelta float64
+	var rlDelta, vrDelta, vfDelta float64
 	n.health.prev.throttleRL, rlDelta = rateOver(n.health.prev.throttleRL,
 		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now)
+	n.health.prev.throttleVR, vrDelta = rateOver(n.health.prev.throttleVR,
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate)), now)
 	n.health.prev.throttleVF, vfDelta = rateOver(n.health.prev.throttleVF,
 		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now)
-	throttleDelta := rlDelta + vfDelta
+	throttleDelta := rlDelta + vrDelta + vfDelta
 	if window := now.Sub(n.health.prev.throttleRL[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
 		// Every figure here is over the same window, so the parenthetical
 		// sums to the total in front of it.
 		add(Problem{Severity: SeverityWarning, Check: "auth-throttled", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication attempts refused before verification in the last %s on this node "+
-				"(%d rate-limited, %d over the concurrent-verification cap): something is attempting to authenticate far faster than any client should",
-				int(throttleDelta), window.Truncate(time.Second), int(rlDelta), int(vfDelta))})
+				"(%d rate-limited, %d over the verification budget, %d over the concurrent-verification cap): something is attempting to authenticate far faster than any client should",
+				int(throttleDelta), window.Truncate(time.Second), int(rlDelta), int(vrDelta), int(vfDelta))})
 	}
 
 	// Capacity: a store on course to fill, from the recorded free-space

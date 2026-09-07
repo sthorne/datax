@@ -241,9 +241,11 @@ function renderSecurityDoc() {
 // this draws what rides the cluster poll.
 
 // authThrottleText renders the refusals this node made before it
-// verified anything, naming the two causes apart: a caller asking too
-// often is somebody else's client to fix, and the concurrent-verify cap
-// filling is this node at its own ceiling (issue #203). Cumulative
+// verified anything, naming the causes apart: a caller asking too often
+// is somebody else's client to fix, so is one having passwords checked
+// too often (a credential re-sent on every request; issue #221), and
+// the concurrent-verify cap filling is this node at its own ceiling
+// (issue #203). Cumulative
 // since this node started, and said so — the health check is what
 // reports a rate, because a lifetime total is amber forever after one
 // bad afternoon.
@@ -252,12 +254,14 @@ function authThrottleText(d) {
   // confident "none" from a document that never had them.
   if (!d) return "—" + qual(" waiting for this node's security document");
   const rl = Math.round(d.auth_throttled_rate_limit || 0);
+  const vr = Math.round(d.auth_throttled_verify_rate || 0);
   const vf = Math.round(d.auth_throttled_verify_full || 0);
-  if (!rl && !vf) return "none" + qual(" since this node started");
+  if (!rl && !vr && !vf) return "none" + qual(" since this node started");
   const parts = [];
   if (rl) parts.push(rl + " rate-limited");
+  if (vr) parts.push(vr + " over the verify budget");
   if (vf) parts.push(vf + " at the verify cap");
-  return String(rl + vf) + qual(" since this node started · " + parts.join(" · "));
+  return String(rl + vr + vf) + qual(" since this node started · " + parts.join(" · "));
 }
 
 // renderAuthTiles draws the Authentication row, which is the one place
