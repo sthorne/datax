@@ -23,6 +23,25 @@ import (
 // httpsClient builds a client that trusts the test CA; a non-empty
 // certUser also loads that user's client certificate (from
 // security.CreateClientCert).
+// httpsClientFrom is httpsClient dialling from a chosen local address.
+// The limiter keys on the source address, so a test that wants an
+// attacker and an operator to hold separate budgets has to give them
+// separate addresses — 127.0.0.0/8 is all local on Linux, so a second
+// loopback address costs nothing to arrange.
+func httpsClientFrom(t *testing.T, certsDir, certUser, localIP string) *http.Client {
+	t.Helper()
+	c := httpsClient(t, certsDir, certUser)
+	tr := c.Transport.(*http.Transport).Clone()
+	ip := net.ParseIP(localIP)
+	if ip == nil {
+		t.Fatalf("bad local address %q", localIP)
+	}
+	d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Timeout: 10 * time.Second}
+	tr.DialContext = d.DialContext
+	c.Transport = tr
+	return c
+}
+
 func httpsClient(t *testing.T, certsDir, certUser string) *http.Client {
 	t.Helper()
 	caPEM, err := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
@@ -778,6 +797,16 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 		t.Fatalf("/api/health seed: %d", code)
 	}
 
+	// The guessing comes from a different source address than the
+	// operator reading the console. That is not decoration: the limiter
+	// keys on source, so sharing one address would drain the operator's
+	// own budget and every read below would be answered 429 — the cost
+	// TestLoginIsRateLimited documents at its own tail. Separating them
+	// makes this test assert the thing an operator actually cares about,
+	// which is that *somebody else* is being throttled and the figure is
+	// still readable while it happens.
+	attacker := httpsClientFrom(t, certsDir, "", "127.0.0.2")
+
 	// Hammer hard enough that the rate is unambiguous: the threshold is
 	// one refusal a second over the window, and this produces hundreds
 	// in a few seconds.
@@ -788,7 +817,7 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 			t.Fatal(err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := attacker.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -806,8 +835,9 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 		t.Fatalf("only %d refusals in four seconds of guessing: the limiter is not engaging, so this test proves nothing", refused)
 	}
 
-	// A non-admin sees the figure. It is this node's own count of its
-	// own refusals and names nobody.
+	// A non-admin sees the figure, from an address the guessing never
+	// touched, while the guessing is still recent. It is this node's own
+	// count of its own refusals and names nobody.
 	code, body, _ := authedGet(t, client, base+"/api/security", "watcher", "watcherpw")
 	if code != http.StatusOK {
 		t.Fatalf("/api/security as a non-admin: %d", code)

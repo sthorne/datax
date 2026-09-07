@@ -17,15 +17,10 @@ state or the internode protocol does, and an entry below says so.
   so the console displayed two of the three authentication figures and
   omitted the one that means something is hammering the node right now.
 
-  `datax_auth_throttled_total` is now labelled by cause: `rate-limit`
-  (one source, or one source and account, asking too often) and
-  `verify-full` (this node already verifying as many passwords at once as
-  it allows). They are counted apart because they call for different
-  actions — the first is someone else's client to fix, the second is this
-  node at its own ceiling. `/api/security` carries the total and both
-  causes, ungated: they are counts of this node's own refusals and name
-  nobody. *Which* addresses were throttled would name people and is
-  deliberately still not published.
+  `/api/security` carries the total and both causes, ungated: they are
+  counts of this node's own refusals and name nobody. *Which* addresses
+  were throttled would name people and is deliberately still not
+  published.
 
   The Security view gains a **refused before verification** tile, with its
   glossary entry. A new `auth-throttled` health check reports sustained
@@ -33,6 +28,21 @@ state or the internode protocol does, and an entry below says so.
   minutes, not a lifetime total — a cumulative count would leave the panel
   amber forever after one bad afternoon, which is how a panel stops being
   read.
+
+### Changed
+- **`datax_auth_throttled_total` is now labelled by cause** (#203), where
+  it was an unlabelled counter in 0.55.0: `rate-limit` (one source, or one
+  source and account, asking too often) and `verify-full` (this node
+  already verifying as many passwords at once as it allows). They are
+  counted apart because they call for different actions — the first is
+  someone else's client to fix, the second is this node at its own
+  ceiling.
+
+  This changes the series' shape. A query selecting the bare metric now
+  returns one series per cause where it returned a single series, so an
+  existing alert, recording rule or single-stat panel needs
+  `sum(datax_auth_throttled_total)` (or `sum by (cause) (…)` to keep the
+  split) to read as it did before.
 
 ## 0.55.0 — unreleased
 

@@ -84,10 +84,15 @@ type healthCache struct {
 // counterSamples remembers earlier readings of cumulative counters so a
 // rate over the last window can be judged.
 type counterSamples struct {
-	stalls   []sample
-	auth     []sample
-	throttle []sample
-	bgErrors int64
+	stalls []sample
+	auth   []sample
+	// One series per throttle cause, so the summary can report each as a
+	// delta over the same window. Reading the cumulative counters for the
+	// split would put a lifetime total inside a sentence about the last
+	// five minutes, which is the confusion this check exists to avoid.
+	throttleRL []sample
+	throttleVF []sample
+	bgErrors   int64
 }
 
 type sample struct {
@@ -396,15 +401,19 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	// asking too often and this node at its verification ceiling call
 	// for different actions.
 	doc.Checks++
-	rl := counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit))
-	vf := counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
-	var throttleDelta float64
-	n.health.prev.throttle, throttleDelta = rateOver(n.health.prev.throttle, rl+vf, now)
-	if window := now.Sub(n.health.prev.throttle[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
+	var rlDelta, vfDelta float64
+	n.health.prev.throttleRL, rlDelta = rateOver(n.health.prev.throttleRL,
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now)
+	n.health.prev.throttleVF, vfDelta = rateOver(n.health.prev.throttleVF,
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now)
+	throttleDelta := rlDelta + vfDelta
+	if window := now.Sub(n.health.prev.throttleRL[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
+		// Every figure here is over the same window, so the parenthetical
+		// sums to the total in front of it.
 		add(Problem{Severity: SeverityWarning, Check: "auth-throttled", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication attempts refused before verification in the last %s on this node "+
 				"(%d rate-limited, %d over the concurrent-verification cap): something is attempting to authenticate far faster than any client should",
-				int(throttleDelta), window.Truncate(time.Second), int(rl), int(vf))})
+				int(throttleDelta), window.Truncate(time.Second), int(rlDelta), int(vfDelta))})
 	}
 
 	// Capacity: a store on course to fill, from the recorded free-space
