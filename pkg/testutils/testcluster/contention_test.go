@@ -214,7 +214,13 @@ func TestIdleTxnDetail(t *testing.T) {
 				t.Fatalf("the last statement is not reported: %+v", it)
 			}
 			if it.TxnMillis <= 0 {
-				t.Fatalf("the transaction block's age is not reported: %+v", it)
+				// The transaction can be visible before it is a whole
+				// millisecond old, and 0 is the honest answer for that
+				// first millisecond. Keep waiting: the deadline below
+				// still fails the run if the age is never reported at
+				// all (issue #228).
+				time.Sleep(20 * time.Millisecond)
+				continue
 			}
 			if it.IdleMillis < 0 {
 				t.Fatalf("negative idle time: %+v", it)

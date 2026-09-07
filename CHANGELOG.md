@@ -257,6 +257,10 @@ state or the internode protocol does, and an entry below says so.
   was this seen from the other side (its sample included such a fresh
   entry); it samples with renewal held off now, and a new test drives
   the renewal by hand and proves the drain outlasts the replaced entry.
+- `TestIdleTxnDetail` failed about a third of the time (#228): it
+  asserted on the idle transaction's age from the first sample that
+  showed the transaction at all, which can be under a millisecond old.
+  It now keeps polling until the age is reported.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the
