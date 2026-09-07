@@ -1763,3 +1763,66 @@ func TestHeaderControlsAreExplained(t *testing.T) {
 		t.Error("the help panel is built from the view alone: the header's controls are not in it")
 	}
 }
+
+// TestSparklinesAreReadings (issue #218): a tile's sparkline carries a
+// baseline, a marker for now, a uniform stroke, a colour that is not a
+// node's, and a title that says what its y-domain is; and a delta in
+// words carries the magnitude the line does not. The figure is set
+// proportionally with a reserved width.
+func TestSparklinesAreReadings(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(core)
+	span := jsFuncSpan(src, "spark")
+	if span == nil {
+		t.Fatal("js/10-core.js has no spark")
+	}
+	body := src[span[0]:span[1]]
+	for _, want := range []string{`class="base"`, `class="now"`, `scaled to its own peak`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("spark() emits no %s: the sparkline is decoration, not a reading", want)
+		}
+	}
+	if strings.Count(body, `vector-effect="non-scaling-stroke"`) < 3 {
+		t.Error("spark() stretches its viewBox without non-scaling strokes: the line thins with the tile's width and the dot squashes")
+	}
+	if jsFuncSpan(src, "delta") == nil || !strings.Contains(src, "% over ${period}") {
+		t.Error("no delta line: the sparkline is the only trend signal and it carries no magnitude")
+	}
+	rt := jsFuncSpan(src, "renderTile")
+	if rt == nil {
+		t.Fatal("js/10-core.js has no renderTile")
+	}
+	if !strings.Contains(src[rt[0]:rt[1]], "delta(") || !strings.Contains(src[rt[0]:rt[1]], "scaled to its own peak") {
+		t.Error("renderTile does not add the delta and say the sparkline's domain in the tile's title")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+	for _, rule := range []string{".tile polyline {", ".tile svg .base {", ".tile svg .now {"} {
+		i := strings.Index(css, rule)
+		if i < 0 {
+			t.Errorf("no %s rule", rule)
+			continue
+		}
+		decl := css[i : i+strings.Index(css[i:], "}")]
+		if strings.Contains(decl, "--series-") {
+			t.Errorf("%s uses a series colour, which means a node everywhere else: %s", rule, decl)
+		}
+	}
+	i := strings.Index(css, ".tile .value {")
+	if i < 0 {
+		t.Fatal("no .tile .value rule")
+	}
+	decl := css[i : i+strings.Index(css[i:], "}")]
+	if strings.Contains(decl, "tabular-nums") {
+		t.Error(".tile .value is tabular: a standalone figure aligns with nothing and reads loose")
+	}
+	if !strings.Contains(decl, "min-width") {
+		t.Error(".tile .value reserves no width: a figure ticking 1→7→11 moves the box")
+	}
+}

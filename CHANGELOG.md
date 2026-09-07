@@ -316,6 +316,18 @@ state or the internode protocol does, and an entry below says so.
   of entries excused from matching the page shrank by those five, as
   the issue asked; what remains on it is prose terms and the copy
   buttons, not controls.
+- **Console: tile sparklines are readings** (#218). They were drawn in
+  node 1's series colour, stretched so the stroke thinned with the
+  tile's width, with no baseline, no marker for which end is now, and
+  each scaled to its own peak without saying so — two tiles moving
+  40→44 and 4,000→4,400 drew the same line. Each now has a baseline at
+  zero and a dot at the current value, the trend in the de-emphasis
+  grey and the dot in the text colour, non-scaling strokes, and a title
+  that says the line is the shape of the recent trend scaled to its own
+  peak. A signed delta over the named window ("▲ +12% over 15 min")
+  carries the magnitude the line does not. Tile figures are set in
+  proportional numerals with a reserved width, so they no longer look
+  loose and still do not jitter.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the

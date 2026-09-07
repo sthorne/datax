@@ -130,13 +130,39 @@ function fmtAgo(ms) {
   if (ms < 60000) return Math.round(ms / 1000) + "s ago";
   return Math.round(ms / 60000) + "m ago";
 }
-function spark(h) {
+// spark draws a tile's recent history as a reading rather than a
+// decoration (issue #218): a baseline says where zero is, a dot says
+// which end is now, the trend is in the de-emphasis grey and the dot in
+// the text colour — never a series slot, which means a node everywhere
+// else. The y-domain is the tile's own, from zero to its peak: a shape
+// read, and the tile's title says so, because two tiles at the same
+// ratio and different magnitudes draw the same line. The viewBox is
+// stretched to the tile's width; every stroke is non-scaling, so the
+// line stays one weight across breakpoints and the dot (a zero-length,
+// round-capped stroke) stays round.
+function spark(h, label) {
   if (h.length < 2) return "";
-  const max = Math.max(...h, 1e-9), w = 100, ht = 26;
-  const pts = h.map((v, i) =>
-    (i * w / (h.length - 1)).toFixed(1) + "," + (ht - 2 - v / max * (ht - 4)).toFixed(1)
-  ).join(" ");
-  return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="recent trend"><polyline points="${pts}"/></svg>`;
+  const max = Math.max(...h, 1e-9), w = 100, ht = 26, base = ht - 2;
+  const x = i => (i * w / (h.length - 1)).toFixed(1);
+  const y = v => (base - v / max * (ht - 4)).toFixed(1);
+  const pts = h.map((v, i) => x(i) + "," + y(v)).join(" ");
+  const lx = x(h.length - 1), ly = y(h[h.length - 1]);
+  return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="${esc(label || "recent trend")}: shape of the recent trend, scaled to its own peak">` +
+    `<line class="base" x1="0" y1="${base}" x2="${w}" y2="${base}" vector-effect="non-scaling-stroke"/>` +
+    `<polyline points="${pts}" vector-effect="non-scaling-stroke"/>` +
+    `<path class="now" d="M${lx} ${ly}L${lx} ${ly}" vector-effect="non-scaling-stroke"/></svg>`;
+}
+// delta is the signed change over the history, against the period it
+// covers, so the sparkline is not the only trend signal and the one
+// thing it throws away — magnitude — is said in words.
+function delta(h, period) {
+  if (h.length < 2) return "";
+  const first = h[0], last = h[h.length - 1];
+  if (!isFinite(first) || !isFinite(last)) return "";
+  if (first === 0) return last === 0 ? "" : `<div class="delta">from 0 over ${period}</div>`;
+  const pct = (last - first) / Math.abs(first) * 100;
+  if (Math.abs(pct) < 0.5) return `<div class="delta">flat over ${period}</div>`;
+  return `<div class="delta">${pct > 0 ? "▲ +" : "▼ "}${pct.toFixed(Math.abs(pct) < 10 ? 1 : 0)}% over ${period}</div>`;
 }
 // Tiles link to the same figure charted over time (the Metrics view);
 // their sparkline is the last 15 minutes from the datax_metrics table
@@ -188,13 +214,20 @@ function tileHTML(label, html, histName, histVal) {
   return renderTile(label, html, valueClass(html), histName, histVal);
 }
 function renderTile(label, html, cls, histName, histVal) {
-  let sp = "";
+  let sp = "", dl = "";
   const series = TILE_SERIES[label];
-  if (series && tileHist[series] && tileHist[series].length > 1) sp = spark(tileHist[series]);
-  else if (histName !== undefined) sp = spark(pushHist(histName, histVal));
-  const body = `<div class="label">${esc(label)}</div><div class="value${cls}">${html}</div>${sp}`;
-  if (!series) return `<div class="tile" data-key="${esc(label)}">${body}</div>`;
-  return `<a class="tile" data-key="${esc(label)}" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time">${body}</a>`;
+  if (series && tileHist[series] && tileHist[series].length > 1) {
+    sp = spark(tileHist[series], label);
+    dl = delta(tileHist[series], "15 min");
+  } else if (histName !== undefined) {
+    const h = pushHist(histName, histVal);
+    sp = spark(h, label);
+    dl = delta(h, `the last ${h.length} polls`);
+  }
+  const body = `<div class="label">${esc(label)}</div><div class="value${cls}">${html}</div>${dl}${sp}`;
+  const shape = sp ? " · the sparkline is the shape of the recent trend, scaled to its own peak" : "";
+  if (!series) return `<div class="tile" data-key="${esc(label)}"${shape ? ` title="${esc(label)}${shape}"` : ""}>${body}</div>`;
+  return `<a class="tile" data-key="${esc(label)}" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time${shape}">${body}</a>`;
 }
 async function pollTileHistory() {
   try {
