@@ -58,6 +58,57 @@ state or the internode protocol does, and an entry below says so.
   A console re-sending its own value never meets the bucket, because the
   suppression comes first.
 
+### Security
+- **A query cancel is authorized on the node that acts on it** (#211).
+  `CancelLocal` read a zero secret as "the caller is trusted, skip the
+  check" — an in-band sentinel on a value that arrives from the network,
+  standing in for an authorization performed on a different node from
+  the one that acted. Two ways in.
+
+  An unauthenticated 16-byte `CancelRequest` packet, which the SQL port
+  served in cleartext even in secure mode, cancelled any statement
+  anywhere in the cluster. Process IDs are `nodeID<<20|seq` with the
+  sequence starting at 1, so the search space per node is a few thousand
+  small integers; the packet was forwarded to the owning node under the
+  forwarding node's own certificate, and the check was skipped again on
+  arrival. And `cancel-query` was classified as an op any authenticated
+  principal may run, so the holder of any CA-signed client certificate —
+  one issued to an ordinary SQL user with no roles and no grants — could
+  dial the internode port and terminate arbitrary sessions, root's
+  included, which is authority the SQL layer reserves to the admin role.
+
+  There are now exactly two authorities and neither is inferred from the
+  other's absence. A wire client holds the secret: it must match
+  exactly, it travels with the request and is checked again where the
+  connection lives, and it authorizes a cancel of that one connection
+  and nothing else. An administrator holds the admin role: it does not
+  travel at all — the receiving node re-derives it from the forwarding
+  node's certificate — and it is what `pg_cancel_backend` and
+  `pg_terminate_backend` spend. `register` no longer issues a zero
+  secret, which one connection in 2³² used to draw.
+
+  **A `CancelRequest` sent in cleartext to a TLS listener is now
+  refused.** The secret is the whole authorization, and in the clear it
+  is there to be read and replayed by anyone on the path. pgx v5.10
+  (the version datax pins) and libpq from PostgreSQL 17 encrypt the
+  cancel connection whenever the connection it cancels is encrypted, so
+  `datax sql` is unaffected; **libpq before PostgreSQL 17 does not, so
+  Ctrl-C in psql 16 or earlier against a secure cluster now does
+  nothing.** Upgrading psql restores it.
+
+  No cluster protocol version: nothing new is sent, and a node running
+  an older binary keeps forwarding exactly the requests it always did.
+  **The fix is complete once every node is upgraded, and the roll itself
+  is a window.** An un-upgraded node has neither the cleartext refusal
+  nor the zero-secret door guard, so both vectors stay reachable through
+  it: directly, at its own unchecked `cancel-query`; and onward, because
+  when it forwards an attacker's zero-secret cancel it does so under the
+  cluster's own certificate, and the bytes are identical to a legitimate
+  forwarded `pg_cancel_backend`. The receiving node cannot tell them
+  apart. Nothing can fix a binary that is already running, so the
+  practical consequence is operational: roll promptly, and do not leave
+  a half-upgraded cluster sitting.
+
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside

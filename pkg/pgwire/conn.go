@@ -567,6 +567,17 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			return c.backend.Flush()
 		case *pgproto3.CancelRequest:
 			// An out-of-band cancel: this connection carries nothing else.
+			// It is unauthenticated by design — PostgreSQL's is too — but
+			// on a secure listener it is refused in cleartext for the same
+			// reason StartupMessage is above: the secret is the whole
+			// authorization, and in the clear it is there for anyone on
+			// the path to read and replay. pgx (v5.10) and libpq (PG17+)
+			// encrypt the cancel connection whenever the connection it
+			// cancels is encrypted; libpq before PG17 does not.
+			if c.opts.TLS != nil && !c.tlsDone {
+				noteCleartextCancel(c.nc.RemoteAddr().String())
+				return fmt.Errorf("cleartext cancel refused in secure mode")
+			}
 			if c.srv != nil && len(m.SecretKey) >= 4 {
 				c.srv.handleCancelRequest(int32(m.ProcessID), binary.BigEndian.Uint32(m.SecretKey[:4]))
 			}

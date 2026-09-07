@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 func pgErrCode(err error) string {
@@ -421,17 +422,80 @@ func TestCancelAndTimeouts(t *testing.T) {
 		_, err := conn2.Exec(ctx, `SELECT pg_sleep(20)`)
 		done <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
-	raw, err := net.Dial("tcp", tc.Nodes[1].SQLAddr())
-	if err != nil {
-		t.Fatal(err)
+	// conn is on the same node as conn2, and pg_stat_activity reports
+	// that node's own sessions, so it can see the statement start.
+	waitForRunningStatement(t, ctx, conn, pid2)
+
+	// cancelVia sends one CancelRequest packet to a node and hangs up,
+	// which is all a cancelling client does.
+	cancelVia := func(node int, pid uint32, key []byte) {
+		t.Helper()
+		raw, err := net.Dial("tcp", tc.Nodes[node].SQLAddr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fe := pgproto3.NewFrontend(raw, raw)
+		fe.Send(&pgproto3.CancelRequest{ProcessID: pid, SecretKey: key})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		_ = raw.Close()
 	}
-	fe := pgproto3.NewFrontend(raw, raw)
-	fe.Send(&pgproto3.CancelRequest{ProcessID: pid2, SecretKey: secret})
-	if err := fe.Flush(); err != nil {
-		t.Fatal(err)
+	// stillRunning fails if the statement stopped: the assertion has to
+	// be about the target, because a refused cancel answers nothing.
+	stillRunning := func(why string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			t.Fatalf("%s: pg_sleep stopped (%v)", why, err)
+		case <-time.After(time.Second):
+		}
 	}
-	_ = raw.Close()
+
+	// The secret is the whole authorization, so it has to be the right
+	// one. These assertions are the only place the door guard in
+	// handleCancelRequest is pinned (issue #211): on a secure cluster the
+	// ambiguous request can no longer be produced, so the secure test
+	// cannot reach it. Do not move them without moving that coverage. A zero secret is what a caller sends when it holds none, and
+	// it used to mean "trusted, skip the check" — sweeping the small,
+	// guessable process-ID space with it cancelled every statement in
+	// the cluster (issue #211). Both of these cross a node boundary, so
+	// they also pin that the far node checks rather than the near one.
+	rec := &auditRecorder{}
+	log.SetAuditSink(rec.record)
+	defer log.SetAuditSink(nil)
+	// auditRecorder joins the event name with the string values that
+	// follow it, so an audited cancel-query reads "admin-op op
+	// cancel-query principal ...". Counting on that prefix keeps any
+	// other op audited in the same window out of the total.
+	forwarded := func() int { return rec.count("admin-op op cancel-query") }
+	before := forwarded()
+	cancelVia(1, pid2, []byte{0, 0, 0, 0})
+	stillRunning("a zero secret")
+	// And it is refused at the door, not at the far end: a zero secret
+	// forwarded to a peer arrives under that peer's node certificate,
+	// which carries admin authority, and a node still running an older
+	// binary would honour it.
+	if n := forwarded() - before; n != 0 {
+		t.Fatalf("a zero secret was forwarded (%d admin ops); all: %v", n, rec.events)
+	}
+	wrong := append([]byte(nil), secret...)
+	wrong[0] ^= 0xff
+	before = forwarded()
+	cancelVia(1, pid2, wrong)
+	stillRunning("a wrong secret")
+	// A non-zero secret does cross, and is checked where the connection
+	// lives rather than where the packet landed. This count is also the
+	// positive control for the one above it: asserting an absence proves
+	// nothing unless the detector is known to fire, so anything that
+	// broke the counting — a reordered audit kv, a rename, cancel-query
+	// joining adminUnauditedOps — fails here instead of quietly
+	// satisfying the n != 0 check. Do not delete it as redundant.
+	if n := forwarded() - before; n != 1 {
+		t.Fatalf("a wrong secret produced %d forwarded admin ops, want 1; all: %v", n, rec.events)
+	}
+
+	cancelVia(1, pid2, secret)
 	select {
 	case err := <-done:
 		if pgErrCode(err) != sql.CodeQueryCanceled {
