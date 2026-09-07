@@ -149,7 +149,7 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		// Paired over the whole ring, not the tail this document
 		// carries, so an operation that started before that tail is
 		// still reported as running.
-		d.Operations = operationsFrom(n.events.Recent(0, 0, admin), n.clock.Now().WallTime/int64(time.Millisecond))
+		d.Operations = operationsFrom(n.events.Recent(0, 0, admin), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	}
 	return d
 }

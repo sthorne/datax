@@ -51,8 +51,14 @@ function opRow(o, running) {
     `<td>${o.outcome === "ok"
       ? `<span class="st live"><span class="dot"></span>ok</span>`
       : `<span class="st draining"><span class="dot"></span>${esc(o.outcome || "ended")}</span>`}</td>`;
+  // A running operation whose end never arrived stops claiming progress:
+  // the elapsed time keeps being reported, because it is true, but the
+  // row says the end was never recorded rather than counting up as
+  // though work continues (issue #190).
   const took = running
-    ? `<td class="num">${fmtElapsed(o.elapsed_ms)}</td>`
+    ? `<td class="num">${fmtElapsed(o.elapsed_ms)}${o.end_unrecorded
+        ? ` <span class="muted" title="this node has recorded no end for this operation; it may have been interrupted">no end recorded</span>`
+        : ""}</td>`
     : `<td class="num">${o.started_unix_ms ? fmtElapsed(o.elapsed_ms) : `<span class="muted" title="this operation's start is older than the event ring, so how long it took is not known">—</span>`}</td>`;
   return { key, html: `<tr data-key="${esc(key)}">
     <td><span class="kind">${esc(o.kind)}</span></td>
