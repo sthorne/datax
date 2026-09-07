@@ -200,3 +200,54 @@ func TestOpenOperationsAreBounded(t *testing.T) {
 		t.Fatalf("%d open operations retained; the map is meant to be a handful, not a job store", got)
 	}
 }
+
+// TestConsistencySweepIsOneOperation (issue #192): the sweep is paced —
+// one range per tick, forever — so the probe is the wrong unit and the
+// pass is the right one. The pass has a duration and an outcome, and the
+// outcome must agree with what the consistency-failure health check
+// reports, because both count the same mismatches.
+func TestConsistencySweepPairsByPass(t *testing.T) {
+	r := events.New()
+	// Two passes over three ranges, the second finding a mismatch.
+	r.RecordStart("consistency", "pass1", "consistency sweep started over 3 ranges this node leads")
+	r.RecordEnd("consistency", "pass1", "ok", "consistency sweep finished: every range agreed")
+	r.RecordStart("consistency", "pass2", "consistency sweep started over 3 ranges this node leads")
+	r.RecordEnd("consistency", "pass2", "mismatch", "consistency sweep finished: 1 range(s) disagreed")
+
+	ops := operationsFrom(r.Recent(0, 0, true), r.Open(), time.Now().UnixMilli())
+	got := map[string]string{}
+	for _, o := range ops {
+		if o.Kind == "consistency" {
+			got[o.Op] = o.Outcome
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %v, want one operation per pass", got)
+	}
+	if got["pass1"] != "ok" {
+		t.Errorf("a sweep that found nothing reports %q", got["pass1"])
+	}
+	if got["pass2"] != "mismatch" {
+		t.Errorf("a sweep that found a disagreement reports %q; it must agree with the consistency-failure check", got["pass2"])
+	}
+	for _, o := range ops {
+		if o.Kind == "consistency" && o.Running {
+			t.Fatalf("a closed pass is still running: %+v", o)
+		}
+	}
+}
+
+// A sweep in progress shows as running with a growing elapsed time,
+// which is the whole point of pairing it: it is the longest-running and
+// least visible thing a node does.
+func TestConsistencySweepInFlight(t *testing.T) {
+	r := events.New()
+	r.RecordStart("consistency", "pass1", "consistency sweep started over 40 ranges this node leads")
+	ops := operationsFrom(r.Recent(0, 0, true), r.Open(), time.Now().Add(time.Minute).UnixMilli())
+	if len(ops) != 1 || !ops[0].Running {
+		t.Fatalf("got %+v", ops)
+	}
+	if ops[0].ElapsedMs < 59*1000 {
+		t.Fatalf("elapsed %d ms, want about a minute", ops[0].ElapsedMs)
+	}
+}

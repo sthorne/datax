@@ -45,6 +45,31 @@ type Event struct {
 	Started time.Time `json:"started,omitempty"`
 }
 
+// What is paired, and what deliberately is not (issue #192).
+//
+// An operation is paired when it has a duration an operator would ask
+// about: backup, restore, decommission, re-encryption, a consistency
+// sweep over every led range, the re-shard janitor's reclaim, and
+// upgrade finalize — short, but the one irreversible thing the product
+// does, so "did it finish" must be answerable.
+//
+// Two families are deliberately left as instants, because pairing them
+// would say less rather than more:
+//
+//   - MVCC garbage collection and raft log truncation are per range and
+//     continuous. There is no pass with a beginning and an end, and a
+//     timeline with one entry per range would bury everything else. They
+//     belong on the Metrics view as a rate, where they already are.
+//   - Splits, merges and rebalances are individually short and
+//     collectively continuous. One entry per split is noise; a single
+//     derived "rebalancing" operation spanning a non-empty queue would
+//     be a truer shape, but it is a queue-depth gauge wearing an
+//     operation's clothes, and the queue depth is already on the Metrics
+//     view. They stay instants, which is what the ops view says.
+//
+// The rule this leaves: pair what a person would wait for, and count
+// what a person would watch a rate of.
+
 // Phases of a paired operation.
 const (
 	PhaseStart = "start"

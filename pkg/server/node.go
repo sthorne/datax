@@ -320,6 +320,13 @@ type Node struct {
 	// authLimit bounds what an unauthenticated caller can cost this node
 	// before any password is verified (issue #195, authlimit.go).
 	authLimit *authLimiter
+	// consistency tracks the sweep in flight, so a pass over every led
+	// range is one operation rather than a stream of instants
+	// (issue #192). Touched only by the single consistency worker.
+	consistency struct {
+		op         string
+		mismatches int
+	}
 	// consistencyFailures counts checksum mismatches this node's sweeps
 	// found (readable, unlike the Prometheus counter).
 	consistencyFailures atomic.Int64

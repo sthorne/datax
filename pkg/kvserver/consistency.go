@@ -119,6 +119,13 @@ type ConsistencyProbe struct {
 	Desc     kvpb.RangeDescriptor
 	LocalSum []byte
 	Index    uint64
+	// PassStart marks the probe that begins a fresh pass over the ranges
+	// this store leads, and Ranges is how many that is. The sweep is
+	// paced — one range per tick, forever — so the unit with a real
+	// beginning and end is the pass, not the probe, and that is what the
+	// operations view pairs (issue #192).
+	PassStart bool
+	Ranges    int
 }
 
 // checksumWait bounds how long proposers and collectors wait for an
@@ -162,8 +169,13 @@ func (s *Store) ProposeChecksum(ctx context.Context) (*ConsistencyProbe, error) 
 	cursor := s.consistencyMu.cursor
 	s.consistencyMu.cursor++
 	s.consistencyMu.Unlock()
-	r := replicas[int(cursor%uint64(len(replicas)))]
-	return s.ProposeChecksumOn(ctx, r.rangeID)
+	idx := int(cursor % uint64(len(replicas)))
+	r := replicas[idx]
+	probe, err := s.ProposeChecksumOn(ctx, r.rangeID)
+	if probe != nil {
+		probe.PassStart, probe.Ranges = idx == 0, len(replicas)
+	}
+	return probe, err
 }
 
 // ProposeChecksumOn runs one consistency probe on a specific range this
