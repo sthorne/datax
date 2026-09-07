@@ -259,8 +259,12 @@ function authThrottleText(d) {
   if (!rl && !vr && !vf) return "none" + qual(" since this node started");
   const parts = [];
   if (rl) parts.push(rl + " rate-limited");
-  if (vr) parts.push(vr + " over the verify budget");
-  if (vf) parts.push(vf + " at the verify cap");
+  // The same three phrases the health check's auth-throttled problem
+  // uses, so a reader moving between the two surfaces is not asked to
+  // match two vocabularies; "concurrent" is the word that tells the
+  // last two apart.
+  if (vr) parts.push(vr + " over the verification budget");
+  if (vf) parts.push(vf + " at the concurrent-verification cap");
   return String(rl + vr + vf) + qual(" since this node started · " + parts.join(" · "));
 }
 
