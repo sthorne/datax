@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,26 +232,55 @@ func TestConsolePrefsWriteIsBounded(t *testing.T) {
 		t.Fatalf("re-setting the same value: %d %s, want 200", code, body)
 	}
 
-	// A caller that actually changes the value meets the bound. Values
-	// alternate so that every request is a real write.
-	limited := false
-	for i := 0; i < 40; i++ {
-		value := "dark"
-		if i%2 == 0 {
-			value = "light"
-		}
-		code, body := setPref(t, tc, 0, "theme", value)
+	// A caller that actually changes the value meets the bound.
+	//
+	// Concurrently, not in a loop. The bucket refills on a wall clock,
+	// so a sequential loop is a race against it: forty round trips take
+	// well under a second on an idle machine and well over ten under a
+	// loaded one, where the refill keeps up and nothing is ever refused.
+	// The budget is taken at the handler's door, before any write, so
+	// firing them at once puts every request inside one refill tick and
+	// makes the outcome about the bound rather than about the machine.
+	const attempts = 40
+	codes := make([]int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			value := "dark"
+			if i%2 == 0 {
+				value = "light"
+			}
+			body, err := json.Marshal(map[string]string{"name": "theme", "value": value})
+			if err != nil {
+				return
+			}
+			req, err := http.NewRequest("POST", "http://"+tc.Nodes[0].HTTPAddr()+"/api/prefs", bytes.NewReader(body))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			codes[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	refused := 0
+	for _, code := range codes {
 		if code == http.StatusTooManyRequests {
-			limited = true
-			break
-		}
-		if code != 200 {
-			t.Fatalf("write %d: %d %s", i, code, body)
+			refused++
 		}
 	}
-	if !limited {
-		t.Fatal("40 back-to-back preference changes were all accepted: the write is unbounded, and the " +
-			"principals reaching it include ones with no write privilege anywhere in the database")
+	if refused == 0 {
+		t.Fatalf("%d concurrent preference changes were all accepted (%v): the write is unbounded, and "+
+			"the principals reaching it include ones with no write privilege anywhere in the database",
+			attempts, codes)
 	}
 
 	// And the no-op is genuinely suppressed rather than merely cheap:

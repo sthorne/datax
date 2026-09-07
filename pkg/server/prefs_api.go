@@ -3,14 +3,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
 
@@ -23,10 +26,13 @@ import (
 //
 // The table is a system table like datax_metrics: a reserved descriptor
 // ID, created by whichever node first finds it missing, written only by
-// the internal system session. Users may read it (that is what
-// catalog.IsSystemTable grants) but not write it, so the only path that
-// sets a preference is the one below, which takes the user from the
-// authenticated principal and never from the request body.
+// the internal system session. catalog.IsSystemTable GRANTS nothing —
+// privileges.go refuses every privilege but SELECT on a system table,
+// and SELECT then takes the ordinary path (owner, an explicit grant, or
+// ReadAllRole). So no SQL user can write this table, and an ordinary
+// one cannot read it either without being given SELECT. The only path
+// that sets a preference is the one below, which takes the user from
+// the authenticated principal and never from the request body.
 
 // PrefsTableDDL creates the preferences table. IF NOT EXISTS makes the
 // nodes' concurrent attempts idempotent.
@@ -45,6 +51,10 @@ const PrefsTableDDL = `CREATE TABLE IF NOT EXISTS ` + catalog.PrefsTableName + `
 // short allowlisted tokens; the limit is generous for the JSON around
 // them and still refuses a body worth buffering.
 const prefsBodyLimit = 4 << 10
+
+// prefsWriteBurst is how many preference changes one principal may make
+// back-to-back before the shared token bucket makes them wait.
+const prefsWriteBurst = 10
 
 // prefValues is the allowlist: every preference the console may store,
 // and every value it may hold. Both halves are checked server-side, so
@@ -79,6 +89,13 @@ type PrefsStatus struct {
 	// is false until the cluster has finalized v17, which is when the
 	// table may exist at all; the console honours a change either way
 	// and says so when it will not outlive the tab.
+	//
+	// It can also be false because THIS NODE could not read the cluster
+	// version: readClusterVersion falls back to its cached value when
+	// the KV read fails. The same viewer on another node would then see
+	// their stored preferences. Fail-safe — nothing is written under a
+	// wrong assumption — but Why says "could not tell" rather than
+	// asserting the cluster is pre-v17, because it may not be.
 	Persistent bool `json:"persistent"`
 	// Why explains a false Persistent in the console's own words.
 	Why string `json:"why,omitempty"`
@@ -121,11 +138,25 @@ func writePrefsError(w http.ResponseWriter, code int, msg string) {
 // console preferences.
 //
 // The write is the console's first state-changing endpoint after
-// sign-in, and it is guarded exactly as /api/login is: POST only, a JSON
-// content type required, and the session cookie is SameSite=Strict. A
-// cross-origin form post cannot set that content type, and a
-// cross-origin fetch that could set it cannot carry the cookie. The
-// user is taken from the authenticated principal, so the worst a
+// sign-in, and it is guarded exactly as /api/login is: POST only, and a
+// JSON content type required.
+//
+// Be precise about which control does the work, because the redundancy
+// is not where it first looks. SameSite=Strict governs the session
+// COOKIE. HTTP Basic credentials and TLS client certificates are also
+// ambient and ARE sent cross-origin, so SameSite does nothing for
+// either — and machines, and plenty of operators, reach this console by
+// exactly those doors. On those two the content type is the ONLY
+// control, and it is sufficient: application/json makes the request
+// non-simple, so a browser must preflight, and this handler answers
+// OPTIONS with 405 and no Access-Control-Allow-Origin. A form post
+// cannot set that content type, and sendBeacon cannot preflight.
+//
+// So: safe on all three doors, belt-and-braces on one of them. Do not
+// relax the content-type check on the reasoning that SameSite still has
+// your back — for two of the three principals it never did.
+//
+// The user is taken from the authenticated principal, so the worst a
 // confused browser could achieve is changing its own theme.
 func (n *Node) servePrefsAPI(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
@@ -141,6 +172,10 @@ func (n *Node) servePrefsAPI(w http.ResponseWriter, req *http.Request) {
 
 func (n *Node) servePrefsGet(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
+	// Per-viewer, so it must not be held by a shared cache. (/api/security
+	// is per-viewer too and does not say this; a document keyed by the
+	// signed-in user is the one that most wants it.)
+	w.Header().Set("Cache-Control", "no-store")
 	user, err := n.prefsUser(req)
 	if err != nil {
 		writePrefsError(w, http.StatusUnauthorized, err.Error())
@@ -212,8 +247,41 @@ func (n *Node) servePrefsPost(w http.ResponseWriter, req *http.Request) {
 		writePrefsError(w, http.StatusServiceUnavailable, why)
 		return
 	}
+	// Storing what is already stored is the request to be rid of.
+	//
+	// Every POST here runs through the internal system session, which
+	// bypasses privilege checks by construction — so a principal with
+	// NO write privilege anywhere in the database (a SELECT-only user, a
+	// metrics scrape account, a read-only certificate identity) can
+	// otherwise drive an unbounded stream of distributed transactions,
+	// each a raft proposal and an MVCC version with GC behind it. The
+	// table cannot grow — two allowlisted rows per user — but the write
+	// RATE was unbounded, and that is a capability those principals do
+	// not have over pgwire.
+	//
+	// A read is cheap next to a write, and in the case being abused the
+	// stored value is already what the caller is asking for.
+	if current, err := n.readPrefs(ctx, user); err == nil && current[pr.Name] == pr.Value {
+		writeJSON(w, http.StatusOK, PrefsStatus{Prefs: map[string]string{pr.Name: pr.Value}, Persistent: true})
+		return
+	}
+	// And a bound on the rest, from the bucket that already guards the
+	// other expensive authenticated path. A display preference changes a
+	// handful of times in a console's life; a burst of ten is past
+	// anything a person does.
+	if !n.authLimit.take("prefs\x00"+user, prefsWriteBurst) {
+		writePrefsError(w, http.StatusTooManyRequests, "too many preference changes; try again shortly")
+		return
+	}
 	if err := n.writePref(ctx, user, pr.Name, pr.Value); err != nil {
-		writePrefsError(w, http.StatusServiceUnavailable, "the preference could not be stored: "+err.Error())
+		// Opaque on purpose. /api/metrics returns its SQL error text,
+		// but that is a READ path; a write error in a distributed store
+		// carries range ids, key bytes, transaction state and
+		// constraint names, and that channel widens on its own as the
+		// storage layer's errors get more detailed. The detail goes to
+		// the node's log, which the operator already has.
+		log.Warnf("prefs: storing %s for %q failed: %v", pr.Name, user, err)
+		writePrefsError(w, http.StatusServiceUnavailable, "the preference could not be stored")
 		return
 	}
 	writeJSON(w, http.StatusOK, PrefsStatus{Prefs: map[string]string{pr.Name: pr.Value}, Persistent: true})
@@ -221,8 +289,15 @@ func (n *Node) servePrefsPost(w http.ResponseWriter, req *http.Request) {
 
 // isMissingTable reports the one error the prefs path treats as "not
 // created yet" rather than as a failure.
+//
+// By code, not by text. Matching "does not exist" anywhere in a message
+// also catches a missing column, a missing database, and any error that
+// merely quotes one — which on the read path would turn a real failure
+// into a silently empty document, and on the write path would clear
+// prefsReady and re-attempt DDL on every request.
 func isMissingTable(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "does not exist")
+	var serr *sql.Error
+	return errors.As(err, &serr) && serr.Code == sql.CodeUndefinedTable
 }
 
 // ensurePrefsTable creates the table when it is missing. Unlike the
