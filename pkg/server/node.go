@@ -113,6 +113,15 @@ type Config struct {
 	// HTTPListen serves /metrics (Prometheus) and /status (JSON); empty
 	// disables.
 	HTTPListen string
+	// AuthTimeout is how long an unauthenticated connection has to
+	// finish its handshake — SQL startup and authentication, an HTTP
+	// request's headers — before it is closed (0 = 60 s, PostgreSQL's
+	// authentication_timeout; negative = never; issue #212).
+	AuthTimeout time.Duration
+	// SQLMaxPendingAuth caps SQL connections in the pre-authentication
+	// state; past it new connections are refused rather than held (0 =
+	// 512; negative = no cap).
+	SQLMaxPendingAuth int
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration

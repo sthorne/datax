@@ -127,3 +127,98 @@ func TestSourceKeyIsTheHost(t *testing.T) {
 		}
 	}
 }
+
+// The SQL door asks before the exchange and charges after a failure
+// (issue #212), so a burst of correct sign-ins from one address — a
+// pool starting — is never refused, and a burst of wrong ones is
+// charged in full even though every one of them was asked before any
+// had failed.
+func TestAuthLimiterBudgetIsSpentOnFailureNotOnAsking(t *testing.T) {
+	l := newAuthLimiter()
+	now := time.Now()
+	l.nowFn = func() time.Time { return now }
+
+	// Asking spends nothing: far more asks than the burst all pass.
+	for i := 0; i < authBurst*3; i++ {
+		if !l.budget("10.0.0.1:5000", "alice") {
+			t.Fatalf("ask %d refused when nothing has failed", i)
+		}
+	}
+	// A burst of failures that all began together is charged when they
+	// land, and the source then has no budget.
+	for i := 0; i < authAccountBurst; i++ {
+		l.spend("10.0.0.1:5000", "alice")
+	}
+	if l.budget("10.0.0.1:5000", "alice") {
+		t.Fatalf("%d failures at one account left budget for another attempt", authAccountBurst)
+	}
+	// The per-source bucket is the wider one: another account from the
+	// same source still has budget until the source's own burst is spent.
+	if !l.budget("10.0.0.1:5000", "bob") {
+		t.Fatal("failures at one account refused another account from the same source inside the source burst")
+	}
+	// A different source is unaffected.
+	if !l.budget("10.0.0.2:5000", "alice") {
+		t.Fatal("one source's failures throttled another")
+	}
+	// Success refunds; the budget is back at once.
+	l.succeeded("10.0.0.1:5000", "alice")
+	if !l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("a success did not refund the budget")
+	}
+}
+
+// A wave costs what a sequence costs. Every guess that asked before the
+// first failure landed runs (that is the order of charging), and every
+// one is charged when it lands — so a hundred at once puts the source a
+// hundred seconds into debt, not a burst's worth. A floor shallower
+// than the wave would be a discount the source could take again as
+// soon as it refilled; the floor there is exists only so that an
+// address is never held for longer than ten minutes.
+func TestAuthLimiterAWaveIsChargedInFull(t *testing.T) {
+	l := newAuthLimiter()
+	now := time.Now()
+	l.nowFn = func() time.Time { return now }
+
+	const wave = 100
+	for i := 0; i < wave; i++ {
+		if !l.budget("10.0.0.1:5000", "alice") {
+			t.Fatalf("guess %d of a wave refused before any had landed: asking must spend nothing", i)
+		}
+	}
+	for i := 0; i < wave; i++ {
+		l.spend("10.0.0.1:5000", "alice")
+	}
+	// A burst's worth of waiting — what a floor at the burst would have
+	// made enough — buys nothing.
+	now = now.Add(time.Duration(2*authBurst+1) * authRefill)
+	if l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("a wave of a hundred was forgiven after a burst's worth of waiting: waves are free")
+	}
+	// The wave is paid for a second at a time: budget returns exactly
+	// when the debt is cleared, and not before.
+	start := now.Add(-time.Duration(2*authBurst+1) * authRefill)
+	now = start.Add(time.Duration(wave-authAccountBurst) * authRefill)
+	if l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("budget returned a second early")
+	}
+	now = start.Add(time.Duration(wave-authAccountBurst+1) * authRefill)
+	if !l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("a wave of a hundred cost more than a hundred seconds")
+	}
+
+	// The floor: an address is never held for longer than authDebtMax
+	// seconds, however wide the wave (an operator who removed the
+	// pending cap).
+	for i := 0; i < 10*int(authDebtMax); i++ {
+		l.spend("10.0.0.2:5000", "alice")
+	}
+	now = now.Add(time.Duration(authDebtMax-10) * authRefill)
+	if l.budget("10.0.0.2:5000", "alice") {
+		t.Fatal("budget before the floor's worth of waiting")
+	}
+	now = now.Add(11 * authRefill)
+	if !l.budget("10.0.0.2:5000", "alice") {
+		t.Fatal("the floor is not holding: an address is held for longer than authDebtMax")
+	}
+}

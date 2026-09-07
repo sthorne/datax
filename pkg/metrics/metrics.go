@@ -267,6 +267,15 @@ var (
 		Name: "datax_auth_throttled_total",
 		Help: "Authentication attempts refused before any password verification ran (issue #195), by cause: rate-limit (the per-source/per-account limiter), verify-full (the concurrent-verification cap).",
 	}, []string{"cause"})
+	// The SQL listener's two connection-level bounds (issue #212), apart
+	// from AuthThrottled because neither is an authentication attempt:
+	// a handshake that never completed, and a connection refused before
+	// it could begin one. Both are pre-created at registration like
+	// AuthThrottled's causes, for the same reason.
+	SQLPreAuthClosed = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_sql_preauth_closed_total",
+		Help: "SQL connections ended before authentication completed (issue #212), by cause: handshake-timeout (no startup or a stalled SCRAM exchange within the authentication deadline), pending-full (refused at accept because this node already holds its maximum of unauthenticated connections).",
+	}, []string{"cause"})
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
 	})
@@ -288,6 +297,15 @@ var (
 // metric's own comment for what each means.
 var AuthThrottleCauses = []string{"rate-limit", "verify-full"}
 
+// The labels SQLPreAuthClosed is counted by.
+const (
+	PreAuthHandshakeTimeout = "handshake-timeout"
+	PreAuthPendingFull      = "pending-full"
+)
+
+// SQLPreAuthCauses are the labels SQLPreAuthClosed is counted by.
+var SQLPreAuthCauses = []string{PreAuthHandshakeTimeout, PreAuthPendingFull}
+
 func init() {
 	// A labelled counter has no children until something asks for one, so
 	// a node that has refused nothing would emit no
@@ -298,6 +316,9 @@ func init() {
 	// replaced was (issue #203 review).
 	for _, cause := range AuthThrottleCauses {
 		AuthThrottled.WithLabelValues(cause)
+	}
+	for _, cause := range SQLPreAuthCauses {
+		SQLPreAuthClosed.WithLabelValues(cause)
 	}
 }
 

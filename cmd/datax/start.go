@@ -41,6 +41,8 @@ type serverFlags struct {
 	bytesThr      int64
 	verbose       bool
 	slowStmt      time.Duration
+	authTimeout   time.Duration
+	maxPending    int
 	metricsRecord time.Duration
 	drainTimeout  time.Duration
 }
@@ -68,6 +70,8 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.DurationVar(&f.slowStmt, "slow-statement-threshold", 0, "SQL statements slower than this are kept for the dashboard's slow list (0 = default 500ms)")
+	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication, HTTP request headers) before it is closed (0 = default 60s, negative = never)")
+	f.fs.IntVar(&f.maxPending, "sql-max-pending-auth", 0, "maximum SQL connections in the pre-authentication state; past it new connections are refused rather than held (0 = default 512, negative = no cap)")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
 	f.fs.DurationVar(&f.drainTimeout, "drain-timeout", server.DefaultDrainTimeout, "on SIGTERM or Ctrl-C, how long to spend handing leases to peers and letting SQL connections finish before stopping (0 stops at once)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
@@ -99,6 +103,8 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		LeaseShedFactor:         f.shedFactor,
 		ConsistencyInterval:     f.consistInt,
 		SlowStatementThreshold:  f.slowStmt,
+		AuthTimeout:             f.authTimeout,
+		SQLMaxPendingAuth:       f.maxPending,
 		MetricsRecordInterval:   metricsRecordInterval(f.metricsRecord),
 		DrainTimeout:            f.drainTimeout,
 		RebalanceBytesThreshold: f.bytesThr,

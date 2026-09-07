@@ -711,6 +711,16 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   exist (#137; PostgreSQL's mock authentication does the same). Cleartext
   startup is refused in secure mode. In
   insecure mode `SSLRequest` gets `N` and authentication is trust.
+  Startup is bounded three ways (#212): password guessing spends the
+  same per-source and per-(source, account) budget `/api/login` does —
+  asked before the exchange, charged by a failure, refunded by a
+  success — and is refused with a FATAL `28000` that names no user;
+  a connection that has not reached ReadyForQuery within
+  `--auth-timeout` (60 s) is closed wherever in the handshake it
+  stalled; and past `--sql-max-pending-auth` (512) connections still in
+  startup, a new one is refused at accept with a FATAL `53300` before
+  anything is allocated for it (a client mid-`SSLRequest` sees that as
+  a failed TLS negotiation).
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is
   all-powerful; members of the **admin role** (`GRANT ADMIN TO user`,
