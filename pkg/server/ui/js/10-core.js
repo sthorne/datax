@@ -284,6 +284,11 @@ document.addEventListener("click", ev => {
   const btn = ev.target.closest("button.copy");
   if (!btn) return;
   ev.preventDefault(); ev.stopPropagation();
+  // Stopping the event here also keeps it from the bubble-phase listener
+  // in 12-help.js that dismisses an open help popup on any click
+  // elsewhere, which would make this the one control on the page that
+  // leaves it open. Close it here instead.
+  closeHelpPop();
   const cell = btn.closest("td, .value, .copysrc");
   copyText(btn.dataset.copy, btn, cell);
 }, true);
@@ -304,9 +309,20 @@ document.addEventListener("keydown", ev => {
 // file, /api/* already returns the same figures as JSON that curl can
 // take — a second path to the same bytes is not worth building.
 //
-// csvCell quotes the way a spreadsheet expects: a field holding a comma,
-// a quote, a newline or an edge space is wrapped, with its own quotes
-// doubled. Statement text and range keys carry all four.
+// csvCell escapes CSV delimiters: a field holding a comma, a quote, a
+// newline or an edge space is wrapped, with its own quotes doubled.
+// Statement text and range keys carry all four.
+//
+// It deliberately does NOT neutralise a leading =, + or @, which a
+// spreadsheet reads as a formula. A quoted identifier can carry one
+// (CREATE TABLE "=..." is legal), so a table name could reach a
+// spreadsheet as a formula — but quoting does not help, since a
+// spreadsheet evaluates quoted fields too, and the usual fix of
+// prefixing an apostrophe changes the value. This export's whole point
+// is that what comes out is what the cluster holds: a key that has been
+// altered to be safe to paste is not one a command will take. The
+// exposure needs CREATE privilege and lands on the reader's own machine,
+// not the cluster. Recorded as a decision rather than left as a gap.
 function csvCell(v) {
   const s = v === undefined || v === null ? "" : String(v);
   return /[",\r\n]|^\s|\s$/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;

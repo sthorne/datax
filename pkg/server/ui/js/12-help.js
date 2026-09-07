@@ -235,7 +235,7 @@ const HELP = {
   "compare": "Overlay every node's series on one chart instead of drawing a chart per node — the fastest way to see that one node disagrees with the rest.",
   "annotate": "Mark cluster operations on the charts where they happened, so a change in a line can be lined up against what the cluster did.",
   "filter": "Narrows this view. It is written into the address, so a filtered view is a link that can be shared.",
-  "copy": "Puts this value on the clipboard — a range key for `datax debug split`, an address for a connection string, a statement for a ticket. The clipboard needs a secure context, so on a console reached over plain HTTP the control selects the text instead and says so, leaving one keystroke to finish the job.",
+  "copy": "Puts this value on the clipboard — a range key for `datax debug split`, an address for a connection string, a statement for a ticket. Where a cell shows a range's whole span, the control takes the start key alone — that is what datax debug split takes, and the end key is a column in the CSV. The clipboard needs a secure context, so on a console reached over plain HTTP the control selects the text instead and says so, leaving one keystroke to finish the job.",
   "copy as csv": "Copies this table as CSV, ready to paste into a spreadsheet or an incident review. It is what is on screen — the filter, the sort and the scope already applied — rather than everything the node holds, and keys are exported in full where the cells shorten them to fit. For a file rather than a paste, the same figures come from this node's /api/ endpoints as JSON that curl can take.",
 
   // ---- Section titles that are not also a column ----
