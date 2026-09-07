@@ -118,6 +118,9 @@ task("txnCharts", pollTxnCharts, 15000, ["sql"]);
 // The table detail joins the shapes that touch one table against this
 // same document (issue #194), so #/schema needs it too.
 task("statements", pollStatements, 10000, ["sql", "schema"]);
+// The cluster's operations (issue #210): a fan-out too, so the same slow
+// poll, for the operations view and the overview's in-flight strip.
+task("operations", pollOperations, 10000, ["ops", "overview"]);
 
 window.addEventListener("hashchange", route);
 document.getElementById("compare-toggle").addEventListener("change", ev => {

@@ -2063,3 +2063,75 @@ func TestHealthFindingsCarryWhenTheyBegan(t *testing.T) {
 		t.Error("the events filter select no longer goes through setOpsKind: a choice made by hand is not in the URL, and the route's q is not dropped")
 	}
 }
+
+// TestOperationsUnderClusterScopeAreClusterWide (issue #210): under the
+// whole-cluster scope the operation tables read /api/operations, the
+// merged document with a node on every row, and say which nodes did
+// not answer; the overview's in-flight strip reads it too; and the
+// names the script reads are the ones the server writes.
+func TestOperationsUnderClusterScopeAreClusterWide(t *testing.T) {
+	api, err := os.ReadFile("../operations_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := string(mustRead(t, "js/92-ops.js"))
+	if !strings.Contains(ops, `fetch("/api/operations"`) {
+		t.Fatal("92-ops.js never fetches /api/operations: the operations view is one node at a time")
+	}
+	// Every field the script reads off the document is one the Go
+	// struct writes.
+	for _, field := range []string{"operations", "nodes", "nodes_asked", "errors", "truncated"} {
+		if !readsField(ops, "opsCluster", field) && !readsField(ops, "d", field) {
+			t.Errorf("92-ops.js does not read %s off the operations document", field)
+		}
+		if !strings.Contains(string(api), "`json:\""+field) {
+			t.Errorf("operations_api.go does not write %s, which 92-ops.js reads", field)
+		}
+	}
+	if !strings.Contains(string(api), "NodeID int `json:\"node_id\"`") || !strings.Contains(ops, "o.node_id") {
+		t.Error("the node each operation is on is not carried from the server to the row")
+	}
+	span := jsFuncSpan(ops, "opsSource")
+	if span == nil {
+		t.Fatal("opsSource not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, `ui.scope === "cluster" && opsCluster`) {
+		t.Error("opsSource does not choose the cluster document under cluster scope: the tables stay the serving node's")
+	}
+	span = jsFuncSpan(ops, "opRow")
+	if span == nil {
+		t.Fatal("opRow not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, `routeTo("node/" + (o.node_id || 0))`) {
+		t.Error("opRow does not link the row to the node it is on")
+	}
+	span = jsFuncSpan(ops, "opsScopeNote")
+	if span == nil {
+		t.Fatal("opsScopeNote not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, "did not answer") || !strings.Contains(body, "d.errors.map(esc)") {
+		t.Error("opsScopeNote does not name the nodes that did not answer: a partial document reads as the whole cluster")
+	}
+	span = jsFuncSpan(ops, "renderRecentOps")
+	if span == nil {
+		t.Fatal("renderRecentOps not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, "opsSource()") || !strings.Contains(body, "runningOpRow") {
+		t.Error("the overview's in-flight strip does not read the cluster document: the first screen answers for the serving node")
+	}
+	boot := string(mustRead(t, "js/95-boot.js"))
+	if !strings.Contains(boot, `task("operations", pollOperations, 10000, ["ops", "overview"])`) {
+		t.Error("the operations fan-out is not polled for the ops view and the overview, slowly")
+	}
+	page := string(mustRead(t, "index.html"))
+	for _, tbody := range []string{"ops-running", "ops-done"} {
+		at := strings.Index(page, `<tbody id="`+tbody+`"`)
+		if at < 0 {
+			t.Fatalf("%s not in index.html", tbody)
+		}
+		head := page[max(0, at-400):at]
+		if !strings.Contains(head, `<th scope="col">node</th>`) {
+			t.Errorf("the %s table has no node column: a cluster-wide row does not say where it is", tbody)
+		}
+	}
+}

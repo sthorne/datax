@@ -290,7 +290,7 @@ func TestStatementGating(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	for _, path := range []string{"/api/statements", "/api/explain?fingerprint=abc"} {
+	for _, path := range []string{"/api/statements", "/api/explain?fingerprint=abc", "/api/operations"} {
 		if code, body, _ := authedGet(t, client, base+path, "scraper", "metrics-pw"); code != http.StatusForbidden {
 			t.Errorf("%s as a non-admin: %d %s, want 403", path, code, body)
 		}

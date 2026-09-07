@@ -60,6 +60,27 @@ state or the internode protocol does, and an entry below says so.
   whatever alerts on `datax_health_problems`. A row that says how long
   it has been open is one an operator can decide about at a glance,
   which is most of what the permanently amber panel needed.
+- **The operations view answers for the cluster** (#210). The event
+  ring is per node, so the view showed whichever node served the page,
+  and the operation an operator most wants to watch — a decommission
+  driven by the draining node, a backup running where it was started, a
+  re-encryption sweep of one store — was, by construction, usually
+  running somewhere else; the per-node label was honest and did not
+  stop anyone concluding the cluster was idle. A new `/api/operations`
+  asks every node for its paired operations over the internode RPC, all
+  at once rather than one after another (a node that does not answer
+  costs the whole timeout, and the cluster's operations are wanted most
+  when a node is not answering), and merges them with the node kept on
+  each row. Partial is the normal case: a node that did not answer is
+  named with the reason and its heartbeat age beside the rows that
+  arrived, never a failed document. Under the whole-cluster scope the
+  operations view's two tables and the overview's *Operations in
+  flight* read it, with a node column and a link to that node; under a
+  node's scope nothing changes. Admin-gated and polled every ten
+  seconds, like the other fan-outs. The rings themselves stay per node:
+  merging five hundred-entry rings into one feed would bury each node's
+  record under the others', and the view already keeps the operations
+  apart from the raw records.
 - **The console's viewer preferences live in the cluster** (#204). Two
   display choices — light/dark/system, and whether a moment reads as how
   long ago it was or as the clock time it happened at — plus the place

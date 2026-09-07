@@ -101,7 +101,14 @@ serves, on that address:
   and within three days a critical one.
 
   **ops**: the operations in flight and the ones that have finished,
-  above the scoped node's event ring with a kind filter. A long-running
+  above the scoped node's event ring with a kind filter. Under the
+  whole-cluster scope the two operation tables are every node's,
+  merged, each row naming the node it is on — a decommission is driven
+  by the draining node and a backup runs where it was started, so the
+  operation worth watching is usually on a node other than the one
+  serving the page; a node that did not answer is named beside the rows
+  that did (admin role; without it, and under a node's scope, the
+  tables are that node's own). A long-running
   operation — a backup, a restore, a re-encryption, a node's drain —
   records both of its ends in the ring, so the view pairs them and shows
   the elapsed time of the ones still running and the duration and
@@ -210,6 +217,12 @@ serves, on that address:
   node's document is fetched from that node over the internode RPC and
   needs the admin role (403 otherwise). Statement text and audit
   events are included only for admins.
+- **`/api/operations`** — JSON: every node's operations — the pairs of
+  start and end records in its event ring plus what it knows is still
+  open — merged over the internode RPC, running first, each with the
+  node it is on. `nodes` of `nodes_asked` answered; a node that did not
+  is named in `errors` with its heartbeat age, and the rest of the
+  document stands. Admin role required.
 - **`/api/statements`** — JSON: the statement shapes the cluster ran,
   unioned from every node over the internode RPC and re-ranked by total
   time; each entry carries the summable figures plus each node's own row
@@ -238,8 +251,8 @@ hold, and signs you out — the credentials are the database credentials
 console](security.md#signing-in-to-the-console)). Scripted clients are
 unaffected: HTTP Basic credentials of any database user, or a client
 certificate, authenticate every route as before. `/api/range`,
-`/api/activity` and another node's `/api/node` additionally require the
-admin role ([Security](security.md)). Without that role the cluster
+`/api/activity`, `/api/operations` and another node's `/api/node`
+additionally require the admin role ([Security](security.md)). Without that role the cluster
 ranges are not clickable and the note under them says which user is
 signed in and how to proceed (`GRANT ADMIN TO ops`, or sign out and back
 in as `root`). `/api/cluster` carries the same identity in its

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
-	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -169,22 +168,9 @@ func (n *Node) statementsDoc(req *http.Request) StatementsStatus {
 // peerStatements asks one node for its fingerprint accounting, over the
 // node-detail RPC the node page already uses.
 func (n *Node) peerStatements(ctx context.Context, id base.NodeID) ([]pgwire.StatementStat, uint64, error) {
-	addr, err := n.registry.Resolve(id)
+	detail, err := n.peerNodeDetail(ctx, id)
 	if err != nil {
 		return nil, 0, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	var resp cluster.AdminResponse
-	if err := n.trans.Call(ctx, addr, "admin", cluster.AdminRequest{Op: "node-detail"}, &resp); err != nil {
-		return nil, 0, err
-	}
-	if resp.Error != "" {
-		return nil, 0, fmt.Errorf("%s", resp.Error)
-	}
-	var detail NodeDetail
-	if err := json.Unmarshal(resp.Status, &detail); err != nil {
-		return nil, 0, fmt.Errorf("undecodable detail: %w", err)
 	}
 	if detail.Activity == nil {
 		return nil, 0, nil

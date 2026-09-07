@@ -303,4 +303,5 @@ function rerenderCurrentView() {
   if (lastSchema) renderSchema(lastSchema);
   if (ui.view === "sql") runNow("activity");
   if (ui.view === "ops" || ui.view === "security") runNow("overview");
+  if (ui.view === "ops" || ui.view === "overview") runNow("operations");
 }
