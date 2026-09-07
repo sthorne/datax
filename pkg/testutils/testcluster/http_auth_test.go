@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -793,8 +795,22 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 	// falls inside a window the rate is measured over. Without this the
 	// first sample would already include the burst and the rate would
 	// be zero — which is what the check is meant to avoid reporting.
-	if code, _, _ := authedGet(t, client, base+"/api/health", "root", "topsecret"); code != http.StatusOK {
+	//
+	// The same call pins the other half of "a rate, not a total": a node
+	// nothing has hammered reports no problem. A check built on the
+	// cumulative counter would already be firing here.
+	code, body, _ := authedGet(t, client, base+"/api/health", "root", "topsecret")
+	if code != http.StatusOK {
 		t.Fatalf("/api/health seed: %d", code)
+	}
+	var seed server.HealthStatus
+	if err := jsonUnmarshal([]byte(body), &seed); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range seed.Problems {
+		if p.Check == "auth-throttled" {
+			t.Fatalf("auth-throttled is reported on a node nothing has throttled: %s", p.Summary)
+		}
 	}
 
 	// The guessing comes from a different source address than the
@@ -838,7 +854,7 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 	// A non-admin sees the figure, from an address the guessing never
 	// touched, while the guessing is still recent. It is this node's own
 	// count of its own refusals and names nobody.
-	code, body, _ := authedGet(t, client, base+"/api/security", "watcher", "watcherpw")
+	code, body, _ = authedGet(t, client, base+"/api/security", "watcher", "watcherpw")
 	if code != http.StatusOK {
 		t.Fatalf("/api/security as a non-admin: %d", code)
 	}
@@ -882,6 +898,113 @@ func TestAuthThrottlingIsVisibleAndRaisesAProblem(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 }
+
+// TestVerifyCapIsCountedApart (issue #203): the concurrent-verification
+// cap is the bound that does not depend on the source key meaning
+// anything — behind a proxy every attempt shares one address — and it is
+// the half of the throttle counter nothing else exercises. Mislabelling
+// both verify-full call sites passes every other test in the tree, which
+// is what this closes.
+//
+// Reaching it needs many sources at once, not many attempts: allow()
+// runs first, so one address gets its burst through and is then refused
+// by the rate limiter long before it can fill the semaphore. Several
+// addresses each spend their burst simultaneously, and with
+// authVerifyInFlight slots against that many arrivals the rest are
+// refused at the cap.
+func TestVerifyCapIsCountedApart(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// A wrong password for a real user, so a real verifier runs (the work
+	// the cap exists to bound) and no success refills anybody's budget.
+	attempt := func(c *http.Client) {
+		body := `{"user":"root","password":"wrong"}`
+		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.Do(req)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	// Several loopback sources, each with its own burst, all released at
+	// once so their verifications overlap.
+	var clients []*http.Client
+	for i := 2; i <= 9; i++ {
+		clients = append(clients, httpsClientFrom(t, certsDir, "", fmt.Sprintf("127.0.0.%d", i)))
+	}
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, c := range clients {
+			for j := 0; j < authVerifyProbePerSource; j++ {
+				wg.Add(1)
+				go func(c *http.Client) {
+					defer wg.Done()
+					<-start
+					attempt(c)
+				}(c)
+			}
+		}
+		close(start)
+		wg.Wait()
+
+		code, body, _ := authedGet(t, client, base+"/api/security", "root", "topsecret")
+		if code != http.StatusOK {
+			t.Fatalf("/api/security: %d", code)
+		}
+		var sec server.SecurityStatus
+		if err := jsonUnmarshal([]byte(body), &sec); err != nil {
+			t.Fatal(err)
+		}
+		if sec.ThrottledVerifyFull > 0 {
+			// And it is counted as its own cause, not folded into the
+			// other one or into the total alone.
+			if sec.AuthThrottled != sec.ThrottledRateLimit+sec.ThrottledVerifyFull {
+				t.Errorf("total %v is not the sum of its causes (%v + %v)",
+					sec.AuthThrottled, sec.ThrottledRateLimit, sec.ThrottledVerifyFull)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no refusal was attributed to the verification cap after repeated concurrent bursts "+
+				"(rate-limited %v, verify-full %v): the cap is either never reached or not labelled apart",
+				sec.ThrottledRateLimit, sec.ThrottledVerifyFull)
+		}
+	}
+}
+
+// authVerifyProbePerSource is how many attempts each source fires in one
+// wave: comfortably past authBurst, so every source contributes its whole
+// burst to the same instant.
+const authVerifyProbePerSource = 24
 
 func jsonQuote(s string) string {
 	b, _ := json.Marshal(s)

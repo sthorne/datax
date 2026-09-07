@@ -66,11 +66,16 @@ const (
 	diskFreeCritical = 0.05
 	fdWarn           = 0.8
 	authFailureRate  = 1.0 // per second over the last five minutes
-	// authThrottleRate is the sustained refusal rate worth reporting. The
-	// limiter hands each source a burst and then refills about one a
-	// second, so a single client looping settles near one refusal a
-	// second: above that, something is hammering this node rather than
-	// one request arriving at an awkward moment (issue #203).
+	// authThrottleRate is the sustained refusal rate worth reporting.
+	//
+	// A source keeps a burst and then one attempt a second, so a client
+	// looping settles at one *allowed* attempt a second and its refusals
+	// run at nearly its whole request rate — a single sequential client
+	// measured 29k refusals in four seconds on a loopback. The threshold
+	// is therefore nowhere near the offender's rate; what one refusal a
+	// second buys is the floor: it trips once something sustains more
+	// than about two attempts a second, and stays quiet for the stray
+	// refusal a burst of legitimate sign-ins can produce (issue #203).
 	authThrottleRate = 1.0
 )
 
