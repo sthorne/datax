@@ -1210,7 +1210,12 @@ var (
 	// left to disagree. A dead data-csv="top10" passed green. The gap
 	// only opened for a new pair, which is exactly when someone reaches
 	// for top-10 or slowQueries.
-	csvControl     = regexp.MustCompile(`data-csv="([^"]+)"`)
-	csvRegister    = regexp.MustCompile(`\bsetCSV\("([^"]+)"`)
-	handRolledCopy = regexp.MustCompile(`data-copy="[^"]*"`)
+	csvControl  = regexp.MustCompile(`data-csv="([^"]+)"`)
+	csvRegister = regexp.MustCompile(`\bsetCSV\("([^"]+)"`)
+	// The security reviewer noted this saw only the double-quoted
+	// attribute literal, so setAttribute("data-copy", …), a dataset
+	// assignment, or a single-quoted attribute would have slipped past
+	// it. No such path exists today; the point is that the check would
+	// not have said so. All four shapes now.
+	handRolledCopy = regexp.MustCompile(`data-copy\s*=\s*["'][^"']*["']|setAttribute\(\s*["']data-copy["']|\.dataset\.copy\s*=`)
 )
