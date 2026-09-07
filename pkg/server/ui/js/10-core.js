@@ -309,22 +309,38 @@ document.addEventListener("keydown", ev => {
 // file, /api/* already returns the same figures as JSON that curl can
 // take — a second path to the same bytes is not worth building.
 //
-// csvCell escapes CSV delimiters: a field holding a comma, a quote, a
-// newline or an edge space is wrapped, with its own quotes doubled.
-// Statement text and range keys carry all four.
+// csvCell prepares one field. Two rules, and they answer different
+// threats.
 //
-// It deliberately does NOT neutralise a leading =, + or @, which a
-// spreadsheet reads as a formula. A quoted identifier can carry one
-// (CREATE TABLE "=..." is legal), so a table name could reach a
-// spreadsheet as a formula — but quoting does not help, since a
-// spreadsheet evaluates quoted fields too, and the usual fix of
-// prefixing an apostrophe changes the value. This export's whole point
-// is that what comes out is what the cluster holds: a key that has been
-// altered to be safe to paste is not one a command will take. The
-// exposure needs CREATE privilege and lands on the reader's own machine,
-// not the cluster. Recorded as a decision rather than left as a gap.
+// Delimiters: a field holding a comma, a quote, a newline or an edge
+// space is wrapped, with its own quotes doubled. Statement text and
+// range keys carry all four.
+//
+// Formulas: a spreadsheet evaluates a cell that opens with = + - @ or a
+// leading tab, and CSV quoting does not stop it — those quotes are
+// stripped before the cell is read. That matters here rather than in the
+// abstract, because of what these tables carry: the range keys are
+// decoded row values (#213), so their content is whatever somebody put
+// in a primary key, and a table name or a locality can carry arbitrary
+// text too. Writing a row is enough; no schema privilege is needed. And
+// the destination is not incidental — this export exists to be pasted
+// into a spreadsheet, which is the context that evaluates it, where
+// =HYPERLINK renders without a prompt and =IMPORTDATA will fetch a URL.
+// A leading apostrophe is how a spreadsheet is told to take the rest of
+// the cell literally.
+//
+// A number is left alone: -1 opens with a minus and is not a formula,
+// and prefixing it would turn a figure into text in a column an operator
+// wants to sum.
+//
+// The copy controls are deliberately not treated this way. They hand
+// over the exact value, because that one is going to a command line and
+// a key that has been altered is not one a command will take. Only the
+// path that ends in a spreadsheet gets the guard.
+const CSV_FORMULA = /^[=+\-@\t\r]/;
 function csvCell(v) {
-  const s = v === undefined || v === null ? "" : String(v);
+  let s = v === undefined || v === null ? "" : String(v);
+  if (CSV_FORMULA.test(s) && !Number.isFinite(Number(s))) s = "'" + s;
   return /[",\r\n]|^\s|\s$/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 function toCSV(headers, rows) {

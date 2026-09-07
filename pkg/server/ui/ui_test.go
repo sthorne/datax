@@ -1155,6 +1155,12 @@ func TestCopyControlsAreWiredToSomething(t *testing.T) {
 		// text inside it, so a second hand-rolled control that happened
 		// to look the same is still reported.
 		def := jsFuncSpan(src, "copyBtn")
+		if def == nil && strings.Contains(src, "copyBtn") && strings.Contains(src, "data-copy=") {
+			t.Errorf("%s defines the copy control but copyBtn could not be located as a top-level "+
+				"`function copyBtn(` declaration, so its own data-copy attribute cannot be excluded. "+
+				"Every finding below is that, not a hand-rolled control: teach jsFuncSpan the new form "+
+				"(an arrow assigned to a const, say) rather than chasing a defect that is not there", name)
+		}
 		for _, loc := range handRolledCopy.FindAllStringIndex(src, -1) {
 			if def != nil && loc[0] >= def[0] && loc[1] <= def[1] {
 				sanctioned++
@@ -1195,7 +1201,16 @@ func jsFuncSpan(src, name string) []int {
 }
 
 var (
-	csvControl     = regexp.MustCompile(`data-csv="([a-z-]+)"`)
-	csvRegister    = regexp.MustCompile(`\bsetCSV\("([a-z-]+)"`)
+	// The two names are only ever matched against each other, so nothing
+	// is gained by constraining their shape — and constraining it cost
+	// the check its point. [a-z-]+ made a name carrying a digit, an
+	// underscore or a capital match neither pattern (the trailing quote
+	// makes the match fail outright rather than capture a prefix), so a
+	// control and its exporter both went invisible and there was nothing
+	// left to disagree. A dead data-csv="top10" passed green. The gap
+	// only opened for a new pair, which is exactly when someone reaches
+	// for top-10 or slowQueries.
+	csvControl     = regexp.MustCompile(`data-csv="([^"]+)"`)
+	csvRegister    = regexp.MustCompile(`\bsetCSV\("([^"]+)"`)
 	handRolledCopy = regexp.MustCompile(`data-copy="[^"]*"`)
 )
