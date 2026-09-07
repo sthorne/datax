@@ -183,7 +183,13 @@ state or the internode protocol does, and an entry below says so.
   the SQL port spends it: SCRAM's server side runs no derivation, so a
   pool reconnecting as often as it likes is not refused. The console's
   glossary entry for that figure, which said the SQL port had no
-  limiter of its own, is corrected for #212.
+  limiter of its own, is corrected for #212. Unlike `--auth-timeout`
+  and `--sql-max-pending-auth`, the two figures are constants, by
+  decision rather than omission: the deployment that could meet them
+  is a fleet of HTTP Basic automation behind one address (a NAT, a
+  proxy, an egress gateway), whose symptom would be 429s on requests
+  that worked yesterday, and the `verify-rate` cause names it. A knob
+  is a small change if anyone meets it.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a

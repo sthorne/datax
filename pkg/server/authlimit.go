@@ -153,8 +153,14 @@ func newAuthLimiter(maxPending int) *authLimiter {
 }
 
 // allow reports whether an attempt from source for user may proceed to
-// the expensive verification. It consumes from both buckets, so a
-// refusal by either costs the caller its budget in neither.
+// the expensive verification. It takes from the source bucket first and
+// then the account bucket: a refusal by the source bucket costs nothing
+// (take charges only what it admits), while a refusal by the account
+// bucket has already cost the source bucket one — which is the right
+// way round, since guessing at one account from an address is still
+// that address asking. unspend, which returns what allow charged when
+// the verification budget then refuses, refunds both buckets and runs
+// only where both were charged, so the asymmetry never reaches it.
 func (l *authLimiter) allow(source, user string) bool {
 	src := sourceKey(source)
 	if !l.take("s\x00"+src, authBurst) {
@@ -170,7 +176,12 @@ func (l *authLimiter) take(key string, burst float64) bool {
 	return l.takeAt(key, burst, authRate)
 }
 
-// takeAt is take for a bucket refilling at rate tokens a second.
+// takeAt is take for a bucket refilling at rate tokens a second. The
+// rate is fixed when the bucket is created and rate is ignored for a
+// bucket that already exists: the three key prefixes ("s\x00", "a\x00",
+// "v\x00") are disjoint and each is only ever taken at one rate, and a
+// fourth budget must keep it that way — share a prefix, or vary a rate
+// at runtime, and the bucket keeps the rate it was born with.
 func (l *authLimiter) takeAt(key string, burst, rate float64) bool {
 	now := l.nowFn()
 	l.mu.Lock()
