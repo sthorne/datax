@@ -39,20 +39,20 @@ function renderOverview(d) {
     retryRate = (r.serialization_failures - rollupPrev.retries) / dt;
   }
   rollupPrev = { at: now, statements: r.statements || 0, retries: r.serialization_failures || 0 };
-  const users = Object.entries(r.connections_by_user || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([u, c]) => `${esc(u)} ${c}`).join(", ");
+  const users = Object.entries(r.connections_by_user || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([u, c]) => `${u} ${c}`).join(", ");
   renderTiles(document.getElementById("tiles"),
     tile("live nodes", (r.live_nodes ?? 0) + " / " + (r.nodes ?? (d.nodes || []).length)) +
-    tile("cluster QPS", Math.round(r.qps || 0) + contrib(r, r.contributing), "qps", r.qps || 0) +
-    tile("cluster data", fmtBytes(r.data_bytes || 0) + contrib(r, r.contributing), "bytes", r.data_bytes || 0) +
-    tile("ranges", (r.ranges ?? 0) + qual(`${r.replicas ?? 0} replicas`)) +
-    tile("leases", (r.leases ?? 0) + contrib(r, r.contributing)) +
+    tileHTML("cluster QPS", Math.round(r.qps || 0) + contrib(r, r.contributing), "qps", r.qps || 0) +
+    tileHTML("cluster data", fmtBytes(r.data_bytes || 0) + contrib(r, r.contributing), "bytes", r.data_bytes || 0) +
+    tileHTML("ranges", (r.ranges ?? 0) + qual(`${r.replicas ?? 0} replicas`)) +
+    tileHTML("leases", (r.leases ?? 0) + contrib(r, r.contributing)) +
     // One qualifier line, not two: the connection breakdown and the
     // fan-out note are both qualifiers of the same figure.
-    tile("connections", `${r.connections ?? 0}` + qual([`${r.active ?? 0} active`, `${r.idle_in_txn ?? 0} idle in txn`]
+    tileHTML("connections", `${r.connections ?? 0}` + qual([`${r.active ?? 0} active`, `${r.idle_in_txn ?? 0} idle in txn`]
       .concat(users ? [users] : []).join(" · ") + (r.sql_contributing < r.live_nodes ? ` · from ${r.sql_contributing} of ${r.live_nodes} live nodes` : ""))) +
-    tile("statements/s", stmtRate === null ? "…" : stmtRate.toFixed(1) + contrib(r, r.sql_contributing), "stmt", stmtRate || 0) +
+    tileHTML("statements/s", stmtRate === null ? "…" : stmtRate.toFixed(1) + contrib(r, r.sql_contributing), "stmt", stmtRate || 0) +
     tile("40001/s", retryRate === null ? "…" : retryRate.toFixed(2), "retry", retryRate || 0) +
-    tile("worst p99", r.worst_p99_node ? `${(r.worst_p99_us / 1000).toFixed(1)} ms` + qual(`on n${r.worst_p99_node}`) : "—", "p99", (r.worst_p99_us || 0) / 1000));
+    tileHTML("worst p99", r.worst_p99_node ? `${(r.worst_p99_us / 1000).toFixed(1)} ms` + qual(`on n${r.worst_p99_node}`) : "—", "p99", (r.worst_p99_us || 0) / 1000));
 
   const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id);
   renderKeyed(document.getElementById("nodes"), nodes.map(n => {
@@ -153,20 +153,24 @@ function rangeRow(r, leaderLabel, extra) {
 // it goes on its own 12px line beneath, not on after the figure at the
 // figure's own 22px: run on, these wrapped to four and five lines of
 // headline text and spilled out of the card.
-function qual(text) { return `<span class="muted">${text}</span>`; }
+// The qualifier is text, and like tile() this escapes it: every caller
+// passes a phrase it built from figures, and the one that passes a role
+// name (the connections tile's per-user breakdown) had to remember to
+// escape it itself. Now none of them do (issue #191).
+function qual(text) { return `<span class="muted">${esc(text)}</span>`; }
 
 function machineTiles(lm) {
   // A node that has not collected yet has no gc percentile; "NaN ms" is
   // not a measurement.
   const gc = Number.isFinite(lm.gc_pause_p99_ns) ? (lm.gc_pause_p99_ns / 1e6).toFixed(1) + " ms" : "—";
-  return tile("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? qual(pct(lm.iowait_percent) + " iowait") : ""), "cpu", lm.cpu_percent) +
-      tile("load", lm.cores ? (lm.load1 ?? 0).toFixed(2) + qual("of " + lm.cores + " cores") : "—") +
-      tile("memory", lm.mem_total ? fmtBytes(lm.mem_total - lm.mem_available) + qual("of " + fmtBytes(lm.mem_total)) : "—") +
-      tile("process", fmtBytes(lm.rss || 0) + qual("rss · " + pct(lm.process_cpu_percent) + " cpu")) +
-      tile("disk free", lm.disk_total ? fmtBytes(lm.disk_free) + qual("of " + fmtBytes(lm.disk_total)) : "in-memory store", "diskfree", lm.disk_free || 0) +
+  return tileHTML("host cpu", pct(lm.cpu_percent) + (lm.iowait_percent >= 1 ? qual(pct(lm.iowait_percent) + " iowait") : ""), "cpu", lm.cpu_percent) +
+      tileHTML("load", lm.cores ? (lm.load1 ?? 0).toFixed(2) + qual("of " + lm.cores + " cores") : "—") +
+      tileHTML("memory", lm.mem_total ? fmtBytes(lm.mem_total - lm.mem_available) + qual("of " + fmtBytes(lm.mem_total)) : "—") +
+      tileHTML("process", fmtBytes(lm.rss || 0) + qual("rss · " + pct(lm.process_cpu_percent) + " cpu")) +
+      tileHTML("disk free", lm.disk_total ? fmtBytes(lm.disk_free) + qual("of " + fmtBytes(lm.disk_total)) : "in-memory store", "diskfree", lm.disk_free || 0) +
       tile("disk i/o", lm.disk_total ? fmtBytes(lm.disk_read_bytes_ps || 0) + "/s read · " + fmtBytes(lm.disk_write_bytes_ps || 0) + "/s write · " + pct(lm.disk_busy_percent) + " busy" : "—", "diskw", lm.disk_write_bytes_ps || 0) +
       tile("network", fmtBytes(lm.net_rx_bytes_ps || 0) + "/s in · " + fmtBytes(lm.net_tx_bytes_ps || 0) + "/s out", "net", (lm.net_rx_bytes_ps || 0) + (lm.net_tx_bytes_ps || 0)) +
-      tile("file descriptors", lm.fd_limit ? lm.open_fds + qual("of " + lm.fd_limit) : "—") +
+      tileHTML("file descriptors", lm.fd_limit ? lm.open_fds + qual("of " + lm.fd_limit) : "—") +
       tile("go runtime", lm.goroutines + " goroutines · " + fmtBytes(lm.heap_in_use || 0) + " heap · gc p99 " + gc) +
       tile("uptime", fmtDuration(lm.process_uptime_seconds ?? lm.uptime_seconds ?? 0));
 }
@@ -174,11 +178,11 @@ function storageTiles(s) {
   return tile("L0 files", s.l0_files ?? 0) +
     tile("L0 sublevels", s.l0_sublevels ?? 0) +
     tile("compaction debt", fmtBytes(s.compaction_debt_bytes || 0), "debt", s.compaction_debt_bytes || 0) +
-    tile("memtables", (s.memtable_count ?? 0) + qual(fmtBytes(s.memtable_bytes || 0))) +
+    tileHTML("memtables", (s.memtable_count ?? 0) + qual(fmtBytes(s.memtable_bytes || 0))) +
     tile("write stalls", s.write_stalls ?? 0) +
     tile("disk slow events", s.disk_slow_events ?? 0) +
-    tile("block cache", fmtBytes(s.block_cache_bytes || 0) + qual(pctOf(s.block_cache_hits, s.block_cache_misses) + " hit")) +
-    tile("bloom filters", pctOf(s.filter_hits, s.filter_misses) + qual("of point reads skipped"));
+    tileHTML("block cache", fmtBytes(s.block_cache_bytes || 0) + qual(pctOf(s.block_cache_hits, s.block_cache_misses) + " hit")) +
+    tileHTML("bloom filters", pctOf(s.filter_hits, s.filter_misses) + qual("of point reads skipped"));
 }
 // pctOf renders hits / (hits + misses) as a percentage ("–" before any read).
 function pctOf(hits, misses) {

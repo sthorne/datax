@@ -288,7 +288,7 @@ func TestTileQualifiersAreNotHeadlines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(core), `class="value${valueClass(value)}"`) {
+	if !strings.Contains(string(core), `class="value${cls}"`) || !strings.Contains(string(core), "valueClass(text)") {
 		t.Error("js/10-core.js: tile() no longer classifies long values, so the " +
 			"CSS rule above can never apply")
 	}
@@ -496,7 +496,7 @@ func pageTerms() ([]pageTerm, error) {
 var (
 	viewSplit = regexp.MustCompile(`(?s)<main id="view-([a-z]+)"(.*?)</main>`)
 	headingRE = regexp.MustCompile(`(?s)<(th|h2)\b[^>]*>(.*?)</(?:th|h2)>`)
-	tileLabel = regexp.MustCompile(`\btile\("([^"]+)"`)
+	tileLabel = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
 	// Controls and screen-reader text live inside a heading without being
 	// part of the term: "Statement shapes" is the heading and the sort
 	// <select> beside it is not.
@@ -516,4 +516,87 @@ func normalizeTerm(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(spaces.ReplaceAllString(strings.ToLower(raw), " "))
+}
+
+// TestTileValuesAreEscaped (issue #191): tile() escapes its value, and a
+// caller that needs to compose markup says so by name.
+//
+// tile() used to escape, then stopped so that callers could pass a
+// qualifier span — but the label beside the value is still escaped, so
+// nothing signalled that the second argument had become a raw-HTML slot.
+// Seven call sites were passing strings the page had not formatted: a
+// node's address and locality, an overload reason, and the signed-in
+// role name, which is a database identifier and can be quoted into
+// anything. The exposure was small (a tile shows the viewer their own
+// name) but the contract was inverted, which is the part that does not
+// stay small.
+func TestTileValuesAreEscaped(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(core), "return renderTile(label, esc(text)") {
+		t.Error("js/10-core.js: tile() no longer escapes its value; the short name must be the safe one")
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, call := range callsTo(string(src), "tile(") {
+			for _, markup := range []string{"qual(", "contrib(", "<span", "<b>", "<a "} {
+				if strings.Contains(call, markup) {
+					t.Errorf("%s: tile(...) is passed composed markup (%s), which it now escapes and would render as text:\n\t%s\n"+
+						"use tileHTML for a value the page composes itself", name, markup, oneLine(call))
+				}
+			}
+		}
+	}
+}
+
+// callsTo returns the text of every call to fn in src, from the opening
+// parenthesis to the one that closes it. It counts parentheses, so a
+// nested call does not end the outer one early; `tileHTML(` is not a
+// match for `tile(` because the search starts at a word boundary.
+func callsTo(src, fn string) []string {
+	var out []string
+	for i := 0; i+len(fn) <= len(src); i++ {
+		if !strings.HasPrefix(src[i:], fn) {
+			continue
+		}
+		if i > 0 && (isWordByte(src[i-1]) || src[i-1] == '.') {
+			continue // tileHTML(, renderTile(, a.tile(
+		}
+		depth := 0
+		for j := i + len(fn) - 1; j < len(src); j++ {
+			switch src[j] {
+			case '(':
+				depth++
+			case ')':
+				if depth--; depth == 0 {
+					out = append(out, src[i:j+1])
+					i = j
+					goto next
+				}
+			}
+		}
+	next:
+	}
+	return out
+}
+
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 160 {
+		return s[:160] + "…"
+	}
+	return s
 }
