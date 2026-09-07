@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,4 +207,94 @@ func TestConsolePrefsBeforeFinalize(t *testing.T) {
 	if code != http.StatusServiceUnavailable || !strings.Contains(body, "v17") {
 		t.Fatalf("set on a v16 cluster: %d %s, want 503 naming v17", code, body)
 	}
+}
+
+// TestConsolePrefsWriteIsBounded (issue #204, raised in review): the
+// write runs through the node's internal system session, which bypasses
+// privilege checks by construction — so the principals this endpoint
+// admits include ones that cannot write a byte over pgwire (a
+// SELECT-only user, a metrics scrape account, a read-only certificate
+// identity). Two things keep that from being an unbounded write path
+// into replicated state, and both are observable from outside.
+func TestConsolePrefsWriteIsBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, _ := StartWithEngines(t, 1, func(c *server.Config) { c.HTTPListener = listener })
+
+	if code, body := setPref(t, tc, 0, "theme", "dark"); code != 200 {
+		t.Fatalf("set theme: %d %s", code, body)
+	}
+	// Storing what is already stored is not a write. It still answers
+	// 200 — the caller asked for a state and got it.
+	if code, body := setPref(t, tc, 0, "theme", "dark"); code != 200 {
+		t.Fatalf("re-setting the same value: %d %s, want 200", code, body)
+	}
+
+	// A caller that actually changes the value meets the bound.
+	//
+	// Concurrently, not in a loop. The bucket refills on a wall clock,
+	// so a sequential loop is a race against it: forty round trips take
+	// well under a second on an idle machine and well over ten under a
+	// loaded one, where the refill keeps up and nothing is ever refused.
+	// The budget is taken at the handler's door, before any write, so
+	// firing them at once puts every request inside one refill tick and
+	// makes the outcome about the bound rather than about the machine.
+	const attempts = 40
+	codes := make([]int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			value := "dark"
+			if i%2 == 0 {
+				value = "light"
+			}
+			body, err := json.Marshal(map[string]string{"name": "theme", "value": value})
+			if err != nil {
+				return
+			}
+			req, err := http.NewRequest("POST", "http://"+tc.Nodes[0].HTTPAddr()+"/api/prefs", bytes.NewReader(body))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			codes[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	refused := 0
+	for _, code := range codes {
+		if code == http.StatusTooManyRequests {
+			refused++
+		}
+	}
+	if refused == 0 {
+		t.Fatalf("%d concurrent preference changes were all accepted (%v): the write is unbounded, and "+
+			"the principals reaching it include ones with no write privilege anywhere in the database",
+			attempts, codes)
+	}
+
+	// And the no-op is genuinely suppressed rather than merely cheap:
+	// with the budget now spent, a request that changes nothing still
+	// succeeds, because it never reaches the write or the bucket.
+	last := setPrefValue(t, tc, 0)
+	if code, body := setPref(t, tc, 0, "theme", last); code != 200 {
+		t.Fatalf("a no-op write was refused by the rate limit (%d %s): it should never reach it, or a "+
+			"console re-sending the value it already holds would be told to slow down", code, body)
+	}
+}
+
+// setPrefValue reads back the stored theme.
+func setPrefValue(t *testing.T, tc *TestCluster, i int) string {
+	t.Helper()
+	return getPrefs(t, tc, i).Prefs["theme"]
 }

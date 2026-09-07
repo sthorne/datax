@@ -378,6 +378,15 @@ document.addEventListener("click", ev => {
 // preference that lives in one browser profile is not a preference a
 // cluster can honour, and we are a database.
 //
+// The cost of that is one frame of the operating system's theme on every
+// load, because index.html is rendered once at node startup and served
+// with an ETag rather than stamped per request. If that flash ever draws
+// a complaint, the escape hatch is NOT a copy in the browser — it is
+// stamping data-theme server-side on an AUTHENTICATED page load, which
+// is the cluster's own value rendered at request time and costs one KV
+// read per page load, not per poll. Page loads are rare next to the 3s
+// cadence. The sign-in page and unauthenticated fetches keep the ETag.
+//
 // prefs holds only what this viewer has actually SET. A preference that
 // is absent is not "the default" written down somewhere — it is the
 // page's natural state (no data-theme attribute, so the operating system
@@ -421,14 +430,26 @@ function fmtWhen(instantMs) {
   return today ? clock : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${clock}`;
 }
 
-// prefNote says, under the controls, when a choice will not outlive the
-// tab — a cluster mid-upgrade cannot store one yet — or when storing it
-// failed. Empty and hidden the rest of the time, which is almost always.
+// setPrefNote says, beside the controls, when a choice will not outlive
+// the tab — a cluster mid-upgrade cannot store one yet — or when storing
+// it failed. Empty and hidden the rest of the time, which is almost
+// always.
+//
+// The announcement rides a SEPARATE always-present region rather than
+// this one. A role="status" element that is not rendered when its text
+// changes does not reliably announce, and unhiding it afterwards is not
+// treated as a live update either — so a note that only ever appears by
+// being unhidden would be silent to exactly the reader who most needs
+// telling. #pref-status is always in the document and sr-only, which is
+// the shape #copy-status already uses for the same job.
 function setPrefNote(text) {
   const el = document.getElementById("pref-note");
-  if (!el) return;
-  el.textContent = text || "";
-  el.hidden = !text;
+  if (el) {
+    el.textContent = text || "";
+    el.hidden = !text;
+  }
+  const status = document.getElementById("pref-status");
+  if (status) status.textContent = text || "";
 }
 
 async function loadPrefs() {

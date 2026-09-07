@@ -51,7 +51,15 @@ func SystemTableID(name string) (uint64, bool) {
 	return id, ok
 }
 
-// IsSystemTableID reports whether id belongs to a system table.
+// IsSystemTableID reports whether id belongs to a system table. It reads
+// the same map the names do — listing the IDs again here would be the
+// registration silently forgetting a table, which is the bug the DDL
+// path had until #204.
 func IsSystemTableID(id uint64) bool {
-	return id == MetricsTableID || id == PrefsTableID
+	for _, known := range systemTableIDs {
+		if id == known {
+			return true
+		}
+	}
+	return false
 }

@@ -1221,7 +1221,13 @@ var (
 	// it. No such path exists today; the point is that the check would
 	// not have said so. All four shapes now.
 	// CSS comments, stripped before a stylesheet is parsed by shape.
-	cssComments    = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	cssComments = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	// "now minus an instant" — a moment. Written as a pattern rather
+	// than as the literal `fmtAgo(Date.now() - `, because that literal
+	// carried its spaces with it: `fmtAgo(Date.now()-x)` walked straight
+	// past the sweep, and the sweep is the only thing guarding every
+	// moment that is not pinned by name below.
+	agoOfInstant   = regexp.MustCompile(`fmtAgo\(\s*Date\.now\(\)\s*-`)
 	handRolledCopy = regexp.MustCompile(`data-copy\s*=\s*["'][^"']*["']|setAttribute\(\s*["']data-copy["']|\.dataset\.copy\s*=`)
 )
 
@@ -1278,6 +1284,12 @@ func darkBlocksIn(page string) []darkBlock {
 	return out
 }
 
+// For whoever lands #216 (dark-palette re-stepping): the dark tokens now
+// live in TWO blocks, and a change has to land in both. This test is
+// what catches a miss, which is the point of it — but it is a failure at
+// the end of that work rather than a note at the start, so here is the
+// note.
+//
 // TestThemeBlocksAgree (issue #204): the dark palette is written out
 // twice — once for the operating system's choice, once for a viewer who
 // overrode it — because collapsing them would cost a frame of the wrong
@@ -1386,9 +1398,22 @@ func TestPreferencesAreStoredInTheCluster(t *testing.T) {
 	if !strings.Contains(core, `fetch("/api/prefs"`) {
 		t.Error("js/10-core.js no longer fetches /api/prefs: nothing reads the preferences the cluster holds")
 	}
-	if !strings.Contains(core, `method: "POST"`) || !strings.Contains(core, `"Content-Type": "application/json"`) {
-		t.Error("the preference write is no longer a JSON POST: the node requires both, and that pair " +
-			"plus SameSite=Strict on the session cookie is what keeps another origin from driving it")
+	// Scoped to the write itself, not to the file. There is only one POST
+	// in js/10-core.js today, so "somewhere in the file" happens to be
+	// true — and stops being the thing this test names the moment a
+	// second one joins it.
+	span := jsFuncSpan(core, "setPref")
+	if span == nil {
+		t.Fatal("js/10-core.js has no setPref function: nothing writes a preference")
+	}
+	write := core[span[0]:span[1]]
+	if !strings.Contains(write, `fetch("/api/prefs"`) {
+		t.Error("setPref no longer posts to /api/prefs: nothing stores the preference in the cluster")
+	}
+	if !strings.Contains(write, `method: "POST"`) || !strings.Contains(write, `"Content-Type": "application/json"`) {
+		t.Error("the preference write is no longer a JSON POST. The node requires both; and on the two " +
+			"doors where credentials are ambient (HTTP Basic, a client certificate) SameSite does nothing, " +
+			"so the content type is the only thing forcing a preflight")
 	}
 }
 
@@ -1417,7 +1442,7 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 			outside = src[:span[0]] + src[span[1]:]
 		}
 		for _, line := range strings.Split(outside, "\n") {
-			if strings.Contains(line, "fmtAgo(Date.now() -") {
+			if agoOfInstant.MatchString(line) {
 				t.Errorf("%s renders a moment with fmtAgo: %s\n"+
 					"    Date.now() minus an instant IS a moment, so it must go through fmtWhen, "+
 					"which honours the viewer's absolute/relative choice.", name, strings.TrimSpace(line))
@@ -1435,6 +1460,19 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 	}
 	if !strings.Contains(string(core), `pref("timestamps") !== "absolute"`) {
 		t.Error("fmtWhen no longer reads the timestamps preference: the toggle renders nothing")
+	}
+	// The one moment written as a bare instant rather than as now-minus-
+	// an-age. It is correct — fmtWhen takes exactly that — but it is
+	// therefore the one call no shape-based sweep can see in either
+	// direction, so it is pinned by hand.
+	boot, err := FS.ReadFile("js/95-boot.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(boot), "fmtWhen(t.lastOK)") {
+		t.Error("the staleness pill no longer renders its last-good time with fmtWhen. It passes an " +
+			"instant directly rather than Date.now() minus an age, so neither sweep above can see it " +
+			"change — which is exactly why it is named here.")
 	}
 	// Not every moment is written as an instant. Some arrive already
 	// subtracted — "this heartbeat was 4s ago" — and the sweep above,
@@ -1530,7 +1568,11 @@ func TestNoUnguardedMotion(t *testing.T) {
 			}
 		}
 	}
-	for _, prop := range []string{"transition:", "animation:", "@keyframes", "scroll-behavior:"} {
+	// No trailing colon: transition-property and animation-duration are
+	// the ordinary way to write this, and "transition:" appears in
+	// neither. The cost is matching the words inside a comment, which is
+	// a cheap false positive next to missing every longhand form.
+	for _, prop := range []string{"transition", "animation", "@keyframes", "scroll-behavior"} {
 		if strings.Contains(src, prop) {
 			t.Errorf("index.html now uses %s outside a reduced-motion guard. The console had no motion "+
 				"at all, which is why issue #204's reduced-motion preference shipped as this test rather "+

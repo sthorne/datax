@@ -218,6 +218,12 @@
   @media (max-width: 640px) {
     main { padding: 10px 10px 30px; }
     header { flex-wrap: wrap; gap: 6px 10px; padding: 10px 12px; }
+    /* The control group wraps too, below where the header does. It is
+       one row at every other width, and header's own flex-wrap does not
+       reach inside it — so without this, adding a control here pushes
+       the whole page sideways on a narrow phone instead of taking a
+       second line (issue #204: measured, 320px was 38px over). */
+    .controls-hdr { flex-wrap: wrap; }
     header .stale { margin-left: 0; }
     .tiles { grid-template-columns: repeat(2, 1fr); }
     .tile .value { font-size: 18px; }
@@ -282,6 +288,10 @@
   header nav a { color: var(--text-2); text-decoration: none; padding: 3px 9px; border-radius: 6px; }
   header nav a:hover { background: color-mix(in srgb, var(--border) 35%, transparent); }
   header nav a.current { background: color-mix(in srgb, var(--border) 50%, transparent); color: var(--text); font-weight: 600; }
+  /* One unwrappable row: header wraps its own children under 640px, but
+     this group does not, so what sits here has to stay short. That is
+     why #204's two preferences went into one <details> rather than
+     becoming two more selects. */
   .controls-hdr { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); }
   .controls-hdr select, .controls-hdr button {
     font: inherit; font-size: 12px; padding: 3px 7px; border-radius: 6px;
@@ -289,9 +299,23 @@
   }
   .controls-hdr button { cursor: pointer; }
   .controls-hdr button:hover { border-color: var(--text-3); }
+  /* The display menu (issue #204), built on the user menu's shape. */
+  header .display { position: relative; }
+  header .display > summary { cursor: pointer; list-style: none; }
+  header .display > summary::-webkit-details-marker { display: none; }
+  header .display[open] > summary { color: var(--text); }
+  header .display .menu {
+    position: absolute; left: 0; top: calc(100% + 6px); z-index: 4; min-width: 240px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  header .display .menu label { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
   /* Shown only when a display choice cannot be stored — a cluster still
-     mid-upgrade, or a node that refused the write (issue #204). */
-  .prefnote { font-size: 12px; color: var(--warning); max-width: 44ch; }
+     mid-upgrade, or a node that refused the write. Inside the menu, so a
+     44-character warning cannot reflow the header bar at the worst
+     possible moment. */
+  .prefnote { font-size: 12px; color: var(--warning); }
   kbd {
     font: inherit; font-size: 11px; padding: 0 4px; border-radius: 4px;
     border: 1px solid var(--border); color: var(--text-3);
@@ -359,18 +383,32 @@
 <a class="skip" href="#main-views">skip to content</a>
 <div id="insecure-banner" role="status"></div>
 <span id="copy-status" role="status" aria-live="polite" class="sr-only"></span>
+<span id="pref-status" role="status" aria-live="polite" class="sr-only"></span>
 <header>
   <h1>datax</h1>
   <nav id="nav" aria-label="views"></nav>
   <span class="controls-hdr">
     <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
     <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
-    <label>theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
-    <label>timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
+    <!-- Display preferences (issue #204). A <details>, like the user
+         menu, because these are set once and then never again: giving
+         them permanent header width alongside scope and range — which an
+         operator drives all day — is the wrong price, and .controls-hdr
+         is an unwrappable flex row that four selects would overflow on a
+         phone. A <details> also needs no outside-click handler, so it
+         cannot collide with the capture-phase copy handler or with the
+         help pop's own close-on-outside-click. -->
+    <details class="display" id="display-menu">
+      <summary title="how this console looks and how it writes a moment">display ▾</summary>
+      <div class="menu">
+        <label>theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
+        <label>timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
+        <span class="prefnote" id="pref-note" hidden></span>
+      </div>
+    </details>
     <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
     <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
-  <span class="prefnote" id="pref-note" role="status" hidden></span>
   <span class="sub" id="hdr-node">connecting…</span>
   <details class="user" id="hdr-user"><summary id="hdr-user-summary" title="who this page is signed in as"></summary><div class="menu" id="hdr-user-menu"></div></details>
   <span class="stale" id="hdr-stale" role="status">● stale — last update failed</span>
