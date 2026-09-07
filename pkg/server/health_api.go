@@ -106,13 +106,27 @@ type sample struct {
 	v  float64
 }
 
-const rateWindow = 5 * time.Minute
+// defaultRateWindow is how far back the rate-based checks look
+// (Config.HealthRateWindow overrides it, for tests: issues #223, #224).
+const defaultRateWindow = 5 * time.Minute
 
-// rateOver appends v and returns the increase over the window.
-func rateOver(ss []sample, v float64, now time.Time) ([]sample, float64) {
+// rateWindow is the window the rate-based checks measure over.
+func (n *Node) rateWindow() time.Duration {
+	if n.cfg.HealthRateWindow > 0 {
+		return n.cfg.HealthRateWindow
+	}
+	return defaultRateWindow
+}
+
+// rateOver appends v and returns the increase over the window: samples
+// older than it are dropped, and the increase is measured from the
+// oldest that survives — which, once nothing has been sampled inside
+// the window, is the sample just taken, so the increase is zero and a
+// problem built on it clears.
+func rateOver(ss []sample, v float64, now time.Time, window time.Duration) ([]sample, float64) {
 	ss = append(ss, sample{at: now, v: v})
 	i := 0
-	for i < len(ss)-1 && now.Sub(ss[i].at) > rateWindow {
+	for i < len(ss)-1 && now.Sub(ss[i].at) > window {
 		i++
 	}
 	ss = ss[i:]
@@ -304,10 +318,10 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				Summary: fmt.Sprintf("the compaction-debt gate is latched (%s of pending compaction); table writes are shed until it halves", fmtBytesGo(m.CompactionDebtBytes))})
 		}
 		var stallDelta float64
-		n.health.prev.stalls, stallDelta = rateOver(n.health.prev.stalls, float64(m.WriteStalls), now)
+		n.health.prev.stalls, stallDelta = rateOver(n.health.prev.stalls, float64(m.WriteStalls), now, n.rateWindow())
 		if stallDelta > 0 {
 			add(Problem{Severity: SeverityCritical, Check: "write-stalls", Node: int(n.ident.NodeID), Section: "storage",
-				Summary: fmt.Sprintf("Pebble hard-stalled writes %d time(s) in the last %s: the store is past backpressure", int(stallDelta), rateWindow)})
+				Summary: fmt.Sprintf("Pebble hard-stalled writes %d time(s) in the last %s: the store is past backpressure", int(stallDelta), n.rateWindow())})
 		}
 		if m.BackgroundErrors > n.health.prev.bgErrors {
 			add(Problem{Severity: SeverityCritical, Check: "storage-errors", Node: int(n.ident.NodeID), Section: "storage",
@@ -392,7 +406,7 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			Summary: fmt.Sprintf("%d replica checksum mismatch(es) found by this node's sweeps since it started: replicated-state divergence; see the events", f)})
 	}
 	var authDelta float64
-	n.health.prev.auth, authDelta = rateOver(n.health.prev.auth, counterValue(metrics.AuthFailures)+counterValue(metrics.AdminDenied), now)
+	n.health.prev.auth, authDelta = rateOver(n.health.prev.auth, counterValue(metrics.AuthFailures)+counterValue(metrics.AdminDenied), now, n.rateWindow())
 	if window := now.Sub(n.health.prev.auth[0].at); window > 0 && authDelta/window.Seconds() > authFailureRate {
 		add(Problem{Severity: SeverityWarning, Check: "auth-failures", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication failures or denied admin operations in the last %s on this node", int(authDelta), window.Truncate(time.Second))})
@@ -409,11 +423,11 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	doc.Checks++
 	var rlDelta, vrDelta, vfDelta float64
 	n.health.prev.throttleRL, rlDelta = rateOver(n.health.prev.throttleRL,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now, n.rateWindow())
 	n.health.prev.throttleVR, vrDelta = rateOver(n.health.prev.throttleVR,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate)), now, n.rateWindow())
 	n.health.prev.throttleVF, vfDelta = rateOver(n.health.prev.throttleVF,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now, n.rateWindow())
 	throttleDelta := rlDelta + vrDelta + vfDelta
 	if window := now.Sub(n.health.prev.throttleRL[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
 		// Every figure here is over the same window, so the parenthetical

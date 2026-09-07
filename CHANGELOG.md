@@ -284,6 +284,13 @@ state or the internode protocol does, and an entry below says so.
   takes, and on an idle machine reached the fixed id 5000 the test
   inserted afterwards. The probe ids are now taken past wherever the
   writer got to.
+- The health check's rate window is settable (`Config.HealthRateWindow`,
+  default five minutes), and the two checks built on it — `auth-failures`
+  and `auth-throttled` — are now tested through their whole shape: quiet,
+  quiet just under the threshold, raised over it, and cleared once the
+  pressure stops and the window rolls past it (#223, #224). That last
+  step is the reason both report a rate rather than a lifetime total, and
+  it had been asserted only in a comment.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the
