@@ -34,10 +34,11 @@ function renderClusterRanges(ranges) {
     ? "click a range, or focus it and press Enter, for its per-replica detail from every holding node (admin role)"
     : `per-replica detail needs the admin role — ${drillDownRefusal()}`);
   const items = [];
-  for (const r of ranges.filter(matchesFilter).slice().sort((a, b) => a.range_id - b.range_id)) {
+  const shown = ranges.filter(matchesFilter).slice().sort((a, b) => a.range_id - b.range_id);
+  for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
       <td>r${r.range_id}</td>
-      <td class="key">${spanText(r)}</td>
+      <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s start key", r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     </tr>` });
     // The open detail row is its own element, filled by its fetch and
@@ -45,6 +46,12 @@ function renderClusterRanges(ranges) {
     if (r.range_id === openRange) items.push({ key: "d" + r.range_id, html: null });
   }
   renderKeyed(document.getElementById("cluster-ranges"), items);
+  // The rows the filter left, with the keys untrimmed: the cell shortens
+  // a span to what fits a column, and a key that has been shortened is
+  // not one a command will take (issue #205).
+  setCSV("ranges", ["range", "table", "start key", "end key", "replicas"],
+    shown.map(r => ["r" + r.range_id, r.table || "", r.start_key || "", r.end_key || "",
+      (r.replicas || []).map(x => "n" + x).join(" ")]));
 }
 {
   const tbody = document.getElementById("cluster-ranges");

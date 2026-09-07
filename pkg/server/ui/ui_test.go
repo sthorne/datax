@@ -390,6 +390,10 @@ func TestHelpGlossaryHasNoDeadEntries(t *testing.T) {
 var helpKeysNotOnAPage = map[string]bool{
 	"scope": true, "range": true, "jump to": true,
 	"compare": true, "annotate": true, "filter": true,
+	// The copy controls (issue #205). Both are buttons: one sits inside a
+	// cell, and the other inside a heading, where normalizeTerm strips it
+	// out so that "Nodes" stays the term rather than "Nodes copy as CSV".
+	"copy": true, "copy as csv": true,
 }
 
 type glossary struct{ entries map[string]string }
@@ -1077,4 +1081,141 @@ var (
 	// A call with identifier-or-member arguments only.
 	jsCallSite = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$.]*(?:,\s*[A-Za-z_$][A-Za-z0-9_$.]*)*)\)`)
 	jsonTag    = regexp.MustCompile("`json:\"([a-z0-9_]+)")
+)
+
+// TestCopyControlsAreWiredToSomething (issue #205): the console grew a
+// copy control on every key, address and statement, and a "copy as CSV"
+// on four tables. Each is a button that looks alive whether or not
+// anything answers it, which is the failure this console has been bitten
+// by before — a control or a figure that renders confidently while
+// reading from nothing (see the tile in #203's review).
+//
+// Two halves have to meet for a CSV control to work: the button in the
+// markup names an export, and some renderer registers rows under that
+// name at the end of its own pass. Neither half is visible from the
+// other, they live in different files, and if they disagree the button
+// says "nothing to copy" on a table full of rows. So this pins that they
+// agree, in both directions — a control with no exporter is dead, and an
+// exporter with no control is a list nobody can reach.
+func TestCopyControlsAreWiredToSomething(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scripts strings.Builder
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scripts.Write(src)
+		scripts.WriteString("\n")
+	}
+	js := scripts.String()
+
+	controls := map[string]bool{}
+	for _, m := range csvControl.FindAllStringSubmatch(string(page), -1) {
+		controls[m[1]] = true
+	}
+	registered := map[string]bool{}
+	for _, m := range csvRegister.FindAllStringSubmatch(js, -1) {
+		registered[m[1]] = true
+	}
+	if len(controls) == 0 || len(registered) == 0 {
+		t.Fatalf("found %d CSV controls and %d registrations; the extractor is broken, not the console",
+			len(controls), len(registered))
+	}
+	for name := range controls {
+		if !registered[name] {
+			t.Errorf("index.html has a copy-as-CSV control for %q, but no script calls setCSV(%q, …): "+
+				"the button renders, and answers every click with \"nothing to copy\"", name, name)
+		}
+	}
+	for name := range registered {
+		if !controls[name] {
+			t.Errorf("a script calls setCSV(%q, …), but no control in index.html carries data-csv=%q: "+
+				"the rows are collected on every render and nothing can ask for them", name, name)
+		}
+	}
+
+	// The other half of the feature is the per-cell control. copyBtn
+	// escapes both the label and the text it carries; a data-copy
+	// attribute written by hand in a template would not, and the text it
+	// carries is a range key, an address or a statement — none of which
+	// the page formatted itself (the contract #191 was about).
+	sanctioned := 0
+	for _, name := range names {
+		src := string(mustRead(t, name))
+		// copyBtn's own body is the one place the attribute is written;
+		// its span is skipped by position rather than by matching the
+		// text inside it, so a second hand-rolled control that happened
+		// to look the same is still reported.
+		def := jsFuncSpan(src, "copyBtn")
+		if def == nil && strings.Contains(src, "copyBtn") && strings.Contains(src, "data-copy=") {
+			t.Errorf("%s defines the copy control but copyBtn could not be located as a top-level "+
+				"`function copyBtn(` declaration, so its own data-copy attribute cannot be excluded. "+
+				"Every finding below is that, not a hand-rolled control: teach jsFuncSpan the new form "+
+				"(an arrow assigned to a const, say) rather than chasing a defect that is not there", name)
+		}
+		for _, loc := range handRolledCopy.FindAllStringIndex(src, -1) {
+			if def != nil && loc[0] >= def[0] && loc[1] <= def[1] {
+				sanctioned++
+				continue
+			}
+			t.Errorf("%s writes a copy control by hand (%s): use copyBtn(label, text), which escapes both. "+
+				"The text is a key, an address or a statement — not something the page composed",
+				name, src[loc[0]:loc[1]])
+		}
+	}
+	if sanctioned != 1 {
+		t.Errorf("found %d data-copy attributes inside copyBtn, want exactly 1: "+
+			"either the helper stopped emitting the attribute the click handler reads, or it grew a second one", sanctioned)
+	}
+}
+
+func mustRead(t *testing.T, name string) []byte {
+	t.Helper()
+	src, err := FS.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return src
+}
+
+// jsFuncSpan returns the [start, end) of a top-level function's source,
+// from its `function name(` to the closing brace in the first column.
+func jsFuncSpan(src, name string) []int {
+	start := strings.Index(src, "function "+name+"(")
+	if start < 0 {
+		return nil
+	}
+	end := strings.Index(src[start:], "\n}")
+	if end < 0 {
+		return nil
+	}
+	return []int{start, start + end + 2}
+}
+
+var (
+	// The two names are only ever matched against each other, so nothing
+	// is gained by constraining their shape — and constraining it cost
+	// the check its point. [a-z-]+ made a name carrying a digit, an
+	// underscore or a capital match neither pattern (the trailing quote
+	// makes the match fail outright rather than capture a prefix), so a
+	// control and its exporter both went invisible and there was nothing
+	// left to disagree. A dead data-csv="top10" passed green. The gap
+	// only opened for a new pair, which is exactly when someone reaches
+	// for top-10 or slowQueries.
+	csvControl  = regexp.MustCompile(`data-csv="([^"]+)"`)
+	csvRegister = regexp.MustCompile(`\bsetCSV\("([^"]+)"`)
+	// The security reviewer noted this saw only the double-quoted
+	// attribute literal, so setAttribute("data-copy", …), a dataset
+	// assignment, or a single-quoted attribute would have slipped past
+	// it. No such path exists today; the point is that the check would
+	// not have said so. All four shapes now.
+	handRolledCopy = regexp.MustCompile(`data-copy\s*=\s*["'][^"']*["']|setAttribute\(\s*["']data-copy["']|\.dataset\.copy\s*=`)
 )

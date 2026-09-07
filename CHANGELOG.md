@@ -8,6 +8,67 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.57.0 — unreleased
+
+### Added
+- **Getting things out of the console** (#205). The console is read-only,
+  and nearly everything a reader wants from it they want somewhere else:
+  a range key into `datax debug split`, an address into a psql connection
+  string or a `--join` flag, a statement into a ticket or an `EXPLAIN`.
+  One block on one page — the reconstructed DDL from #194 — had a copy
+  button; everything else was select-and-drag, which for a long
+  monospace key inside a horizontal scroller is the most annoying thing
+  on the page. Keyed rendering (#148) had already fixed the blocking
+  half of this by letting a selection survive a poll, which left the
+  console merely inconsistent about it.
+
+  There is now a copy control on the range keys (`#/data`, the node view
+  and the overview's hot ranges), the node and SQL addresses, the
+  statement text in every slow-statement list, and the statement shapes
+  and their fingerprints. It appears on hover and on keyboard focus so a
+  dense table is not a field of icons, and it is a real `<button>` in the
+  tab order (#149) with a screen-reader label naming what it copies —
+  "copy" repeated down a column says nothing about which row you are on.
+  On a device with no pointer it is simply always shown.
+
+  The DDL button's clipboard-with-a-fallback is now `copyText` in
+  `js/10-core.js`, shared by every control rather than reimplemented. The
+  clipboard API needs a secure context, and this console is often reached
+  over plain HTTP — a node addressed directly, a port-forward — where it
+  rejects; there the text is selected instead and the control says so,
+  which leaves one keystroke to finish rather than a button that
+  silently does nothing. The reply goes to a live region, so it is
+  announced once instead of the control renaming itself under a screen
+  reader's cursor.
+
+- **Tables copy as CSV** (#205). The node table, the cluster range list,
+  the failure-domain breakdown and the statement-shape list end up in
+  incident reviews, capacity plans and tickets, and the only route out
+  was a screenshot or retyping. Each section's heading now carries a
+  **copy as CSV** control.
+
+  It copies rather than downloads: the console is self-contained and
+  often reached over a port-forward, so a clipboard copy needs no
+  download plumbing, no `Content-Disposition` and no new endpoint. For a
+  file rather than a paste, `/api/*` already returns the same figures as
+  JSON that `curl` can take, and the glossary entry says so rather than
+  the console growing a second path to the same bytes.
+
+  What is exported is what is on screen — the filter, the sort and the
+  scope already applied, because a CSV that ignores the filter the reader
+  set is a different table from the one they are looking at. Keys are
+  exported in full where the cells shorten them to fit a column: a key
+  that has been shortened is not one a command will take. Fields holding
+  a comma, a quote, a newline or an edge space are quoted, which
+  statement text and range keys all manage.
+
+### Changed
+- `statusCell` is now `nodeState` plus its dot, so the word in an
+  exported row and the word in the cell beside it cannot drift apart.
+- A tile's value classifier no longer counts screen-reader-only text
+  toward the length that demotes a long value to smaller type, so a copy
+  control's hidden label cannot shrink a short figure.
+
 ## 0.56.0 — unreleased
 
 ### Added

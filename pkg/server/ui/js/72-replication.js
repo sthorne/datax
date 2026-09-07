@@ -96,6 +96,9 @@ function renderDomains(rep, d) {
       </tr>`,
     };
   }));
+  setCSV("domains", ["domain", "nodes", "live nodes", "replicas", "leases", "ranges losing quorum", "example at-risk range", "ranges on a bare majority"],
+    domains.map(dm => [dm.tier + "=" + dm.value, dm.nodes, dm.live_nodes ?? dm.nodes, dm.replicas, dm.leases,
+      dm.loses_quorum || 0, dm.example_at_risk_range ? "r" + dm.example_at_risk_range : "", dm.bare_majority || 0]));
   const tiers = rep.tiers || [];
   let note = domains.length
     ? `what the loss of a whole domain would cost, computed from the range descriptors and the nodes' declared localities — no fan-out, so it answers even from a partitioned node. Tiers in use: ${tiers.map(esc).join(" › ")}.`

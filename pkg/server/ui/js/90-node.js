@@ -42,8 +42,8 @@ function renderNode(d) {
   const st = d.status || {};
   renderTiles(document.getElementById("node-ident"),
     tile("status", (d.live ? (d.draining ? "draining" : "live") : "down") + (d.heartbeat_ago_ms ? " · heartbeat " + fmtAgo(d.heartbeat_ago_ms) : "")) +
-    tile("address", d.address || "—") +
-    tile("sql", d.sql_address || "—") +
+    tileHTML("address", d.address ? esc(d.address) + copyBtn("this node's address", d.address) : "—") +
+    tileHTML("sql", d.sql_address ? esc(d.sql_address) + copyBtn("this node's SQL address", d.sql_address) : "—") +
     tile("locality", d.locality || "—") +
     tile("version", (d.release ? "v" + d.release + " · " : "") + "protocol v" + (d.binary_version || 1) + (d.cluster_version ? " · cluster v" + d.cluster_version : "")) +
     tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—") +
@@ -83,8 +83,8 @@ function renderNode(d) {
   if (act) {
     box.hidden = false;
     const rows = [];
-    for (const s of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(s.text)}</td></tr>`);
-    for (const s of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}</td></tr>`);
+    for (const s of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(s.text)}${copyBtn("this statement", s.text)}</td></tr>`);
+    for (const s of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}${copyBtn("this statement", s.text)}</td></tr>`);
     setHTML(document.getElementById("node-statements"), rows.join("") || `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently</td></tr>`);
     document.getElementById("node-sql-note").textContent = "";
   } else {

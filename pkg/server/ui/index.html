@@ -130,6 +130,32 @@
     background: var(--panel); color: var(--text);
   }
   .ddlbar button:hover { border-color: var(--text-3); }
+  /* Copy controls on cells (issue #205). Revealed on hover and on
+     keyboard focus: a control on every key, address and statement would
+     otherwise be a field of icons down a dense table. It holds its space
+     while invisible, so nothing shifts when it appears, and a pointerless
+     device — touch, or a keyboard alone — never gets a hover, so there it
+     is simply always shown. */
+  .copy {
+    font: inherit; font-size: 12px; line-height: 1; vertical-align: baseline;
+    margin-left: 6px; padding: 1px 4px; cursor: pointer;
+    border: 1px solid transparent; border-radius: 5px;
+    background: none; color: var(--text-3); opacity: 0;
+  }
+  .copy .glyph { display: inline-block; min-width: 1em; text-align: center; }
+  td:hover > .copy, tr:focus-within > td > .copy, .tile:hover .copy, .copy:focus { opacity: 1; }
+  .copy:hover { color: var(--text); border-color: var(--border); }
+  .copy:focus { outline: 2px solid var(--text-3); outline-offset: 1px; }
+  @media (hover: none) { .copy { opacity: 1; } }
+  /* "copy as CSV" sits in the section's heading, so the way to take a
+     table away is where the table is named. */
+  h2 .csv {
+    font: inherit; font-size: 12px; font-weight: 400; vertical-align: middle;
+    margin-left: 12px; padding: 3px 10px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--text-2);
+  }
+  h2 .csv:hover { color: var(--text); border-color: var(--text-3); }
   pre.ddl {
     font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2);
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
@@ -314,6 +340,7 @@
 <body>
 <a class="skip" href="#main-views">skip to content</a>
 <div id="insecure-banner" role="status"></div>
+<span id="copy-status" role="status" aria-live="polite" class="sr-only"></span>
 <header>
   <h1>datax</h1>
   <nav id="nav" aria-label="views"></nav>
@@ -384,7 +411,7 @@
 </main>
 <main id="view-nodes" hidden>
   <section>
-    <h2>Nodes <input id="node-filter" type="search" placeholder="filter by locality or address" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
+    <h2>Nodes <input id="node-filter" type="search" placeholder="filter by locality or address" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"> <button type="button" class="csv" data-csv="nodes" data-help="copy as csv">copy as CSV</button></h2>
     <div class="tablewrap"><table class="cards">
       <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
         <th class="num" title="host CPU busy, all cores">cpu</th>
@@ -425,7 +452,7 @@
     <p class="muted" id="repl-note"></p>
   </section>
   <section id="sec-failure-domains">
-    <h2>Failure domains</h2>
+    <h2>Failure domains <button type="button" class="csv" data-csv="domains" data-help="copy as csv">copy as CSV</button></h2>
     <div class="tablewrap"><table class="cards">
       <thead><tr><th scope="col">domain</th>
         <th scope="col" class="num" title="nodes in this domain, and how many are live">nodes</th>
@@ -447,7 +474,7 @@
     <p class="muted" id="repl-hot-note"></p>
   </section>
   <section id="sec-cluster-ranges">
-    <h2>Ranges <input id="data-filter" type="search" placeholder="filter by table or range id" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
+    <h2>Ranges <input id="data-filter" type="search" placeholder="filter by table or range id" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"> <button type="button" class="csv" data-csv="ranges" data-help="copy as csv">copy as CSV</button></h2>
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
       <tbody id="cluster-ranges"></tbody>
@@ -517,6 +544,7 @@
         <option value="mean">by mean latency</option>
         <option value="scanned">by rows scanned</option>
       </select>
+      <button type="button" class="csv" data-csv="shapes" data-help="copy as csv">copy as CSV</button>
     </h2>
     <div class="tablewrap"><table class="cards">
       <thead><tr>
@@ -599,7 +627,7 @@
     </table></div>
     <p class="muted" id="table-shapes-note"></p>
     <h2>Reconstructed DDL</h2>
-    <div class="ddlbar"><button type="button" id="table-ddl-copy">copy</button>
+    <div class="ddlbar"><button type="button" id="table-ddl-copy" data-help="copy"><span class="glyph">copy</span></button>
       <span class="muted" id="table-ddl-note"></span></div>
     <pre class="ddl" id="table-ddl"></pre>
   </section>

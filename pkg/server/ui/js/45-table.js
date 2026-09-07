@@ -272,22 +272,13 @@ function wireTableDetail() {
     const name = nameOf(ev);
     if (name) { ev.preventDefault(); go("schema/" + encodeURIComponent(name)); }
   });
-  document.getElementById("table-ddl-copy").addEventListener("click", async () => {
-    const btn = document.getElementById("table-ddl-copy");
-    const text = document.getElementById("table-ddl").textContent;
-    try {
-      // The clipboard API needs a secure context; over plain HTTP it
-      // rejects, and saying so beats a button that silently does nothing.
-      await navigator.clipboard.writeText(text);
-      btn.textContent = "copied";
-    } catch {
-      btn.textContent = "select it and copy";
-      const r = document.createRange();
-      r.selectNodeContents(document.getElementById("table-ddl"));
-      const sel = window.getSelection();
-      sel.removeAllRanges(); sel.addRange(r);
-    }
-    setTimeout(() => { btn.textContent = "copy"; }, 2000);
+  // This was the console's only copy control, and its clipboard-with-a
+  // -fallback is now copyText in 10-core.js, shared with every control
+  // added since (issue #205). The behaviour is unchanged; the block it
+  // used to carry is selected on the fallback path, as before.
+  document.getElementById("table-ddl-copy").addEventListener("click", () => {
+    const block = document.getElementById("table-ddl");
+    copyText(block.textContent, document.getElementById("table-ddl-copy"), block);
   });
   // A shape here opens it where its detail lives, rather than growing a
   // second copy of the statement panel on this page.
