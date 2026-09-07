@@ -384,15 +384,14 @@ func TestHelpGlossaryHasNoDeadEntries(t *testing.T) {
 	}
 }
 
-// helpKeysNotOnAPage are entries that explain a control in the header or
-// a term the page writes in prose rather than as a heading, so the term
-// extractor below will never see them.
+// helpKeysNotOnAPage are entries for terms the page writes in prose
+// rather than as a heading, so the term extractor below will never see
+// them. A header control is NOT one of these any more: it keys its entry
+// with data-help, which the extractor reads, and the help pop and panel
+// reach it (issue #230) — a control listed here is one the reader cannot
+// reach from, which is the gap this list used to paper over.
 var helpKeysNotOnAPage = map[string]bool{
-	"scope": true, "range": true, "jump to": true,
 	"compare": true, "annotate": true, "filter": true,
-	// The viewer preferences (issue #204): two header controls, like
-	// scope and range above.
-	"theme": true, "timestamps": true,
 	// The copy controls (issue #205). Both are buttons: one sits inside a
 	// cell, and the other inside a heading, where normalizeTerm strips it
 	// out so that "Nodes" stays the term rather than "Nodes copy as CSV".
@@ -480,6 +479,13 @@ func pageTerms() ([]pageTerm, error) {
 			add(view, m[2], "index.html #/"+view)
 		}
 	}
+	// The header's controls (issue #230): each keys its entry with
+	// data-help, and the header is outside every view.
+	if hdr := headerRE.FindStringSubmatch(string(page)); hdr != nil {
+		for _, m := range dataHelpRE.FindAllStringSubmatch(hdr[1], -1) {
+			add("", m[1], "index.html header")
+		}
+	}
 	names, err := ScriptFiles()
 	if err != nil {
 		return nil, err
@@ -504,7 +510,10 @@ func pageTerms() ([]pageTerm, error) {
 var (
 	viewSplit = regexp.MustCompile(`(?s)<main id="view-([a-z]+)"(.*?)</main>`)
 	headingRE = regexp.MustCompile(`(?s)<(th|h2)\b[^>]*>(.*?)</(?:th|h2)>`)
-	tileLabel = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
+	// The header, and a control's data-help inside it (issue #230).
+	headerRE   = regexp.MustCompile(`(?s)<header>(.*?)</header>`)
+	dataHelpRE = regexp.MustCompile(`data-help="([^"]+)"`)
+	tileLabel  = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
 	// Controls and screen-reader text live inside a heading without being
 	// part of the term: "Statement shapes" is the heading and the sort
 	// <select> beside it is not.
@@ -1696,5 +1705,61 @@ func TestNetworkSeveritiesAreJudgedAgainstTheCluster(t *testing.T) {
 	}
 	if !strings.Contains(string(rep), "warn(risk, dm.loses_quorum)") {
 		t.Error("the quorum-risk cell is not rendered through warn(): a domain whose loss costs quorum looks like one that does not")
+	}
+}
+
+// TestHeaderControlsAreExplained (issue #230): a header control's
+// glossary entry must be reachable from the control. The header is
+// outside every view, so the help pop's delegated handler and the panel
+// both have to look there on purpose; and each control keys its entry
+// with data-help, since its own words are the control, not a term.
+func TestHeaderControlsAreExplained(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := headerRE.FindStringSubmatch(string(page))
+	if hdr == nil {
+		t.Fatal("index.html has no <header>")
+	}
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed := map[string]bool{}
+	for _, m := range dataHelpRE.FindAllStringSubmatch(hdr[1], -1) {
+		keyed[m[1]] = true
+		if g.entries[m[1]] == "" {
+			t.Errorf("header control keyed data-help=%q has no glossary entry", m[1])
+		}
+	}
+	for _, ctl := range []string{"scope", "range", "jump to", "theme", "timestamps"} {
+		if !keyed[ctl] {
+			t.Errorf("the %q control carries no data-help: its glossary entry cannot be reached from the header", ctl)
+		}
+		if helpKeysNotOnAPage[ctl] {
+			t.Errorf("HELP[%q] is excused from matching the page: a header control keys its entry with data-help and must not be on that list", ctl)
+		}
+	}
+	help, err := FS.ReadFile("js/12-help.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(help)
+	if span := jsFuncSpan(src, "wireHelpControls"); span == nil {
+		t.Fatal("js/12-help.js has no wireHelpControls")
+	} else {
+		body := src[span[0]:span[1]]
+		if !strings.Contains(body, `wireHelp(document.querySelector("header"))`) {
+			t.Error("the header's controls are never marked: wireHelp does not run on the header")
+		}
+		if !strings.Contains(body, `document.querySelector("header").contains(term)`) {
+			t.Error("the help pop's click handler does not answer in the header: a control's entry is reachable only by hover")
+		}
+	}
+	if span := jsFuncSpan(src, "renderHelpPanel"); span == nil {
+		t.Fatal("js/12-help.js has no renderHelpPanel")
+	} else if !strings.Contains(src[span[0]:span[1]], `querySelectorAll("header .helpable")`) {
+		t.Error("the help panel is built from the view alone: the header's controls are not in it")
 	}
 }

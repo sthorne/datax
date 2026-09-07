@@ -371,12 +371,28 @@ function renderHelpPanel() {
     seen.add(term);
     rows += `<dt>${esc(term)}</dt><dd>${esc(text)}</dd>`;
   }
+  // The header's controls, the same on every view (issue #230): the
+  // header is outside every view, so without this section a control's
+  // entry was written, shipped and unreachable.
+  const ctlSeen = new Set();
+  let ctls = "";
+  for (const el of document.querySelectorAll("header .helpable")) {
+    const term = normTerm(labelText(el));
+    if (!term || ctlSeen.has(term)) continue;
+    const text = helpFor(term, "");
+    if (!text) continue;
+    ctlSeen.add(term);
+    ctls += `<dt>${esc(term)}</dt><dd>${esc(text)}</dd>`;
+  }
   const body = document.getElementById("help-body");
-  body.innerHTML = rows
+  body.innerHTML = (rows
     ? `<dl>${rows}</dl>`
-    : `<p class="muted">Nothing on this view has an explanation yet.</p>`;
-  document.getElementById("help-count").textContent =
-    seen.size ? `${seen.size} term${seen.size === 1 ? "" : "s"} on this view` : "";
+    : `<p class="muted">Nothing on this view has an explanation yet.</p>`) +
+    (ctls ? `<p class="muted">the header's controls, on every view</p><dl>${ctls}</dl>` : "");
+  const counts = [];
+  if (seen.size) counts.push(`${seen.size} term${seen.size === 1 ? "" : "s"} on this view`);
+  if (ctlSeen.size) counts.push(`${ctlSeen.size} control${ctlSeen.size === 1 ? "" : "s"}`);
+  document.getElementById("help-count").textContent = counts.join(" · ");
 }
 let helpReturn = null;
 function helpOpen() { return !document.getElementById("help").hidden; }
@@ -396,6 +412,9 @@ function closeHelp() {
 }
 function wireHelpControls() {
   observeHelp();
+  // The header's controls are marked once: its markup is static, and it
+  // is outside the observed views (issue #230).
+  wireHelp(document.querySelector("header"));
   document.getElementById("help-open").addEventListener("click", openHelp);
   document.getElementById("help-close").addEventListener("click", closeHelp);
   // The backdrop closes it; the panel itself does not.
@@ -406,7 +425,7 @@ function wireHelpControls() {
   // carrying them are replaced on every poll.
   document.addEventListener("click", ev => {
     const term = ev.target.closest(".helpable");
-    if (term && document.getElementById("main-views").contains(term)) {
+    if (term && (document.getElementById("main-views").contains(term) || document.querySelector("header").contains(term))) {
       // A heading that is also a link or holds a control keeps its own
       // behaviour; the explanation is the hover and the panel there.
       if (ev.target.closest("a, button, select, input")) return;

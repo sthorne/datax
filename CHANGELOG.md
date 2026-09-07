@@ -305,6 +305,17 @@ state or the internode protocol does, and an entry below says so.
   as a warning, never as "down", which in that column means unreachable.
   p99 is a column of the worst-pairs table rather than hover-only, and
   the glossary says what is flagged and why.
+- **Console: a header control's glossary entry is reachable from the
+  control** (#230). The help pop answered clicks only inside the views
+  and the help panel was built from the current view alone, so the
+  entries for scope, range, jump to, theme and timestamps — written and
+  shipped — could not be reached from the controls they describe; the
+  short `title` was all a reader got. Each control now keys its entry
+  with `data-help`, the pop answers in the header, and the panel ends
+  with the header's controls, the same on every view. The test's list
+  of entries excused from matching the page shrank by those five, as
+  the issue asked; what remains on it is prose terms and the copy
+  buttons, not controls.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the

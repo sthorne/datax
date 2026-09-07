@@ -388,8 +388,12 @@
   <h1>datax</h1>
   <nav id="nav" aria-label="views"></nav>
   <span class="controls-hdr">
-    <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
-    <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
+    <!-- data-help keys each control's glossary entry (issue #230): the
+         header is outside every view, so the help pop and the panel
+         reach these through the header itself; the select's title stays
+         the one-line version. -->
+    <label data-help="scope">scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
+    <label data-help="range">range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
     <!-- Display preferences (issue #204). A <details>, like the user
          menu, because these are set once and then never again: giving
          them permanent header width alongside scope and range — which an
@@ -401,12 +405,12 @@
     <details class="display" id="display-menu">
       <summary title="how this console looks and how it writes a moment">display ▾</summary>
       <div class="menu">
-        <label>theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
-        <label>timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
+        <label data-help="theme">theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
+        <label data-help="timestamps">timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
         <span class="prefnote" id="pref-note" hidden></span>
       </div>
     </details>
-    <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
+    <button type="button" id="jump-open" data-help="jump to" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
     <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
   <span class="sub" id="hdr-node">connecting…</span>
