@@ -8,6 +8,46 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.56.0 — unreleased
+
+### Added
+- **Authentication refusals reach the console** (#203). #195 gave the node
+  a limiter that refuses a sign-in before it spends CPU verifying a
+  password, and a counter to go with it — but nothing showed the counter,
+  so the console displayed two of the three authentication figures and
+  omitted the one that means something is hammering the node right now.
+
+  `/api/security` carries the total and both causes, ungated: they are
+  counts of this node's own refusals and name nobody. *Which* addresses
+  were throttled would name people and is deliberately still not
+  published.
+
+  The Security view gains a **refused before verification** tile, with its
+  glossary entry. A new `auth-throttled` health check reports sustained
+  throttling to the problems panel as a **rate** over the last five
+  minutes, not a lifetime total — a cumulative count would leave the panel
+  amber forever after one bad afternoon, which is how a panel stops being
+  read.
+
+### Changed
+- **`datax_auth_throttled_total` is now labelled by cause** (#203), where
+  it was an unlabelled counter in 0.55.0: `rate-limit` (one source, or one
+  source and account, asking too often) and `verify-full` (this node
+  already verifying as many passwords at once as it allows). They are
+  counted apart because they call for different actions — the first is
+  someone else's client to fix, the second is this node at its own
+  ceiling.
+
+  This changes the series' shape. A query selecting the bare metric now
+  returns one series per cause where it returned a single series, so an
+  existing alert, recording rule or single-stat panel needs
+  `sum(datax_auth_throttled_total)` (or `sum by (cause) (…)` to keep the
+  split) to read as it did before. Both children are created at
+  registration, so the series is still present at `0` from the first
+  scrape rather than appearing only once a refusal happens — a labelled
+  counter otherwise turns an alert on an idle node from `0` into
+  no-data.
+
 ## 0.55.0 — unreleased
 
 Everything under #189: six defects the console review turned up, the

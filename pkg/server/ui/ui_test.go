@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"html"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -743,3 +744,337 @@ func TestTableDetailTermsAreInTheGlossary(t *testing.T) {
 		}
 	}
 }
+
+// TestSecurityFiguresReadTheDocumentThatCarriesThem (issue #203 review):
+// the Security view is fed by two documents — the cluster poll, which
+// carries who you are signed in as, and /api/security, which carries
+// this node's own counters — and a figure read from the wrong one is
+// silently zero rather than visibly broken.
+//
+// That is not hypothetical: the "refused before verification" tile was
+// merged reading auth_throttled_rate_limit off the cluster document,
+// which has no such field, so it rendered "none" while the node refused
+// hundreds a second. Nothing caught it because every test asserted on
+// the API documents and none on the page.
+//
+// What this proves, exactly: for every helper parameter whose body
+// reads a field unique to one of the two documents, the call sites this
+// can trace pass that document — either the global itself, or a
+// parameter its own callers only ever pass that global in. It checks
+// the argument rather than the reading function's body because the bad
+// read was one call away from the renderer that made it.
+//
+// What it does NOT prove, so a passing run is not read as more than it
+// is:
+//
+//   - Nothing about fields both documents carry (principal, node_id).
+//   - Nothing about whether a document has arrived. The follow-on
+//     defect, renderAuthTiles(null) claiming "insecure" on a secure
+//     cluster, was a nullness bug that no document-identity check sees.
+//   - Coverage is per parameter, not per call site. jsCalls reads the
+//     bodies of top-level function declarations, so a call made from an
+//     arrow function or a bare module-level block — renderReplication
+//     (lastCluster) inside a click listener, say — is invisible to it.
+//     A parameter with one traceable call site and four untraceable
+//     ones is reported exactly like one that is fully checked, and only
+//     a parameter with no traceable call site at all reaches the "not
+//     covered" log. So the honest reading of a pass is that some call
+//     site passes the right document, not that every one does.
+func TestSecurityFiguresReadTheDocumentThatCarriesThem(t *testing.T) {
+	wantDoc, err := documentFields()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wantDoc) < 4 {
+		t.Fatalf("only %d fields are unique to one document; the extractor is broken, not the console", len(wantDoc))
+	}
+	// Every script, concatenated the way the page assembles them: the
+	// call graph crosses files (renderSecurity is defined in 92-ops.js
+	// and called from 30-overview.js and 95-boot.js), and reading one
+	// file would leave those call sites invisible — which silently
+	// stopped an earlier version of this test from catching the bug it
+	// was written for.
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all strings.Builder
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all.Write(src)
+		all.WriteString("\n")
+	}
+	body := all.String()
+	funcs := jsFunctions(body)
+	if len(funcs) < 40 {
+		t.Fatalf("parsed %d functions out of the console scripts; the parser is broken", len(funcs))
+	}
+
+	// Which document each parameter must be, from the fields its body
+	// reads off it. A parameter reading fields unique to both documents
+	// is the bug this test is about, stated directly.
+	want := map[paramRef]string{}
+	for _, f := range funcs {
+		for i, param := range f.params {
+			for field, doc := range wantDoc {
+				if !readsField(f.body, param, field) {
+					continue
+				}
+				ref := paramRef{fn: f.name, param: param, idx: i}
+				if prev, ok := want[ref]; ok && prev != doc {
+					t.Errorf("%s(%s) reads fields unique to both documents (%s and %s): "+
+						"one parameter cannot be both", f.name, param, prev, doc)
+				}
+				want[ref] = doc
+			}
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("no helper reads a document-specific field off a parameter; this test is watching nothing")
+	}
+
+	// What each parameter is actually handed, resolved to a global where
+	// it can be: a global passed straight in, or one passed through a
+	// caller's own parameter. Iterated to a fixed point so one level of
+	// indirection (renderAuthTiles(lastCluster, secDoc) -> authThrottleText(sec))
+	// resolves.
+	origins := map[paramRef]map[string]bool{}
+	calls := jsCalls(body, funcs)
+	for round := 0; round < len(funcs)+2; round++ {
+		changed := false
+		for _, c := range calls {
+			target, ok := funcs.byName(c.callee)
+			if !ok {
+				continue
+			}
+			for i, arg := range c.args {
+				if i >= len(target.params) {
+					break
+				}
+				ref := paramRef{fn: target.name, param: target.params[i], idx: i}
+				for _, origin := range resolveArg(arg, c.caller, funcs, origins) {
+					if origins[ref] == nil {
+						origins[ref] = map[string]bool{}
+					}
+					if !origins[ref][origin] {
+						origins[ref][origin] = true
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
+	// A parameter whose arguments this test cannot resolve — passed from
+	// a callback, or computed — is outside its reach, not a defect. It is
+	// reported so the limit is visible, and the covered count is asserted
+	// below so the check cannot quietly decay into covering nothing.
+	covered := 0
+	for ref, doc := range want {
+		got := origins[ref]
+		if len(got) == 0 {
+			t.Logf("not covered: %s(%s) reads a field only %s carries, but every call passes it "+
+				"something this test cannot trace to a document", ref.fn, ref.param, doc)
+			continue
+		}
+		covered++
+		for origin := range got {
+			if origin == doc {
+				continue
+			}
+			t.Errorf("%s(%s) reads a field only %s carries, but is handed %s. "+
+				"That document has no such field, so the figure renders as zero under every condition.",
+				ref.fn, ref.param, doc, origin)
+		}
+	}
+	if covered == 0 {
+		t.Error("no document-specific parameter had a traceable call site: this test is no longer checking anything")
+	}
+
+	// A non-zero count is too low a floor on its own. readsField sees
+	// `name.field` and `name["field"]` and nothing else, so destructuring
+	// the document in a signature or a body takes that parameter out of
+	// the extractor's sight — the check quietly stops watching the
+	// function it was written for, while coverage elsewhere keeps the
+	// count non-zero and the run green. That is a silent coverage loss
+	// rather than a false positive, which makes it the worse of the two.
+	//
+	// So the figures that actually broke are pinned by name. A refactor
+	// that hides one of these from the extractor fails here, saying which
+	// function stopped being watched, instead of passing quietly.
+	// renderAuthTiles is deliberately not here: the only field it reads
+	// off the cluster document is principal, which /api/security
+	// carries too, so it is legitimately outside what this test can
+	// speak to — the same limit the doc comment names above.
+	for _, fn := range []string{"authThrottleText"} {
+		found := false
+		for ref := range want {
+			if ref.fn == fn && len(origins[ref]) > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s no longer has a document-specific parameter this test can both read and trace, "+
+				"so it is no longer covered. It reads a field only one of the two documents carries, and it is "+
+				"the figure this test exists for. If it was refactored to destructure the document, or to take it "+
+				"from a global rather than a parameter, extend readsField or the argument tracer to follow it — "+
+				"do not leave the check silently watching nothing", fn)
+		}
+	}
+}
+
+// documentFields maps each JSON field unique to one of the two documents
+// to the global that carries it. Fields both structs declare are absent:
+// reading those off either document is legitimate.
+func documentFields() (map[string]string, error) {
+	sec, err := structJSONFields("../security_api.go", "SecurityStatus")
+	if err != nil {
+		return nil, err
+	}
+	cluster, err := structJSONFields("../cluster_api.go", "ClusterStatus")
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]string{}
+	for f := range sec {
+		if !cluster[f] {
+			want[f] = "secDoc"
+		}
+	}
+	for f := range cluster {
+		if !sec[f] {
+			want[f] = "lastCluster"
+		}
+	}
+	return want, nil
+}
+
+func structJSONFields(path, name string) (map[string]bool, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	text := string(src)
+	start := strings.Index(text, "type "+name+" struct {")
+	if start < 0 {
+		return nil, errors.New(path + ": no type " + name)
+	}
+	end := strings.Index(text[start:], "\n}")
+	if end < 0 {
+		return nil, errors.New(path + ": type " + name + " is not closed")
+	}
+	fields := map[string]bool{}
+	for _, m := range jsonTag.FindAllStringSubmatch(text[start:start+end], -1) {
+		fields[m[1]] = true
+	}
+	return fields, nil
+}
+
+// readsField reports whether body reads field off name, by property or
+// by bracket. Destructuring is not recognised; the console does not use
+// it on these documents, and a test that quietly half-covers is worse
+// than one whose limits are written down.
+func readsField(body, name, field string) bool {
+	return strings.Contains(body, name+"."+field) ||
+		strings.Contains(body, name+`["`+field+`"]`)
+}
+
+// paramRef identifies one parameter of one function.
+type paramRef struct {
+	fn, param string
+	idx       int
+}
+
+type jsFunc struct {
+	name   string
+	params []string
+	body   string
+}
+
+type jsFuncs []jsFunc
+
+func (fs jsFuncs) byName(n string) (jsFunc, bool) {
+	for _, f := range fs {
+		if f.name == n {
+			return f, true
+		}
+	}
+	return jsFunc{}, false
+}
+
+func jsFunctions(body string) jsFuncs {
+	var out jsFuncs
+	for _, m := range jsFuncDecl.FindAllStringSubmatch(body, -1) {
+		f := jsFunc{name: m[1], body: funcBody(body, m[0])}
+		for _, p := range strings.Split(m[2], ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				f.params = append(f.params, p)
+			}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+type jsCall struct {
+	caller string
+	callee string
+	args   []string
+}
+
+// jsCalls finds calls with plain identifier or member arguments, which
+// is all this check can resolve. A call whose argument is an expression
+// is skipped, and the "handed nothing" branch above reports a parameter
+// left with no resolvable call site rather than passing it silently.
+func jsCalls(body string, funcs jsFuncs) []jsCall {
+	var out []jsCall
+	for _, f := range funcs {
+		for _, m := range jsCallSite.FindAllStringSubmatch(f.body, -1) {
+			c := jsCall{caller: f.name, callee: m[1]}
+			for _, a := range strings.Split(m[2], ",") {
+				c.args = append(c.args, strings.TrimSpace(a))
+			}
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// resolveArg maps one argument to the globals it can be: the global
+// itself, or whatever its caller's own parameter is handed.
+func resolveArg(arg, caller string, funcs jsFuncs, origins map[paramRef]map[string]bool) []string {
+	switch arg {
+	case "secDoc", "lastCluster":
+		return []string{arg}
+	}
+	f, ok := funcs.byName(caller)
+	if !ok {
+		return nil
+	}
+	for i, p := range f.params {
+		if p != arg {
+			continue
+		}
+		var out []string
+		for o := range origins[paramRef{fn: caller, param: p, idx: i}] {
+			out = append(out, o)
+		}
+		return out
+	}
+	return nil
+}
+
+var (
+	// A top-level function declaration, its name and its parameter list.
+	jsFuncDecl = regexp.MustCompile(`(?m)^function ([A-Za-z_$][A-Za-z0-9_$]*)\(([^)]*)\)`)
+	// A call with identifier-or-member arguments only.
+	jsCallSite = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$.]*(?:,\s*[A-Za-z_$][A-Za-z0-9_$.]*)*)\)`)
+	jsonTag    = regexp.MustCompile("`json:\"([a-z0-9_]+)")
+)

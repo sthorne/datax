@@ -258,9 +258,15 @@ var (
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})
-	AuthThrottled = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
-		Name: "datax_auth_throttled_total", Help: "Authentication attempts refused by the rate limiter before any password verification ran (issue #195).",
-	})
+	// Labelled by cause because the two refusals mean different things:
+	// "rate-limit" is one source (or one source and account) asking too
+	// often, and "verify-full" is this node already running as many
+	// password verifications as it allows at once — one caller
+	// misbehaving against the node at its ceiling (issue #203).
+	AuthThrottled = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_auth_throttled_total",
+		Help: "Authentication attempts refused before any password verification ran (issue #195), by cause: rate-limit (the per-source/per-account limiter), verify-full (the concurrent-verification cap).",
+	}, []string{"cause"})
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
 	})
@@ -277,6 +283,23 @@ var (
 		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
 	})
 )
+
+// AuthThrottleCauses are the labels AuthThrottled is counted by; see the
+// metric's own comment for what each means.
+var AuthThrottleCauses = []string{"rate-limit", "verify-full"}
+
+func init() {
+	// A labelled counter has no children until something asks for one, so
+	// a node that has refused nothing would emit no
+	// datax_auth_throttled_total line at all — turning an existing alert
+	// on it from 0 into no-data, which is a different thing and usually a
+	// louder one. Touching both children at registration keeps the series
+	// present from the first scrape, the way the unlabelled counter it
+	// replaced was (issue #203 review).
+	for _, cause := range AuthThrottleCauses {
+		AuthThrottled.WithLabelValues(cause)
+	}
+}
 
 // CounterValue reads a counter's current value (for status summaries;
 // Prometheus counters expose it only through their wire form).

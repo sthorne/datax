@@ -66,6 +66,17 @@ const (
 	diskFreeCritical = 0.05
 	fdWarn           = 0.8
 	authFailureRate  = 1.0 // per second over the last five minutes
+	// authThrottleRate is the sustained refusal rate worth reporting.
+	//
+	// A source keeps a burst and then one attempt a second, so a client
+	// looping settles at one *allowed* attempt a second and its refusals
+	// run at nearly its whole request rate — a single sequential client
+	// measured 29k refusals in four seconds on a loopback. The threshold
+	// is therefore nowhere near the offender's rate; what one refusal a
+	// second buys is the floor: it trips once something sustains more
+	// than about two attempts a second, and stays quiet for the stray
+	// refusal a burst of legitimate sign-ins can produce (issue #203).
+	authThrottleRate = 1.0
 )
 
 type healthCache struct {
@@ -78,9 +89,15 @@ type healthCache struct {
 // counterSamples remembers earlier readings of cumulative counters so a
 // rate over the last window can be judged.
 type counterSamples struct {
-	stalls   []sample
-	auth     []sample
-	bgErrors int64
+	stalls []sample
+	auth   []sample
+	// One series per throttle cause, so the summary can report each as a
+	// delta over the same window. Reading the cumulative counters for the
+	// split would put a lifetime total inside a sentence about the last
+	// five minutes, which is the confusion this check exists to avoid.
+	throttleRL []sample
+	throttleVF []sample
+	bgErrors   int64
 }
 
 type sample struct {
@@ -378,6 +395,30 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	if window := now.Sub(n.health.prev.auth[0].at); window > 0 && authDelta/window.Seconds() > authFailureRate {
 		add(Problem{Severity: SeverityWarning, Check: "auth-failures", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication failures or denied admin operations in the last %s on this node", int(authDelta), window.Truncate(time.Second))})
+	}
+
+	// Throttling is reported as a rate, not a total: the counter is
+	// cumulative since start, so one bad afternoon would leave the
+	// panel amber forever — which is how a panel stops being read
+	// (issue #203). One check rather than two, because both causes are
+	// the same event to the reader ("this node is refusing logins
+	// before it checks them"); the summary names which, since a caller
+	// asking too often and this node at its verification ceiling call
+	// for different actions.
+	doc.Checks++
+	var rlDelta, vfDelta float64
+	n.health.prev.throttleRL, rlDelta = rateOver(n.health.prev.throttleRL,
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now)
+	n.health.prev.throttleVF, vfDelta = rateOver(n.health.prev.throttleVF,
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now)
+	throttleDelta := rlDelta + vfDelta
+	if window := now.Sub(n.health.prev.throttleRL[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
+		// Every figure here is over the same window, so the parenthetical
+		// sums to the total in front of it.
+		add(Problem{Severity: SeverityWarning, Check: "auth-throttled", Node: int(n.ident.NodeID), Section: "events",
+			Summary: fmt.Sprintf("%d authentication attempts refused before verification in the last %s on this node "+
+				"(%d rate-limited, %d over the concurrent-verification cap): something is attempting to authenticate far faster than any client should",
+				int(throttleDelta), window.Truncate(time.Second), int(rlDelta), int(vfDelta))})
 	}
 
 	// Capacity: a store on course to fill, from the recorded free-space

@@ -197,10 +197,25 @@ func sourceKey(remoteAddr string) string {
 	return remoteAddr
 }
 
-// authThrottled records a refusal. It is deliberately the same whatever
-// was asked for: nothing here may separate a known username from an
-// unknown one.
-func (n *Node) authThrottled(source, user, path string) {
-	metrics.AuthThrottled.Inc()
-	log.Audit("auth-throttled", "remote", source, "path", path)
+// The two ways an attempt is refused before any verification runs. They
+// are counted apart because they call for different actions: a
+// rate-limit refusal names one source asking too often, and a
+// verify-full refusal says this node is already doing as much password
+// hashing at once as it permits — the first is someone else's problem
+// to stop, the second is this node's ceiling (issue #203).
+// These are the label values metrics.AuthThrottleCauses pre-creates at
+// registration; a new cause has to be added there too, or its series
+// appears only once it first fires.
+const (
+	throttleRateLimit  = "rate-limit"
+	throttleVerifyFull = "verify-full"
+)
+
+// authThrottled records a refusal. What it records is deliberately the
+// same whatever was asked for: nothing here may separate a known
+// username from an unknown one. The cause describes the node's own
+// state, not the caller's identity, so it discloses nothing.
+func (n *Node) authThrottled(source, user, path, cause string) {
+	metrics.AuthThrottled.WithLabelValues(cause).Inc()
+	log.Audit("auth-throttled", "remote", source, "path", path, "cause", cause)
 }

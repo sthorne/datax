@@ -119,12 +119,12 @@ func (n *Node) serveLogin(w http.ResponseWriter, req *http.Request) {
 	// credential is validated (issue #195). A refusal here answers
 	// exactly as a wrong password does.
 	if !n.authLimit.allow(req.RemoteAddr, lr.User) {
-		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path)
+		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path, throttleRateLimit)
 		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
 		return
 	}
 	if !n.authLimit.acquireVerify() {
-		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path)
+		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path, throttleVerifyFull)
 		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
 		return
 	}
