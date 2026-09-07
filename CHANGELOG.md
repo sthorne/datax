@@ -279,6 +279,11 @@ state or the internode protocol does, and an entry below says so.
   asserted on the idle transaction's age from the first sample that
   showed the transaction at all, which can be under a millisecond old.
   It now keeps polling until the age is reported.
+- `TestAlterColumnType` failed every time it ran alone (#231): its
+  concurrent writer counts ids up from 1000 for as long as the ALTER
+  takes, and on an idle machine reached the fixed id 5000 the test
+  inserted afterwards. The probe ids are now taken past wherever the
+  writer got to.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the
