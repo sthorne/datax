@@ -1284,6 +1284,12 @@ func darkBlocksIn(page string) []darkBlock {
 	return out
 }
 
+// For whoever lands #216 (dark-palette re-stepping): the dark tokens now
+// live in TWO blocks, and a change has to land in both. This test is
+// what catches a miss, which is the point of it — but it is a failure at
+// the end of that work rather than a note at the start, so here is the
+// note.
+//
 // TestThemeBlocksAgree (issue #204): the dark palette is written out
 // twice — once for the operating system's choice, once for a viewer who
 // overrode it — because collapsing them would cost a frame of the wrong
@@ -1454,6 +1460,19 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 	}
 	if !strings.Contains(string(core), `pref("timestamps") !== "absolute"`) {
 		t.Error("fmtWhen no longer reads the timestamps preference: the toggle renders nothing")
+	}
+	// The one moment written as a bare instant rather than as now-minus-
+	// an-age. It is correct — fmtWhen takes exactly that — but it is
+	// therefore the one call no shape-based sweep can see in either
+	// direction, so it is pinned by hand.
+	boot, err := FS.ReadFile("js/95-boot.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(boot), "fmtWhen(t.lastOK)") {
+		t.Error("the staleness pill no longer renders its last-good time with fmtWhen. It passes an " +
+			"instant directly rather than Date.now() minus an age, so neither sweep above can see it " +
+			"change — which is exactly why it is named here.")
 	}
 	// Not every moment is written as an instant. Some arrive already
 	// subtracted — "this heartbeat was 4s ago" — and the sweep above,
