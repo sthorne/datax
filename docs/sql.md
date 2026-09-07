@@ -352,12 +352,28 @@ descriptor **versions and leases** make that cache safe across gateways:
   drain took its backfill boundary, and an index build would miss the
   row (issue #110).
 
-Remaining gap: a transaction that issued its `BEGIN` before the drain, on
-another gateway, keeps the descriptor version it started with until it
-commits, and its gateway's renewals keep the lease live at the new
-version meanwhile. The deadline closes this once the lease lapses;
-long-lived explicit transactions under a healthy gateway are not covered
-(tracked in issue #22).
+The deadline alone was not enough, because it assumed the drain waits for
+every lease a statement could be running under. It did not: a gateway
+whose renewals are perfectly healthy publishes the new version within a
+third of a TTL, which ended the drain — while a statement it had already
+served from cache was still pinned to the old descriptor and still able
+to commit, up to that entry's expiration. Under `CREATE INDEX` that
+statement's row reached the table and no index (issue #185).
+
+So the lease record also carries `prior_expiration`: when a gateway
+adopts a new version having handed the previous one to a statement, it
+publishes the superseded entry's expiration, and the drain waits for that
+as well as for the version. A statement's deadline is exactly that
+expiration, so once it passes nothing can still commit against the old
+schema. The cost is that a schema change waits out the superseded entry —
+up to one TTL — whenever a gateway served that descriptor from cache
+within the last renewal interval.
+
+A statement whose descriptor came from the uncached path holds no
+deadline and needs none: it read the descriptor inside its own
+transaction, so a schema change committing after that read fails the
+transaction's refresh (tracked in issue #22, now covered for both
+paths).
 
 ## Row encoding (v2)
 

@@ -27,10 +27,14 @@ import (
 //     transaction may write it), then drain again so every gateway plans
 //     with it.
 //
-// Remaining gap: a transaction that BEGAN before step 1's drain, on
-// another gateway, still writes with the descriptor it started with;
-// statement-sized windows are closed, long-lived explicit transactions are
-// not (documented in docs/sql.md).
+// What step 1's drain has to establish is not that every gateway has
+// ADOPTED the write-only index but that none can still write without it:
+// a statement served from a gateway's lease cache is pinned to the
+// descriptor it planned against and bounded only by that entry's
+// expiration, which outlives the renewal that superseded it. The drain
+// waits for that expiration too (issue #185, catalog.descLease), so a
+// write that misses the index cannot commit above the boundary this
+// backfill is about to take.
 
 // backfillChunkSize bounds each backfill chunk: rows scanned, KV batch
 // size, raft entry size, and refresh-span width per transaction.

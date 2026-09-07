@@ -213,18 +213,29 @@ func TestDatabases(t *testing.T) {
 		t.Fatalf("bob reads shop.items: %+v", r.Rows)
 	}
 
-	// The schema browser names each table's database.
-	_, _, body := httpGet(t, "http://"+tc.Nodes[0].HTTPAddr()+"/api/schema")
-	var sd server.SchemaStatus
-	if err := jsonUnmarshal([]byte(body), &sd); err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]string{}
-	for _, tbl := range sd.Tables {
-		seen[tbl.Database+"."+tbl.Name] = tbl.Database
-	}
-	if seen["shop.items"] != "shop" || seen["datax.items"] != "datax" || seen["shop.carts"] != "shop" {
-		t.Fatalf("schema browser databases: %v", seen)
+	// The schema browser names each table's database. The document is
+	// rebuilt at most once every schemaCacheFor, so a table created
+	// moments ago appears once that lapses — poll rather than assume the
+	// browser is a live view of the catalog.
+	var seen map[string]string
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		_, _, body := httpGet(t, "http://"+tc.Nodes[0].HTTPAddr()+"/api/schema")
+		var sd server.SchemaStatus
+		if err := jsonUnmarshal([]byte(body), &sd); err != nil {
+			t.Fatal(err)
+		}
+		seen = map[string]string{}
+		for _, tbl := range sd.Tables {
+			seen[tbl.Database+"."+tbl.Name] = tbl.Database
+		}
+		if seen["shop.items"] == "shop" && seen["datax.items"] == "datax" && seen["shop.carts"] == "shop" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("schema browser databases: %v", seen)
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	// Backups carry the database catalog: a restore into a fresh cluster

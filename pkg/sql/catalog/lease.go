@@ -27,18 +27,34 @@ import (
 // Expired leases cannot be used (the cache entry expires with them), so a
 // crashed gateway delays the drain by at most one TTL.
 //
-// Two rules keep the drain sound against a gateway whose renewals stall
-// (issue #110): the cache entry carries the very expiration written into
-// the lease record, so the cache never outlives what the drain waits for;
-// and a transaction that plans against a leased descriptor takes the
-// lease's expiration as its commit deadline (kvclient.Txn.UpdateDeadline),
-// so it cannot commit after the drain has written the lease off.
+// Three rules keep the drain sound. The first two are against a gateway
+// whose renewals stall (issue #110): the cache entry carries the very
+// expiration written into the lease record, so the cache never outlives
+// what the drain waits for; and a transaction that plans against a leased
+// descriptor takes the lease's expiration as its commit deadline
+// (kvclient.Txn.UpdateDeadline), so it cannot commit after the drain has
+// written the lease off.
 //
-// Remaining gap (tracked in issue #22): a transaction that BEGAN before the
-// drain, on another gateway, may keep using the descriptor version it
-// started with until it commits while its gateway's renewals keep the
-// lease live at the NEW version — statements are pinned to the descriptor
-// they planned against. The deadline covers the lapsed-lease case only.
+// The third is against a gateway whose renewals are perfectly healthy
+// (issue #185). Adopting a new version is not the same as having stopped
+// using the old one: a statement is pinned to the descriptor it planned
+// against, and one served from the cache never read that descriptor
+// inside its own transaction, so nothing but its deadline stops it
+// committing after the renewal that superseded it. Publishing the new
+// version therefore also publishes PriorExpiration — the expiration of
+// the entry that was handed out — and the drain waits for that too. A
+// statement's deadline is exactly that expiration, so once it passes,
+// no statement anywhere can still commit against the old schema.
+//
+// The cost is that a schema change waits out the superseded entry, up to
+// one TTL, whenever a gateway served that descriptor from cache within
+// the last renewal interval. Draining is what makes an online schema
+// change safe; this is the part of it that was missing.
+//
+// A statement that took its descriptor from the UNCACHED path holds no
+// deadline and needs none: it read the descriptor inside its own
+// transaction, so a schema change committing after that read fails the
+// transaction's refresh.
 
 // DefaultDescLeaseTTL is how long a gateway's descriptor lease (and cache
 // entry) lives without renewal.
@@ -48,7 +64,17 @@ const DefaultDescLeaseTTL = 10 * time.Second
 type descLease struct {
 	Version    uint64 `json:"version"`
 	Expiration int64  `json:"expiration"` // HLC wall nanos
+	// PriorExpiration is set when this gateway adopted Version while a
+	// statement it had already handed the PREVIOUS version to could still
+	// commit: that statement is bounded by the replaced entry's
+	// expiration, which is this value. A drain waiting for Version is not
+	// finished with this gateway until it passes. Zero when nothing is
+	// outstanding (issue #185).
+	PriorExpiration int64 `json:"prior_expiration,omitempty"`
 }
+
+// leaseInfo is what one acquisition established.
+type leaseInfo struct{ expiration, priorExpiration int64 }
 
 // TestingPauseRenewal stops (or resumes) the background lease renewal:
 // tests use it to let this gateway's leases expire while its sessions
@@ -103,7 +129,7 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 // (nil when dropped).
 func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescriptor, error) {
 	dbID, bare := splitCacheKey(name)
-	desc, exp, err := a.acquireLease(ctx, dbID, bare, name)
+	desc, info, err := a.acquireLease(ctx, dbID, bare, name)
 	if err != nil {
 		return nil, err // keep the old (still-live) cache entry
 	}
@@ -118,7 +144,7 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		return nil, nil
 	}
 	a.mu.Lock()
-	a.cache[name] = &cachedDesc{desc: desc, expiration: exp}
+	a.cache[name] = &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration}
 	a.mu.Unlock()
 	return desc, nil
 }
@@ -149,9 +175,9 @@ func SetTestingBeforeLeaseWrite(f func(a *Accessor, name string)) {
 // cache for a whole TTL. In one transaction the write cannot commit over
 // a descriptor that changed since the read: the transaction restarts and
 // reads the new version. A dropped table returns a nil descriptor.
-func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, exp int64, err error) {
+func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, info leaseInfo, err error) {
 	err = a.db.RunTxn(ctx, "lease-acquire", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, exp = nil, 0
+		desc, info = nil, leaseInfo{}
 		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
 		var nf *ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -163,8 +189,10 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		if hook := testingBeforeLeaseWrite.Load(); hook != nil {
 			(*hook)(a, name)
 		}
-		e := a.clock.Now().WallTime + a.ttl.Nanoseconds()
-		raw, err := json.Marshal(descLease{Version: d.Version, Expiration: e})
+		now := a.clock.Now().WallTime
+		e := now + a.ttl.Nanoseconds()
+		prior := a.priorToDrain(name, d.Version, now)
+		raw, err := json.Marshal(descLease{Version: d.Version, Expiration: e, PriorExpiration: prior})
 		if err != nil {
 			return err
 		}
@@ -180,10 +208,42 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		if err := txn.RunBatch(ctx, &wb); err != nil {
 			return err
 		}
-		desc, exp = d, e
+		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior}
 		return nil
 	})
-	return desc, exp, err
+	return desc, info, err
+}
+
+// priorToDrain is the expiration a drain must still wait out on this
+// gateway once it adopts version: the expiration of the entry being
+// replaced, when that entry was handed to a statement and named an older
+// version.
+//
+// A statement is pinned to the descriptor it planned against and bounded
+// only by that entry's expiration (pinDeadline). Publishing the new
+// version tells a drain this gateway has stopped using the old one —
+// true of new statements, not of one already in flight. Without this the
+// drain could return, the CREATE INDEX backfill take its boundary, and
+// that statement then commit above the boundary having maintained no
+// index: a row in the table with no entry in the new index (issue #185).
+//
+// Zero when there is nothing to wait for: the entry was never handed out,
+// it already named this version, or its expiration has passed.
+func (a *Accessor) priorToDrain(name string, version uint64, nowWall int64) int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	old, ok := a.cache[name]
+	if !ok || old.desc == nil {
+		return 0
+	}
+	prior := old.priorExpiration // an older drain may still be outstanding
+	if old.handedOut && old.desc.Version < version && old.expiration > prior {
+		prior = old.expiration
+	}
+	if prior <= nowWall {
+		return 0
+	}
+	return prior
 }
 
 // FinishDDL runs after a schema change on name commits: it adopts the new
@@ -246,6 +306,15 @@ func (a *Accessor) waitForAdoption(ctx context.Context, descID, version uint64) 
 					continue // expired: unusable, nothing to wait for
 				}
 				if l.Version < version {
+					adopted = false
+					break
+				}
+				// The gateway is on the new version, but it handed the
+				// previous one to a statement that can still commit, up
+				// to the expiration that entry carried. Until then this
+				// gateway is not done with the old schema, whatever its
+				// published version says (issue #185).
+				if l.PriorExpiration > nowWall {
 					adopted = false
 					break
 				}
