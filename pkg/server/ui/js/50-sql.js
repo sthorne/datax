@@ -72,7 +72,7 @@ async function pollActivity() {
     const rows = [];
     for (const st of a.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
       <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
-    for (const st of a.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
+    for (const st of a.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
       <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
     setHTML(document.getElementById("sql-statements"), rows.join("") ||
       `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${a.slow_threshold_ms} ms recently</td></tr>`);
@@ -108,7 +108,7 @@ async function pollNodeStatements(id, box) {
   const rows = [];
   for (const st of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
     <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
-  for (const st of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
+  for (const st of act.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
     <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
   setHTML(document.getElementById("sql-statements"), rows.join("") ||
     `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently on n${id}</td></tr>`);
@@ -246,7 +246,7 @@ function renderRetryShapes(a, id) {
       key: s.shape, html: `<tr data-key="${esc(s.shape)}">
       <td class="num" data-label="40001s">${s.count}</td>
       <td data-label="users">${users || "—"}</td>
-      <td class="when" data-label="last" title="${esc(s.last_at)}">${fmtAgo(Date.now() - Date.parse(s.last_at))}</td>
+      <td class="when" data-label="last" title="${esc(s.last_at)}">${fmtWhen(Date.now() - Date.parse(s.last_at))}</td>
       <td class="key" style="max-width:none;white-space:normal">${esc(s.shape)}</td>
     </tr>` };
   });
@@ -401,7 +401,7 @@ function renderStatementDetail(fp) {
     <td class="num">${fmtMicros(n.total_us)}</td><td class="num">${fmtMicros(n.mean_us)}</td>
     <td class="num">${fmtMicros(n.p50_us)}</td><td class="num">${fmtMicros(n.p99_us)}</td>
     <td class="num">${fmtMicros(n.max_us)}</td><td class="num">${fmtCount(n.rows_scanned)}</td>
-    <td class="when" title="${esc(n.last_at)}">${fmtAgo(Date.now() - Date.parse(n.last_at))}</td></tr>`).join("");
+    <td class="when" title="${esc(n.last_at)}">${fmtWhen(Date.now() - Date.parse(n.last_at))}</td></tr>`).join("");
   setHTML(box, `<div class="panel">
     <div class="row"><b>${esc(s.shape)}</b></div>
     <div class="row muted">${esc(s.kind || "")}${(s.tables || []).length ? " · touches " + s.tables.map(esc).join(", ") : ""} · fingerprint ${esc(s.fingerprint)}</div>

@@ -61,7 +61,7 @@ function renderOverview(d) {
     <div class="head"><b>n${n.node_id}</b> ${statusCell(n)} <span class="muted">${esc(n.locality || "no locality")}</span></div>
     <div class="row">${m ? `cpu <b>${pct(m.cpu_percent)}</b> · load <b>${m.cores ? loadCell(m.load1, m.cores) : "—"}</b> · memory <b>${m.mem_total ? memCell(m) : "—"}</b>` : `<span class="muted">no machine summary (older binary?)</span>`}</div>
     <div class="row">${m ? `disk free <b>${m.disk_total ? diskCell(m) : "in-memory store"}</b> · fds <b>${m.fd_limit ? fdCell(m) : "—"}</b>` : ""}</div>
-    <div class="row">leads <b>${n.leader_count || 0}</b> · <b>${fmtBytes(n.replica_bytes || 0)}</b> · <b>${Math.round(n.leader_qps || 0)}</b> qps${n.sql ? ` · <b>${n.sql.open}</b> connections` : ""} · heartbeat ${fmtAgo(n.heartbeat_ago_ms)}</div>
+    <div class="row">leads <b>${n.leader_count || 0}</b> · <b>${fmtBytes(n.replica_bytes || 0)}</b> · <b>${Math.round(n.leader_qps || 0)}</b> qps${n.sql ? ` · <b>${n.sql.open}</b> connections` : ""} · heartbeat ${fmtWhen(Date.now() - n.heartbeat_ago_ms)}</div>
     <div class="row muted key">${esc(n.address)}</div>
   </a>` }; }));
   const dead = nodes.filter(n => !n.live).length;
@@ -99,7 +99,7 @@ function renderNodesTable(d) {
       <td class="num" data-label="fills in">${fillsInCell(capacityFor(d, n.node_id))}</td>
       <td class="num" data-label="fds">${m && m.fd_limit ? fdCell(m) : "—"}</td>
       <td class="num" data-label="leases">${n.leader_count || 0}</td>
-      <td class="num" data-label="heartbeat">${fmtAgo(n.heartbeat_ago_ms)}</td>
+      <td class="num" data-label="heartbeat">${fmtWhen(Date.now() - n.heartbeat_ago_ms)}</td>
     </tr>` };
   }) : [{ key: "none", html: `<tr data-key="none"><td colspan="12" class="muted">no node matches ${esc(nodeFilter)}</td></tr>` }]);
   // What a reader takes away is the table in front of them, so the rows

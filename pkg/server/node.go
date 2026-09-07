@@ -345,6 +345,9 @@ type Node struct {
 	// metricsPaused holds the recorder off while a restore runs.
 	metricsReady  atomic.Bool
 	metricsPaused atomic.Bool
+	// prefsReady is set once the datax_ui_prefs table is known to exist,
+	// so setting a preference does no DDL in the common case (issue #204).
+	prefsReady atomic.Bool
 	// metricsLastWarn rate-limits the recorder's write-failure warning
 	// (recorder goroutine only).
 	metricsLastWarn time.Time

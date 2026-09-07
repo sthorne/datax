@@ -232,6 +232,8 @@ const HELP = {
   "scope": "Which node the node-scoped panels describe. The whole cluster fans out to every node and needs admin; a single node asks only that node.",
   "range": "The time range every chart and every rate on the page uses. It is part of the address, so a link carries it.",
   "jump to": "Open anything by name: a node, a range id, a table, a locality. ⌘K or Ctrl-K from anywhere.",
+  "theme": "Light, dark, or whatever this device asks for. The choice is stored in the cluster against the signed-in user, not in this browser, so it follows you to another browser, another machine and any node's console — and a cluster still mid-upgrade says so rather than losing it silently.",
+  "timestamps": "Whether a moment reads as how long ago it was or as the clock time it happened at, in this device's own zone with the offset spelled out. It changes moments only: how long a transaction has been open is a length of time, not a moment, and keeps reading as one. Stored in the cluster like the theme.",
   "compare": "Overlay every node's series on one chart instead of drawing a chart per node — the fastest way to see that one node disagrees with the rest.",
   "annotate": "Mark cluster operations on the charts where they happened, so a change in a line can be lined up against what the cluster did.",
   "filter": "Narrows this view. It is written into the address, so a filtered view is a link that can be shared.",

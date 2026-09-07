@@ -367,6 +367,148 @@ document.addEventListener("click", ev => {
   copyText(toCSV(ex.headers, ex.rows), btn, null);
 }, true);
 
+// ---- Viewer preferences (issue #204) -----------------------------
+//
+// Stored in the cluster, not in this browser. /api/prefs keys a
+// preference by the signed-in user, so a choice made here is the choice
+// on every browser that user signs in from and on every node's console,
+// and it survives clearing site data. The browser's own storage is
+// deliberately not used here at all — not even as a cache, because a
+// cached copy is exactly what a second machine would disagree with. A
+// preference that lives in one browser profile is not a preference a
+// cluster can honour, and we are a database.
+//
+// prefs holds only what this viewer has actually SET. A preference that
+// is absent is not "the default" written down somewhere — it is the
+// page's natural state (no data-theme attribute, so the operating system
+// decides; a moment written as how long ago it was). That is why the
+// node stores no defaults either: there is one place a default lives,
+// and it is the rendering below.
+const prefs = {};
+let prefsPersistent = true, prefsWhy = "";
+function pref(name) { return prefs[name] || ""; }
+
+// applyTheme stamps the viewer's override on the root element, or takes
+// it off so the operating system decides again. The three CSS blocks in
+// index.html read exactly this attribute.
+function applyTheme() {
+  const theme = pref("theme");
+  if (theme === "light" || theme === "dark") document.documentElement.setAttribute("data-theme", theme);
+  else document.documentElement.removeAttribute("data-theme");
+}
+
+// fmtWhen renders a MOMENT the way this viewer asked for it: how long
+// ago it was, or the clock time it happened at — in the reader's own
+// zone, with the offset, because an incident is reconstructed against
+// wall clocks and a bare "14:20:05" from an unknown zone is a trap.
+//
+// Only moments. A DURATION — how long a transaction has been open, how
+// long a connection has been idle — keeps fmtAgo: a column headed "idle"
+// reading "14:20:05" would be nonsense.
+function fmtWhen(instantMs) {
+  if (!Number.isFinite(instantMs)) return "—";
+  if (pref("timestamps") !== "absolute") return fmtAgo(Date.now() - instantMs);
+  const d = new Date(instantMs);
+  const p = n => String(n).padStart(2, "0");
+  // Computed from the offset rather than taken from a locale format, so
+  // the string is the same on every browser and can be compared between
+  // two operators' screenshots.
+  const off = -d.getTimezoneOffset();
+  const zone = (off < 0 ? "-" : "+") + p(Math.floor(Math.abs(off) / 60)) + ":" + p(Math.abs(off) % 60);
+  const clock = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} ${zone}`;
+  const now = new Date();
+  const today = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return today ? clock : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${clock}`;
+}
+
+// prefNote says, under the controls, when a choice will not outlive the
+// tab — a cluster mid-upgrade cannot store one yet — or when storing it
+// failed. Empty and hidden the rest of the time, which is almost always.
+function setPrefNote(text) {
+  const el = document.getElementById("pref-note");
+  if (!el) return;
+  el.textContent = text || "";
+  el.hidden = !text;
+}
+
+async function loadPrefs() {
+  try {
+    const resp = await fetch("/api/prefs", { cache: "no-store" });
+    if (resp.ok) {
+      const doc = await resp.json();
+      Object.assign(prefs, doc.prefs || {});
+      prefsPersistent = doc.persistent !== false;
+      prefsWhy = doc.why || "";
+    }
+  } catch (err) {
+    // A node that cannot answer leaves the page on its defaults. Saying
+    // so before the viewer has touched anything would be noise; the
+    // refusal below speaks when they do.
+  }
+  applyTheme();
+  syncPrefControls();
+  // The theme needs no redraw — it is CSS reading an attribute. A stored
+  // timestamp choice does: this fetch races the first poll, and whichever
+  // render wins with no preferences yet has already written every moment
+  // out relatively. Only a viewer who set the preference pays for it.
+  if (pref("timestamps")) refreshView();
+  if (!prefsPersistent && prefsWhy) setPrefNote(prefsWhy);
+}
+
+// setPref applies the choice NOW and stores it after. The page must not
+// wait on a round trip to redraw — and if the store refuses, the tab
+// keeps the choice and says it will not be kept.
+async function setPref(name, value) {
+  prefs[name] = value;
+  applyTheme();
+  refreshView();
+  setPrefNote(prefsPersistent ? "" : prefsWhy);
+  try {
+    const resp = await fetch("/api/prefs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, value }),
+    });
+    if (resp.ok) { setPrefNote(""); return; }
+    const doc = await resp.json().catch(() => ({}));
+    setPrefNote(doc.error || `this choice could not be stored (HTTP ${resp.status}), so it lasts for this tab only`);
+  } catch (err) {
+    setPrefNote("this choice could not be stored, so it lasts for this tab only");
+  }
+}
+
+// The two controls, and the options each offers. The value written into
+// the cluster is the option's value, and the node's allowlist holds the
+// same three and the same two — a control and a stored value cannot
+// drift apart without one end refusing the other loudly.
+const PREF_OPTIONS = {
+  theme: [["system", "match this device"], ["light", "light"], ["dark", "dark"]],
+  timestamps: [["relative", "how long ago"], ["absolute", "clock time"]],
+};
+function syncPrefControls() {
+  for (const [name, id] of [["theme", "theme-picker"], ["timestamps", "time-picker"]]) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (!el.options.length) {
+      setHTML(el, PREF_OPTIONS[name].map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join(""));
+    }
+    // An unset preference shows the first option, which is the page's
+    // natural state — the same thing storing that option would mean. So
+    // does a value this console has no option for: the node filters
+    // those out of what it serves, but a control that silently shows
+    // nothing selected would be a worse way to find out it stopped.
+    const stored = pref(name);
+    const known = PREF_OPTIONS[name].some(([v]) => v === stored);
+    el.value = known ? stored : PREF_OPTIONS[name][0][0];
+  }
+}
+function wirePrefControls() {
+  for (const [name, id] of [["theme", "theme-picker"], ["timestamps", "time-picker"]]) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", ev => setPref(name, ev.target.value));
+  }
+}
+
 // who is the signed-in principal from the last /api/cluster document
 // (null until the first poll). In insecure mode there is no identity and
 // every viewer is treated as admin.

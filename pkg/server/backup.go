@@ -244,9 +244,13 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		if err := json.Unmarshal(rec.Value, &d); err != nil {
 			return fmt.Errorf("corrupt table descriptor at %s: %v", keys.Key(rec.Key), err)
 		}
-		if catalog.IsSystemTable(d.Name) && !includeMetrics {
+		if d.Name == catalog.MetricsTableName && !includeMetrics {
 			return nil // the cluster's own metrics: bulky, regenerable, opt-in
 		}
+		// Every other system table is backed up unconditionally. The
+		// console's preferences (datax_ui_prefs) are small and are not
+		// regenerable from anything — losing them across a restore
+		// silently resets every operator's display choices.
 		descs = append(descs, backupTable{ID: d.ID, Name: d.Name, Descriptor: append(json.RawMessage(nil), rec.Value...)})
 		return nil
 	})

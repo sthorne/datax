@@ -14,14 +14,29 @@
     --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
     --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   }
+  /* Dark is written out twice, and that is deliberate (issue #204).
+     One block answers the operating system's choice; the other answers a
+     viewer who overrode it from the header, which stamps data-theme on
+     the root element. Collapsing them into one block would mean stamping
+     the attribute from script on every load, and paying a frame of the
+     wrong theme for it, so the duplication stays — and TestThemeBlocksAgree
+     pins the two to the same token names and the same values, so they
+     cannot drift apart unnoticed. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       color-scheme: dark;
       --surface: #1a1a19; --panel: #232322; --border: #3a3936;
       --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
       --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
       --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
     }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --panel: #232322; --border: #3a3936;
+    --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
   }
   * { box-sizing: border-box; }
   body {
@@ -274,6 +289,9 @@
   }
   .controls-hdr button { cursor: pointer; }
   .controls-hdr button:hover { border-color: var(--text-3); }
+  /* Shown only when a display choice cannot be stored — a cluster still
+     mid-upgrade, or a node that refused the write (issue #204). */
+  .prefnote { font-size: 12px; color: var(--warning); max-width: 44ch; }
   kbd {
     font: inherit; font-size: 11px; padding: 0 4px; border-radius: 4px;
     border: 1px solid var(--border); color: var(--text-3);
@@ -347,9 +365,12 @@
   <span class="controls-hdr">
     <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
     <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
+    <label>theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
+    <label>timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
     <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
     <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
+  <span class="prefnote" id="pref-note" role="status" hidden></span>
   <span class="sub" id="hdr-node">connecting…</span>
   <details class="user" id="hdr-user"><summary id="hdr-user-summary" title="who this page is signed in as"></summary><div class="menu" id="hdr-user-menu"></div></details>
   <span class="stale" id="hdr-stale" role="status">● stale — last update failed</span>

@@ -390,6 +390,9 @@ func TestHelpGlossaryHasNoDeadEntries(t *testing.T) {
 var helpKeysNotOnAPage = map[string]bool{
 	"scope": true, "range": true, "jump to": true,
 	"compare": true, "annotate": true, "filter": true,
+	// The viewer preferences (issue #204): two header controls, like
+	// scope and range above.
+	"theme": true, "timestamps": true,
 	// The copy controls (issue #205). Both are buttons: one sits inside a
 	// cell, and the other inside a heading, where normalizeTerm strips it
 	// out so that "Nodes" stays the term rather than "Nodes copy as CSV".
@@ -1217,5 +1220,336 @@ var (
 	// assignment, or a single-quoted attribute would have slipped past
 	// it. No such path exists today; the point is that the check would
 	// not have said so. All four shapes now.
+	// CSS comments, stripped before a stylesheet is parsed by shape.
+	cssComments    = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	handRolledCopy = regexp.MustCompile(`data-copy\s*=\s*["'][^"']*["']|setAttribute\(\s*["']data-copy["']|\.dataset\.copy\s*=`)
 )
+
+// ---- Viewer preferences (issue #204) ----------------------------------
+
+// darkBlock is one CSS rule that defines the dark palette: the selector
+// it is written under, and the declarations inside it in source order.
+type darkBlock struct {
+	selector string
+	decls    []string
+}
+
+// darkBlocksIn pulls every rule whose body sets `color-scheme: dark` out
+// of the page, with its selector. Two of them exist by design; the point
+// of finding them by what they DO rather than by where they sit is that
+// a third one, or a renamed one, is found too.
+func darkBlocksIn(page string) []darkBlock {
+	page = cssComments.ReplaceAllString(page, " ")
+	var out []darkBlock
+	for i := 0; i < len(page); {
+		open := strings.Index(page[i:], "{")
+		if open < 0 {
+			break
+		}
+		open += i
+		close := strings.Index(page[open:], "}")
+		if close < 0 {
+			break
+		}
+		close += open
+		body := page[open+1 : close]
+		// A body holding another brace is an at-rule wrapping real
+		// rules (@media). Step past it so the rule INSIDE is the one
+		// that gets read, with its own selector.
+		if strings.Contains(body, "{") {
+			i = open + 1
+			continue
+		}
+		if strings.Contains(body, "color-scheme: dark") {
+			// The selector is what precedes the brace, back to the
+			// previous brace or the start of the stylesheet.
+			start := strings.LastIndexAny(page[:open], "{}")
+			sel := strings.TrimSpace(page[start+1 : open])
+			var decls []string
+			for _, d := range strings.Split(body, ";") {
+				if d = strings.TrimSpace(d); d != "" {
+					decls = append(decls, strings.Join(strings.Fields(d), " "))
+				}
+			}
+			out = append(out, darkBlock{selector: sel, decls: decls})
+		}
+		i = close + 1
+	}
+	return out
+}
+
+// TestThemeBlocksAgree (issue #204): the dark palette is written out
+// twice — once for the operating system's choice, once for a viewer who
+// overrode it — because collapsing them would cost a frame of the wrong
+// theme on every load. Duplication that nothing checks drifts, so this
+// is the check: both blocks must define exactly the same tokens, with
+// exactly the same values. A colour changed in one and not the other is
+// a page whose appearance depends on HOW you asked for dark.
+func TestThemeBlocksAgree(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := darkBlocksIn(string(page))
+	if len(blocks) != 2 {
+		t.Fatalf("index.html has %d rules defining the dark palette, want exactly 2 "+
+			"(the prefers-color-scheme block and the data-theme=\"dark\" block); found %v",
+			len(blocks), selectorsOf(blocks))
+	}
+	// Each must be reachable the way its own half of the feature needs.
+	var byOS, byOverride *darkBlock
+	for i := range blocks {
+		switch {
+		case strings.Contains(blocks[i].selector, `[data-theme="dark"]`):
+			byOverride = &blocks[i]
+		case strings.Contains(blocks[i].selector, `:not([data-theme="light"])`):
+			byOS = &blocks[i]
+		}
+	}
+	if byOS == nil {
+		t.Errorf(`no dark block is guarded by :not([data-theme="light"]): a viewer who chose light `+
+			`on a device set to dark would still get the dark palette. Selectors: %v`, selectorsOf(blocks))
+	}
+	if byOverride == nil {
+		t.Errorf(`no dark block is selected by [data-theme="dark"]: choosing dark on a device set to `+
+			`light would do nothing. Selectors: %v`, selectorsOf(blocks))
+	}
+	if byOS == nil || byOverride == nil {
+		return
+	}
+	if len(byOS.decls) != len(byOverride.decls) {
+		t.Fatalf("the two dark blocks declare different numbers of properties (%d under %q, %d under %q): "+
+			"they must stay identical, or the page looks different depending on how dark was asked for",
+			len(byOS.decls), byOS.selector, len(byOverride.decls), byOverride.selector)
+	}
+	for i := range byOS.decls {
+		if byOS.decls[i] != byOverride.decls[i] {
+			t.Errorf("the dark blocks disagree: %q under %q, but %q under %q",
+				byOS.decls[i], byOS.selector, byOverride.decls[i], byOverride.selector)
+		}
+	}
+	// And the media query still has to be a media query, or the OS
+	// block applies to everyone.
+	if !strings.Contains(string(page), "@media (prefers-color-scheme: dark)") {
+		t.Error("index.html no longer has an @media (prefers-color-scheme: dark) block: " +
+			"the operating system's own setting is what the console follows by default")
+	}
+}
+
+func selectorsOf(blocks []darkBlock) []string {
+	out := make([]string, len(blocks))
+	for i, b := range blocks {
+		out[i] = b.selector
+	}
+	return out
+}
+
+// TestPreferencesAreStoredInTheCluster (issue #204): a viewer preference
+// is stored by the cluster, against the signed-in user, and read back
+// from /api/prefs. It is NOT stored in the browser — a preference that
+// lives in one browser profile does not follow an operator to the next
+// machine, and this is a database.
+//
+// The check is written against the browser storage APIs rather than
+// against /api/prefs, because "the console fetches its preferences" can
+// be true at the same time as "and also caches them in localStorage",
+// which is the version of this that quietly comes back.
+func TestPreferencesAreStoredInTheCluster(t *testing.T) {
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]string{"index.html": string(page)}
+	for _, name := range names {
+		body, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[name] = string(body)
+	}
+	for name, src := range sources {
+		for _, api := range []string{"localStorage", "sessionStorage", "indexedDB", "document.cookie"} {
+			if strings.Contains(src, api) {
+				t.Errorf("%s uses %s: viewer preferences belong to the user in the cluster, not to "+
+					"one browser profile — store it through /api/prefs (see pref/setPref in js/10-core.js). "+
+					"A browser-side cache of the same value is the same bug: it is what a second machine "+
+					"disagrees with.", name, api)
+			}
+		}
+	}
+	// The other half: the console must actually talk to the endpoint.
+	core := sources["js/10-core.js"]
+	if !strings.Contains(core, `fetch("/api/prefs"`) {
+		t.Error("js/10-core.js no longer fetches /api/prefs: nothing reads the preferences the cluster holds")
+	}
+	if !strings.Contains(core, `method: "POST"`) || !strings.Contains(core, `"Content-Type": "application/json"`) {
+		t.Error("the preference write is no longer a JSON POST: the node requires both, and that pair " +
+			"plus SameSite=Strict on the session cookie is what keeps another origin from driving it")
+	}
+}
+
+// TestMomentsReadTheViewersPreference (issue #204): the absolute /
+// relative choice has to reach every moment the console prints, and no
+// duration. fmtWhen is the one function that reads the preference;
+// fmtAgo stays what it always was, a renderer of elapsed time.
+func TestMomentsReadTheViewersPreference(t *testing.T) {
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		body, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := string(body)
+		// A moment is written as "now minus an instant". Every one of
+		// those must go through fmtWhen, or the toggle silently misses
+		// a column.
+		// fmtWhen's own delegation to fmtAgo is the point of fmtWhen,
+		// so its body is not part of the sweep.
+		outside := src
+		if span := jsFuncSpan(src, "fmtWhen"); span != nil {
+			outside = src[:span[0]] + src[span[1]:]
+		}
+		for _, line := range strings.Split(outside, "\n") {
+			if strings.Contains(line, "fmtAgo(Date.now() -") {
+				t.Errorf("%s renders a moment with fmtAgo: %s\n"+
+					"    Date.now() minus an instant IS a moment, so it must go through fmtWhen, "+
+					"which honours the viewer's absolute/relative choice.", name, strings.TrimSpace(line))
+			}
+		}
+		// And the preference is read in exactly one place.
+		if name != "js/10-core.js" && strings.Contains(src, `pref("timestamps")`) {
+			t.Errorf("%s reads the timestamps preference directly: fmtWhen is the one place that "+
+				"decides how a moment reads, so every caller renders it the same way", name)
+		}
+	}
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(core), `pref("timestamps") !== "absolute"`) {
+		t.Error("fmtWhen no longer reads the timestamps preference: the toggle renders nothing")
+	}
+	// Not every moment is written as an instant. Some arrive already
+	// subtracted — "this heartbeat was 4s ago" — and the sweep above,
+	// which looks for `fmtAgo(Date.now() -`, cannot see one of those
+	// reverted to fmtAgo. So each figure is pinned by name, in both
+	// directions: a moment must render with fmtWhen and never fmtAgo, a
+	// duration the other way round.
+	for _, fig := range []struct {
+		field  string
+		moment bool
+	}{
+		// Ages of a moment: "when did this last happen", written as how
+		// long ago rather than as the instant.
+		{"heartbeat_ago_ms", true}, {"age_ms", true}, {"age_seconds", true},
+		// Lengths of time. "idle: 14:20:05" is not a thing.
+		{"idle_ms", false}, {"txn_ms", false}, {"oldest_idle_txn_ms", false},
+	} {
+		want, wrong := "fmtWhen(", "fmtAgo("
+		if !fig.moment {
+			want, wrong = wrong, want
+		}
+		found := false
+		for _, name := range names {
+			body, err := FS.ReadFile(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range strings.Split(string(body), "\n") {
+				if !strings.Contains(line, fig.field) {
+					continue
+				}
+				if strings.Contains(line, want) {
+					found = true
+				}
+				if strings.Contains(line, wrong) {
+					if fig.moment {
+						t.Errorf("%s renders %s with fmtAgo: that figure is a MOMENT written as an age, "+
+							"so the viewer's absolute/relative choice has to reach it — render it with "+
+							"fmtWhen(Date.now() - %s)", name, fig.field, fig.field)
+					} else {
+						t.Errorf("%s renders %s with fmtWhen: that figure is a LENGTH of time, not a "+
+							"moment, and absolute mode would print a clock time for it", name, fig.field)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("nothing renders %s with %s any more: either the figure is gone (drop it from this "+
+				"list) or it changed which kind of thing it is", fig.field, strings.TrimSuffix(want, "("))
+		}
+	}
+}
+
+// TestNoUnguardedMotion (issue #204): the issue asked for a reduced-motion
+// preference. There is nothing in this console that moves — no
+// transition, no animation, no smooth scrolling — so a
+// prefers-reduced-motion block would have guarded nothing, and shipping
+// one would have been a decoration that reads as a feature.
+//
+// This is the honest version of that bullet: the day someone adds motion
+// to the console, this fails and says what to do about it. Motion inside
+// an @media (prefers-reduced-motion: reduce) block is fine — that is the
+// block being asked for.
+func TestNoUnguardedMotion(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(page)
+	// Anything inside a reduced-motion guard is exactly what we want, so
+	// take those blocks out before looking.
+	for {
+		i := strings.Index(src, "@media (prefers-reduced-motion")
+		if i < 0 {
+			break
+		}
+		depth, j := 0, strings.Index(src[i:], "{")
+		if j < 0 {
+			break
+		}
+		j += i
+		for k := j; k < len(src); k++ {
+			if src[k] == '{' {
+				depth++
+			} else if src[k] == '}' {
+				if depth--; depth == 0 {
+					src = src[:i] + src[k+1:]
+					break
+				}
+			}
+			if k == len(src)-1 {
+				src = src[:i]
+			}
+		}
+	}
+	for _, prop := range []string{"transition:", "animation:", "@keyframes", "scroll-behavior:"} {
+		if strings.Contains(src, prop) {
+			t.Errorf("index.html now uses %s outside a reduced-motion guard. The console had no motion "+
+				"at all, which is why issue #204's reduced-motion preference shipped as this test rather "+
+				"than as a CSS block that guarded nothing. Now that something moves, wrap it in "+
+				"@media (prefers-reduced-motion: reduce) — and delete this line from the list once it is.", prop)
+		}
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		body, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), `behavior: "smooth"`) || strings.Contains(string(body), "behavior: 'smooth'") {
+			t.Errorf("%s scrolls smoothly: that is motion, and it needs to ask "+
+				"matchMedia(\"(prefers-reduced-motion: reduce)\") first", name)
+		}
+	}
+}

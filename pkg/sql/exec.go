@@ -180,8 +180,8 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		return nil, ToSQLError(err)
 	}
 	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, Owner: s.user}
-	if catalog.IsSystemTable(bare) {
-		desc.ID = catalog.MetricsTableID
+	if id, ok := catalog.SystemTableID(bare); ok {
+		desc.ID = id
 	}
 	seen := map[string]bool{}
 	var colPK []string
