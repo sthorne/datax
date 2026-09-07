@@ -71,9 +71,9 @@ async function pollActivity() {
     box.hidden = false;
     const rows = [];
     for (const st of a.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
-      <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}</td></tr>`);
+      <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
     for (const st of a.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
-      <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
+      <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
     setHTML(document.getElementById("sql-statements"), rows.join("") ||
       `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${a.slow_threshold_ms} ms recently</td></tr>`);
     renderContention(a, serving);
@@ -107,9 +107,9 @@ async function pollNodeStatements(id, box) {
   renderContention(act, id);
   const rows = [];
   for (const st of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
-    <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}</td></tr>`);
+    <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
   for (const st of act.slow || []) rows.push(`<tr><td>${fmtAgo(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
-    <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
+    <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
   setHTML(document.getElementById("sql-statements"), rows.join("") ||
     `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently on n${id}</td></tr>`);
 }
@@ -365,10 +365,14 @@ function renderStatementShapes() {
       <td class="num" data-label="rows scanned">${warn(scanLevel, fmtCount(s.rows_scanned))}</td>
       <td class="num" data-label="rows returned">${fmtCount(s.rows_returned)}</td>
       <td class="num" data-label="retries">${s.retries ? warn("draining", fmtCount(s.retries)) : "0"}</td>
-      <td class="key" style="max-width:none;white-space:normal"><a href="#" class="stmt-open" data-fp="${esc(s.fingerprint)}">${esc(s.shape)}</a></td>
+      <td class="key" style="max-width:none;white-space:normal"><a href="#" class="stmt-open" data-fp="${esc(s.fingerprint)}">${esc(s.shape)}</a>${copyBtn("this statement shape", s.shape)}${copyBtn("this shape's fingerprint", s.fingerprint)}</td>
     </tr>` };
   }) : [{ key: "none", html: `<tr data-key="none"><td colspan="7" class="muted">no statements recorded yet</td></tr>` }]);
 
+  setCSV("shapes", ["fingerprint", "shape", "total us", "share percent", "executions", "mean us", "rows scanned", "rows returned", "retries"],
+    rows.map(s => [s.fingerprint, s.shape, s.total_us ?? 0,
+      total ? (100 * (s.total_us || 0) / total).toFixed(1) : "",
+      s.count ?? 0, s.mean_us ?? 0, s.rows_scanned ?? 0, s.rows_returned ?? 0, s.retries ?? 0]));
   const parts = [`grouped by the shape the parser normalises each statement to — literals and parameters replaced, so every execution of one query is one row.`];
   parts.push(`Ranked by total time, because a fast statement run often costs more than a slow one run rarely; the percentage is of the time these ${rows.length} shapes account for, not of wall-clock.`);
   if (stmtDoc.nodes < stmtDoc.nodes_asked) {

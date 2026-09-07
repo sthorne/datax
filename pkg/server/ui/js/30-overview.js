@@ -90,7 +90,7 @@ function renderNodesTable(d) {
     return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}">
       <td data-label="node"><a href="${routeTo("node/" + n.node_id)}">n${n.node_id}</a></td>
       <td data-label="status">${statusCell(n)}</td>
-      <td class="key" data-label="address">${esc(n.address)}</td>
+      <td class="key" data-label="address">${esc(n.address)}${copyBtn("n" + n.node_id + "'s address", n.address)}</td>
       <td data-label="locality">${esc(n.locality || "—")}</td>
       <td class="num" data-label="cpu">${m ? pct(m.cpu_percent) : "—"}</td>
       <td class="num" data-label="load">${m && m.cores ? loadCell(m.load1, m.cores) : "—"}</td>
@@ -102,6 +102,19 @@ function renderNodesTable(d) {
       <td class="num" data-label="heartbeat">${fmtAgo(n.heartbeat_ago_ms)}</td>
     </tr>` };
   }) : [{ key: "none", html: `<tr data-key="none"><td colspan="12" class="muted">no node matches ${esc(nodeFilter)}</td></tr>` }]);
+  // What a reader takes away is the table in front of them, so the rows
+  // come from the same filtered, sorted list the markup above was built
+  // from rather than from the document behind it (issue #205).
+  setCSV("nodes", ["node", "status", "address", "locality", "cpu percent", "load1", "cores",
+    "memory used", "memory total", "disk free", "disk total", "open fds", "fd limit", "leases", "heartbeat ago ms"],
+    nodes.map(n => {
+      const m = n.machine || {};
+      return ["n" + n.node_id, nodeState(n), n.address, n.locality || "",
+        m.cpu_percent ?? "", m.load1 ?? "", m.cores ?? "",
+        m.mem_total ? m.mem_total - m.mem_available : "", m.mem_total ?? "",
+        m.disk_free ?? "", m.disk_total ?? "", m.open_fds ?? "", m.fd_limit ?? "",
+        n.leader_count || 0, n.heartbeat_ago_ms ?? ""];
+    }));
   const filling = (d.capacity || []).filter(f => f.filling).length;
   document.getElementById("nodes-table-note").textContent =
     (nodeFilter ? `filtered to ${nodes.length} of ${(d.nodes || []).length} nodes · ` : "") +
@@ -140,7 +153,7 @@ function fillsInCell(f) {
 function rangeRow(r, leaderLabel, extra) {
   return `<tr data-key="r${r.range_id}">
     <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
-    <td class="key">${spanText(r)}</td>
+    <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s start key", r.start_key || "")}</td>
     <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     <td>${r.leader ? leaderLabel : ""}</td>
     <td class="num">${fmtBytes(r.size_bytes)}</td>

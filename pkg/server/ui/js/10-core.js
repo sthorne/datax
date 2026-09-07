@@ -154,7 +154,13 @@ let tileHist = {}; // series -> number[] from the table (this node, last 15 minu
 // which also covers a value that only grows long in the field.
 const LONG_VALUE = 12;
 function valueClass(value) {
-  const figure = String(value).replace(/<span class="muted">[\s\S]*?<\/span>/g, "").replace(/<[^>]*>/g, "").trim();
+  const figure = String(value)
+    .replace(/<span class="muted">[\s\S]*?<\/span>/g, "")
+    // Screen-reader-only text is not on screen, so it cannot make a
+    // value wrap; a copy control's label would otherwise push a short
+    // figure over the threshold and shrink it (issue #205).
+    .replace(/<span class="sr-only">[\s\S]*?<\/span>/g, "")
+    .replace(/<[^>]*>/g, "").trim();
   return figure.length > LONG_VALUE ? " long" : "";
 }
 // A tile's value is text, and tile() escapes it. That is the short name
@@ -195,12 +201,140 @@ async function pollTileHistory() {
     tileHist = h;
   } catch (err) { tileHist = {}; }
 }
-function statusCell(n) {
-  if (!n.live) return `<span class="st down"><span class="dot"></span>down</span>`;
-  if (n.shutting_down) return `<span class="st draining"><span class="dot"></span>stopping</span>`;
-  if (n.draining) return `<span class="st draining"><span class="dot"></span>draining</span>`;
-  return `<span class="st live"><span class="dot"></span>live</span>`;
+// nodeState is the word for a node's status, and statusCell is that word
+// with its dot. They are one function because an exported table saying
+// "draining" while the cell beside it says "stopping" is the kind of
+// disagreement nobody notices until it matters (issue #205).
+function nodeState(n) {
+  if (!n.live) return "down";
+  if (n.shutting_down) return "stopping";
+  if (n.draining) return "draining";
+  return "live";
 }
+const STATE_CLASS = { down: "down", stopping: "draining", draining: "draining", live: "live" };
+function statusCell(n) {
+  const state = nodeState(n);
+  return `<span class="st ${STATE_CLASS[state]}"><span class="dot"></span>${state}</span>`;
+}
+// ---- Getting things off the page (issue #205) --------------------
+//
+// The console is read-only, and nearly everything a reader wants from it
+// they want somewhere else: a range key into `datax debug split`, an
+// address into a psql connection string, a statement into a ticket, a
+// table into an incident review. Until now one block on one page had a
+// copy button and everything else was select-and-drag.
+//
+// Everything below routes through one clipboard call so the fallback is
+// written once. The clipboard API needs a secure context, and the
+// console is often reached over plain HTTP — a node addressed directly,
+// a port-forward — where it rejects. There the text is selected instead
+// and the control says so, which leaves the reader one keystroke from
+// the same result rather than a button that silently did nothing.
+const COPY_OK = "copied", COPY_SELECTED = "select it and copy";
+async function copyText(text, btn, selectEl) {
+  let ok = true;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    ok = false;
+    if (selectEl) {
+      const r = document.createRange();
+      r.selectNodeContents(selectEl);
+      const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(r);
+    }
+  }
+  // The words go to a live region rather than into the control, so the
+  // reply is announced once and a screen reader's cursor is not sitting
+  // on a button that renamed itself underneath it.
+  const status = document.getElementById("copy-status");
+  if (status) status.textContent = ok ? COPY_OK : COPY_SELECTED;
+  if (btn) flashCopy(btn, ok);
+  return ok;
+}
+// flashCopy answers on the control itself, briefly. A worded control has
+// room for the words; an icon in a dense table does not, and a glyph
+// that changes width would shift the column under the pointer.
+function flashCopy(btn, ok) {
+  const g = btn.querySelector(".glyph") || btn;
+  if (btn.__glyph === undefined) btn.__glyph = g.textContent;
+  const icon = btn.classList.contains("icon");
+  g.textContent = ok ? (icon ? "✓" : COPY_OK) : (icon ? "✗" : COPY_SELECTED);
+  clearTimeout(btn.__flash);
+  btn.__flash = setTimeout(() => { g.textContent = btn.__glyph; }, 2000);
+}
+// copyBtn is the control on a cell: a real button, so it is in the tab
+// order and works from the keyboard (issue #149), revealed on hover and
+// focus so a dense table is not a field of icons, and carrying the text
+// it copies so the click needs no second lookup. The label names what is
+// being copied — "copy" repeated down a column tells a screen-reader
+// user nothing about which one they are on.
+function copyBtn(label, text) {
+  return `<button type="button" class="copy icon" data-help="copy" data-copy="${esc(text)}" title="copy ${esc(label)}"` +
+    `><span class="glyph" aria-hidden="true">⧉</span><span class="sr-only">copy ${esc(label)}</span></button>`;
+}
+// A copy control sits inside rows that are themselves clickable — a
+// range row opens its detail, a table row opens its page. Those
+// handlers are on the tbody, which the click reaches before it reaches
+// document, so a bubble-phase listener here would fire second and the
+// row would have acted already. Capture runs the other way round: this
+// sees the click first and stops it, and a clickable row added later
+// cannot forget to exclude the button.
+document.addEventListener("click", ev => {
+  const btn = ev.target.closest("button.copy");
+  if (!btn) return;
+  ev.preventDefault(); ev.stopPropagation();
+  const cell = btn.closest("td, .value, .copysrc");
+  copyText(btn.dataset.copy, btn, cell);
+}, true);
+// Enter and Space on a focused button produce a click of their own, so
+// the keydown only has to be kept away from the row beneath it.
+document.addEventListener("keydown", ev => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  if (ev.target.closest("button.copy, button.csv")) ev.stopPropagation();
+}, true);
+
+// ---- Tables that can be taken away -------------------------------
+//
+// The range list, the failure-domain breakdown, the shape list and the
+// node table end up in incident reviews and capacity plans, and the only
+// route out was a screenshot. They copy as CSV rather than download: the
+// console is self-contained and often reached over a port-forward, and a
+// clipboard copy needs no download plumbing and no new endpoint. For a
+// file, /api/* already returns the same figures as JSON that curl can
+// take — a second path to the same bytes is not worth building.
+//
+// csvCell quotes the way a spreadsheet expects: a field holding a comma,
+// a quote, a newline or an edge space is wrapped, with its own quotes
+// doubled. Statement text and range keys carry all four.
+function csvCell(v) {
+  const s = v === undefined || v === null ? "" : String(v);
+  return /[",\r\n]|^\s|\s$/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function toCSV(headers, rows) {
+  return [headers, ...rows].map(r => r.map(csvCell).join(",")).join("\r\n");
+}
+// A table registers what it would export at the end of its own render,
+// so the CSV is the rows the reader is looking at — filter, sort and
+// scope already applied — rather than the document behind them. A table
+// that has not rendered yet has nothing to give, and its control says so
+// rather than copying an empty file.
+const csvExports = {};
+function setCSV(name, headers, rows) { csvExports[name] = { headers, rows }; }
+document.addEventListener("click", ev => {
+  const btn = ev.target.closest("button.csv");
+  if (!btn) return;
+  ev.preventDefault(); ev.stopPropagation();
+  const ex = csvExports[btn.dataset.csv];
+  if (!ex || !ex.rows.length) {
+    const status = document.getElementById("copy-status");
+    if (status) status.textContent = "nothing to copy — this table is empty";
+    flashCopy(btn, false);
+    return;
+  }
+  copyText(toCSV(ex.headers, ex.rows), btn, null);
+}, true);
+
 // who is the signed-in principal from the last /api/cluster document
 // (null until the first poll). In insecure mode there is no identity and
 // every viewer is treated as admin.
