@@ -41,11 +41,13 @@ function renderSchema(d) {
   note.textContent = (d.tables || []).length
     ? `${(d.tables || []).length} tables in the one namespace (the connection URL's database name is accepted and ignored); local size counts this node's replicas only`
     : (d.principal && d.principal.secure && !d.principal.admin ? "no tables granted to " + d.principal.user : "no tables yet");
-  const uw = document.getElementById("users-wrap");
-  if (d.users && d.users.length) {
-    uw.hidden = false;
-    renderKeyed(document.getElementById("users"), d.users.map(u => ({ key: u.name, html: `<tr data-key="${esc(u.name)}"><td>${esc(u.name)}</td><td>${u.admin ? '<span class="role">admin</span>' : "user"}</td></tr>` })));
-  } else uw.hidden = true;
+  // Users used to be a small table appended here. #/security owns roles
+  // now (issue #156) and draws them from /api/security with their
+  // membership resolved, so this no longer renders them: the wrapper it
+  // reached for no longer exists — which made this line throw and take
+  // the whole schema poll with it for any admin — and #users is that
+  // view's table, which this would have overwritten with a two-column
+  // list every time the schema refreshed.
 }
 async function pollSchema() {
   const resp = await fetch("/api/schema", { cache: "no-store" });

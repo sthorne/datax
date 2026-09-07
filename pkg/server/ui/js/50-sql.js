@@ -34,10 +34,12 @@ function renderSQL(d) {
   });
   renderKeyed(document.getElementById("sql-nodes"), rows);
   renderTiles(document.getElementById("sql-tiles"),
-    tile("connections", `${open} (${active} active, ${idleTxn} idle in txn)`) +
+    // The breakdown is a qualifier of the figure, not more headline:
+    // run on at 22px it wrapped past the bottom of its card.
+    tile("connections", `${open}` + qual(`${active} active · ${idleTxn} idle in txn`)) +
     tile("statements/s", stmtRate.toFixed(1), "stmt", stmtRate) +
     tile("40001/s", retryRate.toFixed(2), "retry", retryRate) +
-    tile("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms (n${p99Node})` : "—", "p99", p99 / 1000) +
+    tile("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms` + qual(`on n${p99Node}`) : "—", "p99", p99 / 1000) +
     tile("oldest idle txn", oldest ? fmtAgo(oldest) : "none"));
   document.getElementById("sql-note").textContent = "rates are differences between polls; kinds: select, insert, update, delete, copy, txn (BEGIN/COMMIT/ROLLBACK/savepoints), ddl";
   renderTxnUsers(d, lastContention && lastContention.retriesByUser, lastContention && lastContention.node);

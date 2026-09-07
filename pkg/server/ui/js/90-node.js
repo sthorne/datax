@@ -5,7 +5,21 @@
 const nv = { id: 0, chartsAt: 0 };
 const NODE_CHART_SERIES = ["node.cpu_percent", "node.leader_qps", "sql.statements", "kv.batch_p99_us"];
 async function pollNode() {
-  const id = nv.id;
+  // The node to show is the one in the route. nv.id was never assigned
+  // from it, so every visit asked for /api/node?id=0 — a 400 — and the
+  // page read "Node n0" above an error. The route is the single source
+  // of truth for which node this view is; nv only caches across polls.
+  const id = ui.node;
+  if (id !== nv.id) {
+    nv.id = id;
+    nv.chartsAt = 0; // a different node's history, so refetch it now
+  }
+  if (!id) {
+    document.getElementById("node-err").style.display = "block";
+    document.getElementById("node-err").textContent =
+      "no node in the address: open a node from the nodes table, or use #/node/1";
+    return;
+  }
   const errBox = document.getElementById("node-err");
   document.getElementById("node-title").textContent = `Node n${id}`;
   document.getElementById("node-metrics-link").href = routeTo("metrics", { nodes: String(id) });
@@ -57,10 +71,12 @@ function renderNode(d) {
     : [{ key: "none", html: `<tr data-key="none"><td colspan="8" class="muted">no replicas</td></tr>` }]);
   const q = d.sql;
   renderTiles(document.getElementById("node-sql"), q
-    ? tile("connections", `${q.open} (${q.active} active, ${q.idle_in_txn} idle in txn)`) +
-      tile("statements", Object.values(q.statements || {}).reduce((a, b) => a + b, 0) + " total") +
-      tile("40001", q.serialization_failures + " total") +
-      tile("plan cache", (q.plan_cache_hits + q.plan_cache_misses) ? `${(100 * q.plan_cache_hits / (q.plan_cache_hits + q.plan_cache_misses)).toFixed(0)}% hits (${q.plan_cache_hits} / ${q.plan_cache_hits + q.plan_cache_misses})` : "no statements planned") +
+    ? tile("connections", `${q.open}` + qual(`${q.active} active · ${q.idle_in_txn} idle in txn`)) +
+      tile("statements", Object.values(q.statements || {}).reduce((a, b) => a + b, 0) + qual("since this node started")) +
+      tile("40001", q.serialization_failures + qual("since this node started")) +
+      tile("plan cache", (q.plan_cache_hits + q.plan_cache_misses)
+        ? `${(100 * q.plan_cache_hits / (q.plan_cache_hits + q.plan_cache_misses)).toFixed(0)}%` + qual(`${q.plan_cache_hits} of ${q.plan_cache_hits + q.plan_cache_misses} planned statements hit`)
+        : "no statements planned") +
       tile("p50 / p99", `${(q.p50_us / 1000).toFixed(1)} / ${(q.p99_us / 1000).toFixed(1)} ms`)
     : `<span class="muted">no SQL listener</span>`);
   const act = d.activity, box = document.getElementById("node-activity");

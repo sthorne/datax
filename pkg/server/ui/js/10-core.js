@@ -145,12 +145,24 @@ const TILE_SERIES = {
 };
 const TILE_RATE = { "write stalls": 1, "statements/s": 1, "40001/s": 1, "cache hits": 1, "bloom hits": 1 };
 let tileHist = {}; // series -> number[] from the table (this node, last 15 minutes)
+// A tile's value is normally one figure, set large. Some are a phrase —
+// "v0.53.1 · protocol v2 · cluster v16", "no statements planned" — and
+// at the figure's size those wrapped into three and four lines of
+// headline type that overran the card. The tile classifies by the
+// length of the figure itself (a qualifier is already its own small
+// line, so it does not count) rather than each caller remembering to,
+// which also covers a value that only grows long in the field.
+const LONG_VALUE = 12;
+function valueClass(value) {
+  const figure = String(value).replace(/<span class="muted">[\s\S]*?<\/span>/g, "").replace(/<[^>]*>/g, "").trim();
+  return figure.length > LONG_VALUE ? " long" : "";
+}
 function tile(label, value, histName, histVal) {
   let sp = "";
   const series = TILE_SERIES[label];
   if (series && tileHist[series] && tileHist[series].length > 1) sp = spark(tileHist[series]);
   else if (histName !== undefined) sp = spark(pushHist(histName, histVal));
-  const body = `<div class="label">${esc(label)}</div><div class="value">${value}</div>${sp}`;
+  const body = `<div class="label">${esc(label)}</div><div class="value${valueClass(value)}">${value}</div>${sp}`;
   if (!series) return `<div class="tile" data-key="${esc(label)}">${body}</div>`;
   return `<a class="tile" data-key="${esc(label)}" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time">${body}</a>`;
 }

@@ -35,6 +35,11 @@
   header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
   header .sub { color: var(--text-2); font-size: 13px; }
   header .stale { color: var(--critical); font-size: 13px; margin-left: auto; display: none; }
+  header .reload {
+    font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--series-1); background: var(--panel); color: var(--text);
+  }
+  header .reload:hover { background: color-mix(in srgb, var(--series-1) 14%, var(--panel)); }
   /* The user menu (issue #158): who you are, how you got in, and the
      way out. A <details> so it needs no JavaScript to open or close. */
   header .user { margin-left: auto; position: relative; font-size: 13px; }
@@ -75,13 +80,26 @@
   tr[tabindex]:focus-visible td { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
   section { margin-top: 22px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 8px; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  /* A tile is a label, one figure, and — sometimes — a qualifier. Every
+     part gets its own line, because they used to share one: the
+     qualifier ran on after the figure at the figure's own 22px, so
+     "0 (0 active, 0 idle in txn) (0 of 2 live nodes)" wrapped to four
+     lines of headline type and spilled past the card's bottom edge onto
+     whatever came next. A qualifier is now a 12px line under the
+     figure, so a tile is two or three short lines whatever it holds. */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(190px, 100%), 1fr)); gap: 10px; }
   .tile {
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px 12px 8px;
+    padding: 10px 12px 8px; overflow: hidden;
   }
   .tile .label { font-size: 12px; color: var(--text-2); }
-  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; line-height: 1.25; }
+  /* A value that is a phrase rather than a figure — "v0.53.1 · protocol
+     v2 · cluster v16" — reads at a size that fits the box instead of
+     wrapping into a paragraph of headline type. tile() decides by
+     length, so a value that grows long in the field is handled too. */
+  .tile .value.long { font-size: 14px; font-weight: 500; line-height: 1.45; }
+  .tile .value .muted { display: block; font-size: 12px; font-weight: 400; line-height: 1.35; margin-top: 3px; }
   .tiles.ident .value { font-size: 15px; word-break: break-all; }
   .tile svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
   .tile polyline { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
@@ -170,11 +188,15 @@
   .seg button.on { background: color-mix(in srgb, var(--series-1) 18%, transparent); color: var(--text); }
   #series-details { margin-top: 14px; }
   #series-details summary { cursor: pointer; font-size: 13px; }
-  #series-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; font-size: 13px; margin: 6px 0 14px; }
+  #series-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr)); gap: 4px 16px; font-size: 13px; margin: 6px 0 14px; }
   #series-picker h4 { grid-column: 1 / -1; margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); }
   #series-picker label { display: flex; gap: 6px; align-items: baseline; cursor: pointer; }
   #series-picker label span.h { color: var(--text-3); font-size: 12px; }
-  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 14px; }
+  /* min() so the track can fall below its ideal width on a narrow
+     screen: a bare minmax(460px, 1fr) keeps a 460px track at a 360px
+     viewport, which widened the whole document and left every view
+     with a chart scrolling sideways. */
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr)); gap: 14px; }
   .charts.compare { grid-template-columns: 1fr; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
   .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
@@ -240,6 +262,40 @@
   #jump .hint { padding: 6px 12px 8px; font-size: 12px; color: var(--text-3); border-top: 1px solid var(--border); }
   /* The view a node-scoped panel is showing, stated rather than assumed. */
   .scoped { font-size: 12px; color: var(--text-3); margin: 0 0 8px; }
+  /* ---- Help: every term on the page explains itself ----
+     A term that has an explanation is underlined the way a footnote
+     marker is: visible enough to be found, quiet enough to read past.
+     The underline is on the label, not a separate icon, so it costs a
+     table column no width. */
+  .helpable { text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; cursor: help; }
+  .helpable:hover { text-decoration-color: var(--series-1); }
+  #help-pop {
+    position: absolute; z-index: 60; width: min(340px, calc(100vw - 16px));
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.22); padding: 9px 12px 11px; font-size: 13px;
+  }
+  #help-pop b { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-2); }
+  #help-pop p { margin: 4px 0 0; line-height: 1.5; }
+  #help {
+    position: fixed; inset: 0; z-index: 70; background: rgba(0,0,0,.35);
+    display: flex; align-items: flex-start; justify-content: center; padding: 8vh 12px 12px;
+  }
+  #help .box { width: min(680px, 94vw); max-height: 80vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.28); overflow: hidden; }
+  #help .head { display: flex; align-items: baseline; gap: 10px; padding: 11px 14px;
+    border-bottom: 1px solid var(--border); font-size: 14px; }
+  #help .head button { margin-left: auto; font: inherit; font-size: 12px; cursor: pointer;
+    border: 1px solid var(--border); background: none; color: var(--text-2); border-radius: 6px; padding: 3px 9px; }
+  #help #help-body { overflow-y: auto; padding: 4px 14px 12px; }
+  #help dl { margin: 0; }
+  #help dt { margin-top: 12px; font-weight: 600; font-size: 13px; }
+  #help dd { margin: 3px 0 0; font-size: 13px; line-height: 1.55; color: var(--text-2); }
+  #help .hint { padding: 8px 14px; font-size: 12px; color: var(--text-3); border-top: 1px solid var(--border); }
+  header #help-open { font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text-2);
+    border-radius: 50%; width: 22px; height: 22px; padding: 0; }
+  header #help-open:hover { border-color: var(--series-1); color: var(--text); }
 </style>
 </head>
 <body>
@@ -252,10 +308,17 @@
     <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
     <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
     <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
+    <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
   <span class="sub" id="hdr-node">connecting…</span>
   <details class="user" id="hdr-user"><summary id="hdr-user-summary" title="who this page is signed in as"></summary><div class="menu" id="hdr-user-menu"></div></details>
   <span class="stale" id="hdr-stale" role="status">● stale — last update failed</span>
+  <!-- Offered when the node starts serving a newer console than this tab
+       is running (a rolling upgrade under a long-lived tab). The script
+       reveals it; it must exist in the markup, or the poll that reveals
+       it throws and the page stops updating exactly when the cluster is
+       changing under it. -->
+  <button type="button" class="reload" id="hdr-reload" hidden>a newer console is available — reload</button>
 </header>
 <div id="jump" hidden>
   <div class="box" role="dialog" aria-modal="true" aria-label="jump to">
@@ -264,6 +327,23 @@
     <div class="hint">Enter opens · Esc closes</div>
   </div>
 </div>
+<!-- The glossary for the current view: every term on screen, in the
+     order it appears, with its explanation. This is also the keyboard
+     and screen reader path to the help, which is why the terms
+     themselves are not ninety separate tab stops. -->
+<div id="help" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <div class="head">
+      <b id="help-title">what am I looking at?</b>
+      <span class="muted" id="help-count"></span>
+      <button type="button" id="help-close" title="close">close</button>
+    </div>
+    <div id="help-body"></div>
+    <div class="hint">Every underlined label on the page explains itself — hover it, or click it for a note in place.</div>
+  </div>
+</div>
+<!-- One term, explained where it stands. Positioned by the script. -->
+<div id="help-pop" role="tooltip" hidden></div>
 <div id="main-views">
 <main id="view-overview" hidden>
   <div class="err" id="cluster-err"></div>
@@ -579,33 +659,6 @@
     <div class="tablewrap"><table>
       <thead><tr><th>range</th><th>span</th><th>replicas</th><th>leader</th><th class="num">size</th><th class="num">qps</th><th class="num">applied</th><th class="num" title="entries kept in the raft log since the last truncation">log</th></tr></thead>
       <tbody id="node-ranges"></tbody>
-    </table></div>
-  </section>
-  <section>
-    <h2>SQL</h2>
-    <div class="tiles" id="node-sql"></div>
-    <div id="node-activity" hidden><div class="tablewrap"><table>
-      <thead><tr><th>when</th><th>user</th><th>kind</th><th class="num">duration</th><th class="num">rows</th><th>statement</th></tr></thead>
-      <tbody id="node-statements"></tbody>
-    </table></div></div>
-    <p class="muted" id="node-sql-note"></p>
-  </section>
-  <section>
-    <h2>Network (this node's row)</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>peer</th><th class="num">round trip</th><th class="num">p99</th><th class="num">clock offset</th><th>reachable</th><th class="num">measured</th></tr></thead>
-      <tbody id="node-latency"></tbody>
-    </table></div>
-  </section>
-  <section>
-    <h2>Settings</h2>
-    <div class="tablewrap"><table><tbody id="node-settings"></tbody></table></div>
-  </section>
-  <section>
-    <h2>Recent events</h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
-      <tbody id="node-events"></tbody>
     </table></div>
   </section>
   <section>

@@ -8,6 +8,107 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.54.0 — unreleased
+
+### Added
+- **Everything on the page explains itself.** The console was full of
+  words that are precise and opaque at the same time — "compaction
+  debt", "bare majority", "40001/s", "stats age", "closed ts". Each is
+  exactly right and each is unreadable to anyone who does not already
+  know it, and the person who most needs to know is the one opening the
+  console during an incident.
+
+  Every label, column heading and section title now carries its own
+  explanation, reachable two ways because there are two questions:
+
+  - *What is this one figure?* Terms that have an explanation are
+    underlined the way a footnote marker is. Hovering one shows it;
+    clicking one opens a note in place.
+  - *What am I looking at?* The `?` in the header — or the `?` key —
+    opens the glossary for the current view: every term on screen, in
+    the order it appears, with its explanation. That is also the
+    keyboard and screen reader path, which is why the terms themselves
+    are not ninety separate tab stops.
+
+  The entries say what a figure measures and what makes a reading worth
+  acting on, not what its label already says. "40001/s" explains that it
+  is the serializable-retry rate and that a steady one is normal while a
+  rising one means transactions are fighting over the same rows; "rows
+  scanned" explains that far more scanned than returned is a scan where
+  an index would do, whether or not the statement is also slow.
+
+  The glossary is keyed by the term as it is written on screen, so a
+  column that says "leases" is explained by the entry called "leases" —
+  a new column naming a term already in the glossary is explained
+  without anyone wiring it up, and one that means something different in
+  its view ("rows" is a result size on `#/sql` and an estimated row
+  count on `#/schema`) is keyed by view. Terms the page generates rather
+  than writes, like a column per node, are matched by pattern.
+
+  Three tests make "everything" true rather than aspirational: one walks
+  every heading and tile label the page shows and fails on a term
+  nothing explains, one fails on an entry too short to add anything the
+  label does not already say, and one reports an entry that has stopped
+  matching anything on the page rather than leaving it to rot. The first
+  of them found six terms the browser check could not see, because they
+  live in a collapsed disclosure.
+
+### Fixed
+- **A tile's breakdown ran on after its figure in three more places** —
+  the connections and worst-p99 tiles on `#/sql`, and connections,
+  statements, 40001 and plan cache on the node page. Same fault as the
+  cluster tiles below, same fix.
+
+## 0.53.2 — unreleased
+
+### Fixed
+- **The node page always asked for node 0.** The view's cache object
+  declared `id: 0` and nothing ever assigned the route's node to it, so
+  every visit fetched `/api/node?id=0` — which the server is right to
+  reject with a 400 — and the page rendered "Node n0" above the error.
+  Opening a node from the nodes table therefore always led to a broken
+  page. The route is now the single source of truth for which node the
+  view is showing, and the cache only carries state between polls; a
+  route with no node says so in words instead of asking for node 0.
+
+- **Tile values overran their cards and pushed into what was below
+  them.** A tile is a label, one figure and sometimes a qualifier, but
+  the qualifier ran on after the figure inside the same 22px line:
+  "connections" read `0 (0 active, 0 idle in txn) (0 of 2 live nodes)`
+  as four lines of headline type, taller than its card, and — because a
+  grid row is as tall as its tallest member — it stretched every other
+  tile beside it into a mostly empty box.
+
+  A qualifier is now a 12px line beneath the figure, and a value that is
+  a phrase rather than a figure ("v0.53.1 · protocol v2 · cluster v16")
+  is set to fit its card. `tile()` classifies by length rather than each
+  caller remembering to, so a value that only grows long in the field is
+  handled too.
+
+- **Every view with a chart scrolled sideways below 460px.** The chart
+  grid asked for `minmax(460px, 1fr)` tracks, and a track wider than the
+  viewport widens the document rather than shrinking. The tile, chart
+  and series-picker grids now cap their ideal track width at the
+  container's, so nothing forces a horizontal scroll at any width.
+
+- **The overview poll threw during a rolling upgrade.** It revealed a
+  reload prompt by id when the node started serving a newer console than
+  the tab was running, and the element was not in the markup: the poll
+  threw on the null, and the console froze at "last updated never"
+  exactly while the cluster was changing under it. The element exists
+  now, the lookup is guarded, and a new test walks every
+  `getElementById` in every script and fails on one the page cannot
+  satisfy. That test also found dead code in the schema view that
+  reached for a container removed earlier and would have clobbered the
+  security view's roles table.
+
+- **The node page rendered four of its sections twice.** SQL, Network,
+  Settings and Recent events were duplicated verbatim in the markup,
+  ids and all, so the second copy could never be filled and the page
+  showed each section once with content and once empty. Also: a node
+  that has not collected a GC percentile yet reports "—" rather than
+  "NaN ms".
+
 ## 0.53.1 — unreleased
 
 ### Fixed

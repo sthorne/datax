@@ -77,8 +77,16 @@ async function pollOverview() {
   if (ui.view === "security") renderSecurity(d.cluster);
   // The node serves a newer console than this tab runs (a rolling
   // upgrade under a long-lived tab): offer a reload, once.
-  if (d.cluster.console_version && d.cluster.console_version !== CONSOLE_VERSION)
-    document.getElementById("hdr-reload").style.display = "inline";
+  //
+  // Reveal it through the hidden attribute rather than an inline style,
+  // so one mechanism hides and shows everything on the page, and guard
+  // the lookup: this runs inside the poll, so a missing element used to
+  // throw here and leave the console frozen at "last updated never" —
+  // during a rolling upgrade, which is when it is most worth reading.
+  if (d.cluster.console_version && d.cluster.console_version !== CONSOLE_VERSION) {
+    const reload = document.getElementById("hdr-reload");
+    if (reload) reload.hidden = false;
+  }
 }
 // Which views need which fetch. A view starts exactly these and stops
 // everything else (issue #147), so the Metrics view fetches no schema
@@ -124,6 +132,7 @@ document.getElementById("node-filter").addEventListener("input", ev => {
   pushRoute(nodeFilter ? { locality: nodeFilter } : {});
   if (lastCluster) renderNodesTable(lastCluster);
 });
+document.getElementById("hdr-reload").addEventListener("click", () => location.reload());
 document.getElementById("events-filter").addEventListener("change", renderOps);
 // The shape list re-ranks what it already has rather than re-fetching.
 document.getElementById("stmt-sort").addEventListener("change", renderStatementShapes);
@@ -140,4 +149,5 @@ document.getElementById("annotate-kinds").addEventListener("change", renderChart
 
 a11yTables();
 wireControls();
+wireHelpControls();
 route();

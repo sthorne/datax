@@ -188,8 +188,24 @@ function wireJump() {
     // Escape closes it wherever the keyboard happens to be. Binding this
     // to the input alone left the dialog undismissable by keyboard the
     // moment focus was anywhere else.
-    if (ev.key === "Escape" && jumpOpen()) { ev.preventDefault(); closeJump(); }
+    if (ev.key === "Escape" && jumpOpen()) { ev.preventDefault(); closeJump(); return; }
+    if (ev.key === "Escape" && helpOpen()) { ev.preventDefault(); closeHelp(); return; }
+    if (ev.key === "Escape") { closeHelpPop(); return; }
+    // "?" explains the current view — but not while the reader is
+    // typing one into a filter or the jump box.
+    if (ev.key === "?" && !ev.metaKey && !ev.ctrlKey && !typingInto(ev.target)) {
+      ev.preventDefault();
+      helpOpen() ? closeHelp() : openHelp();
+    }
   });
+}
+
+// typingInto reports whether a key went to somewhere text is being
+// entered, so a page-level shortcut does not swallow a character the
+// reader meant for a filter.
+function typingInto(el) {
+  return el instanceof HTMLElement &&
+    (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 }
 
 // route applies the hash: it shows one view, remembers where each was
