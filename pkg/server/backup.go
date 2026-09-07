@@ -46,6 +46,15 @@ const (
 	restoreChunk = 1024
 )
 
+// backupDataFile is the name of table id's data file inside its backup
+// directory. Backup writes it; restore derives it again from the id
+// rather than joining whatever the manifest says onto the directory
+// (issue #214): a manifest is operator-supplied input, and one carrying
+// "../../etc/shadow" would otherwise be read with the node's own uid.
+func backupDataFile(id uint64) string {
+	return fmt.Sprintf("table_%d.dxbk", id)
+}
+
 // backupKV is one raw system key/value captured verbatim (users, admin
 // markers).
 type backupKV struct {
@@ -300,7 +309,7 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 	// Table data: the (baseTS, endTS] window over each table's full data
 	// span — every index, raw, so restore needs no backfill.
 	for _, bt := range descs {
-		bt.File = fmt.Sprintf("table_%d.dxbk", bt.ID)
+		bt.File = backupDataFile(bt.ID)
 		f, err := os.Create(filepath.Join(dest, bt.File))
 		if err != nil {
 			return nil, err
@@ -356,6 +365,15 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 	}
 	if man.Magic != backupManifestMagic {
 		return nil, fmt.Errorf("%s: not a datax backup (magic %q)", dir, man.Magic)
+	}
+	// A backup names its own files, and nothing else: refused here, before
+	// any data file is opened, so neither door — restore, or the base of
+	// an incremental — reaches a path the manifest chose (issue #214).
+	for _, t := range man.Tables {
+		if want := backupDataFile(t.ID); t.File != want {
+			return nil, fmt.Errorf("%s: manifest names %q as the data file for table %d, which a datax backup keeps in %q",
+				dir, t.File, t.ID, want)
+		}
 	}
 	return &man, nil
 }
@@ -523,7 +541,9 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.Backup
 			if !live[t.ID] {
 				continue // dropped later in the chain
 			}
-			path := filepath.Join(srcs[i], t.File)
+			// The name is derived, not taken from the manifest (which
+			// readBackupManifest has already held to the same).
+			path := filepath.Join(srcs[i], backupDataFile(t.ID))
 			var wb kvclient.WriteBatch
 			flush := func() error {
 				if wb.Len() == 0 {

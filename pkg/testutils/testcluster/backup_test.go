@@ -2,6 +2,9 @@ package testcluster
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -250,4 +253,105 @@ func BenchmarkRestore(b *testing.B) {
 		}
 	}
 	b.ReportMetric(float64(rows), "rows/op")
+}
+
+// TestRestoreRefusesAFileOutsideTheBackup (issue #214): restore used to
+// open whatever file name the manifest carried, joined onto the backup
+// directory, so a manifest saying "../../etc/shadow" read that with the
+// node's own uid. The attack here is made to work if the check is
+// missing: the file the crafted manifest points at is a copy of the real
+// data file, planted outside the backup directory, so a restore that
+// follows the name succeeds — and the test fails on that success.
+func TestRestoreRefusesAFileOutsideTheBackup(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	execSQL(t, ctx, s, `CREATE TABLE t (id INT8 PRIMARY KEY, v TEXT)`)
+	execSQL(t, ctx, s, `INSERT INTO t VALUES (1, 'kept')`)
+	backup := t.TempDir()
+	if _, err := tc.Nodes[0].RunBackup(ctx, backup, "", false, false); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(backup, "BACKUP.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileField := regexp.MustCompile(`"file": "(table_\d+\.dxbk)"`)
+	m := fileField.FindStringSubmatch(string(manifest))
+	if m == nil {
+		t.Fatalf("no table data file named in the manifest:\n%s", manifest)
+	}
+	data, err := os.ReadFile(filepath.Join(backup, m[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The planted copy, outside any backup directory.
+	elsewhere := t.TempDir()
+	planted := filepath.Join(elsewhere, "planted.dxbk")
+	if err := os.WriteFile(planted, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A crafted backup: the real manifest and data files, with the one
+	// table's file name replaced.
+	craft := func(file string) string {
+		dir := t.TempDir()
+		entries, err := os.ReadDir(backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			raw, err := os.ReadFile(filepath.Join(backup, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.Name() == "BACKUP.json" {
+				raw = []byte(fileField.ReplaceAllString(string(raw), `"file": "`+file+`"`))
+			}
+			if err := os.WriteFile(filepath.Join(dir, e.Name()), raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A subdirectory variant needs the file to exist there too.
+		if d := filepath.Dir(file); d != "." && !filepath.IsAbs(file) && !strings.HasPrefix(file, "..") {
+			if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, file), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	target := Start(t, 1)
+	rel, err := filepath.Rel(t.TempDir(), planted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{
+		rel,                    // "../<dir>/planted.dxbk": a traversal
+		planted,                // absolute
+		"sub/" + m[1],          // a separator
+		"table_999999999.dxbk", // another table's name, inside the directory
+	} {
+		_, err := target.Nodes[0].RunRestore(ctx, []string{craft(file)})
+		if err == nil {
+			t.Fatalf("restore accepted a manifest naming %q", file)
+		}
+		if !strings.Contains(err.Error(), "which a datax backup keeps in") {
+			t.Fatalf("restore from a manifest naming %q failed for another reason: %v", file, err)
+		}
+	}
+
+	// Nothing was applied by the refused attempts, and a backup as
+	// written restores unchanged.
+	if _, err := target.Nodes[0].RunRestore(ctx, []string{backup}); err != nil {
+		t.Fatalf("restore of an unmodified backup after the refusals: %v", err)
+	}
+	s2 := sql.NewSession(target.Nodes[0].DB(), catalog.NewAccessor())
+	if res := execSQL(t, ctx, s2, `SELECT v FROM t WHERE id = 1`); len(res.Rows) != 1 || res.Rows[0][0].S != "kept" {
+		t.Fatalf("restored row: %+v", res.Rows)
+	}
 }
