@@ -47,6 +47,17 @@ state or the internode protocol does, and an entry below says so.
   there made the page scroll sideways at every phone width — it wraps
   under 640px now, and the measurements are in the pull request.
 
+  A preference write is bounded. `/api/prefs` writes through the node's
+  internal system session, which bypasses privilege checks — so the
+  principals it admits include ones that cannot write a byte over
+  pgwire: a `SELECT`-only user, a metrics scrape account, a read-only
+  certificate identity. Storing a value that is already stored is now
+  suppressed entirely, and what remains meets a per-principal token
+  bucket (ten back-to-back), so a caller with no write privilege
+  anywhere cannot drive an unbounded stream of distributed transactions.
+  A console re-sending its own value never meets the bucket, because the
+  suppression comes first.
+
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
