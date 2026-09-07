@@ -109,6 +109,19 @@ func (n *Node) lookupVerifier(ctx context.Context, user string) (*security.Scram
 // (a cluster bootstrapped before the key existed). nil when the read
 // fails; the wire layer then uses a per-process secret until the next
 // attempt succeeds.
+// authSecretReadable reports whether this node has the cluster's
+// authentication secret. It does not go to KV when the answer is already
+// cached, so the health check costs nothing in the normal case.
+func (n *Node) authSecretReadable(ctx context.Context) bool {
+	n.authSecretMu.Lock()
+	cached := n.authSecret != nil
+	n.authSecretMu.Unlock()
+	if cached {
+		return true
+	}
+	return len(n.mockSecret(ctx)) > 0
+}
+
 func (n *Node) mockSecret(ctx context.Context) []byte {
 	n.authSecretMu.Lock()
 	defer n.authSecretMu.Unlock()

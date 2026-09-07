@@ -400,6 +400,17 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		add(p)
 	}
 
+	// The cluster's authentication secret: without it this node cannot
+	// offer a stand-in SCRAM salt that agrees with the other nodes', so
+	// it refuses password authentication rather than answer with one
+	// that would say which usernames exist (issue #196). That is a real
+	// degradation and it used to be a warn line and nothing else.
+	doc.Checks++
+	if n.tlsCfgs != nil && !n.authSecretReadable(req.Context()) {
+		add(Problem{Severity: SeverityCritical, Check: "auth-secret-unavailable", Node: int(n.ident.NodeID), Section: "nodes",
+			Summary: "this node cannot read the cluster's authentication secret, so it is refusing SQL password logins; certificate authentication is unaffected"})
+	}
+
 	// Statistics: tables with stale or missing statistics (info).
 	doc.Checks++
 	// From the cached schema document, refreshed in the background: the
