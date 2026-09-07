@@ -8,6 +8,43 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.54.1 — unreleased
+
+### Fixed
+- **Load splits were biased toward whatever was sampled last** (#186).
+  A range that is hot but not large splits at a sampled key chosen to
+  divide its traffic evenly. The chooser ranked candidates by the raw
+  difference between the traffic seen either side of each — but a sample
+  counts only what arrives after it enters the reservoir, and reservoir
+  sampling replaces slots throughout the window, so two candidates can
+  have observed amounts that differ by three orders of magnitude.
+
+  A slot filled near the end of the window might hold `left=3, right=2`:
+  an imbalance of one, unbeatable by any well-observed key, on five
+  observations of a key carrying a fifth of the traffic. The guard
+  against a fully one-sided sample did not catch it — a handful of
+  requests either side is enough to pass it.
+
+  Candidates are now ranked by the *share* of traffic either side rather
+  than the difference, which is what makes samples with different
+  observation counts comparable at all, and a sample must have seen a
+  hundred requests before its balance is believed. A hundred holds the
+  standard error of the observed share at or below five points, enough to
+  tell a key near the traffic median from one at 80/20. Below it the
+  caller falls back to the byte midpoint, which is honest about knowing
+  nothing rather than acting on a share measured from almost nothing.
+
+  A range only reaches the chooser after a full window sustained above
+  the load threshold — thousands of requests at the default — so nothing
+  is excluded in ordinary operation.
+
+  `TestChooseSplitKeyBalances` now scores the chosen key against the
+  distribution that was actually sent instead of asserting a prefix
+  letter. That is the property the code is for, and it turned out the old
+  assertion was not only flaky but too weak: on the old chooser the
+  strengthened test also fails on splits that put 70% or 30% of the
+  traffic on one side, which the letter check accepted.
+
 ## 0.54.0 — unreleased
 
 ### Added
