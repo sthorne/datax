@@ -207,3 +207,64 @@ func TestConsolePrefsBeforeFinalize(t *testing.T) {
 		t.Fatalf("set on a v16 cluster: %d %s, want 503 naming v17", code, body)
 	}
 }
+
+// TestConsolePrefsWriteIsBounded (issue #204, raised in review): the
+// write runs through the node's internal system session, which bypasses
+// privilege checks by construction — so the principals this endpoint
+// admits include ones that cannot write a byte over pgwire (a
+// SELECT-only user, a metrics scrape account, a read-only certificate
+// identity). Two things keep that from being an unbounded write path
+// into replicated state, and both are observable from outside.
+func TestConsolePrefsWriteIsBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, _ := StartWithEngines(t, 1, func(c *server.Config) { c.HTTPListener = listener })
+
+	if code, body := setPref(t, tc, 0, "theme", "dark"); code != 200 {
+		t.Fatalf("set theme: %d %s", code, body)
+	}
+	// Storing what is already stored is not a write. It still answers
+	// 200 — the caller asked for a state and got it.
+	if code, body := setPref(t, tc, 0, "theme", "dark"); code != 200 {
+		t.Fatalf("re-setting the same value: %d %s, want 200", code, body)
+	}
+
+	// A caller that actually changes the value meets the bound. Values
+	// alternate so that every request is a real write.
+	limited := false
+	for i := 0; i < 40; i++ {
+		value := "dark"
+		if i%2 == 0 {
+			value = "light"
+		}
+		code, body := setPref(t, tc, 0, "theme", value)
+		if code == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+		if code != 200 {
+			t.Fatalf("write %d: %d %s", i, code, body)
+		}
+	}
+	if !limited {
+		t.Fatal("40 back-to-back preference changes were all accepted: the write is unbounded, and the " +
+			"principals reaching it include ones with no write privilege anywhere in the database")
+	}
+
+	// And the no-op is genuinely suppressed rather than merely cheap:
+	// with the budget now spent, a request that changes nothing still
+	// succeeds, because it never reaches the write or the bucket.
+	last := setPrefValue(t, tc, 0)
+	if code, body := setPref(t, tc, 0, "theme", last); code != 200 {
+		t.Fatalf("a no-op write was refused by the rate limit (%d %s): it should never reach it, or a "+
+			"console re-sending the value it already holds would be told to slow down", code, body)
+	}
+}
+
+// setPrefValue reads back the stored theme.
+func setPrefValue(t *testing.T, tc *TestCluster, i int) string {
+	t.Helper()
+	return getPrefs(t, tc, i).Prefs["theme"]
+}
