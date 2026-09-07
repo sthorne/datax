@@ -345,6 +345,22 @@ func TestRestoreRefusesAFileOutsideTheBackup(t *testing.T) {
 		}
 	}
 
+	// The filesystem can name a path too (the PR's review): a symlink at
+	// the derived name, pointing at the planted copy, would have restored
+	// it — same end, other door. Refused without being followed.
+	linked := craft(m[1])
+	if err := os.Remove(filepath.Join(linked, m[1])); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(planted, filepath.Join(linked, m[1])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Nodes[0].RunRestore(ctx, []string{linked}); err == nil {
+		t.Fatalf("restore followed a symlink at %q to %s, outside the backup directory", m[1], planted)
+	} else if !strings.Contains(err.Error(), "is not a regular file") {
+		t.Fatalf("restore from a backup with a symlink at %q failed for another reason: %v", m[1], err)
+	}
+
 	// Nothing was applied by the refused attempts, and a backup as
 	// written restores unchanged.
 	if _, err := target.Nodes[0].RunRestore(ctx, []string{backup}); err != nil {

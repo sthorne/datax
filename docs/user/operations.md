@@ -508,10 +508,12 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
 - A backup directory holds a `BACKUP.json` manifest plus one data file per
   table; the manifest is written last, so its presence marks the backup
   complete. The summary prints per-table record counts and SHA-256
-  checksums over the live data. Restore reads only the files a backup
-  writes, named from each table's id: a manifest naming any other file
-  is refused before anything is opened, so a directory prepared by
-  someone else cannot point the node at a path of their choosing.
+  checksums over the live data. Restore reads only the names a backup
+  writes, derived from each table's id, and only a regular file at one
+  of them: a manifest naming any other file is refused before anything
+  is opened, and a symlink or a directory at the manifest's or a data
+  file's name is refused without being followed, so a directory prepared
+  by someone else cannot point the node at a path of their choosing.
 - Incrementals capture only keys changed since the base — deletions
   included — and must chain within the MVCC GC window (25h by default): an
   older base is refused with "incremental base too old". Take a fresh full

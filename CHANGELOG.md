@@ -203,8 +203,14 @@ state or the internode protocol does, and an entry below says so.
   name from the table id again, exactly as backup wrote it, and a
   manifest naming anything else is refused when it is read, before any
   file is opened — at both doors that read one, `datax restore` and
-  `--base` of an incremental. Backups written by any earlier release
-  restore unchanged: the name has been the same since backup existed.
+  `--base` of an incremental. The filesystem can name a path too, as the
+  review found: a symlink at the derived name reaches wherever it
+  points, and restore would have applied what it found there. A backup
+  writes plain files and nothing else, so only a regular file is read at
+  one of its names — the manifest's or a data file's — and a symlink or
+  a directory there is refused without being followed. Backups written
+  by any earlier release restore unchanged: the name has been the same
+  since backup existed.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
