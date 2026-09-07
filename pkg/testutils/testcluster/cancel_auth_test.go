@@ -73,21 +73,25 @@ func TestCancelAuthorization(t *testing.T) {
 	// certificate. rpc.Server.Admin deliberately does not requireNode,
 	// so any CA-signed client certificate reaches this surface — which
 	// is the point: the op has to authorize itself.
-	callNode := func(node int, user string, req cluster.AdminRequest) cluster.AdminResponse {
+	callNodeAs := func(node int, tlsCfg *tls.Config, req cluster.AdminRequest) cluster.AdminResponse {
 		t.Helper()
-		tlsCfg, err := security.LoadClientTLS(certsDir, user)
-		if err != nil {
-			t.Fatal(err)
-		}
 		trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
 		trans.SetTLS(tlsCfg)
 		cctx, ccancel := context.WithTimeout(ctx, 20*time.Second)
 		defer ccancel()
 		var resp cluster.AdminResponse
 		if err := trans.Call(cctx, tc.Nodes[node].Addr(), "admin", req, &resp); err != nil {
-			t.Fatalf("admin call as %q: %v", user, err)
+			t.Fatalf("admin call: %v", err)
 		}
 		return resp
+	}
+	callNode := func(node int, user string, req cluster.AdminRequest) cluster.AdminResponse {
+		t.Helper()
+		tlsCfg, err := security.LoadClientTLS(certsDir, user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return callNodeAs(node, tlsCfg, req)
 	}
 
 	// The victim runs on node 2, and every call up to the last one is
@@ -200,6 +204,49 @@ func TestCancelAuthorization(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("a CancelRequest inside TLS did not stop pg_sleep")
+	}
+
+	// A peer node's secretless cancel is honoured, because that is what a
+	// forwarded pg_cancel_backend is: the forwarding node presents the
+	// cluster's own certificate and isAdminPrincipal accepts CN "node".
+	//
+	// It is also, and inseparably, the shape an un-upgraded node produces
+	// when it forwards an attacker's cleartext CancelRequest carrying a
+	// zero secret — that node has neither the door guard nor the TLS
+	// refusal, and the bytes it sends are identical to a legitimate
+	// forwarded cancel. So this test pins a real requirement and documents
+	// a real limit: the fix is complete once every node is upgraded, and
+	// the roll itself is a window in which the old behaviour is reachable
+	// through the old nodes. Nothing on this side can tell the two apart
+	// without a discriminator the old node does not send.
+	peer, err := security.LoadNodeTLS(certsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayed, err := connectSecure(ctx, urlFor(1, "bob", "bob-pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = relayed.Close(ctx) }()
+	rpid := relayed.PgConn().PID()
+	rdone := make(chan error, 1)
+	go func() {
+		_, err := relayed.Exec(ctx, `SELECT pg_sleep(60)`)
+		rdone <- err
+	}()
+	waitForRunningStatement(t, ctx, probe, rpid)
+	if resp := callNodeAs(1, peer.Client, cluster.AdminRequest{
+		Op: "cancel-query", PID: int32(rpid),
+	}); resp.Error != "" {
+		t.Fatalf("a peer's forwarded cancel: %q, want it honoured", resp.Error)
+	}
+	select {
+	case err := <-rdone:
+		if pgErrCode(err) != sql.CodeQueryCanceled {
+			t.Fatalf("a peer's forwarded cancel: %v, want 57014", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("a peer's forwarded cancel did not stop pg_sleep")
 	}
 
 	// A terminate that carries a secret must still terminate.

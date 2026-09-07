@@ -96,9 +96,18 @@ state or the internode protocol does, and an entry below says so.
   Ctrl-C in psql 16 or earlier against a secure cluster now does
   nothing.** Upgrading psql restores it.
 
-  No cluster protocol version: nothing new is sent. A node running an
-  older binary keeps forwarding exactly the requests it always did, and
-  a node running this one authorizes them correctly on arrival.
+  No cluster protocol version: nothing new is sent, and a node running
+  an older binary keeps forwarding exactly the requests it always did.
+  **The fix is complete once every node is upgraded, and the roll itself
+  is a window.** An un-upgraded node has neither the cleartext refusal
+  nor the zero-secret door guard, so both vectors stay reachable through
+  it: directly, at its own unchecked `cancel-query`; and onward, because
+  when it forwards an attacker's zero-secret cancel it does so under the
+  cluster's own certificate, and the bytes are identical to a legitimate
+  forwarded `pg_cancel_backend`. The receiving node cannot tell them
+  apart. Nothing can fix a binary that is already running, so the
+  practical consequence is operational: roll promptly, and do not leave
+  a half-upgraded cluster sitting.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a

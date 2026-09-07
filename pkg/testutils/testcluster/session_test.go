@@ -453,7 +453,10 @@ func TestCancelAndTimeouts(t *testing.T) {
 	}
 
 	// The secret is the whole authorization, so it has to be the right
-	// one. A zero secret is what a caller sends when it holds none, and
+	// one. These assertions are the only place the door guard in
+	// handleCancelRequest is pinned (issue #211): on a secure cluster the
+	// ambiguous request can no longer be produced, so the secure test
+	// cannot reach it. Do not move them without moving that coverage. A zero secret is what a caller sends when it holds none, and
 	// it used to mean "trusted, skip the check" — sweeping the small,
 	// guessable process-ID space with it cancelled every statement in
 	// the cluster (issue #211). Both of these cross a node boundary, so

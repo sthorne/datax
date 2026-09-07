@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/sthorne/datax/pkg/sql"
+	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // Query cancellation (issue #97). Every connection gets a process ID
@@ -175,6 +176,39 @@ func (s *Server) handleCancelRequest(pid int32, secret uint32) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_, _ = s.cancelBySecret(ctx, pid, secret)
+}
+
+// cleartextCancels throttles the record below. A CancelRequest is
+// unauthenticated and costs one packet, so an old client reconnecting in
+// a loop — or somebody probing — must not be able to drive the log.
+var cleartextCancels struct {
+	mu     sync.Mutex
+	last   time.Time
+	missed uint64
+}
+
+// noteCleartextCancel records a refused cleartext cancel loudly enough to
+// be diagnosed. The refusal is correct but its symptom is a silence: an
+// operator sees Ctrl-C stop working after an upgrade, with nothing to
+// connect it to. libpq before PostgreSQL 17 sends this packet outside
+// TLS; pgx and psql 17 and later encrypt it and never reach here.
+func noteCleartextCancel(remote string) {
+	cleartextCancels.mu.Lock()
+	cleartextCancels.missed++
+	n := cleartextCancels.missed
+	report := time.Since(cleartextCancels.last) >= time.Minute
+	if report {
+		cleartextCancels.last = time.Now()
+		cleartextCancels.missed = 0
+	}
+	cleartextCancels.mu.Unlock()
+	if report {
+		log.Warnf("refused a query cancel sent in cleartext to the TLS SQL port from %s "+
+			"(%d since the last such record): the cancel key authorizes the cancel and would "+
+			"cross the wire in the clear. libpq before PostgreSQL 17 sends it this way, so Ctrl-C "+
+			"in an older psql does nothing against this cluster; pgx and psql 17+ encrypt it.",
+			remote, n)
+	}
 }
 
 // backendControl is the session hook behind pg_cancel_backend and

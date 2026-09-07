@@ -575,6 +575,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			// encrypt the cancel connection whenever the connection it
 			// cancels is encrypted; libpq before PG17 does not.
 			if c.opts.TLS != nil && !c.tlsDone {
+				noteCleartextCancel(c.nc.RemoteAddr().String())
 				return fmt.Errorf("cleartext cancel refused in secure mode")
 			}
 			if c.srv != nil && len(m.SecretKey) >= 4 {
