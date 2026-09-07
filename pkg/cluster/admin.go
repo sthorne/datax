@@ -39,7 +39,11 @@ type AdminRequest struct {
 	// binary version).
 	Version int `json:"version,omitempty"`
 	// PID, Secret and Terminate route a query cancel (cancel-query) to
-	// the node whose SQL connection the process ID names.
+	// the node whose SQL connection the process ID names. Secret is the
+	// wire client's authority and authorizes a plain cancel of that one
+	// connection; zero means the caller holds none, and then — as for
+	// Terminate always — the admin role authorizes it instead, checked
+	// on the node that acts (issue #211).
 	PID       int32  `json:"pid,omitempty"`
 	Secret    uint32 `json:"secret,omitempty"`
 	Terminate bool   `json:"terminate,omitempty"`

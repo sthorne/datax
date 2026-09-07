@@ -35,7 +35,6 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 // Everything else changes cluster state or exposes per-replica internals:
 // admin role required.
 var adminReadOnlyOps = map[string]bool{
-	"cancel-query":     true, // the secret (or the caller's admin check) gates it
 	"ranges":           true,
 	"nodes":            true,
 	"collect-checksum": true,
@@ -83,6 +82,24 @@ func (n *Node) isMetricsPrincipal(ctx context.Context, cn string) bool {
 	return err == nil && ok
 }
 
+// adminRoleRequired reports whether an op must be run by an admin
+// principal on this node. Everything outside adminReadOnlyOps changes
+// cluster state or exposes per-replica internals. cancel-query is the
+// one op whose answer depends on the request rather than the name: a
+// plain cancel carrying a non-zero secret is authorized by that secret,
+// which is a wire CancelRequest's only identity and is held by the
+// client whose own statement it cancels. Terminating a session, or
+// cancelling without the secret (pg_cancel_backend), is authority the
+// SQL layer reserves to the admin role — so it is checked here, on the
+// node that acts, and not merely on whichever node the caller reached
+// first (issue #211).
+func adminRoleRequired(req cluster.AdminRequest) bool {
+	if req.Op == "cancel-query" {
+		return req.Terminate || req.Secret == 0
+	}
+	return !adminReadOnlyOps[req.Op]
+}
+
 func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
 	// In secure mode the caller's identity is its CA-verified client
 	// certificate (mutual TLS is mandatory on this port); state-changing
@@ -93,7 +110,7 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	if n.tlsCfgs != nil {
 		cn := rpc.PeerCN(ctx)
 		principal = cn
-		if !adminReadOnlyOps[req.Op] && !n.isAdminPrincipal(ctx, cn) {
+		if adminRoleRequired(req) && !n.isAdminPrincipal(ctx, cn) {
 			metrics.AdminDenied.Inc()
 			log.Audit("admin-denied", "op", req.Op, "principal", cn)
 			return cluster.AdminResponse{Error: fmt.Sprintf(
@@ -235,11 +252,21 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		return cluster.AdminResponse{Reencryption: n.reencryptionStatus()}
 
 	case "cancel-query":
-		// A query cancel forwarded from the node a CancelRequest landed
-		// on (or pg_cancel_backend run there): the connection lives here.
+		// A backend cancel or terminate, for a connection that lives on
+		// this node: forwarded from the node a CancelRequest landed on,
+		// forwarded from wherever pg_cancel_backend ran, or sent by an
+		// operator directly. adminRoleRequired has already decided which
+		// authority the caller needed and serveAdmin has checked it, so
+		// what is left here is only to spend the one the caller brought
+		// — the secret cancels that single connection and nothing else,
+		// the admin role does the rest.
 		found := false
-		if n.sqlServer() != nil {
-			found = n.sqlServer().CancelLocal(req.PID, req.Secret, req.Terminate)
+		if srv := n.sqlServer(); srv != nil {
+			if req.Secret != 0 && !req.Terminate {
+				found = srv.CancelBySecret(req.PID, req.Secret)
+			} else {
+				found = srv.ControlBackend(req.PID, req.Terminate)
+			}
 		}
 		raw, _ := json.Marshal(found)
 		return cluster.AdminResponse{Status: raw}
