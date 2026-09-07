@@ -106,12 +106,20 @@ func TestCancelAuthorization(t *testing.T) {
 	if int32(pid)>>20 != 2 {
 		t.Fatalf("pid %d should carry node 2 in its high bits", pid)
 	}
+	// probe watches node 2's own sessions, which is where every victim
+	// here lives; pg_stat_activity reports the node it is asked on.
+	probe, err := connectSecure(ctx, urlFor(1, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = probe.Close(ctx) }()
+
 	done := make(chan error, 1)
 	go func() {
 		_, err := victim.Exec(ctx, `SELECT pg_sleep(60)`)
 		done <- err
 	}()
-	time.Sleep(300 * time.Millisecond)
+	waitForRunningStatement(t, ctx, probe, pid)
 
 	// A refused cancel answers nothing, so every negative assertion here
 	// is about the target: the statement is still running.
@@ -194,6 +202,44 @@ func TestCancelAuthorization(t *testing.T) {
 		t.Fatal("a CancelRequest inside TLS did not stop pg_sleep")
 	}
 
+	// A terminate that carries a secret must still terminate.
+	// adminRoleRequired and the dispatch under it are complements — the
+	// caller who does not need the admin role is exactly the caller
+	// whose request goes to CancelBySecret — and if they drift apart, a
+	// terminate carrying a secret is routed to the method that only ever
+	// cancels. No escalation: the admin role is still required. But the
+	// session an operator asked to end survives, and nothing tells them.
+	ender, err := connectSecure(ctx, urlFor(1, "bob", "bob-pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ender.Close(ctx) }()
+	epid, esecret := ender.PgConn().PID(), ender.PgConn().SecretKey()
+	edone := make(chan error, 1)
+	go func() {
+		_, err := ender.Exec(ctx, `SELECT pg_sleep(60)`)
+		edone <- err
+	}()
+	waitForRunningStatement(t, ctx, probe, epid)
+	if resp := callNode(1, "root", cluster.AdminRequest{
+		Op: "cancel-query", PID: int32(epid), Secret: secretKeyOf(esecret), Terminate: true,
+	}); resp.Error != "" {
+		t.Fatalf("root's terminate carrying a secret: %q", resp.Error)
+	}
+	select {
+	case <-edone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a terminate carrying a secret did not stop pg_sleep")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !ender.IsClosed() && time.Now().Before(deadline) {
+		_, _ = ender.Exec(ctx, `SELECT 1`)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ender.IsClosed() {
+		t.Fatal("a terminate carrying a secret only cancelled: the connection is still open")
+	}
+
 	// An admin's pg_terminate_backend still crosses nodes: root runs it
 	// on node 1 against a connection on node 2, and node 2 authorizes it
 	// by the forwarding node's certificate (CN "node"), which carries
@@ -208,13 +254,41 @@ func TestCancelAuthorization(t *testing.T) {
 	if err := root.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, int32(pid2)).Scan(&ok); err != nil || !ok {
 		t.Fatalf("root's cross-node pg_terminate_backend: %v %v", ok, err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for !victim2.IsClosed() && time.Now().Before(deadline) {
 		_, _ = victim2.Exec(ctx, `SELECT 1`)
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !victim2.IsClosed() {
 		t.Fatal("cross-node pg_terminate_backend did not end the connection")
+	}
+}
+
+// waitForRunningStatement blocks until pid is reported running a
+// statement. Sleeping a fixed interval instead would leave every
+// negative assertion below proving only "nothing cancelled it", which
+// is the same claim as "the refusal held" only if there was something
+// to cancel; it is also the construct that made #215's test flake on a
+// loaded machine. probe must be connected to the node that owns pid,
+// since pg_stat_activity reports the sessions of the node it is asked
+// on.
+func waitForRunningStatement(t *testing.T, ctx context.Context, probe *pgx.Conn, pid uint32) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var n int
+		if err := probe.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = 'active'`,
+			int32(pid)).Scan(&n); err != nil {
+			t.Fatalf("polling pg_stat_activity for pid %d: %v", pid, err)
+		}
+		if n > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never showed a running statement", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

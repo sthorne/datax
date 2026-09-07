@@ -422,7 +422,9 @@ func TestCancelAndTimeouts(t *testing.T) {
 		_, err := conn2.Exec(ctx, `SELECT pg_sleep(20)`)
 		done <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
+	// conn is on the same node as conn2, and pg_stat_activity reports
+	// that node's own sessions, so it can see the statement start.
+	waitForRunningStatement(t, ctx, conn, pid2)
 
 	// cancelVia sends one CancelRequest packet to a node and hangs up,
 	// which is all a cancelling client does.
@@ -480,7 +482,12 @@ func TestCancelAndTimeouts(t *testing.T) {
 	cancelVia(1, pid2, wrong)
 	stillRunning("a wrong secret")
 	// A non-zero secret does cross, and is checked where the connection
-	// lives rather than where the packet landed.
+	// lives rather than where the packet landed. This count is also the
+	// positive control for the one above it: asserting an absence proves
+	// nothing unless the detector is known to fire, so anything that
+	// broke the counting — a reordered audit kv, a rename, cancel-query
+	// joining adminUnauditedOps — fails here instead of quietly
+	// satisfying the n != 0 check. Do not delete it as redundant.
 	if n := forwarded() - before; n != 1 {
 		t.Fatalf("a wrong secret produced %d forwarded admin ops, want 1; all: %v", n, rec.events)
 	}

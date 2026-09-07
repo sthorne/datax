@@ -47,9 +47,12 @@ type cancelRegistry struct {
 func newCancelRegistry() *cancelRegistry { return &cancelRegistry{byPID: map[int32]*conn{}} }
 
 // newSecret draws a connection's cancellation secret. Zero is drawn
-// again: it is the value a caller supplies when it holds no secret at
-// all, so a connection issued one would be cancellable by anybody who
-// guessed its process ID.
+// again, and for the opposite reason to the obvious one: CancelBySecret
+// refuses a zero outright, so a connection issued zero would be
+// cancellable by nobody — its own client's Ctrl-C would silently do
+// nothing — while being the one connection that a regression in that
+// refusal would make cancellable by everybody. Redrawing costs a
+// comparison and removes both.
 func newSecret() uint32 {
 	for {
 		var buf [4]byte
