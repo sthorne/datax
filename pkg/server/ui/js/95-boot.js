@@ -141,7 +141,7 @@ document.getElementById("node-filter").addEventListener("input", ev => {
   if (lastCluster) renderNodesTable(lastCluster);
 });
 document.getElementById("hdr-reload").addEventListener("click", () => location.reload());
-document.getElementById("events-filter").addEventListener("change", renderOps);
+document.getElementById("events-filter").addEventListener("change", ev => setOpsKind(ev.target.value));
 // The shape list re-ranks what it already has rather than re-fetching.
 document.getElementById("stmt-sort").addEventListener("change", renderStatementShapes);
 // One delegated listener for the whole shapes section: the rows are

@@ -91,22 +91,44 @@ function eventRow(e) {
   </tr>` };
 }
 
+// The events filter (issue #207): a kind, from the select or from the
+// route (#/ops?kind=health), and a substring the summary must carry,
+// from the route only (#/ops?kind=health&q=under-replicated is where a
+// problem's "history →" lands). Both ride in the URL so a filtered
+// timeline can be shared; choosing a kind by hand drops the substring,
+// which only ever meant something for the kind it came with.
+let opsFilter = { kind: "", q: "" };
+function applyOpsParams(params) {
+  opsFilter = { kind: params.get("kind") || "", q: params.get("q") || "" };
+}
+function setOpsKind(kind) {
+  opsFilter = { kind: kind || "", q: "" };
+  pushRoute(kind ? { kind } : {});
+  renderOps();
+}
 // renderOps draws the operations view: what the cluster is doing to
 // itself, newest first, with the audit stream left to the security view.
 function renderOps() {
   renderOperations();
   const sel = document.getElementById("events-filter");
-  const want = sel.value;
-  const kinds = [...eventsKinds].filter(k => !AUDIT_KINDS.has(k)).sort();
+  const want = opsFilter.kind, q = opsFilter.q;
+  // A kind the route asks for is offered even before the ring has shown
+  // one, so the select says what the page is filtered to.
+  const kinds = [...eventsKinds].filter(k => !AUDIT_KINDS.has(k));
+  if (want && !kinds.includes(want)) kinds.push(want);
+  kinds.sort();
   const opts = [`<option value="">all kinds</option>`].concat(kinds.map(k => `<option value="${esc(k)}"${k === want ? " selected" : ""}>${esc(k)}</option>`));
   if (sel.options.length !== opts.length) sel.innerHTML = opts.join("");
-  const rows = eventsAll.filter(e => !e.audit && (!want || e.kind === want)).slice().reverse();
+  if (sel.value !== want) sel.value = want;
+  const rows = eventsAll.filter(e => !e.audit && (!want || e.kind === want) && (!q || e.summary.includes(q))).slice().reverse();
+  const none = q ? `no ${esc(want || "")} events mentioning ${esc(q)}` : want ? `no ${esc(want)} events` : "nothing recorded yet";
   renderKeyed(document.getElementById("events"), rows.length ? rows.map(eventRow)
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${want ? "no " + esc(want) + " events" : "nothing recorded yet"}</td></tr>` }]);
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${none}</td></tr>` }]);
   document.getElementById("ops-scope").textContent =
     `the event ring of n${eventsNode || "?"}${lastCluster && eventsNode === lastCluster.node_id ? ", the node serving this page" : ""} — each node keeps its own`;
-  document.getElementById("events-note").textContent =
-    `${rows.length} of the last ${eventsAll.length} events (splits, merges, rebalances, repairs, snapshots, backups, upgrades, key rotations)`;
+  setHTML(document.getElementById("events-note"),
+    `${rows.length} of the last ${eventsAll.length} events (splits, merges, rebalances, repairs, snapshots, backups, upgrades, key rotations, health problems appearing and clearing)`
+    + (q ? ` · only those mentioning <b>${esc(q)}</b> — <a href="${routeTo("ops", want ? { kind: want } : {})}">show every ${esc(want || "")} event</a>` : ""));
 }
 
 // AUDIT_KINDS are the security-relevant records; they are shown on the

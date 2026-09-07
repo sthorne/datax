@@ -31,6 +31,35 @@ state or the internode protocol does, and an entry below says so.
   and `-` widens the window to twice its span. Panning is deliberately
   not included; selection plus a shareable address is most of the
   value.
+- **A health finding has a history** (#207). A problem on the panel was
+  a snapshot: it existed or it did not, and a row that appeared two
+  minutes ago and one that had been there since Tuesday were the same
+  row. Now each row says when this node's checks first found it — a
+  moment, so it reads the viewer's way — and the two transitions, the
+  problem appearing and the same problem clearing with how long it was
+  open, are recorded on the node's event ring under the kind `health`.
+  Transitions only: the checks run every few seconds, and a ring of
+  five hundred entries fed one record per run per open problem would
+  hold an hour of "still broken" and nothing else. A problem keeps its
+  identity, and its date, by check, node and range; its summary carries
+  figures that move every run, and a row re-dated whenever its figure
+  moved would answer "when did this start" with "just now", always. A
+  check that changes severity — `node-unresponsive` becoming
+  `node-down` — is a clear and an appearance, in that order. Each row's
+  **history** link opens the operations view filtered to the records
+  that name its check (`#/ops?kind=health&q=<check>`; the view now reads
+  both from the URL, so a filtered timeline can be shared), which is
+  where "has this been flapping" is answered. `/api/health` carries the
+  date as `since_unix_ms`.
+
+  The issue asked for a decision on acknowledging a finding before one
+  was built, and the decision is its third option: not in the console.
+  An acknowledgement is state that outlives a process and belongs to
+  the whole cluster, and the console does not write to the cluster
+  (#144); the place with silences that carry an owner and an expiry is
+  whatever alerts on `datax_health_problems`. A row that says how long
+  it has been open is one an operator can decide about at a glance,
+  which is most of what the permanently amber panel needed.
 - **The console's viewer preferences live in the cluster** (#204). Two
   display choices — light/dark/system, and whether a moment reads as how
   long ago it was or as the clock time it happened at — plus the place

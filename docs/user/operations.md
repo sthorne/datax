@@ -31,8 +31,10 @@ serves, on that address:
   it — each with the count of contributing nodes beside it when a node
   is down, so a smaller number is never mistaken for a quieter cluster.
   Below them: a problems panel (every finding of the health checks
-  below, colored by severity, each linking to the **view** that shows
-  the figure; a green line when there are none), one card per node
+  below, colored by severity, each saying when this node's checks first
+  found it and linking to the **view** that shows the figure and to its
+  **history** on the operations view; a green line when there are
+  none), one card per node
   (status, locality, CPU, load, memory, free space on the store's disk,
   file descriptors — colored and marked `!`/`!!` when they deserve a
   look — leases, data, QPS, connections, heartbeat age) opening that
@@ -191,8 +193,9 @@ serves, on that address:
   carry data.
 - **`/api/health`** — JSON: the problems panel's document: the findings
   of the health checks (see [Health checks](#health-checks)), sorted
-  critical first, and how many checks ran. Empty `problems` with a
-  non-zero `checks` count means green. Recomputed at most every 3 s.
+  critical first, each with `since_unix_ms` (when this node's checks
+  first found it open), and how many checks ran. Empty `problems` with
+  a non-zero `checks` count means green. Recomputed at most every 3 s.
 - **`/api/events?since=N&limit=M`** — JSON: the serving node's recent
   operational events (the last 500 are kept in memory; `since` returns
   only those after sequence `N`, which is how the dashboard tails). In
@@ -251,8 +254,31 @@ in `/api/health`, and as the gauge `datax_health_problems{severity,check}`
 (one series per finding; a check that finds nothing has no series).
 Alert on `datax_health_problems{severity="critical"} > 0` for the
 page-worthy ones and on `severity="warning"` for the rest, and the panel
-on any node's dashboard says what and where. The checks, with the
-section the dashboard row links to:
+on any node's dashboard says what and where.
+
+A finding has a history. Each row carries when this node's checks first
+found it (`since_unix_ms`; a problem is the same problem while its check,
+node and range agree, whatever its summary's figures now say), and the
+two transitions — the problem appearing, and the same problem clearing,
+with how long it was open — are recorded on the node's event ring under
+the kind `health` and nowhere in between, so a check that flaps leaves
+a pair of records per flap rather than a stream. The row's **history**
+link opens the operations view filtered to that check's records
+(`#/ops?kind=health&q=<check>`), which is where "has this been
+flapping" and "did it clear on its own" are answered. Both are as one
+node sees them: every node runs the checks for itself when something
+asks it for the document, so two nodes' consoles may date a problem a
+few seconds apart, and a restarted node dates every open problem from
+its first run.
+
+Acknowledging a finding is deliberately not a console feature. An
+acknowledgement is state that outlives a process and belongs to the
+cluster, and the console does not write to the cluster; it belongs to
+whatever alerts on `datax_health_problems`, which has silences with an
+owner and an expiry. The console's job is to report the state
+truthfully, and a row that says how long it has been open is one an
+operator can decide about at a glance. The checks, with the section the
+dashboard row links to:
 
 | Check | Severity | Fires when |
 |---|---|---|

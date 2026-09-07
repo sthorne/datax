@@ -144,6 +144,7 @@ func TestHealthAndEvents(t *testing.T) {
 
 	// Stop n3: its heartbeat ages through the grace window (warning) and
 	// then the dead threshold (critical), and /metrics carries the gauge.
+	stoppedAt := time.Now()
 	tc.StopNode(2)
 	sawWarning, sawCritical := false, false
 	deadline = time.Now().Add(dead + 30*time.Second)
@@ -193,6 +194,67 @@ func TestHealthAndEvents(t *testing.T) {
 	_, _, metricsBody := httpGet(t, "http://"+tc.Nodes[0].HTTPAddr()+"/metrics")
 	if !strings.Contains(metricsBody, `datax_health_problems{check="node-down",severity="critical"} 1`) {
 		t.Fatalf("/metrics lacks the node-down gauge:\n%s", grepLines(metricsBody, "datax_health_problems"))
+	}
+
+	// A problem's history (issue #207). The node-down row says when n1's
+	// checks first found it, and keeps saying it: the row is re-made on
+	// every run with a fresh heartbeat age in its summary, and the date
+	// must survive both that and the cache. The panel has been polled
+	// every 300 ms behind a 3 s cache since n3 stopped, so the checks
+	// have run several times over each open problem; each transition
+	// is on the event ring once.
+	sinceOf := func(doc server.HealthStatus) int64 {
+		for _, p := range doc.Problems {
+			if p.Check == "node-down" && p.Node == 3 {
+				return p.Since
+			}
+		}
+		t.Fatalf("no node-down row for n3: %+v", doc.Problems)
+		return 0
+	}
+	since := sinceOf(doc)
+	if since < stoppedAt.UnixMilli() || since > time.Now().UnixMilli() {
+		t.Fatalf("node-down since %d is not between the stop (%d) and now (%d)", since, stoppedAt.UnixMilli(), time.Now().UnixMilli())
+	}
+	time.Sleep(3500 * time.Millisecond) // past the cache: the next poll runs the checks again
+	if again := sinceOf(healthDoc(t, tc, 0)); again != since {
+		t.Fatalf("node-down since moved from %d to %d across a run of the checks: the row was re-dated", since, again)
+	}
+	var health []string
+	for _, e := range eventsDoc(t, tc, 0, before.Latest).Events {
+		if e.Kind == "health" {
+			health = append(health, e.Summary)
+		}
+	}
+	count := func(prefix string) int {
+		n := 0
+		for _, s := range health {
+			if strings.HasPrefix(s, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	for _, want := range []string{"node-unresponsive on n3 (warning): ", "node-unresponsive on n3 cleared after ", "node-down on n3 (critical): "} {
+		if got := count(want); got != 1 {
+			t.Fatalf("%d health events %q, want exactly one (appear and clear are recorded, the state between is not):\n%s", got, want, strings.Join(health, "\n"))
+		}
+	}
+	// The order is the order things happened: the warning appeared, then
+	// cleared as the critical took over.
+	order := []int{-1, -1, -1}
+	for i, s := range health {
+		switch {
+		case strings.HasPrefix(s, "node-unresponsive on n3 (warning)"):
+			order[0] = i
+		case strings.HasPrefix(s, "node-unresponsive on n3 cleared"):
+			order[1] = i
+		case strings.HasPrefix(s, "node-down on n3 (critical)"):
+			order[2] = i
+		}
+	}
+	if !(order[0] < order[1] && order[1] < order[2]) {
+		t.Fatalf("health events out of order %v:\n%s", order, strings.Join(health, "\n"))
 	}
 }
 

@@ -1999,3 +1999,67 @@ func TestChartsBrushToZoom(t *testing.T) {
 		t.Error("the range's glossary entry does not explain the drag or the keys: the gesture is undiscoverable")
 	}
 }
+
+// TestHealthFindingsCarryWhenTheyBegan (issue #207): a problem row says
+// when this node's checks first found it — through fmtWhen, since it is
+// a moment — and links to its history: the operations view, filtered
+// to the health records that name its check. The chain has four links
+// (the JSON field, the row, the route, the filter) and a break in any
+// one of them leaves a row that reads as it did before, so each is
+// pinned.
+func TestHealthFindingsCarryWhenTheyBegan(t *testing.T) {
+	api, err := os.ReadFile("../health_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(api), "Since int64 `json:\"since_unix_ms,omitempty\"`") {
+		t.Fatal("Problem.Since is no longer serialized as since_unix_ms; the row below reads that name")
+	}
+	// The ring records start with the check's name, which is what the
+	// history link's substring filter matches.
+	for _, want := range []string{
+		`return fmt.Sprintf("%s%s (%s): %s", p.Check, p.subject()`,
+		`return fmt.Sprintf("%s%s cleared after %s", p.Check, p.subject()`,
+	} {
+		if !strings.Contains(string(api), want) {
+			t.Errorf("health_api.go no longer phrases a transition as %s: the history link filters the ring by the check's name at the start of the summary", want)
+		}
+	}
+	health := string(mustRead(t, "js/80-health.js"))
+	if !strings.Contains(health, "fmtWhen(p.since_unix_ms)") {
+		t.Error("80-health.js does not render since_unix_ms through fmtWhen: a row has no date, or has one that ignores the viewer's preference")
+	}
+	if !strings.Contains(health, `routeTo("ops", { kind: "health", q: p.check })`) {
+		t.Error("80-health.js does not link a row to #/ops filtered to its check")
+	}
+	span := jsFuncSpan(health, "renderHealth")
+	if span == nil {
+		t.Fatal("renderHealth not found")
+	}
+	row := health[span[0]:span[1]]
+	for _, want := range []string{"problemSince(p)", "problemHistory(p)"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("renderHealth does not put %s in the row", want)
+		}
+	}
+	ops := string(mustRead(t, "js/92-ops.js"))
+	span = jsFuncSpan(ops, "renderOps")
+	if span == nil {
+		t.Fatal("renderOps not found")
+	}
+	body := ops[span[0]:span[1]]
+	if !strings.Contains(body, "e.summary.includes(q)") || !strings.Contains(body, "opsFilter.q") {
+		t.Error("renderOps does not filter events by the route's q: the history link lands on every health event")
+	}
+	if !strings.Contains(body, "opsFilter.kind") {
+		t.Error("renderOps does not take its kind from the route: #/ops?kind=health shows every kind")
+	}
+	router := string(mustRead(t, "js/15-router.js"))
+	if !strings.Contains(router, `if (r.view === "ops") applyOpsParams(r.params);`) {
+		t.Error("route() does not hand #/ops its params: kind= and q= in the URL do nothing")
+	}
+	boot := string(mustRead(t, "js/95-boot.js"))
+	if !strings.Contains(boot, "setOpsKind(ev.target.value)") {
+		t.Error("the events filter select no longer goes through setOpsKind: a choice made by hand is not in the URL, and the route's q is not dropped")
+	}
+}

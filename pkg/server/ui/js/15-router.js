@@ -267,6 +267,7 @@ function route() {
   // already expanded, rather than after the next statements poll.
   if (r.view === "sql" && stmtOpen) renderStatementDetail(stmtOpen);
   if (r.view === "nodes" && r.params.get("locality")) setNodeFilter(r.params.get("locality"));
+  if (r.view === "ops") applyOpsParams(r.params);
   applySchedule(r.view);
   // Restore where this view was, or take the reader to the section a
   // health finding named.

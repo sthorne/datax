@@ -45,6 +45,14 @@ type Problem struct {
 	Range int64 `json:"range,omitempty"`
 	// Section is the dashboard section the row links to.
 	Section string `json:"section,omitempty"`
+	// Since is when this node's checks first found the problem open, in
+	// wall-clock milliseconds, and it holds across check runs until the
+	// problem clears (issue #207). A problem is the same problem while
+	// its check, node and range agree: the summary carries figures — a
+	// heartbeat age, a replica count — that change from one run to the
+	// next, and a row that was re-dated every time its figure moved
+	// would answer "when did this start" with "just now", always.
+	Since int64 `json:"since_unix_ms,omitempty"`
 }
 
 // HealthStatus is the /api/health document.
@@ -84,6 +92,92 @@ type healthCache struct {
 	at   time.Time
 	doc  *HealthStatus
 	prev counterSamples
+	open problemTracker
+}
+
+// problemTracker remembers which findings were open at the last run of
+// the checks, so a run can tell a problem that just appeared from one
+// that has been there since Tuesday, and can notice one that cleared
+// (issue #207). Both transitions go to the event ring; the state
+// between them does not. The checks run every few seconds, and a ring
+// of five hundred entries fed one record per run per open problem
+// would carry an hour of "still broken" and nothing else.
+//
+// The tracker is per node and in memory, like the ring it feeds: each
+// node runs the checks for itself, so each records its own view of
+// when a problem began, and a restarted node knows nothing of what was
+// open before it. The checks also run only when something asks for
+// the document — a console, a poll of /api/health — so "first found
+// open" is as of the first run after the problem began, which is what
+// the field's comment says.
+type problemTracker struct {
+	open map[string]Problem
+}
+
+// problemKey is the identity a problem keeps between runs.
+func problemKey(p Problem) string {
+	return fmt.Sprintf("%s|%d|%d", p.Check, p.Node, p.Range)
+}
+
+// settle stamps Since on every problem of this run and returns the
+// transitions since the last: the problems that appeared, in the order
+// given, and those that cleared, as they were last seen, in a stable
+// order. A problem seen on consecutive runs keeps the Since it was
+// given when it appeared, whatever its summary now says.
+func (t *problemTracker) settle(probs []Problem, nowMs int64) (appeared, cleared []Problem) {
+	if t.open == nil {
+		t.open = map[string]Problem{}
+	}
+	seen := map[string]bool{}
+	for i := range probs {
+		k := problemKey(probs[i])
+		if prev, ok := t.open[k]; ok {
+			probs[i].Since = prev.Since
+		} else {
+			probs[i].Since = nowMs
+			appeared = append(appeared, probs[i])
+		}
+		t.open[k] = probs[i]
+		seen[k] = true
+	}
+	var gone []string
+	for k := range t.open {
+		if !seen[k] {
+			gone = append(gone, k)
+		}
+	}
+	sort.Strings(gone)
+	for _, k := range gone {
+		cleared = append(cleared, t.open[k])
+		delete(t.open, k)
+	}
+	return appeared, cleared
+}
+
+// subject names what a problem concerns, for a sentence about it.
+func (p Problem) subject() string {
+	switch {
+	case p.Node != 0:
+		return fmt.Sprintf(" on n%d", p.Node)
+	case p.Range != 0:
+		return fmt.Sprintf(" on r%d", p.Range)
+	}
+	return ""
+}
+
+// appearedSummary and clearedSummary phrase the two transitions for the
+// event ring. Both start with the check's name, so the operations view
+// filtered to that check finds every one of its transitions.
+func appearedSummary(p Problem) string {
+	return fmt.Sprintf("%s%s (%s): %s", p.Check, p.subject(), p.Severity, p.Summary)
+}
+
+func clearedSummary(p Problem, nowMs int64) string {
+	open := time.Duration(nowMs-p.Since) * time.Millisecond
+	if open < 0 {
+		open = 0
+	}
+	return fmt.Sprintf("%s%s cleared after %s", p.Check, p.subject(), open.Truncate(time.Second))
 }
 
 // counterSamples remembers earlier readings of cumulative counters so a
@@ -490,6 +584,17 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	sort.SliceStable(doc.Problems, func(i, j int) bool {
 		return severityRank(doc.Problems[i].Severity) < severityRank(doc.Problems[j].Severity)
 	})
+	// Transitions go to the event ring — what cleared first, so a check
+	// that changed severity (node-unresponsive becoming node-down) reads
+	// in order — and every row learns when it was first found open.
+	nowMs := nowWall / int64(time.Millisecond)
+	appeared, cleared := n.health.open.settle(doc.Problems, nowMs)
+	for _, p := range cleared {
+		n.events.Record("health", "%s", clearedSummary(p, nowMs))
+	}
+	for _, p := range appeared {
+		n.events.Record("health", "%s", appearedSummary(p))
+	}
 	// Gauges: one per (severity, check) pair, zeroed for the pairs that
 	// cleared so alerts resolve.
 	metrics.HealthProblems.Reset()
