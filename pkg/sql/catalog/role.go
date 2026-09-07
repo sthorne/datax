@@ -510,6 +510,27 @@ func IsMember(ctx context.Context, r RoleReader, name, role string) (bool, error
 
 // OwnerOf returns an object's owner, root for objects that predate
 // ownership (an empty owner).
+// CanSeeTable reports whether a role set may see a table in the
+// catalogs: admins, the owner, any grantee (directly or through a role
+// the set holds, `public` included), read_all and write_all.
+//
+// It lives here rather than in the SQL layer because the console asks
+// the same question over HTTP and got a narrower answer — a direct-grant
+// lookup by the principal's own name, which misses `public`, misses a
+// grant to a role the user is a member of, and misses ownership, which
+// is not a row in Privileges at all (issue #197).
+func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
+	if set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) || set.Has(WriteAllRole) {
+		return true
+	}
+	for g := range d.Privileges {
+		if set.Has(g) {
+			return true
+		}
+	}
+	return false
+}
+
 func OwnerOf(owner string) string {
 	if owner == "" {
 		return RootRole

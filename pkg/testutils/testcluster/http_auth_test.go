@@ -364,3 +364,135 @@ func TestHTTPCertAuthChecksLogin(t *testing.T) {
 		t.Fatalf("node certificate on an admin endpoint: %d, want 200", code)
 	}
 }
+
+// TestSchemaAPIResolvesRoles (issue #197): /api/schema must show a
+// non-admin the tables it can actually read, not only the ones granted
+// to it by name.
+//
+// The filter was a direct-grant lookup keyed by the principal's own
+// username, which is a narrower test than privilege resolution: it
+// missed a grant to `public`, a grant to a role the user is a member of,
+// and ownership, which is not a row in the privilege map at all. It
+// failed closed, so this was never a disclosure — but in the common
+// deployment where access is granted through roles rather than to
+// individuals, a non-admin opened the schema view and saw nothing it
+// could not equally well query from psql.
+func TestSchemaAPIResolvesRoles(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	db, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	for _, stmt := range []string{
+		// One table per way a user can reach a table without a grant in
+		// its own name, plus one it must not see.
+		`CREATE TABLE via_role (id INT PRIMARY KEY)`,
+		`CREATE TABLE via_public (id INT PRIMARY KEY)`,
+		`CREATE TABLE via_none (id INT PRIMARY KEY)`,
+		`CREATE ROLE readers`,
+		`GRANT SELECT ON via_role TO readers`,
+		`GRANT SELECT ON via_public TO public`,
+		`CREATE USER alice WITH PASSWORD 'alicepw'`,
+		`GRANT readers TO alice`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// The console's answer must match what alice can actually read. The
+	// document is rebuilt at most once every schemaCacheFor, so poll for
+	// the tables to appear rather than racing the rebuild.
+	var doc server.SchemaStatus
+	seen := map[string]bool{}
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		code, body, _ := authedGet(t, client, base+"/api/schema", "alice", "alicepw")
+		if code != http.StatusOK {
+			t.Fatalf("/api/schema as alice: %d", code)
+		}
+		doc = server.SchemaStatus{}
+		if err := jsonUnmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		seen = map[string]bool{}
+		for _, tbl := range doc.Tables {
+			seen[tbl.Name] = true
+		}
+		if seen["via_role"] && seen["via_public"] {
+			break
+		}
+		if time.Now().After(deadline) {
+			if !seen["via_role"] {
+				t.Error("via_role: granted to a role alice is a member of, and not shown")
+			}
+			if !seen["via_public"] {
+				t.Error("via_public: granted to public, which every role holds, and not shown")
+			}
+			t.Fatalf("alice's schema after 30s: %v", seen)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if seen["via_none"] {
+		t.Error("via_none: alice holds nothing on it and it was shown")
+	}
+	if doc.Users != nil {
+		t.Error("a non-admin was shown the user list")
+	}
+
+	// The table is visible; the names of everyone else granted on it are
+	// not — the same call /api/security makes.
+	if _, err := db.Exec(ctx, `CREATE ROLE auditors`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `GRANT SELECT ON via_role TO auditors`); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		code, body, _ := authedGet(t, client, base+"/api/schema", "alice", "alicepw")
+		doc = server.SchemaStatus{}
+		if code == http.StatusOK && jsonUnmarshal([]byte(body), &doc) == nil {
+			for _, tbl := range doc.Tables {
+				if tbl.Name != "via_role" {
+					continue
+				}
+				if _, leaked := tbl.Privileges["auditors"]; leaked {
+					t.Fatal("via_role names auditors to alice, who is not a member of it")
+				}
+				if _, own := tbl.Privileges["readers"]; own {
+					return // alice sees the grant she holds, and not the other
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("alice never saw her own grant on via_role: %+v", doc.Tables)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}

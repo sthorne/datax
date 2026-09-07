@@ -150,21 +150,76 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 	doc.Now = n.clock.Now().WallTime / int64(time.Millisecond)
 	doc.Principal = p
 	if !p.Admin {
-		// A user sees the tables it holds a grant on, and not who else
-		// exists.
-		var visible []SchemaTable
+		// A user sees the tables it may read, and not who else exists.
+		//
+		// "May read" is privilege resolution, not a direct-grant lookup:
+		// a grant to `public`, a grant to a role the user is a member of,
+		// ownership (which is not a row in Privileges at all), and the
+		// read_all / write_all roles all count. Asking the narrower
+		// question made the console disagree with SHOW TABLES about the
+		// same user's schema — failing closed, so not a disclosure, but
+		// in the common deployment where access is granted through roles
+		// most non-admins saw nothing at all (issue #197).
+		set, err := catalog.LazyRoleGraph(req.Context(), n.db).Effective(p.User)
+		if err != nil {
+			// Fail closed and say so, rather than showing a list built
+			// from a predicate that did not run.
+			doc.Tables, doc.Users = nil, nil
+			doc.Error = "cannot resolve roles for " + p.User + ": " + err.Error()
+			writeSchemaDoc(w, &doc)
+			return
+		}
+		descs := n.tableDescs()
+		visible := make([]SchemaTable, 0, len(full.Tables))
 		for _, t := range full.Tables {
-			if len(t.Privileges[p.User]) > 0 {
-				visible = append(visible, t)
+			d := descs[t.ID]
+			if d == nil || !catalog.CanSeeTable(set, d) {
+				continue
 			}
+			// The table is visible; its full grantee list is not. Naming
+			// every other role granted on a table is the kind of thing
+			// /api/security filters rather than gates, and the same
+			// applies here: the caller sees its own effective grants.
+			t.Privileges = ownGrants(set, d.Privileges)
+			visible = append(visible, t)
 		}
 		doc.Tables = visible
 		doc.Users = nil
 	}
+	writeSchemaDoc(w, &doc)
+}
+
+func writeSchemaDoc(w http.ResponseWriter, doc *SchemaStatus) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(doc)
+}
+
+// ownGrants narrows a table's grantee map to the roles the caller
+// actually holds. The result is a fresh map: the one it filters belongs
+// to the cached document every request shares.
+func ownGrants(set catalog.RoleSet, privs map[string][]string) map[string][]string {
+	var own map[string][]string
+	for g, list := range privs {
+		if !set.Has(g) {
+			continue
+		}
+		if own == nil {
+			own = map[string][]string{}
+		}
+		own[g] = list
+	}
+	return own
+}
+
+// tableDescs is the descriptor map the last catalog scan built, for the
+// questions the API shape cannot answer on its own (ownership, and so
+// visibility).
+func (n *Node) tableDescs() map[uint64]*catalog.TableDescriptor {
+	n.schema.mu.Lock()
+	defer n.schema.mu.Unlock()
+	return n.schema.descs
 }
 
 // schemaDoc returns the cached full document, rebuilding it past
