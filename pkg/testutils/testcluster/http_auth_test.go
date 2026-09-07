@@ -429,7 +429,8 @@ func TestSchemaAPIResolvesRoles(t *testing.T) {
 	// document is rebuilt at most once every schemaCacheFor, so poll for
 	// the tables to appear rather than racing the rebuild.
 	var doc server.SchemaStatus
-	seen := map[string]bool{}
+	// Filled by each poll below before it is read.
+	var seen map[string]bool
 	deadline = time.Now().Add(30 * time.Second)
 	for {
 		code, body, _ := authedGet(t, client, base+"/api/schema", "alice", "alicepw")
