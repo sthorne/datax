@@ -89,17 +89,20 @@ type SecurityStatus struct {
 	AuthFailures float64 `json:"auth_failures"`
 	AdminDenied  float64 `json:"admin_denied"`
 	// AuthThrottled counts attempts refused before any password was
-	// verified, split by cause (issue #203): ThrottledRateLimit is the
-	// per-source/per-account limiter refusing one caller,
-	// ThrottledVerifyFull this node already verifying as many passwords
-	// at once as it allows. The total is the two summed; both are
-	// cumulative since start, like the two above.
+	// verified, split by cause (issues #203, #221): ThrottledRateLimit is
+	// the per-source/per-account attempt limiter refusing one caller,
+	// ThrottledVerifyRate one source past its verification budget (spent
+	// by every verification, right password or not), ThrottledVerifyFull
+	// this node already verifying as many passwords at once as it
+	// allows. The total is the three summed; all are cumulative since
+	// start, like the two above.
 	//
 	// Not gated on the admin role: these are counts of this node's own
 	// refusals and name nobody. Which addresses were throttled would
 	// name people, and is deliberately not published.
 	AuthThrottled       float64 `json:"auth_throttled"`
 	ThrottledRateLimit  float64 `json:"auth_throttled_rate_limit"`
+	ThrottledVerifyRate float64 `json:"auth_throttled_verify_rate"`
 	ThrottledVerifyFull float64 `json:"auth_throttled_verify_full"`
 	// Stores is the serving node's own store encryption state. Each
 	// node's is on its own page; a cluster-wide sweep would be a fan-out
@@ -131,8 +134,9 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 		AdminDenied:  counterValue(metrics.AdminDenied),
 	}
 	doc.ThrottledRateLimit = counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit))
+	doc.ThrottledVerifyRate = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate))
 	doc.ThrottledVerifyFull = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
-	doc.AuthThrottled = doc.ThrottledRateLimit + doc.ThrottledVerifyFull
+	doc.AuthThrottled = doc.ThrottledRateLimit + doc.ThrottledVerifyRate + doc.ThrottledVerifyFull
 
 	// Certificates. The loaded material is operational and open; the
 	// clients observed connecting name people, so they are not.

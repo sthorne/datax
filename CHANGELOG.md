@@ -162,6 +162,34 @@ state or the internode protocol does, and an entry below says so.
   as with #211, **no cluster version, and the roll is a window**: an
   un-upgraded node has no bound at all on its SQL port, so for the
   duration of the roll an attacker simply picks one. Roll promptly.
+- **A caller holding a valid credential is no longer exempt from the
+  authentication bound** (#221). The attempt budget #195 added is
+  refunded by a success — it has to be, or a legitimate user sharing an
+  address with a guessing loop is locked out — and that made success a
+  reset button: a caller re-sending a valid password on every request,
+  which is what HTTP Basic does, ran a PBKDF2 derivation per request
+  with nothing but the four-slot in-flight cap between it and the
+  node's cores (measured at 470 a second). The cost of a verification
+  is the same whether or not the password was right, so there is now a
+  **verification budget per source** — a hundred in a burst, twenty a
+  second sustained — spent by every verification the HTTP doors run
+  and refunded by nothing. It is asked after the attempt budget, so a
+  guesser is refused by the latter as before and never reaches it, and
+  it is sized for how the doors are used (a scraper, a script, a
+  support bundle) rather than for a person. Refusals count under a new
+  `datax_auth_throttled_total{cause="verify-rate"}`, reach
+  `/api/security` as `auth_throttled_verify_rate`, the health check,
+  and the console's *refused before verification* figure. Nothing on
+  the SQL port spends it: SCRAM's server side runs no derivation, so a
+  pool reconnecting as often as it likes is not refused. The console's
+  glossary entry for that figure, which said the SQL port had no
+  limiter of its own, is corrected for #212. Unlike `--auth-timeout`
+  and `--sql-max-pending-auth`, the two figures are constants, by
+  decision rather than omission: the deployment that could meet them
+  is a fleet of HTTP Basic automation behind one address (a NAT, a
+  proxy, an egress gateway), whose symptom would be 429s on requests
+  that worked yesterday, and the `verify-rate` cause names it. A knob
+  is a small change if anyone meets it.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a

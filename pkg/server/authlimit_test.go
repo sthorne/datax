@@ -270,3 +270,68 @@ func TestAuthLimiterDebtFloorCoversTheWidestWave(t *testing.T) {
 		t.Fatal("the wave cost more than its width in seconds")
 	}
 }
+
+// The verification budget (issue #221): spent by every verification a
+// source has run, right password or not, and refunded by nothing — so
+// a caller holding a valid credential is bounded by it exactly as a
+// guesser is, where the attempt buckets, refunded on success, let it
+// verify without limit.
+func TestAuthLimiterVerificationBudgetIsNotRefundedBySuccess(t *testing.T) {
+	l := newAuthLimiter(0)
+	now := time.Now()
+	l.nowFn = func() time.Time { return now }
+
+	// A burst of successful sign-ins spends the budget; the attempt
+	// bucket, refunded each time, would have admitted every one.
+	admitted := 0
+	for i := 0; i < authVerifyBurst*2; i++ {
+		if !l.allow("10.0.0.1:5000", "alice") {
+			t.Fatalf("sign-in %d refused by the attempt bucket after successes: the refund is not working", i)
+		}
+		if l.allowVerify("10.0.0.1:5000") {
+			admitted++
+		}
+		l.succeeded("10.0.0.1:5000", "alice")
+	}
+	if admitted != authVerifyBurst {
+		t.Fatalf("%d verifications admitted from one source in a burst; the budget is %d", admitted, authVerifyBurst)
+	}
+	if l.allowVerify("10.0.0.1:5000") {
+		t.Fatal("a success refunded the verification budget")
+	}
+	// Another source has its own.
+	if !l.allowVerify("10.0.0.2:5000") {
+		t.Fatal("one source's verifications spent another's budget")
+	}
+	// It refills at its own rate, well above a person's and well below
+	// what pins a core.
+	now = now.Add(time.Second)
+	got := 0
+	for l.allowVerify("10.0.0.1:5000") {
+		got++
+	}
+	if got != authVerifyRate {
+		t.Fatalf("%d verifications admitted after a second, want the refill rate %d", got, authVerifyRate)
+	}
+	// A refusal by the verification budget returns the attempt charge:
+	// nothing was checked, so the source is refused as what it is — over
+	// its verification budget — rather than, five refusals on, as a
+	// guesser out of attempts.
+	for i := 0; i < authAccountBurst*3; i++ {
+		if !l.allow("10.0.0.1:5000", "alice") {
+			t.Fatalf("attempt %d refused as rate-limit while over the verification budget: the attempt charge is not being returned", i)
+		}
+		if l.allowVerify("10.0.0.1:5000") {
+			t.Fatalf("verification %d admitted with the budget spent", i)
+		}
+		l.unspend("10.0.0.1:5000", "alice")
+	}
+	// And the budget is asked after the attempt bucket, so a guesser
+	// never reaches it: the attempt bucket's own bound is unchanged.
+	for i := 0; i < authBurst*2; i++ {
+		l.allow("10.0.0.3:5000", "alice")
+	}
+	if l.allow("10.0.0.3:5000", "alice") {
+		t.Fatal("the attempt bucket stopped bounding guesses")
+	}
+}
