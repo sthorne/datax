@@ -258,9 +258,15 @@ var (
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})
-	AuthThrottled = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
-		Name: "datax_auth_throttled_total", Help: "Authentication attempts refused by the rate limiter before any password verification ran (issue #195).",
-	})
+	// Labelled by cause because the two refusals mean different things:
+	// "rate-limit" is one source (or one source and account) asking too
+	// often, and "verify-full" is this node already running as many
+	// password verifications as it allows at once — one caller
+	// misbehaving against the node at its ceiling (issue #203).
+	AuthThrottled = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_auth_throttled_total",
+		Help: "Authentication attempts refused before any password verification ran (issue #195), by cause: rate-limit (the per-source/per-account limiter), verify-full (the concurrent-verification cap).",
+	}, []string{"cause"})
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
 	})

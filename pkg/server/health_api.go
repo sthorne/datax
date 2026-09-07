@@ -66,6 +66,12 @@ const (
 	diskFreeCritical = 0.05
 	fdWarn           = 0.8
 	authFailureRate  = 1.0 // per second over the last five minutes
+	// authThrottleRate is the sustained refusal rate worth reporting. The
+	// limiter hands each source a burst and then refills about one a
+	// second, so a single client looping settles near one refusal a
+	// second: above that, something is hammering this node rather than
+	// one request arriving at an awkward moment (issue #203).
+	authThrottleRate = 1.0
 )
 
 type healthCache struct {
@@ -80,6 +86,7 @@ type healthCache struct {
 type counterSamples struct {
 	stalls   []sample
 	auth     []sample
+	throttle []sample
 	bgErrors int64
 }
 
@@ -378,6 +385,26 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	if window := now.Sub(n.health.prev.auth[0].at); window > 0 && authDelta/window.Seconds() > authFailureRate {
 		add(Problem{Severity: SeverityWarning, Check: "auth-failures", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication failures or denied admin operations in the last %s on this node", int(authDelta), window.Truncate(time.Second))})
+	}
+
+	// Throttling is reported as a rate, not a total: the counter is
+	// cumulative since start, so one bad afternoon would leave the
+	// panel amber forever — which is how a panel stops being read
+	// (issue #203). One check rather than two, because both causes are
+	// the same event to the reader ("this node is refusing logins
+	// before it checks them"); the summary names which, since a caller
+	// asking too often and this node at its verification ceiling call
+	// for different actions.
+	doc.Checks++
+	rl := counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit))
+	vf := counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
+	var throttleDelta float64
+	n.health.prev.throttle, throttleDelta = rateOver(n.health.prev.throttle, rl+vf, now)
+	if window := now.Sub(n.health.prev.throttle[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
+		add(Problem{Severity: SeverityWarning, Check: "auth-throttled", Node: int(n.ident.NodeID), Section: "events",
+			Summary: fmt.Sprintf("%d authentication attempts refused before verification in the last %s on this node "+
+				"(%d rate-limited, %d over the concurrent-verification cap): something is attempting to authenticate far faster than any client should",
+				int(throttleDelta), window.Truncate(time.Second), int(rl), int(vf))})
 	}
 
 	// Capacity: a store on course to fill, from the recorded free-space

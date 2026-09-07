@@ -230,13 +230,37 @@ function renderSecurityDoc() {
 // the audit stream. The certificate, connection, encryption and role
 // panels are drawn by renderSecurityDoc from /api/security (issue #156);
 // this draws what rides the cluster poll.
+
+// authThrottleText renders the refusals this node made before it
+// verified anything, naming the two causes apart: a caller asking too
+// often is somebody else's client to fix, and the concurrent-verify cap
+// filling is this node at its own ceiling (issue #203). Cumulative
+// since this node started, and said so — the health check is what
+// reports a rate, because a lifetime total is amber forever after one
+// bad afternoon.
+function authThrottleText(d) {
+  const rl = Math.round((d && d.auth_throttled_rate_limit) || 0);
+  const vf = Math.round((d && d.auth_throttled_verify_full) || 0);
+  if (!rl && !vf) return "none" + qual(" since this node started");
+  const parts = [];
+  if (rl) parts.push(rl + " rate-limited");
+  if (vf) parts.push(vf + " at the verify cap");
+  return String(rl + vf) + qual(" since this node started · " + parts.join(" · "));
+}
+
 function renderSecurity(d) {
   const p = d.principal || {};
   renderTiles(document.getElementById("sec-auth"),
     tile("mode", p.secure ? "secure" : "insecure — no authentication") +
     tile("signed in as", p.secure ? (p.user || "?") : "everyone is root") +
     tile("signed in by", p.secure ? (VIA_NAMES[p.via] || p.via || "?") : "—") +
-    tile("admin role", p.admin ? "held" : "not held"));
+    tile("admin role", p.admin ? "held" : "not held") +
+    // The one authentication figure that means something is happening
+    // now rather than describing how this page got here (issue #203).
+    // A tile rather than a third clause on the connections sentence:
+    // it is an authentication figure, not a connections one, and a tile
+    // label is a term the glossary can explain.
+    tileHTML("refused before verification", authThrottleText(d)));
   document.getElementById("sec-auth-note").textContent = p.secure
     ? "every HTTP route takes a session cookie, HTTP Basic credentials, or a client certificate; all three need a role that exists and holds LOGIN"
     : "this cluster authenticates nobody: start the nodes with a certificate directory to change that";

@@ -439,12 +439,12 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			// Basic re-verifies on every request, so this door costs the
 			// node the same PBKDF2 derivation per request rather than
 			// once per session (issue #195).
-			n.authThrottled(req.RemoteAddr, user, req.URL.Path)
+			n.authThrottled(req.RemoteAddr, user, req.URL.Path, throttleRateLimit)
 			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
 			return
 		}
 		if ok && !n.authLimit.acquireVerify() {
-			n.authThrottled(req.RemoteAddr, user, req.URL.Path)
+			n.authThrottled(req.RemoteAddr, user, req.URL.Path, throttleVerifyFull)
 			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
 			return
 		}
