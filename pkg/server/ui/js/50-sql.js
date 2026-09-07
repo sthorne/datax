@@ -429,7 +429,8 @@ async function explainShape(fp) {
       return;
     }
     out.innerHTML = `<pre class="key" style="white-space:pre-wrap">${esc((d.plan || []).join("\n") || "no plan returned")}</pre>`
-      + `<p class="muted">the plan for the statement above, on n${stmtDoc ? stmtDoc.node_id : "?"} — described, not run</p>`;
+      + `<p class="muted">the plan for the statement above, on n${stmtDoc ? stmtDoc.node_id : "?"} — described, not run`
+      + (d.planned_as ? `, as ${esc(d.planned_as)}` : "") + `</p>`;
   } catch (err) {
     out.innerHTML = `<div class="note">${esc(err.message || String(err))}</div>`;
   }

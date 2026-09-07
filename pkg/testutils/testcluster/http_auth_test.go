@@ -496,3 +496,100 @@ func TestSchemaAPIResolvesRoles(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 }
+
+// TestExplainPlansAsTheCaller (issue #193): /api/explain produced its
+// plan through the node's own system session, so the plan a console
+// button returned was not the one the operator's query would produce —
+// different privileges, and a session that bypasses grants and may
+// create system tables. Every other view filters what it shows by what
+// the caller may see; this one did not, and said nothing about it.
+func TestExplainPlansAsTheCaller(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	db, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	for _, stmt := range []string{
+		`CREATE TABLE plans (id INT PRIMARY KEY, v INT)`,
+		`INSERT INTO plans VALUES (1, 1)`,
+		`CREATE USER carol WITH PASSWORD 'carolpw'`,
+		`GRANT admin TO carol`, // /api/explain is admin-gated
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Run a statement so the shape is in this node's accounting: the
+	// endpoint explains what it recorded, never text from the request.
+	if _, err := db.Exec(ctx, `SELECT id FROM plans WHERE v = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the shape, then explain it as carol.
+	var fp string
+	deadline = time.Now().Add(30 * time.Second)
+	for fp == "" {
+		code, body, _ := authedGet(t, client, base+"/api/statements", "carol", "carolpw")
+		if code == http.StatusOK {
+			var doc server.StatementsStatus
+			if jsonUnmarshal([]byte(body), &doc) == nil {
+				for _, sh := range doc.Statements {
+					// The SELECT specifically: EXPLAIN describes a query
+					// plan, and the other shapes on this table are DDL.
+					if sh.Kind == "select" && strings.Contains(sh.Shape, "plans") {
+						fp = sh.Fingerprint
+					}
+				}
+			}
+		}
+		if fp == "" && time.Now().After(deadline) {
+			t.Fatalf("no statement shape for the test query after 30s; last body: %.400s", body)
+		}
+		if fp == "" {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+
+	code, body, _ := authedGet(t, client, base+"/api/explain?fingerprint="+fp, "carol", "carolpw")
+	if code != http.StatusOK {
+		t.Fatalf("/api/explain as carol: %d %s", code, body)
+	}
+	var ex server.ExplainStatus
+	if err := jsonUnmarshal([]byte(body), &ex); err != nil {
+		t.Fatal(err)
+	}
+	if ex.Error != "" {
+		t.Fatalf("explain error: %s", ex.Error)
+	}
+	if ex.PlannedAs != "carol" {
+		t.Errorf("plan produced as %q, want carol: the console must not have to assume whose privileges a plan reflects", ex.PlannedAs)
+	}
+	if len(ex.Plan) == 0 {
+		t.Error("no plan returned")
+	}
+}
