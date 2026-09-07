@@ -199,3 +199,84 @@ func TestSuccessfulSignInsSpendTheVerificationBudget(t *testing.T) {
 		_ = c.Close(ctx)
 	}
 }
+
+// TestGuessingStaysBoundedAtBothDoors (issue #221, from QA's review of
+// its fix): unspend returns the attempt charge when the verification
+// budget refuses — and only then. Called on every request it would
+// refund every guess, and the per-account guessing bound of #195 (five,
+// then one a second) would silently become the verification burst (a
+// hundred), with every other test still green: they check that refusal
+// arrives, not the count at which it arrives. This pins the count, at
+// each door, since the two call sites are independent.
+func TestGuessingStaysBoundedAtBothDoors(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	root := waitForRoot(t, ctx, tc, certsDir)
+	defer root.Close(ctx)
+
+	// The bound: authAccountBurst guesses at one account from one
+	// address, plus one a second for the time the loop takes — a loop
+	// of thirty guesses takes well under a second, so allow one.
+	const bound = 5 + 1
+
+	// Basic, from a fresh address: wrong passwords for root until the
+	// first refusal.
+	guesser := httpsClientFrom(t, certsDir, "", "127.0.0.8")
+	ran := 0
+	for i := 0; i < 30; i++ {
+		code, _, _ := authedGet(t, guesser, base+"/status", "root", "wrong")
+		if code == http.StatusTooManyRequests {
+			break
+		}
+		if code != http.StatusUnauthorized {
+			t.Fatalf("Basic guess %d: %d, want 401 or 429", i, code)
+		}
+		ran++
+	}
+	if ran > bound {
+		t.Fatalf("%d wrong Basic guesses at one account ran before a refusal (bound %d): the guessing bound is being refunded", ran, bound)
+	}
+	if ran == 0 {
+		t.Fatal("the first Basic guess was refused: the bound is not what this test measures")
+	}
+
+	// /api/login, from another fresh address, the same.
+	signer := httpsClientFrom(t, certsDir, "", "127.0.0.9")
+	ran = 0
+	for i := 0; i < 30; i++ {
+		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(`{"user":"root","password":"wrong"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := signer.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			break
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("/api/login guess %d: %d, want 401 or 429", i, resp.StatusCode)
+		}
+		ran++
+	}
+	if ran > bound {
+		t.Fatalf("%d wrong /api/login guesses at one account ran before a refusal (bound %d): the guessing bound is being refunded", ran, bound)
+	}
+	if ran == 0 {
+		t.Fatal("the first /api/login guess was refused: the bound is not what this test measures")
+	}
+}
