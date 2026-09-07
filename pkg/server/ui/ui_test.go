@@ -896,6 +896,38 @@ func TestSecurityFiguresReadTheDocumentThatCarriesThem(t *testing.T) {
 	if covered == 0 {
 		t.Error("no document-specific parameter had a traceable call site: this test is no longer checking anything")
 	}
+
+	// A non-zero count is too low a floor on its own. readsField sees
+	// `name.field` and `name["field"]` and nothing else, so destructuring
+	// the document in a signature or a body takes that parameter out of
+	// the extractor's sight — the check quietly stops watching the
+	// function it was written for, while coverage elsewhere keeps the
+	// count non-zero and the run green. That is a silent coverage loss
+	// rather than a false positive, which makes it the worse of the two.
+	//
+	// So the figures that actually broke are pinned by name. A refactor
+	// that hides one of these from the extractor fails here, saying which
+	// function stopped being watched, instead of passing quietly.
+	// renderAuthTiles is deliberately not here: the only field it reads
+	// off the cluster document is principal, which /api/security
+	// carries too, so it is legitimately outside what this test can
+	// speak to — the same limit the doc comment names above.
+	for _, fn := range []string{"authThrottleText"} {
+		found := false
+		for ref := range want {
+			if ref.fn == fn && len(origins[ref]) > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s no longer has a document-specific parameter this test can both read and trace, "+
+				"so it is no longer covered. It reads a field only one of the two documents carries, and it is "+
+				"the figure this test exists for. If it was refactored to destructure the document, or to take it "+
+				"from a global rather than a parameter, extend readsField or the argument tracer to follow it — "+
+				"do not leave the check silently watching nothing", fn)
+		}
+	}
 }
 
 // documentFields maps each JSON field unique to one of the two documents

@@ -268,7 +268,14 @@ function authThrottleText(d) {
 // condition, including while the node was refusing hundreds a second
 // (issue #203 review).
 function renderAuthTiles(cluster, sec) {
-  const p = (cluster && cluster.principal) || {};
+  // Both call sites guard on the cluster document, so this is not
+  // reachable — but the function was written to tolerate exactly the
+  // input that makes it answer wrongly, claiming "insecure — no
+  // authentication" from a document that has not arrived. The invariant
+  // belongs where the next caller cannot forget it, the way
+  // authThrottleText's own null guard already sits (issue #203 review).
+  if (!cluster) return;
+  const p = cluster.principal || {};
   renderTiles(document.getElementById("sec-auth"),
     tile("mode", p.secure ? "secure" : "insecure — no authentication") +
     tile("signed in as", p.secure ? (p.user || "?") : "everyone is root") +
