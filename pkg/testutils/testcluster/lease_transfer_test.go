@@ -8,6 +8,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/server"
 )
 
 // TestTransferLease: leadership of a range moves to the requested follower
@@ -59,7 +60,19 @@ func TestTransferLease(t *testing.T) {
 func TestTransferLeaseThenRemoveOldLeader(t *testing.T) {
 	// 4 static nodes: range 1 starts with a replica on every node, so
 	// removing one still leaves a healthy RF-3 range.
-	tc := Start(t, 4)
+	//
+	// That fourth replica is a surplus the allocator repairs on its own:
+	// every tick, the range-1 leader removes one replica of any range
+	// over its factor, choosing the lowest node id when nothing else
+	// tells them apart — n1, which is also where range 1's leader
+	// usually is — and it does so by exactly the sequence this test
+	// performs, a transfer and then a remove (issue #200). The two
+	// raced: on a quiet machine the test won inside the first one-second
+	// tick, and under load the allocator did, so the test's own remove
+	// found "n1 has no replica to remove". The balancing passes are off
+	// here; the test is about the transfer-then-remove sequence, which
+	// it now performs alone.
+	tc := StartWithOptions(t, 4, func(cfg *server.Config) { cfg.RebalanceThreshold = -1 })
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
