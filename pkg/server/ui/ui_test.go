@@ -600,3 +600,146 @@ func oneLine(s string) string {
 	}
 	return s
 }
+
+// TestTableDetailIsReachable (issue #194): the schema list was the only
+// level there was, and everything below it lived in `title` attributes —
+// which do not appear on touch, are awkward to reach from a keyboard,
+// are unreadable for a forty-column table and cannot be copied.
+//
+// The level below it is a route, and a row leads to it by click and by
+// keyboard alike, the way #149 established for node and range rows.
+func TestTableDetailIsReachable(t *testing.T) {
+	router, err := FS.ReadFile("js/15-router.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse := funcBody(string(router), "function parseRoute()")
+	if parse == "" {
+		t.Fatal("js/15-router.js has no parseRoute")
+	}
+	if !strings.Contains(parse, `schema\/`) {
+		t.Error("parseRoute does not match #/schema/<table>: the detail route is unreachable and falls through to the overview")
+	}
+	if !strings.Contains(parse, "safeDecode") {
+		t.Error("parseRoute does not decode the table segment: a name with a space or a dot arrives percent-encoded")
+	}
+	route := funcBody(string(router), "function route()")
+	if !strings.Contains(route, "ui.table = r.table") {
+		t.Error("route() never assigns ui.table, so the view cannot know which table the route names")
+	}
+	if !strings.Contains(route, `renderSchema(lastSchema)`) {
+		t.Error("route() does not redraw the schema view: moving between the list and a table would wait for the next poll")
+	}
+
+	list, err := FS.ReadFile("js/40-schema.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := funcBody(string(list), "function renderSchema(d)")
+	for _, want := range []string{`data-table=`, `tabindex="0"`, `role="link"`} {
+		if !strings.Contains(row, want) {
+			t.Errorf("a schema row carries no %s: the detail is reachable by neither pointer nor keyboard", want)
+		}
+	}
+
+	detail, err := FS.ReadFile("js/45-table.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := funcBody(string(detail), "function wireTableDetail()")
+	if wire == "" {
+		t.Fatal("js/45-table.js has no wireTableDetail")
+	}
+	for _, want := range []string{`addEventListener("click"`, `addEventListener("keydown"`} {
+		if !strings.Contains(wire, want) {
+			t.Errorf("wireTableDetail binds no %s on the list: a row reachable one way only is not reachable", want)
+		}
+	}
+	boot, err := FS.ReadFile("js/95-boot.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(boot), "wireTableDetail()") {
+		t.Error("nothing calls wireTableDetail(), so the handlers it binds are never bound")
+	}
+}
+
+// TestTableDetailShowsDetailAsContent (issue #194): the point of the
+// view is that what was in a tooltip is now on the page. A detail put
+// back into a `title` would be the same defect in a new place.
+func TestTableDetailShowsDetailAsContent(t *testing.T) {
+	src, err := FS.ReadFile("js/45-table.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	if strings.Contains(body, `title="`) {
+		t.Error("js/45-table.js puts something in a title attribute: this view exists because the detail was in tooltips")
+	}
+	// Each field the issue names, and the element it lands in.
+	for field, where := range map[string]string{
+		"c.type":                   "renderTableColumns",
+		"c.not_null":               "renderTableColumns",
+		"c.default":                "renderTableColumns",
+		"c.hidden":                 "renderTableColumns",
+		"i.unique":                 "renderTableIndexes",
+		`i.state === "write-only"`: "renderTableIndexes",
+		"t.constraints":            "renderTableConstraints",
+		"st.row_count":             "renderTableStats",
+		"st.stale":                 "renderTableStats",
+		"ANALYZE":                  "renderTableStats",
+		"t.ranges":                 "renderTableRanges",
+		"t.privileges":             "renderTableGrants",
+		"s.tables":                 "renderTableShapes",
+	} {
+		fn := funcBody(body, "function "+where+"(t)")
+		if fn == "" {
+			t.Fatalf("js/45-table.js has no %s", where)
+		}
+		if !strings.Contains(fn, field) {
+			t.Errorf("%s does not read %s, which the detail view is meant to show", where, field)
+		}
+	}
+	// The DDL is the single most-requested thing from a schema browser,
+	// and it is only useful if it can be copied and if it parses.
+	ddl := funcBody(body, "function tableDDL(t)")
+	if ddl == "" {
+		t.Fatal("js/45-table.js has no tableDDL")
+	}
+	for _, want := range []string{"CREATE TABLE", "CREATE VIEW", "PRIMARY KEY", "CREATE ", "COMMENT ON TABLE"} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("tableDDL never writes %q", want)
+		}
+	}
+	if !strings.Contains(ddl, "constraintDDL") {
+		t.Error("tableDDL omits the table's constraints: DDL that silently drops a foreign key is worse than none")
+	}
+	if !strings.Contains(body, "SQL_RESERVED") {
+		t.Error("quoteIdent does not know the reserved words, so a column called `when` produces DDL that will not parse")
+	}
+	if !strings.Contains(funcBody(body, "function wireTableDetail()"), "clipboard") {
+		t.Error("the DDL has no copy button")
+	}
+}
+
+// TestTableDetailTermsAreInTheGlossary (issue #194): the glossary covers
+// every term on the page and must not regress when a view adds some. The
+// two tests above it check coverage generally; this one names the terms
+// this view introduced, so removing an entry fails here with the reason
+// rather than as an anonymous count.
+func TestTableDetailTermsAreInTheGlossary(t *testing.T) {
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, term := range []string{
+		"column", "type", "nullability", "default", "hidden",
+		"index", "unique", "build state",
+		"constraints", "constraint", "definition", "validated",
+		"statistics", "privileges", "reconstructed ddl",
+	} {
+		if g.lookup("schema", term) == "" {
+			t.Errorf("the table detail shows %q and nothing explains it", term)
+		}
+	}
+}

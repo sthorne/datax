@@ -109,7 +109,9 @@ task("txnCharts", pollTxnCharts, 15000, ["sql"]);
 // The statement shapes (issue #157): a cluster fan-out, so it polls
 // slowly — cumulative counters do not change meaningfully in three
 // seconds, and every poll asks every node.
-task("statements", pollStatements, 10000, ["sql"]);
+// The table detail joins the shapes that touch one table against this
+// same document (issue #194), so #/schema needs it too.
+task("statements", pollStatements, 10000, ["sql", "schema"]);
 
 window.addEventListener("hashchange", route);
 document.getElementById("compare-toggle").addEventListener("change", ev => {
@@ -149,5 +151,6 @@ document.getElementById("annotate-kinds").addEventListener("change", renderChart
 
 a11yTables();
 wireControls();
+wireTableDetail();
 wireHelpControls();
 route();

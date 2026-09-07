@@ -307,10 +307,13 @@ let stmtDoc = null, stmtOpen = null;
 
 async function pollStatements() {
   const resp = await fetch("/api/statements", { cache: "no-store" });
-  if (resp.status === 403) { stmtDoc = null; renderStatementShapes(); return; }
-  if (!resp.ok) { stmtDoc = null; renderStatementShapes(); throw new Error("HTTP " + resp.status); }
+  if (resp.status === 403) { stmtDoc = null; renderStatementShapes(); renderTableShapesIfOpen(); return; }
+  if (!resp.ok) { stmtDoc = null; renderStatementShapes(); renderTableShapesIfOpen(); throw new Error("HTTP " + resp.status); }
   stmtDoc = await resp.json();
   renderStatementShapes();
+  // The table detail lists the shapes that touch one table from this
+  // same document (issue #194), so it redraws when the document lands.
+  if (ui.view === "schema" && ui.table && lastSchema) renderTableDetail(lastSchema);
 }
 
 const STMT_SORTS = {

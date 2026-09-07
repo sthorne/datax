@@ -27,7 +27,7 @@ const SECTION_NAMES = {
 
 // ui is the cross-view state: the current route, the node scope every
 // node-scoped panel reads, and the time range every chart and rate uses.
-const ui = { view: "overview", node: 0, scope: "cluster", range: "1h", params: new URLSearchParams(), scroll: {} };
+const ui = { view: "overview", node: 0, table: "", scope: "cluster", range: "1h", params: new URLSearchParams(), scroll: {} };
 
 function parseRoute() {
   const h = location.hash.replace(/^#\/?/, "");
@@ -35,9 +35,22 @@ function parseRoute() {
   const path = q < 0 ? h : h.slice(0, q);
   const params = new URLSearchParams(q < 0 ? "" : h.slice(q + 1));
   const node = path.match(/^node\/(\d+)$/);
-  let view = path === "" ? "overview" : node ? "node" : path;
+  // #/schema/<table> is the level below the schema list (issue #194). A
+  // table name may be qualified ("shop.items"), so the segment is taken
+  // whole and decoded rather than split.
+  const table = path.match(/^schema\/(.+)$/);
+  let view = path === "" ? "overview" : node ? "node" : table ? "schema" : path;
   if (!VIEWS.includes(view)) view = "overview";
-  return { view, node: node ? Number(node[1]) : 0, params };
+  return {
+    view, node: node ? Number(node[1]) : 0,
+    table: table ? safeDecode(table[1]) : "",
+    params,
+  };
+}
+// safeDecode leaves a malformed escape alone rather than throwing and
+// taking the route with it.
+function safeDecode(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
 }
 
 // routeTo builds a hash, carrying the cross-cutting controls so they
@@ -55,7 +68,9 @@ function go(path, params) { location.hash = routeTo(path, params); }
 function pushRoute(params) {
   const p = new URLSearchParams(params || ui.params);
   p.delete("scope"); p.delete("range");
-  const path = ui.view === "node" ? "node/" + ui.node : ui.view === "overview" ? "" : ui.view;
+  const path = ui.view === "node" ? "node/" + ui.node
+    : ui.view === "schema" && ui.table ? "schema/" + encodeURIComponent(ui.table)
+    : ui.view === "overview" ? "" : ui.view;
   history.replaceState(null, "", routeTo(path, p));
 }
 
@@ -117,7 +132,9 @@ function jumpCandidates(q) {
     }
   }
   for (const t of (lastSchema && lastSchema.tables) || []) {
-    if (t.name.toLowerCase().includes(lower)) out.push({ label: t.name, hint: "table", path: "schema", params: { q: t.name } });
+    // Straight to the table, not to the list filtered to it: the
+    // detail is what someone typing a table name is after (issue #194).
+    if (t.name.toLowerCase().includes(lower)) out.push({ label: tableKey(t), hint: "table", path: "schema/" + encodeURIComponent(tableKey(t)) });
   }
   if (!out.length) out.push({ label: q, hint: "search tables and ranges", path: "schema", params: { q } });
   return out.slice(0, 8);
@@ -219,7 +236,7 @@ function route() {
   if (scope && (scope === "cluster" || /^n\d+$/.test(scope))) ui.scope = scope;
   const range = r.params.get("range");
   if (range && RANGE_SECONDS[range]) ui.range = range;
-  ui.view = r.view; ui.node = r.node; ui.params = r.params;
+  ui.view = r.view; ui.node = r.node; ui.table = r.table; ui.params = r.params;
   for (const v of VIEWS) {
     const el = document.getElementById("view-" + v);
     if (el) el.hidden = v !== r.view;
@@ -230,6 +247,16 @@ function route() {
   if (r.view === "metrics") applyMetricsParams(r.params);
   if (r.view === "data" && r.params.get("range")) openRangeDetail(Number(r.params.get("range")));
   if (r.view === "schema" && r.params.get("q") !== null) setSchemaFilter(r.params.get("q"));
+  // The table detail links into #/data filtered to the table's ranges;
+  // the two views already share the filter vocabulary (issue #194).
+  if (r.view === "data" && r.params.get("q") !== null) setDataFilter(r.params.get("q"));
+  // #/schema and #/schema/<table> are one view over one document, so a
+  // move between them redraws from what is already in hand rather than
+  // waiting up to ten seconds for the next schema poll.
+  if (r.view === "schema" && lastSchema) renderSchema(lastSchema);
+  // A shape opened from the table detail lands on #/sql with its panel
+  // already expanded, rather than after the next statements poll.
+  if (r.view === "sql" && stmtOpen) renderStatementDetail(stmtOpen);
   if (r.view === "nodes" && r.params.get("locality")) setNodeFilter(r.params.get("locality"));
   applySchedule(r.view);
   // Restore where this view was, or take the reader to the section a
