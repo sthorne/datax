@@ -224,6 +224,22 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A schema change's drain waits for a statement whose lease entry a
+  renewal had already replaced** (#234). A statement is pinned to the
+  descriptor it planned against until that cache entry expires, and the
+  drain (#185) waited for that expiration by reading it off the entry
+  the new version replaced. A renewal between the statement and the
+  schema change put a fresh entry at the same version in its place —
+  one no statement had taken — so the drain found nothing to wait for
+  and could return while the statement could still commit under the
+  old descriptor: for `CREATE INDEX`, a row in the table and no entry
+  in the index, in the window between the drain and the entry's
+  expiration. The handed-out expiration now rides from entry to entry
+  across same-version renewals and is published when the version
+  changes. The flaky `TestDrainWaitsOutADescriptorHandedToAStatement`
+  was this seen from the other side (its sample included such a fresh
+  entry); it samples with renewal held off now, and a new test drives
+  the renewal by hand and proves the drain outlasts the replaced entry.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the
