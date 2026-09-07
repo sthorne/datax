@@ -295,6 +295,11 @@ func (n *Node) startHTTP() error {
 	mux.HandleFunc("/api/metrics", n.serveMetricsAPI)
 	mux.HandleFunc("/api/node", n.serveNodeAPI)
 	mux.HandleFunc("/api/events", n.serveEventsAPI)
+	// The console's viewer preferences (issue #204). The only
+	// state-changing console endpoint besides sign-in, and it is behind
+	// httpAuth like everything else here: the row it writes is keyed by
+	// the authenticated principal, never by anything in the body.
+	mux.HandleFunc("/api/prefs", n.servePrefsAPI)
 	// The dashboard, exact path only — anything else 404s rather than
 	// serving the page for every typo. Self-contained and read-only.
 	page, uerr := renderConsolePage()

@@ -8,6 +8,56 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.58.0 — unreleased
+
+### Added
+- **The console's viewer preferences live in the cluster** (#204). Two
+  display choices — light/dark/system, and whether a moment reads as how
+  long ago it was or as the clock time it happened at — plus the place
+  they are kept. They are not kept in the browser. A preference stored in
+  one browser profile is not a preference at all to an operator who
+  opens the console from a laptop, from a jump host, and from whichever
+  node answered the load balancer that morning; it is three preferences,
+  two of which are wrong. We are a database, so the cluster holds them:
+  `/api/prefs` keys a preference by the signed-in user, and a choice made
+  on one node's console is the choice on every node's console, in every
+  browser that user signs in from, and after they clear site data.
+
+  The theme override wins over the operating system's own setting in both
+  directions — dark on a machine set to light, and light on a machine set
+  to dark — by stamping `data-theme` on the root element. Absolute
+  timestamps render in the reader's own zone with the offset spelled out
+  (`14:20:05 +01:00`, dated when it is not today), because an incident is
+  reconstructed against wall clocks and a bare clock time from an unknown
+  zone is a trap. The choice reaches moments only: how long a transaction
+  has been open, or a connection idle, is a length of time and keeps
+  reading as one.
+
+  The issue also asked for a reduced-motion preference. Nothing in this
+  console moves — no transition, no animation, no smooth scrolling — so a
+  `prefers-reduced-motion` block would have guarded nothing, and shipping
+  one would have been a decoration that reads as a feature. What ships
+  instead is a test that fails the day motion is added, and says to wrap
+  it in the guard.
+
+### Changed
+- **Cluster protocol version v17.** The console's preferences live in a
+  new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
+  `datax_metrics`. A v16 node knows nothing of the reservation and would
+  treat the table as an ordinary user table — droppable, and writable by
+  its owner — so nothing creates it and `/api/prefs` stores nothing until
+  the cluster has finalized v17. Until then the console still honours a
+  choice for the tab and says plainly that it will not be kept. The table
+  is included in backups: it is small, and unlike the metrics it cannot
+  be regenerated from anything.
+
+### Fixed
+- The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
+  ID to *any* system table by name. With one system table that was
+  correct; with two it would have created the second one on top of the
+  first. It now looks the ID up per table.
+- The header's staleness pill read "last updated 5s ago ago".
+
 ## 0.57.0 — unreleased
 
 ### Added

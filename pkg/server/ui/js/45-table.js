@@ -188,7 +188,7 @@ function renderTableStats(t) {
     setHTML(el, `<span class="st draining">never analyzed</span> — the planner is estimating this table's size from nothing, which is the usual reason it picks a scan over an index. Run <code class="key">ANALYZE ${esc(qualifiedIdent(t))}</code>.`);
     return;
   }
-  const age = fmtAgo(st.age_seconds * 1000);
+  const age = fmtWhen(Date.now() - st.age_seconds * 1000);
   const when = st.collected_at_unix_ms ? new Date(st.collected_at_unix_ms).toLocaleString() : "at an unrecorded time";
   setHTML(el, `<b>${st.row_count.toLocaleString()}</b> rows estimated, collected ${esc(when)}, ${st.stale ? warn("draining", age) : age}. `
     + (st.stale

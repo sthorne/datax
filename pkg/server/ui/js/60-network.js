@@ -32,7 +32,7 @@ function renderNetwork(d) {
       if (!l.reachable) { html += `<td class="num"><span class="st down">✕ unreachable</span></td>`; continue; }
       if (worst === null || Math.abs(l.offset_us) > Math.abs(worst)) worst = l.offset_us;
       const lvl = l.rtt_us < 2000 ? "live" : l.rtt_us < 20000 ? "draining" : "down";
-      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtAgo(l.age_ms)}"><span class="st ${lvl}">${fmtRTT(l.rtt_us)}</span></td>`;
+      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtWhen(Date.now() - l.age_ms)}"><span class="st ${lvl}">${fmtRTT(l.rtt_us)}</span></td>`;
     }
     if (worst === null) html += `<td class="num muted">—</td>`;
     else {

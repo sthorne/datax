@@ -147,9 +147,19 @@ const (
 	// itself is omitempty, so a descriptor written before v16 reads the
 	// same at either version.
 	V16 Version = 16
+	// V17 introduces the datax_ui_prefs system table (see
+	// pkg/sql/catalog.PrefsTableName): the console's per-viewer display
+	// choices — theme, timestamp style — belong to the cluster rather
+	// than to one browser, so they are stored in the cluster and follow
+	// a user to any browser and any node. Like the metrics table, a v16
+	// node knows nothing of the reservation and would treat it as an
+	// ordinary user table (droppable, and writable by its owner), so
+	// nothing creates it and /api/prefs persists nothing before
+	// finalize (rule 4).
+	V17 Version = 17
 
 	// Current is the newest cluster version this binary can run.
-	Current = V16
+	Current = V17
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

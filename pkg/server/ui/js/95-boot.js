@@ -24,6 +24,12 @@ async function runTask(t) {
   finally { t.running = false; armTask(t); renderStaleness(); }
 }
 function runNow(name) { const t = sched.tasks.get(name); if (t) runTask(t); }
+// refreshView re-runs every task the current view needs, at once. A
+// viewer preference that changes how a figure READS (issue #204) has to
+// take effect on the click that made it, not on the next poll.
+function refreshView() {
+  for (const t of sched.tasks.values()) if (t.views.has(sched.view)) runTask(t);
+}
 function applySchedule(view) {
   sched.view = view;
   for (const t of sched.tasks.values()) {
@@ -46,7 +52,7 @@ function renderStaleness() {
   const t = sched.tasks.get(PRIMARY_TASK[sched.view]);
   const el = document.getElementById("hdr-stale");
   if (!t || !t.failures) { el.style.display = "none"; return; }
-  const since = t.lastOK ? fmtAgo(Date.now() - t.lastOK) + " ago" : "never";
+  const since = t.lastOK ? fmtWhen(t.lastOK) : "never";
   const retry = Math.max(0, Math.round((t.next - Date.now()) / 1000));
   el.textContent = `● stale — last updated ${since} · retrying in ${retry}s` + (t.lastErr ? ` (${t.lastErr})` : "");
   el.style.display = "inline";
@@ -151,6 +157,12 @@ document.getElementById("annotate-kinds").addEventListener("change", renderChart
 
 a11yTables();
 wireControls();
+wirePrefControls();
+// The preferences the cluster holds for this viewer. Fetched rather than
+// read out of this browser, so it lands a moment after first paint: the
+// page starts in its natural state and the viewer's theme arrives with
+// the answer (issue #204).
+loadPrefs();
 wireTableDetail();
 wireHelpControls();
 route();
