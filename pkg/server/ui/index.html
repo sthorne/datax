@@ -28,7 +28,7 @@
       --surface: #1a1a19; --panel: #232322; --border: #3a3936;
       --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
       --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
-      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+      --series-5: #d55181; --series-6: #43b043; --series-7: #9085e9; --series-8: #e66767;
     }
   }
   :root[data-theme="dark"] {
@@ -36,7 +36,7 @@
     --surface: #1a1a19; --panel: #232322; --border: #3a3936;
     --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
-    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+    --series-5: #d55181; --series-6: #43b043; --series-7: #9085e9; --series-8: #e66767;
   }
   * { box-sizing: border-box; }
   body {
@@ -269,6 +269,8 @@
      with a chart scrolling sideways. */
   .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr)); gap: 14px; }
   .charts.compare { grid-template-columns: 1fr; }
+  .charts .note { grid-column: 1 / -1; font-size: 12px; }
+  .chart .endlabel { font-size: 11px; font-weight: 600; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
   .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
   .chart .title b { font-weight: 600; }

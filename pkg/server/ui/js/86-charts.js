@@ -152,18 +152,31 @@ function annotationMarks(from, to, x, T, PH) {
 
 function renderCharts() {
   const box = document.getElementById("charts");
-  box.classList.toggle("compare", mv.compare);
   box.innerHTML = "";
   const d = mv.data;
-  for (const s of d.series || []) {
+  // Faceted on request, or when the lines could not be told apart in
+  // one frame (issue #216): the note says which, since a reader who did
+  // not ask for one chart per node should know why they got it.
+  let forced = 0;
+  const series = d.series || [];
+  for (const s of series) if (!mv.compare && mustFacet(Object.keys(s.nodes || {}))) forced++;
+  const facet = mv.compare || forced > 0;
+  box.classList.toggle("compare", facet);
+  if (forced > 0) {
+    const n = document.createElement("div");
+    n.className = "muted note";
+    n.textContent = `one chart per node: more than ${MAX_LINES} nodes, or a node past n8, cannot be told apart by colour in one frame`;
+    box.appendChild(n);
+  }
+  for (const s of series) {
     const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
-    if (mv.compare && ids.length > 1) {
+    if (facet && ids.length > 1) {
       for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d, { annotate: true }));
     } else {
       box.appendChild(chart(s, s.nodes || {}, "", d, { annotate: true }));
     }
   }
-  if (!box.children.length) box.innerHTML = `<div class="muted">nothing to chart</div>`;
+  if (!box.querySelector(".chart")) box.innerHTML = `<div class="muted">nothing to chart</div>`;
 }
 // chart builds one panel: inline SVG, recessive grid, 2px lines, a
 // legend of node line-keys, the crosshair tooltip, and a table view.
@@ -178,7 +191,10 @@ function chart(s, nodes, suffix, win, opts) {
   el.className = "chart";
   const unit = s.rate ? (s.unit || "/s") : s.unit;
   const ids = Object.keys(nodes).sort((a, b) => a - b);
-  const W = 800, H = 200, L = 58, R = 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
+  // Room on the right for the line-end labels when lines share a frame:
+  // identity in a second channel besides colour (issue #216).
+  const labelled = Object.keys(nodes).length > 1;
+  const W = 800, H = 200, L = 58, R = labelled ? 40 : 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
   const from = win.from_ms, to = win.to_ms, step = win.step_ms;
   let min = 0, max = 0, any = false;
   for (const id of ids) for (const p of nodes[id]) { any = true; if (p[1] > max) max = p[1]; if (p[1] < min) min = p[1]; }
@@ -218,6 +234,13 @@ function chart(s, nodes, suffix, win, opts) {
       prev = p[0];
     }
     svg += `<path class="line" stroke="${nodeColor(id)}" d="${dpath}"/>`;
+  }
+  // Direct labels at the line ends, nudged apart where ends coincide,
+  // so a reader never has to carry a colour from the legend to a line.
+  if (labelled) {
+    const ends = ids.map(id => { const p = nodes[id][nodes[id].length - 1]; return p ? { id, x: x(p[0]), y: y(p[1]) } : null; }).filter(Boolean).sort((a, b) => a.y - b.y);
+    for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 11) ends[i].y = ends[i - 1].y + 11;
+    for (const e of ends) svg += `<text class="endlabel" x="${(e.x + 4).toFixed(1)}" y="${(e.y + 4).toFixed(1)}" fill="${nodeColor(e.id)}">${esc(label(e.id))}</text>`;
   }
   svg += `<line class="xhair" y1="${T}" y2="${T + PH}"/>`;
   for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;

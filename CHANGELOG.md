@@ -341,6 +341,17 @@ state or the internode protocol does, and an entry below says so.
   where the plot is focusable and the arrow keys walk the samples; each
   mark is focusable and reads the same on focus; and the chart's "as a
   table" view lists the marked events.
+- **Console: lines that cannot be told apart are not drawn in one
+  frame** (#216). The eight series colours fail all-pairs separation on
+  both themes (down to ΔE 1.6 under deuteranopia for two of them), and
+  any subset of node ids can share a chart since ids are never reused.
+  No eight-hue ramp on these surfaces passes, so the fix is structural:
+  past four nodes, or when a node beyond n8 would share a frame, the
+  metrics view facets into one chart per node and says why; lines that
+  do share a frame carry their node's name at the line end, so identity
+  has a channel besides colour; and `--series-6`, the one slot that was
+  byte-identical in both themes, is re-stepped for dark. A node's colour
+  still follows its id, so filtering one out repaints nothing.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the

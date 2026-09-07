@@ -32,4 +32,20 @@ function metricsParams() {
   if (!mv.rate) p.rate = "0";
   return p;
 }
+// nodeColor follows the node, not its row: filtering a node out never
+// repaints the survivors. Slots 1-8 are the categorical ramp; past that
+// there is no distinguishable hue to hand out, and a chart never plots
+// two such nodes in one frame (see MAX_LINES).
 function nodeColor(id) { id = Number(id); return id >= 1 && id <= 8 ? `var(--series-${id})` : "var(--text-3)"; }
+// MAX_LINES is how many lines share one frame before the view facets
+// into one chart per node (issue #216). Eight categorical hues that
+// hold up across every pair on both themes is not a palette that exists
+// to be found — three replacement ramps were validated and all failed
+// all-pairs, a four-slot set passes — and the console plots any subset
+// of node IDs together (ids are never reused, so a three-node cluster
+// can be n2, n6 and n8). So past four lines, and whenever a node past
+// n8 would share a frame, the remedy is a frame per node, not a hue.
+const MAX_LINES = 4;
+function mustFacet(ids) {
+  return ids.length > MAX_LINES || (ids.length > 1 && ids.some(id => Number(id) > 8));
+}

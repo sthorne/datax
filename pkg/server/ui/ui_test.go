@@ -1883,3 +1883,50 @@ func TestAnnotationsAreReachableAndTheirOwnColour(t *testing.T) {
 		t.Error("the mark's hit rects take pointer events: fattened or not, they shadow one another and the plot's own hit rect")
 	}
 }
+
+// TestLinesThatCannotBeToldApartAreNotOverplotted (issue #216): the
+// metrics view facets past MAX_LINES lines, or when a node past n8
+// would share a frame; lines that share a frame are labelled at their
+// ends; a node's colour follows its id; and the dark theme's --series-6
+// is its own value.
+func TestLinesThatCannotBeToldApartAreNotOverplotted(t *testing.T) {
+	m, err := FS.ReadFile("js/85-metrics.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := string(m)
+	if !strings.Contains(ms, "const MAX_LINES = 4;") {
+		t.Error("MAX_LINES is not four: a four-slot set is the largest that passes all-pairs separation on both themes")
+	}
+	if sp := jsFuncSpan(ms, "mustFacet"); sp == nil {
+		t.Fatal("js/85-metrics.js has no mustFacet")
+	} else if b := ms[sp[0]:sp[1]]; !strings.Contains(b, "ids.length > MAX_LINES") || !strings.Contains(b, "> 8") {
+		t.Error("mustFacet does not facet past MAX_LINES lines and on a node past n8: two nodes past n8 share one grey")
+	}
+	if sp := jsFuncSpan(ms, "nodeColor"); sp == nil || !strings.Contains(ms[sp[0]:sp[1]], "var(--series-${id})") {
+		t.Error("nodeColor no longer follows the node's id: filtering a node out repaints the survivors")
+	}
+	c, err := FS.ReadFile("js/86-charts.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := string(c)
+	if sp := jsFuncSpan(cs, "renderCharts"); sp == nil || !strings.Contains(cs[sp[0]:sp[1]], "mustFacet(") {
+		t.Error("renderCharts does not consult mustFacet: eight lines are overplotted in one frame")
+	}
+	if sp := jsFuncSpan(cs, "chart"); sp == nil || !strings.Contains(cs[sp[0]:sp[1]], `class="endlabel"`) {
+		t.Error("chart() draws no line-end labels: identity is colour alone")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	light := regexp.MustCompile(`:root \{[^}]*--series-6: (#[0-9a-f]{6})`).FindStringSubmatch(string(page))
+	dark := regexp.MustCompile(`data-theme="dark"\] \{[^}]*--series-6: (#[0-9a-f]{6})`).FindStringSubmatch(string(page))
+	if light == nil || dark == nil {
+		t.Fatal("cannot find --series-6 in both themes")
+	}
+	if light[1] == dark[1] {
+		t.Errorf("--series-6 is %s in both themes: the one slot not re-stepped for the dark surface", light[1])
+	}
+}
