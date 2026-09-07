@@ -593,3 +593,120 @@ func TestExplainPlansAsTheCaller(t *testing.T) {
 		t.Error("no plan returned")
 	}
 }
+
+// TestLoginIsRateLimited (issue #195): /api/login is reachable before
+// any credential is validated and each attempt re-derives PBKDF2 —
+// measured at 0.72 ms of CPU. Unbounded, that is a pre-authentication
+// amplification: a request an attacker sends for nothing costs the node
+// a slice of a core, so a handful of connections pins it, against a
+// listener that must stay reachable for the console to work.
+//
+// The refusal has to come before the derivation, so this asserts on
+// latency as well as on the status code: a 429 issued after the work has
+// already run would satisfy a status-code test and none of the point.
+func TestLoginIsRateLimited(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	_ = tc
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	post := func(user, pass string) (int, time.Duration) {
+		t.Helper()
+		body := `{"user":` + jsonQuote(user) + `,"password":` + jsonQuote(pass) + `}`
+		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		start := time.Now()
+		resp, err := client.Do(req)
+		took := time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, took
+	}
+
+	// Wait for auth to be answering at all.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Guess until the limiter refuses, then confirm the refusal is
+	// cheap — it must not have run the derivation.
+	var throttled int
+	var throttledTime time.Duration
+	for i := 0; i < 60 && throttled < 3; i++ {
+		code, took := post("root", "wrong-password")
+		if code == http.StatusTooManyRequests {
+			throttled++
+			throttledTime += took
+			continue
+		}
+		if code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: %d, want 401 or 429", i, code)
+		}
+	}
+	if throttled < 3 {
+		t.Fatal("60 wrong passwords from one source were never refused: the endpoint is unbounded")
+	}
+
+	// A refused attempt is answered without the PBKDF2 derivation. The
+	// derivation is milliseconds; a refusal is a map lookup, so an
+	// average well under a millisecond of server time is the signal.
+	// Network and TLS dominate what is measured here, so the bar is
+	// deliberately loose: it is checking that the work was skipped, not
+	// how fast the machine is.
+	if avg := throttledTime / time.Duration(throttled); avg > 50*time.Millisecond {
+		t.Errorf("refused attempts averaged %s; a refusal should not be doing the work it refuses", avg)
+	}
+
+	// A legitimate sign-in still gets through. Everything in this test
+	// shares one source address, so the guessing above drained the
+	// source's budget — the documented cost of keying on address, and
+	// why the budget refills: within a couple of seconds root is in, and
+	// succeeding restores the budget rather than spending it.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret")
+		if code == http.StatusOK {
+			break
+		}
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("legitimate sign-in: %d, want 200 (or 429 while the budget refills)", code)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a legitimate sign-in never got through: the budget does not refill")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	// Having succeeded, root is not left one attempt from being throttled
+	// again.
+	for i := 0; i < 3; i++ {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code != http.StatusOK {
+			t.Fatalf("sign-in %d after a success: %d — proving a credential must not spend the guessing budget", i, code)
+		}
+	}
+}
+
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

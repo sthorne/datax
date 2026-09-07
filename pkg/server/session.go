@@ -114,6 +114,21 @@ func (n *Node) serveLogin(w http.ResponseWriter, req *http.Request) {
 		writeLoginError(w, http.StatusServiceUnavailable, "the cluster's authentication secret is unavailable on this node; try another node, or use HTTP Basic credentials")
 		return
 	}
+	// Ahead of the expensive work, not after it: verifying a password
+	// costs this node real CPU, and /api/login is reachable before any
+	// credential is validated (issue #195). A refusal here answers
+	// exactly as a wrong password does.
+	if !n.authLimit.allow(req.RemoteAddr, lr.User) {
+		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path)
+		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
+		return
+	}
+	if !n.authLimit.acquireVerify() {
+		n.authThrottled(req.RemoteAddr, lr.User, req.URL.Path)
+		writeLoginError(w, http.StatusTooManyRequests, loginRefusal)
+		return
+	}
+	defer n.authLimit.releaseVerify()
 	// The same work for every outcome: an unknown user is verified
 	// against the dummy verifier so timing does not separate it from a
 	// wrong password (security.DummyVerifier).
@@ -123,6 +138,8 @@ func (n *Node) serveLogin(w http.ResponseWriter, req *http.Request) {
 	}
 	ok := security.VerifyPassword(verifier, lr.Password)
 	if ok {
+		// Proving a credential is not what the limiter is bounding.
+		n.authLimit.succeeded(req.RemoteAddr, lr.User)
 		// A correct password still does not sign in a role that may not:
 		// NOLOGIN and DROP ROLE close this door as they close the others
 		// (issue #138 for the certificate path).

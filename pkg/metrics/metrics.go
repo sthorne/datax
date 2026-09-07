@@ -258,6 +258,9 @@ var (
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})
+	AuthThrottled = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_auth_throttled_total", Help: "Authentication attempts refused by the rate limiter before any password verification ran (issue #195).",
+	})
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
 	})
