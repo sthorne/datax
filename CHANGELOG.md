@@ -328,6 +328,19 @@ state or the internode protocol does, and an entry below says so.
   carries the magnitude the line does not. Tile figures are set in
   proportional numerals with a reserved width, so they no longer look
   loose and still do not jitter.
+- **Console: chart annotations are their own kind of mark, and their
+  text has a path that is not a hover** (#217). A mark was drawn in the
+  colour of the node that served the event — on a chart plotting that
+  node, one hue with two meanings — and its text lived only in a
+  native tooltip on an 8-pixel target under the plot's own hit area, so
+  it was reachable by nothing. Marks are now one neutral event colour
+  with the node named in the label; the plot's hit rect resolves the
+  nearest mark to the pointer, so marks a few pixels apart (a rolling
+  restart) are each reachable; the crosshair readout carries the mark
+  and is anchored under the crosshair for a reader on the keyboard,
+  where the plot is focusable and the arrow keys walk the samples; each
+  mark is focusable and reads the same on focus; and the chart's "as a
+  table" view lists the marked events.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the

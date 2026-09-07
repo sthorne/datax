@@ -172,6 +172,7 @@ const HELP = {
   "recently completed": "Operations that finished, with their outcome. An operation that keeps failing and restarting is why something never settles.",
   "operation": "What the cluster is doing and to which range or node. Nothing here was asked for by a client — this is the cluster maintaining itself.",
   "kind": "The kind of operation: a split, a merge, a rebalance, a lease move, a decommission, a backup.",
+  "summary": "What the node recorded about the event, in its own words — the line the events view shows for it.",
   "started": "When the operation began, by the clock of the node that started it.",
   "elapsed": "How long this operation has been running so far. An operation whose elapsed time keeps growing past what the same kind usually takes is stuck rather than slow.",
   "finished": "When the operation ended, by the clock of the node that ran it.",

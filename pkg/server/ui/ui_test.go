@@ -1826,3 +1826,60 @@ func TestSparklinesAreReadings(t *testing.T) {
 		t.Error(".tile .value reserves no width: a figure ticking 1→7→11 moves the box")
 	}
 }
+
+// TestAnnotationsAreReachableAndTheirOwnColour (issue #217): a mark is
+// drawn in one neutral colour rather than a series slot; its text is in
+// the chart's table and in the crosshair readout, reachable from the
+// keyboard, rather than in a native tooltip on an 8px target; and marks
+// are resolved by nearest-to-pointer so neighbours do not shadow one
+// another.
+func TestAnnotationsAreReachableAndTheirOwnColour(t *testing.T) {
+	src, err := FS.ReadFile("js/86-charts.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	span := jsFuncSpan(js, "annotationMarks")
+	if span == nil {
+		t.Fatal("js/86-charts.js has no annotationMarks")
+	}
+	body := js[span[0]:span[1]]
+	if strings.Contains(body, "<title>") {
+		t.Error("annotationMarks puts the mark's text in a native <title>: unreachable from the keyboard, unstyled, on the OS's delay")
+	}
+	if strings.Contains(body, "nodeColor") || strings.Contains(body, `stroke="${`) {
+		t.Error("annotationMarks colours a mark by node: one hue, two meanings on a chart plotting that node")
+	}
+	if !strings.Contains(body, `tabindex="0"`) || !strings.Contains(body, "aria-label=") {
+		t.Error("a mark's hit rect is not focusable with an accessible name: no keyboard path to it")
+	}
+	cs := jsFuncSpan(js, "chart")
+	if cs == nil {
+		t.Fatal("js/86-charts.js has no chart")
+	}
+	cb := js[cs[0]:cs[1]]
+	if strings.Contains(cb, "annotationMarks(from, to, x, T, PH, ") {
+		t.Error("chart() still passes a colour to annotationMarks")
+	}
+	for _, want := range []string{"nearestMark", `class="annrows"`, `"ArrowLeft"`, `hit.addEventListener("focus"`, `rect.addEventListener("focus"`} {
+		if !strings.Contains(cb, want) {
+			t.Errorf("chart() has no %s: a mark's text is hover-only, or neighbours shadow one another, or the crosshair has no keyboard path", want)
+		}
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+	i := strings.Index(css, ".chart .annotations line.ann {")
+	if i < 0 {
+		t.Fatal("no .chart .annotations line.ann rule")
+	}
+	decl := css[i : i+strings.Index(css[i:], "}")]
+	if !strings.Contains(decl, "stroke: var(--") || strings.Contains(decl, "--series-") {
+		t.Errorf("the mark's stroke is not one neutral colour from the stylesheet: %s", decl)
+	}
+	if !strings.Contains(css, ".chart .annhit { pointer-events: none; }") {
+		t.Error("the mark's hit rects take pointer events: fattened or not, they shadow one another and the plot's own hit rect")
+	}
+}

@@ -852,8 +852,17 @@
 </main>
 </div>
 <style>
-.chart .annotations line.ann { stroke-width: 1; stroke-dasharray: 3 3; opacity: .38; }
-.chart .annhit:hover + line.ann, .chart .annotations:hover line.ann { opacity: .6; }
+/* An event mark is one neutral colour, never a node's (issue #217): the
+   dash says "event", the label says which node. The hit rects take no
+   pointer events — the plot's own hit rect resolves the nearest mark —
+   and are the keyboard's way to a mark. */
+.chart .annotations line.ann { stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 3 3; opacity: .45; }
+.chart .annhit { pointer-events: none; }
+.chart .annhit:focus-visible { outline: none; }
+.chart .annhit:focus-visible + line.ann, .chart .annhit:focus-visible { opacity: 1; }
+.chart .tip .e { margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); color: var(--text-2); max-width: 260px; white-space: normal; }
+.chart .hit:focus-visible { outline: 2px solid var(--series-1); outline-offset: -2px; }
+.chart details table.annrows { margin-top: 8px; }
 .chart .annnote { margin: 4px 0 0; font-size: 12px; }
 </style>
 <script>__CONSOLE_SCRIPTS__</script>
