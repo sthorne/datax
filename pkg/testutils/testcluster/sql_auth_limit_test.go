@@ -358,29 +358,34 @@ func TestAGuessingWaveIsChargedInFull(t *testing.T) {
 	}
 
 	// Wide enough that its debt (wave - 5 seconds) outlasts the twelve
-	// seconds below by a margin; no wider, since the test waits it out.
-	const wave = 20
+	// seconds below by a margin even when landing the wave itself takes
+	// seconds (under the race detector it does); no wider, since the
+	// test waits the debt out.
+	const wave = 25
 	const guesser = "127.0.0.4"
 	first, refused := startupAll(t, tc, certsDir, guesser, "target", wave)
 	if refused != 0 {
 		t.Fatalf("%d of the first wave refused before any guess had landed", refused)
 	}
-	landed := time.Now()
+	began := time.Now()
 	if ok, failed := finishAll(t, first, "target", "wrongpw"); ok != 0 || failed != wave {
 		t.Fatalf("first wave: %d authenticated, %d failed, want 0 and %d", ok, failed, wave)
 	}
+	landed := time.Now() // the last guess of the wave
 
-	// The wave put the source (wave - 5) seconds into debt. Twelve
-	// seconds on — past the eleven a floor at the burst would need to
-	// refill — nothing may run; then, once the debt is paid, one may.
-	time.Sleep(12*time.Second - time.Since(landed))
+	// The wave put the source (wave - 5) seconds into debt, less the
+	// refill while it was landing. Twelve seconds on — past the eleven
+	// a floor at the burst would need to refill — nothing may run.
+	time.Sleep(12*time.Second - time.Since(began))
 	if _, ran := startupAll(t, tc, certsDir, guesser, "target", wave); ran != wave {
-		t.Fatalf("%d of a second wave ran 12s after a wave of %d landed: the wave was charged as a burst, not in full", wave-ran, wave)
+		t.Fatalf("%d of a second wave ran 12s after a wave of %d: the wave was charged as a burst, not in full", wave-ran, wave)
 	}
+	// Once the debt is paid — a second for every guess beyond the burst,
+	// counted from the last one landing — one may.
 	deadline := landed.Add(time.Duration(wave-5+1) * time.Second)
 	time.Sleep(time.Until(deadline))
 	if admitted, _ := startupAll(t, tc, certsDir, guesser, "target", 1); len(admitted) != 1 {
-		t.Fatalf("no budget %s after a wave of %d: the source is held for longer than the guesses cost", time.Since(landed), wave)
+		t.Fatalf("no budget %s after the last of a wave of %d landed: the source is held for longer than the guesses cost", time.Since(landed), wave)
 	}
 }
 
