@@ -758,17 +758,28 @@ func TestTableDetailTermsAreInTheGlossary(t *testing.T) {
 // the API documents and none on the page.
 //
 // What this proves, exactly: for every helper parameter whose body
-// reads a field unique to one of the two documents, every call site
-// passes that document — either the global itself, or a parameter its
-// own callers only ever pass that global in. It checks the argument
-// rather than the reading function's body because the bad read was one
-// call away from the renderer that made it.
+// reads a field unique to one of the two documents, the call sites this
+// can trace pass that document — either the global itself, or a
+// parameter its own callers only ever pass that global in. It checks
+// the argument rather than the reading function's body because the bad
+// read was one call away from the renderer that made it.
 //
 // What it does NOT prove, so a passing run is not read as more than it
-// is: nothing about fields both documents carry (principal, node_id),
-// and nothing about whether a document has arrived — the follow-on
-// defect, renderAuthTiles(null) claiming "insecure" on a secure
-// cluster, was a nullness bug that no document-identity check can see.
+// is:
+//
+//   - Nothing about fields both documents carry (principal, node_id).
+//   - Nothing about whether a document has arrived. The follow-on
+//     defect, renderAuthTiles(null) claiming "insecure" on a secure
+//     cluster, was a nullness bug that no document-identity check sees.
+//   - Coverage is per parameter, not per call site. jsCalls reads the
+//     bodies of top-level function declarations, so a call made from an
+//     arrow function or a bare module-level block — renderReplication
+//     (lastCluster) inside a click listener, say — is invisible to it.
+//     A parameter with one traceable call site and four untraceable
+//     ones is reported exactly like one that is fully checked, and only
+//     a parameter with no traceable call site at all reaches the "not
+//     covered" log. So the honest reading of a pass is that some call
+//     site passes the right document, not that every one does.
 func TestSecurityFiguresReadTheDocumentThatCarriesThem(t *testing.T) {
 	wantDoc, err := documentFields()
 	if err != nil {
