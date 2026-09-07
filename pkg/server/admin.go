@@ -334,15 +334,26 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	if cur >= target {
 		return cluster.AdminResponse{ClusterVersion: int(cur)}
 	}
+	// Paired, short though it is: this is the one irreversible operation
+	// in the product, so "did it finish, and did the migrations under it
+	// finish" being unanswerable is worse here than anywhere else
+	// (issue #192).
+	opID := newOpID()
+	n.events.RecordStart("upgrade", opID, "finalizing the cluster version at %s", target)
+	failed := func(format string, args ...any) cluster.AdminResponse {
+		msg := fmt.Sprintf(format, args...)
+		n.events.RecordEnd("upgrade", opID, "failed", "finalizing at %s failed: %s", target, msg)
+		return cluster.AdminResponse{Error: msg}
+	}
 	if err := n.db.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target)))); err != nil {
-		return cluster.AdminResponse{Error: err.Error()}
+		return failed("%v", err)
 	}
 	if target >= version.V6 {
 		// The v6 catalog migration: every pre-existing table moves under the
 		// default database. Idempotent; a node that starts later at v6 runs
 		// it again as a no-op (ensureDatabaseCatalog).
 		if moved, err := catalog.MigrateNamespace(ctx, n.db); err != nil {
-			return cluster.AdminResponse{Error: fmt.Sprintf("cluster version is %s but the database catalog migration failed: %v (rerun the upgrade)", target, err)}
+			return failed("cluster version is %s but the database catalog migration failed: %v (rerun the upgrade)", target, err)
 		} else if moved > 0 {
 			log.Infof("catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
 			n.events.Record("upgrade", "catalog migration: %d table(s) moved under database %q", moved, catalog.DefaultDatabase)
@@ -352,7 +363,7 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 		// The v11 role migration: credential records and admin markers
 		// become role descriptors. Idempotent (ensureRoleCatalog).
 		if moved, err := catalog.MigrateRoles(ctx, n.db); err != nil {
-			return cluster.AdminResponse{Error: fmt.Sprintf("cluster version is %s but the role migration failed: %v (rerun the upgrade)", target, err)}
+			return failed("cluster version is %s but the role migration failed: %v (rerun the upgrade)", target, err)
 		} else if moved > 0 {
 			log.Infof("role migration: %d record(s) rewritten as role descriptors", moved)
 			n.events.Record("upgrade", "role migration: %d record(s) rewritten as role descriptors", moved)
@@ -360,7 +371,7 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	}
 	n.mirrorClusterVersion(ctx)
 	log.Infof("cluster version finalized at %s", target)
-	n.events.Record("upgrade", "cluster version finalized at %s", target)
+	n.events.RecordEnd("upgrade", opID, "ok", "cluster version finalized at %s", target)
 	return cluster.AdminResponse{ClusterVersion: int(target)}
 }
 

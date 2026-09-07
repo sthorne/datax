@@ -97,7 +97,7 @@ const HELP = {
   // ---- Schema ----
   "schema": "Tables in the cluster, with what each holds and what it costs. Sizes are this node's replicas only, so they are a sample of the cluster rather than its total.",
   "table": "The table's name. Every table lives in one namespace here: the database name in a connection URL is accepted and ignored.",
-  "columns": "How many columns the table has. Wide tables cost on every read that does not name its columns, because the whole row is fetched to answer it.",
+  "columns": "The table's columns — name, type, nullability and default. Wide tables cost on every read that does not name its columns, because the whole row is fetched to answer it.",
   "primary key": "The columns the table is stored by. Rows are physically ordered by this key, so it decides which scans are cheap and where writes land — a monotonically increasing key sends every insert to one range.",
   "indexes": "Secondary indexes on the table. Each one is a second copy of the indexed columns that every write to the table has to maintain.",
   "schema/rows": "Estimated live rows, from the statistics last collected. It is an estimate: it can lag well behind after a bulk change.",
@@ -105,6 +105,23 @@ const HELP = {
   "local size": "Bytes this table's replicas take on this node only, not across the cluster.",
   "stats age": "How long since the table's statistics were last collected. The query planner chooses plans from these, so stale statistics on a table that has changed a lot are a common cause of a plan that suddenly got slow.",
   "grants": "Privileges granted on this table, and to whom.",
+
+  // ---- One table, in full (#/schema/<table>) ----
+  "column": "The column's name. A column marked pk is part of the primary key, which is the order the table is physically stored in.",
+  "type": "The column's SQL type, with the precision, scale or length it was declared with. The type decides how the value is stored and compared, and a narrower one is cheaper on every read.",
+  "nullability": "Whether the column accepts NULL. Not null is a promise the database enforces on every write, so a reader never has to handle the absent case.",
+  "default": "The value an INSERT that omits this column writes instead. A literal is stored as written; an expression like now() or gen_random_uuid() is evaluated per row at insert time.",
+  "hidden": "A column the system maintains and SELECT * never returns. A time-series table's shard column is hidden and leads the primary key, which is why the stored key is wider than the one you declared.",
+  "index": "The index's name. It is a second copy of the indexed columns, kept in their order, that every write to the table has to maintain — which is what makes an unused index pure cost.",
+  "unique": "Whether the index refuses a duplicate of its columns. A unique index is also how a UNIQUE constraint is enforced.",
+  "build state": "Ready, or building. A building index is maintained by writers already but is invisible to the planner until its backfill finishes and the CREATE INDEX returns, so a query will not use it yet. How far along the backfill is is not published.",
+  "constraints": "The rules the table enforces beyond its primary key and NOT NULL: CHECK expressions, foreign keys, and named UNIQUE constraints.",
+  "constraint": "The constraint's name — what ALTER TABLE ... DROP CONSTRAINT takes, and what an error naming a violated rule reports.",
+  "definition": "The constraint as SQL: the CHECK expression, or the columns a foreign key references and what it does when the referenced row is deleted or its key changes.",
+  "validated": "Whether existing rows were checked. A constraint added NOT VALID applies to new writes only, so the table can hold rows that would be refused today.",
+  "statistics": "The row count and column distributions the query planner chooses plans from, collected by ANALYZE or the background sampler. They are an estimate, and a plan that suddenly got slow on a table that changed a lot is usually a stale one.",
+  "privileges": "What the role may do with the table — select, insert, update, delete — granted directly, through a role it is a member of, or to public.",
+  "reconstructed ddl": "The CREATE statement rebuilt from the descriptor this cluster actually holds, not the text that was typed: identifiers are quoted where they need it and the clauses come in the order the catalog stores them.",
 
   // ---- SQL activity ----
   "sql": "What SQL this cluster is running: connections open, statements in flight, and the shapes that cost the most over time.",
@@ -151,7 +168,7 @@ const HELP = {
 
   // ---- Operations and events ----
   "operations in flight": "What the cluster is doing to itself right now — splits, merges, rebalances, lease moves, decommissions, backups. These explain load that no client asked for.",
-  "in flight": "Operations running now, with how long each has been going.",
+  "in flight": "Operations running now, with how long each has been going. Backups, restores, decommissions, re-encryption, consistency sweeps, re-shard reclaims and upgrade finalize are paired and appear here; splits, merges and rebalances are individually short and continuous, so they stay in the event feed as instants and are watched as a rate on the Metrics view instead.",
   "recently completed": "Operations that finished, with their outcome. An operation that keeps failing and restarting is why something never settles.",
   "operation": "What the cluster is doing and to which range or node. Nothing here was asked for by a client — this is the cluster maintaining itself.",
   "kind": "The kind of operation: a split, a merge, a rebalance, a lease move, a decommission, a backup.",

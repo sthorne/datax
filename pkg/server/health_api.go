@@ -400,6 +400,17 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		add(p)
 	}
 
+	// The cluster's authentication secret: without it this node cannot
+	// offer a stand-in SCRAM salt that agrees with the other nodes', so
+	// it refuses password authentication rather than answer with one
+	// that would say which usernames exist (issue #196). That is a real
+	// degradation and it used to be a warn line and nothing else.
+	doc.Checks++
+	if n.tlsCfgs != nil && !n.authSecretReadable(req.Context()) {
+		add(Problem{Severity: SeverityCritical, Check: "auth-secret-unavailable", Node: int(n.ident.NodeID), Section: "nodes",
+			Summary: "this node cannot read the cluster's authentication secret, so it is refusing SQL password logins; certificate authentication is unaffected"})
+	}
+
 	// Statistics: tables with stale or missing statistics (info).
 	doc.Checks++
 	// From the cached schema document, refreshed in the background: the
@@ -498,12 +509,28 @@ type Operation struct {
 	// that cannot be known is shown as elapsed time, never as a bar with
 	// a number nobody measured.
 	ElapsedMs int64 `json:"elapsed_ms"`
+	// EndUnrecorded marks a running operation whose elapsed time has
+	// passed operationEndOverdue: still open as far as this node knows,
+	// but long enough that the view should say the end was never
+	// recorded rather than keep counting up as though work continues.
+	EndUnrecorded bool `json:"end_unrecorded,omitempty"`
 }
 
-// operationsFrom pairs the ring's start/end records by (kind, op).
+// operationEndOverdue is how long a running operation may go without an
+// end record before the view stops implying progress. Nothing a node
+// does to itself runs this long; past it, a growing elapsed counter is
+// more likely a lost end than work still happening, and saying so is
+// more useful than a number that only goes up.
+const operationEndOverdue = 6 * time.Hour
+
+// operationsFrom pairs the ring's start/end records by (kind, op), and
+// takes the starts that are no longer in the ring from open — the
+// operations the node knows are running whose start records have been
+// evicted (issue #190).
+//
 // Running operations come first, newest start first; then the completed
 // ones, newest end first.
-func operationsFrom(evs []events.Event, nowMs int64) []Operation {
+func operationsFrom(evs []events.Event, open []events.OpenOp, nowMs int64) []Operation {
 	type key struct{ kind, op string }
 	idx := map[key]int{}
 	var out []Operation
@@ -525,13 +552,19 @@ func operationsFrom(evs []events.Event, nowMs int64) []Operation {
 		case events.PhaseEnd:
 			i, seen := idx[k]
 			if !seen {
-				// The start aged out of the ring: report the end alone
-				// rather than dropping it, with no elapsed time to
-				// claim.
-				out = append(out, Operation{
+				// The start aged out of the ring. The end record carries
+				// when the operation began if the node was still running
+				// when it closed; otherwise report the end alone rather
+				// than dropping it, with no elapsed time to claim.
+				op := Operation{
 					Kind: ev.Kind, Op: ev.Op, Summary: ev.Summary,
 					EndedMs: ev.At.UnixMilli(), Outcome: ev.Outcome,
-				})
+				}
+				if !ev.Started.IsZero() {
+					op.StartedMs = ev.Started.UnixMilli()
+				}
+				idx[k] = len(out)
+				out = append(out, op)
 				continue
 			}
 			out[i].EndedMs = ev.At.UnixMilli()
@@ -540,10 +573,30 @@ func operationsFrom(evs []events.Event, nowMs int64) []Operation {
 			out[i].Running = false
 		}
 	}
+	// A long operation outlives its start record: the ring holds 500
+	// events and is shared with every split, merge and audit record on
+	// the node, so a backup or a decommission stops being reported as
+	// running partway through. What the node knows is open fills the gap,
+	// with the true start time and so the true elapsed.
+	for _, o := range open {
+		k := key{o.Kind, o.Op}
+		if i, seen := idx[k]; seen {
+			if out[i].StartedMs == 0 {
+				out[i].StartedMs = o.At.UnixMilli()
+			}
+			continue
+		}
+		idx[k] = len(out)
+		out = append(out, Operation{
+			Kind: o.Kind, Op: o.Op, Summary: o.Summary,
+			StartedMs: o.At.UnixMilli(), Running: true,
+		})
+	}
 	for i := range out {
 		switch {
 		case out[i].Running:
 			out[i].ElapsedMs = nowMs - out[i].StartedMs
+			out[i].EndUnrecorded = out[i].ElapsedMs > operationEndOverdue.Milliseconds()
 		case out[i].StartedMs > 0:
 			out[i].ElapsedMs = out[i].EndedMs - out[i].StartedMs
 		}
@@ -585,7 +638,7 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 	if doc.Events == nil {
 		doc.Events = []events.Event{}
 	}
-	doc.Operations = operationsFrom(n.events.Recent(0, 0, p.Admin), n.clock.Now().WallTime/int64(time.Millisecond))
+	doc.Operations = operationsFrom(n.events.Recent(0, 0, p.Admin), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

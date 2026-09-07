@@ -122,6 +122,19 @@
   .muted { color: var(--text-3); }
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--border) 30%, transparent); }
+  /* The table detail's DDL block and its copy button (issue #194). */
+  .ddlbar { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .ddlbar button {
+    font: inherit; font-size: 12px; padding: 3px 10px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--text);
+  }
+  .ddlbar button:hover { border-color: var(--text-3); }
+  pre.ddl {
+    font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin: 0; overflow-x: auto; white-space: pre;
+  }
   td.detail { padding: 0 12px 10px; }
   td.detail table { margin-top: 4px; }
   td.detail .note { color: var(--text-3); font-size: 12px; padding: 6px 0; }
@@ -543,6 +556,52 @@
       <tbody id="schema"></tbody>
     </table></div>
     <p class="muted" id="schema-note"></p>
+  </section>
+  <!-- The level below the list (issue #194): one table, in full. The
+       list is a good index; this is what an application developer came
+       for — did my index finish building, are the statistics fresh
+       enough for the planner to use it, who is granted what, and what
+       is the DDL. -->
+  <section id="sec-table" hidden>
+    <h2 id="table-title">Table</h2>
+    <p class="muted" id="table-summary"></p>
+    <h2>Columns</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>column</th><th>type</th><th>nullability</th><th>default</th><th>hidden</th></tr></thead>
+      <tbody id="table-columns"></tbody>
+    </table></div>
+    <p class="muted" id="table-columns-note"></p>
+    <h2>Indexes</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>index</th><th>columns</th><th>unique</th><th>build state</th></tr></thead>
+      <tbody id="table-indexes"></tbody>
+    </table></div>
+    <p class="muted" id="table-indexes-note"></p>
+    <h2>Constraints</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>constraint</th><th>definition</th><th>validated</th></tr></thead>
+      <tbody id="table-constraints"></tbody>
+    </table></div>
+    <h2>Statistics</h2>
+    <p id="table-stats"></p>
+    <h2>Ranges</h2>
+    <p id="table-ranges"></p>
+    <h2>Grants</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>role</th><th>privileges</th></tr></thead>
+      <tbody id="table-grants"></tbody>
+    </table></div>
+    <h2>Statement shapes</h2>
+    <div class="tablewrap"><table class="cards">
+      <thead><tr><th>statement shape</th><th class="num">executions</th><th class="num">mean</th>
+        <th class="num">rows scanned</th><th class="num">total time</th></tr></thead>
+      <tbody id="table-shapes"></tbody>
+    </table></div>
+    <p class="muted" id="table-shapes-note"></p>
+    <h2>Reconstructed DDL</h2>
+    <div class="ddlbar"><button type="button" id="table-ddl-copy">copy</button>
+      <span class="muted" id="table-ddl-note"></span></div>
+    <pre class="ddl" id="table-ddl"></pre>
   </section>
 </main>
 <main id="view-metrics" hidden>

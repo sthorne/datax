@@ -36,7 +36,16 @@ func (n *Node) CheckRangeConsistency(ctx context.Context, rangeID base.RangeID) 
 	return n.collectAndCompare(ctx, probe)
 }
 
-// runConsistencyOnce probes the next led range, if any.
+// runConsistencyOnce probes the next led range, if any, and pairs the
+// pass it belongs to.
+//
+// The sweep is paced: one range per tick, forever. That makes the probe
+// the wrong unit for the operations view — there is no "the consistency
+// check" that starts and finishes — but a PASS over every led range is a
+// real operation with a duration and an outcome, and it is the longest
+// running and least visible thing a node does (issue #192). So the pass
+// is what is paired, and its outcome is what it found: the same
+// mismatches the consistency-failure health check reports.
 func (n *Node) runConsistencyOnce(ctx context.Context) {
 	probe, err := n.store.ProposeChecksum(ctx)
 	if err != nil {
@@ -46,9 +55,36 @@ func (n *Node) runConsistencyOnce(ctx context.Context) {
 	if probe == nil {
 		return
 	}
-	if _, err := n.collectAndCompare(ctx, probe); err != nil {
+	if probe.PassStart {
+		n.closeConsistencyPass()
+		n.consistency.op = newOpID()
+		n.consistency.mismatches = 0
+		n.events.RecordStart("consistency", n.consistency.op,
+			"consistency sweep started over %d ranges this node leads", probe.Ranges)
+	}
+	mismatch, err := n.collectAndCompare(ctx, probe)
+	if err != nil {
 		log.Debugf("consistency collection for %s: %v", probe.RangeID, err)
 	}
+	if mismatch {
+		n.consistency.mismatches++
+	}
+}
+
+// closeConsistencyPass ends the open sweep, if there is one. The outcome
+// agrees with the consistency-failure health check by construction: both
+// count the same mismatches.
+func (n *Node) closeConsistencyPass() {
+	if n.consistency.op == "" {
+		return
+	}
+	if n.consistency.mismatches > 0 {
+		n.events.RecordEnd("consistency", n.consistency.op, "mismatch",
+			"consistency sweep finished: %d range(s) disagreed", n.consistency.mismatches)
+	} else {
+		n.events.RecordEnd("consistency", n.consistency.op, "ok", "consistency sweep finished: every range agreed")
+	}
+	n.consistency.op = ""
 }
 
 func (n *Node) collectAndCompare(ctx context.Context, probe *kvserver.ConsistencyProbe) (bool, error) {

@@ -157,12 +157,28 @@ function valueClass(value) {
   const figure = String(value).replace(/<span class="muted">[\s\S]*?<\/span>/g, "").replace(/<[^>]*>/g, "").trim();
   return figure.length > LONG_VALUE ? " long" : "";
 }
+// A tile's value is text, and tile() escapes it. That is the short name
+// because the safe one should be: a value can be a role name, a locality
+// string or an overload reason, none of which the page formatted itself,
+// and a caller reaching for the obvious function must not have to know
+// that the obvious function is the dangerous one (issue #191).
+//
+// tileHTML is for the values the page does compose — a figure with a
+// qualifier line under it — and its name is where the caller is told it
+// now owns the escaping.
 function tile(label, value, histName, histVal) {
+  const text = String(value);
+  return renderTile(label, esc(text), valueClass(text), histName, histVal);
+}
+function tileHTML(label, html, histName, histVal) {
+  return renderTile(label, html, valueClass(html), histName, histVal);
+}
+function renderTile(label, html, cls, histName, histVal) {
   let sp = "";
   const series = TILE_SERIES[label];
   if (series && tileHist[series] && tileHist[series].length > 1) sp = spark(tileHist[series]);
   else if (histName !== undefined) sp = spark(pushHist(histName, histVal));
-  const body = `<div class="label">${esc(label)}</div><div class="value${valueClass(value)}">${value}</div>${sp}`;
+  const body = `<div class="label">${esc(label)}</div><div class="value${cls}">${html}</div>${sp}`;
   if (!series) return `<div class="tile" data-key="${esc(label)}">${body}</div>`;
   return `<a class="tile" data-key="${esc(label)}" href="#/metrics?series=${encodeURIComponent(series)}${TILE_RATE[label] ? "&rate=1" : ""}" title="chart ${esc(series)} over time">${body}</a>`;
 }

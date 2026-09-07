@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/pgwire"
+	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/parser"
 )
 
@@ -201,6 +202,12 @@ type ExplainStatus struct {
 	Statement string   `json:"statement,omitempty"`
 	Plan      []string `json:"plan,omitempty"`
 	Error     string   `json:"error,omitempty"`
+	// PlannedAs is the SQL role the plan was produced as, so the console
+	// never has to assume. Every other view filters what it shows by what
+	// the caller may see; this one used to plan as the node's own system
+	// session, which is neither the caller's privileges nor the caller's
+	// question (issue #193).
+	PlannedAs string `json:"planned_as,omitempty"`
 }
 
 // serveExplainAPI closes the loop from "this shape is expensive" to
@@ -239,7 +246,17 @@ func (n *Node) serveExplainAPI(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	doc.Statement = text
-	plan, err := n.explainStatement(req.Context(), text)
+	// Plan as the operator who asked, not as the node. A plan names
+	// tables, indexes and columns, so it describes schema its reader may
+	// hold nothing on; and planning takes descriptor leases and consults
+	// statistics, so a plan produced under other privileges is not an
+	// answer to "what would happen if I ran this" — which is the question
+	// being asked (issue #193).
+	doc.PlannedAs = n.clusterPrincipal(req).User
+	if doc.PlannedAs == "" {
+		doc.PlannedAs = "root" // insecure: there is one identity
+	}
+	plan, err := n.explainStatement(req.Context(), text, doc.PlannedAs)
 	if err != nil {
 		doc.Error = err.Error()
 		_ = enc.Encode(doc)
@@ -249,8 +266,8 @@ func (n *Node) serveExplainAPI(w http.ResponseWriter, req *http.Request) {
 	_ = enc.Encode(doc)
 }
 
-// explainStatement plans one statement without running it.
-func (n *Node) explainStatement(ctx context.Context, text string) ([]string, error) {
+// explainStatement plans one statement, as user, without running it.
+func (n *Node) explainStatement(ctx context.Context, text, user string) ([]string, error) {
 	// A representative may have been truncated to fit the accounting;
 	// an unparseable tail is a "cannot explain", not a failure to hide.
 	stmts, err := parser.Parse(strings.TrimSuffix(text, "…"))
@@ -263,10 +280,14 @@ func (n *Node) explainStatement(ctx context.Context, text string) ([]string, err
 	if _, isExplain := stmts[0].(*parser.Explain); isExplain {
 		return nil, fmt.Errorf("the representative is itself an EXPLAIN")
 	}
-	sess, err := n.systemSession()
+	cat, err := n.catalogAccessor()
 	if err != nil {
 		return nil, err
 	}
+	// A session for the caller, not the node's system session: the system
+	// session bypasses grants and may create system tables, neither of
+	// which belongs behind a console button.
+	sess := sql.NewSessionForUser(n.db, cat, user)
 	// Analyze stays false: EXPLAIN describes the plan, EXPLAIN ANALYZE
 	// runs the statement. A console button must never be the second.
 	res, serr := sess.Execute(ctx, &parser.Explain{Stmt: stmts[0], Analyze: false}, nil)

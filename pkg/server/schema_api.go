@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
@@ -50,6 +52,10 @@ type SchemaColumn struct {
 	Hidden    bool   `json:"hidden,omitempty"`
 	Precision int32  `json:"precision,omitempty"`
 	Scale     int32  `json:"scale,omitempty"`
+	// Default is the column's DEFAULT as SQL text, literal or
+	// expression. The table detail view reconstructs the DDL from this
+	// document (issue #194), which it cannot do without it.
+	Default string `json:"default,omitempty"`
 }
 
 // SchemaIndex is one secondary index.
@@ -60,6 +66,29 @@ type SchemaIndex struct {
 	// State is "" or "public" for a readable index, "write-only" while a
 	// CREATE INDEX backfill is in progress.
 	State string `json:"state,omitempty"`
+}
+
+// SchemaConstraint is one table constraint beyond the primary key and
+// NOT NULL: a CHECK expression, a foreign key, or a named UNIQUE. The
+// detail view reconstructs the table's DDL from this document (issue
+// #194), and DDL that silently omits a foreign key is worse than none.
+type SchemaConstraint struct {
+	Name string `json:"name"`
+	// Kind is "check", "foreign" or "unique".
+	Kind    string   `json:"kind"`
+	Columns []string `json:"columns,omitempty"`
+	// Expr is a CHECK's expression as SQL text.
+	Expr string `json:"expr,omitempty"`
+	// RefTable and RefColumns are a foreign key's referenced table and
+	// columns; OnDelete and OnUpdate its referential actions ("" =
+	// restrict).
+	RefTable   string   `json:"ref_table,omitempty"`
+	RefColumns []string `json:"ref_columns,omitempty"`
+	OnDelete   string   `json:"on_delete,omitempty"`
+	OnUpdate   string   `json:"on_update,omitempty"`
+	// Validated is false for a constraint added NOT VALID, or one still
+	// being validated: new writes are checked, existing rows were not.
+	Validated bool `json:"validated"`
 }
 
 // SchemaStats is a table's statistics as the planner sees them.
@@ -82,6 +111,12 @@ type SchemaTable struct {
 	Columns    []SchemaColumn `json:"columns"`
 	PrimaryKey []string       `json:"primary_key"`
 	Indexes    []SchemaIndex  `json:"indexes,omitempty"`
+	// Constraints are the table's CHECK, FOREIGN KEY and named UNIQUE
+	// constraints, with their columns and referenced table resolved to
+	// names.
+	Constraints []SchemaConstraint `json:"constraints,omitempty"`
+	// Comment is COMMENT ON TABLE's text ("" = none).
+	Comment string `json:"comment,omitempty"`
 	// View marks a view; Definition is its query.
 	View       bool   `json:"view,omitempty"`
 	Definition string `json:"definition,omitempty"`
@@ -150,21 +185,76 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 	doc.Now = n.clock.Now().WallTime / int64(time.Millisecond)
 	doc.Principal = p
 	if !p.Admin {
-		// A user sees the tables it holds a grant on, and not who else
-		// exists.
-		var visible []SchemaTable
+		// A user sees the tables it may read, and not who else exists.
+		//
+		// "May read" is privilege resolution, not a direct-grant lookup:
+		// a grant to `public`, a grant to a role the user is a member of,
+		// ownership (which is not a row in Privileges at all), and the
+		// read_all / write_all roles all count. Asking the narrower
+		// question made the console disagree with SHOW TABLES about the
+		// same user's schema — failing closed, so not a disclosure, but
+		// in the common deployment where access is granted through roles
+		// most non-admins saw nothing at all (issue #197).
+		set, err := catalog.LazyRoleGraph(req.Context(), n.db).Effective(p.User)
+		if err != nil {
+			// Fail closed and say so, rather than showing a list built
+			// from a predicate that did not run.
+			doc.Tables, doc.Users = nil, nil
+			doc.Error = "cannot resolve roles for " + p.User + ": " + err.Error()
+			writeSchemaDoc(w, &doc)
+			return
+		}
+		descs := n.tableDescs()
+		visible := make([]SchemaTable, 0, len(full.Tables))
 		for _, t := range full.Tables {
-			if len(t.Privileges[p.User]) > 0 {
-				visible = append(visible, t)
+			d := descs[t.ID]
+			if d == nil || !catalog.CanSeeTable(set, d) {
+				continue
 			}
+			// The table is visible; its full grantee list is not. Naming
+			// every other role granted on a table is the kind of thing
+			// /api/security filters rather than gates, and the same
+			// applies here: the caller sees its own effective grants.
+			t.Privileges = ownGrants(set, d.Privileges)
+			visible = append(visible, t)
 		}
 		doc.Tables = visible
 		doc.Users = nil
 	}
+	writeSchemaDoc(w, &doc)
+}
+
+func writeSchemaDoc(w http.ResponseWriter, doc *SchemaStatus) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(doc)
+}
+
+// ownGrants narrows a table's grantee map to the roles the caller
+// actually holds. The result is a fresh map: the one it filters belongs
+// to the cached document every request shares.
+func ownGrants(set catalog.RoleSet, privs map[string][]string) map[string][]string {
+	var own map[string][]string
+	for g, list := range privs {
+		if !set.Has(g) {
+			continue
+		}
+		if own == nil {
+			own = map[string][]string{}
+		}
+		own[g] = list
+	}
+	return own
+}
+
+// tableDescs is the descriptor map the last catalog scan built, for the
+// questions the API shape cannot answer on its own (ownership, and so
+// visibility).
+func (n *Node) tableDescs() map[uint64]*catalog.TableDescriptor {
+	n.schema.mu.Lock()
+	defer n.schema.mu.Unlock()
+	return n.schema.descs
 }
 
 // schemaDoc returns the cached full document, rebuilding it past
@@ -301,6 +391,51 @@ func tableIDOfKey(k keys.Key) (uint64, bool) {
 	return id, true
 }
 
+// columnDefault renders a column's DEFAULT as the SQL that produced it:
+// an expression as written, a literal in its literal form.
+func columnDefault(c catalog.Column) string {
+	if c.DefaultExpr != "" {
+		return c.DefaultExpr
+	}
+	if c.Default == nil {
+		return ""
+	}
+	if c.Default.Null {
+		return "NULL"
+	}
+	switch c.Default.Fam {
+	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Enum:
+		return "'" + strings.ReplaceAll(c.Default.Text(), "'", "''") + "'"
+	default:
+		return c.Default.Text()
+	}
+}
+
+// schemaConstraint resolves one constraint's column IDs, and a foreign
+// key's referenced table and columns, to the names the browser shows.
+func schemaConstraint(
+	c catalog.Constraint,
+	own map[catalog.ColumnID]string,
+	tableNames map[uint64]string,
+	colNames map[uint64]map[catalog.ColumnID]string,
+) SchemaConstraint {
+	sc := SchemaConstraint{
+		Name: c.Name, Kind: c.Kind, Expr: c.Expr,
+		OnDelete: c.OnDelete, OnUpdate: c.OnUpdate, Validated: c.Validated,
+	}
+	for _, id := range c.Columns {
+		sc.Columns = append(sc.Columns, own[id])
+	}
+	if c.Kind == catalog.ConstraintForeign {
+		sc.RefTable = tableNames[c.RefTable]
+		ref := colNames[c.RefTable]
+		for _, id := range c.RefColumns {
+			sc.RefColumns = append(sc.RefColumns, ref[id])
+		}
+	}
+	return sc
+}
+
 func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string, map[uint64]*catalog.TableDescriptor, map[uint64]base.PlacementPolicy) {
 	doc := &SchemaStatus{NodeID: int(n.ident.NodeID)}
 	names := map[uint64]string{}
@@ -334,6 +469,19 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].Name < descs[j].Name })
 
+	// Column names for every descriptor up front: a foreign key names a
+	// table that may sort after the one referencing it, and the detail
+	// view needs "REFERENCES orders (id)", not two integers.
+	colNames := make(map[uint64]map[catalog.ColumnID]string, len(descs))
+	for _, d := range descs {
+		m := make(map[catalog.ColumnID]string, len(d.Columns))
+		for _, c := range d.Columns {
+			m[c.ID] = c.Name
+		}
+		colNames[d.ID] = m
+		names[d.ID] = d.Name
+	}
+
 	// Range footprint: every range cluster-wide (from /meta) and this
 	// node's replica views.
 	ranges, _, rerr := n.clusterRanges(ctx)
@@ -353,8 +501,8 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			Timeseries: d.Timeseries, RetentionSeconds: d.RetentionSeconds, Shards: d.ShardBuckets,
 			Privileges: d.Privileges,
 			View:       d.IsView(), Definition: d.ViewQuery,
+			Comment: d.Comment,
 		}
-		names[d.ID] = d.Name
 		byID[d.ID] = d
 		if p, ok := dbPolicy[d.DatabaseID]; ok {
 			policies[d.ID] = p
@@ -364,7 +512,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			colName[c.ID] = c.Name
 			t.Columns = append(t.Columns, SchemaColumn{
 				Name: c.Name, Type: c.TypeSQL(), NotNull: c.NotNull, Hidden: c.Hidden,
-				Precision: c.Precision, Scale: c.Scale,
+				Precision: c.Precision, Scale: c.Scale, Default: columnDefault(c),
 			})
 		}
 		for _, id := range d.PrimaryKey {
@@ -376,6 +524,9 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 				si.Columns = append(si.Columns, colName[id])
 			}
 			t.Indexes = append(t.Indexes, si)
+		}
+		for _, c := range d.Constraints {
+			t.Constraints = append(t.Constraints, schemaConstraint(c, colName, names, colNames))
 		}
 		if d.IsView() {
 			doc.Tables = append(doc.Tables, t) // no rows, no ranges

@@ -317,6 +317,16 @@ type Node struct {
 	rangeList rangeListCache
 	// events is the node's operational event ring (see health_api.go).
 	events *events.Ring
+	// authLimit bounds what an unauthenticated caller can cost this node
+	// before any password is verified (issue #195, authlimit.go).
+	authLimit *authLimiter
+	// consistency tracks the sweep in flight, so a pass over every led
+	// range is one operation rather than a stream of instants
+	// (issue #192). Touched only by the single consistency worker.
+	consistency struct {
+		op         string
+		mismatches int
+	}
 	// consistencyFailures counts checksum mismatches this node's sweeps
 	// found (readable, unlike the Prometheus counter).
 	consistencyFailures atomic.Int64
@@ -424,6 +434,7 @@ func (n *Node) start() error {
 	}
 
 	n.events = events.New()
+	n.authLimit = newAuthLimiter()
 	n.installAuditSink()
 	n.sys = sysstats.New(n.cfg.Dir)
 	n.sys.Sample() // the first heartbeat should already carry a summary

@@ -64,6 +64,16 @@ func (n *Node) RunReshardJanitorOnce(ctx context.Context) {
 		log.Debugf("reshard janitor: descriptor scan: %v", err)
 		return
 	}
+	// Paired only when there is something to reclaim: a janitor pass that
+	// finds nothing is not an operation, and a timeline that fills with
+	// empty passes is worse than one that says nothing (issue #192).
+	var opID string
+	reclaimed := 0
+	defer func() {
+		if opID != "" {
+			n.events.RecordEnd("reshard-reclaim", opID, "ok", "reclaimed %d retired layout(s)", reclaimed)
+		}
+	}()
 	now := n.clock.Now().WallTime
 	keepFor := n.reshardKeepFor()
 	for _, kv := range descKVs {
@@ -80,6 +90,11 @@ func (n *Node) RunReshardJanitorOnce(ctx context.Context) {
 		if len(expired) == 0 {
 			continue
 		}
+		if opID == "" {
+			opID = newOpID()
+			n.events.RecordStart("reshard-reclaim", opID, "reclaiming retired re-shard layouts past the keep window")
+		}
+		reclaimed += len(expired)
 		// Drop the entries transactionally against the current descriptor
 		// (a racing re-shard may have appended more layouts).
 		err := n.db.RunTxn(ctx, "reshard-janitor", func(ctx context.Context, txn *kvclient.Txn) error {

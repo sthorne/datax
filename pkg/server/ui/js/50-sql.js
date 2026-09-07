@@ -36,10 +36,10 @@ function renderSQL(d) {
   renderTiles(document.getElementById("sql-tiles"),
     // The breakdown is a qualifier of the figure, not more headline:
     // run on at 22px it wrapped past the bottom of its card.
-    tile("connections", `${open}` + qual(`${active} active · ${idleTxn} idle in txn`)) +
+    tileHTML("connections", `${open}` + qual(`${active} active · ${idleTxn} idle in txn`)) +
     tile("statements/s", stmtRate.toFixed(1), "stmt", stmtRate) +
     tile("40001/s", retryRate.toFixed(2), "retry", retryRate) +
-    tile("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms` + qual(`on n${p99Node}`) : "—", "p99", p99 / 1000) +
+    tileHTML("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms` + qual(`on n${p99Node}`) : "—", "p99", p99 / 1000) +
     tile("oldest idle txn", oldest ? fmtAgo(oldest) : "none"));
   document.getElementById("sql-note").textContent = "rates are differences between polls; kinds: select, insert, update, delete, copy, txn (BEGIN/COMMIT/ROLLBACK/savepoints), ddl";
   renderTxnUsers(d, lastContention && lastContention.retriesByUser, lastContention && lastContention.node);
@@ -307,10 +307,13 @@ let stmtDoc = null, stmtOpen = null;
 
 async function pollStatements() {
   const resp = await fetch("/api/statements", { cache: "no-store" });
-  if (resp.status === 403) { stmtDoc = null; renderStatementShapes(); return; }
-  if (!resp.ok) { stmtDoc = null; renderStatementShapes(); throw new Error("HTTP " + resp.status); }
+  if (resp.status === 403) { stmtDoc = null; renderStatementShapes(); renderTableShapesIfOpen(); return; }
+  if (!resp.ok) { stmtDoc = null; renderStatementShapes(); renderTableShapesIfOpen(); throw new Error("HTTP " + resp.status); }
   stmtDoc = await resp.json();
   renderStatementShapes();
+  // The table detail lists the shapes that touch one table from this
+  // same document (issue #194), so it redraws when the document lands.
+  if (ui.view === "schema" && ui.table && lastSchema) renderTableDetail(lastSchema);
 }
 
 const STMT_SORTS = {
@@ -429,7 +432,8 @@ async function explainShape(fp) {
       return;
     }
     out.innerHTML = `<pre class="key" style="white-space:pre-wrap">${esc((d.plan || []).join("\n") || "no plan returned")}</pre>`
-      + `<p class="muted">the plan for the statement above, on n${stmtDoc ? stmtDoc.node_id : "?"} — described, not run</p>`;
+      + `<p class="muted">the plan for the statement above, on n${stmtDoc ? stmtDoc.node_id : "?"} — described, not run`
+      + (d.planned_as ? `, as ${esc(d.planned_as)}` : "") + `</p>`;
   } catch (err) {
     out.innerHTML = `<div class="note">${esc(err.message || String(err))}</div>`;
   }

@@ -2,7 +2,6 @@ package pgwire
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"time"
@@ -15,30 +14,35 @@ import (
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
-// processSecret keys the stand-in verifiers for missing users when the
-// server has no cluster-wide secret to offer (ServerOptions.MockSecret
-// unset, or unavailable): random per process, so the salts a node shows
-// for names that do not exist are still per-name and stable on that
-// node for its lifetime (issue #137).
-var processSecret = func() []byte {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
-	return b
-}()
-
 // standInVerifier is the verifier a missing user (or one with no
 // password, or one that cannot log in) authenticates against, so the
 // SCRAM exchange runs to completion identically whether or not the user
 // exists — the client learns only "password authentication failed", and
 // the salt it saw in server-first says nothing either.
+//
+// It needs the cluster's authentication secret, and returns nil when
+// there is none to be had. There used to be a per-process fallback so
+// that a node whose KV read failed could still answer, with salts that
+// were at least per-name and stable on that node. That is what made the
+// oracle (issue #196): a real verifier lives in the replicated catalog,
+// so a genuine user's salt is identical on every node, while a
+// per-process stand-in is not. Ask two nodes for the same username —
+// two different salts means no such user, the same salt means the user
+// exists. One client-first per node, no password guessing, no completed
+// authentication.
+//
+// Refusing to answer at all is the honest alternative, and it is only
+// safe because the caller refuses for EVERY user rather than only for
+// the missing ones: an error where an unknown name gets one and a known
+// name gets a challenge would be a better oracle than the one being
+// closed.
 func (c *conn) standInVerifier(ctx context.Context, user string) *security.ScramVerifier {
-	secret := processSecret
-	if c.opts.MockSecret != nil {
-		if s := c.opts.MockSecret(ctx); len(s) > 0 {
-			secret = s
-		}
+	if c.opts.MockSecret == nil {
+		return nil
+	}
+	secret := c.opts.MockSecret(ctx)
+	if len(secret) == 0 {
+		return nil
 	}
 	return security.MockVerifier(secret, user)
 }
@@ -68,6 +72,17 @@ func (c *conn) authenticateSCRAM(user string) error {
 	genuine := verifier != nil && lookupErr == nil
 	if verifier == nil {
 		verifier = c.standInVerifier(ctx, user)
+	}
+	if verifier == nil {
+		// No cluster secret, so no stand-in that agrees with the other
+		// nodes'. Refuse before the mechanism is advertised, identically
+		// for every username: a node in this state answers nobody, which
+		// says nothing about who exists (issue #196).
+		metrics.AuthSecretUnavailable.Inc()
+		log.Warnf("the cluster's authentication secret is unavailable on this node; refusing password authentication until it can be read")
+		c.sendError(&sql.Error{Code: "08006", Msg: "the cluster's authentication secret is unavailable on this node; try another node"})
+		_ = c.backend.Flush()
+		return fmt.Errorf("authentication secret unavailable")
 	}
 
 	failed := func() error {

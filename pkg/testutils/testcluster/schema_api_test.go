@@ -299,3 +299,110 @@ func TestClusterAPIUnderPartition(t *testing.T) {
 		t.Fatalf("/api/schema on the partitioned node: %d", resp.StatusCode)
 	}
 }
+
+// TestSchemaAPIDescribesATableFully (issue #194): the console's table
+// detail view rebuilds a table's DDL from /api/schema alone. It cannot
+// do that while the document leaves out what a column defaults to, what
+// constraints the table enforces, and what COMMENT ON TABLE said — and
+// DDL that silently drops a foreign key is worse than no DDL at all.
+//
+// A foreign key also names a table and columns by ID, which mean nothing
+// to a reader: the document resolves both to names.
+func TestSchemaAPIDescribesATableFully(t *testing.T) {
+	tc := startWithHTTP(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cat := catalog.NewAccessor()
+	s := sql.NewSession(tc.Nodes[0].DB(), cat)
+
+	execSQL(t, ctx, s, `CREATE TABLE customers (id INT8 PRIMARY KEY, email TEXT NOT NULL)`)
+	execSQL(t, ctx, s, `CREATE TABLE orders (
+		id INT8 PRIMARY KEY,
+		customer_id INT8 NOT NULL,
+		status TEXT DEFAULT 'pending',
+		total DECIMAL(12,2),
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		CONSTRAINT orders_total_positive CHECK (total >= 0),
+		CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE
+	)`)
+	execSQL(t, ctx, s, `COMMENT ON TABLE orders IS 'one row per order'`)
+
+	// The document is cached for schemaCacheFor, so the tables created
+	// above appear on the first rebuild after that, not necessarily on
+	// the first request.
+	base := "http://" + tc.Nodes[0].HTTPAddr()
+	var ord server.SchemaTable
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		code, _, body := httpGet(t, base+"/api/schema")
+		if code != 200 {
+			t.Fatalf("/api/schema: %d", code)
+		}
+		var doc server.SchemaStatus
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, tb := range doc.Tables {
+			if tb.Name == "orders" {
+				ord, found = tb, true
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("orders never appeared in /api/schema")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	byCol := map[string]server.SchemaColumn{}
+	for _, c := range ord.Columns {
+		byCol[c.Name] = c
+	}
+	// A literal default renders as the literal (quoted where its family
+	// needs quoting); an expression default renders as the expression.
+	if got := byCol["status"].Default; got != "'pending'" {
+		t.Errorf("status DEFAULT: got %q, want %q — without it the view's DDL says the column has no default", got, "'pending'")
+	}
+	if got := byCol["created_at"].Default; !strings.Contains(strings.ToLower(got), "now()") {
+		t.Errorf("created_at DEFAULT: got %q, want the now() expression", got)
+	}
+	if got := byCol["id"].Default; got != "" {
+		t.Errorf("id has no DEFAULT, got %q", got)
+	}
+
+	if ord.Comment != "one row per order" {
+		t.Errorf("orders comment: got %q, want %q", ord.Comment, "one row per order")
+	}
+
+	byCon := map[string]server.SchemaConstraint{}
+	for _, c := range ord.Constraints {
+		byCon[c.Name] = c
+	}
+	if len(byCon) != 2 {
+		t.Fatalf("orders constraints: %+v", ord.Constraints)
+	}
+	chk := byCon["orders_total_positive"]
+	if chk.Kind != catalog.ConstraintCheck || !strings.Contains(chk.Expr, "total") || !chk.Validated {
+		t.Errorf("CHECK constraint: %+v", chk)
+	}
+	fk := byCon["orders_customer_fk"]
+	if fk.Kind != catalog.ConstraintForeign {
+		t.Fatalf("foreign key: %+v", fk)
+	}
+	// The names, not the IDs: a reader cannot act on "table 54".
+	if len(fk.Columns) != 1 || fk.Columns[0] != "customer_id" {
+		t.Errorf("foreign key columns: %v", fk.Columns)
+	}
+	if fk.RefTable != "customers" {
+		t.Errorf("foreign key referenced table: got %q, want customers", fk.RefTable)
+	}
+	if len(fk.RefColumns) != 1 || fk.RefColumns[0] != "id" {
+		t.Errorf("foreign key referenced columns: %v", fk.RefColumns)
+	}
+	if fk.OnDelete != catalog.FKCascade {
+		t.Errorf("foreign key ON DELETE: got %q, want %q", fk.OnDelete, catalog.FKCascade)
+	}
+}

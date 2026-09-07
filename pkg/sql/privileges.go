@@ -823,17 +823,10 @@ func (s *Session) execAlterDefaultPrivileges(ctx context.Context, txn *kvclient.
 }
 
 // canSeeTable reports whether a role set may see a table in the
-// catalogs: admins, the owner, any grantee, read_all and write_all.
+// catalogs. The predicate lives in the catalog package: the console asks
+// the same question over HTTP, and answered it differently (issue #197).
 func canSeeTable(set catalog.RoleSet, d *catalog.TableDescriptor) bool {
-	if set.IsAdmin() || set.Has(catalog.OwnerOf(d.Owner)) || set.Has(catalog.ReadAllRole) || set.Has(catalog.WriteAllRole) {
-		return true
-	}
-	for g := range d.Privileges {
-		if set.Has(g) {
-			return true
-		}
-	}
-	return false
+	return catalog.CanSeeTable(set, d)
 }
 
 // grantRows renders SHOW GRANTS: database_name, schema_name,

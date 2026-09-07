@@ -435,7 +435,21 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 			clearSessionCookie(w)
 		}
 		user, pass, ok := req.BasicAuth()
+		if ok && !n.authLimit.allow(req.RemoteAddr, user) {
+			// Basic re-verifies on every request, so this door costs the
+			// node the same PBKDF2 derivation per request rather than
+			// once per session (issue #195).
+			n.authThrottled(req.RemoteAddr, user, req.URL.Path)
+			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
+			return
+		}
+		if ok && !n.authLimit.acquireVerify() {
+			n.authThrottled(req.RemoteAddr, user, req.URL.Path)
+			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
+			return
+		}
 		if ok {
+			defer n.authLimit.releaseVerify()
 			ctx := req.Context()
 			verifier, err := n.lookupVerifier(ctx, user)
 			if err != nil || verifier == nil {
@@ -445,6 +459,7 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 				verifier = security.DummyVerifier()
 			}
 			if security.VerifyPassword(verifier, pass) {
+				n.authLimit.succeeded(req.RemoteAddr, user)
 				serveAs(next, w, req, httpPrincipal{User: user, Via: "basic"})
 				return
 			}

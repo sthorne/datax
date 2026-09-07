@@ -364,3 +364,350 @@ func TestHTTPCertAuthChecksLogin(t *testing.T) {
 		t.Fatalf("node certificate on an admin endpoint: %d, want 200", code)
 	}
 }
+
+// TestSchemaAPIResolvesRoles (issue #197): /api/schema must show a
+// non-admin the tables it can actually read, not only the ones granted
+// to it by name.
+//
+// The filter was a direct-grant lookup keyed by the principal's own
+// username, which is a narrower test than privilege resolution: it
+// missed a grant to `public`, a grant to a role the user is a member of,
+// and ownership, which is not a row in the privilege map at all. It
+// failed closed, so this was never a disclosure — but in the common
+// deployment where access is granted through roles rather than to
+// individuals, a non-admin opened the schema view and saw nothing it
+// could not equally well query from psql.
+func TestSchemaAPIResolvesRoles(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	db, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	for _, stmt := range []string{
+		// One table per way a user can reach a table without a grant in
+		// its own name, plus one it must not see.
+		`CREATE TABLE via_role (id INT PRIMARY KEY)`,
+		`CREATE TABLE via_public (id INT PRIMARY KEY)`,
+		`CREATE TABLE via_none (id INT PRIMARY KEY)`,
+		`CREATE ROLE readers`,
+		`GRANT SELECT ON via_role TO readers`,
+		`GRANT SELECT ON via_public TO public`,
+		`CREATE USER alice WITH PASSWORD 'alicepw'`,
+		`GRANT readers TO alice`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// The console's answer must match what alice can actually read. The
+	// document is rebuilt at most once every schemaCacheFor, so poll for
+	// the tables to appear rather than racing the rebuild.
+	var doc server.SchemaStatus
+	// Filled by each poll below before it is read.
+	var seen map[string]bool
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		code, body, _ := authedGet(t, client, base+"/api/schema", "alice", "alicepw")
+		if code != http.StatusOK {
+			t.Fatalf("/api/schema as alice: %d", code)
+		}
+		doc = server.SchemaStatus{}
+		if err := jsonUnmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		seen = map[string]bool{}
+		for _, tbl := range doc.Tables {
+			seen[tbl.Name] = true
+		}
+		if seen["via_role"] && seen["via_public"] {
+			break
+		}
+		if time.Now().After(deadline) {
+			if !seen["via_role"] {
+				t.Error("via_role: granted to a role alice is a member of, and not shown")
+			}
+			if !seen["via_public"] {
+				t.Error("via_public: granted to public, which every role holds, and not shown")
+			}
+			t.Fatalf("alice's schema after 30s: %v", seen)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if seen["via_none"] {
+		t.Error("via_none: alice holds nothing on it and it was shown")
+	}
+	if doc.Users != nil {
+		t.Error("a non-admin was shown the user list")
+	}
+
+	// The table is visible; the names of everyone else granted on it are
+	// not — the same call /api/security makes.
+	if _, err := db.Exec(ctx, `CREATE ROLE auditors`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `GRANT SELECT ON via_role TO auditors`); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		code, body, _ := authedGet(t, client, base+"/api/schema", "alice", "alicepw")
+		doc = server.SchemaStatus{}
+		if code == http.StatusOK && jsonUnmarshal([]byte(body), &doc) == nil {
+			for _, tbl := range doc.Tables {
+				if tbl.Name != "via_role" {
+					continue
+				}
+				if _, leaked := tbl.Privileges["auditors"]; leaked {
+					t.Fatal("via_role names auditors to alice, who is not a member of it")
+				}
+				if _, own := tbl.Privileges["readers"]; own {
+					return // alice sees the grant she holds, and not the other
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("alice never saw her own grant on via_role: %+v", doc.Tables)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// TestExplainPlansAsTheCaller (issue #193): /api/explain produced its
+// plan through the node's own system session, so the plan a console
+// button returned was not the one the operator's query would produce —
+// different privileges, and a session that bypasses grants and may
+// create system tables. Every other view filters what it shows by what
+// the caller may see; this one did not, and said nothing about it.
+func TestExplainPlansAsTheCaller(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	db, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	for _, stmt := range []string{
+		`CREATE TABLE plans (id INT PRIMARY KEY, v INT)`,
+		`INSERT INTO plans VALUES (1, 1)`,
+		`CREATE USER carol WITH PASSWORD 'carolpw'`,
+		`GRANT admin TO carol`, // /api/explain is admin-gated
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Run a statement so the shape is in this node's accounting: the
+	// endpoint explains what it recorded, never text from the request.
+	if _, err := db.Exec(ctx, `SELECT id FROM plans WHERE v = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the shape, then explain it as carol.
+	var fp string
+	deadline = time.Now().Add(30 * time.Second)
+	for fp == "" {
+		code, body, _ := authedGet(t, client, base+"/api/statements", "carol", "carolpw")
+		if code == http.StatusOK {
+			var doc server.StatementsStatus
+			if jsonUnmarshal([]byte(body), &doc) == nil {
+				for _, sh := range doc.Statements {
+					// The SELECT specifically: EXPLAIN describes a query
+					// plan, and the other shapes on this table are DDL.
+					if sh.Kind == "select" && strings.Contains(sh.Shape, "plans") {
+						fp = sh.Fingerprint
+					}
+				}
+			}
+		}
+		if fp == "" && time.Now().After(deadline) {
+			t.Fatalf("no statement shape for the test query after 30s; last body: %.400s", body)
+		}
+		if fp == "" {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+
+	code, body, _ := authedGet(t, client, base+"/api/explain?fingerprint="+fp, "carol", "carolpw")
+	if code != http.StatusOK {
+		t.Fatalf("/api/explain as carol: %d %s", code, body)
+	}
+	var ex server.ExplainStatus
+	if err := jsonUnmarshal([]byte(body), &ex); err != nil {
+		t.Fatal(err)
+	}
+	if ex.Error != "" {
+		t.Fatalf("explain error: %s", ex.Error)
+	}
+	if ex.PlannedAs != "carol" {
+		t.Errorf("plan produced as %q, want carol: the console must not have to assume whose privileges a plan reflects", ex.PlannedAs)
+	}
+	if len(ex.Plan) == 0 {
+		t.Error("no plan returned")
+	}
+}
+
+// TestLoginIsRateLimited (issue #195): /api/login is reachable before
+// any credential is validated and each attempt re-derives PBKDF2 —
+// measured at 0.72 ms of CPU. Unbounded, that is a pre-authentication
+// amplification: a request an attacker sends for nothing costs the node
+// a slice of a core, so a handful of connections pins it, against a
+// listener that must stay reachable for the console to work.
+//
+// The refusal has to come before the derivation, so this asserts on
+// latency as well as on the status code: a 429 issued after the work has
+// already run would satisfy a status-code test and none of the point.
+func TestLoginIsRateLimited(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i == 0 {
+			cfg.HTTPListener = httpLis
+		}
+	})
+	_ = tc
+	base := "https://" + tc.Nodes[0].HTTPAddr()
+	client := httpsClient(t, certsDir, "")
+
+	post := func(user, pass string) (int, time.Duration) {
+		t.Helper()
+		body := `{"user":` + jsonQuote(user) + `,"password":` + jsonQuote(pass) + `}`
+		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		start := time.Now()
+		resp, err := client.Do(req)
+		took := time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, took
+	}
+
+	// Wait for auth to be answering at all.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root basic auth never succeeded")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Guess until the limiter refuses, then confirm the refusal is
+	// cheap — it must not have run the derivation.
+	var throttled int
+	var throttledTime time.Duration
+	for i := 0; i < 60 && throttled < 3; i++ {
+		code, took := post("root", "wrong-password")
+		if code == http.StatusTooManyRequests {
+			throttled++
+			throttledTime += took
+			continue
+		}
+		if code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: %d, want 401 or 429", i, code)
+		}
+	}
+	if throttled < 3 {
+		t.Fatal("60 wrong passwords from one source were never refused: the endpoint is unbounded")
+	}
+
+	// A refused attempt is answered without the PBKDF2 derivation. The
+	// derivation is milliseconds; a refusal is a map lookup, so an
+	// average well under a millisecond of server time is the signal.
+	// Network and TLS dominate what is measured here, so the bar is
+	// deliberately loose: it is checking that the work was skipped, not
+	// how fast the machine is.
+	if avg := throttledTime / time.Duration(throttled); avg > 50*time.Millisecond {
+		t.Errorf("refused attempts averaged %s; a refusal should not be doing the work it refuses", avg)
+	}
+
+	// A legitimate sign-in still gets through. Everything in this test
+	// shares one source address, so the guessing above drained the
+	// source's budget — the documented cost of keying on address, and
+	// why the budget refills: within a couple of seconds root is in, and
+	// succeeding restores the budget rather than spending it.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret")
+		if code == http.StatusOK {
+			break
+		}
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("legitimate sign-in: %d, want 200 (or 429 while the budget refills)", code)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a legitimate sign-in never got through: the budget does not refill")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	// Having succeeded, root is not left one attempt from being throttled
+	// again.
+	for i := 0; i < 3; i++ {
+		if code, _, _ := authedGet(t, client, base+"/status", "root", "topsecret"); code != http.StatusOK {
+			t.Fatalf("sign-in %d after a success: %d — proving a credential must not spend the guessing budget", i, code)
+		}
+	}
+}
+
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

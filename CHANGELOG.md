@@ -8,6 +8,95 @@ release, and the build workflow stamps binaries with the tag or with
 ... in `pkg/version`) is separate: it changes only when the replicated
 state or the internode protocol does, and an entry below says so.
 
+## 0.55.0 — unreleased
+
+Everything under #189: six defects the console review turned up, the
+operations that never recorded a duration, and the one view that was
+moved rather than rebuilt.
+
+### Added
+- **A table detail view** (#194). `#/schema` was moved to its own route
+  under #144 and otherwise left as it was: one row per table across nine
+  columns, with everything below that in `title` attributes. A tooltip
+  does not appear on touch, is awkward to reach from a keyboard, is
+  unreadable for a forty-column table and cannot be copied — and this is
+  the one view whose audience is not the operator but the application
+  developer, who opens it to find out whether their index finished
+  building, whether the statistics are fresh enough for the planner to
+  pick it, and who is granted what.
+
+  The list keeps its job as an index and gains the level below it:
+  `#/schema/<table>`, reached by clicking a row or focusing it and
+  pressing Enter, and by the jump box, which now goes to the table rather
+  than to the list filtered to it. The detail shows, as content: the
+  columns with type, nullability, default and hidden flag (hidden shown
+  as such — a time-series table's shard column leading the primary key is
+  confusing precisely because it is invisible); the indexes with their
+  build state, where `write-only` reads as "building" and says that the
+  backfill publishes no progress; the constraints; the statistics with
+  what their age means for the planner and the `ANALYZE` that refreshes
+  them; the range footprint with a link into `#/data` filtered to the
+  table; the grants; the statement shapes that name this table, joined
+  against the `/api/statements` document `#/sql` already fetches; and the
+  reconstructed DDL with a copy button.
+
+  `/api/schema` gained the three fields the DDL cannot be rebuilt
+  without — column defaults, constraints, and the table comment — with a
+  foreign key's referenced table and columns resolved to names rather
+  than IDs. Glossary entries for all fifteen new terms ship with it.
+- **Operations that have a duration are now recorded as pairs** (#192).
+  Four operations recorded start/end pairs; the rest were instants, so
+  the operations timeline could not say how long a consistency sweep,
+  a re-encryption pass or a decommission actually took. The ones with a
+  duration now open and close a record, and the two cases deliberately
+  left as instants — garbage collection with log truncation, and
+  split/merge/rebalance — say so in `pkg/util/events/events.go` and in
+  the glossary, rather than looking like an oversight.
+
+### Fixed
+- **Authentication attempts are throttled** (#195). Every unauthenticated
+  attempt cost the node a SCRAM verification — 0.72 ms of CPU — with
+  nothing bounding the rate, so an attacker who cannot guess a password
+  could still spend the node's processor at will. A limiter keyed on the
+  source address, and on the (source, account) pair, now refuses past a
+  burst; a successful sign-in refunds what it spent, so a legitimate user
+  sharing a source with a guessing loop is not locked out by it. Keying
+  on the account alone would itself be a denial of service against a
+  known username, and queuing rather than refusing would hold the
+  goroutine the limiter exists to protect.
+- **A node without the cluster's authentication secret refuses rather
+  than answering with a stand-in salt** (#196). The per-process fallback
+  salt differed from every other node's, so the same user got different
+  salts from different nodes — which is user enumeration by another
+  route. The node now refuses password authentication uniformly, for
+  every user rather than only unknown ones, so there is no oracle: an
+  availability trade on a node that is already degraded, and the client
+  is told to try another node.
+- **A running operation survives its start record leaving the ring**
+  (#190). The event ring is 500 records shared with every split, merge,
+  rebalance, lease shed, snapshot and audit record on the node — minutes
+  of real work, well short of a decommission or a backup. An operation
+  whose start record aged out stopped being reported as running, so "In
+  flight" showed an idle cluster in the middle of moving every replica
+  off a node. The ring now keeps a small map of what is open, keyed by
+  (kind, op), so a long operation keeps its true start time and its true
+  elapsed.
+- **`/api/schema` shows a non-admin the tables it can actually read**
+  (#197). Visibility was a direct-grant lookup, which missed a grant to
+  `public`, a grant to a role the user is a member of, ownership (which
+  is not a grant row at all) and the `read_all`/`write_all` roles. It
+  failed closed, so nothing was disclosed — but in the common deployment
+  where access is granted through roles, most non-admins saw no tables at
+  all, and the console disagreed with `SHOW TABLES` about the same user's
+  schema. Both now ask the same question.
+- **EXPLAIN from the console plans as the operator who asked** (#193),
+  not as the system session — so a plan reflects the privileges and
+  session settings of the person reading it.
+- **`tile()` escapes its value again** (#191). A refactor left the tile
+  helper rendering its value as HTML with seven call sites passing
+  unescaped strings. `tile()` escapes; a caller that really is composing
+  markup calls `tileHTML()` and says so.
+
 ## 0.54.1 — unreleased
 
 ### Fixed

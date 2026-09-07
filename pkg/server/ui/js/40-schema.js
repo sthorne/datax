@@ -11,6 +11,13 @@ function fmtRetention(sec) {
 }
 function renderSchema(d) {
   lastSchema = d;
+  // #/schema is the list; #/schema/<table> is the level below it
+  // (issue #194). One document serves both, so the route decides which
+  // section is on screen rather than a second poll.
+  const detail = ui.view === "schema" && !!ui.table;
+  document.getElementById("sec-schema").hidden = detail;
+  document.getElementById("sec-table").hidden = !detail;
+  if (detail) { renderTableDetail(d); return; }
   const tbody = document.getElementById("schema");
   const tables = (d.tables || []).filter(t => !schemaFilter || t.name.toLowerCase().includes(schemaFilter));
   renderKeyed(tbody, tables.map(t => {
@@ -25,8 +32,9 @@ function renderSchema(d) {
     const age = st ? (st.stale ? `<span class="st draining">${fmtAgo(st.age_seconds * 1000)}</span>` : fmtAgo(st.age_seconds * 1000)) : "—";
     const grants = Object.entries(t.privileges || {}).map(([u, p]) => `${esc(u)}: ${p.map(esc).join(",").toLowerCase()}`).join("<br>") || `<span class="muted">admins only</span>`;
     const key = (t.database || "") + "." + t.name;
-    return { key, html: `<tr data-key="${esc(key)}">
-      <td data-label="table"><b>${esc(t.database && t.database !== "datax" ? t.database + "." + t.name : t.name)}</b>${ts}</td>
+    const to = tableKey(t);
+    return { key, html: `<tr data-key="${esc(key)}" class="clickable" data-table="${esc(to)}" tabindex="0" role="link" title="Enter or click: this table in full">
+      <td data-label="table"><b>${esc(to)}</b>${ts}</td>
       <td data-label="columns" title="${esc(colList)}">${cols.length}</td>
       <td class="key" data-label="primary key" title="${hiddenNames.size ? "led by the hidden shard column" : ""}">${pk.map(esc).join(", ")}</td>
       <td data-label="indexes">${idx || "—"}</td>
@@ -39,7 +47,7 @@ function renderSchema(d) {
   }));
   const note = document.getElementById("schema-note");
   note.textContent = (d.tables || []).length
-    ? `${(d.tables || []).length} tables in the one namespace (the connection URL's database name is accepted and ignored); local size counts this node's replicas only`
+    ? `${(d.tables || []).length} tables in the one namespace (the connection URL's database name is accepted and ignored); local size counts this node's replicas only. Click a table, or focus it and press Enter, for its columns, indexes, statistics, grants and DDL`
     : (d.principal && d.principal.secure && !d.principal.admin ? "no tables granted to " + d.principal.user : "no tables yet");
   // Users used to be a small table appended here. #/security owns roles
   // now (issue #156) and draws them from /api/security with their

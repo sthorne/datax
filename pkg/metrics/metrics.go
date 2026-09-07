@@ -258,6 +258,12 @@ var (
 	AuthFailures = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_failures_total", Help: "Failed authentication attempts (SQL and HTTP).",
 	})
+	AuthThrottled = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_auth_throttled_total", Help: "Authentication attempts refused by the rate limiter before any password verification ran (issue #195).",
+	})
+	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
+	})
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
 	})

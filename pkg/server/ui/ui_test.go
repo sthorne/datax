@@ -288,7 +288,7 @@ func TestTileQualifiersAreNotHeadlines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(core), `class="value${valueClass(value)}"`) {
+	if !strings.Contains(string(core), `class="value${cls}"`) || !strings.Contains(string(core), "valueClass(text)") {
 		t.Error("js/10-core.js: tile() no longer classifies long values, so the " +
 			"CSS rule above can never apply")
 	}
@@ -496,7 +496,7 @@ func pageTerms() ([]pageTerm, error) {
 var (
 	viewSplit = regexp.MustCompile(`(?s)<main id="view-([a-z]+)"(.*?)</main>`)
 	headingRE = regexp.MustCompile(`(?s)<(th|h2)\b[^>]*>(.*?)</(?:th|h2)>`)
-	tileLabel = regexp.MustCompile(`\btile\("([^"]+)"`)
+	tileLabel = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
 	// Controls and screen-reader text live inside a heading without being
 	// part of the term: "Statement shapes" is the heading and the sort
 	// <select> beside it is not.
@@ -516,4 +516,230 @@ func normalizeTerm(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(spaces.ReplaceAllString(strings.ToLower(raw), " "))
+}
+
+// TestTileValuesAreEscaped (issue #191): tile() escapes its value, and a
+// caller that needs to compose markup says so by name.
+//
+// tile() used to escape, then stopped so that callers could pass a
+// qualifier span — but the label beside the value is still escaped, so
+// nothing signalled that the second argument had become a raw-HTML slot.
+// Seven call sites were passing strings the page had not formatted: a
+// node's address and locality, an overload reason, and the signed-in
+// role name, which is a database identifier and can be quoted into
+// anything. The exposure was small (a tile shows the viewer their own
+// name) but the contract was inverted, which is the part that does not
+// stay small.
+func TestTileValuesAreEscaped(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(core), "return renderTile(label, esc(text)") {
+		t.Error("js/10-core.js: tile() no longer escapes its value; the short name must be the safe one")
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		src, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, call := range callsTo(string(src), "tile(") {
+			for _, markup := range []string{"qual(", "contrib(", "<span", "<b>", "<a "} {
+				if strings.Contains(call, markup) {
+					t.Errorf("%s: tile(...) is passed composed markup (%s), which it now escapes and would render as text:\n\t%s\n"+
+						"use tileHTML for a value the page composes itself", name, markup, oneLine(call))
+				}
+			}
+		}
+	}
+}
+
+// callsTo returns the text of every call to fn in src, from the opening
+// parenthesis to the one that closes it. It counts parentheses, so a
+// nested call does not end the outer one early; `tileHTML(` is not a
+// match for `tile(` because the search starts at a word boundary.
+func callsTo(src, fn string) []string {
+	var out []string
+	for i := 0; i+len(fn) <= len(src); i++ {
+		if !strings.HasPrefix(src[i:], fn) {
+			continue
+		}
+		if i > 0 && (isWordByte(src[i-1]) || src[i-1] == '.') {
+			continue // tileHTML(, renderTile(, a.tile(
+		}
+		depth := 0
+		for j := i + len(fn) - 1; j < len(src); j++ {
+			switch src[j] {
+			case '(':
+				depth++
+			case ')':
+				if depth--; depth == 0 {
+					out = append(out, src[i:j+1])
+					i = j
+					goto next
+				}
+			}
+		}
+	next:
+	}
+	return out
+}
+
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 160 {
+		return s[:160] + "…"
+	}
+	return s
+}
+
+// TestTableDetailIsReachable (issue #194): the schema list was the only
+// level there was, and everything below it lived in `title` attributes —
+// which do not appear on touch, are awkward to reach from a keyboard,
+// are unreadable for a forty-column table and cannot be copied.
+//
+// The level below it is a route, and a row leads to it by click and by
+// keyboard alike, the way #149 established for node and range rows.
+func TestTableDetailIsReachable(t *testing.T) {
+	router, err := FS.ReadFile("js/15-router.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse := funcBody(string(router), "function parseRoute()")
+	if parse == "" {
+		t.Fatal("js/15-router.js has no parseRoute")
+	}
+	if !strings.Contains(parse, `schema\/`) {
+		t.Error("parseRoute does not match #/schema/<table>: the detail route is unreachable and falls through to the overview")
+	}
+	if !strings.Contains(parse, "safeDecode") {
+		t.Error("parseRoute does not decode the table segment: a name with a space or a dot arrives percent-encoded")
+	}
+	route := funcBody(string(router), "function route()")
+	if !strings.Contains(route, "ui.table = r.table") {
+		t.Error("route() never assigns ui.table, so the view cannot know which table the route names")
+	}
+	if !strings.Contains(route, `renderSchema(lastSchema)`) {
+		t.Error("route() does not redraw the schema view: moving between the list and a table would wait for the next poll")
+	}
+
+	list, err := FS.ReadFile("js/40-schema.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := funcBody(string(list), "function renderSchema(d)")
+	for _, want := range []string{`data-table=`, `tabindex="0"`, `role="link"`} {
+		if !strings.Contains(row, want) {
+			t.Errorf("a schema row carries no %s: the detail is reachable by neither pointer nor keyboard", want)
+		}
+	}
+
+	detail, err := FS.ReadFile("js/45-table.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := funcBody(string(detail), "function wireTableDetail()")
+	if wire == "" {
+		t.Fatal("js/45-table.js has no wireTableDetail")
+	}
+	for _, want := range []string{`addEventListener("click"`, `addEventListener("keydown"`} {
+		if !strings.Contains(wire, want) {
+			t.Errorf("wireTableDetail binds no %s on the list: a row reachable one way only is not reachable", want)
+		}
+	}
+	boot, err := FS.ReadFile("js/95-boot.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(boot), "wireTableDetail()") {
+		t.Error("nothing calls wireTableDetail(), so the handlers it binds are never bound")
+	}
+}
+
+// TestTableDetailShowsDetailAsContent (issue #194): the point of the
+// view is that what was in a tooltip is now on the page. A detail put
+// back into a `title` would be the same defect in a new place.
+func TestTableDetailShowsDetailAsContent(t *testing.T) {
+	src, err := FS.ReadFile("js/45-table.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	if strings.Contains(body, `title="`) {
+		t.Error("js/45-table.js puts something in a title attribute: this view exists because the detail was in tooltips")
+	}
+	// Each field the issue names, and the element it lands in.
+	for field, where := range map[string]string{
+		"c.type":                   "renderTableColumns",
+		"c.not_null":               "renderTableColumns",
+		"c.default":                "renderTableColumns",
+		"c.hidden":                 "renderTableColumns",
+		"i.unique":                 "renderTableIndexes",
+		`i.state === "write-only"`: "renderTableIndexes",
+		"t.constraints":            "renderTableConstraints",
+		"st.row_count":             "renderTableStats",
+		"st.stale":                 "renderTableStats",
+		"ANALYZE":                  "renderTableStats",
+		"t.ranges":                 "renderTableRanges",
+		"t.privileges":             "renderTableGrants",
+		"s.tables":                 "renderTableShapes",
+	} {
+		fn := funcBody(body, "function "+where+"(t)")
+		if fn == "" {
+			t.Fatalf("js/45-table.js has no %s", where)
+		}
+		if !strings.Contains(fn, field) {
+			t.Errorf("%s does not read %s, which the detail view is meant to show", where, field)
+		}
+	}
+	// The DDL is the single most-requested thing from a schema browser,
+	// and it is only useful if it can be copied and if it parses.
+	ddl := funcBody(body, "function tableDDL(t)")
+	if ddl == "" {
+		t.Fatal("js/45-table.js has no tableDDL")
+	}
+	for _, want := range []string{"CREATE TABLE", "CREATE VIEW", "PRIMARY KEY", "CREATE ", "COMMENT ON TABLE"} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("tableDDL never writes %q", want)
+		}
+	}
+	if !strings.Contains(ddl, "constraintDDL") {
+		t.Error("tableDDL omits the table's constraints: DDL that silently drops a foreign key is worse than none")
+	}
+	if !strings.Contains(body, "SQL_RESERVED") {
+		t.Error("quoteIdent does not know the reserved words, so a column called `when` produces DDL that will not parse")
+	}
+	if !strings.Contains(funcBody(body, "function wireTableDetail()"), "clipboard") {
+		t.Error("the DDL has no copy button")
+	}
+}
+
+// TestTableDetailTermsAreInTheGlossary (issue #194): the glossary covers
+// every term on the page and must not regress when a view adds some. The
+// two tests above it check coverage generally; this one names the terms
+// this view introduced, so removing an entry fails here with the reason
+// rather than as an anonymous count.
+func TestTableDetailTermsAreInTheGlossary(t *testing.T) {
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, term := range []string{
+		"column", "type", "nullability", "default", "hidden",
+		"index", "unique", "build state",
+		"constraints", "constraint", "definition", "validated",
+		"statistics", "privileges", "reconstructed ddl",
+	} {
+		if g.lookup("schema", term) == "" {
+			t.Errorf("the table detail shows %q and nothing explains it", term)
+		}
+	}
 }
