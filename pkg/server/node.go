@@ -446,7 +446,7 @@ func (n *Node) start() error {
 	}
 
 	n.events = events.New()
-	n.authLimit = newAuthLimiter()
+	n.authLimit = newAuthLimiter(n.cfg.SQLMaxPendingAuth)
 	n.installAuditSink()
 	n.sys = sysstats.New(n.cfg.Dir)
 	n.sys.Sample() // the first heartbeat should already carry a summary

@@ -193,16 +193,23 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// pendingLimit is the pre-authentication cap in force (0 = none).
-func (s *Server) pendingLimit() int64 {
+// EffectiveMaxPendingAuth is the pre-authentication cap a configured
+// MaxPendingAuth means: the default for 0, none (0) for a negative
+// value. Exported because the guessing limiter's debt floor is derived
+// from it (pkg/server): a wave of guesses can be as wide as this cap,
+// and the floor has to be at least as deep or a wave is discounted.
+func EffectiveMaxPendingAuth(configured int) int {
 	switch {
-	case s.opts.MaxPendingAuth < 0:
+	case configured < 0:
 		return 0
-	case s.opts.MaxPendingAuth == 0:
+	case configured == 0:
 		return DefaultMaxPendingAuth
 	}
-	return int64(s.opts.MaxPendingAuth)
+	return configured
 }
+
+// pendingLimit is the pre-authentication cap in force (0 = none).
+func (s *Server) pendingLimit() int64 { return int64(EffectiveMaxPendingAuth(s.opts.MaxPendingAuth)) }
 
 // admitPending takes a pre-authentication slot for nc, or refuses it:
 // a FATAL 53300 (too_many_connections) and a close, before any

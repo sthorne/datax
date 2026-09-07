@@ -1,8 +1,11 @@
 package server
 
 import (
+	"math"
 	"testing"
 	"time"
+
+	"github.com/sthorne/datax/pkg/pgwire"
 )
 
 // The bound has to sit ahead of the expensive work, so these tests assert
@@ -11,7 +14,7 @@ import (
 // and none of the point (issue #195).
 
 func TestAuthLimiterBoundsOneSource(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	now := time.Now()
 	l.nowFn = func() time.Time { return now }
 
@@ -55,7 +58,7 @@ func TestAuthLimiterBoundsOneSource(t *testing.T) {
 // (source, account) and not by account. A limiter keyed by username
 // alone would let an attacker lock a known user out.
 func TestAuthLimiterDoesNotLockOutAnAccount(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	now := time.Now()
 	l.nowFn = func() time.Time { return now }
 
@@ -71,7 +74,7 @@ func TestAuthLimiterDoesNotLockOutAnAccount(t *testing.T) {
 }
 
 func TestAuthLimiterCapsVerificationsInFlight(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	for i := 0; i < authVerifyInFlight; i++ {
 		if !l.acquireVerify() {
 			t.Fatalf("slot %d refused below the cap", i)
@@ -97,7 +100,7 @@ func TestAuthLimiterCapsVerificationsInFlight(t *testing.T) {
 
 // The map is what an attacker rotating source addresses would grow.
 func TestAuthLimiterMapIsBounded(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	for i := 0; i < authLimiterMax*2; i++ {
 		l.allow(net4(i)+":1000", "alice")
 	}
@@ -134,7 +137,7 @@ func TestSourceKeyIsTheHost(t *testing.T) {
 // charged in full even though every one of them was asked before any
 // had failed.
 func TestAuthLimiterBudgetIsSpentOnFailureNotOnAsking(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	now := time.Now()
 	l.nowFn = func() time.Time { return now }
 
@@ -176,7 +179,7 @@ func TestAuthLimiterBudgetIsSpentOnFailureNotOnAsking(t *testing.T) {
 // soon as it refilled; the floor there is exists only so that an
 // address is never held for longer than ten minutes.
 func TestAuthLimiterAWaveIsChargedInFull(t *testing.T) {
-	l := newAuthLimiter()
+	l := newAuthLimiter(0)
 	now := time.Now()
 	l.nowFn = func() time.Time { return now }
 
@@ -207,18 +210,63 @@ func TestAuthLimiterAWaveIsChargedInFull(t *testing.T) {
 		t.Fatal("a wave of a hundred cost more than a hundred seconds")
 	}
 
-	// The floor: an address is never held for longer than authDebtMax
-	// seconds, however wide the wave (an operator who removed the
-	// pending cap).
-	for i := 0; i < 10*int(authDebtMax); i++ {
+	// The floor: at the default cap an address is never held for longer
+	// than authDebtMin seconds, however wide the wave.
+	for i := 0; i < 10*int(authDebtMin); i++ {
 		l.spend("10.0.0.2:5000", "alice")
 	}
-	now = now.Add(time.Duration(authDebtMax-10) * authRefill)
+	now = now.Add(time.Duration(authDebtMin-10) * authRefill)
 	if l.budget("10.0.0.2:5000", "alice") {
 		t.Fatal("budget before the floor's worth of waiting")
 	}
 	now = now.Add(11 * authRefill)
 	if !l.budget("10.0.0.2:5000", "alice") {
-		t.Fatal("the floor is not holding: an address is held for longer than authDebtMax")
+		t.Fatal("the floor is not holding: an address is held for longer than authDebtMin")
+	}
+}
+
+// The floor is never shallower than the widest wave the node admits —
+// by construction, from the pre-authentication cap in force, not by two
+// constants kept in step by a comment (review of #212). At the default
+// cap that is authDebtMin, with a margin; a cap raised past it deepens
+// the floor with it; no cap at all means no floor, since the wave is
+// then bounded only by descriptors.
+func TestAuthLimiterDebtFloorCoversTheWidestWave(t *testing.T) {
+	if authDebtMin <= float64(pgwire.DefaultMaxPendingAuth) {
+		t.Fatalf("the default floor (%v) must be deeper than the default pre-auth cap (%d), "+
+			"or a source gets a discount on every wave at the defaults", authDebtMin, pgwire.DefaultMaxPendingAuth)
+	}
+	for _, tc := range []struct {
+		configured int
+		want       float64
+	}{
+		{0, authDebtMin},
+		{pgwire.DefaultMaxPendingAuth, authDebtMin},
+		{2000, 2000},
+		{-1, math.Inf(1)},
+	} {
+		l := newAuthLimiter(tc.configured)
+		if l.debtMax != tc.want {
+			t.Errorf("cap %d: floor %v, want %v", tc.configured, l.debtMax, tc.want)
+		}
+		if cap := pgwire.EffectiveMaxPendingAuth(tc.configured); cap > 0 && l.debtMax < float64(cap) {
+			t.Errorf("cap %d: floor %v is shallower than the widest wave (%d)", tc.configured, l.debtMax, cap)
+		}
+	}
+	// And the deeper floor is the one in force: a wave as wide as a
+	// raised cap is charged in full.
+	l := newAuthLimiter(2000)
+	now := time.Now()
+	l.nowFn = func() time.Time { return now }
+	for i := 0; i < 2000; i++ {
+		l.spend("10.0.0.1:5000", "alice")
+	}
+	now = now.Add(time.Duration(authDebtMin+authBurst) * authRefill)
+	if l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("a wave as wide as a raised cap was forgiven at the default floor: the floor did not follow the cap")
+	}
+	now = now.Add(time.Duration(2000-authDebtMin) * authRefill)
+	if !l.budget("10.0.0.1:5000", "alice") {
+		t.Fatal("the wave cost more than its width in seconds")
 	}
 }

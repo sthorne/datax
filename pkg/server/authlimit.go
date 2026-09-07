@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -62,19 +63,34 @@ const (
 	// without bound. An attacker rotating source addresses to evict
 	// entries still meets the in-flight cap below.
 	authLimiterMax = 4096
-	// authDebtMax is how far below zero a bucket may go. The SQL door
-	// charges a failure after the exchange (spend), so a wave of guesses
-	// that all began before any had failed is charged in full when they
-	// land, and the source then waits a second for every one of them —
-	// which is what makes a wave cost exactly what the same guesses
-	// would cost one at a time (issue #212). A floor shallower than the
-	// widest wave the node admits would be a discount on every wave: a
-	// source could repeat one the moment the floor refilled. So it is
-	// deeper than pgwire.DefaultMaxPendingAuth, and exists for an
-	// operator who removed that cap, so that a shared address is never
-	// held for longer than this after the guessing stops.
-	authDebtMax = float64(10 * time.Minute / authRefill)
+	// authDebtMin is the least far below zero a bucket may go. The SQL
+	// door charges a failure after the exchange (spend), so a wave of
+	// guesses that all began before any had failed is charged in full
+	// when they land, and the source then waits a second for every one
+	// of them — which is what makes a wave cost exactly what the same
+	// guesses would cost one at a time (issue #212). A floor shallower
+	// than the widest wave the node admits would be a discount on every
+	// wave: a source could repeat one the moment the floor refilled. So
+	// the floor in force is the deeper of this and the pre-authentication
+	// connection cap (debtFloor), by construction rather than by keeping
+	// two constants in step; what this constant sets is how long a shared
+	// address can be held after the guessing stops, wherever the cap is
+	// at or below it.
+	authDebtMin = float64(10 * time.Minute / authRefill)
 )
+
+// debtFloor is how far below zero a bucket may go on a node whose
+// pre-authentication cap is maxPending (0 = no cap): the widest wave the
+// node can admit, or authDebtMin, whichever is deeper. With no cap a
+// wave is bounded only by descriptors, and so is the debt — an operator
+// who removes the cap removes the bound on how long a guessing address
+// is held, and the flag says so.
+func debtFloor(maxPending int) float64 {
+	if maxPending <= 0 {
+		return math.Inf(1)
+	}
+	return math.Max(authDebtMin, float64(maxPending))
+}
 
 // authVerifyInFlight caps concurrent password verifications. Four is
 // enough that ordinary sign-ins never queue and small enough that
@@ -87,6 +103,8 @@ type authLimiter struct {
 	buckets map[string]*authBucket
 	verify  chan struct{} // the in-flight cap, as a semaphore
 	nowFn   func() time.Time
+	// debtMax is the floor (debtFloor), set once at construction.
+	debtMax float64
 }
 
 type authBucket struct {
@@ -95,11 +113,14 @@ type authBucket struct {
 	seen   time.Time // for eviction
 }
 
-func newAuthLimiter() *authLimiter {
+// newAuthLimiter builds the limiter for a node whose pre-authentication
+// cap is maxPending (as configured: 0 = the default, negative = none).
+func newAuthLimiter(maxPending int) *authLimiter {
 	return &authLimiter{
 		buckets: map[string]*authBucket{},
 		verify:  make(chan struct{}, authVerifyInFlight),
 		nowFn:   time.Now,
+		debtMax: debtFloor(pgwire.EffectiveMaxPendingAuth(maxPending)),
 	}
 }
 
@@ -163,7 +184,7 @@ func (l *authLimiter) bucketLocked(key string, burst float64, now time.Time) *au
 // lands, into debt, so the wave buys nothing over the same guesses one
 // at a time (see authDebtMax).
 //
-// A bucket goes below zero when a wave lands (authDebtMax).
+// A bucket goes below zero when a wave lands (debtFloor).
 func (l *authLimiter) budget(source, user string) bool {
 	src := sourceKey(source)
 	now := l.nowFn()
@@ -183,8 +204,8 @@ func (l *authLimiter) spend(source, user string) {
 		"a\x00" + src + "\x00" + user: authAccountBurst,
 	} {
 		b := l.bucketLocked(key, burst, now)
-		if b.tokens--; b.tokens < -authDebtMax {
-			b.tokens = -authDebtMax
+		if b.tokens--; b.tokens < -l.debtMax {
+			b.tokens = -l.debtMax
 		}
 	}
 }

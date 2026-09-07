@@ -131,8 +131,11 @@ state or the internode protocol does, and an entry below says so.
   cost: each is charged when it lands, into debt, so a wave of forty
   puts its source forty seconds from its next attempt and buys nothing
   over the same guesses one at a time. The debt is floored at ten
-  minutes, deeper than the default cap, so an address is never held
-  for longer than that after the guessing stops.
+  minutes or the pre-authentication cap below, whichever is deeper —
+  derived from the cap in force, so raising the cap never lets a wave
+  be wider than the floor — and an address is never held for longer
+  than that after the guessing stops (a node with the cap removed has
+  no floor, and the flag says so).
   **An authentication deadline** (`--auth-timeout`, default 60 s,
   PostgreSQL's `authentication_timeout`) closes a connection that has
   not reached ReadyForQuery, wherever in the handshake it stalled; the
@@ -150,6 +153,15 @@ state or the internode protocol does, and an entry below says so.
   `datax_auth_throttled_total{cause="rate-limit"}` and `auth-throttled`
   (path `sql`), and reach `/api/security` and the health check with
   the HTTP ones.
+
+  Two limits to know. **The bound is per node**: the limiter is
+  in-memory on each node, so the per-account figure is 5 + 1/s *per
+  node* — a nine-node cluster gives a guesser who spreads across it
+  nine times that. #195 left cluster-wide backoff out deliberately
+  and it stays out; the figure is stated so it is not discovered. And
+  as with #211, **no cluster version, and the roll is a window**: an
+  un-upgraded node has no bound at all on its SQL port, so for the
+  duration of the roll an attacker simply picks one. Roll promptly.
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
