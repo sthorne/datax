@@ -291,6 +291,20 @@ state or the internode protocol does, and an entry below says so.
   pressure stops and the window rolls past it (#223, #224). That last
   step is the reason both report a rate rather than a lifetime total, and
   it had been asserted only in a comment.
+- **Console: a computed severity is always shown** (#219). The
+  stylesheet colours the status dot and nothing else, so a status span
+  without a dot rendered as plain text — the clock-offset cell of a node
+  past `--max-offset` and the quorum-risk cell of a failure domain, the
+  two most consequential numbers on their views, looked exactly like
+  healthy ones. Every judged number now goes through `warn` (the text
+  cue that survives colour loss) and every state word through a new
+  `tok` (the dot), and a console test refuses a status span that is
+  neither. The round-trip matrix is no longer banded by absolute
+  thresholds that painted a healthy WAN link red: a pair is flagged
+  against the cluster's own median (over three times it, and over 5 ms),
+  as a warning, never as "down", which in that column means unreachable.
+  p99 is a column of the worst-pairs table rather than hover-only, and
+  the glossary says what is flagged and why.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the

@@ -86,11 +86,11 @@ function renderDomains(rep, d) {
       key,
       html: `<tr data-key="${esc(key)}">
         <td><b>${esc(dm.tier)}</b>=${esc(dm.value)}</td>
-        <td class="num">${dm.nodes}${(dm.live_nodes ?? dm.nodes) < dm.nodes ? ` <span class="st down">${dm.live_nodes} live</span>` : ""}</td>
+        <td class="num">${dm.nodes}${(dm.live_nodes ?? dm.nodes) < dm.nodes ? " " + warn("down", `${dm.live_nodes} live`) : ""}</td>
         <td class="num">${dm.replicas}</td>
         <td class="num">${dm.leases}</td>
         <td class="num">${dm.loses_quorum > 0
-          ? `<span class="st ${risk}">${dm.loses_quorum}</span>${dm.example_at_risk_range ? ` <span class="muted">e.g. r${dm.example_at_risk_range}</span>` : ""}`
+          ? `${warn(risk, dm.loses_quorum)}${dm.example_at_risk_range ? ` <span class="muted">e.g. r${dm.example_at_risk_range}</span>` : ""}`
           : "0"}</td>
         <td class="num">${dm.bare_majority || 0}</td>
       </tr>`,

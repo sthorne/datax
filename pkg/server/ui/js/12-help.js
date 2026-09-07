@@ -71,7 +71,7 @@ const HELP = {
   // ---- Network ----
   "pair": "The two nodes this row measures between, in the direction measured. A path can be slow one way only, so the reverse pair is its own row.",
   "peer": "The node on the other end of this measurement.",
-  "round trip": "Median time for a request between these two nodes and back. It sets the floor on any operation needing agreement from a replica elsewhere.",
+  "round trip": "Median time for a request between these two nodes and back. It sets the floor on any operation needing agreement from a replica elsewhere. A pair is flagged when it is more than three times the cluster's own median round trip and over 5 ms — judged against what this cluster measures, not an absolute number, so a cluster that is uniformly far apart is not painted as an outage. Unreachable is its own mark and never the same as slow.",
   "p99": "The 99th percentile — the value one request in a hundred exceeds. Percentiles come from the node that measured them and are never averaged together.",
   "node/p99": "The 99th percentile round trip to this peer: one request in a hundred takes longer.",
   "clock offset": "How far this pair's clocks disagree. Transaction ordering depends on bounded clock skew, so a node whose offset approaches the limit is refused rather than allowed to break serializability.",

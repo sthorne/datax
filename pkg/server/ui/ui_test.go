@@ -1595,3 +1595,106 @@ func TestNoUnguardedMotion(t *testing.T) {
 		}
 	}
 }
+
+// TestSeverityAlwaysCarriesACue (issue #219): the stylesheet colours
+// .st.live .dot and nothing else, so a span classed st without a dot
+// renders as plain text — the severity is computed and then not shown,
+// which is how a node past --max-offset looked like a healthy one. Two
+// helpers carry a status: tok, a state word behind the coloured dot, and
+// warn, a judged number with a text cue. Any other status span in the
+// console is one that will not show, so none may exist.
+func TestSeverityAlwaysCarriesACue(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fn := range []string{"warn", "tok"} {
+		if jsFuncSpan(string(core), fn) == nil {
+			t.Fatalf("js/10-core.js has no %s function: nothing renders a status with its cue", fn)
+		}
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := regexp.MustCompile(`class="st [^"]*"[^>]*>`)
+	for _, name := range names {
+		body, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := string(body)
+		if name == "js/10-core.js" {
+			// The two helpers are the definitions; nothing else in the
+			// file may emit a bare one either. Both spans are found
+			// before either is blanked: jsFuncSpan matches braces, and
+			// warn's template literal carries braces of its own.
+			var spans [][]int
+			for _, fn := range []string{"warn", "tok"} {
+				spans = append(spans, jsFuncSpan(src, fn))
+			}
+			for _, span := range spans {
+				src = src[:span[0]] + strings.Repeat(" ", span[1]-span[0]) + src[span[1]:]
+			}
+		}
+		for _, loc := range open.FindAllStringIndex(src, -1) {
+			after := src[loc[1]:]
+			if strings.HasPrefix(after, `<span class="dot">`) {
+				continue
+			}
+			line := 1 + strings.Count(src[:loc[0]], "\n")
+			t.Errorf("%s:%d emits a status span with neither a dot nor a cue: %q — it renders as plain text. "+
+				"Use tok() for a state word or warn() for a judged number", name, line, src[loc[0]:loc[1]])
+		}
+	}
+}
+
+// TestNetworkSeveritiesAreJudgedAgainstTheCluster (issue #219): the
+// clock-offset cell and the quorum-risk cell are judged numbers, so they
+// go through warn; the round-trip cell is judged against the cluster's
+// own median rather than absolute bands, never as "down" (which in that
+// column means unreachable); and p99 is a column of the worst-pairs
+// table, not a hover-only title.
+func TestNetworkSeveritiesAreJudgedAgainstTheCluster(t *testing.T) {
+	net, err := FS.ReadFile("js/60-network.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	span := jsFuncSpan(string(net), "renderNetwork")
+	if span == nil {
+		t.Fatal("js/60-network.js has no renderNetwork")
+	}
+	body := string(net)[span[0]:span[1]]
+	if !regexp.MustCompile(`warn\(lvl, fmtOffset\(worst\)\)`).MatchString(body) {
+		t.Error("the clock-offset cell is not rendered through warn(): a node past --max-offset looks like a healthy one")
+	}
+	if strings.Contains(body, "rtt_us <") || strings.Contains(body, "rtt_us >=") {
+		t.Error("the round-trip cell is banded by an absolute threshold; judge it against the cluster's median (a 25 ms WAN link is not a fault)")
+	}
+	if !strings.Contains(body, "median") || !regexp.MustCompile(`const slow = .*median`).MatchString(body) {
+		t.Error("the round-trip cell is not judged against the cluster's median round trip")
+	}
+	if regexp.MustCompile(`slow = [^\n]*"down"`).MatchString(body) {
+		t.Error(`a slow pair is classed "down", which in this column means unreachable: slow and dead would be the same red`)
+	}
+	if !strings.Contains(body, `tok("down", "✕ unreachable")`) {
+		t.Error("an unreachable peer is no longer its own mark in the round-trip column")
+	}
+	if !strings.Contains(body, `data-label="p99"`) {
+		t.Error("the worst-pairs table has no p99 cell: p99 is reachable only by hovering the matrix")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), `<th scope="col" class="num">p99</th>`) {
+		t.Error("the worst-pairs table's header has no p99 column")
+	}
+	rep, err := FS.ReadFile("js/72-replication.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rep), "warn(risk, dm.loses_quorum)") {
+		t.Error("the quorum-risk cell is not rendered through warn(): a domain whose loss costs quorum looks like one that does not")
+	}
+}

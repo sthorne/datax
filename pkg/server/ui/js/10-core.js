@@ -95,6 +95,14 @@ function fmtDuration(sec) {
 // warn colours a figure worth a look and adds a text cue (colour is
 // never the only carrier): "!" for a warning, "!!" for a critical one.
 function warn(level, text) { return level ? `<span class="st ${level}">${text}<span class="cue" aria-label="${level === "down" ? "critical" : "warning"}">${level === "down" ? " !!" : " !"}</span></span>` : text; }
+// tok renders a state word — running, building, unreachable — as a status
+// token with the coloured dot in front of it. The dot is where the colour
+// lives (the stylesheet colours .st.live .dot and nothing else), so a
+// span classed st without one renders as plain text: the severity is
+// computed and then not shown (issue #219). Every state word goes
+// through here, every judged number through warn, and the console test
+// refuses a status span that is neither.
+function tok(level, text) { return `<span class="st ${level}"><span class="dot"></span>${text}</span>`; }
 function loadCell(load1, cores) {
   const ratio = load1 / cores;
   return warn(ratio > 2 ? "down" : ratio > 1 ? "draining" : "", (load1 ?? 0).toFixed(2));

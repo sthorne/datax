@@ -70,9 +70,9 @@ async function pollActivity() {
     const a = await resp.json();
     box.hidden = false;
     const rows = [];
-    for (const st of a.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
+    for (const st of a.active || []) rows.push(`<tr><td>${tok("live", "running")}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
       <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
-    for (const st of a.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
+    for (const st of a.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? " " + tok("draining", "40001") : ""}</td>
       <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
     setHTML(document.getElementById("sql-statements"), rows.join("") ||
       `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${a.slow_threshold_ms} ms recently</td></tr>`);
@@ -106,9 +106,9 @@ async function pollNodeStatements(id, box) {
   }
   renderContention(act, id);
   const rows = [];
-  for (const st of act.active || []) rows.push(`<tr><td><span class="st live">running</span></td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
+  for (const st of act.active || []) rows.push(`<tr><td>${tok("live", "running")}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}</td>
     <td class="num">${(st.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}</td></tr>`);
-  for (const st of act.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? ' <span class="st draining">40001</span>' : ""}</td>
+  for (const st of act.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(st.at))}</td><td>${esc(st.user)}</td><td>${esc(st.kind)}${st.retry ? " " + tok("draining", "40001") : ""}</td>
     <td class="num">${(st.duration_us / 1000).toFixed(0)} ms</td><td class="num">${st.rows}</td><td class="key">${esc(st.text)}${copyBtn("this statement", st.text)}${st.error ? `<div class="muted">${esc(st.error)}</div>` : ""}</td></tr>`);
   setHTML(document.getElementById("sql-statements"), rows.join("") ||
     `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently on n${id}</td></tr>`);

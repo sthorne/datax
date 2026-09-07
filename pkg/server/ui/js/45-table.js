@@ -140,7 +140,7 @@ function renderTableColumns(t) {
       <td data-label="type" class="key">${esc(c.type)}</td>
       <td data-label="nullability">${c.not_null ? "not null" : `<span class="muted">nullable</span>`}</td>
       <td data-label="default" class="key">${c.default ? esc(c.default) : "—"}</td>
-      <td data-label="hidden">${c.hidden ? `<span class="st draining">hidden</span>` : "—"}</td>
+      <td data-label="hidden">${c.hidden ? tok("draining", "hidden") : "—"}</td>
     </tr>`,
   })) : [{ key: "none", html: `<tr data-key="none"><td colspan="5" class="muted">no columns</td></tr>` }]);
   const hidden = cols.filter(c => c.hidden);
@@ -158,7 +158,7 @@ function renderTableIndexes(t) {
       <td data-label="columns" class="key">${(i.columns || []).map(esc).join(", ")}</td>
       <td data-label="unique">${i.unique ? "unique" : "—"}</td>
       <td data-label="build state">${i.state === "write-only"
-        ? `<span class="st draining">building</span>`
+        ? tok("draining", "building")
         : `<span class="muted">ready</span>`}</td>
     </tr>`,
   })) : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">no secondary indexes — every read is a scan of the primary key or a lookup by it</td></tr>` }]);
@@ -175,7 +175,7 @@ function renderTableConstraints(t) {
     html: `<tr data-key="${esc(c.name)}">
       <td data-label="constraint"><b>${esc(c.name)}</b> <span class="kind">${esc(c.kind)}</span></td>
       <td data-label="definition" class="key" style="max-width:none;white-space:normal">${esc(constraintDDL(c).replace(/^CONSTRAINT \S+ /, ""))}</td>
-      <td data-label="validated">${c.validated ? "yes" : `<span class="st draining">not valid</span>`}</td>
+      <td data-label="validated">${c.validated ? "yes" : tok("draining", "not valid")}</td>
     </tr>`,
   })) : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">no CHECK, FOREIGN KEY or named UNIQUE constraints</td></tr>` }]);
 }
@@ -185,7 +185,7 @@ function renderTableStats(t) {
   if (t.view) { setHTML(el, `<span class="muted">a view owns no rows, so it has no statistics: the planner uses the statistics of the tables its query reads.</span>`); return; }
   const st = t.stats;
   if (!st) {
-    setHTML(el, `<span class="st draining">never analyzed</span> — the planner is estimating this table's size from nothing, which is the usual reason it picks a scan over an index. Run <code class="key">ANALYZE ${esc(qualifiedIdent(t))}</code>.`);
+    setHTML(el, `${tok("draining", "never analyzed")} — the planner is estimating this table's size from nothing, which is the usual reason it picks a scan over an index. Run <code class="key">ANALYZE ${esc(qualifiedIdent(t))}</code>.`);
     return;
   }
   const age = fmtWhen(Date.now() - st.age_seconds * 1000);
