@@ -197,7 +197,11 @@ serves, on that address:
   operational events (the last 500 are kept in memory; `since` returns
   only those after sequence `N`, which is how the dashboard tails). In
   secure mode audit records (authentication failures, admin operations,
-  privilege DDL) are included only for the admin role.
+  privilege DDL) are included only for the admin role, and a split or
+  merge event names its keys in full only to a caller who may read
+  every table they belong to — to anyone else the keys appear at their
+  table-and-index prefix by id (the boundary is a row value; the same
+  rule as the range lists on `/status` and `/api/cluster`).
 - **`/api/node?id=N`** — JSON: the node detail page's document. The
   serving node answers for itself to any authenticated user; another
   node's document is fetched from that node over the internode RPC and

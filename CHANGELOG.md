@@ -229,7 +229,25 @@ state or the internode protocol does, and an entry below says so.
   by any earlier release restore unchanged: the name has been the same
   since backup existed.
 
-### Changed
+- **Range boundary keys are shown to a caller only for the tables it
+  may read** (#213). A range's boundary is a real row key, and the
+  console rendered it back into its values — `/table/users/primary/
+  "alice@example.com"`, one exact value from a row and the table it
+  came from — on `/status`, `/api/cluster`, `/api/overview`,
+  `/api/node` and in the split and merge events on `/api/events`, for
+  every range in the cluster, to any authenticated user with no grant
+  on anything. The rule the rest of the console follows (`/api/schema`
+  since #197, `/api/security`) is to keep the document and filter the
+  data-bearing fields to what the caller may read, and it now applies
+  to keys: a table the caller may read renders as before; one it may
+  not renders as its table-and-index prefix by id (`/table/7/1`) with
+  the table's name left out, so a caller's `/api/cluster` table list
+  agrees with the same caller's `/api/schema`. The range id, replicas,
+  size and QPS are untouched. Split and merge events are recorded in
+  both forms and the event feed serves the one the caller may see; the
+  exact key stays on the admin-gated `/api/range` and in the node's
+  log. System and meta keys carry no row and are unchanged. Admins and
+  insecure mode see everything, as before.
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
   `datax_metrics`. A v16 node knows nothing of the reservation and would

@@ -16,7 +16,6 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
-	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
 // /api/schema — the schema browser behind the dashboard: every table
@@ -379,17 +378,7 @@ func (n *Node) tableNameOf(start keys.Key) string {
 }
 
 // tableIDOfKey decodes the table ID a user-data key belongs to.
-func tableIDOfKey(k keys.Key) (uint64, bool) {
-	p := keys.TablePrefix
-	if len(k) <= len(p) || string(k[:len(p)]) != string(p) {
-		return 0, false
-	}
-	_, id, err := encoding.DecodeUint64(k[len(p):])
-	if err != nil {
-		return 0, false
-	}
-	return id, true
-}
+func tableIDOfKey(k keys.Key) (uint64, bool) { return keys.TableIDOf(k) }
 
 // columnDefault renders a column's DEFAULT as the SQL that produced it:
 // an expression as written, a literal in its literal form.

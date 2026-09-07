@@ -665,6 +665,7 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 		limit = 200
 	}
 	p := n.clusterPrincipal(req)
+	v := n.keyViewerFor(req.Context(), p)
 	doc := EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq()}
 	// A time window (?from=unix_ms) instead of a tail: what the metrics
 	// charts need to annotate the range they are drawing (issue #155).
@@ -672,12 +673,12 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 	// reaches.
 	if fromMs, err := strconv.ParseInt(q.Get("from"), 10, 64); err == nil && fromMs > 0 {
 		evs, oldest := n.events.Since(time.UnixMilli(fromMs), limit, p.Admin)
-		doc.Events = evs
+		doc.Events = events.Redact(evs, v.sees)
 		if !oldest.IsZero() {
 			doc.OldestMs = oldest.UnixMilli()
 		}
 	} else {
-		doc.Events = n.events.Recent(since, limit, p.Admin)
+		doc.Events = events.Redact(n.events.Recent(since, limit, p.Admin), v.sees)
 	}
 	if doc.Events == nil {
 		doc.Events = []events.Event{}

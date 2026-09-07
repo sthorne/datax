@@ -221,6 +221,14 @@ func (n *Node) serveClusterAPI(w http.ResponseWriter, req *http.Request) {
 // clusterDoc assembles the /api/cluster document (also the cluster
 // section of /api/overview).
 func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
+	p := n.clusterPrincipal(req)
+	return n.clusterDocFor(req, p, n.keyViewerFor(req.Context(), p))
+}
+
+// clusterDocFor is clusterDoc for a caller whose principal and key
+// viewer are already resolved (issue #213: keys and table names are
+// rendered as v may see them).
+func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer) ClusterStatus {
 	now := n.clock.Now().WallTime
 	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	forecasts := n.capacityForecasts()
@@ -232,8 +240,13 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 		Now:            now / int64(time.Millisecond),
 		NodeID:         int(n.ident.NodeID),
 		ConsoleVersion: n.consoleVersion,
-		Principal:      n.clusterPrincipal(req),
-		Local:          n.statusSummary(),
+		Principal:      p,
+		Local:          n.statusSummaryFor(v),
+	}
+	if v.err != nil {
+		// Fail closed and say so: every key below is at its prefix and
+		// no table is named, because the predicate did not run.
+		doc.Error = "cannot resolve roles for " + p.User + ": " + v.err.Error()
 	}
 	doc.MaxOffsetMs = n.clock.MaxOffset().Milliseconds()
 	grace := n.livenessGrace().Nanoseconds()
@@ -267,7 +280,10 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 	}
 	descs, age, err := n.clusterRanges(req.Context())
 	if err != nil {
-		doc.Error = "cluster range listing unavailable: " + err.Error()
+		if doc.Error != "" {
+			doc.Error += "; "
+		}
+		doc.Error += "cluster range listing unavailable: " + err.Error()
 		if descs != nil {
 			doc.Error += fmt.Sprintf("; showing the list from %s ago", age.Truncate(time.Second))
 		}
@@ -276,10 +292,10 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 		for _, d := range descs {
 			cr := ClusterRange{
 				RangeID:    int64(d.RangeID),
-				StartKey:   n.prettyKey(d.StartKey),
-				EndKey:     n.prettyKey(d.EndKey),
+				StartKey:   n.viewKey(v, d.StartKey),
+				EndKey:     n.viewKey(v, d.EndKey),
 				Generation: d.Generation,
-				Table:      n.tableNameOf(d.StartKey),
+				Table:      n.viewTable(v, d.StartKey),
 			}
 			for _, rep := range d.Replicas {
 				cr.Replicas = append(cr.Replicas, int(rep.NodeID))

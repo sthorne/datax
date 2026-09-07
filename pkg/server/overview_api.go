@@ -32,7 +32,9 @@ const overviewEventsLimit = 50
 
 func (n *Node) serveOverviewAPI(w http.ResponseWriter, req *http.Request) {
 	doc := OverviewStatus{Errors: map[string]string{}}
-	doc.Cluster = n.clusterDoc(req)
+	p := n.clusterPrincipal(req)
+	v := n.keyViewerFor(req.Context(), p)
+	doc.Cluster = n.clusterDocFor(req, p, v)
 	if doc.Cluster.Error != "" {
 		doc.Errors["ranges"] = doc.Cluster.Error
 	}
@@ -43,7 +45,7 @@ func (n *Node) serveOverviewAPI(w http.ResponseWriter, req *http.Request) {
 		if limit <= 0 || limit > events.RingSize {
 			limit = overviewEventsLimit
 		}
-		ev := &EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq(), Events: n.events.Recent(since, limit, doc.Cluster.Principal.Admin)}
+		ev := &EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq(), Events: events.Redact(n.events.Recent(since, limit, doc.Cluster.Principal.Admin), v.sees)}
 		// The operations view reads the same poll as everything else
 		// (issue #153); pairing is over the whole ring, not the tail
 		// this document carries, so an operation that started before it

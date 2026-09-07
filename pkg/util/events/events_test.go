@@ -1,6 +1,10 @@
 package events
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestRingOrderBoundsAndFilter(t *testing.T) {
 	r := New()
@@ -46,5 +50,35 @@ func TestRingOrderBoundsAndFilter(t *testing.T) {
 	nilRing.Record("x", "no panic on a nil ring")
 	if nilRing.Recent(0, 0, true) != nil {
 		t.Fatal("nil ring should read as empty")
+	}
+}
+
+// A keyed event is served in full to a reader who may see every table
+// its keys belong to, and at its redacted form to one who may not; an
+// event without keys is untouched (issue #213).
+func TestRedactKeyedEvents(t *testing.T) {
+	r := New()
+	r.Record("plain", "r1 rebalanced")
+	r.RecordKeyed("split", []uint64{5}, `r2 split at /table/users/1/"alice"`, "r2 split at /table/5/1")
+	r.RecordKeyed("merge", []uint64{5, 6}, `r3 absorbed r4; now [/table/users/1/"a", /table/orders/1/"b")`, "r3 absorbed r4; now [/table/5/1, /table/6/1)")
+	all := Redact(r.Recent(0, 0, true), func(uint64) bool { return true })
+	if all[1].Summary != `r2 split at /table/users/1/"alice"` {
+		t.Errorf("a reader who sees every table got %q", all[1].Summary)
+	}
+	sees5 := Redact(r.Recent(0, 0, true), func(id uint64) bool { return id == 5 })
+	if sees5[0].Summary != "r1 rebalanced" || sees5[1].Summary != `r2 split at /table/users/1/"alice"` {
+		t.Errorf("unexpected: %q, %q", sees5[0].Summary, sees5[1].Summary)
+	}
+	if sees5[2].Summary != "r3 absorbed r4; now [/table/5/1, /table/6/1)" {
+		t.Errorf("an event touching a table the reader may not see was served in full: %q", sees5[2].Summary)
+	}
+	none := Redact(r.Recent(0, 0, true), func(uint64) bool { return false })
+	if none[1].Summary != "r2 split at /table/5/1" {
+		t.Errorf("a reader who sees nothing got %q", none[1].Summary)
+	}
+	// Neither form is a wire field: the ring serves Summary alone.
+	raw, _ := json.Marshal(none[1])
+	if strings.Contains(string(raw), "alice") || strings.Contains(string(raw), "Redacted") || strings.Contains(string(raw), "Tables") {
+		t.Errorf("the redacted event's JSON carries what it should not: %s", raw)
 	}
 }

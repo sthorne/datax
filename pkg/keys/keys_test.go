@@ -2,6 +2,7 @@ package keys
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -169,5 +170,40 @@ func TestIsTransactionKey(t *testing.T) {
 		if IsTransactionKey(k) {
 			t.Fatalf("%x should not be a transaction key", k)
 		}
+	}
+}
+
+// PrettyPrefix renders nothing a row wrote (issue #213): a table key
+// stops at the table and index, by id, and a system key at its name.
+func TestPrettyPrefix(t *testing.T) {
+	SetTableNamer(func(id uint64) (string, bool) { return "users", id == 5 })
+	defer SetTableNamer(nil)
+	row := Key(encoding.EncodeString(encoding.EncodeUint64(TableDataPrefix(5), 1), "alice@example.com"))
+	for _, tc := range []struct {
+		k    Key
+		want string
+	}{
+		{row, "/table/5/1"},
+		{TableDataPrefix(5), "/table/5"},
+		{Key(encoding.EncodeUint64(TableDataPrefix(5), 1)), "/table/5/1"},
+		{UserKey("alice"), "/system/users"},
+		{Key(append(MetaPrefix.Clone(), row...)), "/meta/table/5/1"},
+		{MinKey, "/Min"},
+		{MaxKey, "/Max"},
+		{Key{}, "/"},
+	} {
+		if got := PrettyPrefix(tc.k); got != tc.want {
+			t.Errorf("PrettyPrefix(%s) = %q, want %q", Pretty(tc.k), got, tc.want)
+		}
+	}
+	// And the full rendering, for contrast: the name and the value.
+	if got := Pretty(row); !strings.Contains(got, "users") || !strings.Contains(got, "alice@example.com") {
+		t.Errorf("Pretty(row) = %q: expected the table name and the value", got)
+	}
+	if id, ok := TableIDOf(row); !ok || id != 5 {
+		t.Errorf("TableIDOf(row) = %d, %v", id, ok)
+	}
+	if _, ok := TableIDOf(UserKey("alice")); ok {
+		t.Error("TableIDOf(system key) reported a table")
 	}
 }
