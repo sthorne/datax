@@ -154,33 +154,69 @@ func writeBackupRecord(w io.Writer, rec kvpb.ExportRecord) error {
 }
 
 // readBackupRecords streams a data file's records through fn.
-// backupFileIsPlain checks that a file of a backup directory — the
-// manifest, or a table's data file — is the plain file backup wrote. The
-// names are derived (backupDataFile), so a manifest can no longer name a
-// path outside its directory — but the filesystem still can: a symlink
-// at the derived name reaches wherever it points, with the node's uid,
-// and restore would apply what it found there. A datax backup writes
-// plain files and nothing else, so anything else at one of its names is
-// refused (issue #214, from the PR's review). The name is looked at
-// without following it, which is what tells a symlink from what it
-// points at.
-func backupFileIsPlain(path string) error {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file (%s): a datax backup writes plain files, and restore reads nothing else", path, fi.Mode().Type())
-	}
-	return nil
-}
-
-// readBackupFile reads one plain file of a backup directory.
+// readBackupFile reads one file of a backup directory — the manifest, or
+// a table's data file — and only if it is the plain file backup wrote.
+// The names are derived (backupDataFile), so a manifest can no longer
+// name a path outside its directory — but the filesystem still can: a
+// symlink at the derived name reaches wherever it points, with the
+// node's uid, and restore would apply what it found there. A datax
+// backup writes plain files and nothing else, so a symlink, a directory
+// or a device at one of its names is refused (issue #214, from the PR's
+// review). The name is looked at without following it, which is what
+// tells a symlink from what it points at; then the file is opened and
+// the object actually opened is compared with what was looked at, so a
+// symlink swapped in between the two is refused too rather than
+// followed. A hard link is a plain file and is read: it names the same
+// object, and making one already requires being able to write it.
 func readBackupFile(path string) ([]byte, error) {
-	if err := backupFileIsPlain(path); err != nil {
+	fi, err := backupFileIsPlain(path)
+	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(fi, opened) || !opened.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s changed between being looked at and being opened: refusing to read it", path)
+	}
+	return io.ReadAll(f)
+}
+
+// backupFileIsPlain looks at a file of a backup directory without
+// following it and reports what it saw, refusing anything but a regular
+// file.
+func backupFileIsPlain(path string) (os.FileInfo, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (%s): a datax backup writes plain files, and restore reads nothing else", path, fi.Mode().Type())
+	}
+	return fi, nil
+}
+
+// checkBackupFiles looks at every data file a manifest names, before
+// restore has applied anything: the data files are read only after the
+// schema is, so a refusal that waited for the read would leave the
+// target with the tables and none of the rows. This is restore's
+// concern, not the manifest reader's: an incremental's --base takes only
+// the cluster id and the end timestamp from its base's manifest, and an
+// operator who keeps a completed backup's manifest to hand and its data
+// files in cold storage can still chain onto it.
+func checkBackupFiles(dir string, man *backupManifest) error {
+	for _, t := range man.Tables {
+		if _, err := backupFileIsPlain(filepath.Join(dir, backupDataFile(t.ID))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func readBackupRecords(path string, fn func(kvpb.ExportRecord) error) error {
@@ -398,18 +434,10 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 	// A backup names its own files, and nothing else: refused here, before
 	// any data file is opened, so neither door — restore, or the base of
 	// an incremental — reaches a path the manifest chose (issue #214).
-	// And each of those files is looked at here too, before restore has
-	// applied anything: the data files are read only after the schema
-	// is, so a refusal that waited for the read would leave the target
-	// with the tables and none of the rows.
 	for _, t := range man.Tables {
-		want := backupDataFile(t.ID)
-		if t.File != want {
+		if want := backupDataFile(t.ID); t.File != want {
 			return nil, fmt.Errorf("%s: manifest names %q as the data file for table %d, which a datax backup keeps in %q",
 				dir, t.File, t.ID, want)
-		}
-		if err := backupFileIsPlain(filepath.Join(dir, want)); err != nil {
-			return nil, err
 		}
 	}
 	return &man, nil
@@ -449,6 +477,9 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.Backup
 	for i, src := range srcs {
 		man, err := readBackupManifest(src)
 		if err != nil {
+			return nil, err
+		}
+		if err := checkBackupFiles(src, man); err != nil {
 			return nil, err
 		}
 		mans[i] = man

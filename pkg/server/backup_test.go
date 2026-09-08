@@ -25,11 +25,6 @@ func TestBackupManifestNamesOnlyItsOwnFiles(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, backupManifestName), raw, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// The data file backup would have written, so the accepted case
-		// is accepted for its name and not refused for a missing file.
-		if err := os.WriteFile(filepath.Join(dir, "table_7.dxbk"), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
 		return dir
 	}
 
@@ -99,14 +94,18 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, backupManifestName), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readBackupManifest(dir); err == nil || !strings.Contains(err.Error(), "table_7.dxbk is not a regular file") {
+	man2, err := readBackupManifest(dir)
+	if err != nil {
+		t.Fatalf("the manifest reader looks at data files, which the --base door does not need: %v", err)
+	}
+	if err := checkBackupFiles(dir, man2); err == nil || !strings.Contains(err.Error(), "table_7.dxbk is not a regular file") {
 		t.Fatalf("a manifest whose data file is a symlink: %v", err)
 	}
 	// And a data file that is not there at all.
 	if err := os.Remove(filepath.Join(dir, backupDataFile(7))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readBackupManifest(dir); err == nil || !os.IsNotExist(err) {
+	if err := checkBackupFiles(dir, man2); err == nil || !os.IsNotExist(err) {
 		t.Fatalf("a manifest whose data file is missing: %v", err)
 	}
 	// A directory at the name.
