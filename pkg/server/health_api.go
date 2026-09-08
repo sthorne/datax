@@ -693,6 +693,15 @@ const operationEndOverdue = 6 * time.Hour
 //
 // Running operations come first, newest start first; then the completed
 // ones, newest end first.
+//
+// Callers pass evs through events.Redact for the reader, as the event
+// listings do (issue #213): today no paired kind carries a boundary key
+// — backups, restores, drains, sweeps and upgrades name paths, nodes and
+// range ids — so the redaction is a no-op, but the pairing is done on
+// the same ring as the listings and must stay behind the same gate. The
+// open operations are not redacted: they hold the same summaries as
+// their start records, so the day a split or a merge becomes a paired
+// operation, Open() must be redacted here too, not only the ring.
 func operationsFrom(evs []events.Event, open []events.OpenOp, nowMs int64) []Operation {
 	type key struct{ kind, op string }
 	idx := map[key]int{}
@@ -802,7 +811,7 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 	if doc.Events == nil {
 		doc.Events = []events.Event{}
 	}
-	doc.Operations = operationsFrom(n.events.Recent(0, 0, p.Admin), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
+	doc.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, p.Admin), v.sees), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

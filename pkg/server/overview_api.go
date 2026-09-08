@@ -50,7 +50,7 @@ func (n *Node) serveOverviewAPI(w http.ResponseWriter, req *http.Request) {
 		// (issue #153); pairing is over the whole ring, not the tail
 		// this document carries, so an operation that started before it
 		// is still reported as running.
-		ev.Operations = operationsFrom(n.events.Recent(0, 0, doc.Cluster.Principal.Admin), n.events.Open(), doc.Cluster.Now)
+		ev.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, doc.Cluster.Principal.Admin), v.sees), n.events.Open(), doc.Cluster.Now)
 		if ev.Events == nil {
 			ev.Events = []events.Event{}
 		}
