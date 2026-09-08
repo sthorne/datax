@@ -191,6 +191,27 @@ state or the internode protocol does, and an entry below says so.
   that worked yesterday, and the `verify-rate` cause names it. A knob
   is a small change if anyone meets it.
 
+- **Restore reads only the files a backup writes** (#214). Backup names
+  each table's data file from its id (`table_<id>.dxbk`); restore
+  joined whatever name the manifest carried onto the backup directory,
+  and `filepath.Join` resolves `..`, so a manifest saying
+  `"file": "../../../etc/shadow"` had the node open that file with its
+  own uid, parse it as backup records and quote bytes of it in the
+  failure. Admin-only, and a read rather than a write, but a restore
+  from a directory someone else prepared — a shared artifact store, a
+  support bundle — is an ordinary workflow. Restore now derives the
+  name from the table id again, exactly as backup wrote it, and a
+  manifest naming anything else is refused when it is read, before any
+  file is opened — at both doors that read one, `datax restore` and
+  `--base` of an incremental. The filesystem can name a path too, as the
+  review found: a symlink at the derived name reaches wherever it
+  points, and restore would have applied what it found there. A backup
+  writes plain files and nothing else, so only a regular file is read at
+  one of its names — the manifest's or a data file's — and a symlink or
+  a directory there is refused without being followed. Backups written
+  by any earlier release restore unchanged: the name has been the same
+  since backup existed.
+
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
