@@ -231,7 +231,7 @@ const HELP = {
 
   // ---- Controls ----
   "scope": "Which node the node-scoped panels describe. The whole cluster fans out to every node and needs admin; a single node asks only that node.",
-  "range": "The time range every chart and every rate on the page uses. It is part of the address, so a link carries it.",
+  "range": "The time range every chart and every rate on the page uses. It is part of the address, so a link carries it. Drag across any chart to narrow every chart to the window you dragged out: the picker then shows that window's edges, a preset takes you back, and the link carries the window too. On the keyboard, focus a chart, mark the window's ends at the crosshair with [ and ], and press Enter; - widens the window. A window narrower than eight of the chart's samples is widened to eight, since the data has no finer resolution to show.",
   "jump to": "Open anything by name: a node, a range id, a table, a locality. ⌘K or Ctrl-K from anywhere.",
   "theme": "Light, dark, or whatever this device asks for. The choice is stored in the cluster against the signed-in user, not in this browser, so it follows you to another browser, another machine and any node's console — and a cluster still mid-upgrade says so rather than losing it silently.",
   "timestamps": "Whether a moment reads as how long ago it was or as the clock time it happened at, in this device's own zone with the offset spelled out. It changes moments only: how long a transaction has been open is a length of time, not a moment, and keeps reading as one. Stored in the cluster like the theme.",

@@ -112,7 +112,7 @@ function renderNode(d) {
 async function pollNodeCharts(id) {
   const box = document.getElementById("node-charts");
   try {
-    const resp = await fetch(`/api/metrics?series=${NODE_CHART_SERIES.join(",")}&node=${id}&since=${RANGE_SECONDS[ui.range]}s&rate=1`, { cache: "no-store" });
+    const resp = await fetch(`/api/metrics?series=${NODE_CHART_SERIES.join(",")}&node=${id}&${windowQuery()}&rate=1`, { cache: "no-store" });
     if (!resp.ok) { const e = await resp.json().catch(() => ({})); box.innerHTML = `<span class="muted">${esc(e.error || "history unavailable")}</span>`; return; }
     const d = await resp.json();
     box.innerHTML = "";

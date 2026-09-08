@@ -1930,3 +1930,72 @@ func TestLinesThatCannotBeToldApartAreNotOverplotted(t *testing.T) {
 		t.Errorf("--series-6 is %s in both themes: the one slot not re-stepped for the dark surface", light[1])
 	}
 }
+
+// TestChartsBrushToZoom (issue #206): a drag across any chart selects a
+// window that every chart on the page then shows; the selection is
+// visible while dragging; it rides in the route; the picker shows it
+// and a preset returns; a selection below the chart's resolution is
+// widened rather than honoured; and the keyboard has the same path.
+func TestChartsBrushToZoom(t *testing.T) {
+	charts := string(mustRead(t, "js/86-charts.js"))
+	span := jsFuncSpan(charts, "chart")
+	if span == nil {
+		t.Fatal("chart not found")
+	}
+	body := charts[span[0]:span[1]]
+	for _, want := range []string{
+		`hit.addEventListener("pointerdown"`, `hit.addEventListener("pointerup"`, "setWindow(lo, hi)",
+		`class="brush"`, `class="brushlabel bl0"`, "drawBrush(lo, hi)",
+		"const minWindow = BRUSH_MIN_BUCKETS * step", "if (hi - lo < minWindow) {", `ev.key === "["`, `ev.key === "]"`, `ev.key === "Enter"`, `ev.key === "-"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("chart() lacks %s: no brush, no visible selection, no floor at the data's resolution, or no keyboard path", want)
+		}
+	}
+	if !strings.Contains(charts, "const BRUSH_MIN_BUCKETS = 8;") {
+		t.Error("BRUSH_MIN_BUCKETS is not eight buckets")
+	}
+	// Every chart fetch takes its window from one place, so the custom
+	// window reaches the node page and the transactions charts too.
+	for _, name := range []string{"js/86-charts.js", "js/90-node.js", "js/50-sql.js"} {
+		src := string(mustRead(t, name))
+		if !strings.Contains(src, "windowQuery()") {
+			t.Errorf("%s does not take its window from windowQuery(): a dragged window narrows the other views' charts and not this one's", name)
+		}
+		if name != "js/85-metrics.js" && strings.Contains(src, "RANGE_SECONDS[ui.range]") {
+			t.Errorf("%s still reads the preset directly: under a custom window that is undefined", name)
+		}
+	}
+	router := string(mustRead(t, "js/15-router.js"))
+	if !strings.Contains(router, `if (range === "custom") {`) || !strings.Contains(router, "parseWindowParams(r.params)") {
+		t.Error("route() does not read a custom window off the route: a narrowed chart is not a link")
+	}
+	if !strings.Contains(router, `p.set("range", "custom"); p.set("from", String(ui.window.from)); p.set("to", String(ui.window.to));`) {
+		t.Error("routeTo() does not carry the custom window: the address lies about what the page shows")
+	}
+	if !strings.Contains(router, `p.delete("from"); p.delete("to");`) {
+		t.Error("pushRoute() keeps a stale from/to in the params: a preset chosen after a window leaves the window in the address")
+	}
+	rp := jsFuncSpan(router, "renderRangePicker")
+	if rp == nil {
+		t.Fatal("renderRangePicker not found")
+	}
+	if b := router[rp[0]:rp[1]]; !strings.Contains(b, `ui.range === "custom" && ui.window ?`) || !strings.Contains(b, "windowLabel(ui.window)") {
+		t.Error("the range picker does not show the custom window as its own entry: no way to see it, and no explicit way back")
+	}
+	metrics := string(mustRead(t, "js/85-metrics.js"))
+	pw := jsFuncSpan(metrics, "parseWindowParams")
+	if pw == nil {
+		t.Fatal("parseWindowParams not found")
+	}
+	if b := metrics[pw[0]:pw[1]]; !strings.Contains(b, "to <= from") || !strings.Contains(b, `RANGE_SECONDS["7d"] * 1000`) {
+		t.Error("parseWindowParams accepts an empty or over-wide window from the route")
+	}
+	help, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := help.lookup("", "range"); !strings.Contains(entry, "Drag across any chart") || !strings.Contains(entry, "[ and ]") {
+		t.Error("the range's glossary entry does not explain the drag or the keys: the gesture is undiscoverable")
+	}
+}

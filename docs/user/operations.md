@@ -117,7 +117,7 @@ serves, on that address:
   any authenticated user; the per-user connection breakdown and the
   client certificates this node has been shown need the admin role, as
   the audit records do. **metrics** charts any of the series the cluster records about
-  itself over the header's time range, one chart per series with one
+  itself over the header's time range — or over a window dragged out on any chart, which the page's address then carries, so a narrowed chart is a link — one chart per series with one
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from

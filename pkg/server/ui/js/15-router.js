@@ -58,7 +58,8 @@ function safeDecode(s) {
 function routeTo(path, params) {
   const p = new URLSearchParams(params || {});
   if (ui.scope !== "cluster") p.set("scope", ui.scope);
-  if (ui.range !== "1h") p.set("range", ui.range);
+  if (ui.range === "custom" && ui.window) { p.set("range", "custom"); p.set("from", String(ui.window.from)); p.set("to", String(ui.window.to)); }
+  else if (ui.range !== "1h") p.set("range", ui.range);
   const q = p.toString();
   return "#/" + path + (q ? "?" + q : "");
 }
@@ -67,7 +68,7 @@ function go(path, params) { location.hash = routeTo(path, params); }
 // navigation), so Back still steps between views rather than settings.
 function pushRoute(params) {
   const p = new URLSearchParams(params || ui.params);
-  p.delete("scope"); p.delete("range");
+  p.delete("scope"); p.delete("range"); p.delete("from"); p.delete("to");
   const path = ui.view === "node" ? "node/" + ui.node
     : ui.view === "schema" && ui.table ? "schema/" + encodeURIComponent(ui.table)
     : ui.view === "overview" ? "" : ui.view;
@@ -107,7 +108,12 @@ function renderScopePicker() {
 }
 function renderRangePicker() {
   const sel = document.getElementById("range-picker-global");
-  if (!sel.options.length) sel.innerHTML = RANGES.map(r => `<option value="${r}">${r}</option>`).join("");
+  // A custom window is offered only while it is in force, labelled with
+  // its edges, so the picker says what the page shows and a preset is
+  // always one choice away (issue #206).
+  const custom = ui.range === "custom" && ui.window ? `<option value="custom">${esc(windowLabel(ui.window))}</option>` : "";
+  const html = RANGES.map(r => `<option value="${r}">${r}</option>`).join("") + custom;
+  if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
   if (sel.value !== ui.range) sel.value = ui.range;
 }
 
@@ -235,7 +241,10 @@ function route() {
   const scope = r.params.get("scope");
   if (scope && (scope === "cluster" || /^n\d+$/.test(scope))) ui.scope = scope;
   const range = r.params.get("range");
-  if (range && RANGE_SECONDS[range]) ui.range = range;
+  if (range === "custom") {
+    const w = parseWindowParams(r.params);
+    if (w) { ui.range = "custom"; ui.window = w; }
+  } else if (range && RANGE_SECONDS[range]) { ui.range = range; ui.window = null; }
   ui.view = r.view; ui.node = r.node; ui.table = r.table; ui.params = r.params;
   for (const v of VIEWS) {
     const el = document.getElementById("view-" + v);
@@ -279,10 +288,10 @@ function wireControls() {
   });
   document.getElementById("range-picker-global").addEventListener("change", ev => {
     ui.range = ev.target.value;
+    if (ui.range !== "custom") ui.window = null;
     pushRoute();
-    if (ui.view === "metrics") { runNow("metrics"); }
-    else if (ui.view === "node") { nv.chartsAt = 0; runNow("node"); }
-    else if (ui.view === "sql") { runNow("txnCharts"); }
+    renderRangePicker();
+    refetchCharts();
   });
   wireJump();
 }

@@ -148,7 +148,7 @@ async function pollTxnCharts() {
   const box = document.getElementById("txn-charts");
   const note = document.getElementById("txn-note");
   try {
-    const resp = await fetch(`/api/metrics?series=${TXN_SERIES.join(",")}&since=${RANGE_SECONDS[ui.range]}s&rate=1`, { cache: "no-store" });
+    const resp = await fetch(`/api/metrics?series=${TXN_SERIES.join(",")}&${windowQuery()}&rate=1`, { cache: "no-store" });
     if (!resp.ok) {
       const e = await resp.json().catch(() => ({}));
       box.innerHTML = "";

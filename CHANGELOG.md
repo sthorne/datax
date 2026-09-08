@@ -11,6 +11,26 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Brush to zoom on the charts** (#206). The time range was five
+  presets ending at now, so the eleven minutes around 14:20 meant
+  picking an hour and reading a fifth of the width, and yesterday
+  afternoon meant a day or a week and squinting. Drag across any chart —
+  on the metrics view, a node's page or the transactions charts — and
+  every chart on the page narrows to the window dragged out; the band
+  and its edge times are drawn while dragging, so what is about to be
+  picked can be seen before it is. The window rides in the address
+  (`range=custom&from=…&to=…`), so a narrowed chart is a link someone
+  can paste into an incident channel; the header's range picker shows
+  the window as its own entry while it is in force, and choosing a
+  preset returns to one that ends at now. A selection narrower than
+  eight of the chart's buckets is widened to eight: below that the
+  server answers with the same samples drawn wider, which is resolution
+  the data does not have. The keyboard has the same path (#149): focus
+  a chart, `[` and `]` mark the window's ends at the crosshair with the
+  band showing the selection so far, Enter applies it, Escape drops it,
+  and `-` widens the window to twice its span. Panning is deliberately
+  not included; selection plus a shareable address is most of the
+  value.
 - **The console's viewer preferences live in the cluster** (#204). Two
   display choices — light/dark/system, and whether a moment reads as how
   long ago it was or as the clock time it happened at — plus the place
