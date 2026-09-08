@@ -146,6 +146,23 @@ state or the internode protocol does, and an entry below says so.
   (descriptors and names, and counters) and are held to their sets.
   Backups written by any release restore unchanged: nothing a backup
   writes lies outside the spans it was read from.
+- **The encryption-at-rest threat model is stated** (#220, part). File
+  content is AES-256-CTR with no authentication tag and the file header
+  is not authenticated; only the key registry and the metadata backup
+  are GCM-sealed. So `--enc-key` protects a disk that leaves the
+  building and not a store an attacker can write to: with write access
+  to a live store's files, a WAL can be truncated (committed writes
+  vanish as if after a crash), chosen bits flipped in a chosen row with
+  the block checksum repaired in the same pass, a header's key id or IV
+  swapped, or a whole file substituted or rolled back — none of it
+  detected, since Pebble's checksums are keyless and CTR is
+  bit-malleable. The cross-replica consistency sweep is the one thing
+  that would notice, after the fact, and it is off by default.
+  `docs/encryption.md` now says all of this up front and in its
+  limitations, and the package comment says it too, so the feature reads
+  as protecting exactly what it protects. Authenticating the header and
+  the content — the issue's second and third tiers — is a design
+  decision recorded on the issue, not made here.
 - **A query cancel is authorized on the node that acts on it** (#211).
   `CancelLocal` read a zero secret as "the caller is trusted, skip the
   check" — an in-band sentinel on a value that arrives from the network,

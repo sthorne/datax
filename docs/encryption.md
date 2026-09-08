@@ -10,6 +10,46 @@ crypto is the Go standard library.
 datax init --dir data1 --enc-key store.key ...
 ```
 
+## What it protects, and what it does not
+
+Encryption at rest answers one threat: **a disk that leaves the
+building** — a decommissioned drive, a stolen laptop, a cloud volume
+snapshot in the wrong hands, a backup tape. Without the store key the
+files are noise. That is confidentiality, and it is all this feature
+provides.
+
+It does not protect a store that an attacker can **write to**. File
+content is AES-256-CTR with no authentication tag, and the file header
+(magic, key id, IV) is not authenticated either; only the key registry
+and the metadata backup are sealed with an authenticating mode
+(AES-256-GCM). CTR is bit-for-bit malleable, and Pebble's block
+checksums are error-detecting codes with no key — whoever can change the
+bytes can recompute them — so someone with write access to a live
+store's files (a compromised host, a shared or network-backed volume, a
+hostile backup-and-restore path, an operator without database
+privileges) can:
+
+- truncate a WAL, and committed writes vanish on restart as if after a
+  crash, with nothing reported;
+- flip chosen bits in a chosen row, given knowledge of the plaintext —
+  which for a store with an open format and a known schema is a
+  reasonable assumption — and the node serves the altered value as
+  authentic;
+- swap a header's key id or IV, which the node sees as corruption rather
+  than as an attack;
+- substitute a whole file, or roll one back to an older copy, which
+  decrypts cleanly because nothing ties a file to its identity or
+  version.
+
+The only thing that would notice any of this is the cross-replica
+consistency sweep (`--consistency-interval`, off by default), which
+compares replica checksums and raises `consistency-failure` on
+divergence — after the fact, and only where a replica disagrees. It is a
+real mitigation and it is not integrity. If the threat is tampering
+rather than theft, put the data directory on storage the attacker cannot
+write, and run the sweep (issue #220 records what authenticated headers
+and content would take, and why they are not done).
+
 ## Design
 
 Encryption lives in `pkg/storage/enc` as a `vfs.FS` wrapper around
@@ -175,6 +215,12 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
 
 ## Limitations
 
+- **File content and headers are not authenticated** (see *What it
+  protects*): `--enc-key` protects a disk that leaves the building, not a
+  store an attacker can write to. An attacker with write access can
+  alter, truncate, substitute or roll back files undetectably; the
+  cross-replica consistency sweep is the only thing that would notice,
+  and only after the fact.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
 - Keys live in memory unprotected (no mlock/HSM integration).
