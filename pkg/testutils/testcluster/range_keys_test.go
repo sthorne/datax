@@ -68,27 +68,40 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 		return body
 	}
 
-	// The schema cache labels ranges once it has scanned the catalog;
-	// wait until the admin's view names the sealed table's boundary AND
-	// carries both tables' names: the boundary keys and the name map are
-	// filled by separate refreshes, and under load the keys have been
-	// seen to land a poll before the names.
+	// Wait until every document the test reads carries, for the admin,
+	// both boundaries and both tables' names. The pieces land at
+	// different moments: the schema cache's name map fills on its own
+	// refresh, and /status lists the node's own replicas, whose
+	// descriptors take the split a beat after the meta range that
+	// /api/cluster reads — under a loaded suite either has been seen to
+	// arrive a poll after the other. The test is about what each reader
+	// is shown of a document, not about when the document is complete.
+	paths := []string{"/api/cluster", "/status", "/api/overview", "/api/node"}
+	wants := []string{sealedRow, openRow, `"sealedbook"`, `"openbook"`}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		body := get(bases[0]+"/api/cluster", "root", "topsecret")
-		if strings.Contains(body, sealedRow) && strings.Contains(body, openRow) && strings.Contains(body, `"sealedbook"`) && strings.Contains(body, `"openbook"`) {
+		complete := true
+		for _, path := range paths {
+			body := get(bases[0]+path, "root", "topsecret")
+			for _, want := range wants {
+				if !strings.Contains(body, want) {
+					complete = false
+				}
+			}
+		}
+		if complete {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the admin's /api/cluster never rendered the split boundaries")
+			t.Fatal("the admin's documents never all rendered the split boundaries and the table names")
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	// The documents that list ranges, as the admin and as the reader.
-	for _, path := range []string{"/api/cluster", "/status", "/api/overview", "/api/node"} {
+	for _, path := range paths {
 		asRoot := get(bases[0]+path, "root", "topsecret")
-		for _, want := range []string{sealedRow, openRow, `"sealedbook"`, `"openbook"`} {
+		for _, want := range wants {
 			if !strings.Contains(asRoot, want) {
 				t.Errorf("%s as root does not carry %s", path, want)
 			}
