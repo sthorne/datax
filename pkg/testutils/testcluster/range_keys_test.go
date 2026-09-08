@@ -69,10 +69,14 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	}
 
 	// The schema cache labels ranges once it has scanned the catalog;
-	// wait until the admin's view names the sealed table's boundary.
+	// wait until the admin's view names the sealed table's boundary AND
+	// carries both tables' names: the boundary keys and the name map are
+	// filled by separate refreshes, and under load the keys have been
+	// seen to land a poll before the names.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if body := get(bases[0]+"/api/cluster", "root", "topsecret"); strings.Contains(body, sealedRow) && strings.Contains(body, openRow) {
+		body := get(bases[0]+"/api/cluster", "root", "topsecret")
+		if strings.Contains(body, sealedRow) && strings.Contains(body, openRow) && strings.Contains(body, `"sealedbook"`) && strings.Contains(body, `"openbook"`) {
 			break
 		}
 		if time.Now().After(deadline) {
