@@ -190,8 +190,14 @@ type ClusterStatus struct {
 	ConsoleVersion string `json:"console_version,omitempty"`
 	// Principal is per request: the caller's identity, not cluster state.
 	Principal ClusterPrincipal `json:"principal"`
-	Nodes     []ClusterNode    `json:"nodes"`
-	Ranges    []ClusterRange   `json:"ranges"`
+	// KeysRedacted is true when the range keys in this document are the
+	// shown form — table and index by id, no row values — because the
+	// caller does not see every table's keys (issue #213). A control that
+	// copies a key can then say so: the shown form is not one a command
+	// takes, and a reader should not be handed it under a key's name.
+	KeysRedacted bool           `json:"keys_redacted,omitempty"`
+	Nodes        []ClusterNode  `json:"nodes"`
+	Ranges       []ClusterRange `json:"ranges"`
 	// Rollup sums the live nodes' figures (issue #145).
 	Rollup ClusterRollup `json:"rollup"`
 	// Replication buckets the ranges by replication state and projects
@@ -241,6 +247,7 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 		NodeID:         int(n.ident.NodeID),
 		ConsoleVersion: n.consoleVersion,
 		Principal:      p,
+		KeysRedacted:   !v.all,
 		Local:          n.statusSummaryFor(v),
 	}
 	if v.err != nil {

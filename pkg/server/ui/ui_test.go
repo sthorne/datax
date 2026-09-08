@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"html"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -2133,5 +2135,96 @@ func TestOperationsUnderClusterScopeAreClusterWide(t *testing.T) {
 		if !strings.Contains(head, `<th scope="col">node</th>`) {
 			t.Errorf("the %s table has no node column: a cluster-wide row does not say where it is", tbody)
 		}
+	}
+}
+
+// TestSeriesEightIsTellableFromEveryOtherSlot (issue #216, from the
+// console review of the combined PR): --series-8 and --series-2 were
+// both warm reds seven OKLab units apart in either theme, and a two-
+// line chart never facets, so n2 and n8 could not be told apart by
+// colour. The distances are computed here rather than trusted: every
+// pair involving slot 8 clears the normal-vision floor of 15 in both
+// themes.
+func TestSeriesEightIsTellableFromEveryOtherSlot(t *testing.T) {
+	page := string(mustRead(t, "index.html"))
+	light := page[strings.Index(page, ":root {"):]
+	light = light[:strings.Index(light, "}")]
+	di := strings.Index(page, "prefers-color-scheme: dark")
+	dark := page[di : di+1200]
+	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
+	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
+		pal := map[string]string{}
+		for _, m := range slot.FindAllStringSubmatch(theme.css, -1) {
+			pal[m[1]] = m[2]
+		}
+		if len(pal) != 8 {
+			t.Fatalf("%s theme: found %d series slots, want 8", theme.name, len(pal))
+		}
+		for i := 1; i <= 7; i++ {
+			d := oklabDistance(pal["8"], pal[strconv.Itoa(i)])
+			if d < 15 {
+				t.Errorf("%s theme: --series-8 %s and --series-%d %s are %.1f OKLab units apart; the floor for two lines with no other channel is 15", theme.name, pal["8"], i, pal[strconv.Itoa(i)], d)
+			}
+		}
+	}
+}
+
+// oklabDistance is the OKLab Euclidean distance between two sRGB hex
+// colours, scaled by 100 — the ΔE the palette validator reports.
+func oklabDistance(a, b string) float64 {
+	la, aa, ba := oklab(a)
+	lb, ab, bb := oklab(b)
+	return 100 * math.Sqrt((la-lb)*(la-lb)+(aa-ab)*(aa-ab)+(ba-bb)*(ba-bb))
+}
+
+func oklab(hex string) (float64, float64, float64) {
+	lin := func(i int) float64 {
+		v, _ := strconv.ParseUint(hex[1+2*i:3+2*i], 16, 8)
+		c := float64(v) / 255
+		if c <= 0.04045 {
+			return c / 12.92
+		}
+		return math.Pow((c+0.055)/1.055, 2.4)
+	}
+	r, g, b := lin(0), lin(1), lin(2)
+	l := math.Cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b)
+	m := math.Cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b)
+	s := math.Cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b)
+	return 0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+		1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+		0.0259040371*l + 0.7827717662*m - 0.8086757660*s
+}
+
+// TestRedactedKeysAreNotCopiedUnderAKeysName (issue #213 meeting #226):
+// a caller who does not see every table's keys gets the shown form, and
+// the copy control and the CSV say so rather than call it a key.
+func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
+	api, err := os.ReadFile("../cluster_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile("KeysRedacted +bool +`json:\"keys_redacted,omitempty\"`").MatchString(string(api)) {
+		t.Fatal("the cluster document no longer says whether its keys are the shown form")
+	}
+	data := string(mustRead(t, "js/70-data.js"))
+	span := jsFuncSpan(data, "renderClusterRanges")
+	if span == nil {
+		t.Fatal("renderClusterRanges not found")
+	}
+	body := data[span[0]:span[1]]
+	if !strings.Contains(body, "lastCluster.keys_redacted") {
+		t.Error("renderClusterRanges does not read keys_redacted: a redacted key is copied under a key's name")
+	}
+	for _, want := range []string{`"start key as shown (your role does not see the full key)"`, `"start key (as shown)"`, `"end key (as shown)"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("renderClusterRanges does not label the shown form %s", want)
+		}
+	}
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(g.lookup("", "copy"), "shown form") {
+		t.Error("the copy glossary entry does not say what a redacted key is")
 	}
 }

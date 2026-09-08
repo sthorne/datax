@@ -29,6 +29,11 @@ function openRangeDetail(id) {
 }
 function renderClusterRanges(ranges) {
   const admin = canDrillDown();
+  // A caller who does not see every table's keys gets them in the shown
+  // form (issue #213) — not one a command takes — and the copy control
+  // and the CSV say so rather than hand it over under a key's name.
+  const shownForm = !!(lastCluster && lastCluster.keys_redacted);
+  const keyLabel = shownForm ? "start key as shown (your role does not see the full key)" : "start key";
   const hint = document.getElementById("cluster-range-hint");
   setHTML(hint, admin
     ? "click a range, or focus it and press Enter, for its per-replica detail from every holding node (admin role)"
@@ -38,7 +43,7 @@ function renderClusterRanges(ranges) {
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
       <td>r${r.range_id}</td>
-      <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s start key", r.start_key || "")}</td>
+      <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + keyLabel, r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     </tr>` });
     // The open detail row is its own element, filled by its fetch and
@@ -49,7 +54,7 @@ function renderClusterRanges(ranges) {
   // The rows the filter left, with the keys untrimmed: the cell shortens
   // a span to what fits a column, and a key that has been shortened is
   // not one a command will take (issue #205).
-  setCSV("ranges", ["range", "table", "start key", "end key", "replicas"],
+  setCSV("ranges", ["range", "table", shownForm ? "start key (as shown)" : "start key", shownForm ? "end key (as shown)" : "end key", "replicas"],
     shown.map(r => ["r" + r.range_id, r.table || "", r.start_key || "", r.end_key || "",
       (r.replicas || []).map(x => "n" + x).join(" ")]));
 }

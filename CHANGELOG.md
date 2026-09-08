@@ -334,7 +334,11 @@ state or the internode protocol does, and an entry below says so.
   both forms and the event feed serves the one the caller may see; the
   exact key stays on the admin-gated `/api/range` and in the node's
   log. System and meta keys carry no row and are unchanged. Admins and
-  insecure mode see everything, as before.
+  insecure mode see everything, as before. The document says when its
+  keys are the shown form (`keys_redacted`), and the copy control and
+  the CSV export label a key accordingly rather than hand a reader the
+  shown form under a key's name (found in the console review of the
+  combined PR, where #213 met #226's copy controls).
 
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
@@ -448,7 +452,14 @@ state or the internode protocol does, and an entry below says so.
 - The header's staleness pill read "last updated 5s ago ago".
 - `IsSystemTableID` listed the reserved ids again instead of reading the
   registration map — the same shape as the `CREATE TABLE` bug above,
-  left in the one place nothing had needed yet.
+  left in the one place nothing had needed yet. The console review of the combined PR
+  found the pair the issue was filed for still on screen: `--series-8`
+  and `--series-2` were both warm reds at an OKLab distance of 7 in
+  either theme, and faceting never engages for two lines. `--series-8`
+  is re-stepped — a deep red on the light theme, a sky blue on the dark
+  one, no shared family clearing the floors in both — so every pair
+  involving it is at least 15 apart, and a test computes the distances
+  rather than trusting the numbers.
 
 ## 0.57.0 — unreleased
 
