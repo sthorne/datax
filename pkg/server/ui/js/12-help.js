@@ -71,7 +71,7 @@ const HELP = {
   // ---- Network ----
   "pair": "The two nodes this row measures between, in the direction measured. A path can be slow one way only, so the reverse pair is its own row.",
   "peer": "The node on the other end of this measurement.",
-  "round trip": "Median time for a request between these two nodes and back. It sets the floor on any operation needing agreement from a replica elsewhere.",
+  "round trip": "Median time for a request between these two nodes and back. It sets the floor on any operation needing agreement from a replica elsewhere. A pair is flagged when it is more than three times the cluster's own median round trip and over 5 ms — judged against what this cluster measures, not an absolute number, so a cluster that is uniformly far apart is not painted as an outage. Unreachable is its own mark and never the same as slow.",
   "p99": "The 99th percentile — the value one request in a hundred exceeds. Percentiles come from the node that measured them and are never averaged together.",
   "node/p99": "The 99th percentile round trip to this peer: one request in a hundred takes longer.",
   "clock offset": "How far this pair's clocks disagree. Transaction ordering depends on bounded clock skew, so a node whose offset approaches the limit is refused rather than allowed to break serializability.",
@@ -172,6 +172,7 @@ const HELP = {
   "recently completed": "Operations that finished, with their outcome. An operation that keeps failing and restarting is why something never settles.",
   "operation": "What the cluster is doing and to which range or node. Nothing here was asked for by a client — this is the cluster maintaining itself.",
   "kind": "The kind of operation: a split, a merge, a rebalance, a lease move, a decommission, a backup.",
+  "summary": "What the node recorded about the event, in its own words — the line the events view shows for it.",
   "started": "When the operation began, by the clock of the node that started it.",
   "elapsed": "How long this operation has been running so far. An operation whose elapsed time keeps growing past what the same kind usually takes is stuck rather than slow.",
   "finished": "When the operation ended, by the clock of the node that ran it.",
@@ -230,14 +231,14 @@ const HELP = {
 
   // ---- Controls ----
   "scope": "Which node the node-scoped panels describe. The whole cluster fans out to every node and needs admin; a single node asks only that node.",
-  "range": "The time range every chart and every rate on the page uses. It is part of the address, so a link carries it.",
+  "range": "The time range every chart and every rate on the page uses. It is part of the address, so a link carries it. Drag across any chart to narrow every chart to the window you dragged out: the picker then shows that window's edges, a preset takes you back, and the link carries the window too. On the keyboard, focus a chart, mark the window's ends at the crosshair with [ and ], and press Enter; - widens the window. A window narrower than eight of the chart's samples is widened to eight, since the data has no finer resolution to show.",
   "jump to": "Open anything by name: a node, a range id, a table, a locality. ⌘K or Ctrl-K from anywhere.",
   "theme": "Light, dark, or whatever this device asks for. The choice is stored in the cluster against the signed-in user, not in this browser, so it follows you to another browser, another machine and any node's console — and a cluster still mid-upgrade says so rather than losing it silently.",
   "timestamps": "Whether a moment reads as how long ago it was or as the clock time it happened at, in this device's own zone with the offset spelled out. It changes moments only: how long a transaction has been open is a length of time, not a moment, and keeps reading as one. Stored in the cluster like the theme.",
   "compare": "Overlay every node's series on one chart instead of drawing a chart per node — the fastest way to see that one node disagrees with the rest.",
   "annotate": "Mark cluster operations on the charts where they happened, so a change in a line can be lined up against what the cluster did.",
   "filter": "Narrows this view. It is written into the address, so a filtered view is a link that can be shared.",
-  "copy": "Puts this value on the clipboard — a range key for `datax debug split`, an address for a connection string, a statement for a ticket. Where a cell shows a range's whole span, the control takes the start key alone — that is what datax debug split takes, and the end key is a column in the CSV. The clipboard needs a secure context, so on a console reached over plain HTTP the control selects the text instead and says so, leaving one keystroke to finish the job.",
+  "copy": "Puts this value on the clipboard — a range key for `datax debug split`, an address for a connection string, a statement for a ticket. Where a cell shows a range's whole span, the control takes the start key alone — that is what datax debug split takes, and the end key is a column in the CSV. The clipboard needs a secure context, so on a console reached over plain HTTP the control selects the text instead and says so, leaving one keystroke to finish the job. A role that does not see every table's keys gets a range key in the shown form — the table and index by id, with no row values — and the control says so: that form is not one datax debug split will take.",
   "copy as csv": "Copies this table as CSV, ready to paste into a spreadsheet or an incident review. It is what is on screen — the filter, the sort and the scope already applied — rather than everything the node holds, and keys are exported in full where the cells shorten them to fit. A cell that would open with =, + or @ is exported with a leading apostrophe, which is how a spreadsheet is told to take it as text: range keys are decoded row values, so one can hold anything a writer put in a primary key, and a spreadsheet would otherwise run it. For a file rather than a paste, the same figures come from this node's /api/ endpoints as JSON that curl can take.",
 
   // ---- Section titles that are not also a column ----
@@ -371,12 +372,28 @@ function renderHelpPanel() {
     seen.add(term);
     rows += `<dt>${esc(term)}</dt><dd>${esc(text)}</dd>`;
   }
+  // The header's controls, the same on every view (issue #230): the
+  // header is outside every view, so without this section a control's
+  // entry was written, shipped and unreachable.
+  const ctlSeen = new Set();
+  let ctls = "";
+  for (const el of document.querySelectorAll("header .helpable")) {
+    const term = normTerm(labelText(el));
+    if (!term || ctlSeen.has(term)) continue;
+    const text = helpFor(term, "");
+    if (!text) continue;
+    ctlSeen.add(term);
+    ctls += `<dt>${esc(term)}</dt><dd>${esc(text)}</dd>`;
+  }
   const body = document.getElementById("help-body");
-  body.innerHTML = rows
+  body.innerHTML = (rows
     ? `<dl>${rows}</dl>`
-    : `<p class="muted">Nothing on this view has an explanation yet.</p>`;
-  document.getElementById("help-count").textContent =
-    seen.size ? `${seen.size} term${seen.size === 1 ? "" : "s"} on this view` : "";
+    : `<p class="muted">Nothing on this view has an explanation yet.</p>`) +
+    (ctls ? `<p class="muted">the header's controls, on every view</p><dl>${ctls}</dl>` : "");
+  const counts = [];
+  if (seen.size) counts.push(`${seen.size} term${seen.size === 1 ? "" : "s"} on this view`);
+  if (ctlSeen.size) counts.push(`${ctlSeen.size} control${ctlSeen.size === 1 ? "" : "s"}`);
+  document.getElementById("help-count").textContent = counts.join(" · ");
 }
 let helpReturn = null;
 function helpOpen() { return !document.getElementById("help").hidden; }
@@ -396,6 +413,9 @@ function closeHelp() {
 }
 function wireHelpControls() {
   observeHelp();
+  // The header's controls are marked once: its markup is static, and it
+  // is outside the observed views (issue #230).
+  wireHelp(document.querySelector("header"));
   document.getElementById("help-open").addEventListener("click", openHelp);
   document.getElementById("help-close").addEventListener("click", closeHelp);
   // The backdrop closes it; the panel itself does not.
@@ -406,7 +426,7 @@ function wireHelpControls() {
   // carrying them are replaced on every poll.
   document.addEventListener("click", ev => {
     const term = ev.target.closest(".helpable");
-    if (term && document.getElementById("main-views").contains(term)) {
+    if (term && (document.getElementById("main-views").contains(term) || document.querySelector("header").contains(term))) {
       // A heading that is also a link or holds a control keeps its own
       // behaviour; the explanation is the hover and the panel there.
       if (ev.target.closest("a, button, select, input")) return;

@@ -13,6 +13,18 @@ function healthLink(section) {
 // operator with thirty tabs can see it (issue #150): the favicon takes
 // the colour of the worst open problem — steady, never animated — and
 // the title carries the count: "(2) datax — n1".
+//
+// Each row says when this node's checks first found it (issue #207) —
+// a moment, so it reads the viewer's way — and links to its history:
+// the operations view filtered to the health records that name the
+// check, which is where "has this been flapping" is answered.
+function problemSince(p) {
+  if (!p.since_unix_ms) return "";
+  return `<span class="since" title="${esc("first found open by this node's checks at " + new Date(p.since_unix_ms).toISOString())}">${fmtWhen(p.since_unix_ms)}</span>`;
+}
+function problemHistory(p) {
+  return `<a class="history" href="${routeTo("ops", { kind: "health", q: p.check })}" title="when this check appeared and cleared, from this node's event ring">history →</a>`;
+}
 const SEVERITY_RANK = { critical: 3, warning: 2, info: 1 };
 let lastSeverity = null;
 function renderHealth(h) {
@@ -25,7 +37,8 @@ function renderHealth(h) {
       <span class="sev">${esc(p.severity)}</span>
       <span class="check">${esc(p.check)}</span>
       <span>${esc(p.summary)}</span>
-      ${p.section && healthLink(p.section) ? `<a href="${healthLink(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} →</a>` : ""}
+      ${problemSince(p)}
+      <span class="links">${p.section && healthLink(p.section) ? `<a href="${healthLink(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} →</a>` : ""}${problemHistory(p)}</span>
     </div>` })));
   }
   const worst = probs.reduce((w, p) => (SEVERITY_RANK[p.severity] || 0) > (SEVERITY_RANK[w] || 0) ? p.severity : w, "");

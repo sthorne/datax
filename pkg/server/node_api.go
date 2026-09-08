@@ -80,9 +80,11 @@ type NodeDetail struct {
 
 // localNodeDetail assembles this node's document. Statement text and
 // audit records are admin-only material (the same rules as
-// /api/activity and /api/events).
-func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
-	st := n.statusSummary()
+// /api/activity and /api/events); range keys, table names and the keys
+// in split events render as the caller may see them (issue #213).
+func (n *Node) localNodeDetail(ctx context.Context, v keyViewer) NodeDetail {
+	admin := v.all
+	st := n.statusSummaryFor(v)
 	d := NodeDetail{
 		NodeID:         int(n.ident.NodeID),
 		Address:        n.addr,
@@ -142,14 +144,14 @@ func (n *Node) localNodeDetail(ctx context.Context, admin bool) NodeDetail {
 		}
 	}
 	if n.events != nil {
-		d.Events = n.events.Recent(0, 50, admin)
+		d.Events = events.Redact(n.events.Recent(0, 50, admin), v.sees)
 		if d.Events == nil {
 			d.Events = []events.Event{}
 		}
 		// Paired over the whole ring, not the tail this document
 		// carries, so an operation that started before that tail is
 		// still reported as running.
-		d.Operations = operationsFrom(n.events.Recent(0, 0, admin), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
+		d.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, admin), v.sees), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	}
 	return d
 }
@@ -185,7 +187,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 		id = base.NodeID(v)
 	}
 	if id == n.ident.NodeID {
-		_ = enc.Encode(n.localNodeDetail(req.Context(), p.Admin))
+		_ = enc.Encode(n.localNodeDetail(req.Context(), n.keyViewerFor(req.Context(), p)))
 		return
 	}
 	if !p.Admin {

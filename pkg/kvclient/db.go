@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -183,6 +184,44 @@ const (
 	maxRoutingRetries = 30
 )
 
+// routingTrace keeps what a batch's last regroups saw — the descriptor it
+// sent on, at which generation and to which replicas, what the node
+// answered, and which descriptors that answer carried — so a batch that
+// gives up says what it tried rather than only that it tried (issue
+// #200). The last entry is what was still wrong when the budget ran out;
+// the earlier ones show whether the addressing moved between attempts or
+// the same answer came back every time, which tell "too slow" apart from
+// "stuck on a stale entry".
+const routingTraceLen = 8
+
+type routingTrace []string
+
+func (t *routingTrace) note(desc kvpb.RangeDescriptor, kerr *kvpb.Error) {
+	if len(*t) == routingTraceLen {
+		copy(*t, (*t)[1:])
+		*t = (*t)[:routingTraceLen-1]
+	}
+	var carried string
+	if kerr != nil && kerr.RangeKeyMismatch != nil {
+		var ds []string
+		for _, d := range kerr.RangeKeyMismatch.ActualDescriptors {
+			ds = append(ds, fmt.Sprintf("%s@%d", d.RangeID, d.Generation))
+		}
+		carried = fmt.Sprintf(" (answer carried %d descriptor(s): %s)", len(ds), strings.Join(ds, " "))
+	}
+	*t = append(*t, fmt.Sprintf("%s@%d%v: %v%s", desc.RangeID, desc.Generation, replicaNodeIDs(desc), kerr, carried))
+}
+
+func (t routingTrace) String() string { return strings.Join(t, "; ") }
+
+func replicaNodeIDs(desc kvpb.RangeDescriptor) []base.NodeID {
+	ids := make([]base.NodeID, 0, len(desc.Replicas))
+	for _, r := range desc.Replicas {
+		ids = append(ids, r.NodeID)
+	}
+	return ids
+}
+
 // Send routes and executes a batch. Requests are grouped by range and the
 // groups execute in order; scans spanning ranges are stitched together.
 // Note that a non-transactional batch that crosses ranges is NOT atomic —
@@ -213,6 +252,7 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 
 	i := 0
 	regroups := 0
+	var trace routingTrace
 	for i < len(ba.Requests) {
 		if scan := ba.Requests[i].Scan; scan != nil {
 			resp, kerr := db.sendScan(ctx, header, scan)
@@ -280,8 +320,9 @@ func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 		br, regroup, kerr := db.sendPartial(ctx, &gh, ba.Requests[i:j], desc)
 		header.Timestamp = gh.Timestamp
 		if regroup {
+			trace.note(desc, kerr)
 			if regroups++; regroups > maxRoutingRetries {
-				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
+				return nil, kvpb.NewErrorf("routing did not converge after %d retries: %v; the last attempts: %s", regroups, kerr, trace)
 			}
 			if berr := routingBackoff(ctx, regroups); berr != nil {
 				return nil, berr
@@ -458,9 +499,10 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 	}
 
 	regroups := 0
+	var trace routingTrace
 	regroupWait := func(kerr *kvpb.Error) *kvpb.Error {
 		if regroups++; regroups > maxRoutingRetries {
-			return kvpb.NewErrorf("routing did not converge after %d retries: %v", regroups, kerr)
+			return kvpb.NewErrorf("routing did not converge after %d retries: %v; the last attempts: %s", regroups, kerr, trace)
 		}
 		return routingBackoff(ctx, regroups)
 	}
@@ -480,6 +522,7 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 		if ai := anchorGroup(groups); ai >= 0 && len(groups) > 1 {
 			regroup, kerr := sendGroup(groups[ai])
 			if regroup {
+				trace.note(groups[ai].desc, kerr)
 				if werr := regroupWait(kerr); werr != nil {
 					return nil, werr
 				}
@@ -517,6 +560,7 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 				case regroup:
 					retry = append(retry, g)
 					lastRe = kerr
+					trace.note(g.desc, kerr)
 				case kerr != nil && firstErr == nil:
 					firstErr = kerr
 				}
@@ -654,6 +698,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 	cur := req.Key.Clone()
 	remaining := req.MaxRows
 	regroups := 0
+	var trace routingTrace
 	for cur.Less(req.EndKey) {
 		desc, kerr := db.descForKey(ctx, cur)
 		if kerr != nil {
@@ -675,8 +720,9 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		br, regroup, kerr := db.sendPartial(ctx, &gh, []kvpb.RequestUnion{{Scan: sub}}, desc)
 		header.Timestamp = gh.Timestamp
 		if regroup {
+			trace.note(desc, kerr)
 			if regroups++; regroups > maxRoutingRetries {
-				return nil, kvpb.NewErrorf("scan routing did not converge: %v", kerr)
+				return nil, kvpb.NewErrorf("scan routing did not converge after %d retries: %v; the last attempts: %s", regroups, kerr, trace)
 			}
 			if berr := routingBackoff(ctx, regroups); berr != nil {
 				return nil, berr

@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,5 +250,36 @@ func TestConsistencySweepInFlight(t *testing.T) {
 	}
 	if ops[0].ElapsedMs < 59*1000 {
 		t.Fatalf("elapsed %d ms, want about a minute", ops[0].ElapsedMs)
+	}
+}
+
+// The cluster merge (issue #210): running first, newest start first,
+// then completed, newest end first, the node id breaking ties; only the
+// completed ones are bounded, and the count dropped is reported.
+func TestMergeOperationsOrdersAndBounds(t *testing.T) {
+	run := func(node int, started int64) ClusterOperation {
+		return ClusterOperation{NodeID: node, Operation: Operation{Kind: "backup", Op: fmt.Sprintf("r%d-%d", node, started), Running: true, StartedMs: started}}
+	}
+	done := func(node int, ended int64) ClusterOperation {
+		return ClusterOperation{NodeID: node, Operation: Operation{Kind: "backup", Op: fmt.Sprintf("d%d-%d", node, ended), EndedMs: ended, Outcome: "ok"}}
+	}
+	running := []ClusterOperation{run(3, 100), run(1, 300), run(2, 300)}
+	completed := []ClusterOperation{done(2, 50), done(1, 90), done(3, 90), done(1, 10)}
+	out, truncated := mergeOperations(running, completed, 3)
+	var got []string
+	for _, o := range out {
+		got = append(got, o.Op)
+	}
+	want := []string{"r1-300", "r2-300", "r3-100", "d1-90", "d3-90", "d2-50"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("order %v, want %v", got, want)
+	}
+	if truncated != 1 {
+		t.Fatalf("truncated %d, want 1 (the oldest completed operation)", truncated)
+	}
+	// Running operations are never dropped, however many there are.
+	out, truncated = mergeOperations(running, nil, 0)
+	if len(out) != 3 || truncated != 0 {
+		t.Fatalf("a limit of 0 dropped running operations: %d kept, %d truncated", len(out), truncated)
 	}
 }

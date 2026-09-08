@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -369,5 +371,108 @@ func TestRestoreRefusesAFileOutsideTheBackup(t *testing.T) {
 	s2 := sql.NewSession(target.Nodes[0].DB(), catalog.NewAccessor())
 	if res := execSQL(t, ctx, s2, `SELECT v FROM t WHERE id = 1`); len(res.Rows) != 1 || res.Rows[0][0].S != "kept" {
 		t.Fatalf("restored row: %+v", res.Rows)
+	}
+}
+
+// Restore writes a manifest's raw system records back verbatim, so a
+// crafted manifest could have it write any key in the cluster (issue
+// #238) — the authentication secret above all, which no legitimate
+// backup carries and which keys the console's sessions. Each group is
+// held to the spans backup collects it from when the manifest is read,
+// so the restore is refused before anything is applied, and the secret
+// the target had is the secret it keeps.
+func TestRestoreRefusesKeysABackupNeverWrites(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	execSQL(t, ctx, s, `CREATE TABLE t (id INT8 PRIMARY KEY, v TEXT)`)
+	execSQL(t, ctx, s, `INSERT INTO t VALUES (1, 'kept')`)
+	backup := t.TempDir()
+	if _, err := tc.Nodes[0].RunBackup(ctx, backup, "", false, false); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// A crafted copy of the backup with one record added to a group.
+	craft := func(group string, key, value []byte) string {
+		dir := t.TempDir()
+		entries, err := os.ReadDir(backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			raw, err := os.ReadFile(filepath.Join(backup, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.Name() == "BACKUP.json" {
+				var man map[string]any
+				if err := json.Unmarshal(raw, &man); err != nil {
+					t.Fatal(err)
+				}
+				list, _ := man[group].([]any)
+				man[group] = append(list, map[string]any{"key": key, "value": value})
+				if raw, err = json.Marshal(man); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, e.Name()), raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	// The target has a secret of its own; the attacker's is all ones.
+	target := Start(t, 1)
+	secret := make([]byte, 32)
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	if err := target.Nodes[0].DB().Put(ctx, keys.AuthSecretKey(), secret); err != nil {
+		t.Fatal(err)
+	}
+	planted := make([]byte, 32)
+	for i := range planted {
+		planted[i] = 1
+	}
+	metaStart, _ := keys.MetaSpan()
+	for _, c := range []struct {
+		group string
+		key   keys.Key
+	}{
+		{"users", keys.AuthSecretKey()},
+		{"admins", keys.AuthSecretKey()},
+		{"roles", keys.ClusterVersionKey()},
+		{"databases", keys.TableDescKey(5)},
+		{"sequences", metaStart},
+	} {
+		_, err := target.Nodes[0].RunRestore(ctx, []string{craft(c.group, c.key, planted)})
+		if err == nil {
+			t.Fatalf("restore accepted a manifest whose %s carries %s", c.group, c.key)
+		}
+		if !strings.Contains(err.Error(), "manifest's "+c.group+" carries the key") {
+			t.Fatalf("restore from a manifest whose %s carries %s failed for another reason: %v", c.group, c.key, err)
+		}
+		got, err := target.Nodes[0].DB().Get(ctx, keys.AuthSecretKey())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(secret) {
+			t.Fatalf("after a refused restore (%s carrying %s) the cluster's authentication secret is %x, not the one it had", c.group, c.key, got)
+		}
+	}
+
+	// Nothing was applied by the refused attempts: the backup as written
+	// restores into the same cluster, and the secret is still its own.
+	if _, err := target.Nodes[0].RunRestore(ctx, []string{backup}); err != nil {
+		t.Fatalf("restore of an unmodified backup after the refusals: %v", err)
+	}
+	s2 := sql.NewSession(target.Nodes[0].DB(), catalog.NewAccessor())
+	if res := execSQL(t, ctx, s2, `SELECT v FROM t WHERE id = 1`); len(res.Rows) != 1 || res.Rows[0][0].S != "kept" {
+		t.Fatalf("restored row: %+v", res.Rows)
+	}
+	if got, _ := target.Nodes[0].DB().Get(ctx, keys.AuthSecretKey()); string(got) != string(secret) {
+		t.Fatalf("a restore changed the cluster's authentication secret to %x", got)
 	}
 }

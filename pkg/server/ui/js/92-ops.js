@@ -31,6 +31,39 @@ function ingestEvents(nodeID, events, latest) {
 let opsAll = [];
 function ingestOperations(ops) { opsAll = ops || []; }
 
+// The cluster's operations (issue #210): under cluster scope the two
+// operation tables read /api/operations — every live node's operations
+// merged by the server, each row keeping the node it is on — instead of
+// the serving node's ring, because the operation an operator most wants
+// to watch is usually running somewhere other than the node whose
+// console they opened. Under node scope the ring is the right answer
+// and nothing changes. Partial is normal: a node that did not answer is
+// named beside the rows that arrived. The fan-out is admin-gated, like
+// the others; without the role the tables keep describing the serving
+// node and say so.
+let opsCluster = null, opsClusterRefused = false;
+async function pollOperations() {
+  if (ui.scope !== "cluster") { opsCluster = null; return; }
+  const resp = await fetch("/api/operations", { cache: "no-store" });
+  if (resp.status === 403) { opsCluster = null; opsClusterRefused = true; renderIfOps(); return; }
+  if (resp.status === 401) { location.reload(); return; }
+  const d = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
+  opsCluster = d; opsClusterRefused = false;
+  renderIfOps();
+}
+function renderIfOps() {
+  if (ui.view === "ops") renderOperations();
+  if (ui.view === "overview") renderRecentOps();
+}
+// opsSource says which list the operation tables draw: the cluster
+// document when the scope is the cluster and it arrived, else the
+// scoped node's ring.
+function opsSource() {
+  if (ui.scope === "cluster" && opsCluster) return { rows: opsCluster.operations || [], cluster: true };
+  return { rows: opsAll.map(o => Object.assign({ node_id: eventsNode }, o)), cluster: false };
+}
+
 // fmtElapsed renders a duration in ms at a useful resolution: seconds
 // while an operation is young, minutes and hours once it is not.
 function fmtElapsed(ms) {
@@ -41,7 +74,7 @@ function fmtElapsed(ms) {
 }
 
 function opRow(o, running) {
-  const key = o.kind + "/" + o.op;
+  const key = "n" + (o.node_id || "?") + "/" + o.kind + "/" + o.op;
   // Progress that cannot be known is elapsed time, never a bar with a
   // number nobody measured.
   const when = running
@@ -62,25 +95,47 @@ function opRow(o, running) {
     : `<td class="num">${o.started_unix_ms ? fmtElapsed(o.elapsed_ms) : `<span class="muted" title="this operation's start is older than the event ring, so how long it took is not known">—</span>`}</td>`;
   return { key, html: `<tr data-key="${esc(key)}">
     <td><span class="kind">${esc(o.kind)}</span></td>
+    <td><a href="${routeTo("node/" + (o.node_id || 0))}" title="the node this operation is running on">n${esc(String(o.node_id || "?"))}</a></td>
     <td class="key" style="max-width:none;white-space:normal">${esc(o.summary)}</td>
     ${running ? took + when : outcome + took + when}
   </tr>` };
 }
 
-function renderOperations() {
+// opsScopeNote says whose operations the tables show and which nodes are
+// missing from them, in the words the reader needs to not conclude the
+// cluster is idle.
+function opsScopeNote(src) {
+  if (src.cluster) {
+    const d = opsCluster;
+    const missing = (d.errors || []).length ? ` ${warn("draining", `${esc(d.errors.length)} of ${esc(d.nodes_asked)} nodes did not answer`)}: ${d.errors.map(esc).join("; ")}.` : "";
+    return `as reported by every node — ${esc(d.nodes)} of ${esc(d.nodes_asked)} answered${(d.errors || []).length ? "" : "."}${missing}`;
+  }
   const who = "n" + (eventsNode || "?");
-  const running = opsAll.filter(o => o.running);
-  const done = opsAll.filter(o => !o.running);
+  if (ui.scope === "cluster" && opsClusterRefused) {
+    return `as reported by ${esc(who)}, the node serving this page — every node keeps its own, and reading them all needs the admin role: ${drillDownRefusal()}`;
+  }
+  if (ui.scope === "cluster") return `as reported by ${esc(who)}, the node serving this page, until the cluster's operations arrive.`;
+  return `as reported by ${esc(who)} — each node keeps its own; choose the whole cluster in the header to see every node's.`;
+}
+
+function renderOperations() {
+  const src = opsSource();
+  const who = src.cluster ? "any node" : "n" + (eventsNode || "?");
+  const running = src.rows.filter(o => o.running);
+  const done = src.rows.filter(o => !o.running);
   renderKeyed(document.getElementById("ops-running"), running.length
     ? running.map(o => opRow(o, true))
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">nothing long-running on ${esc(who)} right now</td></tr>` }]);
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="5" class="muted">nothing long-running on ${esc(who)} right now</td></tr>` }]);
   setHTML(document.getElementById("ops-running-note"),
-    `backups, restores, re-encryption sweeps and decommission drains record both of their ends, so one still going shows here with how long it has been going, as reported by ${esc(who)}. Progress that cannot be measured is shown as elapsed time rather than as a bar with a number nobody measured.`);
+    `backups, restores, re-encryption sweeps and decommission drains record both of their ends, so one still going shows here with how long it has been going, ${opsScopeNote(src)} Progress that cannot be measured is shown as elapsed time rather than as a bar with a number nobody measured.`);
   renderKeyed(document.getElementById("ops-done"), done.length
     ? done.map(o => opRow(o, false))
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="5" class="muted">none finished within ${esc(who)}'s event ring</td></tr>` }]);
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="6" class="muted">none finished within ${src.cluster ? "any node's" : esc(who) + "'s"} event ring</td></tr>` }]);
   setHTML(document.getElementById("ops-done-note"),
-    "derived from the event ring below, which stays the audit trail it is: an operation whose start has already aged out of the ring is still listed, with no duration claimed for it.");
+    (src.cluster
+      ? `derived from each node's event ring, which stays where it is: the timeline below is the serving node's. ${opsCluster.truncated ? `The ${esc(opsCluster.truncated)} oldest completed operations are not listed. ` : ""}`
+      : "derived from the event ring below, which stays the audit trail it is: ")
+    + "an operation whose start has already aged out of its ring is still listed, with no duration claimed for it.");
 }
 
 function eventRow(e) {
@@ -91,22 +146,44 @@ function eventRow(e) {
   </tr>` };
 }
 
+// The events filter (issue #207): a kind, from the select or from the
+// route (#/ops?kind=health), and a substring the summary must carry,
+// from the route only (#/ops?kind=health&q=under-replicated is where a
+// problem's "history →" lands). Both ride in the URL so a filtered
+// timeline can be shared; choosing a kind by hand drops the substring,
+// which only ever meant something for the kind it came with.
+let opsFilter = { kind: "", q: "" };
+function applyOpsParams(params) {
+  opsFilter = { kind: params.get("kind") || "", q: params.get("q") || "" };
+}
+function setOpsKind(kind) {
+  opsFilter = { kind: kind || "", q: "" };
+  pushRoute(kind ? { kind } : {});
+  renderOps();
+}
 // renderOps draws the operations view: what the cluster is doing to
 // itself, newest first, with the audit stream left to the security view.
 function renderOps() {
   renderOperations();
   const sel = document.getElementById("events-filter");
-  const want = sel.value;
-  const kinds = [...eventsKinds].filter(k => !AUDIT_KINDS.has(k)).sort();
+  const want = opsFilter.kind, q = opsFilter.q;
+  // A kind the route asks for is offered even before the ring has shown
+  // one, so the select says what the page is filtered to.
+  const kinds = [...eventsKinds].filter(k => !AUDIT_KINDS.has(k));
+  if (want && !kinds.includes(want)) kinds.push(want);
+  kinds.sort();
   const opts = [`<option value="">all kinds</option>`].concat(kinds.map(k => `<option value="${esc(k)}"${k === want ? " selected" : ""}>${esc(k)}</option>`));
   if (sel.options.length !== opts.length) sel.innerHTML = opts.join("");
-  const rows = eventsAll.filter(e => !e.audit && (!want || e.kind === want)).slice().reverse();
+  if (sel.value !== want) sel.value = want;
+  const rows = eventsAll.filter(e => !e.audit && (!want || e.kind === want) && (!q || e.summary.includes(q))).slice().reverse();
+  const none = q ? `no ${esc(want || "")} events mentioning ${esc(q)}` : want ? `no ${esc(want)} events` : "nothing recorded yet";
   renderKeyed(document.getElementById("events"), rows.length ? rows.map(eventRow)
-    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${want ? "no " + esc(want) + " events" : "nothing recorded yet"}</td></tr>` }]);
+    : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${none}</td></tr>` }]);
   document.getElementById("ops-scope").textContent =
     `the event ring of n${eventsNode || "?"}${lastCluster && eventsNode === lastCluster.node_id ? ", the node serving this page" : ""} — each node keeps its own`;
-  document.getElementById("events-note").textContent =
-    `${rows.length} of the last ${eventsAll.length} events (splits, merges, rebalances, repairs, snapshots, backups, upgrades, key rotations)`;
+  setHTML(document.getElementById("events-note"),
+    `${rows.length} of the last ${eventsAll.length} events (splits, merges, rebalances, repairs, snapshots, backups, upgrades, key rotations, health problems appearing and clearing)`
+    + (q ? ` · only those mentioning <b>${esc(q)}</b> — <a href="${routeTo("ops", want ? { kind: want } : {})}">show every ${esc(want || "")} event</a>` : ""));
 }
 
 // AUDIT_KINDS are the security-relevant records; they are shown on the
@@ -317,12 +394,29 @@ function renderSecurity(d) {
 // The overview's compact activity strip: the newest few operations, so
 // the front page shows what the cluster is doing to itself without
 // becoming the operations view.
+//
+// Under cluster scope the operations in flight come first, from every
+// node (issue #210), so the first screen answers the cluster's question
+// rather than the serving node's; the newest events of the serving
+// node's ring follow.
+function runningOpRow(o) {
+  const key = "run/n" + o.node_id + "/" + o.kind + "/" + o.op;
+  return { key, html: `<tr data-key="${esc(key)}">
+    <td class="when" title="${esc(new Date(o.started_unix_ms).toISOString())}">${fmtWhen(o.started_unix_ms)}</td>
+    <td><span class="kind">${esc(o.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal"><a href="${routeTo("node/" + o.node_id)}">n${esc(String(o.node_id))}</a>: ${esc(o.summary)} <span class="st live"><span class="dot"></span>running ${fmtElapsed(o.elapsed_ms)}</span></td>
+  </tr>` };
+}
 function renderRecentOps() {
-  const rows = eventsAll.filter(e => !e.audit).slice(-6).reverse();
-  renderKeyed(document.getElementById("recent-ops"), rows.length ? rows.map(eventRow)
+  const src = opsSource();
+  const running = src.cluster ? src.rows.filter(o => o.running).map(runningOpRow) : [];
+  const rows = running.concat(eventsAll.filter(e => !e.audit).slice(-6).reverse().map(eventRow));
+  renderKeyed(document.getElementById("recent-ops"), rows.length ? rows
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
+  const missing = src.cluster && (opsCluster.errors || []).length ? ` (${esc(opsCluster.errors.length)} of ${esc(opsCluster.nodes_asked)} nodes did not answer)` : "";
   document.getElementById("recent-ops-note").innerHTML =
-    `the newest operations on n${eventsNode || "?"} · <a href="${routeTo("ops")}">the whole timeline →</a>`;
+    (src.cluster ? `${running.length ? esc(running.length) : "nothing"} in flight on any node${missing}, then ` : "")
+    + `the newest operations on n${eventsNode || "?"} · <a href="${routeTo("ops")}">the whole timeline →</a>`;
 }
 
 // pollScopedEvents fetches the scoped node's ring when it is not the

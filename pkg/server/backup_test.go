@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
 )
 
@@ -128,5 +129,64 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	}
 	if err := readBackupRecords(filepath.Join(plain, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err != nil {
 		t.Fatalf("a plain data file: %v", err)
+	}
+}
+
+// The raw key/value groups of a manifest are written back verbatim by
+// restore, so each is held to the spans backup collects it from when the
+// manifest is read (issue #238): a manifest carrying the cluster's
+// authentication secret, a /meta record, or a database entry outside both
+// database spans is refused, and what a real backup produces — database
+// descriptors mixed with name entries, sequences from three spans — is
+// still accepted.
+func TestBackupManifestKeysStayInTheirSpans(t *testing.T) {
+	write := func(man backupManifest) string {
+		dir := t.TempDir()
+		man.Magic = backupManifestMagic
+		raw, err := json.Marshal(man)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, backupManifestName), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	start := func(span func() (keys.Key, keys.Key)) []byte { s, _ := span(); return s }
+	metaStart, _ := keys.MetaSpan()
+
+	// What backup writes is accepted, spans mixed as backup mixes them.
+	real := backupManifest{
+		Users:     []backupKV{{Key: start(keys.UserSpan), Value: []byte("u")}},
+		Admins:    []backupKV{{Key: start(keys.AdminUserSpan), Value: []byte("a")}},
+		Roles:     []backupKV{{Key: keys.RoleKey("root"), Value: []byte("r")}},
+		Databases: []backupKV{{Key: keys.DatabaseDescKey(1), Value: []byte("d")}, {Key: keys.DatabaseNamespaceKey("datax"), Value: []byte("1")}},
+		Sequences: []backupKV{{Key: start(keys.SequenceDescSpan), Value: []byte("s")}, {Key: start(keys.AllSequenceNamespaceSpan), Value: []byte("n")}, {Key: start(keys.SequenceValueSpan), Value: []byte("v")}},
+	}
+	if _, err := readBackupManifest(write(real)); err != nil {
+		t.Fatalf("what backup writes was refused: %v", err)
+	}
+
+	for _, c := range []struct {
+		name string
+		man  backupManifest
+		key  keys.Key
+	}{
+		{"users", backupManifest{Users: []backupKV{{Key: keys.AuthSecretKey(), Value: make([]byte, 32)}}}, keys.AuthSecretKey()},
+		{"admins", backupManifest{Admins: []backupKV{{Key: keys.AuthSecretKey()}}}, keys.AuthSecretKey()},
+		{"roles", backupManifest{Roles: []backupKV{{Key: keys.ClusterVersionKey()}}}, keys.ClusterVersionKey()},
+		{"users", backupManifest{Users: []backupKV{{Key: metaStart}}}, metaStart},
+		{"databases", backupManifest{Databases: []backupKV{{Key: keys.DatabaseDescKey(1)}, {Key: keys.TableDescKey(5)}}}, keys.TableDescKey(5)},
+		{"sequences", backupManifest{Sequences: []backupKV{{Key: start(keys.UserSpan)}}}, start(keys.UserSpan)},
+		// The span's end is outside it.
+		{"roles", backupManifest{Roles: []backupKV{{Key: func() []byte { _, e := keys.RoleSpan(); return e }()}}}, nil},
+	} {
+		_, err := readBackupManifest(write(c.man))
+		if err == nil {
+			t.Fatalf("a manifest whose %s carries %s was accepted", c.name, c.key)
+		}
+		if !strings.Contains(err.Error(), "manifest's "+c.name+" carries the key") || !strings.Contains(err.Error(), "never collects there") {
+			t.Fatalf("a manifest whose %s carries %s was refused for another reason: %v", c.name, c.key, err)
+		}
 	}
 }

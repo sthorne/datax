@@ -11,6 +11,76 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Brush to zoom on the charts** (#206). The time range was five
+  presets ending at now, so the eleven minutes around 14:20 meant
+  picking an hour and reading a fifth of the width, and yesterday
+  afternoon meant a day or a week and squinting. Drag across any chart —
+  on the metrics view, a node's page or the transactions charts — and
+  every chart on the page narrows to the window dragged out; the band
+  and its edge times are drawn while dragging, so what is about to be
+  picked can be seen before it is. The window rides in the address
+  (`range=custom&from=…&to=…`), so a narrowed chart is a link someone
+  can paste into an incident channel; the header's range picker shows
+  the window as its own entry while it is in force, and choosing a
+  preset returns to one that ends at now. A selection narrower than
+  eight of the chart's buckets is widened to eight: below that the
+  server answers with the same samples drawn wider, which is resolution
+  the data does not have. The keyboard has the same path (#149): focus
+  a chart, `[` and `]` mark the window's ends at the crosshair with the
+  band showing the selection so far, Enter applies it, Escape drops it,
+  and `-` widens the window to twice its span. Panning is deliberately
+  not included; selection plus a shareable address is most of the
+  value.
+- **A health finding has a history** (#207). A problem on the panel was
+  a snapshot: it existed or it did not, and a row that appeared two
+  minutes ago and one that had been there since Tuesday were the same
+  row. Now each row says when this node's checks first found it — a
+  moment, so it reads the viewer's way — and the two transitions, the
+  problem appearing and the same problem clearing with how long it was
+  open, are recorded on the node's event ring under the kind `health`.
+  Transitions only: the checks run every few seconds, and a ring of
+  five hundred entries fed one record per run per open problem would
+  hold an hour of "still broken" and nothing else. A problem keeps its
+  identity, and its date, by check, node and range; its summary carries
+  figures that move every run, and a row re-dated whenever its figure
+  moved would answer "when did this start" with "just now", always. A
+  check that changes severity — `node-unresponsive` becoming
+  `node-down` — is a clear and an appearance, in that order. Each row's
+  **history** link opens the operations view filtered to the records
+  that name its check (`#/ops?kind=health&q=<check>`; the view now reads
+  both from the URL, so a filtered timeline can be shared), which is
+  where "has this been flapping" is answered. `/api/health` carries the
+  date as `since_unix_ms`.
+
+  The issue asked for a decision on acknowledging a finding before one
+  was built, and the decision is its third option: not in the console.
+  An acknowledgement is state that outlives a process and belongs to
+  the whole cluster, and the console does not write to the cluster
+  (#144); the place with silences that carry an owner and an expiry is
+  whatever alerts on `datax_health_problems`. A row that says how long
+  it has been open is one an operator can decide about at a glance,
+  which is most of what the permanently amber panel needed.
+- **The operations view answers for the cluster** (#210). The event
+  ring is per node, so the view showed whichever node served the page,
+  and the operation an operator most wants to watch — a decommission
+  driven by the draining node, a backup running where it was started, a
+  re-encryption sweep of one store — was, by construction, usually
+  running somewhere else; the per-node label was honest and did not
+  stop anyone concluding the cluster was idle. A new `/api/operations`
+  asks every node for its paired operations over the internode RPC, all
+  at once rather than one after another (a node that does not answer
+  costs the whole timeout, and the cluster's operations are wanted most
+  when a node is not answering), and merges them with the node kept on
+  each row. Partial is the normal case: a node that did not answer is
+  named with the reason and its heartbeat age beside the rows that
+  arrived, never a failed document. Under the whole-cluster scope the
+  operations view's two tables and the overview's *Operations in
+  flight* read it, with a node column and a link to that node; under a
+  node's scope nothing changes. Admin-gated and polled every ten
+  seconds, like the other fan-outs. The rings themselves stay per node:
+  merging five hundred-entry rings into one feed would bury each node's
+  record under the others', and the view already keeps the operations
+  apart from the raw records.
 - **The console's viewer preferences live in the cluster** (#204). Two
   display choices — light/dark/system, and whether a moment reads as how
   long ago it was or as the clock time it happened at — plus the place
@@ -59,6 +129,40 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Restore writes only the keys a backup collects** (#238, found in
+  #237's review). A backup carries five groups of raw system records —
+  users, admins, roles, databases, sequences — each collected from a
+  named key span, and restore wrote every key back verbatim, with no
+  check that it lay in the span it was collected from. So a crafted
+  manifest could have restore write any key in the cluster, as the node,
+  inside its own transaction: the authentication secret, which lies
+  outside every span a backup collects and so appears in no legitimate
+  backup, would have handed whoever wrote the manifest the console's
+  session signing key — a forged `root` session, with no password and
+  no certificate — on a cluster whose operator had chosen to trust the
+  backup's *data*. Each group is now held to the spans backup reads it
+  from, when the manifest is read, so both readers refuse it before
+  anything is applied; databases and sequences legitimately mix spans
+  (descriptors and names, and counters) and are held to their sets.
+  Backups written by any release restore unchanged: nothing a backup
+  writes lies outside the spans it was read from.
+- **The encryption-at-rest threat model is stated** (#220, part). File
+  content is AES-256-CTR with no authentication tag and the file header
+  is not authenticated; only the key registry and the metadata backup
+  are GCM-sealed. So `--enc-key` protects a disk that leaves the
+  building and not a store an attacker can write to: with write access
+  to a live store's files, a WAL can be truncated (committed writes
+  vanish as if after a crash), chosen bits flipped in a chosen row with
+  the block checksum repaired in the same pass, a header's key id or IV
+  swapped, or a whole file substituted or rolled back — none of it
+  detected, since Pebble's checksums are keyless and CTR is
+  bit-malleable. The cross-replica consistency sweep is the one thing
+  that would notice, after the fact, and it is off by default.
+  `docs/encryption.md` now says all of this up front and in its
+  limitations, and the package comment says it too, so the feature reads
+  as protecting exactly what it protects. Authenticating the header and
+  the content — the issue's second and third tiers — is a design
+  decision recorded on the issue, not made here.
 - **A query cancel is authorized on the node that acts on it** (#211).
   `CancelLocal` read a zero secret as "the caller is trusted, skip the
   check" — an in-band sentinel on a value that arrives from the network,
@@ -212,6 +316,30 @@ state or the internode protocol does, and an entry below says so.
   by any earlier release restore unchanged: the name has been the same
   since backup existed.
 
+- **Range boundary keys are shown to a caller only for the tables it
+  may read** (#213). A range's boundary is a real row key, and the
+  console rendered it back into its values — `/table/users/primary/
+  "alice@example.com"`, one exact value from a row and the table it
+  came from — on `/status`, `/api/cluster`, `/api/overview`,
+  `/api/node` and in the split and merge events on `/api/events`, for
+  every range in the cluster, to any authenticated user with no grant
+  on anything. The rule the rest of the console follows (`/api/schema`
+  since #197, `/api/security`) is to keep the document and filter the
+  data-bearing fields to what the caller may read, and it now applies
+  to keys: a table the caller may read renders as before; one it may
+  not renders as its table-and-index prefix by id (`/table/7/1`) with
+  the table's name left out, so a caller's `/api/cluster` table list
+  agrees with the same caller's `/api/schema`. The range id, replicas,
+  size and QPS are untouched. Split and merge events are recorded in
+  both forms and the event feed serves the one the caller may see; the
+  exact key stays on the admin-gated `/api/range` and in the node's
+  log. System and meta keys carry no row and are unchanged. Admins and
+  insecure mode see everything, as before. The document says when its
+  keys are the shown form (`keys_redacted`), and the copy control and
+  the CSV export label a key accordingly rather than hand a reader the
+  shown form under a key's name (found in the console review of the
+  combined PR, where #213 met #226's copy controls).
+
 ### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
@@ -224,6 +352,99 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A schema change's drain waits for a statement whose lease entry a
+  renewal had already replaced** (#234). A statement is pinned to the
+  descriptor it planned against until that cache entry expires, and the
+  drain (#185) waited for that expiration by reading it off the entry
+  the new version replaced. A renewal between the statement and the
+  schema change put a fresh entry at the same version in its place —
+  one no statement had taken — so the drain found nothing to wait for
+  and could return while the statement could still commit under the
+  old descriptor: for `CREATE INDEX`, a row in the table and no entry
+  in the index, in the window between the drain and the entry's
+  expiration. The handed-out expiration now rides from entry to entry
+  across same-version renewals and is published when the version
+  changes. The flaky `TestDrainWaitsOutADescriptorHandedToAStatement`
+  was this seen from the other side (its sample included such a fresh
+  entry); it samples with renewal held off now, and a new test drives
+  the renewal by hand and proves the drain outlasts the replaced entry.
+- `TestIdleTxnDetail` failed about a third of the time (#228): it
+  asserted on the idle transaction's age from the first sample that
+  showed the transaction at all, which can be under a millisecond old.
+  It now keeps polling until the age is reported.
+- `TestAlterColumnType` failed every time it ran alone (#231): its
+  concurrent writer counts ids up from 1000 for as long as the ALTER
+  takes, and on an idle machine reached the fixed id 5000 the test
+  inserted afterwards. The probe ids are now taken past wherever the
+  writer got to.
+- The health check's rate window is settable (`Config.HealthRateWindow`,
+  default five minutes), and the two checks built on it — `auth-failures`
+  and `auth-throttled` — are now tested through their whole shape: quiet,
+  quiet just under the threshold, raised over it, and cleared once the
+  pressure stops and the window rolls past it (#223, #224). That last
+  step is the reason both report a rate rather than a lifetime total, and
+  it had been asserted only in a comment.
+- **Console: a computed severity is always shown** (#219). The
+  stylesheet colours the status dot and nothing else, so a status span
+  without a dot rendered as plain text — the clock-offset cell of a node
+  past `--max-offset` and the quorum-risk cell of a failure domain, the
+  two most consequential numbers on their views, looked exactly like
+  healthy ones. Every judged number now goes through `warn` (the text
+  cue that survives colour loss) and every state word through a new
+  `tok` (the dot), and a console test refuses a status span that is
+  neither. The round-trip matrix is no longer banded by absolute
+  thresholds that painted a healthy WAN link red: a pair is flagged
+  against the cluster's own median (over three times it, and over 5 ms),
+  as a warning, never as "down", which in that column means unreachable.
+  p99 is a column of the worst-pairs table rather than hover-only, and
+  the glossary says what is flagged and why.
+- **Console: a header control's glossary entry is reachable from the
+  control** (#230). The help pop answered clicks only inside the views
+  and the help panel was built from the current view alone, so the
+  entries for scope, range, jump to, theme and timestamps — written and
+  shipped — could not be reached from the controls they describe; the
+  short `title` was all a reader got. Each control now keys its entry
+  with `data-help`, the pop answers in the header, and the panel ends
+  with the header's controls, the same on every view. The test's list
+  of entries excused from matching the page shrank by those five, as
+  the issue asked; what remains on it is prose terms and the copy
+  buttons, not controls.
+- **Console: tile sparklines are readings** (#218). They were drawn in
+  node 1's series colour, stretched so the stroke thinned with the
+  tile's width, with no baseline, no marker for which end is now, and
+  each scaled to its own peak without saying so — two tiles moving
+  40→44 and 4,000→4,400 drew the same line. Each now has a baseline at
+  zero and a dot at the current value, the trend in the de-emphasis
+  grey and the dot in the text colour, non-scaling strokes, and a title
+  that says the line is the shape of the recent trend scaled to its own
+  peak. A signed delta over the named window ("▲ +12% over 15 min")
+  carries the magnitude the line does not. Tile figures are set in
+  proportional numerals with a reserved width, so they no longer look
+  loose and still do not jitter.
+- **Console: chart annotations are their own kind of mark, and their
+  text has a path that is not a hover** (#217). A mark was drawn in the
+  colour of the node that served the event — on a chart plotting that
+  node, one hue with two meanings — and its text lived only in a
+  native tooltip on an 8-pixel target under the plot's own hit area, so
+  it was reachable by nothing. Marks are now one neutral event colour
+  with the node named in the label; the plot's hit rect resolves the
+  nearest mark to the pointer, so marks a few pixels apart (a rolling
+  restart) are each reachable; the crosshair readout carries the mark
+  and is anchored under the crosshair for a reader on the keyboard,
+  where the plot is focusable and the arrow keys walk the samples; each
+  mark is focusable and reads the same on focus; and the chart's "as a
+  table" view lists the marked events.
+- **Console: lines that cannot be told apart are not drawn in one
+  frame** (#216). The eight series colours fail all-pairs separation on
+  both themes (down to ΔE 1.6 under deuteranopia for two of them), and
+  any subset of node ids can share a chart since ids are never reused.
+  No eight-hue ramp on these surfaces passes, so the fix is structural:
+  past four nodes, or when a node beyond n8 would share a frame, the
+  metrics view facets into one chart per node and says why; lines that
+  do share a frame carry their node's name at the line end, so identity
+  has a channel besides colour; and `--series-6`, the one slot that was
+  byte-identical in both themes, is re-stepped for dark. A node's colour
+  still follows its id, so filtering one out repaints nothing.
 - The `CREATE TABLE` path assigned `datax_metrics`'s reserved descriptor
   ID to *any* system table by name. With one system table that was
   correct; with two it would have created the second one on top of the
@@ -231,7 +452,14 @@ state or the internode protocol does, and an entry below says so.
 - The header's staleness pill read "last updated 5s ago ago".
 - `IsSystemTableID` listed the reserved ids again instead of reading the
   registration map — the same shape as the `CREATE TABLE` bug above,
-  left in the one place nothing had needed yet.
+  left in the one place nothing had needed yet. The console review of the combined PR
+  found the pair the issue was filed for still on screen: `--series-8`
+  and `--series-2` were both warm reds at an OKLab distance of 7 in
+  either theme, and faceting never engages for two lines. `--series-8`
+  is re-stepped — a deep red on the light theme, a sky blue on the dark
+  one, no shared family clearing the floors in both — so every pair
+  involving it is at least 15 apart, and a test computes the distances
+  rather than trusting the numbers.
 
 ## 0.57.0 — unreleased
 

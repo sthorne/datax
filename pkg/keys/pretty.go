@@ -49,6 +49,65 @@ func Pretty(k Key) string {
 	return b.String()
 }
 
+// PrettyPrefix renders a key down to the structure it belongs to and no
+// further: /table/<id>/<index> for a table key, /system/<name> for a
+// system key, /meta/<the same of the addressed key>, and Pretty's
+// rendering for local keys, /Min and /Max, which carry no row. Nothing a
+// row wrote appears — no datum, and no table name either, since for a
+// caller without privilege on the table the name is itself what must
+// not be learned (issue #213). This is the form an API serves a caller
+// who may not see the table a boundary key was cut from; Pretty and
+// rowenc.PrettyKey are for the caller who may.
+func PrettyPrefix(k Key) string {
+	switch {
+	case len(k) == 0, k.Equal(MinKey), k.Equal(MaxKey):
+		return Pretty(k)
+	}
+	var b strings.Builder
+	rest := []byte(k)
+	switch rest[0] {
+	case localPrefixByte:
+		return Pretty(k)
+	case metaPrefixByte:
+		b.WriteString("/meta")
+		b.WriteString(PrettyPrefix(Key(rest[1:])))
+	case systemPrefixByte:
+		b.WriteString("/system")
+		if _, name, err := encoding.DecodeString(rest[1:]); err == nil {
+			b.WriteString("/" + name)
+		}
+	case tablePrefixByte:
+		b.WriteString("/table")
+		tail, id, err := encoding.DecodeUint64(rest[1:])
+		if err != nil {
+			break
+		}
+		fmt.Fprintf(&b, "/%d", id)
+		if len(tail) == 0 {
+			break
+		}
+		if _, idx, err := encoding.DecodeUint64(tail); err == nil {
+			fmt.Fprintf(&b, "/%d", idx)
+		}
+	default:
+		b.WriteString("/")
+		b.WriteString(hexOf(rest))
+	}
+	return b.String()
+}
+
+// TableIDOf decodes the table a user-data key belongs to, if it is one.
+func TableIDOf(k Key) (uint64, bool) {
+	if len(k) <= len(TablePrefix) || !k.HasPrefix(TablePrefix) {
+		return 0, false
+	}
+	_, id, err := encoding.DecodeUint64(k[len(TablePrefix):])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
 // Raw renders the exact bytes, Go-quoted, for the rare place that needs
 // them verbatim (debug tooling); String renders Pretty.
 func (k Key) Raw() string { return fmt.Sprintf("%q", []byte(k)) }

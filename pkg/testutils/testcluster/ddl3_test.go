@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -204,8 +205,14 @@ func TestAlterColumnType(t *testing.T) {
 	execSQL(t, ctx, s, `CREATE INDEX m_by_tag ON m (tag)`)
 
 	// INT8 → DECIMAL(12,2), with the other gateway writing throughout.
+	// The writer counts up from 1000 for as long as the ALTER takes, so
+	// the ids the checks below insert are taken past wherever it got to
+	// — a fixed id collided with its rows whenever the ALTER was slow
+	// enough, which was every time in an otherwise idle package and now
+	// and then in a full run (issue #231).
 	stop := make(chan struct{})
 	done := make(chan error, 1)
+	var last atomic.Int64
 	go func() {
 		defer close(done)
 		for i := 1000; ; i++ {
@@ -214,6 +221,7 @@ func TestAlterColumnType(t *testing.T) {
 				return
 			default:
 			}
+			last.Store(int64(i))
 			if _, serr := trySQL(ctx, sB, fmt.Sprintf(`INSERT INTO m (id, n, d) VALUES (%d, %d, '%d.25')`, i, i, i)); serr != nil && serr.Code != sql.CodeSerializationFailure {
 				done <- fmt.Errorf("writer: %v", serr)
 				return
@@ -234,10 +242,11 @@ func TestAlterColumnType(t *testing.T) {
 	expect(s, `SELECT n >= 20 AND n < 100 FROM m WHERE id = 2`, "t") // the updater bumped it a few times
 	expect(sB, `SELECT n FROM m WHERE id = 1000`, "1000.00")
 	expect(s, `SELECT col_description('m'::regclass, 2)`, "a count")
-	execSQL(t, ctx, s, `INSERT INTO m (id) VALUES (5000)`)
-	expect(s, `SELECT n FROM m WHERE id = 5000`, "7.00")
+	probe := last.Load() + 1
+	execSQL(t, ctx, s, fmt.Sprintf(`INSERT INTO m (id) VALUES (%d)`, probe))
+	expect(s, fmt.Sprintf(`SELECT n FROM m WHERE id = %d`, probe), "7.00")
 	expect(sB, `SELECT count(*) FROM m WHERE n < 0`, "0")
-	expectCode(`INSERT INTO m (id, n) VALUES (5001, 'x')`, sql.CodeInvalidTextRepresentation)
+	expectCode(fmt.Sprintf(`INSERT INTO m (id, n) VALUES (%d, 'x')`, probe+1), sql.CodeInvalidTextRepresentation)
 	// Every row of the table carries the converted value (no NULLs where
 	// the source had a value).
 	expect(s, `SELECT count(*) FROM m WHERE n IS NULL`, "0")

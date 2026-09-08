@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"html"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -384,15 +386,14 @@ func TestHelpGlossaryHasNoDeadEntries(t *testing.T) {
 	}
 }
 
-// helpKeysNotOnAPage are entries that explain a control in the header or
-// a term the page writes in prose rather than as a heading, so the term
-// extractor below will never see them.
+// helpKeysNotOnAPage are entries for terms the page writes in prose
+// rather than as a heading, so the term extractor below will never see
+// them. A header control is NOT one of these any more: it keys its entry
+// with data-help, which the extractor reads, and the help pop and panel
+// reach it (issue #230) — a control listed here is one the reader cannot
+// reach from, which is the gap this list used to paper over.
 var helpKeysNotOnAPage = map[string]bool{
-	"scope": true, "range": true, "jump to": true,
 	"compare": true, "annotate": true, "filter": true,
-	// The viewer preferences (issue #204): two header controls, like
-	// scope and range above.
-	"theme": true, "timestamps": true,
 	// The copy controls (issue #205). Both are buttons: one sits inside a
 	// cell, and the other inside a heading, where normalizeTerm strips it
 	// out so that "Nodes" stays the term rather than "Nodes copy as CSV".
@@ -480,6 +481,13 @@ func pageTerms() ([]pageTerm, error) {
 			add(view, m[2], "index.html #/"+view)
 		}
 	}
+	// The header's controls (issue #230): each keys its entry with
+	// data-help, and the header is outside every view.
+	if hdr := headerRE.FindStringSubmatch(string(page)); hdr != nil {
+		for _, m := range dataHelpRE.FindAllStringSubmatch(hdr[1], -1) {
+			add("", m[1], "index.html header")
+		}
+	}
 	names, err := ScriptFiles()
 	if err != nil {
 		return nil, err
@@ -504,7 +512,10 @@ func pageTerms() ([]pageTerm, error) {
 var (
 	viewSplit = regexp.MustCompile(`(?s)<main id="view-([a-z]+)"(.*?)</main>`)
 	headingRE = regexp.MustCompile(`(?s)<(th|h2)\b[^>]*>(.*?)</(?:th|h2)>`)
-	tileLabel = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
+	// The header, and a control's data-help inside it (issue #230).
+	headerRE   = regexp.MustCompile(`(?s)<header>(.*?)</header>`)
+	dataHelpRE = regexp.MustCompile(`data-help="([^"]+)"`)
+	tileLabel  = regexp.MustCompile(`\btile(?:HTML)?\("([^"]+)"`)
 	// Controls and screen-reader text live inside a heading without being
 	// part of the term: "Statement shapes" is the heading and the sort
 	// <select> beside it is not.
@@ -1593,5 +1604,658 @@ func TestNoUnguardedMotion(t *testing.T) {
 			t.Errorf("%s scrolls smoothly: that is motion, and it needs to ask "+
 				"matchMedia(\"(prefers-reduced-motion: reduce)\") first", name)
 		}
+	}
+}
+
+// TestSeverityAlwaysCarriesACue (issue #219): the stylesheet colours
+// .st.live .dot and nothing else, so a span classed st without a dot
+// renders as plain text — the severity is computed and then not shown,
+// which is how a node past --max-offset looked like a healthy one. Two
+// helpers carry a status: tok, a state word behind the coloured dot, and
+// warn, a judged number with a text cue. Any other status span in the
+// console is one that will not show, so none may exist.
+func TestSeverityAlwaysCarriesACue(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fn := range []string{"warn", "tok"} {
+		if jsFuncSpan(string(core), fn) == nil {
+			t.Fatalf("js/10-core.js has no %s function: nothing renders a status with its cue", fn)
+		}
+	}
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := regexp.MustCompile(`class="st [^"]*"[^>]*>`)
+	for _, name := range names {
+		body, err := FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := string(body)
+		if name == "js/10-core.js" {
+			// The two helpers are the definitions; nothing else in the
+			// file may emit a bare one either. Both spans are found
+			// before either is blanked: jsFuncSpan matches braces, and
+			// warn's template literal carries braces of its own.
+			var spans [][]int
+			for _, fn := range []string{"warn", "tok"} {
+				spans = append(spans, jsFuncSpan(src, fn))
+			}
+			for _, span := range spans {
+				src = src[:span[0]] + strings.Repeat(" ", span[1]-span[0]) + src[span[1]:]
+			}
+		}
+		for _, loc := range open.FindAllStringIndex(src, -1) {
+			after := src[loc[1]:]
+			if strings.HasPrefix(after, `<span class="dot">`) {
+				continue
+			}
+			line := 1 + strings.Count(src[:loc[0]], "\n")
+			t.Errorf("%s:%d emits a status span with neither a dot nor a cue: %q — it renders as plain text. "+
+				"Use tok() for a state word or warn() for a judged number", name, line, src[loc[0]:loc[1]])
+		}
+	}
+}
+
+// TestNetworkSeveritiesAreJudgedAgainstTheCluster (issue #219): the
+// clock-offset cell and the quorum-risk cell are judged numbers, so they
+// go through warn; the round-trip cell is judged against the cluster's
+// own median rather than absolute bands, never as "down" (which in that
+// column means unreachable); and p99 is a column of the worst-pairs
+// table, not a hover-only title.
+func TestNetworkSeveritiesAreJudgedAgainstTheCluster(t *testing.T) {
+	net, err := FS.ReadFile("js/60-network.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	span := jsFuncSpan(string(net), "renderNetwork")
+	if span == nil {
+		t.Fatal("js/60-network.js has no renderNetwork")
+	}
+	body := string(net)[span[0]:span[1]]
+	if !regexp.MustCompile(`warn\(lvl, fmtOffset\(worst\)\)`).MatchString(body) {
+		t.Error("the clock-offset cell is not rendered through warn(): a node past --max-offset looks like a healthy one")
+	}
+	if strings.Contains(body, "rtt_us <") || strings.Contains(body, "rtt_us >=") {
+		t.Error("the round-trip cell is banded by an absolute threshold; judge it against the cluster's median (a 25 ms WAN link is not a fault)")
+	}
+	if !strings.Contains(body, "median") || !regexp.MustCompile(`const slow = .*median`).MatchString(body) {
+		t.Error("the round-trip cell is not judged against the cluster's median round trip")
+	}
+	if regexp.MustCompile(`slow = [^\n]*"down"`).MatchString(body) {
+		t.Error(`a slow pair is classed "down", which in this column means unreachable: slow and dead would be the same red`)
+	}
+	if !strings.Contains(body, `tok("down", "✕ unreachable")`) {
+		t.Error("an unreachable peer is no longer its own mark in the round-trip column")
+	}
+	if !strings.Contains(body, `data-label="p99"`) {
+		t.Error("the worst-pairs table has no p99 cell: p99 is reachable only by hovering the matrix")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), `<th scope="col" class="num">p99</th>`) {
+		t.Error("the worst-pairs table's header has no p99 column")
+	}
+	rep, err := FS.ReadFile("js/72-replication.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rep), "warn(risk, dm.loses_quorum)") {
+		t.Error("the quorum-risk cell is not rendered through warn(): a domain whose loss costs quorum looks like one that does not")
+	}
+}
+
+// TestHeaderControlsAreExplained (issue #230): a header control's
+// glossary entry must be reachable from the control. The header is
+// outside every view, so the help pop's delegated handler and the panel
+// both have to look there on purpose; and each control keys its entry
+// with data-help, since its own words are the control, not a term.
+func TestHeaderControlsAreExplained(t *testing.T) {
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := headerRE.FindStringSubmatch(string(page))
+	if hdr == nil {
+		t.Fatal("index.html has no <header>")
+	}
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed := map[string]bool{}
+	for _, m := range dataHelpRE.FindAllStringSubmatch(hdr[1], -1) {
+		keyed[m[1]] = true
+		if g.entries[m[1]] == "" {
+			t.Errorf("header control keyed data-help=%q has no glossary entry", m[1])
+		}
+	}
+	for _, ctl := range []string{"scope", "range", "jump to", "theme", "timestamps"} {
+		if !keyed[ctl] {
+			t.Errorf("the %q control carries no data-help: its glossary entry cannot be reached from the header", ctl)
+		}
+		if helpKeysNotOnAPage[ctl] {
+			t.Errorf("HELP[%q] is excused from matching the page: a header control keys its entry with data-help and must not be on that list", ctl)
+		}
+	}
+	help, err := FS.ReadFile("js/12-help.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(help)
+	if span := jsFuncSpan(src, "wireHelpControls"); span == nil {
+		t.Fatal("js/12-help.js has no wireHelpControls")
+	} else {
+		body := src[span[0]:span[1]]
+		if !strings.Contains(body, `wireHelp(document.querySelector("header"))`) {
+			t.Error("the header's controls are never marked: wireHelp does not run on the header")
+		}
+		if !strings.Contains(body, `document.querySelector("header").contains(term)`) {
+			t.Error("the help pop's click handler does not answer in the header: a control's entry is reachable only by hover")
+		}
+	}
+	if span := jsFuncSpan(src, "renderHelpPanel"); span == nil {
+		t.Fatal("js/12-help.js has no renderHelpPanel")
+	} else if !strings.Contains(src[span[0]:span[1]], `querySelectorAll("header .helpable")`) {
+		t.Error("the help panel is built from the view alone: the header's controls are not in it")
+	}
+}
+
+// TestSparklinesAreReadings (issue #218): a tile's sparkline carries a
+// baseline, a marker for now, a uniform stroke, a colour that is not a
+// node's, and a title that says what its y-domain is; and a delta in
+// words carries the magnitude the line does not. The figure is set
+// proportionally with a reserved width.
+func TestSparklinesAreReadings(t *testing.T) {
+	core, err := FS.ReadFile("js/10-core.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(core)
+	span := jsFuncSpan(src, "spark")
+	if span == nil {
+		t.Fatal("js/10-core.js has no spark")
+	}
+	body := src[span[0]:span[1]]
+	for _, want := range []string{`class="base"`, `class="now"`, `scaled to its own peak`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("spark() emits no %s: the sparkline is decoration, not a reading", want)
+		}
+	}
+	if strings.Count(body, `vector-effect="non-scaling-stroke"`) < 3 {
+		t.Error("spark() stretches its viewBox without non-scaling strokes: the line thins with the tile's width and the dot squashes")
+	}
+	if jsFuncSpan(src, "delta") == nil || !strings.Contains(src, "% over ${period}") {
+		t.Error("no delta line: the sparkline is the only trend signal and it carries no magnitude")
+	}
+	rt := jsFuncSpan(src, "renderTile")
+	if rt == nil {
+		t.Fatal("js/10-core.js has no renderTile")
+	}
+	if !strings.Contains(src[rt[0]:rt[1]], "delta(") || !strings.Contains(src[rt[0]:rt[1]], "scaled to its own peak") {
+		t.Error("renderTile does not add the delta and say the sparkline's domain in the tile's title")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+	for _, rule := range []string{".tile polyline {", ".tile svg .base {", ".tile svg .now {"} {
+		i := strings.Index(css, rule)
+		if i < 0 {
+			t.Errorf("no %s rule", rule)
+			continue
+		}
+		decl := css[i : i+strings.Index(css[i:], "}")]
+		if strings.Contains(decl, "--series-") {
+			t.Errorf("%s uses a series colour, which means a node everywhere else: %s", rule, decl)
+		}
+	}
+	i := strings.Index(css, ".tile .value {")
+	if i < 0 {
+		t.Fatal("no .tile .value rule")
+	}
+	decl := css[i : i+strings.Index(css[i:], "}")]
+	if strings.Contains(decl, "tabular-nums") {
+		t.Error(".tile .value is tabular: a standalone figure aligns with nothing and reads loose")
+	}
+	if !strings.Contains(decl, "min-width") {
+		t.Error(".tile .value reserves no width: a figure ticking 1→7→11 moves the box")
+	}
+}
+
+// TestAnnotationsAreReachableAndTheirOwnColour (issue #217): a mark is
+// drawn in one neutral colour rather than a series slot; its text is in
+// the chart's table and in the crosshair readout, reachable from the
+// keyboard, rather than in a native tooltip on an 8px target; and marks
+// are resolved by nearest-to-pointer so neighbours do not shadow one
+// another.
+func TestAnnotationsAreReachableAndTheirOwnColour(t *testing.T) {
+	src, err := FS.ReadFile("js/86-charts.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	span := jsFuncSpan(js, "annotationMarks")
+	if span == nil {
+		t.Fatal("js/86-charts.js has no annotationMarks")
+	}
+	body := js[span[0]:span[1]]
+	if strings.Contains(body, "<title>") {
+		t.Error("annotationMarks puts the mark's text in a native <title>: unreachable from the keyboard, unstyled, on the OS's delay")
+	}
+	if strings.Contains(body, "nodeColor") || strings.Contains(body, `stroke="${`) {
+		t.Error("annotationMarks colours a mark by node: one hue, two meanings on a chart plotting that node")
+	}
+	if !strings.Contains(body, `tabindex="0"`) || !strings.Contains(body, "aria-label=") {
+		t.Error("a mark's hit rect is not focusable with an accessible name: no keyboard path to it")
+	}
+	cs := jsFuncSpan(js, "chart")
+	if cs == nil {
+		t.Fatal("js/86-charts.js has no chart")
+	}
+	cb := js[cs[0]:cs[1]]
+	if strings.Contains(cb, "annotationMarks(from, to, x, T, PH, ") {
+		t.Error("chart() still passes a colour to annotationMarks")
+	}
+	for _, want := range []string{"nearestMark", `class="annrows"`, `"ArrowLeft"`, `hit.addEventListener("focus"`, `rect.addEventListener("focus"`} {
+		if !strings.Contains(cb, want) {
+			t.Errorf("chart() has no %s: a mark's text is hover-only, or neighbours shadow one another, or the crosshair has no keyboard path", want)
+		}
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(page)
+	i := strings.Index(css, ".chart .annotations line.ann {")
+	if i < 0 {
+		t.Fatal("no .chart .annotations line.ann rule")
+	}
+	decl := css[i : i+strings.Index(css[i:], "}")]
+	if !strings.Contains(decl, "stroke: var(--") || strings.Contains(decl, "--series-") {
+		t.Errorf("the mark's stroke is not one neutral colour from the stylesheet: %s", decl)
+	}
+	if !strings.Contains(css, ".chart .annhit { pointer-events: none; }") {
+		t.Error("the mark's hit rects take pointer events: fattened or not, they shadow one another and the plot's own hit rect")
+	}
+}
+
+// TestLinesThatCannotBeToldApartAreNotOverplotted (issue #216): the
+// metrics view facets past MAX_LINES lines, or when a node past n8
+// would share a frame; lines that share a frame are labelled at their
+// ends; a node's colour follows its id; and the dark theme's --series-6
+// is its own value.
+func TestLinesThatCannotBeToldApartAreNotOverplotted(t *testing.T) {
+	m, err := FS.ReadFile("js/85-metrics.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := string(m)
+	if !strings.Contains(ms, "const MAX_LINES = 4;") {
+		t.Error("MAX_LINES is not four: a four-slot set is the largest that passes all-pairs separation on both themes")
+	}
+	if sp := jsFuncSpan(ms, "mustFacet"); sp == nil {
+		t.Fatal("js/85-metrics.js has no mustFacet")
+	} else if b := ms[sp[0]:sp[1]]; !strings.Contains(b, "ids.length > MAX_LINES") || !strings.Contains(b, "> 8") {
+		t.Error("mustFacet does not facet past MAX_LINES lines and on a node past n8: two nodes past n8 share one grey")
+	}
+	if sp := jsFuncSpan(ms, "nodeColor"); sp == nil || !strings.Contains(ms[sp[0]:sp[1]], "var(--series-${id})") {
+		t.Error("nodeColor no longer follows the node's id: filtering a node out repaints the survivors")
+	}
+	c, err := FS.ReadFile("js/86-charts.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := string(c)
+	if sp := jsFuncSpan(cs, "renderCharts"); sp == nil || !strings.Contains(cs[sp[0]:sp[1]], "mustFacet(") {
+		t.Error("renderCharts does not consult mustFacet: eight lines are overplotted in one frame")
+	}
+	if sp := jsFuncSpan(cs, "chart"); sp == nil || !strings.Contains(cs[sp[0]:sp[1]], `class="endlabel"`) {
+		t.Error("chart() draws no line-end labels: identity is colour alone")
+	}
+	page, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	light := regexp.MustCompile(`:root \{[^}]*--series-6: (#[0-9a-f]{6})`).FindStringSubmatch(string(page))
+	dark := regexp.MustCompile(`data-theme="dark"\] \{[^}]*--series-6: (#[0-9a-f]{6})`).FindStringSubmatch(string(page))
+	if light == nil || dark == nil {
+		t.Fatal("cannot find --series-6 in both themes")
+	}
+	if light[1] == dark[1] {
+		t.Errorf("--series-6 is %s in both themes: the one slot not re-stepped for the dark surface", light[1])
+	}
+}
+
+// TestChartsBrushToZoom (issue #206): a drag across any chart selects a
+// window that every chart on the page then shows; the selection is
+// visible while dragging; it rides in the route; the picker shows it
+// and a preset returns; a selection below the chart's resolution is
+// widened rather than honoured; and the keyboard has the same path.
+func TestChartsBrushToZoom(t *testing.T) {
+	charts := string(mustRead(t, "js/86-charts.js"))
+	span := jsFuncSpan(charts, "chart")
+	if span == nil {
+		t.Fatal("chart not found")
+	}
+	body := charts[span[0]:span[1]]
+	for _, want := range []string{
+		`hit.addEventListener("pointerdown"`, `hit.addEventListener("pointerup"`, "setWindow(lo, hi)",
+		`class="brush"`, `class="brushlabel bl0"`, "drawBrush(lo, hi)",
+		"const minWindow = BRUSH_MIN_BUCKETS * step", "if (hi - lo < minWindow) {", `ev.key === "["`, `ev.key === "]"`, `ev.key === "Enter"`, `ev.key === "-"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("chart() lacks %s: no brush, no visible selection, no floor at the data's resolution, or no keyboard path", want)
+		}
+	}
+	if !strings.Contains(charts, "const BRUSH_MIN_BUCKETS = 8;") {
+		t.Error("BRUSH_MIN_BUCKETS is not eight buckets")
+	}
+	// Every chart fetch takes its window from one place, so the custom
+	// window reaches the node page and the transactions charts too.
+	for _, name := range []string{"js/86-charts.js", "js/90-node.js", "js/50-sql.js"} {
+		src := string(mustRead(t, name))
+		if !strings.Contains(src, "windowQuery()") {
+			t.Errorf("%s does not take its window from windowQuery(): a dragged window narrows the other views' charts and not this one's", name)
+		}
+		if name != "js/85-metrics.js" && strings.Contains(src, "RANGE_SECONDS[ui.range]") {
+			t.Errorf("%s still reads the preset directly: under a custom window that is undefined", name)
+		}
+	}
+	router := string(mustRead(t, "js/15-router.js"))
+	if !strings.Contains(router, `if (range === "custom") {`) || !strings.Contains(router, "parseWindowParams(r.params)") {
+		t.Error("route() does not read a custom window off the route: a narrowed chart is not a link")
+	}
+	if !strings.Contains(router, `p.set("range", "custom"); p.set("from", String(ui.window.from)); p.set("to", String(ui.window.to));`) {
+		t.Error("routeTo() does not carry the custom window: the address lies about what the page shows")
+	}
+	if !strings.Contains(router, `p.delete("from"); p.delete("to");`) {
+		t.Error("pushRoute() keeps a stale from/to in the params: a preset chosen after a window leaves the window in the address")
+	}
+	rp := jsFuncSpan(router, "renderRangePicker")
+	if rp == nil {
+		t.Fatal("renderRangePicker not found")
+	}
+	if b := router[rp[0]:rp[1]]; !strings.Contains(b, `ui.range === "custom" && ui.window ?`) || !strings.Contains(b, "windowLabel(ui.window)") {
+		t.Error("the range picker does not show the custom window as its own entry: no way to see it, and no explicit way back")
+	}
+	metrics := string(mustRead(t, "js/85-metrics.js"))
+	pw := jsFuncSpan(metrics, "parseWindowParams")
+	if pw == nil {
+		t.Fatal("parseWindowParams not found")
+	}
+	if b := metrics[pw[0]:pw[1]]; !strings.Contains(b, "to <= from") || !strings.Contains(b, `RANGE_SECONDS["7d"] * 1000`) {
+		t.Error("parseWindowParams accepts an empty or over-wide window from the route")
+	}
+	help, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := help.lookup("", "range"); !strings.Contains(entry, "Drag across any chart") || !strings.Contains(entry, "[ and ]") {
+		t.Error("the range's glossary entry does not explain the drag or the keys: the gesture is undiscoverable")
+	}
+}
+
+// TestHealthFindingsCarryWhenTheyBegan (issue #207): a problem row says
+// when this node's checks first found it — through fmtWhen, since it is
+// a moment — and links to its history: the operations view, filtered
+// to the health records that name its check. The chain has four links
+// (the JSON field, the row, the route, the filter) and a break in any
+// one of them leaves a row that reads as it did before, so each is
+// pinned.
+func TestHealthFindingsCarryWhenTheyBegan(t *testing.T) {
+	api, err := os.ReadFile("../health_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(api), "Since int64 `json:\"since_unix_ms,omitempty\"`") {
+		t.Fatal("Problem.Since is no longer serialized as since_unix_ms; the row below reads that name")
+	}
+	// The ring records start with the check's name, which is what the
+	// history link's substring filter matches.
+	for _, want := range []string{
+		`return fmt.Sprintf("%s%s (%s): %s", p.Check, p.subject()`,
+		`return fmt.Sprintf("%s%s cleared after %s", p.Check, p.subject()`,
+	} {
+		if !strings.Contains(string(api), want) {
+			t.Errorf("health_api.go no longer phrases a transition as %s: the history link filters the ring by the check's name at the start of the summary", want)
+		}
+	}
+	health := string(mustRead(t, "js/80-health.js"))
+	if !strings.Contains(health, "fmtWhen(p.since_unix_ms)") {
+		t.Error("80-health.js does not render since_unix_ms through fmtWhen: a row has no date, or has one that ignores the viewer's preference")
+	}
+	if !strings.Contains(health, `routeTo("ops", { kind: "health", q: p.check })`) {
+		t.Error("80-health.js does not link a row to #/ops filtered to its check")
+	}
+	span := jsFuncSpan(health, "renderHealth")
+	if span == nil {
+		t.Fatal("renderHealth not found")
+	}
+	row := health[span[0]:span[1]]
+	for _, want := range []string{"problemSince(p)", "problemHistory(p)"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("renderHealth does not put %s in the row", want)
+		}
+	}
+	ops := string(mustRead(t, "js/92-ops.js"))
+	span = jsFuncSpan(ops, "renderOps")
+	if span == nil {
+		t.Fatal("renderOps not found")
+	}
+	body := ops[span[0]:span[1]]
+	if !strings.Contains(body, "e.summary.includes(q)") || !strings.Contains(body, "opsFilter.q") {
+		t.Error("renderOps does not filter events by the route's q: the history link lands on every health event")
+	}
+	if !strings.Contains(body, "opsFilter.kind") {
+		t.Error("renderOps does not take its kind from the route: #/ops?kind=health shows every kind")
+	}
+	router := string(mustRead(t, "js/15-router.js"))
+	if !strings.Contains(router, `if (r.view === "ops") applyOpsParams(r.params);`) {
+		t.Error("route() does not hand #/ops its params: kind= and q= in the URL do nothing")
+	}
+	boot := string(mustRead(t, "js/95-boot.js"))
+	if !strings.Contains(boot, "setOpsKind(ev.target.value)") {
+		t.Error("the events filter select no longer goes through setOpsKind: a choice made by hand is not in the URL, and the route's q is not dropped")
+	}
+}
+
+// TestOperationsUnderClusterScopeAreClusterWide (issue #210): under the
+// whole-cluster scope the operation tables read /api/operations, the
+// merged document with a node on every row, and say which nodes did
+// not answer; the overview's in-flight strip reads it too; and the
+// names the script reads are the ones the server writes.
+func TestOperationsUnderClusterScopeAreClusterWide(t *testing.T) {
+	api, err := os.ReadFile("../operations_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := string(mustRead(t, "js/92-ops.js"))
+	if !strings.Contains(ops, `fetch("/api/operations"`) {
+		t.Fatal("92-ops.js never fetches /api/operations: the operations view is one node at a time")
+	}
+	// Every field the script reads off the document is one the Go
+	// struct writes.
+	for _, field := range []string{"operations", "nodes", "nodes_asked", "errors", "truncated"} {
+		if !readsField(ops, "opsCluster", field) && !readsField(ops, "d", field) {
+			t.Errorf("92-ops.js does not read %s off the operations document", field)
+		}
+		if !strings.Contains(string(api), "`json:\""+field) {
+			t.Errorf("operations_api.go does not write %s, which 92-ops.js reads", field)
+		}
+	}
+	if !strings.Contains(string(api), "NodeID int `json:\"node_id\"`") || !strings.Contains(ops, "o.node_id") {
+		t.Error("the node each operation is on is not carried from the server to the row")
+	}
+	span := jsFuncSpan(ops, "opsSource")
+	if span == nil {
+		t.Fatal("opsSource not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, `ui.scope === "cluster" && opsCluster`) {
+		t.Error("opsSource does not choose the cluster document under cluster scope: the tables stay the serving node's")
+	}
+	span = jsFuncSpan(ops, "opRow")
+	if span == nil {
+		t.Fatal("opRow not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, `routeTo("node/" + (o.node_id || 0))`) {
+		t.Error("opRow does not link the row to the node it is on")
+	}
+	span = jsFuncSpan(ops, "opsScopeNote")
+	if span == nil {
+		t.Fatal("opsScopeNote not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, "did not answer") || !strings.Contains(body, "d.errors.map(esc)") {
+		t.Error("opsScopeNote does not name the nodes that did not answer: a partial document reads as the whole cluster")
+	}
+	span = jsFuncSpan(ops, "renderRecentOps")
+	if span == nil {
+		t.Fatal("renderRecentOps not found")
+	}
+	if body := ops[span[0]:span[1]]; !strings.Contains(body, "opsSource()") || !strings.Contains(body, "runningOpRow") {
+		t.Error("the overview's in-flight strip does not read the cluster document: the first screen answers for the serving node")
+	}
+	boot := string(mustRead(t, "js/95-boot.js"))
+	if !strings.Contains(boot, `task("operations", pollOperations, 10000, ["ops", "overview"])`) {
+		t.Error("the operations fan-out is not polled for the ops view and the overview, slowly")
+	}
+	page := string(mustRead(t, "index.html"))
+	for _, tbody := range []string{"ops-running", "ops-done"} {
+		at := strings.Index(page, `<tbody id="`+tbody+`"`)
+		if at < 0 {
+			t.Fatalf("%s not in index.html", tbody)
+		}
+		head := page[max(0, at-400):at]
+		if !strings.Contains(head, `<th scope="col">node</th>`) {
+			t.Errorf("the %s table has no node column: a cluster-wide row does not say where it is", tbody)
+		}
+	}
+}
+
+// TestSeriesPairsAreTellableApart (issue #216, from the console reviews
+// of the combined PR): --series-8 and --series-2 were both warm reds
+// seven OKLab units apart in either theme, and a two-line chart never
+// facets, so n2 and n8 could not be told apart by colour. The distances
+// are computed here rather than trusted, for every pair in both themes,
+// against the normal-vision floor of 15. The pairs still below it are
+// named (issue #240) so that a seventh cannot join them unnoticed, and
+// an exception that is later fixed must be removed from the list.
+func TestSeriesPairsAreTellableApart(t *testing.T) {
+	page := string(mustRead(t, "index.html"))
+	light := page[strings.Index(page, ":root {"):]
+	light = light[:strings.Index(light, "}")]
+	di := strings.Index(page, "prefers-color-scheme: dark")
+	dark := page[di : di+1200]
+	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
+	// The pairs below the floor at this head, per theme, lower slot first.
+	// Issue #240 is the palette work that clears them.
+	knownBelow := map[string]map[[2]int]bool{
+		"light": {{2, 4}: true, {2, 5}: true},
+		"dark":  {{1, 7}: true, {2, 4}: true, {2, 5}: true, {3, 6}: true},
+	}
+	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
+		pal := map[int]string{}
+		for _, m := range slot.FindAllStringSubmatch(theme.css, -1) {
+			i, _ := strconv.Atoi(m[1])
+			pal[i] = m[2]
+		}
+		if len(pal) != 8 {
+			t.Fatalf("%s theme: found %d series slots, want 8", theme.name, len(pal))
+		}
+		for a := 1; a <= 8; a++ {
+			for b := a + 1; b <= 8; b++ {
+				d := oklabDistance(pal[a], pal[b])
+				known := knownBelow[theme.name][[2]int{a, b}]
+				switch {
+				case d < 15 && !known:
+					t.Errorf("%s theme: --series-%d %s and --series-%d %s are %.1f OKLab units apart; the floor for two lines with no other channel is 15, and this pair is not among the known exceptions (issue #240)", theme.name, a, pal[a], b, pal[b], d)
+				case d >= 15 && known:
+					t.Errorf("%s theme: --series-%d and --series-%d are %.1f apart, above the floor: remove the pair from the known exceptions", theme.name, a, b, d)
+				}
+			}
+		}
+	}
+}
+
+// oklabDistance is the OKLab Euclidean distance between two sRGB hex
+// colours, scaled by 100 — the ΔE the palette validator reports.
+func oklabDistance(a, b string) float64 {
+	la, aa, ba := oklab(a)
+	lb, ab, bb := oklab(b)
+	return 100 * math.Sqrt((la-lb)*(la-lb)+(aa-ab)*(aa-ab)+(ba-bb)*(ba-bb))
+}
+
+func oklab(hex string) (float64, float64, float64) {
+	lin := func(i int) float64 {
+		v, _ := strconv.ParseUint(hex[1+2*i:3+2*i], 16, 8)
+		c := float64(v) / 255
+		if c <= 0.04045 {
+			return c / 12.92
+		}
+		return math.Pow((c+0.055)/1.055, 2.4)
+	}
+	r, g, b := lin(0), lin(1), lin(2)
+	l := math.Cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b)
+	m := math.Cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b)
+	s := math.Cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b)
+	return 0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+		1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+		0.0259040371*l + 0.7827717662*m - 0.8086757660*s
+}
+
+// TestRedactedKeysAreNotCopiedUnderAKeysName (issue #213 meeting #226):
+// a caller who does not see every table's keys gets the shown form, and
+// the copy control and the CSV say so rather than call it a key.
+func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
+	api, err := os.ReadFile("../cluster_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile("KeysRedacted +bool +`json:\"keys_redacted,omitempty\"`").MatchString(string(api)) {
+		t.Fatal("the cluster document no longer says whether its keys are the shown form")
+	}
+	data := string(mustRead(t, "js/70-data.js"))
+	span := jsFuncSpan(data, "renderClusterRanges")
+	if span == nil {
+		t.Fatal("renderClusterRanges not found")
+	}
+	body := data[span[0]:span[1]]
+	if !strings.Contains(body, "lastCluster.keys_redacted") {
+		t.Error("renderClusterRanges does not read keys_redacted: a redacted key is copied under a key's name")
+	}
+	for _, want := range []string{`"start key as shown (your role does not see the full key)"`, `"start key (as shown)"`, `"end key (as shown)"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("renderClusterRanges does not label the shown form %s", want)
+		}
+	}
+	// The node page's replica table copies keys too (QA on the combined
+	// PR): the same document, the same rule.
+	overview := string(mustRead(t, "js/30-overview.js"))
+	rr := jsFuncSpan(overview, "rangeRow")
+	if rr == nil {
+		t.Fatal("rangeRow not found")
+	}
+	if b := overview[rr[0]:rr[1]]; !strings.Contains(b, "lastCluster.keys_redacted") || !strings.Contains(b, "start key as shown (your role does not see the full key)") {
+		t.Error("rangeRow copies a redacted key under a key's name")
+	}
+	// Every key-copy site is one of the two above.
+	for _, name := range []string{"js/70-data.js", "js/30-overview.js", "js/45-table.js", "js/90-node.js"} {
+		src := string(mustRead(t, name))
+		if strings.Contains(src, `"'s start key"`) {
+			t.Errorf("%s labels a copied key unconditionally", name)
+		}
+	}
+	g, err := loadGlossary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(g.lookup("", "copy"), "shown form") {
+		t.Error("the copy glossary entry does not say what a redacted key is")
 	}
 }

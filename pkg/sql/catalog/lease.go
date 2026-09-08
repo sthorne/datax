@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -74,12 +75,17 @@ type descLease struct {
 }
 
 // leaseInfo is what one acquisition established.
-type leaseInfo struct{ expiration, priorExpiration int64 }
+type leaseInfo struct{ expiration, priorExpiration, handedOutExpiration int64 }
 
 // TestingPauseRenewal stops (or resumes) the background lease renewal:
 // tests use it to let this gateway's leases expire while its sessions
 // keep running, the shape of a stalled gateway.
 func (a *Accessor) TestingPauseRenewal(paused bool) { a.renewalPaused.Store(paused) }
+
+// TestingRenewNow runs one renewal pass — what the renewal loop does on
+// a tick — so a test can put a renewal exactly where it wants one
+// (issue #234). Errors are returned rather than logged.
+func (a *Accessor) TestingRenewNow(ctx context.Context) error { return a.renewAll(ctx) }
 
 // StartLeasing enables leasing on this accessor and starts the renewal
 // loop. Call once, before serving sessions. ttl <= 0 uses the default.
@@ -108,19 +114,30 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 			if a.renewalPaused.Load() {
 				continue
 			}
-			a.mu.Lock()
-			names := make([]string, 0, len(a.cache))
-			for name := range a.cache {
-				names = append(names, name)
-			}
-			a.mu.Unlock()
-			for _, name := range names {
-				if _, err := a.refreshOne(ctx, name); err != nil {
-					log.Debugf("lease renewal for %q: %v", name, err)
-				}
+			if err := a.renewAll(ctx); err != nil {
+				log.Debugf("lease renewal: %v", err)
 			}
 		}
 	}
+}
+
+// renewAll renews this gateway's lease on every cached table, adopting
+// any new version; the first error is returned after every table has
+// been tried.
+func (a *Accessor) renewAll(ctx context.Context) error {
+	a.mu.Lock()
+	names := make([]string, 0, len(a.cache))
+	for name := range a.cache {
+		names = append(names, name)
+	}
+	a.mu.Unlock()
+	var first error
+	for _, name := range names {
+		if _, err := a.refreshOne(ctx, name); err != nil && first == nil {
+			first = fmt.Errorf("lease renewal for %q: %w", name, err)
+		}
+	}
+	return first
 }
 
 // refreshOne re-reads a table's descriptor (adopting any new version),
@@ -144,7 +161,7 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		return nil, nil
 	}
 	a.mu.Lock()
-	a.cache[name] = &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration}
+	a.cache[name] = &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
 	a.mu.Unlock()
 	return desc, nil
 }
@@ -191,7 +208,7 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		}
 		now := a.clock.Now().WallTime
 		e := now + a.ttl.Nanoseconds()
-		prior := a.priorToDrain(name, d.Version, now)
+		prior, handedOut := a.carryOver(name, d.Version, now)
 		raw, err := json.Marshal(descLease{Version: d.Version, Expiration: e, PriorExpiration: prior})
 		if err != nil {
 			return err
@@ -208,16 +225,18 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		if err := txn.RunBatch(ctx, &wb); err != nil {
 			return err
 		}
-		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior}
+		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior, handedOutExpiration: handedOut}
 		return nil
 	})
 	return desc, info, err
 }
 
-// priorToDrain is the expiration a drain must still wait out on this
-// gateway once it adopts version: the expiration of the entry being
-// replaced, when that entry was handed to a statement and named an older
-// version.
+// carryOver is what the entry acquired at version inherits from the one
+// it replaces: prior, the expiration a drain must still wait out on this
+// gateway (published in the lease record as PriorExpiration), and
+// handedOut, the latest expiration handed to a statement at the version
+// being kept (carried in the cache, published only once the version
+// changes).
 //
 // A statement is pinned to the descriptor it planned against and bounded
 // only by that entry's expiration (pinDeadline). Publishing the new
@@ -227,23 +246,43 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 // that statement then commit above the boundary having maintained no
 // index: a row in the table with no entry in the new index (issue #185).
 //
-// Zero when there is nothing to wait for: the entry was never handed out,
-// it already named this version, or its expiration has passed.
-func (a *Accessor) priorToDrain(name string, version uint64, nowWall int64) int64 {
+// The entry handed out need not be the one current when the new version
+// is adopted: a renewal in between replaces it with a fresh entry at the
+// same version, which no statement has taken, and the drain would then
+// have nothing to wait for while the statement could still commit. So
+// the handed-out expiration is carried from entry to entry for as long
+// as the version stays the same, and published when it changes. It
+// cannot be published sooner: a drain must never wait for statements
+// holding the version it is draining to, or a busy gateway would keep
+// it waiting for ever (issue #234).
+//
+// Either value is zero when there is nothing to wait for: nothing was
+// handed out, or its expiration has passed.
+func (a *Accessor) carryOver(name string, version uint64, nowWall int64) (prior, handedOut int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	old, ok := a.cache[name]
 	if !ok || old.desc == nil {
-		return 0
+		return 0, 0
 	}
-	prior := old.priorExpiration // an older drain may still be outstanding
-	if old.handedOut && old.desc.Version < version && old.expiration > prior {
-		prior = old.expiration
+	handedOut = old.handedOutExpiration
+	if old.handedOut && old.expiration > handedOut {
+		handedOut = old.expiration
+	}
+	prior = old.priorExpiration // an older drain may still be outstanding
+	if old.desc.Version < version {
+		if handedOut > prior {
+			prior = handedOut
+		}
+		handedOut = 0 // nothing at the new version has been handed out yet
 	}
 	if prior <= nowWall {
-		return 0
+		prior = 0
 	}
-	return prior
+	if handedOut <= nowWall {
+		handedOut = 0
+	}
+	return prior, handedOut
 }
 
 // FinishDDL runs after a schema change on name commits: it adopts the new

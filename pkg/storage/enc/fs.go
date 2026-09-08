@@ -3,6 +3,16 @@
 // MANIFEST, ...) with AES-256-CTR, plus the AES-GCM-sealed key registry
 // and helpers for sealing non-Pebble artifacts (the metadata backup).
 // stdlib crypto only. See docs/encryption.md.
+//
+// What it provides is confidentiality against a disk that leaves the
+// building, and nothing else: file content carries no authentication
+// tag and the file header is not authenticated (only the registry and
+// the metadata backup are GCM-sealed), so an attacker who can write to a
+// live store's files can alter, truncate, substitute or roll back a file
+// undetectably. Pebble's block checksums are not a defence — they are
+// keyless, inside the encrypted block, and CTR is bit-malleable, so an
+// edit repairs them in the same pass. Issue #220 records what
+// authenticating the header and the content would take.
 package enc
 
 import (

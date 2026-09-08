@@ -11,14 +11,25 @@ function renderNetwork(d) {
   // matrix does not fit (and the better view past ~10 nodes anywhere).
   const pairs = [];
   for (const from of nodes) for (const l of from.latency || []) pairs.push({ from: from.node_id, to: l.peer, l });
+  // A slow pair is judged against the cluster's own median round trip,
+  // not an absolute number chosen here: 25 ms between regions is a
+  // healthy WAN link, and a cluster that is uniformly far apart must not
+  // read as an outage. Flagged (as a warning, never as "down", which in
+  // this column means unreachable) when a pair is more than three times
+  // the median and over 5 ms — the second guard so a 0.3 ms outlier on a
+  // 0.1 ms LAN is not painted.
+  const rtts = pairs.filter(p => p.l.reachable && p.l.rtt_us > 0).map(p => p.l.rtt_us).sort((a, b) => a - b);
+  const median = rtts.length ? rtts[Math.floor(rtts.length / 2)] : 0;
+  const slow = us => median > 0 && us > 3 * median && us > 5000 ? "draining" : "";
   pairs.sort((a, b) => (b.l.reachable ? 0 : 1) - (a.l.reachable ? 0 : 1) || (b.l.rtt_us || 0) - (a.l.rtt_us || 0));
   const worstOff = pairs.filter(p => p.l.reachable).sort((a, b) => Math.abs(b.l.offset_us) - Math.abs(a.l.offset_us)).slice(0, 3);
   const shown = [...new Set([...pairs.slice(0, 5), ...worstOff])];
   setHTML(document.getElementById("latency-worst"), shown.map(p => `<tr data-key="${p.from}-${p.to}">
     <td data-label="pair">n${p.from} → n${p.to}</td>
-    <td class="num" data-label="round trip">${p.l.reachable ? fmtRTT(p.l.rtt_us) : `<span class="st down">✕ unreachable</span>`}</td>
+    <td class="num" data-label="round trip">${p.l.reachable ? warn(slow(p.l.rtt_us), fmtRTT(p.l.rtt_us)) : tok("down", "✕ unreachable")}</td>
+    <td class="num" data-label="p99">${p.l.reachable ? fmtRTT(p.l.p99_us) : "—"}</td>
     <td class="num" data-label="clock offset">${p.l.reachable ? fmtOffset(p.l.offset_us) : "—"}</td>
-  </tr>`).join("") || `<tr><td colspan="3" class="muted">no measurements yet</td></tr>`);
+  </tr>`).join("") || `<tr><td colspan="4" class="muted">no measurements yet</td></tr>`);
   let html = `<thead><tr><th>from \\ to</th>` + nodes.map(n => `<th class="num">n${n.node_id}</th>`).join("") +
     `<th class="num" title="largest clock offset this node measured to any peer, vs the tolerated --max-offset">clock offset</th></tr></thead><tbody>`;
   for (const from of nodes) {
@@ -29,21 +40,24 @@ function renderNetwork(d) {
       if (to.node_id === from.node_id) { html += `<td class="num muted">—</td>`; continue; }
       const l = row.get(to.node_id);
       if (!l) { html += `<td class="num muted" title="no measurement yet">·</td>`; continue; }
-      if (!l.reachable) { html += `<td class="num"><span class="st down">✕ unreachable</span></td>`; continue; }
+      if (!l.reachable) { html += `<td class="num">${tok("down", "✕ unreachable")}</td>`; continue; }
       if (worst === null || Math.abs(l.offset_us) > Math.abs(worst)) worst = l.offset_us;
-      const lvl = l.rtt_us < 2000 ? "live" : l.rtt_us < 20000 ? "draining" : "down";
-      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtWhen(Date.now() - l.age_ms)}"><span class="st ${lvl}">${fmtRTT(l.rtt_us)}</span></td>`;
+      html += `<td class="num" title="p99 ${fmtRTT(l.p99_us)} · clock offset ${fmtOffset(l.offset_us)} · measured ${fmtWhen(Date.now() - l.age_ms)}">${warn(slow(l.rtt_us), fmtRTT(l.rtt_us))}</td>`;
     }
     if (worst === null) html += `<td class="num muted">—</td>`;
     else {
       const a = Math.abs(worst);
+      // Judged against the tolerance the cluster declares (--max-offset):
+      // at or past it a node is refused, which is the console's one
+      // surface for the hazard, so it must not look like a healthy cell.
       const lvl = maxOff && a >= maxOff ? "down" : maxOff && a >= maxOff / 2 ? "draining" : "";
-      html += `<td class="num">${lvl ? `<span class="st ${lvl}">${fmtOffset(worst)}</span>` : fmtOffset(worst)}</td>`;
+      html += `<td class="num">${warn(lvl, fmtOffset(worst))}</td>`;
     }
     html += `</tr>`;
   }
   if (setHTML(table, html + "</tbody>")) a11yTables(table.parentElement);
   note.textContent = "round trip from row node to column node (smoothed; hover for p99 and clock offset); pinged every 2s" +
+    (median ? `; a pair over three times the cluster's median round trip (${fmtRTT(median)}) and over 5 ms is flagged` : "") +
     (d.max_offset_ms ? `; clock offsets are judged against the tolerated ${d.max_offset_ms} ms` : "");
 }
 // Cross-node drill-down: clicking a cluster range fetches /api/range?id=N

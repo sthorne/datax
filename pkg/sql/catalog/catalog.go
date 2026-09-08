@@ -729,9 +729,13 @@ type cachedDesc struct {
 	// priorExpiration rides with the entry so a later acquisition can
 	// keep publishing a drain that has not finished yet; handedOut says
 	// a statement took this entry and so may still be committing under
-	// it. See Accessor.priorToDrain (issue #185).
-	priorExpiration int64
-	handedOut       bool
+	// it. handedOutExpiration is the latest expiration of an entry at
+	// this version that was handed out — this one's predecessors, which
+	// a same-version renewal replaced without any drain having waited
+	// for them yet. See Accessor.carryOver (issues #185, #234).
+	priorExpiration     int64
+	handedOut           bool
+	handedOutExpiration int64
 }
 
 func NewAccessor() *Accessor {
@@ -804,7 +808,7 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 			// CACHED path needs, and this path did not take one.
 			return d, nil
 		}
-		entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration}
+		entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
 	}
 	a.mu.Lock()
 	a.cache[key] = entry

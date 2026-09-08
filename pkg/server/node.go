@@ -122,6 +122,13 @@ type Config struct {
 	// state; past it new connections are refused rather than held (0 =
 	// 512; negative = no cap).
 	SQLMaxPendingAuth int
+	// HealthRateWindow is how far back the health check's rate-based
+	// problems (auth-failures, auth-throttled, write-stalls) look. They
+	// report a rate rather than a lifetime total so that a problem
+	// clears once the pressure stops and the window rolls past it (0 =
+	// five minutes). Tests shorten it to watch that happen (issues #223,
+	// #224); nothing else has a reason to set it.
+	HealthRateWindow time.Duration
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration

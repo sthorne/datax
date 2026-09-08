@@ -37,6 +37,14 @@ type Event struct {
 	Op      string `json:"op,omitempty"`
 	Phase   string `json:"phase,omitempty"`
 	Outcome string `json:"outcome,omitempty"`
+	// Tables and Redacted belong to an event whose summary carries keys
+	// (a split, a merge): the tables the keys were cut from, and the
+	// same summary with every key at its table-and-index prefix. A
+	// reader who may not see every one of those tables is served
+	// Redacted as the summary (Redact); the ring itself keeps both and
+	// serves neither field (issue #213).
+	Tables   []uint64 `json:"-"`
+	Redacted string   `json:"-"`
 	// Started is set on an end record: when the operation it closes
 	// began. The pairing is over a bounded ring, so a long operation's
 	// start is usually gone by the time it finishes — carrying the time
@@ -128,6 +136,45 @@ func (r *Ring) Record(kind, format string, args ...any) {
 
 // RecordAudit adds an audit-stream event.
 func (r *Ring) RecordAudit(kind, summary string) { r.record(true, kind, summary) }
+
+// RecordKeyed adds an event whose summary carries keys of the given
+// tables: summary is the full form, redacted the same with every key at
+// its prefix, for a reader who may not see one of the tables (see
+// Redact).
+func (r *Ring) RecordKeyed(kind string, tables []uint64, summary, redacted string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.seq++
+	ev := Event{Seq: r.seq, At: time.Now(), Kind: kind, Summary: summary, Tables: tables, Redacted: redacted}
+	r.store(ev)
+	sinks := r.sinks
+	r.mu.Unlock()
+	for _, fn := range sinks {
+		fn(ev)
+	}
+}
+
+// Redact serves evs to a reader who sees the tables sees admits: an
+// event that carries keys of a table the reader may not see has its
+// summary replaced by the redacted form. The slice is modified in
+// place and returned.
+func Redact(evs []Event, sees func(table uint64) bool) []Event {
+	for i := range evs {
+		ev := &evs[i]
+		if ev.Redacted == "" {
+			continue
+		}
+		for _, t := range ev.Tables {
+			if !sees(t) {
+				ev.Summary = ev.Redacted
+				break
+			}
+		}
+	}
+	return evs
+}
 
 // RecordStart opens a long-running operation under op; RecordEnd closes
 // it with an outcome. The two are matched by (kind, op).

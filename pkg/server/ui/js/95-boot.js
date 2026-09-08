@@ -118,6 +118,9 @@ task("txnCharts", pollTxnCharts, 15000, ["sql"]);
 // The table detail joins the shapes that touch one table against this
 // same document (issue #194), so #/schema needs it too.
 task("statements", pollStatements, 10000, ["sql", "schema"]);
+// The cluster's operations (issue #210): a fan-out too, so the same slow
+// poll, for the operations view and the overview's in-flight strip.
+task("operations", pollOperations, 10000, ["ops", "overview"]);
 
 window.addEventListener("hashchange", route);
 document.getElementById("compare-toggle").addEventListener("change", ev => {
@@ -141,7 +144,7 @@ document.getElementById("node-filter").addEventListener("input", ev => {
   if (lastCluster) renderNodesTable(lastCluster);
 });
 document.getElementById("hdr-reload").addEventListener("click", () => location.reload());
-document.getElementById("events-filter").addEventListener("change", renderOps);
+document.getElementById("events-filter").addEventListener("change", ev => setOpsKind(ev.target.value));
 // The shape list re-ranks what it already has rather than re-fetching.
 document.getElementById("stmt-sort").addEventListener("change", renderStatementShapes);
 // One delegated listener for the whole shapes section: the rows are

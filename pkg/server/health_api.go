@@ -45,6 +45,14 @@ type Problem struct {
 	Range int64 `json:"range,omitempty"`
 	// Section is the dashboard section the row links to.
 	Section string `json:"section,omitempty"`
+	// Since is when this node's checks first found the problem open, in
+	// wall-clock milliseconds, and it holds across check runs until the
+	// problem clears (issue #207). A problem is the same problem while
+	// its check, node and range agree: the summary carries figures — a
+	// heartbeat age, a replica count — that change from one run to the
+	// next, and a row that was re-dated every time its figure moved
+	// would answer "when did this start" with "just now", always.
+	Since int64 `json:"since_unix_ms,omitempty"`
 }
 
 // HealthStatus is the /api/health document.
@@ -84,6 +92,92 @@ type healthCache struct {
 	at   time.Time
 	doc  *HealthStatus
 	prev counterSamples
+	open problemTracker
+}
+
+// problemTracker remembers which findings were open at the last run of
+// the checks, so a run can tell a problem that just appeared from one
+// that has been there since Tuesday, and can notice one that cleared
+// (issue #207). Both transitions go to the event ring; the state
+// between them does not. The checks run every few seconds, and a ring
+// of five hundred entries fed one record per run per open problem
+// would carry an hour of "still broken" and nothing else.
+//
+// The tracker is per node and in memory, like the ring it feeds: each
+// node runs the checks for itself, so each records its own view of
+// when a problem began, and a restarted node knows nothing of what was
+// open before it. The checks also run only when something asks for
+// the document — a console, a poll of /api/health — so "first found
+// open" is as of the first run after the problem began, which is what
+// the field's comment says.
+type problemTracker struct {
+	open map[string]Problem
+}
+
+// problemKey is the identity a problem keeps between runs.
+func problemKey(p Problem) string {
+	return fmt.Sprintf("%s|%d|%d", p.Check, p.Node, p.Range)
+}
+
+// settle stamps Since on every problem of this run and returns the
+// transitions since the last: the problems that appeared, in the order
+// given, and those that cleared, as they were last seen, in a stable
+// order. A problem seen on consecutive runs keeps the Since it was
+// given when it appeared, whatever its summary now says.
+func (t *problemTracker) settle(probs []Problem, nowMs int64) (appeared, cleared []Problem) {
+	if t.open == nil {
+		t.open = map[string]Problem{}
+	}
+	seen := map[string]bool{}
+	for i := range probs {
+		k := problemKey(probs[i])
+		if prev, ok := t.open[k]; ok {
+			probs[i].Since = prev.Since
+		} else {
+			probs[i].Since = nowMs
+			appeared = append(appeared, probs[i])
+		}
+		t.open[k] = probs[i]
+		seen[k] = true
+	}
+	var gone []string
+	for k := range t.open {
+		if !seen[k] {
+			gone = append(gone, k)
+		}
+	}
+	sort.Strings(gone)
+	for _, k := range gone {
+		cleared = append(cleared, t.open[k])
+		delete(t.open, k)
+	}
+	return appeared, cleared
+}
+
+// subject names what a problem concerns, for a sentence about it.
+func (p Problem) subject() string {
+	switch {
+	case p.Node != 0:
+		return fmt.Sprintf(" on n%d", p.Node)
+	case p.Range != 0:
+		return fmt.Sprintf(" on r%d", p.Range)
+	}
+	return ""
+}
+
+// appearedSummary and clearedSummary phrase the two transitions for the
+// event ring. Both start with the check's name, so the operations view
+// filtered to that check finds every one of its transitions.
+func appearedSummary(p Problem) string {
+	return fmt.Sprintf("%s%s (%s): %s", p.Check, p.subject(), p.Severity, p.Summary)
+}
+
+func clearedSummary(p Problem, nowMs int64) string {
+	open := time.Duration(nowMs-p.Since) * time.Millisecond
+	if open < 0 {
+		open = 0
+	}
+	return fmt.Sprintf("%s%s cleared after %s", p.Check, p.subject(), open.Truncate(time.Second))
 }
 
 // counterSamples remembers earlier readings of cumulative counters so a
@@ -106,13 +200,27 @@ type sample struct {
 	v  float64
 }
 
-const rateWindow = 5 * time.Minute
+// defaultRateWindow is how far back the rate-based checks look
+// (Config.HealthRateWindow overrides it, for tests: issues #223, #224).
+const defaultRateWindow = 5 * time.Minute
 
-// rateOver appends v and returns the increase over the window.
-func rateOver(ss []sample, v float64, now time.Time) ([]sample, float64) {
+// rateWindow is the window the rate-based checks measure over.
+func (n *Node) rateWindow() time.Duration {
+	if n.cfg.HealthRateWindow > 0 {
+		return n.cfg.HealthRateWindow
+	}
+	return defaultRateWindow
+}
+
+// rateOver appends v and returns the increase over the window: samples
+// older than it are dropped, and the increase is measured from the
+// oldest that survives — which, once nothing has been sampled inside
+// the window, is the sample just taken, so the increase is zero and a
+// problem built on it clears.
+func rateOver(ss []sample, v float64, now time.Time, window time.Duration) ([]sample, float64) {
 	ss = append(ss, sample{at: now, v: v})
 	i := 0
-	for i < len(ss)-1 && now.Sub(ss[i].at) > rateWindow {
+	for i < len(ss)-1 && now.Sub(ss[i].at) > window {
 		i++
 	}
 	ss = ss[i:]
@@ -304,10 +412,10 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				Summary: fmt.Sprintf("the compaction-debt gate is latched (%s of pending compaction); table writes are shed until it halves", fmtBytesGo(m.CompactionDebtBytes))})
 		}
 		var stallDelta float64
-		n.health.prev.stalls, stallDelta = rateOver(n.health.prev.stalls, float64(m.WriteStalls), now)
+		n.health.prev.stalls, stallDelta = rateOver(n.health.prev.stalls, float64(m.WriteStalls), now, n.rateWindow())
 		if stallDelta > 0 {
 			add(Problem{Severity: SeverityCritical, Check: "write-stalls", Node: int(n.ident.NodeID), Section: "storage",
-				Summary: fmt.Sprintf("Pebble hard-stalled writes %d time(s) in the last %s: the store is past backpressure", int(stallDelta), rateWindow)})
+				Summary: fmt.Sprintf("Pebble hard-stalled writes %d time(s) in the last %s: the store is past backpressure", int(stallDelta), n.rateWindow())})
 		}
 		if m.BackgroundErrors > n.health.prev.bgErrors {
 			add(Problem{Severity: SeverityCritical, Check: "storage-errors", Node: int(n.ident.NodeID), Section: "storage",
@@ -392,7 +500,7 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			Summary: fmt.Sprintf("%d replica checksum mismatch(es) found by this node's sweeps since it started: replicated-state divergence; see the events", f)})
 	}
 	var authDelta float64
-	n.health.prev.auth, authDelta = rateOver(n.health.prev.auth, counterValue(metrics.AuthFailures)+counterValue(metrics.AdminDenied), now)
+	n.health.prev.auth, authDelta = rateOver(n.health.prev.auth, counterValue(metrics.AuthFailures)+counterValue(metrics.AdminDenied), now, n.rateWindow())
 	if window := now.Sub(n.health.prev.auth[0].at); window > 0 && authDelta/window.Seconds() > authFailureRate {
 		add(Problem{Severity: SeverityWarning, Check: "auth-failures", Node: int(n.ident.NodeID), Section: "events",
 			Summary: fmt.Sprintf("%d authentication failures or denied admin operations in the last %s on this node", int(authDelta), window.Truncate(time.Second))})
@@ -409,11 +517,11 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	doc.Checks++
 	var rlDelta, vrDelta, vfDelta float64
 	n.health.prev.throttleRL, rlDelta = rateOver(n.health.prev.throttleRL,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit)), now, n.rateWindow())
 	n.health.prev.throttleVR, vrDelta = rateOver(n.health.prev.throttleVR,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate)), now, n.rateWindow())
 	n.health.prev.throttleVF, vfDelta = rateOver(n.health.prev.throttleVF,
-		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now)
+		counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull)), now, n.rateWindow())
 	throttleDelta := rlDelta + vrDelta + vfDelta
 	if window := now.Sub(n.health.prev.throttleRL[0].at); window > 0 && throttleDelta/window.Seconds() > authThrottleRate {
 		// Every figure here is over the same window, so the parenthetical
@@ -476,6 +584,17 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	sort.SliceStable(doc.Problems, func(i, j int) bool {
 		return severityRank(doc.Problems[i].Severity) < severityRank(doc.Problems[j].Severity)
 	})
+	// Transitions go to the event ring — what cleared first, so a check
+	// that changed severity (node-unresponsive becoming node-down) reads
+	// in order — and every row learns when it was first found open.
+	nowMs := nowWall / int64(time.Millisecond)
+	appeared, cleared := n.health.open.settle(doc.Problems, nowMs)
+	for _, p := range cleared {
+		n.events.Record("health", "%s", clearedSummary(p, nowMs))
+	}
+	for _, p := range appeared {
+		n.events.Record("health", "%s", appearedSummary(p))
+	}
 	// Gauges: one per (severity, check) pair, zeroed for the pairs that
 	// cleared so alerts resolve.
 	metrics.HealthProblems.Reset()
@@ -574,6 +693,15 @@ const operationEndOverdue = 6 * time.Hour
 //
 // Running operations come first, newest start first; then the completed
 // ones, newest end first.
+//
+// Callers pass evs through events.Redact for the reader, as the event
+// listings do (issue #213): today no paired kind carries a boundary key
+// — backups, restores, drains, sweeps and upgrades name paths, nodes and
+// range ids — so the redaction is a no-op, but the pairing is done on
+// the same ring as the listings and must stay behind the same gate. The
+// open operations are not redacted: they hold the same summaries as
+// their start records, so the day a split or a merge becomes a paired
+// operation, Open() must be redacted here too, not only the ring.
 func operationsFrom(evs []events.Event, open []events.OpenOp, nowMs int64) []Operation {
 	type key struct{ kind, op string }
 	idx := map[key]int{}
@@ -665,6 +793,7 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 		limit = 200
 	}
 	p := n.clusterPrincipal(req)
+	v := n.keyViewerFor(req.Context(), p)
 	doc := EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq()}
 	// A time window (?from=unix_ms) instead of a tail: what the metrics
 	// charts need to annotate the range they are drawing (issue #155).
@@ -672,17 +801,17 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 	// reaches.
 	if fromMs, err := strconv.ParseInt(q.Get("from"), 10, 64); err == nil && fromMs > 0 {
 		evs, oldest := n.events.Since(time.UnixMilli(fromMs), limit, p.Admin)
-		doc.Events = evs
+		doc.Events = events.Redact(evs, v.sees)
 		if !oldest.IsZero() {
 			doc.OldestMs = oldest.UnixMilli()
 		}
 	} else {
-		doc.Events = n.events.Recent(since, limit, p.Admin)
+		doc.Events = events.Redact(n.events.Recent(since, limit, p.Admin), v.sees)
 	}
 	if doc.Events == nil {
 		doc.Events = []events.Event{}
 	}
-	doc.Operations = operationsFrom(n.events.Recent(0, 0, p.Admin), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
+	doc.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, p.Admin), v.sees), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

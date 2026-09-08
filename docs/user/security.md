@@ -170,7 +170,7 @@ certificate or the session expires. Authorization is per endpoint:
 
 | Endpoint | Who |
 |---|---|
-| `/`, `/status`, `/api/cluster` | any database user (read-only) |
+| `/`, `/status`, `/api/cluster` | any database user (read-only); range boundary keys and table names are shown for the tables the user may read, and at their table-and-index prefix by id for the rest — a boundary is a row value |
 | `/metrics` | the `metrics` role (or admin) |
 | `/api/range` (cross-node drill-down), `/api/activity`, `/debug/pprof/` | admin role only — the drill-downs fan out over internode RPC; a profile exposes statement text and key bytes |
 

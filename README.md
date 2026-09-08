@@ -196,6 +196,39 @@ index-join and scan workloads; `make bench` runs the checked-in set and
 via `datax debug profile`). On the in-process demo the kv
 workload does ~12.6k ops/s at p50 310µs (16 workers, 95% reads).
 
+## Development
+
+The Makefile is the loop; its targets carry the two pins CI relies on,
+so run them rather than the underlying commands.
+
+```sh
+make build        # bin/datax
+make test         # go test -timeout 30m ./...
+make test-race    # the same under the race detector — what CI runs
+make lint         # vet + gofmt -s + staticcheck: run before every push
+make bench        # the checked-in workload set (bench/README.md)
+```
+
+`make lint` is exactly what CI checks (`.github/workflows/ci.yaml`): a
+push that skipped it fails on staticcheck findings `go vet` does not
+report. Two things the targets do that the bare commands do not:
+
+- `staticcheck` and `vulncheck` pin the tool version CI uses and build
+  it with `GOTOOLCHAIN` set to the module's Go version. `go run
+  pkg@version` ignores the current module, so on a machine whose default
+  Go is older the tool is built with that one and refuses this module's
+  code ("module requires at least go1.25.0, but Staticcheck was built
+  with …").
+- `test` and `test-race` pass `-timeout 30m`. The cluster suite
+  (`pkg/testutils/testcluster`) is the long pole — around twenty minutes
+  under `-race` on a small machine — and runs past `go test`'s default
+  ten-minute per-package timeout, which kills it mid-run with no
+  failure to point at. Expect the wait; it is not a hang.
+
+Format with `make fmt` (gofmt, never goimports: goimports regroups the
+generated `*.pb.go` imports, which `make proto` flips back). Generated
+code is committed; `make proto` is only for changing the `.proto` files.
+
 ## Scope
 
 Everything described above is implemented and covered by the test suite.

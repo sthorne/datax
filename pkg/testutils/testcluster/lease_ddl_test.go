@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -356,8 +357,8 @@ func TestDrainWaitsOutADescriptorHandedToAStatement(t *testing.T) {
 	defer cancel()
 
 	const ttl = 2 * time.Second
-	sA := leasedSession(t, tc, 0, ttl)
-	sB := leasedSession(t, tc, 0, ttl)
+	sA, catA := leasedSessionWithAccessor(t, tc, 0, ttl)
+	sB, catB := leasedSessionWithAccessor(t, tc, 0, ttl)
 
 	execSQL(t, ctx, sA, `CREATE TABLE kv (id INT PRIMARY KEY, v INT)`)
 	execSQL(t, ctx, sA, `INSERT INTO kv VALUES (1, 1), (2, 2)`)
@@ -371,46 +372,170 @@ func TestDrainWaitsOutADescriptorHandedToAStatement(t *testing.T) {
 	}
 
 	// The latest moment a statement holding the current descriptor could
-	// still commit: no drain may finish before it.
+	// still commit: no drain may finish before it. The lease records are
+	// what the drain reads, so they are what is sampled — with renewal
+	// held off around the sample, so the record each gateway published
+	// is the entry its last statement was handed and not a fresh one a
+	// renewal put in its place, which no statement holds and the drain
+	// rightly does not wait for (issue #234).
+	catA.TestingPauseRenewal(true)
+	catB.TestingPauseRenewal(true)
+	execSQL(t, ctx, sA, `SELECT id FROM kv WHERE id = 1`)
+	execSQL(t, ctx, sB, `SELECT id FROM kv WHERE id = 1`)
 	desc := lookupDescriptor(t, ctx, tc.Nodes[0].DB(), "kv")
-	mustOutlast := maxLeaseExpiration(t, ctx, tc, desc.ID)
+	records := leaseRecords(t, ctx, tc, desc.ID)
+	mustOutlast := records.maxExpiration()
 	if mustOutlast == 0 {
 		t.Fatal("no lease records for the table; the gateways are not leasing")
 	}
+	catA.TestingPauseRenewal(false)
+	catB.TestingPauseRenewal(false)
 
 	execSQL(t, ctx, sA, `CREATE INDEX by_v ON kv (v)`)
 
 	if now := tc.Nodes[0].Clock().Now().WallTime; now < mustOutlast {
 		t.Fatalf("CREATE INDEX drained %s before the descriptor it superseded stopped being usable: "+
-			"a statement holding that descriptor can still commit, and its row would reach no index",
-			time.Duration(mustOutlast-now))
+			"a statement holding that descriptor can still commit, and its row would reach no index\n"+
+			"records sampled before the build, relative to the drain's end: %s\nrecords now: %s",
+			time.Duration(mustOutlast-now), records.describe(now), leaseRecords(t, ctx, tc, desc.ID).describe(now))
 	}
 }
 
-// maxLeaseExpiration is the latest expiration among the live lease records
-// on descID — the last moment any gateway's current descriptor could still
-// back a committing statement.
-func maxLeaseExpiration(t *testing.T, ctx context.Context, tc *TestCluster, descID uint64) int64 {
+// TestDrainOutlastsAnEntryARenewalReplaced (issue #234): the entry a
+// statement was handed need not be the entry current when the schema
+// change arrives. A renewal in between replaces it with a fresh one at
+// the same version, which no statement has taken — and a drain that
+// only looked at the entry being replaced at adoption had nothing to
+// wait for, while the statement could still commit under the old
+// descriptor for as long as its own entry lived. B's renewals are
+// driven by hand so the renewal lands exactly between the statement and
+// the schema change, and B adopts each version the moment it is
+// published — the fastest B could be, and so the earliest the drain
+// could end if it waited for nothing else.
+func TestDrainOutlastsAnEntryARenewalReplaced(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const ttl = 3 * time.Second
+	sA, catA := leasedSessionWithAccessor(t, tc, 0, ttl)
+	sB, catB := leasedSessionWithAccessor(t, tc, 0, ttl)
+	catA.TestingPauseRenewal(true)
+	catB.TestingPauseRenewal(true)
+
+	execSQL(t, ctx, sA, `CREATE TABLE kv (id INT PRIMARY KEY, v INT)`)
+	execSQL(t, ctx, sA, `INSERT INTO kv VALUES (1, 1), (2, 2)`)
+	execSQL(t, ctx, sA, `SELECT id FROM kv WHERE id = 1`)
+	execSQL(t, ctx, sB, `SELECT id FROM kv WHERE id = 1`)
+
+	// B's transaction plans a statement against B's current entry and is
+	// pinned to its expiration. A read, deliberately: a write would lay
+	// an intent the index backfill has to wait out, and this transaction
+	// stays open until the build is over — the property under test is
+	// when the drain ends, and the intent path is #110's.
+	execSQL(t, ctx, sB, `BEGIN`)
+	execSQL(t, ctx, sB, `SELECT id FROM kv WHERE id = 2`)
+	desc := lookupDescriptor(t, ctx, tc.Nodes[0].DB(), "kv")
+	pinned := leaseRecords(t, ctx, tc, desc.ID).maxExpiration()
+	if pinned == 0 {
+		t.Fatal("no lease records for the table; the gateways are not leasing")
+	}
+
+	// A renewal on B, same version: the entry the statement holds is
+	// replaced by one nobody has taken.
+	if err := catB.TestingRenewNow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := leaseRecords(t, ctx, tc, desc.ID).maxExpiration(); after <= pinned {
+		t.Fatalf("the renewal did not move B's lease (%d, was %d)", after, pinned)
+	}
+
+	// The schema change, with B adopting every version as soon as it is
+	// published.
+	built := make(chan *sql.Error, 1)
+	go func() {
+		_, serr := trySQL(ctx, sA, `CREATE INDEX by_v ON kv (v)`)
+		built <- serr
+	}()
+	var serr *sql.Error
+adopting:
+	for {
+		select {
+		case serr = <-built:
+			break adopting
+		case <-time.After(50 * time.Millisecond):
+			_ = catB.TestingRenewNow(ctx)
+		}
+	}
+	if serr != nil {
+		t.Fatalf("CREATE INDEX: [%s] %s", serr.Code, serr.Msg)
+	}
+	if now := tc.Nodes[0].Clock().Now().WallTime; now < pinned {
+		t.Fatalf("CREATE INDEX drained %s before the entry B's open transaction holds expires: "+
+			"a renewal replaced that entry, and the drain waited for nothing on B",
+			time.Duration(pinned-now))
+	}
+
+	// The entry B's transaction is pinned to has expired with the drain,
+	// so the transaction cannot commit: that is the deadline of #110
+	// doing its half of the work, and the drain has now done its half by
+	// not ending before the deadline could.
+	_, ierr := trySQL(ctx, sB, `INSERT INTO kv VALUES (99, 9)`)
+	_, cerr := trySQL(ctx, sB, `COMMIT`)
+	if ierr == nil && cerr == nil {
+		t.Fatal("B committed a transaction pinned to a descriptor entry that expired before the build ended")
+	}
+}
+
+// leaseRecord is a gateway's lease record on a descriptor, read as data:
+// these tests are about the contract the drain honours, not the struct
+// that carries it.
+type leaseRecord struct {
+	Version         uint64 `json:"version"`
+	Expiration      int64  `json:"expiration"`
+	PriorExpiration int64  `json:"prior_expiration"`
+}
+
+type leaseRecordList []leaseRecord
+
+// leaseRecords reads the live lease records on descID.
+func leaseRecords(t *testing.T, ctx context.Context, tc *TestCluster, descID uint64) leaseRecordList {
 	t.Helper()
 	lo, hi := keys.DescLeaseSpan(descID)
 	rows, err := tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var max int64
+	var out leaseRecordList
 	for _, kv := range rows {
-		// The record's own shape, read as data: this test is about the
-		// contract the drain honours, not the struct that carries it.
-		var l struct {
-			Version    uint64 `json:"version"`
-			Expiration int64  `json:"expiration"`
-		}
+		var l leaseRecord
 		if json.Unmarshal(kv.Value, &l) != nil {
 			continue
 		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// maxExpiration is the latest expiration among the records — the last
+// moment any gateway's current descriptor could still back a committing
+// statement.
+func (rs leaseRecordList) maxExpiration() int64 {
+	var max int64
+	for _, l := range rs {
 		if l.Expiration > max {
 			max = l.Expiration
 		}
 	}
 	return max
+}
+
+// describe renders the records with their times relative to now.
+func (rs leaseRecordList) describe(now int64) string {
+	var parts []string
+	for _, l := range rs {
+		parts = append(parts, fmt.Sprintf("{v%d expires %+v prior %+v}", l.Version,
+			time.Duration(l.Expiration-now), time.Duration(l.PriorExpiration-now)))
+	}
+	return strings.Join(parts, " ")
 }

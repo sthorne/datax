@@ -11,7 +11,7 @@
     --surface: #fcfcfb; --panel: #ffffff; --border: #e4e3df;
     --text: #0b0b0b; --text-2: #52514e; --text-3: #8a897f;
     --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
-    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #8c0000;
     --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   }
   /* Dark is written out twice, and that is deliberate (issue #204).
@@ -28,7 +28,7 @@
       --surface: #1a1a19; --panel: #232322; --border: #3a3936;
       --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
       --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
-      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+      --series-5: #d55181; --series-6: #43b043; --series-7: #9085e9; --series-8: #3ce6ff;
     }
   }
   :root[data-theme="dark"] {
@@ -36,7 +36,7 @@
     --surface: #1a1a19; --panel: #232322; --border: #3a3936;
     --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
-    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+    --series-5: #d55181; --series-6: #43b043; --series-7: #9085e9; --series-8: #3ce6ff;
   }
   * { box-sizing: border-box; }
   body {
@@ -108,7 +108,10 @@
     padding: 10px 12px 8px; overflow: hidden;
   }
   .tile .label { font-size: 12px; color: var(--text-2); }
-  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; line-height: 1.25; }
+  /* Proportional figures: tabular digits are for columns that align
+     vertically, and a tile aligns with nothing. The reserved width is
+     what keeps the box still while the figure ticks (issue #218). */
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: proportional-nums; min-width: 4ch; margin-top: 2px; line-height: 1.25; }
   /* A value that is a phrase rather than a figure — "v0.53.1 · protocol
      v2 · cluster v16" — reads at a size that fits the box instead of
      wrapping into a paragraph of headline type. tile() decides by
@@ -116,8 +119,16 @@
   .tile .value.long { font-size: 14px; font-weight: 500; line-height: 1.45; }
   .tile .value .muted { display: block; font-size: 12px; font-weight: 400; line-height: 1.35; margin-top: 3px; }
   .tiles.ident .value { font-size: 15px; word-break: break-all; }
+  .tile .delta { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+  /* The sparkline is a reading (issue #218): the trend in the
+     de-emphasis grey, the baseline fainter, the "now" dot in the text
+     colour — never a series slot, which means a node elsewhere. Strokes
+     are non-scaling in the markup, so the stretched viewBox does not
+     thin the line or squash the dot. */
   .tile svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
-  .tile polyline { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
+  .tile polyline { fill: none; stroke: var(--text-3); stroke-width: 1.5; stroke-linejoin: round; }
+  .tile svg .base { stroke: var(--border); stroke-width: 1; }
+  .tile svg .now { stroke: var(--text); stroke-width: 5; stroke-linecap: round; }
   .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: 7px 12px; white-space: nowrap; }
@@ -195,7 +206,9 @@
   .problem.warning .sev { color: var(--warning); }
   .problem.info .sev { color: var(--series-1); }
   .problem .check { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2); flex: none; }
-  .problem a { color: var(--text-2); margin-left: auto; font-size: 12px; white-space: nowrap; }
+  .problem .since { color: var(--text-2); font-size: 12px; white-space: nowrap; flex: none; font-variant-numeric: tabular-nums; }
+  .problem .links { margin-left: auto; display: flex; gap: 10px; flex: none; }
+  .problem a { color: var(--text-2); font-size: 12px; white-space: nowrap; }
   /* Events: newest first, kind badge, audit rows marked. */
   #events td.when { color: var(--text-3); font-size: 12px; }
   .kind { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; border: 1px solid var(--border); color: var(--text-2); }
@@ -258,6 +271,8 @@
      with a chart scrolling sideways. */
   .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr)); gap: 14px; }
   .charts.compare { grid-template-columns: 1fr; }
+  .charts .note { grid-column: 1 / -1; font-size: 12px; }
+  .chart .endlabel { font-size: 11px; font-weight: 600; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
   .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
   .chart .title b { font-weight: 600; }
@@ -267,6 +282,9 @@
   .chart .axis text { fill: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
   .chart path.line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .chart .xhair { stroke: var(--text-3); stroke-width: 1; display: none; }
+  .chart .brush { fill: var(--text-3); opacity: .18; pointer-events: none; }
+  .chart .brushlabel { fill: var(--text-2); font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none; }
+  .chart .hit { cursor: crosshair; }
   .chart .dot { stroke: var(--panel); stroke-width: 2; display: none; }
   .chart .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin-top: 4px; }
   .chart .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; border-radius: 1px; }
@@ -388,8 +406,12 @@
   <h1>datax</h1>
   <nav id="nav" aria-label="views"></nav>
   <span class="controls-hdr">
-    <label>scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
-    <label>range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
+    <!-- data-help keys each control's glossary entry (issue #230): the
+         header is outside every view, so the help pop and the panel
+         reach these through the header itself; the select's title stays
+         the one-line version. -->
+    <label data-help="scope">scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
+    <label data-help="range">range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
     <!-- Display preferences (issue #204). A <details>, like the user
          menu, because these are set once and then never again: giving
          them permanent header width alongside scope and range — which an
@@ -401,12 +423,12 @@
     <details class="display" id="display-menu">
       <summary title="how this console looks and how it writes a moment">display ▾</summary>
       <div class="menu">
-        <label>theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
-        <label>timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
+        <label data-help="theme">theme <select id="theme-picker" title="light, dark, or whatever this device asks for"></select></label>
+        <label data-help="timestamps">timestamps <select id="time-picker" title="whether a moment reads as how long ago it was or as the clock time it happened at"></select></label>
         <span class="prefnote" id="pref-note" hidden></span>
       </div>
     </details>
-    <button type="button" id="jump-open" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
+    <button type="button" id="jump-open" data-help="jump to" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
     <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
   <span class="sub" id="hdr-node">connecting…</span>
@@ -491,7 +513,7 @@
     <div class="tablewrap wide-only"><table id="latency"></table></div>
     <div class="tablewrap narrow-only"><table class="cards">
       <caption class="sr-only">Network: worst pairs</caption>
-      <thead><tr><th scope="col">pair</th><th scope="col" class="num">round trip</th><th scope="col" class="num">clock offset</th></tr></thead>
+      <thead><tr><th scope="col">pair</th><th scope="col" class="num">round trip</th><th scope="col" class="num">p99</th><th scope="col" class="num">clock offset</th></tr></thead>
       <tbody id="latency-worst"></tbody>
     </table></div>
     <p class="muted" id="latency-note"></p>
@@ -711,7 +733,7 @@
   <section id="sec-ops-running">
     <h2>In flight</h2>
     <div class="tablewrap"><table class="cards">
-      <thead><tr><th scope="col">operation</th><th scope="col">what</th>
+      <thead><tr><th scope="col">operation</th><th scope="col">node</th><th scope="col">what</th>
         <th scope="col" class="num" title="how long it has been running">elapsed</th>
         <th scope="col">started</th></tr></thead>
       <tbody id="ops-running"></tbody>
@@ -721,7 +743,7 @@
   <section id="sec-ops-done">
     <h2>Recently completed</h2>
     <div class="tablewrap"><table class="cards">
-      <thead><tr><th scope="col">operation</th><th scope="col">what</th>
+      <thead><tr><th scope="col">operation</th><th scope="col">node</th><th scope="col">what</th>
         <th scope="col">outcome</th>
         <th scope="col" class="num" title="how long it took">took</th>
         <th scope="col">finished</th></tr></thead>
@@ -837,8 +859,17 @@
 </main>
 </div>
 <style>
-.chart .annotations line.ann { stroke-width: 1; stroke-dasharray: 3 3; opacity: .38; }
-.chart .annhit:hover + line.ann, .chart .annotations:hover line.ann { opacity: .6; }
+/* An event mark is one neutral colour, never a node's (issue #217): the
+   dash says "event", the label says which node. The hit rects take no
+   pointer events — the plot's own hit rect resolves the nearest mark —
+   and are the keyboard's way to a mark. */
+.chart .annotations line.ann { stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 3 3; opacity: .45; }
+.chart .annhit { pointer-events: none; }
+.chart .annhit:focus-visible { outline: none; }
+.chart .annhit:focus-visible + line.ann, .chart .annhit:focus-visible { opacity: 1; }
+.chart .tip .e { margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); color: var(--text-2); max-width: 260px; white-space: normal; }
+.chart .hit:focus-visible { outline: 2px solid var(--series-1); outline-offset: -2px; }
+.chart details table.annrows { margin-top: 8px; }
 .chart .annnote { margin: 4px 0 0; font-size: 12px; }
 </style>
 <script>__CONSOLE_SCRIPTS__</script>

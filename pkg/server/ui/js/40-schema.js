@@ -25,11 +25,11 @@ function renderSchema(d) {
     const hiddenNames = new Set((t.columns || []).filter(c => c.hidden).map(c => c.name));
     const pk = (t.primary_key || []).filter(n => !hiddenNames.has(n));
     const colList = cols.map(c => `${c.name} ${c.type}${c.precision ? `(${c.precision},${c.scale})` : ""}${c.not_null ? " not null" : ""}`).join("\n");
-    const idx = (t.indexes || []).map(i => `${i.unique ? "unique " : ""}${esc(i.name)} (${(i.columns || []).map(esc).join(", ")})${i.state === "write-only" ? ' <span class="st draining">building</span>' : ""}`).join("<br>");
+    const idx = (t.indexes || []).map(i => `${i.unique ? "unique " : ""}${esc(i.name)} (${(i.columns || []).map(esc).join(", ")})${i.state === "write-only" ? " " + tok("draining", "building") : ""}`).join("<br>");
     const ts = t.view ? `<div class="muted" style="font-size:12px" title="${esc(t.definition || "")}">view</div>` : t.timeseries ? `<div class="muted" style="font-size:12px">timeseries${t.retention_seconds ? " · retention " + fmtRetention(t.retention_seconds) : ""}${t.shards ? " · " + t.shards + " shards" : ""}</div>` : "";
     const st = t.stats;
     const rows = t.view ? "—" : st ? st.row_count.toLocaleString() : `<span class="muted">not analyzed</span>`;
-    const age = st ? (st.stale ? `<span class="st draining">${fmtWhen(Date.now() - st.age_seconds * 1000)}</span>` : fmtWhen(Date.now() - st.age_seconds * 1000)) : "—";
+    const age = st ? (st.stale ? warn("draining", fmtWhen(Date.now() - st.age_seconds * 1000)) : fmtWhen(Date.now() - st.age_seconds * 1000)) : "—";
     const grants = Object.entries(t.privileges || {}).map(([u, p]) => `${esc(u)}: ${p.map(esc).join(",").toLowerCase()}`).join("<br>") || `<span class="muted">admins only</span>`;
     const key = (t.database || "") + "." + t.name;
     const to = tableKey(t);

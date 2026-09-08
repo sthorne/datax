@@ -41,7 +41,8 @@ async function fetchMetrics() {
   const box = document.getElementById("charts");
   if (mv.series.length === 0) { box.innerHTML = `<div class="muted">pick a series above</div>`; return; }
   try {
-    const p = new URLSearchParams({ series: mv.series.join(","), since: RANGE_SECONDS[ui.range] + "s" });
+    const p = new URLSearchParams(windowQuery());
+    p.set("series", mv.series.join(","));
     if (mv.rate) p.set("rate", "1");
     if (mv.nodes) p.set("node", mv.nodes.join(","));
     const resp = await fetch("/api/metrics?" + p.toString(), { cache: "no-store" });
@@ -54,7 +55,7 @@ async function fetchMetrics() {
     // The marks come from the same window the charts draw, fetched
     // alongside rather than after, so a chart never renders once bare
     // and then again annotated (issue #155).
-    await fetchAnnotations(mv.data.from_ms || (Date.now() - RANGE_SECONDS[ui.range] * 1000));
+    await fetchAnnotations(mv.data.from_ms || windowStart());
     renderCharts();
   } catch (err) {
     box.innerHTML = `<div class="err" style="display:block">metrics unavailable: ${esc(err.message || err)}</div>`;
@@ -117,40 +118,66 @@ async function fetchAnnotations(fromMs) {
   } catch (err) { ann.events = []; }
 }
 
-// annotationLayer draws the marks for one chart's window, plus the
-// hover targets. Returns SVG.
-function annotationMarks(from, to, x, T, PH, colour) {
+// annotationMarks draws the marks for one chart's window and returns
+// them as a list too, for the pointer, the keyboard and the table.
+//
+// A mark is a different kind of thing from a series — an event, not a
+// value — so it is drawn in one neutral event colour from the
+// stylesheet, never in the hue of the node that served it: on a chart
+// plotting n3, an event on n3 in n3's colour is one colour with two
+// meanings. The node is named in the label instead (issue #217).
+//
+// The rects are the keyboard's way in: each is focusable and shows the
+// same readout on focus that the pointer shows on hover. They take no
+// pointer events themselves — the plot's one hit rect resolves the
+// nearest mark to the pointer, so marks a few pixels apart (a rolling
+// restart) are each reachable rather than shadowing one another.
+function annotationMarks(from, to, x, T, PH) {
   const kinds = annotationKindsSelected();
   const marks = ann.events.filter(e => {
     const t = Date.parse(e.at);
     return (kinds === null || kinds.has(e.kind)) && t >= from && t <= to;
-  });
-  if (!marks.length) return { svg: "", count: 0 };
-  let svg = `<g class="annotations">`;
-  for (const e of marks) {
+  }).map(e => {
     const t = Date.parse(e.at);
-    const xx = x(t).toFixed(1);
-    const title = `${e.kind} · ${fmtTime(t, true)}\n${e.summary}`;
-    svg += `<line class="ann" x1="${xx}" x2="${xx}" y1="${T}" y2="${T + PH}" stroke="${colour}"/>`;
-    svg += `<rect class="annhit" x="${(Number(xx) - 4).toFixed(1)}" y="${T}" width="8" height="${PH}" fill="transparent"><title>${esc(title)}</title></rect>`;
-  }
-  return { svg: svg + `</g>`, count: marks.length };
+    return { t, x: x(t), kind: e.kind, summary: e.summary, label: `${e.kind}${ann.node ? ` on n${ann.node}` : ""} · ${fmtTime(t, true)} — ${e.summary}` };
+  });
+  if (!marks.length) return { svg: "", count: 0, list: [] };
+  let svg = `<g class="annotations">`;
+  marks.forEach((m, i) => {
+    const xx = m.x.toFixed(1);
+    svg += `<line class="ann" x1="${xx}" x2="${xx}" y1="${T}" y2="${T + PH}"/>`;
+    svg += `<rect class="annhit" data-mark="${i}" tabindex="0" role="img" aria-label="${esc(m.label)}" x="${(m.x - 4).toFixed(1)}" y="${T}" width="8" height="${PH}" fill="transparent"/>`;
+  });
+  return { svg: svg + `</g>`, count: marks.length, list: marks };
 }
 
 function renderCharts() {
   const box = document.getElementById("charts");
-  box.classList.toggle("compare", mv.compare);
   box.innerHTML = "";
   const d = mv.data;
-  for (const s of d.series || []) {
+  // Faceted on request, or when the lines could not be told apart in
+  // one frame (issue #216): the note says which, since a reader who did
+  // not ask for one chart per node should know why they got it.
+  let forced = 0;
+  const series = d.series || [];
+  for (const s of series) if (!mv.compare && mustFacet(Object.keys(s.nodes || {}))) forced++;
+  const facet = mv.compare || forced > 0;
+  box.classList.toggle("compare", facet);
+  if (forced > 0) {
+    const n = document.createElement("div");
+    n.className = "muted note";
+    n.textContent = `one chart per node: more than ${MAX_LINES} nodes, or a node past n8, cannot be told apart by colour in one frame`;
+    box.appendChild(n);
+  }
+  for (const s of series) {
     const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
-    if (mv.compare && ids.length > 1) {
+    if (facet && ids.length > 1) {
       for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d, { annotate: true }));
     } else {
       box.appendChild(chart(s, s.nodes || {}, "", d, { annotate: true }));
     }
   }
-  if (!box.children.length) box.innerHTML = `<div class="muted">nothing to chart</div>`;
+  if (!box.querySelector(".chart")) box.innerHTML = `<div class="muted">nothing to chart</div>`;
 }
 // chart builds one panel: inline SVG, recessive grid, 2px lines, a
 // legend of node line-keys, the crosshair tooltip, and a table view.
@@ -159,13 +186,21 @@ function renderCharts() {
 // unless asked for, because the marks come from a fetch the metrics
 // view makes: a chart drawn elsewhere would otherwise carry whichever
 // window that view last looked at, which is worse than no marks.
+// BRUSH_MIN_BUCKETS is the narrowest window a brush can select, in the
+// chart's own buckets: below it the server answers with the same samples
+// drawn wider, which is resolution the data does not have, so the
+// selection is widened to it rather than honoured (issue #206).
+const BRUSH_MIN_BUCKETS = 8;
 function chart(s, nodes, suffix, win, opts) {
   const annotate = !!(opts && opts.annotate);
   const el = document.createElement("div");
   el.className = "chart";
   const unit = s.rate ? (s.unit || "/s") : s.unit;
   const ids = Object.keys(nodes).sort((a, b) => a - b);
-  const W = 800, H = 200, L = 58, R = 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
+  // Room on the right for the line-end labels when lines share a frame:
+  // identity in a second channel besides colour (issue #216).
+  const labelled = Object.keys(nodes).length > 1;
+  const W = 800, H = 200, L = 58, R = labelled ? 40 : 12, T = 10, B = 22, PW = W - L - R, PH = H - T - B;
   const from = win.from_ms, to = win.to_ms, step = win.step_ms;
   let min = 0, max = 0, any = false;
   for (const id of ids) for (const p of nodes[id]) { any = true; if (p[1] > max) max = p[1]; if (p[1] < min) min = p[1]; }
@@ -195,9 +230,7 @@ function chart(s, nodes, suffix, win, opts) {
   svg += `</g>`;
   // Annotations go in before the data: a mark explains a line, so it
   // must never be drawn over one.
-  const marks = annotate
-    ? annotationMarks(from, to, x, T, PH, ann.node ? nodeColor(String(ann.node)) : "var(--text-3)")
-    : { svg: "", count: 0 };
+  const marks = annotate ? annotationMarks(from, to, x, T, PH) : { svg: "", count: 0, list: [] };
   svg += marks.svg;
   for (const id of ids) {
     let dpath = "", prev = null;
@@ -208,15 +241,33 @@ function chart(s, nodes, suffix, win, opts) {
     }
     svg += `<path class="line" stroke="${nodeColor(id)}" d="${dpath}"/>`;
   }
+  // Direct labels at the line ends, nudged apart where ends coincide,
+  // so a reader never has to carry a colour from the legend to a line.
+  if (labelled) {
+    const ends = ids.map(id => { const p = nodes[id][nodes[id].length - 1]; return p ? { id, x: x(p[0]), y: y(p[1]) } : null; }).filter(Boolean).sort((a, b) => a.y - b.y);
+    for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 11) ends[i].y = ends[i - 1].y + 11;
+    for (const e of ends) svg += `<text class="endlabel" x="${(e.x + 4).toFixed(1)}" y="${(e.y + 4).toFixed(1)}" fill="${nodeColor(e.id)}">${esc(label(e.id))}</text>`;
+  }
+  svg += `<rect class="brush" x="0" y="${T}" width="0" height="${PH}" style="display:none"/>`;
+  svg += `<text class="brushlabel bl0" y="${T + 12}" text-anchor="end" style="display:none"></text><text class="brushlabel bl1" y="${T + 12}" text-anchor="start" style="display:none"></text>`;
   svg += `<line class="xhair" y1="${T}" y2="${T + PH}"/>`;
   for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;
-  svg += `<rect class="hit" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
+  // The hit rect is also the keyboard's crosshair: focus it and the
+  // arrow keys walk the buckets, showing what the pointer shows.
+  svg += `<rect class="hit" tabindex="0" role="img" aria-label="${esc(s.name)} values: focus and use the arrow keys to read each sample; [ and ] mark a window's ends and Enter narrows every chart to it, - widens" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
   let legend = ids.length > 1 ? `<div class="legend">` + ids.map(id => `<span><i style="background:${nodeColor(id)}"></i>${label(id)}</span>`).join("") + `</div>` : "";
   let table = `<details><summary>as a table</summary><div class="tablewrap"><table><thead><tr><th>time</th>` + ids.map(id => `<th class="num">${label(id)}</th>`).join("") + `</tr></thead><tbody>`;
   const times = [...new Set(ids.flatMap(id => nodes[id].map(p => p[0])))].sort((a, b) => b - a).slice(0, 30);
   const byT = {}; for (const id of ids) { byT[id] = new Map(nodes[id].map(p => [p[0], p[1]])); }
   for (const t of times) table += `<tr><td>${esc(fmtTime(t, true))}</td>` + ids.map(id => `<td class="num">${esc(byT[id].has(t) ? fmtUnit(byT[id].get(t), unit) : "—")}</td>`).join("") + `</tr>`;
-  table += `</tbody></table></div></details>`;
+  table += `</tbody></table>`;
+  // The marked events, so their text has a path that is not a hover.
+  if (marks.list.length) {
+    table += `<table class="annrows"><thead><tr><th>when</th><th>kind</th><th>summary</th></tr></thead><tbody>` +
+      marks.list.slice().sort((a, b) => b.t - a.t).map(m => `<tr><td>${esc(fmtTime(m.t, true))}</td><td>${esc(m.kind)}${ann.node ? ` <span class="muted">n${ann.node}</span>` : ""}</td><td>${esc(m.summary)}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+  table += `</div></details>`;
   let annNote = "";
   if (annotate && marks.count) {
     annNote = `<div class="muted annnote">${marks.count} event${marks.count === 1 ? "" : "s"} marked` +
@@ -228,14 +279,24 @@ function chart(s, nodes, suffix, win, opts) {
     annNote = `<div class="muted annnote">the event ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}; earlier in this window is unmarked rather than quiet</div>`;
   }
   el.innerHTML = title + svg + legend + `<div class="tip"></div>` + annNote + table;
-  // Crosshair: snap to the nearest bucket; the readout lists every node.
+  // Crosshair: snap to the nearest bucket; the readout lists every node,
+  // and the nearest mark when one is within reach of the pointer.
   const svgEl = el.querySelector("svg"), hit = el.querySelector(".hit"), xh = el.querySelector(".xhair"), tip = el.querySelector(".tip");
   const dots = {}; el.querySelectorAll(".dot").forEach(c => dots[c.dataset.node] = c);
-  hit.addEventListener("pointermove", ev => {
+  // nearestMark is the mark closest to plot position px, within reach
+  // (12 viewBox units, about 12 px at the chart's natural width): one
+  // resolution for every mark, so none is shadowed by a neighbour.
+  const nearestMark = px => {
+    let best = null;
+    for (const m of marks.list) if (Math.abs(m.x - px) <= 12 && (best === null || Math.abs(m.x - px) < Math.abs(best.x - px))) best = m;
+    return best;
+  };
+  const hide = () => { xh.style.display = "none"; tip.style.display = "none"; for (const id of ids) dots[id].style.display = "none"; };
+  // showAt draws the crosshair at bucket t and fills the readout; the
+  // tip is anchored at client (cx, cy), or under the crosshair when the
+  // reader is on the keyboard and there is no pointer to anchor to.
+  const showAt = (t, mark, cx, cy) => {
     const r = svgEl.getBoundingClientRect();
-    const px = (ev.clientX - r.left) / r.width * W;
-    let t = from + Math.round((px - L) / PW * (to - from) / step) * step;
-    t = Math.max(from, Math.min(to, t));
     xh.setAttribute("x1", x(t)); xh.setAttribute("x2", x(t)); xh.style.display = "block";
     tip.replaceChildren();
     const tt = document.createElement("div"); tt.className = "t"; tt.textContent = fmtTime(t, true); tip.appendChild(tt);
@@ -250,11 +311,104 @@ function chart(s, nodes, suffix, win, opts) {
       const b = document.createElement("b"); b.textContent = fmtUnit(v, unit);
       row.appendChild(b); row.appendChild(k); tip.appendChild(row);
     }
+    if (mark) { const e = document.createElement("div"); e.className = "e"; e.textContent = mark.label; tip.appendChild(e); }
     tip.style.display = "block";
-    const left = (ev.clientX - r.left) + 14, flip = left + 160 > r.width;
-    tip.style.left = flip ? (ev.clientX - r.left - 14 - tip.offsetWidth) + "px" : left + "px";
-    tip.style.top = (ev.clientY - r.top + 20) + "px";
+    if (cx === undefined) { cx = r.left + x(t) / W * r.width; cy = r.top + T / H * r.height; }
+    const left = (cx - r.left) + 14, flip = left + 160 > r.width;
+    tip.style.left = flip ? (cx - r.left - 14 - tip.offsetWidth) + "px" : left + "px";
+    tip.style.top = (cy - r.top + 20) + "px";
+  };
+  const bucket = t => Math.max(from, Math.min(to, from + Math.round((t - from) / step) * step));
+  let at = to;
+  // Brush to zoom (issue #206): a drag across the plot selects a window
+  // and, on release, applies it to every chart on the page. The band
+  // and its edge times are drawn while dragging, so what is about to be
+  // picked can be seen before it is; a press without a drag is the
+  // crosshair as before. A selection narrower than BRUSH_MIN_BUCKETS is
+  // widened to that, around its middle, and kept inside the chart.
+  const brush = el.querySelector(".brush"), bl0 = el.querySelector(".bl0"), bl1 = el.querySelector(".bl1");
+  const pxOf = ev => { const r = svgEl.getBoundingClientRect(); return (ev.clientX - r.left) / r.width * W; };
+  const tAt = px => from + (Math.max(L, Math.min(L + PW, px)) - L) / PW * (to - from);
+  const minWindow = BRUSH_MIN_BUCKETS * step;
+  const selection = (a, b) => {
+    let lo = Math.min(a, b), hi = Math.max(a, b);
+    if (hi - lo < minWindow) { const mid = (lo + hi) / 2; lo = mid - minWindow / 2; hi = mid + minWindow / 2; }
+    if (lo < from) { hi += from - lo; lo = from; }
+    if (hi > to) { lo -= hi - to; hi = to; }
+    return [Math.max(from, lo), Math.min(to, hi)];
+  };
+  const drawBrush = (lo, hi) => {
+    brush.setAttribute("x", x(lo).toFixed(1)); brush.setAttribute("width", Math.max(0, x(hi) - x(lo)).toFixed(1)); brush.style.display = "block";
+    bl0.textContent = fmtTime(lo, true); bl0.setAttribute("x", (x(lo) - 4).toFixed(1)); bl0.style.display = "block";
+    bl1.textContent = fmtTime(hi, true); bl1.setAttribute("x", (x(hi) + 4).toFixed(1)); bl1.style.display = "block";
+  };
+  const hideBrush = () => { brush.style.display = "none"; bl0.style.display = "none"; bl1.style.display = "none"; };
+  let drag = null, mark0 = null, mark1 = null;
+  hit.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
+    drag = { t0: tAt(pxOf(ev)), moved: false };
+    try { hit.setPointerCapture(ev.pointerId); } catch (err) { /* no capture: the drag ends at the plot's edge */ }
   });
-  hit.addEventListener("pointerleave", () => { xh.style.display = "none"; tip.style.display = "none"; for (const id of ids) dots[id].style.display = "none"; });
+  hit.addEventListener("pointermove", ev => {
+    const px = pxOf(ev);
+    if (drag) {
+      drag.moved = drag.moved || Math.abs(px - x(drag.t0)) > 4;
+      if (drag.moved) { hide(); const [lo, hi] = selection(drag.t0, tAt(px)); drawBrush(lo, hi); return; }
+    }
+    at = bucket(tAt(px));
+    showAt(at, nearestMark(px), ev.clientX, ev.clientY);
+  });
+  hit.addEventListener("pointerup", ev => {
+    if (!drag) return;
+    const d = drag; drag = null; hideBrush();
+    if (!d.moved) return;
+    const [lo, hi] = selection(d.t0, tAt(pxOf(ev)));
+    setWindow(lo, hi);
+  });
+  hit.addEventListener("pointercancel", () => { drag = null; hideBrush(); });
+  hit.addEventListener("pointerleave", () => { if (!drag) hide(); });
+  // Keyboard: the arrow keys walk the buckets, Home and End jump to the
+  // window's ends, Escape hides; a mark is read when the crosshair is
+  // on its bucket.
+  hit.addEventListener("focus", () => showAt(at, nearestMark(x(at))));
+  hit.addEventListener("blur", hide);
+  // The keyboard's brush: [ and ] mark the window's ends at the
+  // crosshair (the band shows the selection so far), Enter applies it,
+  // Escape drops it, and - widens the window to twice its span.
+  hit.addEventListener("keydown", ev => {
+    const stepBy = ev.shiftKey ? 10 : 1;
+    if (ev.key === "ArrowLeft") at = bucket(at - stepBy * step);
+    else if (ev.key === "ArrowRight") at = bucket(at + stepBy * step);
+    else if (ev.key === "Home") at = from;
+    else if (ev.key === "End") at = to;
+    else if (ev.key === "[" || ev.key === "]") {
+      if (ev.key === "[") mark0 = at; else mark1 = at;
+      ev.preventDefault();
+      const [lo, hi] = selection(mark0 ?? at, mark1 ?? at);
+      drawBrush(lo, hi);
+      return;
+    } else if (ev.key === "Enter") {
+      if (mark0 === null && mark1 === null) return;
+      ev.preventDefault();
+      const [lo, hi] = selection(mark0 ?? from, mark1 ?? to);
+      mark0 = mark1 = null; hideBrush();
+      setWindow(lo, hi);
+      return;
+    } else if (ev.key === "-") {
+      ev.preventDefault();
+      const span = to - from;
+      setWindow(Math.max(from - span / 2, Date.now() - RANGE_SECONDS["7d"] * 1000), Math.min(to + span / 2, Date.now()));
+      return;
+    } else if (ev.key === "Escape") { mark0 = mark1 = null; hideBrush(); hide(); return; }
+    else return;
+    ev.preventDefault();
+    showAt(at, nearestMark(x(at)));
+  });
+  // A mark focused from the keyboard reads as the pointer resting on it.
+  for (const rect of el.querySelectorAll(".annhit")) {
+    const m = marks.list[Number(rect.dataset.mark)];
+    rect.addEventListener("focus", () => showAt(bucket(m.t), m));
+    rect.addEventListener("blur", hide);
+  }
   return el;
 }

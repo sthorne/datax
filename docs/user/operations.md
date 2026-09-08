@@ -31,8 +31,10 @@ serves, on that address:
   it — each with the count of contributing nodes beside it when a node
   is down, so a smaller number is never mistaken for a quieter cluster.
   Below them: a problems panel (every finding of the health checks
-  below, colored by severity, each linking to the **view** that shows
-  the figure; a green line when there are none), one card per node
+  below, colored by severity, each saying when this node's checks first
+  found it and linking to the **view** that shows the figure and to its
+  **history** on the operations view; a green line when there are
+  none), one card per node
   (status, locality, CPU, load, memory, free space on the store's disk,
   file descriptors — colored and marked `!`/`!!` when they deserve a
   look — leases, data, QPS, connections, heartbeat age) opening that
@@ -99,7 +101,14 @@ serves, on that address:
   and within three days a critical one.
 
   **ops**: the operations in flight and the ones that have finished,
-  above the scoped node's event ring with a kind filter. A long-running
+  above the scoped node's event ring with a kind filter. Under the
+  whole-cluster scope the two operation tables are every node's,
+  merged, each row naming the node it is on — a decommission is driven
+  by the draining node and a backup runs where it was started, so the
+  operation worth watching is usually on a node other than the one
+  serving the page; a node that did not answer is named beside the rows
+  that did (admin role; without it, and under a node's scope, the
+  tables are that node's own). A long-running
   operation — a backup, a restore, a re-encryption, a node's drain —
   records both of its ends in the ring, so the view pairs them and shows
   the elapsed time of the ones still running and the duration and
@@ -117,7 +126,7 @@ serves, on that address:
   any authenticated user; the per-user connection breakdown and the
   client certificates this node has been shown need the admin role, as
   the audit records do. **metrics** charts any of the series the cluster records about
-  itself over the header's time range, one chart per series with one
+  itself over the header's time range — or over a window dragged out on any chart, which the page's address then carries, so a narrowed chart is a link — one chart per series with one
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from
@@ -191,18 +200,29 @@ serves, on that address:
   carry data.
 - **`/api/health`** — JSON: the problems panel's document: the findings
   of the health checks (see [Health checks](#health-checks)), sorted
-  critical first, and how many checks ran. Empty `problems` with a
-  non-zero `checks` count means green. Recomputed at most every 3 s.
+  critical first, each with `since_unix_ms` (when this node's checks
+  first found it open), and how many checks ran. Empty `problems` with
+  a non-zero `checks` count means green. Recomputed at most every 3 s.
 - **`/api/events?since=N&limit=M`** — JSON: the serving node's recent
   operational events (the last 500 are kept in memory; `since` returns
   only those after sequence `N`, which is how the dashboard tails). In
   secure mode audit records (authentication failures, admin operations,
-  privilege DDL) are included only for the admin role.
+  privilege DDL) are included only for the admin role, and a split or
+  merge event names its keys in full only to a caller who may read
+  every table they belong to — to anyone else the keys appear at their
+  table-and-index prefix by id (the boundary is a row value; the same
+  rule as the range lists on `/status` and `/api/cluster`).
 - **`/api/node?id=N`** — JSON: the node detail page's document. The
   serving node answers for itself to any authenticated user; another
   node's document is fetched from that node over the internode RPC and
   needs the admin role (403 otherwise). Statement text and audit
   events are included only for admins.
+- **`/api/operations`** — JSON: every node's operations — the pairs of
+  start and end records in its event ring plus what it knows is still
+  open — merged over the internode RPC, running first, each with the
+  node it is on. `nodes` of `nodes_asked` answered; a node that did not
+  is named in `errors` with its heartbeat age, and the rest of the
+  document stands. Admin role required.
 - **`/api/statements`** — JSON: the statement shapes the cluster ran,
   unioned from every node over the internode RPC and re-ranked by total
   time; each entry carries the summable figures plus each node's own row
@@ -231,8 +251,8 @@ hold, and signs you out — the credentials are the database credentials
 console](security.md#signing-in-to-the-console)). Scripted clients are
 unaffected: HTTP Basic credentials of any database user, or a client
 certificate, authenticate every route as before. `/api/range`,
-`/api/activity` and another node's `/api/node` additionally require the
-admin role ([Security](security.md)). Without that role the cluster
+`/api/activity`, `/api/operations` and another node's `/api/node`
+additionally require the admin role ([Security](security.md)). Without that role the cluster
 ranges are not clickable and the note under them says which user is
 signed in and how to proceed (`GRANT ADMIN TO ops`, or sign out and back
 in as `root`). `/api/cluster` carries the same identity in its
@@ -247,8 +267,31 @@ in `/api/health`, and as the gauge `datax_health_problems{severity,check}`
 (one series per finding; a check that finds nothing has no series).
 Alert on `datax_health_problems{severity="critical"} > 0` for the
 page-worthy ones and on `severity="warning"` for the rest, and the panel
-on any node's dashboard says what and where. The checks, with the
-section the dashboard row links to:
+on any node's dashboard says what and where.
+
+A finding has a history. Each row carries when this node's checks first
+found it (`since_unix_ms`; a problem is the same problem while its check,
+node and range agree, whatever its summary's figures now say), and the
+two transitions — the problem appearing, and the same problem clearing,
+with how long it was open — are recorded on the node's event ring under
+the kind `health` and nowhere in between, so a check that flaps leaves
+a pair of records per flap rather than a stream. The row's **history**
+link opens the operations view filtered to that check's records
+(`#/ops?kind=health&q=<check>`), which is where "has this been
+flapping" and "did it clear on its own" are answered. Both are as one
+node sees them: every node runs the checks for itself when something
+asks it for the document, so two nodes' consoles may date a problem a
+few seconds apart, and a restarted node dates every open problem from
+its first run.
+
+Acknowledging a finding is deliberately not a console feature. An
+acknowledgement is state that outlives a process and belongs to the
+cluster, and the console does not write to the cluster; it belongs to
+whatever alerts on `datax_health_problems`, which has silences with an
+owner and an expiry. The console's job is to report the state
+truthfully, and a row that says how long it has been open is one an
+operator can decide about at a glance. The checks, with the section the
+dashboard row links to:
 
 | Check | Severity | Fires when |
 |---|---|---|
@@ -514,6 +557,10 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   is opened, and a symlink or a directory at the manifest's or a data
   file's name is refused without being followed, so a directory prepared
   by someone else cannot point the node at a path of their choosing.
+  The system records a backup carries (users, roles, databases,
+  sequences) are written back only to the key spans backup collected
+  them from; a manifest carrying any other key — the cluster's
+  authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
   included — and must chain within the MVCC GC window (25h by default): an
   older base is refused with "incremental base too old". Take a fresh full

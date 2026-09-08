@@ -248,12 +248,15 @@ func (n *Node) startHTTP() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", n.requireMetrics(promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
-	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/status", func(w http.ResponseWriter, req *http.Request) {
 		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(n.statusSummary())
+		// Range keys and table names as the caller may see them (issue
+		// #213); this document has no field to say why roles could not
+		// be resolved, so that case simply shows every key at its prefix.
+		_ = enc.Encode(n.statusSummaryFor(n.keyViewer(req)))
 	})
 	mux.HandleFunc("/api/cluster", n.serveClusterAPI)
 	// Cross-node drill-down: fans out over the internode RPC, so it is
@@ -267,6 +270,9 @@ func (n *Node) startHTTP() error {
 	// fan-out below it runs under the node identity like /api/node's
 	// (issue #157).
 	mux.Handle("/api/statements", n.requireAdmin(http.HandlerFunc(n.serveStatementsAPI)))
+	// The cluster's operations fan out over the same RPC (issue #210);
+	// a node's ring carries admin-only records, so the same gate.
+	mux.Handle("/api/operations", n.requireAdmin(http.HandlerFunc(n.serveOperationsAPI)))
 	mux.Handle("/api/explain", n.requireAdmin(http.HandlerFunc(n.serveExplainAPI)))
 	// Profiles (issue #100): net/http/pprof under /debug/pprof/, admin-gated
 	// like the drill-downs — a profile exposes statement text and key
@@ -580,15 +586,23 @@ type NodeStatus struct {
 	Machine *sysstats.Sample `json:"machine,omitempty"`
 }
 
-func (n *Node) rangeStatuses() []RangeStatus {
+// rangeStatuses lists this store's replicas with every key rendered in
+// full: for the node's own use (metrics, the schema document's per-table
+// ranges) and the admin-gated paths. rangeStatusesFor is the form a
+// request is served.
+func (n *Node) rangeStatuses() []RangeStatus { return n.rangeStatusesFor(keyViewer{all: true}) }
+
+// rangeStatusesFor lists this store's replicas as the caller v may see
+// them (issue #213).
+func (n *Node) rangeStatusesFor(v keyViewer) []RangeStatus {
 	var out []RangeStatus
 	n.store.VisitReplicas(func(r *kvserver.Replica) bool {
 		desc := r.Desc()
 		rs := RangeStatus{
 			RangeID:        int64(desc.RangeID),
-			StartKey:       n.prettyKey(desc.StartKey),
-			EndKey:         n.prettyKey(desc.EndKey),
-			Table:          n.tableNameOf(desc.StartKey),
+			StartKey:       n.viewKey(v, desc.StartKey),
+			EndKey:         n.viewKey(v, desc.EndKey),
+			Table:          n.viewTable(v, desc.StartKey),
 			Leader:         r.IsLeader(),
 			Quiescent:      r.Quiescent(),
 			AppliedIndex:   r.AppliedIndex(),
@@ -612,8 +626,15 @@ func (n *Node) rangeStatuses() []RangeStatus {
 	return out
 }
 
-func (n *Node) statusSummary() NodeStatus {
-	ranges := n.rangeStatuses()
+// statusSummary is the /status document with every key rendered in
+// full: for the node's own use and the admin-gated paths. What a
+// request is served is statusSummaryFor.
+func (n *Node) statusSummary() NodeStatus { return n.statusSummaryFor(keyViewer{all: true}) }
+
+// statusSummaryFor is the /status document as the caller v may see it
+// (issue #213).
+func (n *Node) statusSummaryFor(v keyViewer) NodeStatus {
+	ranges := n.rangeStatusesFor(v)
 	st := NodeStatus{
 		NodeID:    int(n.ident.NodeID),
 		Address:   n.addr,
