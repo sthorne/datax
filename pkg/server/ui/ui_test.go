@@ -2138,32 +2138,46 @@ func TestOperationsUnderClusterScopeAreClusterWide(t *testing.T) {
 	}
 }
 
-// TestSeriesEightIsTellableFromEveryOtherSlot (issue #216, from the
-// console review of the combined PR): --series-8 and --series-2 were
-// both warm reds seven OKLab units apart in either theme, and a two-
-// line chart never facets, so n2 and n8 could not be told apart by
-// colour. The distances are computed here rather than trusted: every
-// pair involving slot 8 clears the normal-vision floor of 15 in both
-// themes.
-func TestSeriesEightIsTellableFromEveryOtherSlot(t *testing.T) {
+// TestSeriesPairsAreTellableApart (issue #216, from the console reviews
+// of the combined PR): --series-8 and --series-2 were both warm reds
+// seven OKLab units apart in either theme, and a two-line chart never
+// facets, so n2 and n8 could not be told apart by colour. The distances
+// are computed here rather than trusted, for every pair in both themes,
+// against the normal-vision floor of 15. The pairs still below it are
+// named (issue #240) so that a seventh cannot join them unnoticed, and
+// an exception that is later fixed must be removed from the list.
+func TestSeriesPairsAreTellableApart(t *testing.T) {
 	page := string(mustRead(t, "index.html"))
 	light := page[strings.Index(page, ":root {"):]
 	light = light[:strings.Index(light, "}")]
 	di := strings.Index(page, "prefers-color-scheme: dark")
 	dark := page[di : di+1200]
 	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
+	// The pairs below the floor at this head, per theme, lower slot first.
+	// Issue #240 is the palette work that clears them.
+	knownBelow := map[string]map[[2]int]bool{
+		"light": {{2, 4}: true, {2, 5}: true},
+		"dark":  {{1, 7}: true, {2, 4}: true, {2, 5}: true, {3, 6}: true},
+	}
 	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
-		pal := map[string]string{}
+		pal := map[int]string{}
 		for _, m := range slot.FindAllStringSubmatch(theme.css, -1) {
-			pal[m[1]] = m[2]
+			i, _ := strconv.Atoi(m[1])
+			pal[i] = m[2]
 		}
 		if len(pal) != 8 {
 			t.Fatalf("%s theme: found %d series slots, want 8", theme.name, len(pal))
 		}
-		for i := 1; i <= 7; i++ {
-			d := oklabDistance(pal["8"], pal[strconv.Itoa(i)])
-			if d < 15 {
-				t.Errorf("%s theme: --series-8 %s and --series-%d %s are %.1f OKLab units apart; the floor for two lines with no other channel is 15", theme.name, pal["8"], i, pal[strconv.Itoa(i)], d)
+		for a := 1; a <= 8; a++ {
+			for b := a + 1; b <= 8; b++ {
+				d := oklabDistance(pal[a], pal[b])
+				known := knownBelow[theme.name][[2]int{a, b}]
+				switch {
+				case d < 15 && !known:
+					t.Errorf("%s theme: --series-%d %s and --series-%d %s are %.1f OKLab units apart; the floor for two lines with no other channel is 15, and this pair is not among the known exceptions (issue #240)", theme.name, a, pal[a], b, pal[b], d)
+				case d >= 15 && known:
+					t.Errorf("%s theme: --series-%d and --series-%d are %.1f apart, above the floor: remove the pair from the known exceptions", theme.name, a, b, d)
+				}
 			}
 		}
 	}
@@ -2218,6 +2232,23 @@ func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
 	for _, want := range []string{`"start key as shown (your role does not see the full key)"`, `"start key (as shown)"`, `"end key (as shown)"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("renderClusterRanges does not label the shown form %s", want)
+		}
+	}
+	// The node page's replica table copies keys too (QA on the combined
+	// PR): the same document, the same rule.
+	overview := string(mustRead(t, "js/30-overview.js"))
+	rr := jsFuncSpan(overview, "rangeRow")
+	if rr == nil {
+		t.Fatal("rangeRow not found")
+	}
+	if b := overview[rr[0]:rr[1]]; !strings.Contains(b, "lastCluster.keys_redacted") || !strings.Contains(b, "start key as shown (your role does not see the full key)") {
+		t.Error("rangeRow copies a redacted key under a key's name")
+	}
+	// Every key-copy site is one of the two above.
+	for _, name := range []string{"js/70-data.js", "js/30-overview.js", "js/45-table.js", "js/90-node.js"} {
+		src := string(mustRead(t, name))
+		if strings.Contains(src, `"'s start key"`) {
+			t.Errorf("%s labels a copied key unconditionally", name)
 		}
 	}
 	g, err := loadGlossary()

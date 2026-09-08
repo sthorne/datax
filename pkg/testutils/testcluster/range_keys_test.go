@@ -124,6 +124,20 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	if err := json.Unmarshal([]byte(get(bases[0]+"/api/cluster", "reader", "reader-pw")), &cluster); err != nil {
 		t.Fatal(err)
 	}
+	// And the document says its keys are the shown form, so the console
+	// does not copy one under a key's name (QA on the combined PR: the
+	// flag has to be seen set, not only declared); the admin's says the
+	// opposite.
+	if !cluster.KeysRedacted {
+		t.Error("the reader's /api/cluster does not set keys_redacted")
+	}
+	var rootCluster server.ClusterStatus
+	if err := json.Unmarshal([]byte(get(bases[0]+"/api/cluster", "root", "topsecret")), &rootCluster); err != nil {
+		t.Fatal(err)
+	}
+	if rootCluster.KeysRedacted {
+		t.Error("root's /api/cluster sets keys_redacted")
+	}
 	var schema server.SchemaStatus
 	if err := json.Unmarshal([]byte(get(bases[0]+"/api/schema", "reader", "reader-pw")), &schema); err != nil {
 		t.Fatal(err)

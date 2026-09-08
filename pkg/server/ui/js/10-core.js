@@ -94,6 +94,11 @@ function fmtDuration(sec) {
 // fds past 80% of the limit likewise.
 // warn colours a figure worth a look and adds a text cue (colour is
 // never the only carrier): "!" for a warning, "!!" for a critical one.
+//
+// Both warn and tok insert text as HTML: the caller escapes it. Their
+// arguments are numbers, formatted numbers and state words the console
+// itself chose; a caller passing anything from a document must esc()
+// it first, as the ops note does.
 function warn(level, text) { return level ? `<span class="st ${level}">${text}<span class="cue" aria-label="${level === "down" ? "critical" : "warning"}">${level === "down" ? " !!" : " !"}</span></span>` : text; }
 // tok renders a state word — running, building, unreachable — as a status
 // token with the coloured dot in front of it. The dot is where the colour
