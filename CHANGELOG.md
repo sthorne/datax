@@ -335,6 +335,8 @@ state or the internode protocol does, and an entry below says so.
   exact key stays on the admin-gated `/api/range` and in the node's
   log. System and meta keys carry no row and are unchanged. Admins and
   insecure mode see everything, as before.
+
+### Changed
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
   `datax_metrics`. A v16 node knows nothing of the reservation and would
