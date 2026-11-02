@@ -138,12 +138,14 @@ state or the internode protocol does, and an entry below says so.
   `golang.org/x/text` v0.39.0 → v0.42.0 closes GO-2026-6629, a panic
   on crafted input in `secure/precis`, reached from SASLprep — that is,
   from the password an unauthenticated client sends to the console's
-  sign-in or as HTTP Basic credentials (the SCRAM exchange on the SQL
-  port never sees the plaintext), and from `CREATE`/`ALTER USER …
-  PASSWORD`, which is privileged and whose panic the statement
-  executor recovers. SASLprep's existing fallback to the raw string
-  on a `precis` *error* does not cover this: it is a panic, and on the
-  two unauthenticated paths it ends one HTTP request, not the process.
+  sign-in or as HTTP Basic credentials; from `CREATE`/`ALTER USER …
+  PASSWORD` over the SQL port, which is privileged and whose panic the
+  statement executor recovers (a SQL login itself cannot reach it: the
+  SCRAM exchange never sees the plaintext); and from the
+  `--root-password` seed at startup, the operator's own string.
+  SASLprep's existing fallback to the raw string on a `precis` *error*
+  does not cover this: it is a panic, and on the two unauthenticated
+  paths it ends one HTTP request, not the process.
   `golang.org/x/net` v0.53.0 → v0.60.0 closes four HTTP/2 server
   advisories (GO-2026-6617 an HPACK encoder race that crashes the
   server, GO-2026-6612 a double flow-control refund, GO-2026-6611 CPU
@@ -168,8 +170,11 @@ state or the internode protocol does, and an entry below says so.
   `toolchain go1.26.10`: every `go` command on the module, locally and
   in CI, switches to that release (`GOTOOLCHAIN=auto`, the default),
   and a standard-library advisory from now on is closed by moving that
-  line, which the weekly run will ask for by going red. Nothing in the
-  code changes.
+  line, which the weekly run will ask for by going red. The run (and
+  `make vulncheck`) now passes `-show verbose`, so the advisories in
+  required modules whose symbols the code does not reach are named in
+  the log instead of counted; until now nobody could say which they
+  were. Nothing in the code changes.
 - **Restore writes only the keys a backup collects** (#238, found in
   #237's review). A backup carries five groups of raw system records —
   users, admins, roles, databases, sequences — each collected from a
