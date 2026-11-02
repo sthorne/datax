@@ -129,6 +129,25 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Seven reachable advisories closed by moving three modules** (found
+  by the weekly govulncheck run #143 set up for exactly this: the code
+  had not changed since 0.58.0's last commit, the advisory database
+  had). `golang.org/x/text` v0.39.0 → v0.42.0 closes GO-2026-6629, a
+  panic on crafted input in `secure/precis`, reached from SASLprep —
+  that is, from the password an unauthenticated client sends to the
+  console's sign-in or as HTTP Basic credentials (the SCRAM exchange
+  on the SQL port never sees the plaintext). `golang.org/x/net` v0.53.0 → v0.60.0 closes four HTTP/2 server
+  advisories (GO-2026-6617 an HPACK encoder race that crashes the
+  server, GO-2026-6612 a double flow-control refund, GO-2026-6611 CPU
+  exhaustion from repeated initial-window changes, GO-2026-6603 memory
+  exhaustion through trailer headers), reached through the internode
+  gRPC server. `google.golang.org/grpc` v1.82.1 → v1.83.1 closes
+  GO-2026-6443, a server panic on a request with no `:authority` or
+  `Host` header, and GO-2026-6348, heap exhaustion through fragmented
+  DATA frames, both on the internode server. `x/sys`, `x/sync` and
+  `x/term` move as those require, and the `go` directive becomes
+  `1.26.0` because `x/net` v0.60.0 asks for it. Nothing in the code
+  changes.
 - **Restore writes only the keys a backup collects** (#238, found in
   #237's review). A backup carries five groups of raw system records —
   users, admins, roles, databases, sequences — each collected from a
