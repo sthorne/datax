@@ -2,6 +2,8 @@ module github.com/sthorne/datax
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/google/uuid v1.6.0
@@ -12,7 +14,7 @@ require (
 	go.etcd.io/raft/v3 v3.6.0
 	golang.org/x/term v0.46.0
 	golang.org/x/text v0.42.0
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 )
 
