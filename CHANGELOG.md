@@ -130,36 +130,46 @@ state or the internode protocol does, and an entry below says so.
 
 ### Security
 - **Every reachable advisory closed, by moving three modules and the
-  toolchain** (found by the weekly govulncheck run #143 set up
-  for exactly this: the code had not changed, the advisory database
-  had). `golang.org/x/text` v0.39.0 → v0.42.0 closes GO-2026-6629, a
-  panic on crafted input in `secure/precis`, reached from SASLprep —
-  that is, from the password an unauthenticated client sends to the
-  console's sign-in or as HTTP Basic credentials (the SCRAM exchange
-  on the SQL port never sees the plaintext). `golang.org/x/net`
-  v0.53.0 → v0.60.0 closes four HTTP/2 server advisories (GO-2026-6617
-  an HPACK encoder race that crashes the server, GO-2026-6612 a double
-  flow-control refund, GO-2026-6611 CPU exhaustion from repeated
-  initial-window changes, GO-2026-6603 memory exhaustion through
-  trailer headers), reached through the internode gRPC server.
-  `google.golang.org/grpc` v1.82.1 → v1.83.2 closes GO-2026-6443, a
-  server panic on a request with no `:authority` or `Host` header, and
-  GO-2026-6348, heap exhaustion through fragmented DATA frames, both
-  on the internode server (v1.83.1 closes the second but not the
-  first; the 1.83 line's fix for it is v1.83.2). `x/sys`, `x/sync` and
-  `x/term` move as those require.
-  The new `x/` releases require `go 1.26.0`, and that directive is
-  exact where `go 1.26` was a floor: CI's Go setup resolved `1.26` to
-  the newest 1.26 patch and now installs go1.26.0, whose standard
-  library carries thirty-six reachable advisories (in `net/http`,
-  `crypto/tls`, `crypto/x509`, `html/template`, `net/url`, `os` and
-  others; four are the `x/net` HTTP/2 ones again, in the bundled copy)
-  fixed across go1.26.1 through go1.26.10. So go.mod now also
-  says `toolchain go1.26.10`: every `go` command on the module, locally
-  and in CI, switches to that release (`GOTOOLCHAIN=auto`, the
-  default), and a standard-library advisory from now on is closed by
-  moving that line, which the weekly run will ask for by going red.
-  Nothing in the code changes.
+  toolchain.** The weekly govulncheck run #143 set up for exactly this
+  — advisories appear against code that has not changed — had been
+  red for seven consecutive weeks, since 2026-09-21, first with two
+  reachable advisories and by 2026-11-02 with seven, and nothing was
+  reading it; the alarm worked and went unanswered, which is #244.
+  `golang.org/x/text` v0.39.0 → v0.42.0 closes GO-2026-6629, a panic
+  on crafted input in `secure/precis`, reached from SASLprep — that is,
+  from the password an unauthenticated client sends to the console's
+  sign-in or as HTTP Basic credentials (the SCRAM exchange on the SQL
+  port never sees the plaintext), and from `CREATE`/`ALTER USER …
+  PASSWORD`, which is privileged and whose panic the statement
+  executor recovers. SASLprep's existing fallback to the raw string
+  on a `precis` *error* does not cover this: it is a panic, and on the
+  two unauthenticated paths it ends one HTTP request, not the process.
+  `golang.org/x/net` v0.53.0 → v0.60.0 closes four HTTP/2 server
+  advisories (GO-2026-6617 an HPACK encoder race that crashes the
+  server, GO-2026-6612 a double flow-control refund, GO-2026-6611 CPU
+  exhaustion from repeated initial-window changes, GO-2026-6603 memory
+  exhaustion through trailer headers), reached through the internode
+  gRPC server. `google.golang.org/grpc` v1.82.1 → v1.83.2 closes
+  GO-2026-6443, a server panic on a request with no `:authority` or
+  `Host` header, and GO-2026-6348, heap exhaustion through fragmented
+  DATA frames, both on the internode server (v1.83.1 closes the second
+  but not the first; the 1.83 line's fix for it is v1.83.2). `x/sys`,
+  `x/sync` and `x/term` move as those require, and `go.sum` carries
+  OpenTelemetry 1.43.0 → 1.44.0 as gRPC's own test dependency, which
+  no package in the build imports.
+  All five `x/` modules at these releases require `go 1.26.0`, and that
+  directive is exact where `go 1.26` was a floor: CI's Go setup
+  resolved `1.26` to the newest 1.26 patch and now installs go1.26.0,
+  whose standard library carries thirty-six reachable advisories (in
+  `net/http`, `crypto/tls`, `crypto/x509`, `html/template`, `net/url`,
+  `os` and others; four are the `x/net` HTTP/2 ones again, in the
+  bundled copy, this time reached through the console's HTTP server)
+  fixed across go1.26.1 through go1.26.10. So go.mod now also says
+  `toolchain go1.26.10`: every `go` command on the module, locally and
+  in CI, switches to that release (`GOTOOLCHAIN=auto`, the default),
+  and a standard-library advisory from now on is closed by moving that
+  line, which the weekly run will ask for by going red. Nothing in the
+  code changes.
 - **Restore writes only the keys a backup collects** (#238, found in
   #237's review). A backup carries five groups of raw system records —
   users, admins, roles, databases, sequences — each collected from a
