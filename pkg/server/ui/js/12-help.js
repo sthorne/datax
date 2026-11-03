@@ -218,8 +218,8 @@ const HELP = {
   "expires": "When it stops being valid. Certificates are not renewed automatically here, so this date is a deadline someone has to act on.",
   "on": "The node this certificate was read from. Certificates are per node, so the same logical certificate can be a different file — and a different expiry — on each.",
   "encryption at rest": "Whether the store encrypts what it writes, and the state of any key rotation in progress.",
-  "state": "Whether the store is encrypted, plain, or part way through re-encrypting.",
-  "encryption": "Whether this store encrypts what it writes to disk. It covers data written from now on; anything already on disk is only encrypted once re-encryption has rewritten it.",
+  "state": "Whether the store is plain or encrypted, and for an encrypted store whether its files are authenticated: sealed so that a byte altered, moved or truncated on disk is refused at read rather than served. A store switches to the authenticated format from cluster version v18 — new files first, then, once none of the old format remains (re-encryption rewrites the sstables; a restart recreates the rest), the old format is refused for good. Before that an encrypted store is confidential against a stolen disk and nothing more.",
+  "encryption": "Whether this store encrypts what it writes to disk. It covers data written from now on; anything already on disk is only encrypted once re-encryption has rewritten it. Authenticated means every file is also sealed against alteration, so an attacker who can write to the disk cannot change, move or truncate data without the read failing.",
   "re-encryption": "Progress rewriting existing files under a new key after a rotation. Until it finishes, both keys are still needed.",
   "audit": "Security-relevant events this node recorded: sign-ins, refusals, privilege changes.",
 

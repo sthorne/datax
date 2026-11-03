@@ -60,6 +60,23 @@ type SecurityStore struct {
 	// after a rotation; nil when the store is not encrypted or no sweep
 	// has run.
 	Reencryption *cluster.ReencryptionStatus `json:"reencryption,omitempty"`
+	// Authenticated describes the store's switch to the authenticated
+	// file format (issue #220): whether new files are written that way,
+	// whether the old format is refused, and how many files of the old
+	// format remain in between.
+	Authenticated *AuthenticatedEncryption `json:"authenticated,omitempty"`
+}
+
+// AuthenticatedEncryption is a store's position in the switch to the
+// authenticated encryption format.
+type AuthenticatedEncryption struct {
+	// Writes: new files are written in the authenticated format.
+	Writes bool `json:"writes"`
+	// Only: the old format is refused; every file is authenticated.
+	Only bool `json:"only"`
+	// LegacyFiles is how many files of the old format remain while
+	// Writes is set and Only is not.
+	LegacyFiles int `json:"legacy_files,omitempty"`
 }
 
 // SecurityStatus is the /api/security document.
@@ -179,6 +196,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 		st := SecurityStore{NodeID: int(n.ident.NodeID), Encrypted: n.engine.Encrypted()}
 		if st.Encrypted {
 			st.Reencryption = n.reencryptionStatus()
+			st.Authenticated = n.authenticatedEncryption()
 		}
 		doc.Stores = append(doc.Stores, st)
 	}

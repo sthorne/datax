@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -74,6 +75,7 @@ type Engine struct {
 	encBase vfs.FS
 	encDir  string
 	encKeys *enc.KeySet
+	encFS   *enc.FS
 	encMu   sync.Mutex // serializes registry reseals
 	reenc   reencStatusCache
 	// filterRewrite caches the sweep for tables still carrying whole-key
@@ -182,6 +184,20 @@ func Open(dir string, o Options) (*Engine, error) {
 	}
 	if keys != nil {
 		e.encBase, e.encDir, e.encKeys = base, dir, keys
+		e.encFS = fs.(*enc.FS)
+		// A store that writes authenticated files converts, before Pebble
+		// opens it, the files Pebble keeps across opens and would
+		// otherwise leave in the old format for good — the MANIFEST, the
+		// OPTIONS file, its markers, a WAL about to be replayed. The
+		// sstables are the sweep's (issue #220). A conversion that fails
+		// leaves the store as it was: still readable, the cutover waits.
+		if e.encFS.AuthenticatedWrites() && !e.encFS.RefusesLegacy() {
+			if _, err := enc.ConvertLegacyFiles(base, dir, keys, func(name string) bool {
+				return !strings.HasSuffix(name, ".sst")
+			}); err != nil {
+				log.Warnf("%v", err)
+			}
+		}
 	}
 	opts.FS = fs
 	db, err := pebble.Open(dir, opts)

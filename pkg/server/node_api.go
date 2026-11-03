@@ -67,6 +67,9 @@ type NodeDetail struct {
 	OverloadReason     string                      `json:"overload_reason,omitempty"`
 	Encrypted          bool                        `json:"encrypted,omitempty"`
 	Reencryption       *cluster.ReencryptionStatus `json:"reencryption,omitempty"`
+	// Authenticated is the store's position in the switch to the
+	// authenticated encryption format (issue #220), as in /api/security.
+	Authenticated *AuthenticatedEncryption `json:"authenticated,omitempty"`
 
 	Latency  []kvpb.PeerLatency `json:"latency,omitempty"`
 	SQL      *kvpb.SQLSummary   `json:"sql,omitempty"`
@@ -131,6 +134,7 @@ func (n *Node) localNodeDetail(ctx context.Context, v keyViewer) NodeDetail {
 		d.Encrypted = n.engine.Encrypted()
 		if d.Encrypted {
 			d.Reencryption = n.reencryptionStatus()
+			d.Authenticated = n.authenticatedEncryption()
 		}
 	}
 	if n.pinger != nil {

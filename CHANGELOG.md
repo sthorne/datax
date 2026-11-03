@@ -129,6 +129,48 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Encryption at rest is authenticated** (#220, tiers 2 and 3; cluster
+  version **v18**). Until now an encrypted store was confidential against
+  a disk that leaves the building and nothing more: AES-256-CTR with no
+  authentication tag, so an attacker who could write to a live store's
+  files could truncate a WAL, flip chosen bits in a chosen row, or
+  substitute a file, and the node served the result as data — Pebble's
+  block checksums are keyless and sit inside the same keystream. A new
+  file format (`DXE2`) seals the content in 4 KiB chunks with AES-256-GCM
+  under a per-file key derived from the data key and a random salt; each
+  chunk's nonce is its position and its rewrite count, stored beside it,
+  so a WAL's tail chunk is rewritten on every append under a fresh nonce
+  (GCM must never seal two plaintexts under one); sstables and WAL
+  segments, which Pebble never renames, carry their own name in every
+  chunk. An altered byte, a chunk moved within or between files, a file
+  truncated anywhere but exactly between chunks, and a renamed sstable or
+  WAL are refused at read with an error rather than served. Not caught,
+  and said so in `docs/encryption.md`: a truncation exactly at a chunk
+  boundary (Pebble's own length checks cover sstables and the MANIFEST),
+  and a whole file rolled back or replaced by another of the same kind
+  and name from a store under the same data key.
+  A store switches in two steps, both recorded in its sealed registry:
+  from cluster version v18 it writes new files authenticated — at every
+  open from then on, converting the files Pebble keeps across opens (the
+  MANIFEST, OPTIONS, its markers, a WAL to replay) before Pebble starts,
+  and counting old-format sstables as stale for `datax debug reencrypt`
+  to rewrite — and once no old-format file remains it refuses the old
+  format for good, since a reader accepting both would accept a file
+  rewritten as the old one. `/api/security`, `/api/node`, the console's
+  security view and the node page's encryption tile say where a store
+  is: unauthenticated, switching with N old-format files left, or
+  authenticated. The operator's path after finalizing v18 is
+  `datax debug reencrypt --wait` and a restart per node. Tier 2's header
+  binding is subsumed: the salt keys the file and the name is in the
+  chunks' authenticated data. Tests: round trips across chunk
+  boundaries, the WAL append pattern, each tampering case from the
+  issue's list (`TestAEADRefusesTampering`), the formats' coexistence
+  and the strict refusal, a flipped byte in a real sstable refused by
+  the engine (`TestAuthenticatedStoreRefusesAnAlteredTable`), the whole
+  switch on a store (`TestAuthenticatedCutover`) and on a disk node
+  across a restart. Costs: 20 bytes per 4 KiB, a chunk decrypted per
+  read inside it (the block cache holds the plaintext), a chunk re-sealed
+  per WAL append.
 - **Every reachable advisory closed, by moving three modules and the
   toolchain.** The weekly govulncheck run #143 set up for exactly this
   — advisories appear against code that has not changed — had been

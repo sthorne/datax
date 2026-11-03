@@ -11,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Online encryption maintenance behind the admin RPCs:
@@ -204,6 +205,12 @@ func (n *Node) reencryptWorker(ctx context.Context) {
 			log.Infof("re-encryption complete: no live sstable under a retired data key")
 			n.events.RecordEnd("re-encryption", opID, "ok", "re-encryption complete: no live sstable under a retired data key")
 			done = true
+			// The sweep is also what retires sstables of the old,
+			// unauthenticated format: with none left, the store may now
+			// be able to refuse that format (issue #220).
+			if version.Version(n.clusterVersion.Load()) >= version.V18 {
+				n.switchToAuthenticatedEncryption()
+			}
 			return
 		}
 		if targeted == 0 {

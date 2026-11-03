@@ -285,11 +285,19 @@ function renderSecurityDoc() {
         : re && re.remaining_bytes > 0 ? warn("draining", fmtBytes(re.remaining_bytes) + " still on a retired key")
           : re && re.sweep_error ? warn("down", esc(re.sweep_error))
             : "every live sstable on the active key";
+      // The store's position in the switch to the authenticated file
+      // format: done (every file authenticated, the old format refused),
+      // switching (new files authenticated, N old ones left), or not
+      // started (an encrypted store before cluster version v18).
+      const au = st.authenticated;
+      const state = !st.encrypted ? `<span class="st draining"><span class="dot"></span>plaintext</span>`
+        : au && au.only ? `<span class="st live"><span class="dot"></span>encrypted, authenticated</span>`
+          : au && au.writes ? warn("draining", `encrypted, switching to authenticated: ${au.legacy_files || 0} old-format file(s) left`)
+            : `<span class="st live"><span class="dot"></span>encrypted, unauthenticated</span>`;
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${st.encrypted ? `<span class="st live"><span class="dot"></span>encrypted</span>`
-            : `<span class="st draining"><span class="dot"></span>plaintext</span>`}</td>
+        <td data-label="state">${state}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

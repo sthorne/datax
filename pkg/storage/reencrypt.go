@@ -37,6 +37,86 @@ func (e *Engine) RotateStoreKeyLive(oldKey, newKey []byte) error {
 	return enc.RotateStoreKey(e.encBase, e.encDir, oldKey, newKey)
 }
 
+// Authenticated encryption (issue #220). The switch from the CTR format
+// to the chunked AES-GCM one happens in two steps a store records in its
+// registry. First, new files are written authenticated
+// (EnableAuthenticatedFiles): the node asks for it once the cluster
+// version allows, and from then every open creates its files that way.
+// Second, once no file of the old format remains (the sweep rewrites the
+// sstables; the WAL, MANIFEST and OPTIONS are recreated by the next
+// open), the store refuses the old format for good
+// (CompleteAuthenticatedCutover) — until then a reader that accepted both
+// would accept a file rewritten as the old format, which is the downgrade
+// the whole change exists to close.
+
+// AuthenticatedFiles reports whether new files are written in the
+// authenticated format.
+func (e *Engine) AuthenticatedFiles() bool {
+	return e.encFS != nil && e.encFS.AuthenticatedWrites()
+}
+
+// AuthenticatedOnly reports whether the store refuses the unauthenticated
+// format (the cutover is complete).
+func (e *Engine) AuthenticatedOnly() bool {
+	return e.encFS != nil && e.encFS.RefusesLegacy()
+}
+
+// EnableAuthenticatedFiles makes the store write new files in the
+// authenticated format, now and at every later open (recorded in the
+// registry under storeKey). A no-op on a plaintext store or one already
+// switched.
+func (e *Engine) EnableAuthenticatedFiles(storeKey []byte) error {
+	if e.encFS == nil || e.encFS.AuthenticatedWrites() {
+		return nil
+	}
+	e.encMu.Lock()
+	defer e.encMu.Unlock()
+	if err := enc.MarkAuthenticatedWrites(e.encBase, e.encDir, storeKey); err != nil {
+		return err
+	}
+	e.encFS.EnableAuthenticatedWrites()
+	return nil
+}
+
+// LegacyEncryptedFiles lists the store's files still in the
+// unauthenticated format.
+func (e *Engine) LegacyEncryptedFiles() ([]string, error) {
+	if e.encFS == nil {
+		return nil, nil
+	}
+	return enc.LegacyFiles(e.encBase, e.encDir)
+}
+
+// CompleteAuthenticatedCutover makes the store refuse the unauthenticated
+// format if no file of it remains, recording that in the registry under
+// storeKey; otherwise it reports how many remain. done is also true when
+// the cutover was already complete.
+func (e *Engine) CompleteAuthenticatedCutover(storeKey []byte) (remaining int, done bool, err error) {
+	if e.encFS == nil {
+		return 0, false, nil
+	}
+	if e.encFS.RefusesLegacy() {
+		return 0, true, nil
+	}
+	if !e.encFS.AuthenticatedWrites() {
+		return 0, false, fmt.Errorf("the store still writes unauthenticated files; enable authenticated files first")
+	}
+	legacy, err := e.LegacyEncryptedFiles()
+	if err != nil {
+		return 0, false, err
+	}
+	if len(legacy) > 0 {
+		return len(legacy), false, nil
+	}
+	e.encMu.Lock()
+	defer e.encMu.Unlock()
+	if err := enc.MarkAuthenticated(e.encBase, e.encDir, storeKey); err != nil {
+		return 0, false, err
+	}
+	e.encFS.RefuseLegacy()
+	return 0, true, nil
+}
+
 // MatchStoreKey reports which of the candidate store keys seals this
 // engine's key registry (see enc.MatchStoreKey); 0 for a plaintext engine.
 func (e *Engine) MatchStoreKey(candidates [][]byte) (int, error) {
@@ -98,11 +178,14 @@ type staleTable struct {
 }
 
 // staleTables sweeps the live sstables and returns those whose data key
-// is not the active one. Files deleted mid-sweep are skipped.
+// is not the active one — and, once the store writes authenticated files,
+// those still in the unauthenticated format, which the same rewrite
+// retires. Files deleted mid-sweep are skipped.
 func (e *Engine) staleTables() ([]staleTable, error) {
 	if !e.Encrypted() {
 		return nil, nil
 	}
+	wantAuthenticated := e.AuthenticatedFiles()
 	activeID, _ := e.encKeys.Active()
 	levels, err := e.db.SSTables()
 	if err != nil {
@@ -112,11 +195,18 @@ func (e *Engine) staleTables() ([]staleTable, error) {
 	for l, level := range levels {
 		for _, t := range level {
 			name := fmt.Sprintf("%06d.sst", t.FileNum)
-			id, ok, err := enc.FileKeyID(e.encBase, e.encBase.PathJoin(e.encDir, name))
+			path := e.encBase.PathJoin(e.encDir, name)
+			id, ok, err := enc.FileKeyID(e.encBase, path)
 			if err != nil || !ok {
 				continue // deleted under us, or headerless
 			}
-			if id != activeID {
+			legacy := false
+			if wantAuthenticated {
+				if authenticated, ok, err := enc.FileAuthenticated(e.encBase, path); err == nil && ok {
+					legacy = !authenticated
+				}
+			}
+			if id != activeID || legacy {
 				out = append(out, staleTable{
 					fileNum:  uint64(t.FileNum),
 					level:    l,

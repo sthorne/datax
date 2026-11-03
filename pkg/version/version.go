@@ -157,9 +157,19 @@ const (
 	// nothing creates it and /api/prefs persists nothing before
 	// finalize (rule 4).
 	V17 Version = 17
+	// V18 introduces the authenticated encryption-at-rest file format
+	// (issue #220, pkg/storage/enc "DXE2"): file content sealed in
+	// chunks with AES-256-GCM, so an altered, moved or truncated byte is
+	// refused at read rather than served. A store at v18 writes its new
+	// files that way from its next open and, once none of the old format
+	// remains, refuses the old format; a v17 binary cannot read the new
+	// one, so a store that has written any is refused by the version
+	// gate (rule 4). The cluster version is what guarantees every node
+	// can read the format before any node writes it.
+	V18 Version = 18
 
 	// Current is the newest cluster version this binary can run.
-	Current = V17
+	Current = V18
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

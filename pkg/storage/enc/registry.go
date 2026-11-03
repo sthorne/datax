@@ -33,14 +33,35 @@ type registryData struct {
 	Version     int               `json:"version"`
 	ActiveKeyID uint32            `json:"active_key_id"`
 	Keys        map[string]string `json:"keys"` // decimal key ID -> hex key
+	// AuthenticatedWrites records that the store writes new files in the
+	// authenticated format (issue #220, "DXE2"): the cluster version that
+	// allows it has been observed, and every open from now on creates
+	// its files that way from the first — Pebble's OPTIONS, MANIFEST and
+	// WAL are created before the engine can tell the node anything, so
+	// the FS has to know at open, from here. Authenticated records that
+	// the switch is complete: no "DXE1" file remains, and from now on one
+	// is refused. Both are sealed with the keys, so neither can be
+	// cleared without the store key.
+	AuthenticatedWrites bool `json:"authenticated_writes,omitempty"`
+	Authenticated       bool `json:"authenticated,omitempty"`
 }
 
 // KeySet is the decrypted registry: the active data key new files are
 // written with, plus every historical data key for reading old files.
 type KeySet struct {
-	activeID uint32
-	keys     map[uint32][]byte
+	activeID            uint32
+	keys                map[uint32][]byte
+	authenticatedWrites bool
+	authenticated       bool
 }
+
+// AuthenticatedWrites reports whether the registry records that new files
+// are written authenticated (registryData.AuthenticatedWrites).
+func (ks *KeySet) AuthenticatedWrites() bool { return ks.authenticatedWrites }
+
+// Authenticated reports whether the registry records the completed
+// cutover (registryData.Authenticated).
+func (ks *KeySet) Authenticated() bool { return ks.authenticated }
 
 // Active returns the data key new files are encrypted with.
 func (ks *KeySet) Active() (uint32, []byte) {
@@ -150,7 +171,7 @@ func LoadOrInitRegistry(base vfs.FS, dir string, storeKey []byte) (*KeySet, erro
 }
 
 func keySetFrom(reg *registryData) (*KeySet, error) {
-	ks := &KeySet{activeID: reg.ActiveKeyID, keys: map[uint32][]byte{}}
+	ks := &KeySet{activeID: reg.ActiveKeyID, keys: map[uint32][]byte{}, authenticatedWrites: reg.AuthenticatedWrites || reg.Authenticated, authenticated: reg.Authenticated}
 	for idStr, hexKey := range reg.Keys {
 		var id uint32
 		if _, err := fmt.Sscan(idStr, &id); err != nil {
@@ -213,6 +234,59 @@ func writeRegistry(base vfs.FS, dir string, storeKey []byte, reg *registryData) 
 		return err
 	}
 	return d.Close()
+}
+
+// loadRegistry unseals the registry in dir with storeKey.
+func loadRegistry(base vfs.FS, dir string, storeKey []byte) (*registryData, error) {
+	path := base.PathJoin(dir, RegistryName)
+	sealed, err := readAll(base, path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("store is not encrypted (no %s in %s)", RegistryName, dir)
+		}
+		return nil, err
+	}
+	plain, err := Unseal(registryMagic, storeKey, sealed)
+	if err != nil {
+		return nil, fmt.Errorf("encryption key does not match store: %w", err)
+	}
+	var reg registryData
+	if err := json.Unmarshal(plain, &reg); err != nil {
+		return nil, fmt.Errorf("corrupt key registry: %w", err)
+	}
+	return &reg, nil
+}
+
+// MarkAuthenticatedWrites records in the registry that new files are
+// written authenticated (registryData.AuthenticatedWrites) and reseals
+// it; from the next open the FS creates "DXE2" files from the first.
+// Idempotent.
+func MarkAuthenticatedWrites(base vfs.FS, dir string, storeKey []byte) error {
+	reg, err := loadRegistry(base, dir, storeKey)
+	if err != nil {
+		return err
+	}
+	if reg.AuthenticatedWrites {
+		return nil
+	}
+	reg.AuthenticatedWrites = true
+	return writeRegistry(base, dir, storeKey, reg)
+}
+
+// MarkAuthenticated records the completed cutover in the registry
+// (registryData.Authenticated) and reseals it. The caller has established
+// that the store holds no "DXE1" file (LegacyFiles); from the next open
+// the FS refuses them. Idempotent.
+func MarkAuthenticated(base vfs.FS, dir string, storeKey []byte) error {
+	reg, err := loadRegistry(base, dir, storeKey)
+	if err != nil {
+		return err
+	}
+	if reg.Authenticated {
+		return nil
+	}
+	reg.Authenticated, reg.AuthenticatedWrites = true, true
+	return writeRegistry(base, dir, storeKey, reg)
 }
 
 // RotateStoreKey reseals the registry (and nothing else) under a new store
