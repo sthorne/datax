@@ -398,6 +398,57 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A split or a replica change built before a merge no longer rewrites
+  the merged range to its old bounds** (#200, the reshard half; the
+  nightly bench's `routing did not converge … answer carried r125@106`).
+  A split, a merge and a replica change each build the descriptor they
+  will propose from the one the leader holds and propose it afterwards,
+  so two of them on the same range can be built from the same descriptor
+  and raft decides which applies first. The merge apply refused a trigger
+  built from a superseded descriptor; the split apply and the membership
+  change did not, and adopted theirs. A split or an addition built before
+  the range absorbed its neighbour and applied after thus set the range
+  back to its pre-merge span at the merged generation: the absorbed span
+  belonged to no range on any node, `/meta` still named the merged
+  descriptor at that same generation, and every batch for a key in it
+  retried against the same descriptor until the budget ran out — the
+  same range id and generation on both sides of every attempt, which is
+  what the routing trace showed. A split applied after a replica change
+  did the reverse, resetting the membership. Every descriptor change is
+  now checked at apply against the generation it was built from, like
+  the merge's: a stale split is refused and its caller retries against
+  the current descriptor; a stale membership change is refused too — raft
+  is not told of it, which is its contract for a rejected configuration
+  change — and the proposer sees the refusal rather than taking the
+  generation it was waiting for, which the merge also reaches, as
+  success. Every refusal counts in
+  `datax_descriptor_change_refused_total{op}`, so a range starved of
+  splits under sustained churn is visible rather than only logged. A
+  refused addition leaves the node it preseeded holding a replica of
+  nothing, which used to refuse every later attempt to add that node
+  ("bounds changed; replica must be removed and re-added"): a preseed
+  now says what the range was before its change, and a receiver holding
+  a replica that is not a member of that — and no newer than it, for a
+  preseed exactly one change on from it — is holding a leftover, which
+  it replaces unless the leftover's span overlaps a replica the store
+  still serves. `TestSplitBuiltBeforeAMergeIsRefused`,
+  `TestReplicaChangeBuiltBeforeAMergeIsRefused`,
+  `TestSplitBuiltBeforeAReplicaChangeIsRefused` and
+  `TestLeftoverOverlappingALiveReplicaIsNotReplaced` hold each
+  operation between building and proposing, change the range underneath
+  it, and check the range stays whole, reachable and re-splittable, and
+  that a leftover over a live replica is left alone.
+- **A snapshot the receiver refuses is reported with the receiver's
+  reason, not `EOF`** (found by #200's overlap test under the race
+  detector). A receiver that refuses a snapshot at its header — a
+  leftover over a live replica, an install below the applied index —
+  ends the stream while the sender is still sending, and gRPC then fails
+  the sender's next send with a bare end-of-file; the receiver's status
+  is only read from the stream afterwards, which the sender did not do.
+  Whether the refusal or `EOF` came back depended on which side was
+  faster. The sender now reads the status after such a send.
+  `TestSendSnapshotReportsTheReceiversRefusal` refuses at the header
+  against a sender with two hundred chunks to send, twenty times over.
 - **A schema change's drain waits for a statement whose lease entry a
   renewal had already replaced** (#234). A statement is pinned to the
   descriptor it planned against until that cache entry expires, and the

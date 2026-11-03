@@ -99,7 +99,14 @@ func TestQuiescence(t *testing.T) {
 
 	// Asleep, every replica's closed timestamp keeps advancing through
 	// the off-log group promise (follower reads stay fresh), and nobody
-	// wakes for it.
+	// wakes for it. The promise lands once a second and the closed
+	// timestamp is the promise's own time, so three seconds of sleep see
+	// two or three promises and an advance of about 2 s or 3 s — "about",
+	// because the promise's clock reading and this goroutine's wake-up
+	// are not the same instant (CI measured 1.999941587 s once, 59 µs
+	// short of a 2 s bar). The bar is one and a half promises: more than
+	// one promise certainly landed, and the test is not measuring the
+	// scheduler.
 	before := map[int]hlc.Timestamp{}
 	for i, r := range replicasOf(tc, rid) {
 		before[i] = r.ClosedTimestamp()
@@ -109,7 +116,7 @@ func TestQuiescence(t *testing.T) {
 		if !r.Quiescent() {
 			t.Fatalf("n%d woke while idle", i+1)
 		}
-		if adv := r.ClosedTimestamp().WallTime - before[i].WallTime; adv < int64(2*time.Second) {
+		if adv := r.ClosedTimestamp().WallTime - before[i].WallTime; adv < int64(1500*time.Millisecond) {
 			t.Fatalf("n%d: closed timestamp advanced %s in 3 s while quiescent (before %s, now %s)", i+1, time.Duration(adv), before[i], r.ClosedTimestamp())
 		}
 	}

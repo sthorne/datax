@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -65,6 +66,9 @@ func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.Admi
 	// The RHS inherits the parent's closed timestamp: reads served at or
 	// below it covered the RHS span, so no post-split write may land there.
 	trig := &splitTrigger{Left: left, Right: right, ClosedTS: r.ClosedTimestamp()}
+	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
+		k(r.rangeID, "split")
+	}
 
 	// Serialize against everything: nothing may be in flight through the
 	// old bounds while the split lands.
@@ -112,7 +116,24 @@ func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, order
 	return nil
 }
 
+// stageSplit applies the split on a replica. The trigger was built from
+// the descriptor the leader saw when it was proposed; if the range has
+// moved on since — a merge widened it, a replica change rewrote its
+// membership — both sides of the trigger are wrong (the merged span's
+// right part would belong to no range at all, or the new member would
+// vanish from the descriptor), so the split is refused deterministically
+// and the caller retries against the current descriptor (issue #200).
+// stageMerge guards the same way with a different comparison: a split
+// trigger's Left carries the generation the split PRODUCES, a merge
+// trigger's Left the generation the merge was BUILT FROM (the pre-merge
+// LHS), so the two sites cannot share one expression — see the comment
+// there before "tidying" either into the other (that is mutant G1).
 func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
+	if cur := r.Desc().Generation; staleDescriptorChange(cur, trig.Left.Generation) {
+		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
+		return kvpb.NewErrorf("%s: split against generation %d but range is at %d; the range changed under it, retry against the current descriptor",
+			r.rangeID, trig.Left.Generation-1, cur)
+	}
 	if err := PutRangeDescriptor(b, trig.Left); err != nil {
 		return err
 	}
@@ -144,6 +165,16 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 		// reads the parent already served there.
 		ClosedTS: trig.ClosedTS,
 	})
+}
+
+// staleDescriptorChange reports whether a descriptor change (split, merge
+// or replica change) that produced generation produced was built from a
+// descriptor other than the one the replica holds now, at current. Every
+// change bumps the generation by exactly one, so a trigger built from the
+// current descriptor produces current+1; anything else was built from an
+// earlier descriptor and the range has changed under it. Pure, for tests.
+func staleDescriptorChange(current, produced int64) bool {
+	return produced != current+1
 }
 
 // spanSizeBytes sums the stored MVCC bytes of [start, end) as seen by r.

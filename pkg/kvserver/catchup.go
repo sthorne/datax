@@ -66,7 +66,7 @@ func (r *Replica) startCatchupSnapshot(target base.NodeID, m raftpb.Message) {
 
 func (r *Replica) runCatchupSnapshot(ctx context.Context, target base.NodeID, m raftpb.Message) {
 	desc := r.Desc()
-	hdr, err := r.streamSnapshot(ctx, target, desc, base.ReplicaID(m.To))
+	hdr, err := r.streamSnapshot(ctx, target, desc, base.ReplicaID(m.To), nil)
 	if err != nil {
 		log.Warnf("%s: catch-up snapshot to n%d (replica %d): %v", r.rangeID, target, m.To, err)
 		r.reportSnapshot(m.To, raft.SnapshotFailure)

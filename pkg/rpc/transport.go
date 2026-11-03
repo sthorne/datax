@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -403,7 +404,7 @@ func (t *Transport) SendSnapshot(ctx context.Context, to base.NodeID, header []b
 		return err
 	}
 	if err := stream.Send(&rpcpb.SnapshotChunk{HeaderJson: header, Now: t.now()}); err != nil {
-		return err
+		return snapshotSendError(stream, err)
 	}
 	for {
 		kvs, err := next()
@@ -418,11 +419,29 @@ func (t *Transport) SendSnapshot(ctx context.Context, to base.NodeID, header []b
 			chunk.Kvs = append(chunk.Kvs, &rpcpb.SnapshotKV{Key: kv.Key, Value: kv.Value})
 		}
 		if err := stream.Send(chunk); err != nil {
-			return err
+			return snapshotSendError(stream, err)
 		}
 	}
 	_, err = stream.CloseAndRecv()
 	return err
+}
+
+// snapshotSendError is the error a failed Send on the snapshot stream
+// stands for. gRPC reports a stream the receiver has already ended with
+// io.EOF from Send, whatever the receiver returned; its status is read
+// from the stream afterwards. A receiver that refuses a snapshot at the
+// header — a stale leftover overlapping a live replica, an install below
+// the applied index — ends the stream while the sender is still sending,
+// so without this the sender saw "EOF" or the refusal depending on which
+// side was faster.
+func snapshotSendError(stream rpcpb.Internode_SnapshotClient, err error) error {
+	if err != io.EOF {
+		return err
+	}
+	if _, rerr := stream.CloseAndRecv(); rerr != nil {
+		return rerr
+	}
+	return fmt.Errorf("receiver ended the snapshot stream before it was complete")
 }
 
 // Call performs a unary JSON RPC (join/admin) against an address.

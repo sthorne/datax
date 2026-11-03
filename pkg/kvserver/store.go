@@ -167,6 +167,12 @@ type TestingKnobs struct {
 	// ApplyQueueMaxBytes overrides the bound on a replica's queue of
 	// committed entries awaiting apply (0 = the default, 64 MiB).
 	ApplyQueueMaxBytes int64
+	// BeforeProposeDescriptorChange runs on the leader after a split, a
+	// merge or a replica change has built the descriptor it is about to
+	// propose and before it proposes it — lets a test change the range
+	// underneath a trigger that was built from the old descriptor (issue
+	// #200). op is "split", "merge" or "replica-change".
+	BeforeProposeDescriptorChange func(rangeID base.RangeID, op string)
 }
 
 // Sender executes routed KV batches (implemented by kvclient.DB). The store

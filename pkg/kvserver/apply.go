@@ -13,6 +13,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -64,6 +65,45 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 		if err := cc.Unmarshal(ent.Data); err != nil {
 			return fmt.Errorf("corrupt conf change: %w", err)
 		}
+		// Membership-change conf changes carry the new descriptor; adopt it
+		// atomically with the applied index. (Bootstrap conf changes from
+		// StartNode carry no context.) The descriptor was built from the
+		// one the leader held when it proposed; if the range has moved on
+		// since — a merge widened it, a split narrowed it, another replica
+		// change landed — adopting it would rewrite the bounds or the
+		// membership to a stale shape at the current generation (issue
+		// #200: a merge's absorbed span then belongs to no range, and
+		// nothing can route to it). So, like a split's or a merge's
+		// trigger, a stale membership change is refused: raft is told
+		// nothing (its contract for a rejected conf change is that
+		// ApplyConfChange is not called), only the applied index advances,
+		// and the proposer sees the refusal and rebuilds.
+		var newDesc *kvpb.RangeDescriptor
+		if len(cc.Context) > 0 {
+			var ccCtx confChangeContext
+			if err := json.Unmarshal(cc.Context, &ccCtx); err != nil {
+				return fmt.Errorf("corrupt conf change context: %w", err)
+			}
+			// The replica the change adds was preseeded with a snapshot
+			// carrying this very descriptor, so there the entry finds the
+			// range already at the produced generation: an idempotent
+			// repeat, applied as before, not a refusal.
+			if cur := r.Desc(); staleDescriptorChange(cur.Generation, ccCtx.Desc.Generation) && !sameDescriptor(cur, ccCtx.Desc) {
+				log.Warnf("%s: replica change against generation %d refused: range is at %d; the proposer retries against the current descriptor",
+					r.rangeID, ccCtx.Desc.Generation-1, cur.Generation)
+				if err := r.persistAppliedIndex(ent.Index); err != nil {
+					return err
+				}
+				r.mu.Lock()
+				r.mu.confChangeRefusals++
+				r.mu.Unlock()
+				metrics.DescriptorChangeRefusals.WithLabelValues("replica-change").Inc()
+				r.setApplied(ent.Index)
+				r.noteAppliedTerm(ent.Term)
+				return nil
+			}
+			newDesc = &ccCtx.Desc
+		}
 		var state *raftpb.ConfState
 		if err := r.withRaftGroup(func(rn *raft.RawNode) error {
 			state = rn.ApplyConfChange(cc)
@@ -73,17 +113,6 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 		}
 		r.rs.setConfStateRaw(*state)
 
-		// Membership-change conf changes carry the new descriptor; adopt it
-		// atomically with the applied index. (Bootstrap conf changes from
-		// StartNode carry no context.)
-		var newDesc *kvpb.RangeDescriptor
-		if len(cc.Context) > 0 {
-			var ccCtx confChangeContext
-			if err := json.Unmarshal(cc.Context, &ccCtx); err != nil {
-				return fmt.Errorf("corrupt conf change context: %w", err)
-			}
-			newDesc = &ccCtx.Desc
-		}
 		b := r.store.cfg.Engine.NewBatch()
 		if newDesc != nil {
 			if err := PutRangeDescriptor(b, *newDesc); err != nil {
@@ -245,7 +274,7 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 	}
 	if aerr == nil && cmd.Split != nil {
 		if err := r.stageSplit(b, cmd.Split); err != nil {
-			log.Errorf("%s: split application failed: %v", r.rangeID, err)
+			log.Warnf("%s: split application refused: %v", r.rangeID, err)
 			_ = b.Close()
 			b = eng.NewBatch()
 			aerr = kvpb.NewError(err)
