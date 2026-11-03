@@ -16,6 +16,12 @@ on:
 # surface against unchanged code. A reachable advisory with no fix is
 # recorded as a dated exclusion where the next person will find it
 # (this file), never as a permanently red build nobody reads.
+# -show verbose also names the advisories in required modules whose
+# symbols this module does not reach; they do not fail the gate, but a
+# reviewer deciding whether one deserves action anyway needs the list,
+# not the count. The toolchain line in go.mod picks the Go release the
+# gate (and everything else) runs on: setup-go installs the go line's
+# exact version and Go switches to the toolchain line.
 jobs:
   govulncheck:
     runs-on: ubuntu-latest
@@ -26,4 +32,4 @@ jobs:
         with:
           go-version-file: go.mod
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -show verbose ./...
