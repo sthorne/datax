@@ -65,20 +65,6 @@ function renderNode(d) {
     tile("encryption", encryptionTileText(d)) +
     (d.store_prefix_bloom ? tile("prefix bloom filters", d.prefix_bloom_rewrite && d.prefix_bloom_rewrite.remaining_files ? `rewriting ${d.prefix_bloom_rewrite.remaining_files} legacy tables` : "on") : ""));
   document.getElementById("node-storage-note").textContent = d.reencryption && d.reencryption.sweep_error ? "re-encryption sweep error: " + d.reencryption.sweep_error : "";
-}
-
-// encryptionTileText: the store's encryption in one phrase — plain,
-// re-encrypting (a key rotation's rewrite in progress), authenticated
-// (every file sealed in the authenticated format, the old one refused),
-// switching (new files authenticated, N of the old format left), or
-// encrypted but unauthenticated (before cluster version v18).
-function encryptionTileText(d) {
-  if (!d.encrypted) return "plaintext";
-  if (d.reencryption && d.reencryption.active) return "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left";
-  const au = d.authenticated;
-  if (au && au.only) return "encrypted at rest, authenticated";
-  if (au && au.writes) return "encrypted at rest; switching to authenticated, " + (au.legacy_files || 0) + " old-format file(s) left";
-  return "encrypted at rest, unauthenticated";
   const ranges = (st.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
   renderKeyed(document.getElementById("node-ranges"), ranges.length
     ? ranges.map(r => ({ key: "r" + r.range_id, html: rangeRow(r, "this node", x => String(Math.max(0, (x.applied_index || 0) - (x.truncated_index || 0)))) }))
@@ -122,6 +108,17 @@ function encryptionTileText(d) {
     <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
   </tr>` }))
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
+}
+// encryptionTileText: the store's encryption in one phrase — plaintext,
+// re-encrypting (a key rotation's rewrite in progress), or its position
+// in the switch to the authenticated format, in the words the security
+// view's state column uses (encryptionState). The tile is labelled
+// "encryption", so the phrases stay short enough for a phone's two-column
+// tile row; the glossary carries the rest.
+function encryptionTileText(d) {
+  if (!d.encrypted) return "plaintext";
+  if (d.reencryption && d.reencryption.active) return "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left";
+  return encryptionState(d.authenticated);
 }
 async function pollNodeCharts(id) {
   const box = document.getElementById("node-charts");

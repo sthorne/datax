@@ -286,14 +286,19 @@ function renderSecurityDoc() {
           : re && re.sweep_error ? warn("down", esc(re.sweep_error))
             : "every live sstable on the active key";
       // The store's position in the switch to the authenticated file
-      // format: done (every file authenticated, the old format refused),
-      // switching (new files authenticated, N old ones left), or not
-      // started (an encrypted store before cluster version v18).
+      // format (encryptionState): done is the only green. Switching and
+      // unauthenticated are both amber with a cue — the colour here means
+      // "has the operator finished the switch", and for both the answer
+      // is no; unauthenticated is the state the switch exists to leave.
+      // So the column reads as an ordered progression: plaintext,
+      // unauthenticated, switching, authenticated. A node too old to send
+      // the field cannot have started, and says so, since during a
+      // rolling upgrade that is a different situation from a node that
+      // can and has not.
       const au = st.authenticated;
-      const state = !st.encrypted ? `<span class="st draining"><span class="dot"></span>plaintext</span>`
-        : au && au.only ? `<span class="st live"><span class="dot"></span>encrypted, authenticated</span>`
-          : au && au.writes ? warn("draining", `encrypted, switching to authenticated: ${au.legacy_files || 0} old-format file(s) left`)
-            : `<span class="st live"><span class="dot"></span>encrypted, unauthenticated</span>`;
+      const state = !st.encrypted ? tok("draining", "plaintext")
+        : au && au.only ? tok("live", encryptionState(au))
+          : warn("draining", esc(encryptionState(au)) + (au ? "" : " (older binary)"));
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>

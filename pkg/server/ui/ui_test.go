@@ -2259,3 +2259,74 @@ func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
 		t.Error("the copy glossary entry does not say what a redacted key is")
 	}
 }
+
+// TestNothingFollowsAnUnconditionalReturn: a statement after a function's
+// unconditional return never runs, and the console has no way to notice.
+// The file parses, so TestScriptFilesAssemble passes; the elements the
+// dead code names exist, so TestScriptsOnlyTouchElementsThatExist passes
+// too — that check is the inverse of this failure. The third time it
+// happened (#247: a helper spliced into the middle of renderNode closed
+// renderNode early, and the eight containers below the storage tiles were
+// never written again) the UI reviewer asked for this: for every
+// top-level function in every script, once a line at the function's own
+// nesting level begins with return, nothing but comments may follow it
+// at that level. Lines inside a template literal, and continuation lines
+// indented deeper than the return, are the return's own.
+func TestNothingFollowsAnUnconditionalReturn(t *testing.T) {
+	entries, err := os.ReadDir("js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range entries {
+		if !strings.HasSuffix(ent.Name(), ".js") {
+			continue
+		}
+		src := string(mustRead(t, "js/"+ent.Name()))
+		for _, f := range jsFunctions(src) {
+			if dead := deadAfterReturn(f.body); dead != "" {
+				t.Errorf("%s: %s has code after an unconditional return that never runs: %s", ent.Name(), f.name, oneLine(dead))
+			}
+		}
+	}
+}
+
+// deadAfterReturn returns the first statement of body that follows an
+// unconditional return at the body's own nesting level, or "".
+func deadAfterReturn(body string) string {
+	depth, inTemplate := 0, false
+	returned, returnIndent := false, 0
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		startedInTemplate := inTemplate
+		// Braces and backticks on this line, outside string literals as
+		// far as a line-local scan can tell; a template literal's own
+		// ${} braces are balanced and so change nothing.
+		for i := 0; i < len(line); i++ {
+			switch line[i] {
+			case '\\':
+				i++
+			case '`':
+				inTemplate = !inTemplate
+			case '{':
+				if !inTemplate {
+					depth++
+				}
+			case '}':
+				if !inTemplate {
+					depth--
+				}
+			}
+		}
+		if startedInTemplate || trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		if returned && depth == 0 && indent <= returnIndent && !strings.HasPrefix(trimmed, "}") {
+			return trimmed
+		}
+		if depth == 0 && !returned && (trimmed == "return;" || strings.HasPrefix(trimmed, "return ")) {
+			returned, returnIndent = true, indent
+		}
+	}
+	return ""
+}

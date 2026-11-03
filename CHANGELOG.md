@@ -158,8 +158,11 @@ state or the internode protocol does, and an entry below says so.
   format for good, since a reader accepting both would accept a file
   rewritten as the old one. `/api/security`, `/api/node`, the console's
   security view and the node page's encryption tile say where a store
-  is: unauthenticated, switching with N old-format files left, or
-  authenticated. The operator's path after finalizing v18 is
+  is, in one vocabulary (`encryptionState`): unauthenticated, switching
+  with N old-format files left, or authenticated — only the last is
+  green; the other two are the states the switch exists to leave, and a
+  node too old to send the field says so. The operator's path after
+  finalizing v18 is
   `datax debug reencrypt --wait` and a restart per node. Tier 2's header
   binding is subsumed: the salt keys the file and the name is in the
   chunks' authenticated data. Tests: round trips across chunk
@@ -170,7 +173,13 @@ state or the internode protocol does, and an entry below says so.
   switch on a store (`TestAuthenticatedCutover`) and on a disk node
   across a restart. Costs: 20 bytes per 4 KiB, a chunk decrypted per
   read inside it (the block cache holds the plaintext), a chunk re-sealed
-  per WAL append.
+  per WAL append. The console's test suite gained
+  `TestNothingFollowsAnUnconditionalReturn` (from the UI review): a
+  helper spliced into `renderNode` had closed it early, leaving the
+  replicas, SQL, latency, events and settings sections unwritten while
+  every existing check stayed green, since the file parsed and every
+  element the dead code named exists; a statement after a function's
+  unconditional return now fails the suite.
 - **Every reachable advisory closed, by moving three modules and the
   toolchain.** The weekly govulncheck run #143 set up for exactly this
   — advisories appear against code that has not changed — had been
