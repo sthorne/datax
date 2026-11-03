@@ -438,6 +438,17 @@ state or the internode protocol does, and an entry below says so.
   operation between building and proposing, change the range underneath
   it, and check the range stays whole, reachable and re-splittable, and
   that a leftover over a live replica is left alone.
+- **A snapshot the receiver refuses is reported with the receiver's
+  reason, not `EOF`** (found by #200's overlap test under the race
+  detector). A receiver that refuses a snapshot at its header — a
+  leftover over a live replica, an install below the applied index —
+  ends the stream while the sender is still sending, and gRPC then fails
+  the sender's next send with a bare end-of-file; the receiver's status
+  is only read from the stream afterwards, which the sender did not do.
+  Whether the refusal or `EOF` came back depended on which side was
+  faster. The sender now reads the status after such a send.
+  `TestSendSnapshotReportsTheReceiversRefusal` refuses at the header
+  against a sender with two hundred chunks to send, twenty times over.
 - **A schema change's drain waits for a statement whose lease entry a
   renewal had already replaced** (#234). A statement is pinned to the
   descriptor it planned against until that cache entry expires, and the
