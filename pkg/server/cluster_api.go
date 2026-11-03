@@ -190,11 +190,14 @@ type ClusterStatus struct {
 	ConsoleVersion string `json:"console_version,omitempty"`
 	// Principal is per request: the caller's identity, not cluster state.
 	Principal ClusterPrincipal `json:"principal"`
-	// KeysRedacted is true when the range keys in this document are the
-	// shown form — table and index by id, no row values — because the
-	// caller does not see every table's keys (issue #213). A control that
-	// copies a key can then say so: the shown form is not one a command
-	// takes, and a reader should not be handed it under a key's name.
+	// KeysRedacted is true when at least one range key in this document
+	// is the shown form — table and index by id, no row values — because
+	// it belongs to a table the caller does not see (issue #213). A
+	// control that copies a key can then say so: the shown form is not
+	// one a command takes, and a reader should not be handed it under a
+	// key's name. A caller who sees every table's keys, admin or not,
+	// gets a document with nothing redacted and the flag unset (issue
+	// #241).
 	KeysRedacted bool           `json:"keys_redacted,omitempty"`
 	Nodes        []ClusterNode  `json:"nodes"`
 	Ranges       []ClusterRange `json:"ranges"`
@@ -247,7 +250,6 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 		NodeID:         int(n.ident.NodeID),
 		ConsoleVersion: n.consoleVersion,
 		Principal:      p,
-		KeysRedacted:   !v.all,
 		Local:          n.statusSummaryFor(v),
 	}
 	if v.err != nil {
@@ -316,6 +318,9 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 	}
 	doc.Rollup = rollup(doc.Nodes, doc.Ranges)
 	doc.Replication = n.replicationStatus(descs, doc.Nodes)
+	// Set last: every key above has been rendered by now, and the flag
+	// states what actually happened to them for this caller.
+	doc.KeysRedacted = v.redactedAny()
 	return doc
 }
 

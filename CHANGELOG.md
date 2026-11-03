@@ -515,6 +515,20 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **`keys_redacted` says a key was redacted, not that the caller is not
+  an admin** (#241, from QA on #239). The cluster document's flag — what
+  tells the console to label a copied key as the shown form — was set
+  for every non-admin, so a reader with privileges on every table saw
+  full keys and was still told its role did not see them, and its CSV
+  headers said "(as shown)". The viewer now records the first key it
+  renders at its prefix, and the document sets the flag from that, after
+  every key is rendered: a caller who sees every table's keys, admin or
+  not, gets the plain labels; a caller with one table hidden gets the
+  warning, as before; a caller whose roles could not be resolved, for
+  whom every table key is redacted, gets it too. The console side is
+  unchanged. `TestRangeKeysAreShownPerPrivilege` adds a `read_all`
+  auditor and asserts its document decodes both boundaries and leaves
+  the flag unset.
 - **A split or a replica change built before a merge no longer rewrites
   the merged range to its old bounds** (#200, the reshard half; the
   nightly bench's `routing did not converge … answer carried r125@106`).

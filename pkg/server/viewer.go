@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -36,6 +37,12 @@ type keyViewer struct {
 	// then sees no table at all: fail closed, and say so where the
 	// document has a place for it.
 	err error
+	// redacted is set the first time viewKey renders a key at its prefix
+	// for this viewer: a document whose keys all decoded for the caller
+	// has nothing to warn about, whatever the caller's role (issue
+	// #241). Shared by every copy of the viewer, and safe across the
+	// goroutines a fan-out renders on.
+	redacted *atomic.Bool
 }
 
 // keyViewerFor resolves the caller's effective roles, once per request.
@@ -44,13 +51,19 @@ type keyViewer struct {
 // read_all / write_all roles all count.
 func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 	if p.Admin {
-		return keyViewer{all: true}
+		return keyViewer{all: true, redacted: new(atomic.Bool)}
 	}
 	set, err := catalog.LazyRoleGraph(ctx, n.db).Effective(p.User)
 	if err != nil {
-		return keyViewer{err: err}
+		return keyViewer{err: err, redacted: new(atomic.Bool)}
 	}
-	return keyViewer{set: set, descs: n.tableDescs()}
+	return keyViewer{set: set, descs: n.tableDescs(), redacted: new(atomic.Bool)}
+}
+
+// redactedAny reports whether a key was rendered at its prefix for this
+// viewer so far — the fact a document states as keys_redacted.
+func (v keyViewer) redactedAny() bool {
+	return v.redacted != nil && v.redacted.Load()
 }
 
 func (n *Node) keyViewer(req *http.Request) keyViewer {
@@ -76,6 +89,9 @@ func (v keyViewer) sees(id uint64) bool {
 // belongs to no table.
 func (n *Node) viewKey(v keyViewer, k keys.Key) string {
 	if id, ok := keys.TableIDOf(k); ok && !v.sees(id) {
+		if v.redacted != nil {
+			v.redacted.Store(true)
+		}
 		return keys.PrettyPrefix(k)
 	}
 	return n.prettyKey(k)
