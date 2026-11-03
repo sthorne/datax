@@ -180,8 +180,13 @@ type Replica struct {
 		pendingSince   time.Time
 		// frozen: a Subsume applied — the range refuses traffic pending a
 		// merge into mergedInto (see merge.go). Mirrors replicaState.
-		frozen     bool
-		mergedInto base.RangeID
+		frozen bool
+		// confChangeRefusals counts the membership changes this replica
+		// refused at apply because the descriptor they were built from
+		// was no longer current (issue #200); proposeConfChange watches
+		// it to learn that its own proposal was the one refused.
+		confChangeRefusals uint64
+		mergedInto         base.RangeID
 		// closedTS mirrors replicaState.ClosedTS: the range's replicated
 		// closed timestamp, below which this replica may serve reads
 		// locally without being the leader.
@@ -409,6 +414,14 @@ func (r *Replica) transferLeader(transferee uint64) {
 		return nil
 	})
 	r.store.sched.enqueue(r.rangeID, schedReady)
+}
+
+// confChangeRefusals returns how many membership changes this replica has
+// refused at apply (see stageConfChange).
+func (r *Replica) confChangeRefusals() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.confChangeRefusals
 }
 
 // Desc returns the replica's current view of the range descriptor.

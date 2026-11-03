@@ -50,6 +50,15 @@ type snapshotHeader struct {
 	Term         uint64               `json:"term"`
 	GCThreshold  hlc.Timestamp        `json:"gc_threshold,omitempty"`
 	SizeBytes    int64                `json:"size_bytes,omitempty"`
+	// Prior is the range as the sender held it before the membership
+	// change this snapshot preseeds for, when it is one. A receiver that
+	// already holds a replica of the range but is not a member of Prior
+	// is holding a stale leftover — a preseed whose change never landed
+	// (refused because the range changed under it, issue #200; or its
+	// proposal timed out) — and replaces it instead of refusing a snapshot
+	// whose bounds differ. Absent (older sender, or a catch-up snapshot to
+	// a member), the receiver behaves as before.
+	Prior *kvpb.RangeDescriptor `json:"prior,omitempty"`
 }
 
 // adminChangeReplicas executes an AdminChangeReplicasRequest on the leader.
@@ -62,6 +71,9 @@ func (r *Replica) adminChangeReplicas(ctx context.Context, req *kvpb.AdminChange
 		return nil, kvpb.NewErrorf("%s: cannot change replicas: range is frozen for a merge", r.rangeID)
 	}
 	desc := r.Desc()
+	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
+		k(r.rangeID, "replica-change")
+	}
 
 	if req.AddNode != 0 {
 		if _, ok := desc.GetReplica(req.AddNode); ok {
@@ -75,7 +87,8 @@ func (r *Replica) adminChangeReplicas(ctx context.Context, req *kvpb.AdminChange
 		newDesc.NextReplicaID = desc.NextReplicaID + 1
 		newDesc.Generation = desc.Generation + 1
 
-		if err := r.sendSnapshotTo(ctx, req.AddNode, newDesc, newReplicaID); err != nil {
+		prior := desc
+		if err := r.sendSnapshotTo(ctx, req.AddNode, newDesc, newReplicaID, &prior); err != nil {
 			return nil, kvpb.NewErrorf("%s: preseeding n%d: %v", r.rangeID, req.AddNode, err)
 		}
 		if err := r.proposeConfChange(ctx, raftpb.ConfChangeAddNode, newReplicaID, newDesc); err != nil {
@@ -129,11 +142,24 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 		return kvpb.NewError(err)
 	}
 	r.store.sched.enqueue(r.rangeID, schedReady)
-	// Wait for the change to apply locally (the descriptor generation is
-	// bumped by the apply path).
+	// Wait for the change to apply locally. Applied, the replica holds
+	// newDesc itself. Refused — the apply found the range at a generation
+	// other than the one newDesc was built from, because a split, a merge
+	// or another replica change landed first (issue #200) — the refusal
+	// counter moves, or the generation passes newDesc's without the
+	// descriptor ever being newDesc; either way the caller must rebuild
+	// from the current descriptor. Reaching newDesc's generation is not
+	// enough on its own: the merge that caused the refusal reaches it
+	// too, with the merged bounds and the old membership.
+	refusals := r.confChangeRefusals()
 	for {
-		if r.Desc().Generation >= newDesc.Generation {
+		cur := r.Desc()
+		if cur.Generation == newDesc.Generation && sameReplicas(cur.Replicas, newDesc.Replicas) {
 			return nil
+		}
+		if r.confChangeRefusals() != refusals || cur.Generation >= newDesc.Generation {
+			return kvpb.NewErrorf("%s: replica change against generation %d was refused: the range changed under it (now at generation %d); retry against the current descriptor",
+				r.rangeID, newDesc.Generation-1, cur.Generation)
 		}
 		select {
 		case <-ctx.Done():
@@ -143,12 +169,40 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 	}
 }
 
+// sameDescriptor reports whether two descriptors describe the same range
+// at the same generation with the same bounds and the same replicas.
+func sameDescriptor(a, b kvpb.RangeDescriptor) bool {
+	return a.RangeID == b.RangeID && a.Generation == b.Generation &&
+		a.StartKey.Equal(b.StartKey) && a.EndKey.Equal(b.EndKey) && sameReplicas(a.Replicas, b.Replicas)
+}
+
+// sameReplicas reports whether two replica sets name the same replicas
+// (node, store and replica id), in any order.
+func sameReplicas(a, b []kvpb.ReplicaDescriptor) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			if x == y {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 const snapshotChunkSize = 256
 
 // sendSnapshotTo captures a consistent snapshot of the range and streams it
 // to the target node (the preseed path for new replicas).
-func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID) error {
-	_, err := r.streamSnapshot(ctx, target, newDesc, newReplicaID)
+func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID, prior *kvpb.RangeDescriptor) error {
+	_, err := r.streamSnapshot(ctx, target, newDesc, newReplicaID, prior)
 	return err
 }
 
@@ -157,7 +211,7 @@ func (r *Replica) sendSnapshotTo(ctx context.Context, target base.NodeID, newDes
 // returning the header it sent. While the stream is in flight, the
 // replica's log truncation holds back so the receiver can still be caught
 // up from the applied index the stream carries.
-func (r *Replica) streamSnapshot(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID) (snapshotHeader, error) {
+func (r *Replica) streamSnapshot(ctx context.Context, target base.NodeID, newDesc kvpb.RangeDescriptor, newReplicaID base.ReplicaID, prior *kvpb.RangeDescriptor) (snapshotHeader, error) {
 	sender := r.store.cfg.SnapshotSender
 	if sender == nil {
 		return snapshotHeader{}, fmt.Errorf("no snapshot sender configured")
@@ -191,6 +245,7 @@ func (r *Replica) streamSnapshot(ctx context.Context, target base.NodeID, newDes
 		Term:         term,
 		GCThreshold:  st.GCThreshold,
 		SizeBytes:    st.SizeBytes,
+		Prior:        prior,
 	}
 	header, err := json.Marshal(h)
 	if err != nil {
@@ -258,7 +313,24 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 		return fmt.Errorf("corrupt snapshot header: %w", err)
 	}
 	if r, ok := s.GetReplica(h.Desc.RangeID); ok {
-		return s.installSnapshot(r, h, next)
+		if !staleLeftover(r, h, s.cfg.NodeID) {
+			return s.installSnapshot(r, h, next)
+		}
+		// A replica of this range that the sender does not count as a
+		// member is a leftover of a membership change that never landed;
+		// it holds nothing the range needs and would otherwise refuse
+		// this preseed forever ("bounds changed; replica must be removed
+		// and re-added") while the sender keeps trying to add this node.
+		// It goes, and the preseed proceeds as onto an empty store —
+		// unless its span overlaps a live replica here, which a wipe
+		// would damage; then the refusal stands.
+		if live := s.overlappingLiveReplica(r); live != nil {
+			return fmt.Errorf("%s: stale replica %d spans [%s,%s), overlapping live replica %s; not replaced",
+				r.rangeID, r.replicaID, r.Desc().StartKey, r.Desc().EndKey, live.rangeID)
+		}
+		log.Warnf("%s: replica %d is a stale leftover (not a member of %v as the sender holds it); replaced by replica %d's preseed",
+			r.rangeID, r.replicaID, replicaNodes(*h.Prior), h.ReplicaID)
+		s.destroyStaleReplica(r)
 	}
 	b := s.cfg.Engine.NewBatch()
 	count := 0
@@ -303,6 +375,59 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 		h.Desc.RangeID, h.ReplicaID, count, h.AppliedIndex)
 	s.cfg.Events.Record("snapshot", "%s: replica %d seeded from snapshot (%d keys, applied index %d)", h.Desc.RangeID, h.ReplicaID, count, h.AppliedIndex)
 	return nil
+}
+
+// staleLeftover reports whether the replica a preseed found already on
+// this store is a leftover the sender does not count as a member of the
+// range: the sender said what the range was before its change (Prior), and
+// this node is not in it. A catch-up snapshot (no Prior) or a preseed for
+// a node the sender does count never qualifies.
+func staleLeftover(r *Replica, h snapshotHeader, self base.NodeID) bool {
+	if h.Prior == nil {
+		return false
+	}
+	_, member := h.Prior.GetReplica(self)
+	return !member
+}
+
+// overlappingLiveReplica returns another replica on this store whose span
+// overlaps r's, if any.
+func (s *Store) overlappingLiveReplica(r *Replica) *Replica {
+	d := r.Desc()
+	var found *Replica
+	s.VisitReplicas(func(o *Replica) bool {
+		if o == r {
+			return true
+		}
+		od := o.Desc()
+		if od.StartKey.Compare(d.EndKey) < 0 && d.StartKey.Compare(od.EndKey) < 0 {
+			found = o
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// destroyStaleReplica stops a leftover replica's raft group and removes it
+// with its data, so a preseed can take its place.
+func (s *Store) destroyStaleReplica(r *Replica) {
+	s.mu.Lock()
+	delete(s.mu.replicas, r.rangeID)
+	s.mu.Unlock()
+	s.sched.stopReplica(r, nil)
+	r.mu.Lock()
+	r.mu.destroyed = true
+	r.mu.Unlock()
+	s.removeReplica(r.rangeID, r.Desc())
+}
+
+func replicaNodes(d kvpb.RangeDescriptor) []base.NodeID {
+	ids := make([]base.NodeID, 0, len(d.Replicas))
+	for _, r := range d.Replicas {
+		ids = append(ids, r.NodeID)
+	}
+	return ids
 }
 
 // removeReplica destroys a replica that was removed from its range,

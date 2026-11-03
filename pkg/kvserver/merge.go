@@ -296,6 +296,9 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		NextReplicaID: desc.NextReplicaID,
 		Generation:    gen + 1,
 	}
+	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
+		k(r.rangeID, "merge")
+	}
 
 	// Phase 2: the replicated merge on the LHS, serialized against all LHS
 	// traffic like a split.
