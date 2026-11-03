@@ -417,7 +417,7 @@ func (r *Replica) transferLeader(transferee uint64) {
 }
 
 // confChangeRefusals returns how many membership changes this replica has
-// refused at apply (see stageConfChange).
+// refused at apply (the conf-change branch of applyEntry, apply.go).
 func (r *Replica) confChangeRefusals() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()

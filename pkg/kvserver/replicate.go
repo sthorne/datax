@@ -150,7 +150,14 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 	// descriptor ever being newDesc; either way the caller must rebuild
 	// from the current descriptor. Reaching newDesc's generation is not
 	// enough on its own: the merge that caused the refusal reaches it
-	// too, with the merged bounds and the old membership.
+	// too, with the merged bounds and the old membership. The counter is
+	// per replica, not per proposal: two changes on one range in flight
+	// together (nothing serializes adminChangeReplicas callers) can see
+	// each other's refusal and both report "refused". That errs the safe
+	// way — a caller told "refused" rebuilds from the current descriptor
+	// and retries, and the generation test below is what carries the
+	// common case anyway, since a change of ours can only be refused if
+	// the generation moved on without it.
 	refusals := r.confChangeRefusals()
 	for {
 		cur := r.Desc()
@@ -379,11 +386,40 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 
 // staleLeftover reports whether the replica a preseed found already on
 // this store is a leftover the sender does not count as a member of the
-// range: the sender said what the range was before its change (Prior), and
-// this node is not in it. A catch-up snapshot (no Prior) or a preseed for
-// a node the sender does count never qualifies.
+// range. The sender said what the range was before its change (Prior);
+// this node is not in it; and the local state agrees it is behind. It is
+// the one place a header field leads to local state being destroyed, so
+// it rests on stated invariants rather than on the field alone:
+//
+//   - The sender is the range's leader and has applied its own entries, so
+//     Prior, read from its own descriptor, is never behind the range's real
+//     membership: a node absent from Prior is not a member.
+//   - Two concurrent additions of one node build from the same descriptor
+//     (adminChangeReplicas reads it before the membership check), so they
+//     produce identical preseeds and the second's replace is a no-op in
+//     effect.
+//   - A genuine preseed is exactly one change on from Prior
+//     (Desc.Generation == Prior.Generation+1), and a genuine leftover is
+//     behind the change that orphaned it (its generation <= Prior's). A
+//     Prior that fails either — a buggy or hostile sender's — destroys
+//     nothing: the preseed is refused as before.
+//
+// A catch-up snapshot (no Prior) or a preseed for a node the sender does
+// count never qualifies.
 func staleLeftover(r *Replica, h snapshotHeader, self base.NodeID) bool {
+	return leftoverByPrior(r.Desc().Generation, h, self)
+}
+
+// leftoverByPrior is staleLeftover's rule, pure for tests: localGen is the
+// generation of the replica already on the store.
+func leftoverByPrior(localGen int64, h snapshotHeader, self base.NodeID) bool {
 	if h.Prior == nil {
+		return false
+	}
+	if h.Desc.Generation != h.Prior.Generation+1 {
+		return false
+	}
+	if localGen > h.Prior.Generation {
 		return false
 	}
 	_, member := h.Prior.GetReplica(self)

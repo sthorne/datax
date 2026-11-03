@@ -13,6 +13,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -96,6 +97,7 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 				r.mu.Lock()
 				r.mu.confChangeRefusals++
 				r.mu.Unlock()
+				metrics.DescriptorChangeRefusals.WithLabelValues("replica-change").Inc()
 				r.setApplied(ent.Index)
 				r.noteAppliedTerm(ent.Term)
 				return nil

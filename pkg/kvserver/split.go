@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -122,9 +123,14 @@ func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, order
 // right part would belong to no range at all, or the new member would
 // vanish from the descriptor), so the split is refused deterministically
 // and the caller retries against the current descriptor (issue #200).
-// The merge apply makes the same check.
+// stageMerge guards the same way with a different comparison: a split
+// trigger's Left carries the generation the split PRODUCES, a merge
+// trigger's Left the generation the merge was BUILT FROM (the pre-merge
+// LHS), so the two sites cannot share one expression — see the comment
+// there before "tidying" either into the other (that is mutant G1).
 func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	if cur := r.Desc().Generation; staleDescriptorChange(cur, trig.Left.Generation) {
+		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
 		return kvpb.NewErrorf("%s: split against generation %d but range is at %d; the range changed under it, retry against the current descriptor",
 			r.rangeID, trig.Left.Generation-1, cur)
 	}

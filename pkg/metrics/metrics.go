@@ -82,6 +82,10 @@ var (
 	RangeMerges = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_range_merges_total", Help: "Adjacent underfull ranges merged.",
 	})
+	DescriptorChangeRefusals = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_descriptor_change_refused_total",
+		Help: "Splits, merges and replica changes refused at apply because the range changed under them between being built and being applied (issue #200); each is retried by its caller. A range under sustained churn can starve here, which this counter is the only sign of.",
+	}, []string{"op"})
 	RaftSchedulerLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
 		Name:    "datax_raft_scheduler_latency_seconds",
 		Help:    "Time a replica waited in the store's raft scheduler queue before a worker picked it up.",

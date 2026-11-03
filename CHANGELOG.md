@@ -421,16 +421,23 @@ state or the internode protocol does, and an entry below says so.
   is not told of it, which is its contract for a rejected configuration
   change — and the proposer sees the refusal rather than taking the
   generation it was waiting for, which the merge also reaches, as
-  success. A refused addition leaves the node it preseeded holding a
-  replica of nothing, which used to refuse every later attempt to add
-  that node ("bounds changed; replica must be removed and re-added"):
-  a preseed now says what the range was before its change, and a
-  receiver holding a replica that is not a member of that is holding a
-  leftover, which it replaces. `TestSplitBuiltBeforeAMergeIsRefused`,
-  `TestReplicaChangeBuiltBeforeAMergeIsRefused` and
-  `TestSplitBuiltBeforeAReplicaChangeIsRefused` hold each operation
-  between building and proposing, change the range underneath it, and
-  check the range stays whole, reachable and re-splittable.
+  success. Every refusal counts in
+  `datax_descriptor_change_refused_total{op}`, so a range starved of
+  splits under sustained churn is visible rather than only logged. A
+  refused addition leaves the node it preseeded holding a replica of
+  nothing, which used to refuse every later attempt to add that node
+  ("bounds changed; replica must be removed and re-added"): a preseed
+  now says what the range was before its change, and a receiver holding
+  a replica that is not a member of that — and no newer than it, for a
+  preseed exactly one change on from it — is holding a leftover, which
+  it replaces unless the leftover's span overlaps a replica the store
+  still serves. `TestSplitBuiltBeforeAMergeIsRefused`,
+  `TestReplicaChangeBuiltBeforeAMergeIsRefused`,
+  `TestSplitBuiltBeforeAReplicaChangeIsRefused` and
+  `TestLeftoverOverlappingALiveReplicaIsNotReplaced` hold each
+  operation between building and proposing, change the range underneath
+  it, and check the range stays whole, reachable and re-splittable, and
+  that a leftover over a live replica is left alone.
 - **A schema change's drain waits for a statement whose lease entry a
   renewal had already replaced** (#234). A statement is pinned to the
   descriptor it planned against until that cache entry expires, and the

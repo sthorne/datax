@@ -381,3 +381,82 @@ func TestSplitBuiltBeforeAReplicaChangeIsRefused(t *testing.T) {
 	}
 	f.everyKeyReadable(t, ctx, "after the fresh split")
 }
+
+// TestLeftoverOverlappingALiveReplicaIsNotReplaced: the one irreversible
+// step a preseed can take — wiping a leftover replica — is refused when the
+// leftover's span overlaps a replica the store still serves. A leftover of
+// the LHS from before a split covers the new RHS's span; once the node
+// holds a live replica of that RHS, a preseed of the LHS must leave the
+// leftover alone rather than wipe the RHS's keys with it.
+func TestLeftoverOverlappingALiveReplicaIsNotReplaced(t *testing.T) {
+	hold := newDescriptorHold()
+	tc := StartWithOptions(t, 4, func(c *server.Config) {
+		c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob
+		c.RebalanceThreshold = -1
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 864)
+	spare := f.shedReplica(t, ctx)
+	spareIdx := -1
+	for i, n := range tc.Nodes {
+		if n.NodeID() == spare {
+			spareIdx = i
+		}
+	}
+
+	// An addition of the spare to the LHS, preseeded (with the LHS's
+	// whole span) and held; the LHS splits underneath it; the addition is
+	// refused and the preseed stays behind as a leftover covering both
+	// halves.
+	hold.arm(f.lhs.RangeID, "replica-change")
+	lead := tc.LeaderIndex(f.lhs.RangeID)
+	changeErr := make(chan error, 1)
+	go func() {
+		_, err := tc.Nodes[lead].DB().AdminChangeReplicas(ctx, f.lhs.StartKey, spare, 0)
+		changeErr <- err
+	}()
+	hold.waitArrived(t, "the replica change")
+	sr, err := tc.Nodes[lead].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
+	if err != nil {
+		t.Fatalf("split under the held change: %v", err)
+	}
+	close(hold.release)
+	select {
+	case err := <-changeErr:
+		if err == nil || !strings.Contains(err.Error(), "replica change against generation") {
+			t.Fatalf("stale replica change: got %v, want refusal", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("stale replica change never returned")
+	}
+	leftover, ok := tc.Nodes[spareIdx].Store().LocalDescriptor(f.lhs.RangeID)
+	if !ok || !leftover.EndKey.Equal(f.lhs.EndKey) {
+		t.Fatalf("spare n%d holds %v (%v), want the preseeded leftover ending at %s", spare, leftover, ok, f.lhs.EndKey)
+	}
+
+	// The spare now gains a live replica of the new RHS, whose span the
+	// leftover covers.
+	if _, err := tc.Nodes[tc.LeaderIndex(sr.Right.RangeID)].DB().AdminChangeReplicas(ctx, sr.Right.StartKey, spare, 0); err != nil {
+		t.Fatalf("adding the spare to the RHS: %v", err)
+	}
+	rhsOnSpare, ok := tc.Nodes[spareIdx].Store().LocalDescriptor(sr.Right.RangeID)
+	if !ok || !rhsOnSpare.StartKey.Equal(sr.Right.StartKey) {
+		t.Fatalf("spare n%d does not hold the RHS: %v %v", spare, rhsOnSpare, ok)
+	}
+
+	// Adding the spare to the LHS now finds the leftover, and the leftover
+	// overlaps the live RHS replica: the preseed is refused, the leftover
+	// stays, and the RHS's keys still read everywhere.
+	_, err = tc.Nodes[tc.LeaderIndex(f.lhs.RangeID)].DB().AdminChangeReplicas(ctx, f.lhs.StartKey, spare, 0)
+	if err == nil || !strings.Contains(err.Error(), "overlapping live replica") {
+		t.Fatalf("preseed over a leftover overlapping a live replica: got %v, want refusal naming the overlap", err)
+	}
+	if d, ok := tc.Nodes[spareIdx].Store().LocalDescriptor(f.lhs.RangeID); !ok || !d.EndKey.Equal(f.lhs.EndKey) {
+		t.Fatalf("leftover replaced or wiped despite the overlap: %v %v", d, ok)
+	}
+	if d, ok := tc.Nodes[spareIdx].Store().LocalDescriptor(sr.Right.RangeID); !ok || !sameRangeDescriptor(d, rhsOnSpare) {
+		t.Fatalf("the live RHS replica on the spare changed: %v %v", d, ok)
+	}
+	f.everyKeyReadable(t, ctx, "after the refused preseed")
+}

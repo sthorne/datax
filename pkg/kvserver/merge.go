@@ -388,7 +388,13 @@ func updateMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, or
 // abandons the apply without advancing the applied index, so the restart
 // replays the merge instead of skipping it.
 func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeTrigger) error {
+	// trig.Left is the LHS the merge was BUILT FROM, so this compares the
+	// current generation against the base: equal means the range has not
+	// changed since. (stageSplit compares against the generation its
+	// trigger PRODUCES, base+1, through staleDescriptorChange; the two
+	// fields named Left carry different generations.)
 	if r.Desc().Generation != trig.Left.Generation {
+		metrics.DescriptorChangeRefusals.WithLabelValues("merge").Inc()
 		return kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
 			r.rangeID, trig.Left.Generation, r.Desc().Generation)
 	}
