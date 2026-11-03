@@ -231,3 +231,152 @@ func TestAuthenticatedStoreRefusesAnAlteredTable(t *testing.T) {
 		t.Fatal("the altered table was read without a refusal")
 	}
 }
+
+// TestWALTornTailIsRecoveredAndMidWALDamageRefused is the engine-level
+// shape of QA's finding on #247: acknowledged writes live only in the raft
+// engine's WAL until a flush, and a crash in the middle of an append must
+// cost at most the record being appended. The WAL is framed, so a torn
+// final frame — cut short, or whole but not authenticating — is the end
+// of the log and every acknowledged write replays; a frame damaged with
+// frames after it is no crash, and the store refuses to open rather than
+// serve it. The control, the store untouched, proves the WAL is what
+// carries the writes.
+func TestWALTornTailIsRecoveredAndMidWALDamageRefused(t *testing.T) {
+	const commits = 40
+	key := testStoreKey(t)
+	build := func(t *testing.T) string {
+		dir := t.TempDir()
+		e, err := Open(dir, Options{EncryptionKey: key, Raft: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.EnableAuthenticatedFiles(key); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Reopened, Pebble's own files are authenticated from the first.
+		e, err = Open(dir, Options{EncryptionKey: key, Raft: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < commits; i++ {
+			b := e.NewBatch()
+			if err := b.Put(mvccTestKey("ack", i), []byte("acked")); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Commit(true); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if e.FlushedSeqNum() != 0 {
+			t.Fatal("a flush happened; the WAL is not the only copy and the test proves nothing")
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	wal := func(t *testing.T, dir string) string {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var logs []string
+		for _, ent := range entries {
+			if strings.HasSuffix(ent.Name(), ".log") {
+				logs = append(logs, filepath.Join(dir, ent.Name()))
+			}
+		}
+		if len(logs) != 1 {
+			t.Fatalf("want one WAL segment, have %v", logs)
+		}
+		return logs[0]
+	}
+	expectAll := func(t *testing.T, dir string) {
+		e, err := Open(dir, Options{EncryptionKey: key, Raft: true})
+		if err != nil {
+			t.Fatalf("the store did not open: %v", err)
+		}
+		defer e.Close()
+		for i := 0; i < commits; i++ {
+			if v, err := e.Get(mvccTestKey("ack", i)); err != nil || string(v) != "acked" {
+				t.Fatalf("acknowledged write %d after the crash: %q %v", i, v, err)
+			}
+		}
+	}
+	t.Run("control", func(t *testing.T) { expectAll(t, build(t)) })
+	t.Run("last frame cut short", func(t *testing.T) {
+		dir := build(t)
+		raw, err := os.ReadFile(wal(t, dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The sync after the last commit is the whole point: the commit is
+		// acknowledged, so its frame is complete, and only a frame after it
+		// can be torn. Append a frame header and a few bytes of a body that
+		// never arrived, then cut into the body.
+		torn := append(raw, 0, 0, 1, 0, 9, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4, 5)
+		if err := os.WriteFile(wal(t, dir), torn, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		expectAll(t, dir)
+	})
+	t.Run("last frame whole but altered", func(t *testing.T) {
+		dir := build(t)
+		raw, err := os.ReadFile(wal(t, dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A write whose pages reached the disk out of order: the frame is
+		// there in full and does not authenticate. The frame carries the
+		// last commit, which the writer was told was durable — but that is
+		// what a lost final write is on any store, authenticated or not,
+		// and it is one record, not the log.
+		raw[len(raw)-5] ^= 1
+		if err := os.WriteFile(wal(t, dir), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		e, err := Open(dir, Options{EncryptionKey: key, Raft: true})
+		if err != nil {
+			t.Fatalf("the store did not open after a torn final frame: %v", err)
+		}
+		defer e.Close()
+		for i := 0; i < commits-1; i++ {
+			if v, err := e.Get(mvccTestKey("ack", i)); err != nil || string(v) != "acked" {
+				t.Fatalf("acknowledged write %d after the crash: %q %v", i, v, err)
+			}
+		}
+	})
+	t.Run("a middle frame altered", func(t *testing.T) {
+		dir := build(t)
+		raw, err := os.ReadFile(wal(t, dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Inside a middle frame's ciphertext (a damaged length field would
+		// instead end the log there, which the layer cannot tell from a
+		// crash: see the format's comment). Frames are
+		// [len u32][nonce 8][ciphertext][tag 16] after the 32-byte header.
+		const header, frameOverhead = 32, 4 + 8 + 16
+		pos, frames := int64(header), 0
+		for frames < commits/2 {
+			n := int64(raw[pos])<<24 | int64(raw[pos+1])<<16 | int64(raw[pos+2])<<8 | int64(raw[pos+3])
+			pos += frameOverhead + n
+			frames++
+		}
+		raw[pos+12+2] ^= 1
+		if err := os.WriteFile(wal(t, dir), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		e, err := Open(dir, Options{EncryptionKey: key, Raft: true})
+		if err == nil {
+			_ = e.Close()
+			t.Fatal("a WAL altered in the middle opened")
+		}
+		if !strings.Contains(err.Error(), "does not authenticate") {
+			t.Fatalf("refusal names something else: %v", err)
+		}
+	})
+}

@@ -133,9 +133,9 @@ func TestAEADFileRoundtrip(t *testing.T) {
 }
 
 // TestAEADAppendLikeAWAL: many small appends, each synced, then the file
-// reopened for append (OpenReadWrite) and extended, then read whole. The
-// tail chunk is rewritten on every append, each time under a fresh
-// generation, and what comes back is what went in.
+// reopened for append (OpenReadWrite) and extended, then read whole. A
+// log takes the framed layout: every append is a frame of its own, and
+// what comes back is what went in.
 func TestAEADAppendLikeAWAL(t *testing.T) {
 	fs, base := authenticatedFS(t)
 	f, err := fs.Create("000002.log", vfs.WriteCategoryUnspecified)
@@ -160,8 +160,6 @@ func TestAEADAppendLikeAWAL(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The tail chunk's generation counts its rewrites: with the plaintext
-	// past one chunk, chunk 0 was rewritten until it filled.
 	rf, err := fs.OpenReadWrite("000002.log", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatal(err)
@@ -177,29 +175,52 @@ func TestAEADAppendLikeAWAL(t *testing.T) {
 	if err := rf.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if st, err := fs.Stat("000002.log"); err != nil || st.Size() != int64(len(ref)) {
+		t.Fatalf("fs.Stat of a log: %v size=%d want %d", err, st.Size(), len(ref))
+	}
 	rf, err = fs.Open("000002.log")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rf.Close()
-	got := make([]byte, len(ref))
-	if _, err := rf.ReadAt(got, 0); err != nil && err != io.EOF {
+	// Sequentially, as Pebble replays a log …
+	got, err := io.ReadAll(rf)
+	if err != nil || !bytes.Equal(got, ref) {
+		t.Fatalf("WAL-shaped file does not read back sequentially: %v", err)
+	}
+	// … and at an offset behind the cursor, which rewinds.
+	at := make([]byte, 500)
+	if _, err := rf.ReadAt(at, 1000); err != nil && err != io.EOF {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, ref) {
-		t.Fatal("WAL-shaped file does not read back")
+	if !bytes.Equal(at, ref[1000:1500]) {
+		t.Fatal("ReadAt behind the cursor does not match")
 	}
-	// The generation of chunk 0 on disk is the number of times it was
-	// rewritten; it was appended to many times before it filled.
+	// On disk the file is framed — 400 frames for the appends and one for
+	// the extension — and nothing in it is plaintext.
 	raw, _ := base.Open("000002.log")
 	defer raw.Close()
-	var gen [4]byte
-	if _, err := raw.ReadAt(gen[:], headerLenV2); err != nil {
+	st, _ := raw.Stat()
+	frames, size := scanFrames(t, raw, st.Size())
+	if frames != 401 || size != int64(len(ref)) {
+		t.Fatalf("on disk: %d frames holding %d bytes; want 401 holding %d", frames, size, len(ref))
+	}
+	rawBuf := make([]byte, st.Size())
+	_, _ = raw.ReadAt(rawBuf, 0)
+	if bytes.Contains(rawBuf, more[:64]) {
+		t.Fatal("plaintext visible in the underlying log")
+	}
+}
+
+// scanFrames counts a framed file's complete frames and their plaintext,
+// through the base FS.
+func scanFrames(t *testing.T, raw vfs.File, physical int64) (frames, size int64) {
+	t.Helper()
+	e := &frameFile{f: raw}
+	if err := e.scan(physical); err != nil {
 		t.Fatal(err)
 	}
-	if g := uint32(gen[0])<<24 | uint32(gen[1])<<16 | uint32(gen[2])<<8 | uint32(gen[3]); g < 10 {
-		t.Fatalf("chunk 0 generation %d; want many rewrites from the small appends", g)
-	}
+	return e.frames, e.size
 }
 
 // writeFile writes content as a fresh authenticated file and returns it.
@@ -251,7 +272,7 @@ func flipByte(t *testing.T, base vfs.FS, name string, off int64) {
 
 // TestAEADRefusesTampering: the distinguishing cases from issue #220's
 // test list. A flipped ciphertext byte, a flipped tag byte and a changed
-// generation are each refused at read; two chunks swapped are refused at
+// nonce are each refused at read; two chunks swapped are refused at
 // read; a file truncated inside a chunk is refused at open; a bound file
 // renamed is refused at open. The same bytes untouched read back.
 func TestAEADRefusesTampering(t *testing.T) {
@@ -264,12 +285,12 @@ func TestAEADRefusesTampering(t *testing.T) {
 		at     string // "open" or "read"
 	}{
 		{"ciphertext byte in chunk 1", func(t *testing.T, base vfs.FS, name string) {
-			flipByte(t, base, name, headerLenV2+phys+chunkGenLen+17)
+			flipByte(t, base, name, headerLenV2+phys+chunkNonceLen+17)
 		}, "read"},
 		{"tag byte of chunk 2", func(t *testing.T, base vfs.FS, name string) {
 			flipByte(t, base, name, headerLenV2+3*phys-1)
 		}, "read"},
-		{"generation of chunk 0", func(t *testing.T, base vfs.FS, name string) {
+		{"nonce of chunk 0", func(t *testing.T, base vfs.FS, name string) {
 			flipByte(t, base, name, headerLenV2+3)
 		}, "read"},
 		{"chunks 0 and 1 swapped", func(t *testing.T, base vfs.FS, name string) {

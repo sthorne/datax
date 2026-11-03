@@ -40,20 +40,23 @@ depends on which file format it holds, and a store can be looked up
   (`--consistency-interval`, off by default), after the fact and only
   where a replica disagrees.
 - **Authenticated** (`DXE2`, from cluster version v18; see *Authenticated
-  files* below). File content is sealed in 4 KiB chunks with
-  AES-256-GCM under a per-file key, each chunk's position and rewrite
-  count in its nonce, and sstables and WAL segments carry their own name
-  in every chunk. A byte altered anywhere, a chunk moved within or
-  between files, a file truncated anywhere but exactly between chunks,
-  and a renamed sstable or WAL are **refused at read** — the node
-  reports an error, it does not serve the data. What the format still
-  does not catch: a file truncated exactly at a chunk boundary (a WAL cut
-  at a record boundary looks like a crash, as before; sstables and the
-  MANIFEST carry their own length checks above this layer), and a whole
-  file replaced by an older version of itself or by another file of the
-  same kind under the same name from a store sealed with the same data
-  key, since nothing above the file layer hands it a version. The
-  consistency sweep remains the thing that would notice those.
+  files* below). File content is sealed with AES-256-GCM under a per-file
+  key — sstables in 4 KiB chunks read at random, the WAL and MANIFEST as
+  append-only frames, one per write — with the file's header in every
+  tag, the chunk's or frame's position in its nonce, and, for sstables
+  and WAL segments, the file's own name in every tag too. A byte altered
+  anywhere, a chunk or frame moved within or between files, an sstable
+  truncated anywhere but exactly between chunks, and a renamed sstable
+  or WAL are **refused at read** — the node reports an error, it does not
+  serve the data. What the format still does not catch: an sstable
+  truncated exactly at a chunk boundary and a log cut anywhere (either
+  looks like a crash, as before, and a crash is what a log's torn tail
+  usually is; sstables and the MANIFEST carry their own length checks
+  above this layer, a WAL's records their own), and a whole file replaced
+  by an older version of itself or by another file of the same kind
+  under the same name from a store sealed with the same data key, since
+  nothing above the file layer hands it a version. The consistency sweep
+  remains the thing that would notice those.
 
 If the threat is tampering rather than theft, run a cluster at v18 or
 later and let every store complete the switch, put the data directory on
@@ -85,16 +88,26 @@ Each file is in one of two formats. The unauthenticated one is
 the keystream counter derived from the IV and the logical offset so
 random reads (`ReadAt`) never re-derive more than one block. The
 authenticated one is `"DXE2" | data-key ID | flags | chunk size | 16-byte
-random salt`, then chunks of `gen | AES-256-GCM(4 KiB of plaintext) | tag`:
-the file key is HKDF-SHA256(data key, salt); the nonce is the chunk's
-index and its rewrite count `gen`, which is stored beside the chunk and
-goes up every time the chunk is rewritten (a WAL's tail grows by a
-record at a time, and GCM must never seal two plaintexts under one
-nonce); and for files Pebble never renames — sstables, WAL segments — the
-base name is authenticated with every chunk. A read decrypts whole
-chunks; an append rewrites the tail chunk; `Stat` and the offset hints
-translate between logical and physical offsets. Details that matter for
-correctness and confidentiality:
+random salt`, then either chunks of `nonce | AES-256-GCM(4 KiB of
+plaintext) | tag` (sstables, OPTIONS, markers: anything read at random
+offsets) or, for the files Pebble appends to and replays front to back
+(WAL segments, MANIFEST files; a header flag says which), frames of
+`length | nonce | AES-256-GCM(one write's bytes) | tag`. The file key is
+HKDF-SHA256(data key, salt). The GCM nonce is the chunk's or frame's
+index and eight random bytes drawn at every write and stored beside it,
+so a chunk rewritten (an sstable writer extends its tail chunk) is never
+sealed twice under one nonce and nothing has to be remembered across a
+crash for that to hold. The whole header is in every tag's additional
+data, so no header field can be edited, and for files Pebble never
+renames — sstables, WAL segments — the base name is too. A chunked read
+decrypts whole chunks and an append rewrites the tail chunk; a framed
+write appends a frame and never touches a byte already on disk, which
+is what lets a crash during an append cost only the record being
+appended (a torn final frame is the end of the log, as Pebble's own
+record checksum treats it; a frame that fails with frames after it is
+refused). `Stat` and the offset hints translate between logical and
+physical offsets. Details that matter for correctness and
+confidentiality:
 
 - **`ReuseForWrite` never recycles.** Rewriting a recycled WAL under its
   original key+IV would reuse the CTR keystream — an actual plaintext
@@ -151,9 +164,14 @@ So the operator's path after finalizing v18 is: run
 `datax debug reencrypt --wait` on each node, restart it, and read
 `encrypted, authenticated` in the security view. The node logs each
 transition once, and the log and the status say how many old-format
-files remain in between. A store that has written any authenticated file
-is refused by a v17 binary's version gate, like every store-format
-change before it.
+files remain in between. An old-format sstable Pebble has made obsolete
+but not yet deleted counts among them and is not the sweep's to rewrite;
+it goes when Pebble deletes it, shortly after. A conversion the node
+cannot carry out — a file it cannot examine — holds the cutover rather
+than passing the file over: the switch is one way, so an error means
+"not yet". A store that has written any authenticated file is refused
+by a v17 binary's version gate, like every store-format change before
+it.
 
 ## Key rotation
 
@@ -273,16 +291,30 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   truncate, substitute or roll back its files undetectably; the
   cross-replica consistency sweep is the only thing that would notice,
   and only after the fact.
-- **The authenticated format does not see a file truncated exactly at a
-  chunk boundary, nor a whole file replaced by an older version of
-  itself** or by another file of the same kind and name sealed with the
-  same data key; Pebble's own length checks catch the first for
-  sstables and the MANIFEST, and the consistency sweep is what notices
-  the rest.
-- Authenticated files cost 20 bytes per 4 KiB (about 0.5%), a whole
-  chunk decrypted for any read inside it (Pebble's block cache holds the
-  plaintext, so a cache hit never touches the wrapper), and one chunk
-  re-sealed and rewritten for every WAL append.
+- **The authenticated format does not see an sstable truncated exactly
+  at a chunk boundary, a log cut anywhere, nor a whole file replaced by
+  an older version of itself** or by another file of the same kind and
+  name sealed with the same data key; Pebble's own length checks catch
+  the first for sstables and the MANIFEST and a WAL's record checksums
+  the second, and the consistency sweep is what notices the rest.
+- **The key registry can be rolled back as a whole**: its two cutover
+  flags cannot be cleared without the store key, but an older, validly
+  sealed copy of the registry — a backup from before the switch — opens
+  the store unauthenticated again, writing the old format until the node
+  next observes cluster version v18 (which re-enables authenticated
+  writes within seconds of start) and accepting old-format files until
+  the cutover completes again. That is the whole-file rollback class
+  above, applied to the one file whose rollback turns the feature off
+  rather than one file's contents. The cluster version, in replicated
+  KV, is a signal a single disk cannot roll back; cross-checking the
+  registry against a record of the cutover kept there, before the store
+  serves, is filed as #248.
+- Authenticated files cost 24 bytes per 4 KiB chunk (about 0.6%) and 28
+  bytes per WAL or MANIFEST append, a whole chunk decrypted for any read
+  inside it (Pebble's block cache holds the plaintext, so a cache hit
+  never touches the wrapper), and one chunk re-sealed and rewritten for
+  every append to an sstable's tail chunk; a log append writes only its
+  own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
 - Keys live in memory unprotected (no mlock/HSM integration).

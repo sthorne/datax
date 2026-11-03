@@ -298,7 +298,7 @@ function renderSecurityDoc() {
       const au = st.authenticated;
       const state = !st.encrypted ? tok("draining", "plaintext")
         : au && au.only ? tok("live", encryptionState(au))
-          : warn("draining", esc(encryptionState(au)) + (au ? "" : " (older binary)"));
+          : warn("draining", encryptionState(au) + (au ? "" : " (older binary)"));
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>

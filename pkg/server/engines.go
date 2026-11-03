@@ -258,6 +258,7 @@ func (n *Node) ratchetStoreFormat() {
 func (n *Node) switchToAuthenticatedEncryption() {
 	n.encKeyMu.Lock()
 	key := append([]byte(nil), n.encKey...)
+	raftKey := append([]byte(nil), n.raftEncKey...)
 	n.encKeyMu.Unlock()
 	if key == nil {
 		return
@@ -268,9 +269,14 @@ func (n *Node) switchToAuthenticatedEncryption() {
 		if e == nil || !e.Encrypted() {
 			continue
 		}
+		// Each engine's registry is sealed under its own store key: the
+		// raft engine's differs from the state engine's while a rotation
+		// interrupted between the two is outstanding (matchRaftEncKey), and
+		// its registry refuses the wrong one.
+		engineKey, engineName := storeKeyForEngine(e == n.raftEngine, key, raftKey)
 		if !e.AuthenticatedFiles() {
-			if err := e.EnableAuthenticatedFiles(key); err != nil {
-				log.Warnf("switching the store to authenticated encryption files: %v", err)
+			if err := e.EnableAuthenticatedFiles(engineKey); err != nil {
+				log.Warnf("switching the %s engine to authenticated encryption files: %v", engineName, err)
 				allDone = false
 				continue
 			}
@@ -279,9 +285,9 @@ func (n *Node) switchToAuthenticatedEncryption() {
 				n.events.Record("upgrade", "the store writes new files in the authenticated encryption format from now on")
 			}
 		}
-		r, done, err := e.CompleteAuthenticatedCutover(key)
+		r, done, err := e.CompleteAuthenticatedCutover(engineKey)
 		if err != nil {
-			log.Warnf("completing the switch to authenticated encryption: %v", err)
+			log.Warnf("completing the %s engine's switch to authenticated encryption: %v", engineName, err)
 			allDone = false
 			continue
 		}
@@ -319,6 +325,19 @@ func (n *Node) authenticatedEncryption() *AuthenticatedEncryption {
 		a.LegacyFiles = n.legacyEncryptedFiles()
 	}
 	return a
+}
+
+// storeKeyForEngine picks the store key an engine's registry is sealed
+// under — the raft engine's own when a rotation left it with one — the
+// way raftOptions does at open, and names the engine for the log.
+func storeKeyForEngine(raft bool, key, raftKey []byte) ([]byte, string) {
+	if raft {
+		if len(raftKey) > 0 {
+			return raftKey, "raft"
+		}
+		return key, "raft"
+	}
+	return key, "state"
 }
 
 // legacyEncryptedFiles counts the store's files still in the old

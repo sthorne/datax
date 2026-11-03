@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -71,7 +72,7 @@ func FileKeyID(base vfs.FS, path string) (uint32, bool, error) {
 // authenticated "DXE2" format; ok=false when it carries no encryption
 // header at all.
 func FileAuthenticated(base vfs.FS, path string) (authenticated bool, ok bool, err error) {
-	magic, _, err := fileFormat(base, path)
+	magic, _, _, err := fileFormat(base, path)
 	if err != nil {
 		return false, false, err
 	}
@@ -135,7 +136,7 @@ func (fs *FS) RefusesLegacy() bool { return fs.strict.Load() }
 // create picks the format for a new file.
 func (fs *FS) create(f vfs.File, name string) (vfs.File, error) {
 	if fs.authenticated.Load() {
-		return newAEADFileCreate(f, fs.keys, fs.FS.PathBase(name))
+		return newAuthenticatedCreate(f, fs.keys, fs.FS.PathBase(name))
 	}
 	return newEncFileCreate(f, fs.keys)
 }
@@ -152,7 +153,7 @@ func (fs *FS) open(f vfs.File, name string) (vfs.File, error) {
 		if n < headerLenV2 {
 			return nil, fmt.Errorf("truncated encryption header")
 		}
-		return newAEADFileOpen(f, fs.keys, fs.FS.PathBase(name), hdr)
+		return openAuthenticated(f, fs.keys, fs.FS.PathBase(name), hdr)
 	case fileMagic:
 		if fs.strict.Load() {
 			return nil, fmt.Errorf("unauthenticated (DXE1) file in a store that has switched to authenticated encryption; refusing to read it (issue #220)")
@@ -253,12 +254,27 @@ func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	if fs.isRegistry(name) || st.IsDir() || st.Size() < headerLen {
 		return st, nil
 	}
-	magic, chunk, err := fileFormat(fs.FS, name)
+	magic, chunk, flags, err := fileFormat(fs.FS, name)
 	if err != nil {
 		return nil, err
 	}
 	switch magic {
 	case fileMagicV2:
+		if flags&flagFrames != 0 {
+			// A log's logical size is what its complete frames hold, the
+			// last one verified: the same answer an open gives.
+			f, err := fs.FS.Open(name)
+			if err != nil {
+				return nil, err
+			}
+			ef, err := fs.open(f, name)
+			if err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("stat %s: %w", name, err)
+			}
+			defer func() { _ = ef.Close() }()
+			return ef.Stat()
+		}
 		size, ok := logicalSize(st.Size(), chunk)
 		if !ok {
 			return nil, fmt.Errorf("stat %s: corrupt encrypted file: %d bytes is no whole number of chunks", name, st.Size())
@@ -270,30 +286,35 @@ func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	return st, nil
 }
 
-// fileFormat reads a file's magic and, for "DXE2", its chunk size.
-func fileFormat(base vfs.FS, name string) (string, int, error) {
+// fileFormat reads a file's magic and, for "DXE2", its chunk size and
+// flags.
+func fileFormat(base vfs.FS, name string) (magic string, chunk int, flags uint32, err error) {
 	f, err := base.Open(name)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 	defer func() { _ = f.Close() }()
 	var hdr [headerLenV2]byte
 	n, err := f.ReadAt(hdr[:], 0)
 	if err != nil && err != io.EOF {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 	if n < 4 {
-		return "", 0, nil
+		return "", 0, 0, nil
 	}
-	magic := string(hdr[0:4])
+	magic = string(hdr[0:4])
 	if magic == fileMagicV2 {
 		if n < headerLenV2 {
-			return "", 0, fmt.Errorf("truncated encryption header")
+			return "", 0, 0, fmt.Errorf("truncated encryption header")
 		}
-		return magic, int(binary.BigEndian.Uint32(hdr[12:16])), nil
+		return magic, int(binary.BigEndian.Uint32(hdr[12:16])), binary.BigEndian.Uint32(hdr[8:12]), nil
 	}
-	return magic, 0, nil
+	return magic, 0, 0, nil
 }
+
+// convertTmpSuffix names the temporary file a conversion writes before
+// renaming it over the original.
+const convertTmpSuffix = ".dxe2tmp"
 
 // ConvertLegacyFiles rewrites the "DXE1" files in dir that convert says
 // to, in the authenticated format, each through a temporary file renamed
@@ -304,6 +325,20 @@ func fileFormat(base vfs.FS, name string) (string, int, error) {
 // sstables are the re-encryption sweep's, which rewrites them online.
 // Returns the names converted.
 func ConvertLegacyFiles(base vfs.FS, dir string, keys *KeySet, convert func(name string) bool) ([]string, error) {
+	// A conversion that crashed between writing its temporary file and
+	// renaming it left the temporary behind; it is nothing a reader wants
+	// (its original is still there, and converts again), so sweep it.
+	names, err := base.List(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		if strings.HasSuffix(name, convertTmpSuffix) {
+			if err := base.Remove(base.PathJoin(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("removing a leftover %s: %w", name, err)
+			}
+		}
+	}
 	legacy, err := LegacyFiles(base, dir)
 	if err != nil {
 		return nil, err
@@ -336,25 +371,36 @@ func convertLegacyFile(base vfs.FS, dir string, keys *KeySet, name string) error
 	if err != nil {
 		return err
 	}
-	plain := make([]byte, st.Size())
-	if _, err := old.ReadAt(plain, 0); err != nil && err != io.EOF {
-		return err
-	}
-	tmp := path + ".dxe2tmp"
+	tmp := path + convertTmpSuffix
 	dst, err := base.Create(tmp, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}
-	out, err := newAEADFileCreate(dst, keys, name)
+	out, err := newAuthenticatedCreate(dst, keys, name)
 	if err != nil {
 		_ = dst.Close()
 		_ = base.Remove(tmp)
 		return err
 	}
-	if _, err := out.Write(plain); err != nil {
-		_ = dst.Close()
-		_ = base.Remove(tmp)
-		return err
+	// A piece at a time: a WAL or MANIFEST can run to tens of megabytes
+	// and this runs at open, where memory is least spare.
+	const piece = 1 << 20
+	buf := make([]byte, piece)
+	for off := int64(0); off < st.Size(); off += piece {
+		n := int64(piece)
+		if rem := st.Size() - off; rem < n {
+			n = rem
+		}
+		if _, err := old.ReadAt(buf[:n], off); err != nil && err != io.EOF {
+			_ = dst.Close()
+			_ = base.Remove(tmp)
+			return err
+		}
+		if _, err := out.Write(buf[:n]); err != nil {
+			_ = dst.Close()
+			_ = base.Remove(tmp)
+			return err
+		}
 	}
 	if err := dst.Sync(); err != nil {
 		_ = dst.Close()
@@ -397,13 +443,26 @@ func LegacyFiles(base vfs.FS, dir string) ([]string, error) {
 			continue
 		}
 		path := base.PathJoin(dir, name)
+		// This list gates the cutover, which is one way: a file that
+		// cannot be examined is reported as an error, not passed over —
+		// an error means "not yet", never "go ahead". A file gone since
+		// the listing (Pebble deletes obsolete ones under us) is no file.
 		st, err := base.Stat(path)
-		if err != nil || st.IsDir() {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		magic, _, err := fileFormat(base, path)
 		if err != nil {
+			return nil, fmt.Errorf("examining %s for the old encryption format: %w", name, err)
+		}
+		if st.IsDir() {
 			continue
+		}
+		magic, _, _, err := fileFormat(base, path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("examining %s for the old encryption format: %w", name, err)
 		}
 		if magic == fileMagic {
 			out = append(out, name)
