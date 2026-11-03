@@ -370,11 +370,61 @@ func TestAEADRewriteDrawsAFreshNonce(t *testing.T) {
 	}
 }
 
-// failingFS makes one file unexaminable: Open fails with fail.
+// TestLogReopenedAfterATornTailDrawsAFreshNonce: the fresh-nonce draw is
+// load-bearing in the framed layout too (QA's re-review on #247), not
+// only where a chunk is rewritten. A torn last frame is dropped at open,
+// and the reopened writer appends at the same index and the same physical
+// offset — the MANIFEST, which Pebble appends to across opens, is the
+// ordinary way in. Two plaintexts under one (index, random) would be GCM
+// authentication-key recovery, so the random must differ.
+func TestLogReopenedAfterATornTailDrawsAFreshNonce(t *testing.T) {
+	fs, base := authenticatedFS(t)
+	f, err := fs.Create("000050.log", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []string{"frame-zero", "frame-one"} {
+		if _, err := f.Write([]byte(rec)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.SyncData(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = f.Close()
+	frame1 := int64(headerLenV2 + frameOverhead + len("frame-zero"))
+	before := append([]byte(nil), physicalBytes(t, base, "000050.log")[frame1+frameLenLen:frame1+frameLenLen+chunkNonceLen]...)
+	// Tear frame 1: whole, not authenticating.
+	all := physicalBytes(t, base, "000050.log")
+	all[frame1+frameLenLen+chunkNonceLen+2] ^= 1
+	rewritePhysical(t, base, "000050.log", all)
+	w, err := fs.OpenReadWrite("000050.log", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := w.Stat(); st.Size() != int64(len("frame-zero")) {
+		t.Fatalf("reopened log holds %d bytes, want the first frame only", st.Size())
+	}
+	if _, err := w.Write([]byte("frame-one-again")); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	after := physicalBytes(t, base, "000050.log")[frame1+frameLenLen : frame1+frameLenLen+chunkNonceLen]
+	if bytes.Equal(before, after) {
+		t.Fatal("frame 1 was re-sealed at the same index under the nonce the torn frame had")
+	}
+	if got, err := readAllThrough(fs, "000050.log", len("frame-zeroframe-one-again")); err != nil || string(got) != "frame-zeroframe-one-again" {
+		t.Fatalf("read back: %q %v", got, err)
+	}
+}
+
+// failingFS makes one file unexaminable: Open, or Stat when statToo is
+// set, fails with fail.
 type failingFS struct {
 	vfs.FS
-	name string
-	fail error
+	name    string
+	fail    error
+	statToo bool
 }
 
 func (f *failingFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
@@ -382,6 +432,13 @@ func (f *failingFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) 
 		return nil, f.fail
 	}
 	return f.FS.Open(name, opts...)
+}
+
+func (f *failingFS) Stat(name string) (vfs.FileInfo, error) {
+	if f.statToo && name == f.name {
+		return nil, f.fail
+	}
+	return f.FS.Stat(name)
 }
 
 // TestLegacyFilesFailClosed: the list that gates the one-way cutover
@@ -408,6 +465,16 @@ func TestLegacyFilesFailClosed(t *testing.T) {
 	gone := &failingFS{FS: mem, name: "000002.sst", fail: os.ErrNotExist}
 	if names, err := LegacyFiles(gone, ""); err != nil || len(names) != 1 || names[0] != "000001.sst" {
 		t.Fatalf("a file deleted under the listing: %v %v", names, err)
+	}
+	// The same two answers when it is Stat, before the header read, that
+	// fails.
+	unstattable := &failingFS{FS: mem, name: "000002.sst", fail: errors.New("input/output error"), statToo: true}
+	if names, err := LegacyFiles(unstattable, ""); err == nil || !strings.Contains(err.Error(), "000002.sst") {
+		t.Fatalf("a file that cannot be stat'd was passed over: %v %v", names, err)
+	}
+	goneAtStat := &failingFS{FS: mem, name: "000002.sst", fail: os.ErrNotExist, statToo: true}
+	if names, err := LegacyFiles(goneAtStat, ""); err != nil || len(names) != 1 || names[0] != "000001.sst" {
+		t.Fatalf("a file deleted before its stat: %v %v", names, err)
 	}
 }
 
