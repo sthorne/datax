@@ -458,20 +458,44 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 // before anything is applied. Databases and sequences legitimately mix
 // spans — descriptors and names, and counters — so each group is held
 // to the set backup reads for it, not to one span.
+// manifestKeyGroup is one of the manifest's raw-record groups: its JSON
+// field name, how to read it from a manifest, and the key spans a backup
+// collects it from — the only spans restore accepts it in (issue #238).
+type manifestKeyGroup struct {
+	name  string
+	kvs   func(*backupManifest) []backupKV
+	spans func() [][2]keys.Key
+}
+
+// manifestKeyGroups is the table checkManifestKeys holds a manifest to.
+// It must name every []backupKV field of backupManifest and nothing else:
+// a raw group that RunBackup collects but this table does not name would
+// be restored unchecked, which is the hole #238 closed, and
+// TestManifestKeyGroupsCoverTheManifest pins the two to each other
+// (issue #242). name is the field's JSON tag; kvs must return that very
+// field.
+var manifestKeyGroups = []manifestKeyGroup{
+	{"users", func(m *backupManifest) []backupKV { return m.Users },
+		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.UserSpan())} }},
+	{"admins", func(m *backupManifest) []backupKV { return m.Admins },
+		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.AdminUserSpan())} }},
+	{"roles", func(m *backupManifest) []backupKV { return m.Roles },
+		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.RoleSpan())} }},
+	{"databases", func(m *backupManifest) []backupKV { return m.Databases },
+		func() [][2]keys.Key {
+			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}
+		}},
+	{"sequences", func(m *backupManifest) []backupKV { return m.Sequences },
+		func() [][2]keys.Key {
+			return [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())}
+		}},
+}
+
 func checkManifestKeys(dir string, man *backupManifest) error {
-	for _, g := range []struct {
-		name  string
-		kvs   []backupKV
-		spans [][2]keys.Key
-	}{
-		{"users", man.Users, [][2]keys.Key{spanOf(keys.UserSpan())}},
-		{"admins", man.Admins, [][2]keys.Key{spanOf(keys.AdminUserSpan())}},
-		{"roles", man.Roles, [][2]keys.Key{spanOf(keys.RoleSpan())}},
-		{"databases", man.Databases, [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}},
-		{"sequences", man.Sequences, [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())}},
-	} {
-		for _, kv := range g.kvs {
-			if !inAnySpan(keys.Key(kv.Key), g.spans) {
+	for _, g := range manifestKeyGroups {
+		spans := g.spans()
+		for _, kv := range g.kvs(man) {
+			if !inAnySpan(keys.Key(kv.Key), spans) {
 				return fmt.Errorf("%s: manifest's %s carries the key %s, which a datax backup never collects there", dir, g.name, keys.Key(kv.Key))
 			}
 		}
