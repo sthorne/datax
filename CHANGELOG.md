@@ -462,6 +462,32 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- **Every pair of chart series colours is at least 15 OKLab units apart,
+  in both themes** (#240, from QA on #239). Six pairs sat below the
+  floor two lines with no other channel need — light `n2`/`n4` 13.7 and
+  `n2`/`n5` 12.9; dark `n3`/`n6` 8.8, `n1`/`n7` 9.8, `n2`/`n4` 10.6 and
+  `n2`/`n5` 11.6 — and were carried as named exceptions. The slots
+  involved are re-stepped by the smallest moves that clear every pair
+  with margin (floor 15.6 in the search, so the test's 15 holds against
+  rounding), keeping each slot's hue family and the palette's own chroma
+  and panel-contrast floors, with `n1` (the console's accent) and `n8`
+  (re-stepped in #239) fixed: light `n2` `#eb6834` → `#db5e12` (a deeper
+  orange, 4.2 units) and `n6` `#008300` → `#077c06` (2.2); dark `n2`
+  `#d95926` → `#dc560d` (1.2), `n3` `#199e70` → `#0c9e73` (0.5), `n4`
+  `#c98500` → `#d59d21` (6.4), `n5` `#d55181` → `#d34e94` (3.2), `n6`
+  `#43b043` → `#5fc425` (7.0), `n7` `#9085e9` → `#b685f5` (6.1). The
+  smallest pair is now 15.6 (light) and 15.7 (dark). The search also
+  held the first four slots — the lines a chart shows in one frame
+  before it facets (#216) — at least 9 units apart under simulated
+  protanopia and deuteranopia (Machado 2009, full severity): 9.1 light,
+  10.5 dark, where dark `n2`/`n4` had been 4.9 under deuteranopia. The
+  pairs #216's validator flagged across the facet boundary, light
+  `n2`/`n6` under protanopia and dark `n3`/`n5` under deuteranopia,
+  remain close under those simulations (1.0 and 3.9): orange against
+  green and teal against pink collapse for those viewers whatever their
+  hue, and the two slots do not share a frame of four. The all-pairs
+  test's exception list is now empty, so a pair that drops below the
+  floor again fails the test rather than joining a list.
 - **Cluster protocol version v17.** The console's preferences live in a
   new system table, `datax_ui_prefs`, at a reserved descriptor ID beside
   `datax_metrics`. A v16 node knows nothing of the reservation and would

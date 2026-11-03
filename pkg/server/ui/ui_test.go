@@ -2153,11 +2153,14 @@ func TestSeriesPairsAreTellableApart(t *testing.T) {
 	di := strings.Index(page, "prefers-color-scheme: dark")
 	dark := page[di : di+1200]
 	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
-	// The pairs below the floor at this head, per theme, lower slot first.
-	// Issue #240 is the palette work that clears them.
+	// The pairs below the floor at this head, per theme, lower slot first:
+	// none, since #240 re-stepped the slots that collided (a pair added
+	// here must be a decision, with its number). The mechanism stays so a
+	// future slot change that lowers a pair is caught, and a listed pair
+	// that clears the floor again must be removed.
 	knownBelow := map[string]map[[2]int]bool{
-		"light": {{2, 4}: true, {2, 5}: true},
-		"dark":  {{1, 7}: true, {2, 4}: true, {2, 5}: true, {3, 6}: true},
+		"light": {},
+		"dark":  {},
 	}
 	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
 		pal := map[int]string{}
