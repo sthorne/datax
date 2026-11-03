@@ -22,6 +22,15 @@ on:
 # not the count. The toolchain line in go.mod picks the Go release the
 # gate (and everything else) runs on: setup-go installs the go line's
 # exact version and Go switches to the toolchain line.
+#
+# A scheduled run's result is written where it is read (issue #244): a
+# red scheduled run files or updates one standing issue carrying the
+# run's link and the tail of govulncheck's output, and a green one closes
+# it. Push and pull-request runs are watched by whoever pushed; the
+# schedule has no such person, which is how it was red for seven weeks.
+permissions:
+  contents: read
+  issues: write
 jobs:
   govulncheck:
     runs-on: ubuntu-latest
@@ -32,4 +41,11 @@ jobs:
         with:
           go-version-file: go.mod
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -show verbose ./...
+        id: scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -show verbose ./... 2>&1 | tee govulncheck.out
+        shell: bash -o pipefail -e {0}
+      - name: standing issue
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/standing-issue.sh vulncheck ${{ steps.scan.outcome == 'success' && 'green' || 'red' }} govulncheck.out
