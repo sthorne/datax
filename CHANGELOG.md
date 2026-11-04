@@ -489,12 +489,14 @@ state or the internode protocol does, and an entry below says so.
   least 9 units apart under simulated protanopia and deuteranopia
   (Machado 2009, full severity): 9.1 light, 10.5 dark, where dark
   `n2`/`n4` had been 4.9 under deuteranopia. Five pairs remain under 9
-  in one theme or the other: light `n2`/`n6` (1.0) and `n3`/`n5` (6.1);
-  dark `n1`/`n7` (4.0), `n3`/`n5` (3.9), `n4`/`n6` (1.3), `n3`/`n8`
-  (7.4) — orange against green, teal against pink, yellow against
-  yellow-green collapse for those viewers whatever their hue, and no
-  light green or further dark re-step clears them without colliding
-  elsewhere. They are no longer left to the count-based facet rule, which
+  in one theme or the other: light `n2`/`n6` (1.2) and `n3`/`n5` (6.1);
+  dark `n1`/`n7` (4.2), `n3`/`n5` (3.8), `n4`/`n6` (1.2), and `n3`/`n8`
+  (7.9), which the coral created — joining the red family cost that one
+  collision, and the facet gate below absorbs it — while orange against
+  green, teal against pink and yellow against yellow-green collapse for
+  those viewers whatever their hue, and no light green or further dark
+  re-step clears them without colliding elsewhere. The next pair above
+  the line is dark `n3`/`n4` at 9.1. They are no longer left to the count-based facet rule, which
   never fired for a two-node cluster numbered 2 and 6: the metrics view
   facets whenever two nodes of such a pair would share a frame
   (`CVD_CLOSE_PAIRS` in `mustFacet`), its note says which pair, and the

@@ -170,7 +170,7 @@ function renderCharts() {
   if (forced > 0) {
     const n = document.createElement("div");
     n.className = "muted note";
-    n.textContent = `one chart per node: ${[...reasons].join("; ")} cannot be told apart by colour in one frame`;
+    n.textContent = `one chart per node: ${[...reasons].join("; ")}`;
     box.appendChild(n);
   }
   for (const s of series) {

@@ -106,11 +106,14 @@ function mustFacet(ids) {
     || CVD_CLOSE_PAIRS.some(([a, b]) => set.has(a) && set.has(b));
 }
 // facetReason says, for the note under a faceted view, why the lines
-// could not share a frame.
+// could not share a frame: a whole clause, so that two series faceted
+// for different reasons read as two statements when the note joins
+// them. Its branches mirror mustFacet's, so it is never "" where that
+// is true.
 function facetReason(ids) {
   const set = new Set(ids.map(Number));
-  if (set.size > MAX_LINES) return `more than ${MAX_LINES} nodes`;
-  if (ids.some(id => Number(id) > 8)) return "a node past n8";
+  if (set.size > MAX_LINES) return `more than ${MAX_LINES} nodes cannot be told apart by colour in one frame`;
+  if (set.size > 1 && ids.some(id => Number(id) > 8)) return "a node past n8 has no colour of its own";
   const pair = CVD_CLOSE_PAIRS.find(([a, b]) => set.has(a) && set.has(b));
-  return pair ? `n${pair[0]} and n${pair[1]}, which a colour-vision deficiency merges,` : "";
+  return pair ? `n${pair[0]} and n${pair[1]} cannot be told apart by a colour-vision deficiency` : "";
 }
