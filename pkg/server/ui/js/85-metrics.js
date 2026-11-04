@@ -79,7 +79,7 @@ function metricsParams() {
 // nodeColor follows the node, not its row: filtering a node out never
 // repaints the survivors. Slots 1-8 are the categorical ramp; past that
 // there is no distinguishable hue to hand out, and a chart never plots
-// two such nodes in one frame (see MAX_LINES).
+// two such nodes in one frame (see mustFacet).
 function nodeColor(id) { id = Number(id); return id >= 1 && id <= 8 ? `var(--series-${id})` : "var(--text-3)"; }
 // MAX_LINES is how many lines share one frame before the view facets
 // into one chart per node (issue #216). Eight categorical hues that
@@ -90,6 +90,27 @@ function nodeColor(id) { id = Number(id); return id >= 1 && id <= 8 ? `var(--ser
 // can be n2, n6 and n8). So past four lines, and whenever a node past
 // n8 would share a frame, the remedy is a frame per node, not a hue.
 const MAX_LINES = 4;
+// CVD_CLOSE_PAIRS are the slot pairs that collapse under a colour-vision
+// deficiency: in either theme, under simulated protanopia or
+// deuteranopia (Machado 2009, full severity), the two colours come out
+// fewer than 9 OKLab units apart, which the end labels cannot carry on
+// their own where the lines cross (issue #240; the UI review on #249).
+// Two such nodes never share a frame whatever the count — the count is a
+// proxy for "cannot be told apart", and this is the real rule for these.
+// The console test recomputes the set from the palette, so a palette
+// change that adds or clears a pair fails until this list agrees.
+const CVD_CLOSE_PAIRS = [[1, 7], [2, 6], [3, 5], [3, 8], [4, 6]];
 function mustFacet(ids) {
-  return ids.length > MAX_LINES || (ids.length > 1 && ids.some(id => Number(id) > 8));
+  const set = new Set(ids.map(Number));
+  return set.size > MAX_LINES || (set.size > 1 && ids.some(id => Number(id) > 8))
+    || CVD_CLOSE_PAIRS.some(([a, b]) => set.has(a) && set.has(b));
+}
+// facetReason says, for the note under a faceted view, why the lines
+// could not share a frame.
+function facetReason(ids) {
+  const set = new Set(ids.map(Number));
+  if (set.size > MAX_LINES) return `more than ${MAX_LINES} nodes`;
+  if (ids.some(id => Number(id) > 8)) return "a node past n8";
+  const pair = CVD_CLOSE_PAIRS.find(([a, b]) => set.has(a) && set.has(b));
+  return pair ? `n${pair[0]} and n${pair[1]}, whose colours a colour-vision deficiency merges` : "";
 }

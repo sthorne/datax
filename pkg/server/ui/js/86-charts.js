@@ -159,14 +159,18 @@ function renderCharts() {
   // one frame (issue #216): the note says which, since a reader who did
   // not ask for one chart per node should know why they got it.
   let forced = 0;
+  const reasons = new Set();
   const series = d.series || [];
-  for (const s of series) if (!mv.compare && mustFacet(Object.keys(s.nodes || {}))) forced++;
+  for (const s of series) {
+    const ids = Object.keys(s.nodes || {});
+    if (!mv.compare && mustFacet(ids)) { forced++; reasons.add(facetReason(ids)); }
+  }
   const facet = mv.compare || forced > 0;
   box.classList.toggle("compare", facet);
   if (forced > 0) {
     const n = document.createElement("div");
     n.className = "muted note";
-    n.textContent = `one chart per node: more than ${MAX_LINES} nodes, or a node past n8, cannot be told apart by colour in one frame`;
+    n.textContent = `one chart per node: ${[...reasons].join("; ")} cannot be told apart by colour in one frame`;
     box.appendChild(n);
   }
   for (const s of series) {

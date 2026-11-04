@@ -470,22 +470,36 @@ state or the internode protocol does, and an entry below says so.
   involved are re-stepped by the smallest moves that clear every pair
   with margin (floor 15.6 in the search, so the test's 15 holds against
   rounding), keeping each slot's hue family and the palette's own chroma
-  and panel-contrast floors, with `n1` (the console's accent) and `n8`
-  (re-stepped in #239) fixed: light `n2` `#eb6834` → `#db5e12` (a deeper
+  and panel-contrast floors, with `n1` (the console's accent) fixed:
+  light `n2` `#eb6834` → `#db5e12` (a deeper
   orange, 4.2 units) and `n6` `#008300` → `#077c06` (2.2); dark `n2`
   `#d95926` → `#dc560d` (1.2), `n3` `#199e70` → `#0c9e73` (0.5), `n4`
   `#c98500` → `#d59d21` (6.4), `n5` `#d55181` → `#d34e94` (3.2), `n6`
   `#43b043` → `#5fc425` (7.0), `n7` `#9085e9` → `#b685f5` (6.1). The
-  smallest pair is now 15.6 (light) and 15.7 (dark). The search also
-  held the first four slots — the lines a chart shows in one frame
-  before it facets (#216) — at least 9 units apart under simulated
-  protanopia and deuteranopia (Machado 2009, full severity): 9.1 light,
-  10.5 dark, where dark `n2`/`n4` had been 4.9 under deuteranopia. The
-  pairs #216's validator flagged across the facet boundary, light
-  `n2`/`n6` under protanopia and dark `n3`/`n5` under deuteranopia,
-  remain close under those simulations (1.0 and 3.9): orange against
-  green and teal against pink collapse for those viewers whatever their
-  hue, and the two slots do not share a frame of four. The all-pairs
+  smallest pair is now 15.6 (light) and 15.7 (dark). Dark `n8` `#3ce6ff`
+  → `#fe93a3`: it had been a cyan where light `n8` is a dark red (since
+  the metrics view's first palette), the one slot whose hue family
+  changed with the theme — and a theme is a stored preference that
+  follows an operator to any browser (#204), so the same node could be
+  "the red line" on one screen and cyan on the next. A red on a dark
+  panel can only be a light one (the contrast floor forbids a deep red),
+  so dark `n8` is a coral, 16.5 units from its nearest neighbour; no
+  light-theme cyan clears the floors, so the pair joined on the red side
+  (the UI review on #249). The search also held the first four slots at
+  least 9 units apart under simulated protanopia and deuteranopia
+  (Machado 2009, full severity): 9.1 light, 10.5 dark, where dark
+  `n2`/`n4` had been 4.9 under deuteranopia. Five pairs remain under 9
+  in one theme or the other: light `n2`/`n6` (1.0) and `n3`/`n5` (6.1);
+  dark `n1`/`n7` (4.0), `n3`/`n5` (3.9), `n4`/`n6` (1.3), `n3`/`n8`
+  (7.4) — orange against green, teal against pink, yellow against
+  yellow-green collapse for those viewers whatever their hue, and no
+  light green or further dark re-step clears them without colliding
+  elsewhere. They are no longer left to the count-based facet rule, which
+  never fired for a two-node cluster numbered 2 and 6: the metrics view
+  facets whenever two nodes of such a pair would share a frame
+  (`CVD_CLOSE_PAIRS` in `mustFacet`), its note says which pair, and the
+  console test recomputes the pair set from the palette so the list and
+  the colours cannot drift apart in either direction. The all-pairs
   test's exception list is now empty, so a pair that drops below the
   floor again fails the test rather than joining a list.
 - **Cluster protocol version v17.** The console's preferences live in a
