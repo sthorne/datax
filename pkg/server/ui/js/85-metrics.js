@@ -112,5 +112,5 @@ function facetReason(ids) {
   if (set.size > MAX_LINES) return `more than ${MAX_LINES} nodes`;
   if (ids.some(id => Number(id) > 8)) return "a node past n8";
   const pair = CVD_CLOSE_PAIRS.find(([a, b]) => set.has(a) && set.has(b));
-  return pair ? `n${pair[0]} and n${pair[1]}, whose colours a colour-vision deficiency merges` : "";
+  return pair ? `n${pair[0]} and n${pair[1]}, which a colour-vision deficiency merges,` : "";
 }
