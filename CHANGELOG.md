@@ -496,7 +496,7 @@ state or the internode protocol does, and an entry below says so.
   green, teal against pink and yellow against yellow-green collapse for
   those viewers whatever their hue, and no light green or further dark
   re-step clears them without colliding elsewhere. The next pair above
-  the line is dark `n3`/`n4` at 9.1. They are no longer left to the count-based facet rule, which
+  the line is light `n3`/`n4` at 9.1. They are no longer left to the count-based facet rule, which
   never fired for a two-node cluster numbered 2 and 6: the metrics view
   facets whenever two nodes of such a pair would share a frame
   (`CVD_CLOSE_PAIRS` in `mustFacet`), its note says which pair, and the
