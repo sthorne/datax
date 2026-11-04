@@ -285,11 +285,24 @@ function renderSecurityDoc() {
         : re && re.remaining_bytes > 0 ? warn("draining", fmtBytes(re.remaining_bytes) + " still on a retired key")
           : re && re.sweep_error ? warn("down", esc(re.sweep_error))
             : "every live sstable on the active key";
+      // The store's position in the switch to the authenticated file
+      // format (encryptionState): done is the only green. Switching and
+      // unauthenticated are both amber with a cue — the colour here means
+      // "has the operator finished the switch", and for both the answer
+      // is no; unauthenticated is the state the switch exists to leave.
+      // So the column reads as an ordered progression: plaintext,
+      // unauthenticated, switching, authenticated. A node too old to send
+      // the field cannot have started, and says so, since during a
+      // rolling upgrade that is a different situation from a node that
+      // can and has not.
+      const au = st.authenticated;
+      const state = !st.encrypted ? tok("draining", "plaintext")
+        : au && au.only ? tok("live", encryptionState(au))
+          : warn("draining", encryptionState(au) + (au ? "" : " (older binary)"));
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${st.encrypted ? `<span class="st live"><span class="dot"></span>encrypted</span>`
-            : `<span class="st draining"><span class="dot"></span>plaintext</span>`}</td>
+        <td data-label="state">${state}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

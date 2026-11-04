@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 
@@ -234,6 +235,9 @@ func (n *Node) ratchetStoreFormat() {
 			log.Infof("store Pebble format %d → %d (cluster version %s: columnar blocks)", was, e.Format(), version.Version(n.clusterVersion.Load()))
 		}
 	}
+	if version.Version(n.clusterVersion.Load()) >= version.V18 {
+		n.switchToAuthenticatedEncryption()
+	}
 	// Prefix mode (v15) is a property of the open, not of the store:
 	// say so once when the version arrives while the engine runs
 	// without it.
@@ -241,6 +245,120 @@ func (n *Node) ratchetStoreFormat() {
 		log.Infof("cluster version %s: the store switches to prefix bloom filters at this node's next restart (issue #161)", version.Version(n.clusterVersion.Load()))
 		n.events.Record("upgrade", "the store switches to prefix bloom filters at this node's next restart")
 	}
+}
+
+// switchToAuthenticatedEncryption moves an encrypted store to the
+// authenticated file format (issue #220, cluster version v18): new files
+// are written authenticated from now on and at every later open, and once
+// no file of the old format remains the store refuses that format for
+// good. Called wherever the cluster version is learned and when a
+// re-encryption sweep finishes, since the sweep is what rewrites the
+// sstables of the old format; the WAL, MANIFEST and OPTIONS are recreated
+// by the next open. Idempotent; each transition is logged once.
+func (n *Node) switchToAuthenticatedEncryption() {
+	n.encKeyMu.Lock()
+	key := append([]byte(nil), n.encKey...)
+	raftKey := append([]byte(nil), n.raftEncKey...)
+	n.encKeyMu.Unlock()
+	if key == nil {
+		return
+	}
+	remaining := 0
+	allDone := true
+	for _, e := range []*storage.Engine{n.engine, n.raftEngine} {
+		if e == nil || !e.Encrypted() {
+			continue
+		}
+		// Each engine's registry is sealed under its own store key: the
+		// raft engine's differs from the state engine's while a rotation
+		// interrupted between the two is outstanding (matchRaftEncKey), and
+		// its registry refuses the wrong one.
+		engineKey, engineName := storeKeyForEngine(e == n.raftEngine, key, raftKey)
+		if !e.AuthenticatedFiles() {
+			if err := e.EnableAuthenticatedFiles(engineKey); err != nil {
+				log.Warnf("switching the %s engine to authenticated encryption files: %v", engineName, err)
+				allDone = false
+				continue
+			}
+			if n.authWritesNoticed.CompareAndSwap(false, true) {
+				log.Infof("cluster version %s: the store writes new files in the authenticated encryption format from now on; files of the old format are retired by `datax debug reencrypt` and by the next restart (issue #220)", version.Version(n.clusterVersion.Load()))
+				n.events.Record("upgrade", "the store writes new files in the authenticated encryption format from now on")
+			}
+		}
+		r, done, err := e.CompleteAuthenticatedCutover(engineKey)
+		if err != nil {
+			log.Warnf("completing the %s engine's switch to authenticated encryption: %v", engineName, err)
+			allDone = false
+			continue
+		}
+		remaining += r
+		if !done {
+			allDone = false
+		}
+	}
+	switch {
+	case allDone:
+		if n.authDoneNoticed.CompareAndSwap(false, true) {
+			log.Infof("every file of the store is in the authenticated encryption format; the old format is refused from now on (issue #220)")
+			n.events.Record("upgrade", "the store holds only authenticated encryption files; the old format is refused from now on")
+		}
+	case remaining > 0:
+		if n.authLegacyNoticed.Swap(int64(remaining)) != int64(remaining) {
+			log.Infof("%d files of the store are still in the old encryption format; `datax debug reencrypt` rewrites the sstables among them and a restart recreates the rest, after which the old format is refused", remaining)
+		}
+	}
+}
+
+// authenticatedEncryption is the store's position in the switch to the
+// authenticated format, for the status documents; nil for a plaintext
+// store.
+func (n *Node) authenticatedEncryption() *AuthenticatedEncryption {
+	if n.engine == nil || !n.engine.Encrypted() {
+		return nil
+	}
+	a := &AuthenticatedEncryption{Writes: n.engine.AuthenticatedFiles(), Only: n.engine.AuthenticatedOnly()}
+	if n.raftEngine != nil && n.raftEngine.Encrypted() {
+		a.Writes = a.Writes && n.raftEngine.AuthenticatedFiles()
+		a.Only = a.Only && n.raftEngine.AuthenticatedOnly()
+	}
+	if a.Writes && !a.Only {
+		a.LegacyFiles = n.legacyEncryptedFiles()
+	}
+	return a
+}
+
+// storeKeyForEngine picks the store key an engine's registry is sealed
+// under — the raft engine's own when a rotation left it with one — the
+// way raftOptions does at open, and names the engine for the log.
+func storeKeyForEngine(raft bool, key, raftKey []byte) ([]byte, string) {
+	if raft {
+		if len(raftKey) > 0 {
+			return raftKey, "raft"
+		}
+		return key, "raft"
+	}
+	return key, "state"
+}
+
+// legacyEncryptedFiles counts the store's files still in the old
+// encryption format, cached for the status documents.
+func (n *Node) legacyEncryptedFiles() int {
+	n.legacyFilesMu.Lock()
+	defer n.legacyFilesMu.Unlock()
+	if !n.legacyFilesAt.IsZero() && time.Since(n.legacyFilesAt) < 10*time.Second {
+		return n.legacyFilesN
+	}
+	total := 0
+	for _, e := range []*storage.Engine{n.engine, n.raftEngine} {
+		if e == nil || !e.Encrypted() || e.AuthenticatedOnly() {
+			continue
+		}
+		if names, err := e.LegacyEncryptedFiles(); err == nil {
+			total += len(names)
+		}
+	}
+	n.legacyFilesAt, n.legacyFilesN = time.Now(), total
+	return total
 }
 
 // adoptBootstrapVersion records, on a store this binary just bootstrapped,

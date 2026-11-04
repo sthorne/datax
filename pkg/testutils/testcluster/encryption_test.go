@@ -51,6 +51,15 @@ func TestEncryptedDiskNode(t *testing.T) {
 		}
 	}
 
+	// Bootstrapped at the current cluster version, the store writes
+	// authenticated files from the start — but Pebble created its own
+	// files (MANIFEST, OPTIONS, markers, the first WAL) before the node
+	// could say so, so the switch is not complete until the next open
+	// converts them (issue #220).
+	if au := n.AuthenticatedEncryptionStatus(); au == nil || !au.Writes || au.Only {
+		t.Fatalf("fresh encrypted store: authenticated status %+v, want writes and not yet only", au)
+	}
+
 	// The metadata backup (written each heartbeat) must come out sealed.
 	bakPath := filepath.Join(dir, server.MetadataBackupFile)
 	deadline := time.Now().Add(30 * time.Second)
@@ -89,7 +98,9 @@ func TestEncryptedDiskNode(t *testing.T) {
 		t.FailNow()
 	}
 
-	// Restart with the key: everything is still there.
+	// Restart with the key: everything is still there, and with Pebble's
+	// own files converted at this open and every sstable written
+	// authenticated, the switch completes: the old format is refused.
 	n = startDiskNode(t, dir, false, "", withKey)
 	tc.Nodes[0] = n
 	rows, err := n.DB().Scan(ctx, prefix, prefix.PrefixEnd(), 0)
@@ -98,6 +109,10 @@ func TestEncryptedDiskNode(t *testing.T) {
 	}
 	if len(rows) != 20 {
 		t.Fatalf("after restart: %d rows, want 20", len(rows))
+	}
+	if au := n.AuthenticatedEncryptionStatus(); au == nil || !au.Only {
+		legacy, _ := enc.LegacyFiles(vfs.Default, dir)
+		t.Fatalf("after a restart: authenticated status %+v, want the switch complete; old-format files: %v", au, legacy)
 	}
 	tc.StopNode(0)
 

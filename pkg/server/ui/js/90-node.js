@@ -62,7 +62,7 @@ function renderNode(d) {
   renderTiles(document.getElementById("node-storage"), storageTiles(d.storage || {}) +
     tile("debt gate", d.debt_gated ? "latched" : "open" + (d.debt_gate_entries ? " · " + d.debt_gate_entries + " entries" : "")) +
     tile("overload", d.overloaded ? "shedding: " + (d.overload_reason || "") : "no") +
-    tile("encryption", d.encrypted ? (d.reencryption && d.reencryption.active ? "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left" : "encrypted at rest") : "plaintext") +
+    tile("encryption", encryptionTileText(d)) +
     (d.store_prefix_bloom ? tile("prefix bloom filters", d.prefix_bloom_rewrite && d.prefix_bloom_rewrite.remaining_files ? `rewriting ${d.prefix_bloom_rewrite.remaining_files} legacy tables` : "on") : ""));
   document.getElementById("node-storage-note").textContent = d.reencryption && d.reencryption.sweep_error ? "re-encryption sweep error: " + d.reencryption.sweep_error : "";
   const ranges = (st.ranges || []).slice().sort((a, b) => a.range_id - b.range_id);
@@ -108,6 +108,17 @@ function renderNode(d) {
     <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
   </tr>` }))
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
+}
+// encryptionTileText: the store's encryption in one phrase — plaintext,
+// re-encrypting (a key rotation's rewrite in progress), or its position
+// in the switch to the authenticated format, in the words the security
+// view's state column uses (encryptionState). The tile is labelled
+// "encryption", so the phrases stay short enough for a phone's two-column
+// tile row; the glossary carries the rest.
+function encryptionTileText(d) {
+  if (!d.encrypted) return "plaintext";
+  if (d.reencryption && d.reencryption.active) return "re-encrypting: " + fmtBytes(d.reencryption.remaining_bytes) + " left";
+  return encryptionState(d.authenticated);
 }
 async function pollNodeCharts(id) {
   const box = document.getElementById("node-charts");

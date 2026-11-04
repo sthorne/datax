@@ -129,6 +129,81 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Encryption at rest is authenticated** (#220, tiers 2 and 3; cluster
+  version **v18**). Until now an encrypted store was confidential against
+  a disk that leaves the building and nothing more: AES-256-CTR with no
+  authentication tag, so an attacker who could write to a live store's
+  files could truncate a WAL, flip chosen bits in a chosen row, or
+  substitute a file, and the node served the result as data — Pebble's
+  block checksums are keyless and sit inside the same keystream. A new
+  file format (`DXE2`) seals the content with AES-256-GCM under a
+  per-file key derived from the data key and a random salt: sstables and
+  the other files read at random offsets in 4 KiB chunks, the WAL and the
+  MANIFEST — the logs, appended to and replayed front to back — as
+  append-only frames, one per write, so no byte an earlier sync made
+  durable is ever written again and a crash during an append can damage
+  only the record being appended (QA's finding on the review: a chunked
+  log rewrote its tail chunk over synced bytes, and a torn rewrite left
+  the log refused at open with the acknowledged writes in it). Each
+  chunk's or frame's nonce is its position and eight random bytes drawn
+  at every write, so nothing has to survive a crash for a nonce never to
+  seal two plaintexts (InfoSec's point: a counter restarts from whatever
+  reached the disk). The whole header is in every tag, so no field of it
+  — the salt above all — can be edited; sstables and WAL segments, which
+  Pebble never renames, carry their own name in every tag too. An altered
+  byte, a chunk or frame moved within or between files, an sstable
+  truncated anywhere but exactly between chunks, and a renamed sstable or
+  WAL are refused at read with an error rather than served; a log's torn
+  final frame is the end of the log, as Pebble's own record checksum
+  treats it, and a frame that fails with frames after it is refused. Not
+  caught, and said so in `docs/encryption.md`: an sstable truncated
+  exactly at a chunk boundary and a log cut anywhere (either looks like a
+  crash; Pebble's own length checks cover sstables and the MANIFEST, a
+  WAL's record checksums the WAL), a whole file rolled back or replaced
+  by another of the same kind and name from a store under the same data
+  key, and the key registry itself rolled back to a copy from before the
+  switch — the one rollback that turns the feature off rather than one
+  file's contents; a cross-check against a record of the cutover in
+  replicated KV, which a single disk cannot roll back, is filed as
+  #248.
+  A store switches in two steps, both recorded in its sealed registry:
+  from cluster version v18 it writes new files authenticated — at every
+  open from then on, converting the files Pebble keeps across opens (the
+  MANIFEST, OPTIONS, its markers, a WAL to replay) before Pebble starts,
+  and counting old-format sstables as stale for `datax debug reencrypt`
+  to rewrite — and once no old-format file remains it refuses the old
+  format for good, since a reader accepting both would accept a file
+  rewritten as the old one. The list that gates that one-way step treats
+  a file it cannot examine as an error, not as absent; each engine's
+  registry is marked under the store key that seals it (the raft engine
+  keeps its own across an interrupted rotation); a conversion streams a
+  file rather than reading it whole, and sweeps the temporary a crashed
+  one left behind. `/api/security`, `/api/node`, the console's
+  security view and the node page's encryption tile say where a store
+  is, in one vocabulary (`encryptionState`): unauthenticated, switching
+  with N old-format files left, or authenticated — only the last is
+  green; the other two are the states the switch exists to leave, and a
+  node too old to send the field says so. The operator's path after
+  finalizing v18 is
+  `datax debug reencrypt --wait` and a restart per node. Tier 2's header
+  binding is subsumed: the salt keys the file and the name is in the
+  chunks' authenticated data. Tests: round trips across chunk
+  boundaries, the WAL append pattern, each tampering case from the
+  issue's list (`TestAEADRefusesTampering`), the formats' coexistence
+  and the strict refusal, a flipped byte in a real sstable refused by
+  the engine (`TestAuthenticatedStoreRefusesAnAlteredTable`), the whole
+  switch on a store (`TestAuthenticatedCutover`) and on a disk node
+  across a restart, and the WAL torn at its tail recovered with every
+  acknowledged write while one altered in the middle is refused. Costs:
+  24 bytes per 4 KiB chunk and 28 per log append, a chunk decrypted per
+  read inside it (the block cache holds the plaintext), a chunk re-sealed
+  per append to an sstable's tail. The console's test suite gained
+  `TestNothingFollowsAnUnconditionalReturn` (from the UI review): a
+  helper spliced into `renderNode` had closed it early, leaving the
+  replicas, SQL, latency, events and settings sections unwritten while
+  every existing check stayed green, since the file parsed and every
+  element the dead code named exists; a statement after a function's
+  unconditional return now fails the suite.
 - **Every reachable advisory closed, by moving three modules and the
   toolchain.** The weekly govulncheck run #143 set up for exactly this
   — advisories appear against code that has not changed — had been

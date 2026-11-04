@@ -108,6 +108,17 @@ function warn(level, text) { return level ? `<span class="st ${level}">${text}<s
 // through here, every judged number through warn, and the console test
 // refuses a status span that is neither.
 function tok(level, text) { return `<span class="st ${level}"><span class="dot"></span>${text}</span>`; }
+// encryptionState words an encrypted store's position in the switch to
+// the authenticated file format (issue #220) — done, switching with N
+// old-format files left, or not started — for the node page's tile and
+// the security view's state column alike, so the two surfaces never
+// describe one state in two vocabularies. A node too old to send the
+// field has not started.
+function encryptionState(au) {
+  if (au && au.only) return "encrypted, authenticated";
+  if (au && au.writes) return `switching: ${au.legacy_files || 0} old-format file(s) left`;
+  return "encrypted, unauthenticated";
+}
 function loadCell(load1, cores) {
   const ratio = load1 / cores;
   return warn(ratio > 2 ? "down" : ratio > 1 ? "draining" : "", (load1 ?? 0).toFixed(2));

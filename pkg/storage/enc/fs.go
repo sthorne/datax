@@ -1,18 +1,20 @@
 // Package enc implements datax's encryption at rest: a vfs.FS wrapper that
 // transparently encrypts every file Pebble writes (sstables, WAL,
-// MANIFEST, ...) with AES-256-CTR, plus the AES-GCM-sealed key registry
-// and helpers for sealing non-Pebble artifacts (the metadata backup).
-// stdlib crypto only. See docs/encryption.md.
+// MANIFEST, ...), plus the AES-GCM-sealed key registry and helpers for
+// sealing non-Pebble artifacts (the metadata backup). stdlib crypto only.
+// See docs/encryption.md.
 //
-// What it provides is confidentiality against a disk that leaves the
-// building, and nothing else: file content carries no authentication
-// tag and the file header is not authenticated (only the registry and
-// the metadata backup are GCM-sealed), so an attacker who can write to a
-// live store's files can alter, truncate, substitute or roll back a file
-// undetectably. Pebble's block checksums are not a defence — they are
-// keyless, inside the encrypted block, and CTR is bit-malleable, so an
-// edit repairs them in the same pass. Issue #220 records what
-// authenticating the header and the content would take.
+// Two file formats. "DXE1" (fs.go) is AES-256-CTR: confidentiality
+// against a disk that leaves the building, and nothing else — the content
+// carries no authentication tag, so an attacker who can write to a live
+// store's files can alter, truncate, substitute or roll back a file
+// undetectably, and Pebble's keyless block checksums are no defence
+// against it. "DXE2" (aead.go) seals the content in chunks with
+// AES-256-GCM, so an altered, moved or truncated-mid-chunk byte is refused
+// at read; a store switches to it from cluster version v18 — new files
+// first, then, once none of the old format remains, the old format is
+// refused for good (issue #220). What the authenticated format still does
+// not catch is stated at the top of aead.go.
 package enc
 
 import (
@@ -24,6 +26,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
@@ -45,9 +49,9 @@ const (
 // FS (sealed with the store key, not a data key) and passed through raw.
 const RegistryName = "ENCRYPTION-REGISTRY"
 
-// FileKeyID reads the data-key ID from an encrypted file's header,
-// through the BASE (unencrypted) filesystem. ok=false when the file
-// carries no encryption header (the registry, LOCK, short files).
+// FileKeyID reads the data-key ID from an encrypted file's header (either
+// format), through the BASE (unencrypted) filesystem. ok=false when the
+// file carries no encryption header (the registry, LOCK, short files).
 func FileKeyID(base vfs.FS, path string) (uint32, bool, error) {
 	f, err := base.Open(path)
 	if err != nil {
@@ -58,22 +62,105 @@ func FileKeyID(base vfs.FS, path string) (uint32, bool, error) {
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
 		return 0, false, nil
 	}
-	if string(hdr[0:4]) != fileMagic {
+	if m := string(hdr[0:4]); m != fileMagic && m != fileMagicV2 {
 		return 0, false, nil
 	}
 	return binary.BigEndian.Uint32(hdr[4:8]), true, nil
 }
 
-// FS encrypts every file created through it. Non-file operations pass
-// through to the base FS.
-type FS struct {
-	vfs.FS
-	keys *KeySet
+// FileAuthenticated reports whether an encrypted file is in the
+// authenticated "DXE2" format; ok=false when it carries no encryption
+// header at all.
+func FileAuthenticated(base vfs.FS, path string) (authenticated bool, ok bool, err error) {
+	magic, _, _, err := fileFormat(base, path)
+	if err != nil {
+		return false, false, err
+	}
+	switch magic {
+	case fileMagicV2:
+		return true, true, nil
+	case fileMagic:
+		return false, true, nil
+	}
+	return false, false, nil
 }
 
-// NewFS wraps base so all file content is encrypted with keys.
+// FS encrypts every file created through it. Non-file operations pass
+// through to the base FS.
+//
+// Two formats (see aead.go): "DXE1", CTR, confidentiality only; and
+// "DXE2", chunked AES-GCM, authenticated. Which one new files get is
+// authenticated (the server turns it on from cluster version v18, so no
+// node that cannot read "DXE2" is left in the cluster); both are read
+// until strict is set, which the server does once the store holds no
+// "DXE1" file any more (enc.LegacyFiles) — until then a reader that
+// accepted "DXE1" would hand an attacker the downgrade: rewrite a file's
+// header as "DXE1" and its content is a keystream again, unauthenticated.
+type FS struct {
+	vfs.FS
+	keys          *KeySet
+	authenticated atomic.Bool
+	strict        atomic.Bool
+}
+
+// NewFS wraps base so all file content is encrypted with keys. A key set
+// whose registry records the authenticated cutover opens strict.
 func NewFS(base vfs.FS, keys *KeySet) *FS {
-	return &FS{FS: base, keys: keys}
+	fs := &FS{FS: base, keys: keys}
+	if keys != nil && keys.AuthenticatedWrites() {
+		fs.authenticated.Store(true)
+	}
+	if keys != nil && keys.Authenticated() {
+		fs.authenticated.Store(true)
+		fs.strict.Store(true)
+	}
+	return fs
+}
+
+// EnableAuthenticatedWrites makes every file created from now on "DXE2".
+func (fs *FS) EnableAuthenticatedWrites() { fs.authenticated.Store(true) }
+
+// AuthenticatedWrites reports whether new files are "DXE2".
+func (fs *FS) AuthenticatedWrites() bool { return fs.authenticated.Load() }
+
+// RefuseLegacy makes the FS refuse to open "DXE1" files (and write
+// "DXE2" ones): the cutover's reader half.
+func (fs *FS) RefuseLegacy() {
+	fs.authenticated.Store(true)
+	fs.strict.Store(true)
+}
+
+// RefusesLegacy reports whether "DXE1" files are refused.
+func (fs *FS) RefusesLegacy() bool { return fs.strict.Load() }
+
+// create picks the format for a new file.
+func (fs *FS) create(f vfs.File, name string) (vfs.File, error) {
+	if fs.authenticated.Load() {
+		return newAuthenticatedCreate(f, fs.keys, fs.FS.PathBase(name))
+	}
+	return newEncFileCreate(f, fs.keys)
+}
+
+// open dispatches on an existing file's header.
+func (fs *FS) open(f vfs.File, name string) (vfs.File, error) {
+	var hdr [headerLenV2]byte
+	n, err := f.ReadAt(hdr[:], 0)
+	if err != nil && (err != io.EOF || n < headerLen) {
+		return nil, fmt.Errorf("reading encryption header: %w", err)
+	}
+	switch string(hdr[0:4]) {
+	case fileMagicV2:
+		if n < headerLenV2 {
+			return nil, fmt.Errorf("truncated encryption header")
+		}
+		return openAuthenticated(f, fs.keys, fs.FS.PathBase(name), hdr)
+	case fileMagic:
+		if fs.strict.Load() {
+			return nil, fmt.Errorf("unauthenticated (DXE1) file in a store that has switched to authenticated encryption; refusing to read it (issue #220)")
+		}
+		return newEncFileOpen(f, fs.keys)
+	}
+	return nil, fmt.Errorf("missing encryption header (plaintext file in an encrypted store?)")
 }
 
 func (fs *FS) isRegistry(name string) bool {
@@ -88,7 +175,12 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 	if fs.isRegistry(name) {
 		return f, nil
 	}
-	return newEncFileCreate(f, fs.keys)
+	ef, err := fs.create(f, name)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return ef, nil
 }
 
 func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
@@ -99,7 +191,7 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	if fs.isRegistry(name) {
 		return f, nil
 	}
-	ef, err := newEncFileOpen(f, fs.keys)
+	ef, err := fs.open(f, name)
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("open %s: %w", name, err)
@@ -118,9 +210,14 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 		return nil, err
 	}
 	if st.Size() == 0 {
-		return newEncFileCreate(f, fs.keys)
+		ef, err := fs.create(f, name)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return ef, nil
 	}
-	ef, err := newEncFileOpen(f, fs.keys)
+	ef, err := fs.open(f, name)
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("open %s: %w", name, err)
@@ -145,8 +242,10 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 // chain for the disk-health and category bookkeeping of the base FS).
 func (fs *FS) Unwrap() vfs.FS { return fs.FS }
 
-// Stat subtracts the header so logical sizes line up. Files smaller than a
-// header (the zero-length LOCK file, directories) are reported as-is.
+// Stat reports logical sizes: the header and, for a "DXE2" file, the
+// chunk framing are subtracted. Files smaller than a header (the
+// zero-length LOCK file, directories) are reported as-is. Telling the
+// formats apart costs a read of the header.
 func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	st, err := fs.FS.Stat(name)
 	if err != nil {
@@ -155,7 +254,221 @@ func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	if fs.isRegistry(name) || st.IsDir() || st.Size() < headerLen {
 		return st, nil
 	}
-	return sizedFileInfo{FileInfo: st, size: st.Size() - headerLen}, nil
+	magic, chunk, flags, err := fileFormat(fs.FS, name)
+	if err != nil {
+		return nil, err
+	}
+	switch magic {
+	case fileMagicV2:
+		if flags&flagFrames != 0 {
+			// A log's logical size is what its complete frames hold, the
+			// last one verified: the same answer an open gives.
+			f, err := fs.FS.Open(name)
+			if err != nil {
+				return nil, err
+			}
+			ef, err := fs.open(f, name)
+			if err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("stat %s: %w", name, err)
+			}
+			defer func() { _ = ef.Close() }()
+			return ef.Stat()
+		}
+		size, ok := logicalSize(st.Size(), chunk)
+		if !ok {
+			return nil, fmt.Errorf("stat %s: corrupt encrypted file: %d bytes is no whole number of chunks", name, st.Size())
+		}
+		return sizedFileInfo{FileInfo: st, size: size}, nil
+	case fileMagic:
+		return sizedFileInfo{FileInfo: st, size: st.Size() - headerLen}, nil
+	}
+	return st, nil
+}
+
+// fileFormat reads a file's magic and, for "DXE2", its chunk size and
+// flags.
+func fileFormat(base vfs.FS, name string) (magic string, chunk int, flags uint32, err error) {
+	f, err := base.Open(name)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer func() { _ = f.Close() }()
+	var hdr [headerLenV2]byte
+	n, err := f.ReadAt(hdr[:], 0)
+	if err != nil && err != io.EOF {
+		return "", 0, 0, err
+	}
+	if n < 4 {
+		return "", 0, 0, nil
+	}
+	magic = string(hdr[0:4])
+	if magic == fileMagicV2 {
+		if n < headerLenV2 {
+			return "", 0, 0, fmt.Errorf("truncated encryption header")
+		}
+		return magic, int(binary.BigEndian.Uint32(hdr[12:16])), binary.BigEndian.Uint32(hdr[8:12]), nil
+	}
+	return magic, 0, 0, nil
+}
+
+// convertTmpSuffix names the temporary file a conversion writes before
+// renaming it over the original.
+const convertTmpSuffix = ".dxe2tmp"
+
+// ConvertLegacyFiles rewrites the "DXE1" files in dir that convert says
+// to, in the authenticated format, each through a temporary file renamed
+// over the original with the directory synced after — a crash leaves
+// either version, and both are readable until the store turns strict.
+// Meant for the small files Pebble keeps across opens (MANIFEST, OPTIONS,
+// its markers, a WAL it will replay) before Pebble opens the store;
+// sstables are the re-encryption sweep's, which rewrites them online.
+// Returns the names converted.
+func ConvertLegacyFiles(base vfs.FS, dir string, keys *KeySet, convert func(name string) bool) ([]string, error) {
+	// A conversion that crashed between writing its temporary file and
+	// renaming it left the temporary behind; it is nothing a reader wants
+	// (its original is still there, and converts again), so sweep it.
+	names, err := base.List(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		if strings.HasSuffix(name, convertTmpSuffix) {
+			if err := base.Remove(base.PathJoin(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("removing a leftover %s: %w", name, err)
+			}
+		}
+	}
+	legacy, err := LegacyFiles(base, dir)
+	if err != nil {
+		return nil, err
+	}
+	var done []string
+	for _, name := range legacy {
+		if convert != nil && !convert(name) {
+			continue
+		}
+		if err := convertLegacyFile(base, dir, keys, name); err != nil {
+			return done, fmt.Errorf("converting %s to the authenticated format: %w", name, err)
+		}
+		done = append(done, name)
+	}
+	return done, nil
+}
+
+func convertLegacyFile(base vfs.FS, dir string, keys *KeySet, name string) error {
+	path := base.PathJoin(dir, name)
+	src, err := base.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = src.Close() }()
+	old, err := newEncFileOpen(src, keys)
+	if err != nil {
+		return err
+	}
+	st, err := old.Stat()
+	if err != nil {
+		return err
+	}
+	tmp := path + convertTmpSuffix
+	dst, err := base.Create(tmp, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return err
+	}
+	out, err := newAuthenticatedCreate(dst, keys, name)
+	if err != nil {
+		_ = dst.Close()
+		_ = base.Remove(tmp)
+		return err
+	}
+	// A piece at a time: a WAL or MANIFEST can run to tens of megabytes
+	// and this runs at open, where memory is least spare.
+	const piece = 1 << 20
+	buf := make([]byte, piece)
+	for off := int64(0); off < st.Size(); off += piece {
+		n := int64(piece)
+		if rem := st.Size() - off; rem < n {
+			n = rem
+		}
+		if _, err := old.ReadAt(buf[:n], off); err != nil && err != io.EOF {
+			_ = dst.Close()
+			_ = base.Remove(tmp)
+			return err
+		}
+		if _, err := out.Write(buf[:n]); err != nil {
+			_ = dst.Close()
+			_ = base.Remove(tmp)
+			return err
+		}
+	}
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		_ = base.Remove(tmp)
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		_ = base.Remove(tmp)
+		return err
+	}
+	if err := base.Rename(tmp, path); err != nil {
+		_ = base.Remove(tmp)
+		return err
+	}
+	if dir == "" {
+		return nil
+	}
+	d, err := base.OpenDir(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
+}
+
+// LegacyFiles lists the files in dir (through the base FS) that are
+// unauthenticated "DXE1" files: what must be gone before the store can
+// refuse the format. The registry and headerless files do not count.
+func LegacyFiles(base vfs.FS, dir string) ([]string, error) {
+	names, err := base.List(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, name := range names {
+		if name == RegistryName {
+			continue
+		}
+		path := base.PathJoin(dir, name)
+		// This list gates the cutover, which is one way: a file that
+		// cannot be examined is reported as an error, not passed over —
+		// an error means "not yet", never "go ahead". A file gone since
+		// the listing (Pebble deletes obsolete ones under us) is no file.
+		st, err := base.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("examining %s for the old encryption format: %w", name, err)
+		}
+		if st.IsDir() {
+			continue
+		}
+		magic, _, _, err := fileFormat(base, path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("examining %s for the old encryption format: %w", name, err)
+		}
+		if magic == fileMagic {
+			out = append(out, name)
+		}
+	}
+	return out, nil
 }
 
 type sizedFileInfo struct {

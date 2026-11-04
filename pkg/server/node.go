@@ -299,6 +299,17 @@ type Node struct {
 	rewriteActive      bool
 	rewriteRewritten   int64
 	prefixBloomNoticed atomic.Bool
+	// authNoticed: the store's switch to authenticated encryption files
+	// and its completion have each been logged once (engines.go);
+	// authLegacyNoticed remembers the last "N files remain" count logged.
+	authWritesNoticed atomic.Bool
+	authDoneNoticed   atomic.Bool
+	authLegacyNoticed atomic.Int64
+	// legacyFiles caches the scan for unauthenticated files behind a TTL
+	// for the status documents (one header read per store file).
+	legacyFilesMu sync.Mutex
+	legacyFilesAt time.Time
+	legacyFilesN  int
 
 	// consoleVersion digests the embedded console page (http.go);
 	// loginPage is the rendered sign-in page (session.go).
@@ -907,6 +918,13 @@ func (n *Node) EngineMode() string { return n.engineMode() }
 
 // StoreFormat is the state engine's Pebble format major version.
 func (n *Node) StoreFormat() int { return n.storeFormat() }
+
+// AuthenticatedEncryptionStatus is the store's position in the switch to
+// the authenticated encryption format (issue #220); nil for a plaintext
+// store.
+func (n *Node) AuthenticatedEncryptionStatus() *AuthenticatedEncryption {
+	return n.authenticatedEncryption()
+}
 
 // StorePrefixBloom reports whether the state engine runs with the MVCC
 // comparer and prefix bloom filters (cluster version v15, issue #161).
