@@ -15,14 +15,18 @@ import (
 // with no test failing. So: every []backupKV field of backupManifest is
 // named in the table, under its JSON tag; every table entry names a
 // field; and each entry's accessor returns that very field. The join is
-// the JSON tag, which is also what a manifest on disk is keyed by.
+// the JSON tag, which is also what a manifest on disk is keyed by. A raw
+// group is any field whose type is a slice of backupKV, named or not;
+// a group held one level down — inside a sub-struct, or as a map of
+// slices — is beyond what this test sees, so the manifest keeps its raw
+// groups as top-level fields.
 func TestManifestKeyGroupsCoverTheManifest(t *testing.T) {
-	kvType := reflect.TypeOf([]backupKV(nil))
+	kvElem := reflect.TypeOf(backupKV{})
 	mt := reflect.TypeOf(backupManifest{})
 	fields := map[string]int{} // json name -> field index
 	for i := 0; i < mt.NumField(); i++ {
 		f := mt.Field(i)
-		if f.Type != kvType {
+		if f.Type.Kind() != reflect.Slice || f.Type.Elem() != kvElem {
 			continue
 		}
 		tag := strings.Split(f.Tag.Get("json"), ",")[0]
@@ -32,13 +36,13 @@ func TestManifestKeyGroupsCoverTheManifest(t *testing.T) {
 		fields[tag] = i
 	}
 	if len(fields) == 0 {
-		t.Fatal("backupManifest has no []backupKV field; the test is looking at the wrong type")
+		t.Fatal("backupManifest has no slice-of-backupKV field; the test is looking at the wrong type")
 	}
 	seen := map[string]bool{}
 	for _, g := range manifestKeyGroups {
 		idx, ok := fields[g.name]
 		if !ok {
-			t.Errorf("manifestKeyGroups names %q, which is no []backupKV field of backupManifest", g.name)
+			t.Errorf("manifestKeyGroups names %q, which is no slice-of-backupKV field of backupManifest", g.name)
 			continue
 		}
 		if seen[g.name] {
@@ -49,7 +53,8 @@ func TestManifestKeyGroupsCoverTheManifest(t *testing.T) {
 		// through reflection and read it back through the accessor.
 		var man backupManifest
 		sentinel := []backupKV{{Key: []byte("sentinel-" + g.name)}}
-		reflect.ValueOf(&man).Elem().Field(idx).Set(reflect.ValueOf(sentinel))
+		field := reflect.ValueOf(&man).Elem().Field(idx)
+		field.Set(reflect.ValueOf(sentinel).Convert(field.Type()))
 		got := g.kvs(&man)
 		if len(got) != 1 || string(got[0].Key) != "sentinel-"+g.name {
 			t.Errorf("manifestKeyGroups[%q].kvs returns something other than backupManifest's %q field", g.name, g.name)
