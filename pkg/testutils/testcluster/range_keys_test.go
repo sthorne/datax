@@ -48,6 +48,10 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 		`ALTER TABLE sealedbook SPLIT AT VALUES ('` + sealedRow + `')`,
 		`CREATE USER reader PASSWORD 'reader-pw'`,
 		`GRANT SELECT ON openbook TO reader`,
+		// auditor sees every table without being an admin: the document
+		// it gets has nothing redacted and must say so (issue #241).
+		`CREATE USER auditor PASSWORD 'auditor-pw'`,
+		`GRANT read_all TO auditor`,
 	} {
 		if _, err := root.Exec(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -137,6 +141,22 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	}
 	if rootCluster.KeysRedacted {
 		t.Error("root's /api/cluster sets keys_redacted")
+	}
+	// The flag means "a key in this document is the shown form", not
+	// "the caller is not an admin" (issue #241): a non-admin who sees
+	// every table gets both boundaries decoded and the flag unset.
+	asAuditor := get(bases[0]+"/api/cluster", "auditor", "auditor-pw")
+	for _, want := range wants {
+		if !strings.Contains(asAuditor, want) {
+			t.Errorf("/api/cluster as auditor (read_all) does not carry %s", want)
+		}
+	}
+	var auditorCluster server.ClusterStatus
+	if err := json.Unmarshal([]byte(asAuditor), &auditorCluster); err != nil {
+		t.Fatal(err)
+	}
+	if auditorCluster.KeysRedacted {
+		t.Error("the auditor's /api/cluster sets keys_redacted though every key decoded for it")
 	}
 	var schema server.SchemaStatus
 	if err := json.Unmarshal([]byte(get(bases[0]+"/api/schema", "reader", "reader-pw")), &schema); err != nil {

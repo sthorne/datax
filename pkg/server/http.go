@@ -590,7 +590,7 @@ type NodeStatus struct {
 // full: for the node's own use (metrics, the schema document's per-table
 // ranges) and the admin-gated paths. rangeStatusesFor is the form a
 // request is served.
-func (n *Node) rangeStatuses() []RangeStatus { return n.rangeStatusesFor(keyViewer{all: true}) }
+func (n *Node) rangeStatuses() []RangeStatus { return n.rangeStatusesFor(allKeysViewer()) }
 
 // rangeStatusesFor lists this store's replicas as the caller v may see
 // them (issue #213).
@@ -629,7 +629,7 @@ func (n *Node) rangeStatusesFor(v keyViewer) []RangeStatus {
 // statusSummary is the /status document with every key rendered in
 // full: for the node's own use and the admin-gated paths. What a
 // request is served is statusSummaryFor.
-func (n *Node) statusSummary() NodeStatus { return n.statusSummaryFor(keyViewer{all: true}) }
+func (n *Node) statusSummary() NodeStatus { return n.statusSummaryFor(allKeysViewer()) }
 
 // statusSummaryFor is the /status document as the caller v may see it
 // (issue #213).
