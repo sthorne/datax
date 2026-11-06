@@ -515,6 +515,20 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **The manifest's raw-record groups are pinned to the spans restore
+  checks** (#242, from QA on #239). `checkManifestKeys` held each of the
+  five groups a backup collects — users, admins, roles, databases,
+  sequences — to its spans (#238), but the groups lived in two places
+  kept in step by memory: the manifest's `[]backupKV` fields and the
+  check's table. A sixth group added to both the struct and the
+  collector, and not to the table, would have been restored unchecked
+  with no test failing. The table is now a named value
+  (`manifestKeyGroups`, keyed by the field's JSON tag) and
+  `TestManifestKeyGroupsCoverTheManifest` joins it to the struct by
+  reflection: every `[]backupKV` field is named in the table, every
+  entry names a field, and each entry's accessor returns that very field
+  (a sentinel set through reflection comes back through it). Nothing
+  restore does changes.
 - **`keys_redacted` says a key was redacted, not that the caller is not
   an admin** (#241, from QA on #239). The cluster document's flag — what
   tells the console to label a copied key as the shown form — was set
