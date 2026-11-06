@@ -40,9 +40,19 @@ type keyViewer struct {
 	// redacted is set the first time viewKey renders a key at its prefix
 	// for this viewer: a document whose keys all decoded for the caller
 	// has nothing to warn about, whatever the caller's role (issue
-	// #241). Shared by every copy of the viewer, and safe across the
-	// goroutines a fan-out renders on.
+	// #241). A pointer, so every copy of this value-copied struct shares
+	// the one flag; atomic, so a fan-out that one day renders a
+	// document's keys on several goroutines cannot race it. Build a
+	// viewer with keyViewerFor or allKeysViewer, which allocate it: a
+	// restricted viewer built without it reports every key as redacted
+	// (redactedAny), the direction a forgotten field should fail.
 	redacted *atomic.Bool
+}
+
+// allKeysViewer is the viewer that sees everything: the node's own
+// use, the admin-gated paths, and the admin role.
+func allKeysViewer() keyViewer {
+	return keyViewer{all: true, redacted: new(atomic.Bool)}
 }
 
 // keyViewerFor resolves the caller's effective roles, once per request.
@@ -51,7 +61,7 @@ type keyViewer struct {
 // read_all / write_all roles all count.
 func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 	if p.Admin {
-		return keyViewer{all: true, redacted: new(atomic.Bool)}
+		return allKeysViewer()
 	}
 	set, err := catalog.LazyRoleGraph(ctx, n.db).Effective(p.User)
 	if err != nil {
@@ -61,9 +71,14 @@ func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 }
 
 // redactedAny reports whether a key was rendered at its prefix for this
-// viewer so far — the fact a document states as keys_redacted.
+// viewer so far — the fact a document states as keys_redacted. A
+// restricted viewer with nowhere to record that fails closed: it may
+// have redacted, so it says it did.
 func (v keyViewer) redactedAny() bool {
-	return v.redacted != nil && v.redacted.Load()
+	if v.redacted == nil {
+		return !v.all
+	}
+	return v.redacted.Load()
 }
 
 func (n *Node) keyViewer(req *http.Request) keyViewer {

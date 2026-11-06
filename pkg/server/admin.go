@@ -275,7 +275,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		// This node's /api/node document, for another node's dashboard
 		// (/api/node?id=N fans out under the node identity; admin-only
 		// like node-status, so the admin-only material is included).
-		raw, err := json.Marshal(n.localNodeDetail(ctx, keyViewer{all: true}))
+		raw, err := json.Marshal(n.localNodeDetail(ctx, allKeysViewer()))
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
