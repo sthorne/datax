@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"html"
 	"math"
 	"os"
@@ -1902,8 +1903,34 @@ func TestLinesThatCannotBeToldApartAreNotOverplotted(t *testing.T) {
 	}
 	if sp := jsFuncSpan(ms, "mustFacet"); sp == nil {
 		t.Fatal("js/85-metrics.js has no mustFacet")
-	} else if b := ms[sp[0]:sp[1]]; !strings.Contains(b, "ids.length > MAX_LINES") || !strings.Contains(b, "> 8") {
-		t.Error("mustFacet does not facet past MAX_LINES lines and on a node past n8: two nodes past n8 share one grey")
+	} else if b := ms[sp[0]:sp[1]]; !strings.Contains(b, "set.size > MAX_LINES") || !strings.Contains(b, "> 8") || !strings.Contains(b, "CVD_CLOSE_PAIRS") {
+		t.Error("mustFacet does not facet past MAX_LINES lines, on a node past n8, and on a pair a colour-vision deficiency merges")
+	}
+	// The pairs the gate facets on are the palette's own: in either
+	// theme, under simulated protanopia or deuteranopia, fewer than nine
+	// OKLab units apart (issue #240, the UI review on #249: a two-node
+	// cluster numbered 2 and 6 draws exactly such a pair, and a count
+	// never facets it). Recomputed here from the page, so the list and
+	// the palette cannot drift apart in either direction.
+	listed := map[[2]int]bool{}
+	pairsSrc := regexp.MustCompile(`const CVD_CLOSE_PAIRS = \[([^;]*)\];`).FindStringSubmatch(ms)
+	if pairsSrc == nil {
+		t.Fatal("js/85-metrics.js has no CVD_CLOSE_PAIRS")
+	}
+	for _, m := range regexp.MustCompile(`\[(\d), (\d)\]`).FindAllStringSubmatch(pairsSrc[1], -1) {
+		a, _ := strconv.Atoi(m[1])
+		b, _ := strconv.Atoi(m[2])
+		listed[[2]int{a, b}] = true
+	}
+	for pair := range cvdClosePairs(t) {
+		if !listed[pair] {
+			t.Errorf("--series-%d and --series-%d merge under a colour-vision deficiency in one theme and CVD_CLOSE_PAIRS does not list them: two such nodes would share a frame", pair[0], pair[1])
+		}
+	}
+	for pair := range listed {
+		if !cvdClosePairs(t)[pair] {
+			t.Errorf("CVD_CLOSE_PAIRS lists --series-%d and --series-%d, which are tellable apart under both simulations in both themes: remove the pair, or the view facets for nothing", pair[0], pair[1])
+		}
 	}
 	if sp := jsFuncSpan(ms, "nodeColor"); sp == nil || !strings.Contains(ms[sp[0]:sp[1]], "var(--series-${id})") {
 		t.Error("nodeColor no longer follows the node's id: filtering a node out repaints the survivors")
@@ -2153,11 +2180,14 @@ func TestSeriesPairsAreTellableApart(t *testing.T) {
 	di := strings.Index(page, "prefers-color-scheme: dark")
 	dark := page[di : di+1200]
 	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
-	// The pairs below the floor at this head, per theme, lower slot first.
-	// Issue #240 is the palette work that clears them.
+	// The pairs below the floor at this head, per theme, lower slot first:
+	// none, since #240 re-stepped the slots that collided (a pair added
+	// here must be a decision, with its number). The mechanism stays so a
+	// future slot change that lowers a pair is caught, and a listed pair
+	// that clears the floor again must be removed.
 	knownBelow := map[string]map[[2]int]bool{
-		"light": {{2, 4}: true, {2, 5}: true},
-		"dark":  {{1, 7}: true, {2, 4}: true, {2, 5}: true, {3, 6}: true},
+		"light": {},
+		"dark":  {},
 	}
 	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
 		pal := map[int]string{}
@@ -2181,6 +2211,92 @@ func TestSeriesPairsAreTellableApart(t *testing.T) {
 			}
 		}
 	}
+}
+
+// seriesPalettes reads the eight series slots of each theme from the page.
+func seriesPalettes(t *testing.T) map[string]map[int]string {
+	t.Helper()
+	page := string(mustRead(t, "index.html"))
+	light := page[strings.Index(page, ":root {"):]
+	light = light[:strings.Index(light, "}")]
+	di := strings.Index(page, "prefers-color-scheme: dark")
+	dark := page[di : di+1200]
+	slot := regexp.MustCompile(`--series-(\d): (#[0-9a-f]{6})`)
+	out := map[string]map[int]string{}
+	for _, theme := range []struct{ name, css string }{{"light", light}, {"dark", dark}} {
+		pal := map[int]string{}
+		for _, m := range slot.FindAllStringSubmatch(theme.css, -1) {
+			i, _ := strconv.Atoi(m[1])
+			pal[i] = m[2]
+		}
+		if len(pal) != 8 {
+			t.Fatalf("%s theme: found %d series slots, want 8", theme.name, len(pal))
+		}
+		out[theme.name] = pal
+	}
+	return out
+}
+
+// cvdClosePairs is the set of slot pairs fewer than cvdFloor OKLab units
+// apart under simulated protanopia or deuteranopia in either theme.
+func cvdClosePairs(t *testing.T) map[[2]int]bool {
+	t.Helper()
+	out := map[[2]int]bool{}
+	for _, pal := range seriesPalettes(t) {
+		for a := 1; a <= 8; a++ {
+			for b := a + 1; b <= 8; b++ {
+				if cvdDistance(pal[a], pal[b], protan) < cvdFloor || cvdDistance(pal[a], pal[b], deutan) < cvdFloor {
+					out[[2]int{a, b}] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// cvdFloor is the OKLab distance below which two lines are one colour to
+// a viewer with the deficiency, end labels or not (#216's band for a
+// pair carrying a secondary channel started at 6–8; 9 is the margin
+// above it).
+const cvdFloor = 9.0
+
+// protan and deutan are Machado, Oliveira and Fernandes' (2009) severity
+// 1.0 simulation matrices over linear sRGB, as #216's validator used.
+var (
+	protan = [3][3]float64{{0.152286, 1.052583, -0.204868}, {0.114503, 0.786281, 0.099216}, {-0.003882, -0.048116, 1.051998}}
+	deutan = [3][3]float64{{0.367322, 0.860646, -0.227968}, {0.280085, 0.672501, 0.047413}, {-0.011820, 0.042940, 0.968881}}
+)
+
+// cvdDistance is the OKLab distance between two colours as a viewer with
+// the simulated deficiency sees them.
+func cvdDistance(a, b string, m [3][3]float64) float64 {
+	return oklabDistance(simulateCVD(a, m), simulateCVD(b, m))
+}
+
+func simulateCVD(hex string, m [3][3]float64) string {
+	var lin [3]float64
+	for i := range lin {
+		v, _ := strconv.ParseUint(hex[1+2*i:3+2*i], 16, 8)
+		c := float64(v) / 255
+		if c <= 0.04045 {
+			lin[i] = c / 12.92
+		} else {
+			lin[i] = math.Pow((c+0.055)/1.055, 2.4)
+		}
+	}
+	out := "#"
+	for _, row := range m {
+		v := row[0]*lin[0] + row[1]*lin[1] + row[2]*lin[2]
+		v = math.Min(1, math.Max(0, v))
+		var e float64
+		if v <= 0.0031308 {
+			e = 12.92 * v
+		} else {
+			e = 1.055*math.Pow(v, 1/2.4) - 0.055
+		}
+		out += fmt.Sprintf("%02x", int(math.Round(255*e)))
+	}
+	return out
 }
 
 // oklabDistance is the OKLab Euclidean distance between two sRGB hex
