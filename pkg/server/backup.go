@@ -446,18 +446,6 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 	return &man, nil
 }
 
-// checkManifestKeys holds a manifest's raw key/value groups — users,
-// admins, roles, databases, sequences — to the key spans backup collects
-// each from. Restore writes those keys back verbatim, so a crafted
-// manifest could otherwise have it write any key in the cluster, as the
-// node, inside restore's own transaction: the authentication secret
-// (keys.AuthSecretKey, outside every span a backup collects, so no
-// legitimate backup carries it) would hand the console's session
-// signing key to whoever wrote the manifest (issue #238). Checked when
-// the manifest is read, like the file names, so both readers refuse it
-// before anything is applied. Databases and sequences legitimately mix
-// spans — descriptors and names, and counters — so each group is held
-// to the set backup reads for it, not to one span.
 // manifestKeyGroup is one of the manifest's raw-record groups: its JSON
 // field name, how to read it from a manifest, and the key spans a backup
 // collects it from — the only spans restore accepts it in (issue #238).
@@ -491,6 +479,18 @@ var manifestKeyGroups = []manifestKeyGroup{
 		}},
 }
 
+// checkManifestKeys holds a manifest's raw key/value groups — users,
+// admins, roles, databases, sequences — to the key spans backup collects
+// each from. Restore writes those keys back verbatim, so a crafted
+// manifest could otherwise have it write any key in the cluster, as the
+// node, inside restore's own transaction: the authentication secret
+// (keys.AuthSecretKey, outside every span a backup collects, so no
+// legitimate backup carries it) would hand the console's session
+// signing key to whoever wrote the manifest (issue #238). Checked when
+// the manifest is read, like the file names, so both readers refuse it
+// before anything is applied. Databases and sequences legitimately mix
+// spans — descriptors and names, and counters — so each group is held
+// to the set backup reads for it, not to one span.
 func checkManifestKeys(dir string, man *backupManifest) error {
 	for _, g := range manifestKeyGroups {
 		spans := g.spans()
