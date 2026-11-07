@@ -55,6 +55,11 @@ type StoreConfig struct {
 	// DisableQuiescence keeps idle ranges ticking and heartbeating (see
 	// quiesce.go); heartbeats still travel coalesced.
 	DisableQuiescence bool
+	// ReplicaGCGrace is how long a replica that leads nothing, hears
+	// from no leader and applies nothing is left alone before the
+	// housekeeping pass asks /meta whether it is a member of its range
+	// (replicagc.go, issue #245); 0 = DefaultReplicaGCGrace.
+	ReplicaGCGrace time.Duration
 	// TruncationFlushAfter bounds how long a split store's deferred log
 	// truncation waits for the state engine to flush on its own: a
 	// pending truncation older than this makes the housekeeping tick
@@ -180,6 +185,12 @@ type TestingKnobs struct {
 // meta record updates).
 type Sender interface {
 	Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
+}
+
+// metaLookup is the part of kvclient.DB replica GC uses: the /meta record
+// covering a key, as the cluster currently addresses it (issue #245).
+type metaLookup interface {
+	LookupMetaRecord(ctx context.Context, key keys.Key) (kvpb.RangeDescriptor, bool, error)
 }
 
 // Store owns all replicas hosted by this node's engine.

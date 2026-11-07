@@ -297,6 +297,13 @@ var (
 	MetricsRecordErrors = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_metrics_record_errors_total", Help: "Metrics-recorder ticks whose write failed (retried next tick).",
 	})
+	// Replica GC (issue #245).
+	ReplicaGCRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_replica_gc_removed_total", Help: "Leftover replicas the housekeeping pass removed because /meta showed them to be members of nothing.",
+	})
+	RaftNonMemberDropped = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_nonmember_messages_dropped_total", Help: "Raft messages dropped because the sender's replica id is one the range's descriptor has moved past.",
+	})
 )
 
 // AuthThrottleCauses are the labels AuthThrottled is counted by; see the

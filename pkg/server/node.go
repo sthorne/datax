@@ -65,6 +65,11 @@ type Config struct {
 	ConsistencyInterval time.Duration
 	// GCInterval is how often the GC loop scans led ranges (default 60s).
 	GCInterval time.Duration
+	// ReplicaGCGrace is how long a replica that leads nothing, hears
+	// from no leader and applies nothing is left alone before the
+	// housekeeping pass asks /meta whether it is still a member of its
+	// range (issue #245; default kvserver.DefaultReplicaGCGrace, 60s).
+	ReplicaGCGrace time.Duration
 	// LivenessGrace is how stale a node's heartbeat may be before the
 	// allocator stops treating it as live (default 15s).
 	LivenessGrace time.Duration
@@ -592,6 +597,7 @@ func (n *Node) start() error {
 		MergeBarrier:            n.placementBarrier,
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
+		ReplicaGCGrace:          n.cfg.ReplicaGCGrace,
 		WaitForApplication:      n.waitForApplication,
 		ClusterVersion: func() version.Version {
 			if cv := version.Version(n.clusterVersion.Load()); cv > 0 {
