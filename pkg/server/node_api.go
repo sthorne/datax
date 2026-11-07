@@ -148,14 +148,14 @@ func (n *Node) localNodeDetail(ctx context.Context, v keyViewer) NodeDetail {
 		}
 	}
 	if n.events != nil {
-		d.Events = events.Redact(n.events.Recent(0, 50, admin), v.sees)
+		d.Events = events.Redact(n.events.Recent(0, 50, admin), v.reads)
 		if d.Events == nil {
 			d.Events = []events.Event{}
 		}
 		// Paired over the whole ring, not the tail this document
 		// carries, so an operation that started before that tail is
 		// still reported as running.
-		d.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, admin), v.sees), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
+		d.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, admin), v.reads), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	}
 	return d
 }

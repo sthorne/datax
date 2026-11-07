@@ -55,9 +55,16 @@ func TestManifestKeyGroupsCoverTheManifest(t *testing.T) {
 		sentinel := []backupKV{{Key: []byte("sentinel-" + g.name)}}
 		field := reflect.ValueOf(&man).Elem().Field(idx)
 		field.Set(reflect.ValueOf(sentinel).Convert(field.Type()))
-		got := g.kvs(&man)
+		got := *g.kvs(&man)
 		if len(got) != 1 || string(got[0].Key) != "sentinel-"+g.name {
 			t.Errorf("manifestKeyGroups[%q].kvs returns something other than backupManifest's %q field", g.name, g.name)
+		}
+		// And it is the field, not a copy of it: RunBackup appends
+		// through the pointer, so a write through it must land in the
+		// manifest (issue #256).
+		*g.kvs(&man) = append(*g.kvs(&man), backupKV{Key: []byte("appended")})
+		if l := field.Len(); l != 2 {
+			t.Errorf("manifestKeyGroups[%q].kvs does not point at backupManifest's %q field: an append through it left the field with %d records, not 2", g.name, g.name, l)
 		}
 		if len(g.spans()) == 0 {
 			t.Errorf("manifestKeyGroups[%q] has no spans: every key in it would be refused", g.name)

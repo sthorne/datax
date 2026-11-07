@@ -531,6 +531,20 @@ func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
 	return false
 }
 
+// CanReadTable reports whether a role set may read a table's rows:
+// admins, the owner, read_all, and a SELECT grant held directly or
+// through a role the set holds, `public` included. It is the question
+// to ask before showing a row value — a range boundary rendered into the
+// key it was split at is one — where CanSeeTable is the question to ask
+// before naming the table. The two differ exactly on a grantee holding
+// a write privilege and no read one: an INSERT-only grantee may see the
+// table exists and may not read a row of it, and write_all is write
+// everything, not read everything (issue #253).
+func CanReadTable(set RoleSet, d *TableDescriptor) bool {
+	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
+		HasPrivilege(d.Privileges, set, "SELECT")
+}
+
 func OwnerOf(owner string) string {
 	if owner == "" {
 		return RootRole

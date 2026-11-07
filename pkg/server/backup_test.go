@@ -189,4 +189,98 @@ func TestBackupManifestKeysStayInTheirSpans(t *testing.T) {
 			t.Fatalf("a manifest whose %s carries %s was refused for another reason: %v", c.name, c.key, err)
 		}
 	}
+
+	// The same, derived from the table rather than listed: every group
+	// refuses every key a backup never collects anywhere — the
+	// authentication secret above all. A span added to one group's
+	// entry that reaches one of these is caught here whichever group it
+	// is added to (issue #256: the hand-written cases above asserted the
+	// secret refused for users and admins only, so widening sequences
+	// to accept it survived the suite).
+	outside := []struct {
+		what string
+		key  keys.Key
+	}{
+		{"the authentication secret", keys.AuthSecretKey()},
+		{"the cluster version", keys.ClusterVersionKey()},
+		{"the meta span's start", metaStart},
+		{"a table descriptor", keys.TableDescKey(5)},
+		{"a table's data", keys.TableDataPrefix(5)},
+	}
+	for _, g := range manifestKeyGroups {
+		for _, o := range outside {
+			if inAnySpan(o.key, g.spans()) {
+				t.Fatalf("manifestKeyGroups[%q] accepts %s (%s), which no backup collects", g.name, o.what, o.key)
+			}
+			var man backupManifest
+			*g.kvs(&man) = []backupKV{{Key: o.key, Value: make([]byte, 32)}}
+			_, err := readBackupManifest(write(man))
+			if err == nil {
+				t.Fatalf("a manifest whose %s carries %s (%s) was accepted", g.name, o.what, o.key)
+			}
+			if !strings.Contains(err.Error(), "manifest's "+g.name+" carries the key") {
+				t.Fatalf("a manifest whose %s carries %s was refused for another reason: %v", g.name, o.what, err)
+			}
+		}
+	}
+}
+
+// TestBackupDataFilesStayInTheirTableSpan (issue #255): a table's data
+// file is held to that table's data span before anything is applied,
+// and tombstones are held to it too — a record appended to the file
+// with the manifest untouched is refused, as a manifest key outside its
+// group's span is.
+func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
+	const tableID = 5
+	table := backupTable{ID: tableID, Name: "t", File: backupDataFile(tableID)}
+	man := &backupManifest{Tables: []backupTable{table}}
+	write := func(recs ...kvpb.ExportRecord) string {
+		dir := t.TempDir()
+		f, err := os.Create(filepath.Join(dir, table.File))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, rec := range recs {
+			if err := writeBackupRecord(f, rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	own := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 1), Value: []byte("row")}
+	ownGone := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 2), Deleted: true}
+	if err := checkBackupRecords(write(own, ownGone), man); err != nil {
+		t.Fatalf("a file carrying the table's own keys, a tombstone among them, was refused: %v", err)
+	}
+	if err := checkBackupRecords(write(), man); err != nil {
+		t.Fatalf("an empty data file was refused: %v", err)
+	}
+	metaStart, _ := keys.MetaSpan()
+	_, end := keys.TableDataSpan(tableID)
+	for _, c := range []struct {
+		what string
+		rec  kvpb.ExportRecord
+	}{
+		{"the authentication secret", kvpb.ExportRecord{Key: keys.AuthSecretKey(), Value: make([]byte, 32)}},
+		{"a tombstone for the authentication secret", kvpb.ExportRecord{Key: keys.AuthSecretKey(), Deleted: true}},
+		{"a role's verifier", kvpb.ExportRecord{Key: keys.RoleKey("root"), Value: []byte("v")}},
+		{"the cluster version", kvpb.ExportRecord{Key: keys.ClusterVersionKey(), Value: []byte("1")}},
+		{"a table descriptor", kvpb.ExportRecord{Key: keys.TableDescKey(tableID), Value: []byte("{}")}},
+		{"the meta span", kvpb.ExportRecord{Key: metaStart, Value: []byte("m")}},
+		{"another table's row", kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID+1, 1), Value: []byte("row")}},
+		{"the span's end", kvpb.ExportRecord{Key: end, Value: []byte("row")}},
+	} {
+		// After the table's own records, so a refusal has to come from
+		// the record and not from a position.
+		err := checkBackupRecords(write(own, c.rec), man)
+		if err == nil {
+			t.Fatalf("a data file carrying %s (%s) was accepted", c.what, keys.Key(c.rec.Key))
+		}
+		if !strings.Contains(err.Error(), "table t's data file carries the key") || !strings.Contains(err.Error(), "outside the table's own span") {
+			t.Fatalf("a data file carrying %s was refused for another reason: %v", c.what, err)
+		}
+	}
 }

@@ -219,6 +219,43 @@ func checkBackupFiles(dir string, man *backupManifest) error {
 	return nil
 }
 
+// checkBackupRecords holds every record in a backup's data files to the
+// data span of the table the file is for, before restore has applied
+// anything. Restore writes a record's key back verbatim, so a record
+// appended to table_N.dxbk could otherwise have it write — or, as a
+// tombstone, delete — any key in the cluster, the authentication secret
+// first among them, with the manifest left byte-for-byte as backup
+// wrote it: the manifest's checksums are reported after a restore for
+// the operator to compare, never enforced before one (issue #255,
+// #238's other half). A table's file legitimately carries only keys in
+// keys.TableDataSpan(t.ID), the span backup exported it from. Checked
+// here, alongside the file names, so a crafted file is refused before
+// the first chunk is committed rather than after the chunks before it;
+// restore checks each record again as it applies it, so a file changed
+// between the two reads is refused too.
+func checkBackupRecords(dir string, man *backupManifest) error {
+	for _, t := range man.Tables {
+		path := filepath.Join(dir, backupDataFile(t.ID))
+		err := readBackupRecords(path, func(rec kvpb.ExportRecord) error {
+			return checkBackupRecord(path, t, rec)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkBackupRecord refuses a record of table t's data file whose key
+// lies outside t's data span, tombstones included.
+func checkBackupRecord(path string, t backupTable, rec kvpb.ExportRecord) error {
+	start, end := keys.TableDataSpan(t.ID)
+	if k := keys.Key(rec.Key); k.Compare(start) < 0 || k.Compare(end) >= 0 {
+		return fmt.Errorf("%s: table %s's data file carries the key %s, which lies outside the table's own span", path, t.Name, k)
+	}
+	return nil
+}
+
 func readBackupRecords(path string, fn func(kvpb.ExportRecord) error) error {
 	raw, err := readBackupFile(path)
 	if err != nil {
@@ -341,34 +378,19 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		})
 		return out, err
 	}
-	uStart, uEnd := keys.UserSpan()
-	if man.Users, err = collectRaw(uStart, uEnd); err != nil {
-		return nil, err
-	}
-	aStart, aEnd := keys.AdminUserSpan()
-	if man.Admins, err = collectRaw(aStart, aEnd); err != nil {
-		return nil, err
-	}
-	rStart, rEnd := keys.RoleSpan()
-	if man.Roles, err = collectRaw(rStart, rEnd); err != nil {
-		return nil, err
-	}
-	dStart, dEnd := keys.DatabaseDescSpan()
-	if man.Databases, err = collectRaw(dStart, dEnd); err != nil {
-		return nil, err
-	}
-	nStart, nEnd := keys.DatabaseNamespaceSpan()
-	dbNames, err := collectRaw(nStart, nEnd)
-	if err != nil {
-		return nil, err
-	}
-	man.Databases = append(man.Databases, dbNames...)
-	for _, span := range [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())} {
-		kvs, err := collectRaw(span[0], span[1])
-		if err != nil {
-			return nil, err
+	// The raw groups — users, admins, roles, databases (descriptors and
+	// names), sequences (descriptors, names, counters) — each from the
+	// spans manifestKeyGroups lists for it, which are the spans restore
+	// holds the group to (issue #256): one list for both sides.
+	for _, g := range manifestKeyGroups {
+		dst := g.kvs(&man)
+		for _, span := range g.spans() {
+			kvs, err := collectRaw(span[0], span[1])
+			if err != nil {
+				return nil, err
+			}
+			*dst = append(*dst, kvs...)
 		}
-		man.Sequences = append(man.Sequences, kvs...)
 	}
 
 	// Table data: the (baseTS, endTS] window over each table's full data
@@ -447,33 +469,43 @@ func readBackupManifest(dir string) (*backupManifest, error) {
 }
 
 // manifestKeyGroup is one of the manifest's raw-record groups: its JSON
-// field name, how to read it from a manifest, and the key spans a backup
-// collects it from — the only spans restore accepts it in (issue #238).
+// field name, the manifest field that holds it, and the key spans a
+// backup collects it from — the only spans restore accepts it in (issue
+// #238).
 type manifestKeyGroup struct {
-	name  string
-	kvs   func(*backupManifest) []backupKV
+	name string
+	// kvs returns the manifest's field for this group. A pointer, so
+	// RunBackup fills the field through it and checkManifestKeys reads
+	// the same field back.
+	kvs   func(*backupManifest) *[]backupKV
 	spans func() [][2]keys.Key
 }
 
-// manifestKeyGroups is the table checkManifestKeys holds a manifest to.
-// It must name every []backupKV field of backupManifest and nothing else:
-// a raw group that RunBackup collects but this table does not name would
-// be restored unchecked, which is the hole #238 closed, and
+// manifestKeyGroups is the one list of the manifest's raw groups and
+// their spans. RunBackup collects each group from its spans through it,
+// and checkManifestKeys holds a manifest's groups to the same spans, so
+// what backup collects and what restore accepts cannot drift apart:
+// there is no second list to keep in step (issue #256; before it,
+// RunBackup named the spans again by hand, and a span added to this
+// table alone widened what restore accepted with no test failing). It
+// must name every []backupKV field of backupManifest and nothing else:
+// a raw group collected but not named here would be restored
+// unchecked, which is the hole #238 closed, and
 // TestManifestKeyGroupsCoverTheManifest pins the two to each other
 // (issue #242). name is the field's JSON tag; kvs must return that very
-// field.
+// field. The spans are listed in the order backup writes them.
 var manifestKeyGroups = []manifestKeyGroup{
-	{"users", func(m *backupManifest) []backupKV { return m.Users },
+	{"users", func(m *backupManifest) *[]backupKV { return &m.Users },
 		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.UserSpan())} }},
-	{"admins", func(m *backupManifest) []backupKV { return m.Admins },
+	{"admins", func(m *backupManifest) *[]backupKV { return &m.Admins },
 		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.AdminUserSpan())} }},
-	{"roles", func(m *backupManifest) []backupKV { return m.Roles },
+	{"roles", func(m *backupManifest) *[]backupKV { return &m.Roles },
 		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.RoleSpan())} }},
-	{"databases", func(m *backupManifest) []backupKV { return m.Databases },
+	{"databases", func(m *backupManifest) *[]backupKV { return &m.Databases },
 		func() [][2]keys.Key {
 			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}
 		}},
-	{"sequences", func(m *backupManifest) []backupKV { return m.Sequences },
+	{"sequences", func(m *backupManifest) *[]backupKV { return &m.Sequences },
 		func() [][2]keys.Key {
 			return [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())}
 		}},
@@ -494,7 +526,7 @@ var manifestKeyGroups = []manifestKeyGroup{
 func checkManifestKeys(dir string, man *backupManifest) error {
 	for _, g := range manifestKeyGroups {
 		spans := g.spans()
-		for _, kv := range g.kvs(man) {
+		for _, kv := range *g.kvs(man) {
 			if !inAnySpan(keys.Key(kv.Key), spans) {
 				return fmt.Errorf("%s: manifest's %s carries the key %s, which a datax backup never collects there", dir, g.name, keys.Key(kv.Key))
 			}
@@ -549,6 +581,9 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.Backup
 			return nil, err
 		}
 		if err := checkBackupFiles(src, man); err != nil {
+			return nil, err
+		}
+		if err := checkBackupRecords(src, man); err != nil {
 			return nil, err
 		}
 		mans[i] = man
@@ -694,6 +729,13 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.Backup
 				})
 			}
 			err := readBackupRecords(path, func(rec kvpb.ExportRecord) error {
+				// Held to the table's span again at the write: the
+				// pass above read the file once already, and a file
+				// rewritten since is refused rather than applied
+				// (issue #255).
+				if err := checkBackupRecord(path, t, rec); err != nil {
+					return err
+				}
 				if rec.Deleted {
 					wb.Delete(keys.Key(rec.Key))
 				} else {
