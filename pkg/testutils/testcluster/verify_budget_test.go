@@ -49,29 +49,32 @@ func TestSuccessfulSignInsSpendTheVerificationBudget(t *testing.T) {
 	}
 
 	// A flood of correct Basic credentials from one address. Every one
-	// is a derivation; before #221 all of them ran.
-	const flood = 300
+	// is a derivation; before #221 all of them ran. Each flood here runs
+	// on three connections at once until the door refuses: a sign-in
+	// costs a derivation (about 3 ms at the current count, issue #225)
+	// plus the round trip, and on a slow runner one connection in
+	// sequence can spend the budget no faster than it refills (CI on
+	// the PR for #225: three hundred sign-ins in thirteen seconds, none
+	// refused, against a hundred plus twenty a second). Three stay under
+	// the four-slot in-flight cap, so no refusal is for that cause — the
+	// health check at the end depends on it.
 	hammer := httpsClientFrom(t, certsDir, "", "127.0.0.5")
-	start := time.Now()
-	var ok, refused int
-	for i := 0; i < flood; i++ {
-		switch code, _, _ := authedGet(t, hammer, base+"/status", "root", "topsecret"); code {
-		case http.StatusOK:
-			ok++
-		case http.StatusTooManyRequests:
-			refused++
-		default:
-			t.Fatalf("request %d: %d, want 200 or 429", i, code)
+	ok, refused, elapsed := floodUntilRefused(t, hammer, func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodGet, base+"/status", nil)
+		if err == nil {
+			req.SetBasicAuth("root", "topsecret")
 		}
-	}
-	elapsed := time.Since(start)
+		return req, err
+	}, 300)
 	if refused == 0 {
-		t.Fatalf("%d correct sign-ins from one address in %s, none refused: a credential-holder is exempt from the bound", flood, elapsed)
+		t.Fatalf("%d correct sign-ins from one address in %s, none refused: a credential-holder is exempt from the bound", ok, elapsed)
 	}
 	// The bound: a burst of 100 plus twenty a second (server.authVerifyBurst,
-	// server.authVerifyRate), measured against the time the flood took.
-	if limit := 100 + int(20*elapsed.Seconds()) + 20; ok > limit {
-		t.Fatalf("%d of %d correct sign-ins verified in %s (limit %d): the verification budget is not holding", ok, flood, elapsed, limit)
+	// server.authVerifyRate), measured against the time the flood took;
+	// three in flight when the budget ran out can each have been
+	// admitted a beat before the refusal, hence the slack.
+	if limit := 100 + int(20*elapsed.Seconds()) + 20 + 3; ok > limit {
+		t.Fatalf("%d correct sign-ins verified in %s (limit %d): the verification budget is not holding", ok, elapsed, limit)
 	}
 
 	// Another address is unaffected, and so is the operator's.
@@ -82,75 +85,20 @@ func TestSuccessfulSignInsSpendTheVerificationBudget(t *testing.T) {
 	// The same through /api/login, from a third address: the other door
 	// that verifies, and the one the issue measured — a script signing
 	// in afresh on every call. Each door is its own call site, so each
-	// is proved on its own. The flood runs until the door refuses, on
-	// three connections at once: a sign-in costs a derivation (about 3
-	// ms at the current count, issue #225) plus the round trip, and on a
-	// slow runner one connection in sequence can spend the budget no
-	// faster than it refills (CI on the PR for #225: 200 sign-ins in six
-	// seconds, none refused, against a hundred plus twenty a second).
-	// Three stay under the four-slot in-flight cap, so no refusal here
-	// is for that cause — the health check below depends on it.
+	// is proved on its own.
 	signer := httpsClientFrom(t, certsDir, "", "127.0.0.7")
-	start = time.Now()
-	var loginMu sync.Mutex
-	var loginOK, loginRefused, loginAttempts int
-	var loginErr error
-	loginDeadline := time.Now().Add(60 * time.Second)
-	var wg sync.WaitGroup
-	for w := 0; w < 3; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				loginMu.Lock()
-				done := loginErr != nil || (loginRefused > 0 && loginAttempts >= 200) || time.Now().After(loginDeadline)
-				loginAttempts++
-				loginMu.Unlock()
-				if done {
-					return
-				}
-				req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(`{"user":"root","password":"topsecret"}`))
-				if err != nil {
-					loginMu.Lock()
-					loginErr = err
-					loginMu.Unlock()
-					return
-				}
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := signer.Do(req)
-				if err != nil {
-					loginMu.Lock()
-					loginErr = err
-					loginMu.Unlock()
-					return
-				}
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-				loginMu.Lock()
-				switch resp.StatusCode {
-				case http.StatusOK:
-					loginOK++
-				case http.StatusTooManyRequests:
-					loginRefused++
-				default:
-					loginErr = fmt.Errorf("login: %d, want 200 or 429", resp.StatusCode)
-				}
-				loginMu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	elapsed = time.Since(start)
-	if loginErr != nil {
-		t.Fatal(loginErr)
-	}
+	loginOK, loginRefused, loginElapsed := floodUntilRefused(t, signer, func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(`{"user":"root","password":"topsecret"}`))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, err
+	}, 200)
 	if loginRefused == 0 {
-		t.Fatalf("%d correct sign-ins through /api/login from one address in %s, none refused: that door does not spend the verification budget", loginOK, elapsed)
+		t.Fatalf("%d correct sign-ins through /api/login from one address in %s, none refused: that door does not spend the verification budget", loginOK, loginElapsed)
 	}
-	// Three in flight when the budget ran out can each have been admitted
-	// a beat before the refusal, hence the slack.
-	if limit := 100 + int(20*elapsed.Seconds()) + 20 + 3; loginOK > limit {
-		t.Fatalf("%d correct /api/login sign-ins verified in %s (limit %d): the verification budget is not holding at that door", loginOK, elapsed, limit)
+	if limit := 100 + int(20*loginElapsed.Seconds()) + 20 + 3; loginOK > limit {
+		t.Fatalf("%d correct /api/login sign-ins verified in %s (limit %d): the verification budget is not holding at that door", loginOK, loginElapsed, limit)
 	}
 	refused += loginRefused
 
@@ -318,4 +266,66 @@ func TestGuessingStaysBoundedAtBothDoors(t *testing.T) {
 	if ran == 0 {
 		t.Fatal("the first /api/login guess was refused: the bound is not what this test measures")
 	}
+}
+
+// floodUntilRefused sends mkReq's request through client on three
+// connections at once until the server has refused at least one and at
+// least minAttempts were made, or a minute has passed, and reports the
+// admitted and refused counts and the time it took. Three in flight stay
+// under the verification in-flight cap of four, so a refusal is the
+// verification budget's and not the cap's.
+func floodUntilRefused(t *testing.T, client *http.Client, mkReq func() (*http.Request, error), minAttempts int) (ok, refused int, elapsed time.Duration) {
+	t.Helper()
+	start := time.Now()
+	deadline := start.Add(60 * time.Second)
+	var mu sync.Mutex
+	var attempts int
+	var failure error
+	var wg sync.WaitGroup
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				mu.Lock()
+				done := failure != nil || (refused > 0 && attempts >= minAttempts) || time.Now().After(deadline)
+				if !done {
+					attempts++
+				}
+				mu.Unlock()
+				if done {
+					return
+				}
+				req, err := mkReq()
+				if err == nil {
+					var resp *http.Response
+					resp, err = client.Do(req)
+					if err == nil {
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
+						mu.Lock()
+						switch resp.StatusCode {
+						case http.StatusOK:
+							ok++
+						case http.StatusTooManyRequests:
+							refused++
+						default:
+							failure = fmt.Errorf("%s %s: %d, want 200 or 429", req.Method, req.URL.Path, resp.StatusCode)
+						}
+						mu.Unlock()
+						continue
+					}
+				}
+				mu.Lock()
+				failure = err
+				mu.Unlock()
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	return ok, refused, time.Since(start)
 }
