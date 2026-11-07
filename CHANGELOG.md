@@ -579,7 +579,15 @@ state or the internode protocol does, and an entry below says so.
   unchanged), and the dark theme, whose minimum was already 3.96, is
   untouched. `TestSeriesLinesClearTheGraphicalContrastFloor` pins every
   slot of both themes to the floor, with exceptions recorded by number
-  rather than as validator WARNs.
+  rather than as validator WARNs. Two costs, recorded here so they are
+  not discovered later (the UI review on the PR): the light palette is
+  more muted — `n3`'s chroma is now the lowest in either theme, and
+  `n4` and `n5` come down too, which is what 3:1 against white costs —
+  and light `n3`/`n5` under a colour-vision deficiency moved from 6.1
+  to 4.8 OKLab units apart, the wrong direction, though the pair was
+  already in `CVD_CLOSE_PAIRS` and never shares a frame. Three slots
+  sit within 0.13 of the floor, so the next nudge in that region is
+  stopped by contrast before separation.
 - **Backup collects the manifest's raw groups from the same table restore
   checks them against** (#256, from QA and InfoSec on #254). #254 pinned
   `manifestKeyGroups` to the manifest struct; the spans were still

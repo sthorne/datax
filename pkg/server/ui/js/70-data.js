@@ -71,13 +71,19 @@ function renderClusterRanges(ranges) {
     if (r.range_id === openRange) items.push({ key: "d" + r.range_id, html: null });
   }
   renderKeyed(document.getElementById("cluster-ranges"), items);
+  // The cap line holds a button, and this runs on every poll: through
+  // setHTML, so unchanged markup is left alone and a change waits while
+  // the reader is on the button rather than replacing it under them
+  // (the UI and security reviews on the PR; the #148/#149 class). The
+  // empty case goes the same way, so the helper's record of what the
+  // element holds stays true.
   const cap = document.getElementById("cluster-range-cap");
   if (all.length > shown.length) {
-    cap.innerHTML = `showing the first ${esc(String(shown.length))} of ${esc(String(all.length))} ranges · <button type="button" class="linkish" data-ranges="all">show all ${esc(String(all.length))}</button> · the CSV carries every row`;
+    setHTML(cap, `showing the first ${esc(String(shown.length))} of ${esc(String(all.length))} ranges · <button type="button" class="linkish" data-ranges="all">show all ${esc(String(all.length))}</button> · the CSV carries every row`);
   } else if (rangesShowAll && all.length > RANGE_TABLE_CAP) {
-    cap.innerHTML = `showing all ${esc(String(all.length))} ranges · <button type="button" class="linkish" data-ranges="first">show the first ${RANGE_TABLE_CAP}</button>`;
+    setHTML(cap, `showing all ${esc(String(all.length))} ranges · <button type="button" class="linkish" data-ranges="first">show the first ${RANGE_TABLE_CAP}</button>`);
   } else {
-    cap.textContent = "";
+    setHTML(cap, "");
   }
   // The rows the filter left, all of them, with the keys untrimmed: the
   // cell shortens a span to what fits a column, and a key that has been

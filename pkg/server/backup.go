@@ -250,9 +250,11 @@ func checkBackupRecords(dir string, man *backupManifest) error {
 // of a data file — the pass before anything is applied and the apply
 // loop — go through here, so neither can be written without the check:
 // the second read is deliberate, for a file rewritten between the two,
-// and this is what keeps it from being tidied away as already done.
+// and this is what keeps it from being tidied away as already done. The
+// reader beneath is named for what it lacks, so a call site that reaches
+// past this one reads as what it is.
 func readCheckedBackupRecords(path string, t backupTable, fn func(kvpb.ExportRecord) error) error {
-	return readBackupRecords(path, func(rec kvpb.ExportRecord) error {
+	return readBackupRecordsUnchecked(path, func(rec kvpb.ExportRecord) error {
 		if err := checkBackupRecord(path, t, rec); err != nil {
 			return err
 		}
@@ -270,7 +272,7 @@ func checkBackupRecord(path string, t backupTable, rec kvpb.ExportRecord) error 
 	return nil
 }
 
-func readBackupRecords(path string, fn func(kvpb.ExportRecord) error) error {
+func readBackupRecordsUnchecked(path string, fn func(kvpb.ExportRecord) error) error {
 	raw, err := readBackupFile(path)
 	if err != nil {
 		return err

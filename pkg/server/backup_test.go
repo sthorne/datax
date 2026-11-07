@@ -86,7 +86,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if err := os.Symlink(filepath.Join(elsewhere, "data.dxbk"), filepath.Join(dir, backupDataFile(7))); err != nil {
 		t.Fatal(err)
 	}
-	if err := readBackupRecords(filepath.Join(dir, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file") {
+	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file") {
 		t.Fatalf("a symlink at a data file's name: %v", err)
 	}
 	if err := os.Remove(filepath.Join(dir, backupManifestName)); err != nil {
@@ -113,7 +113,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, backupDataFile(8)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := readBackupRecords(filepath.Join(dir, backupDataFile(8)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file (d---------)") {
+	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(8)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file (d---------)") {
 		t.Fatalf("a directory at a data file's name: %v", err)
 	}
 	// The plain files themselves are read.
@@ -127,7 +127,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if _, err := readBackupManifest(plain); err != nil {
 		t.Fatalf("a plain manifest: %v", err)
 	}
-	if err := readBackupRecords(filepath.Join(plain, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err != nil {
+	if err := readBackupRecordsUnchecked(filepath.Join(plain, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err != nil {
 		t.Fatalf("a plain data file: %v", err)
 	}
 }

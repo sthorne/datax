@@ -2407,13 +2407,16 @@ func TestRangesTableIsCapped(t *testing.T) {
 		t.Fatal("renderClusterRanges not found")
 	}
 	body := data[span[0]:span[1]]
-	for _, want := range []string{"all.slice(0, RANGE_TABLE_CAP)", `getElementById("cluster-range-cap")`, `data-ranges="all"`, "the CSV carries every row", "all.map(r =>"} {
+	for _, want := range []string{"slice(0, RANGE_TABLE_CAP)", `getElementById("cluster-range-cap")`, `data-ranges="all"`, "the CSV carries every row", "setHTML(cap,"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("renderClusterRanges lacks %q: the table is not capped, or the cap is not said, or the CSV follows the cap", want)
+			t.Errorf("renderClusterRanges lacks %q: the table is not capped, or the cap is not said, or its line is written under the reader's focus", want)
 		}
 	}
 	if strings.Contains(body, "shown.map(r =>") {
 		t.Error("the ranges CSV follows the cap: an export is every row the filter left")
+	}
+	if strings.Contains(body, "cap.innerHTML") || strings.Contains(body, "cap.textContent") {
+		t.Error("the cap line is written directly: every poll would replace its button under a reader's focus (use setHTML)")
 	}
 	page := string(mustRead(t, "index.html"))
 	if !strings.Contains(page, `id="cluster-range-cap"`) {
