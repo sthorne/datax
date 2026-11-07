@@ -273,12 +273,24 @@ func TestShapeTextIsForAdmins(t *testing.T) {
 	}
 	// Nor a table, or an index, the reader has no grant on: the table
 	// and index label values follow the same rule as /api/schema
-	// (InfoSec on the PR; issue #197's rule).
-	if strings.Contains(body, "secrets") {
-		t.Errorf("reader's catalog names a table or index it has no grant on: %s", body)
+	// (InfoSec on the PR; issue #197's rule). The labels come from the
+	// schema cache, which learns of the table on its own refresh, so
+	// first wait until the admin's catalog offers the table's index —
+	// a reader's catalog that lacks the name only because the cache
+	// does would prove nothing.
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		if _, rootBody, _ := authedGet(t, client, base+"/api/metrics", "root", "topsecret"); strings.Contains(rootBody, `"secrets.primary"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			_, rootBody, _ := authedGet(t, client, base+"/api/metrics", "root", "topsecret")
+			t.Fatalf("root's catalog never offered the index label secrets.primary: %s", rootBody)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if _, rootBody, _ := authedGet(t, client, base+"/api/metrics", "root", "topsecret"); !strings.Contains(rootBody, `"secrets.primary"`) {
-		t.Errorf("root's catalog does not offer the index label secrets.primary: %s", rootBody)
+	if _, body, _ := authedGet(t, client, base+"/api/metrics", "reader", "reader-pw"); strings.Contains(body, "secrets") {
+		t.Errorf("reader's catalog names a table or index it has no grant on: %s", body)
 	}
 	code, body, _ = authedGet(t, client, base+"/api/metrics?series=stmt.count{fp="+fp+"}&since=5m", "reader", "reader-pw")
 	if code != http.StatusOK || strings.Contains(body, `"label"`) || strings.Contains(body, "secrets") {
