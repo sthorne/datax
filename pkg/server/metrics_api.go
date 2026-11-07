@@ -94,9 +94,14 @@ func (n *Node) serveMetricsAPI(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	admin := n.clusterPrincipal(req).Admin
+	// The caller's view of the schema decides which table and index
+	// label values the catalog offers, as /api/schema decides which
+	// tables it lists (issue #197); the admin flag decides the shape
+	// text (issue #209).
+	v := n.keyViewer(req)
+	admin := v.all
 	if q.Get("series") == "" {
-		_ = enc.Encode(n.metricsCatalog(req.Context(), admin))
+		_ = enc.Encode(n.metricsCatalog(req.Context(), v))
 		return
 	}
 	res, code, err := n.queryMetrics(req.Context(), q, admin)
@@ -108,7 +113,8 @@ func (n *Node) serveMetricsAPI(w http.ResponseWriter, req *http.Request) {
 	_ = enc.Encode(res)
 }
 
-func (n *Node) metricsCatalog(ctx context.Context, admin bool) MetricsCatalog {
+func (n *Node) metricsCatalog(ctx context.Context, v keyViewer) MetricsCatalog {
+	admin := v.all
 	doc := MetricsCatalog{
 		NodeID:                 int(n.ident.NodeID),
 		Enabled:                n.metricsRecordInterval() > 0,
@@ -141,7 +147,11 @@ func (n *Node) metricsCatalog(ctx context.Context, admin bool) MetricsCatalog {
 	sort.Strings(doc.Labels["peer"])
 	if sd := n.cachedSchemaDoc(); sd != nil {
 		for _, t := range sd.Tables {
-			if catalog.IsSystemTable(t.Name) {
+			// A table the caller may not see is not named here either,
+			// nor its indexes: the label values are the listing question
+			// /api/schema asks (issue #197), and an index name can say
+			// more than its table's.
+			if catalog.IsSystemTable(t.Name) || !v.sees(t.ID) {
 				continue
 			}
 			doc.Labels["table"] = append(doc.Labels["table"], t.Name)

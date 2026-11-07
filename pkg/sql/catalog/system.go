@@ -34,7 +34,10 @@ const MetricsTableID uint64 = 1 << 40
 const PrefsTableID uint64 = 1<<40 + 1
 
 // ShapesMetricsTableName is the reserved name of the statement-shape
-// time series; StatementShapesTableName that of the fingerprint table.
+// time series; StatementShapesTableName that of the fingerprint table,
+// which holds each shape's normalised text: no literal value, every
+// identifier (issue #209). Both are regenerable history, left out of
+// backups unless asked, like MetricsTableName.
 const (
 	ShapesMetricsTableName   = "datax_metrics_shapes"
 	StatementShapesTableName = "datax_statement_shapes"

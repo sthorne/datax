@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -52,6 +53,46 @@ func TestIndexUsageIsCounted(t *testing.T) {
 	}
 	if u[2].LastUsed.IsZero() || time.Since(u[2].LastUsed) > time.Minute {
 		t.Errorf("by_c's last use is %v", u[2].LastUsed)
+	}
+
+	// The same lookup and a full scan over the wire, where a plain
+	// top-level SELECT streams (QA on the PR): the stream iterator's
+	// charges are the ordinary client's path, and the in-process session
+	// above never takes it.
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	drain := func(q string) int {
+		t.Helper()
+		rows, err := conn.Query(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		n := 0
+		for rows.Next() {
+			n++
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			t.Fatalf("%s: %v", q, rows.Err())
+		}
+		return n
+	}
+	sql.ResetIndexUsage()
+	if n := drain(`SELECT id FROM usage_t WHERE c = 20`); n != 2 {
+		t.Fatalf("streamed lookup by c: %d rows", n)
+	}
+	if n := drain(`SELECT id FROM usage_t`); n != 3 {
+		t.Fatalf("streamed full scan: %d rows", n)
+	}
+	u = use()
+	if u[2].Scans != 1 || u[2].Rows != 2 {
+		t.Errorf("a streamed lookup through by_c charged it %d scans and %d rows, want 1 and 2", u[2].Scans, u[2].Rows)
+	}
+	if u[1].Scans != 1 || u[1].Rows != 3 {
+		t.Errorf("a streamed full scan charged the primary %d scans and %d rows, want 1 and 3", u[1].Scans, u[1].Rows)
 	}
 
 	sql.ResetIndexUsage()

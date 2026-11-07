@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/pgwire"
@@ -39,10 +40,16 @@ import (
 // is; a restart shows as the counter's reset.
 //
 // A fingerprint is not a chart label. What makes a chart readable is
-// the shape — the normalised text with literals replaced by ?, which is
-// what the shapes view already shows and which carries no data by
-// construction — kept in datax_statement_shapes, written when a
-// fingerprint is first recorded and touched now and then after. The
+// the shape — the normalised text with every literal replaced by ?,
+// which is what the shapes view already shows and which carries no
+// literal value by construction. It keeps identifiers, deliberately:
+// they are what makes it readable, and a schema whose identifiers are
+// themselves data (a table per customer, a column named for a person)
+// puts those names in the shape, which is why the text is admin-gated
+// on the console and left out of backups unless asked. It is kept in
+// datax_statement_shapes, written when a fingerprint is first recorded
+// and touched now and then after, cut at shapeTextMax so a very wide
+// statement bounds its row and the catalog that reads it. The
 // representative statement text, which can carry data, stays in memory,
 // admin-gated, and a restart still clears it: persisting it would be a
 // different security posture, decided here rather than arrived at.
@@ -50,8 +57,16 @@ import (
 const (
 	// shapeSeriesTopN is how many shapes a node writes per tick: the
 	// in-memory table's point is that the full set is unbounded, and
-	// persisting all of it would move that problem, not solve it.
+	// persisting all of it would move that problem, not solve it. The
+	// in-memory table's own cap (pgwire's stmtShapeMax) does not carry
+	// over: the fingerprint table is bounded by this many new rows per
+	// tick per node and by the sweep, which a client cycling distinct
+	// shapes can fill at that rate and no faster.
 	shapeSeriesTopN = 50
+	// shapeTextMax is the longest shape text persisted: a statement's
+	// width is unbounded where its depth is not, and the text is read
+	// shapeTextLimit rows at a time into one document.
+	shapeTextMax = 1024
 	// shapeSeenFor is how long a fingerprint's row in the shapes table
 	// goes before this node touches its last_seen again.
 	shapeSeenFor = 10 * time.Minute
@@ -217,7 +232,7 @@ func (n *Node) touchShapes(ctx context.Context, stats []pgwire.StatementStat, at
 	for _, st := range due {
 		tables := append([]string(nil), st.Tables...)
 		sort.Strings(tables)
-		params := []types.Datum{types.NewString(st.Fingerprint), types.NewString(st.Shape), types.NewString(st.Kind),
+		params := []types.Datum{types.NewString(st.Fingerprint), types.NewString(truncateShape(st.Shape)), types.NewString(st.Kind),
 			types.NewString(strings.Join(tables, ",")), types.NewTimestamp(at.UnixNano())}
 		if _, serr := sess.Execute(ctx, stmts[0], params); serr != nil {
 			return serr
@@ -292,4 +307,17 @@ func seriesTable(base string) string {
 		return catalog.ShapesMetricsTableName
 	}
 	return catalog.MetricsTableName
+}
+
+// truncateShape cuts a shape text at shapeTextMax bytes, on a rune
+// boundary, marking the cut.
+func truncateShape(text string) string {
+	if len(text) <= shapeTextMax {
+		return text
+	}
+	cut := shapeTextMax
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + "…"
 }

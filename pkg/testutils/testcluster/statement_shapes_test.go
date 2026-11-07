@@ -144,12 +144,47 @@ func TestStatementShapesAreRecorded(t *testing.T) {
 	if len(r.Rows) != 1 || r.Rows[0][0].Text() != "0" {
 		t.Errorf("datax_metrics has shape rows: %+v", r.Rows)
 	}
+
+	// Both shape tables are regenerable history, like datax_metrics: a
+	// backup leaves them out unless asked (InfoSec on the PR: the
+	// fingerprint table is a workload-and-schema disclosure in a backup
+	// shared with a third party).
+	backedUp := func(includeMetrics bool) map[string]bool {
+		t.Helper()
+		sum, err := tc.Nodes[0].RunBackup(ctx, t.TempDir(), "", false, includeMetrics)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := map[string]bool{}
+		for _, bt := range sum.Tables {
+			names[bt.Name] = true
+		}
+		return names
+	}
+	for _, tbl := range []string{catalog.ShapesMetricsTableName, catalog.StatementShapesTableName} {
+		if backedUp(false)[tbl] {
+			t.Errorf("a default backup carries %s", tbl)
+		}
+		if !backedUp(true)[tbl] {
+			t.Errorf("an --include-metrics backup lacks %s", tbl)
+		}
+	}
 }
 
 // TestStatementShapesVersionGate: a cluster that has not finalized v19
 // never creates the shape tables, and the endpoint says so.
 func TestStatementShapesVersionGate(t *testing.T) {
-	tc := startMetricsCluster(t, 1, func(c *server.Config) { c.BinaryVersionOverride = version.V18 })
+	// The node serves SQL, so the recorder reaches the version clause
+	// of its gate rather than returning for want of a SQL server (QA on
+	// the PR: without the listener the test held at any version).
+	pglis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := startMetricsCluster(t, 1, func(c *server.Config) {
+		c.BinaryVersionOverride = version.V18
+		c.PGListener = pglis
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	time.Sleep(4 * time.Second)
@@ -235,6 +270,15 @@ func TestShapeTextIsForAdmins(t *testing.T) {
 	}
 	if strings.Contains(body, fp) || strings.Contains(body, "label_text") || strings.Contains(body, "SELECT v FROM secrets") {
 		t.Errorf("reader's catalog names a shape: %s", body)
+	}
+	// Nor a table, or an index, the reader has no grant on: the table
+	// and index label values follow the same rule as /api/schema
+	// (InfoSec on the PR; issue #197's rule).
+	if strings.Contains(body, "secrets") {
+		t.Errorf("reader's catalog names a table or index it has no grant on: %s", body)
+	}
+	if _, rootBody, _ := authedGet(t, client, base+"/api/metrics", "root", "topsecret"); !strings.Contains(rootBody, `"secrets.primary"`) {
+		t.Errorf("root's catalog does not offer the index label secrets.primary: %s", rootBody)
 	}
 	code, body, _ = authedGet(t, client, base+"/api/metrics?series=stmt.count{fp="+fp+"}&since=5m", "reader", "reader-pw")
 	if code != http.StatusOK || strings.Contains(body, `"label"`) || strings.Contains(body, "secrets") {

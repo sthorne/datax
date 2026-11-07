@@ -41,7 +41,8 @@ state or the internode protocol does, and an entry below says so.
   out of the top 50 stops being written rather than written as zero,
   so the chart shows the gap; a restart shows as the counter's reset.
   A fingerprint is not a chart label, so the shape's text — the
-  normalised statement with literals replaced, which carries no data —
+  normalised statement with every literal replaced and its identifiers
+  kept, so it carries no value but does name the schema —
   is kept in `datax_statement_shapes` and resolved by the catalog for
   admins: the picker lists the statement beside the series, the
   chart's title carries it, and the shapes view's detail has a "chart
