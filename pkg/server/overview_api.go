@@ -45,12 +45,12 @@ func (n *Node) serveOverviewAPI(w http.ResponseWriter, req *http.Request) {
 		if limit <= 0 || limit > events.RingSize {
 			limit = overviewEventsLimit
 		}
-		ev := &EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq(), Events: events.Redact(n.events.Recent(since, limit, doc.Cluster.Principal.Admin), v.sees)}
+		ev := &EventsStatus{NodeID: int(n.ident.NodeID), Latest: n.events.Seq(), Events: events.Redact(n.events.Recent(since, limit, doc.Cluster.Principal.Admin), v.reads)}
 		// The operations view reads the same poll as everything else
 		// (issue #153); pairing is over the whole ring, not the tail
 		// this document carries, so an operation that started before it
 		// is still reported as running.
-		ev.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, doc.Cluster.Principal.Admin), v.sees), n.events.Open(), doc.Cluster.Now)
+		ev.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, doc.Cluster.Principal.Admin), v.reads), n.events.Open(), doc.Cluster.Now)
 		if ev.Events == nil {
 			ev.Events = []events.Event{}
 		}

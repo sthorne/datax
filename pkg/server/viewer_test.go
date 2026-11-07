@@ -46,3 +46,41 @@ func TestKeyViewerReportsWhatItRedacted(t *testing.T) {
 		t.Error("a bare all-keys viewer reports a redaction")
 	}
 }
+
+// Any grant names a table; only a read privilege shows a row of it
+// (issue #253): a range boundary is a row key, so a grantee holding
+// INSERT and no SELECT gets the table's name and its boundaries at their
+// prefix. write_all is write everything, not read everything; the
+// owner, read_all and a SELECT grant through a role read.
+func TestKeyViewerDecodesOnlyWhatTheCallerMayRead(t *testing.T) {
+	d := &catalog.TableDescriptor{ID: 7, Name: "sealedbook", Owner: "keeper",
+		Privileges: map[string][]string{"ingest": {"INSERT"}, "seer": {"SELECT"}, "editors": {"SELECT", "UPDATE"}}}
+	descs := map[uint64]*catalog.TableDescriptor{7: d}
+	for _, c := range []struct {
+		who         string
+		set         catalog.RoleSet
+		sees, reads bool
+	}{
+		{"an INSERT-only grantee", catalog.RoleSet{"ingest": true, "public": true}, true, false},
+		{"a SELECT grantee", catalog.RoleSet{"seer": true, "public": true}, true, true},
+		{"a member of a role holding SELECT", catalog.RoleSet{"alice": true, "editors": true, "public": true}, true, true},
+		{"write_all", catalog.RoleSet{"w": true, "write_all": true, "public": true}, true, false},
+		{"read_all", catalog.RoleSet{"r": true, "read_all": true, "public": true}, true, true},
+		{"the owner", catalog.RoleSet{"keeper": true, "public": true}, true, true},
+		{"nobody", catalog.RoleSet{"nobody": true, "public": true}, false, false},
+	} {
+		v := keyViewer{set: c.set, descs: descs, redacted: new(atomic.Bool)}
+		if got := v.sees(7); got != c.sees {
+			t.Errorf("%s: sees = %v, want %v", c.who, got, c.sees)
+		}
+		if got := v.reads(7); got != c.reads {
+			t.Errorf("%s: reads = %v, want %v", c.who, got, c.reads)
+		}
+	}
+	if !(keyViewer{all: true}).reads(7) {
+		t.Error("the admin form does not read a table")
+	}
+	if (keyViewer{err: errors.New("catalog unavailable")}).reads(7) {
+		t.Error("a viewer whose roles could not be resolved reads a table")
+	}
+}

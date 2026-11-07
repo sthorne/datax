@@ -129,6 +129,34 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **Restore holds a table's data file to the table's own span** (#255,
+  from InfoSec on #254; the other half of #238). Restore wrote every
+  record of `table_N.dxbk` back under the key the record named, so one
+  record appended to a data file — with `BACKUP.json` left byte-for-byte
+  as backup wrote it, since the manifest's checksums are reported after
+  a restore and never enforced before one — had restore write any key
+  in the cluster as the node, or as a tombstone delete one. The
+  authentication secret was the key that mattered: a planted one keys
+  every console session, admin included. Every record is now held to
+  `keys.TableDataSpan` of the table its file is for, tombstones
+  included, in a pass before the first chunk is committed and again at
+  the write, so a file rewritten between the two reads is refused too.
+  With #238's manifest half this closes the restore-writes-anything
+  class: the manifest's raw groups are held to their spans, the data
+  files to theirs, and the file names to the ones backup derives.
+- **A range boundary decodes only for a caller who may read the row**
+  (#253, from InfoSec on #251). The console's key viewer asked
+  `CanSeeTable` before decoding a range boundary into the row value it
+  was split at, and `CanSeeTable` answers the listing question — any
+  grant, including `INSERT` alone, and `write_all`. So a grantee the SQL
+  authorizer refuses `SELECT` was handed one exact row value per split
+  boundary on `/api/cluster`, `/api/overview`, `/status`, `/api/node`
+  and the split events. Decoding now asks `catalog.CanReadTable` —
+  admins, the owner, `read_all`, and a `SELECT` grant held directly or
+  through a role — while naming the table still asks `CanSeeTable`, so
+  an `INSERT`-only grantee gets the table's name, its boundaries at
+  their prefix, and `keys_redacted` set, which is what the console needs
+  to label the copy.
 - **Encryption at rest is authenticated** (#220, tiers 2 and 3; cluster
   version **v18**). Until now an encrypted store was confidential against
   a disk that leaves the building and nothing more: AES-256-CTR with no
@@ -515,6 +543,17 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **Backup collects the manifest's raw groups from the same table restore
+  checks them against** (#256, from QA and InfoSec on #254). #254 pinned
+  `manifestKeyGroups` to the manifest struct; the spans were still
+  written twice, once in the table restore holds a manifest to and once
+  by hand in `RunBackup`, and a span added to the table alone widened
+  what restore accepted with no test failing. `RunBackup` now collects
+  each group from `manifestKeyGroups`' spans, so there is one list and
+  nothing to keep in step, and the unit test derives its outside-key
+  assertions from the table: every group refuses the authentication
+  secret, the cluster version, the meta span and table keys, rather than
+  the two groups a hand-written list happened to name.
 - **A red scheduled run files an issue** (#244). The weekly govulncheck
   run on `main` was red for seven consecutive weeks before anyone read
   it: a scheduled run's result lives on the Actions tab, which nobody

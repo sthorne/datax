@@ -801,17 +801,17 @@ func (n *Node) serveEventsAPI(w http.ResponseWriter, req *http.Request) {
 	// reaches.
 	if fromMs, err := strconv.ParseInt(q.Get("from"), 10, 64); err == nil && fromMs > 0 {
 		evs, oldest := n.events.Since(time.UnixMilli(fromMs), limit, p.Admin)
-		doc.Events = events.Redact(evs, v.sees)
+		doc.Events = events.Redact(evs, v.reads)
 		if !oldest.IsZero() {
 			doc.OldestMs = oldest.UnixMilli()
 		}
 	} else {
-		doc.Events = events.Redact(n.events.Recent(since, limit, p.Admin), v.sees)
+		doc.Events = events.Redact(n.events.Recent(since, limit, p.Admin), v.reads)
 	}
 	if doc.Events == nil {
 		doc.Events = []events.Event{}
 	}
-	doc.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, p.Admin), v.sees), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
+	doc.Operations = operationsFrom(events.Redact(n.events.Recent(0, 0, p.Admin), v.reads), n.events.Open(), n.clock.Now().WallTime/int64(time.Millisecond))
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

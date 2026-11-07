@@ -17,6 +17,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
 // TestBackupRestore: a consistent full backup taken UNDER concurrent
@@ -460,6 +461,70 @@ func TestRestoreRefusesKeysABackupNeverWrites(t *testing.T) {
 		}
 		if string(got) != string(secret) {
 			t.Fatalf("after a refused restore (%s carrying %s) the cluster's authentication secret is %x, not the one it had", c.group, c.key, got)
+		}
+	}
+
+	// The data files are the same hole from the other side (issue #255):
+	// a record appended to a table's file, with the manifest left
+	// byte-for-byte as backup wrote it, would be written verbatim too —
+	// and a tombstone would delete. Each is held to the table's own span.
+	craftFile := func(key []byte, value []byte, deleted bool) string {
+		dir := t.TempDir()
+		entries, err := os.ReadDir(backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crafted := false
+		for _, e := range entries {
+			raw, err := os.ReadFile(filepath.Join(backup, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(e.Name(), "table_") && strings.HasSuffix(e.Name(), ".dxbk") && !crafted {
+				rec := encoding.EncodeUvarint(nil, uint64(len(key)))
+				rec = append(rec, key...)
+				rec = encoding.EncodeUvarint(rec, uint64(len(value)))
+				rec = append(rec, value...)
+				if deleted {
+					rec = append(rec, 1)
+				} else {
+					rec = append(rec, 0)
+				}
+				raw = append(raw, rec...)
+				crafted = true
+			}
+			if err := os.WriteFile(filepath.Join(dir, e.Name()), raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !crafted {
+			t.Fatal("the backup has no table data file to craft")
+		}
+		return dir
+	}
+	for _, c := range []struct {
+		what    string
+		key     keys.Key
+		deleted bool
+	}{
+		{"the authentication secret", keys.AuthSecretKey(), false},
+		{"a tombstone for the authentication secret", keys.AuthSecretKey(), true},
+		{"the cluster version", keys.ClusterVersionKey(), false},
+		{"a key in the meta span", metaStart, false},
+	} {
+		_, err := target.Nodes[0].RunRestore(ctx, []string{craftFile(c.key, planted, c.deleted)})
+		if err == nil {
+			t.Fatalf("restore accepted a data file carrying %s", c.what)
+		}
+		if !strings.Contains(err.Error(), "data file carries the key") || !strings.Contains(err.Error(), "outside the table's own span") {
+			t.Fatalf("restore from a data file carrying %s failed for another reason: %v", c.what, err)
+		}
+		got, err := target.Nodes[0].DB().Get(ctx, keys.AuthSecretKey())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(secret) {
+			t.Fatalf("after a refused restore (a data file carrying %s) the cluster's authentication secret is %x, not the one it had", c.what, got)
 		}
 	}
 

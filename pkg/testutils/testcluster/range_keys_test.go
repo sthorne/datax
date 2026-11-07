@@ -52,6 +52,11 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 		// it gets has nothing redacted and must say so (issue #241).
 		`CREATE USER auditor PASSWORD 'auditor-pw'`,
 		`GRANT read_all TO auditor`,
+		// ingest may write sealedbook and not read it: it sees the table
+		// named, as /api/schema names it, and its boundary — a row
+		// value — at its prefix (issue #253).
+		`CREATE USER ingest PASSWORD 'ingest-pw'`,
+		`GRANT INSERT ON sealedbook TO ingest`,
 	} {
 		if _, err := root.Exec(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -158,6 +163,58 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	if auditorCluster.KeysRedacted {
 		t.Error("the auditor's /api/cluster sets keys_redacted though every key decoded for it")
 	}
+	type labelled struct{ table, start string }
+	// Any grant names a table; only a read privilege shows a row of it
+	// (issue #253). ingest holds INSERT on sealedbook and no SELECT: on
+	// every document its name is there, its boundary value is not, and
+	// the document says a key is the shown form.
+	for _, path := range paths {
+		asIngest := get(bases[0]+path, "ingest", "ingest-pw")
+		if strings.Contains(asIngest, sealedRow) {
+			t.Errorf("%s as ingest (INSERT only) carries %q, a row value of a table it may not read:\n%s", path, sealedRow, asIngest)
+		}
+		if !strings.Contains(asIngest, `"sealedbook"`) {
+			t.Errorf("%s as ingest does not name sealedbook, a table it holds a grant on", path)
+		}
+	}
+	var ingestCluster server.ClusterStatus
+	if err := json.Unmarshal([]byte(get(bases[0]+"/api/cluster", "ingest", "ingest-pw")), &ingestCluster); err != nil {
+		t.Fatal(err)
+	}
+	if !ingestCluster.KeysRedacted {
+		t.Error("ingest's /api/cluster does not set keys_redacted though its sealedbook boundary is at its prefix")
+	}
+	ingestSealed := 0
+	var ingestRanges []labelled
+	for _, r := range ingestCluster.Ranges {
+		ingestRanges = append(ingestRanges, labelled{r.Table, r.StartKey})
+	}
+	for _, r := range ingestCluster.Local.Ranges {
+		ingestRanges = append(ingestRanges, labelled{r.Table, r.StartKey})
+	}
+	for _, r := range ingestRanges {
+		if r.table == "sealedbook" {
+			ingestSealed++
+			if strings.Contains(r.start, `"`) {
+				t.Errorf("ingest's /api/cluster decodes a sealedbook boundary: %s", r.start)
+			}
+		}
+	}
+	if ingestSealed == 0 {
+		t.Error("ingest's /api/cluster labels no range with sealedbook, the table it holds a grant on")
+	}
+	var ingestSchema server.SchemaStatus
+	if err := json.Unmarshal([]byte(get(bases[0]+"/api/schema", "ingest", "ingest-pw")), &ingestSchema); err != nil {
+		t.Fatal(err)
+	}
+	ingestSees := false
+	for _, tb := range ingestSchema.Tables {
+		ingestSees = ingestSees || tb.Name == "sealedbook"
+	}
+	if !ingestSees {
+		t.Error("ingest's /api/schema does not list sealedbook: the range list and the schema disagree on what a grantee sees named")
+	}
+
 	var schema server.SchemaStatus
 	if err := json.Unmarshal([]byte(get(bases[0]+"/api/schema", "reader", "reader-pw")), &schema); err != nil {
 		t.Fatal(err)
@@ -169,7 +226,6 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	if !visible["openbook"] || visible["sealedbook"] {
 		t.Fatalf("reader's schema: %v", visible)
 	}
-	type labelled struct{ table, start string }
 	var ranges []labelled
 	for _, r := range cluster.Ranges {
 		ranges = append(ranges, labelled{r.Table, r.StartKey})
@@ -202,6 +258,9 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 			if body := get(base+path, "reader", "reader-pw"); strings.Contains(body, sealedRow) || strings.Contains(body, "sealedbook") {
 				t.Errorf("n%d %s as reader carries the sealed table:\n%s", i+1, path, body)
 			}
+		}
+		if body := get(base+"/api/events", "ingest", "ingest-pw"); strings.Contains(body, sealedRow) {
+			t.Errorf("n%d /api/events as ingest (INSERT only) carries the sealed boundary value:\n%s", i+1, body)
 		}
 		var asRoot, asReader server.EventsStatus
 		if err := json.Unmarshal([]byte(get(base+"/api/events", "root", "topsecret")), &asRoot); err != nil {
