@@ -230,20 +230,36 @@ func checkBackupFiles(dir string, man *backupManifest) error {
 // #238's other half). A table's file legitimately carries only keys in
 // keys.TableDataSpan(t.ID), the span backup exported it from. Checked
 // here, alongside the file names, so a crafted file is refused before
-// the first chunk is committed rather than after the chunks before it;
-// restore checks each record again as it applies it, so a file changed
-// between the two reads is refused too.
+// the first chunk is committed rather than after the chunks before it.
+// This pass and the apply loop both read the file through
+// readCheckedBackupRecords, so a file changed between the two reads is
+// refused too; the price is that restore reads every data file twice,
+// chosen over applying a chunk and then finding the file bad.
 func checkBackupRecords(dir string, man *backupManifest) error {
 	for _, t := range man.Tables {
 		path := filepath.Join(dir, backupDataFile(t.ID))
-		err := readBackupRecords(path, func(rec kvpb.ExportRecord) error {
-			return checkBackupRecord(path, t, rec)
-		})
-		if err != nil {
+		if err := readCheckedBackupRecords(path, t, func(kvpb.ExportRecord) error { return nil }); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// readCheckedBackupRecords reads path's records, refusing any key outside
+// t's data span before fn sees it (issue #255). Both of restore's reads
+// of a data file — the pass before anything is applied and the apply
+// loop — go through here, so neither can be written without the check:
+// the second read is deliberate, for a file rewritten between the two,
+// and this is what keeps it from being tidied away as already done. The
+// reader beneath is named for what it lacks, so a call site that reaches
+// past this one reads as what it is.
+func readCheckedBackupRecords(path string, t backupTable, fn func(kvpb.ExportRecord) error) error {
+	return readBackupRecordsUnchecked(path, func(rec kvpb.ExportRecord) error {
+		if err := checkBackupRecord(path, t, rec); err != nil {
+			return err
+		}
+		return fn(rec)
+	})
 }
 
 // checkBackupRecord refuses a record of table t's data file whose key
@@ -256,7 +272,7 @@ func checkBackupRecord(path string, t backupTable, rec kvpb.ExportRecord) error 
 	return nil
 }
 
-func readBackupRecords(path string, fn func(kvpb.ExportRecord) error) error {
+func readBackupRecordsUnchecked(path string, fn func(kvpb.ExportRecord) error) error {
 	raw, err := readBackupFile(path)
 	if err != nil {
 		return err
@@ -728,14 +744,10 @@ func (n *Node) RunRestore(ctx context.Context, srcs []string) (_ *cluster.Backup
 					return txn.RunBatch(ctx, &b)
 				})
 			}
-			err := readBackupRecords(path, func(rec kvpb.ExportRecord) error {
-				// Held to the table's span again at the write: the
-				// pass above read the file once already, and a file
-				// rewritten since is refused rather than applied
-				// (issue #255).
-				if err := checkBackupRecord(path, t, rec); err != nil {
-					return err
-				}
+			// Held to the table's span again at the write (issue
+			// #255): the pass above read the file once already, and
+			// a file rewritten since is refused rather than applied.
+			err := readCheckedBackupRecords(path, t, func(rec kvpb.ExportRecord) error {
 				if rec.Deleted {
 					wb.Delete(keys.Key(rec.Key))
 				} else {

@@ -118,15 +118,19 @@ func (v keyViewer) may(id uint64, pred func(catalog.RoleSet, *catalog.TableDescr
 
 // viewKey renders k for the caller: decoded when it belongs to a table
 // the caller may read, at its prefix when not, and as for anyone when it
-// belongs to no table.
-func (n *Node) viewKey(v keyViewer, k keys.Key) string {
+// belongs to no table. It also reports whether the key was rendered at
+// its prefix, for a document that says so where the key is (issue
+// #252): the document's keys_redacted is the any-of over every key it
+// rendered, and a row labelled from it told a caller who may read some
+// tables that its role did not see a key it was looking at in full.
+func (n *Node) viewKey(v keyViewer, k keys.Key) (string, bool) {
 	if id, ok := keys.TableIDOf(k); ok && !v.reads(id) {
 		if v.redacted != nil {
 			v.redacted.Store(true)
 		}
-		return keys.PrettyPrefix(k)
+		return keys.PrettyPrefix(k), true
 	}
-	return n.prettyKey(k)
+	return n.prettyKey(k), false
 }
 
 // viewTable labels a range with its table's name when the caller may

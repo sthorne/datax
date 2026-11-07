@@ -2336,29 +2336,45 @@ func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
 	if !regexp.MustCompile("KeysRedacted +bool +`json:\"keys_redacted,omitempty\"`").MatchString(string(api)) {
 		t.Fatal("the cluster document no longer says whether its keys are the shown form")
 	}
+	// The label is the row's, from the start key's own flag (issue
+	// #252): the document's any-of flag labelled a key a partially
+	// privileged reader could see in full.
+	if !regexp.MustCompile("StartKeyRedacted +bool +`json:\"start_key_redacted,omitempty\"`").MatchString(string(api)) {
+		t.Fatal("the cluster document's ranges no longer say whether their start key is the shown form")
+	}
 	data := string(mustRead(t, "js/70-data.js"))
+	lbl := jsFuncSpan(data, "rangeKeyLabel")
+	if lbl == nil {
+		t.Fatal("rangeKeyLabel not found")
+	}
+	if b := data[lbl[0]:lbl[1]]; !strings.Contains(b, "r.start_key_redacted") || !strings.Contains(b, `"start key as shown (your role does not see the full key)"`) || strings.Contains(b, "keys_redacted") {
+		t.Error("rangeKeyLabel does not label a row's copy control from that row's start_key_redacted")
+	}
 	span := jsFuncSpan(data, "renderClusterRanges")
 	if span == nil {
 		t.Fatal("renderClusterRanges not found")
 	}
 	body := data[span[0]:span[1]]
-	if !strings.Contains(body, "lastCluster.keys_redacted") {
-		t.Error("renderClusterRanges does not read keys_redacted: a redacted key is copied under a key's name")
+	if !strings.Contains(body, "rangeKeyLabel(r)") {
+		t.Error("renderClusterRanges does not label each row's copy control for itself")
 	}
-	for _, want := range []string{`"start key as shown (your role does not see the full key)"`, `"start key (as shown)"`, `"end key (as shown)"`} {
+	if !strings.Contains(body, "lastCluster.keys_redacted") {
+		t.Error("renderClusterRanges does not read keys_redacted: the CSV's one header does not say its keys are the shown form")
+	}
+	for _, want := range []string{`"start key (as shown)"`, `"end key (as shown)"`, `"keys as shown"`, `shownKeys(r)`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("renderClusterRanges does not label the shown form %s", want)
 		}
 	}
 	// The node page's replica table copies keys too (QA on the combined
-	// PR): the same document, the same rule.
+	// PR): the same document, the same rule, per row.
 	overview := string(mustRead(t, "js/30-overview.js"))
 	rr := jsFuncSpan(overview, "rangeRow")
 	if rr == nil {
 		t.Fatal("rangeRow not found")
 	}
-	if b := overview[rr[0]:rr[1]]; !strings.Contains(b, "lastCluster.keys_redacted") || !strings.Contains(b, "start key as shown (your role does not see the full key)") {
-		t.Error("rangeRow copies a redacted key under a key's name")
+	if b := overview[rr[0]:rr[1]]; !strings.Contains(b, "rangeKeyLabel(r)") || strings.Contains(b, "keys_redacted") {
+		t.Error("rangeRow copies a redacted key under a key's name, or labels it from the document's any-of flag")
 	}
 	// Every key-copy site is one of the two above.
 	for _, name := range []string{"js/70-data.js", "js/30-overview.js", "js/45-table.js", "js/90-node.js"} {
@@ -2374,6 +2390,91 @@ func TestRedactedKeysAreNotCopiedUnderAKeysName(t *testing.T) {
 	if !strings.Contains(g.lookup("", "copy"), "shown form") {
 		t.Error("the copy glossary entry does not say what a redacted key is")
 	}
+}
+
+// TestRangesTableIsCapped (issue #227): every range row carries a copy
+// control that is a tab stop, and a real cluster has hundreds of rows,
+// so the table renders the first RANGE_TABLE_CAP of the rows the filter
+// left, says how many it left out, offers the rest on one control, and
+// the CSV carries every row regardless.
+func TestRangesTableIsCapped(t *testing.T) {
+	data := string(mustRead(t, "js/70-data.js"))
+	if !strings.Contains(data, "const RANGE_TABLE_CAP = 200;") {
+		t.Error("RANGE_TABLE_CAP is not 200")
+	}
+	span := jsFuncSpan(data, "renderClusterRanges")
+	if span == nil {
+		t.Fatal("renderClusterRanges not found")
+	}
+	body := data[span[0]:span[1]]
+	for _, want := range []string{"slice(0, RANGE_TABLE_CAP)", `getElementById("cluster-range-cap")`, `data-ranges="all"`, "the CSV carries every row", "setHTML(cap,"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("renderClusterRanges lacks %q: the table is not capped, or the cap is not said, or its line is written under the reader's focus", want)
+		}
+	}
+	if strings.Contains(body, "shown.map(r =>") {
+		t.Error("the ranges CSV follows the cap: an export is every row the filter left")
+	}
+	if strings.Contains(body, "cap.innerHTML") || strings.Contains(body, "cap.textContent") {
+		t.Error("the cap line is written directly: every poll would replace its button under a reader's focus (use setHTML)")
+	}
+	page := string(mustRead(t, "index.html"))
+	if !strings.Contains(page, `id="cluster-range-cap"`) {
+		t.Error("index.html has no cluster-range-cap element for the cap's line")
+	}
+}
+
+// TestSeriesLinesClearTheGraphicalContrastFloor (issue #250): a chart
+// line is a graphical object, and WCAG 1.4.11 wants 3:1 against what it
+// is drawn on. Every series slot clears it against the panel in both
+// themes; a slot that cannot — pair separation and contrast pull in
+// different directions on white — is a decision recorded here with its
+// number, not a WARN in a validator nobody re-runs.
+func TestSeriesLinesClearTheGraphicalContrastFloor(t *testing.T) {
+	page := string(mustRead(t, "index.html"))
+	panel := map[string]string{}
+	for _, theme := range []struct{ name, anchor string }{{"light", ":root {"}, {"dark", "prefers-color-scheme: dark"}} {
+		css := page[strings.Index(page, theme.anchor):]
+		m := regexp.MustCompile(`--panel: (#[0-9a-f]{6})`).FindStringSubmatch(css)
+		if m == nil {
+			t.Fatalf("%s theme: no --panel", theme.name)
+		}
+		panel[theme.name] = m[1]
+	}
+	known := map[string]map[int]bool{"light": {}, "dark": {}}
+	for theme, pal := range seriesPalettes(t) {
+		for slot := 1; slot <= 8; slot++ {
+			ratio := contrastRatio(pal[slot], panel[theme])
+			switch {
+			case ratio < 3 && !known[theme][slot]:
+				t.Errorf("%s theme: --series-%d %s is %.2f:1 against the panel %s, below the 3:1 floor for a graphical object, and not a recorded exception", theme, slot, pal[slot], ratio, panel[theme])
+			case ratio >= 3 && known[theme][slot]:
+				t.Errorf("%s theme: --series-%d is %.2f:1, above the floor: remove it from the exceptions", theme, slot, ratio)
+			}
+		}
+	}
+}
+
+// contrastRatio is the WCAG contrast ratio between two sRGB hex colours.
+func contrastRatio(a, b string) float64 {
+	lum := func(hex string) float64 {
+		var c [3]float64
+		for i := range c {
+			v, _ := strconv.ParseUint(hex[1+2*i:3+2*i], 16, 8)
+			f := float64(v) / 255
+			if f <= 0.04045 {
+				c[i] = f / 12.92
+			} else {
+				c[i] = math.Pow((f+0.055)/1.055, 2.4)
+			}
+		}
+		return 0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]
+	}
+	la, lb := lum(a), lum(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
 }
 
 // TestNothingFollowsAnUnconditionalReturn: a statement after a function's

@@ -152,11 +152,11 @@ function fillsInCell(f) {
 }
 function rangeRow(r, leaderLabel, extra) {
   // The same rule as the ranges table (issue #213 meeting #226): a key
-  // the server redacted is copied as the shown form, and labelled so.
-  const keyLabel = lastCluster && lastCluster.keys_redacted ? "start key as shown (your role does not see the full key)" : "start key";
+  // the server redacted is copied as the shown form, and labelled so —
+  // per row, from the row's own key_redacted (issue #252).
   return `<tr data-key="r${r.range_id}">
     <td>r${r.range_id}${r.leader ? " ★" : ""}</td>
-    <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + keyLabel, r.start_key || "")}</td>
+    <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + rangeKeyLabel(r), r.start_key || "")}</td>
     <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     <td>${r.leader ? leaderLabel : ""}</td>
     <td class="num">${fmtBytes(r.size_bytes)}</td>
