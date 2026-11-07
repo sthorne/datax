@@ -170,6 +170,60 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **The console's key viewer asks for schema USAGE** (#259). SQL
+  authorizes a table read as the table's own privilege AND usage of its
+  schema, and `REVOKE USAGE ON SCHEMA public FROM PUBLIC` turns the
+  second on; the viewer asked only the first, so a `SELECT` grantee
+  without `USAGE` was refused the row by SQL and still shown the table's
+  range boundaries decoded into row values, and `/api/schema` still
+  listed the table. The databases whose schema the caller may not use
+  are resolved once per request, the way the roles are, and every
+  predicate the viewer and the listing ask ANDs them in; a read that
+  fails fails closed. SQL's own catalogs — `information_schema`,
+  `pg_catalog`, and now `SHOW TABLES`, which listed every table of the
+  database whatever the session's grants — ask the same predicate, so
+  a table the session holds no privilege on, or whose schema it may
+  not use, is not listed there either, and the console and SQL answer
+  the listing question the same way (#197). The database list behind
+  the console's half is reused
+  for five seconds, so a revoke reaches it within that rather than
+  costing every document a KV round trip.
+- **SCRAM verifiers are derived at 16384 iterations** (#225), four times
+  the RFC floor PostgreSQL defaults to. A verifier leaves the cluster in
+  every plaintext backup, where the count is what an offline grind
+  costs; 16384 is as far as the raise goes without moving the HTTP
+  verification budget (a derivation is about 3 ms, so a source at the
+  budget's 20 a second costs 6% of a core), and the SQL door pays
+  nothing — SCRAM's server side runs no derivation. Existing verifiers
+  keep the count they were made with, so the raise applies as passwords
+  are set or rotated; no migration, no client change. The stand-in
+  verifier for a name that does not exist no longer advertises the
+  constant: beside real users still at the old count that would mark
+  the names that are not users as surely as a shared salt did (#137),
+  so it draws its count per name from the counts the stored verifiers
+  carry, in their proportions, under the same secret as the per-name
+  salt — a property of the replicated catalog, the same on every node,
+  refreshed off the handshake's path — so neither the old count nor the
+  new says whether a name exists. While the catalog cannot be read the
+  stand-in falls back to the constant, the one window that remains.
+- **The switch to authenticated encryption is cross-checked against
+  records a registry rollback cannot reach** (#248). The sealed key
+  registry's two cutover flags cannot be cleared without the store key,
+  but an older, validly sealed copy of the registry — a backup from
+  before the switch — reopened the store unauthenticated, writing the
+  old format until the node next observed v18 and accepting it until
+  the cutover completed again. The switch is now also recorded in the
+  store itself, after each registry transition, and per store in
+  replicated KV once the node has made each step. The registry alone
+  rolled back is refused at open, before Pebble writes a file; a whole
+  store rolled back opens, is caught on the first heartbeat that reads
+  the cluster's record, and the node logs the refusal, records a
+  `security` event and stops serving. Both compare against what the
+  engines opened with, since the node re-enables authenticated writes
+  within seconds of observing v18. A rollback that was meant is
+  accepted by one start with `--accept-encryption-rollback`, which
+  lowers the records to what the store has; they rise again as it
+  re-completes the switch.
 - **Restore holds a table's data file to the table's own span** (#255,
   from InfoSec on #254; the other half of #238). Restore wrote every
   record of `table_N.dxbk` back under the key the record named, so one
@@ -595,6 +649,24 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A preseeded replica whose membership change never landed is
+  collected** (#245). A replica addition preseeds the target before
+  proposing the change, so a change that never lands — its proposal
+  timed out, the leader lost leadership, or the apply refused it because
+  the range changed under it (#200) — left the target holding a replica
+  that is a member of nothing: a raft group of one, campaigning on its
+  own timer, its data on disk for good on a range that never comes back
+  to that node. The housekeeping pass now asks `/meta` about a replica
+  that has led nothing, heard from no leader and applied nothing for a
+  grace (60 s; `ReplicaGCGrace`), and removes one the record does not
+  list — names another range for its span, names its range without this
+  store, or lists this store with a newer replica. No record means
+  nothing (a repair in flight); a listed store is a partitioned member,
+  left alone however quiet; a frozen replica is the merge's to remove. A
+  raft message from a replica id the descriptor has moved past is
+  dropped rather than stepped. Two counters:
+  `datax_replica_gc_removed_total` and
+  `datax_raft_nonmember_messages_dropped_total`.
 - **A range row is labelled from its own key** (#252, from QA on #251).
   `keys_redacted` became exact per document in #251; the console still
   applied it per row, so a reader with `SELECT` on some tables was told

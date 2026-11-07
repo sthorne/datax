@@ -173,6 +173,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			log.Debugf("%s registry scan failed: %v", n.ident.NodeID, err)
 		}
 		n.mirrorClusterVersion(hctx)
+		n.auditEncryptionCutover(hctx)
 		cancel()
 	}
 }

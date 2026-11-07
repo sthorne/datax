@@ -420,3 +420,30 @@ func BootstrapDatabases(put func(key keys.Key, value []byte) error) error {
 	}
 	return put(keys.DescIDGenKey(), []byte("2"))
 }
+
+// SchemaUsageDenied is the databases, among dbs, whose public schema set
+// may not use: the clause of SQL's read question that the table
+// predicates (CanSeeTable, CanReadTable) do not carry (issue #259).
+// Usage is everyone's unless REVOKE USAGE ON SCHEMA public FROM PUBLIC
+// restricted it (UsageRestricted), after which the owner and holders of
+// USAGE, directly or through a role, may reach the schema's objects; an
+// admin always may. A table in a denied database is neither listed nor
+// read for set, by SQL's catalogs and the console alike, so the two
+// never answer the listing question differently (issue #197). nil when
+// nothing is denied.
+func SchemaUsageDenied(dbs []*DatabaseDescriptor, set RoleSet) map[uint64]bool {
+	if set.IsAdmin() {
+		return nil
+	}
+	var denied map[uint64]bool
+	for _, db := range dbs {
+		if db == nil || !db.UsageRestricted || set.Has(OwnerOf(db.Owner)) || HasPrivilege(db.SchemaPrivileges, set, PrivUsage) {
+			continue
+		}
+		if denied == nil {
+			denied = map[uint64]bool{}
+		}
+		denied[db.ID] = true
+	}
+	return denied
+}

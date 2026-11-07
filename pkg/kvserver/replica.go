@@ -138,6 +138,10 @@ type Replica struct {
 		sync.Mutex
 		desc         kvpb.RangeDescriptor
 		appliedIndex uint64
+		// appliedAt is when appliedIndex last advanced, or when the
+		// replica was created or loaded: the clock replica GC's grace
+		// runs on (issue #245).
+		appliedAt    time.Time
 		gcThreshold  hlc.Timestamp // replicated; raised by applied GC commands
 		sizeBytes    int64         // replicated approximate MVCC data size
 		term         uint64        // highest raft term observed
@@ -292,6 +296,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	rs.setApplied(st.AppliedIndex)
 	r.mu.desc = desc
 	r.mu.appliedIndex = st.AppliedIndex
+	r.mu.appliedAt = time.Now()
 	r.mu.gcThreshold = st.GCThreshold
 	r.mu.sizeBytes = st.SizeBytes
 	if hs, _, err := rs.InitialState(); err == nil {
@@ -796,6 +801,19 @@ func (r *Replica) sendRaftMessages(ctx context.Context, msgs []raftpb.Message) {
 // Any message but a heartbeat response wakes a quiescent replica (the
 // response to a leader's parting heartbeat must not wake it back up).
 func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
+	if r.fromNonMember(m.From) {
+		// A replica id this range has moved past — removed, or a
+		// preseed whose membership change never landed (issue #245) —
+		// is not stepped: its votes and appends are noise the members
+		// would reject on the vote rules anyway, and a non-member is
+		// not a peer. An id the descriptor has not reached yet is a
+		// member this replica has not applied the addition of, and is
+		// stepped as before.
+		metrics.RaftNonMemberDropped.Inc()
+		desc := r.Desc()
+		log.Debugf("%s/%d: dropping %s from replica %d, which is not a member of %s", r.rangeID, r.replicaID, m.Type, m.From, &desc)
+		return nil
+	}
 	switch m.Type {
 	case raftpb.MsgHeartbeatResp, raftpb.MsgAppResp:
 		// Follower contact, timestamped for the lease-read backstop.
@@ -811,6 +829,28 @@ func (r *Replica) stepRaftMessage(ctx context.Context, m raftpb.Message) error {
 		r.store.sched.enqueue(r.rangeID, schedReady)
 	}
 	return err
+}
+
+// fromNonMember reports whether from is a replica id the range's
+// descriptor, as this replica holds it, has moved past: not listed and
+// below NextReplicaID. 0 (no sender) and ids the descriptor has not
+// allocated yet are not.
+func (r *Replica) fromNonMember(from uint64) bool {
+	if from == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d := &r.mu.desc
+	if d.NextReplicaID == 0 || base.ReplicaID(from) >= d.NextReplicaID {
+		return false
+	}
+	for _, rd := range d.Replicas {
+		if uint64(rd.ReplicaID) == from {
+			return false
+		}
+	}
+	return true
 }
 
 // noteTick runs on every raft ticker fire and detects stalls: a gap far
@@ -1071,6 +1111,9 @@ func (r *Replica) leaseReadIndex() (idx uint64, ok bool) {
 func (r *Replica) setApplied(idx uint64) {
 	r.rs.setApplied(idx)
 	r.mu.Lock()
+	if idx > r.mu.appliedIndex {
+		r.mu.appliedAt = time.Now()
+	}
 	r.mu.appliedIndex = idx
 	var remaining []appliedWait
 	for _, w := range r.mu.appliedWaits {

@@ -32,6 +32,7 @@ type serverFlags struct {
 	profile       string
 	cacheSize     string
 	encKeyPath    string
+	acceptEncRB   bool
 	loadSplit     float64
 	mergeThr      int64
 	raftWorkers   int
@@ -61,6 +62,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
 	f.fs.StringVar(&f.profile, "storage-profile", "balanced", "storage engine tuning profile: balanced or ingest")
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
+	f.fs.BoolVar(&f.acceptEncRB, "accept-encryption-rollback", false, "start a store whose switch to authenticated encryption was rolled back (its key registry or the whole store restored from before the switch), lowering the records that caught the rollback to what the store has; for the one start after a rollback that was meant")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
@@ -93,32 +95,33 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
-		StorageProfile:          prof,
-		StorageCacheSize:        cacheSize,
-		EncKeyPath:              f.encKeyPath,
-		LoadSplitThreshold:      f.loadSplit,
-		MergeSizeThreshold:      f.mergeThr,
-		RaftWorkers:             f.raftWorkers,
-		DisableQuiescence:       !f.quiescence,
-		LeaseShedFactor:         f.shedFactor,
-		ConsistencyInterval:     f.consistInt,
-		SlowStatementThreshold:  f.slowStmt,
-		AuthTimeout:             f.authTimeout,
-		SQLMaxPendingAuth:       f.maxPending,
-		MetricsRecordInterval:   metricsRecordInterval(f.metricsRecord),
-		DrainTimeout:            f.drainTimeout,
-		RebalanceBytesThreshold: f.bytesThr,
-		Dir:                     f.dir,
-		Listen:                  f.listen,
-		PGListen:                f.pgListen,
-		Join:                    f.join,
-		BootstrapSelf:           bootstrap,
-		Locality:                loc,
-		MaxOffset:               f.maxOffset,
-		AdvertiseAddr:           f.advertise,
-		CertsDir:                f.certsDir,
-		RootPassword:            f.rootPw,
-		HTTPListen:              f.httpListen,
+		StorageProfile:           prof,
+		StorageCacheSize:         cacheSize,
+		EncKeyPath:               f.encKeyPath,
+		AcceptEncryptionRollback: f.acceptEncRB,
+		LoadSplitThreshold:       f.loadSplit,
+		MergeSizeThreshold:       f.mergeThr,
+		RaftWorkers:              f.raftWorkers,
+		DisableQuiescence:        !f.quiescence,
+		LeaseShedFactor:          f.shedFactor,
+		ConsistencyInterval:      f.consistInt,
+		SlowStatementThreshold:   f.slowStmt,
+		AuthTimeout:              f.authTimeout,
+		SQLMaxPendingAuth:        f.maxPending,
+		MetricsRecordInterval:    metricsRecordInterval(f.metricsRecord),
+		DrainTimeout:             f.drainTimeout,
+		RebalanceBytesThreshold:  f.bytesThr,
+		Dir:                      f.dir,
+		Listen:                   f.listen,
+		PGListen:                 f.pgListen,
+		Join:                     f.join,
+		BootstrapSelf:            bootstrap,
+		Locality:                 loc,
+		MaxOffset:                f.maxOffset,
+		AdvertiseAddr:            f.advertise,
+		CertsDir:                 f.certsDir,
+		RootPassword:             f.rootPw,
+		HTTPListen:               f.httpListen,
 	}, nil
 }
 

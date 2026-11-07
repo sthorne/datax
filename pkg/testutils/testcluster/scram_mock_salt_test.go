@@ -4,16 +4,20 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/security"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 )
 
 // scramServerFirst opens a TLS connection to node i, starts SCRAM as
@@ -75,6 +79,32 @@ func scramServerFirst(t *testing.T, tc *TestCluster, certsDir string, i int, use
 }
 
 // saltOf extracts the s= attribute of a server-first message.
+func iterationsOf(t *testing.T, serverFirst string) int {
+	t.Helper()
+	for _, attr := range strings.Split(serverFirst, ",") {
+		if strings.HasPrefix(attr, "i=") {
+			n, err := strconv.Atoi(attr[2:])
+			if err != nil {
+				t.Fatalf("iteration count in %q: %v", serverFirst, err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("no iteration count in %q", serverFirst)
+	return 0
+}
+
+// mustVerifier derives a verifier at a given count, for planting a role
+// the way a cluster upgraded from before the raise holds them.
+func mustVerifier(t *testing.T, password string, iterations int) *security.ScramVerifier {
+	t.Helper()
+	v, err := security.MakeScramVerifierAt(password, iterations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 func saltOf(t *testing.T, serverFirst string) string {
 	t.Helper()
 	for _, attr := range strings.Split(serverFirst, ",") {
@@ -125,6 +155,42 @@ func TestSCRAMStandInSaltPerUser(t *testing.T) {
 	rootSalt := saltOf(t, scramServerFirst(t, tc, certsDir, 0, "root"))
 	if len(rootSalt) != len(nobodyA) || rootSalt == nobodyA {
 		t.Fatalf("real salt %s, stand-in %s", rootSalt, nobodyA)
+	}
+	// The iteration count it advertises is what the real verifiers carry
+	// (issue #225): a verifier made before the count was raised keeps
+	// its own, so the stand-in follows the highest stored count rather
+	// than the constant, and a name that does not exist shows the count
+	// of a real user. "legacy" is planted at the old count, as an
+	// upgraded cluster's users are until they rotate; root, seeded at
+	// the current count, is what the stand-in shows while legacy still
+	// authenticates at its own.
+	legacy, err := security.MarshalVerifier(mustVerifier(t, "legacy-pw", 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(catalog.RoleDescriptor{Name: "legacy", Login: true, Verifier: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.Nodes[0].DB().Put(ctx, keys.RoleKey("legacy"), raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := iterationsOf(t, scramServerFirst(t, tc, certsDir, 0, "legacy")); got != 4096 {
+		t.Fatalf("legacy's verifier advertises %d iterations, want the 4096 it was made with", got)
+	}
+	rootIters := iterationsOf(t, scramServerFirst(t, tc, certsDir, 0, "root"))
+	if rootIters != security.ScramIterations {
+		t.Fatalf("root's verifier advertises %d iterations, want %d", rootIters, security.ScramIterations)
+	}
+	for i := range tc.Nodes {
+		if got := iterationsOf(t, scramServerFirst(t, tc, certsDir, i, "nobody-a")); got != rootIters {
+			t.Fatalf("node %d: the stand-in advertises %d iterations where the real users show %d", i+1, got, rootIters)
+		}
+	}
+	if conn, err := connectSecure(ctx, secureURL(tc, certsDir, "legacy", "legacy-pw")); err != nil {
+		t.Fatalf("legacy, with a verifier at the old count, cannot authenticate: %v", err)
+	} else {
+		_ = conn.Close(ctx)
 	}
 	// And the exchange still fails the same way for both.
 	for _, user := range []string{"nobody-a", "root"} {

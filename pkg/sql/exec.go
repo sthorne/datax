@@ -2676,10 +2676,23 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 	if err != nil {
 		return nil, err
 	}
+	// The same listing question information_schema, pg_catalog and the
+	// console ask (issues #197, #259): a table the session holds no
+	// privilege on, or whose schema it may not use, is not named. SHOW
+	// TABLES listed every table of the database before, which was the
+	// one listing that answered differently.
+	set, err := s.roleSet(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	denied := catalog.SchemaUsageDenied([]*catalog.DatabaseDescriptor{db}, set)
 	res := &Result{Columns: []ResultColumn{{Name: "table_name", Type: types.String}}}
 	for _, d := range descs {
 		if d.IsView() {
 			continue // SHOW VIEWS
+		}
+		if !canSeeTable(set, d) || denied[d.DatabaseID] {
+			continue
 		}
 		res.Rows = append(res.Rows, []types.Datum{types.NewString(d.Name)})
 	}

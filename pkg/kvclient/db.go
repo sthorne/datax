@@ -609,6 +609,33 @@ func (db *DB) descForKey(ctx context.Context, addr keys.Key) (kvpb.RangeDescript
 // within milliseconds, and a batch should wait for it rather than fail.
 const metaStaleWait = 3 * time.Second
 
+// LookupMetaRecord reads the /meta record covering key, as the cluster
+// currently addresses it: the descriptor, whether one was found, and a
+// read error. Unlike the gateway's own lookup it never waits for stale
+// addressing to converge — a record that does not cover the key, or no
+// record at all, is reported as not found, for a caller that would
+// rather do nothing than act on a repair in flight (replica GC, issue
+// #245).
+func (db *DB) LookupMetaRecord(ctx context.Context, key keys.Key) (kvpb.RangeDescriptor, bool, error) {
+	start := keys.Key(keys.RangeMetaKey(key)).Next()
+	_, metaEnd := keys.MetaSpan()
+	rows, err := db.Scan(ctx, start, metaEnd, 1)
+	if err != nil {
+		return kvpb.RangeDescriptor{}, false, err
+	}
+	if len(rows) == 0 {
+		return kvpb.RangeDescriptor{}, false, nil
+	}
+	var d kvpb.RangeDescriptor
+	if err := json.Unmarshal(rows[0].Value, &d); err != nil {
+		return kvpb.RangeDescriptor{}, false, fmt.Errorf("corrupt meta record: %w", err)
+	}
+	if !d.ContainsKey(key) {
+		return kvpb.RangeDescriptor{}, false, nil
+	}
+	return d, true, nil
+}
+
 // lookupMeta scans /meta for the first record whose range ends beyond key.
 // The scan is inconsistent (never blocks on intents) and itself routed via
 // the cache — the bootstrap invariant is that a descriptor covering the

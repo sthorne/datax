@@ -87,6 +87,7 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 				s.RunLogTruncationOnce(ctx)
 				s.RunAutoSplitOnce(ctx)
 				s.RunRangeMergeOnce(ctx)
+				s.RunReplicaGCOnce(ctx)
 			}
 		}
 	})

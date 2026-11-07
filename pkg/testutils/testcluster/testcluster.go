@@ -5,6 +5,8 @@ package testcluster
 import (
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -334,6 +336,17 @@ func (tc *TestCluster) LeaderIndex(rangeID base.RangeID) int {
 // changed-address path is covered by RestartNodeNewPort and address_test.go.
 func startDiskNode(t testing.TB, dir string, bootstrap bool, join string, opts ...func(*server.Config)) *server.Node {
 	t.Helper()
+	n, err := tryStartDiskNode(t, dir, bootstrap, join, opts...)
+	if err != nil {
+		t.Fatalf("starting disk node: %v", err)
+	}
+	return n
+}
+
+// tryStartDiskNode is startDiskNode for a start the test expects may be
+// refused: the error comes back instead of failing the test.
+func tryStartDiskNode(t testing.TB, dir string, bootstrap bool, join string, opts ...func(*server.Config)) (*server.Node, error) {
+	t.Helper()
 	lis := listenerForDir(t, dir)
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
@@ -348,9 +361,37 @@ func startDiskNode(t testing.TB, dir string, bootstrap bool, join string, opts .
 	}
 	n, err := server.Start(cfg)
 	if err != nil {
-		t.Fatalf("starting disk node: %v", err)
+		_ = lis.Close()
+		return nil, err
 	}
-	return n
+	return n, nil
+}
+
+// copyTree copies the files under src to dst, creating directories as
+// it goes: a store snapshot a test later restores.
+func copyTree(t testing.TB, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, b, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatalf("copying %s to %s: %v", src, dst, err)
+	}
 }
 
 var diskAddrs sync.Map // dir -> address, so restarts reuse their port

@@ -203,11 +203,22 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 			writeSchemaDoc(w, &doc)
 			return
 		}
+		// And the schema half of the question: a table whose schema's
+		// USAGE the user lacks is not listed, as SHOW TABLES does not
+		// list it either — both ask catalog.SchemaUsageDenied (issue
+		// #259).
+		denied, err := n.schemaUsageDenied(req.Context(), set)
+		if err != nil {
+			doc.Tables, doc.Users = nil, nil
+			doc.Error = "cannot resolve schema usage for " + p.User + ": " + err.Error()
+			writeSchemaDoc(w, &doc)
+			return
+		}
 		descs := n.tableDescs()
 		visible := make([]SchemaTable, 0, len(full.Tables))
 		for _, t := range full.Tables {
 			d := descs[t.ID]
-			if d == nil || !catalog.CanSeeTable(set, d) {
+			if d == nil || denied[d.DatabaseID] || !catalog.CanSeeTable(set, d) {
 				continue
 			}
 			// The table is visible; its full grantee list is not. Naming

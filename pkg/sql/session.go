@@ -422,8 +422,13 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 	if err != nil {
 		return nil, err
 	}
+	// A table whose schema the session may not use is not listed, as
+	// the console does not list it (issue #259): both ask
+	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
+	// the listing question the same way (issue #197).
+	denied := catalog.SchemaUsageDenied(dbs, set)
 	for _, d := range all {
-		if !canSeeTable(set, d) {
+		if !canSeeTable(set, d) || denied[d.DatabaseID] {
 			continue
 		}
 		env.Tables = append(env.Tables, d)

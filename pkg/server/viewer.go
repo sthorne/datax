@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"net/http"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 )
 
@@ -35,6 +38,10 @@ type keyViewer struct {
 	all   bool
 	set   catalog.RoleSet
 	descs map[uint64]*catalog.TableDescriptor
+	// denied is the databases whose schema the caller may not use
+	// (schemaUsageDenied): a table in one is neither seen nor read,
+	// whatever its own grants say (issue #259).
+	denied map[uint64]bool
 	// err is why the caller's roles could not be resolved. The viewer
 	// then sees no table at all: fail closed, and say so where the
 	// document has a place for it.
@@ -69,7 +76,36 @@ func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 	if err != nil {
 		return keyViewer{err: err, redacted: new(atomic.Bool)}
 	}
-	return keyViewer{set: set, descs: n.tableDescs(), redacted: new(atomic.Bool)}
+	denied, err := n.schemaUsageDenied(ctx, set)
+	if err != nil {
+		return keyViewer{err: err, redacted: new(atomic.Bool)}
+	}
+	return keyViewer{set: set, descs: n.tableDescs(), denied: denied, redacted: new(atomic.Bool)}
+}
+
+// schemaUsageDenied is the set of databases whose schema the role set may
+// not use: the clause of the SQL authorizer's read question that the
+// table predicates do not carry (issue #259). SQL authorizes a table read
+// as the table's own privilege AND usage of its schema, and REVOKE USAGE
+// ON SCHEMA public FROM PUBLIC turns the second on: after it, a grantee
+// holding SELECT on a table and no USAGE on its schema is refused the
+// row, so the console must not decode the table's boundaries for it,
+// nor list the table. Resolved once per request, as the roles are, for
+// every database rather than per key: the viewer answers for many keys
+// and the databases are few. An admin may use every schema; a database
+// that does not restrict usage, or whose owner the set holds, is usable;
+// otherwise USAGE must be held, directly or through a role. A database
+// the read does not find is usable, as the authorizer treats it; a read
+// that fails is an error, and the viewer fails closed on it.
+func (n *Node) schemaUsageDenied(ctx context.Context, set catalog.RoleSet) (map[uint64]bool, error) {
+	if set.IsAdmin() {
+		return nil, nil
+	}
+	dbs, err := n.databaseDescs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.SchemaUsageDenied(dbs, set), nil
 }
 
 // redactedAny reports whether a key was rendered at its prefix for this
@@ -113,7 +149,7 @@ func (v keyViewer) may(id uint64, pred func(catalog.RoleSet, *catalog.TableDescr
 		return false
 	}
 	d := v.descs[id]
-	return d != nil && pred(v.set, d)
+	return d != nil && !v.denied[d.DatabaseID] && pred(v.set, d)
 }
 
 // viewKey renders k for the caller: decoded when it belongs to a table
@@ -140,4 +176,42 @@ func (n *Node) viewTable(v keyViewer, start keys.Key) string {
 		return ""
 	}
 	return n.tableNameOf(start)
+}
+
+// databaseDescsFor is how long the viewer's database list is reused
+// before it is read again: UsageRestricted changes about as often as a
+// role grant, and the console polls every few seconds, so the list is
+// read once per few seconds rather than once per document (InfoSec on
+// the PR for #259). A failed read is not cached: the next request reads
+// again, and fails closed until one succeeds.
+const databaseDescsFor = 5 * time.Second
+
+type databaseDescsCache struct {
+	mu   sync.Mutex
+	dbs  []*catalog.DatabaseDescriptor
+	at   time.Time
+	read bool
+}
+
+func (n *Node) databaseDescs(ctx context.Context) ([]*catalog.DatabaseDescriptor, error) {
+	n.dbDescs.mu.Lock()
+	if n.dbDescs.read && time.Since(n.dbDescs.at) < databaseDescsFor {
+		dbs := n.dbDescs.dbs
+		n.dbDescs.mu.Unlock()
+		return dbs, nil
+	}
+	n.dbDescs.mu.Unlock()
+	var dbs []*catalog.DatabaseDescriptor
+	err := n.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		dbs, err = catalog.ListDatabases(ctx, txn)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	n.dbDescs.mu.Lock()
+	n.dbDescs.dbs, n.dbDescs.at, n.dbDescs.read = dbs, time.Now(), true
+	n.dbDescs.mu.Unlock()
+	return dbs, nil
 }

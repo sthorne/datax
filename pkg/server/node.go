@@ -65,6 +65,11 @@ type Config struct {
 	ConsistencyInterval time.Duration
 	// GCInterval is how often the GC loop scans led ranges (default 60s).
 	GCInterval time.Duration
+	// ReplicaGCGrace is how long a replica that leads nothing, hears
+	// from no leader and applies nothing is left alone before the
+	// housekeeping pass asks /meta whether it is still a member of its
+	// range (issue #245; default kvserver.DefaultReplicaGCGrace, 60s).
+	ReplicaGCGrace time.Duration
 	// LivenessGrace is how stale a node's heartbeat may be before the
 	// allocator stops treating it as live (default 15s).
 	LivenessGrace time.Duration
@@ -197,6 +202,13 @@ type Config struct {
 	// and a restart in between still opens the store (see
 	// enc.MatchStoreKey).
 	EncKeyPath string
+	// AcceptEncryptionRollback lets a store whose switch to authenticated
+	// encryption has been rolled back — its key registry, or the whole
+	// store, restored from before the switch — start anyway (issue
+	// #248): the records that caught the rollback are lowered to what
+	// the store has, and rise again as it re-completes the switch. For
+	// the one start after a rollback the operator meant.
+	AcceptEncryptionRollback bool
 	// BinaryVersionOverride makes the node advertise (and gate on) this
 	// protocol version instead of version.Current — used by tests to
 	// simulate mixed-version clusters. 0 = version.Current.
@@ -368,6 +380,16 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// dbDescs caches the database list the key viewer resolves schema
+	// usage from (viewer.go, issue #259).
+	dbDescs databaseDescsCache
+	// encCheck is the cross-check of the store's switch to authenticated
+	// encryption against the records a registry rollback cannot reach
+	// (enccheck.go, issue #248).
+	encCheck encryptionCheck
+	// standIn caches the iteration count the stand-in SCRAM verifier
+	// advertises (standInIterations, issue #225).
+	standIn standInState
 	// indexUsage caches /api/index-usage documents (issue #208).
 	indexUsage indexUsageCache
 	// shapes is the statement-shape recorder's state (issue #209).
@@ -453,6 +475,17 @@ func (n *Node) start() error {
 	}
 	if n.raftEngine != nil {
 		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
+	}
+	// Before anything asks the engines to move: what they opened with,
+	// held to the store's own record of its switch (issue #248).
+	if err := n.checkEncryptionMarker(); err != nil {
+		return err
+	}
+	if n.cfg.AcceptEncryptionRollback {
+		// Said on every start the flag is set, rollback or not: it is a
+		// flag for one start, and one left in a unit file would
+		// otherwise disable both halves of issue #248 silently.
+		log.Warnf("--accept-encryption-rollback is set: a store rolled back to before its switch to authenticated encryption would be accepted at this start rather than refused; remove the flag once the node is up (issue #248)")
 	}
 
 	lis := n.cfg.Listener
@@ -589,6 +622,7 @@ func (n *Node) start() error {
 		MergeBarrier:            n.placementBarrier,
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,
+		ReplicaGCGrace:          n.cfg.ReplicaGCGrace,
 		WaitForApplication:      n.waitForApplication,
 		ClusterVersion: func() version.Version {
 			if cv := version.Version(n.clusterVersion.Load()); cv > 0 {
