@@ -11,6 +11,13 @@ package catalog
 //     choices. A console preference belongs to the person, not to the
 //     browser they happen to be sitting at, so the cluster holds it and
 //     it follows them to any browser and any node.
+//   - datax_metrics_shapes (issue #209) is the statement-shape time
+//     series: each node's busiest shapes by total time, recorded every
+//     interval, with a shorter retention than datax_metrics because
+//     the rows are numerous and go stale fast.
+//   - datax_statement_shapes (issue #209) maps a fingerprint to the
+//     normalised shape it stands for — literals replaced, so it carries
+//     no data — which is what lets a chart of a fingerprint be read.
 
 // MetricsTableName is the reserved name of the metrics table.
 const MetricsTableName = "datax_metrics"
@@ -26,13 +33,29 @@ const MetricsTableID uint64 = 1 << 40
 // value above the last, so no two system tables can collide.
 const PrefsTableID uint64 = 1<<40 + 1
 
+// ShapesMetricsTableName is the reserved name of the statement-shape
+// time series; StatementShapesTableName that of the fingerprint table.
+const (
+	ShapesMetricsTableName   = "datax_metrics_shapes"
+	StatementShapesTableName = "datax_statement_shapes"
+)
+
+// ShapesMetricsTableID and StatementShapesTableID are the two shape
+// tables' fixed descriptor IDs, the next above PrefsTableID.
+const (
+	ShapesMetricsTableID   uint64 = 1<<40 + 2
+	StatementShapesTableID uint64 = 1<<40 + 3
+)
+
 // systemTableIDs is every reserved name and the ID it is created at.
 // Adding an entry here is the whole registration: the DDL path assigns
 // the ID from it, and the privilege, rename, drop and backup rules read
 // the membership.
 var systemTableIDs = map[string]uint64{
-	MetricsTableName: MetricsTableID,
-	PrefsTableName:   PrefsTableID,
+	MetricsTableName:         MetricsTableID,
+	PrefsTableName:           PrefsTableID,
+	ShapesMetricsTableName:   ShapesMetricsTableID,
+	StatementShapesTableName: StatementShapesTableID,
 }
 
 // IsSystemTable reports whether name is reserved for the cluster.

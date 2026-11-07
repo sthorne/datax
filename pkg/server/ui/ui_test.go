@@ -2547,3 +2547,36 @@ func deadAfterReturn(body string) string {
 	}
 	return ""
 }
+
+// TestShapeSeriesCarryTheirText (issue #209): a statement shape's series
+// is labelled by its fingerprint, which no one recognises, so the
+// picker and the chart title carry the shape's text when the catalog
+// resolved it; the note says where the stmt.* series come from and how
+// short their window is; and the statement detail links to the chart.
+func TestShapeSeriesCarryTheirText(t *testing.T) {
+	charts := string(mustRead(t, "js/86-charts.js"))
+	if sp := jsFuncSpan(charts, "seriesChoices"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "labelText(def.label, v)") {
+		t.Error("seriesChoices does not resolve a label value to its text: a shape's series is a bare fingerprint in the picker")
+	}
+	if sp := jsFuncSpan(charts, "labelText"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "label_text") {
+		t.Error("labelText does not read the catalog's label_text")
+	}
+	if sp := jsFuncSpan(charts, "renderPickers"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "shortShape(c.text)") || !strings.Contains(charts[sp[0]:sp[1]], "shapesNote()") {
+		t.Error("renderPickers shows no shape text or no note on where the stmt.* series come from")
+	}
+	if sp := jsFuncSpan(charts, "shapesNote"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "shapes_top_n") || !strings.Contains(charts[sp[0]:sp[1]], "shapes_retention_seconds") {
+		t.Error("shapesNote does not say how many shapes are kept or for how long")
+	}
+	if sp := jsFuncSpan(charts, "chart"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "shortShape(s.label)") {
+		t.Error("chart() title does not carry the series' label text")
+	}
+	sqlv := string(mustRead(t, "js/50-sql.js"))
+	sp := jsFuncSpan(sqlv, "renderStatementDetail")
+	if sp == nil {
+		t.Fatal("renderStatementDetail not found")
+	}
+	body := sqlv[sp[0]:sp[1]]
+	if !strings.Contains(body, `id="stmt-chart"`) || !strings.Contains(body, `routeTo("metrics"`) || !strings.Contains(body, "stmt.total_us{fp=") {
+		t.Error("the statement detail has no link to chart the shape's series")
+	}
+}

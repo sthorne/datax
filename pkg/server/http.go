@@ -270,6 +270,7 @@ func (n *Node) startHTTP() error {
 	// fan-out below it runs under the node identity like /api/node's
 	// (issue #157).
 	mux.Handle("/api/statements", n.requireAdmin(http.HandlerFunc(n.serveStatementsAPI)))
+	mux.Handle("/api/index-usage", n.requireAdmin(http.HandlerFunc(n.serveIndexUsageAPI)))
 	// The cluster's operations fan out over the same RPC (issue #210);
 	// a node's ring carries admin-only records, so the same gate.
 	mux.Handle("/api/operations", n.requireAdmin(http.HandlerFunc(n.serveOperationsAPI)))

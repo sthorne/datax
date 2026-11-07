@@ -149,9 +149,52 @@ function renderTableColumns(t) {
     : `columns in descriptor order, which is the order the primary key and SELECT * use.`);
 }
 
+// Index usage (issue #208): /api/index-usage sums, over the metrics
+// table's retention window and across every node that recorded, the
+// scans opened and rows read through each index, the primary included
+// so the figures read as a ratio. Admin-gated like the statements, so a
+// non-admin sees the column explained rather than filled. Fetched when
+// the table detail opens and then at most every thirty seconds — the
+// server caches a table's document for that long, and the schema poll
+// that redraws this table runs every few seconds.
+let indexUsage = { table: "", at: 0, doc: null, error: "" };
+async function fetchIndexUsage(t) {
+  if (!canDrillDown()) return;
+  if (indexUsage.table === t.name && Date.now() - indexUsage.at < 30000) return;
+  indexUsage = { table: t.name, at: Date.now(), doc: null, error: "" };
+  try {
+    const resp = await fetch("/api/index-usage?table=" + encodeURIComponent(t.name), { cache: "no-store" });
+    const d = await resp.json().catch(() => ({}));
+    if (!resp.ok) { indexUsage.error = d.error || ("HTTP " + resp.status); }
+    else indexUsage.doc = d;
+  } catch (err) {
+    indexUsage.error = err.message || String(err);
+  }
+  if (ui.view === "table" && ui.table === t.name) renderTableIndexes(t);
+}
+function usageCell(name) {
+  const d = indexUsage.doc;
+  if (!canDrillDown()) return `<span class="muted">admin role</span>`;
+  if (!d || indexUsage.table !== (ui.table || "")) return `<span class="muted">${indexUsage.error ? esc(indexUsage.error) : "…"}</span>`;
+  const row = (d.indexes || []).find(i => i.name === name);
+  if (!row) return `<span class="muted">—</span>`;
+  if (!row.scans) return `<span class="muted">no recorded scans</span>`;
+  return `${fmtCount(row.scans)} scan${row.scans === 1 ? "" : "s"} · ${fmtCount(row.rows)} row${row.rows === 1 ? "" : "s"}${row.last_used_unix_ms ? ` · last ${esc(fmtWhen(row.last_used_unix_ms))}` : ""}`;
+}
 function renderTableIndexes(t) {
   const idx = t.indexes || [];
-  renderKeyed(document.getElementById("table-indexes"), idx.length ? idx.map(i => ({
+  fetchIndexUsage(t);
+  // The primary key leads the list (issue #208): an index with zero
+  // scans is only alarming next to a table with traffic, so the ratio
+  // needs the primary's figure beside it.
+  const primary = { key: "primary", html: `<tr data-key="primary">
+      <td data-label="index"><b>primary key</b></td>
+      <td data-label="columns" class="key">${(t.primary_key || []).map(esc).join(", ")}</td>
+      <td data-label="unique">unique</td>
+      <td data-label="build state"><span class="muted">ready</span></td>
+      <td data-label="usage">${usageCell("primary")}</td>
+    </tr>` };
+  renderKeyed(document.getElementById("table-indexes"), [primary].concat(idx.map(i => ({
     key: i.name,
     html: `<tr data-key="${esc(i.name)}">
       <td data-label="index"><b>${esc(i.name)}</b></td>
@@ -160,12 +203,31 @@ function renderTableIndexes(t) {
       <td data-label="build state">${i.state === "write-only"
         ? tok("draining", "building")
         : `<span class="muted">ready</span>`}</td>
+      <td data-label="usage">${usageCell(i.name)}</td>
     </tr>`,
-  })) : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">no secondary indexes — every read is a scan of the primary key or a lookup by it</td></tr>` }]);
+  }))));
   const building = idx.filter(i => i.state === "write-only");
-  setHTML(document.getElementById("table-indexes-note"), building.length
-    ? `${building.map(i => esc(i.name)).join(", ")} ${building.length === 1 ? "is" : "are"} still being built: writers maintain the index already, but the planner will not use it until the backfill finishes and the CREATE INDEX returns. How far along the backfill is is not published, so this says building, not a percentage.`
-    : `the primary key is the table itself and is not listed here.`);
+  const notes = [];
+  if (!idx.length) notes.push("no secondary indexes: every read is a scan of the primary key or a lookup by it.");
+  if (building.length) notes.push(`${building.map(i => esc(i.name)).join(", ")} ${building.length === 1 ? "is" : "are"} still being built: writers maintain the index already, but the planner will not use it until the backfill finishes and the CREATE INDEX returns. How far along the backfill is is not published, so this says building, not a percentage.`);
+  notes.push(usageNote(t));
+  setHTML(document.getElementById("table-indexes-note"), notes.join(" "));
+}
+// usageNote says what the usage column covers — and does not — because
+// someone will drop an index on the strength of it.
+function usageNote(t) {
+  if (!canDrillDown()) return `index usage needs the admin role — ${drillDownRefusal()}`;
+  const d = indexUsage.doc;
+  if (!d || indexUsage.table !== t.name) return indexUsage.error ? `index usage unavailable: ${esc(indexUsage.error)}` : "index usage is loading.";
+  const window = fmtDuration(d.window_seconds || 0);
+  const nodes = (d.nodes || []).length;
+  const asked = d.nodes_asked || 0;
+  let s = `usage is scans opened and rows read through each index, as the nodes recorded them into datax_metrics, summed over the last ${esc(window)} across ${nodes} of ${asked} node${asked === 1 ? "" : "s"}`;
+  if (nodes < asked) s += ` (${asked - nodes} recorded nothing for this table: recording off, or no reads)`;
+  s += `; a restart changes nothing here. Zero is "no recorded scans in that window on those nodes", not "unused": a workload whose cycle is longer than the window leaves a used index at zero.`;
+  if (!d.recording) s += " Recording is off on this node, so its own reads are not in these figures.";
+  if (d.error) s += ` Partial: ${esc(d.error)}.`;
+  return s;
 }
 
 function renderTableConstraints(t) {

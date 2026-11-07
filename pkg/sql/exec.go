@@ -1361,17 +1361,22 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if err != nil {
 			return nil, err
 		}
-		return s.fetchByPrimaryKey(ctx, txn, desc, key, where, params)
+		noteIndexScan(desc, desc.LivePrimaryIndex())
+		rows, err := s.fetchByPrimaryKey(ctx, txn, desc, key, where, params)
+		noteIndexRows(desc, desc.LivePrimaryIndex(), len(rows))
+		return rows, err
 
 	case planUniquePoint:
 		key, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
 			return nil, err
 		}
+		noteIndexScan(desc, plan.idx.ID)
 		pkEnc, err := txn.Get(ctx, key)
 		if err != nil || pkEnc == nil {
 			return nil, err
 		}
+		noteIndexRows(desc, plan.idx.ID, 1)
 		pk := append(rowenc.PrimaryKeyPrefixFor(desc), pkEnc...)
 		rows, err := s.fetchByPrimaryKey(ctx, txn, desc, pk, where, params)
 		if err != nil {
@@ -1406,12 +1411,14 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if len(plan.residual) == 0 {
 			scanLimit = limit
 		}
+		noteIndexScan(desc, plan.idx.ID)
 		kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 		if err != nil {
 			return nil, err
 		}
 		metrics.SQLRowsScanned.Add(float64(len(kvs)))
 		s.AddScanned(int64(len(kvs)))
+		noteIndexRows(desc, plan.idx.ID, len(kvs))
 		// The primary rows behind the entries come back in pages of
 		// primaryFetchPage, each page one routed batch, in the index's
 		// order (issue #103): a lookup matching 1,000 entries is four
@@ -1557,12 +1564,14 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 	if len(plan.residual) == 0 {
 		scanLimit = limit
 	}
+	noteIndexScan(desc, desc.LivePrimaryIndex())
 	kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 	if err != nil {
 		return nil, err
 	}
 	metrics.SQLRowsScanned.Add(float64(len(kvs)))
 	s.AddScanned(int64(len(kvs)))
+	noteIndexRows(desc, desc.LivePrimaryIndex(), len(kvs))
 	var out []fetchedRow
 	for _, kv := range kvs {
 		row, err := decodeFullRow(desc, kv.Key, kv.Value)

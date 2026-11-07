@@ -417,6 +417,7 @@ function renderStatementDetail(fp) {
     <div class="row"><b>representative statement</b></div>
     <pre class="key" style="white-space:pre-wrap">${esc(s.representative || "—")}</pre>
     <div class="row"><button id="stmt-explain" data-fp="${esc(s.fingerprint)}">explain this statement</button>
+      <a id="stmt-chart" href="${esc(routeTo("metrics", { series: `stmt.total_us{fp=${s.fingerprint}},stmt.count{fp=${s.fingerprint}}` }))}" title="chart this shape's time and executions over the header's range">chart this shape</a>
       <button id="stmt-close">close</button></div>
     <div id="stmt-plan"></div>
   </div>`);

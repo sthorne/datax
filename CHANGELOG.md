@@ -11,6 +11,46 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Index usage that survives a restart** (#208, closing #202 with
+  #209). "Is anyone using this index" had no answer: the executor kept
+  no count, and a count in memory would have reset with the node. Now
+  the executor charges every scan and the rows it reads to the index
+  the plan went through, where the scan opens — a secondary-index
+  lookup to that index, a primary-key point and a full scan to the
+  primary — and the metrics recorder writes the counts as
+  `index.scans{index=table.name}` and `index.rows{…}` every tick, so
+  they live in `datax_metrics` with the rest of the history. The table
+  page's indexes list gains a usage column: scans and rows summed over
+  the retention window across every node that recorded, with the most
+  recent interval in which the count rose, and the primary key listed
+  so the figures read as a ratio; `/api/index-usage?table=t` (admins)
+  is the same document. Zero means no recorded scans in that window on
+  those nodes, which the note under the table says is not the same as
+  unused — a node with recording off, a workload whose cycle is longer
+  than the window, or a cluster younger than it all leave a used index
+  at zero, and someone will drop an index on this column.
+- **Statement shapes over time** (#209). The fingerprint table is a
+  cumulative count since the node started: it says which shape costs
+  the most and nothing about when, so "was this slow yesterday" and
+  "what did the workload look like during the incident" had no answer.
+  Every tick each node now writes its 50 busiest shapes by total time
+  — executions, time, rows scanned, retries, each a counter keyed by
+  fingerprint — into `datax_metrics_shapes`, a second time-series
+  table with a day's retention, and `/api/metrics` charts them like
+  any counter (`stmt.total_us{fp=…}`, as a rate). A shape that falls
+  out of the top 50 stops being written rather than written as zero,
+  so the chart shows the gap; a restart shows as the counter's reset.
+  A fingerprint is not a chart label, so the shape's text — the
+  normalised statement with literals replaced, which carries no data —
+  is kept in `datax_statement_shapes` and resolved by the catalog for
+  admins: the picker lists the statement beside the series, the
+  chart's title carries it, and the shapes view's detail has a "chart
+  this shape" link. The representative text, which can carry data,
+  stays in memory and admin-gated as before. The two tables are
+  reserved like `datax_metrics`, created once the cluster has
+  finalized **v19** (clusters upgraded from earlier need `datax debug
+  upgrade`), and excluded from backups unless `--include-metrics`.
+  Cluster protocol version: v19.
 - **Brush to zoom on the charts** (#206). The time range was five
   presets ending at now, so the eleven minutes around 14:20 meant
   picking an hour and reading a fifth of the width, and yesterday

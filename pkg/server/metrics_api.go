@@ -14,6 +14,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // /api/metrics — the Metrics view's query endpoint over the datax_metrics
@@ -48,6 +49,19 @@ type MetricsCatalog struct {
 	Series          []MetricSeries      `json:"series"`
 	Labels          map[string][]string `json:"labels"`
 	Nodes           []int               `json:"nodes"`
+	// ShapesTable is where the stmt.* series live (issue #209), and
+	// ShapesReady whether this node has seen it exist; ShapesTopN and
+	// ShapesRetentionSeconds say what window and how many shapes a node
+	// records, so the console can say "the last 24 hours, the 50
+	// busiest shapes per node" rather than "history".
+	ShapesTable            string `json:"shapes_table"`
+	ShapesReady            bool   `json:"shapes_ready"`
+	ShapesTopN             int    `json:"shapes_top_n"`
+	ShapesRetentionSeconds int64  `json:"shapes_retention_seconds"`
+	// LabelText resolves a label value to the text a person recognises:
+	// a fingerprint to its shape. Admins only, like the shapes view the
+	// text comes from; the fp label values go with it.
+	LabelText map[string]map[string]string `json:"label_text,omitempty"`
 }
 
 // MetricsResult is the /api/metrics document for a query.
@@ -69,6 +83,10 @@ type MetricResult struct {
 	Group string                  `json:"group"`
 	Rate  bool                    `json:"rate,omitempty"`
 	Nodes map[string][][2]float64 `json:"nodes"`
+	// Label is the series' label value as a person reads it — a
+	// fingerprint's shape (issue #209) — for the chart's title. Admins
+	// only; the figures themselves are counts and go to anyone.
+	Label string `json:"label,omitempty"`
 }
 
 func (n *Node) serveMetricsAPI(w http.ResponseWriter, req *http.Request) {
@@ -76,11 +94,12 @@ func (n *Node) serveMetricsAPI(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	admin := n.clusterPrincipal(req).Admin
 	if q.Get("series") == "" {
-		_ = enc.Encode(n.metricsCatalog())
+		_ = enc.Encode(n.metricsCatalog(req.Context(), admin))
 		return
 	}
-	res, code, err := n.queryMetrics(req.Context(), q)
+	res, code, err := n.queryMetrics(req.Context(), q, admin)
 	if err != nil {
 		w.WriteHeader(code)
 		_ = enc.Encode(map[string]string{"error": err.Error()})
@@ -89,15 +108,28 @@ func (n *Node) serveMetricsAPI(w http.ResponseWriter, req *http.Request) {
 	_ = enc.Encode(res)
 }
 
-func (n *Node) metricsCatalog() MetricsCatalog {
+func (n *Node) metricsCatalog(ctx context.Context, admin bool) MetricsCatalog {
 	doc := MetricsCatalog{
-		NodeID:          int(n.ident.NodeID),
-		Enabled:         n.metricsRecordInterval() > 0,
-		IntervalSeconds: n.metricsRecordInterval().Seconds(),
-		Table:           catalog.MetricsTableName,
-		Ready:           n.metricsReady.Load(),
-		Series:          metricSeriesDefs,
-		Labels:          map[string][]string{"peer": {}, "table": {}},
+		NodeID:                 int(n.ident.NodeID),
+		Enabled:                n.metricsRecordInterval() > 0,
+		IntervalSeconds:        n.metricsRecordInterval().Seconds(),
+		Table:                  catalog.MetricsTableName,
+		Ready:                  n.metricsReady.Load(),
+		Series:                 metricSeriesDefs,
+		Labels:                 map[string][]string{"peer": {}, "table": {}, "index": {}, "fp": {}},
+		ShapesTable:            catalog.ShapesMetricsTableName,
+		ShapesReady:            n.shapesReady(),
+		ShapesTopN:             shapeSeriesTopN,
+		ShapesRetentionSeconds: 24 * 3600,
+	}
+	if admin && doc.ShapesReady {
+		if texts, err := n.shapeTexts(ctx); err == nil {
+			doc.LabelText = map[string]map[string]string{"fp": texts}
+			for fp := range texts {
+				doc.Labels["fp"] = append(doc.Labels["fp"], fp)
+			}
+			sort.Strings(doc.Labels["fp"])
+		}
 	}
 	for _, nd := range n.registry.All() {
 		doc.Nodes = append(doc.Nodes, int(nd.NodeID))
@@ -109,8 +141,15 @@ func (n *Node) metricsCatalog() MetricsCatalog {
 	sort.Strings(doc.Labels["peer"])
 	if sd := n.cachedSchemaDoc(); sd != nil {
 		for _, t := range sd.Tables {
-			if !catalog.IsSystemTable(t.Name) {
-				doc.Labels["table"] = append(doc.Labels["table"], t.Name)
+			if catalog.IsSystemTable(t.Name) {
+				continue
+			}
+			doc.Labels["table"] = append(doc.Labels["table"], t.Name)
+			// Every index of every table, the primary included (issue
+			// #208), so the picker offers index.scans{index=t.primary}.
+			doc.Labels["index"] = append(doc.Labels["index"], indexUsageLabel(t.Name, indexUsagePrimary))
+			for _, ix := range t.Indexes {
+				doc.Labels["index"] = append(doc.Labels["index"], indexUsageLabel(t.Name, ix.Name))
 			}
 		}
 	}
@@ -183,7 +222,7 @@ func (n *Node) parseWindow(q map[string][]string) (from, to, step time.Duration,
 	return from, to, step, nil
 }
 
-func (n *Node) queryMetrics(ctx context.Context, q map[string][]string) (*MetricsResult, int, error) {
+func (n *Node) queryMetrics(ctx context.Context, q map[string][]string, admin bool) (*MetricsResult, int, error) {
 	from, to, step, err := n.parseWindow(q)
 	if err != nil {
 		return nil, http.StatusBadRequest, err
@@ -217,26 +256,48 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string) (*Metric
 	if err != nil {
 		return nil, http.StatusInternalServerError, err
 	}
-	stmts, err := parser.Parse("SELECT at, value FROM " + catalog.MetricsTableName +
-		" WHERE node = $1 AND name = $2 AND at >= $3 AND at < $4 ORDER BY at LIMIT " + strconv.Itoa(metricsScanLimit))
-	if err != nil {
-		return nil, http.StatusInternalServerError, err
+	// One parsed query per table a series can live in (issue #209: the
+	// shape series have a table of their own).
+	queries := map[string]parser.Statement{}
+	queryFor := func(table string) (parser.Statement, error) {
+		if st, ok := queries[table]; ok {
+			return st, nil
+		}
+		stmts, err := parser.Parse("SELECT at, value FROM " + table +
+			" WHERE node = $1 AND name = $2 AND at >= $3 AND at < $4 ORDER BY at LIMIT " + strconv.Itoa(metricsScanLimit))
+		if err != nil {
+			return nil, err
+		}
+		queries[table] = stmts[0]
+		return stmts[0], nil
 	}
 	interval := n.metricsRecordInterval()
 	if interval <= 0 {
 		interval = defaultMetricsRecordInterval
 	}
+	var texts map[string]string
 	for _, name := range names {
 		name = strings.TrimSpace(name)
-		base, _ := splitSeriesName(name)
+		base, label := splitSeriesName(name)
 		def, ok := metricSeriesByName[base]
 		if !ok {
 			return nil, http.StatusNotFound, fmt.Errorf("unknown series %q", name)
+		}
+		table := seriesTable(base)
+		stmt, err := queryFor(table)
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
 		}
 		mr := MetricResult{Name: name, Kind: def.Kind, Unit: def.Unit, Group: def.Group, Nodes: map[string][][2]float64{}}
 		if rate && def.Kind == SeriesCounter {
 			mr.Rate = true
 			mr.Unit = strings.TrimSuffix(def.Unit, "/s") + "/s"
+		}
+		if admin && def.Label == "fp" && label != "" {
+			if texts == nil {
+				texts, _ = n.shapeTexts(ctx)
+			}
+			mr.Label = texts[label]
 		}
 		targets := nodes
 		if def.Cluster {
@@ -244,9 +305,12 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string) (*Metric
 		}
 		for _, id := range targets {
 			params := []types.Datum{types.NewInt(id), types.NewString(name), types.NewTimestamp(int64(from)), types.NewTimestamp(int64(to))}
-			r, serr := sess.Execute(ctx, stmts[0], params)
+			r, serr := sess.Execute(ctx, stmt, params)
 			if serr != nil {
 				if strings.Contains(serr.Error(), "does not exist") {
+					if table == catalog.ShapesMetricsTableName {
+						return nil, http.StatusServiceUnavailable, fmt.Errorf("the %s table does not exist yet (shapes are recorded once the cluster has finalized v%d)", table, int(version.V19))
+					}
 					return nil, http.StatusServiceUnavailable, fmt.Errorf("the %s table does not exist yet (recording starts once the cluster has finalized v5)", catalog.MetricsTableName)
 				}
 				return nil, http.StatusInternalServerError, serr
