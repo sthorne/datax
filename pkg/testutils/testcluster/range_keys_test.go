@@ -200,6 +200,11 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 			}
 		}
 	}
+	for _, r := range ingestCluster.Ranges {
+		if r.Table == "sealedbook" && !r.StartKeyRedacted {
+			t.Errorf("ingest's sealedbook range r%d is at its prefix and start_key_redacted is not set (issue #252)", r.RangeID)
+		}
+	}
 	if ingestSealed == 0 {
 		t.Error("ingest's /api/cluster labels no range with sealedbook, the table it holds a grant on")
 	}
@@ -240,6 +245,23 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 		}
 		if r.table == "" && strings.HasPrefix(r.start, "/table/") {
 			sealedPrefix = r.start
+		}
+	}
+	// Each range says which of its own keys is the shown form (issue
+	// #252): a decoded openbook boundary is not flagged, the sealed
+	// table's prefix is, and the admin's rows carry no flag at all.
+	for _, r := range cluster.Ranges {
+		decoded := strings.Contains(r.StartKey, `"`)
+		if decoded && r.StartKeyRedacted {
+			t.Errorf("reader's range r%d has its start key decoded (%s) and start_key_redacted set", r.RangeID, r.StartKey)
+		}
+		if r.Table == "" && strings.HasPrefix(r.StartKey, "/table/") && !r.StartKeyRedacted {
+			t.Errorf("reader's range r%d starts at a hidden table's prefix (%s) and start_key_redacted is not set", r.RangeID, r.StartKey)
+		}
+	}
+	for _, r := range rootCluster.Ranges {
+		if r.StartKeyRedacted || r.EndKeyRedacted {
+			t.Errorf("root's range r%d says a key is the shown form", r.RangeID)
 		}
 	}
 	// A hidden table's range still says which table and index it is,

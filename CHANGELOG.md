@@ -490,6 +490,17 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- **The ranges table shows two hundred rows at a time** (#227, raised
+  on #226). Every range row carries a copy control, which is a tab stop
+  (#205, #149), and the table rendered every range the filter left: on
+  a real cluster, hundreds of stops to get past, falling hardest on a
+  non-admin whose rows are not focusable. The table now renders the
+  first 200 rows the filter left and says so beneath — "showing the
+  first 200 of 1,340 ranges · show all 1,340" — with one control for the
+  rest and one to go back; the filter narrows the set before the cap,
+  and the CSV carries every row the filter left regardless of it. The
+  copy controls stay in the tab order, which is what put them there.
+  A change to the tables' keyboard model was proposed and not taken.
 - **Every pair of chart series colours is at least 15 OKLab units apart,
   in both themes** (#240, from QA on #239). Six pairs sat below the
   floor two lines with no other channel need — light `n2`/`n4` 13.7 and
@@ -543,6 +554,32 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A range row is labelled from its own key** (#252, from QA on #251).
+  `keys_redacted` became exact per document in #251; the console still
+  applied it per row, so a reader with `SELECT` on some tables was told
+  "your role does not see the full key" on the copy control of a key it
+  was looking at in full. Each range now carries `start_key_redacted`
+  and `end_key_redacted` — the server knows which keys it rendered at
+  their prefix, and the document says so where the row is — and the
+  copy control, which copies the start key, is labelled from the start
+  key's flag. The CSV keeps the document's any-of header and gains a
+  "keys as shown" column (start, end, both, none) so an exported row
+  says the same. `keys_redacted` stays for the controls that need one
+  answer.
+- **Every series colour clears 3:1 against the light panel** (#250, from
+  QA on #249). Four of the light theme's eight line colours sat below
+  WCAG 1.4.11's floor for graphical objects on white — the yellow at
+  2.17:1, the pink 2.69, the green 2.82, and the orange only just above
+  — which is faint for reasons unrelated to telling a line from its
+  neighbours, the thing #240 and #249 were about. The four are
+  re-stepped darker along their own hues (`--series-2` `#c9442a`, `-3`
+  `#4ba27e`, `-4` `#bd8919`, `-5` `#d670a4`), found by the same
+  constrained search as #249: every pair stays 15.6 OKLab units apart,
+  no colour-vision pair opens or closes (`CVD_CLOSE_PAIRS` is
+  unchanged), and the dark theme, whose minimum was already 3.96, is
+  untouched. `TestSeriesLinesClearTheGraphicalContrastFloor` pins every
+  slot of both themes to the floor, with exceptions recorded by number
+  rather than as validator WARNs.
 - **Backup collects the manifest's raw groups from the same table restore
   checks them against** (#256, from QA and InfoSec on #254). #254 pinned
   `manifestKeyGroups` to the manifest struct; the spans were still

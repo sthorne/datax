@@ -65,6 +65,15 @@ type ClusterRange struct {
 	// Table names the table the range's start key belongs to ("" for
 	// system and meta ranges, or before the first catalog scan).
 	Table string `json:"table,omitempty"`
+	// StartKeyRedacted and EndKeyRedacted say which of this range's keys
+	// was rendered at its prefix for the caller, so a row — and the copy
+	// control, which copies the start key — can be labelled for itself
+	// (issue #252); the document's KeysRedacted is the any-of over every
+	// range, for the controls that need one answer. A range's end key is
+	// often the next table's prefix, so the two differ on the last range
+	// of a readable table that precedes one the caller may not read.
+	StartKeyRedacted bool `json:"start_key_redacted,omitempty"`
+	EndKeyRedacted   bool `json:"end_key_redacted,omitempty"`
 }
 
 // ClusterPrincipal tells the dashboard who it is signed in as, so the page
@@ -299,12 +308,16 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 	}
 	{
 		for _, d := range descs {
+			start, startRedacted := n.viewKey(v, d.StartKey)
+			end, endRedacted := n.viewKey(v, d.EndKey)
 			cr := ClusterRange{
-				RangeID:    int64(d.RangeID),
-				StartKey:   n.viewKey(v, d.StartKey),
-				EndKey:     n.viewKey(v, d.EndKey),
-				Generation: d.Generation,
-				Table:      n.viewTable(v, d.StartKey),
+				RangeID:          int64(d.RangeID),
+				StartKey:         start,
+				EndKey:           end,
+				Generation:       d.Generation,
+				Table:            n.viewTable(v, d.StartKey),
+				StartKeyRedacted: startRedacted,
+				EndKeyRedacted:   endRedacted,
 			}
 			for _, rep := range d.Replicas {
 				cr.Replicas = append(cr.Replicas, int(rep.NodeID))

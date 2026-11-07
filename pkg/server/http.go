@@ -552,8 +552,13 @@ type RangeStatus struct {
 	StartKey string `json:"start_key"`
 	EndKey   string `json:"end_key"`
 	Table    string `json:"table,omitempty"`
-	Replicas []int  `json:"replicas"`
-	Leader   bool   `json:"leader"`
+	// StartKeyRedacted, EndKeyRedacted: which of the range's keys was
+	// rendered at its prefix for the caller (issue #252; see
+	// ClusterRange's).
+	StartKeyRedacted bool  `json:"start_key_redacted,omitempty"`
+	EndKeyRedacted   bool  `json:"end_key_redacted,omitempty"`
+	Replicas         []int `json:"replicas"`
+	Leader           bool  `json:"leader"`
 	// Quiescent: the replica is asleep (no ticks, no heartbeats) until a
 	// message or request wakes it.
 	Quiescent      bool   `json:"quiescent,omitempty"`
@@ -598,18 +603,22 @@ func (n *Node) rangeStatusesFor(v keyViewer) []RangeStatus {
 	var out []RangeStatus
 	n.store.VisitReplicas(func(r *kvserver.Replica) bool {
 		desc := r.Desc()
+		start, startRedacted := n.viewKey(v, desc.StartKey)
+		end, endRedacted := n.viewKey(v, desc.EndKey)
 		rs := RangeStatus{
-			RangeID:        int64(desc.RangeID),
-			StartKey:       n.viewKey(v, desc.StartKey),
-			EndKey:         n.viewKey(v, desc.EndKey),
-			Table:          n.viewTable(v, desc.StartKey),
-			Leader:         r.IsLeader(),
-			Quiescent:      r.Quiescent(),
-			AppliedIndex:   r.AppliedIndex(),
-			LastIndex:      r.LastIndex(),
-			TruncatedIndex: r.TruncatedIndex(),
-			SizeBytes:      r.SizeBytes(),
-			QPS:            math.Round(r.QPS()*10) / 10,
+			RangeID:          int64(desc.RangeID),
+			StartKey:         start,
+			EndKey:           end,
+			Table:            n.viewTable(v, desc.StartKey),
+			StartKeyRedacted: startRedacted,
+			EndKeyRedacted:   endRedacted,
+			Leader:           r.IsLeader(),
+			Quiescent:        r.Quiescent(),
+			AppliedIndex:     r.AppliedIndex(),
+			LastIndex:        r.LastIndex(),
+			TruncatedIndex:   r.TruncatedIndex(),
+			SizeBytes:        r.SizeBytes(),
+			QPS:              math.Round(r.QPS()*10) / 10,
 		}
 		if thr := r.GCThreshold(); !thr.IsEmpty() {
 			rs.GCThreshold = thr.String()
