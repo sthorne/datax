@@ -361,6 +361,7 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 		}
 		metrics.SQLRowsScanned.Add(float64(len(kvs)))
 		it.s.AddScanned(int64(len(kvs)))
+		noteIndexRows(it.desc, it.indexID(), len(kvs))
 		if int64(len(kvs)) < page {
 			it.active = false // the span is exhausted with this page
 		} else if it.reverse {
@@ -495,12 +496,24 @@ func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor
 		start, end := rowenc.PrimarySpanFor(desc)
 		it.spans = []keySpan{{start, end}}
 	}
+	// One scan opened, whichever path and however many pages it reads
+	// (issue #208).
+	noteIndexScan(desc, it.indexID())
 	res := &Result{Stream: &RowStream{s: s, stmt: t, iter: it, offset: t.Offset, limit: t.Limit}}
 	for _, p := range proj {
 		res.Columns = append(res.Columns, colResult(p.name, p.col))
 	}
 	res.Stream.cols = res.Columns
 	return res, nil
+}
+
+// indexID is the index this stream reads through: the plan's secondary
+// index, or the table's live primary.
+func (it *scanIter) indexID() uint64 {
+	if it.index && it.plan.idx != nil {
+		return it.plan.idx.ID
+	}
+	return it.desc.LivePrimaryIndex()
 }
 
 // pkScanSpans builds a primary-key scan's spans: one, or one per shard

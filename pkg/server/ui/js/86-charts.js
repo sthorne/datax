@@ -6,16 +6,23 @@ async function loadCatalog() {
   } catch (err) { /* rendered as unavailable below */ }
 }
 // The picker lists every series the recorder writes, grouped; a
-// labelled series expands to the label values this node knows.
+// labelled series expands to the label values this node knows. A
+// statement shape's label is its fingerprint (issue #209), which no one
+// recognises, so the choice also carries the shape's text when the
+// catalog resolved it (admins only; the text is what the shapes view
+// shows).
 function seriesChoices() {
   const out = [];
   if (!mv.catalog) return out;
   for (const def of mv.catalog.series || []) {
     if (!def.label) { out.push({ name: def.name, def }); continue; }
-    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def });
+    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def, text: labelText(def.label, v) });
   }
   return out;
 }
+// labelText is what a person reads for a label value: a fingerprint's
+// shape, or nothing when the catalog has no text for it.
+function labelText(label, v) { return ((mv.catalog && mv.catalog.label_text) || {})[label]?.[v] || ""; }
 function renderPickers() {
   const sp = document.getElementById("series-picker");
   const choices = seriesChoices();
@@ -23,7 +30,7 @@ function renderPickers() {
   for (const c of choices) { if (!groups.has(c.def.group)) groups.set(c.def.group, []); groups.get(c.def.group).push(c); }
   let html = "";
   for (const [g, items] of groups) {
-    html += `<h4>${esc(g)}</h4>` + items.map(c => `<label><input type="checkbox" value="${esc(c.name)}" ${mv.series.includes(c.name) ? "checked" : ""}> ${esc(c.name)} <span class="h">${esc(c.def.kind === "counter" ? "rate" : c.def.unit || "")}</span></label>`).join("");
+    html += `<h4>${esc(g)}</h4>` + items.map(c => `<label><input type="checkbox" value="${esc(c.name)}" ${mv.series.includes(c.name) ? "checked" : ""}> ${esc(c.name)} <span class="h">${esc(c.def.kind === "counter" ? "rate" : c.def.unit || "")}</span>${c.text ? `<span class="h key" title="${esc(c.text)}"> ${esc(shortShape(c.text))}</span>` : ""}</label>`).join("");
   }
   sp.innerHTML = html || `<span class="muted">${mv.catalog ? "no series" : "the metrics catalog is unavailable"}</span>`;
   document.getElementById("series-summary").textContent = `choose series (${mv.series.length} of ${choices.length} selected)`;
@@ -35,8 +42,23 @@ function renderPickers() {
   const note = document.getElementById("metrics-note");
   if (mv.catalog && !mv.catalog.enabled) note.textContent = "recording is disabled on this node (--metrics-record-interval 0)";
   else if (mv.catalog && !mv.catalog.ready) note.textContent = "the datax_metrics table does not exist yet: recording starts once the cluster has finalized v5";
-  else if (mv.catalog) note.textContent = `from the datax_metrics table, recorded every ${mv.catalog.interval_seconds}s per node; the same data by SQL: SELECT at, value FROM datax_metrics WHERE node = 1 AND name = '…' ORDER BY at`;
+  else if (mv.catalog) note.textContent = `from the datax_metrics table, recorded every ${mv.catalog.interval_seconds}s per node; the same data by SQL: SELECT at, value FROM datax_metrics WHERE node = 1 AND name = '…' ORDER BY at`
+    + shapesNote();
 }
+// shapesNote says where the stmt.* series come from and how far they
+// go back (issue #209): a shorter window and only the busiest shapes,
+// so a chart that stops short is not a recorder that broke.
+function shapesNote() {
+  const c = mv.catalog;
+  if (!c || !c.shapes_table) return "";
+  if (!c.shapes_ready) return `; the stmt.* series start once the cluster has finalized v19`;
+  // The retention as a duration, not a rounded hour count: a retention
+  // lowered under an hour reads "kept 30m 0s", never "kept 0h".
+  return `; the stmt.* series come from ${c.shapes_table}: the ${c.shapes_top_n} busiest shapes per node, kept ${fmtDuration(c.shapes_retention_seconds || 0)}`;
+}
+// shortShape trims a statement shape for a picker row or a chart title;
+// the full text stays in the title attribute.
+function shortShape(text) { return text.length > 72 ? text.slice(0, 69) + "…" : text; }
 async function fetchMetrics() {
   const box = document.getElementById("charts");
   if (mv.series.length === 0) { box.innerHTML = `<div class="muted">pick a series above</div>`; return; }
@@ -213,7 +235,7 @@ function chart(s, nodes, suffix, win, opts) {
   const x = t => L + (t - from) / (to - from) * PW;
   const y = v => T + (max - v) / (max - min) * PH;
   const label = (id) => id === "0" ? "cluster" : "n" + id;
-  let title = `<div class="title"><b>${esc(s.name)}${esc(suffix)}</b><span>${esc(s.rate ? "per second" : unit || "")}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span></div>`;
+  let title = `<div class="title"><b>${esc(s.name)}${esc(suffix)}</b><span>${esc(s.rate ? "per second" : unit || "")}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span>${s.label ? `<span class="key" title="${esc(s.label)}">${esc(shortShape(s.label))}</span>` : ""}</div>`;
   if (!any) { el.innerHTML = title + `<div class="empty">no samples in this range</div>`; return el; }
   let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(s.name)} over time"><g class="grid">`;
   const ticks = 4;

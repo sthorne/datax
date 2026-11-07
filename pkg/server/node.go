@@ -368,6 +368,10 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// indexUsage caches /api/index-usage documents (issue #208).
+	indexUsage indexUsageCache
+	// shapes is the statement-shape recorder's state (issue #209).
+	shapes shapesRecorder
 	// metricsReady is set once the datax_metrics table is known to exist;
 	// metricsPaused holds the recorder off while a restore runs.
 	metricsReady  atomic.Bool

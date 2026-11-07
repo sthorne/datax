@@ -371,7 +371,7 @@ func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaint
 		if err := json.Unmarshal(rec.Value, &d); err != nil {
 			return fmt.Errorf("corrupt table descriptor at %s: %v", keys.Key(rec.Key), err)
 		}
-		if d.Name == catalog.MetricsTableName && !includeMetrics {
+		if (d.Name == catalog.MetricsTableName || d.Name == catalog.ShapesMetricsTableName || d.Name == catalog.StatementShapesTableName) && !includeMetrics {
 			return nil // the cluster's own metrics: bulky, regenerable, opt-in
 		}
 		// Every other system table is backed up unconditionally. The

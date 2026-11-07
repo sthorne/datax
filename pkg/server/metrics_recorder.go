@@ -118,6 +118,17 @@ var metricSeriesDefs = []MetricSeries{
 
 	{Name: "table.rows", Kind: SeriesGauge, Unit: "", Group: "tables", Label: "table", Cluster: true, Help: "rows per table (from statistics)"},
 	{Name: "table.ranges", Kind: SeriesGauge, Unit: "", Group: "tables", Label: "table", Cluster: true, Help: "ranges per table"},
+
+	{Name: "index.scans", Kind: SeriesCounter, Unit: "", Group: "indexes", Label: "index", Help: "scans this node opened through the index (table.index; the primary as table.primary)"},
+	{Name: "index.rows", Kind: SeriesCounter, Unit: "", Group: "indexes", Label: "index", Help: "rows this node read through the index"},
+
+	// Statement shapes (issue #209): the node's busiest shapes by total
+	// time, in datax_metrics_shapes with a day's retention; the label
+	// is the fingerprint, which /api/metrics resolves to its shape.
+	{Name: "stmt.count", Kind: SeriesCounter, Unit: "", Group: "statements", Label: "fp", Help: "executions of the shape on this node"},
+	{Name: "stmt.total_us", Kind: SeriesCounter, Unit: "us", Group: "statements", Label: "fp", Help: "time spent in the shape on this node"},
+	{Name: "stmt.rows_scanned", Kind: SeriesCounter, Unit: "", Group: "statements", Label: "fp", Help: "rows the shape scanned on this node"},
+	{Name: "stmt.retries", Kind: SeriesCounter, Unit: "", Group: "statements", Label: "fp", Help: "transaction retries the shape caused on this node"},
 }
 
 // metricSeriesByName indexes the definitions by base name.
@@ -221,7 +232,7 @@ func (n *Node) recordMetricsOnce(ctx context.Context, interval time.Duration) {
 	if len(rows) == 0 {
 		return
 	}
-	if err := n.writeMetricRows(wctx, at, rows); err != nil {
+	if err := n.writeMetricRows(wctx, catalog.MetricsTableName, at, rows); err != nil {
 		metrics.MetricsRecordErrors.Inc()
 		if now := time.Now(); now.Sub(n.metricsLastWarn) > time.Minute {
 			n.metricsLastWarn = now
@@ -232,6 +243,7 @@ func (n *Node) recordMetricsOnce(ctx context.Context, interval time.Duration) {
 		}
 		return
 	}
+	n.recordShapesOnce(wctx, at)
 }
 
 // ensureMetricsTable creates the table when it is missing.
@@ -267,16 +279,16 @@ type metricRow struct {
 	value float64
 }
 
-// writeMetricRows inserts the tick's rows in one statement (one
-// transaction), through the SQL layer so re-shards and retention apply
-// exactly as they do for user writes.
-func (n *Node) writeMetricRows(ctx context.Context, at int64, rows []metricRow) error {
+// writeMetricRows inserts the tick's rows into table in one statement
+// (one transaction), through the SQL layer so re-shards and retention
+// apply exactly as they do for user writes.
+func (n *Node) writeMetricRows(ctx context.Context, table string, at int64, rows []metricRow) error {
 	sess, err := n.systemSession()
 	if err != nil {
 		return err
 	}
 	var b strings.Builder
-	b.WriteString("INSERT INTO " + catalog.MetricsTableName + " (node, name, at, value) VALUES ")
+	b.WriteString("INSERT INTO " + table + " (node, name, at, value) VALUES ")
 	params := make([]types.Datum, 0, 4*len(rows))
 	for i, r := range rows {
 		if i > 0 {
@@ -378,6 +390,7 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 	add("txn.retries", counterValue(metrics.TxnRetries))
 	add("kv.batch_p99_us", histogramQuantile(metrics.KVBatchLatency, 0.99)*1e6)
 	add("sql.rows_scanned", counterValue(metrics.SQLRowsScanned))
+	n.indexUsageRows(add)
 
 	if n.sqlServer() != nil {
 		if s := n.sqlServer().Activity().Summary(); s != nil {

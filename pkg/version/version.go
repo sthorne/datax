@@ -167,9 +167,19 @@ const (
 	// gate (rule 4). The cluster version is what guarantees every node
 	// can read the format before any node writes it.
 	V18 Version = 18
+	// V19 introduces two statement-shape system tables (issue #209,
+	// pkg/sql/catalog.ShapesMetricsTableName and
+	// StatementShapesTableName): every node records its busiest
+	// statement shapes into a time series with a day's retention, and
+	// the fingerprint-to-shape map beside it, so "was this slow
+	// yesterday" is a chart rather than a guess. Like the metrics and
+	// preferences tables, a v18 node knows nothing of the reservations
+	// and would treat them as ordinary user tables, so nothing creates
+	// them before finalize (rule 4).
+	V19 Version = 19
 
 	// Current is the newest cluster version this binary can run.
-	Current = V18
+	Current = V19
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

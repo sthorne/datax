@@ -355,6 +355,37 @@ node 0 by the leader of range 1, the table gauges
 cumulative; the query side (and the dashboard) differentiate them. The
 full list, with kinds and units, is the `/api/metrics` catalog.
 
+Two groups of series are keyed by what they measure rather than by the
+node alone. Index usage (`index.scans{index=t.i}`,
+`index.rows{index=t.i}`; the primary key is `t.primary`) counts the
+scans opened and rows read through each index on the node, charged by
+the executor where the scan opens; the table page's indexes list sums
+them over the retention window across every node that recorded, and
+`/api/index-usage?table=t` (admins) is the same figure by API. Zero
+there means no recorded scans in the window on the nodes that
+recorded, not an index nobody uses: a node with recording off, a
+workload whose cycle is longer than seven days, or a cluster younger
+than the window all leave a used index at zero.
+
+Statement shapes (`stmt.count{fp=…}`, `stmt.total_us{fp=…}`,
+`stmt.rows_scanned{fp=…}`, `stmt.retries{fp=…}`) are the fingerprint
+table's counters with a time dimension: every tick each node writes
+its 50 busiest shapes by total time into `datax_metrics_shapes`, a
+second time-series table of the same shape as `datax_metrics` with a
+day's retention (the rows are numerous and go stale fast; retention is
+per table), once the cluster has finalized v19. A shape that falls out
+of a node's top 50 stops being written, never written as zero, so its
+chart shows the gap it is. The fingerprint's text lives in
+`datax_statement_shapes` (`fingerprint`, `shape`, `kind`,
+`relations`, `first_seen`, `last_seen`), written when a shape is first
+recorded and swept after two days unseen; the metrics catalog resolves
+it for admins, so the picker and the chart title read as the
+statement, and the shapes view's detail has a "chart this shape" link.
+The representative statement text, which can carry data, is not
+persisted. Both tables are reserved like `datax_metrics`, excluded
+from backups unless `--include-metrics`, and the `stmt.*` series are
+served from the shapes table by the same `/api/metrics`.
+
 The same data by SQL, for `psql` or a Grafana PostgreSQL data source
 (pass an absolute timestamp; `now() - interval` needs the INTERVAL type):
 
