@@ -172,10 +172,14 @@ async function fetchIndexUsage(t) {
   }
   if (ui.view === "table" && ui.table === t.name) renderTableIndexes(t);
 }
-function usageCell(name) {
+// usageCell is one index's usage figures for table t: the same "is the
+// document this table's" test as usageNote beneath, by the table the
+// renderer was handed, so the cell and the note never disagree about
+// whether the data is loaded (the UI review on the PR).
+function usageCell(t, name) {
   const d = indexUsage.doc;
   if (!canDrillDown()) return `<span class="muted">admin role</span>`;
-  if (!d || indexUsage.table !== (ui.table || "")) return `<span class="muted">${indexUsage.error ? esc(indexUsage.error) : "…"}</span>`;
+  if (!d || indexUsage.table !== t.name) return `<span class="muted">${indexUsage.error ? esc(indexUsage.error) : "…"}</span>`;
   const row = (d.indexes || []).find(i => i.name === name);
   if (!row) return `<span class="muted">—</span>`;
   if (!row.scans) return `<span class="muted">no recorded scans</span>`;
@@ -192,7 +196,7 @@ function renderTableIndexes(t) {
       <td data-label="columns" class="key">${(t.primary_key || []).map(esc).join(", ")}</td>
       <td data-label="unique">unique</td>
       <td data-label="build state"><span class="muted">ready</span></td>
-      <td data-label="usage">${usageCell("primary")}</td>
+      <td data-label="usage">${usageCell(t, "primary")}</td>
     </tr>` };
   renderKeyed(document.getElementById("table-indexes"), [primary].concat(idx.map(i => ({
     key: i.name,
@@ -203,7 +207,7 @@ function renderTableIndexes(t) {
       <td data-label="build state">${i.state === "write-only"
         ? tok("draining", "building")
         : `<span class="muted">ready</span>`}</td>
-      <td data-label="usage">${usageCell(i.name)}</td>
+      <td data-label="usage">${usageCell(t, i.name)}</td>
     </tr>`,
   }))));
   const building = idx.filter(i => i.state === "write-only");

@@ -52,8 +52,9 @@ function shapesNote() {
   const c = mv.catalog;
   if (!c || !c.shapes_table) return "";
   if (!c.shapes_ready) return `; the stmt.* series start once the cluster has finalized v19`;
-  const hours = Math.round((c.shapes_retention_seconds || 0) / 3600);
-  return `; the stmt.* series come from ${c.shapes_table}: the ${c.shapes_top_n} busiest shapes per node, kept ${hours}h`;
+  // The retention as a duration, not a rounded hour count: a retention
+  // lowered under an hour reads "kept 30m 0s", never "kept 0h".
+  return `; the stmt.* series come from ${c.shapes_table}: the ${c.shapes_top_n} busiest shapes per node, kept ${fmtDuration(c.shapes_retention_seconds || 0)}`;
 }
 // shortShape trims a statement shape for a picker row or a chart title;
 // the full text stays in the title attribute.
