@@ -4,7 +4,9 @@ import (
 	"context"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"net/http"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -99,12 +101,7 @@ func (n *Node) schemaUsageDenied(ctx context.Context, set catalog.RoleSet) (map[
 	if set.IsAdmin() {
 		return nil, nil
 	}
-	var dbs []*catalog.DatabaseDescriptor
-	err := n.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
-		var err error
-		dbs, err = catalog.ListDatabases(ctx, txn)
-		return err
-	})
+	dbs, err := n.databaseDescs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -189,4 +186,42 @@ func (n *Node) viewTable(v keyViewer, start keys.Key) string {
 		return ""
 	}
 	return n.tableNameOf(start)
+}
+
+// databaseDescsFor is how long the viewer's database list is reused
+// before it is read again: UsageRestricted changes about as often as a
+// role grant, and the console polls every few seconds, so the list is
+// read once per few seconds rather than once per document (InfoSec on
+// the PR for #259). A failed read is not cached: the next request reads
+// again, and fails closed until one succeeds.
+const databaseDescsFor = 5 * time.Second
+
+type databaseDescsCache struct {
+	mu   sync.Mutex
+	dbs  []*catalog.DatabaseDescriptor
+	at   time.Time
+	read bool
+}
+
+func (n *Node) databaseDescs(ctx context.Context) ([]*catalog.DatabaseDescriptor, error) {
+	n.dbDescs.mu.Lock()
+	if n.dbDescs.read && time.Since(n.dbDescs.at) < databaseDescsFor {
+		dbs := n.dbDescs.dbs
+		n.dbDescs.mu.Unlock()
+		return dbs, nil
+	}
+	n.dbDescs.mu.Unlock()
+	var dbs []*catalog.DatabaseDescriptor
+	err := n.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		dbs, err = catalog.ListDatabases(ctx, txn)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	n.dbDescs.mu.Lock()
+	n.dbDescs.dbs, n.dbDescs.at, n.dbDescs.read = dbs, time.Now(), true
+	n.dbDescs.mu.Unlock()
+	return dbs, nil
 }

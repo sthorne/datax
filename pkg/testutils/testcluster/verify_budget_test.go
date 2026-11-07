@@ -2,12 +2,14 @@ package testcluster
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,38 +82,75 @@ func TestSuccessfulSignInsSpendTheVerificationBudget(t *testing.T) {
 	// The same through /api/login, from a third address: the other door
 	// that verifies, and the one the issue measured — a script signing
 	// in afresh on every call. Each door is its own call site, so each
-	// is proved on its own.
-	const logins = 200
+	// is proved on its own. The flood runs until the door refuses, on
+	// three connections at once: a sign-in costs a derivation (about 3
+	// ms at the current count, issue #225) plus the round trip, and on a
+	// slow runner one connection in sequence can spend the budget no
+	// faster than it refills (CI on the PR for #225: 200 sign-ins in six
+	// seconds, none refused, against a hundred plus twenty a second).
+	// Three stay under the four-slot in-flight cap, so no refusal here
+	// is for that cause — the health check below depends on it.
 	signer := httpsClientFrom(t, certsDir, "", "127.0.0.7")
 	start = time.Now()
-	var loginOK, loginRefused int
-	for i := 0; i < logins; i++ {
-		req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(`{"user":"root","password":"topsecret"}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := signer.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		switch resp.StatusCode {
-		case http.StatusOK:
-			loginOK++
-		case http.StatusTooManyRequests:
-			loginRefused++
-		default:
-			t.Fatalf("login %d: %d, want 200 or 429", i, resp.StatusCode)
-		}
+	var loginMu sync.Mutex
+	var loginOK, loginRefused, loginAttempts int
+	var loginErr error
+	loginDeadline := time.Now().Add(60 * time.Second)
+	var wg sync.WaitGroup
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				loginMu.Lock()
+				done := loginErr != nil || (loginRefused > 0 && loginAttempts >= 200) || time.Now().After(loginDeadline)
+				loginAttempts++
+				loginMu.Unlock()
+				if done {
+					return
+				}
+				req, err := http.NewRequest(http.MethodPost, base+"/api/login", strings.NewReader(`{"user":"root","password":"topsecret"}`))
+				if err != nil {
+					loginMu.Lock()
+					loginErr = err
+					loginMu.Unlock()
+					return
+				}
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := signer.Do(req)
+				if err != nil {
+					loginMu.Lock()
+					loginErr = err
+					loginMu.Unlock()
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				loginMu.Lock()
+				switch resp.StatusCode {
+				case http.StatusOK:
+					loginOK++
+				case http.StatusTooManyRequests:
+					loginRefused++
+				default:
+					loginErr = fmt.Errorf("login: %d, want 200 or 429", resp.StatusCode)
+				}
+				loginMu.Unlock()
+			}
+		}()
 	}
+	wg.Wait()
 	elapsed = time.Since(start)
-	if loginRefused == 0 {
-		t.Fatalf("%d correct sign-ins through /api/login from one address in %s, none refused: that door does not spend the verification budget", logins, elapsed)
+	if loginErr != nil {
+		t.Fatal(loginErr)
 	}
-	if limit := 100 + int(20*elapsed.Seconds()) + 20; loginOK > limit {
-		t.Fatalf("%d of %d correct /api/login sign-ins verified in %s (limit %d): the verification budget is not holding at that door", loginOK, logins, elapsed, limit)
+	if loginRefused == 0 {
+		t.Fatalf("%d correct sign-ins through /api/login from one address in %s, none refused: that door does not spend the verification budget", loginOK, elapsed)
+	}
+	// Three in flight when the budget ran out can each have been admitted
+	// a beat before the refusal, hence the slack.
+	if limit := 100 + int(20*elapsed.Seconds()) + 20 + 3; loginOK > limit {
+		t.Fatalf("%d correct /api/login sign-ins verified in %s (limit %d): the verification budget is not holding at that door", loginOK, elapsed, limit)
 	}
 	refused += loginRefused
 

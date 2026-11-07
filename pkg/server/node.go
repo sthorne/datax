@@ -380,6 +380,9 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// dbDescs caches the database list the key viewer resolves schema
+	// usage from (viewer.go, issue #259).
+	dbDescs databaseDescsCache
 	// encCheck is the cross-check of the store's switch to authenticated
 	// encryption against the records a registry rollback cannot reach
 	// (enccheck.go, issue #248).

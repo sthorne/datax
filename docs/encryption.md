@@ -341,9 +341,15 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   shorter than what it acknowledged; a leader that still holds its
   progress for the store refuses that with a raft panic before the
   cross-check runs, which is a cruder refusal of the same rollback.) A
-  rollback of every store in the cluster at once — the
-  record with them — is not caught: the cluster's record is only as
-  old as its oldest surviving replica.
+  rollback of every store in the cluster at once — the record with
+  them — is not caught: the cluster's record is only as old as its
+  oldest surviving replica, and a single-node cluster is that case by
+  definition, its record living on the one store being rolled back.
+  Nor is a store rolled back to before encryption was enabled at all,
+  with `--enc-key` dropped from its configuration to match: it opens
+  plaintext and neither check runs (with the key still configured it
+  opens encrypted on a fresh registry, and the cluster's record
+  catches it).
 - Authenticated files cost 24 bytes per 4 KiB chunk (about 0.6%) and 28
   bytes per WAL or MANIFEST append, a whole chunk decrypted for any read
   inside it (Pebble's block cache holds the plaintext, so a cache hit

@@ -46,7 +46,7 @@ func (c *conn) standInVerifier(ctx context.Context, user string) *security.Scram
 	}
 	iterations := 0
 	if c.opts.MockIterations != nil {
-		iterations = c.opts.MockIterations(ctx)
+		iterations = c.opts.MockIterations(ctx, user)
 	}
 	return security.MockVerifier(secret, user, iterations)
 }

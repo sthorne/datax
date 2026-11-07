@@ -179,7 +179,9 @@ state or the internode protocol does, and an entry below says so.
   listed the table. The databases whose schema the caller may not use
   are resolved once per request, the way the roles are, and every
   predicate the viewer and the listing ask ANDs them in; a read that
-  fails fails closed.
+  fails fails closed. The database list behind it is reused for five
+  seconds, so a revoke reaches the console within that rather than
+  costing every document a KV round trip.
 - **SCRAM verifiers are derived at 16384 iterations** (#225), four times
   the RFC floor PostgreSQL defaults to. A verifier leaves the cluster in
   every plaintext backup, where the count is what an offline grind
@@ -192,9 +194,12 @@ state or the internode protocol does, and an entry below says so.
   verifier for a name that does not exist no longer advertises the
   constant: beside real users still at the old count that would mark
   the names that are not users as surely as a shared salt did (#137),
-  so it advertises the highest count any stored verifier carries — a
-  property of the replicated catalog, the same on every node — refreshed
-  off the handshake's path.
+  so it draws its count per name from the counts the stored verifiers
+  carry, in their proportions, under the same secret as the per-name
+  salt — a property of the replicated catalog, the same on every node,
+  refreshed off the handshake's path — so neither the old count nor the
+  new says whether a name exists. While the catalog cannot be read the
+  stand-in falls back to the constant, the one window that remains.
 - **The switch to authenticated encryption is cross-checked against
   records a registry rollback cannot reach** (#248). The sealed key
   registry's two cutover flags cannot be cleared without the store key,

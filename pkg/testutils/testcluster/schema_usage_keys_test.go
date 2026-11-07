@@ -79,15 +79,36 @@ func TestSchemaUsageGatesTheKeyViewer(t *testing.T) {
 	if _, err := blocked.Exec(ctx, `SELECT v FROM sealedbook`); err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("SELECT as blocked after the revoke: %v, want permission denied", err)
 	}
-	// So the console shows neither the row value nor the table.
-	for _, path := range []string{"/api/cluster", "/status", "/api/overview", "/api/node"} {
-		if body := get(path, "blocked", "blocked-pw"); strings.Contains(body, row) {
-			t.Errorf("%s as blocked after REVOKE USAGE carries %q, a row value SQL refuses it:\n%s", path, row, body)
+	// So the console shows neither the row value nor the table — within
+	// the few seconds the viewer reuses its database list for (the
+	// cache InfoSec asked for on the PR), after which it must hold.
+	consoleShows := func(want bool, when string) {
+		t.Helper()
+		paths := []string{"/api/cluster", "/status", "/api/overview", "/api/node"}
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			var wrong []string
+			for _, path := range paths {
+				if body := get(path, "blocked", "blocked-pw"); strings.Contains(body, row) != want {
+					wrong = append(wrong, path+": "+body)
+				}
+			}
+			if body := get("/api/schema", "blocked", "blocked-pw"); strings.Contains(body, `"sealedbook"`) != want {
+				wrong = append(wrong, "/api/schema: "+body)
+			}
+			if len(wrong) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				if want {
+					t.Fatalf("%s, the console still withholds from blocked what SQL lets it read:\n%s", when, strings.Join(wrong, "\n"))
+				}
+				t.Fatalf("%s, the console still shows blocked the row value or the table SQL refuses it:\n%s", when, strings.Join(wrong, "\n"))
+			}
+			time.Sleep(250 * time.Millisecond)
 		}
 	}
-	if body := get("/api/schema", "blocked", "blocked-pw"); strings.Contains(body, `"sealedbook"`) {
-		t.Errorf("/api/schema as blocked after REVOKE USAGE lists sealedbook:\n%s", body)
-	}
+	consoleShows(false, "after REVOKE USAGE")
 	// The admin is unaffected.
 	if body := get("/api/cluster", "root", "topsecret"); !strings.Contains(body, row) {
 		t.Errorf("root lost the boundary row value to the revoke")
@@ -97,10 +118,5 @@ func TestSchemaUsageGatesTheKeyViewer(t *testing.T) {
 	if _, err := blocked.Exec(ctx, `SELECT v FROM sealedbook`); err != nil {
 		t.Fatalf("SELECT as blocked after GRANT USAGE: %v", err)
 	}
-	if body := get("/api/cluster", "blocked", "blocked-pw"); !strings.Contains(body, row) {
-		t.Errorf("/api/cluster as blocked after GRANT USAGE does not carry the row value it may read again:\n%s", body)
-	}
-	if body := get("/api/schema", "blocked", "blocked-pw"); !strings.Contains(body, `"sealedbook"`) {
-		t.Errorf("/api/schema as blocked after GRANT USAGE does not list sealedbook:\n%s", body)
-	}
+	consoleShows(true, "after GRANT USAGE")
 }

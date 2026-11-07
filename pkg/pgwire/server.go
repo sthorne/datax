@@ -97,11 +97,12 @@ type ServerOptions struct {
 	// falls back to a per-process secret.
 	MockSecret func(ctx context.Context) []byte
 	// MockIterations, when set, returns the PBKDF2 iteration count the
-	// stand-in verifier advertises: the count the cluster's real
-	// verifiers carry, so a name that does not exist is not marked by
-	// a count no real user has (issue #225). nil, or zero, means
+	// stand-in verifier advertises for a name: one of the counts the
+	// cluster's real verifiers carry, chosen per name, so a name that
+	// does not exist is not marked by a count no real user has, nor by
+	// one only some have (issue #225). nil, or zero, means
 	// security.ScramIterations.
-	MockIterations func(ctx context.Context) int
+	MockIterations func(ctx context.Context, user string) int
 	// SlowStatementThreshold is the duration past which a statement is
 	// kept in the slow-statement ring (0 = the default, 500 ms).
 	SlowStatementThreshold time.Duration
