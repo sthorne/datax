@@ -10,7 +10,14 @@ on:
 
 # Nightly, not per PR: hosted runners are noisy, so this is a trend line
 # that catches a regression within a day when a PR skipped its own
-# before/after (bench/README.md), not a gate.
+# before/after (bench/README.md), not a gate. A failed night files or
+# updates one standing issue with the run's last lines, and a clean
+# night closes it (issue #244): a workload that errors — the #200
+# routing failure hit three nights of seven — is otherwise seen by
+# nobody.
+permissions:
+  contents: read
+  issues: write
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -23,10 +30,12 @@ jobs:
       - name: build
         run: go build -o bin/datax ./cmd/datax
       - name: run the workload set
+        id: run
         env:
           OUT: bench-results/nightly
           DURATION_SCALE: ${{ github.event.inputs.duration_scale || '1' }}
-        run: bench/run.sh
+        run: bench/run.sh 2>&1 | tee bench.out
+        shell: bash -o pipefail -e {0}
       - name: summary
         run: |
           for f in bench-results/nightly/*/*.json; do
@@ -37,3 +46,8 @@ jobs:
           name: bench-${{ github.sha }}
           path: bench-results/nightly
           retention-days: 90
+      - name: standing issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/standing-issue.sh bench ${{ steps.run.outcome == 'success' && 'green' || 'red' }} bench.out

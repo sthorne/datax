@@ -515,6 +515,20 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A red scheduled run files an issue** (#244). The weekly govulncheck
+  run on `main` was red for seven consecutive weeks before anyone read
+  it: a scheduled run's result lives on the Actions tab, which nobody
+  opens on a quiet repository, where a push's result has the person who
+  pushed. The `vulncheck` and `bench` workflows now end with a step
+  that, on a scheduled (or manually dispatched) run, writes the result
+  where it is read: a red run files one standing issue per workflow —
+  "Scheduled run red: vulncheck" under the `scheduled-run` label — with
+  the run's link and the last lines of its output, or adds the new run
+  to the issue already open, and a green run closes it. One issue per
+  workflow, updated rather than one per night, so the alarm stays
+  quieter than what it reports. The script is
+  `.github/scripts/standing-issue.sh`; both workflows gain
+  `issues: write`.
 - **The manifest's raw-record groups are pinned to the spans restore
   checks** (#242, from QA on #239). `checkManifestKeys` held each of the
   five groups a backup collects — users, admins, roles, databases,
