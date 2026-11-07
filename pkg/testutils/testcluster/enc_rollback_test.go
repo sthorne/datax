@@ -208,12 +208,22 @@ func TestEncryptionStoreRollbackStopsTheNode(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// The third store rolled back wholesale.
-	tc.StopNode(2)
+	// The third store rolled back wholesale. The other two restart
+	// before it comes back: a leader that still holds the progress it
+	// had for the store — entries it acknowledged and now lacks — would
+	// send a commit index past its log, which raft refuses with a panic
+	// of its own (the pre-existing refusal docs/encryption.md notes);
+	// fresh leaders probe the store's log and catch it up, so what
+	// stops the node is the cross-check, which is what this test is
+	// about.
+	tc.StopAll()
 	if err := os.RemoveAll(dirs[2]); err != nil {
 		t.Fatal(err)
 	}
 	copyTree(t, snapshot, dirs[2])
+	for i := 0; i < 2; i++ {
+		tc.Nodes[i] = startDiskNode(t, dirs[i], false, "", withKey)
+	}
 	n3, err := tryStartDiskNode(t, dirs[2], false, "", withKey)
 	if err != nil {
 		t.Fatalf("a store rolled back wholesale, its own record with it, did not open: %v", err)

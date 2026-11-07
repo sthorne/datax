@@ -337,7 +337,11 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   KV when the whole store was. In the second case the store has opened
   and may have written a file or two in the old format before the node
   stops; they are rewritten by the sweep once the store re-completes
-  the switch. A rollback of every store in the cluster at once — the
+  the switch. (A store rolled back wholesale also carries a raft log
+  shorter than what it acknowledged; a leader that still holds its
+  progress for the store refuses that with a raft panic before the
+  cross-check runs, which is a cruder refusal of the same rollback.) A
+  rollback of every store in the cluster at once — the
   record with them — is not caught: the cluster's record is only as
   old as its oldest surviving replica.
 - Authenticated files cost 24 bytes per 4 KiB chunk (about 0.6%) and 28
