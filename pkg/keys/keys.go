@@ -20,6 +20,7 @@ package keys
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
@@ -100,6 +101,14 @@ func StoreRegistryKey() Key {
 // upgrade.
 func StoreClusterVersionKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-cluster-version")...)
+}
+
+// StoreEncryptionMarkerKey holds the store's own record of its switch to
+// authenticated encryption (JSON; issue #248): written after each
+// transition the sealed key registry records, so a registry rolled back
+// to before the switch beside a store that was not is caught at open.
+func StoreEncryptionMarkerKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-encryption")...)
 }
 
 // StoreRaftEngineKey marks a store whose raft state lives on its own
@@ -259,6 +268,14 @@ func systemKey(parts ...string) Key {
 // (decimal string, e.g. "2"; missing = version 1). It only moves forward,
 // via the "upgrade-cluster" admin op.
 func ClusterVersionKey() Key { return systemKey("cluster-version") }
+
+// StoreEncryptionCutoverKey holds the cluster's record of a store's
+// switch to authenticated encryption (JSON; issue #248), written by the
+// store's node once it has made each step: replicated, so a single
+// node's disk rolled back to before the switch cannot take it with it.
+func StoreEncryptionCutoverKey(storeID base.StoreID) Key {
+	return systemKey("enc-cutover", strconv.FormatInt(int64(storeID), 10))
+}
 
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {

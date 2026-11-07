@@ -202,6 +202,13 @@ type Config struct {
 	// and a restart in between still opens the store (see
 	// enc.MatchStoreKey).
 	EncKeyPath string
+	// AcceptEncryptionRollback lets a store whose switch to authenticated
+	// encryption has been rolled back — its key registry, or the whole
+	// store, restored from before the switch — start anyway (issue
+	// #248): the records that caught the rollback are lowered to what
+	// the store has, and rise again as it re-completes the switch. For
+	// the one start after a rollback the operator meant.
+	AcceptEncryptionRollback bool
 	// BinaryVersionOverride makes the node advertise (and gate on) this
 	// protocol version instead of version.Current — used by tests to
 	// simulate mixed-version clusters. 0 = version.Current.
@@ -373,6 +380,10 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// encCheck is the cross-check of the store's switch to authenticated
+	// encryption against the records a registry rollback cannot reach
+	// (enccheck.go, issue #248).
+	encCheck encryptionCheck
 	// standIn caches the iteration count the stand-in SCRAM verifier
 	// advertises (standInIterations, issue #225).
 	standIn standInState
@@ -461,6 +472,11 @@ func (n *Node) start() error {
 	}
 	if n.raftEngine != nil {
 		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
+	}
+	// Before anything asks the engines to move: what they opened with,
+	// held to the store's own record of its switch (issue #248).
+	if err := n.checkEncryptionMarker(); err != nil {
+		return err
 	}
 
 	lis := n.cfg.Listener

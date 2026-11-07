@@ -296,6 +296,11 @@ func (n *Node) switchToAuthenticatedEncryption() {
 			allDone = false
 		}
 	}
+	// Each transition the registries now record, recorded where a
+	// registry rollback cannot reach (issue #248).
+	if err := n.persistEncryptionMarker(); err != nil {
+		log.Warnf("recording the store's switch to authenticated encryption in the store: %v", err)
+	}
 	switch {
 	case allDone:
 		if n.authDoneNoticed.CompareAndSwap(false, true) {

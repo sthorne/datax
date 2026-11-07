@@ -173,6 +173,39 @@ than passing the file over: the switch is one way, so an error means
 by a v17 binary's version gate, like every store-format change before
 it.
 
+### The switch, cross-checked
+
+The registry's two cutover flags cannot be cleared without the store
+key, but the registry can be replaced wholesale by an older, validly
+sealed copy — a backup or a volume snapshot from before the switch —
+and the store would then reopen unauthenticated. So the switch is
+recorded twice more, where a registry rollback cannot reach (issue
+#248):
+
+- **in the store itself**, a marker in the state engine written after
+  each registry transition. The registry file alone rolled back beside
+  a store that was not is caught at open, before Pebble has written a
+  file: the marker says more than the registry, and the node refuses
+  to start with `encryption: the key registry was rolled back`.
+- **in the cluster**, a record per store in replicated KV, written by
+  the node once it has made each step. A whole volume rolled back —
+  marker and all — opens, and is caught on the node's first heartbeat
+  that can read KV: the record says the store had switched, the store
+  opened without it, and the node logs the refusal, records a
+  `security` event and stops serving.
+
+Both compare against what the engines had when they were opened, not
+what they have by the time the record is read: the node re-enables
+authenticated writes within seconds of observing v18, which is what
+a rolled-back store would show by then.
+
+A rollback that was meant — a store restored from an old backup on
+purpose — is accepted by starting the node once with
+`--accept-encryption-rollback`: the marker and the record are lowered
+to what the store has, and rise again as the store re-completes the
+switch (writes within seconds; the old format refused after the sweep
+and a restart, as above).
+
 ## Key rotation
 
 - **Data keys** rotate themselves: every node start mints a new active
@@ -297,18 +330,16 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   name sealed with the same data key; Pebble's own length checks catch
   the first for sstables and the MANIFEST and a WAL's record checksums
   the second, and the consistency sweep is what notices the rest.
-- **The key registry can be rolled back as a whole**: its two cutover
-  flags cannot be cleared without the store key, but an older, validly
-  sealed copy of the registry — a backup from before the switch — opens
-  the store unauthenticated again, writing the old format until the node
-  next observes cluster version v18 (which re-enables authenticated
-  writes within seconds of start) and accepting old-format files until
-  the cutover completes again. That is the whole-file rollback class
-  above, applied to the one file whose rollback turns the feature off
-  rather than one file's contents. The cluster version, in replicated
-  KV, is a signal a single disk cannot roll back; cross-checking the
-  registry against a record of the cutover kept there, before the store
-  serves, is filed as #248.
+- **The key registry rolled back as a whole is caught, not prevented**:
+  an older, validly sealed copy of the registry opens the store
+  unauthenticated until the cross-check above refuses it — at open when
+  the registry alone was rolled back, on the first heartbeat that reads
+  KV when the whole store was. In the second case the store has opened
+  and may have written a file or two in the old format before the node
+  stops; they are rewritten by the sweep once the store re-completes
+  the switch. A rollback of every store in the cluster at once — the
+  record with them — is not caught: the cluster's record is only as
+  old as its oldest surviving replica.
 - Authenticated files cost 24 bytes per 4 KiB chunk (about 0.6%) and 28
   bytes per WAL or MANIFEST append, a whole chunk decrypted for any read
   inside it (Pebble's block cache holds the plaintext, so a cache hit
