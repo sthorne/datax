@@ -539,7 +539,9 @@ func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
 // before naming the table. The two differ exactly on a grantee holding
 // a write privilege and no read one: an INSERT-only grantee may see the
 // table exists and may not read a row of it, and write_all is write
-// everything, not read everything (issue #253).
+// everything, not read everything (issue #253). It is the table half of
+// the SQL authorizer's read question only: SQL also requires USAGE on
+// the table's schema, which this does not ask (issue #259).
 func CanReadTable(set RoleSet, d *TableDescriptor) bool {
 	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
 		HasPrivilege(d.Privileges, set, "SELECT")

@@ -275,12 +275,28 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 	} {
 		// After the table's own records, so a refusal has to come from
 		// the record and not from a position.
-		err := checkBackupRecords(write(own, c.rec), man)
+		dir := write(own, c.rec)
+		err := checkBackupRecords(dir, man)
 		if err == nil {
 			t.Fatalf("a data file carrying %s (%s) was accepted", c.what, keys.Key(c.rec.Key))
 		}
 		if !strings.Contains(err.Error(), "table t's data file carries the key") || !strings.Contains(err.Error(), "outside the table's own span") {
 			t.Fatalf("a data file carrying %s was refused for another reason: %v", c.what, err)
+		}
+		// The apply loop's read is the same read: the bad record is
+		// refused before the caller sees it, and the records before it
+		// were delivered (a reader that saw nothing would have refused
+		// at the wrong place).
+		var seen []string
+		err = readCheckedBackupRecords(filepath.Join(dir, table.File), table, func(rec kvpb.ExportRecord) error {
+			seen = append(seen, keys.Key(rec.Key).String())
+			return nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "outside the table's own span") {
+			t.Fatalf("readCheckedBackupRecords delivered %s to its caller: %v", c.what, err)
+		}
+		if len(seen) != 1 || seen[0] != keys.Key(own.Key).String() {
+			t.Fatalf("readCheckedBackupRecords delivered %v before refusing %s", seen, c.what)
 		}
 	}
 }
