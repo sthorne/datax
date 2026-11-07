@@ -69,13 +69,13 @@ func (s *Store) RunReplicaGCOnce(ctx context.Context) {
 		rec, found, err := lookup.LookupMetaRecord(lctx, desc.StartKey)
 		cancel()
 		if err != nil {
-			log.Debugf("%s/%d: replica GC: reading the meta record: %v", r.rangeID, r.replicaID, err)
-			return true
+			// KV is not answering: end the pass rather than pay the
+			// timeout once per quiet replica, which during a partition
+			// is every one of them; the next cycle asks again.
+			log.Debugf("%s/%d: replica GC: reading the meta record: %v; the pass ends here", r.rangeID, r.replicaID, err)
+			return false
 		}
-		if !found {
-			return true
-		}
-		why := s.leftoverReason(r, desc, rec)
+		why := s.leftoverByMeta(r, desc, rec, found)
 		if why == "" {
 			return true
 		}
@@ -109,15 +109,31 @@ func (r *Replica) replicaGCCandidate(grace time.Duration) bool {
 	return true
 }
 
+// leftoverByMeta is the pass's decision: what /meta's answer for the
+// replica's start key says about the replica, or "" to leave it alone.
+// No record, or one that does not cover the key (found false), means
+// nothing — an addressing repair in flight — whatever rec holds: this
+// is the branch that keeps the pass from destroying a live replica's
+// data while /meta is being rewritten, and it is tested on its own.
+func (s *Store) leftoverByMeta(r *Replica, desc, rec kvpb.RangeDescriptor, found bool) string {
+	if !found {
+		return ""
+	}
+	return s.leftoverReason(r, desc, rec)
+}
+
 // leftoverReason says why the meta record rec shows the replica to be a
 // leftover, or "" when it does not: the record covers the replica's
-// start key by construction.
+// start key by construction. A replica descriptor is this store's only
+// when both its store and its node match: today a node has one store
+// and the ids are equal, and a node with several would otherwise have
+// one store's replica read as another's.
 func (s *Store) leftoverReason(r *Replica, desc, rec kvpb.RangeDescriptor) string {
 	if rec.RangeID != desc.RangeID {
 		return "/meta names " + rec.String() + " for its span, not " + desc.RangeID.String()
 	}
 	for _, rd := range rec.Replicas {
-		if rd.StoreID != s.cfg.StoreID && rd.NodeID != s.cfg.NodeID {
+		if rd.StoreID != s.cfg.StoreID || rd.NodeID != s.cfg.NodeID {
 			continue
 		}
 		if rd.ReplicaID > r.replicaID {

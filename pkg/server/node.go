@@ -481,6 +481,12 @@ func (n *Node) start() error {
 	if err := n.checkEncryptionMarker(); err != nil {
 		return err
 	}
+	if n.cfg.AcceptEncryptionRollback {
+		// Said on every start the flag is set, rollback or not: it is a
+		// flag for one start, and one left in a unit file would
+		// otherwise disable both halves of issue #248 silently.
+		log.Warnf("--accept-encryption-rollback is set: a store rolled back to before its switch to authenticated encryption would be accepted at this start rather than refused; remove the flag once the node is up (issue #248)")
+	}
 
 	lis := n.cfg.Listener
 	if lis == nil {

@@ -204,8 +204,9 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		// And the schema half of the question: a table whose schema's
-		// USAGE the user lacks is not listed, as SHOW TABLES would not
-		// (issue #259).
+		// USAGE the user lacks is not listed, as SHOW TABLES does not
+		// list it either — both ask catalog.SchemaUsageDenied (issue
+		// #259).
 		denied, err := n.schemaUsageDenied(req.Context(), set)
 		if err != nil {
 			doc.Tables, doc.Users = nil, nil

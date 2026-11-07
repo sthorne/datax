@@ -179,8 +179,14 @@ state or the internode protocol does, and an entry below says so.
   listed the table. The databases whose schema the caller may not use
   are resolved once per request, the way the roles are, and every
   predicate the viewer and the listing ask ANDs them in; a read that
-  fails fails closed. The database list behind it is reused for five
-  seconds, so a revoke reaches the console within that rather than
+  fails fails closed. SQL's own catalogs — `information_schema`,
+  `pg_catalog`, and now `SHOW TABLES`, which listed every table of the
+  database whatever the session's grants — ask the same predicate, so
+  a table the session holds no privilege on, or whose schema it may
+  not use, is not listed there either, and the console and SQL answer
+  the listing question the same way (#197). The database list behind
+  the console's half is reused
+  for five seconds, so a revoke reaches it within that rather than
   costing every document a KV round trip.
 - **SCRAM verifiers are derived at 16384 iterations** (#225), four times
   the RFC floor PostgreSQL defaults to. A verifier leaves the cluster in

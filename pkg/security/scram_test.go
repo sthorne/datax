@@ -278,3 +278,23 @@ func TestMockVerifier(t *testing.T) {
 		}
 	}
 }
+
+// TestScramIterationsAreNotLoweredAgain (issue #225): the whole of the
+// raise is the number. Every other assertion is written against the
+// constant and holds at any value it takes, so a revert, a bad merge or
+// a well-meant "authentication is slow" change would put 4096 back with
+// the suite green; this is the one that would not. Raising it further
+// means moving server.authVerifyRate with it (see the constant's
+// comment); lowering it is the thing this test exists to refuse.
+func TestScramIterationsAreNotLoweredAgain(t *testing.T) {
+	if ScramIterations < 16384 {
+		t.Fatalf("ScramIterations is %d; the raise to 16384 (issue #225) has been undone", ScramIterations)
+	}
+	v, err := MakeScramVerifier("pencil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Iterations != ScramIterations {
+		t.Fatalf("a new verifier carries %d iterations, not the constant's %d", v.Iterations, ScramIterations)
+	}
+}

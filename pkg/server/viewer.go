@@ -2,13 +2,13 @@ package server
 
 import (
 	"context"
-	"github.com/sthorne/datax/pkg/kvclient"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 )
 
@@ -105,17 +105,7 @@ func (n *Node) schemaUsageDenied(ctx context.Context, set catalog.RoleSet) (map[
 	if err != nil {
 		return nil, err
 	}
-	var denied map[uint64]bool
-	for _, db := range dbs {
-		if !db.UsageRestricted || set.Has(catalog.OwnerOf(db.Owner)) || catalog.HasPrivilege(db.SchemaPrivileges, set, catalog.PrivUsage) {
-			continue
-		}
-		if denied == nil {
-			denied = map[uint64]bool{}
-		}
-		denied[db.ID] = true
-	}
-	return denied, nil
+	return catalog.SchemaUsageDenied(dbs, set), nil
 }
 
 // redactedAny reports whether a key was rendered at its prefix for this

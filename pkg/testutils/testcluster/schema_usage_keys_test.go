@@ -108,6 +108,36 @@ func TestSchemaUsageGatesTheKeyViewer(t *testing.T) {
 			time.Sleep(250 * time.Millisecond)
 		}
 	}
+	// And SQL's own listing agrees with the console (QA on the PR):
+	// SHOW TABLES as blocked no longer names the table either.
+	showsTable := func(when string, want bool) {
+		t.Helper()
+		rows, err := blocked.Query(ctx, `SHOW TABLES`)
+		if err != nil {
+			t.Fatalf("SHOW TABLES as blocked %s: %v", when, err)
+		}
+		var names []string
+		for rows.Next() {
+			var name string
+			vals, err := rows.Values()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(vals) > 0 {
+				name, _ = vals[0].(string)
+			}
+			names = append(names, name)
+		}
+		rows.Close()
+		got := false
+		for _, n := range names {
+			got = got || n == "sealedbook"
+		}
+		if got != want {
+			t.Errorf("SHOW TABLES as blocked %s lists %v; sealedbook listed = %v, want %v", when, names, got, want)
+		}
+	}
+	showsTable("after REVOKE USAGE", false)
 	consoleShows(false, "after REVOKE USAGE")
 	// The admin is unaffected.
 	if body := get("/api/cluster", "root", "topsecret"); !strings.Contains(body, row) {
@@ -118,5 +148,6 @@ func TestSchemaUsageGatesTheKeyViewer(t *testing.T) {
 	if _, err := blocked.Exec(ctx, `SELECT v FROM sealedbook`); err != nil {
 		t.Fatalf("SELECT as blocked after GRANT USAGE: %v", err)
 	}
+	showsTable("after GRANT USAGE", true)
 	consoleShows(true, "after GRANT USAGE")
 }

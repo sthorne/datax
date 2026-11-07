@@ -48,10 +48,25 @@ func TestLeftoverReason(t *testing.T) {
 		{"this store with a newer replica", kvpb.RangeDescriptor{RangeID: 7, Replicas: with(6)}, true},
 		{"this store at this replica", kvpb.RangeDescriptor{RangeID: 7, Replicas: with(5)}, false},
 		{"this store at an older replica (stale record)", kvpb.RangeDescriptor{RangeID: 7, Replicas: with(4)}, false},
+		// A sibling store of this node, or this store's id on another
+		// node, is not this store: the match needs both ids.
+		{"another store of this node holds the newer replica", kvpb.RangeDescriptor{RangeID: 7, Replicas: append(append([]kvpb.ReplicaDescriptor(nil), members...), kvpb.ReplicaDescriptor{NodeID: 4, StoreID: 9, ReplicaID: 6})}, true},
+		{"this store's id on another node", kvpb.RangeDescriptor{RangeID: 7, Replicas: append(append([]kvpb.ReplicaDescriptor(nil), members...), kvpb.ReplicaDescriptor{NodeID: 8, StoreID: 4, ReplicaID: 5})}, true},
 	}
 	for _, c := range cases {
 		if got := s.leftoverReason(r, desc, c.rec); (got != "") != c.gone {
 			t.Errorf("%s: %q, want gone=%v", c.name, got, c.gone)
+		}
+		if got := s.leftoverByMeta(r, desc, c.rec, true); (got != "") != c.gone {
+			t.Errorf("%s (through leftoverByMeta): %q, want gone=%v", c.name, got, c.gone)
+		}
+	}
+	// No record, or one that does not cover the key, means nothing,
+	// whatever the zero or stale descriptor beside it would have said
+	// (QA on the PR: the most destructive branch, pinned on its own).
+	for _, rec := range []kvpb.RangeDescriptor{{}, {RangeID: 8, Replicas: with(5)}, {RangeID: 7, Replicas: members}} {
+		if got := s.leftoverByMeta(r, desc, rec, false); got != "" {
+			t.Errorf("with no record found, the pass would destroy the replica: %q", got)
 		}
 	}
 }
