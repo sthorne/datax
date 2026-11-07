@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"net/http"
 	"sync/atomic"
 
@@ -35,6 +36,10 @@ type keyViewer struct {
 	all   bool
 	set   catalog.RoleSet
 	descs map[uint64]*catalog.TableDescriptor
+	// denied is the databases whose schema the caller may not use
+	// (schemaUsageDenied): a table in one is neither seen nor read,
+	// whatever its own grants say (issue #259).
+	denied map[uint64]bool
 	// err is why the caller's roles could not be resolved. The viewer
 	// then sees no table at all: fail closed, and say so where the
 	// document has a place for it.
@@ -69,7 +74,51 @@ func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 	if err != nil {
 		return keyViewer{err: err, redacted: new(atomic.Bool)}
 	}
-	return keyViewer{set: set, descs: n.tableDescs(), redacted: new(atomic.Bool)}
+	denied, err := n.schemaUsageDenied(ctx, set)
+	if err != nil {
+		return keyViewer{err: err, redacted: new(atomic.Bool)}
+	}
+	return keyViewer{set: set, descs: n.tableDescs(), denied: denied, redacted: new(atomic.Bool)}
+}
+
+// schemaUsageDenied is the set of databases whose schema the role set may
+// not use: the clause of the SQL authorizer's read question that the
+// table predicates do not carry (issue #259). SQL authorizes a table read
+// as the table's own privilege AND usage of its schema, and REVOKE USAGE
+// ON SCHEMA public FROM PUBLIC turns the second on: after it, a grantee
+// holding SELECT on a table and no USAGE on its schema is refused the
+// row, so the console must not decode the table's boundaries for it,
+// nor list the table. Resolved once per request, as the roles are, for
+// every database rather than per key: the viewer answers for many keys
+// and the databases are few. An admin may use every schema; a database
+// that does not restrict usage, or whose owner the set holds, is usable;
+// otherwise USAGE must be held, directly or through a role. A database
+// the read does not find is usable, as the authorizer treats it; a read
+// that fails is an error, and the viewer fails closed on it.
+func (n *Node) schemaUsageDenied(ctx context.Context, set catalog.RoleSet) (map[uint64]bool, error) {
+	if set.IsAdmin() {
+		return nil, nil
+	}
+	var dbs []*catalog.DatabaseDescriptor
+	err := n.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		dbs, err = catalog.ListDatabases(ctx, txn)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	var denied map[uint64]bool
+	for _, db := range dbs {
+		if !db.UsageRestricted || set.Has(catalog.OwnerOf(db.Owner)) || catalog.HasPrivilege(db.SchemaPrivileges, set, catalog.PrivUsage) {
+			continue
+		}
+		if denied == nil {
+			denied = map[uint64]bool{}
+		}
+		denied[db.ID] = true
+	}
+	return denied, nil
 }
 
 // redactedAny reports whether a key was rendered at its prefix for this
@@ -113,7 +162,7 @@ func (v keyViewer) may(id uint64, pred func(catalog.RoleSet, *catalog.TableDescr
 		return false
 	}
 	d := v.descs[id]
-	return d != nil && pred(v.set, d)
+	return d != nil && !v.denied[d.DatabaseID] && pred(v.set, d)
 }
 
 // viewKey renders k for the caller: decoded when it belongs to a table

@@ -21,9 +21,22 @@ import (
 // SASL protocol messages. Verifiers (never plaintext passwords) are stored
 // per user; comparisons use hmac.Equal.
 
-// ScramIterations is the PBKDF2 iteration count for new verifiers (the RFC
-// 7677 recommended minimum).
-const ScramIterations = 4096
+// ScramIterations is the PBKDF2 iteration count for new verifiers: four
+// times the RFC 7677 minimum of 4096 that PostgreSQL defaults to and
+// that this was until issue #225. A verifier leaves the cluster in every
+// plaintext backup, where its holder grinds it offline at whatever rate
+// they like; the count is what that grind costs, and 4096 was two
+// orders of magnitude under current guidance for anything
+// password-derived. 16384 is as far as the raise goes without moving
+// the HTTP verification budget (server.authVerifyRate): a derivation is
+// about 3 ms, so a source at the budget's 20 a second costs 6% of a
+// core, and past this count the budget would have to shrink below what
+// a Basic-auth scraper polling every second needs. The SQL door pays
+// nothing for it — SCRAM's server side runs no derivation — and
+// existing verifiers keep the count they were made with (VerifyPassword
+// re-derives with v.Iterations), so the raise applies as passwords are
+// set or rotated, with no migration.
+const ScramIterations = 16384
 
 // ScramVerifier is a user's stored SCRAM credential (no plaintext).
 type ScramVerifier struct {
@@ -59,6 +72,17 @@ func MakeScramVerifier(password string) (*ScramVerifier, error) {
 		return nil, err
 	}
 	return makeVerifier(SASLprep(password), salt, ScramIterations)
+}
+
+// MakeScramVerifierAt is MakeScramVerifier at a given iteration count:
+// for tests that plant a verifier made before the count was raised, the
+// way an upgraded cluster holds them (issue #225).
+func MakeScramVerifierAt(password string, iterations int) (*ScramVerifier, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	return makeVerifier(SASLprep(password), salt, iterations)
 }
 
 // EndpointChannelBinding computes RFC 5929 tls-server-end-point data for a
@@ -134,11 +158,19 @@ func DummyVerifier() *ScramVerifier { return dummyVerifier }
 // correlatable across names than the random salts of real users. The
 // keys are zero (nothing verifies against them, as with DummyVerifier),
 // and no PBKDF2 runs: a real user's verifier is read from storage, so
-// deriving one here would make the unknown user the slower path.
-func MockVerifier(secret []byte, user string) *ScramVerifier {
+// deriving one here would make the unknown user the slower path. The
+// iteration count it advertises is the caller's: the count the real
+// verifiers carry, not the constant new ones are made with, since after
+// a raise (issue #225) a stand-in at the new count beside real users
+// still at the old one would mark the names that do not exist as surely
+// as a shared salt did. Zero means ScramIterations.
+func MockVerifier(secret []byte, user string, iterations int) *ScramVerifier {
+	if iterations <= 0 {
+		iterations = ScramIterations
+	}
 	salt := hmacSHA256(secret, "scram-mock-salt\x00"+user)[:16]
 	return &ScramVerifier{
-		Salt: salt, Iterations: ScramIterations,
+		Salt: salt, Iterations: iterations,
 		StoredKey: make([]byte, sha256.Size), ServerKey: make([]byte, sha256.Size),
 	}
 }

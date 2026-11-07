@@ -368,6 +368,9 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// standIn caches the iteration count the stand-in SCRAM verifier
+	// advertises (standInIterations, issue #225).
+	standIn standInState
 	// indexUsage caches /api/index-usage documents (issue #208).
 	indexUsage indexUsageCache
 	// shapes is the statement-shape recorder's state (issue #209).

@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/version"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
@@ -63,6 +64,7 @@ func (n *Node) startSQL() error {
 		opts.Auth = n.lookupVerifier
 		opts.CanLogin = n.canLogin
 		opts.MockSecret = n.mockSecret
+		opts.MockIterations = n.standInIterations
 		opts.AuthLimiter = sqlAuthLimiter{n.authLimit}
 		if n.cfg.RootPassword != "" {
 			if err := n.stopper.RunWorker(n.seedRootUser); err != nil {
@@ -221,3 +223,81 @@ func (n *Node) seedRootUser(ctx context.Context) {
 // sqlServer is the SQL server once startSQL has started it (nil before,
 // and on a node without a SQL listener).
 func (n *Node) sqlServer() *pgwire.Server { return n.pgServer.Load() }
+
+// The stand-in verifier's iteration count (issue #225). A real user's
+// verifier carries the count it was made with, and ScramIterations
+// governs only new ones, so after a raise the cluster holds verifiers at
+// both counts until every password has been rotated. A stand-in at the
+// constant would then say, in server-first, that a name is not a user
+// whenever the count differs from what the real users show — the oracle
+// issue #137 closed for the salt, reopened for the count. So the
+// stand-in advertises the highest count any stored verifier carries:
+// the count of the newest verifier once any password has been set since
+// the raise, and the old count until then, when every real user shows
+// it too. It is a property of the replicated catalog, so it is the same
+// on every node, which a per-node choice would not be (issue #196).
+//
+// The scan is not on the handshake's path: the count is cached and
+// refreshed in the background once it is standInRefreshAfter old, so an
+// unknown user's handshake costs what a known user's does — one role
+// lookup — except for the very first on a node, which fills the cache.
+const standInRefreshAfter = 5 * time.Second
+
+type standInState struct {
+	mu         sync.Mutex
+	iterations int
+	at         time.Time
+	refreshing bool
+}
+
+func (n *Node) standInIterations(ctx context.Context) int {
+	n.standIn.mu.Lock()
+	cached, at, refreshing := n.standIn.iterations, n.standIn.at, n.standIn.refreshing
+	if cached != 0 && time.Since(at) >= standInRefreshAfter && !refreshing {
+		n.standIn.refreshing = true
+		go n.refreshStandInIterations(n.stopper.Ctx())
+	}
+	n.standIn.mu.Unlock()
+	if cached != 0 {
+		return cached
+	}
+	n.refreshStandInIterations(ctx)
+	n.standIn.mu.Lock()
+	defer n.standIn.mu.Unlock()
+	return n.standIn.iterations
+}
+
+func (n *Node) refreshStandInIterations(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	roles, err := catalog.ListRoles(ctx, n.db)
+	n.standIn.mu.Lock()
+	defer n.standIn.mu.Unlock()
+	n.standIn.refreshing = false
+	if err != nil {
+		log.Warnf("reading the stored verifiers for the stand-in SCRAM count: %v (the stand-in advertises %d until they can be read)", err, security.ScramIterations)
+		if n.standIn.iterations == 0 {
+			n.standIn.iterations = security.ScramIterations
+		}
+		return
+	}
+	n.standIn.iterations, n.standIn.at = advertisedIterations(roles), time.Now()
+}
+
+// advertisedIterations is the highest iteration count among the roles'
+// stored verifiers, or ScramIterations when none has one.
+func advertisedIterations(roles []*catalog.RoleDescriptor) int {
+	best := 0
+	for _, r := range roles {
+		if len(r.Verifier) == 0 {
+			continue
+		}
+		if v, err := security.UnmarshalVerifier(r.Verifier); err == nil && v.Iterations > best {
+			best = v.Iterations
+		}
+	}
+	if best == 0 {
+		return security.ScramIterations
+	}
+	return best
+}

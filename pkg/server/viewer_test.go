@@ -84,3 +84,26 @@ func TestKeyViewerDecodesOnlyWhatTheCallerMayRead(t *testing.T) {
 		t.Error("a viewer whose roles could not be resolved reads a table")
 	}
 }
+
+// TestKeyViewerAsksForSchemaUsage (issue #259): a table whose schema the
+// caller may not use is neither seen nor read, whatever the table's own
+// grants say — the clause of the SQL read question the table predicates
+// do not carry — and a table in any other database is unaffected.
+func TestKeyViewerAsksForSchemaUsage(t *testing.T) {
+	set := catalog.RoleSet{"reader": true}
+	descs := map[uint64]*catalog.TableDescriptor{
+		7: {ID: 7, Name: "t", DatabaseID: 1, Privileges: map[string][]string{"reader": {"SELECT"}}},
+		8: {ID: 8, Name: "u", DatabaseID: 2, Privileges: map[string][]string{"reader": {"SELECT"}}},
+	}
+	open := keyViewer{set: set, descs: descs, redacted: new(atomic.Bool)}
+	if !open.sees(7) || !open.reads(7) || !open.sees(8) || !open.reads(8) {
+		t.Fatal("with usage of every schema, a SELECT grantee neither sees nor reads its table")
+	}
+	denied := keyViewer{set: set, descs: descs, denied: map[uint64]bool{1: true}, redacted: new(atomic.Bool)}
+	if denied.sees(7) || denied.reads(7) {
+		t.Error("a table whose schema the caller may not use is seen or read")
+	}
+	if !denied.sees(8) || !denied.reads(8) {
+		t.Error("denying one database's schema hid a table of another")
+	}
+}

@@ -254,14 +254,14 @@ func TestVerifyPassword(t *testing.T) {
 // no password verifies against it.
 func TestMockVerifier(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
-	a, a2, b := MockVerifier(secret, "alice"), MockVerifier(secret, "alice"), MockVerifier(secret, "bob")
+	a, a2, b := MockVerifier(secret, "alice", 0), MockVerifier(secret, "alice", 0), MockVerifier(secret, "bob", 0)
 	if !bytes.Equal(a.Salt, a2.Salt) {
 		t.Fatal("the same name under the same secret produced different salts")
 	}
 	if bytes.Equal(a.Salt, b.Salt) {
 		t.Fatal("two names produced the same salt")
 	}
-	other := MockVerifier([]byte("another secret entirely, 32 bytes!"), "alice")
+	other := MockVerifier([]byte("another secret entirely, 32 bytes!"), "alice", 0)
 	if bytes.Equal(a.Salt, other.Salt) {
 		t.Fatal("two secrets produced the same salt for one name")
 	}

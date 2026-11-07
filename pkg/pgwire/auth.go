@@ -44,7 +44,11 @@ func (c *conn) standInVerifier(ctx context.Context, user string) *security.Scram
 	if len(secret) == 0 {
 		return nil
 	}
-	return security.MockVerifier(secret, user)
+	iterations := 0
+	if c.opts.MockIterations != nil {
+		iterations = c.opts.MockIterations(ctx)
+	}
+	return security.MockVerifier(secret, user, iterations)
 }
 
 // clientCertUser returns the CommonName of a CA-verified client
