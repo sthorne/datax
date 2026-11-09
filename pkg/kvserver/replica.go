@@ -523,8 +523,10 @@ func (r *Replica) isFrozen() bool {
 
 // checkFrozen refuses traffic on a frozen range. Subsume (idempotent
 // re-drive) and Unfreeze (abandonment) are the only requests allowed
-// through. The error carries a RangeKeyMismatch so clients re-resolve
-// routing — once the merge lands, the merged range's descriptor answers.
+// through. The error carries a RangeKeyMismatch marked Frozen: the
+// routing was right, the range is briefly out of service, and the client
+// waits for the merge to land (the merged range's descriptor then
+// answers) or to be abandoned (this range serves again) — issue #263.
 func (r *Replica) checkFrozen(ba *kvpb.BatchRequest) *kvpb.Error {
 	if !r.isFrozen() {
 		return nil
@@ -537,7 +539,7 @@ func (r *Replica) checkFrozen(ba *kvpb.BatchRequest) *kvpb.Error {
 	}
 	addr, _ := addrOf(ba.Requests[0].GetInner().Header().Key)
 	e := kvpb.NewErrorf("%s: range is frozen for a merge", r.rangeID)
-	e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: addr}
+	e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: addr, Frozen: true}
 	return e
 }
 

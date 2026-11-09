@@ -142,6 +142,23 @@ and re-repaired. An interrupted merge is re-driven (or unfrozen, if
 membership diverged) by the same pass; `datax debug merge --range N`
 drives one by hand.
 
+The freeze takes the RHS out of service, so the driver only enters it
+when the merge is expected to go through: before the Subsume it confirms
+that every RHS replica exists and has applied what the RHS has applied on
+the driver (one second at most), and skips the merge for this pass
+otherwise — a node that has not yet applied the split that made the range
+has no replica to confirm with, and a merge driven against it would have
+frozen a range that then could not be merged (issue #263: the presplit of
+a thousand ranges left one node more than a minute behind, and every pass
+re-froze the ranges it could not merge, so they refused every request
+until it caught up). If the confirmation after the freeze fails anyway,
+a freeze this attempt made is unwound at once; one inherited from an
+earlier, interrupted attempt is left for the re-drive, since that merge
+may still land. A gateway that reaches a frozen range gets a refusal that
+says so (`RangeKeyMismatchError.Frozen`): its descriptor was right, so it
+holds it and retries with backoff for up to fifteen seconds rather than
+re-resolving the same range until its routing budget runs out.
+
 ## Peer discovery
 
 Range addressing lives in the KV layer, but node *addresses* deliberately do

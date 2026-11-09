@@ -935,10 +935,37 @@ func (db *DB) sendRefresh(ctx context.Context, header kvpb.BatchHeader, req *kvp
 	return nil
 }
 
+// frozenRangeWait bounds how long sendPartial waits on a range that is
+// frozen for a merge before handing the refusal to the routing loop as a
+// regroup. A merge holds the freeze for the time it takes to confirm it
+// on every replica (mergeApplicationWait at most) and land; an abandoned
+// one is unwound at once. The bound is generous so a slow but working
+// merge is waited out, and small enough that a freeze nothing will lift
+// still surfaces as an error. A variable so tests can shorten it.
+var frozenRangeWait = 15 * time.Second
+
+// frozenBackoff paces the retries against a frozen range: 10 ms doubling
+// to 200 ms. Returns the ctx error once it expires.
+func frozenBackoff(ctx context.Context, n int) *kvpb.Error {
+	delay := 10 * time.Millisecond << uint(min(n, 4))
+	if delay > 200*time.Millisecond {
+		delay = 200 * time.Millisecond
+	}
+	select {
+	case <-ctx.Done():
+		return kvpb.NewError(ctx.Err())
+	case <-time.After(delay):
+		return nil
+	}
+}
+
 // sendPartial sends one single-range sub-batch, handling timestamp-refresh
-// retries (non-transactional writes) inline and reporting stale routing to
-// the caller (regroup=true after refreshing the cache).
+// retries (non-transactional writes) and a range frozen for a merge inline
+// and reporting stale routing to the caller (regroup=true after refreshing
+// the cache).
 func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []kvpb.RequestUnion, desc kvpb.RangeDescriptor) (br *kvpb.BatchResponse, regroup bool, kerr *kvpb.Error) {
+	var frozenSince time.Time
+	frozenWaits := 0
 	for {
 		ba := &kvpb.BatchRequest{Header: *header, Requests: reqs}
 		br, kerr = db.sendToRange(ctx, ba, desc)
@@ -955,6 +982,27 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 			default:
 				continue
 			}
+		}
+		if kerr.RangeKeyMismatch != nil && kerr.RangeKeyMismatch.Frozen {
+			// The descriptor is right: the range covers the key but is
+			// frozen for a merge. Re-resolving would find the same
+			// descriptor and spend the routing budget on it (issue #263);
+			// wait instead. Once the merge lands this range is gone and
+			// its merged neighbor answers (RangeNotFound below, repaired
+			// through /meta); once it is abandoned the range serves again.
+			if frozenSince.IsZero() {
+				frozenSince = time.Now()
+			}
+			if time.Since(frozenSince) < frozenRangeWait {
+				if berr := frozenBackoff(ctx, frozenWaits); berr != nil {
+					return nil, false, berr
+				}
+				frozenWaits++
+				continue
+			}
+			e := kvpb.NewErrorf("%v (frozen for %s)", kerr, frozenRangeWait)
+			e.RangeKeyMismatch = kerr.RangeKeyMismatch
+			kerr = e
 		}
 		if kerr.RangeKeyMismatch != nil || kerr.RangeNotFound != nil {
 			db.cache.Evict(desc.RangeID)

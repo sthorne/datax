@@ -47,9 +47,18 @@ type RangeNotFoundError struct {
 // RangeKeyMismatchError: the range does not cover the request's key (stale
 // routing). ActualDescriptors, if set, are fresher descriptors the server
 // knows (e.g. both halves after a split).
+//
+// Frozen marks the one mismatch that is not stale routing: the range does
+// cover the key but is frozen for a merge in progress, so it refuses all
+// traffic until the merge lands (the merged neighbor then answers) or is
+// abandoned (the range serves again). A client that sees it holds its
+// descriptor and waits briefly instead of re-resolving (issue #263). A
+// server that predates the field never sets it; a client that predates
+// it ignores it and re-resolves as before.
 type RangeKeyMismatchError struct {
 	RequestKey        keys.Key          `json:"request_key"`
 	ActualDescriptors []RangeDescriptor `json:"actual_descriptors,omitempty"`
+	Frozen            bool              `json:"frozen,omitempty"`
 }
 
 // WriteIntentError mirrors storage.WriteIntentError across the wire.
