@@ -171,6 +171,13 @@ type TestingKnobs struct {
 	// replica — lets a test take a replica away between the two (issue
 	// #263). It also tells a test whether a merge attempt froze at all.
 	AfterMergeSubsume func(lhs, rhs base.RangeID)
+	// BeforeMergeProposal runs on the merge driver in place of proposing
+	// the merge: an error it returns stands in for the proposal's result
+	// and the proposal is not made — lets a test hand the driver an
+	// ambiguous outcome (the RHS must stay frozen) or a definitive one
+	// (the freeze must be unwound) without a real leader change (issue
+	// #263). Nil, or a nil return, proposes as usual.
+	BeforeMergeProposal func(lhs, rhs base.RangeID) *kvpb.Error
 	// SyncApply applies committed entries inside the raft pass that
 	// committed them instead of handing them to the apply workers — a
 	// test's way to make "the proposal was acknowledged" imply "every

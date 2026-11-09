@@ -202,3 +202,61 @@ func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
 	}
 	f.everyKeyReadable(t, ctx, "after the merge")
 }
+
+// TestMergeProposalOutcomeDecidesTheFreeze: after the freeze, a merge
+// proposal that definitely did not happen unwinds the freeze, and one
+// whose outcome is unknown — the leader lost, the context gone, the group
+// stopped with the entry in flight — leaves the RHS frozen, because the
+// merge may still apply and must find it so. The knob stands in for the
+// proposal with each kind of failure in turn; afterwards the re-drive
+// completes the merge.
+func TestMergeProposalOutcomeDecidesTheFreeze(t *testing.T) {
+	var outcome atomic.Pointer[kvpb.Error] // what the next proposal "returns"; nil proposes for real
+	tc, _ := StartWithEngines(t, 3, func(c *server.Config) {
+		c.TestingKnobs.BeforeMergeProposal = func(_, _ base.RangeID) *kvpb.Error {
+			return outcome.Swap(nil)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 866)
+	lead, _ := leadBothSides(t, ctx, tc, f)
+	rhs, ok := tc.Nodes[lead].Store().GetReplica(f.rhs.RangeID)
+	if !ok {
+		t.Fatalf("n%d holds no replica of %s", tc.Nodes[lead].NodeID(), f.rhs.RangeID)
+	}
+	frozen := func() bool {
+		put := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+		put.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: append(f.prefix.Clone(), "z97"...)}, Value: []byte("x")})
+		_, kerr := rhs.Execute(ctx, put)
+		return kerr != nil && kerr.RangeKeyMismatch != nil && kerr.RangeKeyMismatch.Frozen
+	}
+
+	// A definitive failure: the freeze this attempt made is unwound.
+	outcome.Store(kvpb.NewErrorf("injected: the proposal was never made"))
+	if _, err := tc.Nodes[lead].DB().AdminMerge(ctx, f.lhs.StartKey); err == nil || !strings.Contains(err.Error(), "never made") {
+		t.Fatalf("merge with a definitive proposal failure: got %v, want the injected error", err)
+	}
+	if frozen() {
+		t.Fatal("a definitive proposal failure left the RHS frozen")
+	}
+	rhsServes(t, ctx, tc, f, lead, "after the definitive failure")
+
+	// An ambiguous one: the merge may still land, so the RHS stays frozen.
+	amb := kvpb.NewErrorf("injected: proposal abandoned with its fate unknown")
+	amb.Ambiguous = &kvpb.AmbiguousResultError{}
+	outcome.Store(amb)
+	if _, err := tc.Nodes[lead].DB().AdminMerge(ctx, f.lhs.StartKey); err == nil || !strings.Contains(err.Error(), "fate unknown") {
+		t.Fatalf("merge with an ambiguous proposal result: got %v, want the injected error", err)
+	}
+	if !frozen() {
+		t.Fatal("an ambiguous proposal result unwound a freeze whose merge may still land")
+	}
+
+	// The re-drive finishes it.
+	merged := mergeRanges(t, ctx, tc, f.lhs.RangeID)
+	if !merged.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("merge produced %v, want end %s", merged, f.rhs.EndKey)
+	}
+	f.everyKeyReadable(t, ctx, "after the merge")
+}

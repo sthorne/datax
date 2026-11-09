@@ -365,12 +365,19 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	if gerr != nil {
 		return abandon(kvpb.NewError(gerr))
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{merge: trig}); kerr != nil {
+	var perr *kvpb.Error
+	if k := r.store.cfg.TestingKnobs.BeforeMergeProposal; k != nil {
+		perr = k(r.rangeID, rhsDesc.RangeID)
+	}
+	if perr == nil {
+		_, perr = r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{merge: trig})
+	}
+	if perr != nil {
 		guard.Release()
-		if kerr.Ambiguous != nil {
-			return nil, kerr // may still apply: the RHS stays frozen for it
+		if perr.Ambiguous != nil {
+			return nil, perr // may still apply: the RHS stays frozen for it
 		}
-		return abandon(kerr) // never proposed, or refused at apply
+		return abandon(perr) // never proposed, or refused at apply
 	}
 	guard.Release()
 
