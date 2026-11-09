@@ -460,3 +460,72 @@ func TestLeftoverOverlappingALiveReplicaIsNotReplaced(t *testing.T) {
 	}
 	f.everyKeyReadable(t, ctx, "after the refused preseed")
 }
+
+// TestSplitProposedBeforeAFreezeIsRefused: a split of the RHS built and
+// about to be proposed when a Subsume freezes the range — adminSplit's
+// own frozen check ran before the freeze applied and let it through. At
+// apply the split finds the range frozen and must be refused: the merge
+// driver has read the frozen descriptor as final, and a split landing
+// after it would hand half the span to a new range the merge then
+// absorbs as well (seen once in CI on #264's branch under merge churn).
+// Unfrozen, the same split goes through.
+func TestSplitProposedBeforeAFreezeIsRefused(t *testing.T) {
+	hold := newDescriptorHold()
+	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 867)
+
+	hold.arm(f.rhs.RangeID, "split")
+	lead := tc.LeaderIndex(f.rhs.RangeID)
+	splitKey := append(f.prefix.Clone(), "z07"...)
+	splitErr := make(chan error, 1)
+	go func() {
+		_, err := tc.Nodes[lead].DB().AdminSplit(ctx, splitKey)
+		splitErr <- err
+	}()
+	hold.waitArrived(t, "the split")
+
+	// The freeze lands while the split waits to be proposed.
+	rhs, ok := tc.Nodes[lead].Store().GetReplica(f.rhs.RangeID)
+	if !ok {
+		t.Fatalf("n%d holds no replica of %s", tc.Nodes[lead].NodeID(), f.rhs.RangeID)
+	}
+	sub := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+	sub.Add(&kvpb.SubsumeRequest{RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey}, MergeInto: f.lhs.RangeID})
+	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
+		t.Fatalf("freezing the RHS: %v", kerr)
+	}
+	close(hold.release)
+
+	select {
+	case err := <-splitErr:
+		if err == nil || !strings.Contains(err.Error(), "frozen for a merge") {
+			t.Fatalf("split applied on a frozen range: got %v, want the frozen refusal", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the held split never returned")
+	}
+	// Nothing of it landed: every replica holds the frozen descriptor as
+	// the merge driver read it.
+	for i, d := range f.localDescriptors(f.rhs.RangeID) {
+		if d.Generation != f.rhs.Generation || !d.EndKey.Equal(f.rhs.EndKey) {
+			t.Fatalf("node %d holds %v after the refused split, want %v", i, d, f.rhs)
+		}
+	}
+
+	// Unfrozen (an abandoned merge), the same split goes through.
+	unf := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+	unf.Add(&kvpb.UnfreezeRequest{RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey}})
+	if _, kerr := rhs.Execute(ctx, unf); kerr != nil {
+		t.Fatalf("unfreezing the RHS: %v", kerr)
+	}
+	sr, err := tc.Nodes[lead].DB().AdminSplit(ctx, splitKey)
+	if err != nil {
+		t.Fatalf("split after the unfreeze: %v", err)
+	}
+	if sr.Left.Generation != f.rhs.Generation+1 || !sr.Right.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("split produced %v / %v, want generation %d ending at %s", sr.Left, sr.Right, f.rhs.Generation+1, f.rhs.EndKey)
+	}
+	f.everyKeyReadable(t, ctx, "after the split")
+}
