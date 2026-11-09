@@ -936,12 +936,15 @@ func (db *DB) sendRefresh(ctx context.Context, header kvpb.BatchHeader, req *kvp
 }
 
 // frozenRangeWait bounds how long sendPartial waits on a range that is
-// frozen for a merge before handing the refusal to the routing loop as a
-// regroup. A merge holds the freeze for the time it takes to confirm it
-// on every replica (mergeApplicationWait at most) and land; an abandoned
-// one is unwound at once. The bound is generous so a slow but working
-// merge is waited out, and small enough that a freeze nothing will lift
-// still surfaces as an error. A variable so tests can shorten it.
+// frozen for a merge before failing the batch. A merge holds the freeze
+// for the time it takes to confirm it on every replica
+// (mergeApplicationWait at most) and land; an abandoned one is unwound at
+// once. The bound is generous so a slow but working merge is waited out,
+// and small enough that a freeze nothing will lift still surfaces as an
+// error — a terminal one, not a regroup: re-resolving would find the same
+// descriptor, and the routing loop would spend its whole budget on it,
+// thirty waits of this length for one batch. A variable so tests can
+// shorten it.
 var frozenRangeWait = 15 * time.Second
 
 // frozenBackoff paces the retries against a frozen range: 10 ms doubling
@@ -1000,9 +1003,8 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 				frozenWaits++
 				continue
 			}
-			e := kvpb.NewErrorf("%v (frozen for %s)", kerr, frozenRangeWait)
-			e.RangeKeyMismatch = kerr.RangeKeyMismatch
-			kerr = e
+			// Terminal: the descriptor is still right, nothing to repair.
+			return nil, false, kvpb.NewErrorf("%v (frozen for %s)", kerr, frozenRangeWait)
 		}
 		if kerr.RangeKeyMismatch != nil || kerr.RangeNotFound != nil {
 			db.cache.Evict(desc.RangeID)

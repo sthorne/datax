@@ -535,10 +535,11 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			// Freeze for a merge; persisted by stageAppliedIndex in this
 			// same batch, so every future leader and restart honors it.
 			r.mu.Lock()
+			already := r.mu.frozen
 			r.mu.frozen = true
 			r.mu.mergedInto = req.MergeInto
 			r.mu.Unlock()
-			ru.Subsume = &kvpb.SubsumeResponse{}
+			ru.Subsume = &kvpb.SubsumeResponse{AlreadyFrozen: already}
 		case *kvpb.UnfreezeRequest:
 			r.mu.Lock()
 			r.mu.frozen = false

@@ -518,7 +518,13 @@ type AdminMergeResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
 
-type SubsumeResponse struct{}
+// SubsumeResponse: AlreadyFrozen reports that the range was frozen before
+// this Subsume applied — a re-drive of an interrupted merge, or a second
+// driver racing the first — so the caller did not make the freeze and
+// must not unwind it (issue #263).
+type SubsumeResponse struct {
+	AlreadyFrozen bool `json:"already_frozen,omitempty"`
+}
 
 type UnfreezeResponse struct{}
 

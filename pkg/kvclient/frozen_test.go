@@ -14,7 +14,11 @@ import (
 )
 
 // frozenStore is a LocalStore whose one range answers "frozen for a
-// merge" a set number of times before serving.
+// merge" a set number of times before serving. The refusal carries no
+// descriptors, as an answer need not: a gateway that evicted its
+// descriptor on it would have nothing to route by (meta lookups are off
+// here) and fail, so a write that goes through shows the descriptor was
+// held.
 type frozenStore struct {
 	desc          kvpb.RangeDescriptor
 	frozenAnswers atomic.Int32
@@ -28,9 +32,8 @@ func (s *frozenStore) ExecuteBatch(_ context.Context, ba *kvpb.BatchRequest) (*k
 	if s.frozenAnswers.Add(-1) >= 0 {
 		e := kvpb.NewErrorf("%s: range is frozen for a merge", s.desc.RangeID)
 		e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{
-			RequestKey:        ba.Requests[0].GetInner().Header().Key,
-			ActualDescriptors: []kvpb.RangeDescriptor{s.desc},
-			Frozen:            true,
+			RequestKey: ba.Requests[0].GetInner().Header().Key,
+			Frozen:     true,
 		}
 		return nil, e
 	}
@@ -66,9 +69,10 @@ func TestGatewayWaitsOutAFrozenRange(t *testing.T) {
 	}
 }
 
-// A freeze that never lifts is still an error: after frozenRangeWait the
-// refusal goes back to the routing loop as a regroup, saying how long the
-// range was frozen.
+// A freeze that never lifts is still an error, and a terminal one: after
+// frozenRangeWait the batch fails saying how long the range was frozen,
+// and the routing loop does not re-resolve and wait again — one batch
+// waits the bound once, not thirty times.
 func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	db, store, key := newFrozenStoreDB()
 	store.frozenAnswers.Store(1 << 30)
@@ -82,8 +86,8 @@ func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	reqs := []kvpb.RequestUnion{{Put: &kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: key}, Value: []byte("v")}}}
 	start := time.Now()
 	_, regroup, kerr := db.sendPartial(ctx, &header, reqs, store.desc)
-	if !regroup || kerr == nil || kerr.RangeKeyMismatch == nil || !kerr.RangeKeyMismatch.Frozen {
-		t.Fatalf("got regroup=%v err=%v, want the frozen refusal handed back as a regroup", regroup, kerr)
+	if regroup || kerr == nil || kerr.RangeKeyMismatch != nil {
+		t.Fatalf("got regroup=%v err=%v, want a terminal error", regroup, kerr)
 	}
 	if !strings.Contains(kerr.Error(), "frozen for a merge") || !strings.Contains(kerr.Error(), "frozen for 300ms") {
 		t.Fatalf("error %q does not say the range stayed frozen for the bound", kerr.Error())
@@ -93,5 +97,22 @@ func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	}
 	if store.calls.Load() < 2 {
 		t.Fatalf("store answered %d times, want retries while frozen", store.calls.Load())
+	}
+	if _, ok := db.cache.Lookup(key); !ok {
+		t.Fatal("the descriptor was evicted: the routing was right and must be kept")
+	}
+
+	// Through the whole batch path the bound is paid once.
+	calls := store.calls.Load()
+	start = time.Now()
+	err := db.Put(ctx, key, []byte("v"))
+	if err == nil || !strings.Contains(err.Error(), "frozen for 300ms") {
+		t.Fatalf("Put on a range nothing unfreezes: %v, want the frozen error", err)
+	}
+	if el := time.Since(start); el > 3*frozenRangeWait {
+		t.Fatalf("Put took %s against a %s bound: the routing loop waited again", el, frozenRangeWait)
+	}
+	if n := store.calls.Load() - calls; n > 40 {
+		t.Fatalf("Put sent %d batches to a frozen range, want one bounded wait's worth", n)
 	}
 }
