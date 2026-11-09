@@ -129,6 +129,20 @@ func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, order
 // LHS), so the two sites cannot share one expression — see the comment
 // there before "tidying" either into the other (that is mutant G1).
 func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
+	// A split proposed before a Subsume applied lands on a frozen range.
+	// The freeze is replicated state (set by the Subsume's apply, in log
+	// order, on every replica), so this refusal is deterministic — and
+	// necessary: the merge driver read the frozen range's descriptor as
+	// its final one, and a split applied after that would make the merge
+	// absorb a span the split had already given to a new range (issue
+	// #263's CI run: r1 absorbed a pre-split r5 while r6 held half of
+	// it, and /meta kept a record no replica answered for). adminSplit's
+	// own frozen check runs before proposing and cannot see a freeze
+	// that applies in between.
+	if r.isFrozen() {
+		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
+		return kvpb.NewErrorf("%s: cannot split: range is frozen for a merge (the freeze applied after the split was proposed); retry once the merge lands", r.rangeID)
+	}
 	if cur := r.Desc().Generation; staleDescriptorChange(cur, trig.Left.Generation) {
 		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
 		return kvpb.NewErrorf("%s: split against generation %d but range is at %d; the range changed under it, retry against the current descriptor",

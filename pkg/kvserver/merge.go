@@ -58,6 +58,15 @@ import (
 // RHS replica to confirm the subsume before proposing the merge.
 const mergeApplicationWait = 10 * time.Second
 
+// mergePreflightWait bounds the check that runs BEFORE the RHS is frozen:
+// every RHS replica must exist and have applied what the RHS has applied
+// here, or the merge is not attempted this pass. The freeze takes the
+// range out of service, so it is only entered when the confirmation after
+// it is expected to pass at once; a replica that is missing (a split the
+// node has not applied yet) or far behind defers the merge instead of
+// freezing a range that then cannot be merged (issue #263).
+const mergePreflightWait = time.Second
+
 // mergeTrigger is carried by the replicated merge command on the LHS.
 type mergeTrigger struct {
 	Left   kvpb.RangeDescriptor `json:"left"`   // pre-merge LHS (generation check)
@@ -228,13 +237,69 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		return nil, kvpb.NewErrorf("%s: this node does not lead the right neighbor %s; transfer its lease here first", r.rangeID, rhsDesc.RangeID)
 	}
 
+	confirm := r.store.cfg.WaitForApplication
+	if r.store.cfg.TestingKnobs.SkipMergeConfirmation {
+		confirm = nil
+	}
+	// Before anything is frozen, make sure the merge can go through: every
+	// RHS replica exists and is caught up to the RHS's position here. The
+	// freeze takes the range out of service, and until issue #263 a merge
+	// driven against a replica that did not exist yet (its node had not
+	// applied the split that made the range) froze the RHS, failed to
+	// confirm, left it frozen, and re-froze it on every pass — the range
+	// refused every request until the node caught up, which under the
+	// presplit of a thousand ranges took it more than a minute. On a
+	// re-drive (the RHS is frozen already) the check cannot save the
+	// range, but it saves the pass the full confirmation wait for a
+	// replica a one-second check already shows is behind.
+	if confirm != nil {
+		pctx, cancel := context.WithTimeout(ctx, mergePreflightWait)
+		err := confirmRHSApplied(pctx, confirm, r.store.cfg.NodeID, rhsDesc, rhs.AppliedIndex(), "is not caught up")
+		cancel()
+		if err != nil {
+			metrics.RangeMergesDeferred.Inc()
+			return nil, kvpb.NewErrorf("%s: not merging %s now: %v (retried by housekeeping)", r.rangeID, rhsDesc.RangeID, err)
+		}
+	}
+
 	// Phase 1: freeze the RHS (idempotent for re-drives).
 	sub := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: rhsDesc.RangeID, Timestamp: r.store.cfg.Clock.Now()}}
 	sub.Add(&kvpb.SubsumeRequest{
 		RequestHeader: kvpb.RequestHeader{Key: rhsDesc.StartKey, EndKey: rhsDesc.EndKey},
 		MergeInto:     r.rangeID,
 	})
-	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
+	subResp, kerr := rhs.Execute(ctx, sub)
+	if kerr != nil {
+		return nil, kerr
+	}
+	// The Subsume's own answer says whether THIS call froze the range.
+	// Anything read before it could be stale: a re-drive of an attempt
+	// that crashed or lost the leader finds the RHS frozen already, and
+	// so does the loser of two drivers racing on one pair (housekeeping
+	// and `datax debug merge` both lead here, and nothing serializes
+	// them). Only the attempt that made the freeze may unwind it; an
+	// answer that does not say (it always does) is read as not ours.
+	fresh := false
+	if len(subResp.Responses) == 1 && subResp.Responses[0].Subsume != nil {
+		fresh = !subResp.Responses[0].Subsume.AlreadyFrozen
+	}
+	if k := r.store.cfg.TestingKnobs.AfterMergeSubsume; k != nil {
+		k(r.rangeID, rhsDesc.RangeID)
+	}
+	// abandon gives up on a merge that definitely did not happen. A freeze
+	// this attempt made is unwound at once so the RHS serves again
+	// (housekeeping tries the merge afresh later); one inherited from an
+	// earlier attempt is left alone, since that attempt's merge may still
+	// land and must find the RHS frozen at the subsume. Every exit between
+	// the freeze and the proposal goes through here; after the proposal,
+	// only a definitive failure does — an ambiguous one (the context ran
+	// out or the group stopped with the proposal in flight) may still
+	// apply, so the RHS stays frozen for it and the re-drive finishes or
+	// unwinds the merge.
+	abandon := func(kerr *kvpb.Error) (*kvpb.AdminMergeResponse, *kvpb.Error) {
+		if fresh {
+			r.store.tryUnfreeze(ctx, rhs)
+		}
 		return nil, kerr
 	}
 
@@ -249,8 +314,8 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	desc = r.Desc()
 	rhsDesc = rhs.Desc()
 	if !rhsDesc.StartKey.Equal(desc.EndKey) {
-		return nil, kvpb.NewErrorf("%s: cannot merge: right neighbor %s now starts at %s, not at this range's end %s; retried by housekeeping",
-			r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey, desc.EndKey)
+		return abandon(kvpb.NewErrorf("%s: cannot merge: right neighbor %s now starts at %s, not at this range's end %s; retried by housekeeping",
+			r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey, desc.EndKey))
 	}
 
 	// Capture the RHS's final position: subsume was its last command.
@@ -271,17 +336,11 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// merge apply forever, wedging its raft loop. Confirming application
 	// here keeps the RHS group alive until every member has caught up;
 	// a straggler defers the merge, which housekeeping re-drives.
-	if wait := r.store.cfg.WaitForApplication; wait != nil && !r.store.cfg.TestingKnobs.SkipMergeConfirmation {
+	if confirm != nil {
 		wctx, cancel := context.WithTimeout(ctx, mergeApplicationWait)
 		defer cancel()
-		for _, rep := range rhsDesc.Replicas {
-			if rep.NodeID == r.store.cfg.NodeID {
-				continue
-			}
-			if err := wait(wctx, rep.NodeID, rhsDesc.RangeID, trig.RightAppliedIndex); err != nil {
-				return nil, kvpb.NewErrorf("%s: cannot merge %s yet: its replica on n%d has not applied the subsume: %v (re-driven by housekeeping)",
-					r.rangeID, rhsDesc.RangeID, rep.NodeID, err)
-			}
+		if err := confirmRHSApplied(wctx, confirm, r.store.cfg.NodeID, rhsDesc, trig.RightAppliedIndex, "has not applied the subsume"); err != nil {
+			return abandon(kvpb.NewErrorf("%s: cannot merge %s yet: %v (re-driven by housekeeping)", r.rangeID, rhsDesc.RangeID, err))
 		}
 	}
 	gen := desc.Generation
@@ -304,11 +363,21 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// traffic like a split.
 	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
 	if gerr != nil {
-		return nil, kvpb.NewError(gerr)
+		return abandon(kvpb.NewError(gerr))
 	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{merge: trig}); kerr != nil {
+	var perr *kvpb.Error
+	if k := r.store.cfg.TestingKnobs.BeforeMergeProposal; k != nil {
+		perr = k(r.rangeID, rhsDesc.RangeID)
+	}
+	if perr == nil {
+		_, perr = r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{merge: trig})
+	}
+	if perr != nil {
 		guard.Release()
-		return nil, kerr
+		if perr.Ambiguous != nil {
+			return nil, perr // may still apply: the RHS stays frozen for it
+		}
+		return abandon(perr) // never proposed, or refused at apply
 	}
 	guard.Release()
 
@@ -329,10 +398,27 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	return &kvpb.AdminMergeResponse{Desc: trig.Merged}, nil
 }
 
+// confirmRHSApplied asks every other node holding a replica of the RHS to
+// confirm that its replica has applied index (StoreConfig.WaitForApplication,
+// bounded by ctx). The first failure is returned, naming the node and
+// what it has not done.
+func confirmRHSApplied(ctx context.Context, wait func(context.Context, base.NodeID, base.RangeID, uint64) error, self base.NodeID, rhsDesc kvpb.RangeDescriptor, index uint64, what string) error {
+	for _, rep := range rhsDesc.Replicas {
+		if rep.NodeID == self {
+			continue
+		}
+		if err := wait(ctx, rep.NodeID, rhsDesc.RangeID, index); err != nil {
+			return fmt.Errorf("its replica on n%d %s: %w", rep.NodeID, what, err)
+		}
+	}
+	return nil
+}
+
 // tryUnfreeze abandons a stuck merge by clearing the RHS freeze (needs RHS
 // leadership on this node; otherwise retried on a later pass).
 func (s *Store) tryUnfreeze(ctx context.Context, rhs *Replica) {
 	if !rhs.isLeader() {
+		log.Warnf("%s: frozen for a merge that was abandoned, and this node no longer leads it; left frozen for the leader's housekeeping", rhs.rangeID)
 		return
 	}
 	d := rhs.Desc()

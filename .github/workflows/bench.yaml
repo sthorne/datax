@@ -12,9 +12,9 @@ on:
 # that catches a regression within a day when a PR skipped its own
 # before/after (bench/README.md), not a gate. A failed night files or
 # updates one standing issue with the run's last lines, and a clean
-# night closes it (issue #244): a workload that errors — the #200
-# routing failure hit three nights of seven — is otherwise seen by
-# nobody.
+# night closes it (issue #244): a workload that errors — the routing
+# failures of #200 and then #263 hit three nights of seven — is otherwise
+# seen by nobody.
 permissions:
   contents: read
   issues: write

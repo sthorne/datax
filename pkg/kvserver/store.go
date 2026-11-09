@@ -162,8 +162,22 @@ type TestingKnobs struct {
 	FailApply func(rangeID base.RangeID, index uint64) error
 	// SkipMergeConfirmation disables the merge driver's pre-propose check
 	// that every RHS replica applied the subsume, exposing the apply-time
-	// wait to an RHS replica that never will (issue #70).
+	// wait to an RHS replica that never will (issue #70). It also disables
+	// the pre-freeze check that every RHS replica is present and caught
+	// up (issue #263).
 	SkipMergeConfirmation bool
+	// AfterMergeSubsume runs on the merge driver right after the RHS is
+	// frozen and before the driver confirms the freeze on every RHS
+	// replica — lets a test take a replica away between the two (issue
+	// #263). It also tells a test whether a merge attempt froze at all.
+	AfterMergeSubsume func(lhs, rhs base.RangeID)
+	// BeforeMergeProposal runs on the merge driver in place of proposing
+	// the merge: an error it returns stands in for the proposal's result
+	// and the proposal is not made — lets a test hand the driver an
+	// ambiguous outcome (the RHS must stay frozen) or a definitive one
+	// (the freeze must be unwound) without a real leader change (issue
+	// #263). Nil, or a nil return, proposes as usual.
+	BeforeMergeProposal func(lhs, rhs base.RangeID) *kvpb.Error
 	// SyncApply applies committed entries inside the raft pass that
 	// committed them instead of handing them to the apply workers — a
 	// test's way to make "the proposal was acknowledged" imply "every
@@ -555,10 +569,19 @@ func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.
 			return nil, e
 		}
 	}
+	// Stale routing is repaired from this store's own replica map: the
+	// batch may name a range a split has since narrowed, or arrive while
+	// one applies. A mismatch the covering replica itself answers is not
+	// routing: the range is frozen for a merge (issue #263), or a later
+	// key of the batch falls outside it. That answer goes back as the
+	// replica gave it — decorated with the local descriptors — rather
+	// than being retried against the same replica and then reported as
+	// "no replica covering key", which hid the freeze behind a message
+	// that read as a lost range.
 	for attempt := 0; ; attempt++ {
 		if r == nil || !containsKey(r.Desc(), addr) {
 			r2, ok := s.replicaForKey(addr)
-			if !ok || (r != nil && r2 == r) || attempt >= 2 {
+			if !ok {
 				e := kvpb.NewErrorf("no replica covering key %s on node %s", addr, s.cfg.NodeID)
 				e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: addr, ActualDescriptors: s.localDescriptors()}
 				return nil, e
@@ -569,9 +592,8 @@ func (s *Store) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.
 		br, kerr := r.Execute(ctx, ba)
 		if kerr != nil && kerr.RangeKeyMismatch != nil {
 			kerr.RangeKeyMismatch.ActualDescriptors = s.localDescriptors()
-			if attempt < 2 {
-				r = nil // re-route: our own replica map may have fresher bounds
-				continue
+			if attempt < 2 && !kerr.RangeKeyMismatch.Frozen && !containsKey(r.Desc(), addr) {
+				continue // the range moved under the batch; route again
 			}
 		}
 		return br, kerr

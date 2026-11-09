@@ -82,6 +82,10 @@ var (
 	RangeMerges = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_range_merges_total", Help: "Adjacent underfull ranges merged.",
 	})
+	RangeMergesDeferred = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_merges_deferred_total",
+		Help: "Merges not attempted because a replica of the right-hand range was missing or behind when the driver checked, before freezing anything (issue #263); each is retried on a later housekeeping pass. A count that keeps growing means a replica is chronically behind and its ranges are not being merged. A merge abandoned after its freeze (the confirmation failed anyway) is not counted here; it is logged by the unwind.",
+	})
 	DescriptorChangeRefusals = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_descriptor_change_refused_total",
 		Help: "Splits, merges and replica changes refused at apply because the range changed under them between being built and being applied (issue #200); each is retried by its caller. A range under sustained churn can starve here, which this counter is the only sign of.",

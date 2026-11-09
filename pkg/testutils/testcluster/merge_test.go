@@ -313,8 +313,14 @@ func TestMergeFrozenAndRecovery(t *testing.T) {
 	// Frozen: direct writes to the RHS are refused.
 	put := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: sr.Right.RangeID, Timestamp: n.Clock().Now()}}
 	put.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: append(prefix.Clone(), "z2"...)}, Value: []byte("x")})
-	if _, kerr := rhs.Execute(ctx, put); kerr == nil || kerr.RangeKeyMismatch == nil {
-		t.Fatalf("frozen range accepted a write: %v", kerr)
+	if _, kerr := rhs.Execute(ctx, put); kerr == nil || kerr.RangeKeyMismatch == nil || !kerr.RangeKeyMismatch.Frozen {
+		t.Fatalf("frozen range accepted a write or did not say it is frozen: %v", kerr)
+	}
+	// Through the store the refusal is the replica's own, still marked
+	// frozen — not the "no replica covering key" the store's re-routing
+	// used to report after retrying the same replica (issue #263).
+	if _, kerr := n.Store().ExecuteBatch(ctx, put); kerr == nil || kerr.RangeKeyMismatch == nil || !kerr.RangeKeyMismatch.Frozen || !strings.Contains(kerr.Error(), "frozen for a merge") {
+		t.Fatalf("store answered %v for a frozen range, want its frozen refusal", kerr)
 	}
 
 	// The freeze survives a restart.

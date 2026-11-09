@@ -485,7 +485,7 @@ mixed ranges),
 bytes still under retired data keys — 0 attests re-encryption is
 complete),
 `datax_auto_splits_total` / `datax_load_splits_total` /
-`datax_range_merges_total`, `datax_gc_runs_total`,
+`datax_range_merges_total`, `datax_range_merges_deferred_total`, `datax_gc_runs_total`,
 `datax_raft_scheduler_latency_seconds` (how long replicas wait for a raft
 worker — a growing tail means the store's raft workers are saturated),
 `datax_raft_log_syncs_total` / `datax_raft_readies_per_sync` (one synced
