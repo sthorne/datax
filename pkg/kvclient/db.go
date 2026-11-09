@@ -111,6 +111,9 @@ type DB struct {
 	// them. Nil (tests, tools) reads as the binary's own version: a
 	// process without version plumbing never talks to older binaries.
 	versionGate atomic.Pointer[func() version.Version]
+	// frozenWait bounds the wait on a range frozen for a merge
+	// (defaultFrozenRangeWait; tests shorten it).
+	frozenWait time.Duration
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
@@ -151,7 +154,7 @@ type localSender struct {
 }
 
 func NewDB(local LocalStore, transport *rpc.Transport, clock *hlc.Clock) *DB {
-	db := &DB{transport: transport, clock: clock, cache: newRangeCache()}
+	db := &DB{transport: transport, clock: clock, cache: newRangeCache(), frozenWait: defaultFrozenRangeWait}
 	if local != nil {
 		db.local = &localSender{store: local}
 	}
@@ -935,22 +938,21 @@ func (db *DB) sendRefresh(ctx context.Context, header kvpb.BatchHeader, req *kvp
 	return nil
 }
 
-// frozenRangeWait bounds how long sendPartial waits on a range that is
-// frozen for a merge before failing the batch. A merge holds the freeze
-// for the time it takes to confirm it on every replica
-// (mergeApplicationWait at most) and land; an abandoned one is unwound at
-// once. The bound is generous so a slow but working merge is waited out,
-// and small enough that a freeze nothing will lift still surfaces as an
-// error — a terminal one, not a regroup: re-resolving would find the same
-// descriptor, and the routing loop would spend its whole budget on it,
-// thirty waits of this length for one batch. A variable so tests can
-// shorten it.
-var frozenRangeWait = 15 * time.Second
+// defaultFrozenRangeWait bounds how long sendPartial waits on a range
+// that is frozen for a merge before failing the batch (DB.frozenWait). A
+// merge holds the freeze for the time it takes to confirm it on every
+// replica (mergeApplicationWait at most) and land; an abandoned one is
+// unwound at once. The bound is generous so a slow but working merge is
+// waited out, and small enough that a freeze nothing will lift still
+// surfaces as an error — a terminal one, not a regroup: re-resolving
+// would find the same descriptor, and the routing loop would spend its
+// whole budget on it, thirty waits of this length for one batch.
+const defaultFrozenRangeWait = 15 * time.Second
 
 // frozenBackoff paces the retries against a frozen range: 10 ms doubling
 // to 200 ms. Returns the ctx error once it expires.
 func frozenBackoff(ctx context.Context, n int) *kvpb.Error {
-	delay := 10 * time.Millisecond << uint(min(n, 4))
+	delay := 10 * time.Millisecond << uint(min(n, 5))
 	if delay > 200*time.Millisecond {
 		delay = 200 * time.Millisecond
 	}
@@ -996,7 +998,7 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 			if frozenSince.IsZero() {
 				frozenSince = time.Now()
 			}
-			if time.Since(frozenSince) < frozenRangeWait {
+			if time.Since(frozenSince) < db.frozenWait {
 				if berr := frozenBackoff(ctx, frozenWaits); berr != nil {
 					return nil, false, berr
 				}
@@ -1004,7 +1006,7 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 				continue
 			}
 			// Terminal: the descriptor is still right, nothing to repair.
-			return nil, false, kvpb.NewErrorf("%v (frozen for %s)", kerr, frozenRangeWait)
+			return nil, false, kvpb.NewErrorf("%v (frozen for %s)", kerr, db.frozenWait)
 		}
 		if kerr.RangeKeyMismatch != nil || kerr.RangeNotFound != nil {
 			db.cache.Evict(desc.RangeID)

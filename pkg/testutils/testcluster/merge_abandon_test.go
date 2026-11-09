@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -122,6 +123,77 @@ func TestMergeAbandonedAfterTheFreezeUnfreezesTheRHS(t *testing.T) {
 		t.Fatal("the knob never ran: the merge did not freeze the RHS")
 	}
 	rhsServes(t, ctx, tc, f, lead, "after the abandoned merge")
+
+	tc.RestartNode(v, engines[v])
+	merged := mergeRanges(t, ctx, tc, f.lhs.RangeID)
+	if !merged.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("merge produced %v, want end %s", merged, f.rhs.EndKey)
+	}
+	f.everyKeyReadable(t, ctx, "after the merge")
+}
+
+// TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive: the counterpart of
+// the test above. An RHS frozen by an attempt that died right after its
+// Subsume (frozen by hand, as TestMergeFrozenAndRecovery does) is
+// re-driven, and the re-drive loses an RHS replica's node between its
+// Subsume and the confirmation. The re-drive fails like any other
+// attempt, but it did not make the freeze, so it must leave it: the dead
+// attempt's merge may still be in the LHS's log and must find the RHS
+// frozen at the subsume. Once the node is back, the re-drive completes
+// the merge.
+func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
+	var (
+		cluster atomic.Pointer[TestCluster]
+		victim  atomic.Int64 // index+1, 0 = not chosen yet
+		stopped atomic.Bool
+	)
+	tc, engines := StartWithEngines(t, 3, func(c *server.Config) {
+		c.TestingKnobs.AfterMergeSubsume = func(_, _ base.RangeID) {
+			if v := victim.Load(); v != 0 && stopped.CompareAndSwap(false, true) {
+				cluster.Load().StopNode(int(v - 1))
+			}
+		}
+	})
+	cluster.Store(tc)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 865)
+	lead, v := leadBothSides(t, ctx, tc, f)
+
+	// The freeze a dead attempt left behind.
+	rhs, ok := tc.Nodes[lead].Store().GetReplica(f.rhs.RangeID)
+	if !ok {
+		t.Fatalf("n%d holds no replica of %s", tc.Nodes[lead].NodeID(), f.rhs.RangeID)
+	}
+	sub := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+	sub.Add(&kvpb.SubsumeRequest{
+		RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey},
+		MergeInto:     f.lhs.RangeID,
+	})
+	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
+		t.Fatalf("freezing the RHS by hand: %v", kerr)
+	}
+	frozen := func() bool {
+		put := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+		put.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: append(f.prefix.Clone(), "z98"...)}, Value: []byte("x")})
+		_, kerr := rhs.Execute(ctx, put)
+		return kerr != nil && kerr.RangeKeyMismatch != nil && kerr.RangeKeyMismatch.Frozen
+	}
+	if !frozen() {
+		t.Fatal("the hand-made freeze did not take")
+	}
+
+	victim.Store(int64(v + 1))
+	_, err := tc.Nodes[lead].DB().AdminMerge(ctx, f.lhs.StartKey)
+	if err == nil || !strings.Contains(err.Error(), "has not applied the subsume") {
+		t.Fatalf("re-drive losing a replica after its subsume: got %v, want the confirmation failure", err)
+	}
+	if !stopped.Load() {
+		t.Fatal("the knob never ran: the re-drive did not reach its subsume")
+	}
+	if !frozen() {
+		t.Fatal("the abandoned re-drive unwound a freeze it did not make")
+	}
 
 	tc.RestartNode(v, engines[v])
 	merged := mergeRanges(t, ctx, tc, f.lhs.RangeID)

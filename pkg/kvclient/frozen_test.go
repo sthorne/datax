@@ -70,15 +70,13 @@ func TestGatewayWaitsOutAFrozenRange(t *testing.T) {
 }
 
 // A freeze that never lifts is still an error, and a terminal one: after
-// frozenRangeWait the batch fails saying how long the range was frozen,
+// the frozen wait the batch fails saying how long the range was frozen,
 // and the routing loop does not re-resolve and wait again — one batch
 // waits the bound once, not thirty times.
 func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	db, store, key := newFrozenStoreDB()
 	store.frozenAnswers.Store(1 << 30)
-	saved := frozenRangeWait
-	frozenRangeWait = 300 * time.Millisecond
-	defer func() { frozenRangeWait = saved }()
+	db.frozenWait = 300 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -92,8 +90,8 @@ func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	if !strings.Contains(kerr.Error(), "frozen for a merge") || !strings.Contains(kerr.Error(), "frozen for 300ms") {
 		t.Fatalf("error %q does not say the range stayed frozen for the bound", kerr.Error())
 	}
-	if el := time.Since(start); el < frozenRangeWait || el > 10*time.Second {
-		t.Fatalf("waited %s, want about %s", el, frozenRangeWait)
+	if el := time.Since(start); el < db.frozenWait || el > 10*time.Second {
+		t.Fatalf("waited %s, want about %s", el, db.frozenWait)
 	}
 	if store.calls.Load() < 2 {
 		t.Fatalf("store answered %d times, want retries while frozen", store.calls.Load())
@@ -109,8 +107,8 @@ func TestFrozenRangeWaitIsBounded(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "frozen for 300ms") {
 		t.Fatalf("Put on a range nothing unfreezes: %v, want the frozen error", err)
 	}
-	if el := time.Since(start); el > 3*frozenRangeWait {
-		t.Fatalf("Put took %s against a %s bound: the routing loop waited again", el, frozenRangeWait)
+	if el := time.Since(start); el > 3*db.frozenWait {
+		t.Fatalf("Put took %s against a %s bound: the routing loop waited again", el, db.frozenWait)
 	}
 	if n := store.calls.Load() - calls; n > 40 {
 		t.Fatalf("Put sent %d batches to a frozen range, want one bounded wait's worth", n)
