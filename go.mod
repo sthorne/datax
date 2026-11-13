@@ -2,7 +2,7 @@ module github.com/sthorne/datax
 
 go 1.26.0
 
-toolchain go1.26.10
+toolchain go1.26.11
 
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.7

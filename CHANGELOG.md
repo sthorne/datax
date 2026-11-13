@@ -170,6 +170,16 @@ state or the internode protocol does, and an entry below says so.
   suppression comes first.
 
 ### Security
+- **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
+  crash from a `MaxBytesReader` header race in `net/http`) is reachable
+  through the console's HTTP server and is fixed in go1.26.11, so the
+  `toolchain` line in go.mod moves there; that is the whole change. The
+  advisory was published after the last green weekly scan, and the
+  scan had been red on every push since. Four advisories in required
+  modules stay named in the verbose log and are not reached by any
+  symbol the build calls: GO-2026-5841 and GO-2026-6865 in
+  `klauspost/compress`, GO-2026-6866 and GO-2026-6860 in `x/net`'s
+  `html` package.
 - **The console's key viewer asks for schema USAGE** (#259). SQL
   authorizes a table read as the table's own privilege AND usage of its
   schema, and `REVOKE USAGE ON SCHEMA public FROM PUBLIC` turns the
@@ -649,6 +659,24 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A read caught by a leadership change is answered NotLeader instead
+  of timing out** (#269). A consistent read confirms leadership with a
+  quorum round before it evaluates. A leader that stepped down with
+  such a round in flight never answered it: raft drops the request,
+  and the reader waited out the round's 3 s timeout. That is also the
+  gateway's deadline for one attempt at one replica, so the gateway
+  returned the replica's `read index abandoned: context deadline
+  exceeded` as the statement's result. The balancer shedding a lease
+  from a busy range is the everyday trigger, and the nightly benchmark
+  hit it reading the time-series table straight after ingesting it. A
+  replica that loses leadership now releases its waiting readers with
+  NotLeader at once, a replica that is not the leader no longer asks
+  raft for a round at all, and the gateway treats a read attempt that
+  ran out its own per-attempt deadline as unanswered and tries the
+  next replica under the caller's deadline
+  (`datax_read_attempt_timeouts_total` counts those). Writes are not
+  resent by the gateway on a timeout: an abandoned proposal is
+  ambiguous, and the transaction layer owns that decision.
 - **A preseeded replica whose membership change never landed is
   collected** (#245). A replica addition preseeds the target before
   proposing the change, so a change that never lands — its proposal
