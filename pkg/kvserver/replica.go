@@ -1102,7 +1102,13 @@ func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
 		return 0, kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
 	case idx, ok := <-ch:
 		if !ok {
-			return 0, r.notLeaderError() // leadership lost with the round in flight
+			// Leadership was lost with the round in flight (stageReady
+			// closed the channel). This check is what keeps the read
+			// linearizable, not a convenience: a closed channel reads as
+			// index 0, which waitApplied passes at once, and with lease
+			// reads off nothing after this point re-checks leadership. A
+			// closed channel must never be read as an index.
+			return 0, r.notLeaderError()
 		}
 		return idx, nil
 	}

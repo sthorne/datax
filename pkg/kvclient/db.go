@@ -1120,6 +1120,12 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				// statement as its result. Writes are not retried here:
 				// one may have been proposed, and its fate is the
 				// transaction layer's to settle (kvpb.AmbiguousResultError).
+				//
+				// Like an unreachable replica above, this is bounded only
+				// by the caller's context: a read whose every attempt runs
+				// out its deadline is retried until ctx is done, so a
+				// caller with no deadline waits rather than failing after
+				// one attempt as it used to.
 				metrics.ReadAttemptTimeouts.Inc()
 				lastErr = kvpb.NewErrorf("n%d: read attempt timed out after %s: %v", target, db.attemptTimeout, kerr)
 				continue

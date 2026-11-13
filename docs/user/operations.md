@@ -478,7 +478,8 @@ replication path), `datax_follower_reads_total` vs
 leaders), `datax_read_attempt_timeouts_total` (reads that waited out a
 whole per-attempt deadline on one replica and were sent again — occasional
 under heavy load, a steady rate means some leader keeps reads waiting for
-seconds), `datax_parallel_commits_total`,
+seconds; such a read keeps trying until its own deadline, so one with no
+`statement_timeout` waits rather than fails), `datax_parallel_commits_total`,
 `datax_sql_rows_scanned_total` (a jump usually means a query lost its
 index), `datax_stats_refreshes_total` / `datax_stats_rows_scanned_total`
 (the table-statistics sampler's pace and cost),

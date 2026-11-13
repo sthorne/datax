@@ -365,7 +365,10 @@ a replica runs out its per-attempt deadline on a **read** while the
 caller's own deadline has not passed, the read is sent again
 (`datax_read_attempt_timeouts_total` counts them) rather than failing the
 statement. A write is not resent that way: it may have been proposed, and
-its fate is the transaction layer's to settle.
+its fate is the transaction layer's to settle. The resend is bounded by
+the caller's deadline and by nothing else, the same as for an unreachable
+replica: a read with no deadline (no `statement_timeout`) whose every
+attempt times out keeps trying instead of failing after the first.
 
 ## Follower reads (closed timestamps)
 
