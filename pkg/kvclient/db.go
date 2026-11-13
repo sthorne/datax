@@ -1049,6 +1049,7 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 	}
 	var lastErr *kvpb.Error
 	overloads := 0
+	readTimeouts := 0 // read attempts that ran out their own deadline and were sent again
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -1127,8 +1128,21 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				// caller with no deadline waits rather than failing after
 				// one attempt as it used to.
 				metrics.ReadAttemptTimeouts.Inc()
-				lastErr = kvpb.NewErrorf("n%d: read attempt timed out after %s: %v", target, db.attemptTimeout, kerr)
+				readTimeouts++
+				lastErr = kvpb.NewErrorf("n%d: read attempt timed out after %s (%d so far): %v", target, db.attemptTimeout, readTimeouts, kerr)
 				continue
+			}
+			if kerr != nil && readTimeouts > 0 && ctx.Err() != nil {
+				// The caller's own deadline ran out inside a later attempt,
+				// so that attempt is not counted as a timeout of its own
+				// (expired is false) and the replica's answer goes back.
+				// Without this the statement's error would read the same
+				// whether the gateway had sent the read again twice or not
+				// at all; say how many attempts came before it. The typed
+				// fields are kept as they are.
+				e := *kerr
+				e.Message = fmt.Sprintf("%s (after %d earlier read attempts timed out at %s each)", kerr.Message, readTimeouts, db.attemptTimeout)
+				return br, &e
 			}
 			// Definitive KV-level answer (including txn conflicts and
 			// routing corrections): return to caller.

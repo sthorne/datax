@@ -7,9 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -20,6 +23,11 @@ import (
 type stallingStore struct {
 	stalls atomic.Int32
 	calls  atomic.Int32
+	// ranOut counts the stalled calls that waited at least ranOutAfter:
+	// attempts that ran out their own deadline rather than being cut short
+	// by the caller's.
+	ranOut      atomic.Int32
+	ranOutAfter time.Duration
 }
 
 func (s *stallingStore) NodeID() base.NodeID { return 1 }
@@ -27,7 +35,11 @@ func (s *stallingStore) NodeID() base.NodeID { return 1 }
 func (s *stallingStore) ExecuteBatch(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	s.calls.Add(1)
 	if s.stalls.Add(-1) >= 0 {
+		start := time.Now()
 		<-ctx.Done()
+		if s.ranOutAfter > 0 && time.Since(start) >= s.ranOutAfter {
+			s.ranOut.Add(1)
+		}
 		return nil, kvpb.NewErrorf("r5: read index abandoned: %v", ctx.Err())
 	}
 	br := &kvpb.BatchResponse{}
@@ -51,6 +63,7 @@ func newStallingStoreDB() (*DB, *stallingStore, keys.Key) {
 	store := &stallingStore{}
 	db := NewDB(store, nil, hlc.NewClock(nil, 0))
 	db.attemptTimeout = 150 * time.Millisecond
+	store.ranOutAfter = db.attemptTimeout
 	db.SeedDescriptor(desc)
 	return db, store, append(prefix.Clone(), "k"...)
 }
@@ -84,10 +97,15 @@ func TestReadAttemptTimeoutIsRetried(t *testing.T) {
 
 // The retry runs under the caller's deadline, not past it: a replica that
 // never answers costs the caller its own budget and then the error says
-// what the attempts ran into.
+// what the attempts ran into, and how many of them there were. The attempt
+// the caller's deadline cuts short is the caller running out of time, not
+// an attempt timing out: it is not counted in
+// datax_read_attempt_timeouts_total, the counter operators watch for a
+// steady rate.
 func TestReadAttemptTimeoutRespectsTheCallersDeadline(t *testing.T) {
 	db, store, key := newStallingStoreDB()
 	store.stalls.Store(1 << 30)
+	counted := testutil.ToFloat64(metrics.ReadAttemptTimeouts)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -103,6 +121,14 @@ func TestReadAttemptTimeoutRespectsTheCallersDeadline(t *testing.T) {
 	}
 	if store.calls.Load() < 2 {
 		t.Fatalf("store was asked %d times, want more than one attempt inside the budget", store.calls.Load())
+	}
+	if !strings.Contains(err.Error(), "read attempt") {
+		t.Fatalf("error %q does not say that earlier attempts timed out", err.Error())
+	}
+	counted = testutil.ToFloat64(metrics.ReadAttemptTimeouts) - counted
+	if ranOut := float64(store.ranOut.Load()); counted < 1 || counted > ranOut {
+		t.Fatalf("counted %v read attempt timeouts; %v attempts ran out their own %s (of %d asked), and the one the caller's deadline cut short is not one",
+			counted, ranOut, db.attemptTimeout, store.calls.Load())
 	}
 }
 
