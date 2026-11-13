@@ -349,6 +349,24 @@ result. The failure mode of any false negative is only a NotLeader retry.
 `--disable-lease-reads`-style configuration (`DisableLeaseReads`) restores
 the v1 quorum path.
 
+A confirmation that does go through raft (a leader that has not yet
+applied an entry of its own term, or the quorum path) can be overtaken by
+a leadership change — the balancer moving the lease away is the common
+one. Raft answers nothing for a round a leader had pending when it stepped
+down, and drops one issued by a replica that has just stepped down and
+knows no leader yet. So a replica asks only while it is the leader, and
+when it loses leadership the waiters of a round in flight are answered
+NotLeader at once, as its in-flight proposals are answered. Until issue
+#269 they sat out the round's timeout, which is as long as the gateway's
+per-attempt deadline, and the read came back as "read index abandoned:
+context deadline exceeded" — an error the gateway handed to the statement.
+The gateway now also treats that shape for what it is: when one attempt at
+a replica runs out its per-attempt deadline on a **read** while the
+caller's own deadline has not passed, the read is sent again
+(`datax_read_attempt_timeouts_total` counts them) rather than failing the
+statement. A write is not resent that way: it may have been proposed, and
+its fate is the transaction layer's to settle.
+
 ## Follower reads (closed timestamps)
 
 Followers hold full copies of every range; closed timestamps let them

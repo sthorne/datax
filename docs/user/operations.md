@@ -475,7 +475,10 @@ Also useful: `datax_kv_batch_latency_seconds` (histogram — p99 of the
 replication path), `datax_follower_reads_total` vs
 `datax_follower_read_fallbacks_total` (are your `AS OF` /
 `with_max_staleness` reads actually staying local, or falling back to
-leaders), `datax_parallel_commits_total`,
+leaders), `datax_read_attempt_timeouts_total` (reads that waited out a
+whole per-attempt deadline on one replica and were sent again — occasional
+under heavy load, a steady rate means some leader keeps reads waiting for
+seconds), `datax_parallel_commits_total`,
 `datax_sql_rows_scanned_total` (a jump usually means a query lost its
 index), `datax_stats_refreshes_total` / `datax_stats_rows_scanned_total`
 (the table-statistics sampler's pace and cost),
