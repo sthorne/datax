@@ -584,3 +584,74 @@ func waitDescriptorEverywhere(t *testing.T, f *raceFixture, want kvpb.RangeDescr
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestReplicaChangeProposedBeforeAFreezeIsRefused (issue #268): a removal
+// is held just before it is proposed, the range is frozen for a merge
+// underneath it, and the removal then applies on a frozen range. It must
+// be refused there — on every replica, at the same entry — because a
+// node that dropped its replica of a frozen range would have nothing to
+// subsume when the merge applied on it. The membership is unchanged, the
+// caller is told to retry, and the merge the freeze was for goes through.
+func TestReplicaChangeProposedBeforeAFreezeIsRefused(t *testing.T) {
+	hold := newDescriptorHold()
+	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 868)
+
+	lead := tc.LeaderIndex(f.rhs.RangeID)
+	var victim base.NodeID
+	for _, n := range tc.Nodes {
+		if n.NodeID() != tc.Nodes[lead].NodeID() {
+			victim = n.NodeID()
+			break
+		}
+	}
+	hold.arm(f.rhs.RangeID, "replica-change")
+	changeErr := make(chan error, 1)
+	go func() {
+		_, err := tc.Nodes[lead].DB().AdminChangeReplicas(ctx, f.rhs.StartKey, 0, victim)
+		changeErr <- err
+	}()
+	hold.waitArrived(t, "the replica change")
+
+	rhs, ok := tc.Nodes[lead].Store().GetReplica(f.rhs.RangeID)
+	if !ok {
+		t.Fatalf("n%d holds no replica of %s", tc.Nodes[lead].NodeID(), f.rhs.RangeID)
+	}
+	sub := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+	sub.Add(&kvpb.SubsumeRequest{RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey}, MergeInto: f.lhs.RangeID})
+	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
+		t.Fatalf("freezing the RHS: %v", kerr)
+	}
+	refusedBefore := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("replica-change"))
+	close(hold.release)
+	select {
+	case err := <-changeErr:
+		if err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("a removal applied on a frozen range: got %v, want a refusal", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the replica change never returned")
+	}
+	if got := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("replica-change")); got == refusedBefore {
+		t.Fatal("the refusal was not counted")
+	}
+	// Every node still holds the range, at the generation and with the
+	// membership the merge driver froze.
+	descs := f.localDescriptors(f.rhs.RangeID)
+	if len(descs) != len(tc.Nodes) {
+		t.Fatalf("%d of %d nodes hold the frozen range after the refused removal", len(descs), len(tc.Nodes))
+	}
+	for i, d := range descs {
+		if d.Generation != f.rhs.Generation || len(d.Replicas) != len(f.rhs.Replicas) {
+			t.Fatalf("node %d holds %v after the refused removal, want %v", i, d, f.rhs)
+		}
+	}
+	// The merge the freeze was for lands on every node, which is what a
+	// removal applied on the frozen range would have made fatal.
+	if _, err := tc.Nodes[tc.LeaderIndex(f.lhs.RangeID)].DB().AdminMerge(ctx, f.lhs.StartKey); err != nil {
+		t.Fatalf("the merge after the refused removal: %v", err)
+	}
+	f.everyKeyReadable(t, ctx, "after the merge")
+}

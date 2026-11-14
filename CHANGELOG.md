@@ -883,6 +883,14 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A replica change that lands on a range frozen for a merge is
+  refused** (#268). The change is checked before it is proposed, but a
+  merge's freeze could apply in between, and a freeze moves no
+  generation, so the change applied anyway. A removal applied that way
+  let a node drop its replica of the frozen range while keeping the
+  range it was merging into, and the merge's apply there then stopped
+  the node ("local RHS replica missing"). The change is now refused at
+  apply, on every replica at the same entry, and the proposer retries.
 - **`ALTER TABLE ... SPLIT AT` no longer fails because the range
   changed first** (#290). A split is built from the range's descriptor
   and applied a moment later; when another split or a merge landed in

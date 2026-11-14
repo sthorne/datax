@@ -102,6 +102,29 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 				r.noteAppliedTerm(ent.Term)
 				return nil
 			}
+			// A range frozen for a merge takes no membership change either
+			// (issue #268). The proposer checks before proposing, but a
+			// Subsume can apply between that check and this entry, and a
+			// Subsume moves no generation, so the test above passes. Applied
+			// here, a removal would let a node drop its replica of this
+			// range while keeping its replica of the range it is merging
+			// into — and the merge's apply there finds no right-hand replica
+			// to subsume, which it treats as impossible. Frozen is part of
+			// the replicated state, written in log order, so every replica
+			// refuses at the same entry.
+			if r.isFrozen() {
+				log.Warnf("%s: replica change refused: range is frozen for a merge (the freeze applied after the change was proposed)", r.rangeID)
+				if err := r.persistAppliedIndex(ent.Index); err != nil {
+					return err
+				}
+				r.mu.Lock()
+				r.mu.confChangeRefusals++
+				r.mu.Unlock()
+				metrics.DescriptorChangeRefusals.WithLabelValues("replica-change").Inc()
+				r.setApplied(ent.Index)
+				r.noteAppliedTerm(ent.Term)
+				return nil
+			}
 			newDesc = &ccCtx.Desc
 		}
 		var state *raftpb.ConfState
