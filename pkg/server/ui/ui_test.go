@@ -2722,3 +2722,43 @@ func TestScrollBoxesClipWhatIsPositionedInsideThem(t *testing.T) {
 			"its cells: a wide table makes the whole page scroll sideways on a phone")
 	}
 }
+
+// An event's summary is escaped before anything else is done to it. A
+// split's summary carries the decoded row value of the key it cut at,
+// and that value is whatever the writer of the row chose — a user with
+// INSERT and nothing else included — while the timeline is innerHTML in
+// front of every reader, admins too. eventText adds links to that text;
+// the links are safe because they are added to text that is already
+// escaped and are built from digits alone. Linking first, or dropping
+// the escape in a refactor, is stored XSS from the least-privileged
+// writer (the InfoSec review of #285), and every test of the scripts
+// passed with the escape removed.
+func TestEventTextIsEscapedBeforeItIsLinked(t *testing.T) {
+	ops := string(mustRead(t, "js/92-ops.js"))
+	body := regexp.MustCompile(`(?s)function eventText\(summary\) \{\n(.*?)\n\}`).FindStringSubmatch(ops)
+	if body == nil {
+		t.Fatal("eventText(summary) was not found in 92-ops.js")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(body[1]), "return esc(summary).replace(") {
+		t.Errorf("eventText does not begin by escaping its summary and linking the result:\n%s", body[1])
+	}
+	if n := strings.Count(body[1], "summary"); n != 1 {
+		t.Errorf("eventText uses the raw summary %d times, want once, inside esc()", n)
+	}
+	// What the links interpolate are the captured letter and digits.
+	for _, m := range regexp.MustCompile(`\$\{([^}]*)\}`).FindAllStringSubmatch(body[1], -1) {
+		switch m[1] {
+		case "id", "rangeRoute(id)", `routeTo("node/" + id)`:
+		default:
+			t.Errorf("eventText interpolates %q into its markup; only the matched digits may be", m[1])
+		}
+	}
+	// And no row prints a summary as it arrived. (The charts build an
+	// annotation's label from one, as text; it is escaped where it is
+	// written, which TestAnnotationsAreReachableAndTheirOwnColour reads.)
+	for _, f := range []string{"js/92-ops.js", "js/90-node.js", "js/30-overview.js", "js/80-health.js"} {
+		for _, m := range regexp.MustCompile(`\$\{\w+\.summary\}`).FindAllString(string(mustRead(t, f)), -1) {
+			t.Errorf("%s writes %s into markup unescaped", f, m)
+		}
+	}
+}

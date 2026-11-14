@@ -15,7 +15,7 @@ function render(d) {
   // picker can offer, and a partial-data note if the document carries one.
   const loc = d.local && d.local.locality;
   setHTML(document.getElementById("hdr-node"),
-    `served by <a href="${routeTo("node/" + d.node_id)}" title="this node's page">n${d.node_id}</a>` + (loc ? " · " + esc(loc) : "") + (d.local.address ? ` <span class="muted addr">${esc(d.local.address)}</span>` : ""));
+    `served by <a href="${routeTo("node/" + d.node_id)}" title="this node's page">n${d.node_id}</a>` + (loc ? `<span class="loc"> · ${esc(loc)}</span>` : "") + (d.local.address ? ` <span class="muted addr">${esc(d.local.address)}</span>` : ""));
   renderPrincipal(d.principal);
   renderScopePicker();
   const errBox = document.getElementById("cluster-err");

@@ -64,6 +64,19 @@ function routeTo(path, params) {
   return "#/" + path + (q ? "?" + q : "");
 }
 function go(path, params) { location.hash = routeTo(path, params); }
+// rangeRoute is the link that opens one range's detail in the data view.
+// The range rides as r=, a name of its own: "range" is the time window,
+// and while the two shared it a link built by routeTo lost its range
+// under any window but the default — r5 at 6h became ?range=6h — and
+// one written by hand kept the range and reset the window (the InfoSec
+// review of #285). rangeOfRoute reads it back, and still reads a number
+// in range=, which is what links shared before this carry.
+function rangeRoute(id) { return routeTo("data", { r: String(id) }); }
+function rangeOfRoute(params) {
+  const r = params.get("r"), old = params.get("range");
+  const id = /^\d+$/.test(r || "") ? r : /^\d+$/.test(old || "") ? old : "";
+  return id ? Number(id) : 0;
+}
 // pushRoute rewrites the current URL in place (a control changed, not a
 // navigation), so Back still steps between views rather than settings.
 function pushRoute(params) {
@@ -129,7 +142,7 @@ function jumpCandidates(q) {
   const node = q.match(/^n?(\d+)$/i);
   if (node) out.push({ label: "node n" + node[1], hint: "node detail", path: "node/" + node[1] });
   const range = q.match(/^r(\d+)$/i);
-  if (range) out.push({ label: "range r" + range[1], hint: "replica placement", path: "data", params: { range: range[1] } });
+  if (range) out.push({ label: "range r" + range[1], hint: "replica placement", path: "data", params: { r: range[1] } });
   if (/^\w+=/.test(q)) out.push({ label: "locality " + q, hint: "nodes in it", path: "nodes", params: { locality: q } });
   const lower = q.toLowerCase();
   for (const n of (lastCluster && lastCluster.nodes) || []) {
@@ -254,7 +267,7 @@ function route() {
   renderScopePicker();
   renderRangePicker();
   if (r.view === "metrics") applyMetricsParams(r.params);
-  if (r.view === "data" && r.params.get("range")) openRangeDetail(Number(r.params.get("range")));
+  if (r.view === "data" && rangeOfRoute(r.params)) openRangeDetail(rangeOfRoute(r.params));
   if (r.view === "schema" && r.params.get("q") !== null) setSchemaFilter(r.params.get("q"));
   // The table detail links into #/data filtered to the table's ranges;
   // the two views already share the filter vocabulary (issue #194).

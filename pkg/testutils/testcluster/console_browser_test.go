@@ -287,6 +287,63 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
   for (let i = 0; i < 5; i++) evs.push({ seq: 70 - i, kind: "snapshot", at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(), summary: "s" });
   return foldEvents(evs).map(it => it.fold ? it.fold[0].kind + "x" + it.fold.length : it.ev.kind).join(",");
 })()`, "lease-shedx6,split,merge,merge,merge,merge,merge,snapshot,snapshot,snapshot,snapshot,snapshot")
+		// The kinds where each record is its own finding are never one
+		// row, however fast they come: an incident is a burst of them.
+		check(desk, "findings are not folded (#280)", `(() => {
+  const at = s => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+  return ["health", "consistency-failure", "security", "auth-failure", "rebalance"].map(kind => {
+    const evs = [];
+    for (let i = 0; i < 5; i++) evs.push({ seq: 50 - i, kind, at: at(30 - i), summary: kind + " " + i });
+    return foldEvents(evs).length;
+  }).join(",");
+})()`, "5,5,5,5,1")
+		// A fold's row, shut and open. Shut it says how many, how long
+		// ago and the newest; open it is the header of the rows under it
+		// and says only how many — the first row beneath has the rest,
+		// live. The caret is drawn from the state and is not part of the
+		// button's name.
+		check(desk, "a fold opens in place (#280)", `(() => {
+  const at = s => new Date(Date.now() - s * 1000).toISOString();
+  const evs = [];
+  for (let i = 0; i < 6; i++) evs.push({ seq: 100 - i, kind: "lease-shed", at: at(i), summary: "shedding lease of r" + (i + 1) });
+  const t = document.createElement("table");
+  t.innerHTML = "<tbody>" + foldRows(foldEvents(evs)).map(r => r.html).join("") + "</tbody>";
+  document.querySelector("main").appendChild(t);
+  const row = t.querySelector("tr.fold"), b = row.querySelector("button[data-fold]");
+  const shown = () => [...row.querySelectorAll(".shut")].filter(s => getComputedStyle(s).display !== "none").length;
+  const out = [t.querySelectorAll("tr").length, shown(), b.getAttribute("aria-expanded"), b.textContent];
+  b.click();
+  out.push(shown(), b.getAttribute("aria-expanded"), row.hasAttribute("data-open"));
+  out.push(foldRows(foldEvents(evs)).length);
+  b.click();
+  out.push(shown(), b.getAttribute("aria-expanded"), row.hasAttribute("data-open"));
+  out.push(/\/\s*""$/.test(getComputedStyle(b, "::before").content));
+  t.remove();
+  return out.join("|");
+})()`, "1|2|false|6 in a row|0|true|true|7|2|false|false|true")
+		// A locality never costs the header a line. At 1280 it gives way
+		// (the node's page and card state it); from 1300 it shows, and one
+		// too long for the room that is left ends in an ellipsis instead
+		// of putting the sign-in on a second line. The test cluster has no
+		// localities, so a long one is put where the header puts it — and
+		// the header is measured against itself, before and after, since
+		// how many lines it is to begin with depends on this machine's
+		// fonts.
+		for _, c := range []struct {
+			width int
+			want  string
+		}{{1280, "none 0 ellipsis"}, {1320, "inline 0 ellipsis"}, {1440, "inline 0 ellipsis"}, {1920, "inline 0 ellipsis"}} {
+			p := br.open(t, base, c.width, 900, false)
+			wait(p, "the overview", `document.getElementById('hdr-node').textContent.includes('served by')`)
+			check(p, fmt.Sprintf("the header's locality, the height it adds and how it is cut at %dpx", c.width), `(() => {
+  const h = () => Math.round(document.querySelector("header").getBoundingClientRect().height);
+  const n = document.getElementById("hdr-node"), before = h();
+  const s = document.createElement("span"); s.className = "loc"; s.textContent = " · region=us-east-1,zone=us-east-1b,rack=12";
+  n.querySelector("a").after(s);
+  return [getComputedStyle(s).display, h() - before, getComputedStyle(n).textOverflow].join(" ");
+})()`, c.want)
+			p.close()
+		}
 
 		// #279: the cell that names a row that opens reads as a link.
 		schema := br.open(t, base+"schema", 1440, 900, false)
@@ -322,7 +379,28 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		wait(ops, "the timeline", `!!document.querySelector('#events td.when')`)
 		check(ops, "a split names its table (#280)",
 			`String([...document.querySelectorAll('#events tr')].some(r => /split at \/table\/`+consoleLongTable+`\//.test(r.textContent)))`, "true")
-		check(ops, "an event links the range it names (#280)", `String(!!document.querySelector('#events td a[href*="range="]'))`, "true")
+		check(ops, "an event links the range it names (#280)", `String([...document.querySelectorAll('#events td a')].some(a => /[?&]r=\d+/.test(a.getAttribute('href'))))`, "true")
+
+		// A link to a range keeps both the range and the time window. The
+		// two shared the name "range", and under any window but the
+		// default the link an event built opened the data view with no
+		// range at all.
+		win := br.open(t, base+"ops?range=6h", 1440, 900, false)
+		defer win.close()
+		wait(win, "the timeline under a 6h window", `ui.range === '6h' && !!document.querySelector('#events td.when')`)
+		check(win, "a range's link under a 6h window", `(() => {
+  const d = document.createElement('div'); d.innerHTML = eventText('r1 split');
+  const q = new URLSearchParams(d.querySelector('a').getAttribute('href').split('?')[1]);
+  return q.get('r') + ' ' + q.get('range');
+})()`, "1 6h")
+		for _, link := range []string{"data?r=1&range=6h", "data?range=1"} {
+			p := br.open(t, base+link, 1440, 900, false)
+			wait(p, "the range opened by "+link, `!!document.querySelector('#cluster-ranges tr[data-range="1"][aria-expanded="true"]')`)
+			if strings.Contains(link, "6h") {
+				check(p, "the window beside the range in "+link, `ui.range + ' ' + document.getElementById('range-picker-global').value`, "6h 6h")
+			}
+			p.close()
+		}
 	})
 
 	// The formatters themselves, called in the page: an age is said in

@@ -55,6 +55,22 @@
      1440px it was what pushed the sign-in onto a second line once the
      jump hint read "Ctrl K" (issue #278). It shows where there is room. */
   @media (max-width: 1599px) { #hdr-node .addr { display: none; } }
+  /* And at 1280, a common laptop, the locality is what was left to give:
+     with it the sign-in sat alone on a second line, 20px short. The
+     node's page and card state it. Phones show it again — their header
+     wraps by design and has the line to spare. */
+  @media (min-width: 641px) and (max-width: 1299px) { #hdr-node .loc { display: none; } }
+  /* That rule is for the usual case; this one is the guarantee. How wide
+     a locality is belongs to the operator — "region=us-east-1,zone=us-
+     east-1b,rack=12" wrapped the header up to 1480 — so above a phone
+     the label takes the room that is left and ends in an ellipsis when
+     that is not enough, instead of pushing the sign-in to a second line.
+     "served by n1" is 85px and always fits in the basis. The padding,
+     taken back by the margin, is room for the link's focus ring, which
+     a box that clips would otherwise cut top and bottom. */
+  @media (min-width: 641px) {
+    #hdr-node { flex: 1 1 90px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 0; margin: -4px 0; }
+  }
   header .reload {
     font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
     border: 1px solid var(--series-1); background: var(--panel); color: var(--text);
@@ -190,8 +206,18 @@
     font: inherit; padding: 0; border: 0; background: none; cursor: pointer;
     color: LinkText; text-decoration: underline; text-underline-offset: 2px;
   }
-  button.linkish[data-fold]::before { content: "▸"; display: inline-block; margin-right: 5px; text-decoration: none; }
-  button.linkish[data-fold][aria-expanded="true"]::before { content: "▾"; }
+  /* The caret is decoration: aria-expanded already says whether the run
+     is open, and a caret read out with the name — "black right-pointing
+     small triangle, 18 in a row" — says it again, worse. The second
+     value of content is its alternative text, here none; the first
+     declaration is what a browser without that syntax keeps. */
+  button.linkish[data-fold]::before { content: "▸"; content: "▸" / ""; display: inline-block; margin-right: 5px; text-decoration: none; }
+  button.linkish[data-fold][aria-expanded="true"]::before { content: "▾"; content: "▾" / ""; }
+  /* An open fold's row is the header of its run: the count and nothing
+     else. Its age and its "newest" belong to the first row beneath it,
+     which shows them live, while this row — holding the focus — is not
+     redrawn and would show them stale and twice. */
+  tr.fold[data-open] .shut { display: none; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--border) 30%, transparent); }
   /* The table detail's DDL block and its copy button (issue #194). */
   .ddlbar { display: flex; align-items: center; gap: 10px; margin: 6px 0; }

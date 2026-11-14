@@ -120,7 +120,10 @@ serves, on that address:
   and a burst — four or more events of one kind within a minute of
   each other, as when the balancer sheds a dozen leases after an
   ingest — is one row that says how many and opens in place, so the
-  split or merge behind it stays on screen. **security**:
+  split or merge behind it stays on screen. Findings are never folded:
+  health, consistency-failure, security and auth-failure events each
+  keep a row, since a burst of those is an incident and its order is
+  what you came to read. **security**:
   how the cluster authenticates, who is signed in and by what, the
   certificates this node loaded with their expiry dates, the roles and
   what each one effectively holds through membership, who is connected

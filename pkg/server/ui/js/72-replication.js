@@ -53,7 +53,7 @@ function renderBucketDetail(rep) {
     return {
       key: "b" + id,
       html: `<tr data-key="b${id}">
-        <td><a href="#/data?range=${id}" title="open r${id}'s per-replica detail">r${id}</a></td>
+        <td><a href="${rangeRoute(id)}" title="open r${id}'s per-replica detail">r${id}</a></td>
         <td class="key">${r ? spanText(r) : "—"}</td>
         <td>${r ? (r.replicas || []).map(x => "n" + x).join(" ") : ""}</td>
       </tr>`,
@@ -136,7 +136,7 @@ function renderHotRanges(d) {
     return {
       key: "h" + e.id,
       html: `<tr data-key="h${e.id}">
-        <td><a href="#/data?range=${e.id}" title="open r${e.id}'s per-replica detail">r${e.id}</a></td>
+        <td><a href="${rangeRoute(e.id)}" title="open r${e.id}'s per-replica detail">r${e.id}</a></td>
         <td class="key">${r ? spanText(r) : "—"}</td>
         <td>${e.leader ? "n" + e.leader : "—"}</td>
         <td class="num">${e.qps ? e.qps.toFixed(0) : "—"}</td>

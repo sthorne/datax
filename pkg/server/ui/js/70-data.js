@@ -129,13 +129,18 @@ function toggleRangeDetail(id) {
     openRange = null;
     document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${id}"]`)?.remove();
     if (lastCluster) renderClusterRanges(lastCluster.ranges || []);
-    pushRoute();
+    // The closed range leaves the URL, whichever name it came under.
+    const p = new URLSearchParams(ui.params);
+    p.delete("r");
+    if (/^\d+$/.test(p.get("range") || "")) p.delete("range");
+    ui.params = p;
+    pushRoute(p);
     return;
   }
   if (openRange !== null) document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${openRange}"]`)?.remove();
   openRange = id;
   if (lastCluster) renderClusterRanges(lastCluster.ranges || []);
-  pushRoute({ range: String(id) });
+  pushRoute({ r: String(id) });
   fetchRangeDetail(id);
 }
 // fetchRangeDetail fills the open row from every holding node's view of

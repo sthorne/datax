@@ -61,6 +61,19 @@ var systemTableIDs = map[string]uint64{
 	StatementShapesTableName: StatementShapesTableID,
 }
 
+// SystemTableName is the reserved name whose table is created at id, or
+// "". A reserved table exists as a span before it exists as a
+// descriptor — the preferences table is created on the first write to
+// it — and a key in that span is named from here until then.
+func SystemTableName(id uint64) string {
+	for name, tid := range systemTableIDs {
+		if tid == id {
+			return name
+		}
+	}
+	return ""
+}
+
 // IsSystemTable reports whether name is reserved for the cluster.
 func IsSystemTable(name string) bool {
 	_, ok := systemTableIDs[name]

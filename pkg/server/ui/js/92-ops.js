@@ -152,7 +152,7 @@ function renderOperations() {
 // key is left as the key it is.
 function eventText(summary) {
   return esc(summary).replace(/(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => lead + (kind === "r"
-    ? `<a href="${routeTo("data", { range: id })}" title="open r${id}'s per-replica detail">r${id}</a>`
+    ? `<a href="${rangeRoute(id)}" title="open r${id}'s per-replica detail">r${id}</a>`
     : `<a href="${routeTo("node/" + id)}" title="n${id}'s page">n${id}</a>`));
 }
 function eventRow(e) {
@@ -173,13 +173,20 @@ function eventRow(e) {
 //
 // A fold is keyed by its OLDEST event, so it stays the same row — and
 // stays open — while the burst is still growing at its newest end.
+//
+// Nor do the kinds where each record is a different finding (the UI
+// review of #285): a node going down, ranges going under-replicated and
+// a placement becoming unsatisfiable inside one minute are three health
+// records, and that sequence is what the timeline is for. Folding is for
+// churn — lease moves, rebalances, splits — where the count is the news.
 const FOLD_MIN = 4, FOLD_GAP_MS = 60000;
+const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation"]);
 const openFolds = new Set();
 function foldEvents(evs) {
   const out = [];
   for (let i = 0; i < evs.length;) {
     let j = i + 1;
-    while (j < evs.length && !evs[i].audit && !evs[j].audit && evs[j].kind === evs[i].kind
+    while (j < evs.length && !evs[i].audit && !evs[j].audit && !NEVER_FOLD.has(evs[i].kind) && evs[j].kind === evs[i].kind
       && Math.abs(Date.parse(evs[j - 1].at) - Date.parse(evs[j].at)) <= FOLD_GAP_MS) j++;
     if (j - i >= FOLD_MIN) out.push({ fold: evs.slice(i, j) });
     else for (let k = i; k < j; k++) out.push({ ev: evs[k] });
@@ -194,10 +201,10 @@ function foldRows(items) {
     const run = it.fold, newest = run[0], oldest = run[run.length - 1];
     const key = "fold/" + oldest.kind + "/" + (oldest.seq || oldest.at);
     const open = openFolds.has(key);
-    rows.push({ key, html: `<tr data-key="${esc(key)}" class="fold">
-    <td class="when" title="${esc(oldest.at + " to " + newest.at)}">${fmtWhen(Date.parse(newest.at))}</td>
+    rows.push({ key, html: `<tr data-key="${esc(key)}" class="fold"${open ? " data-open" : ""}>
+    <td class="when" title="${esc(oldest.at + " to " + newest.at)}"><span class="shut">${fmtWhen(Date.parse(newest.at))}</span></td>
     <td><span class="kind">${esc(newest.kind)}</span></td>
-    <td class="key" style="max-width:none;white-space:normal"><button type="button" class="linkish" data-fold="${esc(key)}" aria-expanded="${open}">${run.length} in a row</button> · newest: ${eventText(newest.summary)}</td>
+    <td class="key" style="max-width:none;white-space:normal"><button type="button" class="linkish" data-fold="${esc(key)}" aria-expanded="${open}">${run.length} in a row</button><span class="shut"> · newest: ${eventText(newest.summary)}</span></td>
   </tr>` });
     if (open) for (const e of run) rows.push(eventRow(e));
   }
@@ -206,17 +213,20 @@ function foldRows(items) {
 // One listener for every list that folds: the rows are redrawn on each
 // poll, so a listener on a row would not outlive it.
 //
-// The button's own state is set here, on the element. A redraw leaves
-// the row holding the focus alone until the focus moves on — which is
+// The row's own state is set here, on the elements. A redraw leaves the
+// row holding the focus alone until the focus moves on — which is
 // right, and is why the row's markup is the same open and shut but for
-// aria-expanded: the caret is drawn from that attribute, so the button
-// says what it did on the click that did it.
+// two attributes: the caret is drawn from aria-expanded and the parts
+// an open fold does not show are hidden from data-open, so the row says
+// what the click did on the click that did it.
 document.addEventListener("click", ev => {
   const b = ev.target.closest && ev.target.closest("button[data-fold]");
   if (!b) return;
   const open = !openFolds.delete(b.dataset.fold);
   if (open) openFolds.add(b.dataset.fold);
   b.setAttribute("aria-expanded", String(open));
+  const row = b.closest("tr");
+  if (row) row.toggleAttribute("data-open", open);
   rerenderCurrentView();
 });
 

@@ -607,7 +607,14 @@ state or the internode protocol does, and an entry below says so.
     event is a link. A burst of four or more events of one kind within
     a minute of each other folds into one row that opens in place;
     thirteen lease moves after an ingest used to push the split that
-    explained them off the screen.
+    explained them off the screen. Health, consistency-failure,
+    security and auth-failure events are never folded. A link to a
+    range now carries it as `r=`: `range=` is the time window, and
+    while the two shared a name a range's link lost its range under any
+    window but the default (`#/data?range=<id>` still opens the range).
+    A reserved table that has no rows yet — the console's preferences
+    table before anyone saves one — is named in key spans like the
+    others, where it was `/table/1099511627777`.
   - *On a phone.* The banner, title, navigation, controls and serving
     node took 300 of 844 pixels before any content; they take about
     200. The navigation sits beside the title, the pickers keep their
@@ -630,7 +637,9 @@ state or the internode protocol does, and an entry below says so.
     jump button's hint is `Ctrl K` off a Mac; a health problem's age
     and links wrap together; and the header keeps the serving node's
     address for screens 1600px and wider, where it no longer pushes
-    the sign-in onto a second line.
+    the sign-in onto a second line. Nor does a locality: at 1280px
+    it gives way too, and wider than that one too long for the room
+    left ends in an ellipsis.
 - **The console is tested in a browser** (#276). Its tests read the
   JavaScript as text, which is how two of the faults above shipped: a
   test checked that a moment was rendered by the right function and
