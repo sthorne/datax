@@ -55,19 +55,16 @@
      1440px it was what pushed the sign-in onto a second line once the
      jump hint read "Ctrl K" (issue #278). It shows where there is room. */
   @media (max-width: 1599px) { #hdr-node .addr { display: none; } }
-  /* And at 1280, a common laptop, the locality is what was left to give:
-     with it the sign-in sat alone on a second line, 20px short. The
-     node's page and card state it. Phones show it again — their header
-     wraps by design and has the line to spare. */
-  @media (min-width: 641px) and (max-width: 1299px) { #hdr-node .loc { display: none; } }
-  /* That rule is for the usual case; this one is the guarantee. How wide
-     a locality is belongs to the operator — "region=us-east-1,zone=us-
-     east-1b,rack=12" wrapped the header up to 1480 — so above a phone
-     the label takes the room that is left and ends in an ellipsis when
-     that is not enough, instead of pushing the sign-in to a second line.
-     "served by n1" is 85px and always fits in the basis. The padding,
-     taken back by the margin, is room for the link's focus ring, which
-     a box that clips would otherwise cut top and bottom. */
+  /* A locality never costs the header a line either, and how wide one
+     is belongs to the operator: "region=us-east-1,zone=us-east-1b,
+     rack=12" put the sign-in on a second line up to 1480. So above a
+     phone the label takes the room that is left and ends in an ellipsis
+     when that is not enough; its title has the whole of it. Hiding the
+     locality below some width was tried and only removed what would
+     have fitted (the UI review of #285). "served by n1" is 85px and
+     always fits in the basis. The padding, taken back by the margin, is
+     room for the link's focus ring, which a box that clips would
+     otherwise cut top and bottom. */
   @media (min-width: 641px) {
     #hdr-node { flex: 1 1 90px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 0; margin: -4px 0; }
   }

@@ -637,9 +637,9 @@ state or the internode protocol does, and an entry below says so.
     jump button's hint is `Ctrl K` off a Mac; a health problem's age
     and links wrap together; and the header keeps the serving node's
     address for screens 1600px and wider, where it no longer pushes
-    the sign-in onto a second line. Nor does a locality: at 1280px
-    it gives way too, and wider than that one too long for the room
-    left ends in an ellipsis.
+    the sign-in onto a second line. Nor does a locality: one too
+    long for the room left ends in an ellipsis, with the whole label
+    in its title.
 - **The console is tested in a browser** (#276). Its tests read the
   JavaScript as text, which is how two of the faults above shipped: a
   test checked that a moment was rendered by the right function and

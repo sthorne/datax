@@ -148,10 +148,15 @@ function renderOperations() {
 // escaped first and only then linked, and a link is built from the
 // digits alone, so nothing in a summary can become markup. An id counts
 // only where it stands as a word of its own — after a space or an
-// opening bracket, before a space or punctuation — so the "n1" inside a
-// key is left as the key it is.
+// opening bracket, before a space or punctuation — so the "n1" inside
+// /table/n1/primary/3 is left as the key it is. A quoted string is
+// passed over whole for the same reason: a split at the text key
+// "from n1 to n3" has words of that shape inside a row's value, and
+// they are somebody's data, not this cluster's nodes (the QA review of
+// #285). The printers quote strings Go's way, so inside one a quote is
+// \" — here, after escaping, \&quot;.
 function eventText(summary) {
-  return esc(summary).replace(/(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => lead + (kind === "r"
+  return esc(summary).replace(/&quot;(?:\\[\s\S]|(?!&quot;)[\s\S])*?&quot;|(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => kind === undefined ? m : lead + (kind === "r"
     ? `<a href="${rangeRoute(id)}" title="open r${id}'s per-replica detail">r${id}</a>`
     : `<a href="${routeTo("node/" + id)}" title="n${id}'s page">n${id}</a>`));
 }

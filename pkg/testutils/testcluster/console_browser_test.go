@@ -264,6 +264,8 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		// #278: the strip is named for what it holds; the hint names a key
 		// this keyboard has (the test's browser is not on a Mac).
 		check(desk, "the overview's strip (#278)", `document.getElementById('recent-ops-title').textContent`, "Recent operations")
+		// What the ellipsis may cut, the title keeps.
+		check(desk, "the header label's title", `String(/^served by n\d+( · \S+)*$/.test(document.getElementById('hdr-node').title))`, "true")
 		check(desk, "the jump hint (#278)", `String(['⌘K', 'Ctrl K'].includes(document.getElementById('jump-key').textContent))`, "true")
 		// #278: a length of time says no "ago".
 		check(desk, "a duration (#278)", `fmtElapsed(5100000)`, "1h 25m")
@@ -276,17 +278,25 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		check(desk, "event text is escaped before it is linked (#280)",
 			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('<img src=x onerror=window.pwned=1> r2 "quoted"'); return String(d.querySelectorAll('img').length) + ' ' + String(window.pwned === undefined) + ' ' + d.querySelectorAll('a').length; })()`,
 			"0 true 1")
-		// #280: a burst is one row; a lone event, a slow drip and audit
-		// records are not folded.
+		// A row value is not linked, whatever it says: a quoted string is
+		// passed over whole, escaped quotes inside it included, and what
+		// follows it is linked as before.
+		check(desk, "a quoted key is left alone (#280)",
+			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('r5 split at /table/t/primary/"from n1 to n3 \\"r7\\" x"; r6 takes [/table/t/primary/"to n2", /Max) on n4'); return [...d.querySelectorAll('a')].map(a => a.textContent).join(' ') + '|' + d.textContent.includes('"from n1 to n3 \\"r7\\" x"'); })()`,
+			"r5 r6 n4|true")
+		// #280: a burst is one row; a lone event, a run of three, a slow
+		// drip and audit records are not folded.
 		check(desk, "folding (#280)", `(() => {
   const at = s => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
   const evs = [];
   for (let i = 0; i < 6; i++) evs.push({ seq: 100 - i, kind: "lease-shed", at: at(60 - i), summary: "shedding lease of r" + i });
   evs.push({ seq: 90, kind: "split", at: at(50), summary: "r1 split" });
   for (let i = 0; i < 5; i++) evs.push({ seq: 80 - i, kind: "merge", at: at(40 - i), summary: "m", audit: true });
-  for (let i = 0; i < 5; i++) evs.push({ seq: 70 - i, kind: "snapshot", at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(), summary: "s" });
+  for (let i = 0; i < 3; i++) evs.push({ seq: 75 - i, kind: "rebalance", at: at(30 - i), summary: "b" });
+  for (let i = 0; i < 4; i++) evs.push({ seq: 72 - i, kind: "upreplicate", at: at(20 - i), summary: "u" });
+  for (let i = 0; i < 5; i++) evs.push({ seq: 68 - i, kind: "snapshot", at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(), summary: "s" });
   return foldEvents(evs).map(it => it.fold ? it.fold[0].kind + "x" + it.fold.length : it.ev.kind).join(",");
-})()`, "lease-shedx6,split,merge,merge,merge,merge,merge,snapshot,snapshot,snapshot,snapshot,snapshot")
+})()`, "lease-shedx6,split,merge,merge,merge,merge,merge,rebalance,rebalance,rebalance,upreplicatex4,snapshot,snapshot,snapshot,snapshot,snapshot")
 		// The kinds where each record is its own finding are never one
 		// row, however fast they come: an incident is a burst of them.
 		check(desk, "findings are not folded (#280)", `(() => {
@@ -301,7 +311,10 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		// ago and the newest; open it is the header of the rows under it
 		// and says only how many — the first row beneath has the rest,
 		// live. The caret is drawn from the state and is not part of the
-		// button's name.
+		// button's name. An open fold stays open while its burst grows:
+		// it is known by its oldest event, and the newest is the one that
+		// changes — a reader opens a burst while it is happening, and it
+		// must not shut on the next poll.
 		check(desk, "a fold opens in place (#280)", `(() => {
   const at = s => new Date(Date.now() - s * 1000).toISOString();
   const evs = [];
@@ -315,24 +328,26 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
   b.click();
   out.push(shown(), b.getAttribute("aria-expanded"), row.hasAttribute("data-open"));
   out.push(foldRows(foldEvents(evs)).length);
+  evs.unshift({ seq: 101, kind: "lease-shed", at: new Date().toISOString(), summary: "shedding lease of r9" });
+  const grown = foldRows(foldEvents(evs));
+  out.push(grown.length, grown[0].html.includes('aria-expanded="true"'), grown[0].html.includes("7 in a row"));
   b.click();
   out.push(shown(), b.getAttribute("aria-expanded"), row.hasAttribute("data-open"));
   out.push(/\/\s*""$/.test(getComputedStyle(b, "::before").content));
   t.remove();
   return out.join("|");
-})()`, "1|2|false|6 in a row|0|true|true|7|2|false|false|true")
-		// A locality never costs the header a line. At 1280 it gives way
-		// (the node's page and card state it); from 1300 it shows, and one
-		// too long for the room that is left ends in an ellipsis instead
-		// of putting the sign-in on a second line. The test cluster has no
-		// localities, so a long one is put where the header puts it — and
-		// the header is measured against itself, before and after, since
-		// how many lines it is to begin with depends on this machine's
-		// fonts.
+})()`, "1|2|false|6 in a row|0|true|true|7|8|true|true|2|false|false|true")
+		// A locality never costs the header a line: one too long for the
+		// room that is left ends in an ellipsis instead of putting the
+		// sign-in on a second line, at every width above a phone. The test
+		// cluster has no localities, so a long one is put where the header
+		// puts it — and the header is measured against itself, before and
+		// after, since how many lines it is to begin with depends on this
+		// machine's fonts.
 		for _, c := range []struct {
 			width int
 			want  string
-		}{{1280, "none 0 ellipsis"}, {1320, "inline 0 ellipsis"}, {1440, "inline 0 ellipsis"}, {1920, "inline 0 ellipsis"}} {
+		}{{700, "inline 0 ellipsis"}, {1100, "inline 0 ellipsis"}, {1280, "inline 0 ellipsis"}, {1320, "inline 0 ellipsis"}, {1920, "inline 0 ellipsis"}} {
 			p := br.open(t, base, c.width, 900, false)
 			wait(p, "the overview", `document.getElementById('hdr-node').textContent.includes('served by')`)
 			check(p, fmt.Sprintf("the header's locality, the height it adds and how it is cut at %dpx", c.width), `(() => {

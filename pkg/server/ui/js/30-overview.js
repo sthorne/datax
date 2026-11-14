@@ -14,6 +14,9 @@ function render(d) {
   // Every view: who served the page, who is signed in, what the scope
   // picker can offer, and a partial-data note if the document carries one.
   const loc = d.local && d.local.locality;
+  // The label is cut with an ellipsis where the header is short of room;
+  // the title is all of it, for the pointer that asks.
+  document.getElementById("hdr-node").title = "served by n" + d.node_id + (loc ? " · " + loc : "") + (d.local.address ? " · " + d.local.address : "");
   setHTML(document.getElementById("hdr-node"),
     `served by <a href="${routeTo("node/" + d.node_id)}" title="this node's page">n${d.node_id}</a>` + (loc ? `<span class="loc"> · ${esc(loc)}</span>` : "") + (d.local.address ? ` <span class="muted addr">${esc(d.local.address)}</span>` : ""));
   renderPrincipal(d.principal);

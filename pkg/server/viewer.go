@@ -182,12 +182,26 @@ func (n *Node) viewKey(v keyViewer, k keys.Key) (string, bool) {
 // same console says "bench_ts_s4 · /primary/3". An event that carries
 // its keys is printed here with prettyKey, the printer the range tables
 // use, so the two read the same. A reader who is refused is never
-// handed that form: the check below is the same predicate over the same
-// tables that Redact applies, made first.
+// handed that form, and what guarantees it is the Redact call at the
+// end, which runs over everything printed here and puts the prefix form
+// back for anyone it refuses. The check in the loop is the same
+// predicate over the same tables; it saves printing what Redact would
+// throw away, and nothing rests on it (the QA and InfoSec reviews of
+// #285 both removed it and found nothing leaked).
+//
+// The keys are laid between the pieces of the template, not substituted
+// for its marks one at a time: a printed key that itself held a mark
+// would then take the next key's place. No printer emits one today —
+// strings are quoted, bytes are hex — and this way nothing depends on
+// that.
 func (n *Node) viewEvents(v keyViewer, evs []events.Event) []events.Event {
 	for i := range evs {
 		ev := &evs[i]
-		if ev.Template == "" || strings.Count(ev.Template, events.KeyMark) != len(ev.Keys) {
+		if ev.Template == "" {
+			continue
+		}
+		parts := strings.Split(ev.Template, events.KeyMark)
+		if len(parts) != len(ev.Keys)+1 {
 			continue
 		}
 		readable := true
@@ -200,11 +214,13 @@ func (n *Node) viewEvents(v keyViewer, evs []events.Event) []events.Event {
 		if !readable {
 			continue // Redact serves the prefix form
 		}
-		s := ev.Template
-		for _, k := range ev.Keys {
-			s = strings.Replace(s, events.KeyMark, n.prettyKey(keys.Key(k)), 1)
+		var b strings.Builder
+		for i, k := range ev.Keys {
+			b.WriteString(parts[i])
+			b.WriteString(n.prettyKey(keys.Key(k)))
 		}
-		ev.Summary = s
+		b.WriteString(parts[len(parts)-1])
+		ev.Summary = b.String()
 	}
 	return events.Redact(evs, v.reads)
 }
