@@ -280,19 +280,22 @@ function unitWord(s, unit) { return s.rate ? "per second" : (UNIT_WORDS[unit] ||
 // 1 B, 0 B, 0 B", five labels for the two values the formatter could
 // tell apart.
 function niceTicks(lo, hi, unit) {
+  const bytes = unit === "bytes" || unit === "bytes/s";
   if (!(hi > lo)) {
     // A flat series: one gridline at its value and one a unit above, so
     // the line has somewhere to sit and the axis does not invent detail.
     const one = lo === 0 ? 1 : Math.abs(lo) * 0.1;
-    return [lo, lo + one];
+    return [lo, lo + (bytes ? Math.max(1, one) : one)];
   }
-  const bytes = unit === "bytes" || unit === "bytes/s";
   const base = bytes ? 1024 : 10;
   const raw = (hi - lo) / 4;
   const mag = Math.pow(base, Math.floor(Math.log(raw) / Math.log(base)));
   const mults = bytes ? [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] : [1, 2, 2.5, 5, 10];
   let step = mag * mults[mults.length - 1];
   for (const m of mults) if (mag * m >= raw) { step = mag * m; break; }
+  // There is no fraction of a byte: a nearly empty bytes axis was
+  // gridded at 0.13 B, 0.25 B, 0.38 B.
+  if (bytes) step = Math.max(1, step);
   const first = Math.floor(lo / step) * step;
   const ticks = [];
   for (let v = first; ticks.length < 12; v += step) {

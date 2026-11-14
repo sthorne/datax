@@ -53,6 +53,13 @@ sortBy("ranges", {
   range: r => r.range_id, span: r => (r.table || "") + " " + (r.start_key || ""), replicas: r => (r.replicas || []).length,
   leader: r => r.load.leader, qps: r => r.load.qps, size: r => r.load.bytes,
 });
+// heaviestFirst is the ranges table's own order (issue #283): by the
+// rate a range's leader serves, then by size, then by id — so the first
+// rows, and the rows the cap keeps, are the ones a reader came to find.
+// A range with no advertised figure follows those that have one.
+function heaviestFirst(a, b) {
+  return (b.load.qps || 0) - (a.load.qps || 0) || (b.load.bytes || 0) - (a.load.bytes || 0) || a.range_id - b.range_id;
+}
 function renderClusterRanges(ranges) {
   const admin = canDrillDown();
   // The document's any-of flag: a CSV has one header for every row.
@@ -62,14 +69,9 @@ function renderClusterRanges(ranges) {
     ? "click a range, or focus it and press Enter, for its per-replica detail from every holding node (admin role)"
     : `per-replica detail needs the admin role — ${drillDownRefusal()}`);
   const items = [];
-  // The table's own order is heaviest first (issue #283): by the rate
-  // its leader serves, then by size, then by id — so the first rows, and
-  // the rows the cap keeps, are the ones a reader came to find. A range
-  // with no advertised figure follows those that have one.
   const load = lastCluster ? rangeLoad(lastCluster) : new Map();
   const of = r => load.get(r.range_id) || {};
-  const all = sortRows("ranges", ranges.filter(matchesFilter).map(r => Object.assign({ load: of(r) }, r))
-    .sort((a, b) => (b.load.qps || 0) - (a.load.qps || 0) || (b.load.bytes || 0) - (a.load.bytes || 0) || a.range_id - b.range_id));
+  const all = sortRows("ranges", ranges.filter(matchesFilter).map(r => Object.assign({ load: of(r) }, r)).sort(heaviestFirst));
   const shown = rangesShowAll ? all : all.slice(0, RANGE_TABLE_CAP);
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>

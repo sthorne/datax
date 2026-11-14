@@ -526,6 +526,52 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			check(data, "the "+table+" table's headers sort (#282)",
 				`String(document.querySelectorAll('table[data-sorts="`+table+`"] th[data-sort] button.sort').length >= 4)`, "true")
 		}
+		// #283: what a range's row is given. A node lists a range because
+		// it leads it, so a quiet one (no qps in the document) still has
+		// its leader; a higher rate from another node takes the range; a
+		// hot range's size counts as a big range's does.
+		check(data, "rangeLoad (#283)", `(() => {
+  const m = rangeLoad({ nodes: [
+    { node_id: 1, hot_ranges: [{ range_id: 5 }, { range_id: 7, qps: 3, bytes: 900 }, { range_id: 8, qps: 2 }], big_ranges: [{ range_id: 9, bytes: 5000 }, { range_id: 7, bytes: 400 }] },
+    { node_id: 2, hot_ranges: [{ range_id: 8, qps: 6 }, { range_id: 5 }] },
+  ] });
+  return [5, 7, 8, 9, 4].map(id => { const e = m.get(id); return id + ":" + (e ? [e.leader, e.qps, e.bytes].map(v => v === undefined ? "-" : v).join("/") : "none"); }).join(" ");
+})()`, "5:1/-/- 7:1/3/900 8:2/6/- 9:-/-/5000 4:none")
+		// The table's own order: rate, then size, then id, with ranges
+		// that have no figure after those that do.
+		check(data, "heaviestFirst (#283)", `[{ range_id: 1, load: {} }, { range_id: 2, load: { bytes: 10 } }, { range_id: 3, load: { qps: 4 } }, { range_id: 4, load: { leader: 1 } }, { range_id: 5, load: { qps: 4, bytes: 9 } }, { range_id: 6, load: { bytes: 70 } }, { range_id: 7, load: { qps: 9 } }].sort(heaviestFirst).map(r => r.range_id).join(",")`,
+			"7,5,3,6,2,1,4")
+		// And the table drawn from a document, with no column sorted:
+		// the rows are in that order, the three cells say what the
+		// document said, and the CSV carries them. The document is this
+		// cluster's own with three of its ranges given figures, put in
+		// place for one render and put back.
+		check(data, "the ranges table's own order, its load cells and its CSV (#283)", `(() => {
+  const real = lastCluster, ids = (real.ranges || []).map(r => r.range_id).sort((a, b) => a - b);
+  if (ids.length < 3) return "the cluster has " + ids.length + " ranges";
+  const [a, b, c] = ids, lead = real.nodes[0].node_id;
+  const doc = Object.assign({}, real, { nodes: real.nodes.map((n, i) => Object.assign({}, n, {
+    hot_ranges: i === 0 ? [{ range_id: c, qps: 50.4 }, { range_id: b }] : [],
+    big_ranges: i === 0 ? [{ range_id: a, bytes: 4096 }] : [],
+  })) });
+  try {
+    lastCluster = doc;
+    renderClusterRanges(doc.ranges);
+    const rows = [...document.querySelectorAll('#cluster-ranges tr[data-range]')];
+    const order = rows.map(r => Number(r.dataset.range));
+    const cells = id => [...rows.find(r => Number(r.dataset.range) === id).children].slice(3).map(td => td.textContent.trim()).join("/");
+    const rest = order.slice(2);
+    const csv = csvExports.ranges, col = h => csv.headers.indexOf(h), line = id => csv.rows.find(r => r[0] === "r" + id);
+    const csvOf = id => [line(id)[col("leader")], line(id)[col("qps")], line(id)[col("size bytes")]].join("/");
+    return [order[0] === c && order[1] === a, rest.every((v, i) => i === 0 || rest[i - 1] < v) && rest.includes(b),
+      cells(c) === "n" + lead + "/50/—", cells(b) === "n" + lead + "/—/—", cells(a) === "—/—/4.0 KiB",
+      csv.rows.map(r => r[0]).join(",") === order.map(id => "r" + id).join(","),
+      csvOf(c) === "n" + lead + "/50/", csvOf(b) === "n" + lead + "//", csvOf(a) === "//4096"].join(",");
+  } finally {
+    lastCluster = real;
+    renderClusterRanges(real.ranges || []);
+  }
+})()`, "true,true,true,true,true,true,true,true,true")
 		// The rule itself: no figure sorts last in either direction, and
 		// equal rows keep the order they came in.
 		check(data, "sortRows (#282)", `(() => {
@@ -539,8 +585,10 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 
 		// #277: round gridlines, a flat series that does not invent
 		// detail, words for a title and a unit.
-		check(data, "niceTicks (#277)", `[niceTicks(0, 1566, "/s"), niceTicks(0, 0, "bytes"), niceTicks(0, 87, "percent"), niceTicks(0, 400 * 1048576, "bytes").map(v => v / 1048576), niceTicks(0, 0.0004, "")].map(a => a.join(",")).join(" | ")`,
-			"0,500,1000,1500,2000 | 0,1 | 0,25,50,75,100 | 0,128,256,384,512 | 0,0.0001,0.0002,0.00030000000000000003,0.0004")
+		check(data, "niceTicks (#277)", `[niceTicks(0, 1566, "/s"), niceTicks(0, 0, "bytes"), niceTicks(0, 87, "percent"), niceTicks(0, 400 * 1048576, "bytes").map(v => v / 1048576), niceTicks(0, 0.0004, ""), niceTicks(0, 0.5, "bytes"), niceTicks(3.2, 3.2, "bytes/s")].map(a => a.join(",")).join(" | ")`,
+			"0,500,1000,1500,2000 | 0,1 | 0,25,50,75,100 | 0,128,256,384,512 | 0,0.0001,0.0002,0.00030000000000000003,0.0004 | 0,1 | 3.2,4.2")
+		// The glossary answers for its own entries and nothing else's.
+		check(data, "a term that is also a property of every object", `[helpFor("constructor", "data"), helpFor("__proto__", ""), helpFor("toString", "nodes"), helpFor("qps", "data").length > 20].join("|")`, "|||true")
 		// A gridline's label has the precision of its step and no more,
 		// the same on every tick of an axis; a duration is in the unit its
 		// largest tick is said in; zero is zero.

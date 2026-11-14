@@ -274,8 +274,11 @@ function helpFor(term, view) {
   const key = normTerm(term);
   if (!key) return "";
   const bare = key.replace(/\s*\([^)]*\)\s*$/, "").trim();
-  return (view && HELP[view + "/" + key]) || HELP[key] ||
-    (bare !== key && ((view && HELP[view + "/" + bare]) || HELP[bare])) ||
+  // Own entries only: HELP is an object, and a term that happened to be
+  // "constructor" would otherwise be explained by Object's.
+  const entry = k => Object.hasOwn(HELP, k) ? HELP[k] : "";
+  return (view && entry(view + "/" + key)) || entry(key) ||
+    (bare !== key && ((view && entry(view + "/" + bare)) || entry(bare))) ||
     patternHelp(key) || "";
 }
 // Terms the page generates rather than writes: one per node, one per

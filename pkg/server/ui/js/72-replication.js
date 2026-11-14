@@ -132,7 +132,16 @@ function rangeLoad(d) {
   for (const n of d.nodes || []) {
     for (const h of n.hot_ranges || []) {
       const e = load.get(h.range_id) || {};
-      if ((h.qps || 0) > (e.qps || 0)) { e.qps = h.qps; e.leader = n.node_id; }
+      // A node lists a range here because it leads it, whatever its
+      // rate: a quiet range arrives with no qps at all (the field is
+      // left out at zero), and "is this rate higher" then never named
+      // its leader — on an idle node, every range it listed (the QA
+      // review of #288). The first node to list a range is its leader
+      // until one with a higher rate says otherwise. The entry carries
+      // the range's size too, and a hot range need not be among the
+      // node's largest.
+      if (e.leader === undefined || (h.qps || 0) > (e.qps || 0)) { e.qps = h.qps; e.leader = n.node_id; }
+      if (h.bytes) e.bytes = Math.max(e.bytes || 0, h.bytes);
       load.set(h.range_id, e);
     }
     for (const h of n.big_ranges || []) {

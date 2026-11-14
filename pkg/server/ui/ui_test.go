@@ -2809,3 +2809,41 @@ func TestNoTopLevelNameIsDeclaredTwice(t *testing.T) {
 		t.Fatalf("read %d scripts and %d top-level names; the console has more than that, so the pattern has stopped matching", files, len(seen))
 	}
 }
+
+// Two things about the ranges table and the charts that a rendered page
+// shows only when a particular thing is on it (the QA review of #288).
+//
+// A range's detail row spans the table. The table gained three columns
+// when the hotspots table was folded into it (#283), and a detail row
+// that still spanned three would sit under the first half of it — but
+// only while a detail is open, which the browser test's tables check
+// does not do.
+//
+// A gridline is labelled by fmtTick, not fmtUnit. fmtTick is tested on
+// its own; putting fmtUnit back on the axis passed every test, since on
+// the test cluster's charts the two often agree.
+func TestRangeDetailSpansTheTableAndAxesUseTheTickFormatter(t *testing.T) {
+	page := string(mustRead(t, "index.html"))
+	head := regexp.MustCompile(`(?s)<table data-sorts="ranges">\s*<thead><tr>(.*?)</tr></thead>`).FindStringSubmatch(page)
+	if head == nil {
+		t.Fatal("the ranges table's header was not found in index.html")
+	}
+	cols := strings.Count(head[1], "<th")
+	data := string(mustRead(t, "js/70-data.js"))
+	span := regexp.MustCompile(`<td class="detail" colspan="(\d+)">`).FindStringSubmatch(data)
+	if span == nil {
+		t.Fatal("the range detail row was not found in 70-data.js")
+	}
+	if span[1] != strconv.Itoa(cols) {
+		t.Errorf("a range's detail row spans %s columns and the ranges table has %d", span[1], cols)
+	}
+
+	charts := string(mustRead(t, "js/86-charts.js"))
+	axis := regexp.MustCompile(`(?s)<g class="axis">.*?for \(const v of yticks\) \{(.*?)\n  \}`).FindStringSubmatch(charts)
+	if axis == nil {
+		t.Fatal("the loop that labels a chart's gridlines was not found in 86-charts.js")
+	}
+	if !strings.Contains(axis[1], "esc(fmtTick(v, unit, ystep, ytop))") || strings.Contains(axis[1], "fmtUnit(") {
+		t.Errorf("a chart's gridlines are not labelled by fmtTick:\n%s", axis[1])
+	}
+}
