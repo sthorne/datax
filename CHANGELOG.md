@@ -29,6 +29,16 @@ state or the internode protocol does, and an entry below says so.
   root key itself, the new key's shares are submitted to the running
   nodes and each store key is rewrapped under it. Shares and root keys
   are never written to disk, logged, or put in an event.
+- **Console: rows that open are real links, cards sort on a phone, and
+  time axes tick at round moments** (#286, #289). A table's name in the
+  schema list and a range's id in the ranges table are anchors, so
+  ctrl-, cmd- and middle-click open a new tab and the address can be
+  copied; the row is still the single tab stop. On a narrow screen the
+  nodes, failure domains and schema cards have a "sort by" list and a
+  direction button sharing the header's sort state. A chart's time axis
+  is labelled at multiples of a round step on the reader's clock, three
+  to seven ticks. A heading that holds a filter or "copy as CSV" is
+  underlined under its words only.
 - **A store key can be kept under a root instead of in a file** (#305,
   the first piece of #292). `--enc-root file:<path>` or `--enc-root
   exec:<command>` is the alternative to `--enc-key`: the node makes its
