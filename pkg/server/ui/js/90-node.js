@@ -125,6 +125,9 @@ async function pollNodeCharts(id) {
     if (!resp.ok) { const e = await resp.json().catch(() => ({})); box.innerHTML = `<span class="muted">${esc(e.error || "history unavailable")}</span>`; return; }
     const d = await resp.json();
     box.innerHTML = "";
-    for (const s of d.series || []) box.appendChild(chart(s, s.nodes || {}, "", d));
+    const cw = chartWindow(d);
+    const moved = chartWindowNote(cw, d);
+    if (moved) box.appendChild(moved);
+    for (const s of d.series || []) box.appendChild(chart(s, s.nodes || {}, "", cw.win));
   } catch (err) { box.innerHTML = `<span class="muted">history unavailable: ${esc(err.message || err)}</span>`; }
 }

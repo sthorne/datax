@@ -11,6 +11,42 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Tables sort from their headers, and the data view has one table of
+  ranges** (#282, #283). The nodes, failure domains, schema and ranges
+  tables sort by a column from a small arrow beside the header's words
+  (after a name, before a figure, so the words stay over the column):
+  once sorts a figure largest-first and a name A-first, again reverses
+  it, a third time returns the table's own order. A row with no figure
+  in that column stays last either way, a poll redraws the table in the
+  order chosen, and "copy as CSV" follows it. The header's words are
+  still the glossary term, so clicking them still explains the column.
+  On a phone, where these tables are cards, there is no header to sort
+  from. "Range hotspots" and "Ranges" were two tables over the same
+  ranges with different columns, and for a few seconds after a merge
+  the first listed ranges that no longer existed. They are one table:
+  range, span, replicas, leader, QPS and size, the heaviest first, with
+  the filter and the 200-row cap the ranges table had. Leader, QPS and
+  size are what each node advertises for its heaviest and largest
+  ranges, so a quiet, small range shows a dash; the CSV gains the three
+  columns.
+- **Charts say what they show** (#277). A chart is titled with what its
+  series measures, in the catalog's words, with the metric's name
+  beside it — "p99 KV batch latency `kv.batch_p99_us`" where it said
+  only the name, on a line of its own on a phone — and its unit is a
+  word. Gridlines fall on round
+  values (`0, 500, 1000, 1500, 2000` where the axis was its maximum cut
+  in four, `391, 783, 1174, 1566`), in powers of 1024 for bytes, and
+  are labelled at the precision of their step — `0, 1 s, 2 s, 3 s`,
+  `0%, 5%, 10%, 15%`, `0 B, 512 MiB, 1 GiB`; a
+  series flat at zero has two gridlines where it had five labelled
+  `1 B, 1 B, 1 B, 0 B, 0 B`. Line-end labels stay inside the plot when
+  lines end together on the baseline. A window under ten minutes
+  labels its time axis to the second. The note about marked events is
+  said once for the page, not under every chart. And when the data
+  begins more than halfway through the range — a cluster ten minutes
+  old under "1h" — the charts start where the data does, all of them
+  alike, and a line says so. `/api/metrics` results carry each series'
+  `help`.
 - **Index usage that survives a restart** (#208, closing #202 with
   #209). "Is anyone using this index" had no answer: the executor kept
   no count, and a count in memory would have reset with the node. Now
@@ -717,6 +753,15 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **Clicking a term in the console explains it again.** A column
+  header, a section heading, a tile's label and the header's controls
+  each open the glossary's entry for the term when clicked, and carry it
+  as a tooltip. None of them had since the statement-shape charts
+  landed (#208, #209): the charts added a function with the name of one
+  the glossary used, the console's scripts share one scope, and the
+  later function silently replaced the earlier, which then found no
+  term in anything. The two have different names, and a test refuses a
+  name declared twice.
 - **The console's "when" columns tell the time again** (#272). Every
   event, slow statement and retried shape read `29910444m ago` — the
   current Unix time, in minutes — on the overview, the operations

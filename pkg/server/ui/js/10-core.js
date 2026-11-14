@@ -84,6 +84,86 @@ function a11yTables(root) {
     for (const th of table.querySelectorAll("thead th")) if (!th.hasAttribute("scope")) th.setAttribute("scope", "col");
   }
 }
+// ---- Sortable tables (issue #282) ----
+// A table that sorts is named (<table data-sorts="nodes">), its sortable
+// headers say which column they are (<th data-sort="cpu">), and its
+// renderer registers how to read each column from a row (sortBy) and
+// passes its rows through sortRows before it draws them — so the rows,
+// the cap and the CSV all follow the one order, and a poll redraws the
+// table in the order the reader chose.
+//
+// The control is a small button beside the header's words, not the
+// header itself: the words are a glossary term, and clicking them
+// already explains the column. Two things a click must not both do.
+//
+// First click sorts a figure largest-first and a name A-first; the
+// second reverses; the third returns the table's own order, which for
+// several tables means something (worst first, heaviest first). A row
+// with no figure in the sorted column goes last in either direction: a
+// dash is not the smallest value, it is no value.
+const SORTS = {};      // table -> { column -> row => value }
+const sortChoice = {}; // table -> { col, dir: 1 ascending | -1 descending }
+function sortBy(table, cols) { SORTS[table] = cols; }
+function sortMissing(v) { return v === null || v === undefined || v === "" || (typeof v === "number" && Number.isNaN(v)); }
+function sortRows(table, rows) {
+  const c = sortChoice[table], cols = SORTS[table];
+  if (!c || !cols || !cols[c.col]) return rows;
+  const get = cols[c.col];
+  return rows.map((r, i) => ({ r, i, v: get(r) })).sort((x, y) => {
+    const mx = sortMissing(x.v), my = sortMissing(y.v);
+    if (mx || my) return mx === my ? x.i - y.i : mx ? 1 : -1;
+    const d = typeof x.v === "number" && typeof y.v === "number" ? x.v - y.v
+      : String(x.v).localeCompare(String(y.v), undefined, { numeric: true, sensitivity: "base" });
+    return d * c.dir || x.i - y.i;
+  }).map(x => x.r);
+}
+// sortFirst is the direction a column's first press sorts it: a figure
+// largest-first, a name A-first.
+function sortFirst(th) { return th.classList.contains("num") ? -1 : 1; }
+function paintSortHeaders(table) {
+  const c = sortChoice[table.dataset.sorts];
+  for (const th of table.querySelectorAll("thead th[data-sort]")) {
+    const on = c && c.col === th.dataset.sort;
+    th.setAttribute("aria-sort", on ? (c.dir === 1 ? "ascending" : "descending") : "none");
+    const b = th.querySelector("button.sort");
+    // What the next press does depends on where the column is in its
+    // cycle, not on which way it is sorted: a figure starts largest-
+    // first, so "descending" is its first press and reverses next,
+    // where for a name it is the second and clears next.
+    const word = on && (c.dir === 1 ? "ascending" : "descending");
+    if (b) b.title = !on ? "sort by this column"
+      : c.dir === sortFirst(th) ? `sorted ${word} — press to reverse`
+      : `sorted ${word} — press for the table's own order`;
+  }
+}
+function wireSortHeaders() {
+  for (const table of document.querySelectorAll("table[data-sorts]")) {
+    const name = table.dataset.sorts;
+    for (const th of table.querySelectorAll("thead th[data-sort]")) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "sort";
+      const words = th.textContent.trim();
+      b.setAttribute("aria-label", "sort by " + words);
+      // The header is named by its words alone. A header's name is read
+      // out with every cell beneath it, and with the button inside it
+      // each figure was announced as "cpu sort by cpu, 8.1%".
+      th.setAttribute("aria-label", words);
+      // A column of figures is right-aligned, so its button goes before
+      // the words and the words stay over the figures' right edge.
+      if (th.classList.contains("num")) th.prepend(b); else th.appendChild(b);
+      b.addEventListener("click", () => {
+        const first = sortFirst(th);
+        const cur = sortChoice[name];
+        if (!cur || cur.col !== th.dataset.sort) sortChoice[name] = { col: th.dataset.sort, dir: first };
+        else if (cur.dir === first) cur.dir = -first;
+        else delete sortChoice[name];
+        paintSortHeaders(table);
+        rerenderCurrentView();
+      });
+    }
+    paintSortHeaders(table);
+  }
+}
 function pct(v) { return (v === undefined || v === null) ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + "%"; }
 function fmtDuration(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);

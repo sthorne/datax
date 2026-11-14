@@ -84,11 +84,10 @@ const HELP = {
   "span": "The keys this range covers, from its start key up to but not including its end key.",
   "leader": "The replica currently holding the lease: it serves this range's reads and sequences its writes.",
   "size": "Live logical bytes in this range, counting one replica. A range past the target size is a candidate to split, which is how the cluster keeps any one range from becoming the bottleneck.",
-  "qps": "Requests per second this range is serving, counted at its leaseholder.",
+  "qps": "Requests per second this range is serving, counted at its leaseholder. A single range far above the rest is the usual cause of a cluster that will not scale by adding nodes: the work is not spread, and adding a node does not move it.",
   "applied": "The raft log index this replica has applied. A replica far behind the leader is catching up and cannot take over.",
   "log": "Entries in this range's raft log not yet truncated. A log that will not shrink usually means one replica is too far behind to let the others discard what it still needs.",
   "replication": "How many replicas each range is meant to have, how many it has, and which ranges are short. A range below its target survives but has less margin; one at bare majority loses availability if it loses one more replica.",
-  "range hotspots": "The ranges taking the most load. A single range far above the rest is the usual cause of a cluster that will not scale by adding nodes: the work is not spread, and adding a node does not move it.",
   "failure domains": "What the cluster loses if a whole domain — a region, a zone, a rack — goes away at once. Replicas spread across domains are only useful if no single domain holds a majority of any range.",
   "domain": "The failure domain this row is about: everything sharing this region, zone or rack value.",
   "bare majority": "Ranges holding exactly the minimum number of replicas needed to stay available in this domain. They are available now and stop being available if this domain is lost.",
@@ -275,8 +274,11 @@ function helpFor(term, view) {
   const key = normTerm(term);
   if (!key) return "";
   const bare = key.replace(/\s*\([^)]*\)\s*$/, "").trim();
-  return (view && HELP[view + "/" + key]) || HELP[key] ||
-    (bare !== key && ((view && HELP[view + "/" + bare]) || HELP[bare])) ||
+  // Own entries only: HELP is an object, and a term that happened to be
+  // "constructor" would otherwise be explained by Object's.
+  const entry = k => Object.hasOwn(HELP, k) ? HELP[k] : "";
+  return (view && entry(view + "/" + key)) || entry(key) ||
+    (bare !== key && ((view && entry(view + "/" + bare)) || entry(bare))) ||
     patternHelp(key) || "";
 }
 // Terms the page generates rather than writes: one per node, one per

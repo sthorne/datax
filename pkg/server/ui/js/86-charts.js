@@ -16,13 +16,13 @@ function seriesChoices() {
   if (!mv.catalog) return out;
   for (const def of mv.catalog.series || []) {
     if (!def.label) { out.push({ name: def.name, def }); continue; }
-    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def, text: labelText(def.label, v) });
+    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def, text: seriesLabelText(def.label, v) });
   }
   return out;
 }
-// labelText is what a person reads for a label value: a fingerprint's
+// seriesLabelText is what a person reads for a label value: a fingerprint's
 // shape, or nothing when the catalog has no text for it.
-function labelText(label, v) { return ((mv.catalog && mv.catalog.label_text) || {})[label]?.[v] || ""; }
+function seriesLabelText(label, v) { return ((mv.catalog && mv.catalog.label_text) || {})[label]?.[v] || ""; }
 function renderPickers() {
   const sp = document.getElementById("series-picker");
   const choices = seriesChoices();
@@ -91,8 +91,43 @@ function fmtUnit(v, unit) {
     case "percent": return pct(v);
     case "us": return Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + " ms" : v.toFixed(0) + " µs";
     case "us/s": return (v / 1000).toFixed(1) + " ms/s";
-    case "/s": return v.toFixed(v < 10 ? 2 : 0) + "/s";
+    case "/s": return (v === 0 ? "0" : v.toFixed(v < 10 ? 2 : 0)) + "/s";
     default: return Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  }
+}
+// fmtTick writes a gridline's value. fmtUnit is for a reading — a
+// sample under the crosshair, at the precision a sample has — and on
+// round gridlines it wrote "0 µs, 1000.0 ms, 2000.0 ms", "0.0%, 5.0%,
+// 10%" and "32.0 KiB": the precision of a reading on values that have
+// none, two precisions on one axis, and milliseconds past a second (the
+// UI review of #288). A tick carries the decimals its step needs and no
+// more, every tick of an axis alike; a duration is in the unit the
+// axis's largest tick is said in; zero is zero.
+function stepDecimals(step) {
+  step = Math.abs(step);
+  for (let d = 0; d < 6; d++) { const m = step * Math.pow(10, d); if (Math.abs(m - Math.round(m)) < 1e-6 * Math.max(1, m)) return d; }
+  return 6;
+}
+function trimNum(v, d) { return String(Number(v.toFixed(d))); }
+function tickBytes(v) {
+  const a = Math.abs(v);
+  for (const [u, name] of [[Math.pow(1024, 4), "TiB"], [1 << 30, "GiB"], [1 << 20, "MiB"], [1 << 10, "KiB"]]) if (a >= u) return trimNum(v / u, 2) + " " + name;
+  return trimNum(v, 2) + " B";
+}
+function fmtTick(v, unit, step, top) {
+  const dec = div => stepDecimals(step / div);
+  switch (unit) {
+    case "bytes": return tickBytes(v);
+    case "bytes/s": return tickBytes(v) + "/s";
+    case "percent": return v === 0 ? "0%" : v.toFixed(dec(1)) + "%";
+    case "us": {
+      if (v === 0) return "0";
+      const [div, name] = top >= 1e6 ? [1e6, " s"] : top >= 1000 ? [1000, " ms"] : [1, " µs"];
+      return (v / div).toFixed(dec(div)) + name;
+    }
+    case "us/s": return v === 0 ? "0" : (v / 1000).toFixed(dec(1000)) + " ms/s";
+    case "/s": return v === 0 ? "0/s" : v.toFixed(dec(1)) + "/s";
+    default: return v === 0 ? "0" : v.toFixed(dec(1));
   }
 }
 function fmtTime(ms, long) {
@@ -195,15 +230,21 @@ function renderCharts() {
     n.textContent = `one chart per node: ${[...reasons].join("; ")}`;
     box.appendChild(n);
   }
+  const cw = chartWindow(d);
+  const moved = chartWindowNote(cw, d);
+  if (moved) box.appendChild(moved);
   for (const s of series) {
     const ids = Object.keys(s.nodes || {}).sort((a, b) => a - b);
     if (facet && ids.length > 1) {
-      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, d, { annotate: true }));
+      for (const id of ids) box.appendChild(chart(s, { [id]: s.nodes[id] }, ` · n${id}`, cw.win, { annotate: true }));
     } else {
-      box.appendChild(chart(s, s.nodes || {}, "", d, { annotate: true }));
+      box.appendChild(chart(s, s.nodes || {}, "", cw.win, { annotate: true }));
     }
   }
-  if (!box.querySelector(".chart")) box.innerHTML = `<div class="muted">nothing to chart</div>`;
+  const first = box.querySelector(".chart");
+  if (!first) { box.innerHTML = `<div class="muted">nothing to chart</div>`; return; }
+  const marked = annotationNote(Number(first.dataset.marks || 0), cw.win.from_ms);
+  if (marked) box.insertBefore(marked, first);
 }
 // chart builds one panel: inline SVG, recessive grid, 2px lines, a
 // legend of node line-keys, the crosshair tooltip, and a table view.
@@ -217,6 +258,87 @@ function renderCharts() {
 // drawn wider, which is resolution the data does not have, so the
 // selection is widened to it rather than honoured (issue #206).
 const BRUSH_MIN_BUCKETS = 8;
+
+// ---- What a chart says about itself (issue #277) ----
+// A chart was titled with its metric's name and labelled with its unit
+// as the recorder spells it: "kv.batch_p99_us", "us". The title is now
+// what the series measures, in the catalog's words, with the name beside
+// it for whoever wants to query datax_metrics for it; the unit is a
+// word.
+const UNIT_WORDS = { percent: "percent", us: "duration", "us/s": "time per second", bytes: "bytes", "bytes/s": "bytes per second", "/s": "per second" };
+function seriesTitle(s) {
+  const h = (s.help || "").trim();
+  return h ? h[0].toUpperCase() + h.slice(1) : s.name;
+}
+function unitWord(s, unit) { return s.rate ? "per second" : (UNIT_WORDS[unit] || unit || ""); }
+
+// niceTicks picks round gridlines for an axis from lo to hi: a step of
+// 1, 2, 2.5 or 5 times a power of ten (of 1024 for bytes, so a tick is
+// "512 MiB" and not "476.8 MiB"), from the round value at or below lo
+// to the one at or above hi. The axis used to be its maximum cut in
+// four — 391, 783, 1174, 1566 — and a flat zero came out as "1 B, 1 B,
+// 1 B, 0 B, 0 B", five labels for the two values the formatter could
+// tell apart.
+function niceTicks(lo, hi, unit) {
+  const bytes = unit === "bytes" || unit === "bytes/s";
+  if (!(hi > lo)) {
+    // A flat series: one gridline at its value and one a unit above, so
+    // the line has somewhere to sit and the axis does not invent detail.
+    const one = lo === 0 ? 1 : Math.abs(lo) * 0.1;
+    return [lo, lo + (bytes ? Math.max(1, one) : one)];
+  }
+  const base = bytes ? 1024 : 10;
+  const raw = (hi - lo) / 4;
+  const mag = Math.pow(base, Math.floor(Math.log(raw) / Math.log(base)));
+  const mults = bytes ? [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] : [1, 2, 2.5, 5, 10];
+  let step = mag * mults[mults.length - 1];
+  for (const m of mults) if (mag * m >= raw) { step = mag * m; break; }
+  // There is no fraction of a byte: a nearly empty bytes axis was
+  // gridded at 0.13 B, 0.25 B, 0.38 B.
+  if (bytes) step = Math.max(1, step);
+  const first = Math.floor(lo / step) * step;
+  const ticks = [];
+  for (let v = first; ticks.length < 12; v += step) {
+    ticks.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+    if (v >= hi) break;
+  }
+  return ticks;
+}
+
+// chartWindow is the window the charts of one document are drawn over.
+// It is the document's own unless the data begins more than halfway
+// through it — a cluster ten minutes old under a one-hour range — where
+// every line used to be drawn in the last few pixels of an empty frame.
+// Then it starts just before the first sample, for every chart of the
+// document alike, so they still share one time axis; since says when
+// that is, for the note that tells the reader the axis moved.
+function chartWindow(d) {
+  let first = Infinity;
+  for (const s of d.series || []) for (const id in (s.nodes || {})) { const p = s.nodes[id][0]; if (p && p[0] < first) first = p[0]; }
+  if (!Number.isFinite(first) || first - d.from_ms < (d.to_ms - d.from_ms) / 2) return { win: d, since: 0 };
+  return { win: Object.assign({}, d, { from_ms: Math.max(d.from_ms, first - 2 * (d.step_ms || 0)) }), since: first };
+}
+function chartWindowNote(cw, d) {
+  if (!cw.since) return null;
+  const n = document.createElement("div");
+  n.className = "muted note";
+  n.textContent = `recording begins at ${fmtTime(cw.since, true)}, later than this range's start (${fmtTime(d.from_ms, true)}), so the charts start there rather than leaving most of the frame empty`;
+  return n;
+}
+// annotationNote says, once for the page, how many events the charts
+// mark and how far back the ring that supplies them reaches. It sat
+// under every chart, the same sentence four times.
+function annotationNote(count, from) {
+  const short = ann.oldestMs && ann.oldestMs > from;
+  if (!count && !short) return null;
+  const n = document.createElement("div");
+  n.className = "muted note annnote";
+  n.textContent = count
+    ? `${count} event${count === 1 ? "" : "s"} marked on each chart` + (ann.node ? ` from n${ann.node}'s ring` : "")
+      + (short ? ` — the ring reaches back only to ${fmtTime(ann.oldestMs, true)}, so anything earlier in this window is unmarked rather than absent` : "")
+    : `the event ring reaches back only to ${fmtTime(ann.oldestMs, true)}; earlier in this window is unmarked rather than quiet`;
+  return n;
+}
 function chart(s, nodes, suffix, win, opts) {
   const annotate = !!(opts && opts.annotate);
   const el = document.createElement("div");
@@ -230,28 +352,33 @@ function chart(s, nodes, suffix, win, opts) {
   const from = win.from_ms, to = win.to_ms, step = win.step_ms;
   let min = 0, max = 0, any = false;
   for (const id of ids) for (const p of nodes[id]) { any = true; if (p[1] > max) max = p[1]; if (p[1] < min) min = p[1]; }
-  if (max === min) max = min + 1;
-  max = max + (max - min) * 0.05;
+  // The axis runs between round gridlines that enclose the data.
+  const yticks = niceTicks(min, max, unit);
+  min = yticks[0]; max = yticks[yticks.length - 1];
   const x = t => L + (t - from) / (to - from) * PW;
   const y = v => T + (max - v) / (max - min) * PH;
   const label = (id) => id === "0" ? "cluster" : "n" + id;
-  let title = `<div class="title"><b>${esc(s.name)}${esc(suffix)}</b><span>${esc(s.rate ? "per second" : unit || "")}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span>${s.label ? `<span class="key" title="${esc(s.label)}">${esc(shortShape(s.label))}</span>` : ""}</div>`;
+  let title = `<div class="title"><b>${esc(seriesTitle(s))}${esc(suffix)}</b>${seriesTitle(s) !== s.name ? `<code class="metric">${esc(s.name)}</code>` : ""}<span>${esc(unitWord(s, unit))}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span>${s.label ? `<span class="key" title="${esc(s.label)}">${esc(shortShape(s.label))}</span>` : ""}</div>`;
   if (!any) { el.innerHTML = title + `<div class="empty">no samples in this range</div>`; return el; }
-  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(s.name)} over time"><g class="grid">`;
-  const ticks = 4;
-  for (let i = 0; i <= ticks; i++) {
-    const v = min + (max - min) * i / ticks, yy = y(v).toFixed(1);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(seriesTitle(s))} over time"><g class="grid">`;
+  for (const v of yticks) {
+    const yy = y(v).toFixed(1);
     svg += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}"/>`;
   }
   svg += `</g><g class="axis">`;
-  for (let i = 0; i <= ticks; i++) {
-    const v = min + (max - min) * i / ticks;
-    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtUnit(v, unit))}</text>`;
+  const ystep = yticks[1] - yticks[0], ytop = Math.max(Math.abs(min), Math.abs(max));
+  for (const v of yticks) {
+    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtTick(v, unit, ystep, ytop))}</text>`;
   }
   const long = to - from > 36 * 3600 * 1000;
+  // Under ten minutes the five labels would be the same minute three
+  // times over, so they carry seconds (a young cluster's window, or one
+  // brushed down to an incident).
+  const fine = to - from < 10 * 60 * 1000;
+  const clock = t => { const d = new Date(t), p = n => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
   for (let i = 0; i <= 4; i++) {
     const t = from + (to - from) * i / 4;
-    svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fmtTime(t, long))}</text>`;
+    svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fine ? clock(t) : fmtTime(t, long))}</text>`;
   }
   svg += `</g>`;
   // Annotations go in before the data: a mark explains a line, so it
@@ -272,6 +399,15 @@ function chart(s, nodes, suffix, win, opts) {
   if (labelled) {
     const ends = ids.map(id => { const p = nodes[id][nodes[id].length - 1]; return p ? { id, x: x(p[0]), y: y(p[1]) } : null; }).filter(Boolean).sort((a, b) => a.y - b.y);
     for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 11) ends[i].y = ends[i - 1].y + 11;
+    // Nudging apart pushes down, and lines that end together on the
+    // baseline pushed their labels off the plot and onto the time axis
+    // (issue #277). Whatever ran past the bottom is walked back up, each
+    // label keeping its distance from the one below it.
+    const floor = T + PH - 2;
+    for (let i = ends.length - 1; i >= 0; i--) {
+      const most = floor - (ends.length - 1 - i) * 11;
+      if (ends[i].y > most) ends[i].y = most;
+    }
     for (const e of ends) svg += `<text class="endlabel" x="${(e.x + 4).toFixed(1)}" y="${(e.y + 4).toFixed(1)}" fill="${nodeColor(e.id)}">${esc(label(e.id))}</text>`;
   }
   svg += `<rect class="brush" x="0" y="${T}" width="0" height="${PH}" style="display:none"/>`;
@@ -280,7 +416,7 @@ function chart(s, nodes, suffix, win, opts) {
   for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;
   // The hit rect is also the keyboard's crosshair: focus it and the
   // arrow keys walk the buckets, showing what the pointer shows.
-  svg += `<rect class="hit" tabindex="0" role="img" aria-label="${esc(s.name)} values: focus and use the arrow keys to read each sample; [ and ] mark a window's ends and Enter narrows every chart to it, - widens" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
+  svg += `<rect class="hit" tabindex="0" role="img" aria-label="${esc(seriesTitle(s))} values: focus and use the arrow keys to read each sample; [ and ] mark a window's ends and Enter narrows every chart to it, - widens" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
   let legend = ids.length > 1 ? `<div class="legend">` + ids.map(id => `<span><i style="background:${nodeColor(id)}"></i>${label(id)}</span>`).join("") + `</div>` : "";
   let table = `<details><summary>as a table</summary><div class="tablewrap"><table><thead><tr><th>time</th>` + ids.map(id => `<th class="num">${label(id)}</th>`).join("") + `</tr></thead><tbody>`;
   const times = [...new Set(ids.flatMap(id => nodes[id].map(p => p[0])))].sort((a, b) => b - a).slice(0, 30);
@@ -294,17 +430,10 @@ function chart(s, nodes, suffix, win, opts) {
       `</tbody></table>`;
   }
   table += `</div></details>`;
-  let annNote = "";
-  if (annotate && marks.count) {
-    annNote = `<div class="muted annnote">${marks.count} event${marks.count === 1 ? "" : "s"} marked` +
-      (ann.node ? ` from n${ann.node}'s ring` : "") +
-      (ann.oldestMs && ann.oldestMs > from
-        ? ` — the ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}, so anything earlier in this window is unmarked rather than absent`
-        : "") + `</div>`;
-  } else if (annotate && ann.oldestMs && ann.oldestMs > from) {
-    annNote = `<div class="muted annnote">the event ring reaches back only to ${esc(fmtTime(ann.oldestMs, true))}; earlier in this window is unmarked rather than quiet</div>`;
-  }
-  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + annNote + table;
+  // How many events this chart marks: the page says it once (see
+  // annotationNote), not under every chart.
+  el.dataset.marks = String(marks.count);
+  el.innerHTML = title + svg + legend + `<div class="tip"></div>` + table;
   // Crosshair: snap to the nearest bucket; the readout lists every node,
   // and the nearest mark when one is within reach of the pointer.
   const svgEl = el.querySelector("svg"), hit = el.querySelector(".hit"), xh = el.querySelector(".xhair"), tip = el.querySelector(".tip");

@@ -176,6 +176,7 @@ document.getElementById("annotate-toggle").addEventListener("change", renderChar
 document.getElementById("annotate-kinds").addEventListener("change", renderCharts);
 
 a11yTables();
+wireSortHeaders();
 wireControls();
 wirePrefControls();
 // The preferences the cluster holds for this viewer. Fetched rather than

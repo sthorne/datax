@@ -60,6 +60,8 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 	}
 	first := true
 	tc := StartWithOptions(t, 3, func(cfg *server.Config) {
+		// The charts need samples to draw, and soon.
+		cfg.MetricsRecordInterval = 2 * time.Second
 		if first {
 			cfg.HTTPListener = httpLis
 			first = false
@@ -399,8 +401,10 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		ops := br.open(t, base+"ops", 1440, 900, false)
 		defer ops.close()
 		wait(ops, "the timeline", `!!document.querySelector('#events td.when')`)
+		// Whichever split is on screen — a burst folds to its newest —
+		// names its table, and none is left with a number for one.
 		check(ops, "a split names its table (#280)",
-			`String([...document.querySelectorAll('#events tr')].some(r => /split at \/table\/`+consoleLongTable+`\//.test(r.textContent)))`, "true")
+			`(() => { const rows = [...document.querySelectorAll('#events tr')].map(r => r.textContent).filter(t => /split at \/table\//.test(t)); return String(rows.length > 0 && rows.every(t => /split at \/table\/[a-z_]+/.test(t))); })()`, "true")
 		check(ops, "an event links the range it names (#280)", `String([...document.querySelectorAll('#events td a')].some(a => /[?&]r=\d+/.test(a.getAttribute('href'))))`, "true")
 
 		// A link to a range keeps both the range and the time window. The
@@ -432,6 +436,199 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			check(p, "the range after closing it", `String(!!document.querySelector('#cluster-ranges tr[data-range="1"][aria-expanded="true"]'))`, "false")
 			p.close()
 		}
+	})
+
+	// Sorting, the one ranges table, and what a chart says about itself
+	// (#282, #283, #277).
+	t.Run("tables and charts", func(t *testing.T) {
+		wait := func(page *browserPage, what, expr string) {
+			t.Helper()
+			deadline := time.Now().Add(30 * time.Second)
+			guarded := `(() => { try { return String(!!(` + expr + `)); } catch (e) { return "false"; } })()`
+			for page.eval(t, guarded) != "true" {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: never true: %s", what, expr)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		check := func(page *browserPage, what, expr, want string) {
+			t.Helper()
+			if got := page.eval(t, expr); got != want {
+				t.Errorf("%s: %s = %q, want %q", what, expr, got, want)
+			}
+		}
+
+		// #283: one table of ranges, with the load figures as columns.
+		data := br.open(t, base+"data", 1440, 900, false)
+		defer data.close()
+		wait(data, "the ranges table", `document.querySelectorAll('#cluster-ranges tr[data-range]').length > 1`)
+		check(data, "the ranges table's columns (#283)",
+			`[...document.querySelectorAll('table[data-sorts="ranges"] thead th')].map(th => th.getAttribute("aria-label")).join(",")`,
+			"range,span,replicas,leader,qps,size")
+		// A header's words are still the glossary term: they are marked,
+		// they open the explanation, and the button beside them does not.
+		// (For a week they did neither: a second function named labelText
+		// had replaced the help's.)
+		check(data, "every sortable header is a glossary term (#282)",
+			`String([...document.querySelectorAll('table[data-sorts="ranges"] thead th[data-sort]')].every(th => th.classList.contains("helpable") && th.title.length > 20))`, "true")
+		check(data, "a header's words open its explanation, its button does not (#282)", `(() => {
+  const th = document.querySelector('table[data-sorts="ranges"] th[data-sort="qps"]'), pop = () => { const p = document.getElementById("help-pop"); return !!p && !p.hidden; };
+  const out = [pop()];
+  th.click(); out.push(pop());
+  th.click(); out.push(pop());
+  th.querySelector("button.sort").click(); out.push(pop());
+  th.querySelector("button.sort").click(); th.querySelector("button.sort").click();
+  return out.join(",") + " " + (th.getAttribute("aria-sort") || "");
+})()`, "false,true,false,false none")
+		// A header is named by its words; its button says what it does,
+		// and its tooltip says what the next press does.
+		check(data, "a sortable header's names and its button's tooltips (#282)", `(() => {
+  const out = [];
+  for (const col of ["qps", "span"]) {
+    const th = document.querySelector('table[data-sorts="ranges"] th[data-sort="' + col + '"]'), b = th.querySelector("button.sort");
+    out.push(th.getAttribute("aria-label"), b.getAttribute("aria-label"), th.firstChild === b ? "button first" : "words first", b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+  }
+  return out.join(" | ");
+})()`, "qps | sort by qps | button first | sort by this column | descending: sorted descending — press to reverse | ascending: sorted ascending — press for the table's own order | none: sort by this column | "+
+			"span | sort by span | words first | sort by this column | ascending: sorted ascending — press to reverse | descending: sorted descending — press for the table's own order | none: sort by this column")
+		check(data, "the hotspots table is gone (#283)", `String(!document.getElementById('repl-hot') && !document.getElementById('sec-hot-ranges'))`, "true")
+		check(data, "every range row has the six cells (#283)",
+			`String([...document.querySelectorAll('#cluster-ranges tr[data-range]')].every(r => r.children.length === 6))`, "true")
+
+		// #282: a header's button sorts, reverses, and gives the table its
+		// own order back; the header says which, and a poll keeps it.
+		ids := `[...document.querySelectorAll('#cluster-ranges tr[data-range]')].map(r => Number(r.dataset.range)).join(",")`
+		click := `(document.querySelector('table[data-sorts="ranges"] th[data-sort="range"] button.sort').click(), "ok")`
+		// The order is read as a property of the rows on screen, not
+		// against a list taken earlier: the cluster splits and merges
+		// ranges while this runs, so which ranges there are can change
+		// between two looks, and only their order is the table's doing.
+		ordered := func(dir string) string {
+			return `(() => { const s = ` + ids + `.split(",").map(Number); return String(s.length > 1 && s.every((v, i) => i === 0 || (` + dir + ` ? s[i - 1] < v : s[i - 1] > v))); })()`
+		}
+		sortOf := `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`
+		data.eval(t, click)
+		check(data, "sorted ascending (#282)", sortOf, "ascending")
+		check(data, "ascending is ascending (#282)", ordered("true"), "true")
+		data.eval(t, click)
+		check(data, "sorted descending (#282)", sortOf, "descending")
+		check(data, "descending is descending (#282)", ordered("false"), "true")
+		time.Sleep(3500 * time.Millisecond) // a poll redraws the table
+		check(data, "a poll keeps the reader's choice (#282)", sortOf, "descending")
+		check(data, "a poll keeps the reader's order (#282)", ordered("false"), "true")
+		data.eval(t, click)
+		check(data, "the third press clears the sort (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "none")
+		for _, table := range []string{"nodes", "domains", "schema", "ranges"} {
+			check(data, "the "+table+" table's headers sort (#282)",
+				`String(document.querySelectorAll('table[data-sorts="`+table+`"] th[data-sort] button.sort').length >= 4)`, "true")
+		}
+		// #283: what a range's row is given. A node lists a range because
+		// it leads it, so a quiet one (no qps in the document) still has
+		// its leader; a higher rate from another node takes the range; a
+		// hot range's size counts as a big range's does.
+		check(data, "rangeLoad (#283)", `(() => {
+  const m = rangeLoad({ nodes: [
+    { node_id: 1, hot_ranges: [{ range_id: 5 }, { range_id: 7, qps: 3, bytes: 900 }, { range_id: 8, qps: 2 }], big_ranges: [{ range_id: 9, bytes: 5000 }, { range_id: 7, bytes: 400 }] },
+    { node_id: 2, hot_ranges: [{ range_id: 8, qps: 6 }, { range_id: 5 }] },
+  ] });
+  return [5, 7, 8, 9, 4].map(id => { const e = m.get(id); return id + ":" + (e ? [e.leader, e.qps, e.bytes].map(v => v === undefined ? "-" : v).join("/") : "none"); }).join(" ");
+})()`, "5:1/-/- 7:1/3/900 8:2/6/- 9:-/-/5000 4:none")
+		// The table's own order: rate, then size, then id, with ranges
+		// that have no figure after those that do.
+		check(data, "heaviestFirst (#283)", `[{ range_id: 1, load: {} }, { range_id: 2, load: { bytes: 10 } }, { range_id: 3, load: { qps: 4 } }, { range_id: 4, load: { leader: 1 } }, { range_id: 5, load: { qps: 4, bytes: 9 } }, { range_id: 6, load: { bytes: 70 } }, { range_id: 7, load: { qps: 9 } }].sort(heaviestFirst).map(r => r.range_id).join(",")`,
+			"7,5,3,6,2,1,4")
+		// And the table drawn from a document, with no column sorted:
+		// the rows are in that order, the three cells say what the
+		// document said, and the CSV carries them. The document is this
+		// cluster's own with three of its ranges given figures, put in
+		// place for one render and put back.
+		check(data, "the ranges table's own order, its load cells and its CSV (#283)", `(() => {
+  const real = lastCluster, ids = (real.ranges || []).map(r => r.range_id).sort((a, b) => a - b);
+  if (ids.length < 3) return "the cluster has " + ids.length + " ranges";
+  const [a, b, c] = ids, lead = real.nodes[0].node_id;
+  const doc = Object.assign({}, real, { nodes: real.nodes.map((n, i) => Object.assign({}, n, {
+    hot_ranges: i === 0 ? [{ range_id: c, qps: 50.4 }, { range_id: b }] : [],
+    big_ranges: i === 0 ? [{ range_id: a, bytes: 4096 }] : [],
+  })) });
+  try {
+    lastCluster = doc;
+    renderClusterRanges(doc.ranges);
+    const rows = [...document.querySelectorAll('#cluster-ranges tr[data-range]')];
+    const order = rows.map(r => Number(r.dataset.range));
+    const cells = id => [...rows.find(r => Number(r.dataset.range) === id).children].slice(3).map(td => td.textContent.trim()).join("/");
+    const rest = order.slice(2);
+    const csv = csvExports.ranges, col = h => csv.headers.indexOf(h), line = id => csv.rows.find(r => r[0] === "r" + id);
+    const csvOf = id => [line(id)[col("leader")], line(id)[col("qps")], line(id)[col("size bytes")]].join("/");
+    return [order[0] === c && order[1] === a, rest.every((v, i) => i === 0 || rest[i - 1] < v) && rest.includes(b),
+      cells(c) === "n" + lead + "/50/—", cells(b) === "n" + lead + "/—/—", cells(a) === "—/—/4.0 KiB",
+      csv.rows.map(r => r[0]).join(",") === order.map(id => "r" + id).join(","),
+      csvOf(c) === "n" + lead + "/50/", csvOf(b) === "n" + lead + "//", csvOf(a) === "//4096"].join(",");
+  } finally {
+    lastCluster = real;
+    renderClusterRanges(real.ranges || []);
+  }
+})()`, "true,true,true,true,true,true,true,true,true")
+		// The rule itself: no figure sorts last in either direction, and
+		// equal rows keep the order they came in.
+		check(data, "sortRows (#282)", `(() => {
+  sortBy("t", { v: r => r.v, n: r => r.n });
+  const rows = [{ k: "a", v: 3, n: "n10" }, { k: "b", v: null, n: "n2" }, { k: "c", v: 1, n: "n2" }, { k: "d", v: 3, n: "" }, { k: "e", v: undefined, n: "n1" }];
+  const run = (col, dir) => { sortChoice.t = { col, dir }; return sortRows("t", rows).map(r => r.k).join(""); };
+  const out = [run("v", 1), run("v", -1), run("n", 1), run("n", -1)].join(" ");
+  delete sortChoice.t;
+  return out + " " + sortRows("t", rows).map(r => r.k).join("");
+})()`, "cadbe adcbe ebcad abced abcde")
+
+		// #277: round gridlines, a flat series that does not invent
+		// detail, words for a title and a unit.
+		check(data, "niceTicks (#277)", `[niceTicks(0, 1566, "/s"), niceTicks(0, 0, "bytes"), niceTicks(0, 87, "percent"), niceTicks(0, 400 * 1048576, "bytes").map(v => v / 1048576), niceTicks(0, 0.0004, ""), niceTicks(0, 0.5, "bytes"), niceTicks(3.2, 3.2, "bytes/s")].map(a => a.join(",")).join(" | ")`,
+			"0,500,1000,1500,2000 | 0,1 | 0,25,50,75,100 | 0,128,256,384,512 | 0,0.0001,0.0002,0.00030000000000000003,0.0004 | 0,1 | 3.2,4.2")
+		// The glossary answers for its own entries and nothing else's.
+		check(data, "a term that is also a property of every object", `[helpFor("constructor", "data"), helpFor("__proto__", ""), helpFor("toString", "nodes"), helpFor("qps", "data").length > 20].join("|")`, "|||true")
+		// A gridline's label has the precision of its step and no more,
+		// the same on every tick of an axis; a duration is in the unit its
+		// largest tick is said in; zero is zero.
+		check(data, "tick labels (#277)", `(() => {
+  const axis = (lo, hi, unit) => { const t = niceTicks(lo, hi, unit), top = Math.max(Math.abs(t[0]), Math.abs(t[t.length - 1])); return t.map(v => fmtTick(v, unit, t[1] - t[0], top)).join(","); };
+  return [axis(0, 2900000, "us"), axis(0, 1400, "us"), axis(0, 700, "us"), axis(0, 14, "percent"), axis(0, 9, "percent"), axis(0, 1.8, "/s"), axis(0, 0, "/s"),
+    axis(0, 60000, "bytes"), axis(0, 1800 * 1048576, "bytes"), axis(0, 1566, ""), axis(0, 0.9, ""), axis(0, 3000, "us/s")].join(" | ");
+})()`, "0,1 s,2 s,3 s | 0,0.5 ms,1.0 ms,1.5 ms | 0,200 µs,400 µs,600 µs,800 µs | 0%,5%,10%,15% | 0%,2.5%,5.0%,7.5%,10.0% | 0/s,0.5/s,1.0/s,1.5/s,2.0/s | 0/s,1/s | "+
+			"0 B,16 KiB,32 KiB,48 KiB,64 KiB | 0 B,512 MiB,1 GiB,1.5 GiB,2 GiB | 0,500,1000,1500,2000 | 0,0.25,0.50,0.75,1.00 | 0,1 ms/s,2 ms/s,3 ms/s")
+		check(data, "a chart's title and unit (#277)",
+			`[seriesTitle({ name: "kv.batch_p99_us", help: "p99 KV batch latency" }), seriesTitle({ name: "x.y" }), unitWord({}, "us"), unitWord({ rate: true }, "/s"), unitWord({}, "percent")].join(" | ")`,
+			"P99 KV batch latency | x.y | duration | per second | percent")
+		// A window whose data begins late starts where the data does, for
+		// every chart alike; one that is mostly full is left alone.
+		check(data, "chartWindow (#277)", `(() => {
+  const doc = first => ({ from_ms: 0, to_ms: 3600000, step_ms: 10000, series: [{ nodes: { 1: [[first, 1], [3590000, 2]] } }, { nodes: { 2: [[first + 20000, 1]] } }] });
+  const late = chartWindow(doc(3000000)), early = chartWindow(doc(600000));
+  return [late.win.from_ms, late.since, early.win.from_ms, early.since].join(",");
+})()`, "2980000,3000000,0,0")
+
+		metrics := br.open(t, base+"metrics", 1440, 900, false)
+		defer metrics.close()
+		wait(metrics, "the charts", `document.querySelectorAll('#charts .chart svg').length > 0`)
+		check(metrics, "the event note is said once (#277)", `String(document.querySelectorAll('#charts .annnote').length <= 1 && document.querySelectorAll('#charts .chart .annnote').length === 0)`, "true")
+		check(metrics, "a chart is titled in words beside its metric's name (#277)",
+			`String([...document.querySelectorAll('#charts .chart')].every(c => c.querySelector('.title code.metric') && c.querySelector('.title b').textContent !== c.querySelector('.title code.metric').textContent))`, "true")
+		check(metrics, "no axis repeats a label (#277)",
+			`String([...document.querySelectorAll('#charts .chart svg')].every(svg => { const l = [...svg.querySelectorAll('g.axis text[text-anchor="end"]')].map(t => t.textContent); return new Set(l).size === l.length; }))`, "true")
+		check(metrics, "line-end labels stay inside the plot (#277)",
+			`String([...document.querySelectorAll('#charts .endlabel')].every(l => Number(l.getAttribute("y")) <= 182))`, "true")
+		check(metrics, "a chart is named to a screen reader as it is titled (#277)",
+			`String([...document.querySelectorAll('#charts .chart')].every(c => c.querySelector('svg').getAttribute('aria-label') === c.querySelector('.title b').textContent.trim() + ' over time'))`, "true")
+		// On a phone the metric's name has a line of its own; it had the
+		// width the title and unit left, which was none.
+		small := br.open(t, base+"metrics", 390, 844, true)
+		defer small.close()
+		wait(small, "the charts on a phone", `document.querySelectorAll('#charts .chart svg').length > 0`)
+		check(small, "the metric's name is readable on a phone (#277)",
+			`String([...document.querySelectorAll('#charts .chart .title code.metric')].every(c => c.scrollWidth <= c.clientWidth + 1 && c.getBoundingClientRect().width > 60 && c.getBoundingClientRect().top >= c.parentElement.querySelector('b').getBoundingClientRect().bottom - 2))`, "true")
+		check(small, "no chart makes the phone scroll sideways (#277)", `String(document.documentElement.scrollWidth <= innerWidth)`, "true")
 	})
 
 	// The formatters themselves, called in the page: an age is said in

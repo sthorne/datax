@@ -170,7 +170,10 @@ function renderTxnCharts() {
   const note = document.getElementById("txn-note");
   if (!txnData) return;
   box.innerHTML = "";
-  for (const s of txnData.series || []) box.appendChild(chart(s, s.nodes || {}, "", txnData, { annotate: false }));
+  const cw = chartWindow(txnData);
+  const moved = chartWindowNote(cw, txnData);
+  if (moved) box.appendChild(moved);
+  for (const s of txnData.series || []) box.appendChild(chart(s, s.nodes || {}, "", cw.win, { annotate: false }));
   if (!box.children.length) box.innerHTML = `<div class="muted">no samples in this range</div>`;
   // Commits, aborts and retries are per-node counters of independent
   // work, so a cluster total is a sum. Latency percentiles are not:
