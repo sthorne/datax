@@ -680,7 +680,7 @@ state or the internode protocol does, and an entry below says so.
   cells showed a date in January 1970. The call sites pass the instant.
   An age is also said in the unit a person would use: it stopped at
   minutes, so a day-old event read `1440m ago`; it now reads `59m ago`,
-  `1h 25m ago`, `17h ago`, `3d ago`.
+  `1h 25m ago`, `17h ago`, `3d ago`, rounded down in every unit.
 - **A console page opened directly loads its header** (#273). The
   header — which node served the page, who is signed in, the nodes the
   scope picker offers — and the insecure-mode banner are filled from
@@ -706,7 +706,8 @@ state or the internode protocol does, and an entry below says so.
   than rendered in full took the parser's type name, upper-cased whole.
   It is now the words that open the statement — `CREATE TABLE
   bench_kv`, `CREATE INDEX ON bench_ij`, `ROLLBACK TO SAVEPOINT`,
-  `GRANT` or `REVOKE`, `SET`, `COPY`. The fingerprint is a hash of that
+  `GRANT` or `REVOKE`, `SET`, `COPY`, and `ALTER ROLE` where a password
+  change used to be listed as `CREATEROLE`. The fingerprint is a hash of that
   text, so these shapes get new fingerprints: their counts start again,
   the old rows age out of `datax_metrics_shapes` with its retention,
   and during a rolling upgrade a schema statement can be listed under

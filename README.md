@@ -231,7 +231,10 @@ and reads the rendered page back: the header, the insecure-mode banner,
 every "when", and whether anything scrolls sideways. It finds
 `google-chrome` or `chromium` on `PATH`, or takes the binary from
 `DATAX_CHROME`, and skips when there is none. CI sets
-`DATAX_REQUIRE_BROWSER`, which turns that skip into a failure. If you
+`DATAX_REQUIRE_BROWSER`, which turns that skip into a failure. Chrome
+keeps its sandbox unless the test runs as root, where it cannot have
+one; `DATAX_CHROME_NO_SANDBOX=1` is for a container that denies it to
+an ordinary user. If you
 change the console, run it:
 
 ```sh

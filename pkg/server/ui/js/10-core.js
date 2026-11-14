@@ -143,11 +143,12 @@ function fmtBytes(b) {
 }
 // fmtAgo writes an age in the unit a person would say it in. It used to
 // stop at minutes, so a day-old event read "1440m ago" (issue #272).
-// Past a minute the figure is floored, the way an age is spoken: 59.6
-// minutes is still "59m ago", not "60m".
+// The figure is floored in every unit, the way an age is spoken: 59.6
+// minutes is still "59m ago", and 59.6 seconds "59s ago" — rounded, it
+// read "60s ago" for the last half second of every minute.
 function fmtAgo(ms) {
   if (ms < 1500) return "now";
-  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
+  if (ms < 60000) return Math.floor(ms / 1000) + "s ago";
   if (ms < 3600000) return Math.floor(ms / 60000) + "m ago";
   if (ms < 2 * 3600000) { const m = Math.floor(ms % 3600000 / 60000); return "1h" + (m ? " " + m + "m" : "") + " ago"; }
   if (ms < 48 * 3600000) return Math.floor(ms / 3600000) + "h ago";

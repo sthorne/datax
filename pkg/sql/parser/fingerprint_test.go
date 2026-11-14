@@ -1,6 +1,9 @@
 package parser
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -185,6 +188,15 @@ func TestFingerprintKindsReadAsSQL(t *testing.T) {
 		{`SET statement_timeout = '5s'`, "SET"},
 		{`SHOW TABLES`, "SHOW TABLES"},
 		{`ANALYZE t1`, "ANALYZE"},
+		// CREATE and ALTER ROLE share a type; a password change is not a
+		// role being created (from InfoSec's review of #284). The role's
+		// name and the password are not part of the shape.
+		{`CREATE ROLE alice LOGIN PASSWORD 'hunter2'`, "CREATE ROLE"},
+		{`CREATE USER alice PASSWORD 'hunter2'`, "CREATE ROLE"},
+		{`ALTER ROLE alice PASSWORD 'hunter2'`, "ALTER ROLE"},
+		{`ALTER USER alice PASSWORD 'hunter2'`, "ALTER ROLE"},
+		// "ALTER OWNER" is not a statement.
+		{`ALTER TABLE t1 OWNER TO alice`, "ALTER TABLE … OWNER TO"},
 	} {
 		got := shapeOf(t, c.sql).Text
 		if got != c.want {
@@ -199,6 +211,54 @@ func TestFingerprintKindsReadAsSQL(t *testing.T) {
 		first := strings.Fields(sql)[0] + " " + strings.Fields(sql)[1]
 		if !strings.HasPrefix(got, first) {
 			t.Errorf("%s\n    shape %q does not open with %q", sql, got, first)
+		}
+	}
+}
+
+// TestEveryStatementKindIsWords (issue #275, from the UI review of
+// #284): the kind of a statement is its type's name split into words,
+// and that is only right while every type is named in whole SQL words.
+// This walks every Statement type in the package, so one added later
+// under a name the splitter cannot read — an initialism, a stray
+// letter — fails here instead of appearing in the console's list.
+func TestEveryStatementKindIsWords(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmtMethod := regexp.MustCompile(`(?m)^func \((?:\w+ )?\*?(\w+)\) stmt\(\)`)
+	seen := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range stmtMethod.FindAllStringSubmatch(string(src), -1) {
+			seen++
+			kind := kindWords(m[1])
+			for _, w := range strings.Fields(kind) {
+				if len(w) < 2 {
+					t.Errorf("%s reads as %q: the one-letter word %q means the type's name is not made of whole SQL words; name its kind outright in statementKindOf", m[1], kind, w)
+				}
+			}
+			if kind != strings.ToUpper(kind) || strings.Contains(kind, "  ") {
+				t.Errorf("%s reads as %q", m[1], kind)
+			}
+		}
+	}
+	if seen < 40 {
+		t.Fatalf("found %d Statement types, want the forty-odd the parser has: the stmt() marker is no longer where this looks", seen)
+	}
+	for name, want := range map[string]string{
+		"CreateTable": "CREATE TABLE", "RollbackToSavepoint": "ROLLBACK TO SAVEPOINT", "Use": "USE",
+		// A run of capitals is one word.
+		"ShowSQL": "SHOW SQL", "SQLShow": "SQL SHOW", "ShowDDLFor": "SHOW DDL FOR",
+	} {
+		if got := kindWords(name); got != want {
+			t.Errorf("kindWords(%q) = %q, want %q", name, got, want)
 		}
 	}
 }

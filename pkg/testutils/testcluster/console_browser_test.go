@@ -170,6 +170,7 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		}{
 			{fmt.Sprintf("fmtAgo(%d)", 900), "now"},
 			{fmt.Sprintf("fmtAgo(%d)", 42000), "42s ago"},
+			{fmt.Sprintf("fmtAgo(%d)", 59600), "59s ago"},
 			{fmt.Sprintf("fmtAgo(%d)", 90000), "1m ago"},
 			{fmt.Sprintf("fmtAgo(%d)", 59*m+40000), "59m ago"},
 			{fmt.Sprintf("fmtAgo(%d)", h), "1h ago"},
@@ -298,9 +299,12 @@ func startChrome(t *testing.T, bin string) *chrome {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// --no-sandbox: CI runs as root in a container, where Chrome's
-	// sandbox cannot start. The only pages this browser ever loads are
-	// the console of the cluster this test started, on loopback.
+	// Chrome keeps its sandbox unless it cannot have one: as root it
+	// refuses to start with it, and DATAX_CHROME_NO_SANDBOX is for the
+	// other place it cannot, an ordinary user in a container without
+	// user namespaces. Either way the only pages this browser ever loads
+	// are the console of the cluster this test started, on loopback, and
+	// the DevTools pipe below opens no port another process could reach.
 	// Not t.TempDir(): Chrome's helper processes can still be writing
 	// their profile for a moment after the browser exits, and a test
 	// must not fail on tidying up after it.
@@ -308,8 +312,12 @@ func startChrome(t *testing.T, bin string) *chrome {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-		"--no-first-run", "--no-default-browser-check", "--user-data-dir="+profile, "--remote-debugging-pipe")
+	args := []string{"--headless", "--disable-gpu", "--disable-dev-shm-usage",
+		"--no-first-run", "--no-default-browser-check", "--user-data-dir=" + profile, "--remote-debugging-pipe"}
+	if os.Geteuid() == 0 || os.Getenv("DATAX_CHROME_NO_SANDBOX") != "" {
+		args = append(args, "--no-sandbox")
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.ExtraFiles = []*os.File{toChromeR, fromChromeW} // the child's fd 3 and fd 4
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", bin, err)
@@ -407,7 +415,8 @@ func (c *chrome) call(t *testing.T, session, method string, params any) json.Raw
 		}
 		return m.Result
 	case <-time.After(30 * time.Second):
-		t.Fatalf("%s: no reply from the browser in 30s", method)
+		t.Fatalf("%s: no reply from the browser in 30s (if this is the first call, Chrome did not come up: "+
+			"where it cannot start its sandbox, set DATAX_CHROME_NO_SANDBOX=1)", method)
 	}
 	return nil
 }

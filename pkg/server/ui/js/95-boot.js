@@ -108,6 +108,12 @@ task("overview", pollOverview, 3000, ["overview", "nodes", "data", "sql", "ops",
 // "connecting…" with no banner for as long as it stayed open (issue
 // #273). They fetch it once on arrival and then slowly: nothing in a
 // header changes from one second to the next.
+//
+// The staleness pill does not watch this task. It reports the view's
+// PRIMARY_TASK, the fetch the view's own content waits on, so a failing
+// header fetch leaves "served by n1" as it last was and says nothing.
+// That is the right way round — a schema page whose schema is current
+// is not stale — but it is a choice, not an oversight.
 task("header", pollOverview, 30000, ["schema", "metrics", "node"]);
 task("schema", pollSchema, 10000, ["schema", "data", "security"]);
 task("activity", pollActivity, 3000, ["sql"]);

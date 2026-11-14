@@ -628,15 +628,40 @@ func statementKindOf(s Statement) string {
 	case *CreateIndex:
 		// Its subject is the table the index is on, not the index.
 		return "CREATE INDEX ON"
+	case *CreateRole:
+		// One type for CREATE and ALTER ROLE: a password change must not
+		// be listed as a role being created.
+		if t.Alter {
+			return "ALTER ROLE"
+		}
+		return "CREATE ROLE"
+	case *AlterOwner:
+		// ALTER TABLE | VIEW | ... name OWNER TO role. "ALTER OWNER"
+		// is not a statement; the ellipsis stands where the name goes.
+		return "ALTER " + strings.ToUpper(t.Kind) + " … OWNER TO"
 	}
 	name := fmt.Sprintf("%T", s)
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		name = name[i+1:]
 	}
+	return kindWords(name)
+}
+
+// kindWords turns a statement type's name into the SQL words it is made
+// of: "ReleaseSavepoint" is "RELEASE SAVEPOINT". A word starts at a
+// capital that follows a lower-case letter, or that is followed by one
+// while following a capital — so a run of capitals stays one word, and
+// a type named ShowSQL would read "SHOW SQL" rather than "SHOW S Q L".
+func kindWords(name string) string {
+	rs := []rune(name)
 	var b strings.Builder
-	for i, r := range name {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			b.WriteByte(' ')
+	for i, r := range rs {
+		if i > 0 && unicode.IsUpper(r) {
+			prevLower := unicode.IsLower(rs[i-1])
+			nextLower := i+1 < len(rs) && unicode.IsLower(rs[i+1])
+			if prevLower || (unicode.IsUpper(rs[i-1]) && nextLower) {
+				b.WriteByte(' ')
+			}
 		}
 		b.WriteRune(unicode.ToUpper(r))
 	}
