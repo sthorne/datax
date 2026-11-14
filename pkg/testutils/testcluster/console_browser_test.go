@@ -421,6 +421,15 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			if strings.Contains(link, "6h") {
 				check(p, "the window beside the range in "+link, `ui.range + ' ' + document.getElementById('range-picker-global').value`, "6h 6h")
 			}
+			// Closing the range takes it out of the address and leaves
+			// the window: a reload, a bookmark or Back must not reopen
+			// what the reader just closed.
+			want := "#/data"
+			if strings.Contains(link, "6h") {
+				want = "#/data?range=6h"
+			}
+			check(p, "the address after closing the range opened by "+link, `(() => { toggleRangeDetail(1); return location.hash; })()`, want)
+			check(p, "the range after closing it", `String(!!document.querySelector('#cluster-ranges tr[data-range="1"][aria-expanded="true"]'))`, "false")
 			p.close()
 		}
 	})
