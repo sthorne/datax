@@ -226,6 +226,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	size := r.mu.sizeBytes
 	frozen := r.mu.frozen
 	mergedInto := r.mu.mergedInto
+	mergeEpoch := r.mu.mergeEpoch
 	closedTS := r.mu.closedTS
 	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
@@ -236,6 +237,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 		SizeBytes:      size,
 		Frozen:         frozen,
 		MergedInto:     mergedInto,
+		MergeEpoch:     mergeEpoch,
 		ClosedTS:       closedTS,
 	})
 }
@@ -570,14 +572,24 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			// same batch, so every future leader and restart honors it.
 			r.mu.Lock()
 			already := r.mu.frozen
+			if !already {
+				// The epoch is the freeze's, not the latest caller's: a
+				// re-drive that finds the range frozen is told whose
+				// freeze it is under.
+				r.mu.mergeEpoch = req.MergeEpoch
+			}
 			r.mu.frozen = true
 			r.mu.mergedInto = req.MergeInto
+			epoch := r.mu.mergeEpoch
 			r.mu.Unlock()
-			ru.Subsume = &kvpb.SubsumeResponse{AlreadyFrozen: already}
+			ru.Subsume = &kvpb.SubsumeResponse{AlreadyFrozen: already, MergeEpoch: epoch}
 		case *kvpb.UnfreezeRequest:
 			r.mu.Lock()
-			r.mu.frozen = false
-			r.mu.mergedInto = 0
+			if req.MergeEpoch == 0 || req.MergeEpoch == r.mu.mergeEpoch {
+				r.mu.frozen = false
+				r.mu.mergedInto = 0
+				r.mu.mergeEpoch = 0
+			}
 			r.mu.Unlock()
 			ru.Unfreeze = &kvpb.UnfreezeResponse{}
 		default:

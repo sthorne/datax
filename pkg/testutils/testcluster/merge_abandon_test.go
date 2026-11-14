@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -132,16 +134,17 @@ func TestMergeAbandonedAfterTheFreezeUnfreezesTheRHS(t *testing.T) {
 	f.everyKeyReadable(t, ctx, "after the merge")
 }
 
-// TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive: the counterpart of
-// the test above. An RHS frozen by an attempt that died right after its
-// Subsume (frozen by hand, as TestMergeFrozenAndRecovery does) is
-// re-driven, and the re-drive loses an RHS replica's node between its
-// Subsume and the confirmation. The re-drive fails like any other
-// attempt, but it did not make the freeze, so it must leave it: the dead
-// attempt's merge may still be in the LHS's log and must find the RHS
-// frozen at the subsume. Once the node is back, the re-drive completes
-// the merge.
-func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
+// TestInheritedFreezeIsUnwoundBehindAFence (issue #266): the counterpart
+// of the test above. An RHS frozen by an attempt that died right after
+// its Subsume (frozen by hand, under the epoch a real attempt would have
+// used) is re-driven, and the re-drive loses an RHS replica's node
+// between its Subsume and the confirmation. The re-drive did not make
+// the freeze, and the dead attempt's merge may still be in the LHS's
+// log — so the freeze is not simply cleared: the LHS's generation is
+// moved on first, which rules that merge out, and then the RHS serves
+// again instead of staying frozen for as long as the replica is behind.
+// Once the node is back, a fresh merge goes through.
+func TestInheritedFreezeIsUnwoundBehindAFence(t *testing.T) {
 	var (
 		cluster atomic.Pointer[TestCluster]
 		victim  atomic.Int64 // index+1, 0 = not chosen yet
@@ -169,6 +172,7 @@ func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
 	sub.Add(&kvpb.SubsumeRequest{
 		RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey},
 		MergeInto:     f.lhs.RangeID,
+		MergeEpoch:    int64(f.lhs.Generation) + 1,
 	})
 	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
 		t.Fatalf("freezing the RHS by hand: %v", kerr)
@@ -182,6 +186,7 @@ func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
 	if !frozen() {
 		t.Fatal("the hand-made freeze did not take")
 	}
+	unwoundBefore := testutil.ToFloat64(metrics.RangeMergesUnwound)
 
 	victim.Store(int64(v + 1))
 	_, err := tc.Nodes[lead].DB().AdminMerge(ctx, f.lhs.StartKey)
@@ -191,8 +196,16 @@ func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
 	if !stopped.Load() {
 		t.Fatal("the knob never ran: the re-drive did not reach its subsume")
 	}
-	if !frozen() {
-		t.Fatal("the abandoned re-drive unwound a freeze it did not make")
+	if frozen() {
+		t.Fatal("the RHS is still frozen after a re-drive that could not finish: it is out of service for as long as the replica is behind")
+	}
+	if got := testutil.ToFloat64(metrics.RangeMergesUnwound); got != unwoundBefore+1 {
+		t.Fatalf("unwound merges counted %v, want %v", got, unwoundBefore+1)
+	}
+	// The fence: the LHS is one generation on, with the same bounds.
+	lhsNow, ok := tc.Nodes[lead].Store().LocalDescriptor(f.lhs.RangeID)
+	if !ok || lhsNow.Generation != f.lhs.Generation+1 || !lhsNow.EndKey.Equal(f.lhs.EndKey) {
+		t.Fatalf("LHS after the unwind: %v, want generation %d ending at %s", lhsNow, f.lhs.Generation+1, f.lhs.EndKey)
 	}
 
 	tc.RestartNode(v, engines[v])
@@ -201,6 +214,78 @@ func TestInheritedFreezeIsNotUnwoundByAnAbandonedRedrive(t *testing.T) {
 		t.Fatalf("merge produced %v, want end %s", merged, f.rhs.EndKey)
 	}
 	f.everyKeyReadable(t, ctx, "after the merge")
+}
+
+// TestMergeInFlightWhenItsFreezeIsUnwoundIsRefused (issue #266): the case
+// the fence exists for. A merge is built and held just before it is
+// proposed — standing in for an attempt whose proposal is in the log
+// with its fate unknown. Its freeze is unwound from under it; the RHS
+// serves and takes a write. The held merge is then proposed, and must
+// not apply: it would absorb an RHS that kept changing after the point
+// the merge captured. It is refused on every replica by the generation
+// the unwind moved, the write survives, and its own giving-up does not
+// disturb the range.
+func TestMergeInFlightWhenItsFreezeIsUnwoundIsRefused(t *testing.T) {
+	hold := newDescriptorHold()
+	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 869)
+	lead, _ := leadBothSides(t, ctx, tc, f)
+
+	hold.arm(f.lhs.RangeID, "merge")
+	mergeErr := make(chan error, 1)
+	go func() {
+		_, err := tc.Nodes[lead].DB().AdminMerge(ctx, f.lhs.StartKey)
+		mergeErr <- err
+	}()
+	hold.waitArrived(t, "the merge")
+
+	if !tc.Nodes[lead].Store().TestingUnwindMergeFreeze(ctx, f.lhs.RangeID) {
+		t.Fatal("the freeze was not unwound")
+	}
+	late := append(f.prefix.Clone(), "z99"...)
+	if err := tc.Nodes[lead].DB().Put(ctx, late, []byte("written after the unwind")); err != nil {
+		t.Fatalf("the unfrozen RHS refused a write: %v", err)
+	}
+	refusedBefore := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("merge"))
+	close(hold.release)
+	select {
+	case err := <-mergeErr:
+		if err == nil {
+			t.Fatal("a merge applied after its freeze was unwound and the RHS had taken a write")
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the held merge never returned")
+	}
+	if got := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("merge")); got == refusedBefore {
+		t.Fatal("the stale merge was not refused at apply")
+	}
+	// Both ranges stand, on every node, and the late write is there.
+	for i, d := range f.localDescriptors(f.rhs.RangeID) {
+		if !d.StartKey.Equal(f.rhs.StartKey) || !d.EndKey.Equal(f.rhs.EndKey) {
+			t.Fatalf("node %d holds RHS %v after the refused merge", i, d)
+		}
+	}
+	if got := len(f.localDescriptors(f.rhs.RangeID)); got != len(tc.Nodes) {
+		t.Fatalf("%d of %d nodes still hold the RHS", got, len(tc.Nodes))
+	}
+	for i, n := range tc.Nodes {
+		v, err := n.DB().Get(ctx, late)
+		if err != nil || string(v) != "written after the unwind" {
+			t.Fatalf("node %d: the write made after the unwind reads %q, %v", i, v, err)
+		}
+	}
+	f.everyKeyReadable(t, ctx, "after the refused merge")
+	// And a merge made afresh absorbs it, late write included.
+	if merged := mergeRanges(t, ctx, tc, f.lhs.RangeID); !merged.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("fresh merge produced %v, want end %s", merged, f.rhs.EndKey)
+	}
+	for i, n := range tc.Nodes {
+		if v, err := n.DB().Get(ctx, late); err != nil || string(v) != "written after the unwind" {
+			t.Fatalf("node %d after the fresh merge: %q, %v", i, v, err)
+		}
+	}
 }
 
 // TestMergeProposalOutcomeDecidesTheFreeze: after the freeze, a merge

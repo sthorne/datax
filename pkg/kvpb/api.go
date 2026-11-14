@@ -262,6 +262,14 @@ type AdminTransferLeaseRequest struct {
 type SubsumeRequest struct {
 	RequestHeader              // Key = start key, EndKey = end key
 	MergeInto     base.RangeID `json:"merge_into"`
+	// MergeEpoch ties the freeze to the left-hand range as the driver saw
+	// it: that range's generation plus one (0: not stated — a driver from
+	// before cluster version v20). A merge may be built under a freeze
+	// only while the left-hand range is still at that generation, which
+	// is what lets a freeze left behind by a dead attempt be unwound
+	// safely: move the left-hand range's generation on, and nothing built
+	// or yet to be built under the old freeze can apply (issue #266).
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 // UpdateMetaRequest writes the range addressing record at Key — or, with
@@ -286,6 +294,11 @@ type UpdateMetaRequest struct {
 // UnfreezeRequest clears a Subsume freeze (the merge was abandoned).
 type UnfreezeRequest struct {
 	RequestHeader // Key = start key, EndKey = end key
+	// MergeEpoch, when not 0, names the freeze to clear (see
+	// SubsumeRequest.MergeEpoch): a range frozen under another epoch is
+	// left as it is. An attempt giving up on its own freeze must not
+	// clear the freeze a later attempt has made since.
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 // AdminMergeRequest merges the range containing Key with its right
@@ -580,6 +593,10 @@ type AdminMergeResponse struct {
 // must not unwind it (issue #263).
 type SubsumeResponse struct {
 	AlreadyFrozen bool `json:"already_frozen,omitempty"`
+	// MergeEpoch is the epoch of the freeze the range is under after this
+	// Subsume: the request's own when it made the freeze, the earlier
+	// freeze's when the range was frozen already.
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 type UnfreezeResponse struct{}

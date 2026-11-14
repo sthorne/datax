@@ -255,10 +255,17 @@ message AdminMergeRequest {
 message SubsumeRequest {
   RequestHeader header = 1;
   int64 merge_into = 2;
+  // merge_epoch ties the freeze to the left-hand range as the driver
+  // saw it: that range's generation plus one, or 0 from a driver that
+  // does not say (before cluster version v20).
+  int64 merge_epoch = 3;
 }
 
 message UnfreezeRequest {
   RequestHeader header = 1;
+  // merge_epoch, when not 0, names the freeze to clear: a range frozen
+  // under another epoch is left frozen.
+  int64 merge_epoch = 2;
 }
 
 // UpdateMetaRequest writes (or, with an empty desc, deletes) the range
@@ -403,7 +410,12 @@ message AdminMergeResponse {
   RangeDescriptor desc = 1;
 }
 
-message SubsumeResponse {}
+message SubsumeResponse {
+  bool already_frozen = 1;
+  // merge_epoch is the epoch of the freeze the range is under now: the
+  // request's when this Subsume made it, the earlier one's otherwise.
+  int64 merge_epoch = 2;
+}
 
 message UnfreezeResponse {}
 

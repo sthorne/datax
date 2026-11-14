@@ -883,6 +883,20 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A merge freeze left behind by an attempt that died no longer keeps
+  the range out of service** (#266). A range frozen for a merge by an
+  attempt that crashed, lost its leader or ended with its proposal's
+  fate unknown stayed frozen for as long as a later pass could not
+  finish the merge — with a replica behind, indefinitely. Such a freeze
+  is now unwound safely: the left-hand range's generation is moved on
+  first, which rules out that attempt's merge on every replica (a merge
+  applies only at the generation it was built from, and a freeze now
+  names the generation it was made for), and then the freeze is
+  cleared. The range serves again and the merge is retried afresh;
+  `datax_range_merges_unwound_total` counts these. One merge driver
+  runs at a time per range on a node, and an attempt giving up on its
+  own freeze can no longer clear one a later attempt made. Needs
+  cluster version v20.
 - **A replica change that lands on a range frozen for a merge is
   refused** (#268). The change is checked before it is proposed, but a
   merge's freeze could apply in between, and a freeze moves no

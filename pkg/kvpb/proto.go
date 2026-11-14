@@ -330,9 +330,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *AdminMergeRequest:
 		out.Value = &rpcpb.RequestUnion_AdminMerge{AdminMerge: &rpcpb.AdminMergeRequest{Header: reqHeaderToProto(r.RequestHeader)}}
 	case *SubsumeRequest:
-		out.Value = &rpcpb.RequestUnion_Subsume{Subsume: &rpcpb.SubsumeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeInto: int64(r.MergeInto)}}
+		out.Value = &rpcpb.RequestUnion_Subsume{Subsume: &rpcpb.SubsumeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeInto: int64(r.MergeInto), MergeEpoch: r.MergeEpoch}}
 	case *UnfreezeRequest:
-		out.Value = &rpcpb.RequestUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+		out.Value = &rpcpb.RequestUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeEpoch: r.MergeEpoch}}
 	case *UpdateMetaRequest:
 		var desc []byte
 		if r.Desc != nil {
@@ -468,9 +468,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_AdminMerge:
 		u.AdminMerge = &AdminMergeRequest{RequestHeader: reqHeaderFromProto(v.AdminMerge.Header)}
 	case *rpcpb.RequestUnion_Subsume:
-		u.Subsume = &SubsumeRequest{RequestHeader: reqHeaderFromProto(v.Subsume.Header), MergeInto: base.RangeID(v.Subsume.MergeInto)}
+		u.Subsume = &SubsumeRequest{RequestHeader: reqHeaderFromProto(v.Subsume.Header), MergeInto: base.RangeID(v.Subsume.MergeInto), MergeEpoch: v.Subsume.MergeEpoch}
 	case *rpcpb.RequestUnion_Unfreeze:
-		u.Unfreeze = &UnfreezeRequest{RequestHeader: reqHeaderFromProto(v.Unfreeze.Header)}
+		u.Unfreeze = &UnfreezeRequest{RequestHeader: reqHeaderFromProto(v.Unfreeze.Header), MergeEpoch: v.Unfreeze.MergeEpoch}
 	case *rpcpb.RequestUnion_UpdateMeta:
 		req := &UpdateMetaRequest{
 			RequestHeader: reqHeaderFromProto(v.UpdateMeta.Header),
@@ -612,7 +612,7 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	case u.AdminMerge != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminMerge{AdminMerge: &rpcpb.AdminMergeResponse{Desc: RangeDescriptorToProto(u.AdminMerge.Desc)}}
 	case u.Subsume != nil:
-		out.Value = &rpcpb.ResponseUnion_Subsume{Subsume: &rpcpb.SubsumeResponse{}}
+		out.Value = &rpcpb.ResponseUnion_Subsume{Subsume: &rpcpb.SubsumeResponse{AlreadyFrozen: u.Subsume.AlreadyFrozen, MergeEpoch: u.Subsume.MergeEpoch}}
 	case u.Unfreeze != nil:
 		out.Value = &rpcpb.ResponseUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeResponse{}}
 	case u.UpdateMeta != nil:
@@ -707,7 +707,7 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 	case *rpcpb.ResponseUnion_AdminMerge:
 		u.AdminMerge = &AdminMergeResponse{Desc: RangeDescriptorFromProto(v.AdminMerge.Desc)}
 	case *rpcpb.ResponseUnion_Subsume:
-		u.Subsume = &SubsumeResponse{}
+		u.Subsume = &SubsumeResponse{AlreadyFrozen: v.Subsume.AlreadyFrozen, MergeEpoch: v.Subsume.MergeEpoch}
 	case *rpcpb.ResponseUnion_Unfreeze:
 		u.Unfreeze = &UnfreezeResponse{}
 	case *rpcpb.ResponseUnion_UpdateMeta:

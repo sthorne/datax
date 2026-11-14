@@ -124,6 +124,9 @@ type Replica struct {
 	// yet visible. Disjoint requests run in parallel. See latch.go for the
 	// L1/L2 invariants.
 	latches *latchManager
+	// mergeDriveMu admits one merge driver at a time with this replica as
+	// the left-hand side (adminMerge).
+	mergeDriveMu sync.Mutex
 
 	// leaseReads is whether ReadIndex runs lease-based (no quorum round
 	// trip per read); fixed at replica creation.
@@ -195,6 +198,9 @@ type Replica struct {
 		// it to learn that its own proposal was the one refused.
 		confChangeRefusals uint64
 		mergedInto         base.RangeID
+		// mergeEpoch mirrors replicaState.MergeEpoch: which generation of
+		// the left-hand range the freeze was made for.
+		mergeEpoch int64
 		// closedTS mirrors replicaState.ClosedTS: the range's replicated
 		// closed timestamp, below which this replica may serve reads
 		// locally without being the leader.
@@ -312,6 +318,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.snapInFlight = make(map[uint64]uint64)
 	r.mu.frozen = st.Frozen
 	r.mu.mergedInto = st.MergedInto
+	r.mu.mergeEpoch = st.MergeEpoch
 	r.mu.closedTS = st.ClosedTS
 	if !st.ClosedTS.IsEmpty() {
 		// The closed timestamp is a promise about the whole range; the

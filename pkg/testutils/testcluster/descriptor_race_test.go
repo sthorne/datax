@@ -650,8 +650,10 @@ func TestReplicaChangeProposedBeforeAFreezeIsRefused(t *testing.T) {
 	}
 	// The merge the freeze was for lands on every node, which is what a
 	// removal applied on the frozen range would have made fatal.
-	if _, err := tc.Nodes[tc.LeaderIndex(f.lhs.RangeID)].DB().AdminMerge(ctx, f.lhs.StartKey); err != nil {
-		t.Fatalf("the merge after the refused removal: %v", err)
+	// (The freeze was made by hand and names no epoch, so the first pass
+	// unwinds it and a later one merges afresh; mergeRanges retries.)
+	if merged := mergeRanges(t, ctx, tc, f.lhs.RangeID); !merged.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("the merge after the refused removal produced %v, want end %s", merged, f.rhs.EndKey)
 	}
 	f.everyKeyReadable(t, ctx, "after the merge")
 }

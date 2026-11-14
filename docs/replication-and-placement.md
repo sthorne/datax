@@ -202,9 +202,22 @@ ranges left one node more than a minute behind, and every pass re-froze
 the ranges it could not merge, so they refused every request until it
 caught up). The Subsume's answer says whether this attempt made the
 freeze; if the attempt then fails anywhere short of a proposal that may
-still apply, a freeze it made is unwound at once, while one inherited
-from an earlier, interrupted attempt (or from a second driver racing this
-one) is left for the re-drive, since that merge may still land. A gateway
+still apply, a freeze it made is unwound at once. One inherited from an
+earlier, interrupted attempt is unwound too, but behind a fence, since
+that attempt's merge may still be in the LHS's log and must not apply
+to an RHS that has gone back to taking writes (issue #266). A freeze
+names the LHS generation it was made for (its *epoch*); a merge applies
+only if the LHS is still at the generation it was built from, and is
+built under a freeze only while the LHS is at the generation the freeze
+names. So the driver first moves the LHS's generation on by one — a
+descriptor update that changes nothing else — which rules out every
+merge under the old freeze at one log position on every replica, and
+only then clears the freeze, naming its epoch so that a later attempt's
+freeze is never cleared by mistake
+(`datax_range_merges_unwound_total`). The RHS serves again and the merge
+is made afresh on a later pass, instead of the range staying frozen for
+as long as a replica is behind. This needs cluster version v20; before
+it an inherited freeze is left for the re-drive, as it was. A gateway
 that reaches a frozen range gets a refusal that says so
 (`RangeKeyMismatchError.Frozen`): its descriptor was right, so it holds
 it and retries with backoff for up to fifteen seconds, then fails the

@@ -2023,9 +2023,13 @@ func (x *AdminMergeRequest) GetHeader() *RequestHeader {
 }
 
 type SubsumeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
-	MergeInto     int64                  `protobuf:"varint,2,opt,name=merge_into,json=mergeInto,proto3" json:"merge_into,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Header    *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	MergeInto int64                  `protobuf:"varint,2,opt,name=merge_into,json=mergeInto,proto3" json:"merge_into,omitempty"`
+	// merge_epoch ties the freeze to the left-hand range as the driver
+	// saw it: that range's generation plus one, or 0 from a driver that
+	// does not say (before cluster version v20).
+	MergeEpoch    int64 `protobuf:"varint,3,opt,name=merge_epoch,json=mergeEpoch,proto3" json:"merge_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2074,9 +2078,19 @@ func (x *SubsumeRequest) GetMergeInto() int64 {
 	return 0
 }
 
+func (x *SubsumeRequest) GetMergeEpoch() int64 {
+	if x != nil {
+		return x.MergeEpoch
+	}
+	return 0
+}
+
 type UnfreezeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Header *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
+	// merge_epoch, when not 0, names the freeze to clear: a range frozen
+	// under another epoch is left frozen.
+	MergeEpoch    int64 `protobuf:"varint,2,opt,name=merge_epoch,json=mergeEpoch,proto3" json:"merge_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2116,6 +2130,13 @@ func (x *UnfreezeRequest) GetHeader() *RequestHeader {
 		return x.Header
 	}
 	return nil
+}
+
+func (x *UnfreezeRequest) GetMergeEpoch() int64 {
+	if x != nil {
+		return x.MergeEpoch
+	}
+	return 0
 }
 
 // UpdateMetaRequest writes (or, with an empty desc, deletes) the range
@@ -3682,6 +3703,10 @@ func (x *AdminMergeResponse) GetDesc() *RangeDescriptor {
 
 type SubsumeResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	AlreadyFrozen bool                   `protobuf:"varint,1,opt,name=already_frozen,json=alreadyFrozen,proto3" json:"already_frozen,omitempty"`
+	// merge_epoch is the epoch of the freeze the range is under now: the
+	// request's when this Subsume made it, the earlier one's otherwise.
+	MergeEpoch    int64 `protobuf:"varint,2,opt,name=merge_epoch,json=mergeEpoch,proto3" json:"merge_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3714,6 +3739,20 @@ func (x *SubsumeResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use SubsumeResponse.ProtoReflect.Descriptor instead.
 func (*SubsumeResponse) Descriptor() ([]byte, []int) {
 	return file_datax_v1_kv_proto_rawDescGZIP(), []int{57}
+}
+
+func (x *SubsumeResponse) GetAlreadyFrozen() bool {
+	if x != nil {
+		return x.AlreadyFrozen
+	}
+	return false
+}
+
+func (x *SubsumeResponse) GetMergeEpoch() int64 {
+	if x != nil {
+		return x.MergeEpoch
+	}
+	return 0
 }
 
 type UnfreezeResponse struct {
@@ -5590,13 +5629,17 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\x03R\x06target\"D\n" +
 	"\x11AdminMergeRequest\x12/\n" +
-	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"`\n" +
+	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"\x81\x01\n" +
 	"\x0eSubsumeRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1d\n" +
 	"\n" +
-	"merge_into\x18\x02 \x01(\x03R\tmergeInto\"B\n" +
+	"merge_into\x18\x02 \x01(\x03R\tmergeInto\x12\x1f\n" +
+	"\vmerge_epoch\x18\x03 \x01(\x03R\n" +
+	"mergeEpoch\"c\n" +
 	"\x0fUnfreezeRequest\x12/\n" +
-	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\"\x9d\x01\n" +
+	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x1f\n" +
+	"\vmerge_epoch\x18\x02 \x01(\x03R\n" +
+	"mergeEpoch\"\x9d\x01\n" +
 	"\x11UpdateMetaRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12\x12\n" +
 	"\x04desc\x18\x02 \x01(\fR\x04desc\x12\x1e\n" +
@@ -5690,8 +5733,11 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x1aAdminTransferLeaseResponse\x12-\n" +
 	"\x04desc\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04desc\"C\n" +
 	"\x12AdminMergeResponse\x12-\n" +
-	"\x04desc\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04desc\"\x11\n" +
-	"\x0fSubsumeResponse\"\x12\n" +
+	"\x04desc\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04desc\"Y\n" +
+	"\x0fSubsumeResponse\x12%\n" +
+	"\x0ealready_frozen\x18\x01 \x01(\bR\ralreadyFrozen\x12\x1f\n" +
+	"\vmerge_epoch\x18\x02 \x01(\x03R\n" +
+	"mergeEpoch\"\x12\n" +
 	"\x10UnfreezeResponse\".\n" +
 	"\x12UpdateMetaResponse\x12\x18\n" +
 	"\aapplied\x18\x01 \x01(\bR\aapplied\"\xa2\v\n" +
