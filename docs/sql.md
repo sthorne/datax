@@ -32,7 +32,7 @@ SELECT [DISTINCT] * | col, ... | aggregates | func() OVER ([PARTITION BY ...] [O
     [WHERE conjunction] [GROUP BY col, ...] [HAVING conjunction] [WINDOW name AS (...), ...]
     [UNION | INTERSECT | EXCEPT [ALL] query]
     [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
-    [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE]
+    [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE [SKIP LOCKED | NOWAIT]]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
 UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]
@@ -780,7 +780,8 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `T` (in transaction), or `E` (failed transaction — everything except
   `ROLLBACK` is rejected with `25P02`).
 - **Errors** carry proper SQLSTATEs: `40001` serialization_failure (retry
-  me!), `42P01` undefined_table, `23505` unique_violation, `42601`
+  me!), `55P03` lock_not_available (`lock_timeout`, `FOR UPDATE NOWAIT`),
+  `42P01` undefined_table, `23505` unique_violation, `42601`
   syntax_error, `0A000` feature_not_supported.
 
 ## Client compatibility

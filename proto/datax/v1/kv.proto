@@ -106,6 +106,12 @@ message RequestHeader {
 message GetRequest {
   RequestHeader header = 1;
   bool for_update = 2; // locking read (see pkg/kvpb)
+  // skip_locked reports a key holding another transaction's intent as
+  // absent (with the intent in the response) instead of conflicting.
+  // Read path only. Not version-gated: a node that predates the field
+  // ignores it and answers with the write-intent conflict, which the
+  // sender handles by waiting as it always has.
+  bool skip_locked = 3;
 }
 
 message PutRequest {
@@ -131,6 +137,9 @@ message ScanRequest {
   // field and would run a forward scan, so senders must not set it until
   // the upgrade is finalized (pkg/version rule 4).
   bool reverse = 4;
+  // skip_locked leaves keys holding another transaction's intent out of
+  // the rows and lists the intents in the response (see GetRequest).
+  bool skip_locked = 5;
 }
 
 message EndTxnRequest {
@@ -312,6 +321,10 @@ message BatchRequest {
 message GetResponse {
   bytes value = 1;
   bool found = 2; // distinguishes empty value from not-found
+  // skipped: the key was passed over under skip_locked; this is the
+  // intent it holds, or the key alone when it was passed over for a
+  // committed version inside the read's uncertainty window.
+  Intent skipped = 3;
 }
 
 message PutResponse {}
@@ -325,6 +338,8 @@ message IncrementResponse {
 message ScanResponse {
   repeated KeyValue rows = 1;
   bytes resume = 2;
+  // skipped: the keys passed over under skip_locked (see GetResponse).
+  repeated Intent skipped = 3;
 }
 
 message EndTxnResponse {

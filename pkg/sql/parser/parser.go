@@ -2588,6 +2588,19 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, p.errf("FOR UPDATE requires a FROM clause")
 		}
 		sel.ForUpdate = true
+		// SKIP LOCKED | NOWAIT (neither is reserved; both lex as
+		// identifiers).
+		if t := p.peek(); t.kind == tkIdent && t.text == "skip" {
+			p.i++
+			if n := p.peek(); n.kind != tkIdent || n.text != "locked" {
+				return nil, p.errf("expected LOCKED after FOR UPDATE SKIP, found %q", n.text)
+			}
+			p.i++
+			sel.LockWait = LockWaitSkipLocked
+		} else if t.kind == tkIdent && t.text == "nowait" {
+			p.i++
+			sel.LockWait = LockWaitNoWait
+		}
 	}
 	if err := p.parseSetOps(sel); err != nil {
 		return nil, err

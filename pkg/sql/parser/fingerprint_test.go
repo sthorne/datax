@@ -93,6 +93,8 @@ func TestFingerprintInequality(t *testing.T) {
 		`DELETE FROM accounts WHERE id = 1`,                    // another verb
 		`SELECT count(*) FROM accounts WHERE id = 1`,           // an aggregate
 		`SELECT * FROM accounts WHERE id = 1 FOR UPDATE`,       // a lock
+		`SELECT * FROM accounts WHERE id = 1 FOR UPDATE SKIP LOCKED`,
+		`SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT`,
 	}
 	seen := map[string]string{}
 	for _, src := range distinct {

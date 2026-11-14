@@ -857,3 +857,43 @@ func TestParseConstraints(t *testing.T) {
 func stepIs(s PathStep, key string, text bool) bool {
 	return s.Key == key && s.Text == text && !s.IsIndex && len(s.Keys) == 0
 }
+
+// TestForUpdateWaitPolicy: FOR UPDATE takes an optional SKIP LOCKED or
+// NOWAIT, after ORDER BY and LIMIT; neither stands without FOR UPDATE.
+func TestForUpdateWaitPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want LockWait
+	}{
+		{`SELECT id FROM jobs WHERE id = 1 FOR UPDATE`, LockWaitBlock},
+		{`SELECT id FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`, LockWaitSkipLocked},
+		{`select id from jobs for update skip locked`, LockWaitSkipLocked},
+		{`SELECT * FROM jobs WHERE id = $1 FOR UPDATE NOWAIT`, LockWaitNoWait},
+	} {
+		sel, ok := parseOne(t, tc.src).(*Select)
+		if !ok {
+			t.Fatalf("%q: not a SELECT", tc.src)
+		}
+		if !sel.ForUpdate || sel.LockWait != tc.want {
+			t.Errorf("%q: ForUpdate=%v LockWait=%v, want true, %v", tc.src, sel.ForUpdate, sel.LockWait, tc.want)
+		}
+	}
+	if sel := parseOne(t, `SELECT id FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).(*Select); sel.Limit != 1 || len(sel.OrderBy) != 1 {
+		t.Errorf("ORDER BY / LIMIT lost before the lock clause: %+v", sel)
+	}
+	for _, bad := range []string{
+		`SELECT id FROM jobs SKIP LOCKED`,
+		`SELECT id FROM jobs WHERE id = 1 SKIP LOCKED`,
+		`SELECT id FROM jobs LIMIT 1 SKIP LOCKED`,
+		`SELECT id FROM jobs WHERE id = 1 NOWAIT`,
+		`SELECT id FROM jobs LIMIT 1 NOWAIT`,
+		`SELECT id FROM jobs FOR UPDATE SKIP`,
+		`SELECT id FROM jobs FOR UPDATE SKIP LOCKED NOWAIT`,
+		`SELECT id FROM jobs FOR UPDATE NOWAIT SKIP LOCKED`,
+		`SELECT 1 FOR UPDATE SKIP LOCKED`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("no error for %q", bad)
+		}
+	}
+}

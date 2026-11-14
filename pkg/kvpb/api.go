@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
@@ -23,9 +24,19 @@ type RequestHeader struct {
 // an absent one — so no other transaction can change the key until this
 // one finishes. A committed version above the read timestamp fails the
 // lock with WriteTooOld (the snapshot is stale), exactly like a write.
+//
+// With SkipLocked set (plain reads only; the write path ignores it) a key
+// holding another transaction's intent is not a conflict: the response
+// reports it absent and carries the intent in Skipped; so is a key with a
+// committed version inside the read's uncertainty window, which would
+// otherwise fail the read with an UncertaintyError. Not version-gated:
+// a server that predates the field ignores it and answers with the
+// write-intent conflict, which the sender handles by waiting as it always
+// has.
 type GetRequest struct {
 	RequestHeader
-	ForUpdate bool `json:"for_update,omitempty"`
+	ForUpdate  bool `json:"for_update,omitempty"`
+	SkipLocked bool `json:"skip_locked,omitempty"`
 }
 
 // PutRequest writes a value.
@@ -55,12 +66,15 @@ type IncrementRequest struct {
 // exclusive END of the next page); Reverse may only be SENT once the
 // cluster version has reached v3 — an older node ignores the field and
 // runs a forward scan (pkg/version rule 4). Reverse+ForUpdate is not
-// supported.
+// supported. With SkipLocked set (plain scans only) rows holding another
+// transaction's intent are left out of Rows and their intents listed in
+// the response's Skipped (see GetRequest).
 type ScanRequest struct {
 	RequestHeader
-	MaxRows   int64 `json:"max_rows,omitempty"`
-	ForUpdate bool  `json:"for_update,omitempty"`
-	Reverse   bool  `json:"reverse,omitempty"`
+	MaxRows    int64 `json:"max_rows,omitempty"`
+	ForUpdate  bool  `json:"for_update,omitempty"`
+	Reverse    bool  `json:"reverse,omitempty"`
+	SkipLocked bool  `json:"skip_locked,omitempty"`
 }
 
 // ExportRequest returns, for every key in [Key, EndKey) that changed in
@@ -445,6 +459,11 @@ func (*AdminUnsplitRequest) IsReadOnly() bool        { return false }
 
 type GetResponse struct {
 	Value []byte `json:"value,omitempty"` // nil = not found
+	// Skipped is set when a SkipLocked read passed the key over (Value
+	// is then nil): the intent it holds, or just the key (an empty Txn)
+	// when it was passed over for a committed version the read could not
+	// order itself against.
+	Skipped *storage.Intent `json:"skipped,omitempty"`
 }
 
 type PutResponse struct{}
@@ -458,6 +477,9 @@ type IncrementResponse struct {
 type ScanResponse struct {
 	Rows   []KeyValue `json:"rows,omitempty"`
 	Resume keys.Key   `json:"resume,omitempty"`
+	// Skipped lists the rows a SkipLocked scan passed over (see
+	// GetResponse.Skipped).
+	Skipped []storage.Intent `json:"skipped,omitempty"`
 }
 
 // ExportRecord is one exported key: its newest visible value at the export

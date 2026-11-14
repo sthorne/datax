@@ -591,11 +591,19 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
 		case *kvpb.GetRequest:
-			val, err := getter.Get(req.Key, ts, opts)
+			gopts := opts
+			var skipped []storage.Intent
+			if req.SkipLocked {
+				gopts.SkipLocked = &skipped
+			}
+			val, err := getter.Get(req.Key, ts, gopts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.Get = &kvpb.GetResponse{Value: val}
+			if len(skipped) > 0 {
+				ru.Get.Skipped = &skipped[0]
+			}
 		case *kvpb.ScanRequest:
 			scan := storage.MVCCScan
 			if req.Reverse {
@@ -603,11 +611,16 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 			}
 			sopts := opts
 			sopts.TargetBytes = scanTargetBytes
+			var skipped []storage.Intent
+			if req.SkipLocked {
+				sopts.SkipLocked = &skipped
+			}
 			res, err := scan(eng, req.Key, req.EndKey, ts, req.MaxRows, sopts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.Scan = scanResponse(res)
+			ru.Scan.Skipped = skipped
 		case *kvpb.ExportRequest:
 			res, err := storage.MVCCExport(eng, req.Key, req.EndKey, req.StartTS, ts, req.MaxRecords)
 			if err != nil {

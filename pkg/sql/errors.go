@@ -109,6 +109,9 @@ func ToSQLError(err error) *Error {
 	if kvclient.IsLockTimeout(err) {
 		return &Error{Code: CodeLockNotAvailable, Msg: "canceling statement due to lock timeout"}
 	}
+	if kvclient.IsLockNotAvailable(err) {
+		return &Error{Code: CodeLockNotAvailable, Msg: "could not obtain lock on row"}
+	}
 	var nf *catalog.ErrTableNotFound
 	if errors.As(err, &nf) {
 		return &Error{Code: CodeUndefinedTable, Msg: nf.Error()}

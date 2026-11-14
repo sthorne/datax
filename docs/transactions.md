@@ -229,6 +229,102 @@ intent commits as a version carrying the same bytes, invisible to
 readers' results. On the bank workload (100 hot accounts, 8 workers) this
 raises committed throughput ~4× and roughly halves 40001s.
 
+**SKIP LOCKED and NOWAIT** (issue #296) are the same locking read told
+not to queue. Both halves of the statement have to change, because both
+wait today: the lock, and before it the fetch — a plain read pushes any
+intent at or below its timestamp, and a row another transaction locked a
+moment ago carries exactly such an intent.
+
+- *The lock* (`Txn.GetBatchForUpdateNoWait`). The locking Gets go out as
+  before; a write-intent conflict comes back to the coordinator as
+  always, and the coordinator pushes the intents' transactions — but
+  never with the power to abort (declining to wait for a lock is no
+  reason to take it), so the push only tells an abandoned intent, which
+  it resolves and then locks over, from a held one. A held lock fails
+  `NOWAIT` with a lock-not-available error (SQLSTATE `55P03`); under
+  `SKIP LOCKED` the key is dropped from the batch and the rest are
+  locked. Nothing new is evaluated on the write path, so nothing here is
+  version-gated. Until the transaction has its record the keys are
+  locked one batch each: a single-key batch lays its intent and the
+  record together or does nothing, whereas a multi-range batch refused
+  on the anchor's range could leave intents elsewhere naming an anchor
+  with no record.
+- *The fetch.* Reads sent under `kvclient.WithLockWait` carry the
+  policy. For `NOWAIT` the coordinator simply refuses to wait on a live
+  intent the read conflicts with. For `SKIP LOCKED` the request itself
+  is marked (`skip_locked` on Get and Scan, read path only): the server
+  reports a key holding a foreign intent as absent — at any timestamp,
+  including one an ordinary read would look beneath, since the lock
+  would be refused either way — and returns the intents it stepped
+  around; a scan's row limit counts only the rows returned, and a page
+  ends after 256 skipped keys. A server that predates the field ignores
+  it and answers with the conflict, and the read then waits as it always
+  did — slower, never wrong — so the field needs no cluster version.
+
+`SKIP LOCKED` extends "locked" to one more case: a key with a version
+**committed** above the transaction's read timestamp. A plain locking
+read refuses such a key with WriteTooOld, and a plain read fails with an
+uncertainty error when the version is inside the uncertainty window;
+both normally mean a refresh or a restart. Here the row is passed over
+instead (PostgreSQL's read-committed would re-read the new version and
+lock it; a serializable snapshot cannot, and to a queue reader the row
+is one another worker just took and finished with). Without this a
+drained queue's head is a run of fresh tombstones, and every dequeue
+scan restarts on the first one it cannot order itself against.
+
+**Skipped rows and the read set.** A transaction's read spans are what a
+refresh re-validates, and a refresh is routine — any reader of a locked
+row at a later timestamp pushes the lock holder's next write above its
+read timestamp. A skipped row is, almost by definition, about to be
+changed by someone else, so leaving it in the read set would turn that
+routine refresh into a `40001` over a row the statement never returned.
+It is therefore taken out (`Txn.ForgetReads`): a scan records its span
+less the keys the server skipped, a skipped point read is not recorded,
+and a row refused at the lock step is punched out of the spans the
+statement's fetch recorded — at once, before the statement reads again.
+The gaps between forgotten keys stay covered, so an insert into the
+scanned range is still caught, and reads recorded by *earlier*
+statements of the transaction are never touched: a row the transaction
+really read keeps its protection even if a later `SKIP LOCKED` passes
+it over. What is given up is exactly what the clause gives up in
+PostgreSQL — the result is not a serializable read of the skipped rows.
+Two limits: an index scan's entries for skipped rows stay in the read
+set (the fetch forgets primary keys), so a queue ordered by a secondary
+index can still fail a refresh when a skipped row's entry is deleted;
+and a statement that skips more keys than the read set holds spans for
+(512) loses refresh for the transaction, as overflowing it with plain
+reads does.
+
+**LIMIT.** Plain `FOR UPDATE` locks what the fetch returned, and the
+fetch stops at the limit only when the access path delivers the order —
+with an in-memory sort it locks every matching row and then cuts.
+`SKIP LOCKED` sorts first when it must, then locks candidates in order,
+only as many as are still wanted, and stops when the limit is met: a row
+locked and then cut would be hidden from every other skipping reader for
+nothing. If a limit-bounded fetch comes back full and the lock step
+still leaves the limit unmet (rows taken between fetch and lock), the
+fetch is repeated at four times the size, unbounded after three rounds;
+rows fetched beyond the limit in an ordered scan are forgotten like
+skipped ones, since a fetch that could stop exactly at the limit would
+not have read them.
+
+**Dead lock holders.** Nothing conflicts with an intent under
+`SKIP LOCKED`, so the push-on-conflict that normally cleans up after a
+crashed coordinator never runs, and a row it had locked would stay
+invisible to a table read only by skipping readers. The coordinator
+therefore pushes the transactions behind the intents its reads skipped
+— only those older than the expiry window (younger ones cannot have
+expired, and a live coordinator resolves its own), and each at most once
+a second per gateway — and resolves what turns out finished or expired.
+
+Measured on the queue test (8 workers on 3 nodes draining 200 rows with
+`ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED` then `DELETE`, one job per
+transaction): every row taken once and no `40001` in any of fifteen
+runs. The rules above are what that rests on: with skipped rows left in
+the read set the same run produced 280 `40001`s for its 200 rows, and
+with the read-set rule alone, about five (dequeue scans giving up after
+ten refreshes in a row over fresh tombstones).
+
 ### Savepoints
 
 `SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name`

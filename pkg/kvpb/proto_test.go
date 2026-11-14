@@ -72,6 +72,8 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	ba.Add(&IncrementRequest{RequestHeader: h("i"), By: -4})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10, Reverse: true})
+	ba.Add(&GetRequest{RequestHeader: h("g"), SkipLocked: true})
+	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 1, SkipLocked: true})
 	ba.Add(&EndTxnRequest{RequestHeader: h("e"), Commit: true, IntentKeys: []keys.Key{keys.Key("x")}})
 	ba.Add(&HeartbeatTxnRequest{RequestHeader: h("h"), Now: mkts(60)})
 	ba.Add(&PushTxnRequest{RequestHeader: h("q"), PusherTxn: testTxn(), PusheeTxn: testTxn().TxnMeta, PushAbort: true, Now: mkts(61)})
@@ -114,6 +116,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Delete: &DeleteResponse{}},
 		{Increment: &IncrementResponse{NewValue: 9}},
 		{Scan: &ScanResponse{Rows: []KeyValue{{Key: keys.Key("k"), Value: []byte("v")}}, Resume: keys.Key("r")}},
+		{Get: &GetResponse{Skipped: &storage.Intent{Key: keys.Key("g"), Txn: testTxn().TxnMeta}}},
+		{Scan: &ScanResponse{Skipped: []storage.Intent{{Key: keys.Key("s"), Txn: testTxn().TxnMeta}, {Key: keys.Key("u")}}}},
 		{EndTxn: &EndTxnResponse{CommitTimestamp: mkts(71)}},
 		{HeartbeatTxn: &HeartbeatTxnResponse{Status: enginepb.ABORTED}},
 		{PushTxn: &PushTxnResponse{Status: enginepb.COMMITTED, CommitTS: mkts(72)}},

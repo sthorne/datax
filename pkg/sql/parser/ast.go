@@ -643,7 +643,21 @@ type Select struct {
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool
+	// LockWait is what FOR UPDATE does about a row another transaction
+	// holds locked: wait for it (the default), leave it out of the result
+	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
+	// ForUpdate.
+	LockWait LockWait
 }
+
+// LockWait is the wait policy of a FOR UPDATE clause.
+type LockWait int
+
+const (
+	LockWaitBlock      LockWait = iota // FOR UPDATE
+	LockWaitSkipLocked                 // FOR UPDATE SKIP LOCKED
+	LockWaitNoWait                     // FOR UPDATE NOWAIT
+)
 
 type Update struct {
 	With      []CTE

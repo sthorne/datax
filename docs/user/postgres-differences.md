@@ -29,6 +29,18 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
+- **`FOR UPDATE SKIP LOCKED` and `NOWAIT`** work, with two differences
+  that follow from serializable isolation
+  ([details](sql.md#not-waiting-for-a-lock-skip-locked-and-nowait)).
+  `SKIP LOCKED` also passes over a row another transaction changed and
+  committed after this transaction's snapshot — PostgreSQL's
+  read-committed would lock the new version; here the row is skipped
+  rather than failing the statement with `40001` — and a transaction
+  block sees the table as of its snapshot, so rows inserted after
+  `BEGIN` do not appear. `NOWAIT` can fail with `55P03` on a locked row
+  the statement had to read but would have filtered out. `FOR SHARE`,
+  `FOR NO KEY UPDATE`, `FOR KEY SHARE` and `FOR UPDATE OF table` are
+  not supported.
 - **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
   half-even, `22003` on overflow, fixed-scale rendering), the integer
   widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
@@ -144,6 +156,7 @@ syntax error or `0A000` feature not supported):
 |---|---|---|
 | `40001` | serialization failure | retry the whole transaction |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
+| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |

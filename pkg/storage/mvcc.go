@@ -35,7 +35,29 @@ type MVCCGetOptions struct {
 	// newest committed version beneath any intent. Used for meta/gossip
 	// scans where staleness is fine but stalls are not.
 	Inconsistent bool
+	// SkipLocked, when non-nil, makes the read step around other
+	// transactions' intents instead of conflicting with them: a key
+	// holding a foreign intent — at any timestamp, even one the read
+	// would otherwise look beneath — is reported as absent and its
+	// intent appended here. The fetch of SELECT ... FOR UPDATE SKIP
+	// LOCKED reads this way: a row another transaction has locked is not
+	// a row it may wait for, and whoever reads the list can tell an
+	// abandoned lock from a live one by pushing its transaction.
+	//
+	// A key with a committed version inside the uncertainty window is
+	// passed over the same way instead of failing the read with an
+	// UncertaintyError, and listed with an empty Txn (no one holds it).
+	// It could not be locked anyway — a locking read refuses any key
+	// with a version above the read timestamp — and to a queue reader it
+	// is a row someone else just took and finished with: restarting the
+	// reader over it only sends it back to trip over the next one.
+	SkipLocked *[]Intent
 }
+
+// maxSkippedPerScan bounds the intents one SkipLocked scan page steps
+// around: past it the page ends with Resume set, as a full page of rows
+// does, so the response stays bounded however many rows are locked.
+const maxSkippedPerScan = 256
 
 // intentAboveRead reports whether a foreign intent at intentTS is strictly
 // above everything a read at ts can observe — above the read timestamp AND
@@ -174,6 +196,9 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 			} else {
 				skipAt = meta.Timestamp
 			}
+		case opts.SkipLocked != nil:
+			*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: key.Clone(), Txn: meta.Txn})
+			return nil, nil
 		case opts.Inconsistent:
 			skipAt = meta.Timestamp // read beneath the intent
 		case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
@@ -240,6 +265,10 @@ func mvccGet(it Iterator, metaKey []byte, key keys.Key, ts hlc.Timestamp, opts M
 					continue
 				}
 				if ts.Less(vts) {
+					if opts.SkipLocked != nil {
+						*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: key.Clone()})
+						return nil, nil
+					}
 					return nil, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: vts}
 				}
 				break
@@ -516,6 +545,10 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 	var intents []Intent
 	var bytes int64
 	var prefix []byte // cur's metadata key, copied off the iterator per row
+	skippedBefore := 0
+	if opts.SkipLocked != nil {
+		skippedBefore = len(*opts.SkipLocked)
+	}
 
 	ok := it.SeekGE(lower)
 	for ok {
@@ -536,6 +569,10 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 				res.Resume = cur.Next()
 				return res, nil
 			}
+		}
+		if opts.SkipLocked != nil && len(*opts.SkipLocked)-skippedBefore >= maxSkippedPerScan {
+			res.Resume = cur.Next()
+			return res, nil
 		}
 		ok = stepPastKey(it, cur, prefix)
 	}
@@ -622,6 +659,10 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 	var intents []Intent
 	var bytes int64
 	var curStart []byte // cur's metadata key, copied off the iterator per row
+	skippedBefore := 0
+	if opts.SkipLocked != nil {
+		skippedBefore = len(*opts.SkipLocked)
+	}
 
 	ok := it.SeekLT(upper)
 	for ok {
@@ -645,6 +686,10 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 				res.Resume = cur
 				return res, nil
 			}
+		}
+		if opts.SkipLocked != nil && len(*opts.SkipLocked)-skippedBefore >= maxSkippedPerScan {
+			res.Resume = cur
+			return res, nil
 		}
 		ok = stepBeforeKey(it, curStart)
 	}
@@ -718,6 +763,9 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 			} else {
 				skipAt = meta.Timestamp
 			}
+		case opts.SkipLocked != nil:
+			*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur, Txn: meta.Txn})
+			return nil, false, nil
 		case opts.Inconsistent:
 			skipAt = meta.Timestamp // read beneath the intent
 		case intentAboveRead(meta.Timestamp, ts, opts.UncertaintyLimit):
@@ -770,6 +818,10 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 				uvts := versionOf(k, prefix)
 				if uvts.LessEq(opts.UncertaintyLimit) && !(!skipAt.IsEmpty() && uvts.Equal(skipAt)) {
 					if ts.Less(uvts) {
+						if opts.SkipLocked != nil {
+							*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur})
+							return nil, false, nil
+						}
 						return nil, false, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: uvts}
 					}
 					break

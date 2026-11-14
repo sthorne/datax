@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -117,6 +118,12 @@ type DB struct {
 	// attemptTimeout bounds one attempt at one replica (perAttemptTimeout;
 	// tests shorten it).
 	attemptTimeout time.Duration
+	// skipPushes remembers when each transaction whose lock a SKIP LOCKED
+	// read stepped around was last pushed (see resolveAbandonedLocks).
+	skipPushes struct {
+		sync.Mutex
+		last map[uuid.UUID]time.Time
+	}
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
@@ -741,7 +748,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		if desc.EndKey.Less(end) {
 			end = desc.EndKey
 		}
-		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining, ForUpdate: req.ForUpdate}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining, ForUpdate: req.ForUpdate, SkipLocked: req.SkipLocked}
 		// The transaction record is created on the anchor key's range only:
 		// scope the flag to the one segment covering it (locking scans may
 		// be a transaction's first, anchoring operation).
@@ -767,6 +774,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
+		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {
@@ -818,7 +826,7 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 			segStart, segEnd, desc = s, e, d
 			s = e
 		}
-		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: segStart, EndKey: segEnd}, MaxRows: remaining, Reverse: true}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: segStart, EndKey: segEnd}, MaxRows: remaining, Reverse: true, SkipLocked: req.SkipLocked}
 		// Anchor scoping, as in the forward path.
 		gh := header
 		if gh.CreateTxnRecord && gh.Txn != nil {
@@ -841,6 +849,7 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
+		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {

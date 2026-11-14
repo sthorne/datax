@@ -246,7 +246,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	out := &rpcpb.RequestUnion{}
 	switch r := u.GetInner().(type) {
 	case *GetRequest:
-		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate}}
+		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate, SkipLocked: r.SkipLocked}}
 	case *PutRequest:
 		out.Value = &rpcpb.RequestUnion_Put{Put: &rpcpb.PutRequest{Header: reqHeaderToProto(r.RequestHeader), Value: r.Value}}
 	case *DeleteRequest:
@@ -254,7 +254,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *IncrementRequest:
 		out.Value = &rpcpb.RequestUnion_Increment{Increment: &rpcpb.IncrementRequest{Header: reqHeaderToProto(r.RequestHeader), By: r.By}}
 	case *ScanRequest:
-		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse}}
+		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse, SkipLocked: r.SkipLocked}}
 	case *ExportRequest:
 		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords}}
 	case *EndTxnRequest:
@@ -357,7 +357,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	var u RequestUnion
 	switch v := p.Value.(type) {
 	case *rpcpb.RequestUnion_Get:
-		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate}
+		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate, SkipLocked: v.Get.SkipLocked}
 	case *rpcpb.RequestUnion_Put:
 		u.Put = &PutRequest{RequestHeader: reqHeaderFromProto(v.Put.Header), Value: v.Put.Value}
 	case *rpcpb.RequestUnion_Delete:
@@ -365,7 +365,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Increment:
 		u.Increment = &IncrementRequest{RequestHeader: reqHeaderFromProto(v.Increment.Header), By: v.Increment.By}
 	case *rpcpb.RequestUnion_Scan:
-		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse}
+		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse, SkipLocked: v.Scan.SkipLocked}
 	case *rpcpb.RequestUnion_Export:
 		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords}
 	case *rpcpb.RequestUnion_EndTxn:
@@ -548,7 +548,11 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	out := &rpcpb.ResponseUnion{}
 	switch {
 	case u.Get != nil:
-		out.Value = &rpcpb.ResponseUnion_Get{Get: &rpcpb.GetResponse{Value: u.Get.Value, Found: u.Get.Value != nil}}
+		pb := &rpcpb.GetResponse{Value: u.Get.Value, Found: u.Get.Value != nil}
+		if in := u.Get.Skipped; in != nil {
+			pb.Skipped = &rpcpb.Intent{Key: in.Key, Txn: txnMetaToProto(in.Txn)}
+		}
+		out.Value = &rpcpb.ResponseUnion_Get{Get: pb}
 	case u.Put != nil:
 		out.Value = &rpcpb.ResponseUnion_Put{Put: &rpcpb.PutResponse{}}
 	case u.Delete != nil:
@@ -559,6 +563,9 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		pb := &rpcpb.ScanResponse{Resume: u.Scan.Resume}
 		for _, kv := range u.Scan.Rows {
 			pb.Rows = append(pb.Rows, &rpcpb.KeyValue{Key: kv.Key, Value: kv.Value})
+		}
+		for _, in := range u.Scan.Skipped {
+			pb.Skipped = append(pb.Skipped, &rpcpb.Intent{Key: in.Key, Txn: txnMetaToProto(in.Txn)})
 		}
 		out.Value = &rpcpb.ResponseUnion_Scan{Scan: pb}
 	case u.Export != nil:
@@ -625,6 +632,13 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			val = []byte{}
 		}
 		u.Get = &GetResponse{Value: val}
+		if v.Get.Skipped != nil {
+			meta, err := txnMetaFromProto(v.Get.Skipped.Txn)
+			if err != nil {
+				return u, err
+			}
+			u.Get.Skipped = &storage.Intent{Key: v.Get.Skipped.Key, Txn: meta}
+		}
 	case *rpcpb.ResponseUnion_Put:
 		u.Put = &PutResponse{}
 	case *rpcpb.ResponseUnion_Delete:
@@ -635,6 +649,13 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		r := &ScanResponse{Resume: v.Scan.Resume}
 		for _, kv := range v.Scan.Rows {
 			r.Rows = append(r.Rows, KeyValue{Key: kv.Key, Value: kv.Value})
+		}
+		for _, in := range v.Scan.Skipped {
+			meta, err := txnMetaFromProto(in.Txn)
+			if err != nil {
+				return u, err
+			}
+			r.Skipped = append(r.Skipped, storage.Intent{Key: in.Key, Txn: meta})
 		}
 		u.Scan = r
 	case *rpcpb.ResponseUnion_Export:

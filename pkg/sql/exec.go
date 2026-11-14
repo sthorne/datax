@@ -1558,9 +1558,11 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if err != nil {
 			return nil, err
 		}
-		if rows == nil {
+		if rows == nil && kvclient.LockWaitFrom(ctx) != kvclient.LockWaitSkip {
 			// The entry and the row commit atomically; a dangling entry is
 			// corruption, not an empty result — unless the row was filtered.
+			// (Under SKIP LOCKED a locked row reads as absent, so absence
+			// proves nothing there.)
 			if raw, gerr := txn.Get(ctx, pk); gerr == nil && raw == nil {
 				return nil, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 			}
@@ -1614,6 +1616,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			for i, raw := range raws {
 				pk := pks[first+i]
 				if raw == nil {
+					if kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip {
+						continue // locked by another transaction: passed over
+					}
 					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 				}
 				row, err := decodeFullRow(desc, pk, raw)
@@ -2156,47 +2161,60 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if s.streamable(top, desc, plan, t, needSort, corr, corrProjs) {
 		return s.newScanStream(txn, desc, plan, t, proj, t.Where, params, fetchLimit)
 	}
-	rows, err := s.executePlan(ctx, txn, desc, plan, t.Where, params, fetchLimit)
-	if err != nil {
-		return nil, err
-	}
-	if len(corr) > 0 {
-		memo := corrMemo{}
-		kept := rows[:0]
-		for _, fr := range rows {
-			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
-			if cerr != nil {
-				return nil, cerr
-			}
-			if match {
-				kept = append(kept, fr)
-			}
-		}
-		rows = kept
-		if !needSort && !t.Distinct {
-			rows = cutRows(rows, keepCount(t))
-		}
-	}
-	if t.ForUpdate {
-		// Lock each selected row: the locking read re-verifies the row at
-		// the transaction's read timestamp server-side (any newer committed
-		// version surfaces as a retryable conflict), so the fetch-then-lock
-		// gap cannot admit a stale read.
-		lockKeys := make([]keys.Key, len(rows))
-		for i, fr := range rows {
-			lockKeys[i] = fr.key
-		}
-		if _, lerr := txn.GetBatchForUpdate(ctx, lockKeys); lerr != nil {
-			return nil, lerr
-		}
-	}
-	if needSort {
-		if err := sortRows(desc, rows, order, params); err != nil {
+	var rows []fetchedRow
+	if t.ForUpdate && t.LockWait == parser.LockWaitSkipLocked {
+		rows, err = s.fetchSkipLocked(ctx, txn, desc, plan, t, params, fetchLimit, corr, needSort, order)
+		if err != nil {
 			return nil, err
 		}
-		s.note("sort: %d rows in memory", len(rows))
-		if !t.Distinct {
-			rows = cutRows(rows, keepCount(t))
+	} else {
+		nowait := t.ForUpdate && t.LockWait == parser.LockWaitNoWait
+		fetchCtx := ctx
+		if nowait {
+			// The fetch must not wait either: a plain read queues behind
+			// an intent at or below its timestamp.
+			fetchCtx = kvclient.WithLockWait(ctx, kvclient.LockWaitError)
+		}
+		rows, err = s.executePlan(fetchCtx, txn, desc, plan, t.Where, params, fetchLimit)
+		if err != nil {
+			return nil, rowLockErr(desc, err)
+		}
+		if len(corr) > 0 {
+			rows, err = s.filterCorrelated(ctx, txn, corr, desc, rows, params)
+			if err != nil {
+				return nil, err
+			}
+			if !needSort && !t.Distinct {
+				rows = cutRows(rows, keepCount(t))
+			}
+		}
+		if t.ForUpdate {
+			// Lock each selected row: the locking read re-verifies the row at
+			// the transaction's read timestamp server-side (any newer committed
+			// version surfaces as a retryable conflict), so the fetch-then-lock
+			// gap cannot admit a stale read.
+			lockKeys := make([]keys.Key, len(rows))
+			for i, fr := range rows {
+				lockKeys[i] = fr.key
+			}
+			var lerr error
+			if nowait {
+				_, lerr = txn.GetBatchForUpdateNoWait(ctx, lockKeys, false)
+			} else {
+				_, lerr = txn.GetBatchForUpdate(ctx, lockKeys)
+			}
+			if lerr != nil {
+				return nil, rowLockErr(desc, lerr)
+			}
+		}
+		if needSort {
+			if err := sortRows(desc, rows, order, params); err != nil {
+				return nil, err
+			}
+			s.note("sort: %d rows in memory", len(rows))
+			if !t.Distinct {
+				rows = cutRows(rows, keepCount(t))
+			}
 		}
 	}
 	res := &Result{}
@@ -3312,6 +3330,153 @@ func resolveLimitParams(t *parser.Select, params []types.Datum) (*parser.Select,
 		}
 	}
 	return &c, nil
+}
+
+// filterCorrelated keeps the rows the statement's correlated subquery
+// filters accept.
+func (s *Session) filterCorrelated(ctx context.Context, txn *kvclient.Txn, corr []correlatedConjunct, desc *catalog.TableDescriptor, rows []fetchedRow, params []types.Datum) ([]fetchedRow, error) {
+	memo := corrMemo{}
+	kept := rows[:0]
+	for _, fr := range rows {
+		match, err := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			kept = append(kept, fr)
+		}
+	}
+	return kept, nil
+}
+
+// rowLockErr gives a NOWAIT failure PostgreSQL's wording, naming the
+// table; any other error passes through.
+func rowLockErr(desc *catalog.TableDescriptor, err error) error {
+	if kvclient.IsLockNotAvailable(err) {
+		return newErrf(CodeLockNotAvailable, "could not obtain lock on row in relation %q", desc.Name)
+	}
+	return err
+}
+
+// skipLockedGrowth and skipLockedBoundedRounds shape the refetch of a
+// SKIP LOCKED statement whose limited fetch came back full and still
+// left the limit unmet: each round asks for four times as many rows,
+// and after the bounded rounds the fetch is unlimited.
+const (
+	skipLockedGrowth        = 4
+	skipLockedBoundedRounds = 3
+)
+
+// fetchSkipLocked fetches and locks the rows of a SELECT ... FOR UPDATE
+// SKIP LOCKED, leaving out every row it cannot lock at once, and returns
+// them in the statement's order, cut to LIMIT+OFFSET.
+//
+// The fetch reads under kvclient.LockWaitSkip, so rows carrying another
+// transaction's intent never come back, and a pushed-down limit counts
+// only rows that were free when the scan passed them. The rows are then
+// locked in order, only as many as the statement returns — a row locked
+// and then cut by LIMIT would be hidden from every other SKIP LOCKED
+// reader for nothing. A row that cannot be locked after all (taken
+// between the fetch and the lock, or changed and committed since this
+// transaction's snapshot) is passed over like one locked from the start,
+// and the next candidate takes its place. When a limited fetch runs out
+// of candidates that way, it is repeated with a larger limit: the rows
+// already locked come back (this transaction reads its own intents), the
+// ones passed over are not tried again.
+//
+// Every row passed over is then taken out of the transaction's read set
+// (Txn.ForgetReads): another transaction is about to change it, and it
+// is no part of this statement's result. So is a row that was fetched
+// but lay beyond the limit in an ordered scan — a fetch that could have
+// stopped exactly at the limit would never have read it.
+func (s *Session) fetchSkipLocked(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, t *parser.Select, params []types.Datum, fetchLimit int64, corr []correlatedConjunct, needSort bool, order []parser.OrderCol) ([]fetchedRow, error) {
+	if t.Limit == 0 {
+		return nil, nil // nothing is returned, so nothing is locked
+	}
+	want := keepCount(t)
+	skipCtx := kvclient.WithLockWait(ctx, kvclient.LockWaitSkip)
+	mark := txn.ReadMark()
+	held := map[string]bool{}   // locked by this statement
+	passed := map[string]bool{} // could not be locked: not tried again
+	limit := fetchLimit
+	for round := 1; ; round++ {
+		rows, err := s.executePlan(skipCtx, txn, desc, plan, t.Where, params, limit)
+		if err != nil {
+			return nil, err
+		}
+		exhausted := limit == 0 || int64(len(rows)) < limit
+		if len(corr) > 0 {
+			if rows, err = s.filterCorrelated(ctx, txn, corr, desc, rows, params); err != nil {
+				return nil, err
+			}
+		}
+		if needSort {
+			if err := sortRows(desc, rows, order, params); err != nil {
+				return nil, err
+			}
+			s.note("sort: %d rows in memory", len(rows))
+		}
+		var kept []fetchedRow
+		next := 0
+		for next < len(rows) && (want == 0 || int64(len(kept)) < want) {
+			// Lock as many candidates as are still wanted, in one batch.
+			n := len(rows) - next
+			if want > 0 && want-int64(len(kept)) < int64(n) {
+				n = int(want - int64(len(kept)))
+			}
+			chunk := rows[next : next+n]
+			next += n
+			var lockKeys []keys.Key
+			for _, fr := range chunk {
+				if k := string(fr.key); !held[k] && !passed[k] {
+					lockKeys = append(lockKeys, fr.key)
+				}
+			}
+			got, err := txn.GetBatchForUpdateNoWait(ctx, lockKeys, true)
+			if err != nil {
+				return nil, err
+			}
+			var refused []keys.Key
+			for i, k := range lockKeys {
+				if got[i] {
+					held[string(k)] = true
+				} else {
+					passed[string(k)] = true
+					refused = append(refused, k)
+				}
+			}
+			// At once, not at the end: the very next read of this
+			// statement may have to refresh, and the transaction that
+			// took the row has likely committed by then.
+			txn.ForgetReads(mark, refused)
+			for _, fr := range chunk {
+				if held[string(fr.key)] {
+					kept = append(kept, fr)
+				}
+			}
+		}
+		if want > 0 && int64(len(kept)) < want && !exhausted {
+			if round >= skipLockedBoundedRounds {
+				limit = 0
+			} else {
+				limit *= skipLockedGrowth
+			}
+			continue
+		}
+		var forget []keys.Key
+		for k := range passed {
+			forget = append(forget, keys.Key(k))
+		}
+		if !needSort {
+			for _, fr := range rows[next:] {
+				if !held[string(fr.key)] {
+					forget = append(forget, fr.key)
+				}
+			}
+		}
+		txn.ForgetReads(mark, forget)
+		return kept, nil
+	}
 }
 
 // keepCount is how many leading rows a stage must keep for the query's

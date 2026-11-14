@@ -762,6 +762,74 @@ transaction is poisoned (`25P02`) until `ROLLBACK` — or
 
 Deadlocks are detected and broken automatically (one victim gets `40001`).
 
+### Not waiting for a lock: SKIP LOCKED and NOWAIT
+
+`FOR UPDATE` waits for a row another transaction holds. Two suffixes
+say not to:
+
+```sql
+SELECT id FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;  -- the first job nobody else has
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;           -- 55P03 if someone holds it
+```
+
+**`SKIP LOCKED`** leaves out every row it cannot lock at once and locks
+and returns the rest. `LIMIT n` counts the rows returned: the scan goes
+on past the rows it skips until it has locked `n` or run out, and only
+the rows returned are locked. This is the job-queue statement — each
+worker takes the first job no other worker has, and none of them waits:
+
+```sql
+BEGIN;
+SELECT id, payload FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+-- ... do the work ...
+DELETE FROM jobs WHERE id = $1;
+COMMIT;
+```
+
+What counts as "cannot lock":
+
+- a row another transaction has locked or written and not yet finished
+  with (`FOR UPDATE`, `UPDATE`, `DELETE`, or a row it is inserting);
+- a row another transaction changed and **committed** after this
+  transaction's snapshot was taken (or so close to it that the clocks
+  cannot order the two). Plain `FOR UPDATE` treats that as a conflict
+  and may fail with `40001`; `SKIP LOCKED` passes the row over. In a
+  queue it is a job another worker took and finished a moment ago.
+
+The result is therefore not a consistent picture of the table — that is
+the point of the clause, as in PostgreSQL — and rows that were skipped
+are not reads of the transaction: whatever happens to them later cannot
+fail it. The transaction still reads at its snapshot, so a block that
+began long ago does not see rows inserted since; take the snapshot late
+(run the `SELECT` first in its block, or on its own) when draining a
+queue. A lock whose transaction died without finishing does not hide
+its row for good: skipping readers notice it once it has expired
+(about five seconds) and release it.
+
+Keep the retry loop: skipped rows cost no `40001`, but the rows the
+transaction did read and write are under the same rules as anywhere
+else. A queue drained this way sees `40001` rarely, not never. Give the
+query an order the table or an index delivers (`ORDER BY` the primary
+key, or an indexed column): with an in-memory sort every matching free
+row is read before the first is chosen, and each of those is a read
+another worker's `DELETE` can invalidate.
+
+**`NOWAIT`** fails the statement with SQLSTATE **`55P03`**
+(`could not obtain lock on row in relation "..."`) when it meets a row
+another transaction holds, and locks nothing more. It is an ordinary
+statement error — the block is poisoned until `ROLLBACK` or
+`ROLLBACK TO SAVEPOINT` — and not a retry signal like `40001`: the row
+is busy, and trying again at once will most likely find it busy still.
+Unlike in PostgreSQL the refusal can come from a row the statement had
+to read on the way and would then have filtered out (a full scan with a
+`WHERE` no index serves reads every row); a lookup by key or by index
+meets only the rows it selects.
+
+Neither suffix lets a transaction take a lock away from its holder, and
+both are refused wherever `FOR UPDATE` is (joins, aggregates,
+`DISTINCT`, subqueries, views, `AS OF SYSTEM TIME`). `FOR SHARE` and
+`FOR UPDATE OF table` are not supported.
+
 ## Session settings
 
 ```sql
@@ -788,7 +856,7 @@ invalid value `22023`:
 |---|---|---|
 | `statement_timeout` | ms, or `'5s'`, `'1min'`, `'500ms'`; `0` = none | a statement past it is cancelled: `57014`, its transaction block failed |
 | `statement_memory_limit` | bytes, or `'64MB'`, `'1GB'`, `'512kB'`; `0` = none; default `64MB` | what one statement may hold in memory on the gateway (rows it sorts, aggregates, joins or otherwise collects); past it the statement fails with `53200` instead of growing without bound. Streamed `SELECT`s are unaffected (see [Streaming](#reading)) |
-| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`) |
+| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`); to not wait at all, see [`FOR UPDATE NOWAIT` and `SKIP LOCKED`](#not-waiting-for-a-lock-skip-locked-and-nowait) |
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
 | `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
