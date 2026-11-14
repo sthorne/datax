@@ -3464,36 +3464,70 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		if !p.consumeIdentWord("at") {
 			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
 		}
-		if err := p.expectKeyword("VALUES"); err != nil {
+		tuples, err := p.parseSplitTuples()
+		if err != nil {
 			return nil, err
 		}
+		at.SplitAt = tuples
+		if p.consumeIdentWord("with") {
+			if !p.consumeIdentWord("expiration") {
+				return nil, p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
+			}
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			at.SplitExpiration = &e
+		}
+	case p.consumeIdentWord("unsplit"):
+		if p.consumeIdentWord("all") {
+			at.UnsplitAll = true
+			break
+		}
+		if !p.consumeIdentWord("at") {
+			return nil, p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
+		}
+		tuples, err := p.parseSplitTuples()
+		if err != nil {
+			return nil, err
+		}
+		at.UnsplitAt = tuples
+	default:
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+	}
+	return at, nil
+}
+
+// parseSplitTuples parses VALUES (k, ...), (k, ...): the key tuples of
+// ALTER TABLE ... SPLIT AT and UNSPLIT AT.
+func (p *parser) parseSplitTuples() ([][]Expr, error) {
+	if err := p.expectKeyword("VALUES"); err != nil {
+		return nil, err
+	}
+	var tuples [][]Expr
+	for {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		var tuple []Expr
 		for {
-			if err := p.expectOp("("); err != nil {
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
 				return nil, err
 			}
-			var tuple []Expr
-			for {
-				e, err := p.parseValueOrColumnExpr()
-				if err != nil {
-					return nil, err
-				}
-				tuple = append(tuple, e)
-				if !p.consumeOp(",") {
-					break
-				}
-			}
-			if err := p.expectOp(")"); err != nil {
-				return nil, err
-			}
-			at.SplitAt = append(at.SplitAt, tuple)
+			tuple = append(tuple, e)
 			if !p.consumeOp(",") {
 				break
 			}
 		}
-	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET or SPLIT AT, found %q", p.peek().text)
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		tuples = append(tuples, tuple)
+		if !p.consumeOp(",") {
+			return tuples, nil
+		}
 	}
-	return at, nil
 }
 
 // tryBareColumnList parses `a, b [, PRIMARY KEY (cols)])` — the name

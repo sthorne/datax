@@ -140,3 +140,38 @@ func TestParseSplitAt(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSplitExpirationAndUnsplit: SPLIT AT ... WITH EXPIRATION e, and
+// the way back, UNSPLIT AT VALUES (...) and UNSPLIT ALL (issue #265).
+func TestParseSplitExpirationAndUnsplit(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10), (20) WITH EXPIRATION INTERVAL '1 hour'`).(*AlterTable)
+	if len(at.SplitAt) != 2 || at.SplitExpiration == nil || at.UnsplitAt != nil || at.UnsplitAll {
+		t.Fatalf("split at with expiration: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10) WITH EXPIRATION $1`).(*AlterTable); at.SplitExpiration == nil {
+		t.Fatalf("split at with a parameter for the expiration: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10)`).(*AlterTable); at.SplitExpiration != nil {
+		t.Fatalf("split at without an expiration: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE IF EXISTS t UNSPLIT AT VALUES (10), (20, 'x')`).(*AlterTable)
+	if !at.IfExists || len(at.UnsplitAt) != 2 || len(at.UnsplitAt[1]) != 2 || at.SplitAt != nil || at.UnsplitAll {
+		t.Fatalf("unsplit at: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t UNSPLIT ALL`).(*AlterTable); !at.UnsplitAll || at.UnsplitAt != nil || at.SplitAt != nil {
+		t.Fatalf("unsplit all: %+v", at)
+	}
+	for _, bad := range []string{
+		`ALTER TABLE t SPLIT AT VALUES (1) WITH EXPIRATION`,
+		`ALTER TABLE t SPLIT AT VALUES (1) WITH (expiration = 1)`,
+		`ALTER TABLE t UNSPLIT`,
+		`ALTER TABLE t UNSPLIT VALUES (1)`,
+		`ALTER TABLE t UNSPLIT AT (1)`,
+		`ALTER TABLE t UNSPLIT ALL VALUES (1)`,
+		`ALTER TABLE t UNSPLIT AT VALUES (1) WITH EXPIRATION '1 hour'`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%s: parsed", bad)
+		}
+	}
+}

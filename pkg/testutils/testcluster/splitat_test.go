@@ -45,8 +45,17 @@ func TestSplitAt(t *testing.T) {
 			t.Fatalf("boundary %d: %q", i, got)
 		}
 	}
-	if after := countRanges(tc.Nodes[0]); after < before+3 {
-		t.Fatalf("ranges: %d before, %d after three splits", before, after)
+	// The statement returns when the splits are acknowledged by their
+	// leaders; this node may follow those ranges and apply them a moment
+	// later, so its own count is waited for rather than read once.
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		after := countRanges(tc.Nodes[0])
+		if after >= before+3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ranges: %d before, %d after three splits", before, after)
+		}
 	}
 	// Idempotent: a boundary that already exists is fine.
 	execSQL(t, ctx, s, `ALTER TABLE sp SPLIT AT VALUES (10)`)

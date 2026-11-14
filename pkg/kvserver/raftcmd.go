@@ -64,6 +64,9 @@ func encodeRaftCommand(cmd *raftCommand) ([]byte, error) {
 			RightGcThreshold:  tsToProto(cmd.Merge.RightGCThreshold),
 		}
 	}
+	if cmd.Descriptor != nil {
+		pb.DescriptorUpdate = &rpcpb.DescriptorUpdateTrigger{Desc: kvpb.RangeDescriptorToProto(cmd.Descriptor.Desc)}
+	}
 	raw, err := proto.Marshal(pb)
 	if err != nil {
 		return nil, err
@@ -121,6 +124,9 @@ func decodeRaftCommand(data []byte) (*raftCommand, error) {
 			RightSizeBytes:    pb.Merge.RightSizeBytes,
 			RightGCThreshold:  tsFromProto(pb.Merge.RightGcThreshold),
 		}
+	}
+	if pb.DescriptorUpdate != nil {
+		cmd.Descriptor = &descriptorTrigger{Desc: kvpb.RangeDescriptorFromProto(pb.DescriptorUpdate.Desc)}
 	}
 	return cmd, nil
 }

@@ -3,6 +3,7 @@ package sql
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime/debug"
@@ -20,6 +21,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // execStmt runs one statement in txn. It is the panic barrier of the
@@ -520,14 +522,169 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 	}
 }
 
-// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ...: carve a
-// range boundary at each primary-key tuple (a prefix of the key is
-// allowed), so a bulk load or a benchmark spreads over many ranges from
-// the start instead of waiting for size- and load-based splits. Rows are
-// the boundaries as key paths. A sharded timeseries table's key begins
-// with its shard bucket, so it is split by shard (SET (shards = N)), not
-// here.
+// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ... [WITH
+// EXPIRATION e]: carve a range boundary at each primary-key tuple (a
+// prefix of the key is allowed), so a bulk load or a benchmark spreads
+// over many ranges from the start instead of waiting for size- and
+// load-based splits. Rows are the boundaries as key paths. A sharded
+// timeseries table's key begins with its shard bucket, so it is split by
+// shard (SET (shards = N)), not here.
+//
+// The boundaries are sticky (issue #265): the halves of a pre-split are
+// empty, which is exactly what the merge queue folds back together, so
+// each is recorded on its range as made on purpose and stays until
+// UNSPLIT or its expiration. Before the cluster has finalized v20 the
+// record cannot be written; the split is then an ordinary one, as it was
+// before, and an expiration — which would promise something the cluster
+// cannot keep — is refused.
 func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	desc, err := s.splitTable(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	stickyUntil := int64(kvpb.StickyForever)
+	if t.SplitExpiration != nil {
+		if !s.db.StickyBitsOK() {
+			return nil, newErrf(CodeFeatureNotSupported, "SPLIT AT ... WITH EXPIRATION needs cluster version %s (finalize the upgrade first)", version.V20)
+		}
+		if stickyUntil, err = s.splitExpiration(*t.SplitExpiration, params); err != nil {
+			return nil, err
+		}
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	for _, tuple := range t.SplitAt {
+		key, err := splitKey(desc, "SPLIT AT", tuple, params)
+		if err != nil {
+			return nil, err
+		}
+		// An existing boundary is the state asked for (a re-run of a
+		// load script or a benchmark's set-up) and the KV split treats
+		// it so, marking it sticky. The KV layer also carries the two
+		// waits this statement used to fail on or spin for: a range
+		// frozen for a merge in flight is waited out by the client, and
+		// a range that another split or merge changed first is re-read
+		// and split again by the leader (issue #290).
+		if _, err := s.db.AdminSplitSticky(ctx, key, stickyUntil); err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
+// execUnsplit is ALTER TABLE t UNSPLIT AT VALUES (k, ...), ... and
+// UNSPLIT ALL: stop holding manual range boundaries against merging.
+// Nothing merges here; the merge queue folds the ranges back when they
+// are small enough, as it does any others. UNSPLIT AT names boundaries
+// the way SPLIT AT does and fails on a key that is not one; UNSPLIT ALL
+// releases every sticky boundary inside the table. Rows are the
+// boundaries released.
+func (s *Session) execUnsplit(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	desc, err := s.splitTable(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	if !s.db.StickyBitsOK() {
+		return nil, newErrf(CodeFeatureNotSupported, "UNSPLIT needs cluster version %s (finalize the upgrade first)", version.V20)
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	var unsplit []keys.Key
+	if t.UnsplitAll {
+		// Every range that starts strictly inside the table's primary
+		// index: the table's own edges are not SPLIT AT boundaries.
+		lo := rowenc.PrimaryKeyPrefixFor(desc)
+		if unsplit, err = s.stickyBoundaries(ctx, lo, lo.PrefixEnd()); err != nil {
+			return nil, err
+		}
+	}
+	for _, tuple := range t.UnsplitAt {
+		key, err := splitKey(desc, "UNSPLIT AT", tuple, params)
+		if err != nil {
+			return nil, err
+		}
+		unsplit = append(unsplit, key)
+	}
+	for _, key := range unsplit {
+		if _, err := s.db.AdminUnsplit(ctx, key); err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
+// stickyBoundaries lists, from the range addressing records, the start
+// keys of the ranges that begin strictly inside (lo, hi) and carry a
+// sticky bit (expired or not: an expired bit is as well cleared).
+func (s *Session) stickyBoundaries(ctx context.Context, lo, hi keys.Key) ([]keys.Key, error) {
+	const page = 256
+	_, metaEnd := keys.MetaSpan()
+	var out []keys.Key
+	// A range's record is keyed by its end key, so the first record past
+	// lo's own is the range holding lo.
+	for cursor := keys.Key(keys.RangeMetaKey(lo)).Next(); ; {
+		rows, err := s.db.Scan(ctx, cursor, metaEnd, page)
+		if err != nil {
+			return nil, err
+		}
+		for _, kv := range rows {
+			var d kvpb.RangeDescriptor
+			if err := json.Unmarshal(kv.Value, &d); err != nil {
+				return nil, fmt.Errorf("corrupt range addressing record at %s: %w", kv.Key, err)
+			}
+			if d.StartKey.Compare(hi) >= 0 {
+				return out, nil
+			}
+			if d.StartKey.Compare(lo) > 0 && d.StickyUntil != 0 {
+				out = append(out, d.StartKey)
+			}
+		}
+		if len(rows) < page {
+			return out, nil
+		}
+		cursor = rows[len(rows)-1].Key.Next()
+	}
+}
+
+// releaseManualSplits stops holding every manual range boundary inside a
+// table's data, for DROP TABLE and TRUNCATE: both leave the table's old
+// key space empty for good (a truncated table continues under new index
+// IDs), and a sticky boundary there would keep an empty range alive with
+// no table left to name it in an UNSPLIT. Best-effort and outside the
+// statement's transaction, like the splits themselves: a failure is
+// logged and the boundary stays (datax debug unsplit can release it),
+// and a statement that then rolls back has given up boundaries it could
+// have kept — they merge only if their ranges are small, and SPLIT AT
+// makes them again.
+func (s *Session) releaseManualSplits(ctx context.Context, tableID uint64) {
+	if tableID == 0 || !s.db.StickyBitsOK() {
+		return
+	}
+	lo, hi := keys.TableDataSpan(tableID)
+	sticky, err := s.stickyBoundaries(ctx, lo, hi)
+	if err != nil {
+		log.Debugf("releasing manual splits of table %d: %v", tableID, err)
+		return
+	}
+	for _, key := range sticky {
+		if _, err := s.db.AdminUnsplit(ctx, key); err != nil {
+			log.Debugf("releasing manual split at %s: %v", keys.Pretty(key), err)
+		}
+	}
+}
+
+// splitTable resolves the table of a SPLIT AT or UNSPLIT and checks that
+// its key space is one those statements carve. A nil descriptor with a
+// nil error is IF EXISTS on a table that does not exist.
+func (s *Session) splitTable(ctx context.Context, t *parser.AlterTable) (*catalog.TableDescriptor, error) {
 	var desc *catalog.TableDescriptor
 	if err := s.db.RunTxn(ctx, "split-at", func(ctx context.Context, txn *kvclient.Txn) error {
 		shared, err := s.lookup(ctx, txn, t.Table)
@@ -539,7 +696,7 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 	}); err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {
-			return &Result{Tag: "ALTER TABLE"}, nil
+			return nil, nil
 		}
 		return nil, err
 	}
@@ -549,54 +706,72 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 	if desc.ShardBuckets > 1 {
 		return nil, newErrf(CodeFeatureNotSupported, "%q is sharded: its key space is carved by shard (ALTER TABLE ... SET (shards = N)), not by primary key", desc.Name)
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
-	for _, tuple := range t.SplitAt {
-		if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
-			return nil, newErrf(CodeSyntaxError, "SPLIT AT: a tuple names 1 to %d primary key values (%q has %d)", len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
-		}
-		key := rowenc.PrimaryKeyPrefixFor(desc)
-		for i, e := range tuple {
-			col, _ := desc.ColByID(desc.PrimaryKey[i])
-			d, err := evalExpr(e, nil, nil, params)
-			if err != nil {
-				return nil, err
-			}
-			if d, err = col.Conform(d); err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
-			}
-			if d.Null {
-				return nil, newErrf(CodeSyntaxError, "SPLIT AT: column %q: a split key cannot be NULL", col.Name)
-			}
-			if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
-			}
-		}
-		// An existing boundary is the state asked for (a re-run of a
-		// load script or a benchmark's set-up), not an error. A range
-		// frozen for a merge in flight (the housekeeping loop folding
-		// empty neighbors back together) is split once the merge lands.
-		var err error
-		for attempt := 0; attempt < 50; attempt++ {
-			if _, err = s.db.AdminSplit(ctx, key); err == nil || strings.Contains(err.Error(), "already a range boundary") {
-				err = nil
-				break
-			}
-			if !strings.Contains(err.Error(), "frozen for a merge") {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
+	return desc, nil
+}
+
+// splitKey encodes one SPLIT AT / UNSPLIT AT tuple as a key of desc's
+// primary index; what names the statement in errors.
+func splitKey(desc *catalog.TableDescriptor, what string, tuple []parser.Expr, params []types.Datum) (keys.Key, error) {
+	if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
+		return nil, newErrf(CodeSyntaxError, "%s: a tuple names 1 to %d primary key values (%q has %d)", what, len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
+	}
+	key := rowenc.PrimaryKeyPrefixFor(desc)
+	for i, e := range tuple {
+		col, _ := desc.ColByID(desc.PrimaryKey[i])
+		d, err := evalExpr(e, nil, nil, params)
 		if err != nil {
 			return nil, err
 		}
-		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+		if d, err = col.Conform(d); err != nil {
+			return nil, newErrf(CodeInvalidParameterValue, "%s: column %q: %v", what, col.Name, err)
+		}
+		if d.Null {
+			return nil, newErrf(CodeSyntaxError, "%s: column %q: a split key cannot be NULL", what, col.Name)
+		}
+		if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
+			return nil, newErrf(CodeInvalidParameterValue, "%s: column %q: %v", what, col.Name, err)
+		}
 	}
-	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
-	return res, nil
+	return key, nil
+}
+
+// splitExpiration evaluates SPLIT AT ... WITH EXPIRATION e to the
+// wall-clock time, in nanoseconds, at which the boundaries stop being
+// held: a timestamp (or text that reads as one) is that moment, an
+// interval is that long from now. It must lie in the future — a boundary
+// that is already expired is a plain split, and saying so is kinder than
+// making one silently.
+func (s *Session) splitExpiration(e parser.Expr, params []types.Datum) (int64, error) {
+	d, err := evalExpr(e, nil, nil, params)
+	if err != nil {
+		return 0, err
+	}
+	now := s.db.Clock().Now().WallTime
+	var until int64
+	switch {
+	case d.Null:
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration cannot be NULL (leave WITH EXPIRATION out for a boundary that does not expire)")
+	case d.Fam == types.Timestamp:
+		until = d.I
+	case d.Fam == types.Date:
+		until = d.I * int64(24*time.Hour)
+	case d.Fam == types.IntervalFam:
+		until = d.IntervalVal().AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+	case d.Fam == types.String:
+		if until, err = types.ParseTimestamp(d.S); err != nil {
+			iv, ierr := types.ParseInterval(d.S)
+			if ierr != nil {
+				return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration %q is neither a timestamp nor an interval", d.S)
+			}
+			until = iv.AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+		}
+	default:
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration must be a timestamp or an interval, not %s", d.Fam)
+	}
+	if until <= now {
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration %s is not in the future", time.Unix(0, until).UTC().Format(time.RFC3339))
+	}
+	return until, nil
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
@@ -629,6 +804,7 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	// sampler's orphan sweep is the backstop for anything missed), and so
 	// do the sequences its columns own.
 	if desc != nil {
+		s.releaseManualSplits(ctx, desc.ID)
 		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
 			return nil, err
 		}

@@ -82,7 +82,8 @@ type mergeTrigger struct {
 
 // RunRangeMergeOnce merges adjacent underfull ranges: for every range this
 // store leads, if its right neighbor is local, colocated (identical node
-// sets), and both are below the merge threshold, drive the merge — first
+// sets), not held by a sticky bit (a manual split; issue #265), and both
+// are below the merge threshold, drive the merge — first
 // pulling the RHS's leadership here if needed. Also re-drives (or unwinds)
 // merges interrupted by a crash. Called by the housekeeping loop.
 func (s *Store) RunRangeMergeOnce(ctx context.Context) {
@@ -116,6 +117,17 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 			return true
 		}
 		redrive := rhs.isFrozen() && rhs.mergedIntoRange() == lhs.rangeID
+		// Never undo a manual split: the boundary between the two is the
+		// RHS's start, and an unexpired sticky bit on the RHS says an
+		// operator put it there on purpose (ALTER TABLE ... SPLIT AT,
+		// datax debug split) — typically ahead of a load, when both
+		// halves are still empty and would otherwise be folded back
+		// within seconds (issue #265). UNSPLIT clears the bit. An
+		// interrupted merge still finishes: its RHS is frozen and serves
+		// nothing until it does.
+		if !redrive && rhsDesc.Sticky(s.cfg.Clock.Now().WallTime) {
+			return true
+		}
 		if !redrive && (lhs.SizeBytes() >= threshold || rhs.SizeBytes() >= threshold) {
 			return true
 		}
@@ -174,7 +186,7 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 			}
 			return true
 		}
-		if _, err := lhs.adminMerge(ctx); err != nil {
+		if _, err := lhs.adminMerge(ctx, true); err != nil {
 			log.Warnf("%s: merge with %s: %v", lhs.rangeID, rhsDesc.RangeID, err)
 		}
 		return true
@@ -220,7 +232,12 @@ func (r *Replica) mergedIntoRange() base.RangeID {
 
 // adminMerge merges this (leading, unfrozen) range with its right
 // neighbor, which must be local, led by this node, and colocated.
-func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kvpb.Error) {
+// honorSticky is set by the merge queue and not by an operator's explicit
+// merge (datax debug merge), which overrides a manual split: with it, a
+// sticky bit found on the RHS once it is frozen abandons the merge. The
+// queue checks the bit before calling, but a manual split of the boundary
+// can land between that check and the freeze; after the freeze none can.
+func (r *Replica) adminMerge(ctx context.Context, honorSticky bool) (*kvpb.AdminMergeResponse, *kvpb.Error) {
 	desc := r.Desc()
 	if r.isFrozen() {
 		return nil, kvpb.NewErrorf("%s: cannot merge: range is itself frozen", r.rangeID)
@@ -313,6 +330,9 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// apply, but the spans must still meet here.
 	desc = r.Desc()
 	rhsDesc = rhs.Desc()
+	if honorSticky && fresh && rhsDesc.Sticky(r.store.cfg.Clock.Now().WallTime) {
+		return abandon(kvpb.NewErrorf("%s: not merging %s: its start boundary %s was split manually (sticky)", r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey))
+	}
 	if !rhsDesc.StartKey.Equal(desc.EndKey) {
 		return abandon(kvpb.NewErrorf("%s: cannot merge: right neighbor %s now starts at %s, not at this range's end %s; retried by housekeeping",
 			r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey, desc.EndKey))
@@ -354,6 +374,9 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		Replicas:      append([]kvpb.ReplicaDescriptor(nil), desc.Replicas...),
 		NextReplicaID: desc.NextReplicaID,
 		Generation:    gen + 1,
+		// The merged range starts where the LHS did, so it keeps the
+		// LHS's sticky bit; the RHS's described a boundary that is gone.
+		StickyUntil: desc.StickyUntil,
 	}
 	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
 		k(r.rangeID, "merge")
@@ -481,8 +504,10 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 	// fields named Left carry different generations.)
 	if r.Desc().Generation != trig.Left.Generation {
 		metrics.DescriptorChangeRefusals.WithLabelValues("merge").Inc()
-		return kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
+		e := kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
 			r.rangeID, trig.Left.Generation, r.Desc().Generation)
+		e.DescriptorChanged = &kvpb.DescriptorChangedError{RangeID: r.rangeID, BuiltFrom: trig.Left.Generation, Current: r.Desc().Generation}
+		return e
 	}
 	rhs, ok := r.store.GetReplica(trig.Right.RangeID)
 	if !ok {

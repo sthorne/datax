@@ -10,9 +10,9 @@ import (
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
 type AdminRequest struct {
 	// Op: "split", "ranges", "nodes", "rebalance", "transfer-lease",
-	// "decommission", "merge".
+	// "decommission", "merge", "unsplit".
 	Op string `json:"op"`
-	// Key for split (raw key bytes).
+	// Key for split and unsplit (raw key bytes).
 	Key []byte `json:"key,omitempty"`
 	// RangeID and target/source nodes for rebalance.
 	RangeID  base.RangeID `json:"range_id,omitempty"`

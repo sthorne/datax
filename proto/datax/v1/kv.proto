@@ -80,6 +80,10 @@ message RangeDescriptor {
   repeated ReplicaDescriptor replicas = 4;
   int64 next_replica_id = 5;
   int64 generation = 6;
+  // sticky_until marks the start boundary as set on purpose: wall-clock
+  // nanoseconds until which the merge queue leaves it alone (0 = not
+  // sticky). Written only once the cluster has finalized v20.
+  int64 sticky_until = 7;
 }
 
 message KeyValue {
@@ -212,6 +216,16 @@ message TruncateLogRequest {
 
 message AdminSplitRequest {
   RequestHeader header = 1;
+  // sticky_until makes this a manual split: the boundary is recorded as
+  // sticky until this wall-clock time, and an existing boundary is
+  // marked instead of refused. 0 = an ordinary (automatic) split.
+  int64 sticky_until = 2;
+}
+
+// AdminUnsplitRequest clears the sticky bit of the range starting at the
+// header's key (cluster version v20).
+message AdminUnsplitRequest {
+  RequestHeader header = 1;
 }
 
 message AdminChangeReplicasRequest {
@@ -273,6 +287,7 @@ message RequestUnion {
     UnfreezeRequest unfreeze = 18;
     ExportRequest export = 21;
     UpdateMetaRequest update_meta = 22;
+    AdminUnsplitRequest admin_unsplit = 23;
   }
 }
 
@@ -357,6 +372,10 @@ message AdminSplitResponse {
   RangeDescriptor right = 2;
 }
 
+message AdminUnsplitResponse {
+  RangeDescriptor desc = 1;
+}
+
 message AdminChangeReplicasResponse {
   RangeDescriptor desc = 1;
 }
@@ -401,6 +420,7 @@ message ResponseUnion {
     UnfreezeResponse unfreeze = 18;
     ExportResponse export = 21;
     UpdateMetaResponse update_meta = 22;
+    AdminUnsplitResponse admin_unsplit = 23;
   }
 }
 
@@ -424,6 +444,18 @@ message RangeNotFoundError {
 message RangeKeyMismatchError {
   bytes request_key = 1;
   repeated RangeDescriptor actual_descriptors = 2;
+  // frozen: the range covers the key but is frozen for a merge; the
+  // client waits on its descriptor instead of re-resolving.
+  bool frozen = 3;
+}
+
+// DescriptorChangedError: a split, merge or descriptor update was built
+// from a descriptor the range has since moved past, and was refused at
+// apply.
+message DescriptorChangedError {
+  int64 range_id = 1;
+  int64 built_from = 2; // generation the change was built from
+  int64 current = 3;    // generation the range held at apply
 }
 
 message WriteIntentError {
@@ -467,6 +499,7 @@ message Error {
   TxnNotFoundError txn_not_found = 10;
   AmbiguousResultError ambiguous = 11;
   StorageOverloadedError storage_overloaded = 12;
+  DescriptorChangedError descriptor_changed = 13;
 }
 
 // BatchEnvelope is the Batch RPC's response body: outcome or wire error.
@@ -497,6 +530,14 @@ message RaftCommand {
   // at this command's applied index (identical by construction across
   // replicas) — the consistency checker's probe.
   ChecksumTrigger checksum = 7;
+  // descriptor_update replaces the range descriptor with one that differs
+  // only in its sticky bit and generation (cluster version v20; an older
+  // replica would ignore it, so it is never proposed before finalize).
+  DescriptorUpdateTrigger descriptor_update = 8;
+}
+
+message DescriptorUpdateTrigger {
+  RangeDescriptor desc = 1;
 }
 
 message LoadHandoff {

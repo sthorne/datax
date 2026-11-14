@@ -202,8 +202,28 @@ type TruncateLogRequest struct {
 }
 
 // AdminSplitRequest splits the range containing SplitKey at SplitKey.
+//
+// StickyUntil makes it a manual split — one an operator asked for, as
+// opposed to the size- and load-based splits and the pre-splits DDL makes
+// for itself. The new right-hand range records the bit
+// (RangeDescriptor.StickyUntil) and the merge queue leaves its start
+// boundary alone until then; and because a manual split asks for a state
+// ("a sticky boundary at this key") rather than an action, a key that is
+// already a boundary is not an error: the range starting there gets the
+// bit. Zero is an ordinary split, merged back when both halves are small.
+// A leader below cluster version v20 splits without recording the bit.
 type AdminSplitRequest struct {
-	RequestHeader // Key = split key
+	RequestHeader       // Key = split key
+	StickyUntil   int64 `json:"sticky_until,omitempty"`
+}
+
+// AdminUnsplitRequest clears the sticky bit of the range that starts at
+// Key, so the merge queue may fold it into its left neighbor again. The
+// key must be a range boundary; a boundary that is not sticky is left as
+// it is. Sent only once the cluster has finalized v20 (older leaders do
+// not know the request).
+type AdminUnsplitRequest struct {
+	RequestHeader // Key = the range's start key
 }
 
 // AdminChangeReplicasRequest adds and/or removes one replica of the range
@@ -284,6 +304,7 @@ type RequestUnion struct {
 	Subsume             *SubsumeRequest             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeRequest            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaRequest          `json:"update_meta,omitempty"`
+	AdminUnsplit        *AdminUnsplitRequest        `json:"admin_unsplit,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -333,6 +354,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Unfreeze
 	case u.UpdateMeta != nil:
 		return u.UpdateMeta
+	case u.AdminUnsplit != nil:
+		return u.AdminUnsplit
 	}
 	return nil
 }
@@ -368,6 +391,7 @@ func (h *AdminMergeRequest) Header() RequestHeader          { return h.RequestHe
 func (h *SubsumeRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *UnfreezeRequest) Header() RequestHeader            { return h.RequestHeader }
 func (h *UpdateMetaRequest) Header() RequestHeader          { return h.RequestHeader }
+func (h *AdminUnsplitRequest) Header() RequestHeader        { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -391,6 +415,7 @@ func (*AdminMergeRequest) Method() string          { return "AdminMerge" }
 func (*SubsumeRequest) Method() string             { return "Subsume" }
 func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
 func (*UpdateMetaRequest) Method() string          { return "UpdateMeta" }
+func (*AdminUnsplitRequest) Method() string        { return "AdminUnsplit" }
 
 func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -414,6 +439,7 @@ func (*AdminMergeRequest) IsReadOnly() bool          { return false }
 func (*SubsumeRequest) IsReadOnly() bool             { return false }
 func (*UnfreezeRequest) IsReadOnly() bool            { return false }
 func (*UpdateMetaRequest) IsReadOnly() bool          { return false }
+func (*AdminUnsplitRequest) IsReadOnly() bool        { return false }
 
 // Response types.
 
@@ -495,9 +521,17 @@ type ResolveIntentResponse struct{}
 
 type RollbackIntentResponse struct{}
 
+// AdminSplitResponse carries both halves. When a manual split found its
+// key already a boundary, nothing was split: Right is the range starting
+// at the key and Left is empty (RangeID 0).
 type AdminSplitResponse struct {
 	Left  RangeDescriptor `json:"left"`
 	Right RangeDescriptor `json:"right"`
+}
+
+// AdminUnsplitResponse carries the range's descriptor after the call.
+type AdminUnsplitResponse struct {
+	Desc RangeDescriptor `json:"desc"`
 }
 
 type RefreshResponse struct{}
@@ -558,6 +592,7 @@ type ResponseUnion struct {
 	Subsume             *SubsumeResponse             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeResponse            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaResponse          `json:"update_meta,omitempty"`
+	AdminUnsplit        *AdminUnsplitResponse        `json:"admin_unsplit,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -671,6 +706,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Unfreeze = t
 	case *UpdateMetaRequest:
 		u.UpdateMeta = t
+	case *AdminUnsplitRequest:
+		u.AdminUnsplit = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

@@ -177,9 +177,21 @@ const (
 	// and would treat them as ordinary user tables, so nothing creates
 	// them before finalize (rule 4).
 	V19 Version = 19
+	// V20 introduces sticky range boundaries (issues #265, #290): a
+	// range descriptor may record that its start boundary was set on
+	// purpose (kvpb.RangeDescriptor.StickyUntil), which the merge queue
+	// honours, and two things travel to carry it — a descriptor-update
+	// trigger in the raft log and kvpb.AdminUnsplitRequest. A v19 replica
+	// drops the field from a split trigger and ignores the new trigger
+	// outright, so its copy of the descriptor would differ from a v20
+	// replica's; a v19 leader would merge the range back. Until finalize,
+	// therefore, a manual split is an ordinary one and UNSPLIT is refused
+	// (rule 4). The field itself is omitempty, so a descriptor written
+	// before v20 reads the same at either version.
+	V20 Version = 20
 
 	// Current is the newest cluster version this binary can run.
-	Current = V19
+	Current = V20
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

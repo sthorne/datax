@@ -19,6 +19,8 @@ CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [,
 CREATE TABLE t [(names [, PRIMARY KEY (cols)])] AS SELECT ... [WITH [NO] DATA]   -- streamed through the COPY chunk path
 CREATE TABLE t (LIKE src [INCLUDING | EXCLUDING DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL], ...)
 ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE type       -- online rewrite: shadow column, chunked convert, swap
+ALTER TABLE [IF EXISTS] t SPLIT AT VALUES (k, ...) [, (k, ...)]... [WITH EXPIRATION expr]   -- manual (sticky) range boundaries; expr: timestamp | interval
+ALTER TABLE [IF EXISTS] t UNSPLIT AT VALUES (k, ...) [, (k, ...)]... | UNSPLIT ALL          -- release them to the merge queue
 COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text' | NULL
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below

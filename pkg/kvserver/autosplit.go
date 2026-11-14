@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -44,7 +45,7 @@ func (s *Store) RunAutoSplitOnce(ctx context.Context) {
 			}
 			log.Infof("%s: size %d bytes exceeds %d; auto-splitting at %s", r.rangeID, size, sizeThreshold, splitKey)
 			recordKeyed(s.cfg.Events, "auto-split", "%s at %d bytes (threshold %d): splitting at %s", r.rangeID, size, sizeThreshold, splitKey)
-			if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
+			if _, kerr := r.adminSplit(ctx, &kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: splitKey}}); kerr != nil {
 				log.Warnf("%s: auto-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
 			} else {
 				metrics.AutoSplits.Inc()
@@ -82,7 +83,7 @@ func (s *Store) maybeLoadSplit(ctx context.Context, r *Replica, threshold float6
 	}
 	log.Infof("%s: %.0f qps exceeds %.0f; load-splitting at %s", r.rangeID, qps, threshold, splitKey)
 	recordKeyed(s.cfg.Events, "load-split", "%s at %.0f qps (threshold %.0f): splitting at %s", r.rangeID, qps, threshold, splitKey)
-	if _, kerr := r.adminSplit(ctx, splitKey); kerr != nil {
+	if _, kerr := r.adminSplit(ctx, &kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: splitKey}}); kerr != nil {
 		log.Warnf("%s: load-split at %s: %v (will retry)", r.rangeID, splitKey, kerr)
 		return
 	}

@@ -280,6 +280,14 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 			aerr = kvpb.NewError(err)
 		}
 	}
+	if aerr == nil && cmd.Descriptor != nil {
+		if err := r.stageDescriptorUpdate(b, cmd.Descriptor); err != nil {
+			log.Warnf("%s: descriptor update refused: %v", r.rangeID, err)
+			_ = b.Close()
+			b = eng.NewBatch()
+			aerr = kvpb.NewError(err)
+		}
+	}
 	if aerr == nil && cmd.Merge != nil {
 		if err := r.stageMerge(ctx, b, cmd.Merge); err != nil {
 			_ = b.Close()
@@ -303,6 +311,9 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 	r.setApplied(idx)
 	if aerr == nil && cmd.Split != nil {
 		r.finishSplit(cmd.Split)
+	}
+	if aerr == nil && cmd.Descriptor != nil {
+		r.finishDescriptorUpdate(cmd.Descriptor)
 	}
 	if aerr == nil && cmd.Merge != nil {
 		r.finishMerge(cmd.Merge)

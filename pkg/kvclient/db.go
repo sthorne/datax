@@ -1396,17 +1396,60 @@ func (db *DB) AdminMerge(ctx context.Context, key keys.Key) (*kvpb.AdminMergeRes
 	return resp, nil
 }
 
-// AdminSplit splits the range containing key at key.
+// AdminSplit splits the range containing key at key — an ordinary split,
+// which the merge queue undoes when both halves are small. A key that is
+// already a range boundary is success (Left is then empty).
 func (db *DB) AdminSplit(ctx context.Context, key keys.Key) (*kvpb.AdminSplitResponse, error) {
+	return db.AdminSplitSticky(ctx, key, 0)
+}
+
+// AdminSplitSticky is a manual split: the boundary at key is made, or if
+// it exists marked, sticky until the wall-clock time stickyUntil
+// (kvpb.StickyForever for no expiry), and the merge queue leaves it alone
+// until then or until AdminUnsplit. Below cluster version v20 the bit
+// cannot be recorded and the split is an ordinary one; StickyBitsOK tells
+// the caller which it will be.
+func (db *DB) AdminSplitSticky(ctx context.Context, key keys.Key, stickyUntil int64) (*kvpb.AdminSplitResponse, error) {
+	if !db.StickyBitsOK() {
+		stickyUntil = 0
+	}
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
-	ba.Add(&kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	ba.Add(&kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}, StickyUntil: stickyUntil})
 	br, kerr := db.Send(ctx, ba)
 	if kerr != nil {
 		return nil, kerr
 	}
 	resp := br.Responses[0].AdminSplit
-	db.cache.Evict(resp.Left.RangeID)
-	db.cache.Insert(resp.Left, resp.Right)
+	if resp.Left.RangeID != 0 {
+		db.cache.Evict(resp.Left.RangeID)
+		db.cache.Insert(resp.Left)
+	}
+	db.cache.Insert(resp.Right)
+	return resp, nil
+}
+
+// StickyBitsOK reports whether manual splits are recorded as sticky and
+// AdminUnsplit may be sent (cluster version v20).
+func (db *DB) StickyBitsOK() bool {
+	return db.ClusterVersion() >= version.V20
+}
+
+// AdminUnsplit clears the sticky bit of the range starting at key, which
+// must be a range boundary; a boundary that is not sticky is left as it
+// is. The request is new in v20 and is not sent before the cluster has
+// finalized it.
+func (db *DB) AdminUnsplit(ctx context.Context, key keys.Key) (*kvpb.AdminUnsplitResponse, error) {
+	if !db.StickyBitsOK() {
+		return nil, fmt.Errorf("unsplit needs cluster version %s (finalize the upgrade first)", version.V20)
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminUnsplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	resp := br.Responses[0].AdminUnsplit
+	db.cache.Insert(resp.Desc)
 	return resp, nil
 }
 

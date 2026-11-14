@@ -422,6 +422,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 	var names []string
 	for _, id := range order {
 		desc := descs[id]
+		s.releaseManualSplits(ctx, desc.ID)
 		if err := truncateLayout(desc, now); err != nil {
 			return nil, err
 		}

@@ -47,6 +47,13 @@ func testDesc() RangeDescriptor {
 	}
 }
 
+// stickyDesc is testDesc with its start boundary held against merging.
+func stickyDesc() RangeDescriptor {
+	d := testDesc()
+	d.StickyUntil = 1725000000000000000
+	return d
+}
+
 // TestBatchRequestProtoRoundTrip: every request type survives the proto
 // round trip byte-for-byte at the Go struct level.
 func TestBatchRequestProtoRoundTrip(t *testing.T) {
@@ -75,6 +82,8 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 		TxnRecordKeys: []keys.Key{keys.Key("t")}})
 	ba.Add(&TruncateLogRequest{RequestHeader: h("a"), Index: 100, Term: 3})
 	ba.Add(&AdminSplitRequest{RequestHeader: h("m")})
+	ba.Add(&AdminSplitRequest{RequestHeader: h("m"), StickyUntil: StickyForever})
+	ba.Add(&AdminUnsplitRequest{RequestHeader: h("m")})
 	ba.Add(&AdminChangeReplicasRequest{RequestHeader: h("n"), AddNode: 4, RemoveNode: 2})
 	ba.Add(&AdminTransferLeaseRequest{RequestHeader: h("o"), Target: 3})
 	ba.Add(&AdminMergeRequest{RequestHeader: h("u")})
@@ -113,6 +122,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{GC: &GCResponse{}},
 		{TruncateLog: &TruncateLogResponse{}},
 		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: testDesc()}},
+		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: stickyDesc()}},
+		{AdminUnsplit: &AdminUnsplitResponse{Desc: testDesc()}},
 		{AdminChangeReplicas: &AdminChangeReplicasResponse{Desc: testDesc()}},
 		{AdminTransferLease: &AdminTransferLeaseResponse{Desc: testDesc()}},
 		{AdminMerge: &AdminMergeResponse{Desc: testDesc()}},
@@ -125,6 +136,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Message: "nl", NotLeader: &NotLeaderError{RangeID: 3, LeaderHint: 2}},
 		{Message: "rnf", RangeNotFound: &RangeNotFoundError{RangeID: 5}},
 		{Message: "rkm", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), ActualDescriptors: []RangeDescriptor{testDesc()}}},
+		{Message: "frozen", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), Frozen: true}},
+		{Message: "dc", DescriptorChanged: &DescriptorChangedError{RangeID: 7, BuiltFrom: 3, Current: 4}},
 		{Message: "wi", WriteIntent: &WriteIntentError{Intents: []storage.Intent{{Key: keys.Key("k"), Txn: testTxn().TxnMeta}}}},
 		{Message: "wto", WriteTooOld: &WriteTooOldError{Timestamp: mkts(1), ActualTimestamp: mkts(2)}},
 		{Message: "unc", Uncertainty: &UncertaintyError{ReadTimestamp: mkts(1), ExistingTimestamp: mkts(2)}},

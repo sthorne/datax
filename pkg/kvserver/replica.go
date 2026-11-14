@@ -30,6 +30,9 @@ type raftCommand struct {
 	Batch kvpb.BatchRequest `json:"batch"`
 	Split *splitTrigger     `json:"split,omitempty"`
 	Merge *mergeTrigger     `json:"merge,omitempty"`
+	// Descriptor replaces the range descriptor in place (the sticky bit;
+	// see descriptorTrigger). Proposed only at cluster version v20.
+	Descriptor *descriptorTrigger `json:"descriptor,omitempty"`
 	// ClosedTS publishes "no write at or below this timestamp will ever
 	// commit on this range". Riding the log makes the applied-index
 	// condition automatic: applying this command implies every earlier
@@ -62,11 +65,12 @@ type checksumTrigger struct {
 // cmdTriggers bundles the optional replicated side effects a proposal may
 // carry alongside (or instead of) its write batch.
 type cmdTriggers struct {
-	split    *splitTrigger
-	merge    *mergeTrigger
-	closedTS hlc.Timestamp
-	load     *loadHandoff
-	checksum *checksumTrigger
+	split      *splitTrigger
+	merge      *mergeTrigger
+	descriptor *descriptorTrigger
+	closedTS   hlc.Timestamp
+	load       *loadHandoff
+	checksum   *checksumTrigger
 }
 
 // splitTrigger is carried by the replicated split command (Phase 3).
@@ -942,7 +946,7 @@ func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cmdTriggers) (*kvpb.BatchResponse, *kvpb.Error) {
 	cmd := raftCommand{
 		ID: uuid.NewString(), Batch: *ba,
-		Split: trig.split, Merge: trig.merge, ClosedTS: trig.closedTS,
+		Split: trig.split, Merge: trig.merge, Descriptor: trig.descriptor, ClosedTS: trig.closedTS,
 		Load: trig.load, Checksum: trig.checksum,
 	}
 	data, err := encodeRaftCommand(&cmd)
@@ -1206,11 +1210,18 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return nil, r.notLeaderError()
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminSplit != nil {
-		resp, err := r.adminSplit(ctx, ba.Requests[0].AdminSplit.Key)
+		resp, err := r.adminSplit(ctx, ba.Requests[0].AdminSplit)
 		if err != nil {
 			return nil, err
 		}
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminSplit: resp}}}, nil
+	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminUnsplit != nil {
+		resp, err := r.adminUnsplit(ctx, ba.Requests[0].AdminUnsplit)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminUnsplit: resp}}}, nil
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminChangeReplicas != nil {
 		resp, err := r.adminChangeReplicas(ctx, ba.Requests[0].AdminChangeReplicas)
@@ -1227,7 +1238,7 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminTransferLease: resp}}}, nil
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminMerge != nil {
-		resp, err := r.adminMerge(ctx)
+		resp, err := r.adminMerge(ctx, false)
 		if err != nil {
 			return nil, err
 		}

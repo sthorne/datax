@@ -133,7 +133,14 @@ pre-v3 plan (an in-memory sort). The second is the ordered
 range-addressing repair (`UpdateMetaRequest`, introduced under **v4**):
 a v3 leader of the meta range does not know the request, so until v4 is
 finalized splits and merges repair `/meta` with the blind writes they
-always used.
+always used. The sticky bit of a manual split (**v20**) is gated the
+same way and for a second reason: besides a new request
+(`AdminUnsplitRequest`) it adds a field to the range descriptor and a
+trigger to the raft log, and a v19 replica applying either would end up
+with a different descriptor than its v20 peers — so until v20 is
+finalized no descriptor is written with the bit, manual splits are
+merged back like automatic ones, and unsplit is refused (see
+[replication-and-placement.md](replication-and-placement.md)).
 
 ## Modules
 

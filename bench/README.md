@@ -57,9 +57,11 @@ duration, so two runs draw the same keys:
 into N ranges before the run (`ALTER TABLE ... SPLIT AT` at evenly
 spaced keys; a sharded timeseries table is carved by `--shards`
 instead), so a run measures many raft groups on one store rather than
-one hot range. The housekeeping loop merges empty neighbors back
-together within minutes, so start the nodes with
-`--merge-size-threshold -1` for an idle-cluster measurement; 10,000 is
+one hot range. The boundaries are sticky (cluster version v20), so the
+housekeeping loop does not merge the empty neighbors back together; on
+a cluster that has not finalized v20 it does, within minutes, so there
+start the nodes with `--merge-size-threshold -1` for an idle-cluster
+measurement; 10,000 is
 the largest worth trying on a laptop. A record's `error_samples` lists
 the distinct error messages behind its `errors` count.
 

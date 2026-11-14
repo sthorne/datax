@@ -724,11 +724,12 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 	}
 
-	if at, ok := stmt.(*parser.AlterTable); ok && at.SplitAt != nil {
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.SplitAt != nil || at.UnsplitAt != nil || at.UnsplitAll) {
 		// A split is a range operation, not a descriptor write: it runs
 		// outside any transaction, like the manual datax debug split.
+		// So does giving one up.
 		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SPLIT AT cannot run inside a transaction block")
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SPLIT AT and UNSPLIT cannot run inside a transaction block")
 		}
 		if at.IfExists && !s.tableExists(ctx, at.Table) {
 			return &Result{Tag: "ALTER TABLE"}, nil
@@ -736,7 +737,13 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}
-		res, err := s.execSplitAt(ctx, at, params)
+		var res *Result
+		var err error
+		if at.SplitAt != nil {
+			res, err = s.execSplitAt(ctx, at, params)
+		} else {
+			res, err = s.execUnsplit(ctx, at, params)
+		}
 		if err != nil {
 			return nil, ToSQLError(err)
 		}

@@ -564,10 +564,13 @@ applies to `datax sql` and `datax debug status`.
 datax debug nodes                      # liveness, locality, last heartbeat
 datax debug ranges                     # every range: span, replicas, leader
 #   r7 [/table/orders/primary/1000, /table/orders/by_city) gen=3 replicas=[...]
+#   r8 [...) gen=4 replicas=[...] sticky         <- starts at a manual split
+#   r9 [...) gen=4 replicas=[...] sticky-until=2026-12-01T00:00:00Z
 datax debug status --url http://127.0.0.1:8080/status
 
-datax debug split --table 100          # manual split (also: --key <hex>)
-datax debug merge --key <hex>          # manual merge
+datax debug split --table 100          # manual split (also: --key <hex>); sticky
+datax debug unsplit --table 100        # stop holding it (also: --key <hex>)
+datax debug merge --range 7            # manual merge of r7 with its right neighbor
 datax debug transfer-lease --range 5 --node 2
 datax debug rebalance --range 5 [--from 1]
 ```
@@ -578,6 +581,20 @@ load and for tests. From SQL, `ALTER TABLE t SPLIT AT VALUES (1000),
 (2000), ...` carves a table at primary-key tuples (a prefix of the key is
 allowed) and returns the boundaries; `datax bench ... --presplit N` uses
 it to spread a workload over N ranges from the start.
+
+A manual split is **sticky**: housekeeping merges adjacent ranges that
+are both small, which would undo a pre-split within seconds, so a
+boundary made by `debug split` or `SPLIT AT` is marked and left alone
+(`debug ranges` shows `sticky`; `/api/cluster` and `/api/range` carry
+`sticky_until`). It stays until it is released — `datax debug unsplit`,
+`ALTER TABLE t UNSPLIT AT VALUES (...)` / `UNSPLIT ALL` — or until the
+expiration given with `SPLIT AT ... WITH EXPIRATION`; releasing merges
+nothing by itself, it only lets housekeeping merge the ranges again when
+they are small. Automatic splits are never sticky. `debug merge` merges
+the range it is given whether or not its neighbor is sticky. Dropping or
+truncating a table releases its manual boundaries, so the emptied ranges
+merge away. All of this needs cluster version v20; before finalize a
+manual split is an ordinary one.
 
 Keys print as paths everywhere — logs, `datax debug`, the dashboard and
 its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range
@@ -789,6 +806,11 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v20 makes manual splits sticky.** Until it is finalized `ALTER TABLE
+  ... SPLIT AT` and `datax debug split` split as before and housekeeping
+  may merge the ranges back; boundaries made before finalize are not
+  marked afterwards either — run the `SPLIT AT` again (it is idempotent)
+  to mark them.
 
 ## Decommissioning a node
 

@@ -179,7 +179,7 @@ func (r *Replica) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTy
 // sameDescriptor reports whether two descriptors describe the same range
 // at the same generation with the same bounds and the same replicas.
 func sameDescriptor(a, b kvpb.RangeDescriptor) bool {
-	return a.RangeID == b.RangeID && a.Generation == b.Generation &&
+	return a.RangeID == b.RangeID && a.Generation == b.Generation && a.StickyUntil == b.StickyUntil &&
 		a.StartKey.Equal(b.StartKey) && a.EndKey.Equal(b.EndKey) && sameReplicas(a.Replicas, b.Replicas)
 }
 

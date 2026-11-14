@@ -296,7 +296,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -321,8 +321,8 @@ func runDebug(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
 	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); state-changing ops require an admin")
-	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
-	rawKey := fs.String("key", "", "split: raw split key (hex)")
+	table := fs.Uint64("table", 0, "split, unsplit: the boundary of this table ID")
+	rawKey := fs.String("key", "", "split, unsplit: raw key (hex)")
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
 	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID; upgrade: target cluster version")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
@@ -336,7 +336,7 @@ func runDebug(args []string) error {
 
 	req := cluster.AdminRequest{Op: sub}
 	switch sub {
-	case "split":
+	case "split", "unsplit":
 		switch {
 		case *table != 0:
 			req.Key = keys.TableDataPrefix(*table)
@@ -347,7 +347,7 @@ func runDebug(args []string) error {
 			}
 			req.Key = k
 		default:
-			return fmt.Errorf("split requires --table or --key")
+			return fmt.Errorf("%s requires --table or --key", sub)
 		}
 	case "rebalance", "transfer-lease":
 		req.RangeID = base.RangeID(*rangeID)
@@ -404,7 +404,17 @@ func runDebug(args []string) error {
 	switch sub {
 	case "split":
 		useTableNames(resp.TableNames)
+		if resp.Left == nil {
+			// The key was a boundary already; the split only marked it.
+			fmt.Printf("already split; boundary is now sticky:\n  right: %s\n", resp.Right)
+			break
+		}
 		fmt.Printf("split done:\n  left:  %s\n  right: %s\n", resp.Left, resp.Right)
+	case "unsplit":
+		if len(resp.Ranges) == 1 {
+			useTableNames(resp.TableNames)
+			fmt.Printf("unsplit: %s\n", &resp.Ranges[0])
+		}
 	case "ranges":
 		useTableNames(resp.TableNames)
 		for _, d := range resp.Ranges {

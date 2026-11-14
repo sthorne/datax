@@ -103,6 +103,9 @@ ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
 TRUNCATE [TABLE] t [, t2] [RESTART IDENTITY] [CASCADE]; -- one descriptor write, however many ranges
 ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE DECIMAL(12, 2);   -- online rewrite; widening and text conversions
 ALTER TABLE t SPLIT AT VALUES (1000), (2000, 'x');      -- carve ranges at primary-key tuples (a prefix allowed); returns the boundaries
+ALTER TABLE t SPLIT AT VALUES (3000) WITH EXPIRATION INTERVAL '1 day';  -- ...held until then (an interval from now, or a timestamp)
+ALTER TABLE t UNSPLIT AT VALUES (1000);                 -- stop holding a boundary; the ranges merge back when small
+ALTER TABLE t UNSPLIT ALL;                              -- ...every manual boundary in the table
 CREATE TABLE t2 (LIKE t INCLUDING ALL);                  -- columns, defaults, constraints, indexes, comments
 CREATE TABLE big AS SELECT id, qty FROM t WHERE qty > 10;          -- a hidden rowid key
 CREATE TABLE keyed (order_id, qty, PRIMARY KEY (order_id)) AS SELECT id, qty FROM t [WITH NO DATA];
@@ -199,9 +202,53 @@ COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
 TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
 drain and sweep (or stream) in several transactions of their own and
-are refused inside a block with `25001`; so is `SPLIT AT`, a range
-operation rather than a descriptor write (idempotent: an existing
-boundary is fine; a sharded timeseries table is carved by shard instead).
+are refused inside a block with `25001`; so are `SPLIT AT` and
+`UNSPLIT`, range operations rather than descriptor writes.
+
+#### SPLIT AT and UNSPLIT
+
+`ALTER TABLE t SPLIT AT VALUES (k, ...), ...` puts a range boundary at
+each primary-key tuple (a prefix of the key is allowed) and returns the
+boundaries as key paths. It is for pre-splitting: carving a table that is
+about to take a bulk load or a benchmark into ranges up front, instead of
+waiting for size- and load-based splits to catch up.
+
+- **The boundaries stay.** Left to itself the cluster merges adjacent
+  ranges that are both small, and the halves of a pre-split are empty —
+  so a boundary made by `SPLIT AT` is marked as made on purpose (it is
+  *sticky*) and housekeeping leaves it alone, however small the ranges
+  on either side. Splits the cluster makes for itself, by size or load,
+  are not marked and merge back when the data shrinks, as before.
+- **`WITH EXPIRATION e`** holds the boundaries only until `e`: a
+  timestamp, or an interval counted from now (`INTERVAL '1 day'`). After
+  that they are ordinary boundaries again. The expiration must be in the
+  future; without the clause a boundary is held until it is unsplit.
+- **`UNSPLIT AT VALUES (k, ...), ...`** is the way back: it stops holding
+  the boundaries named, and `UNSPLIT ALL` every manual boundary in the
+  table. Neither merges anything itself — the ranges fold together on
+  housekeeping's next passes if they are small enough, and stay split if
+  they have since filled up. `UNSPLIT AT` fails on a key that is not a
+  range boundary and does nothing to one that is not sticky; both return
+  the boundaries they released.
+- **Idempotent.** Splitting at a boundary that exists is not an error: it
+  marks the boundary sticky (or changes its expiration to the one given).
+  A load script can run its `SPLIT AT` every time.
+- **Concurrent with everything.** If the range changes while the split
+  is on its way — another split lands first, housekeeping is merging the
+  range — the statement waits or re-reads the range and carries on; it
+  does not fail because someone else got there first.
+- A sharded timeseries table is carved by shard (`SET (shards = N)`), not
+  by key, and refuses both statements. The splits a timeseries table gets
+  at `CREATE` are the cluster's own and are not sticky.
+- `DROP TABLE` and `TRUNCATE` release the table's manual boundaries:
+  its old key space is empty for good (a truncated table continues in a
+  fresh one), so the emptied ranges are left to merge away. Split again
+  after a `TRUNCATE` to pre-split the reload. The release is immediate
+  and is not undone if the statement's transaction rolls back.
+- Sticky boundaries, `WITH EXPIRATION` and `UNSPLIT` need cluster version
+  v20. On a cluster that has not finalized it, `SPLIT AT` splits as it
+  always did — the boundary is not held — and the other two are refused
+  with `0A000`.
 
 ### Defaults, SERIAL, identity columns and sequences
 

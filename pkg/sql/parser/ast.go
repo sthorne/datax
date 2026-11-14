@@ -693,6 +693,14 @@ type AlterTable struct {
 	// SplitAt is SPLIT AT VALUES (k, ...), (k, ...): one primary-key
 	// tuple (a prefix of the key is allowed) per range boundary to carve.
 	SplitAt [][]Expr
+	// SplitExpiration is SPLIT AT ... WITH EXPIRATION e: when the
+	// boundaries stop being held against merging (a timestamp, or an
+	// interval from now). Nil holds them until UNSPLIT.
+	SplitExpiration *Expr
+	// UnsplitAt is UNSPLIT AT VALUES (k, ...), ...: the boundaries to
+	// stop holding; UnsplitAll is UNSPLIT ALL, every one in the table.
+	UnsplitAt  [][]Expr
+	UnsplitAll bool
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.

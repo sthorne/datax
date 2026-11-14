@@ -44,6 +44,12 @@ primary key:
   edge splits also make "range fully inside the table" the common case
   for retention GC). The splits are best-effort and outlive an aborted
   enclosing transaction — harmless empty ranges the merger re-absorbs.
+  For that reason they are ordinary splits, not the sticky ones `ALTER
+  TABLE ... SPLIT AT` makes: a sticky boundary of a table that was never
+  created, or of a layout a re-shard has retired, could not be named by
+  any statement to release it. The table's edges are held by the
+  retention rule below; a bucket boundary is held, like any other, by
+  the data and traffic on either side of it.
 
 The planner plans against the **logical** primary key:
 

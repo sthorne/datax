@@ -103,7 +103,7 @@ transport.
 leaseholder = Raft leader.
 
 **Splits** happen automatically by size (v2; see below) or manually
-(`datax debug split <key>`): the split is proposed as a replicated command;
+(`datax debug split`, `ALTER TABLE ... SPLIT AT`): the split is proposed as a replicated command;
 at apply time each replica atomically writes both descriptors and creates
 the right-hand side's Raft state, and bumps the RHS's timestamp-cache
 floor to now(): the parent served reads on that span up to this moment,
@@ -121,9 +121,54 @@ only while that record still names the range it meant to remove — a
 late repair can no longer resurrect a range that no longer exists and
 send every lookup into "no replica" until it gives up.
 
+A split is built from the descriptor the leader holds and applied a
+moment later, and it is refused at apply — on every replica alike — if
+another descriptor change landed in between (the trigger's generation no
+longer follows the range's; issue #200). The request is still meaningful
+on the changed range, so the leader does not hand that refusal to the
+caller: it re-reads the descriptor and decides again (issue #290). The
+key may still be inside the range (split again, reusing the range ID it
+allocated), may have become the range's start (the boundary exists: done),
+or may have left the range (a `RangeKeyMismatch` carries the current
+descriptor and the gateway re-routes). The refusal is a typed error
+detail, `DescriptorChangedError`, not a message to match; after ten
+rebuilds in a row the caller gets it. A split that meets a range frozen
+for a merge — before proposing or at apply — answers with the same
+`RangeKeyMismatchError.Frozen` any request gets, so the gateway waits the
+merge out and asks whichever range holds the key afterwards.
+
+**Manual splits are sticky** (cluster version v20; issue #265). A range
+descriptor carries a sticky bit, `sticky_until`: the wall-clock time until
+which its *start* boundary is held against merging (the maximum value
+for "no expiry", zero for "not sticky"). `ALTER TABLE ... SPLIT AT` and
+`datax debug split` send their split with one, and the right-hand range
+is created with it; a manual split at a key that is already a boundary
+sets the bit on the range starting there instead of failing. Because the
+bit describes the start boundary, the left half of any later split keeps
+it and the right half starts without (unless that split is manual too),
+and a merge keeps the left-hand range's bit and drops the right-hand
+one's along with the boundary it described. Size- and load-based splits,
+and the pre-splits DDL makes for itself (timeseries shard buckets and
+table edges at `CREATE`, the new layout of a re-shard, a placement
+policy's table edges, a restore's), are not sticky: they are best-effort
+and outlive an aborted `CREATE` or a dropped layout, where nothing could
+ever name them to release them, and the merge queue re-absorbing their
+empty ranges is what cleans up. `ALTER TABLE ... UNSPLIT AT` / `UNSPLIT
+ALL` and `datax debug unsplit` clear the bit, and so do `DROP TABLE` and
+`TRUNCATE` for every boundary in the table's data (its key space is
+empty from then on, and no statement could name the boundary any more).
+Setting or clearing it on
+an existing range is a replicated descriptor update that takes a
+generation like any other descriptor change, so it cannot be silently
+overwritten by a split or merge built before it, and it is rebuilt the
+same way if one of those lands first. A v19 replica would drop the field
+from a split trigger and ignore the update, so until v20 is finalized a
+manual split is an ordinary one and unsplit is refused.
+
 **Merges** are the inverse: when a range and its right neighbor are both
-below the merge threshold (default: a quarter of the split threshold) and
-have identical replica sets, the housekeeping pass on the node leading the
+below the merge threshold (default: a quarter of the split threshold),
+have identical replica sets, and the right-hand range carries no
+unexpired sticky bit, the housekeeping pass on the node leading the
 left-hand side pulls the right-hand side's leadership to itself and merges
 in two replicated phases. First a **Subsume** command freezes the RHS —
 every replica persists the flag, and the range refuses all traffic from
@@ -140,7 +185,10 @@ shrinks in one atomic batch (the merged record overwrites the RHS's — same
 end key — and the old LHS record is deleted); a failed cleanup is benign
 and re-repaired. An interrupted merge is re-driven (or unfrozen, if
 membership diverged) by the same pass; `datax debug merge --range N`
-drives one by hand.
+drives one by hand — sticky bit or not, since the operator asked. The
+queue reads the bit before it freezes anything and once more after the
+freeze (a manual split of the boundary can land in between; after the
+freeze none can), abandoning the merge if it has appeared.
 
 The freeze takes the RHS out of service, so the driver only enters it
 when the merge is expected to go through: before the Subsume it confirms

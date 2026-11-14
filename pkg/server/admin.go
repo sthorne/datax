@@ -202,11 +202,28 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if len(req.Key) == 0 {
 			return cluster.AdminResponse{Error: "split requires a key"}
 		}
-		sr, err := n.db.AdminSplit(ctx, keys.Key(req.Key))
+		// An operator's split is a manual one: sticky, so the merge
+		// queue does not fold two small halves back together (issue
+		// #265). `datax debug unsplit` releases it.
+		sr, err := n.db.AdminSplitSticky(ctx, keys.Key(req.Key), kvpb.StickyForever)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Left: &sr.Left, Right: &sr.Right, TableNames: n.tableNames(ctx)}
+		resp := cluster.AdminResponse{Right: &sr.Right, TableNames: n.tableNames(ctx)}
+		if sr.Left.RangeID != 0 {
+			resp.Left = &sr.Left
+		}
+		return resp
+
+	case "unsplit":
+		if len(req.Key) == 0 {
+			return cluster.AdminResponse{Error: "unsplit requires a key"}
+		}
+		ur, err := n.db.AdminUnsplit(ctx, keys.Key(req.Key))
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Ranges: []kvpb.RangeDescriptor{ur.Desc}, TableNames: n.tableNames(ctx)}
 
 	case "ranges":
 		descs, err := n.listRanges(ctx)

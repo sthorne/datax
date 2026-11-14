@@ -198,6 +198,7 @@ func RangeDescriptorToProto(d RangeDescriptor) *rpcpb.RangeDescriptor {
 		EndKey:        d.EndKey,
 		NextReplicaId: int64(d.NextReplicaID),
 		Generation:    d.Generation,
+		StickyUntil:   d.StickyUntil,
 	}
 	for _, r := range d.Replicas {
 		pb.Replicas = append(pb.Replicas, &rpcpb.ReplicaDescriptor{
@@ -218,6 +219,7 @@ func RangeDescriptorFromProto(p *rpcpb.RangeDescriptor) RangeDescriptor {
 		EndKey:        p.EndKey,
 		NextReplicaID: base.ReplicaID(p.NextReplicaId),
 		Generation:    p.Generation,
+		StickyUntil:   p.StickyUntil,
 	}
 	for _, r := range p.Replicas {
 		d.Replicas = append(d.Replicas, ReplicaDescriptor{
@@ -314,7 +316,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *TruncateLogRequest:
 		out.Value = &rpcpb.RequestUnion_TruncateLog{TruncateLog: &rpcpb.TruncateLogRequest{Header: reqHeaderToProto(r.RequestHeader), Index: r.Index, Term: r.Term}}
 	case *AdminSplitRequest:
-		out.Value = &rpcpb.RequestUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+		out.Value = &rpcpb.RequestUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitRequest{Header: reqHeaderToProto(r.RequestHeader), StickyUntil: r.StickyUntil}}
+	case *AdminUnsplitRequest:
+		out.Value = &rpcpb.RequestUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitRequest{Header: reqHeaderToProto(r.RequestHeader)}}
 	case *AdminChangeReplicasRequest:
 		out.Value = &rpcpb.RequestUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasRequest{
 			Header: reqHeaderToProto(r.RequestHeader), AddNode: int64(r.AddNode), RemoveNode: int64(r.RemoveNode),
@@ -447,7 +451,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_TruncateLog:
 		u.TruncateLog = &TruncateLogRequest{RequestHeader: reqHeaderFromProto(v.TruncateLog.Header), Index: v.TruncateLog.Index, Term: v.TruncateLog.Term}
 	case *rpcpb.RequestUnion_AdminSplit:
-		u.AdminSplit = &AdminSplitRequest{RequestHeader: reqHeaderFromProto(v.AdminSplit.Header)}
+		u.AdminSplit = &AdminSplitRequest{RequestHeader: reqHeaderFromProto(v.AdminSplit.Header), StickyUntil: v.AdminSplit.StickyUntil}
+	case *rpcpb.RequestUnion_AdminUnsplit:
+		u.AdminUnsplit = &AdminUnsplitRequest{RequestHeader: reqHeaderFromProto(v.AdminUnsplit.Header)}
 	case *rpcpb.RequestUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasRequest{
 			RequestHeader: reqHeaderFromProto(v.AdminChangeReplicas.Header),
@@ -590,6 +596,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		out.Value = &rpcpb.ResponseUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitResponse{
 			Left: RangeDescriptorToProto(u.AdminSplit.Left), Right: RangeDescriptorToProto(u.AdminSplit.Right),
 		}}
+	case u.AdminUnsplit != nil:
+		out.Value = &rpcpb.ResponseUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitResponse{Desc: RangeDescriptorToProto(u.AdminUnsplit.Desc)}}
 	case u.AdminChangeReplicas != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasResponse{Desc: RangeDescriptorToProto(u.AdminChangeReplicas.Desc)}}
 	case u.AdminTransferLease != nil:
@@ -669,6 +677,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			Left:  RangeDescriptorFromProto(v.AdminSplit.Left),
 			Right: RangeDescriptorFromProto(v.AdminSplit.Right),
 		}
+	case *rpcpb.ResponseUnion_AdminUnsplit:
+		u.AdminUnsplit = &AdminUnsplitResponse{Desc: RangeDescriptorFromProto(v.AdminUnsplit.Desc)}
 	case *rpcpb.ResponseUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasResponse{Desc: RangeDescriptorFromProto(v.AdminChangeReplicas.Desc)}
 	case *rpcpb.ResponseUnion_AdminTransferLease:
@@ -737,7 +747,7 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 		pb.RangeNotFound = &rpcpb.RangeNotFoundError{RangeId: int64(e.RangeNotFound.RangeID)}
 	}
 	if e.RangeKeyMismatch != nil {
-		m := &rpcpb.RangeKeyMismatchError{RequestKey: e.RangeKeyMismatch.RequestKey}
+		m := &rpcpb.RangeKeyMismatchError{RequestKey: e.RangeKeyMismatch.RequestKey, Frozen: e.RangeKeyMismatch.Frozen}
 		for _, d := range e.RangeKeyMismatch.ActualDescriptors {
 			m.ActualDescriptors = append(m.ActualDescriptors, RangeDescriptorToProto(d))
 		}
@@ -771,6 +781,9 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 	if e.StorageOverloaded != nil {
 		pb.StorageOverloaded = &rpcpb.StorageOverloadedError{}
 	}
+	if d := e.DescriptorChanged; d != nil {
+		pb.DescriptorChanged = &rpcpb.DescriptorChangedError{RangeId: int64(d.RangeID), BuiltFrom: d.BuiltFrom, Current: d.Current}
+	}
 	return pb
 }
 
@@ -787,7 +800,7 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 		e.RangeNotFound = &RangeNotFoundError{RangeID: base.RangeID(pb.RangeNotFound.RangeId)}
 	}
 	if pb.RangeKeyMismatch != nil {
-		m := &RangeKeyMismatchError{RequestKey: pb.RangeKeyMismatch.RequestKey}
+		m := &RangeKeyMismatchError{RequestKey: pb.RangeKeyMismatch.RequestKey, Frozen: pb.RangeKeyMismatch.Frozen}
 		for _, d := range pb.RangeKeyMismatch.ActualDescriptors {
 			m.ActualDescriptors = append(m.ActualDescriptors, RangeDescriptorFromProto(d))
 		}
@@ -824,6 +837,9 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 	}
 	if pb.StorageOverloaded != nil {
 		e.StorageOverloaded = &StorageOverloadedError{}
+	}
+	if d := pb.DescriptorChanged; d != nil {
+		e.DescriptorChanged = &DescriptorChangedError{RangeID: base.RangeID(d.RangeId), BuiltFrom: d.BuiltFrom, Current: d.Current}
 	}
 	return e, nil
 }
