@@ -86,8 +86,22 @@ function matchesNode(n) {
     (n.locality || "").toLowerCase().includes(nodeFilter) ||
     (n.address || "").toLowerCase().includes(nodeFilter);
 }
+// How each sortable column of the nodes table reads a node. A ratio is
+// sorted as the ratio the cell shows — memory in use of total, load per
+// core — and a node that reports no machine section has no figure.
+sortBy("nodes", {
+  node: n => n.node_id, status: n => nodeState(n), address: n => n.address, locality: n => n.locality,
+  cpu: n => n.machine ? n.machine.cpu_percent : null,
+  load: n => n.machine && n.machine.cores ? n.machine.load1 / n.machine.cores : null,
+  memory: n => n.machine && n.machine.mem_total ? (n.machine.mem_total - n.machine.mem_available) / n.machine.mem_total : null,
+  disk: n => n.machine && n.machine.disk_total ? n.machine.disk_free : null,
+  fds: n => n.machine && n.machine.fd_limit ? n.machine.open_fds / n.machine.fd_limit : null,
+  leases: n => n.leader_count || 0,
+  // The most recent heartbeat is the smallest age.
+  heartbeat: n => n.heartbeat_ago_ms === undefined ? null : -n.heartbeat_ago_ms,
+});
 function renderNodesTable(d) {
-  const nodes = (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id).filter(matchesNode);
+  const nodes = sortRows("nodes", (d.nodes || []).slice().sort((a, b) => a.node_id - b.node_id).filter(matchesNode));
   renderKeyed(document.getElementById("nodes-table"), nodes.length ? nodes.map(n => {
     const m = n.machine;
     return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}">

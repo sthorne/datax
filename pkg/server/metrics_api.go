@@ -77,11 +77,14 @@ type MetricsResult struct {
 // time order; buckets with no sample are absent (a restart shows as a
 // gap, not as a line to zero).
 type MetricResult struct {
-	Name  string                  `json:"name"`
-	Kind  string                  `json:"kind"`
-	Unit  string                  `json:"unit"`
-	Group string                  `json:"group"`
-	Rate  bool                    `json:"rate,omitempty"`
+	Name  string `json:"name"`
+	Kind  string `json:"kind"`
+	Unit  string `json:"unit"`
+	Group string `json:"group"`
+	Rate  bool   `json:"rate,omitempty"`
+	// Help is the series' one-line description from the catalog: what a
+	// chart is titled with, the metric's name beside it (issue #277).
+	Help  string                  `json:"help,omitempty"`
 	Nodes map[string][][2]float64 `json:"nodes"`
 	// Label is the series' label value as a person reads it — a
 	// fingerprint's shape (issue #209) — for the chart's title. Admins
@@ -298,7 +301,7 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string, admin bo
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
-		mr := MetricResult{Name: name, Kind: def.Kind, Unit: def.Unit, Group: def.Group, Nodes: map[string][][2]float64{}}
+		mr := MetricResult{Name: name, Kind: def.Kind, Unit: def.Unit, Group: def.Group, Help: def.Help, Nodes: map[string][][2]float64{}}
 		if rate && def.Kind == SeriesCounter {
 			mr.Rate = true
 			mr.Unit = strings.TrimSuffix(def.Unit, "/s") + "/s"

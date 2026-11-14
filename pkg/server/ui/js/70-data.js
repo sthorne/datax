@@ -49,6 +49,10 @@ function shownKeys(r) {
 // CSV always carries every row the filter left.
 const RANGE_TABLE_CAP = 200;
 let rangesShowAll = false;
+sortBy("ranges", {
+  range: r => r.range_id, span: r => (r.table || "") + " " + (r.start_key || ""), replicas: r => (r.replicas || []).length,
+  leader: r => r.load.leader, qps: r => r.load.qps, size: r => r.load.bytes,
+});
 function renderClusterRanges(ranges) {
   const admin = canDrillDown();
   // The document's any-of flag: a CSV has one header for every row.
@@ -58,13 +62,23 @@ function renderClusterRanges(ranges) {
     ? "click a range, or focus it and press Enter, for its per-replica detail from every holding node (admin role)"
     : `per-replica detail needs the admin role — ${drillDownRefusal()}`);
   const items = [];
-  const all = ranges.filter(matchesFilter).slice().sort((a, b) => a.range_id - b.range_id);
+  // The table's own order is heaviest first (issue #283): by the rate
+  // its leader serves, then by size, then by id — so the first rows, and
+  // the rows the cap keeps, are the ones a reader came to find. A range
+  // with no advertised figure follows those that have one.
+  const load = lastCluster ? rangeLoad(lastCluster) : new Map();
+  const of = r => load.get(r.range_id) || {};
+  const all = sortRows("ranges", ranges.filter(matchesFilter).map(r => Object.assign({ load: of(r) }, r))
+    .sort((a, b) => (b.load.qps || 0) - (a.load.qps || 0) || (b.load.bytes || 0) - (a.load.bytes || 0) || a.range_id - b.range_id));
   const shown = rangesShowAll ? all : all.slice(0, RANGE_TABLE_CAP);
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
       <td><span${admin ? ' class="opens"' : ""}>r${r.range_id}</span></td>
       <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + rangeKeyLabel(r), r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
+      <td>${r.load.leader ? "n" + r.load.leader : "—"}</td>
+      <td class="num">${r.load.qps ? r.load.qps.toFixed(0) : "—"}</td>
+      <td class="num">${r.load.bytes ? fmtBytes(r.load.bytes) : "—"}</td>
     </tr>` });
     // The open detail row is its own element, filled by its fetch and
     // left alone by re-renders (its identity survives them).
@@ -89,9 +103,11 @@ function renderClusterRanges(ranges) {
   // cell shortens a span to what fits a column, and a key that has been
   // shortened is not one a command will take (issue #205). With the
   // any-of header, a column says which rows the shown form applies to.
-  setCSV("ranges", ["range", "table", shownForm ? "start key (as shown)" : "start key", shownForm ? "end key (as shown)" : "end key", "replicas"].concat(shownForm ? ["keys as shown"] : []),
+  setCSV("ranges", ["range", "table", shownForm ? "start key (as shown)" : "start key", shownForm ? "end key (as shown)" : "end key", "replicas", "leader", "qps", "size bytes"].concat(shownForm ? ["keys as shown"] : []),
     all.map(r => ["r" + r.range_id, r.table || "", r.start_key || "", r.end_key || "",
-      (r.replicas || []).map(x => "n" + x).join(" ")].concat(shownForm ? [shownKeys(r)] : [])));
+      (r.replicas || []).map(x => "n" + x).join(" "), r.load.leader ? "n" + r.load.leader : "", r.load.qps ? Math.round(r.load.qps) : "", r.load.bytes || ""].concat(shownForm ? [shownKeys(r)] : [])));
+  setHTML(document.getElementById("cluster-range-load-note"),
+    "heaviest first unless a column is sorted. Leader, qps and size are what each node advertises in its heartbeat for its heaviest and largest ranges, so a quiet, small range shows a dash. QPS is the leader's own rate over a range it leads — it is not summed across nodes, and a range whose leader is down reports none.");
 }
 {
   const cap = document.getElementById("cluster-range-cap");
@@ -118,7 +134,7 @@ function detailRowFor(id) {
   if (!el) {
     el = document.createElement("tr");
     el.className = "detailrow"; el.dataset.key = "d" + id;
-    el.innerHTML = `<td class="detail" colspan="3"></td>`;
+    el.innerHTML = `<td class="detail" colspan="6"></td>`;
     const row = tbody.querySelector(`tr[data-key="r${id}"]`);
     if (row) row.after(el); else tbody.appendChild(el);
   }

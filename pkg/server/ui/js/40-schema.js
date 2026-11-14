@@ -9,6 +9,14 @@ function fmtRetention(sec) {
   if (sec % 3600 === 0) return (sec / 3600) + "h";
   return sec + "s";
 }
+// A table that was never analyzed has no row count and no statistics
+// age, so it sorts last on both rather than as zero. The freshest
+// statistics are the smallest age.
+sortBy("schema", {
+  table: t => tableKey(t), columns: t => (t.columns || []).filter(c => !c.hidden).length,
+  rows: t => t.stats ? t.stats.row_count : null, age: t => t.stats ? -t.stats.age_seconds : null,
+  ranges: t => t.ranges, size: t => t.local_bytes || 0,
+});
 function renderSchema(d) {
   lastSchema = d;
   // #/schema is the list; #/schema/<table> is the level below it
@@ -19,7 +27,7 @@ function renderSchema(d) {
   document.getElementById("sec-table").hidden = !detail;
   if (detail) { renderTableDetail(d); return; }
   const tbody = document.getElementById("schema");
-  const tables = (d.tables || []).filter(t => !schemaFilter || t.name.toLowerCase().includes(schemaFilter));
+  const tables = sortRows("schema", (d.tables || []).filter(t => !schemaFilter || t.name.toLowerCase().includes(schemaFilter)));
   renderKeyed(tbody, tables.map(t => {
     const cols = (t.columns || []).filter(c => !c.hidden);
     const hiddenNames = new Set((t.columns || []).filter(c => c.hidden).map(c => c.name));

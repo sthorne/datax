@@ -195,6 +195,18 @@
   tr.clickable .opens { color: LinkText; text-decoration: underline; text-underline-offset: 2px; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--series-1) 7%, transparent); }
   tr.fold td { background: color-mix(in srgb, var(--border) 22%, transparent); }
+  /* The sort control (issue #282): a small button after a header's
+     words. The glyph is drawn from aria-sort, so the header says how the
+     table is sorted to a reader and to a screen reader from one fact. */
+  button.sort {
+    font: inherit; font-size: 11px; line-height: 1; padding: 2px 3px; margin-left: 3px; border: 0; border-radius: 4px;
+    background: none; color: var(--text-3); cursor: pointer; vertical-align: baseline;
+  }
+  button.sort::before { content: "↕"; }
+  button.sort:hover { color: var(--text); background: color-mix(in srgb, var(--border) 45%, transparent); }
+  th[aria-sort="ascending"] button.sort, th[aria-sort="descending"] button.sort { color: var(--text); }
+  th[aria-sort="ascending"] button.sort::before { content: "↑"; }
+  th[aria-sort="descending"] button.sort::before { content: "↓"; }
   /* .linkish: a button that reads as a link — it acts in place rather
      than going somewhere. The class was on the ranges table's "show
      all" buttons with no rule behind it, so they were the browser's own
@@ -380,6 +392,9 @@
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
   .chart .title { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
   .chart .title b { font-weight: 600; }
+  /* The metric's name, beside the words that say what it measures. It
+     takes the room the words leave and is the first thing to truncate. */
+  .chart .title code.metric { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-3); }
   .chart .title span { color: var(--text-3); font-size: 12px; }
   .chart svg { display: block; width: 100%; height: auto; margin-top: 6px; }
   .chart .grid line { stroke: var(--border); stroke-width: 1; }
@@ -597,16 +612,16 @@
 <main id="view-nodes" hidden>
   <section>
     <h2>Nodes <input id="node-filter" type="search" placeholder="filter by locality or address" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"> <button type="button" class="csv" data-csv="nodes" data-help="copy as csv">copy as CSV</button></h2>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th>node</th><th>status</th><th>address</th><th>locality</th>
-        <th class="num" title="host CPU busy, all cores">cpu</th>
-        <th class="num" title="one-minute load average / cores">load</th>
-        <th class="num" title="host memory in use / total">memory</th>
-        <th class="num" title="free space on the store's filesystem">disk free</th>
+    <div class="tablewrap"><table class="cards" data-sorts="nodes">
+      <thead><tr><th data-sort="node">node</th><th data-sort="status">status</th><th data-sort="address">address</th><th data-sort="locality">locality</th>
+        <th class="num" data-sort="cpu" title="host CPU busy, all cores">cpu</th>
+        <th class="num" data-sort="load" title="one-minute load average / cores">load</th>
+        <th class="num" data-sort="memory" title="host memory in use / total">memory</th>
+        <th class="num" data-sort="disk" title="free space on the store's filesystem">disk free</th>
         <th class="num" title="how long until the store fills at its recent rate; blank where free space is not trending">fills in</th>
-        <th class="num" title="open file descriptors / soft limit">fds</th>
-        <th class="num" title="ranges this node leads">leases</th>
-        <th class="num">heartbeat</th></tr></thead>
+        <th class="num" data-sort="fds" title="open file descriptors / soft limit">fds</th>
+        <th class="num" data-sort="leases" title="ranges this node leads">leases</th>
+        <th class="num" data-sort="heartbeat">heartbeat</th></tr></thead>
       <tbody id="nodes-table"></tbody>
     </table></div>
     <p class="muted" id="nodes-table-note"></p>
@@ -638,34 +653,27 @@
   </section>
   <section id="sec-failure-domains">
     <h2>Failure domains <button type="button" class="csv" data-csv="domains" data-help="copy as csv">copy as CSV</button></h2>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th scope="col">domain</th>
-        <th scope="col" class="num" title="nodes in this domain, and how many are live">nodes</th>
-        <th scope="col" class="num" title="replicas this domain currently holds">replicas</th>
-        <th scope="col" class="num" title="ranges this domain currently leads (leader = leaseholder)">leases</th>
-        <th scope="col" class="num" title="ranges that would drop below a majority of replicas if this whole domain were lost at once">loses quorum</th>
-        <th scope="col" class="num" title="ranges that would survive losing this domain with no margin: one further failure would finish them">bare majority</th></tr></thead>
+    <div class="tablewrap"><table class="cards" data-sorts="domains">
+      <thead><tr><th scope="col" data-sort="domain">domain</th>
+        <th scope="col" class="num" data-sort="nodes" title="nodes in this domain, and how many are live">nodes</th>
+        <th scope="col" class="num" data-sort="replicas" title="replicas this domain currently holds">replicas</th>
+        <th scope="col" class="num" data-sort="leases" title="ranges this domain currently leads (leader = leaseholder)">leases</th>
+        <th scope="col" class="num" data-sort="quorum" title="ranges that would drop below a majority of replicas if this whole domain were lost at once">loses quorum</th>
+        <th scope="col" class="num" data-sort="bare" title="ranges that would survive losing this domain with no margin: one further failure would finish them">bare majority</th></tr></thead>
       <tbody id="repl-domains"></tbody>
     </table></div>
     <p class="muted" id="repl-domain-note"></p>
   </section>
-  <section id="sec-hot-ranges">
-    <h2>Range hotspots</h2>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th scope="col">range</th><th scope="col">span</th><th scope="col">leader</th>
-        <th scope="col" class="num">qps</th><th scope="col" class="num">size</th></tr></thead>
-      <tbody id="repl-hot"></tbody>
-    </table></div>
-    <p class="muted" id="repl-hot-note"></p>
-  </section>
   <section id="sec-cluster-ranges">
     <h2>Ranges <input id="data-filter" type="search" placeholder="filter by table or range id" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"> <button type="button" class="csv" data-csv="ranges" data-help="copy as csv">copy as CSV</button></h2>
-    <div class="tablewrap"><table>
-      <thead><tr><th>range</th><th>span</th><th>replicas</th></tr></thead>
+    <div class="tablewrap"><table data-sorts="ranges">
+      <thead><tr><th data-sort="range">range</th><th data-sort="span">span</th><th data-sort="replicas">replicas</th>
+        <th data-sort="leader">leader</th><th class="num" data-sort="qps">qps</th><th class="num" data-sort="size">size</th></tr></thead>
       <tbody id="cluster-ranges"></tbody>
     </table></div>
     <p class="muted" id="cluster-range-cap"></p>
     <p class="muted" id="cluster-range-hint"></p>
+    <p class="muted" id="cluster-range-load-note"></p>
   </section>
 </main>
 <main id="view-sql" hidden>
@@ -760,12 +768,12 @@
 <main id="view-schema" hidden>
   <section id="sec-schema">
     <h2>Schema <input id="schema-filter" type="search" placeholder="filter tables" style="margin-left:12px;font-size:13px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text)"></h2>
-    <div class="tablewrap"><table class="cards">
-      <thead><tr><th>table</th><th>columns</th><th>primary key</th><th>indexes</th>
-        <th class="num" title="from the table's statistics (ANALYZE or the background sampler)">rows</th>
-        <th class="num" title="how old the statistics are">stats age</th>
-        <th class="num" title="ranges covering the table cluster-wide">ranges</th>
-        <th class="num" title="bytes held by this node's replicas of the table (exact when this node holds every replica)">local size</th>
+    <div class="tablewrap"><table class="cards" data-sorts="schema">
+      <thead><tr><th data-sort="table">table</th><th data-sort="columns">columns</th><th>primary key</th><th>indexes</th>
+        <th class="num" data-sort="rows" title="from the table's statistics (ANALYZE or the background sampler)">rows</th>
+        <th class="num" data-sort="age" title="how old the statistics are">stats age</th>
+        <th class="num" data-sort="ranges" title="ranges covering the table cluster-wide">ranges</th>
+        <th class="num" data-sort="size" title="bytes held by this node's replicas of the table (exact when this node holds every replica)">local size</th>
         <th>grants</th></tr></thead>
       <tbody id="schema"></tbody>
     </table></div>

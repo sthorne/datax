@@ -60,6 +60,8 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 	}
 	first := true
 	tc := StartWithOptions(t, 3, func(cfg *server.Config) {
+		// The charts need samples to draw, and soon.
+		cfg.MetricsRecordInterval = 2 * time.Second
 		if first {
 			cfg.HTTPListener = httpLis
 			first = false
@@ -399,8 +401,10 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		ops := br.open(t, base+"ops", 1440, 900, false)
 		defer ops.close()
 		wait(ops, "the timeline", `!!document.querySelector('#events td.when')`)
+		// Whichever split is on screen — a burst folds to its newest —
+		// names its table, and none is left with a number for one.
 		check(ops, "a split names its table (#280)",
-			`String([...document.querySelectorAll('#events tr')].some(r => /split at \/table\/`+consoleLongTable+`\//.test(r.textContent)))`, "true")
+			`(() => { const rows = [...document.querySelectorAll('#events tr')].map(r => r.textContent).filter(t => /split at \/table\//.test(t)); return String(rows.length > 0 && rows.every(t => /split at \/table\/[a-z_]+/.test(t))); })()`, "true")
 		check(ops, "an event links the range it names (#280)", `String([...document.querySelectorAll('#events td a')].some(a => /[?&]r=\d+/.test(a.getAttribute('href'))))`, "true")
 
 		// A link to a range keeps both the range and the time window. The
@@ -432,6 +436,95 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			check(p, "the range after closing it", `String(!!document.querySelector('#cluster-ranges tr[data-range="1"][aria-expanded="true"]'))`, "false")
 			p.close()
 		}
+	})
+
+	// Sorting, the one ranges table, and what a chart says about itself
+	// (#282, #283, #277).
+	t.Run("tables and charts", func(t *testing.T) {
+		wait := func(page *browserPage, what, expr string) {
+			t.Helper()
+			deadline := time.Now().Add(30 * time.Second)
+			guarded := `(() => { try { return String(!!(` + expr + `)); } catch (e) { return "false"; } })()`
+			for page.eval(t, guarded) != "true" {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: never true: %s", what, expr)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		check := func(page *browserPage, what, expr, want string) {
+			t.Helper()
+			if got := page.eval(t, expr); got != want {
+				t.Errorf("%s: %s = %q, want %q", what, expr, got, want)
+			}
+		}
+
+		// #283: one table of ranges, with the load figures as columns.
+		data := br.open(t, base+"data", 1440, 900, false)
+		defer data.close()
+		wait(data, "the ranges table", `document.querySelectorAll('#cluster-ranges tr[data-range]').length > 1`)
+		check(data, "the ranges table's columns (#283)",
+			`[...document.querySelectorAll('table[data-sorts="ranges"] thead th')].map(th => th.childNodes[0].textContent.trim()).join(",")`,
+			"range,span,replicas,leader,qps,size")
+		check(data, "the hotspots table is gone (#283)", `String(!document.getElementById('repl-hot') && !document.getElementById('sec-hot-ranges'))`, "true")
+		check(data, "every range row has the six cells (#283)",
+			`String([...document.querySelectorAll('#cluster-ranges tr[data-range]')].every(r => r.children.length === 6))`, "true")
+
+		// #282: a header's button sorts, reverses, and gives the table its
+		// own order back; the header says which, and a poll keeps it.
+		ids := `[...document.querySelectorAll('#cluster-ranges tr[data-range]')].map(r => Number(r.dataset.range)).join(",")`
+		click := `(document.querySelector('table[data-sorts="ranges"] th[data-sort="range"] button.sort').click(), "ok")`
+		data.eval(t, click)
+		asc := data.eval(t, ids)
+		check(data, "sorted ascending (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "ascending")
+		check(data, "ascending is ascending (#282)", `String((s => s.join(",") === s.slice().sort((a, b) => a - b).join(","))(`+"`"+`${`+ids+`}`+"`"+`.split(",").map(Number)))`, "true")
+		data.eval(t, click)
+		check(data, "sorted descending (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "descending")
+		check(data, "descending is the reverse (#282)", ids, reverseCSV(asc))
+		time.Sleep(3500 * time.Millisecond) // a poll redraws the table
+		check(data, "a poll keeps the reader's order (#282)", ids, reverseCSV(asc))
+		data.eval(t, click)
+		check(data, "the third press clears the sort (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "none")
+		for _, table := range []string{"nodes", "domains", "schema", "ranges"} {
+			check(data, "the "+table+" table's headers sort (#282)",
+				`String(document.querySelectorAll('table[data-sorts="`+table+`"] th[data-sort] button.sort').length >= 4)`, "true")
+		}
+		// The rule itself: no figure sorts last in either direction, and
+		// equal rows keep the order they came in.
+		check(data, "sortRows (#282)", `(() => {
+  sortBy("t", { v: r => r.v, n: r => r.n });
+  const rows = [{ k: "a", v: 3, n: "n10" }, { k: "b", v: null, n: "n2" }, { k: "c", v: 1, n: "n2" }, { k: "d", v: 3, n: "" }, { k: "e", v: undefined, n: "n1" }];
+  const run = (col, dir) => { sortChoice.t = { col, dir }; return sortRows("t", rows).map(r => r.k).join(""); };
+  const out = [run("v", 1), run("v", -1), run("n", 1), run("n", -1)].join(" ");
+  delete sortChoice.t;
+  return out + " " + sortRows("t", rows).map(r => r.k).join("");
+})()`, "cadbe adcbe ebcad abced abcde")
+
+		// #277: round gridlines, a flat series that does not invent
+		// detail, words for a title and a unit.
+		check(data, "niceTicks (#277)", `[niceTicks(0, 1566, "/s"), niceTicks(0, 0, "bytes"), niceTicks(0, 87, "percent"), niceTicks(0, 400 * 1048576, "bytes").map(v => v / 1048576), niceTicks(0, 0.0004, "")].map(a => a.join(",")).join(" | ")`,
+			"0,500,1000,1500,2000 | 0,1 | 0,25,50,75,100 | 0,128,256,384,512 | 0,0.0001,0.0002,0.00030000000000000003,0.0004")
+		check(data, "a chart's title and unit (#277)",
+			`[seriesTitle({ name: "kv.batch_p99_us", help: "p99 KV batch latency" }), seriesTitle({ name: "x.y" }), unitWord({}, "us"), unitWord({ rate: true }, "/s"), unitWord({}, "percent")].join(" | ")`,
+			"P99 KV batch latency | x.y | duration | per second | percent")
+		// A window whose data begins late starts where the data does, for
+		// every chart alike; one that is mostly full is left alone.
+		check(data, "chartWindow (#277)", `(() => {
+  const doc = first => ({ from_ms: 0, to_ms: 3600000, step_ms: 10000, series: [{ nodes: { 1: [[first, 1], [3590000, 2]] } }, { nodes: { 2: [[first + 20000, 1]] } }] });
+  const late = chartWindow(doc(3000000)), early = chartWindow(doc(600000));
+  return [late.win.from_ms, late.since, early.win.from_ms, early.since].join(",");
+})()`, "2980000,3000000,0,0")
+
+		metrics := br.open(t, base+"metrics", 1440, 900, false)
+		defer metrics.close()
+		wait(metrics, "the charts", `document.querySelectorAll('#charts .chart svg').length > 0`)
+		check(metrics, "the event note is said once (#277)", `String(document.querySelectorAll('#charts .annnote').length <= 1 && document.querySelectorAll('#charts .chart .annnote').length === 0)`, "true")
+		check(metrics, "a chart is titled in words beside its metric's name (#277)",
+			`String([...document.querySelectorAll('#charts .chart')].every(c => c.querySelector('.title code.metric') && c.querySelector('.title b').textContent !== c.querySelector('.title code.metric').textContent))`, "true")
+		check(metrics, "no axis repeats a label (#277)",
+			`String([...document.querySelectorAll('#charts .chart svg')].every(svg => { const l = [...svg.querySelectorAll('g.axis text[text-anchor="end"]')].map(t => t.textContent); return new Set(l).size === l.length; }))`, "true")
+		check(metrics, "line-end labels stay inside the plot (#277)",
+			`String([...document.querySelectorAll('#charts .endlabel')].every(l => Number(l.getAttribute("y")) <= 182))`, "true")
 	})
 
 	// The formatters themselves, called in the page: an age is said in
@@ -538,6 +631,15 @@ const consoleFactsJS = `(() => {
     widest,
   });
 })()`
+
+// reverseCSV is a comma-separated list, back to front.
+func reverseCSV(s string) string {
+	parts := strings.Split(s, ",")
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, ",")
+}
 
 func findChrome() string {
 	if p := os.Getenv("DATAX_CHROME"); p != "" {

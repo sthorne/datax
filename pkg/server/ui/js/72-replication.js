@@ -34,7 +34,6 @@ function renderReplication(d) {
 
   renderBucketDetail(rep);
   renderDomains(rep, d);
-  renderHotRanges(d);
 }
 
 function renderBucketDetail(rep) {
@@ -77,8 +76,12 @@ function renderBucketDetail(rep) {
   });
 }
 
+sortBy("domains", {
+  domain: dm => dm.tier + "=" + dm.value, nodes: dm => dm.nodes, replicas: dm => dm.replicas, leases: dm => dm.leases,
+  quorum: dm => dm.loses_quorum || 0, bare: dm => dm.bare_majority || 0,
+});
 function renderDomains(rep, d) {
-  const domains = rep.domains || [];
+  const domains = sortRows("domains", rep.domains || []);
   renderKeyed(document.getElementById("repl-domains"), domains.map(dm => {
     const key = dm.tier + "=" + dm.value;
     const risk = dm.loses_quorum > 0 ? "down" : dm.bare_majority > 0 ? "draining" : "";
@@ -109,42 +112,34 @@ function renderDomains(rep, d) {
   setHTML(document.getElementById("repl-domain-note"), note);
 }
 
-// Range hotspots come from the nodes' own heartbeats — every node
-// advertises its heaviest leaseholders and largest replicas for the
-// allocator, so this needs no fan-out either. QPS is the LEADER's local
-// measurement of ranges it leads, never a cluster total.
-function renderHotRanges(d) {
-  const byID = new Map((d.ranges || []).map(r => [r.range_id, r]));
-  const rows = new Map();
+// rangeLoad is what the nodes' heartbeats say about a range's load: who
+// leads it, the rate it serves and its size. Every node advertises its
+// heaviest leaseholders and largest replicas for the allocator, so this
+// needs no fan-out — and covers only what was advertised: a range that
+// is neither among a node's heaviest nor among its largest has no entry,
+// and the table shows a dash for it rather than a zero nobody measured.
+// QPS is the LEADER's own measurement of a range it leads, never a
+// cluster total.
+//
+// This was the "Range hotspots" table (issue #283). It listed the same
+// ranges as the table below it with different columns, and for a few
+// seconds after a merge it listed ranges that no longer existed, with a
+// blank span, because its rows came from heartbeats and the spans from
+// the descriptors. The figures are columns of the one ranges table now,
+// which is drawn from the descriptors.
+function rangeLoad(d) {
+  const load = new Map();
   for (const n of d.nodes || []) {
     for (const h of n.hot_ranges || []) {
-      const e = rows.get(h.range_id) || { id: h.range_id };
+      const e = load.get(h.range_id) || {};
       if ((h.qps || 0) > (e.qps || 0)) { e.qps = h.qps; e.leader = n.node_id; }
-      rows.set(h.range_id, e);
+      load.set(h.range_id, e);
     }
     for (const h of n.big_ranges || []) {
-      const e = rows.get(h.range_id) || { id: h.range_id };
+      const e = load.get(h.range_id) || {};
       e.bytes = Math.max(e.bytes || 0, h.bytes || 0);
-      rows.set(h.range_id, e);
+      load.set(h.range_id, e);
     }
   }
-  const list = [...rows.values()]
-    .sort((a, b) => (b.qps || 0) - (a.qps || 0) || (b.bytes || 0) - (a.bytes || 0))
-    .slice(0, 20);
-  renderKeyed(document.getElementById("repl-hot"), list.map(e => {
-    const r = byID.get(e.id);
-    return {
-      key: "h" + e.id,
-      html: `<tr data-key="h${e.id}">
-        <td><a href="${rangeRoute(e.id)}" title="open r${e.id}'s per-replica detail">r${e.id}</a></td>
-        <td class="key">${r ? spanText(r) : "—"}</td>
-        <td>${e.leader ? "n" + e.leader : "—"}</td>
-        <td class="num">${e.qps ? e.qps.toFixed(0) : "—"}</td>
-        <td class="num">${e.bytes ? fmtBytes(e.bytes) : "—"}</td>
-      </tr>`,
-    };
-  }));
-  setHTML(document.getElementById("repl-hot-note"), list.length
-    ? "the heaviest and largest ranges each node advertises in its heartbeat. QPS is the leader's own rate over the ranges it leads — it is not summed across nodes, and a range whose leader is down reports none."
-    : "no node is advertising a hot or large range yet; the lists fill once a range's rate tracker matures.");
+  return load;
 }
