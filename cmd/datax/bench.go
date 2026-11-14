@@ -58,6 +58,10 @@ type benchResult struct {
 	Metrics map[string]float64 `json:"metrics,omitempty"`
 	// ReadPhase is the timeseries workload's windowed-read phase.
 	ReadPhase *benchReadPhase `json:"read_phase,omitempty"`
+
+	// maxErrors is the run's --max-errors: how many Errors the command
+	// tolerates before it exits non-zero. Not part of the record.
+	maxErrors int64
 }
 
 type benchReadPhase struct {
@@ -82,7 +86,7 @@ var benchWorkloads = []struct{ name, doc string }{
 }
 
 func benchUsage(fs *flag.FlagSet) {
-	fmt.Fprintf(fs.Output(), "Usage: datax bench <workload> [flags]\n       datax bench run --set bench/workloads.json --out DIR [flags]\n       datax bench compare BEFORE AFTER [--threshold 5]\n\nWorkloads:\n")
+	fmt.Fprintf(fs.Output(), "Usage: datax bench <workload> [flags]\n       datax bench run --set bench/workloads.json --out DIR [flags]\n       datax bench compare BEFORE AFTER [--threshold 5]\n\nA run whose measured phase counts more errors than --max-errors exits non-zero.\n\nWorkloads:\n")
 	for _, w := range benchWorkloads {
 		fmt.Fprintf(fs.Output(), "  %-12s %s\n", w.name, w.doc)
 	}
@@ -101,8 +105,45 @@ func runBench(args []string) error {
 			return runBenchCompare(args[1:])
 		}
 	}
-	_, err := runBenchWorkload(args)
-	return err
+	res, err := runBenchWorkload(args)
+	if err != nil {
+		return err
+	}
+	// The record and the printed results are already out: the exit status
+	// is the only thing an error count changes.
+	return checkBenchErrors(res, res.maxErrors)
+}
+
+// benchMaxErrorsDoc is the --max-errors help shared by the single-workload
+// commands and the set runner.
+const benchMaxErrorsDoc = "exit non-zero when the measured run counts more errors than this (serialization retries, the 40001s, are not errors); -1 never fails on errors"
+
+// topBenchError returns the most frequent message of a record's error
+// samples and its count; the lexically first message wins a tie, so the
+// same record always names the same one.
+func topBenchError(samples map[string]int64) (msg string, n int64) {
+	for m, c := range samples {
+		if c > n || (c == n && m < msg) {
+			msg, n = m, c
+		}
+	}
+	return msg, n
+}
+
+// checkBenchErrors is the exit rule (issue #267): a run that counted more
+// errors in its measured phase than maxErrors failed, however good its
+// throughput looks — an operation that errors is not measured, and the
+// numbers of a run that shed 80 of them describe a different workload.
+// A negative maxErrors tolerates any count.
+func checkBenchErrors(res *benchResult, maxErrors int64) error {
+	if maxErrors < 0 || res.Errors <= maxErrors {
+		return nil
+	}
+	detail := ""
+	if msg, n := topBenchError(res.ErrorSamples); n > 0 {
+		detail = fmt.Sprintf("; most frequent, %d times: %s", n, msg)
+	}
+	return fmt.Errorf("%d errors during the measured run (--max-errors %d)%s", res.Errors, maxErrors, detail)
 }
 
 // runBenchWorkload runs one workload and returns its record.
@@ -133,6 +174,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	groups := fs.Int("groups", 1000, "index-join workload: distinct indexed values (rows per lookup = preload / groups)")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
+	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
 	name := fs.String("name", "", "label in the JSON record (default: the workload)")
 	jsonOut := fs.String("json", "", "write the run's record to this file")
 	cpuProfile := fs.String("cpuprofile", "", "write the client's CPU profile here")
@@ -208,7 +250,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 
 	res := &benchResult{Workload: workload, Args: args, Seed: *seed, Concurrency: *concurrency, DurationSec: duration.Seconds(),
-		StartedAt: time.Now().UTC(), Version: version, GoVersion: runtime.Version()}
+		StartedAt: time.Now().UTC(), Version: version, GoVersion: runtime.Version(), maxErrors: *maxErrors}
 	res.Name = *name
 	if res.Name == "" {
 		res.Name = workload
@@ -524,7 +566,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			}
 			conn, err := connect()
 			if err != nil {
-				errs.Add(1)
+				// A worker that never connected is an error with a message
+				// like any other: the count alone does not say why.
+				noteError(fmt.Errorf("worker could not connect: %w", err))
 				return
 			}
 			defer func() { _ = conn.Close(ctx) }()
@@ -955,11 +999,28 @@ type benchSet struct {
 type benchSetEntry struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
+	// MaxErrors, when present, is this workload's error tolerance in
+	// place of the runner's --max-errors (-1: any count).
+	MaxErrors *int64 `json:"max_errors,omitempty"`
 }
 
 // runBenchSet runs every workload of a set against one cluster, writing
 // a JSON record per workload into --out.
 func runBenchSet(args []string) error {
+	return runBenchSetWith(args, runBenchWorkload)
+}
+
+// runBenchSetWith is runBenchSet over the given single-workload runner
+// (the tests substitute one that needs no cluster).
+//
+// Every workload runs, whatever the ones before it did: a set stopped at
+// its first bad workload leaves no record for the rest, and the night
+// that most needs comparing is the one with nothing to compare. The
+// verdict comes at the end — the runner fails if any workload did not
+// complete, or counted more errors in its measured run than its
+// tolerance (issue #267: a night with 80 routing errors in one workload
+// was green, because only a failed setup used to reach the exit status).
+func runBenchSetWith(args []string, run func([]string) (*benchResult, error)) error {
 	fs := flag.NewFlagSet("bench run", flag.ContinueOnError)
 	set := fs.String("set", "bench/workloads.json", "the workload set")
 	url := fs.String("url", "postgres://root@127.0.0.1:26433/datax?sslmode=disable", "database URL")
@@ -967,8 +1028,9 @@ func runBenchSet(args []string) error {
 	out := fs.String("out", "bench-results", "directory for the JSON records")
 	only := fs.String("only", "", "run only the workloads whose name contains this")
 	durationScale := fs.Float64("duration-scale", 1, "multiply every workload's --duration (a quick smoke run: 0.1)")
+	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc+`; a workload's "max_errors" in the set takes precedence`)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: datax bench run --set bench/workloads.json --url ... [--server-url ...] --out DIR\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: datax bench run --set bench/workloads.json --url ... [--server-url ...] --out DIR\n\nRuns every workload of the set, then exits non-zero if any did not complete or\ncounted more errors than its tolerance.\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -982,25 +1044,60 @@ func runBenchSet(args []string) error {
 	if err := json.Unmarshal(raw, &bs); err != nil {
 		return fmt.Errorf("%s: %v", *set, err)
 	}
+	// A malformed set is refused before anything runs, not discovered
+	// halfway through the night.
+	for _, w := range bs.Workloads {
+		if len(w.Args) == 0 {
+			return fmt.Errorf("workload %q has no args", w.Name)
+		}
+		for _, a := range w.Args {
+			if name, _, _ := strings.Cut(a, "="); name == "--max-errors" || name == "-max-errors" {
+				return fmt.Errorf("workload %q: set the tolerance with \"max_errors\" beside \"args\", not with --max-errors inside them", w.Name)
+			}
+		}
+	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
+	ran := 0
+	var failures []string
 	for _, w := range bs.Workloads {
 		if *only != "" && !strings.Contains(w.Name, *only) {
 			continue
 		}
-		if len(w.Args) == 0 {
-			return fmt.Errorf("workload %q has no args", w.Name)
-		}
+		ran++
 		wargs := append([]string{w.Args[0]}, "--url", *url, "--name", w.Name, "--json", filepath.Join(*out, w.Name+".json"))
 		if *serverURL != "" {
 			wargs = append(wargs, "--server-url", *serverURL)
 		}
 		wargs = append(wargs, scaleDurations(w.Args[1:], *durationScale)...)
 		fmt.Printf("\n=== %s: datax bench %s\n", w.Name, strings.Join(wargs, " "))
-		if _, err := runBenchWorkload(wargs); err != nil {
-			return fmt.Errorf("%s: %w", w.Name, err)
+		res, err := run(wargs)
+		if err != nil {
+			fmt.Printf("%s did not complete: %v\n", w.Name, err)
+			failures = append(failures, fmt.Sprintf("FAIL %s: did not complete: %v", w.Name, err))
+			continue
 		}
+		tolerance := *maxErrors
+		if w.MaxErrors != nil {
+			tolerance = *w.MaxErrors
+		}
+		if tolerance >= 0 && res.Errors > tolerance {
+			line := fmt.Sprintf("FAIL %s: %d errors (tolerance %d)", w.Name, res.Errors, tolerance)
+			if msg, n := topBenchError(res.ErrorSamples); n > 0 {
+				line += fmt.Sprintf("; most frequent, %d times: %s", n, msg)
+			}
+			failures = append(failures, line)
+		}
+	}
+	// The verdict is the run's last lines on purpose: the nightly's
+	// standing issue quotes the tail of the output.
+	fmt.Printf("\n=== bench run: %d of %d workloads clean (records in %s)\n", ran-len(failures), ran, *out)
+	for _, f := range failures {
+		fmt.Println(f)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d workloads failed", len(failures), ran)
 	}
 	return nil
 }

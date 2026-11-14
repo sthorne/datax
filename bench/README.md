@@ -63,6 +63,33 @@ together within minutes, so start the nodes with
 the largest worth trying on a laptop. A record's `error_samples` lists
 the distinct error messages behind its `errors` count.
 
+## Errors fail a run
+
+An operation that errors during the measured run is not measured, so a
+run that shed some describes a different workload than the one asked
+for. `datax bench <workload>` and `datax bench run` therefore exit
+non-zero when a run counts more errors than `--max-errors` (default 0;
+`-1` never fails on errors). The record and the printed results are
+written either way; only the exit status changes.
+
+- A serialization conflict (SQLSTATE 40001, "restart transaction") is
+  not an error: it is counted under `retries`, and a contended workload
+  such as `bank` produces them on every honest run. Everything else is
+  an error — a routing failure, a dropped connection, a timeout. The
+  whole set against a healthy 3-node local cluster counts none.
+- `datax bench run` runs every workload of the set whatever the earlier
+  ones did, so one bad workload does not cost the records of the rest,
+  and gives its verdict at the end: one `FAIL` line per workload that
+  did not complete (its setup failed) or went over its tolerance, with
+  the error count and the most frequent error message.
+- A workload that is expected to shed a few operations can carry its own
+  tolerance in the set, which takes precedence over the runner's flag:
+  `{"name": "...", "args": [...], "max_errors": 5}`. None of the
+  checked-in workloads has one.
+- `bench/run.sh` runs both targets even when the first fails, repeats
+  the `FAIL` lines of both as its last lines, and then exits non-zero.
+  `MAX_ERRORS=-1 make bench` records a set without the check.
+
 `bench/run.sh` starts a fresh single-node on-disk store
 (`datax init --dir`) and a fresh in-memory 3-node cluster (`datax demo`)
 and runs the set against each, writing `OUT/single/<name>.json` and
@@ -121,3 +148,11 @@ of the same shape (`datax bench ingest --keys sequential --batch B
 `.github/workflows/bench.yaml` runs the set on `main` every night on a
 hosted runner and uploads the records as an artifact. Runner noise makes
 it a trend line, not a gate: a PR still records its own before/after.
+
+A night is red when `bench/run.sh` exits non-zero: a workload did not
+complete, or counted errors in its measured run beyond its tolerance
+(above). The records are uploaded and summarized on a red night too, and
+the standing issue the workflow files or updates
+(`.github/scripts/standing-issue.sh`) quotes the run's last lines, which
+name each failing workload, its error count and its most frequent
+error. A clean night closes the issue.

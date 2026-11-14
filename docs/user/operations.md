@@ -896,6 +896,14 @@ the deltas and flags anything beyond ±5 %. `bench/README.md` says how a
 PR records its before/after; a nightly workflow runs the set on `main`
 and keeps the records as an artifact.
 
+A run exits non-zero when its measured phase counts more errors than
+`--max-errors` (default 0; `-1` to never fail on errors). Serialization
+retries (40001) are counted separately and are not errors. `datax bench
+run` still runs every workload of the set and then names the ones that
+failed, each with its error count and most frequent error; a workload
+in the set can carry its own tolerance (`"max_errors"`). The nightly is
+red on exactly that exit status.
+
 Two counters show which commit fast path your workload rides:
 `datax_one_phase_commits_total` (single-range implicit transactions — one
 raft proposal, the cheapest commit) and `datax_parallel_commits_total`
