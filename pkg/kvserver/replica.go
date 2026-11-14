@@ -594,6 +594,7 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		term                         uint64
 		handoff                      *loadHandoff
 		pending                      []chan proposalResult
+		reads                        []chan uint64
 	)
 	r.mu.Lock()
 	prevTerm := r.mu.term
@@ -619,6 +620,20 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 			pending = append(pending, ch)
 			delete(r.mu.proposals, id)
 		}
+		// A leadership-confirmation round in flight will never be
+		// answered now: raft drops a leader's pending read-index
+		// requests when it steps down, and one issued in the moment
+		// between stepping down and learning the new leader is dropped
+		// outright. Its waiters are released here, as the proposers
+		// are, instead of sitting out the round's timeout — which is
+		// as long as the gateway's per-attempt deadline, so a read
+		// caught by a lease transfer came back as "read index
+		// abandoned: context deadline exceeded" and failed its
+		// statement (issue #269).
+		for id, ch := range r.mu.readWaits {
+			reads = append(reads, ch)
+			delete(r.mu.readWaits, id)
+		}
 	}
 	r.mu.Unlock()
 	if becameLeader && term > 1 {
@@ -638,6 +653,9 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 			Message:   "leadership lost with proposal in flight",
 			Ambiguous: &kvpb.AmbiguousResultError{},
 		}}
+	}
+	for _, ch := range reads {
+		close(ch) // issueReadIndex answers NotLeader
 	}
 
 	// 2. Acknowledge the snapshot (state already installed out of band),
@@ -1024,6 +1042,13 @@ func (r *Replica) readIndexLoop() {
 	}
 }
 
+// TestingIssueReadIndex runs one leadership-confirmation round on this
+// replica, whatever its role. Test hook.
+func (r *Replica) TestingIssueReadIndex() (uint64, *kvpb.Error) { return r.issueReadIndex() }
+
+// readIndexTimeout bounds one leadership-confirmation round.
+const readIndexTimeout = 3 * time.Second
+
 // issueReadIndex performs one ReadIndex round trip on behalf of a cohort.
 // It runs under the store's lifetime (not any single caller's context) with
 // a bounded timeout; a timeout surfaces to the cohort as a retryable error.
@@ -1033,7 +1058,11 @@ func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
 			return idx, nil
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.store.cfg.Stopper.Ctx(), 3*time.Second)
+	timeout := readIndexTimeout
+	if d := r.store.cfg.TestingKnobs.ReadIndexTimeout; d > 0 {
+		timeout = d
+	}
+	ctx, cancel := context.WithTimeout(r.store.cfg.Stopper.Ctx(), timeout)
 	defer cancel()
 	rctx := uuid.NewString()
 	ch := make(chan uint64, 1)
@@ -1047,17 +1076,40 @@ func (r *Replica) issueReadIndex() (uint64, *kvpb.Error) {
 	}()
 
 	r.unquiesce()
+	// Only a leader asks: a follower's request is forwarded to the leader
+	// it knows, or dropped without a word when it knows none (it has just
+	// stepped down), and either way a follower serves no linearizable
+	// read. The state is read and the request made under one hold of the
+	// raft group, so a step-down after this point is one the Ready loop
+	// will see and answer for (stageReady).
+	leader := true
 	if err := r.withRaftGroup(func(rn *raft.RawNode) error {
+		if rn.BasicStatus().RaftState != raft.StateLeader {
+			leader = false
+			return nil
+		}
 		rn.ReadIndex([]byte(rctx))
 		return nil
 	}); err != nil {
 		return 0, kvpb.NewError(err)
 	}
+	if !leader {
+		return 0, r.notLeaderError()
+	}
 	r.store.sched.enqueue(r.rangeID, schedReady)
 	select {
 	case <-ctx.Done():
 		return 0, kvpb.NewErrorf("%s: read index abandoned: %v", r.rangeID, ctx.Err())
-	case idx := <-ch:
+	case idx, ok := <-ch:
+		if !ok {
+			// Leadership was lost with the round in flight (stageReady
+			// closed the channel). This check is what keeps the read
+			// linearizable, not a convenience: a closed channel reads as
+			// index 0, which waitApplied passes at once, and with lease
+			// reads off nothing after this point re-checks leadership. A
+			// closed channel must never be read as an index.
+			return 0, r.notLeaderError()
+		}
 		return idx, nil
 	}
 }

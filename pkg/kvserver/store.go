@@ -171,6 +171,11 @@ type TestingKnobs struct {
 	// replica — lets a test take a replica away between the two (issue
 	// #263). It also tells a test whether a merge attempt froze at all.
 	AfterMergeSubsume func(lhs, rhs base.RangeID)
+	// ReadIndexTimeout overrides how long one leadership-confirmation
+	// round may take (0 = the default, 3s) — a long one lets a test tell a
+	// round released by a leadership change from one that merely timed
+	// out (issue #269).
+	ReadIndexTimeout time.Duration
 	// BeforeMergeProposal runs on the merge driver in place of proposing
 	// the merge: an error it returns stands in for the proposal's result
 	// and the proposal is not made — lets a test hand the driver an

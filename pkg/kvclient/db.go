@@ -114,6 +114,9 @@ type DB struct {
 	// frozenWait bounds the wait on a range frozen for a merge
 	// (defaultFrozenRangeWait; tests shorten it).
 	frozenWait time.Duration
+	// attemptTimeout bounds one attempt at one replica (perAttemptTimeout;
+	// tests shorten it).
+	attemptTimeout time.Duration
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
@@ -154,7 +157,7 @@ type localSender struct {
 }
 
 func NewDB(local LocalStore, transport *rpc.Transport, clock *hlc.Clock) *DB {
-	db := &DB{transport: transport, clock: clock, cache: newRangeCache(), frozenWait: defaultFrozenRangeWait}
+	db := &DB{transport: transport, clock: clock, cache: newRangeCache(), frozenWait: defaultFrozenRangeWait, attemptTimeout: perAttemptTimeout}
 	if local != nil {
 		db.local = &localSender{store: local}
 	}
@@ -1046,6 +1049,7 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 	}
 	var lastErr *kvpb.Error
 	overloads := 0
+	readTimeouts := 0 // read attempts that ran out their own deadline and were sent again
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -1054,7 +1058,7 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 			return nil, kvpb.NewError(err)
 		}
 		for _, target := range db.replicaOrder(desc, ba.Header.StaleRead) {
-			br, kerr, err := db.sendToReplica(ctx, ba, target)
+			br, kerr, expired, err := db.sendToReplica(ctx, ba, target)
 			if err != nil {
 				lastErr = kvpb.NewErrorf("n%d unreachable: %v", target, err)
 				continue
@@ -1099,6 +1103,46 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				db.cache.SetHint(desc.RangeID, 0)
 				lastErr = kerr
 				continue
+			}
+			if expired && ba.IsReadOnly() {
+				// The attempt's own deadline passed while the replica was
+				// still working on a read — waiting for a latch behind a
+				// slow write, for the leader's confirmation round, or for
+				// its apply to catch up on a loaded node — and what came
+				// back is the replica saying it gave up ("read index
+				// abandoned: context deadline exceeded"). That is this
+				// attempt timing out, not an answer about the data: the
+				// caller's own deadline has not passed, and a read can be
+				// sent again without harm. Over the wire the transport
+				// reports the same event as a failed call, which is retried
+				// above; a local replica, or a remote one whose reply beat
+				// the deadline's own error back, reports it as a KV error,
+				// and until issue #269 that one-off was handed to the
+				// statement as its result. Writes are not retried here:
+				// one may have been proposed, and its fate is the
+				// transaction layer's to settle (kvpb.AmbiguousResultError).
+				//
+				// Like an unreachable replica above, this is bounded only
+				// by the caller's context: a read whose every attempt runs
+				// out its deadline is retried until ctx is done, so a
+				// caller with no deadline waits rather than failing after
+				// one attempt as it used to.
+				metrics.ReadAttemptTimeouts.Inc()
+				readTimeouts++
+				lastErr = kvpb.NewErrorf("n%d: read attempt timed out after %s (%d so far): %v", target, db.attemptTimeout, readTimeouts, kerr)
+				continue
+			}
+			if kerr != nil && readTimeouts > 0 && ctx.Err() != nil {
+				// The caller's own deadline ran out inside a later attempt,
+				// so that attempt is not counted as a timeout of its own
+				// (expired is false) and the replica's answer goes back.
+				// Without this the statement's error would read the same
+				// whether the gateway had sent the read again twice or not
+				// at all; say how many attempts came before it. The typed
+				// fields are kept as they are.
+				e := *kerr
+				e.Message = fmt.Sprintf("%s (after %d earlier read attempts timed out at %s each)", kerr.Message, readTimeouts, db.attemptTimeout)
+				return br, &e
 			}
 			// Definitive KV-level answer (including txn conflicts and
 			// routing corrections): return to caller.
@@ -1158,14 +1202,20 @@ func (db *DB) replicaOrder(desc kvpb.RangeDescriptor, staleOK bool) []base.NodeI
 	return order
 }
 
-func (db *DB) sendToReplica(ctx context.Context, ba *kvpb.BatchRequest, target base.NodeID) (*kvpb.BatchResponse, *kvpb.Error, error) {
-	actx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+// sendToReplica makes one attempt at one replica, bounded by the attempt
+// timeout. expired reports that the attempt's own deadline passed while the
+// caller's has not: an error that comes back then is, as far as anyone can
+// tell, the attempt running out of time rather than the replica's answer.
+func (db *DB) sendToReplica(ctx context.Context, ba *kvpb.BatchRequest, target base.NodeID) (br *kvpb.BatchResponse, kerr *kvpb.Error, expired bool, err error) {
+	actx, cancel := context.WithTimeout(ctx, db.attemptTimeout)
 	defer cancel()
 	if db.local != nil && target == db.local.store.NodeID() {
-		br, kerr := db.local.store.ExecuteBatch(actx, ba)
-		return br, kerr, nil
+		br, kerr = db.local.store.ExecuteBatch(actx, ba)
+	} else {
+		br, kerr, err = db.transport.SendBatch(actx, target, ba)
 	}
-	return db.transport.SendBatch(actx, target, ba)
+	expired = actx.Err() != nil && ctx.Err() == nil
+	return br, kerr, expired, err
 }
 
 // ---------------------------------------------------------------------------

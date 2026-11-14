@@ -158,6 +158,9 @@ var (
 	FollowerReadFallbacks = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_follower_read_fallbacks_total", Help: "Stale-read sub-batches the gateway could not serve from its local replica (none held, or its closed timestamp lagged) and sent to the leader instead.",
 	})
+	ReadAttemptTimeouts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_read_attempt_timeouts_total", Help: "Read sub-batches whose attempt at a replica ran out its per-attempt deadline (a latch held by a slow write, a leader confirmation or apply that did not finish in time) and were sent again by the gateway instead of failing the statement (issue #269). Occasional under heavy load; a steady rate means reads are waiting seconds on some leader.",
+	})
 	DeadlockAborts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_deadlock_aborts_total", Help: "Transactions aborted as chosen victims of detected deadlock cycles.",
 	})
