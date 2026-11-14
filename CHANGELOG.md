@@ -883,6 +883,16 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **A write in flight across a planned lease transfer is answered with
+  its outcome** (#271). When the balancer shed a lease, writes proposed
+  just before the hand-over were told at once "leadership lost with
+  proposal in flight" — an unknown outcome, which a one-phase commit
+  cannot resend, so a client occasionally saw `XX000`. For a transfer
+  the replica itself asked for, those entries are in the new leader's
+  log (raft hands over only to a follower holding the whole log), so
+  their proposers now wait for the entries' own apply, bounded at two
+  seconds. An unplanned loss of leadership is answered at once, as
+  before.
 - **A merge freeze left behind by an attempt that died no longer keeps
   the range out of service** (#266). A range frozen for a merge by an
   attempt that crashed, lost its leader or ended with its proposal's

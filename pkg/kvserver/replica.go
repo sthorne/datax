@@ -198,6 +198,9 @@ type Replica struct {
 		// it to learn that its own proposal was the one refused.
 		confChangeRefusals uint64
 		mergedInto         base.RangeID
+		// transferAt is when this replica last asked raft to hand its
+		// leadership to another (adminTransferLease); see stageReady.
+		transferAt time.Time
 		// mergeEpoch mirrors replicaState.MergeEpoch: which generation of
 		// the left-hand range the freeze was made for.
 		mergeEpoch int64
@@ -605,6 +608,7 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		term                         uint64
 		handoff                      *loadHandoff
 		pending                      []chan proposalResult
+		settling                     []string
 		reads                        []chan uint64
 	)
 	r.mu.Lock()
@@ -627,7 +631,24 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		handoff, r.mu.loadHandoff = r.mu.loadHandoff, nil
 	}
 	if lostLeadership {
+		// Leadership this replica gave away on purpose (a lease transfer
+		// it asked for moments ago, and it is no longer the leader) is a
+		// different case from leadership it lost: raft hands over only to
+		// a follower holding the leader's whole log and takes no new
+		// proposal while the transfer is pending, so every entry in
+		// flight here is in the new leader's log and will commit under
+		// it. Those proposers are left waiting and answered from their
+		// entries' own apply on this replica, which follows within a round
+		// trip, instead of being told an outcome is unknown that is in
+		// fact decided (issue #271: a one-phase commit cannot be resent,
+		// so the client saw the error). A bound covers the transfer that
+		// did not go as raft promised.
+		planned := !isLeader && !r.mu.transferAt.IsZero() && time.Since(r.mu.transferAt) < transferSettleWindow
 		for id, ch := range r.mu.proposals {
+			if planned {
+				settling = append(settling, id)
+				continue
+			}
 			pending = append(pending, ch)
 			delete(r.mu.proposals, id)
 		}
@@ -664,6 +685,25 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 			Message:   "leadership lost with proposal in flight",
 			Ambiguous: &kvpb.AmbiguousResultError{},
 		}}
+	}
+	if len(settling) > 0 {
+		time.AfterFunc(transferSettleGrace, func() {
+			var late []chan proposalResult
+			r.mu.Lock()
+			for _, id := range settling {
+				if ch, ok := r.mu.proposals[id]; ok {
+					late = append(late, ch)
+					delete(r.mu.proposals, id)
+				}
+			}
+			r.mu.Unlock()
+			for _, ch := range late {
+				ch <- proposalResult{err: &kvpb.Error{
+					Message:   "leadership transferred with proposal in flight, and the proposal did not apply in time",
+					Ambiguous: &kvpb.AmbiguousResultError{},
+				}}
+			}
+		})
 	}
 	for _, ch := range reads {
 		close(ch) // issueReadIndex answers NotLeader

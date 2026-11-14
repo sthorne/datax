@@ -3,11 +3,13 @@ package testcluster
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -168,5 +170,74 @@ func TestTransferLeaseUnderLoad(t *testing.T) {
 	}
 	if len(acked) == 0 {
 		t.Fatal("no writes succeeded during the transfer storm")
+	}
+}
+
+// TestWritesInFlightAcrossAPlannedTransferAreSettled (issue #271): a
+// write proposed just before a lease transfer is still waiting for its
+// apply when the old leader steps down. For a transfer this replica
+// asked for, that entry is in the new leader's log — raft hands over
+// only to a follower that holds the whole log — so its proposer is
+// answered from the entry's own apply a moment later, not told at once
+// that its outcome is unknown. Writers hammer the leader's replica
+// directly while the lease goes round the cluster; none may see
+// "leadership lost with proposal in flight".
+func TestWritesInFlightAcrossAPlannedTransferAreSettled(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	prefix := keys.TableDataPrefix(803)
+	var (
+		mu        sync.Mutex
+		ambiguous []string
+		applied   int
+	)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				lead := tc.LeaderIndex(1)
+				rep, ok := tc.Nodes[lead].Store().GetReplica(1)
+				if !ok {
+					continue
+				}
+				ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: 1, Timestamp: tc.Nodes[lead].Clock().Now()}}
+				ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: append(prefix.Clone(), fmt.Sprintf("w%d-%06d", w, i)...)}, Value: []byte("v")})
+				_, kerr := rep.Execute(ctx, ba)
+				mu.Lock()
+				switch {
+				case kerr == nil:
+					applied++
+				case kerr.Ambiguous != nil:
+					ambiguous = append(ambiguous, kerr.Message)
+				}
+				mu.Unlock()
+			}
+		}(w)
+	}
+	transfers := 0
+	for round := 0; round < 30; round++ {
+		lead := tc.LeaderIndex(1)
+		target := tc.Nodes[(lead+1)%3].NodeID()
+		if err := tc.Nodes[lead].DB().AdminTransferLease(ctx, keys.MinKey, target); err == nil {
+			transfers++
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if transfers < 10 || applied == 0 {
+		t.Fatalf("%d transfers and %d writes: the test did not exercise what it is about", transfers, applied)
+	}
+	if len(ambiguous) > 0 {
+		t.Fatalf("%d of %d writes were answered with an unknown outcome across %d planned transfers; first: %s", len(ambiguous), len(ambiguous)+applied, transfers, ambiguous[0])
 	}
 }
