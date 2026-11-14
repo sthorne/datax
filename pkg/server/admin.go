@@ -55,8 +55,11 @@ var adminUnauditedOps = map[string]bool{
 	"wait-applied":     true,
 	"reencrypt-status": true,
 	"seal-status":      true,
-	"node-status":      true,
-	"node-detail":      true,
+	// peer-unseal writes its own record, with the node asked about and
+	// the reason for a refusal.
+	"peer-unseal": true,
+	"node-status": true,
+	"node-detail": true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -252,6 +255,12 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 
 	case "unseal":
 		return n.serveStageShare(ctx, req)
+
+	case "peer-unseal":
+		return n.servePeerUnseal(ctx, req)
+
+	case "peer-unseal-setting":
+		return n.servePeerUnsealSetting(ctx, req)
 
 	case "reencrypt":
 		return n.serveReencrypt(req)

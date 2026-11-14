@@ -257,6 +257,29 @@ func TestSealedStartOpensOnAQuorumOfShares(t *testing.T) {
 		}
 	}
 
+	// This test is about people unsealing nodes, so the cluster is told
+	// not to do it for them (peer unseal has its own test). Each node
+	// keeps its own copy of the setting, to answer by when there is no
+	// quorum; wait for all three.
+	off := false
+	if resp := call(tc.addrs[0], false, cluster.AdminRequest{Op: "peer-unseal-setting", Enable: &off}); resp.Error != "" {
+		t.Fatalf("turning peer unseal off: %s", resp.Error)
+	}
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		n := 0
+		for _, addr := range tc.addrs {
+			if st := call(addr, false, cluster.AdminRequest{Op: "seal-status"}); st.Seal != nil && st.Seal.PeerUnseal == "off" {
+				n++
+			}
+		}
+		if n == len(tc.addrs) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("peer unseal reads off on %d of %d nodes", n, len(tc.addrs))
+		}
+	}
+
 	// A cold start: everything down, and each node waits for two shares
 	// again — this time knowing, from its own disk, which key's.
 	tc.StopAll()

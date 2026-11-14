@@ -103,6 +103,14 @@ func StoreClusterVersionKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-cluster-version")...)
 }
 
+// StorePeerUnsealKey holds this store's copy of the cluster's peer-unseal
+// setting (issue #307), so a node can answer a sealed peer while the
+// cluster has no quorum to read the setting from — which is exactly
+// when a cold start needs the answer.
+func StorePeerUnsealKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-peer-unseal")...)
+}
+
 // StoreEncryptionMarkerKey holds the store's own record of its switch to
 // authenticated encryption (JSON; issue #248): written after each
 // transition the sealed key registry records, so a registry rolled back
@@ -294,6 +302,11 @@ func NodeRegistrySpan() (Key, Key) {
 // one value wins), keying the stand-in SCRAM salts for users that do not
 // exist (issue #137). Never shown to a client.
 func AuthSecretKey() Key { return systemKey("auth-secret") }
+
+// PeerUnsealSettingKey holds the cluster's peer-unseal setting: "off"
+// when running nodes must not hand the root key to a restarting peer
+// (issue #307). Absent means on.
+func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
 
 // NodeIDGenKey is the counter for allocating node IDs.
 func NodeIDGenKey() Key { return systemKey("idgen", "node") }

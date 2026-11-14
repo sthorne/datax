@@ -29,6 +29,19 @@ state or the internode protocol does, and an entry below says so.
   root key itself, the new key's shares are submitted to the running
   nodes and each store key is rewrapped under it. Shares and root keys
   are never written to disk, logged, or put in an event.
+- **Peer unseal: a restarting node gets the root key from the running
+  cluster** (#307). Under a root key held as shares, a sealed node asks
+  its peers before waiting for people, so a rolling restart needs no
+  operator and a cold start needs share-holders for one node only. A
+  node hands the key over only to the cluster's node certificate, for
+  this cluster and its own root key, for a member that is not being
+  decommissioned and is not live (a second copy of a running node gets
+  nothing); the key crosses sealed under a key agreed for the one
+  exchange. Every request is audited and counted, granted or refused.
+  `datax debug peer-unseal --off` makes every start need shares. With it
+  on, whoever holds a node's certificate key and can reach the cluster
+  while that node is down is a node; the documentation says what that
+  means for where the node key is kept.
 - **Keys are held in locked memory, and an encrypted node cannot be
   core-dumped** (#309). The store key, the registry's data keys and
   root keys live in memory that is `mlock`ed and marked

@@ -149,6 +149,14 @@ func describeSeal(st *cluster.SealStatus) string {
 			fmt.Fprintf(&b, " (key id %s)", st.KeyID)
 		}
 	}
+	if st.PeerUnseal != "" {
+		fmt.Fprintf(&b, "\npeer unseal is %s", st.PeerUnseal)
+		if st.PeerUnseal == "on" {
+			b.WriteString(": this node hands the root key to a member of the cluster that restarts")
+		} else {
+			b.WriteString(": a node that restarts waits for shares")
+		}
+	}
 	if s := st.Staged; s != nil {
 		if s.Sealed {
 			fmt.Fprintf(&b, "\na new root key is being assembled: %s", progress(s))
@@ -253,5 +261,34 @@ func emitShares(shares []enc.Share, outDir string) error {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "\nroot key %s: any %d of these %d shares rebuild it; fewer reveal nothing.\nGive each to a different person and keep no copy together: this is the only time they are shown,\nand the root key itself has not been kept anywhere.\n", shares[0].KeyID, shares[0].Threshold, shares[0].Total)
+	return nil
+}
+
+// runDebugPeerUnseal reports or changes the cluster's peer-unseal
+// setting: whether running nodes hand the root key to a restarting
+// member.
+func runDebugPeerUnseal(args []string) error {
+	fs := flag.NewFlagSet("debug peer-unseal", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of a running node")
+	on := fs.Bool("on", false, "turn peer unseal on (the default for a cluster)")
+	off := fs.Bool("off", false, "turn peer unseal off: every start of every node then needs a quorum of shares")
+	certsDir := fs.String("certs-dir", "", "secure cluster: certificate directory (presents client.<user>.crt)")
+	certUser := fs.String("user", "root", "username whose client certificate authenticates the call; must be an admin")
+	timeout := connectTimeoutFlag(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *on && *off {
+		return errors.New("--on and --off are alternatives")
+	}
+	req := cluster.AdminRequest{Op: "peer-unseal-setting"}
+	if *on || *off {
+		req.Enable = on
+	}
+	resp, err := adminCall(*addr, *certsDir, *certUser, *timeout, req)
+	if err != nil {
+		return err
+	}
+	fmt.Println(describeSeal(resp.Seal))
 	return nil
 }

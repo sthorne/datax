@@ -142,8 +142,18 @@ and console ports not open — until two share-holders have each run
 `datax unseal --addr <node>` and typed their share. See
 [a root key held as shares](../encryption.md#a-root-key-held-as-shares).
 
+A node that restarts while the rest of the cluster is up needs nobody:
+a running peer hands it the root key once it has been down longer than
+the liveness grace (*peer unseal*; `datax debug peer-unseal --off`
+turns that off, and then every start needs shares). Read
+[what peer unseal gives up](../encryption.md#peer-unseal) before
+relying on it: with it on, protect the node certificate's key as you
+would the data.
+
 *Runbook: cold start of a sealed cluster.* Start every node; each
-prints that it is sealed. For each node, two share-holders run
+prints that it is sealed. With peer unseal on, unseal one node as below
+and the others follow by themselves; with it off, do this for each
+node. Two share-holders run
 `datax unseal --addr <node> --certs-dir certs` (the root user's client
 certificate) and enter their share; `datax debug seal-status --addr
 <node>` shows how many are in and whose. A node opens as soon as its

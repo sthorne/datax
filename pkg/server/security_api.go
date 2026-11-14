@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/google/uuid"
 	"net/http"
 	"sort"
 	"time"
@@ -73,6 +74,18 @@ type SecurityStore struct {
 	// #309): whether their memory is locked against swap and left out of
 	// core dumps, and whether the process can be dumped at all.
 	KeyMemory *enc.KeyMemoryStatus `json:"key_memory,omitempty"`
+	// PeerUnseal, for a store under a root key held as shares, says
+	// whether this node hands that key to restarting peers and how often
+	// it has been asked (issue #307).
+	PeerUnseal *SecurityPeerUnseal `json:"peer_unseal,omitempty"`
+}
+
+// SecurityPeerUnseal is a node's record as the answering side of peer
+// unseal, since it started.
+type SecurityPeerUnseal struct {
+	Enabled bool  `json:"enabled"`
+	Granted int64 `json:"granted"`
+	Refused int64 `json:"refused"`
 }
 
 // SecurityRoot names the root a store key is wrapped by. Neither field
@@ -207,17 +220,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 	}
 
 	// The serving node's store.
-	if n.engine != nil {
-		st := SecurityStore{NodeID: int(n.ident.NodeID), Encrypted: n.engine.Encrypted()}
-		if st.Encrypted {
-			st.Reencryption = n.reencryptionStatus()
-			st.Authenticated = n.authenticatedEncryption()
-			st.Root = n.securityRoot()
-			km := enc.KeyMemory()
-			st.KeyMemory = &km
-		}
-		doc.Stores = append(doc.Stores, st)
-	}
+	doc.Stores = append(doc.Stores, n.SecurityStores()...)
 	return doc
 }
 
@@ -254,3 +257,26 @@ func (n *Node) securityRoles(ctx context.Context, doc *SecurityStatus) []Securit
 	}
 	return out
 }
+
+// SecurityStores is this node's own store encryption state, as
+// /api/security reports it.
+func (n *Node) SecurityStores() []SecurityStore {
+	if n.engine != nil {
+		st := SecurityStore{NodeID: int(n.ident.NodeID), Encrypted: n.engine.Encrypted()}
+		if st.Encrypted {
+			st.Reencryption = n.reencryptionStatus()
+			st.Authenticated = n.authenticatedEncryption()
+			st.Root = n.securityRoot()
+			km := enc.KeyMemory()
+			st.KeyMemory = &km
+			if st.Root != nil && st.Root.Kind == "shares" {
+				st.PeerUnseal = &SecurityPeerUnseal{Enabled: !n.peerUnseal.off.Load(), Granted: n.peerUnseal.granted.Load(), Refused: n.peerUnseal.refused.Load()}
+			}
+		}
+		return []SecurityStore{st}
+	}
+	return nil
+}
+
+// ClusterID is the id of the cluster this node belongs to.
+func (n *Node) ClusterID() uuid.UUID { return n.ident.ClusterID }

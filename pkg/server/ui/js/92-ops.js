@@ -193,7 +193,7 @@ function eventRow(e) {
 // records, and that sequence is what the timeline is for. Folding is for
 // churn — lease moves, rebalances, splits — where the count is the news.
 const FOLD_MIN = 4, FOLD_GAP_MS = 60000;
-const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation"]);
+const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation", "peer-unseal"]);
 const openFolds = new Set();
 function foldEvents(evs) {
   const out = [];
@@ -285,7 +285,7 @@ function renderOps() {
 
 // AUDIT_KINDS are the security-relevant records; they are shown on the
 // security view instead of mixed into the operational timeline.
-const AUDIT_KINDS = new Set(["key-rotation"]);
+const AUDIT_KINDS = new Set(["key-rotation", "peer-unseal"]);
 
 // secDoc is the last /api/security document (issue #156). It is fetched
 // on its own cadence, so the parts of the view drawn from the cluster
@@ -408,10 +408,15 @@ function renderSecurityDoc() {
       const km = st.key_memory;
       const keyMem = !st.encrypted || !km || (km.locked && km.no_dump) ? ""
         : ` <span class="muted">· ${warn("draining", "key memory not " + (km.locked ? "kept out of core dumps" : "locked"))}${km.reason ? " — " + esc(km.reason) : ""}</span>`;
+      // Under a root key held as shares: whether this node hands the key
+      // to a restarting peer, and how often it has been asked (#307).
+      const pu = st.peer_unseal;
+      const peerUnseal = !pu ? ""
+        : ` <span class="muted">· peer unseal ${pu.enabled ? "on" : "off"}${pu.granted || pu.refused ? ` (${pu.granted} granted, ${pu.refused} refused)` : ""}</span>`;
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${state}${keyHome}${keyMem}</td>
+        <td data-label="state">${state}${keyHome}${keyMem}${peerUnseal}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

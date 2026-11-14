@@ -169,6 +169,8 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 				log.Debugf("persisting registry: %v", err)
 			}
 			n.exportMetadata(hctx)
+			n.writeSealIdentity()
+			n.mirrorPeerUnsealSetting(hctx)
 		} else {
 			log.Debugf("%s registry scan failed: %v", n.ident.NodeID, err)
 		}

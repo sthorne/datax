@@ -385,11 +385,70 @@ datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs --to-root 2
 
 What this root gives: a disk, every disk, or a powered-off machine
 opens nothing, and no one person can open it either. What it costs: a
-cold start of a node needs `k` people (letting a running cluster vouch
-for a restarting node is #307), and losing more than `n-k` shares
+cold start of the cluster needs `k` people (a restart of one node does
+not: see *Peer unseal*), and losing more than `n-k` shares
 loses the root key — after which a node that is running can still be
 moved to a new root key, and one that is stopped cannot be opened by
 anyone.
+
+### Peer unseal
+
+With shares alone, every start of every node would need a quorum of
+people. A running node holds the root key in memory, so a sealed node
+asks the peers it knew for it before it settles down to wait for
+shares, and a rolling restart needs nobody.
+
+A running node hands the root key over only when all of these hold:
+
+- the asker presents the cluster's **node** certificate over mutual TLS
+  (a client certificate, root's included, is refused; a cluster without
+  TLS has no peer unseal);
+- it names this cluster, and the root key the answering node itself
+  runs under;
+- its node id is a member of the cluster and is not being
+  decommissioned;
+- that node is **not live**: its last heartbeat is older than the
+  liveness grace (15 s by default), so a second copy of a running node
+  is handed nothing. A node restarted at once therefore waits out the
+  grace, asking every two seconds;
+- peer unseal is on.
+
+The key crosses inside the TLS connection sealed under a key agreed for
+that one exchange (X25519, bound to the cluster, node and key ids), so
+something that terminates and forwards the TLS sees no key; that layer
+is against reading, not impersonation, which is the certificate's job.
+The asker takes the key only if it is the one its own wrapped store key
+names. Every request is audited on the node that answers, granted or
+refused with the reason, appears in the console's events, and is
+counted in the security view. The node keeps, unencrypted in its data
+directory, the little it needs to ask before its store is open
+(`SEAL-IDENTITY`: cluster id, node id, peers' addresses — none secret,
+and trusted for nothing but where to ask).
+
+```
+datax debug peer-unseal --addr 10.0.0.1:26257 --certs-dir certs          # report
+datax debug peer-unseal --addr 10.0.0.1:26257 --certs-dir certs --off    # every start needs shares
+```
+
+The setting is the cluster's; each node keeps a copy so it can answer
+during a cold start, before there is a quorum to read it from.
+
+What peer unseal keeps and gives up:
+
+- It keeps the promise that matters for encryption at rest: a disk that
+  leaves the building cannot open itself, because it cannot reach the
+  cluster.
+- It does **not** protect against someone who holds a node's
+  certificate and private key **and** can reach the cluster while that
+  node is down: that is a node, as far as the cluster can tell. With
+  peer unseal on, a node key kept on the same disk as the data is all
+  that stands between a stolen disk and its contents for an attacker on
+  the network. Where that is in scope, keep the node key elsewhere (or
+  in hardware), or turn peer unseal off.
+- A cold start of the whole cluster still needs the share-holders, by
+  design — for one node; the others take the key from it.
+- A node that has never been a member (a new node joining) has no id
+  to be vouched for and is unsealed with shares.
 
 ## Keys in memory
 

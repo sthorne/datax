@@ -181,6 +181,19 @@ func (n *Node) awaitUnseal(root *enc.ShareRoot) error {
 	if n.cfg.OnSealed != nil {
 		n.cfg.OnSealed(lis.Addr().String())
 	}
+	// Before settling down to wait for people, ask the cluster: a peer
+	// that is running holds this root key and may hand it over
+	// (peerunseal.go). Shares are accepted all the while.
+	askCtx, stopAsking := context.WithCancel(context.Background())
+	asked := make(chan struct{})
+	go func() {
+		defer close(asked)
+		n.askPeersToUnseal(askCtx, root)
+	}()
+	defer func() {
+		stopAsking()
+		<-asked
+	}()
 	var err error
 	select {
 	case <-root.Opened():
@@ -273,6 +286,9 @@ func (n *Node) serveSealStatus() cluster.AdminResponse {
 	st := &cluster.SealStatus{}
 	if n.encRoot != nil {
 		st.Root, st.KeyID = n.encRoot.Kind(), n.encRoot.KeyID()
+	}
+	if st.Root == "shares" {
+		st.PeerUnseal = n.peerUnsealSetting()
 	}
 	for i, r := range n.encRoots {
 		s, ok := r.(*enc.ShareRoot)

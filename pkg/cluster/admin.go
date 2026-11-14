@@ -62,6 +62,27 @@ type AdminRequest struct {
 	// Share (unseal) is one share of a root key, as its holder keeps it.
 	// It is a secret in transit: never logged, audited or echoed.
 	Share string `json:"share,omitempty"`
+	// Peer (peer-unseal) is a sealed node's request for the root key.
+	Peer *PeerUnsealRequest `json:"peer,omitempty"`
+	// Enable (peer-unseal-setting) turns peer unseal on or off; nil
+	// only reports it.
+	Enable *bool `json:"enable,omitempty"`
+}
+
+// PeerUnsealRequest is what a sealed node sends a running peer: who it
+// is, which root key it waits for, and the public half of the key
+// exchange the answer is sealed under.
+type PeerUnsealRequest struct {
+	ClusterID string      `json:"cluster_id"`
+	NodeID    base.NodeID `json:"node_id"`
+	KeyID     string      `json:"key_id"`
+	Exchange  []byte      `json:"exchange"`
+}
+
+// PeerUnsealAnswer carries the root key, sealed for the one exchange.
+type PeerUnsealAnswer struct {
+	Exchange []byte `json:"exchange"`
+	Sealed   []byte `json:"sealed"`
 }
 
 // SealStatus (seal-status, unseal) says where a node stands with a root
@@ -85,6 +106,9 @@ type SealStatus struct {
 	Staged *SealStatus `json:"staged,omitempty"`
 	// Position is a staged root's place among the node's roots.
 	Position int `json:"position,omitempty"`
+	// PeerUnseal reports the cluster's setting as this node holds it:
+	// "on", "off", or "" where it does not apply.
+	PeerUnseal string `json:"peer_unseal,omitempty"`
 }
 
 // ReencryptionStatus reports the background re-encryption pass on one
@@ -107,6 +131,7 @@ type ReencryptionStatus struct {
 type AdminResponse struct {
 	Error  string                 `json:"error,omitempty"`
 	Seal   *SealStatus            `json:"seal,omitempty"`
+	Peer   *PeerUnsealAnswer      `json:"peer,omitempty"`
 	Ranges []kvpb.RangeDescriptor `json:"ranges,omitempty"`
 	// TableNames (ranges, split, merge) maps table IDs to names, so a
 	// client can print spans as /table/orders/... (keys.SetTableNamer).

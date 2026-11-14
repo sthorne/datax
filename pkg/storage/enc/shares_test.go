@@ -243,8 +243,16 @@ func TestShareRootUnsealsOnAQuorum(t *testing.T) {
 		if _, err := r.Submit(shares[pair[0]].String()); err == nil || !strings.Contains(err.Error(), "already been submitted") {
 			t.Fatalf("a repeated share: %v", err)
 		}
-		damaged := shares[pair[1]].String()
-		damaged = damaged[:len(damaged)-1] + map[bool]string{true: "b", false: "a"}[damaged[len(damaged)-1] == 'a']
+		// A character in the middle: the last one carries a spare bit, and
+		// changing it can make the text malformed rather than wrong.
+		d := []byte(shares[pair[1]].String())
+		at := len(SharePrefix) + 20
+		if d[at] == 'a' {
+			d[at] = 'c'
+		} else {
+			d[at] = 'a'
+		}
+		damaged := string(d)
 		if _, err := r.Submit(damaged); err == nil || !strings.Contains(err.Error(), "mistyped or damaged") {
 			t.Fatalf("a damaged share: %v", err)
 		}
@@ -347,5 +355,87 @@ func TestParseRootKnowsShares(t *testing.T) {
 	}
 	if _, err := ParseRoot("shares:2/3"); err == nil {
 		t.Fatal("shares took an argument: the split is made by `datax debug enc-root split`, not named at start")
+	}
+}
+
+// TestRootKeyHandedBetweenPeers: the key crosses under a key made for
+// the one exchange, is taken only if it is the key the asker waits for,
+// and an answer does not open under another exchange or another
+// request's description.
+func TestRootKeyHandedBetweenPeers(t *testing.T) {
+	key := randomKey(t)
+	giver := NewShareRoot()
+	if err := giver.Open(key); err != nil {
+		t.Fatal(err)
+	}
+	binding := []byte("cluster c1 node 2 key " + RootKeyID(key))
+	ask := func() (*ShareRoot, *PeerExchange) {
+		r := NewShareRoot()
+		r.Expect(RootKeyID(key))
+		x, err := NewPeerExchange()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, x
+	}
+
+	asker, x := ask()
+	pub, sealed, err := giver.HandTo(x.Public(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(sealed, key) {
+		t.Fatal("the answer contains the root key in the clear")
+	}
+	// Not under another exchange, another description, or altered.
+	other, y := ask()
+	if err := other.OpenFromPeer(y, pub, sealed, binding); err == nil || !other.Sealed() {
+		t.Fatalf("an answer opened under another exchange: %v", err)
+	}
+	if err := asker.OpenFromPeer(x, pub, sealed, []byte("cluster c1 node 3 key "+RootKeyID(key))); err == nil || !asker.Sealed() {
+		t.Fatalf("an answer opened for another request: %v", err)
+	}
+	bad := append([]byte(nil), sealed...)
+	bad[len(bad)-1] ^= 1
+	if err := asker.OpenFromPeer(x, pub, bad, binding); err == nil || !asker.Sealed() {
+		t.Fatalf("an altered answer opened: %v", err)
+	}
+	if err := asker.OpenFromPeer(x, pub, sealed, binding); err != nil || asker.Sealed() {
+		t.Fatalf("the answer did not open: %v", err)
+	}
+	wrapped, err := giver.Wrap(context.Background(), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := asker.Unwrap(context.Background(), wrapped); err != nil || string(got) != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("the handed key does not unwrap what the giver wrapped: %v", err)
+	}
+
+	// A peer holding some other key cannot give it to a node waiting for
+	// this one, and a node that waits for no key in particular takes none.
+	stranger := NewShareRoot()
+	if err := stranger.Open(randomKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	asker2, x2 := ask()
+	pub2, sealed2, err := stranger.HandTo(x2.Public(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := asker2.OpenFromPeer(x2, pub2, sealed2, binding); err == nil || !asker2.Sealed() {
+		t.Fatalf("another root key was taken from a peer: %v", err)
+	}
+	blank := NewShareRoot()
+	x3, _ := NewPeerExchange()
+	pub3, sealed3, _ := giver.HandTo(x3.Public(), binding)
+	if err := blank.OpenFromPeer(x3, pub3, sealed3, binding); err == nil || !blank.Sealed() {
+		t.Fatalf("a root with no expectation took a peer's key: %v", err)
+	}
+	// A sealed root hands nothing over; a malformed public half is refused.
+	if _, _, err := NewShareRoot().HandTo(x.Public(), binding); err != ErrSealed {
+		t.Fatalf("a sealed root handed over a key: %v", err)
+	}
+	if _, _, err := giver.HandTo([]byte("short"), binding); err == nil {
+		t.Fatal("a malformed exchange key was accepted")
 	}
 }

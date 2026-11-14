@@ -316,6 +316,9 @@ type Node struct {
 	// guarded by encKeyMu: a rewrap can move the store to another.
 	encRoots []enc.Root
 	encRoot  enc.Root
+	// peerUnseal is what this node remembers as the answering side of
+	// peer unseal (peerunseal.go).
+	peerUnseal peerUnsealState
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener
@@ -512,6 +515,7 @@ func (n *Node) start() error {
 	if n.raftEngine != nil {
 		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
 	}
+	n.loadPeerUnsealSetting()
 	// Before anything asks the engines to move: what they opened with,
 	// held to the store's own record of its switch (issue #248).
 	if err := n.checkEncryptionMarker(); err != nil {
@@ -754,6 +758,9 @@ func (n *Node) start() error {
 		}
 	}()
 	n.stopper.AddCloser(grpcServer.Stop)
+	// What a sealed restart of this node will need before its store is
+	// open; the heartbeat keeps it in step with the registry after this.
+	n.writeSealIdentity()
 
 	if initialized {
 		// A restarted node may be back on a different address. Announce it
