@@ -396,10 +396,16 @@ function renderSecurityDoc() {
       const state = !st.encrypted ? tok("draining", "plaintext")
         : au && au.only ? tok("live", encryptionState(au))
           : warn("draining", encryptionState(au) + (au ? "" : " (older binary)"));
+      // Where the store's key lives (issue #305): under a root, named by
+      // its kind and the name the root gives its key, or in a key file
+      // on the node — which is the answer a reviewer is asking for.
+      const keyHome = !st.encrypted ? ""
+        : st.root ? ` <span class="muted">· store key under a ${esc(st.root.kind)} root${st.root.key_id ? ` (${esc(st.root.key_id)})` : ""}</span>`
+          : ` <span class="muted">· store key from a key file</span>`;
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${state}</td>
+        <td data-label="state">${state}${keyHome}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

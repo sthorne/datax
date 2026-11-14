@@ -40,6 +40,32 @@ func loadKeyCandidates(value string) ([][]byte, error) {
 	return enc.LoadKeyFiles(paths)
 }
 
+// storeKeyCandidates resolves the store key of a stopped store for the
+// offline tools: from key files (--enc-key), or by unwrapping what the
+// data directory holds through a root (--enc-root). Either way the
+// result is candidates for enc.MatchStoreKey.
+func storeKeyCandidates(dir, keyPaths, rootSpec string) ([][]byte, error) {
+	if rootSpec == "" {
+		return loadKeyCandidates(keyPaths)
+	}
+	if keyPaths != "" {
+		return nil, fmt.Errorf("--enc-key and --enc-root are alternatives")
+	}
+	roots, err := enc.ParseRoots(rootSpec)
+	if err != nil {
+		return nil, err
+	}
+	got, err := enc.UnwrapStoreKeys(context.Background(), vfs.Default, dir, roots)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([][]byte, len(got))
+	for i := range got {
+		keys[i] = got[i].Key
+	}
+	return keys, nil
+}
+
 // runDebugMetadata prints the node's periodic metadata export (written to
 // the data directory every heartbeat; the recovery artifact for a cluster
 // whose metadata range lost quorum).
@@ -47,6 +73,7 @@ func runDebugMetadata(args []string) error {
 	fs := flag.NewFlagSet("debug metadata", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of a (stopped or running) node")
 	keyPath := fs.String("enc-key", "", "store encryption key file (for an encrypted store's sealed backup); a comma-separated list is tried in order")
+	rootSpec := fs.String("enc-root", "", "for a store whose key is kept under a root: the root, as given to the node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,12 +85,12 @@ func runDebugMetadata(args []string) error {
 		return fmt.Errorf("no metadata backup found: %w", err)
 	}
 	if len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
-		keys, err := loadKeyCandidates(*keyPath)
+		keys, err := storeKeyCandidates(*dir, *keyPath, *rootSpec)
 		if err != nil {
 			return err
 		}
 		if len(keys) == 0 {
-			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key is required")
+			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key or --enc-root is required")
 		}
 		var plain []byte
 		for _, key := range keys {
@@ -92,17 +119,63 @@ func runDebugRotateEncKey(args []string) error {
 	addr := fs.String("addr", "", "online mode: RPC address of the RUNNING node to rotate")
 	oldPath := fs.String("old-key", "", "current store encryption key file")
 	newPath := fs.String("new-key", "", "new store encryption key file")
+	rootSpec := fs.String("enc-root", "", "offline mode, for a store whose key is kept under a root: the root, as given to the node (the new key is made here and wrapped by it; no key file is involved)")
 	certsDir := fs.String("certs-dir", "", "online mode, secure cluster: certificate directory (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "online mode: username whose client certificate authenticates the call; must be an admin")
 	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *oldPath == "" || *newPath == "" {
-		return fmt.Errorf("rotate-enc-key requires --old-key and --new-key")
+	rooted := *rootSpec != "" || (*addr != "" && *oldPath == "" && *newPath == "")
+	if !rooted && (*oldPath == "" || *newPath == "") {
+		return fmt.Errorf("rotate-enc-key requires --old-key and --new-key (or, for a store whose key is kept under a root: neither with --addr, or --enc-root with --dir)")
+	}
+	if rooted && (*oldPath != "" || *newPath != "") {
+		return fmt.Errorf("a store whose key is kept under a root makes its new key itself: --old-key and --new-key do not apply")
 	}
 	if (*dir == "") == (*addr == "") {
 		return fmt.Errorf("rotate-enc-key requires exactly one of --dir (stopped node) or --addr (running node)")
+	}
+	if rooted && *addr != "" {
+		// Nothing secret is sent: the node makes the key.
+		if _, err := adminCall(*addr, *certsDir, *certUser, *timeout, cluster.AdminRequest{Op: "rotate-store-key"}); err != nil {
+			return err
+		}
+		fmt.Println("store key rotated online; the node made the new key and its root wrapped it (nothing to keep: a restart unwraps it through the same root)")
+		return nil
+	}
+	if rooted {
+		roots, err := enc.ParseRoots(*rootSpec)
+		if err != nil {
+			return err
+		}
+		ctx := context.Background()
+		got, err := enc.UnwrapStoreKeys(ctx, vfs.Default, *dir, roots)
+		if err != nil {
+			return err
+		}
+		cands := make([][]byte, len(got))
+		for i := range got {
+			cands[i] = got[i].Key
+		}
+		idx, err := enc.MatchStoreKey(vfs.Default, *dir, cands)
+		if err != nil {
+			return err
+		}
+		if err := enc.PruneWrappedKeys(vfs.Default, *dir, got[idx].Index); err != nil {
+			return err
+		}
+		if _, err := enc.RotateWrappedStoreKey(ctx, vfs.Default, *dir, got[idx].Root, cands[idx], func(o, n []byte) error {
+			if err := enc.RotateStoreKey(vfs.Default, *dir, o, n); err != nil {
+				return err
+			}
+			return server.ResealMetadataBackup(*dir, o, n)
+		}); err != nil {
+			return err
+		}
+		log.Audit("store-key-rotate", "dir", *dir, "root", got[idx].Root.Kind(), "key_id", got[idx].Root.KeyID(), "principal", "os:"+osUsername())
+		fmt.Println("store key rotated; restart the node with the same --enc-root")
+		return nil
 	}
 	if *addr != "" {
 		if *certsDir == "" {
@@ -136,23 +209,8 @@ func runDebugRotateEncKey(args []string) error {
 		return err
 	}
 	// Reseal the metadata backup too, so one key opens everything.
-	bakPath := filepath.Join(*dir, server.MetadataBackupFile)
-	if raw, err := os.ReadFile(bakPath); err == nil &&
-		len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
-		plain, err := enc.Unseal(server.MetadataBackupMagic, oldKey, raw)
-		if err != nil {
-			return fmt.Errorf("resealing metadata backup: %w", err)
-		}
-		sealed, err := enc.Seal(server.MetadataBackupMagic, newKey, plain)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(bakPath+".tmp", sealed, 0o600); err != nil {
-			return err
-		}
-		if err := os.Rename(bakPath+".tmp", bakPath); err != nil {
-			return err
-		}
+	if err := server.ResealMetadataBackup(*dir, oldKey, newKey); err != nil {
+		return err
 	}
 	fmt.Println("store key rotated; restart the node with the new key")
 	return nil
@@ -165,6 +223,7 @@ func runDebugUnsafeRecover(args []string) error {
 	dir := fs.String("dir", "", "data directory of the STOPPED surviving node")
 	rangeID := fs.Int64("range", 0, "recover only this range (default: every range on the store)")
 	keyPath := fs.String("enc-key", "", "store encryption key file (required for an encrypted store); a comma-separated list is tried in order")
+	rootSpec := fs.String("enc-root", "", "for a store whose key is kept under a root: the root, as given to the node")
 	yes := fs.Bool("yes", false, "confirm: I understand this discards the other replicas")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -183,7 +242,7 @@ nodes join.
 
 Re-run with --yes to proceed`)
 	}
-	keys, err := loadKeyCandidates(*keyPath)
+	keys, err := storeKeyCandidates(*dir, *keyPath, *rootSpec)
 	if err != nil {
 		return err
 	}
@@ -237,7 +296,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -249,6 +308,8 @@ func runDebug(args []string) error {
 		return runDebugUnsafeRecover(rest)
 	case "rotate-enc-key":
 		return runDebugRotateEncKey(rest)
+	case "enc-root":
+		return runDebugEncRoot(rest)
 	case "profile":
 		return runDebugProfile(rest)
 	}

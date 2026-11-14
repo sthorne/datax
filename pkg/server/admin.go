@@ -242,6 +242,9 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	case "rotate-store-key":
 		return n.serveRotateStoreKey(ctx, req)
 
+	case "rewrap-store-key":
+		return n.serveRewrapStoreKey(ctx, req)
+
 	case "reencrypt":
 		return n.serveReencrypt(req)
 

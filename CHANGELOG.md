@@ -11,6 +11,23 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **A store key can be kept under a root instead of in a file** (#305,
+  the first piece of #292). `--enc-root file:<path>` or `--enc-root
+  exec:<command>` is the alternative to `--enc-key`: the node makes its
+  own store key and the data directory holds it only wrapped — by a
+  wrapping key kept elsewhere, or by a command the operator supplies
+  that talks to a TPM, a cloud KMS's CLI or an HSM tool. A store key is
+  then in the clear only in the node's memory. Rotation under a root
+  involves no key file and no key in transit: the node makes the new
+  key, the root wraps it, and the request carries only the operation's
+  name. `datax debug enc-root` re-wraps a key (after the root's own key
+  rotates, or to move to another root), adopts a root on a key-file
+  store, releases one, and reports what wrapped a store's key; the
+  console's security view says where each store's key lives. A root
+  that fails, hangs, or hands the key back unwrapped is refused before
+  anything is written; a crash at any point of a rotation leaves a
+  store that opens; and no request can name a command for a node to
+  run. `--enc-key` is unchanged.
 - **Tables sort from their headers, and the data view has one table of
   ranges** (#282, #283). The nodes, failure domains, schema and ranges
   tables sort by a column from a small arrow beside the header's words

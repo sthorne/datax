@@ -125,6 +125,15 @@ online rotation is served only over mutual TLS (a secure cluster); on an
 insecure cluster, and for damaged stores, use the offline form
 (`--dir /var/lib/datax`, node stopped).
 
+To keep the store key off the node's disks altogether, start the node
+with `--enc-root` in place of `--enc-key`: the node makes its own store
+key and keeps it only wrapped by a *root* — a command you supply that
+talks to a TPM, a cloud KMS or an HSM (`exec:<command>`), or a wrapping
+key file kept elsewhere (`file:<path>`). Rotation then needs no key
+file and sends no key over the network
+(`datax debug rotate-enc-key --addr ...`). See
+[encryption](../encryption.md#roots-where-the-store-key-lives).
+
 Files written under retired data keys are re-encrypted on demand:
 
 ```sh

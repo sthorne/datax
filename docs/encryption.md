@@ -206,6 +206,93 @@ to what the store has, and rise again as the store re-completes the
 switch (writes within seconds; the old format refused after the sweep
 and a restart, as above).
 
+## Roots: where the store key lives
+
+`--enc-key` makes the store key a file the operator writes. `--enc-root`
+is the alternative: the node makes its own store key, and what the data
+directory holds (`ENCRYPTION-STOREKEY`, beside the registry) is that key
+**wrapped** by a *root* — something outside the data directory that can
+encrypt a small blob and decrypt it again.
+
+```
+root          wraps    store key    seals    registry of data keys    which encrypt    files
+(--enc-root)           (per node)            (per node)
+```
+
+Nothing below the store key changes. What changes is that a store key
+exists in the clear only in the node's memory: not in a file, and not
+in the request that rotates it.
+
+```sh
+datax init  --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
+datax start --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
+```
+
+Two roots exist today:
+
+- **`file:<path>`** — a 32-byte wrapping key in a file (raw or hex, as a
+  key file is). This moves the problem one step: the wrapping key is a
+  file where the store key was. It is for a wrapping key kept on
+  storage other than the data's, for tests, and as a step when moving a
+  store to another root.
+- **`exec:<command> [args...]`** — the node runs the operator's command
+  to do the wrapping. This is the bridge to anything with a command
+  line: a TPM (`tpm2-tools`), a cloud KMS's CLI, an HSM vendor's tool.
+  The command is run directly (no shell), with the node's environment,
+  with one more argument:
+
+  | verb | standard input | standard output |
+  |---|---|---|
+  | `wrap` | the store key, 32 raw bytes | the wrapped key, any bytes up to 64 KiB |
+  | `unwrap` | the wrapped key, exactly as `wrap` wrote it | the store key: 32 raw bytes or 64 hex characters |
+  | `key-id` | — | a one-line name for the wrapping key (optional; a non-zero exit means "unnamed") |
+
+  Exit status zero is success; anything else is a failure, and the
+  command's standard error is the reason the operator is shown. Each
+  call is cut off after 30 seconds. A sketch for AWS KMS:
+
+  ```sh
+  #!/bin/sh
+  KEY=arn:aws:kms:eu-west-1:111122223333:key/…
+  case "$1" in
+    key-id) echo "$KEY" ;;
+    wrap)   aws kms encrypt --key-id "$KEY" --plaintext fileb:///dev/stdin \
+              --query CiphertextBlob --output text ;;
+    unwrap) base64 -d | aws kms decrypt --ciphertext-blob fileb:///dev/stdin \
+              --query Plaintext --output text | base64 -d ;;
+  esac
+  ```
+
+What the node does with a root, and refuses:
+
+- A root's answer is checked before anything is sealed under it: the
+  wrapped form must not contain the key, must be non-empty and bounded,
+  and must unwrap to the same key. A root that fails, hangs or returns
+  the key unwrapped is refused, and no wrapped-key file is written.
+- The wrapped-key file is not secret, but it cannot be edited: each
+  entry carries a tag, keyed from the store key it wraps, over the
+  root's kind, its key id and the wrapped bytes.
+- A node that cannot reach its root cannot start. A running node is
+  unaffected: it unwrapped its key at start.
+- `--enc-key` and `--enc-root` together are refused. A root does not
+  take over a store it did not make: one opened with a key file is
+  refused with a pointer to `datax debug enc-root adopt`, and a
+  plaintext one is refused as with `--enc-key`.
+- The command line of an `exec` root comes from the node's own flags
+  only. No request can name a command for a node to run; an online
+  re-wrap names its target by position in the node's `--enc-root` list.
+- `/api/security` and the console's security view say, per store,
+  whether its key is under a root (kind and key id) or from a key file.
+  Every unwrap at start, and every rotation and re-wrap, is audited.
+
+What a root does and does not give depends on the root. A `file` root
+on the same disk as the data protects nothing a key file would not. An
+`exec` root is as strong as what its command talks to. Neither changes
+the fact that the store key is in the node's memory while it runs.
+Roots that keep the root key off every disk — split among operators,
+handed between running nodes, or held in a KMS spoken to directly — are
+planned (#306, #307, #308).
+
 ## Key rotation
 
 - **Data keys** rotate themselves: every node start mints a new active
@@ -242,6 +329,41 @@ and a restart, as above).
   store. After a rotation the node logs which of its key files holds
   the new key, or a warning that none does (then a restart before the
   file is added fails with "none of the store keys given matches").
+
+- **Under a root** (`--enc-root`), rotation involves no key file and
+  no key in transit:
+
+  ```sh
+  datax debug rotate-enc-key --addr 10.0.0.1:26257 --certs-dir certs   # online
+  datax debug rotate-enc-key --dir data1 --enc-root exec:/usr/local/bin/datax-wrap   # node stopped
+  ```
+
+  The node makes the new store key, has the root wrap it, and reseals
+  the registry and the metadata backup. The request carries nothing but
+  the operation's name, so it is served on any cluster. The order makes
+  a crash anywhere survivable: the wrapped-key file is first rewritten
+  to hold the new key's entry and the old one's, then the registry is
+  resealed, then the old entry is dropped; a start in between unwraps
+  both, uses the one the registry reached, finishes a split store's
+  second registry if it was left behind, and drops the other.
+
+  When the root's own key has rotated, or to move a store to another
+  root, the store key is **re-wrapped** — one small file replaced in
+  one rename, nothing else touched:
+
+  ```sh
+  datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs              # same root, its new key
+  datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs --to-root 2  # to the node's second --enc-root
+  ```
+
+  To move roots online, restart the node with both (`--enc-root
+  old,new`), re-wrap with `--to-root 2`, and from the next restart name
+  the new one alone. `datax debug enc-root` also has `status` (what
+  wrapped the key in a data directory; nothing secret is printed),
+  `adopt` (put a key-file store's key under a root: node stopped, then
+  start with `--enc-root` and rotate, so the key that was in the file
+  opens nothing) and `release` (the way back: the store key is written
+  to a new file, mode 0600, and the wrapped copy removed).
 
 - **Background re-encryption** retires old-data-key exposure on cold
   data. `datax debug reencrypt --addr ... [--wait]` starts a paced pass
@@ -358,7 +480,9 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
-- Keys live in memory unprotected (no mlock/HSM integration).
+- Keys live in memory unprotected (no mlock; #309). An HSM or KMS is
+  reachable through an `exec` root's command, not spoken to directly
+  (#308).
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
 - The node never rewrites the operator's key file: after an online

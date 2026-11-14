@@ -202,6 +202,13 @@ type Config struct {
 	// and a restart in between still opens the store (see
 	// enc.MatchStoreKey).
 	EncKeyPath string
+	// EncRoot is the alternative to EncKeyPath (issue #305): the root the
+	// store key is kept under — "file:<path>" or "exec:<command>". The
+	// key itself is made on the node and lives in the data directory only
+	// wrapped by the root. A comma-separated list names candidates: the
+	// one that wrapped the store's key is used, so the root a store is
+	// moving to can be staged beside the one it is under.
+	EncRoot string
 	// AcceptEncryptionRollback lets a store whose switch to authenticated
 	// encryption has been rolled back — its key registry, or the whole
 	// store, restored from before the switch — start anyway (issue
@@ -291,6 +298,11 @@ type Node struct {
 	// the store first), consulted after an online rotation to tell the
 	// operator whether a restart would find the new key.
 	encKeyPaths []string
+	// encRoots are the roots EncRoot named and encRoot the one the store
+	// key is under (nil for a key-file or plaintext store). encRoot is
+	// guarded by encKeyMu: a rewrap can move the store to another.
+	encRoots []enc.Root
+	encRoot  enc.Root
 	// rotateMu serializes online store-key rotations end to end: registry
 	// reseal, encKey swap, and metadata-backup reseal (issue #66).
 	rotateMu sync.Mutex
@@ -457,6 +469,11 @@ func (n *Node) start() error {
 			log.Infof("store encryption key: %s matches the store (%d key files given)", paths[idx], len(paths))
 		}
 		n.matchRaftEncKey(candidates)
+	}
+	if n.cfg.EncRoot != "" {
+		if err := n.loadRootedStoreKey(context.Background()); err != nil {
+			return err
+		}
 	}
 	n.engine, n.raftEngine = n.cfg.Engine, n.cfg.RaftEngine
 	if n.engine == nil {

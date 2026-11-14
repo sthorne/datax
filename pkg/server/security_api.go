@@ -65,6 +65,16 @@ type SecurityStore struct {
 	// whether the old format is refused, and how many files of the old
 	// format remain in between.
 	Authenticated *AuthenticatedEncryption `json:"authenticated,omitempty"`
+	// Root is what the store's key is kept under (issue #305); nil for a
+	// store opened with a key file, or a plaintext one.
+	Root *SecurityRoot `json:"root,omitempty"`
+}
+
+// SecurityRoot names the root a store key is wrapped by. Neither field
+// is secret: the kind, and the name the root gives its key.
+type SecurityRoot struct {
+	Kind  string `json:"kind"`
+	KeyID string `json:"key_id,omitempty"`
 }
 
 // AuthenticatedEncryption is a store's position in the switch to the
@@ -197,6 +207,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 		if st.Encrypted {
 			st.Reencryption = n.reencryptionStatus()
 			st.Authenticated = n.authenticatedEncryption()
+			st.Root = n.securityRoot()
 		}
 		doc.Stores = append(doc.Stores, st)
 	}

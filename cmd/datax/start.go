@@ -32,6 +32,7 @@ type serverFlags struct {
 	profile       string
 	cacheSize     string
 	encKeyPath    string
+	encRoot       string
 	acceptEncRB   bool
 	loadSplit     float64
 	mergeThr      int64
@@ -64,6 +65,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.BoolVar(&f.acceptEncRB, "accept-encryption-rollback", false, "start a store whose switch to authenticated encryption was rolled back (its key registry or the whole store restored from before the switch), lowering the records that caught the rollback to what the store has; for the one start after a rollback that was meant")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
+	f.fs.StringVar(&f.encRoot, "enc-root", "", "the alternative to --enc-key: what the store key is kept under, file:<path> (a 32-byte wrapping key) or exec:<command> (run with wrap, unwrap or key-id; see docs/encryption.md). The store key is made on the node and kept in the data directory only wrapped. A comma-separated list names candidates; the one that wrapped the store's key is used")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
 	f.fs.BoolVar(&f.quiescence, "raft-quiescence", true, "let idle ranges stop ticking and heartbeating (cluster version v12)")
@@ -98,6 +100,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		StorageProfile:           prof,
 		StorageCacheSize:         cacheSize,
 		EncKeyPath:               f.encKeyPath,
+		EncRoot:                  f.encRoot,
 		AcceptEncryptionRollback: f.acceptEncRB,
 		LoadSplitThreshold:       f.loadSplit,
 		MergeSizeThreshold:       f.mergeThr,

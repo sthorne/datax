@@ -50,8 +50,15 @@ type AdminRequest struct {
 	// Store-key rotation (rotate-store-key): the node's current store key
 	// (verified against the on-disk registry) and its replacement. Carried
 	// over mutual TLS in secure mode; never logged.
+	// A node whose key is under a root (--enc-root) makes the new key
+	// itself, and for it both fields must be empty.
 	OldStoreKey []byte `json:"old_store_key,omitempty"`
 	NewStoreKey []byte `json:"new_store_key,omitempty"`
+	// Root names the root rewrap-store-key wraps under: the 1-based
+	// position among the node's own --enc-root values, 0 for the root in
+	// use. A position, not a spec — an exec root is a command line, and
+	// no request may name a command for a node to run.
+	Root int `json:"root,omitempty"`
 }
 
 // ReencryptionStatus reports the background re-encryption pass on one

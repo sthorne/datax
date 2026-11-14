@@ -317,7 +317,7 @@ func hashLiveRecord(h hash.Hash, rec kvpb.ExportRecord) {
 
 // RunBackup executes a backup to dest on this node's filesystem.
 func (n *Node) RunBackup(ctx context.Context, dest, basePath string, allowPlaintext, includeMetrics bool) (_ *cluster.BackupSummary, err error) {
-	if n.cfg.EncKeyPath != "" && !allowPlaintext {
+	if (n.cfg.EncKeyPath != "" || n.cfg.EncRoot != "") && !allowPlaintext {
 		return nil, fmt.Errorf("the store is encrypted but backup files are written in plaintext; pass --allow-plaintext to proceed")
 	}
 	// A backup is long enough to be worth watching while it runs

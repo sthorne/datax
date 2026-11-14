@@ -40,6 +40,9 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 	if n.engine == nil || !n.engine.Encrypted() {
 		return cluster.AdminResponse{Error: "store is not encrypted"}
 	}
+	if n.encRoot != nil {
+		return n.serveRotateRootedStoreKey(ctx, req)
+	}
 	if len(req.OldStoreKey) != enc.KeyLen || len(req.NewStoreKey) != enc.KeyLen {
 		return cluster.AdminResponse{Error: "rotate-store-key requires --old-key and --new-key (32 bytes each)"}
 	}
@@ -59,35 +62,13 @@ func (n *Node) serveRotateStoreKey(ctx context.Context, req cluster.AdminRequest
 	// opens the store but cannot read its backup (issue #66).
 	n.rotateMu.Lock()
 	defer n.rotateMu.Unlock()
-	if err := n.engine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
+	if err := n.resealStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
-	}
-	if n.raftEngine != nil {
-		// The raft engine's registry is sealed under the same store key.
-		// On disk it lives under the state engine's directory and the
-		// reseal above already covered it (enc.RotateStoreKey rotates a
-		// store's raft subdirectory with it); an engine elsewhere (an
-		// in-memory pair) is rotated here. A crash between the two
-		// reseals is repaired at the next start by matching each
-		// engine's registry against the candidate keys.
-		if err := n.raftEngine.RotateStoreKeyLive(req.OldStoreKey, req.NewStoreKey); err != nil {
-			if _, merr := n.raftEngine.MatchStoreKey([][]byte{req.NewStoreKey}); merr != nil {
-				return cluster.AdminResponse{Error: "state engine rotated but the raft engine did not: " + err.Error() + "; rerun the rotation with the same keys"}
-			}
-		}
 	}
 	// Future artifact seals (metadata backup) must use the new key; swap it
 	// and re-seal the backup now rather than waiting a heartbeat, so no
 	// old-key artifact outlives the rotation.
-	n.encKeyMu.Lock()
-	hadKey := n.encKey != nil
-	if hadKey {
-		n.encKey = append([]byte(nil), req.NewStoreKey...)
-	}
-	n.encKeyMu.Unlock()
-	if hadKey {
-		n.exportMetadata(ctx)
-	}
+	n.adoptStoreKey(ctx, req.NewStoreKey)
 	log.Infof("store key rotated online; registry and metadata backup sealed under the new key")
 	n.events.Record("key-rotation", "store key rotated online; registry and metadata backup sealed under the new key")
 	n.reportKeyFilesAfterRotation(req.NewStoreKey)
