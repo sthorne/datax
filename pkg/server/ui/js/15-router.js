@@ -281,7 +281,15 @@ function route() {
 // wireControls binds the header's cross-cutting controls. Changing one
 // rewrites the URL in place and re-renders the current view rather than
 // navigating, so Back steps between views and not between settings.
+// jumpKeyHint is the shortcut as this keyboard writes it (issue #278):
+// the hint read ⌘K everywhere, and off a Mac there is no ⌘. Both keys
+// open the box on every platform; this is only what the button says.
+function jumpKeyHint() {
+  const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  return /mac|iphone|ipad/i.test(p) ? "⌘K" : "Ctrl K";
+}
 function wireControls() {
+  document.getElementById("jump-key").textContent = jumpKeyHint();
   document.getElementById("scope-picker").addEventListener("change", ev => {
     ui.scope = ev.target.value;
     pushRoute();

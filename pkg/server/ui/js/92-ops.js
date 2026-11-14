@@ -64,8 +64,12 @@ function opsSource() {
   return { rows: opsAll.map(o => Object.assign({ node_id: eventsNode }, o)), cluster: false };
 }
 
-// fmtElapsed renders a duration in ms at a useful resolution: seconds
-// while an operation is young, minutes and hours once it is not.
+// fmtElapsed renders a LENGTH of time in ms at a useful resolution:
+// seconds while it is short, minutes and hours once it is not. It is
+// what an operation's elapsed time reads as, and how long a session has
+// sat idle or held a transaction open (issue #278): those were written
+// with fmtAgo, so a column headed "idle" read "1h 25m ago", a point in
+// time, for something that is not one.
 function fmtElapsed(ms) {
   if (!ms || ms < 0) return "—";
   const sec = Math.round(ms / 1000);
@@ -138,13 +142,83 @@ function renderOperations() {
     + "an operation whose start has already aged out of its ring is still listed, with no duration claimed for it.");
 }
 
+// eventText is an event's summary with what it names made into links
+// (issue #280): "r23 split …" and "… from n1 to n3" named a range and
+// two nodes that each have a page, as plain text. The summary is
+// escaped first and only then linked, and a link is built from the
+// digits alone, so nothing in a summary can become markup. An id counts
+// only where it stands as a word of its own — after a space or an
+// opening bracket, before a space or punctuation — so the "n1" inside a
+// key is left as the key it is.
+function eventText(summary) {
+  return esc(summary).replace(/(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => lead + (kind === "r"
+    ? `<a href="${routeTo("data", { range: id })}" title="open r${id}'s per-replica detail">r${id}</a>`
+    : `<a href="${routeTo("node/" + id)}" title="n${id}'s page">n${id}</a>`));
+}
 function eventRow(e) {
   return { key: String(e.seq || (e.at + e.summary)), html: `<tr data-key="${esc(String(e.seq || (e.at + e.summary)))}">
     <td class="when" title="${esc(e.at)}">${fmtWhen(Date.parse(e.at))}</td>
     <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
-    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
+    <td class="key" style="max-width:none;white-space:normal">${eventText(e.summary)}</td>
   </tr>` };
 }
+
+// A burst folds (issue #280). After an ingest the balancer sheds a dozen
+// leases inside a second, and thirteen rows of lease-shed pushed the
+// split and the merge that explain them off the screen. A run of
+// FOLD_MIN or more events of one kind, each within FOLD_GAP_MS of the
+// next, is one row that says how many and shows the newest; its button
+// opens the run in place. Audit records never fold: each one is a thing
+// someone did.
+//
+// A fold is keyed by its OLDEST event, so it stays the same row — and
+// stays open — while the burst is still growing at its newest end.
+const FOLD_MIN = 4, FOLD_GAP_MS = 60000;
+const openFolds = new Set();
+function foldEvents(evs) {
+  const out = [];
+  for (let i = 0; i < evs.length;) {
+    let j = i + 1;
+    while (j < evs.length && !evs[i].audit && !evs[j].audit && evs[j].kind === evs[i].kind
+      && Math.abs(Date.parse(evs[j - 1].at) - Date.parse(evs[j].at)) <= FOLD_GAP_MS) j++;
+    if (j - i >= FOLD_MIN) out.push({ fold: evs.slice(i, j) });
+    else for (let k = i; k < j; k++) out.push({ ev: evs[k] });
+    i = j;
+  }
+  return out;
+}
+function foldRows(items) {
+  const rows = [];
+  for (const it of items) {
+    if (it.ev) { rows.push(eventRow(it.ev)); continue; }
+    const run = it.fold, newest = run[0], oldest = run[run.length - 1];
+    const key = "fold/" + oldest.kind + "/" + (oldest.seq || oldest.at);
+    const open = openFolds.has(key);
+    rows.push({ key, html: `<tr data-key="${esc(key)}" class="fold">
+    <td class="when" title="${esc(oldest.at + " to " + newest.at)}">${fmtWhen(Date.parse(newest.at))}</td>
+    <td><span class="kind">${esc(newest.kind)}</span></td>
+    <td class="key" style="max-width:none;white-space:normal"><button type="button" class="linkish" data-fold="${esc(key)}" aria-expanded="${open}">${run.length} in a row</button> · newest: ${eventText(newest.summary)}</td>
+  </tr>` });
+    if (open) for (const e of run) rows.push(eventRow(e));
+  }
+  return rows;
+}
+// One listener for every list that folds: the rows are redrawn on each
+// poll, so a listener on a row would not outlive it.
+//
+// The button's own state is set here, on the element. A redraw leaves
+// the row holding the focus alone until the focus moves on — which is
+// right, and is why the row's markup is the same open and shut but for
+// aria-expanded: the caret is drawn from that attribute, so the button
+// says what it did on the click that did it.
+document.addEventListener("click", ev => {
+  const b = ev.target.closest && ev.target.closest("button[data-fold]");
+  if (!b) return;
+  const open = !openFolds.delete(b.dataset.fold);
+  if (open) openFolds.add(b.dataset.fold);
+  b.setAttribute("aria-expanded", String(open));
+  rerenderCurrentView();
+});
 
 // The events filter (issue #207): a kind, from the select or from the
 // route (#/ops?kind=health), and a substring the summary must carry,
@@ -177,7 +251,7 @@ function renderOps() {
   if (sel.value !== want) sel.value = want;
   const rows = eventsAll.filter(e => !e.audit && (!want || e.kind === want) && (!q || e.summary.includes(q))).slice().reverse();
   const none = q ? `no ${esc(want || "")} events mentioning ${esc(q)}` : want ? `no ${esc(want)} events` : "nothing recorded yet";
-  renderKeyed(document.getElementById("events"), rows.length ? rows.map(eventRow)
+  renderKeyed(document.getElementById("events"), rows.length ? foldRows(foldEvents(rows))
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">${none}</td></tr>` }]);
   document.getElementById("ops-scope").textContent =
     `the event ring of n${eventsNode || "?"}${lastCluster && eventsNode === lastCluster.node_id ? ", the node serving this page" : ""} — each node keeps its own`;
@@ -423,9 +497,15 @@ function runningOpRow(o) {
 function renderRecentOps() {
   const src = opsSource();
   const running = src.cluster ? src.rows.filter(o => o.running).map(runningOpRow) : [];
-  const rows = running.concat(eventsAll.filter(e => !e.audit).slice(-6).reverse().map(eventRow));
+  // Folded before the newest six are taken, so a burst is one of the six
+  // rather than all of them.
+  const rows = running.concat(foldRows(foldEvents(eventsAll.filter(e => !e.audit).slice().reverse()).slice(0, 6)));
   renderKeyed(document.getElementById("recent-ops"), rows.length ? rows
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
+  // The heading says what the table holds (issue #278). It read
+  // "Operations in flight" over a list that is, nearly always, six
+  // things that have finished.
+  document.getElementById("recent-ops-title").textContent = running.length ? "Operations in flight, then recent" : "Recent operations";
   const missing = src.cluster && (opsCluster.errors || []).length ? ` (${esc(opsCluster.errors.length)} of ${esc(opsCluster.nodes_asked)} nodes did not answer)` : "";
   document.getElementById("recent-ops-note").innerHTML =
     (src.cluster ? `${running.length ? esc(running.length) : "nothing"} in flight on any node${missing}, then ` : "")

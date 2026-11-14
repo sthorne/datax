@@ -37,8 +37,7 @@ function renderHealth(h) {
       <span class="sev">${esc(p.severity)}</span>
       <span class="check">${esc(p.check)}</span>
       <span>${esc(p.summary)}</span>
-      ${problemSince(p)}
-      <span class="links">${p.section && healthLink(p.section) ? `<a href="${healthLink(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} →</a>` : ""}${problemHistory(p)}</span>
+      <span class="tail">${problemSince(p)}<span class="links">${p.section && healthLink(p.section) ? `<a href="${healthLink(p.section)}">${esc(SECTION_NAMES[p.section] || p.section)} →</a>` : ""}${problemHistory(p)}</span></span>
     </div>` })));
   }
   const worst = probs.reduce((w, p) => (SEVERITY_RANK[p.severity] || 0) > (SEVERITY_RANK[w] || 0) ? p.severity : w, "");

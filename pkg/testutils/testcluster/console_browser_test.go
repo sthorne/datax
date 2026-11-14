@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -182,15 +183,29 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
     { severity: "warning", check: "under-replicated", section: "cluster-ranges", since_unix_ms: since, summary: "4 ranges have fewer replicas than their target" },
     { severity: "warning", check: "placement-unsatisfiable", section: "nodes", since_unix_ms: since, summary: "database shop asks for 3 replicas across regions and only 2 regions have a live node" },
     { severity: "info", check: "stale-statistics", section: "schema", since_unix_ms: since, summary: "a_table_whose_name_is_long_enough_to_scroll_sideways has not been analyzed since it grew tenfold" },
+    // One unbroken token wider than a phone: nothing but the summary's
+    // own overflow-wrap can fit it (QA on #284: the rule was otherwise
+    // unexercised).
+    { severity: "info", check: "stale-statistics", section: "schema", since_unix_ms: since, summary: "an_identifier_with_no_break_in_it_that_is_wider_than_any_phone_screen_this_console_will_ever_be_read_on" },
   ] });
   const f = JSON.parse(`+consoleFactsJS+`);
   f.problems = document.querySelectorAll('#problems .problem').length;
+  // Every row ends in one tail that holds its age and its links (issue
+  // #278): apart, the age stayed beside a short summary while the links
+  // wrapped, and sat in a different place from row to row.
+  f.tails = [...document.querySelectorAll('#problems .problem')].filter(r => {
+    const t = r.querySelector(':scope > .tail');
+    return t && t.querySelector('.since') && t.querySelector('.links') && !r.querySelector(':scope > .since, :scope > .links');
+  }).length;
   return JSON.stringify(f);
 })()`)), &got); err != nil {
 				t.Fatal(err)
 			}
-			if got.Problems != 4 {
-				t.Fatalf("the panel shows %d problems, want the 4 rendered into it", got.Problems)
+			if got.Problems != 5 {
+				t.Fatalf("the panel shows %d problems, want the 5 rendered into it", got.Problems)
+			}
+			if got.Tails != got.Problems {
+				t.Errorf("%d of %d problem rows keep their age and links together in one tail (issue #278)", got.Tails, got.Problems)
 			}
 			if got.ScrollWidth > got.ClientWidth {
 				t.Errorf("with problems open the overview is %dpx wide in a %dpx viewport, so it scrolls sideways; the furthest element is %s (issue #274)",
@@ -204,6 +219,111 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			}
 		})
 	}
+
+	// The polish of #278 to #281, each read off a rendered page.
+	t.Run("polish", func(t *testing.T) {
+		// wait polls until expr is true. A page that is still about:blank,
+		// or mid-navigation, has none of the elements expr asks about, and
+		// asking throws: that is "not yet", not a failure — under a loaded
+		// suite the first look regularly lands there.
+		wait := func(page *browserPage, what, expr string) {
+			t.Helper()
+			deadline := time.Now().Add(30 * time.Second)
+			guarded := `(() => { try { return String(!!(` + expr + `)); } catch (e) { return "false"; } })()`
+			for page.eval(t, guarded) != "true" {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: never true: %s", what, expr)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		check := func(page *browserPage, what, expr, want string) {
+			t.Helper()
+			if got := page.eval(t, expr); got != want {
+				t.Errorf("%s: %s = %q, want %q", what, expr, got, want)
+			}
+		}
+
+		// #281: on a phone the header leaves the screen to the content.
+		// It was 300px of 844 before any of it; with the insecure banner
+		// showing it is now about 200.
+		phone := br.open(t, base, 390, 844, true)
+		defer phone.close()
+		wait(phone, "the overview on a phone", `document.getElementById('hdr-node').textContent.includes('served by')`)
+		if h, err := strconv.Atoi(phone.eval(t, `String(Math.round(document.querySelector('header').getBoundingClientRect().bottom))`)); err != nil || h > 235 {
+			t.Errorf("on a phone the banner and header end %dpx down the screen (%v), want 235 at most (issue #281)", h, err)
+		}
+		check(phone, "every view is still one tap away on a phone (#281)",
+			`String([...document.querySelectorAll('#nav a')].filter(a => { const r = a.getBoundingClientRect(); return r.width > 0 && r.left >= 0 && r.right <= innerWidth; }).length)`, "8")
+		check(phone, "the banner still says who has access (#281)",
+			`String(document.getElementById('insecure-banner').innerText.includes('authenticates nobody') && document.getElementById('insecure-banner').innerText.includes('full access'))`, "true")
+
+		desk := br.open(t, base, 1440, 900, false)
+		defer desk.close()
+		wait(desk, "the overview", `document.getElementById('hdr-node').textContent.includes('served by')`)
+		// #278: the strip is named for what it holds; the hint names a key
+		// this keyboard has (the test's browser is not on a Mac).
+		check(desk, "the overview's strip (#278)", `document.getElementById('recent-ops-title').textContent`, "Recent operations")
+		check(desk, "the jump hint (#278)", `String(['⌘K', 'Ctrl K'].includes(document.getElementById('jump-key').textContent))`, "true")
+		// #278: a length of time says no "ago".
+		check(desk, "a duration (#278)", `fmtElapsed(5100000)`, "1h 25m")
+		check(desk, "a short duration (#278)", `fmtElapsed(14000)`, "14s")
+		// #280: an event's text links what it names, escapes what it is
+		// given, and leaves an id inside a key alone.
+		check(desk, "event links (#280)",
+			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('r23 split at /table/n1/primary/3; shedding lease of r1 from n1 to n3 (r9)'); return [...d.querySelectorAll('a')].map(a => a.textContent).join(' '); })()`,
+			"r23 r1 n1 n3 r9")
+		check(desk, "event text is escaped before it is linked (#280)",
+			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('<img src=x onerror=window.pwned=1> r2 "quoted"'); return String(d.querySelectorAll('img').length) + ' ' + String(window.pwned === undefined) + ' ' + d.querySelectorAll('a').length; })()`,
+			"0 true 1")
+		// #280: a burst is one row; a lone event, a slow drip and audit
+		// records are not folded.
+		check(desk, "folding (#280)", `(() => {
+  const at = s => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+  const evs = [];
+  for (let i = 0; i < 6; i++) evs.push({ seq: 100 - i, kind: "lease-shed", at: at(60 - i), summary: "shedding lease of r" + i });
+  evs.push({ seq: 90, kind: "split", at: at(50), summary: "r1 split" });
+  for (let i = 0; i < 5; i++) evs.push({ seq: 80 - i, kind: "merge", at: at(40 - i), summary: "m", audit: true });
+  for (let i = 0; i < 5; i++) evs.push({ seq: 70 - i, kind: "snapshot", at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(), summary: "s" });
+  return foldEvents(evs).map(it => it.fold ? it.fold[0].kind + "x" + it.fold.length : it.ev.kind).join(",");
+})()`, "lease-shedx6,split,merge,merge,merge,merge,merge,snapshot,snapshot,snapshot,snapshot,snapshot")
+
+		// #279: the cell that names a row that opens reads as a link.
+		schema := br.open(t, base+"schema", 1440, 900, false)
+		defer schema.close()
+		wait(schema, "the schema list", `!!document.querySelector('#schema tr.clickable .opens')`)
+		check(schema, "a table's name in the schema list (#279)",
+			`getComputedStyle(document.querySelector('#schema tr.clickable .opens')).textDecorationLine`, "underline")
+		data := br.open(t, base+"data", 1440, 900, false)
+		defer data.close()
+		wait(data, "the ranges table", `!!document.querySelector('#cluster-ranges tr.clickable .opens')`)
+		check(data, "a range's id in the ranges table (#279)",
+			`getComputedStyle(document.querySelector('#cluster-ranges tr.clickable .opens')).textDecorationLine`, "underline")
+
+		// #278: the admin badge is a badge beside a role's name too.
+		sec := br.open(t, base+"security", 1440, 900, false)
+		defer sec.close()
+		wait(sec, "the roles table", `!!document.querySelector('#view-security td .role')`)
+		check(sec, "the admin badge in the roles table (#278)",
+			`String(parseFloat(getComputedStyle(document.querySelector('#view-security td .role')).borderTopWidth) > 0 && parseFloat(getComputedStyle(document.querySelector('#view-security td .role')).marginLeft) > 0)`, "true")
+
+		// #278: uptime once on a node's page; the version breaks at a space.
+		node := br.open(t, base+"node/1", 390, 844, true)
+		defer node.close()
+		wait(node, "the node page", `document.querySelectorAll('#view-node .tile').length > 6`)
+		check(node, "uptime tiles on the node page (#278)",
+			`String([...document.querySelectorAll('#view-node .tile .label')].filter(l => l.textContent.trim() === 'uptime').length)`, "1")
+		check(node, "the version tile does not break inside a word (#278)",
+			`getComputedStyle(document.querySelector('#node-ident .value')).wordBreak`, "normal")
+
+		// #280: the timeline says what a split cut by the table's name.
+		ops := br.open(t, base+"ops", 1440, 900, false)
+		defer ops.close()
+		wait(ops, "the timeline", `!!document.querySelector('#events td.when')`)
+		check(ops, "a split names its table (#280)",
+			`String([...document.querySelectorAll('#events tr')].some(r => /split at \/table\/`+consoleLongTable+`\//.test(r.textContent)))`, "true")
+		check(ops, "an event links the range it names (#280)", `String(!!document.querySelector('#events td a[href*="range="]'))`, "true")
+	})
 
 	// The formatters themselves, called in the page: an age is said in
 	// the unit a person would use (issue #272), and a moment handed to
@@ -263,6 +383,7 @@ type consoleFacts struct {
 	ClientWidth int      `json:"clientWidth"`
 	Widest      string   `json:"widest"`
 	Problems    int      `json:"problems"`
+	Tails       int      `json:"tails"`
 }
 
 // ready reports whether the page has finished its first render: the

@@ -34,7 +34,7 @@ function renderSchema(d) {
     const key = (t.database || "") + "." + t.name;
     const to = tableKey(t);
     return { key, html: `<tr data-key="${esc(key)}" class="clickable" data-table="${esc(to)}" tabindex="0" role="link" title="Enter or click: this table in full">
-      <td data-label="table"><b>${esc(to)}</b>${ts}</td>
+      <td data-label="table"><b class="opens">${esc(to)}</b>${ts}</td>
       <td data-label="columns" title="${esc(colList)}">${cols.length}</td>
       <td class="key" data-label="primary key" title="${hiddenNames.size ? "led by the hidden shard column" : ""}">${pk.map(esc).join(", ")}</td>
       <td data-label="indexes">${idx || "—"}</td>

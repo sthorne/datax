@@ -59,8 +59,8 @@ func TestRingOrderBoundsAndFilter(t *testing.T) {
 func TestRedactKeyedEvents(t *testing.T) {
 	r := New()
 	r.Record("plain", "r1 rebalanced")
-	r.RecordKeyed("split", []uint64{5}, `r2 split at /table/users/1/"alice"`, "r2 split at /table/5/1")
-	r.RecordKeyed("merge", []uint64{5, 6}, `r3 absorbed r4; now [/table/users/1/"a", /table/orders/1/"b")`, "r3 absorbed r4; now [/table/5/1, /table/6/1)")
+	r.RecordKeyed("split", []uint64{5}, `r2 split at /table/users/1/"alice"`, "r2 split at /table/5/1", "", nil)
+	r.RecordKeyed("merge", []uint64{5, 6}, `r3 absorbed r4; now [/table/users/1/"a", /table/orders/1/"b")`, "r3 absorbed r4; now [/table/5/1, /table/6/1)", "", nil)
 	all := Redact(r.Recent(0, 0, true), func(uint64) bool { return true })
 	if all[1].Summary != `r2 split at /table/users/1/"alice"` {
 		t.Errorf("a reader who sees every table got %q", all[1].Summary)

@@ -62,7 +62,7 @@ function renderClusterRanges(ranges) {
   const shown = rangesShowAll ? all : all.slice(0, RANGE_TABLE_CAP);
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
-      <td>r${r.range_id}</td>
+      <td><span${admin ? ' class="opens"' : ""}>r${r.range_id}</span></td>
       <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + rangeKeyLabel(r), r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     </tr>` });

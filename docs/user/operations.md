@@ -116,7 +116,11 @@ serves, on that address:
   progress bar: nothing here knows how much work is left. The ring is
   bounded, so an operation whose start has already aged out of it is
   listed by its end alone and claims no duration rather than inventing
-  one. **security**:
+  one. In the timeline, a range or node an event names is a link to it,
+  and a burst — four or more events of one kind within a minute of
+  each other, as when the balancer sheds a dozen leases after an
+  ingest — is one row that says how many and opens in place, so the
+  split or merge behind it stays on screen. **security**:
   how the cluster authenticates, who is signed in and by what, the
   certificates this node loaded with their expiry dates, the roles and
   what each one effectively holds through membership, who is connected
@@ -211,7 +215,11 @@ serves, on that address:
   merge event names its keys in full only to a caller who may read
   every table they belong to — to anyone else the keys appear at their
   table-and-index prefix by id (the boundary is a row value; the same
-  rule as the range lists on `/status` and `/api/cluster`).
+  rule as the range lists on `/status` and `/api/cluster`). In full
+  means as those lists print a key, the table by name and the index by
+  name (`/table/orders/primary/42`); the node log keeps the raw form
+  (`/table/7/1/42`), which is all the layer that records the event
+  knows.
 - **`/api/node?id=N`** — JSON: the node detail page's document. The
   serving node answers for itself to any authenticated user; another
   node's document is fetched from that node over the internode RPC and

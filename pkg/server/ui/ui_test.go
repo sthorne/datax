@@ -1499,12 +1499,14 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 		// Ages of a moment: "when did this last happen", written as how
 		// long ago rather than as the instant.
 		{"heartbeat_ago_ms", true}, {"age_ms", true}, {"age_seconds", true},
-		// Lengths of time. "idle: 14:20:05" is not a thing.
+		// Lengths of time. "idle: 14:20:05" is not a thing, and neither
+		// is "idle: 1h 25m ago" (issue #278): a length is written by
+		// fmtElapsed, which says no "ago".
 		{"idle_ms", false}, {"txn_ms", false}, {"oldest_idle_txn_ms", false},
 	} {
 		want, wrong := "fmtWhen(", "fmtAgo("
 		if !fig.moment {
-			want, wrong = wrong, want
+			want, wrong = "fmtElapsed(", "fmtWhen("
 		}
 		found := false
 		for _, name := range names {
@@ -1528,6 +1530,10 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 						t.Errorf("%s renders %s with fmtWhen: that figure is a LENGTH of time, not a "+
 							"moment, and absolute mode would print a clock time for it", name, fig.field)
 					}
+				}
+				if !fig.moment && strings.Contains(line, "fmtAgo(") {
+					t.Errorf("%s renders %s with fmtAgo: that figure is a LENGTH of time, and \"ago\" makes "+
+						"it read as a point in time — render it with fmtElapsed(%s)", name, fig.field, fig.field)
 				}
 			}
 		}
