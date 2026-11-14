@@ -16,13 +16,13 @@ function seriesChoices() {
   if (!mv.catalog) return out;
   for (const def of mv.catalog.series || []) {
     if (!def.label) { out.push({ name: def.name, def }); continue; }
-    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def, text: labelText(def.label, v) });
+    for (const v of (mv.catalog.labels || {})[def.label] || []) out.push({ name: `${def.name}{${def.label}=${v}}`, def, text: seriesLabelText(def.label, v) });
   }
   return out;
 }
-// labelText is what a person reads for a label value: a fingerprint's
+// seriesLabelText is what a person reads for a label value: a fingerprint's
 // shape, or nothing when the catalog has no text for it.
-function labelText(label, v) { return ((mv.catalog && mv.catalog.label_text) || {})[label]?.[v] || ""; }
+function seriesLabelText(label, v) { return ((mv.catalog && mv.catalog.label_text) || {})[label]?.[v] || ""; }
 function renderPickers() {
   const sp = document.getElementById("series-picker");
   const choices = seriesChoices();
@@ -93,6 +93,41 @@ function fmtUnit(v, unit) {
     case "us/s": return (v / 1000).toFixed(1) + " ms/s";
     case "/s": return (v === 0 ? "0" : v.toFixed(v < 10 ? 2 : 0)) + "/s";
     default: return Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  }
+}
+// fmtTick writes a gridline's value. fmtUnit is for a reading — a
+// sample under the crosshair, at the precision a sample has — and on
+// round gridlines it wrote "0 µs, 1000.0 ms, 2000.0 ms", "0.0%, 5.0%,
+// 10%" and "32.0 KiB": the precision of a reading on values that have
+// none, two precisions on one axis, and milliseconds past a second (the
+// UI review of #288). A tick carries the decimals its step needs and no
+// more, every tick of an axis alike; a duration is in the unit the
+// axis's largest tick is said in; zero is zero.
+function stepDecimals(step) {
+  step = Math.abs(step);
+  for (let d = 0; d < 6; d++) { const m = step * Math.pow(10, d); if (Math.abs(m - Math.round(m)) < 1e-6 * Math.max(1, m)) return d; }
+  return 6;
+}
+function trimNum(v, d) { return String(Number(v.toFixed(d))); }
+function tickBytes(v) {
+  const a = Math.abs(v);
+  for (const [u, name] of [[Math.pow(1024, 4), "TiB"], [1 << 30, "GiB"], [1 << 20, "MiB"], [1 << 10, "KiB"]]) if (a >= u) return trimNum(v / u, 2) + " " + name;
+  return trimNum(v, 2) + " B";
+}
+function fmtTick(v, unit, step, top) {
+  const dec = div => stepDecimals(step / div);
+  switch (unit) {
+    case "bytes": return tickBytes(v);
+    case "bytes/s": return tickBytes(v) + "/s";
+    case "percent": return v === 0 ? "0%" : v.toFixed(dec(1)) + "%";
+    case "us": {
+      if (v === 0) return "0";
+      const [div, name] = top >= 1e6 ? [1e6, " s"] : top >= 1000 ? [1000, " ms"] : [1, " µs"];
+      return (v / div).toFixed(dec(div)) + name;
+    }
+    case "us/s": return v === 0 ? "0" : (v / 1000).toFixed(dec(1000)) + " ms/s";
+    case "/s": return v === 0 ? "0/s" : v.toFixed(dec(1)) + "/s";
+    default: return v === 0 ? "0" : v.toFixed(dec(1));
   }
 }
 function fmtTime(ms, long) {
@@ -322,14 +357,15 @@ function chart(s, nodes, suffix, win, opts) {
   const label = (id) => id === "0" ? "cluster" : "n" + id;
   let title = `<div class="title"><b>${esc(seriesTitle(s))}${esc(suffix)}</b>${seriesTitle(s) !== s.name ? `<code class="metric">${esc(s.name)}</code>` : ""}<span>${esc(unitWord(s, unit))}${s.kind === "counter" && !s.rate ? " · cumulative" : ""}</span>${s.label ? `<span class="key" title="${esc(s.label)}">${esc(shortShape(s.label))}</span>` : ""}</div>`;
   if (!any) { el.innerHTML = title + `<div class="empty">no samples in this range</div>`; return el; }
-  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(s.name)} over time"><g class="grid">`;
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(seriesTitle(s))} over time"><g class="grid">`;
   for (const v of yticks) {
     const yy = y(v).toFixed(1);
     svg += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}"/>`;
   }
   svg += `</g><g class="axis">`;
+  const ystep = yticks[1] - yticks[0], ytop = Math.max(Math.abs(min), Math.abs(max));
   for (const v of yticks) {
-    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtUnit(v, unit))}</text>`;
+    svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtTick(v, unit, ystep, ytop))}</text>`;
   }
   const long = to - from > 36 * 3600 * 1000;
   // Under ten minutes the five labels would be the same minute three
@@ -377,7 +413,7 @@ function chart(s, nodes, suffix, win, opts) {
   for (const id of ids) svg += `<circle class="dot" data-node="${id}" r="4" fill="${nodeColor(id)}"/>`;
   // The hit rect is also the keyboard's crosshair: focus it and the
   // arrow keys walk the buckets, showing what the pointer shows.
-  svg += `<rect class="hit" tabindex="0" role="img" aria-label="${esc(s.name)} values: focus and use the arrow keys to read each sample; [ and ] mark a window's ends and Enter narrows every chart to it, - widens" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
+  svg += `<rect class="hit" tabindex="0" role="img" aria-label="${esc(seriesTitle(s))} values: focus and use the arrow keys to read each sample; [ and ] mark a window's ends and Enter narrows every chart to it, - widens" x="${L}" y="${T}" width="${PW}" height="${PH}" fill="transparent"/></svg>`;
   let legend = ids.length > 1 ? `<div class="legend">` + ids.map(id => `<span><i style="background:${nodeColor(id)}"></i>${label(id)}</span>`).join("") + `</div>` : "";
   let table = `<details><summary>as a table</summary><div class="tablewrap"><table><thead><tr><th>time</th>` + ids.map(id => `<th class="num">${label(id)}</th>`).join("") + `</tr></thead><tbody>`;
   const times = [...new Set(ids.flatMap(id => nodes[id].map(p => p[0])))].sort((a, b) => b - a).slice(0, 30);

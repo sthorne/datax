@@ -195,13 +195,14 @@
   tr.clickable .opens { color: LinkText; text-decoration: underline; text-underline-offset: 2px; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--series-1) 7%, transparent); }
   tr.fold td { background: color-mix(in srgb, var(--border) 22%, transparent); }
-  /* The sort control (issue #282): a small button after a header's
+  /* The sort control (issue #282): a small button beside a header's
      words. The glyph is drawn from aria-sort, so the header says how the
      table is sorted to a reader and to a screen reader from one fact. */
   button.sort {
     font: inherit; font-size: 11px; line-height: 1; padding: 2px 3px; margin-left: 3px; border: 0; border-radius: 4px;
     background: none; color: var(--text-3); cursor: pointer; vertical-align: baseline;
   }
+  th.num button.sort { margin-left: 0; margin-right: 3px; }
   button.sort::before { content: "↕"; }
   button.sort:hover { color: var(--text); background: color-mix(in srgb, var(--border) 45%, transparent); }
   th[aria-sort="ascending"] button.sort, th[aria-sort="descending"] button.sort { color: var(--text); }
@@ -396,6 +397,12 @@
      takes the room the words leave and is the first thing to truncate. */
   .chart .title code.metric { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-3); }
   .chart .title span { color: var(--text-3); font-size: 12px; }
+  /* On a phone the name had what the title and unit left, which was
+     nothing: kv.batch_p99_us was 0px wide. It takes a line of its own. */
+  @media (max-width: 640px) {
+    .chart .title { flex-wrap: wrap; row-gap: 0; }
+    .chart .title code.metric { order: 3; flex: 0 0 100%; white-space: normal; overflow-wrap: anywhere; }
+  }
   .chart svg { display: block; width: 100%; height: auto; margin-top: 6px; }
   .chart .grid line { stroke: var(--border); stroke-width: 1; }
   .chart .axis text { fill: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }

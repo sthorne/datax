@@ -63,7 +63,7 @@ serves, on that address:
   a dash for those. QPS there is the leader's own measurement of ranges
   it leads and is never summed across nodes. Like the nodes, failure
   domains and schema tables it sorts from a column's header: the small
-  arrow after the header's words sorts by that column, again reverses
+  arrow beside the header's words sorts by that column, again reverses
   it, and a third time returns the table's own order; a row with no
   figure in that column stays last either way. All of it is computed from the range descriptors
   and the nodes' declared localities that the page already fetches, so

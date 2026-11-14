@@ -92,7 +92,7 @@ function a11yTables(root) {
 // the cap and the CSV all follow the one order, and a poll redraws the
 // table in the order the reader chose.
 //
-// The control is a small button after the header's words, not the
+// The control is a small button beside the header's words, not the
 // header itself: the words are a glossary term, and clicking them
 // already explains the column. Two things a click must not both do.
 //
@@ -117,13 +117,23 @@ function sortRows(table, rows) {
     return d * c.dir || x.i - y.i;
   }).map(x => x.r);
 }
+// sortFirst is the direction a column's first press sorts it: a figure
+// largest-first, a name A-first.
+function sortFirst(th) { return th.classList.contains("num") ? -1 : 1; }
 function paintSortHeaders(table) {
   const c = sortChoice[table.dataset.sorts];
   for (const th of table.querySelectorAll("thead th[data-sort]")) {
     const on = c && c.col === th.dataset.sort;
     th.setAttribute("aria-sort", on ? (c.dir === 1 ? "ascending" : "descending") : "none");
     const b = th.querySelector("button.sort");
-    if (b) b.title = on ? (c.dir === 1 ? "sorted ascending — press to reverse" : "sorted descending — press for the table's own order") : "sort by this column";
+    // What the next press does depends on where the column is in its
+    // cycle, not on which way it is sorted: a figure starts largest-
+    // first, so "descending" is its first press and reverses next,
+    // where for a name it is the second and clears next.
+    const word = on && (c.dir === 1 ? "ascending" : "descending");
+    if (b) b.title = !on ? "sort by this column"
+      : c.dir === sortFirst(th) ? `sorted ${word} — press to reverse`
+      : `sorted ${word} — press for the table's own order`;
   }
 }
 function wireSortHeaders() {
@@ -132,10 +142,17 @@ function wireSortHeaders() {
     for (const th of table.querySelectorAll("thead th[data-sort]")) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "sort";
-      b.setAttribute("aria-label", "sort by " + th.textContent.trim());
-      th.appendChild(b);
+      const words = th.textContent.trim();
+      b.setAttribute("aria-label", "sort by " + words);
+      // The header is named by its words alone. A header's name is read
+      // out with every cell beneath it, and with the button inside it
+      // each figure was announced as "cpu sort by cpu, 8.1%".
+      th.setAttribute("aria-label", words);
+      // A column of figures is right-aligned, so its button goes before
+      // the words and the words stay over the figures' right edge.
+      if (th.classList.contains("num")) th.prepend(b); else th.appendChild(b);
       b.addEventListener("click", () => {
-        const first = th.classList.contains("num") ? -1 : 1;
+        const first = sortFirst(th);
         const cur = sortChoice[name];
         if (!cur || cur.col !== th.dataset.sort) sortChoice[name] = { col: th.dataset.sort, dir: first };
         else if (cur.dir === first) cur.dir = -first;

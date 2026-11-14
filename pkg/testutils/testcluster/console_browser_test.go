@@ -464,8 +464,37 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		defer data.close()
 		wait(data, "the ranges table", `document.querySelectorAll('#cluster-ranges tr[data-range]').length > 1`)
 		check(data, "the ranges table's columns (#283)",
-			`[...document.querySelectorAll('table[data-sorts="ranges"] thead th')].map(th => th.childNodes[0].textContent.trim()).join(",")`,
+			`[...document.querySelectorAll('table[data-sorts="ranges"] thead th')].map(th => th.getAttribute("aria-label")).join(",")`,
 			"range,span,replicas,leader,qps,size")
+		// A header's words are still the glossary term: they are marked,
+		// they open the explanation, and the button beside them does not.
+		// (For a week they did neither: a second function named labelText
+		// had replaced the help's.)
+		check(data, "every sortable header is a glossary term (#282)",
+			`String([...document.querySelectorAll('table[data-sorts="ranges"] thead th[data-sort]')].every(th => th.classList.contains("helpable") && th.title.length > 20))`, "true")
+		check(data, "a header's words open its explanation, its button does not (#282)", `(() => {
+  const th = document.querySelector('table[data-sorts="ranges"] th[data-sort="qps"]'), pop = () => { const p = document.getElementById("help-pop"); return !!p && !p.hidden; };
+  const out = [pop()];
+  th.click(); out.push(pop());
+  th.click(); out.push(pop());
+  th.querySelector("button.sort").click(); out.push(pop());
+  th.querySelector("button.sort").click(); th.querySelector("button.sort").click();
+  return out.join(",") + " " + (th.getAttribute("aria-sort") || "");
+})()`, "false,true,false,false none")
+		// A header is named by its words; its button says what it does,
+		// and its tooltip says what the next press does.
+		check(data, "a sortable header's names and its button's tooltips (#282)", `(() => {
+  const out = [];
+  for (const col of ["qps", "span"]) {
+    const th = document.querySelector('table[data-sorts="ranges"] th[data-sort="' + col + '"]'), b = th.querySelector("button.sort");
+    out.push(th.getAttribute("aria-label"), b.getAttribute("aria-label"), th.firstChild === b ? "button first" : "words first", b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+    b.click(); out.push(th.getAttribute("aria-sort") + ": " + b.title);
+  }
+  return out.join(" | ");
+})()`, "qps | sort by qps | button first | sort by this column | descending: sorted descending — press to reverse | ascending: sorted ascending — press for the table's own order | none: sort by this column | "+
+			"span | sort by span | words first | sort by this column | ascending: sorted ascending — press to reverse | descending: sorted descending — press for the table's own order | none: sort by this column")
 		check(data, "the hotspots table is gone (#283)", `String(!document.getElementById('repl-hot') && !document.getElementById('sec-hot-ranges'))`, "true")
 		check(data, "every range row has the six cells (#283)",
 			`String([...document.querySelectorAll('#cluster-ranges tr[data-range]')].every(r => r.children.length === 6))`, "true")
@@ -474,15 +503,23 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		// own order back; the header says which, and a poll keeps it.
 		ids := `[...document.querySelectorAll('#cluster-ranges tr[data-range]')].map(r => Number(r.dataset.range)).join(",")`
 		click := `(document.querySelector('table[data-sorts="ranges"] th[data-sort="range"] button.sort').click(), "ok")`
+		// The order is read as a property of the rows on screen, not
+		// against a list taken earlier: the cluster splits and merges
+		// ranges while this runs, so which ranges there are can change
+		// between two looks, and only their order is the table's doing.
+		ordered := func(dir string) string {
+			return `(() => { const s = ` + ids + `.split(",").map(Number); return String(s.length > 1 && s.every((v, i) => i === 0 || (` + dir + ` ? s[i - 1] < v : s[i - 1] > v))); })()`
+		}
+		sortOf := `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`
 		data.eval(t, click)
-		asc := data.eval(t, ids)
-		check(data, "sorted ascending (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "ascending")
-		check(data, "ascending is ascending (#282)", `String((s => s.join(",") === s.slice().sort((a, b) => a - b).join(","))(`+"`"+`${`+ids+`}`+"`"+`.split(",").map(Number)))`, "true")
+		check(data, "sorted ascending (#282)", sortOf, "ascending")
+		check(data, "ascending is ascending (#282)", ordered("true"), "true")
 		data.eval(t, click)
-		check(data, "sorted descending (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "descending")
-		check(data, "descending is the reverse (#282)", ids, reverseCSV(asc))
+		check(data, "sorted descending (#282)", sortOf, "descending")
+		check(data, "descending is descending (#282)", ordered("false"), "true")
 		time.Sleep(3500 * time.Millisecond) // a poll redraws the table
-		check(data, "a poll keeps the reader's order (#282)", ids, reverseCSV(asc))
+		check(data, "a poll keeps the reader's choice (#282)", sortOf, "descending")
+		check(data, "a poll keeps the reader's order (#282)", ordered("false"), "true")
 		data.eval(t, click)
 		check(data, "the third press clears the sort (#282)", `document.querySelector('table[data-sorts="ranges"] th[data-sort="range"]').getAttribute("aria-sort")`, "none")
 		for _, table := range []string{"nodes", "domains", "schema", "ranges"} {
@@ -504,6 +541,15 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		// detail, words for a title and a unit.
 		check(data, "niceTicks (#277)", `[niceTicks(0, 1566, "/s"), niceTicks(0, 0, "bytes"), niceTicks(0, 87, "percent"), niceTicks(0, 400 * 1048576, "bytes").map(v => v / 1048576), niceTicks(0, 0.0004, "")].map(a => a.join(",")).join(" | ")`,
 			"0,500,1000,1500,2000 | 0,1 | 0,25,50,75,100 | 0,128,256,384,512 | 0,0.0001,0.0002,0.00030000000000000003,0.0004")
+		// A gridline's label has the precision of its step and no more,
+		// the same on every tick of an axis; a duration is in the unit its
+		// largest tick is said in; zero is zero.
+		check(data, "tick labels (#277)", `(() => {
+  const axis = (lo, hi, unit) => { const t = niceTicks(lo, hi, unit), top = Math.max(Math.abs(t[0]), Math.abs(t[t.length - 1])); return t.map(v => fmtTick(v, unit, t[1] - t[0], top)).join(","); };
+  return [axis(0, 2900000, "us"), axis(0, 1400, "us"), axis(0, 700, "us"), axis(0, 14, "percent"), axis(0, 9, "percent"), axis(0, 1.8, "/s"), axis(0, 0, "/s"),
+    axis(0, 60000, "bytes"), axis(0, 1800 * 1048576, "bytes"), axis(0, 1566, ""), axis(0, 0.9, ""), axis(0, 3000, "us/s")].join(" | ");
+})()`, "0,1 s,2 s,3 s | 0,0.5 ms,1.0 ms,1.5 ms | 0,200 µs,400 µs,600 µs,800 µs | 0%,5%,10%,15% | 0%,2.5%,5.0%,7.5%,10.0% | 0/s,0.5/s,1.0/s,1.5/s,2.0/s | 0/s,1/s | "+
+			"0 B,16 KiB,32 KiB,48 KiB,64 KiB | 0 B,512 MiB,1 GiB,1.5 GiB,2 GiB | 0,500,1000,1500,2000 | 0,0.25,0.50,0.75,1.00 | 0,1 ms/s,2 ms/s,3 ms/s")
 		check(data, "a chart's title and unit (#277)",
 			`[seriesTitle({ name: "kv.batch_p99_us", help: "p99 KV batch latency" }), seriesTitle({ name: "x.y" }), unitWord({}, "us"), unitWord({ rate: true }, "/s"), unitWord({}, "percent")].join(" | ")`,
 			"P99 KV batch latency | x.y | duration | per second | percent")
@@ -525,6 +571,16 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			`String([...document.querySelectorAll('#charts .chart svg')].every(svg => { const l = [...svg.querySelectorAll('g.axis text[text-anchor="end"]')].map(t => t.textContent); return new Set(l).size === l.length; }))`, "true")
 		check(metrics, "line-end labels stay inside the plot (#277)",
 			`String([...document.querySelectorAll('#charts .endlabel')].every(l => Number(l.getAttribute("y")) <= 182))`, "true")
+		check(metrics, "a chart is named to a screen reader as it is titled (#277)",
+			`String([...document.querySelectorAll('#charts .chart')].every(c => c.querySelector('svg').getAttribute('aria-label') === c.querySelector('.title b').textContent.trim() + ' over time'))`, "true")
+		// On a phone the metric's name has a line of its own; it had the
+		// width the title and unit left, which was none.
+		small := br.open(t, base+"metrics", 390, 844, true)
+		defer small.close()
+		wait(small, "the charts on a phone", `document.querySelectorAll('#charts .chart svg').length > 0`)
+		check(small, "the metric's name is readable on a phone (#277)",
+			`String([...document.querySelectorAll('#charts .chart .title code.metric')].every(c => c.scrollWidth <= c.clientWidth + 1 && c.getBoundingClientRect().width > 60 && c.getBoundingClientRect().top >= c.parentElement.querySelector('b').getBoundingClientRect().bottom - 2))`, "true")
+		check(small, "no chart makes the phone scroll sideways (#277)", `String(document.documentElement.scrollWidth <= innerWidth)`, "true")
 	})
 
 	// The formatters themselves, called in the page: an age is said in
@@ -631,15 +687,6 @@ const consoleFactsJS = `(() => {
     widest,
   });
 })()`
-
-// reverseCSV is a comma-separated list, back to front.
-func reverseCSV(s string) string {
-	parts := strings.Split(s, ",")
-	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
-		parts[i], parts[j] = parts[j], parts[i]
-	}
-	return strings.Join(parts, ",")
-}
 
 func findChrome() string {
 	if p := os.Getenv("DATAX_CHROME"); p != "" {

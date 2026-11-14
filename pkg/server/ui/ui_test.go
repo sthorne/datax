@@ -2561,11 +2561,11 @@ func deadAfterReturn(body string) string {
 // short their window is; and the statement detail links to the chart.
 func TestShapeSeriesCarryTheirText(t *testing.T) {
 	charts := string(mustRead(t, "js/86-charts.js"))
-	if sp := jsFuncSpan(charts, "seriesChoices"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "labelText(def.label, v)") {
+	if sp := jsFuncSpan(charts, "seriesChoices"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "seriesLabelText(def.label, v)") {
 		t.Error("seriesChoices does not resolve a label value to its text: a shape's series is a bare fingerprint in the picker")
 	}
-	if sp := jsFuncSpan(charts, "labelText"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "label_text") {
-		t.Error("labelText does not read the catalog's label_text")
+	if sp := jsFuncSpan(charts, "seriesLabelText"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "label_text") {
+		t.Error("seriesLabelText does not read the catalog's label_text")
 	}
 	if sp := jsFuncSpan(charts, "renderPickers"); sp == nil || !strings.Contains(charts[sp[0]:sp[1]], "shortShape(c.text)") || !strings.Contains(charts[sp[0]:sp[1]], "shapesNote()") {
 		t.Error("renderPickers shows no shape text or no note on where the stmt.* series come from")
@@ -2769,5 +2769,43 @@ func TestEventTextIsEscapedBeforeItIsLinked(t *testing.T) {
 		for _, m := range regexp.MustCompile(`\$\{\w+\.summary\}`).FindAllString(string(mustRead(t, f)), -1) {
 			t.Errorf("%s writes %s into markup unescaped", f, m)
 		}
+	}
+}
+
+// The console's scripts are one program: the files are joined in order
+// and share one scope. Two functions with one name do not collide — the
+// later one silently replaces the earlier, everywhere. That is how every
+// glossary term in the console stopped answering a click for a week:
+// the charts gained a labelText(label, v) that replaced the help's
+// labelText(el), which then returned "" for every header, and wireHelp
+// marked nothing (the UI review of #288; it shipped in #208/#209). The
+// glossary's own tests read the glossary, which was fine.
+//
+// A const or let declared twice is a syntax error and the page does not
+// load, which the browser test would notice; they are checked here too
+// so the report names the two files.
+func TestNoTopLevelNameIsDeclaredTwice(t *testing.T) {
+	entries, err := os.ReadDir("js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decl := regexp.MustCompile(`(?m)^(?:async\s+)?(?:function\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)`)
+	seen := map[string]string{}
+	files := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".js") {
+			continue
+		}
+		files++
+		for _, m := range decl.FindAllStringSubmatch(string(mustRead(t, "js/"+e.Name())), -1) {
+			if first, dup := seen[m[1]]; dup {
+				t.Errorf("%s is declared at the top level of %s and again in %s: the scripts share one scope, and the later declaration replaces the earlier", m[1], first, e.Name())
+				continue
+			}
+			seen[m[1]] = e.Name()
+		}
+	}
+	if files < 10 || len(seen) < 200 {
+		t.Fatalf("read %d scripts and %d top-level names; the console has more than that, so the pattern has stopped matching", files, len(seen))
 	}
 }
