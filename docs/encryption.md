@@ -391,6 +391,43 @@ loses the root key — after which a node that is running can still be
 moved to a new root key, and one that is stopped cannot be opened by
 anyone.
 
+## Keys in memory
+
+The keys a node holds for as long as it runs — its store key, the data
+keys of its registry, a `file` root's wrapping key, a root key rebuilt
+from shares — are kept in memory set aside for them rather than on the
+ordinary heap (#309). On Linux that memory is `mlock`ed, so it is never
+written to swap, and marked `MADV_DONTDUMP`, so it is left out of core
+dumps; a key is zeroed when it is released (a store closing, a root
+discarded). Short-lived copies made on the way — a key file's bytes as
+read, a candidate key that did not match — are zeroed when done with.
+
+A node started with `--enc-key` or `--enc-root` also turns core dumps
+off for the whole process: its core-file limit is set to zero and it is
+marked not dumpable, which additionally stops another process of the
+same user from reading its memory. `--allow-core-dumps` leaves the
+process dumpable, for debugging.
+
+The start log says how this went, and `/api/security` (`key_memory`)
+and the console's security view report it per store. Locking can fail
+under a low memory-lock limit (16 KiB is needed; `ulimit -l`, or
+`LimitMEMLOCK=` in a systemd unit): by default that is a warning that
+names the remedy and the node runs; `--require-locked-keys` makes it,
+and a failure to disable core dumps, a refusal to start.
+
+What this does not cover:
+
+- A cipher built from a key holds its own expanded copy, and the Go
+  runtime may copy a key onto a stack; those copies are on ordinary
+  memory. Disabling core dumps is what covers them against a dump, and
+  nothing covers them against swap short of encrypted swap or none.
+- A privileged user on the host, or anything that can read this
+  process's memory, can read the keys regardless.
+- Plaintext data in the block cache is not key material and is not
+  locked.
+- On platforms other than Linux keys are held on the heap and reported
+  as not locked.
+
 ## Key rotation
 
 - **Data keys** rotate themselves: every node start mints a new active
@@ -578,9 +615,12 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
-- Keys live in memory unprotected (no mlock; #309). An HSM or KMS is
-  reachable through an `exec` root's command, not spoken to directly
-  (#308).
+- **Keys in memory are narrowed, not hidden** (see *Keys in memory*).
+  The held copies are locked and out of core dumps; a cipher's expanded
+  key, and a key on its way through a stack, are on the ordinary heap,
+  and anyone who can read the process's memory can read all of it.
+- An HSM or KMS is reachable through an `exec` root's command, not
+  spoken to directly (#308).
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
 - The node never rewrites the operator's key file: after an online

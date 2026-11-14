@@ -402,10 +402,16 @@ function renderSecurityDoc() {
       const keyHome = !st.encrypted ? ""
         : st.root ? ` <span class="muted">· store key under a ${esc(st.root.kind)} root${st.root.key_id ? ` (${esc(st.root.key_id)})` : ""}</span>`
           : ` <span class="muted">· store key from a key file</span>`;
+      // How the keys are held while the node runs (issue #309): said
+      // only when short of the ordinary case, with the reason the node
+      // gave, since "locked" on every row would be noise.
+      const km = st.key_memory;
+      const keyMem = !st.encrypted || !km || (km.locked && km.no_dump) ? ""
+        : ` <span class="muted">· ${warn("draining", "key memory not " + (km.locked ? "kept out of core dumps" : "locked"))}${km.reason ? " — " + esc(km.reason) : ""}</span>`;
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${state}${keyHome}</td>
+        <td data-label="state">${state}${keyHome}${keyMem}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

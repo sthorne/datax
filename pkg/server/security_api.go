@@ -11,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
 // /api/security (issue #156). Security state was scattered: audit
@@ -68,6 +69,10 @@ type SecurityStore struct {
 	// Root is what the store's key is kept under (issue #305); nil for a
 	// store opened with a key file, or a plaintext one.
 	Root *SecurityRoot `json:"root,omitempty"`
+	// KeyMemory says how the node holds its keys while it runs (issue
+	// #309): whether their memory is locked against swap and left out of
+	// core dumps, and whether the process can be dumped at all.
+	KeyMemory *enc.KeyMemoryStatus `json:"key_memory,omitempty"`
 }
 
 // SecurityRoot names the root a store key is wrapped by. Neither field
@@ -208,6 +213,8 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 			st.Reencryption = n.reencryptionStatus()
 			st.Authenticated = n.authenticatedEncryption()
 			st.Root = n.securityRoot()
+			km := enc.KeyMemory()
+			st.KeyMemory = &km
 		}
 		doc.Stores = append(doc.Stores, st)
 	}

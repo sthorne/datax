@@ -194,6 +194,11 @@ func TestSealedStartOpensOnAQuorumOfShares(t *testing.T) {
 			t.Fatalf("n%d: root %q %q, want shares %q", i+1, kind, id, keyID)
 		}
 	}
+	// The root key and the three store keys are in memory kept for keys
+	// (issue #309), not on the heap.
+	if km := enc.KeyMemory(); km.Held < 4 {
+		t.Fatalf("key memory holds %d keys with three nodes open under one root key", km.Held)
+	}
 	// A running node says it is not sealed, and to anyone.
 	if st := call(tc.addrs[0], true, cluster.AdminRequest{Op: "seal-status"}); st.Error != "" || st.Seal == nil || st.Seal.Sealed || st.Seal.Root != "shares" || st.Seal.KeyID != keyID {
 		t.Fatalf("seal-status of a running node: %+v %q", st.Seal, st.Error)

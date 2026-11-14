@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
 	pversion "github.com/sthorne/datax/pkg/version"
 )
@@ -33,6 +34,8 @@ type serverFlags struct {
 	cacheSize     string
 	encKeyPath    string
 	encRoot       string
+	allowDumps    bool
+	requireLocked bool
 	acceptEncRB   bool
 	loadSplit     float64
 	mergeThr      int64
@@ -65,6 +68,8 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.BoolVar(&f.acceptEncRB, "accept-encryption-rollback", false, "start a store whose switch to authenticated encryption was rolled back (its key registry or the whole store restored from before the switch), lowering the records that caught the rollback to what the store has; for the one start after a rollback that was meant")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
+	f.fs.BoolVar(&f.allowDumps, "allow-core-dumps", false, "encrypted node: leave the process dumpable. By default a node with --enc-key or --enc-root sets its core-file limit to zero and marks itself not dumpable, because a core dump holds its keys")
+	f.fs.BoolVar(&f.requireLocked, "require-locked-keys", false, "encrypted node: refuse to start unless key memory could be locked against swap and left out of core dumps (by default that is a warning with the remedy)")
 	f.fs.StringVar(&f.encRoot, "enc-root", "", "the alternative to --enc-key: what the store key is kept under, file:<path> (a 32-byte wrapping key), exec:<command> (run with wrap, unwrap or key-id) or shares (a root key split among operators: the node starts sealed until enough run `datax unseal`); see docs/encryption.md. The store key is made on the node and kept in the data directory only wrapped. A comma-separated list names candidates; the one that wrapped the store's key is used")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
@@ -101,6 +106,8 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		StorageCacheSize:         cacheSize,
 		EncKeyPath:               f.encKeyPath,
 		EncRoot:                  f.encRoot,
+		RequireLockedKeys:        f.requireLocked,
+		AllowCoreDumps:           f.allowDumps,
 		AcceptEncryptionRollback: f.acceptEncRB,
 		LoadSplitThreshold:       f.loadSplit,
 		MergeSizeThreshold:       f.mergeThr,
@@ -165,6 +172,15 @@ func metricsRecordInterval(d time.Duration) time.Duration {
 }
 
 func runServer(cfg server.Config) error {
+	if (cfg.EncKeyPath != "" || cfg.EncRoot != "") && !cfg.AllowCoreDumps {
+		// Before any key is read: a dump of this process would hold them.
+		if err := enc.DisableCoreDumps(); err != nil {
+			if cfg.RequireLockedKeys {
+				return fmt.Errorf("--require-locked-keys: core dumps could not be disabled: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "warning: core dumps could not be disabled (%v); a dump of this process would hold its keys\n", err)
+		}
+	}
 	cfg.OnSealed = func(addr string) {
 		fmt.Printf("datax node is SEALED: its store key is under a root key held as shares, and the store stays closed until enough are submitted\n  submit a share: datax unseal --addr %s\n  progress:       datax debug seal-status --addr %s\n", addr, addr)
 	}

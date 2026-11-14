@@ -278,6 +278,10 @@ func (e *Engine) Close() error {
 		}
 	}
 	err := e.db.Close()
+	if err == nil {
+		// Every file is closed: nothing reads through the data keys now.
+		e.encKeys.Release()
+	}
 	if e.cacheHeld {
 		e.cacheHeld = false
 		releaseCache()

@@ -29,6 +29,17 @@ state or the internode protocol does, and an entry below says so.
   root key itself, the new key's shares are submitted to the running
   nodes and each store key is rewrapped under it. Shares and root keys
   are never written to disk, logged, or put in an event.
+- **Keys are held in locked memory, and an encrypted node cannot be
+  core-dumped** (#309). The store key, the registry's data keys and
+  root keys live in memory that is `mlock`ed and marked
+  `MADV_DONTDUMP` on Linux and zeroed on release, instead of on the
+  heap. A node started with `--enc-key` or `--enc-root` sets its
+  core-file limit to zero and marks itself not dumpable
+  (`--allow-core-dumps` undoes that for debugging). A memory-lock limit
+  too low to lock 16 KiB is a start-up warning with the remedy, or a
+  refusal with `--require-locked-keys`; `/api/security` and the
+  console's security view report the state. A cipher's expanded key and
+  copies on a stack are not covered, and the documentation says so.
 - **Console: rows that open are real links, cards sort on a phone, and
   time axes tick at round moments** (#286, #289). A table's name in the
   schema list and a range's id in the ranges table are anchors, so

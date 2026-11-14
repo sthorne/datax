@@ -518,7 +518,9 @@ func newFileRoot(path string) (*fileRoot, error) {
 	// wrapping keys apart and tells nothing else: the key is 256 random
 	// bits.
 	sum := sha256.Sum256(append([]byte("datax file root key id v1\x00"), key...))
-	return &fileRoot{path: path, key: key, id: hex.EncodeToString(sum[:8])}, nil
+	held := HoldKey(key)
+	Zero(key)
+	return &fileRoot{path: path, key: held, id: hex.EncodeToString(sum[:8])}, nil
 }
 
 func (r *fileRoot) Kind() string   { return "file" }

@@ -223,6 +223,13 @@ type Config struct {
 
 	// Test hooks.
 	TestingKnobs kvserver.TestingKnobs
+	// RequireLockedKeys refuses to start an encrypted node whose key
+	// memory could not be locked and kept out of core dumps (issue
+	// #309); without it that is a warning.
+	RequireLockedKeys bool
+	// AllowCoreDumps records that the operator asked for the process to
+	// stay dumpable (the command, not the node, changes the process).
+	AllowCoreDumps bool
 	// OnSealed is called, with the RPC address, when the start stops to
 	// wait for shares of the root key (sealed.go): Start does not return
 	// until the node is unsealed, so this is how its caller learns it is
@@ -483,6 +490,9 @@ func (n *Node) start() error {
 		if err := n.loadRootedStoreKey(context.Background()); err != nil {
 			return err
 		}
+	}
+	if err := n.holdStoreKey(); err != nil {
+		return err
 	}
 	n.engine, n.raftEngine = n.cfg.Engine, n.cfg.RaftEngine
 	if n.engine == nil {

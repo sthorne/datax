@@ -159,7 +159,9 @@ func (n *Node) adoptStoreKey(ctx context.Context, newKey []byte) {
 	n.encKeyMu.Lock()
 	hadKey := n.encKey != nil
 	if hadKey {
-		n.encKey = append([]byte(nil), newKey...)
+		// The key it replaces stays held, not released: a reader that
+		// took it before the swap may still be using it.
+		n.encKey = enc.HoldKey(newKey)
 	}
 	n.encKeyMu.Unlock()
 	if hadKey {
@@ -280,4 +282,39 @@ func ResealMetadataBackup(dir string, oldKey, newKey []byte) error {
 		return err
 	}
 	return os.Rename(bakPath+".tmp", bakPath)
+}
+
+// holdStoreKey moves the store key this start resolved into memory kept
+// for keys (enc.HoldKey, issue #309) and says, once, how well that
+// memory is protected. With RequireLockedKeys a shortfall refuses the
+// start; otherwise it is a warning that carries its remedy.
+func (n *Node) holdStoreKey() error {
+	if n.encKey == nil {
+		return nil
+	}
+	loaded := n.encKey
+	n.encKey = enc.HoldKey(loaded)
+	// The raft engine's key is the same key unless a rotation was
+	// interrupted between the two engines; either way it moves too,
+	// before the loaded copy it may share is wiped.
+	if n.raftEncKey != nil {
+		if bytes.Equal(n.raftEncKey, loaded) {
+			n.raftEncKey = n.encKey
+		} else {
+			other := n.raftEncKey
+			n.raftEncKey = enc.HoldKey(other)
+			enc.Zero(other)
+		}
+	}
+	enc.Zero(loaded)
+	st := enc.KeyMemory()
+	switch {
+	case st.Locked && st.NoDump:
+		log.Infof("key memory: locked (never swapped) and left out of core dumps; core dumps of the process: %s", st.CoreDumps)
+	case n.cfg.RequireLockedKeys:
+		return fmt.Errorf("--require-locked-keys: key memory is not fully protected (locked=%t, out of core dumps=%t): %s", st.Locked, st.NoDump, st.Reason)
+	default:
+		log.Warnf("key memory is not fully protected (locked=%t, out of core dumps=%t): %s. The node runs; its keys may reach swap or a core dump. --require-locked-keys refuses to start in this state", st.Locked, st.NoDump, st.Reason)
+	}
+	return nil
 }

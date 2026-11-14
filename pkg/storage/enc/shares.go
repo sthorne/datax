@@ -414,7 +414,8 @@ func (r *ShareRoot) Submit(text string) (SealStatus, error) {
 		r.held = map[int]Share{}
 		return refuse(fmt.Errorf("%w; the shares submitted so far have been discarded", err))
 	}
-	r.key = key
+	r.key = HoldKey(key)
+	Zero(key)
 	st := r.statusLocked()
 	for i, h := range r.held {
 		h.value = [KeyLen]byte{}
@@ -437,7 +438,7 @@ func (r *ShareRoot) Open(key []byte) error {
 	if r.key != nil {
 		return errors.New("already unsealed")
 	}
-	r.key = append([]byte(nil), key...)
+	r.key = HoldKey(key)
 	r.expect = RootKeyID(key)
 	r.held = map[int]Share{}
 	close(r.opened)

@@ -181,12 +181,29 @@ func keySetFrom(reg *registryData) (*KeySet, error) {
 		if err != nil || len(k) != KeyLen {
 			return nil, fmt.Errorf("corrupt key registry: bad key for ID %s", idStr)
 		}
-		ks.keys[id] = k
+		// The data keys live as long as the store is open: held memory
+		// (keymem.go), not the heap the decoder left this copy on.
+		ks.keys[id] = HoldKey(k)
+		Zero(k)
 	}
 	if _, ok := ks.keys[ks.activeID]; !ok {
+		ks.Release()
 		return nil, fmt.Errorf("corrupt key registry: active key %d missing", ks.activeID)
 	}
 	return ks, nil
+}
+
+// Release zeroes the set's keys and gives their memory back. It is for
+// the store's close, after its last file is closed: a key set in use
+// must not be released.
+func (ks *KeySet) Release() {
+	if ks == nil {
+		return
+	}
+	for id, k := range ks.keys {
+		ReleaseKey(k)
+		delete(ks.keys, id)
+	}
 }
 
 func writeRegistry(base vfs.FS, dir string, storeKey []byte, reg *registryData) error {

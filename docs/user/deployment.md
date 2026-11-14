@@ -162,6 +162,14 @@ replace the root key instead: `split` a new one, have its holders
 Do this while the nodes are running: a stopped node whose root key
 cannot be rebuilt cannot be opened.
 
+An encrypted node keeps its keys in locked memory and turns core dumps
+off for its process. Give the service a memory-lock limit of at least
+16 KiB (`LimitMEMLOCK=64K` in a systemd unit is ample); with less, the
+node warns at start and runs with its keys swappable. Add
+`--require-locked-keys` to refuse to start instead, and
+`--allow-core-dumps` only while debugging a crash. See
+[keys in memory](../encryption.md#keys-in-memory).
+
 Files written under retired data keys are re-encrypted on demand:
 
 ```sh
