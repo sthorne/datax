@@ -225,6 +225,19 @@ report. Two things the targets do that the bare commands do not:
   ten-minute per-package timeout, which kills it mid-run with no
   failure to point at. Expect the wait; it is not a hang.
 
+One test wants a browser. `TestConsoleRendersEveryRouteOpenedCold` opens
+every view of the console in headless Chrome, cold and at two widths,
+and reads the rendered page back: the header, the insecure-mode banner,
+every "when", and whether anything scrolls sideways. It finds
+`google-chrome` or `chromium` on `PATH`, or takes the binary from
+`DATAX_CHROME`, and skips when there is none. CI sets
+`DATAX_REQUIRE_BROWSER`, which turns that skip into a failure. If you
+change the console, run it:
+
+```sh
+DATAX_CHROME=/path/to/chrome go test -run TestConsoleRendersEveryRouteOpenedCold ./pkg/testutils/testcluster/
+```
+
 Format with `make fmt` (gofmt, never goimports: goimports regroups the
 generated `*.pb.go` imports, which `make proto` flips back). Generated
 code is committed; `make proto` is only for changing the `.proto` files.

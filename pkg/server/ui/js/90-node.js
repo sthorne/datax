@@ -84,7 +84,7 @@ function renderNode(d) {
     box.hidden = false;
     const rows = [];
     for (const s of act.active || []) rows.push(`<tr><td>${tok("live", "running")}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.elapsed_us / 1000).toFixed(0)} ms</td><td class="num">—</td><td class="key">${esc(s.text)}${copyBtn("this statement", s.text)}</td></tr>`);
-    for (const s of act.slow || []) rows.push(`<tr><td>${fmtWhen(Date.now() - Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}${copyBtn("this statement", s.text)}</td></tr>`);
+    for (const s of act.slow || []) rows.push(`<tr><td>${fmtWhen(Date.parse(s.at))}</td><td>${esc(s.user)}</td><td>${esc(s.kind)}</td><td class="num">${(s.duration_us / 1000).toFixed(0)} ms</td><td class="num">${s.rows}</td><td class="key">${esc(s.text)}${copyBtn("this statement", s.text)}</td></tr>`);
     setHTML(document.getElementById("node-statements"), rows.join("") || `<tr><td colspan="6" class="muted">nothing in flight and nothing over ${act.slow_threshold_ms} ms recently</td></tr>`);
     document.getElementById("node-sql-note").textContent = "";
   } else {
@@ -103,7 +103,7 @@ function renderNode(d) {
   const evs = (d.events || []).slice().reverse();
   renderKeyed(document.getElementById("node-events"), evs.length
     ? evs.map(e => ({ key: String(e.seq), html: `<tr data-key="${e.seq}">
-    <td class="when" title="${esc(e.at)}">${fmtWhen(Date.now() - Date.parse(e.at))}</td>
+    <td class="when" title="${esc(e.at)}">${fmtWhen(Date.parse(e.at))}</td>
     <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
     <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
   </tr>` }))

@@ -2580,3 +2580,139 @@ func TestShapeSeriesCarryTheirText(t *testing.T) {
 		t.Error("the statement detail has no link to chart the shape's series")
 	}
 }
+
+// ageFields are the figures that arrive already subtracted: "this
+// heartbeat was 4s ago". They are the only things fmtWhen may be handed
+// as Date.now() minus something.
+var ageFields = []string{"heartbeat_ago_ms", "age_ms", "age_seconds"}
+
+// TestMomentsAreHandedAnInstant (issue #272): fmtWhen takes an instant.
+// TestMomentsReadTheViewersPreference checks that a moment is rendered
+// by fmtWhen and never asks what fmtWhen is given, so when #204 rewrote
+// fmtAgo(Date.now() - Date.parse(e.at)) to fmtWhen(Date.now() -
+// Date.parse(e.at)) by pattern, it passed — and every event and slow
+// statement read "29910444m ago", the current Unix time in minutes, for
+// two months.
+//
+// This reads the argument. Date.now() minus something is an instant
+// only when the something is an age; an "at" timestamp or a *_unix_ms
+// is an instant already, and goes in as it is.
+func TestMomentsAreHandedAnInstant(t *testing.T) {
+	names, err := ScriptFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	isAge := func(expr string) bool {
+		for _, f := range ageFields {
+			if strings.Contains(expr, f) {
+				return true
+			}
+		}
+		return false
+	}
+	calls := 0
+	for _, name := range names {
+		src := string(mustRead(t, name))
+		if span := jsFuncSpan(src, "fmtWhen"); span != nil {
+			src = src[:span[0]] + src[span[1]:] // the definition is not a call
+		}
+		for _, call := range callsTo(src, "fmtWhen(") {
+			calls++
+			arg := strings.TrimSpace(call[len("fmtWhen(") : len(call)-1])
+			if rest, ok := strings.CutPrefix(arg, "Date.now() - "); ok {
+				if !isAge(rest) {
+					t.Errorf("%s: %s\n    hands fmtWhen now minus %q, which is an AGE unless that is one of %v. "+
+						"fmtWhen takes the instant itself: pass %s", name, call, rest, ageFields, rest)
+				}
+				continue
+			}
+			if strings.Contains(arg, "Date.now()") {
+				t.Errorf("%s: %s\n    mixes the current time into fmtWhen's argument in a shape this test cannot "+
+					"read; write it as an instant, or as Date.now() - <an age field>", name, call)
+			}
+			if isAge(arg) {
+				t.Errorf("%s: %s\n    hands fmtWhen an age as if it were an instant: write fmtWhen(Date.now() - %s)", name, call, arg)
+			}
+		}
+	}
+	// The sweep is only worth something if it sees the calls.
+	if calls < 15 {
+		t.Errorf("found %d calls to fmtWhen, want the twenty-odd the console makes: callsTo no longer sees them", calls)
+	}
+}
+
+// taskDef matches one polling task: its name, its fetch, and the views
+// that run it.
+var taskDef = regexp.MustCompile(`(?m)^task\("(\w+)",\s*(\w+),\s*\d+,\s*\[([^\]]*)\]\);`)
+
+// TestEveryViewFillsTheHeader (issue #273): the header — which node
+// served the page, who is signed in, the insecure-mode banner, the
+// scope picker's nodes — is filled from the cluster document, by
+// pollOverview. A view that runs no task with that fetch shows
+// "connecting…" and no banner for as long as it is open, which is what
+// the node, schema and metrics views did when opened from a bookmark.
+func TestEveryViewFillsTheHeader(t *testing.T) {
+	router := string(mustRead(t, "js/15-router.js"))
+	m := regexp.MustCompile(`const VIEWS = \[([^\]]*)\];`).FindStringSubmatch(router)
+	if m == nil {
+		t.Fatal("the router's VIEWS list was not found")
+	}
+	views := regexp.MustCompile(`"(\w+)"`).FindAllStringSubmatch(m[1], -1)
+	if len(views) < 9 {
+		t.Fatalf("read %d views from the router, want its nine", len(views))
+	}
+	boot := string(mustRead(t, "js/95-boot.js"))
+	fed := map[string]string{}
+	for _, d := range taskDef.FindAllStringSubmatch(boot, -1) {
+		if d[2] != "pollOverview" {
+			continue
+		}
+		for _, v := range regexp.MustCompile(`"(\w+)"`).FindAllStringSubmatch(d[3], -1) {
+			if prev, dup := fed[v[1]]; dup {
+				t.Errorf("the %q view fetches the cluster document from two tasks, %q and %q: one view, one poll of it", v[1], prev, d[1])
+			}
+			fed[v[1]] = d[1]
+		}
+	}
+	for _, v := range views {
+		if fed[v[1]] == "" {
+			t.Errorf("the %q view runs no task that fetches the cluster document, so opened directly its header "+
+				"stays on \"connecting…\" and an insecure cluster shows no banner: add it to the header task", v[1])
+		}
+	}
+	overview := string(mustRead(t, "js/30-overview.js"))
+	sp := jsFuncSpan(overview, "render")
+	if sp == nil {
+		t.Fatal("render() not found")
+	}
+	body := overview[sp[0]:sp[1]]
+	for _, want := range []string{`getElementById("hdr-node")`, "renderPrincipal(", "renderScopePicker("} {
+		if !strings.Contains(body, want) {
+			t.Errorf("render() no longer calls %s: the header is filled somewhere this test does not look", want)
+		}
+	}
+}
+
+// TestScrollBoxesClipWhatIsPositionedInsideThem (issue #274): a box with
+// overflow-x: auto clips an absolutely positioned descendant only if the
+// box is positioned too. Every copy button carries an .sr-only label,
+// which is absolute, so in a wide table on a narrow screen the labels of
+// cells scrolled out of view widened the page itself. The browser test
+// measures the result; this names the line that prevents it.
+func TestScrollBoxesClipWhatIsPositionedInsideThem(t *testing.T) {
+	page := string(mustRead(t, "index.html"))
+	if !regexp.MustCompile(`\.sr-only\s*\{[^}]*position:\s*absolute`).MatchString(page) {
+		t.Fatal(".sr-only is no longer absolutely positioned: this test's premise is gone, so revisit it")
+	}
+	rule := regexp.MustCompile(`(?m)^\s*\.tablewrap\s*\{([^}]*)\}`).FindStringSubmatch(page)
+	if rule == nil {
+		t.Fatal("the .tablewrap rule was not found")
+	}
+	if !strings.Contains(rule[1], "overflow-x: auto") {
+		t.Error(".tablewrap no longer scrolls sideways")
+	}
+	if !regexp.MustCompile(`position:\s*relative`).MatchString(rule[1]) {
+		t.Error(".tablewrap is not positioned, so it does not clip the absolutely positioned .sr-only labels inside " +
+			"its cells: a wide table makes the whole page scroll sideways on a phone")
+	}
+}

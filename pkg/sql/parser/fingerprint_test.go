@@ -159,3 +159,46 @@ func TestFingerprintNonDML(t *testing.T) {
 		t.Errorf("COMMIT produced no shape: %+v", c)
 	}
 }
+
+// TestFingerprintKindsReadAsSQL (issue #275): a statement that is named
+// by kind rather than rendered in full is named in the SQL words that
+// open it. The kind used to be the Go type's name upper-cased whole, so
+// the console listed "CREATETABLE bench_kv" and "ROLLBACKTOSAVEPOINT".
+func TestFingerprintKindsReadAsSQL(t *testing.T) {
+	for _, c := range []struct{ sql, want string }{
+		{`CREATE TABLE IF NOT EXISTS t1 (id INT8 PRIMARY KEY)`, "CREATE TABLE t1"},
+		{`DROP TABLE t1`, "DROP TABLE t1"},
+		{`ALTER TABLE t1 ADD COLUMN v TEXT`, "ALTER TABLE t1"},
+		// The subject of CREATE INDEX is the table: "CREATE INDEX t1"
+		// would read as an index named t1.
+		{`CREATE INDEX IF NOT EXISTS t1_v ON t1 (v)`, "CREATE INDEX ON t1"},
+		{`DROP INDEX t1_v`, "DROP INDEX t1_v"},
+		{`TRUNCATE t1`, "TRUNCATE t1"},
+		{`BEGIN`, "BEGIN"},
+		{`COMMIT`, "COMMIT"},
+		{`ROLLBACK`, "ROLLBACK"},
+		{`SAVEPOINT s`, "SAVEPOINT"},
+		{`RELEASE SAVEPOINT s`, "RELEASE SAVEPOINT"},
+		{`ROLLBACK TO SAVEPOINT s`, "ROLLBACK TO SAVEPOINT"},
+		{`GRANT SELECT ON t1 TO alice`, "GRANT"},
+		{`REVOKE SELECT ON t1 FROM alice`, "REVOKE"},
+		{`SET statement_timeout = '5s'`, "SET"},
+		{`SHOW TABLES`, "SHOW TABLES"},
+		{`ANALYZE t1`, "ANALYZE"},
+	} {
+		got := shapeOf(t, c.sql).Text
+		if got != c.want {
+			t.Errorf("%s\n    shape %q, want %q", c.sql, got, c.want)
+		}
+	}
+	// Whatever the kind, it is words: no shape opens with two SQL words
+	// run together. A new statement type whose name is not its keywords
+	// shows up here as soon as it is added to the list above.
+	for _, sql := range []string{`CREATE VIEW v AS SELECT 1`, `DROP VIEW v`, `CREATE SEQUENCE s`, `CREATE ROLE r`, `DROP ROLE r`, `SHOW DATABASES`} {
+		got := shapeOf(t, sql).Text
+		first := strings.Fields(sql)[0] + " " + strings.Fields(sql)[1]
+		if !strings.HasPrefix(got, first) {
+			t.Errorf("%s\n    shape %q does not open with %q", sql, got, first)
+		}
+	}
+}

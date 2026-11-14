@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Statement fingerprints (issue #157).
@@ -126,7 +127,7 @@ func (f *fingerprinter) stmt(s Statement) {
 		// Everything else is named by kind and subject. These are not
 		// shapes anyone optimises, and rendering each of them in full
 		// would be a second copy of the grammar.
-		f.kw(strings.ToUpper(statementKindOf(s)))
+		f.kw(statementKindOf(s))
 		if name := statementSubject(s); name != "" {
 			f.table(name)
 			f.kw(name)
@@ -606,12 +607,38 @@ func statementSubject(s Statement) string {
 }
 
 // statementKindOf names a statement for the fingerprint of kinds that
-// are not rendered in full: the concrete type's name, which is already
-// the SQL keyword in this parser ("CreateTable", "Commit").
+// are not rendered in full, as the SQL words that open it.
+//
+// The concrete type's name is those words run together ("CreateTable",
+// "ReleaseSavepoint"), so it is split at each capital. Upper-casing the
+// name whole gave "CREATETABLE" and "ROLLBACKTOSAVEPOINT" in the
+// console's statement list (issue #275). The few types whose name is
+// not their keywords are named outright.
 func statementKindOf(s Statement) string {
+	switch t := s.(type) {
+	case *GrantRevoke:
+		if t.Revoke {
+			return "REVOKE"
+		}
+		return "GRANT"
+	case *SetVar:
+		return "SET"
+	case *CopyFrom:
+		return "COPY"
+	case *CreateIndex:
+		// Its subject is the table the index is on, not the index.
+		return "CREATE INDEX ON"
+	}
 	name := fmt.Sprintf("%T", s)
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		name = name[i+1:]
 	}
-	return name
+	var b strings.Builder
+	for i, r := range name {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			b.WriteByte(' ')
+		}
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return b.String()
 }

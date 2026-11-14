@@ -595,6 +595,17 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- **The console is tested in a browser** (#276). Its tests read the
+  JavaScript as text, which is how two of the faults above shipped: a
+  test checked that a moment was rendered by the right function and
+  never what the function was handed. `TestConsoleRendersEveryRouteOpenedCold`
+  starts a cluster and opens every view in headless Chrome, a new tab
+  per view, at a desktop and a phone width, then reads the page: the
+  header, the banner, the scope picker, every "when", script errors,
+  and the widest thing on the page. It drives Chrome over the DevTools
+  pipe with the standard library, so it adds no dependency. It skips
+  where there is no Chrome (`DATAX_CHROME` names one), and CI sets
+  `DATAX_REQUIRE_BROWSER` so that a runner without one fails instead.
 - **The ranges table shows two hundred rows at a time** (#227, raised
   on #226). Every range row carries a copy control, which is a tab stop
   (#205, #149), and the table rendered every range the filter left: on
@@ -659,6 +670,47 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **The console's "when" columns tell the time again** (#272). Every
+  event, slow statement and retried shape read `29910444m ago` — the
+  current Unix time, in minutes — on the overview, the operations
+  timeline, a node's page and the SQL view, and had since the viewer
+  preferences landed (#204). The formatter takes an instant; nine call
+  sites handed it `Date.now()` minus an instant, an age, and it
+  subtracted that from now a second time. In clock-time mode the same
+  cells showed a date in January 1970. The call sites pass the instant.
+  An age is also said in the unit a person would use: it stopped at
+  minutes, so a day-old event read `1440m ago`; it now reads `59m ago`,
+  `1h 25m ago`, `17h ago`, `3d ago`.
+- **A console page opened directly loads its header** (#273). The
+  header — which node served the page, who is signed in, the nodes the
+  scope picker offers — and the insecure-mode banner are filled from
+  the cluster document, and the node, schema, table and metrics views
+  never fetched it. Reached by a click from another view they looked
+  right, because the header was already filled; opened from a bookmark,
+  a shared link or a reload they sat on `connecting…` for as long as
+  the tab stayed open, and a cluster that authenticates nobody did not
+  say so. Those views now fetch the document on arrival and every 30 s
+  after.
+- **The console does not scroll sideways on a phone** (#274). The SQL,
+  data and node views were up to twice the width of a 390 px screen.
+  The tables scroll inside their own box, but each copy button carries
+  a screen-reader label that is absolutely positioned, and a scroll box
+  clips such an element only if the box is positioned itself; the
+  labels of cells scrolled out of view widened the page instead. The
+  box is positioned now. Running text also breaks a word longer than
+  the line, which a table with a fifty-character name needed on its own
+  page.
+- **Schema and transaction statements are named in SQL** (#275). The
+  statement list showed `CREATETABLE bench_kv`, `CREATEINDEX bench_ij`
+  and `ROLLBACKTOSAVEPOINT`: a statement that is named by kind rather
+  than rendered in full took the parser's type name, upper-cased whole.
+  It is now the words that open the statement — `CREATE TABLE
+  bench_kv`, `CREATE INDEX ON bench_ij`, `ROLLBACK TO SAVEPOINT`,
+  `GRANT` or `REVOKE`, `SET`, `COPY`. The fingerprint is a hash of that
+  text, so these shapes get new fingerprints: their counts start again,
+  the old rows age out of `datax_metrics_shapes` with its retention,
+  and during a rolling upgrade a schema statement can be listed under
+  both names. Queries and writes are untouched.
 - **A read caught by a leadership change is answered NotLeader instead
   of timing out** (#269). A consistent read confirms leadership with a
   quorum round before it evaluates. A leader that stepped down with
