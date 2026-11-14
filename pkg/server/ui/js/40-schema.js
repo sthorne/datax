@@ -41,8 +41,13 @@ function renderSchema(d) {
     const grants = Object.entries(t.privileges || {}).map(([u, p]) => `${esc(u)}: ${p.map(esc).join(",").toLowerCase()}`).join("<br>") || `<span class="muted">admins only</span>`;
     const key = (t.database || "") + "." + t.name;
     const to = tableKey(t);
+    // The name is a real link to the table's route (issue #286), so a
+    // modified or middle click opens it in a new tab and its address
+    // can be copied; the row was a link in role only. It is out of the
+    // tab order: the row is the one stop, and a second on the same
+    // destination would double the keys a reader presses down the list.
     return { key, html: `<tr data-key="${esc(key)}" class="clickable" data-table="${esc(to)}" tabindex="0" role="link" title="Enter or click: this table in full">
-      <td data-label="table"><b class="opens">${esc(to)}</b>${ts}</td>
+      <td data-label="table"><a class="opens" href="${esc(routeTo("schema/" + encodeURIComponent(to)))}" tabindex="-1">${esc(to)}</a>${ts}</td>
       <td data-label="columns" title="${esc(colList)}">${cols.length}</td>
       <td class="key" data-label="primary key" title="${hiddenNames.size ? "led by the hidden shard column" : ""}">${pk.map(esc).join(", ")}</td>
       <td data-label="indexes">${idx || "—"}</td>

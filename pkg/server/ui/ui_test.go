@@ -662,6 +662,13 @@ func TestTableDetailIsReachable(t *testing.T) {
 		}
 	}
 
+	// Issue #286: the name is a real link, so a new tab and "copy link
+	// address" work on it, and it stays out of the tab order so the row
+	// is the one stop.
+	if !strings.Contains(row, `<a class="opens" href="${esc(routeTo("schema/"`) || !strings.Contains(row, `tabindex="-1"`) {
+		t.Error("a schema row's name is not an anchor to the table's route with tabindex -1: a modified click has nothing to open, or the row has two tab stops")
+	}
+
 	detail, err := FS.ReadFile("js/45-table.js")
 	if err != nil {
 		t.Fatal(err)
@@ -669,6 +676,9 @@ func TestTableDetailIsReachable(t *testing.T) {
 	wire := funcBody(string(detail), "function wireTableDetail()")
 	if wire == "" {
 		t.Fatal("js/45-table.js has no wireTableDetail")
+	}
+	if !strings.Contains(wire, "modifiedClick(ev)") {
+		t.Error("wireTableDetail's click does not stand down for a modified click: a ctrl-click on a row opens the table in this tab as well as the new one")
 	}
 	for _, want := range []string{`addEventListener("click"`, `addEventListener("keydown"`} {
 		if !strings.Contains(wire, want) {

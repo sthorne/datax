@@ -305,6 +305,65 @@ function niceTicks(lo, hi, unit) {
   return ticks;
 }
 
+// timeTicks picks the time axis's labels the way niceTicks picks the
+// value axis's (issue #289): a round step for the window, and a tick at
+// each multiple of it. The axis used to label its two ends and the
+// three quarter-points between — 13:15:00, 13:15:29, 13:15:58, 13:16:28
+// — which are moments of no significance that change with every poll.
+//
+// The step is the smallest of TIME_STEPS that leaves at most seven
+// ticks, which leaves at least three: the step before it gave eight or
+// more, and no step is more than two and a half times the one before.
+// (Across that widest jump, 2 to 5, eight ticks of two span fourteen
+// from an even second, and every such stretch holds three fives.) Only
+// a window of a second or two, shorter than any step, has fewer.
+//
+// "Multiple" is on the reader's clock, the one every time in the
+// console is written in: a six-hour step lands on 00:00, 06:00, 12:00
+// where the reader is, not in UTC. The offset is taken at each tick, so
+// a window across a daylight-saving change keeps its ticks on the hour.
+// zoneOffset is a parameter so the rule can be checked for a zone other
+// than the one the browser is in.
+const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 2 * 86400, 4 * 86400, 8 * 86400, 16 * 86400].map(s => s * 1000);
+function localOffsetMs(t) { return -new Date(t).getTimezoneOffset() * 60000; }
+function timeTicks(from, to, zoneOffset) {
+  const off = zoneOffset || localOffsetMs;
+  const at = step => {
+    const ticks = [];
+    // Walk the multiples on a clock that has no offset, then say when
+    // each of them is here.
+    for (let w = Math.ceil((from + off(from)) / step) * step; ticks.length < 64; w += step) {
+      const t = w - off(w - off(from));
+      if (t < from) continue;
+      if (t > to) break;
+      // The hour a clock skips forward over is no moment at all, and
+      // comes out as the tick before it.
+      if (ticks.length && t <= ticks[ticks.length - 1]) continue;
+      ticks.push(t);
+    }
+    return ticks;
+  };
+  if (!(to > from)) return { step: TIME_STEPS[0], ticks: [] };
+  for (const step of TIME_STEPS) {
+    const ticks = at(step);
+    if (ticks.length <= 7) return { step, ticks };
+  }
+  // Longer than the console keeps anything: the coarsest step, thinned.
+  const last = TIME_STEPS[TIME_STEPS.length - 1], all = at(last), every = Math.ceil(all.length / 7);
+  return { step: last * every, ticks: all.filter((_, i) => i % every === 0) };
+}
+// fmtTimeTick writes a tick at the precision its step has: seconds only
+// when the step is under a minute, the date alone when it is whole
+// days, and the date beside the time when the window is long enough
+// that 06:00 could be any of several.
+function fmtTimeTick(t, step, span) {
+  const d = new Date(t), p = n => String(n).padStart(2, "0");
+  const day = `${d.getMonth() + 1}/${d.getDate()}`, clock = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  if (step >= 86400000) return day;
+  if (step < 60000) return `${clock}:${p(d.getSeconds())}`;
+  return span > 36 * 3600 * 1000 ? `${day} ${clock}` : clock;
+}
+
 // chartWindow is the window the charts of one document are drawn over.
 // It is the document's own unless the data begins more than halfway
 // through it — a cluster ten minutes old under a one-hour range — where
@@ -370,16 +429,21 @@ function chart(s, nodes, suffix, win, opts) {
   for (const v of yticks) {
     svg += `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtTick(v, unit, ystep, ytop))}</text>`;
   }
-  const long = to - from > 36 * 3600 * 1000;
-  // Under ten minutes the five labels would be the same minute three
-  // times over, so they carry seconds (a young cluster's window, or one
-  // brushed down to an incident).
-  const fine = to - from < 10 * 60 * 1000;
-  const clock = t => { const d = new Date(t), p = n => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
-  for (let i = 0; i <= 4; i++) {
-    const t = from + (to - from) * i / 4;
-    svg += `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(fine ? clock(t) : fmtTime(t, long))}</text>`;
+  // Time ticks at round moments, each with a small mark under the plot
+  // so the label has something to stand under. A label is centred on
+  // its tick unless that would run it past an end of the plot; there it
+  // is set against the tick instead. The width is an estimate that errs
+  // wide: the text has not been measured, and cannot be before it is
+  // drawn.
+  const tt = timeTicks(from, to);
+  let xl = "";
+  for (const t of tt.ticks) {
+    const text = fmtTimeTick(t, tt.step, to - from), half = text.length * 3.6, xx = x(t);
+    const anchor = xx - half < L ? "start" : xx + half > W - R ? "end" : "middle";
+    svg += `<line class="tick" x1="${xx.toFixed(1)}" x2="${xx.toFixed(1)}" y1="${T + PH}" y2="${T + PH + 4}"/>`;
+    xl += `<text class="xtick" data-t="${t}" x="${(anchor === "start" ? Math.max(xx, L) : anchor === "end" ? Math.min(xx, W - R) : xx).toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${esc(text)}</text>`;
   }
+  svg += xl;
   svg += `</g>`;
   // Annotations go in before the data: a mark explains a line, so it
   // must never be drawn over one.

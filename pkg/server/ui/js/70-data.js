@@ -75,7 +75,7 @@ function renderClusterRanges(ranges) {
   const shown = rangesShowAll ? all : all.slice(0, RANGE_TABLE_CAP);
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
-      <td><span${admin ? ' class="opens"' : ""}>r${r.range_id}</span></td>
+      <td>${admin ? `<a class="opens" href="${esc(rangeRoute(r.range_id))}" tabindex="-1">r${r.range_id}</a>` : `<span>r${r.range_id}</span>`}</td>
       <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + rangeKeyLabel(r), r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
       <td>${r.load.leader ? "n" + r.load.leader : "—"}</td>
@@ -127,7 +127,18 @@ function renderClusterRanges(ranges) {
 {
   const tbody = document.getElementById("cluster-ranges");
   const rangeOf = ev => { const tr = ev.target.closest("tr.clickable"); return tr && tbody.contains(tr) ? Number(tr.dataset.range) : null; };
-  tbody.addEventListener("click", ev => { const id = rangeOf(ev); if (id !== null && !ev.target.closest("tr.detailrow")) toggleRangeDetail(id); });
+  // A range's id is a link to the range's own route (issue #286), for a
+  // new tab and for its address. A plain click on it still opens the
+  // detail in place, as anywhere else on the row: following the link in
+  // this tab could open a range but never close one, and would leave a
+  // history entry for each. A modified click is the browser's.
+  tbody.addEventListener("click", ev => {
+    if (modifiedClick(ev)) return;
+    const id = rangeOf(ev);
+    if (id === null || ev.target.closest("tr.detailrow")) return;
+    if (ev.target.closest("a.opens")) ev.preventDefault();
+    toggleRangeDetail(id);
+  });
   tbody.addEventListener("keydown", ev => { if (ev.key !== "Enter" && ev.key !== " ") return; const id = rangeOf(ev); if (id !== null) { ev.preventDefault(); toggleRangeDetail(id); } });
 }
 function detailRowFor(id) {

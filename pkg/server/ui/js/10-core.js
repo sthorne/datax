@@ -135,6 +135,59 @@ function paintSortHeaders(table) {
       : c.dir === sortFirst(th) ? `sorted ${word} — press to reverse`
       : `sorted ${word} — press for the table's own order`;
   }
+  paintCardSort(table);
+}
+// ---- The sort control of the card layout (issue #289) ----
+// Under 640px the nodes, failure domains and schema tables are one card
+// per row and their header is not drawn, so the buttons above are not
+// there to press. Those tables get a "sort by" list of the same columns
+// and a button for the direction, above the cards and shown only at
+// that width. It is a second view of sortChoice, not a second state:
+// what is chosen here is what the header shows when the window widens,
+// and a poll keeps it for the same reason it keeps the header's.
+function cardSortOf(table) {
+  const box = table.closest(".tablewrap")?.previousElementSibling;
+  return box && box.classList.contains("cardsort") ? box : null;
+}
+function paintCardSort(table) {
+  const box = cardSortOf(table);
+  if (!box) return;
+  const c = sortChoice[table.dataset.sorts];
+  const sel = box.querySelector("select"), b = box.querySelector("button");
+  sel.value = c ? c.col : "";
+  // With no column chosen there is no direction to reverse.
+  b.disabled = !c;
+  b.textContent = !c ? "—" : c.dir === 1 ? "↑ ascending" : "↓ descending";
+  b.setAttribute("aria-label", !c ? "direction: the table's own order" : `sorted ${c.dir === 1 ? "ascending" : "descending"} — press to reverse`);
+}
+function wireCardSort(table) {
+  const wrap = table.closest(".tablewrap");
+  if (!wrap || !table.classList.contains("cards")) return;
+  const name = table.dataset.sorts, heads = [...table.querySelectorAll("thead th[data-sort]")];
+  const box = document.createElement("div");
+  box.className = "cardsort";
+  const label = document.createElement("label"), sel = document.createElement("select"), b = document.createElement("button");
+  label.textContent = "sort by ";
+  sel.setAttribute("aria-label", "sort the " + name + " by");
+  sel.add(new Option("the table's own order", ""));
+  for (const th of heads) sel.add(new Option(th.getAttribute("aria-label"), th.dataset.sort));
+  b.type = "button";
+  label.appendChild(sel); box.append(label, b);
+  wrap.before(box);
+  sel.addEventListener("change", () => {
+    const th = heads.find(h => h.dataset.sort === sel.value);
+    // A column starts the way its header's first press sorts it.
+    if (th) sortChoice[name] = { col: sel.value, dir: sortFirst(th) }; else delete sortChoice[name];
+    paintSortHeaders(table);
+    rerenderCurrentView();
+  });
+  b.addEventListener("click", () => {
+    const cur = sortChoice[name];
+    if (!cur) return;
+    cur.dir = -cur.dir;
+    paintSortHeaders(table);
+    rerenderCurrentView();
+  });
 }
 function wireSortHeaders() {
   for (const table of document.querySelectorAll("table[data-sorts]")) {
@@ -161,6 +214,7 @@ function wireSortHeaders() {
         rerenderCurrentView();
       });
     }
+    wireCardSort(table);
     paintSortHeaders(table);
   }
 }

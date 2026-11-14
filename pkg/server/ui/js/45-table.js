@@ -333,7 +333,11 @@ function wireTableDetail() {
   const tbody = document.getElementById("schema");
   const nameOf = ev => { const tr = ev.target.closest("tr[data-table]"); return tr && tbody.contains(tr) ? tr.dataset.table : null; };
   tbody.addEventListener("click", ev => {
-    if (ev.target.closest("a, button")) return;
+    // The row stands down for a click on the name, which is a link and
+    // goes there itself, and for one the browser reads as "elsewhere"
+    // (issue #286): a new tab opened from the name must not also move
+    // this one.
+    if (ev.target.closest("a, button") || modifiedClick(ev)) return;
     const name = nameOf(ev);
     if (name) go("schema/" + encodeURIComponent(name));
   });

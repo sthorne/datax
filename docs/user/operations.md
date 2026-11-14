@@ -65,7 +65,14 @@ serves, on that address:
   domains and schema tables it sorts from a column's header: the small
   arrow beside the header's words sorts by that column, again reverses
   it, and a third time returns the table's own order; a row with no
-  figure in that column stays last either way. All of it is computed from the range descriptors
+  figure in that column stays last either way. On a narrow screen the
+  nodes, failure domains and schema tables are drawn one card per row
+  with no header, so a **sort by** list above the cards offers the same
+  columns, with a button beside it that reverses the direction; it is
+  the same choice as the header's, and carries when the window widens.
+  A range's id there, like a table's name in the schema list, is a real
+  link: the row still opens on a click or Enter, and a ctrl-, cmd- or
+  middle-click on the name opens it in a new tab. All of it is computed from the range descriptors
   and the nodes' declared localities that the page already fetches, so
   it costs no fan-out and answers from a partitioned node. **sql**: connections by state with
   the oldest idle transaction, statements per second by kind, `40001`
@@ -143,7 +150,10 @@ serves, on that address:
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from
-  that table. The charts can mark the events that explain a change in
+  that table. Both axes are labelled at round values: the time axis at
+  multiples of a round step for the window (every 15 seconds, every 10
+  minutes, every 6 hours, each midnight) on the reader's own clock,
+  three to seven of them. The charts can mark the events that explain a change in
   shape: a dashed line at each event in the window, the structural kinds
   (splits, merges, rebalances, lease transfers, repairs, restarts,
   upgrades) by default and any other kind on request. The marks come

@@ -381,6 +381,67 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		check(data, "a range's id in the ranges table (#279)",
 			`getComputedStyle(document.querySelector('#cluster-ranges tr.clickable .opens')).textDecorationLine`, "underline")
 
+		// #286: the name is a real link to the row's destination, so a
+		// new tab and "copy link address" work on it. The row is still
+		// the one tab stop, a modified click is left to the browser, and
+		// a plain click on the row opens the table as it did.
+		check(schema, "a table's name is a link to its route, out of the tab order (#286)", `(() => {
+  const rows = [...document.querySelectorAll('#schema tr[data-table]')];
+  return String(rows.length > 0 && rows.every(tr => {
+    const a = tr.querySelector('.opens'), stops = [tr, ...tr.querySelectorAll('a, button, input, select, [tabindex]')].filter(el => el.tabIndex >= 0);
+    return a.tagName === "A" && a.getAttribute("href") === routeTo("schema/" + encodeURIComponent(tr.dataset.table)) && a.getAttribute("tabindex") === "-1"
+      && a.textContent === tr.dataset.table && stops.length === 1 && stops[0] === tr;
+  }));
+})()`, "true")
+		// The click is dispatched with ctrlKey and watched from the
+		// window, after the row's handler has had it: the row must not
+		// have gone anywhere, nor have cancelled the browser's own
+		// handling. The watcher then cancels it, so the test does not
+		// open a tab of its own.
+		modified := func(target string) string {
+			return `(() => {
+  const el = document.querySelector('#schema tr[data-table="` + consoleLongTable + `"] ` + target + `'), before = location.hash;
+  let cancelled = null;
+  const watch = ev => { cancelled = ev.defaultPrevented; ev.preventDefault(); };
+  window.addEventListener("click", watch);
+  el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+  window.removeEventListener("click", watch);
+  return [location.hash === before, cancelled].join(",");
+})()`
+		}
+		check(schema, "a ctrl-click on a table's name is the browser's (#286)", modified("a.opens"), "true,false")
+		check(schema, "a ctrl-click elsewhere on the row does not move this tab (#286)", modified("td:nth-child(2)"), "true,false")
+		check(schema, "a plain click on the row opens the table (#286)", `(() => {
+  const tr = document.querySelector('#schema tr[data-table="`+consoleLongTable+`"]');
+  tr.querySelector("td:nth-child(2)").click();
+  return String(location.hash === tr.querySelector("a.opens").getAttribute("href")) + " " + location.hash;
+})()`, "true #/schema/"+consoleLongTable)
+		wait(schema, "the table's page after the click", `ui.table === '`+consoleLongTable+`' && !document.getElementById('sec-table').hidden`)
+		// A range has a route too, and its id is the link to it. A plain
+		// click on the id still opens the detail in place — following
+		// the link could open a range and never close one — and a
+		// modified one is left alone. Whichever range is first will do.
+		check(data, "a range's id is a link to the range's route (#286)", `(() => {
+  const rows = [...document.querySelectorAll('#cluster-ranges tr[data-range]')];
+  return String(rows.length > 0 && rows.every(tr => { const a = tr.querySelector('.opens'); return a.tagName === "A" && a.getAttribute("href") === rangeRoute(Number(tr.dataset.range)) && a.getAttribute("tabindex") === "-1" && tr.tabIndex === 0; }));
+})()`, "true")
+		check(data, "a ctrl-click on a range's id is the browser's, a plain one opens it in place (#286)", `(() => {
+  const tr = document.querySelector('#cluster-ranges tr[data-range]'), a = tr.querySelector('a.opens'), id = tr.dataset.range, before = location.hash;
+  const open = () => String(document.querySelector('#cluster-ranges tr[data-range="' + id + '"]').getAttribute("aria-expanded"));
+  const out = [];
+  let cancelled = null;
+  const watch = ev => { cancelled = ev.defaultPrevented; ev.preventDefault(); };
+  window.addEventListener("click", watch);
+  a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+  out.push(open(), location.hash === before, cancelled);
+  a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  out.push(open(), location.hash === rangeRoute(Number(id)), cancelled);
+  window.removeEventListener("click", watch);
+  toggleRangeDetail(Number(id));
+  out.push(open(), location.hash === before);
+  return out.join(",");
+})()`, "false,true,false,true,true,true,false,true")
+
 		// #278: the admin badge is a badge beside a role's name too.
 		sec := br.open(t, base+"security", 1440, 900, false)
 		defer sec.close()
@@ -609,9 +670,115 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
   return [late.win.from_ms, late.since, early.win.from_ms, early.since].join(",");
 })()`, "2980000,3000000,0,0")
 
+		// #289: on a phone the nodes table is cards with no header, so a
+		// "sort by" list and a direction button stand in for it. They
+		// read and write the header's own state: the choice is the one
+		// the header shows when the window widens, and a poll keeps it.
+		cards := br.open(t, base+"nodes", 390, 844, true)
+		defer cards.close()
+		wait(cards, "the node cards and their sort control", `document.querySelectorAll('#nodes-table tr[data-key^="n"]').length === 3 && !!document.querySelector('#view-nodes .cardsort select')`)
+		check(cards, "the sort control stands where the header is not drawn (#289)", `(() => {
+  const t = document.querySelector('table[data-sorts="nodes"]'), box = t.closest(".tablewrap").previousElementSibling, sel = box.querySelector("select");
+  return [getComputedStyle(t.tHead).display, getComputedStyle(box).display, sel.getAttribute("aria-label"), box.querySelector("button").getAttribute("aria-label"),
+    [...sel.options].map(o => o.value).join(",") === [""].concat([...t.querySelectorAll("thead th[data-sort]")].map(th => th.dataset.sort)).join(","), sel.options[0].text].join(" | ");
+})()`, "none | flex | sort the nodes by | direction: the table's own order | true | the table's own order")
+		check(cards, "the ranges table keeps its header and has no second control (#289)",
+			`String(document.querySelectorAll('.cardsort').length) + " " + String(!!document.querySelector('table[data-sorts="ranges"]').closest(".tablewrap").previousElementSibling?.classList.contains("cardsort"))`, "3 false")
+		cardIDs := `[...document.querySelectorAll('#nodes-table tr')].map(r => r.dataset.key).join(",")`
+		// By node, because the three ids are the one column whose order
+		// is known here: a name sorts A-first, which is also the table's
+		// own order, so it is the reverse that shows the cards moved. A
+		// figure starts largest-first, as its header's first press does.
+		check(cards, "choosing a column sorts the cards, the button reverses them, the table's own order restores it (#289)", `(() => {
+  const box = document.querySelector('#view-nodes .cardsort'), sel = box.querySelector("select"), b = box.querySelector("button");
+  const pick = v => { sel.value = v; sel.dispatchEvent(new Event("change", { bubbles: true })); };
+  const now = () => `+cardIDs+` + " " + (b.disabled ? "-" : b.getAttribute("aria-label"));
+  const out = [now()];
+  pick("node"); out.push(now());
+  b.click(); out.push(now());
+  pick(""); out.push(now());
+  pick("leases"); out.push(sortChoice.nodes.dir);
+  pick("node"); b.click(); out.push(now());
+  return out.join(" | ");
+})()`, "n1,n2,n3 - | n1,n2,n3 sorted ascending — press to reverse | n3,n2,n1 sorted descending — press to reverse | n1,n2,n3 - | -1 | n3,n2,n1 sorted descending — press to reverse")
+		cards.eval(t, `(window.__doc = lastCluster, "ok")`)
+		wait(cards, "a poll of the cluster", `lastCluster !== window.__doc`)
+		check(cards, "a poll keeps the cards' order (#289)", cardIDs, "n3,n2,n1")
+		cards.resize(1440, 900, false)
+		wait(cards, "the header, with the window widened", `getComputedStyle(document.querySelector('table[data-sorts="nodes"]').tHead).display !== "none"`)
+		check(cards, "the header shows the choice made on the cards (#289)", `(() => {
+  const t = document.querySelector('table[data-sorts="nodes"]'), th = t.querySelector('th[data-sort="node"]'), box = document.querySelector('#view-nodes .cardsort');
+  const out = [th.getAttribute("aria-sort"), getComputedStyle(box).display, `+cardIDs+`];
+  th.querySelector("button.sort").click();
+  out.push(th.getAttribute("aria-sort"), box.querySelector("select").value === "" && box.querySelector("button").disabled, `+cardIDs+`);
+  return out.join(" | ");
+})()`, "descending | none | n3,n2,n1 | none | true | n1,n2,n3")
+
+		// #289: a heading that holds controls is underlined under its
+		// words and not under the gaps between the controls. The heading
+		// is still the term — marked, and what a click on the words
+		// reaches — and a heading with no controls is as it was. ("copy
+		// as CSV" is a term of its own, so it carries its own underline;
+		// the filter box is not, and has none.)
+		check(cards, "the nodes heading underlines its words only (#289)", `(() => {
+  const h = document.getElementById("node-filter").closest("h2"), words = h.querySelector(".helpwords"), plain = document.querySelector("#sec-network h2") || [...document.querySelectorAll("#view-nodes h2")].find(x => !x.querySelector("input, button, select"));
+  const line = el => getComputedStyle(el).textDecorationLine;
+  const bare = [...h.childNodes].filter(n => n.nodeType === 3).every(n => !n.nodeValue.trim());
+  return [h.classList.contains("helpable"), line(h), line(words), words.textContent, bare, line(h.querySelector("input")), [...h.querySelectorAll("button")].every(b => line(b) === "none" || b.classList.contains("helpable")),
+    plain.classList.contains("helpable"), line(plain), !!plain.querySelector(".helpwords")].join(" | ");
+})()`, "true | none | underline | Nodes | true | none | true | true | underline | false")
+		check(cards, "the heading's words open its explanation, its controls do not (#289)", `(() => {
+  const h = document.getElementById("node-filter").closest("h2"), pop = () => { const p = document.getElementById("help-pop"); return !!p && !p.hidden; };
+  const out = [pop()];
+  h.querySelector(".helpwords").click(); out.push(pop());
+  h.querySelector(".helpwords").click(); out.push(pop());
+  h.querySelector("input").click(); out.push(pop());
+  return out.join(",");
+})()`, "false,true,false,false")
+
+		// #289: the time axis is ticked at round moments, as the value
+		// axis is at round values. For each window, slid to four ends so
+		// that no one alignment is what passes: three to seven ticks,
+		// inside the window, in order, each a multiple of the step on the
+		// clock the reader sees.
+		check(data, "timeTicks (#289)", `(() => {
+  const bad = [];
+  for (const span of [90e3, 480e3, 3600e3, 6 * 3600e3, 3 * 86400e3]) for (const shift of [0, 1234, 61000, 3 * 3600e3 + 777]) {
+    const to = Date.now() - shift, from = to - span, r = timeTicks(from, to);
+    const ok = r.ticks.length >= 3 && r.ticks.length <= 7 && TIME_STEPS.includes(r.step)
+      && r.ticks.every((t, i) => t >= from && t <= to && (i === 0 || t > r.ticks[i - 1]) && (t + localOffsetMs(t)) % r.step === 0);
+    if (!ok) bad.push(span + "/" + shift + ": step " + r.step + ", " + r.ticks.length + " ticks");
+  }
+  return bad.join("; ") || "ok";
+})()`, "ok")
+		// The same with the clock named, so the answer does not depend on
+		// where the test runs: the steps chosen, and that a zone a
+		// quarter-hour off UTC has its ticks on its own hours.
+		check(data, "timeTicks on a named clock (#289)", `(() => {
+  const to = 1794697103000, utc = () => 0, kathmandu = () => 5.75 * 3600e3;
+  const steps = [90e3, 480e3, 3600e3, 6 * 3600e3, 3 * 86400e3, 7 * 86400e3, 14500].map(span => { const r = timeTicks(to - span, to, utc); return r.step / 1000 + "x" + r.ticks.length; }).join(" ");
+  const k = timeTicks(to - 6 * 3600e3, to, kathmandu);
+  return steps + " | " + k.ticks.every(t => (t + 5.75 * 3600e3) % k.step === 0) + " " + (k.ticks[0] % 3600e3 !== 0);
+})()`, "15x6 120x4 600x6 3600x6 43200x6 86400x7 2x7 | true true")
+		check(data, "a time tick is written at its step's precision (#289)", `(() => {
+  const t = new Date(2026, 10, 14, 6, 5, 30).getTime();
+  return [fmtTimeTick(t, 15000, 90e3), fmtTimeTick(t, 600e3, 3600e3), fmtTimeTick(t, 43200e3, 3 * 86400e3), fmtTimeTick(t, 86400e3, 7 * 86400e3)].join(" | ");
+})()`, "06:05:30 | 06:05 | 11/14 06:05 | 11/14")
+
 		metrics := br.open(t, base+"metrics", 1440, 900, false)
 		defer metrics.close()
 		wait(metrics, "the charts", `document.querySelectorAll('#charts .chart svg').length > 0`)
+		// On the page: every chart's time labels are evenly spaced
+		// multiples of one step, no two alike, and each is anchored so it
+		// runs into the plot and not out of it. Read from the attributes
+		// the chart wrote, not from measured text, which is the font's.
+		check(metrics, "a chart's time axis is ticked at round moments (#289)", `String([...document.querySelectorAll('#charts .chart svg')].every(svg => {
+  const ticks = [...svg.querySelectorAll('text.xtick')], ts = ticks.map(x => Number(x.dataset.t)), step = ts[1] - ts[0], labels = ticks.map(x => x.textContent);
+  const right = Number(svg.querySelector('rect.hit').getAttribute("x")) + Number(svg.querySelector('rect.hit').getAttribute("width")), left = Number(svg.querySelector('rect.hit').getAttribute("x"));
+  return ticks.length >= 2 && ticks.length <= 7 && TIME_STEPS.includes(step) && new Set(labels).size === labels.length
+    && ts.every((v, i) => (v + localOffsetMs(v)) % step === 0 && (i === 0 || v - ts[i - 1] === step))
+    && ticks.every(x => { const at = Number(x.getAttribute("x")), half = x.textContent.length * 3.6, a = x.getAttribute("text-anchor"); return at >= left && at <= right && (a === "start" || at - half >= left) && (a === "end" || at + half <= right); });
+}))`, "true")
 		check(metrics, "the event note is said once (#277)", `String(document.querySelectorAll('#charts .annnote').length <= 1 && document.querySelectorAll('#charts .chart .annnote').length === 0)`, "true")
 		check(metrics, "a chart is titled in words beside its metric's name (#277)",
 			`String([...document.querySelectorAll('#charts .chart')].every(c => c.querySelector('.title code.metric') && c.querySelector('.title b').textContent !== c.querySelector('.title code.metric').textContent))`, "true")
@@ -931,6 +1098,13 @@ func (c *chrome) open(t *testing.T, url string, width, height int, mobile bool) 
 	c.call(t, p.session, "Emulation.setDeviceMetricsOverride", map[string]any{"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
 	c.call(t, p.session, "Page.navigate", map[string]any{"url": url})
 	return p
+}
+
+// resize gives an open page another viewport, as a reader turning a
+// phone or dragging a window does: the page keeps its state, which is
+// the point of asking.
+func (p *browserPage) resize(width, height int, mobile bool) {
+	p.c.call(p.t, p.session, "Emulation.setDeviceMetricsOverride", map[string]any{"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
 }
 
 func (p *browserPage) close() {
