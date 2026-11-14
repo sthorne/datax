@@ -11,6 +11,56 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Sealed backups** (#291). `datax backup --backup-key <file>` seals every
+  file of a backup — the manifest included — with AES-256-GCM under a key
+  given at backup time (32 raw bytes or 64 hex characters), and
+  `datax restore --backup-key` reads it. Each backup has its own random data
+  key, wrapped under the backup key; each file is sealed in 64 KiB chunks
+  under a key derived from the data key and the file's name, with the name,
+  each chunk's position and the end of the file authenticated, so a changed
+  byte, a truncated file, swapped files or another backup's manifest are
+  refused before restore applies anything. A sealed backup is never read
+  without its key and a plaintext backup is refused when a key is given.
+  Chains may mix keys: restore takes one key for the chain or a
+  comma-separated list matching `--src` (an empty entry for a plaintext
+  backup); `--base-key` opens a base sealed under a different key. On an
+  encrypted store `--backup-key` satisfies the plaintext gate;
+  `--allow-plaintext` remains the explicit way to write an unsealed backup,
+  and the two together are refused. The key is sent in the admin request:
+  over mutual TLS, or on an insecure node only from the node's own machine;
+  it is never logged or audited. Summary checksums are over the plaintext
+  and match an unsealed backup of the same data. Still visible in a sealed
+  directory: table count, table ids, file sizes. Backup keys are key files
+  only (no `--enc-root`/KMS yet).
+- **A manual split sticks** (#265). A range boundary made on purpose —
+  `ALTER TABLE ... SPLIT AT`, `datax debug split` — was folded back by
+  housekeeping within seconds whenever the two halves were small, which
+  the halves of a pre-split always are. Such a boundary is now marked
+  on its range (a sticky bit on the descriptor, replicated like the rest
+  of it) and the merge queue leaves it alone. `SPLIT AT ... WITH
+  EXPIRATION <timestamp or interval>` holds it only until then;
+  `ALTER TABLE ... UNSPLIT AT VALUES (...)`, `UNSPLIT ALL` and `datax
+  debug unsplit` release it, after which the ranges merge when they are
+  small, and `DROP TABLE` and `TRUNCATE` release a table's boundaries
+  with it. Splitting at a boundary that exists marks it. Splits the
+  cluster makes for itself — by size, by load, and the pre-splits of
+  timeseries tables, re-shards, placement and restore — are not sticky
+  and merge back as before; `datax debug merge` merges a range whether
+  or not its neighbor is sticky. `datax debug ranges`, `/api/cluster`
+  and `/api/range` show the mark.
+  Cluster protocol version: v20. Until it is finalized a manual split
+  is an ordinary one and `UNSPLIT` and `WITH EXPIRATION` are refused;
+  boundaries made before finalize are marked by running the `SPLIT AT`
+  again.
+- **bench: errors during a measured run fail the run** (#267). `datax
+  bench run` runs every workload of the set, then exits non-zero if any
+  did not complete or counted more errors than `--max-errors` (default
+  0; `-1` disables; a workload's `"max_errors"` in the set takes
+  precedence), naming each failing workload with its error count and
+  most frequent error. The single-workload commands take the same flag.
+  Serialization retries (40001) are not errors. `bench/run.sh` runs both
+  targets before failing, and the nightly is red on that status; its
+  summary and artifact are produced on red nights too.
 - **A root key split among operators, and a sealed start** (#306, the
   second piece of #292). `datax debug enc-root split --shares 2/3`
   makes a root key, hands out three shares of which any two rebuild it
@@ -822,6 +872,28 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **`ALTER TABLE ... SPLIT AT` no longer fails because the range
+  changed first** (#290). A split is built from the range's descriptor
+  and applied a moment later; when another split or a merge landed in
+  between, the statement failed with "split against generation 0 but
+  range is at 1". The range's leader now looks at the range again and
+  carries on — splits it, finds the boundary already there, or sends
+  the request on to the range that holds the key now — for every caller
+  of a split, not only SQL. The refusal is a typed error
+  (`DescriptorChangedError`) instead of a message to match, a split
+  that meets a range frozen for a merge waits the merge out like any
+  other request, and the frozen mark now survives the trip between
+  nodes: it was missing from the binary error encoding, so a gateway on
+  another node than the range's leader re-resolved the range instead of
+  waiting. A split at a key that is already a range boundary is success
+  rather than an error.
+- **A re-encryption pass reports the bytes its seed's compaction
+  rewrote** (#287). Flushing a pass's seed can set off an automatic
+  compaction that retires the stale file before the pass's own
+  compaction runs; the pass then reported zero bytes, which the sweep
+  reads as "nothing left that a compaction can rewrite" and could stop
+  early. The pass now measures from before the seed is written. This
+  was the cause of the flaky `TestReencryptPass`.
 - **Clicking a term in the console explains it again.** A column
   header, a section heading, a tile's label and the header's controls
   each open the glossary's entry for the term when clicked, and carry it
