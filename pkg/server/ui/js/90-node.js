@@ -46,7 +46,9 @@ function renderNode(d) {
     tileHTML("sql", d.sql_address ? esc(d.sql_address) + copyBtn("this node's SQL address", d.sql_address) : "—") +
     tile("locality", d.locality || "—") +
     tile("version", (d.release ? "v" + d.release + " · " : "") + "protocol v" + (d.binary_version || 1) + (d.cluster_version ? " · cluster v" + d.cluster_version : "")) +
-    tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—") +
+    // Uptime is a machine figure and the machine tiles carry it; it is
+    // repeated here only for a node that reports no machine section.
+    (st.machine ? "" : tile("uptime", d.uptime_seconds ? fmtDuration(d.uptime_seconds) : "—")) +
     tile("replicas", (st.ranges || []).length + (st.leader_of !== undefined ? " · leads " + st.leader_of : "")));
   const lm = st.machine;
   // The forecast rides the cluster document, so this page shows it for
@@ -102,11 +104,7 @@ function renderNode(d) {
   renderKeyed(document.getElementById("node-settings"), Object.entries(d.settings || {}).sort().map(([k, v]) => ({ key: k, html: `<tr data-key="${esc(k)}"><td>${esc(k)}</td><td class="key">${esc(v)}</td></tr>` })));
   const evs = (d.events || []).slice().reverse();
   renderKeyed(document.getElementById("node-events"), evs.length
-    ? evs.map(e => ({ key: String(e.seq), html: `<tr data-key="${e.seq}">
-    <td class="when" title="${esc(e.at)}">${fmtWhen(Date.parse(e.at))}</td>
-    <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
-    <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
-  </tr>` }))
+    ? foldRows(foldEvents(evs))
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">nothing recorded yet</td></tr>` }]);
 }
 // encryptionTileText: the store's encryption in one phrase — plaintext,

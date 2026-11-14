@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/util/events"
 )
 
 // keyViewer is one request's answer to which tables the caller may see
@@ -167,6 +169,60 @@ func (n *Node) viewKey(v keyViewer, k keys.Key) (string, bool) {
 		return keys.PrettyPrefix(k), true
 	}
 	return n.prettyKey(k), false
+}
+
+// viewEvents serves evs to the caller. Who is served which form of a
+// keyed event is events.Redact's decision and is unchanged: a reader
+// who may not read every table an event's keys belong to gets the
+// summary with each key at its prefix (issue #213).
+//
+// What changes is how the full form is printed for a reader who may
+// (issue #280). The storage layer that records a split has no catalog,
+// so its summary says "/table/5/1/3" where every range table on the
+// same console says "bench_ts_s4 · /primary/3". An event that carries
+// its keys is printed here with prettyKey, the printer the range tables
+// use, so the two read the same. A reader who is refused is never
+// handed that form, and what guarantees it is the Redact call at the
+// end, which runs over everything printed here and puts the prefix form
+// back for anyone it refuses. The check in the loop is the same
+// predicate over the same tables; it saves printing what Redact would
+// throw away, and nothing rests on it (the QA and InfoSec reviews of
+// #285 both removed it and found nothing leaked).
+//
+// The keys are laid between the pieces of the template, not substituted
+// for its marks one at a time: a printed key that itself held a mark
+// would then take the next key's place. No printer emits one today —
+// strings are quoted, bytes are hex — and this way nothing depends on
+// that.
+func (n *Node) viewEvents(v keyViewer, evs []events.Event) []events.Event {
+	for i := range evs {
+		ev := &evs[i]
+		if ev.Template == "" {
+			continue
+		}
+		parts := strings.Split(ev.Template, events.KeyMark)
+		if len(parts) != len(ev.Keys)+1 {
+			continue
+		}
+		readable := true
+		for _, t := range ev.Tables {
+			if !v.reads(t) {
+				readable = false
+				break
+			}
+		}
+		if !readable {
+			continue // Redact serves the prefix form
+		}
+		var b strings.Builder
+		for i, k := range ev.Keys {
+			b.WriteString(parts[i])
+			b.WriteString(n.prettyKey(keys.Key(k)))
+		}
+		b.WriteString(parts[len(parts)-1])
+		ev.Summary = b.String()
+	}
+	return events.Redact(evs, v.reads)
 }
 
 // viewTable labels a range with its table's name when the caller may

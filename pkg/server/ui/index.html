@@ -50,6 +50,24 @@
   header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
   header .sub { color: var(--text-2); font-size: 13px; }
   header .stale { color: var(--critical); font-size: 13px; margin-left: auto; display: none; }
+  /* The serving node's address is the header's least-needed part — the
+     node's page and its card on the overview both state it — and at
+     1440px it was what pushed the sign-in onto a second line once the
+     jump hint read "Ctrl K" (issue #278). It shows where there is room. */
+  @media (max-width: 1599px) { #hdr-node .addr { display: none; } }
+  /* A locality never costs the header a line either, and how wide one
+     is belongs to the operator: "region=us-east-1,zone=us-east-1b,
+     rack=12" put the sign-in on a second line up to 1480. So above a
+     phone the label takes the room that is left and ends in an ellipsis
+     when that is not enough; its title has the whole of it. Hiding the
+     locality below some width was tried and only removed what would
+     have fitted (the UI review of #285). "served by n1" is 85px and
+     always fits in the basis. The padding, taken back by the margin, is
+     room for the link's focus ring, which a box that clips would
+     otherwise cut top and bottom. */
+  @media (min-width: 641px) {
+    #hdr-node { flex: 1 1 90px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 0; margin: -4px 0; }
+  }
   header .reload {
     font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
     border: 1px solid var(--series-1); background: var(--panel); color: var(--text);
@@ -80,7 +98,11 @@
     border-bottom: 1px solid var(--warning); border-left: 4px solid var(--warning);
   }
   #insecure-banner b { color: var(--warning); }
-  header .role {
+  /* The admin badge, in the header and beside a role's name on the
+     security view. It was styled for the header only, so in the roles
+     table it was plain text and the rows read "root admin" and "admin
+     admin" (issue #278). */
+  .role {
     display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
     font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase;
     color: var(--good); border: 1px solid var(--good);
@@ -123,7 +145,12 @@
      length, so a value that grows long in the field is handled too. */
   .tile .value.long { font-size: 14px; font-weight: 500; line-height: 1.45; }
   .tile .value .muted { display: block; font-size: 12px; font-weight: 400; line-height: 1.35; margin-top: 3px; }
-  .tiles.ident .value { font-size: 15px; word-break: break-all; }
+  /* overflow-wrap, not word-break: break-all (issue #278). break-all
+     breaks anywhere at all, so "v0.58.0 · protocol v19 · cluster v19"
+     wrapped inside "cluster", and on a phone inside "v19". anywhere
+     breaks at a space when there is one and inside a word only when the
+     word alone is too long, which is what an address needs. */
+  .tiles.ident .value { font-size: 15px; overflow-wrap: anywhere; }
   .tile .delta { font-size: 12px; color: var(--text-2); margin-top: 2px; }
   /* The sparkline is a reading (issue #218): the trend in the
      de-emphasis grey, the baseline fainter, the "now" dot in the text
@@ -158,6 +185,36 @@
   }
   .muted { color: var(--text-3); }
   tr.clickable { cursor: pointer; }
+  /* A row that opens says so (issue #279). The schema list and the
+     ranges table open a detail on click or Enter and only the note under
+     the table said it; the name was plain text, while the same range ids
+     one table up, in the hotspots, were links. The cell that names the
+     thing takes the link's colour and underline, and the row answers the
+     pointer. The row stays the control — one tab stop, with its role —
+     so this is how it looks, not a second link inside it. */
+  tr.clickable .opens { color: LinkText; text-decoration: underline; text-underline-offset: 2px; }
+  tr.clickable:hover td { background: color-mix(in srgb, var(--series-1) 7%, transparent); }
+  tr.fold td { background: color-mix(in srgb, var(--border) 22%, transparent); }
+  /* .linkish: a button that reads as a link — it acts in place rather
+     than going somewhere. The class was on the ranges table's "show
+     all" buttons with no rule behind it, so they were the browser's own
+     grey buttons in the middle of a sentence. */
+  button.linkish {
+    font: inherit; padding: 0; border: 0; background: none; cursor: pointer;
+    color: LinkText; text-decoration: underline; text-underline-offset: 2px;
+  }
+  /* The caret is decoration: aria-expanded already says whether the run
+     is open, and a caret read out with the name — "black right-pointing
+     small triangle, 18 in a row" — says it again, worse. The second
+     value of content is its alternative text, here none; the first
+     declaration is what a browser without that syntax keeps. */
+  button.linkish[data-fold]::before { content: "▸"; content: "▸" / ""; display: inline-block; margin-right: 5px; text-decoration: none; }
+  button.linkish[data-fold][aria-expanded="true"]::before { content: "▾"; content: "▾" / ""; }
+  /* An open fold's row is the header of its run: the count and nothing
+     else. Its age and its "newest" belong to the first row beneath it,
+     which shows them live, while this row — holding the focus — is not
+     redrawn and would show them stale and twice. */
+  tr.fold[data-open] .shut { display: none; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--border) 30%, transparent); }
   /* The table detail's DDL block and its copy button (issue #194). */
   .ddlbar { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
@@ -224,7 +281,14 @@
   .problem.info .sev { color: var(--series-1); }
   .problem .check { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-2); flex: none; }
   .problem .since { color: var(--text-2); font-size: 12px; white-space: nowrap; flex: none; font-variant-numeric: tabular-nums; }
-  .problem .links { margin-left: auto; display: flex; gap: 10px; flex: none; }
+  /* The age and the links are one unit, the row's tail (issue #278,
+     from the UI review of #284). Apart, a row whose age happened to fit
+     beside its summary kept it there while its links wrapped, so the
+     age sat in a different place from one row to the next. Together
+     every row ends in the same right-aligned "1m ago · nodes → ·
+     history →", at every width and at no cost in height. */
+  .problem .tail { margin-left: auto; display: flex; gap: 10px; align-items: baseline; flex: none; }
+  .problem .links { display: flex; gap: 10px; flex: none; }
   .problem a { color: var(--text-2); font-size: 12px; white-space: nowrap; }
   /* Events: newest first, kind badge, audit rows marked. */
   #events td.when { color: var(--text-3); font-size: 12px; }
@@ -255,6 +319,29 @@
        second line (issue #204: measured, 320px was 38px over). */
     .controls-hdr { flex-wrap: wrap; }
     header .stale { margin-left: 0; }
+    /* The header on a phone (issue #281). It took 300 of 844 pixels
+       before any content: a four-line banner, the title, two rows of
+       navigation, two rows of controls, the serving node and the sign-in
+       each on a line of their own. Every piece is still here; each
+       takes less.
+       - The navigation sits beside the title instead of under it, in
+         the two rows its eight links need. A single row that scrolled
+         sideways was tried and dropped: it saved one more line by
+         hiding "ops" and "security" off the edge.
+       - The pickers drop their word labels to screen readers (the
+         select's first option and its title say what it is) and the
+         jump button its keyboard hint, which a phone has no use for, so
+         the five controls share a row.
+       - The banner's remedy is left to the security view, which states
+         it (the serving node's address is already gone below 1600px). The
+         banner still says, on every view, that nobody is authenticated
+         and who therefore has full access. */
+    header nav { flex: 1 1 0; min-width: 0; }
+    .controls-hdr { width: 100%; }
+    .controls-hdr .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .controls-hdr label { position: relative; }
+    #jump-open kbd { display: none; }
+    #insecure-banner .remedy { display: none; }
     .tiles { grid-template-columns: repeat(2, 1fr); }
     .tile .value { font-size: 18px; }
     .wide-only { display: none; }
@@ -427,8 +514,8 @@
          header is outside every view, so the help pop and the panel
          reach these through the header itself; the select's title stays
          the one-line version. -->
-    <label data-help="scope">scope <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
-    <label data-help="range">range <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
+    <label data-help="scope"><span class="lbl">scope</span> <select id="scope-picker" title="which node the node-scoped panels describe"></select></label>
+    <label data-help="range"><span class="lbl">range</span> <select id="range-picker-global" title="the time range every chart and rate on the page uses"></select></label>
     <!-- Display preferences (issue #204). A <details>, like the user
          menu, because these are set once and then never again: giving
          them permanent header width alongside scope and range — which an
@@ -445,7 +532,7 @@
         <span class="prefnote" id="pref-note" hidden></span>
       </div>
     </details>
-    <button type="button" id="jump-open" data-help="jump to" title="jump to a node, range, table or locality">jump to <kbd>⌘K</kbd></button>
+    <button type="button" id="jump-open" data-help="jump to" title="jump to a node, range, table or locality">jump to <kbd id="jump-key">⌘K</kbd></button>
     <button type="button" id="help-open" title="explain every figure on this view" aria-haspopup="dialog"><span aria-hidden="true">?</span><span class="sr-only">explain this view</span></button>
   </span>
   <span class="sub" id="hdr-node">connecting…</span>
@@ -499,7 +586,7 @@
   </section>
 
   <section id="sec-recent">
-    <h2>Operations in flight</h2>
+    <h2 id="recent-ops-title">Recent operations</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>when</th><th>kind</th><th>what</th></tr></thead>
       <tbody id="recent-ops"></tbody>

@@ -11,7 +11,7 @@ function renderPrincipal(p) {
   el.hidden = false;
   if (!who.secure) {
     banner.style.display = "block";
-    setHTML(banner, `<b>Insecure mode.</b> This cluster authenticates nobody: anyone who can reach this port has full access, and so does anyone who can reach the SQL port. Start the nodes with a certificate directory to change that.`);
+    setHTML(banner, `<b>Insecure mode.</b> This cluster authenticates nobody: anyone who can reach this port has full access, and so does anyone who can reach the SQL port. <span class="remedy">Start the nodes with a certificate directory to change that.</span>`);
     setHTML(document.getElementById("hdr-user-summary"), `<span class="muted">no sign-in</span>`);
     setHTML(document.getElementById("hdr-user-menu"), `<div class="muted">This cluster runs in insecure mode; there is no identity to show and nothing to sign out of.</div>`);
     return;

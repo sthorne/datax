@@ -1499,12 +1499,14 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 		// Ages of a moment: "when did this last happen", written as how
 		// long ago rather than as the instant.
 		{"heartbeat_ago_ms", true}, {"age_ms", true}, {"age_seconds", true},
-		// Lengths of time. "idle: 14:20:05" is not a thing.
+		// Lengths of time. "idle: 14:20:05" is not a thing, and neither
+		// is "idle: 1h 25m ago" (issue #278): a length is written by
+		// fmtElapsed, which says no "ago".
 		{"idle_ms", false}, {"txn_ms", false}, {"oldest_idle_txn_ms", false},
 	} {
 		want, wrong := "fmtWhen(", "fmtAgo("
 		if !fig.moment {
-			want, wrong = wrong, want
+			want, wrong = "fmtElapsed(", "fmtWhen("
 		}
 		found := false
 		for _, name := range names {
@@ -1528,6 +1530,10 @@ func TestMomentsReadTheViewersPreference(t *testing.T) {
 						t.Errorf("%s renders %s with fmtWhen: that figure is a LENGTH of time, not a "+
 							"moment, and absolute mode would print a clock time for it", name, fig.field)
 					}
+				}
+				if !fig.moment && strings.Contains(line, "fmtAgo(") {
+					t.Errorf("%s renders %s with fmtAgo: that figure is a LENGTH of time, and \"ago\" makes "+
+						"it read as a point in time — render it with fmtElapsed(%s)", name, fig.field, fig.field)
 				}
 			}
 		}
@@ -2714,5 +2720,54 @@ func TestScrollBoxesClipWhatIsPositionedInsideThem(t *testing.T) {
 	if !regexp.MustCompile(`position:\s*relative`).MatchString(rule[1]) {
 		t.Error(".tablewrap is not positioned, so it does not clip the absolutely positioned .sr-only labels inside " +
 			"its cells: a wide table makes the whole page scroll sideways on a phone")
+	}
+}
+
+// An event's summary is escaped before anything else is done to it. A
+// split's summary carries the decoded row value of the key it cut at,
+// and that value is whatever the writer of the row chose — a user with
+// INSERT and nothing else included — while the timeline is innerHTML in
+// front of every reader, admins too. eventText adds links to that text;
+// the links are safe because they are added to text that is already
+// escaped and are built from digits alone. Linking first, or dropping
+// the escape in a refactor, is stored XSS from the least-privileged
+// writer (the InfoSec review of #285), and every test of the scripts
+// passed with the escape removed.
+func TestEventTextIsEscapedBeforeItIsLinked(t *testing.T) {
+	ops := string(mustRead(t, "js/92-ops.js"))
+	body := regexp.MustCompile(`(?s)function eventText\(summary\) \{\n(.*?)\n\}`).FindStringSubmatch(ops)
+	if body == nil {
+		t.Fatal("eventText(summary) was not found in 92-ops.js")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(body[1]), "return esc(summary).replace(") {
+		t.Errorf("eventText does not begin by escaping its summary and linking the result:\n%s", body[1])
+	}
+	if n := strings.Count(body[1], "summary"); n != 1 {
+		t.Errorf("eventText uses the raw summary %d times, want once, inside esc()", n)
+	}
+	// Its pattern reads a quoted string in one way only. If the branch
+	// for an ordinary character also accepts a backslash, a run of
+	// backslashes after an unclosed quote is matched exponentially and
+	// the timeline freezes the tab; a test that ran such an input would
+	// hang rather than fail, so the pattern is read instead.
+	if !strings.Contains(body[1], `&quot;(?:\\[\s\S]|(?!&quot;)[^\\])*?&quot;|`) {
+		t.Errorf("eventText's quoted-string pattern is not the linear one, "+
+			"&quot;(?:\\\\[\\s\\S]|(?!&quot;)[^\\\\])*?&quot; — an ordinary character must not be a backslash:\n%s", body[1])
+	}
+	// What the links interpolate are the captured letter and digits.
+	for _, m := range regexp.MustCompile(`\$\{([^}]*)\}`).FindAllStringSubmatch(body[1], -1) {
+		switch m[1] {
+		case "id", "rangeRoute(id)", `routeTo("node/" + id)`:
+		default:
+			t.Errorf("eventText interpolates %q into its markup; only the matched digits may be", m[1])
+		}
+	}
+	// And no row prints a summary as it arrived. (The charts build an
+	// annotation's label from one, as text; it is escaped where it is
+	// written, which TestAnnotationsAreReachableAndTheirOwnColour reads.)
+	for _, f := range []string{"js/92-ops.js", "js/90-node.js", "js/30-overview.js", "js/80-health.js"} {
+		for _, m := range regexp.MustCompile(`\$\{\w+\.summary\}`).FindAllString(string(mustRead(t, f)), -1) {
+			t.Errorf("%s writes %s into markup unescaped", f, m)
+		}
 	}
 }

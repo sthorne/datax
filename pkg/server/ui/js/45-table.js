@@ -254,9 +254,13 @@ function renderTableStats(t) {
     setHTML(el, `${tok("draining", "never analyzed")} — the planner is estimating this table's size from nothing, which is the usual reason it picks a scan over an index. Run <code class="key">ANALYZE ${esc(qualifiedIdent(t))}</code>.`);
     return;
   }
+  // One moment, written once and the viewer's way (issue #278). It used
+  // to be written twice — the browser's locale date, then the age — so
+  // the line ignored the timestamps preference and read differently on
+  // two operators' screens. The clock time is the preference's other
+  // setting, not a tooltip: this view shows its detail as content.
   const age = fmtWhen(Date.now() - st.age_seconds * 1000);
-  const when = st.collected_at_unix_ms ? new Date(st.collected_at_unix_ms).toLocaleString() : "at an unrecorded time";
-  setHTML(el, `<b>${st.row_count.toLocaleString()}</b> rows estimated, collected ${esc(when)}, ${st.stale ? warn("draining", age) : age}. `
+  setHTML(el, `<b>${st.row_count.toLocaleString()}</b> rows estimated, collected ${st.stale ? warn("draining", age) : age}. `
     + (st.stale
       ? `Past the point where the background sampler refreshes them, so the planner may be choosing from figures the table has outgrown. <code class="key">ANALYZE ${esc(qualifiedIdent(t))}</code> collects them now.`
       : `Fresh enough for the planner to use. It is still an estimate: a bulk change can leave it far behind before it goes stale.`));

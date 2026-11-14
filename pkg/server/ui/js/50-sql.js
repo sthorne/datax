@@ -21,7 +21,7 @@ function renderSQL(d) {
     sqlPrev.set(n.node_id, { at: now, total, retries: q.serialization_failures });
     const mix = Object.entries(q.statements || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 4)
       .map(([k, v]) => `${esc(k)} ${Math.round(100 * v / Math.max(total, 1))}%`).join(" · ");
-    const idle = q.oldest_idle_txn_ms ? warn(q.oldest_idle_txn_ms > 60000 ? "down" : q.oldest_idle_txn_ms > 10000 ? "draining" : "", fmtAgo(q.oldest_idle_txn_ms)) : "—";
+    const idle = q.oldest_idle_txn_ms ? warn(q.oldest_idle_txn_ms > 60000 ? "down" : q.oldest_idle_txn_ms > 10000 ? "draining" : "", fmtElapsed(q.oldest_idle_txn_ms)) : "—";
     return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}">
       <td data-label="node">n${n.node_id}</td>
       <td class="num" data-label="connections">${q.open} <span class="muted">(${q.active} / ${q.idle_in_txn})</span></td>
@@ -40,7 +40,7 @@ function renderSQL(d) {
     tile("statements/s", stmtRate.toFixed(1), "stmt", stmtRate) +
     tile("40001/s", retryRate.toFixed(2), "retry", retryRate) +
     tileHTML("worst p99", p99Node ? `${(p99 / 1000).toFixed(1)} ms` + qual(`on n${p99Node}`) : "—", "p99", p99 / 1000) +
-    tile("oldest idle txn", oldest ? fmtAgo(oldest) : "none"));
+    tile("oldest idle txn", oldest ? fmtElapsed(oldest) : "none"));
   document.getElementById("sql-note").textContent = "rates are differences between polls; kinds: select, insert, update, delete, copy, txn (BEGIN/COMMIT/ROLLBACK/savepoints), ddl";
   renderTxnUsers(d, lastContention && lastContention.retriesByUser, lastContention && lastContention.node);
 }
@@ -269,8 +269,8 @@ function renderIdleTxns(a, id) {
       <td data-label="user">${esc(t.user || "—")}</td>
       <td data-label="client">${esc(t.remote || "—")}</td>
       <td data-label="application">${esc(t.application || "—")}${t.database ? ` <span class="muted">${esc(t.database)}</span>` : ""}</td>
-      <td class="num" data-label="idle">${warn(t.idle_ms > 60000 ? "down" : t.idle_ms > 10000 ? "draining" : "", fmtAgo(t.idle_ms))}</td>
-      <td class="num" data-label="txn open">${t.txn_ms ? fmtAgo(t.txn_ms) : "—"}</td>
+      <td class="num" data-label="idle">${warn(t.idle_ms > 60000 ? "down" : t.idle_ms > 10000 ? "draining" : "", fmtElapsed(t.idle_ms))}</td>
+      <td class="num" data-label="txn open">${t.txn_ms ? fmtElapsed(t.txn_ms) : "—"}</td>
       <td class="key" style="max-width:none;white-space:normal">${esc(t.last || "—")}</td>
     </tr>` }));
   renderKeyed(document.getElementById("idle-txns"), rows.length ? rows

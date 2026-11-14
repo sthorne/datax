@@ -62,7 +62,7 @@ function renderClusterRanges(ranges) {
   const shown = rangesShowAll ? all : all.slice(0, RANGE_TABLE_CAP);
   for (const r of shown) {
     items.push({ key: "r" + r.range_id, html: `<tr class="${admin ? "clickable" : ""}" data-key="r${r.range_id}" data-range="${r.range_id}"${admin ? ` tabindex="0" role="button" aria-expanded="${r.range_id === openRange}" title="Enter or click: per-replica detail from every holding node"` : ""}>
-      <td>r${r.range_id}</td>
+      <td><span${admin ? ' class="opens"' : ""}>r${r.range_id}</span></td>
       <td class="key">${spanText(r)}${copyBtn("r" + r.range_id + "'s " + rangeKeyLabel(r), r.start_key || "")}</td>
       <td>${(r.replicas || []).map(x => "n" + x).join(" ")}</td>
     </tr>` });
@@ -129,13 +129,18 @@ function toggleRangeDetail(id) {
     openRange = null;
     document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${id}"]`)?.remove();
     if (lastCluster) renderClusterRanges(lastCluster.ranges || []);
-    pushRoute();
+    // The closed range leaves the URL, whichever name it came under.
+    const p = new URLSearchParams(ui.params);
+    p.delete("r");
+    if (/^\d+$/.test(p.get("range") || "")) p.delete("range");
+    ui.params = p;
+    pushRoute(p);
     return;
   }
   if (openRange !== null) document.getElementById("cluster-ranges").querySelector(`tr[data-key="d${openRange}"]`)?.remove();
   openRange = id;
   if (lastCluster) renderClusterRanges(lastCluster.ranges || []);
-  pushRoute({ range: String(id) });
+  pushRoute({ r: String(id) });
   fetchRangeDetail(id);
 }
 // fetchRangeDetail fills the open row from every holding node's view of

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -273,7 +274,15 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	// The split events, on whichever node recorded them: the admin sees
 	// the boundary value, the reader sees the same event at the prefix —
 	// and still sees the value for the table it may read.
-	var sealedSeen, openSeen bool
+	//
+	// And the keys read as the range tables write them (issue #280): the
+	// layer that records a split has no catalog, so the event used to say
+	// "/table/5/1/…" beside a ranges table that said "sealedbook". For a
+	// reader who may see the key it is printed by name now — and only for
+	// that reader: the refused form is still the numeric prefix, with no
+	// name in it, which the loop below already insists on.
+	var sealedSeen, openSeen, sealedNamed, openNamed bool
+	rawTableKey := regexp.MustCompile(`/table/\d+/`)
 	for i, base := range bases {
 		// The documents that embed events, on every node, as the reader.
 		for _, path := range []string{"/api/overview", "/api/node", "/status", "/api/cluster"} {
@@ -295,6 +304,12 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 		for _, ev := range asRoot.Events {
 			if ev.Kind == "split" && strings.Contains(ev.Summary, sealedRow) {
 				rootSplits++
+				if strings.Contains(ev.Summary, "sealedbook") {
+					sealedNamed = true
+				}
+				if rawTableKey.MatchString(ev.Summary) {
+					t.Errorf("n%d /api/events as root: %q still carries a key by its table's number", i+1, ev.Summary)
+				}
 			}
 		}
 		readerSplits := 0
@@ -307,6 +322,9 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 			}
 			if strings.Contains(ev.Summary, openRow) {
 				openSeen = true
+				if strings.Contains(ev.Summary, "openbook") && !rawTableKey.MatchString(ev.Summary) {
+					openNamed = true
+				}
 			}
 		}
 		if rootSplits > 0 {
@@ -321,5 +339,11 @@ func TestRangeKeysAreShownPerPrivilege(t *testing.T) {
 	}
 	if !openSeen {
 		t.Error("the reader sees no split event carrying the readable table's boundary value")
+	}
+	if !sealedNamed {
+		t.Error("the admin's split event does not name the table its keys belong to: it reads /table/<number>/… where the ranges table says sealedbook")
+	}
+	if !openNamed {
+		t.Error("the reader's split event for the table it may read does not name it")
 	}
 }

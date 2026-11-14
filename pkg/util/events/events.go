@@ -45,6 +45,17 @@ type Event struct {
 	// serves neither field (issue #213).
 	Tables   []uint64 `json:"-"`
 	Redacted string   `json:"-"`
+	// Template and Keys are the full summary before its keys were
+	// printed: the text with KeyMark standing where each key goes, and
+	// the keys in that order. The layer that records a split has no
+	// catalog, so the keys in Summary are in their raw form
+	// (/table/5/1/3); a server that has one can print them as it prints
+	// a range's bounds (bench_ts_s4 · /primary/3) for a reader who may
+	// see every table in Tables (issue #280). Neither field is served,
+	// and neither changes who is served which form: Redact decides that,
+	// as before.
+	Template string   `json:"-"`
+	Keys     [][]byte `json:"-"`
 	// Started is set on an end record: when the operation it closes
 	// began. The pairing is over a bounded ring, so a long operation's
 	// start is usually gone by the time it finishes — carrying the time
@@ -137,17 +148,23 @@ func (r *Ring) Record(kind, format string, args ...any) {
 // RecordAudit adds an audit-stream event.
 func (r *Ring) RecordAudit(kind, summary string) { r.record(true, kind, summary) }
 
+// KeyMark stands in an Event's Template where a key is printed. It is a
+// byte no summary contains: the other arguments of a keyed event are
+// range ids and counts.
+const KeyMark = "\x00"
+
 // RecordKeyed adds an event whose summary carries keys of the given
 // tables: summary is the full form, redacted the same with every key at
 // its prefix, for a reader who may not see one of the tables (see
-// Redact).
-func (r *Ring) RecordKeyed(kind string, tables []uint64, summary, redacted string) {
+// Redact). template and keys are the full form unprinted (see
+// Event.Template); a caller with nothing better passes "" and nil.
+func (r *Ring) RecordKeyed(kind string, tables []uint64, summary, redacted, template string, keys [][]byte) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	r.seq++
-	ev := Event{Seq: r.seq, At: time.Now(), Kind: kind, Summary: summary, Tables: tables, Redacted: redacted}
+	ev := Event{Seq: r.seq, At: time.Now(), Kind: kind, Summary: summary, Tables: tables, Redacted: redacted, Template: template, Keys: keys}
 	r.store(ev)
 	sinks := r.sinks
 	r.mu.Unlock()

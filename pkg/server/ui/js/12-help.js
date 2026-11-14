@@ -168,7 +168,7 @@ const HELP = {
   "rows scanned": "Rows read to produce those results. Far more scanned than returned is a scan where an index would do, and it is worth fixing whether or not the statement is also slow.",
 
   // ---- Operations and events ----
-  "operations in flight": "What the cluster is doing to itself right now — splits, merges, rebalances, lease moves, decommissions, backups. These explain load that no client asked for.",
+  "recent operations": "What the cluster has been doing to itself — splits, merges, rebalances, lease moves, decommissions, backups — newest first. An operation still running is listed ahead of the ones that have finished, and the heading says when there is one. These explain load that no client asked for.",
   "in flight": "Operations running now, with how long each has been going. Backups, restores, decommissions, re-encryption, consistency sweeps, re-shard reclaims and upgrade finalize are paired and appear here; splits, merges and rebalances are individually short and continuous, so they stay in the event feed as instants and are watched as a rate on the Metrics view instead.",
   "recently completed": "Operations that finished, with their outcome. An operation that keeps failing and restarting is why something never settles.",
   "operation": "What the cluster is doing and to which range or node. Nothing here was asked for by a client — this is the cluster maintaining itself.",

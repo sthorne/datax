@@ -595,6 +595,51 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- **The console, tidied** (#278, #279, #280, #281). A pass over what a
+  person reads and reaches for, none of it new capability.
+  - *The event timeline.* A split or merge names its keys the way the
+    range tables do, `/table/orders/primary/42` where it said
+    `/table/7/1/42`: the storage layer that records the event has no
+    catalog, so the event now carries its keys and the server prints
+    them, for a reader who may read every table they belong to. Who
+    that is has not changed — the same check serves everyone else the
+    keys at their prefix, by id, as before. A range or node named in an
+    event is a link. A burst of four or more events of one kind within
+    a minute of each other folds into one row that opens in place;
+    thirteen lease moves after an ingest used to push the split that
+    explained them off the screen. Health, consistency-failure,
+    security and auth-failure events are never folded. A link to a
+    range now carries it as `r=`: `range=` is the time window, and
+    while the two shared a name a range's link lost its range under any
+    window but the default (`#/data?range=<id>` still opens the range).
+    A reserved table that has no rows yet — the console's preferences
+    table before anyone saves one — is named in key spans like the
+    others, where it was `/table/1099511627777`.
+  - *On a phone.* The banner, title, navigation, controls and serving
+    node took 300 of 844 pixels before any content; they take about
+    200. The navigation sits beside the title, the pickers keep their
+    labels for a screen reader only, and the insecure-mode banner
+    leaves its remedy to the security view while still saying, on
+    every view, that nobody is authenticated and who has full access.
+  - *Rows that open.* The schema list and the ranges table opened a
+    detail on click with nothing to say so but a note under the table.
+    The cell that names the row reads as a link, and the row answers
+    the pointer.
+  - *Smaller things.* A length of time — how long a session has been
+    idle, how long a transaction has been open — no longer ends in
+    "ago". A table's statistics say when they were collected once, the
+    viewer's way, where they gave the browser's locale date and then
+    the age. The overview's strip is headed "Recent operations", which
+    is what it lists, and says so when one is still in flight. Uptime
+    appears once on a node's page; the version tile breaks at a space
+    instead of inside `cluster` or `v19`; the admin badge beside a
+    role's name is a badge, where the rows read "admin admin"; the
+    jump button's hint is `Ctrl K` off a Mac; a health problem's age
+    and links wrap together; and the header keeps the serving node's
+    address for screens 1600px and wider, where it no longer pushes
+    the sign-in onto a second line. Nor does a locality: one too
+    long for the room left ends in an ellipsis, with the whole label
+    in its title.
 - **The console is tested in a browser** (#276). Its tests read the
   JavaScript as text, which is how two of the faults above shipped: a
   test checked that a moment was rendered by the right function and

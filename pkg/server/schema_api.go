@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -359,6 +360,16 @@ func (n *Node) prettyKey(k keys.Key) string {
 		n.schema.mu.Unlock()
 		if d != nil {
 			return rowenc.PrettyKey(d, k)
+		}
+		// No descriptor: a dropped table, or a reserved one not created
+		// yet. The second kind has a name all the same, and the console
+		// showed "/table/1099511627777" beside its named siblings (the UI
+		// review of #285).
+		if name := catalog.SystemTableName(id); name != "" {
+			raw := "/table/" + strconv.FormatUint(id, 10)
+			if p := keys.Pretty(k); strings.HasPrefix(p, raw) {
+				return "/table/" + name + p[len(raw):]
+			}
 		}
 	}
 	return keys.Pretty(k)
