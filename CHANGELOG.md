@@ -11,6 +11,17 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`SELECT ... FOR UPDATE SKIP LOCKED` and `NOWAIT`** (#296). `SKIP
+  LOCKED` leaves out rows another transaction holds — or changed and
+  committed since this transaction's snapshot — and locks the rest;
+  `LIMIT n` counts the rows returned, so `SELECT id FROM jobs ORDER BY
+  id LIMIT 1 FOR UPDATE SKIP LOCKED` is a job queue whose workers do not
+  wait on each other. Skipped rows are not reads of the transaction and
+  cannot fail it with `40001` later (on a primary-key scan; a queue
+  ordered by a secondary index can still see one). `NOWAIT` fails at
+  once with `55P03`. Neither aborts a lock holder. Adds a read-only
+  `skip_locked` field to Get and Scan; no cluster version change (an
+  older node ignores it and the read waits as before).
 - **Sealed backups** (#291). `datax backup --backup-key <file>` seals every
   file of a backup — the manifest included — with AES-256-GCM under a key
   given at backup time (32 raw bytes or 64 hex characters), and
