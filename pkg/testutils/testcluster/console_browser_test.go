@@ -284,6 +284,13 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		check(desk, "a quoted key is left alone (#280)",
 			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('r5 split at /table/t/primary/"from n1 to n3 \\"r7\\" x"; r6 takes [/table/t/primary/"to n2", /Max) on n4'); return [...d.querySelectorAll('a')].map(a => a.textContent).join(' ') + '|' + d.textContent.includes('"from n1 to n3 \\"r7\\" x"'); })()`,
 			"r5 r6 n4|true")
+		// An unclosed quote hides nothing after it, and a run of
+		// backslashes behind one is read in one way, at once (sixty of
+		// them took minutes while a backslash could be read two ways;
+		// the static test holds the pattern, this the behaviour).
+		check(desk, "an unclosed quote (#280)",
+			`(() => { const d = document.createElement('div'); d.innerHTML = eventText('restore failed: "' + '\\'.repeat(60) + ' on n4 for r2'); return [...d.querySelectorAll('a')].map(a => a.textContent).join(' '); })()`,
+			"n4 r2")
 		// #280: a burst is one row; a lone event, a run of three, a slow
 		// drip and audit records are not folded.
 		check(desk, "folding (#280)", `(() => {

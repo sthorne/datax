@@ -155,8 +155,16 @@ function renderOperations() {
 // they are somebody's data, not this cluster's nodes (the QA review of
 // #285). The printers quote strings Go's way, so inside one a quote is
 // \" — here, after escaping, \&quot;.
+//
+// Inside the quotes a backslash is only ever the first half of a pair:
+// the branch for an ordinary character refuses one. While both branches
+// could take a backslash, a run of k of them could be read fib(k) ways,
+// and with no closing quote to find the engine tried every one — 48
+// backslashes after an unclosed quote held the tab for five seconds
+// (the InfoSec re-review of #285). Nothing a user controls prints an
+// unclosed quote today; the pattern no longer depends on that.
 function eventText(summary) {
-  return esc(summary).replace(/&quot;(?:\\[\s\S]|(?!&quot;)[\s\S])*?&quot;|(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => kind === undefined ? m : lead + (kind === "r"
+  return esc(summary).replace(/&quot;(?:\\[\s\S]|(?!&quot;)[^\\])*?&quot;|(^|[\s(\[])([rn])(\d+)(?=$|[\s,;:.)\]])/g, (m, lead, kind, id) => kind === undefined ? m : lead + (kind === "r"
     ? `<a href="${rangeRoute(id)}" title="open r${id}'s per-replica detail">r${id}</a>`
     : `<a href="${routeTo("node/" + id)}" title="n${id}'s page">n${id}</a>`));
 }

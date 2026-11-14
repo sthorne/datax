@@ -2745,6 +2745,15 @@ func TestEventTextIsEscapedBeforeItIsLinked(t *testing.T) {
 	if n := strings.Count(body[1], "summary"); n != 1 {
 		t.Errorf("eventText uses the raw summary %d times, want once, inside esc()", n)
 	}
+	// Its pattern reads a quoted string in one way only. If the branch
+	// for an ordinary character also accepts a backslash, a run of
+	// backslashes after an unclosed quote is matched exponentially and
+	// the timeline freezes the tab; a test that ran such an input would
+	// hang rather than fail, so the pattern is read instead.
+	if !strings.Contains(body[1], `&quot;(?:\\[\s\S]|(?!&quot;)[^\\])*?&quot;|`) {
+		t.Errorf("eventText's quoted-string pattern is not the linear one, "+
+			"&quot;(?:\\\\[\\s\\S]|(?!&quot;)[^\\\\])*?&quot; — an ordinary character must not be a backslash:\n%s", body[1])
+	}
 	// What the links interpolate are the captured letter and digits.
 	for _, m := range regexp.MustCompile(`\$\{([^}]*)\}`).FindAllStringSubmatch(body[1], -1) {
 		switch m[1] {
