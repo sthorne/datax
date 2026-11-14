@@ -100,8 +100,8 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   collection, raft log truncation, splitting and merging by size and
   load — plus dead-node repair, load rebalancing (count, bytes, and lease
   shedding), decommission, a paced replica consistency sweep, consistent
-  cluster backup/restore (full + incremental, `datax backup` /
-  `datax restore`), rolling upgrades with an explicit finalize
+  cluster backup/restore (full + incremental, optionally sealed under a
+  backup key, `datax backup` / `datax restore`), rolling upgrades with an explicit finalize
   (`datax debug upgrade`), the `datax debug` toolbox (split, merge,
   transfer-lease, rebalance, status, metadata, unsafe-recover,
   rotate-enc-key, reencrypt), `datax bench`, and a built-in
@@ -259,7 +259,7 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
 | Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |
-| Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
+| Backup | backup keys held by a KMS or an `--enc-root` root (a sealed backup, `--backup-key`, takes a key file); hiding a sealed backup's table count, table ids and file sizes; restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
 | Encryption | a KMS or HSM spoken to directly (an `exec` root reaches one through its command line; keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |
 | Storage | debt-gate thresholds are first-cut constants (per-cause counters tell the compaction-debt gate and follower-health shedding apart; tune with production data) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |

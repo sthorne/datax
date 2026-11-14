@@ -629,9 +629,78 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   included — and must chain within the MVCC GC window (25h by default): an
   older base is refused with "incremental base too old". Take a fresh full
   backup at least daily.
-- On an encrypted store, backup files are written in plaintext; the
-  command refuses unless you pass `--allow-plaintext`. Protect the backup
-  location accordingly.
+- Without a key, backup files are written in plaintext. On an encrypted
+  store the command refuses to do that silently: pass `--backup-key` to
+  seal the backup (below), or `--allow-plaintext` to write an unsealed
+  one and protect the backup location yourself. Passing both is refused.
+
+### Sealed backups
+
+A backup is where a cluster's data leaves the protection of its stores:
+rows, and also everything about them — which tables and accounts exist,
+how many rows each holds, role names and password verifiers.
+`--backup-key <file>` seals every file of the backup, the manifest
+included, with authenticated encryption (AES-256-GCM) under a key you
+supply. The key file is 32 raw bytes or 64 hex characters, like a store
+key file (`openssl rand -hex 32 > backup.key`); it is a key of its own,
+not the store key, and works the same on an unencrypted store.
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/full --backup-key backup.key
+datax backup  --addr 10.0.0.1:26257 --dest /backups/inc1 --base /backups/full \
+              --backup-key backup.key
+datax restore --addr 10.0.1.1:26257 --src /backups/full,/backups/inc1 \
+              --backup-key backup.key
+```
+
+- **What is sealed.** `BACKUP.json` becomes a small envelope holding the
+  backup's own random data key, wrapped under your key, and the sealed
+  manifest; each `table_<id>.dxbk` is sealed in 64 KiB chunks under a
+  key derived from the data key and the file's name. The file's name,
+  each chunk's position and whether it is the last are part of what is
+  authenticated, so a changed byte, a truncated file (at a chunk
+  boundary too), chunks reordered, two files exchanged, or a file or
+  manifest taken from another backup all fail to open. The summary's
+  record counts and checksums are computed over the plaintext, so a
+  sealed backup and an unsealed one of the same data print the same.
+- **What is still visible** to someone holding the directory: that it is
+  a sealed datax backup, how many tables it has, their numeric ids (in
+  the file names — never their names), and each file's size.
+- **Restore refuses before it applies.** Every manifest is opened and
+  every data file read to its end and authenticated before the first
+  record is written. A wrong key, a missing key, or any of the damage
+  above leaves the target cluster untouched.
+- **Sealed and plaintext do not stand in for each other.** A sealed
+  backup is never read without its key, and a plaintext directory given
+  to a restore together with a key is refused — anyone who can write
+  the backup location can write a plaintext backup, and only a holder
+  of the key can write a sealed one, so a plaintext directory where you
+  named a key is not the backup you meant.
+- **Keys in a chain.** Each backup of a chain may have its own key. For
+  restore, `--backup-key` takes one key file, used for every directory
+  in `--src`, or a comma-separated list with exactly one entry per
+  directory, in the same order. Keys are paired by position; none is
+  tried against another directory. An empty entry says that directory
+  is a plaintext backup: `--src /backups/old-full,/backups/inc1
+  --backup-key ,backup.key`.
+- **An incremental's base.** `--base` is read only for its cluster id and
+  end timestamp. A sealed base is opened with `--backup-key`; if it was
+  sealed under a different key, name that with `--base-key <file>`. With
+  `--base-key`, the base must be sealed under it; without, a plaintext
+  base is accepted (so sealing can start mid-chain).
+- **How the key travels.** The serving node writes and reads the backup,
+  so the command reads the key file and sends the key in the admin
+  request. On a secure cluster that is mutual TLS. On an insecure
+  cluster the request is cleartext, so a node accepts a backup key only
+  from its own machine: run the command there, against a loopback
+  address. The key is never logged or written to the audit log (the
+  audit record notes only that a key was given), is not stored on the
+  node, and is not written into the backup.
+- **Losing the key loses the backup.** There is no escrow and no second
+  way in. Keep the key apart from the backup location; a key stored
+  beside the files it seals protects nothing.
+- `--enc-root` roots (a KMS command, operator shares) do not hold backup
+  keys yet: a backup key is always a key file.
 
 `datax restore` applies a chain (full first, then incrementals in order)
 into an **empty** cluster — it refuses if any table exists:

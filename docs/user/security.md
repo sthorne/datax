@@ -254,7 +254,11 @@ decommission, upgrade, backup, restore, store-key rotation) and
 require the **admin role** — `root`, or a member of `admin` (`GRANT
 admin TO ops`), resolved through role membership.
 Every admin op except the read-only ones is audited with its outcome.
-In insecure mode the admin surface is open, like everything else.
+In insecure mode the admin surface is open, like everything else. One
+exception: a request carrying a backup key (`datax backup` /
+`datax restore` with `--backup-key`) is accepted on an insecure node only
+from the node's own machine, since the key would otherwise cross the
+network in the clear.
 
 Only the admin RPC accepts user certificates. The internode surfaces on
 the same port — KV batches, Raft messages, snapshots, join — require the

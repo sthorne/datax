@@ -28,6 +28,15 @@ type AdminRequest struct {
 	BasePath       string   `json:"base_path,omitempty"`
 	Paths          []string `json:"paths,omitempty"`
 	AllowPlaintext bool     `json:"allow_plaintext,omitempty"`
+	// Backup keys (issue #291). BackupKey seals the backup being written
+	// and BaseBackupKey opens a sealed base; BackupKeys opens a restore's
+	// chain — one key for all of Paths, or one per path in the same
+	// order, an empty entry for a plaintext backup. Key material in
+	// transit: accepted over mutual TLS, or without TLS only from the
+	// node's own machine; never logged, audited or echoed.
+	BackupKey     []byte   `json:"backup_key,omitempty"`
+	BaseBackupKey []byte   `json:"base_backup_key,omitempty"`
+	BackupKeys    [][]byte `json:"backup_keys,omitempty"`
 	// IncludeMetrics backs up the datax_metrics system table too (bulky
 	// and regenerable, so excluded by default).
 	IncludeMetrics bool `json:"include_metrics,omitempty"`
@@ -173,10 +182,12 @@ type BackupTableSummary struct {
 
 // BackupSummary is the admin RPC's report for a backup or restore.
 type BackupSummary struct {
-	Path        string               `json:"path,omitempty"`
-	ClusterID   string               `json:"cluster_id,omitempty"`
-	EndTSNanos  int64                `json:"end_ts_nanos,omitempty"`
-	Incremental bool                 `json:"incremental,omitempty"`
-	Tables      []BackupTableSummary `json:"tables,omitempty"`
-	Users       int                  `json:"users,omitempty"`
+	Path        string `json:"path,omitempty"`
+	ClusterID   string `json:"cluster_id,omitempty"`
+	EndTSNanos  int64  `json:"end_ts_nanos,omitempty"`
+	Incremental bool   `json:"incremental,omitempty"`
+	// Sealed: the backup's files were written sealed under a backup key.
+	Sealed bool                 `json:"sealed,omitempty"`
+	Tables []BackupTableSummary `json:"tables,omitempty"`
+	Users  int                  `json:"users,omitempty"`
 }

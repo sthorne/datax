@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -155,6 +156,11 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	if req.Version != 0 {
 		kv = append(kv, "version", int64(req.Version))
 	}
+	// That a backup key came with the request is worth a record; the key
+	// is not, and no field of it is listed here.
+	if requestCarriesBackupKey(req) {
+		kv = append(kv, "backup_key", "given")
+	}
 	if resp.Error != "" {
 		kv = append(kv, "outcome", "error", "error", resp.Error)
 	} else {
@@ -162,6 +168,31 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	}
 	log.Audit("admin-op", kv...)
 	return resp
+}
+
+func requestCarriesBackupKey(req cluster.AdminRequest) bool {
+	return len(req.BackupKey) != 0 || len(req.BaseBackupKey) != 0 || len(req.BackupKeys) != 0
+}
+
+// backupKeyAccepted is the gate on a backup key arriving in a request
+// (issue #291). The backup is written, and read back, by the serving
+// node, so the key has to reach it; over mutual TLS it does so encrypted,
+// from an authenticated admin. Without TLS it would cross the network in
+// the clear, to be read by anyone on the path — after which the sealed
+// backup is sealed against nobody — so it is accepted only from the
+// node's own machine, the rule a root key's shares follow
+// (sealAuthorized). rotate-store-key refuses an insecure cluster
+// outright; this does not, because a single-machine cluster without TLS
+// is a real deployment whose backups leave the machine all the same.
+func (n *Node) backupKeyAccepted(ctx context.Context, req cluster.AdminRequest) error {
+	return backupKeyTransportOK(requestCarriesBackupKey(req), n.tlsCfgs != nil, rpc.PeerIsLoopback(ctx))
+}
+
+func backupKeyTransportOK(carriesKey, secure, loopback bool) error {
+	if !carriesKey || secure || loopback {
+		return nil
+	}
+	return errors.New("this node runs without TLS: a backup key would cross the network in the clear, so it is accepted only from the node's own machine (run the command there, against a loopback address) or over a secure cluster's mutual TLS")
 }
 
 // serveAdminOp dispatches an admin op the caller is already authorized for.
@@ -206,14 +237,23 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
 		}
-		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext, req.IncludeMetrics)
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunBackupWith(ctx, BackupOptions{
+			Dest: req.Path, BasePath: req.BasePath, Key: req.BackupKey, BaseKey: req.BaseBackupKey,
+			AllowPlaintext: req.AllowPlaintext, IncludeMetrics: req.IncludeMetrics,
+		})
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
 		return cluster.AdminResponse{Backup: sum}
 
 	case "restore":
-		sum, err := n.RunRestore(ctx, req.Paths)
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunRestoreWith(ctx, req.Paths, req.BackupKeys)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

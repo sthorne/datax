@@ -604,6 +604,52 @@ What this does not cover:
   stale file spanning a single user key admits no interior seed and
   waits for natural churn.
 
+## Backups
+
+A backup (`datax backup`) is written outside the store, and the store
+key has no part in it: without `--backup-key` its files are plaintext,
+which is why an encrypted store refuses to write one unless told
+`--allow-plaintext`. With `--backup-key <file>` the backup is sealed
+under a key the operator supplies for it, in the same construction as
+authenticated store files with the gaps a file that travels cannot
+afford closed (docs/user/operations.md, *Sealed backups*, has the
+operator's view):
+
+- **Keys.** Each backup has a random 32-byte data key. `BACKUP.json` is
+  an envelope: the data key sealed under the backup key (AES-256-GCM,
+  magic `DXBW`), and the manifest sealed under the data key. Each file's
+  key is HKDF-SHA256(data key, the file's random salt, a label and the
+  file's name). The backup key therefore encrypts 32 bytes per backup
+  and is never used on bulk data.
+- **Files.** A sealed file is a `DXE2` stream: the 32-byte `DXE2` header
+  (flags *bound* and *stream*, data-key id 0, 64 KiB chunks), then
+  chunks of `nonce ‖ ciphertext ‖ tag`. Every tag covers the header, the
+  file's name and a marker saying whether the chunk is the last; the
+  chunk's index is in its nonce. So, unlike a store's sstable, a sealed
+  backup file cut exactly between chunks is refused: the chunk it now
+  ends on was not sealed as a last one.
+- **What is refused.** A changed byte in any file; a file truncated
+  anywhere, extended, or with chunks reordered; a file under another
+  file's name; a file or the manifest from a different backup (its data
+  key differs) — each before restore applies anything, because restore
+  reads every file to its end first. A sealed backup without its key,
+  and a plaintext backup presented with a key, are refused as well.
+- **What is not protected.** The number of tables, their numeric ids
+  (file names) and file sizes are visible. A whole sealed backup
+  replaced by an **older sealed backup under the same key** opens: it is
+  a genuine backup, and nothing tells restore which one was meant —
+  compare the summary's cluster id, tables and checksums with what you
+  recorded when the backup was taken. A chain is checked for continuity
+  (each incremental's base timestamp against its predecessor's end), not
+  for being the newest. Someone who holds the key can write any backup;
+  the checks restore makes of every backup (file names, key spans)
+  apply to sealed ones too, but a key holder can restore rows of their
+  choosing, exactly as someone who can write a plaintext backup can.
+- **The key in transit.** The key is sent to the serving node in the
+  admin request: over mutual TLS on a secure cluster, and on an insecure
+  one accepted only from the node's own machine. It is not logged,
+  audited, or kept.
+
 ## Recovery tooling
 
 `datax debug metadata --dir ... --enc-key store.key` unseals the sealed
@@ -674,6 +720,12 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
+- **Backups are sealed only when asked** (`datax backup --backup-key`);
+  otherwise they are plaintext whatever the store is. A sealed backup
+  shows its table count, table ids and file sizes; a rollback to an
+  older backup sealed under the same key is not detected; and a backup
+  key is a key file only — it cannot yet be held by an `--enc-root`
+  root (a KMS command or shares).
 - **Keys in memory are narrowed, not hidden** (see *Keys in memory*).
   The held copies are locked and out of core dumps; a cipher's expanded
   key, and a key on its way through a stack, are on the ordinary heap,

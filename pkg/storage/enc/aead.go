@@ -29,6 +29,8 @@ import (
 //	        name is refused
 //	        flagFrames: the body is a sequence of append-only frames (a
 //	        log) rather than fixed chunks; see below
+//	        flagStream: not a store file at all but a sealed stream, the
+//	        chunked layout for a file that leaves the store (stream.go)
 //	[12:16) chunk size in plaintext bytes, uint32 big-endian (0 for a
 //	        framed file)
 //	[16:32) 16-byte random salt
@@ -102,7 +104,10 @@ const (
 	frameOverhead    = frameLenLen + chunkNonceLen + chunkTagLen
 	flagBound        = uint32(1) << 0
 	flagFrames       = uint32(1) << 1
-	fileKeyInfo      = "datax/enc/v2 file key"
+	// flagStream marks a sealed stream (stream.go): written once front to
+	// back outside any store, with its end authenticated.
+	flagStream  = uint32(1) << 2
+	fileKeyInfo = "datax/enc/v2 file key"
 	// maxChunkSize bounds what a header may ask a reader to allocate;
 	// maxFrameLen what a frame's length field may. A Write longer than
 	// maxFrameLen becomes several frames.
@@ -123,7 +128,14 @@ var boundName = regexp.MustCompile(`^[0-9]{6}\.(sst|log)$`)
 var framedName = regexp.MustCompile(`^[0-9]{6}\.log$|^MANIFEST-[0-9]{6}$`)
 
 func fileKeyFor(dataKey, salt []byte) (cipher.AEAD, error) {
-	key, err := hkdf.Key(sha256.New, dataKey, salt, fileKeyInfo, KeyLen)
+	return derivedAEAD(dataKey, salt, fileKeyInfo)
+}
+
+// derivedAEAD is AES-256-GCM under HKDF-SHA256(dataKey, salt, info): the
+// one derivation behind a store file's key and a sealed stream's
+// (stream.go), which differ only in what info says the key is for.
+func derivedAEAD(dataKey, salt []byte, info string) (cipher.AEAD, error) {
+	key, err := hkdf.Key(sha256.New, dataKey, salt, info, KeyLen)
 	if err != nil {
 		return nil, err
 	}
@@ -195,12 +207,17 @@ func newAuthenticatedCreate(f vfs.File, keys *KeySet, baseName string) (vfs.File
 // inside a chunk is refused at open rather than read short; a framed file
 // is scanned for where its complete frames end.
 func openAuthenticated(f vfs.File, keys *KeySet, baseName string, hdr [headerLenV2]byte) (vfs.File, error) {
+	flags := binary.BigEndian.Uint32(hdr[8:12])
+	if flags&flagStream != 0 {
+		// A sealed stream (stream.go) is keyed and laid out differently
+		// and is never a store file; say so rather than fail its tags.
+		return nil, fmt.Errorf("file is a sealed stream, not a store file")
+	}
 	id := binary.BigEndian.Uint32(hdr[4:8])
 	dataKey, ok := keys.Lookup(id)
 	if !ok {
 		return nil, fmt.Errorf("file encrypted with unknown data key %d", id)
 	}
-	flags := binary.BigEndian.Uint32(hdr[8:12])
 	aead, err := fileKeyFor(dataKey, hdr[16:32])
 	if err != nil {
 		return nil, err
