@@ -78,8 +78,8 @@ function opRow(o, running) {
   // Progress that cannot be known is elapsed time, never a bar with a
   // number nobody measured.
   const when = running
-    ? `<td class="when" title="${esc(new Date(o.started_unix_ms).toISOString())}">${fmtWhen(Date.now() - o.started_unix_ms)}</td>`
-    : `<td class="when" title="${esc(new Date(o.ended_unix_ms).toISOString())}">${fmtWhen(Date.now() - o.ended_unix_ms)}</td>`;
+    ? `<td class="when" title="${esc(new Date(o.started_unix_ms).toISOString())}">${fmtWhen(o.started_unix_ms)}</td>`
+    : `<td class="when" title="${esc(new Date(o.ended_unix_ms).toISOString())}">${fmtWhen(o.ended_unix_ms)}</td>`;
   const outcome = running ? "" :
     `<td>${o.outcome === "ok"
       ? `<span class="st live"><span class="dot"></span>ok</span>`
@@ -140,7 +140,7 @@ function renderOperations() {
 
 function eventRow(e) {
   return { key: String(e.seq || (e.at + e.summary)), html: `<tr data-key="${esc(String(e.seq || (e.at + e.summary)))}">
-    <td class="when" title="${esc(e.at)}">${fmtWhen(Date.now() - Date.parse(e.at))}</td>
+    <td class="when" title="${esc(e.at)}">${fmtWhen(Date.parse(e.at))}</td>
     <td><span class="kind${e.audit ? " audit" : ""}">${esc(e.kind)}</span></td>
     <td class="key" style="max-width:none;white-space:normal">${esc(e.summary)}</td>
   </tr>` };

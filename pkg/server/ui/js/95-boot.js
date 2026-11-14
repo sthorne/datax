@@ -96,8 +96,25 @@ async function pollOverview() {
 }
 // Which views need which fetch. A view starts exactly these and stops
 // everything else (issue #147), so the Metrics view fetches no schema
-// and the Schema view polls no cluster document.
+// and the Schema view takes the cluster document only at the header's
+// slow pace.
 task("overview", pollOverview, 3000, ["overview", "nodes", "data", "sql", "ops", "security"]);
+// The header belongs to every view: which node served the page, who is
+// signed in, the insecure-mode banner, the nodes the scope picker can
+// offer, and the offer to reload onto a newer console all come from the
+// cluster document. The views above poll it for their own content. The
+// three below have no other use for it, and never fetched it — so a
+// node, schema or metrics page opened from a bookmark sat on
+// "connecting…" with no banner for as long as it stayed open (issue
+// #273). They fetch it once on arrival and then slowly: nothing in a
+// header changes from one second to the next.
+//
+// The staleness pill does not watch this task. It reports the view's
+// PRIMARY_TASK, the fetch the view's own content waits on, so a failing
+// header fetch leaves "served by n1" as it last was and says nothing.
+// That is the right way round — a schema page whose schema is current
+// is not stale — but it is a choice, not an oversight.
+task("header", pollOverview, 30000, ["schema", "metrics", "node"]);
 task("schema", pollSchema, 10000, ["schema", "data", "security"]);
 task("activity", pollActivity, 3000, ["sql"]);
 task("scopedEvents", pollScopedEvents, 5000, ["ops", "security", "overview"]);

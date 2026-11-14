@@ -1,6 +1,9 @@
 package parser
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -157,5 +160,113 @@ func TestFingerprintNonDML(t *testing.T) {
 	c := shapeOf(t, `COMMIT`)
 	if c.Text == "" || c.Hash == "" {
 		t.Errorf("COMMIT produced no shape: %+v", c)
+	}
+}
+
+// TestFingerprintKindsReadAsSQL (issue #275): a statement that is named
+// by kind rather than rendered in full is named in the SQL words that
+// open it. The kind used to be the Go type's name upper-cased whole, so
+// the console listed "CREATETABLE bench_kv" and "ROLLBACKTOSAVEPOINT".
+func TestFingerprintKindsReadAsSQL(t *testing.T) {
+	for _, c := range []struct{ sql, want string }{
+		{`CREATE TABLE IF NOT EXISTS t1 (id INT8 PRIMARY KEY)`, "CREATE TABLE t1"},
+		{`DROP TABLE t1`, "DROP TABLE t1"},
+		{`ALTER TABLE t1 ADD COLUMN v TEXT`, "ALTER TABLE t1"},
+		// The subject of CREATE INDEX is the table: "CREATE INDEX t1"
+		// would read as an index named t1.
+		{`CREATE INDEX IF NOT EXISTS t1_v ON t1 (v)`, "CREATE INDEX ON t1"},
+		{`DROP INDEX t1_v`, "DROP INDEX t1_v"},
+		{`TRUNCATE t1`, "TRUNCATE t1"},
+		{`BEGIN`, "BEGIN"},
+		{`COMMIT`, "COMMIT"},
+		{`ROLLBACK`, "ROLLBACK"},
+		{`SAVEPOINT s`, "SAVEPOINT"},
+		{`RELEASE SAVEPOINT s`, "RELEASE SAVEPOINT"},
+		{`ROLLBACK TO SAVEPOINT s`, "ROLLBACK TO SAVEPOINT"},
+		{`GRANT SELECT ON t1 TO alice`, "GRANT"},
+		{`REVOKE SELECT ON t1 FROM alice`, "REVOKE"},
+		{`SET statement_timeout = '5s'`, "SET"},
+		{`SHOW TABLES`, "SHOW TABLES"},
+		{`ANALYZE t1`, "ANALYZE"},
+		// CREATE and ALTER ROLE share a type; a password change is not a
+		// role being created (from InfoSec's review of #284). The role's
+		// name and the password are not part of the shape.
+		{`CREATE ROLE alice LOGIN PASSWORD 'hunter2'`, "CREATE ROLE"},
+		{`CREATE USER alice PASSWORD 'hunter2'`, "CREATE ROLE"},
+		{`ALTER ROLE alice PASSWORD 'hunter2'`, "ALTER ROLE"},
+		{`ALTER USER alice PASSWORD 'hunter2'`, "ALTER ROLE"},
+		// "ALTER OWNER" is not a statement.
+		{`ALTER TABLE t1 OWNER TO alice`, "ALTER TABLE t1 OWNER TO"},
+		{`ALTER DATABASE d OWNER TO alice`, "ALTER DATABASE d OWNER TO"},
+		// SET, RESET and SHOW name share a type too (from QA's review of
+		// #284): a read of a setting is not a write of one.
+		{`SHOW statement_timeout`, "SHOW"},
+		{`SHOW TRANSACTION ISOLATION LEVEL`, "SHOW"},
+		{`RESET statement_timeout`, "RESET"},
+		{`RESET ALL`, "RESET"},
+		{`SET LOCAL statement_timeout = '30s'`, "SET"},
+	} {
+		got := shapeOf(t, c.sql).Text
+		if got != c.want {
+			t.Errorf("%s\n    shape %q, want %q", c.sql, got, c.want)
+		}
+	}
+	// Whatever the kind, it is words: no shape opens with two SQL words
+	// run together. A new statement type whose name is not its keywords
+	// shows up here as soon as it is added to the list above.
+	for _, sql := range []string{`CREATE VIEW v AS SELECT 1`, `DROP VIEW v`, `CREATE SEQUENCE s`, `CREATE ROLE r`, `DROP ROLE r`, `SHOW DATABASES`} {
+		got := shapeOf(t, sql).Text
+		first := strings.Fields(sql)[0] + " " + strings.Fields(sql)[1]
+		if !strings.HasPrefix(got, first) {
+			t.Errorf("%s\n    shape %q does not open with %q", sql, got, first)
+		}
+	}
+}
+
+// TestEveryStatementKindIsWords (issue #275, from the UI review of
+// #284): the kind of a statement is its type's name split into words,
+// and that is only right while every type is named in whole SQL words.
+// This walks every Statement type in the package, so one added later
+// under a name the splitter cannot read — an initialism, a stray
+// letter — fails here instead of appearing in the console's list.
+func TestEveryStatementKindIsWords(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmtMethod := regexp.MustCompile(`(?m)^func \((?:\w+ )?\*?(\w+)\) stmt\(\)`)
+	seen := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range stmtMethod.FindAllStringSubmatch(string(src), -1) {
+			seen++
+			kind := kindWords(m[1])
+			for _, w := range strings.Fields(kind) {
+				if len(w) < 2 {
+					t.Errorf("%s reads as %q: the one-letter word %q means the type's name is not made of whole SQL words; name its kind outright in statementKindOf", m[1], kind, w)
+				}
+			}
+			if kind != strings.ToUpper(kind) || strings.Contains(kind, "  ") {
+				t.Errorf("%s reads as %q", m[1], kind)
+			}
+		}
+	}
+	if seen < 40 {
+		t.Fatalf("found %d Statement types, want the forty-odd the parser has: the stmt() marker is no longer where this looks", seen)
+	}
+	for name, want := range map[string]string{
+		"CreateTable": "CREATE TABLE", "RollbackToSavepoint": "ROLLBACK TO SAVEPOINT", "Use": "USE",
+		// A run of capitals is one word.
+		"ShowSQL": "SHOW SQL", "SQLShow": "SQL SHOW", "ShowDDLFor": "SHOW DDL FOR",
+	} {
+		if got := kindWords(name); got != want {
+			t.Errorf("kindWords(%q) = %q, want %q", name, got, want)
+		}
 	}
 }

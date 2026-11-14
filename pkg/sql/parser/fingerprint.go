@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Statement fingerprints (issue #157).
@@ -122,11 +123,24 @@ func (f *fingerprinter) stmt(s Statement) {
 			f.kw("ANALYZE")
 		}
 		f.stmt(t.Stmt)
+	case *AlterOwner:
+		// ALTER TABLE | VIEW | SEQUENCE | TYPE | DATABASE name OWNER TO
+		// role. Its kind is two words around its subject, which the
+		// kind-then-subject form below cannot say: the type's name alone
+		// reads "ALTER OWNER", which is not a statement. The role is a
+		// value, and is left out like one.
+		f.kw("ALTER")
+		f.kw(strings.ToUpper(t.Kind))
+		if t.Kind == "table" || t.Kind == "view" {
+			f.table(t.Name)
+		}
+		f.kw(t.Name)
+		f.kw("OWNER TO")
 	default:
 		// Everything else is named by kind and subject. These are not
 		// shapes anyone optimises, and rendering each of them in full
 		// would be a second copy of the grammar.
-		f.kw(strings.ToUpper(statementKindOf(s)))
+		f.kw(statementKindOf(s))
 		if name := statementSubject(s); name != "" {
 			f.table(name)
 			f.kw(name)
@@ -606,12 +620,68 @@ func statementSubject(s Statement) string {
 }
 
 // statementKindOf names a statement for the fingerprint of kinds that
-// are not rendered in full: the concrete type's name, which is already
-// the SQL keyword in this parser ("CreateTable", "Commit").
+// are not rendered in full, as the SQL words that open it.
+//
+// The concrete type's name is those words run together ("CreateTable",
+// "ReleaseSavepoint"), so it is split at each capital. Upper-casing the
+// name whole gave "CREATETABLE" and "ROLLBACKTOSAVEPOINT" in the
+// console's statement list (issue #275). The few types whose name is
+// not their keywords are named outright.
 func statementKindOf(s Statement) string {
+	switch t := s.(type) {
+	case *GrantRevoke:
+		if t.Revoke {
+			return "REVOKE"
+		}
+		return "GRANT"
+	case *SetVar:
+		// One type for SET, RESET and SHOW name (Name "show:name"). A
+		// read of a setting must not be listed as a write of one: drivers
+		// send SHOW on connect, so it is often the busiest of the three.
+		switch {
+		case strings.HasPrefix(t.Name, "show:"):
+			return "SHOW"
+		case t.Reset:
+			return "RESET"
+		}
+		return "SET"
+	case *CopyFrom:
+		return "COPY"
+	case *CreateIndex:
+		// Its subject is the table the index is on, not the index.
+		return "CREATE INDEX ON"
+	case *CreateRole:
+		// One type for CREATE and ALTER ROLE: a password change must not
+		// be listed as a role being created.
+		if t.Alter {
+			return "ALTER ROLE"
+		}
+		return "CREATE ROLE"
+	}
 	name := fmt.Sprintf("%T", s)
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		name = name[i+1:]
 	}
-	return name
+	return kindWords(name)
+}
+
+// kindWords turns a statement type's name into the SQL words it is made
+// of: "ReleaseSavepoint" is "RELEASE SAVEPOINT". A word starts at a
+// capital that follows a lower-case letter, or that is followed by one
+// while following a capital — so a run of capitals stays one word, and
+// a type named ShowSQL would read "SHOW SQL" rather than "SHOW S Q L".
+func kindWords(name string) string {
+	rs := []rune(name)
+	var b strings.Builder
+	for i, r := range rs {
+		if i > 0 && unicode.IsUpper(r) {
+			prevLower := unicode.IsLower(rs[i-1])
+			nextLower := i+1 < len(rs) && unicode.IsLower(rs[i+1])
+			if prevLower || (unicode.IsUpper(rs[i-1]) && nextLower) {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return b.String()
 }

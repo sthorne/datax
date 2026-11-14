@@ -25,5 +25,11 @@ jobs:
       # "Code generated ... DO NOT EDIT." header staticcheck skips.
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+      # DATAX_REQUIRE_BROWSER (issue #276): the console's browser test
+      # skips where there is no Chrome, which is right on a laptop and
+      # wrong here — the runner image ships one, and if that ever stops
+      # being true the test must fail rather than quietly stop running.
       - name: test
+        env:
+          DATAX_REQUIRE_BROWSER: "1"
         run: go test -race -timeout 30m ./...

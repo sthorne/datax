@@ -94,6 +94,11 @@
   .st .cue { font-size: 11px; }
   tr[tabindex]:focus-visible td { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
   section { margin-top: 22px; }
+  /* Running text breaks a word that is longer than the line (issue
+     #274). An identifier has no spaces in it, and a table with a
+     fifty-character name pushed its own page wider than a phone from
+     the sentence that tells the reader to ANALYZE it. */
+  main p, main h2 { overflow-wrap: anywhere; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 8px; }
   /* A tile is a label, one figure, and — sometimes — a qualifier. Every
      part gets its own line, because they used to share one: the
@@ -129,7 +134,13 @@
   .tile polyline { fill: none; stroke: var(--text-3); stroke-width: 1.5; stroke-linejoin: round; }
   .tile svg .base { stroke: var(--border); stroke-width: 1; }
   .tile svg .now { stroke: var(--text); stroke-width: 5; stroke-linecap: round; }
-  .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  /* position: relative is load-bearing (issue #274). A scroll box clips
+     an absolutely positioned descendant only if the box is itself
+     positioned, and every copy button in a key or statement cell carries
+     an .sr-only label, which is absolute. Without this the labels of
+     cells scrolled out of view widened the page instead of the table,
+     and the SQL, data and node views scrolled sideways on a phone. */
+  .tablewrap { position: relative; overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: 7px 12px; white-space: nowrap; }
   th { font-size: 12px; color: var(--text-2); font-weight: 500; border-bottom: 1px solid var(--border); }
@@ -193,11 +204,17 @@
   /* Problems panel: one row per finding, severity-colored, hidden when green. */
   #problems { margin-top: 10px; }
   #problems .ok { color: var(--good); font-size: 13px; }
+  /* The row wraps (issue #274). Every part but the summary is flex:
+     none, so on a phone the links had nowhere to go but past the right
+     edge, and any open problem made the overview scroll sideways — on
+     the screen, and at the moment, someone is most likely to be reading
+     it from a phone. The summary may shrink and break a long word. */
   .problem {
-    display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
     border-left-width: 4px;
   }
+  .problem > span:not([class]) { min-width: 0; overflow-wrap: anywhere; }
   .problem.critical { border-left-color: var(--critical); }
   .problem.warning { border-left-color: var(--warning); }
   .problem.info { border-left-color: var(--series-1); }

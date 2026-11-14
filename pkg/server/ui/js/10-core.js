@@ -141,10 +141,18 @@ function fmtBytes(b) {
   if (b >= 1 << 10) return (b / (1 << 10)).toFixed(1) + " KiB";
   return Math.round(b) + " B";
 }
+// fmtAgo writes an age in the unit a person would say it in. It used to
+// stop at minutes, so a day-old event read "1440m ago" (issue #272).
+// The figure is floored in every unit, the way an age is spoken: 59.6
+// minutes is still "59m ago", and 59.6 seconds "59s ago" — rounded, it
+// read "60s ago" for the last half second of every minute.
 function fmtAgo(ms) {
   if (ms < 1500) return "now";
-  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
-  return Math.round(ms / 60000) + "m ago";
+  if (ms < 60000) return Math.floor(ms / 1000) + "s ago";
+  if (ms < 3600000) return Math.floor(ms / 60000) + "m ago";
+  if (ms < 2 * 3600000) { const m = Math.floor(ms % 3600000 / 60000); return "1h" + (m ? " " + m + "m" : "") + " ago"; }
+  if (ms < 48 * 3600000) return Math.floor(ms / 3600000) + "h ago";
+  return Math.floor(ms / 86400000) + "d ago";
 }
 // spark draws a tile's recent history as a reading rather than a
 // decoration (issue #218): a baseline says where zero is, a dot says
@@ -471,6 +479,14 @@ function applyTheme() {
 // Only moments. A DURATION — how long a transaction has been open, how
 // long a connection has been idle — keeps fmtAgo: a column headed "idle"
 // reading "14:20:05" would be nonsense.
+//
+// It takes an INSTANT, in milliseconds since the epoch — never an age.
+// A source that carries an age ("heartbeat_ago_ms") is turned into an
+// instant at the call, by subtracting it from Date.now(); one that
+// carries an instant (an "at" timestamp, a *_unix_ms) is passed as it is. Handing
+// it Date.now() minus an instant printed the current Unix time as an
+// age, "29910444m ago", on every event and statement for two months
+// (issue #272); TestMomentsAreHandedAnInstant holds the line now.
 function fmtWhen(instantMs) {
   if (!Number.isFinite(instantMs)) return "—";
   if (pref("timestamps") !== "absolute") return fmtAgo(Date.now() - instantMs);
