@@ -65,7 +65,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.BoolVar(&f.acceptEncRB, "accept-encryption-rollback", false, "start a store whose switch to authenticated encryption was rolled back (its key registry or the whole store restored from before the switch), lowering the records that caught the rollback to what the store has; for the one start after a rollback that was meant")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
-	f.fs.StringVar(&f.encRoot, "enc-root", "", "the alternative to --enc-key: what the store key is kept under, file:<path> (a 32-byte wrapping key) or exec:<command> (run with wrap, unwrap or key-id; see docs/encryption.md). The store key is made on the node and kept in the data directory only wrapped. A comma-separated list names candidates; the one that wrapped the store's key is used")
+	f.fs.StringVar(&f.encRoot, "enc-root", "", "the alternative to --enc-key: what the store key is kept under, file:<path> (a 32-byte wrapping key), exec:<command> (run with wrap, unwrap or key-id) or shares (a root key split among operators: the node starts sealed until enough run `datax unseal`); see docs/encryption.md. The store key is made on the node and kept in the data directory only wrapped. A comma-separated list names candidates; the one that wrapped the store's key is used")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
 	f.fs.BoolVar(&f.quiescence, "raft-quiescence", true, "let idle ranges stop ticking and heartbeating (cluster version v12)")
@@ -165,6 +165,9 @@ func metricsRecordInterval(d time.Duration) time.Duration {
 }
 
 func runServer(cfg server.Config) error {
+	cfg.OnSealed = func(addr string) {
+		fmt.Printf("datax node is SEALED: its store key is under a root key held as shares, and the store stays closed until enough are submitted\n  submit a share: datax unseal --addr %s\n  progress:       datax debug seal-status --addr %s\n", addr, addr)
+	}
 	n, err := server.Start(cfg)
 	if err != nil {
 		return err

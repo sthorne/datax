@@ -23,7 +23,7 @@ import (
 // The store key and everything under it are never changed by these: one
 // small file in the data directory is.
 func runDebugEncRoot(args []string) error {
-	const usage = "usage: datax debug enc-root <status|adopt|rewrap|release> [flags]"
+	const usage = "usage: datax debug enc-root <status|adopt|rewrap|release|split|resplit> [flags]"
 	if len(args) < 1 {
 		return errors.New(usage)
 	}
@@ -32,8 +32,10 @@ func runDebugEncRoot(args []string) error {
 	dir := fs.String("dir", "", "data directory of the STOPPED node")
 	addr := fs.String("addr", "", "rewrap: RPC address of the RUNNING node")
 	keyPath := fs.String("enc-key", "", "adopt: the store's current key file (a comma-separated list is tried in order)")
-	rootSpec := fs.String("enc-root", "", "the root: file:<path> or exec:<command>; for an offline rewrap, a comma-separated list of the root the store is under and the one it moves to")
+	rootSpec := fs.String("enc-root", "", "the root: file:<path>, exec:<command> or shares; for an offline rewrap, a comma-separated list of the root the store is under and the one it moves to")
 	toRoot := fs.Int("to-root", 0, "rewrap: wrap under this root instead of the one in use — its position (from 1) in the node's --enc-root list (online) or in --enc-root here (offline)")
+	split := fs.String("shares", "", "split, resplit: <threshold>/<total>, for example 2/3")
+	outDir := fs.String("out-dir", "", "split, resplit: write each share to its own file in this directory instead of printing them")
 	out := fs.String("out", "", "release: file to write the store key to (created, never overwritten)")
 	certsDir := fs.String("certs-dir", "", "online mode, secure cluster: certificate directory (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "online mode: username whose client certificate authenticates the call; must be an admin")
@@ -48,7 +50,7 @@ func runDebugEncRoot(args []string) error {
 	// openStore unwraps the store key in --dir through --enc-root and
 	// settles which entry the registry is under.
 	openStore := func() ([]enc.Root, enc.Unwrapped, error) {
-		roots, err := enc.ParseRoots(*rootSpec)
+		roots, err := parseRootsOffline(*dir, *rootSpec)
 		if err != nil {
 			return nil, enc.Unwrapped{}, err
 		}
@@ -67,6 +69,51 @@ func runDebugEncRoot(args []string) error {
 		return roots, got[idx], nil
 	}
 	switch action {
+	case "split":
+		// A new root key, split and forgotten. Nothing here touches a
+		// store: the shares are what a node is later unsealed with, and a
+		// store comes under the key when a node first starts with
+		// --enc-root shares, or is moved to it.
+		threshold, total, err := parseSplit(*split)
+		if err != nil {
+			return err
+		}
+		key, err := enc.NewStoreKey()
+		if err != nil {
+			return err
+		}
+		shares, err := enc.SplitRootKey(nil, key, threshold, total)
+		for i := range key {
+			key[i] = 0
+		}
+		if err != nil {
+			return err
+		}
+		log.Audit("root-key-split", "key_id", shares[0].KeyID, "threshold", int64(threshold), "shares", int64(total), "reason", "new root key", "principal", "os:"+osUsername())
+		return emitShares(shares, *outDir)
+
+	case "resplit":
+		// The same root key under a new split: gather a quorum of the
+		// shares there are, and hand out new ones.
+		threshold, total, err := parseSplit(*split)
+		if err != nil {
+			return err
+		}
+		root := enc.NewShareRoot()
+		if err := unsealOffline("", []enc.Root{root}); err != nil {
+			return err
+		}
+		shares, err := root.Resplit(nil, threshold, total)
+		if err != nil {
+			return err
+		}
+		log.Audit("root-key-split", "key_id", shares[0].KeyID, "threshold", int64(threshold), "shares", int64(total), "reason", "new split of the same key", "principal", "os:"+osUsername())
+		if err := emitShares(shares, *outDir); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "The shares of the earlier split still rebuild this key among themselves: a new split does not cancel them.\nTo shut out a holder who may have kept a share, make a new root key (split) and move each store under it.")
+		return nil
+
 	case "status":
 		if *dir == "" {
 			return fmt.Errorf("enc-root status requires --dir")
@@ -112,10 +159,14 @@ func runDebugEncRoot(args []string) error {
 		if err != nil {
 			return err
 		}
-		root, err := enc.ParseRoot(*rootSpec)
+		adoptRoots, err := parseRootsOffline("", *rootSpec)
 		if err != nil {
 			return err
 		}
+		if len(adoptRoots) != 1 {
+			return fmt.Errorf("enc-root adopt takes one root in --enc-root, not %d", len(adoptRoots))
+		}
+		root := adoptRoots[0]
 		if err := enc.RewrapStoreKey(ctx, vfs.Default, *dir, root, keys[idx]); err != nil {
 			return err
 		}

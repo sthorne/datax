@@ -40,6 +40,7 @@ var adminReadOnlyOps = map[string]bool{
 	"collect-checksum": true,
 	"wait-applied":     true,
 	"reencrypt-status": true,
+	"seal-status":      true,
 }
 
 // adminUnauditedOps skip the audit log: the read-only ops (collect-checksum
@@ -53,6 +54,7 @@ var adminUnauditedOps = map[string]bool{
 	"collect-checksum": true,
 	"wait-applied":     true,
 	"reencrypt-status": true,
+	"seal-status":      true,
 	"node-status":      true,
 	"node-detail":      true,
 }
@@ -244,6 +246,12 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 
 	case "rewrap-store-key":
 		return n.serveRewrapStoreKey(ctx, req)
+
+	case "seal-status":
+		return n.serveSealStatus()
+
+	case "unseal":
+		return n.serveStageShare(ctx, req)
 
 	case "reencrypt":
 		return n.serveReencrypt(req)

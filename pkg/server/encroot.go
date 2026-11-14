@@ -36,6 +36,15 @@ func (n *Node) loadRootedStoreKey(ctx context.Context) error {
 		return fmt.Errorf("--enc-root: %w", err)
 	}
 	dir := n.cfg.Dir
+	// A root key held as shares is in nobody's hands yet: wait, sealed,
+	// for the people who hold them.
+	if waitFor, err := sealedRoot(dir, roots); err != nil {
+		return fmt.Errorf("reading the wrapped store key: %w", err)
+	} else if waitFor != nil {
+		if err := n.awaitUnseal(waitFor); err != nil {
+			return err
+		}
+	}
 	if !enc.WrappedKeyExists(vfs.Default, dir) {
 		// No wrapped key. That is a new store, or one that is not this
 		// root's to open.
@@ -205,13 +214,14 @@ func (n *Node) serveRewrapStoreKey(ctx context.Context, req cluster.AdminRequest
 	n.encKeyMu.Lock()
 	key := append([]byte(nil), n.encKey...)
 	from := n.encRoot
+	roots := append([]enc.Root(nil), n.encRoots...)
 	n.encKeyMu.Unlock()
 	to := from
 	if req.Root != 0 {
-		if req.Root < 1 || req.Root > len(n.encRoots) {
-			return cluster.AdminResponse{Error: fmt.Sprintf("this node was started with %d root(s); there is no root %d to rewrap under", len(n.encRoots), req.Root)}
+		if req.Root < 1 || req.Root > len(roots) {
+			return cluster.AdminResponse{Error: fmt.Sprintf("this node has %d root(s); there is no root %d to rewrap under", len(roots), req.Root)}
 		}
-		to = n.encRoots[req.Root-1]
+		to = roots[req.Root-1]
 	}
 	if err := enc.RewrapStoreKey(ctx, vfs.Default, n.cfg.Dir, to, key); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}

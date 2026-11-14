@@ -223,6 +223,12 @@ type Config struct {
 
 	// Test hooks.
 	TestingKnobs kvserver.TestingKnobs
+	// OnSealed is called, with the RPC address, when the start stops to
+	// wait for shares of the root key (sealed.go): Start does not return
+	// until the node is unsealed, so this is how its caller learns it is
+	// waiting. StartContext, when set, abandons a start that is waiting.
+	OnSealed     func(addr string)
+	StartContext context.Context
 	// Engine injects the state engine (tests: in-memory); RaftEngine,
 	// with it, injects a raft engine so the store runs split. With
 	// Engine set the node never opens or migrates a store itself.
@@ -303,6 +309,9 @@ type Node struct {
 	// guarded by encKeyMu: a rewrap can move the store to another.
 	encRoots []enc.Root
 	encRoot  enc.Root
+	// rpcListener is the RPC listener when a sealed start opened it
+	// early (sealed.go); nil otherwise.
+	rpcListener *handoffListener
 	// rotateMu serializes online store-key rotations end to end: registry
 	// reseal, encKey swap, and metadata-backup reseal (issue #66).
 	rotateMu sync.Mutex
@@ -506,7 +515,12 @@ func (n *Node) start() error {
 	}
 
 	lis := n.cfg.Listener
-	if lis == nil {
+	if n.rpcListener != nil {
+		// A sealed start has been listening here since before the store
+		// opened; the node proper takes the listener over.
+		lis = n.rpcListener.final()
+		n.stopper.AddCloser(func() { _ = lis.Close() })
+	} else if lis == nil {
 		lis, err = net.Listen("tcp", n.cfg.Listen)
 		if err != nil {
 			return err

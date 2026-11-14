@@ -11,6 +11,24 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **A root key split among operators, and a sealed start** (#306, the
+  second piece of #292). `datax debug enc-root split --shares 2/3`
+  makes a root key, hands out three shares of which any two rebuild it
+  (Shamir's scheme, standard library only), and keeps nothing. A node
+  started with `--enc-root shares` starts **sealed**: it listens on its
+  RPC address but its store, SQL port and console stay closed — to the
+  cluster it is down — until enough share-holders have each run `datax
+  unseal --addr <node>` and typed a share, which is asked for without
+  echo and is never a flag. `datax debug seal-status` shows how many
+  shares are in and whose. A mistyped share, a repeated one, a share of
+  another cluster's key or of another split is refused as it arrives,
+  and a set that does not rebuild the key it names never opens
+  anything. Only the root user's certificate may unseal (a sealed node
+  cannot read its roles); without TLS, only the node's own machine.
+  `enc-root resplit` makes a new split of the same key; to replace the
+  root key itself, the new key's shares are submitted to the running
+  nodes and each store key is rewrapped under it. Shares and root keys
+  are never written to disk, logged, or put in an event.
 - **A store key can be kept under a root instead of in a file** (#305,
   the first piece of #292). `--enc-root file:<path>` or `--enc-root
   exec:<command>` is the alternative to `--enc-key`: the node makes its

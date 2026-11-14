@@ -289,9 +289,107 @@ What a root does and does not give depends on the root. A `file` root
 on the same disk as the data protects nothing a key file would not. An
 `exec` root is as strong as what its command talks to. Neither changes
 the fact that the store key is in the node's memory while it runs.
-Roots that keep the root key off every disk — split among operators,
-handed between running nodes, or held in a KMS spoken to directly — are
-planned (#306, #307, #308).
+A root key split among operators is the next section. Roots handed
+between running nodes, or held in a KMS spoken to directly, are planned
+(#307, #308).
+
+### A root key held as shares
+
+`--enc-root shares` keeps the root key nowhere. The key is made once,
+split into `n` shares of which any `k` rebuild it, the shares are given
+to people, and the key is forgotten:
+
+```
+datax debug enc-root split --shares 2/3 --out-dir /dev/shm/shares
+```
+
+prints or writes three shares (`datax-share-…`, one per file, mode
+0600, never over an existing file) and keeps nothing. The split is
+Shamir's scheme over GF(256): each byte of the key is the constant term
+of its own random polynomial of degree `k-1`, and a share is the
+polynomials' values at one point. `k` shares determine the key; `k-1`
+are consistent with every key equally, so they say nothing about it.
+One root key serves a whole cluster: each node's store key is its own,
+wrapped under the same root.
+
+A node started with `--enc-root shares` cannot open its store, and
+starts **sealed**:
+
+```
+$ datax start --dir data1 --enc-root shares --certs-dir certs ...
+datax node is SEALED: its store key is under a root key held as shares ...
+
+$ datax unseal --addr 10.0.0.1:26257 --certs-dir certs      # one share-holder
+share:                                                       # typed, not echoed
+share accepted
+sealed: 1 of 2 shares in (share 3); waiting for shares of root key 644fe2bbf57d9721
+
+$ datax unseal --addr 10.0.0.1:26257 --certs-dir certs      # another
+share accepted: unsealed. The node is opening its store (root key 644fe2bbf57d9721)
+```
+
+- **Sealed means closed.** A sealed node has loaded its certificates
+  and listens on its RPC address, where it serves `unseal` and
+  `datax debug seal-status` and refuses everything else. Its SQL port
+  and console are not open and it runs no raft: to the cluster it is a
+  node that is down, and is counted as one. A new node starts sealed
+  too — it needs the root key to wrap the store key it makes — and its
+  first share says which root key it will be under.
+- **Who may unseal.** The root user's client certificate. A sealed node
+  cannot read its role table, so membership of the admin role cannot be
+  checked until it is open. On a cluster without TLS a share is accepted
+  only from the node's own machine, since it would otherwise cross the
+  network in the clear.
+- **A share is never a flag.** `datax unseal` asks for it without echo,
+  or reads one line of standard input (for a password manager's CLI);
+  it does not accept one as an argument or from the environment. Shares
+  and the root key are never written to disk, logged, or put in an
+  event. Every submission is audited — who, which share by its number,
+  the outcome — without the share.
+- **What is refused, and when.** A share carries a check over its own
+  bytes and the id of the root key it is a share of. A mistyped or
+  damaged share, a share of another cluster's key, a share already
+  submitted and a share of a different split of the key are each
+  refused as they arrive, with the reason. If a set of shares that all
+  pass still does not rebuild the key they name — one was forged — the
+  node stays sealed and discards them rather than open on a wrong key.
+  More than ten refusals in a minute pause submissions; a share is 256
+  random bits, so this is against noise, not guessing.
+- **In memory while running.** Once unsealed the node holds the root
+  key in memory, as it holds the store key: that is what lets it rotate
+  its store key without the share-holders. A restart seals it again.
+- **Offline tools ask for shares.** `datax debug metadata`,
+  `rotate-enc-key --dir`, `unsafe-recover` and `enc-root
+  adopt|rewrap|release` given `--enc-root shares` prompt for shares
+  until they have a quorum.
+
+Changing who holds shares, or how many:
+
+```
+datax debug enc-root resplit --shares 3/5 --out-dir /dev/shm/new   # asks for a quorum of the current shares
+```
+
+makes a new split of the **same** root key. The old shares still
+rebuild it among themselves — a new split cancels nothing — so this is
+for a holder trusted to have destroyed their share. To shut out one
+who is not, replace the root key: make a new one with `split`, have its
+holders submit shares to each **running** node with `datax unseal`
+(there, shares assemble a second root key beside the one in use), then
+move each store key under it and restart on the new shares when
+convenient:
+
+```
+datax debug seal-status --addr 10.0.0.1:26257 --certs-dir certs       # "a new root key (…) is held as root 2"
+datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs --to-root 2
+```
+
+What this root gives: a disk, every disk, or a powered-off machine
+opens nothing, and no one person can open it either. What it costs: a
+cold start of a node needs `k` people (letting a running cluster vouch
+for a restarting node is #307), and losing more than `n-k` shares
+loses the root key — after which a node that is running can still be
+moved to a new root key, and one that is stopped cannot be opened by
+anyone.
 
 ## Key rotation
 

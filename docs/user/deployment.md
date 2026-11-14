@@ -134,6 +134,34 @@ file and sends no key over the network
 (`datax debug rotate-enc-key --addr ...`). See
 [encryption](../encryption.md#roots-where-the-store-key-lives).
 
+To keep the root key off every machine, split it among people:
+`datax debug enc-root split --shares 2/3` makes a root key, prints
+three shares of which any two rebuild it, and keeps nothing. Nodes
+started with `--enc-root shares` come up **sealed** — store closed, SQL
+and console ports not open — until two share-holders have each run
+`datax unseal --addr <node>` and typed their share. See
+[a root key held as shares](../encryption.md#a-root-key-held-as-shares).
+
+*Runbook: cold start of a sealed cluster.* Start every node; each
+prints that it is sealed. For each node, two share-holders run
+`datax unseal --addr <node> --certs-dir certs` (the root user's client
+certificate) and enter their share; `datax debug seal-status --addr
+<node>` shows how many are in and whose. A node opens as soon as its
+second share arrives; the cluster serves once a majority of nodes are
+open. A refused share says why (mistyped, already submitted, another
+cluster's) and does not count.
+
+*Runbook: a lost share.* With a 2-of-3 split, one lost share costs
+nothing yet, and a second lost share costs the root key — so act on the
+first. If the share is merely lost, run `datax debug enc-root resplit
+--shares 2/3` with two of the remaining holders and hand out the new
+shares; destroy the old ones. If it may be in someone else's hands,
+replace the root key instead: `split` a new one, have its holders
+`datax unseal` each running node, then `datax debug enc-root rewrap
+--addr <node> --to-root 2` on each; the old shares then open nothing.
+Do this while the nodes are running: a stopped node whose root key
+cannot be rebuilt cannot be opened.
+
 Files written under retired data keys are re-encrypted on demand:
 
 ```sh

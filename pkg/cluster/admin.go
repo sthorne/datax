@@ -59,6 +59,32 @@ type AdminRequest struct {
 	// use. A position, not a spec — an exec root is a command line, and
 	// no request may name a command for a node to run.
 	Root int `json:"root,omitempty"`
+	// Share (unseal) is one share of a root key, as its holder keeps it.
+	// It is a secret in transit: never logged, audited or echoed.
+	Share string `json:"share,omitempty"`
+}
+
+// SealStatus (seal-status, unseal) says where a node stands with a root
+// key that is rebuilt from operators' shares.
+type SealStatus struct {
+	// Sealed: the node's store is closed, waiting for shares.
+	Sealed bool `json:"sealed"`
+	// Root is the kind of root the store key is under ("" for a key
+	// file or a plaintext store) and KeyID that root's key.
+	Root  string `json:"root,omitempty"`
+	KeyID string `json:"key_id,omitempty"`
+	// Have and Need count the distinct shares submitted and the
+	// threshold (0 until a first share has said what it is); Indexes are
+	// the shares in, which are not secret.
+	Have    int   `json:"have"`
+	Need    int   `json:"need"`
+	Indexes []int `json:"indexes,omitempty"`
+	// Staged describes a second root key being assembled on a running
+	// node, to move the store key under (rotating the root key): its
+	// progress, and once complete its position for rewrap --to-root.
+	Staged *SealStatus `json:"staged,omitempty"`
+	// Position is a staged root's place among the node's roots.
+	Position int `json:"position,omitempty"`
 }
 
 // ReencryptionStatus reports the background re-encryption pass on one
@@ -80,6 +106,7 @@ type ReencryptionStatus struct {
 // AdminResponse is the JSON reply.
 type AdminResponse struct {
 	Error  string                 `json:"error,omitempty"`
+	Seal   *SealStatus            `json:"seal,omitempty"`
 	Ranges []kvpb.RangeDescriptor `json:"ranges,omitempty"`
 	// TableNames (ranges, split, merge) maps table IDs to names, so a
 	// client can print spans as /table/orders/... (keys.SetTableNamer).

@@ -452,13 +452,18 @@ func RemoveWrappedKeys(base vfs.FS, dir string) error {
 
 // ---- Parsing ----
 
-// ParseRoot builds a root from its spec: "file:<path>" or
-// "exec:<command> [args...]".
+// ParseRoot builds a root from its spec: "file:<path>",
+// "exec:<command> [args...]", or "shares" (shares.go), which is made
+// sealed.
 func ParseRoot(spec string) (Root, error) {
+	if strings.TrimSpace(spec) == "shares" {
+		// Nothing to configure: the shares say what they are shares of.
+		return NewShareRoot(), nil
+	}
 	kind, rest, ok := strings.Cut(strings.TrimSpace(spec), ":")
 	rest = strings.TrimSpace(rest)
 	if !ok || rest == "" {
-		return nil, fmt.Errorf("root %q: want file:<path> or exec:<command>", spec)
+		return nil, fmt.Errorf("root %q: want file:<path>, exec:<command> or shares", spec)
 	}
 	switch kind {
 	case "file":
@@ -466,7 +471,7 @@ func ParseRoot(spec string) (Root, error) {
 	case "exec":
 		return newExecRoot(rest, DefaultRootTimeout)
 	}
-	return nil, fmt.Errorf("root %q: unknown kind %q (want file or exec)", spec, kind)
+	return nil, fmt.Errorf("root %q: unknown kind %q (want file, exec or shares)", spec, kind)
 }
 
 // ParseRoots builds the roots of an --enc-root value: one spec, or
