@@ -204,11 +204,17 @@
   /* Problems panel: one row per finding, severity-colored, hidden when green. */
   #problems { margin-top: 10px; }
   #problems .ok { color: var(--good); font-size: 13px; }
+  /* The row wraps (issue #274). Every part but the summary is flex:
+     none, so on a phone the links had nowhere to go but past the right
+     edge, and any open problem made the overview scroll sideways — on
+     the screen, and at the moment, someone is most likely to be reading
+     it from a phone. The summary may shrink and break a long word. */
   .problem {
-    display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 7px 12px; margin-top: 6px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
     border-left-width: 4px;
   }
+  .problem > span:not([class]) { min-width: 0; overflow-wrap: anywhere; }
   .problem.critical { border-left-color: var(--critical); }
   .problem.warning { border-left-color: var(--warning); }
   .problem.info { border-left-color: var(--series-1); }

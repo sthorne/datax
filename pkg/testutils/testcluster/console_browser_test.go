@@ -150,6 +150,61 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 			})
 		}
 	}
+	// The health panel, with problems open. A young test cluster usually
+	// has none, so the routes above see the panel empty — and when one
+	// did happen to be open, under a loaded suite, the overview was 439px
+	// wide on the phone and this test failed one run in several (found
+	// by QA on #284). Whether the panel fits must not depend on the
+	// cluster being unwell at the right moment, so the problems are
+	// rendered on purpose, through the console's own renderHealth, and
+	// the page is measured in the same breath, before the next poll
+	// redraws it.
+	for _, vp := range []struct {
+		name          string
+		width, height int
+		mobile        bool
+	}{{"desktop", 1440, 900, false}, {"phone", 390, 844, true}} {
+		t.Run("problems/"+vp.name, func(t *testing.T) {
+			page := br.open(t, base, vp.width, vp.height, vp.mobile)
+			defer page.close()
+			deadline := time.Now().Add(30 * time.Second)
+			for !page.facts(t).ready(false) {
+				if time.Now().After(deadline) {
+					t.Fatal("the overview never finished its first render")
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			var got consoleFacts
+			if err := json.Unmarshal([]byte(page.eval(t, `(() => {
+  const since = Date.now() - 90000;
+  renderHealth({ checks: 11, problems: [
+    { severity: "critical", check: "node-down", section: "nodes", since_unix_ms: since, summary: "n3 has not heartbeated for 42s" },
+    { severity: "warning", check: "under-replicated", section: "cluster-ranges", since_unix_ms: since, summary: "4 ranges have fewer replicas than their target" },
+    { severity: "warning", check: "placement-unsatisfiable", section: "nodes", since_unix_ms: since, summary: "database shop asks for 3 replicas across regions and only 2 regions have a live node" },
+    { severity: "info", check: "stale-statistics", section: "schema", since_unix_ms: since, summary: "a_table_whose_name_is_long_enough_to_scroll_sideways has not been analyzed since it grew tenfold" },
+  ] });
+  const f = JSON.parse(`+consoleFactsJS+`);
+  f.problems = document.querySelectorAll('#problems .problem').length;
+  return JSON.stringify(f);
+})()`)), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Problems != 4 {
+				t.Fatalf("the panel shows %d problems, want the 4 rendered into it", got.Problems)
+			}
+			if got.ScrollWidth > got.ClientWidth {
+				t.Errorf("with problems open the overview is %dpx wide in a %dpx viewport, so it scrolls sideways; the furthest element is %s (issue #274)",
+					got.ScrollWidth, got.ClientWidth, got.Widest)
+			}
+			if m := absurdAge.FindString(got.Text); m != "" {
+				t.Errorf("the panel says %q of a problem found 90s ago (issue #272)", m)
+			}
+			if !strings.Contains(got.Text, "1m ago") {
+				t.Errorf("no problem says when it was found; the view reads: %.300q", got.Text)
+			}
+		})
+	}
+
 	// The formatters themselves, called in the page: an age is said in
 	// the unit a person would use (issue #272), and a moment handed to
 	// fmtWhen as an instant reads as the age it is.
@@ -207,6 +262,7 @@ type consoleFacts struct {
 	ScrollWidth int      `json:"scrollWidth"`
 	ClientWidth int      `json:"clientWidth"`
 	Widest      string   `json:"widest"`
+	Problems    int      `json:"problems"`
 }
 
 // ready reports whether the page has finished its first render: the

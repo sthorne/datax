@@ -123,6 +123,19 @@ func (f *fingerprinter) stmt(s Statement) {
 			f.kw("ANALYZE")
 		}
 		f.stmt(t.Stmt)
+	case *AlterOwner:
+		// ALTER TABLE | VIEW | SEQUENCE | TYPE | DATABASE name OWNER TO
+		// role. Its kind is two words around its subject, which the
+		// kind-then-subject form below cannot say: the type's name alone
+		// reads "ALTER OWNER", which is not a statement. The role is a
+		// value, and is left out like one.
+		f.kw("ALTER")
+		f.kw(strings.ToUpper(t.Kind))
+		if t.Kind == "table" || t.Kind == "view" {
+			f.table(t.Name)
+		}
+		f.kw(t.Name)
+		f.kw("OWNER TO")
 	default:
 		// Everything else is named by kind and subject. These are not
 		// shapes anyone optimises, and rendering each of them in full
@@ -622,6 +635,15 @@ func statementKindOf(s Statement) string {
 		}
 		return "GRANT"
 	case *SetVar:
+		// One type for SET, RESET and SHOW name (Name "show:name"). A
+		// read of a setting must not be listed as a write of one: drivers
+		// send SHOW on connect, so it is often the busiest of the three.
+		switch {
+		case strings.HasPrefix(t.Name, "show:"):
+			return "SHOW"
+		case t.Reset:
+			return "RESET"
+		}
 		return "SET"
 	case *CopyFrom:
 		return "COPY"
@@ -635,10 +657,6 @@ func statementKindOf(s Statement) string {
 			return "ALTER ROLE"
 		}
 		return "CREATE ROLE"
-	case *AlterOwner:
-		// ALTER TABLE | VIEW | ... name OWNER TO role. "ALTER OWNER"
-		// is not a statement; the ellipsis stands where the name goes.
-		return "ALTER " + strings.ToUpper(t.Kind) + " … OWNER TO"
 	}
 	name := fmt.Sprintf("%T", s)
 	if i := strings.LastIndex(name, "."); i >= 0 {

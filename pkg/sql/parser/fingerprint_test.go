@@ -196,7 +196,15 @@ func TestFingerprintKindsReadAsSQL(t *testing.T) {
 		{`ALTER ROLE alice PASSWORD 'hunter2'`, "ALTER ROLE"},
 		{`ALTER USER alice PASSWORD 'hunter2'`, "ALTER ROLE"},
 		// "ALTER OWNER" is not a statement.
-		{`ALTER TABLE t1 OWNER TO alice`, "ALTER TABLE … OWNER TO"},
+		{`ALTER TABLE t1 OWNER TO alice`, "ALTER TABLE t1 OWNER TO"},
+		{`ALTER DATABASE d OWNER TO alice`, "ALTER DATABASE d OWNER TO"},
+		// SET, RESET and SHOW name share a type too (from QA's review of
+		// #284): a read of a setting is not a write of one.
+		{`SHOW statement_timeout`, "SHOW"},
+		{`SHOW TRANSACTION ISOLATION LEVEL`, "SHOW"},
+		{`RESET statement_timeout`, "RESET"},
+		{`RESET ALL`, "RESET"},
+		{`SET LOCAL statement_timeout = '30s'`, "SET"},
 	} {
 		got := shapeOf(t, c.sql).Text
 		if got != c.want {

@@ -602,7 +602,9 @@ state or the internode protocol does, and an entry below says so.
   starts a cluster and opens every view in headless Chrome, a new tab
   per view, at a desktop and a phone width, then reads the page: the
   header, the banner, the scope picker, every "when", script errors,
-  and the widest thing on the page. It drives Chrome over the DevTools
+  and the widest thing on the page. It also renders health problems
+  into the overview on purpose, so the panel is measured on every run
+  and not only when the cluster is unwell. It drives Chrome over the DevTools
   pipe with the standard library, so it adds no dependency. It skips
   where there is no Chrome (`DATAX_CHROME` names one), and CI sets
   `DATAX_REQUIRE_BROWSER` so that a runner without one fails instead.
@@ -699,15 +701,20 @@ state or the internode protocol does, and an entry below says so.
   labels of cells scrolled out of view widened the page instead. The
   box is positioned now. Running text also breaks a word longer than
   the line, which a table with a fifty-character name needed on its own
-  page.
+  page. And a health problem's row wraps: its links had nowhere to go
+  but past the right edge, so the overview scrolled sideways exactly
+  when a problem was open.
 - **Schema and transaction statements are named in SQL** (#275). The
   statement list showed `CREATETABLE bench_kv`, `CREATEINDEX bench_ij`
   and `ROLLBACKTOSAVEPOINT`: a statement that is named by kind rather
   than rendered in full took the parser's type name, upper-cased whole.
   It is now the words that open the statement — `CREATE TABLE
   bench_kv`, `CREATE INDEX ON bench_ij`, `ROLLBACK TO SAVEPOINT`,
-  `GRANT` or `REVOKE`, `SET`, `COPY`, and `ALTER ROLE` where a password
-  change used to be listed as `CREATEROLE`. The fingerprint is a hash of that
+  `GRANT` or `REVOKE`, `COPY`, `ALTER TABLE t OWNER TO`, and `ALTER
+  ROLE` where a password change used to be listed as `CREATEROLE`.
+  `SET`, `RESET` and `SHOW name` are told apart: they share a parser
+  type and were one shape, so the `SHOW` a driver sends on connect was
+  counted with the session's `SET`s. The fingerprint is a hash of that
   text, so these shapes get new fingerprints: their counts start again,
   the old rows age out of `datax_metrics_shapes` with its retention,
   and during a rolling upgrade a schema statement can be listed under
