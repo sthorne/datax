@@ -49,8 +49,16 @@ func NewPeerExchange() (*PeerExchange, error) {
 func (x *PeerExchange) Public() []byte { return x.priv.PublicKey().Bytes() }
 
 func peerSealKey(shared, askerPub, giverPub, binding []byte) ([]byte, error) {
+	return exchangeKey("datax peer unseal v1", shared, askerPub, giverPub, binding)
+}
+
+// exchangeKey derives the key one exchange seals under. label keeps the
+// exchanges of different purposes apart: a root key handed over for
+// peer unseal can never be taken for a cluster key, nor the reverse.
+func exchangeKey(label string, shared, askerPub, giverPub, binding []byte) ([]byte, error) {
 	info := make([]byte, 0, 32+len(askerPub)+len(giverPub)+len(binding))
-	info = append(info, "datax peer unseal v1\x00"...)
+	info = append(info, label...)
+	info = append(info, 0)
 	info = append(info, askerPub...)
 	info = append(info, giverPub...)
 	info = append(info, binding...)
