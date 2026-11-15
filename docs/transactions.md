@@ -491,10 +491,18 @@ resolution only touches keys the enumeration skipped.
 
 Correctness rules enforced around the threshold:
 
-- **Reads at or below the threshold are rejected**, non-retryably — the
-  versions they would need may be gone. Live transactions never trip this
-  (TTL ≫ transaction lifetime, and refresh/uncertainty only move `readTS`
-  forward).
+- **Reads at or below the threshold are rejected** — the versions they
+  would need may be gone — with a typed detail
+  (`kvpb.BelowGCThresholdError`; a peer that predates it is recognized
+  by the message). What follows depends on who chose the timestamp
+  (issue #313). A transaction the cluster timestamped restarts at a new
+  one (`kvclient.RetryableError`; SQLSTATE `40001`), which succeeds: it
+  tripped because it outlived a short `gc_ttl` or began before a purge.
+  A historical transaction's timestamp is the client's, so the refusal
+  stands (SQLSTATE `72000`, PostgreSQL's `snapshot_too_old`): no retry
+  at that timestamp can succeed. With the default 25h window live
+  transactions never trip it (TTL ≫ transaction lifetime, and
+  refresh/uncertainty only move `readTS` forward).
 - **Resurrection guard**: `createTxnRecord` rejects any transaction whose
   `MinTimestamp` is at or below the threshold, so a zombie coordinator
   cannot recreate a reclaimed record as PENDING after having possibly been

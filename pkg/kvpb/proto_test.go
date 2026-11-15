@@ -146,6 +146,7 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Message: "rkm", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), ActualDescriptors: []RangeDescriptor{testDesc()}}},
 		{Message: "frozen", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), Frozen: true}},
 		{Message: "dc", DescriptorChanged: &DescriptorChangedError{RangeID: 7, BuiltFrom: 3, Current: 4}},
+		{Message: "gc", BelowGCThreshold: &BelowGCThresholdError{Timestamp: mkts(1), Threshold: mkts(2)}},
 		{Message: "wi", WriteIntent: &WriteIntentError{Intents: []storage.Intent{{Key: keys.Key("k"), Txn: testTxn().TxnMeta}}}},
 		{Message: "wto", WriteTooOld: &WriteTooOldError{Timestamp: mkts(1), ActualTimestamp: mkts(2)}},
 		{Message: "unc", Uncertainty: &UncertaintyError{ReadTimestamp: mkts(1), ExistingTimestamp: mkts(2)}},
@@ -169,5 +170,22 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		if !reflect.DeepEqual(kerr, gotErr) {
 			t.Fatalf("error mismatch:\n got %+v\nwant %+v", gotErr, kerr)
 		}
+	}
+}
+
+// TestBelowGCThresholdDetail (issue #313): a range's refusal of a batch
+// at or below its GC threshold carries a typed detail, and one from a
+// peer that predates the detail is still recognized by its message.
+func TestBelowGCThresholdDetail(t *testing.T) {
+	e := NewBelowGCThresholdError(4, mkts(1), mkts(2))
+	if !e.IsBelowGCThreshold() || e.BelowGCThreshold == nil || e.BelowGCThreshold.Threshold != mkts(2) {
+		t.Fatalf("typed refusal: %+v", e)
+	}
+	old := &Error{Message: e.Message}
+	if !old.IsBelowGCThreshold() {
+		t.Fatalf("an older peer's refusal is not recognized: %q", old.Message)
+	}
+	if (&Error{Message: "something else"}).IsBelowGCThreshold() || (*Error)(nil).IsBelowGCThreshold() {
+		t.Fatal("an unrelated error recognized as a GC-threshold refusal")
 	}
 }

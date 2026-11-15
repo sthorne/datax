@@ -1170,6 +1170,16 @@ state or the internode protocol does, and an entry below says so.
   `backup` and `restore` with keys from older commands. A command from this
   release pointed at a node from before it fails with an unknown op: run it
   against an upgraded node.
+- A read below a range's GC threshold now reaches the client with a SQLSTATE
+  that says what to do, instead of `XX000` (#313). A transaction the cluster
+  timestamped — one that ran longer than a table's `gc_ttl`, or began before
+  a `PURGE` of what it reads — is restarted like any other conflict: inside
+  the cluster's own transactions automatically, and over SQL as `40001`,
+  which succeeds when retried. `AS OF SYSTEM TIME` below the kept history
+  fails with `72000` (PostgreSQL's `snapshot_too_old`): retrying the same
+  timestamp cannot succeed. The KV error carries a typed detail
+  (`BelowGCThreshold`); one from a node that predates it is recognized by
+  its message.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it

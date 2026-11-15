@@ -1320,11 +1320,12 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		k(ba)
 	}
 	// Reads at or below the GC threshold could miss reclaimed versions:
-	// reject them outright (non-retryable — the data is gone). GC commands
-	// themselves are exempt.
+	// reject them outright — the data is gone at that timestamp; whether
+	// another timestamp will do is the client's to know (the typed
+	// detail lets it tell). GC commands themselves are exempt.
 	if !isGCBatch(ba) {
 		if thr := r.GCThreshold(); !thr.IsEmpty() && readTimestamp(ba).LessEq(thr) {
-			return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, readTimestamp(ba), thr)
+			return nil, kvpb.NewBelowGCThresholdError(r.rangeID, readTimestamp(ba), thr)
 		}
 	}
 	// An incremental export whose window opens below the GC threshold could

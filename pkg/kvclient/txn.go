@@ -846,10 +846,25 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			}
 			metrics.TxnRetries.Inc()
 			return nil, &RetryableError{Cause: kerr}
+		case t.restartsBelowGCThreshold(kerr):
+			metrics.TxnRetries.Inc()
+			return nil, &RetryableError{Cause: kerr}
 		default:
 			return nil, kerr
 		}
 	}
+}
+
+// restartsBelowGCThreshold reports whether kerr is a range refusing the
+// transaction's timestamp as at or below its GC threshold, and the
+// transaction is one a restart can help (issue #313). A transaction the
+// cluster timestamped — one that has run longer than a short gc_ttl, or
+// began before a purge of what it reads — succeeds when run again at a
+// new timestamp, so the refusal is a restart like any other conflict. A
+// historical transaction's timestamp is the client's, and the history at
+// it is gone: no restart can help, and the refusal stands.
+func (t *Txn) restartsBelowGCThreshold(kerr *kvpb.Error) bool {
+	return !t.historical && kerr.IsBelowGCThreshold()
 }
 
 // maxRefreshesPerOp bounds refresh loops under pathological contention.
@@ -1341,6 +1356,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 				metrics.TxnRefreshes.Inc()
 				continue
 			}
+			metrics.TxnRetries.Inc()
+			return nil, true, &RetryableError{Cause: kerr}
+		case t.restartsBelowGCThreshold(kerr):
 			metrics.TxnRetries.Inc()
 			return nil, true, &RetryableError{Cause: kerr}
 		default:
