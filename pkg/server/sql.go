@@ -66,6 +66,9 @@ func (n *Node) startSQL() error {
 		return found, nil
 	}
 	opts.Notify = n.notifyHub()
+	if ks := n.KeyService(); ks != nil {
+		opts.KeyService = ks
+	}
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier

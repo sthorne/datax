@@ -1711,6 +1711,28 @@ func (n *Node) KeyStore() (*keystore.Store, error) {
 	}), nil
 }
 
+// KeyService returns the node's key service (pkg/keystore.Service): the
+// SQL statements and functions of the key service, and the cache of
+// named keys' material that this gateway shares with anything else that
+// uses named keys. nil before the store is open.
+func (n *Node) KeyService() *keystore.Service {
+	n.keyServiceOnce.Do(func() {
+		ks, err := n.KeyStore()
+		if err != nil {
+			return
+		}
+		n.keyService = keystore.NewService(keystore.ServiceConfig{
+			Store: ks,
+			Lease: n.cfg.KeyCacheLease,
+			Rate:  keystore.ClusterSettingRate(n.db),
+		})
+		if err := n.stopper.RunWorker(n.keyService.Run); err != nil {
+			log.Debugf("key cache sweeper: %v", err)
+		}
+	})
+	return n.keyService
+}
+
 // clusterKeyReady refuses named keys until the cluster key is enabled.
 func (n *Node) clusterKeyReady(ctx context.Context) error {
 	if n.ClusterVersion() < version.V22 {

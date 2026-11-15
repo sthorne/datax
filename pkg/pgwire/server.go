@@ -18,6 +18,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
+	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -117,6 +118,9 @@ type ServerOptions struct {
 	// other nodes (nil: a hub of this server's own, reaching no other
 	// node).
 	Notify *notify.Hub
+	// KeyService is the node's key service (issue #310), given to every
+	// session; nil refuses the key statements and functions.
+	KeyService sql.KeyService
 }
 
 // Server accepts SQL client connections.
