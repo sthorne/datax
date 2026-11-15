@@ -43,6 +43,13 @@ type benchResult struct {
 	RowsPerSec float64 `json:"rows_per_sec,omitempty"`
 	Errors     int64   `json:"errors"`
 	Retries    int64   `json:"retries"`
+	// RetrySec is the worker time spent in attempts that ended in a
+	// 40001 — on a contended workload this, not the latency of the
+	// operations that succeed, is what sets the throughput.
+	// RetrySamples counts the distinct messages behind Retries, as
+	// ErrorSamples does for Errors.
+	RetrySec     float64          `json:"retry_sec,omitempty"`
+	RetrySamples map[string]int64 `json:"retry_samples,omitempty"`
 	// ErrorSamples counts the distinct error messages behind Errors
 	// (the first 160 characters of each; at most 8 distinct kinds).
 	ErrorSamples map[string]int64 `json:"error_samples,omitempty"`
@@ -608,6 +615,21 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	var firstLats []time.Duration // time to first row (scan, index-join)
 	var errSampleMu sync.Mutex
 	errSamples := map[string]int64{}
+	retrySamples := map[string]int64{}
+	var retryNanos atomic.Int64
+	noteRetry := func(err error, took time.Duration) {
+		retries.Add(1)
+		retryNanos.Add(int64(took))
+		msg := err.Error()
+		if len(msg) > 160 {
+			msg = msg[:160]
+		}
+		errSampleMu.Lock()
+		if _, ok := retrySamples[msg]; ok || len(retrySamples) < 8 {
+			retrySamples[msg]++
+		}
+		errSampleMu.Unlock()
+	}
 	noteError := func(err error) {
 		errs.Add(1)
 		msg := err.Error()
@@ -860,7 +882,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
-						retries.Add(1)
+						noteRetry(err, time.Since(start))
 					} else {
 						noteError(err)
 					}
@@ -881,7 +903,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if len(errSamples) > 0 {
 		res.ErrorSamples = errSamples
 	}
+	if len(retrySamples) > 0 {
+		res.RetrySamples = retrySamples
+	}
 	errSampleMu.Unlock()
+	res.RetrySec = time.Duration(retryNanos.Load()).Seconds()
 	fmt.Printf("\n%s results:\n", workload)
 	fmt.Printf("  ops:        %d (%.1f/s)\n", total, res.OpsPerSec)
 	switch {
@@ -894,7 +920,14 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		res.RowsPerSec = float64(res.Rows) / duration.Seconds()
 		fmt.Printf("  rows:       %d (%.0f/s)\n", res.Rows, res.RowsPerSec)
 	}
-	fmt.Printf("  40001s:     %d\n", res.Retries)
+	fmt.Printf("  40001s:     %d", res.Retries)
+	if res.Retries > 0 {
+		fmt.Printf(" (%.1f worker-seconds in the attempts that ended in them)", res.RetrySec)
+	}
+	fmt.Println()
+	for msg, n := range res.RetrySamples {
+		fmt.Printf("    %6d × %s\n", n, msg)
+	}
 	fmt.Printf("  errors:     %d\n", res.Errors)
 	for msg, n := range res.ErrorSamples {
 		fmt.Printf("    %6d × %s\n", n, msg)

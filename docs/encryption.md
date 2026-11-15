@@ -1153,28 +1153,45 @@ does not protect a gateway's memory while it holds the key.
 
 **What it costs.** One AES-GCM operation and 30 bytes per row value
 written or read, and a cache lookup; no extra round trip once the key is
-cached (one read of `datax_keys` per key per lease per gateway).
-Measured with `datax bench --sealed` on one secure node (a shared
-4-core VM, on-disk store, 16 workers, 10-second runs, five rounds of
-sealed and plain tables alternating, medians):
+cached (one read of `datax_keys` per key per lease per gateway, in a
+transaction of its own, never in the statement's). Measured with
+`datax bench --sealed` on one secure, encrypted on-disk node (a shared
+4-core VM with another build running, 16 workers, `--seed 7`; each run
+on freshly created tables, sealed and plain alternating which goes
+first; `bank` six rounds of 30 seconds, `kv` four of 20), with the
+server's counters per operation from `--server-url`:
 
-| Workload | Plain (ops/s) | Sealed (ops/s) | Change |
-|---|---|---|---|
-| `kv`, 95% reads | 21,250 | 20,476 | −3.6% |
-| `kv`, 50% reads | 8,135 | 8,336 | +2.5% |
-| `bank` | 522 | 370 | see below |
+| Workload | Plain ops/s, median (range) | Sealed ops/s, median (range) | KV batches per op, plain / sealed | 40001s per op, plain / sealed |
+|---|---|---|---|---|
+| `kv`, 95% reads | 19,833 (18,881–21,235) | 18,775 (17,094–20,865) | 1.001 / 1.001 | 0 / 0 |
+| `kv`, 50% reads | 8,810 (7,259–8,847) | 8,010 (7,016–8,579) | 1.005 / 1.005 | 0 / 0 |
+| `bank` | 227 (201–240) | 216 (171–326) | 10.32 / 10.36 | 0.0171 / 0.0172 |
 
-The round-to-round spread on that machine (`kv` 95% plain: 13,150 to
-22,194) is wider than either difference. A server CPU profile under
-each workload puts the boundary — sealing, opening, the cache — at 1.1%
-(`kv` 50%), 1.05% (`kv` 95%) and 0.93% (`bank`) of the server's CPU, and
-a seal plus an open of a 64-byte value costs about 0.8 µs
-(`BenchmarkBoundary`). `bank` is a contended workload whose throughput
-swung from 280 to 784 transfers/s between plain runs alone; its sealed
-runs were lower in most rounds with the same p50 and p95 latency, which
-this machine could not separate from noise. It should be measured again
-on a dedicated machine before the feature is called done against the 5%
-bar.
+Per committed transfer, `bank` did the same work on both tables: 6.10
+statements, 1.01 KV commits, 0.015 transaction restarts, 0.013 / 0.014
+refreshes, 0.017 serialization failures and 0.15 / 0.13 latch waits;
+the median p50 / p95 latency was 7.8 / 15.0 ms plain and 7.2 / 13.4 ms
+sealed. Both tables sat at the end of the keyspace on the one store and
+took the same one load split. What sets `bank`'s throughput is not the
+latency of the transfers that commit but the time spent in the attempts
+that end in a 40001: about three seconds each (2.85 s plain, 3.02 s
+sealed, median), 64–77% of all worker time in every run, sealed or
+plain. The number of those attempts and their length vary from run to
+run, and that accounts for the spread above — the fastest sealed run
+had the most 40001s and the shortest ones — and, most likely, for the
+−29% recorded earlier from five 10-second rounds (plain alone swung
+from 280 to 784 transfers/s between them). `bench` records that time as `retry_sec`.
+
+So sealing adds no KV requests, restarts or conflicts. What remains is
+CPU on the gateway: a server CPU profile puts the boundary — sealing,
+opening, the cache — at 1.4% of the server's CPU under `kv` 50%
+(earlier profiles: 1.1% under `kv` 50%, 1.05% under `kv` 95%, 0.93%
+under `bank`), and a seal plus an open of a 64-byte value costs about
+0.8 µs (`BenchmarkBoundary`). The medians are within this machine's
+noise for `bank` and `kv` 95%; under `kv` 50% the sealed run was lower
+in each of the four rounds (−2.5% to −9.6%) while a profiled pair run
+just after had it 2.6% faster. Whether that is below the 5% bar needs a
+dedicated machine to say.
 
 ## Keys in memory
 
