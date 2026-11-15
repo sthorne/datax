@@ -793,6 +793,219 @@ vendor's tool or `pkcs11-tool` — or through a KMS that fronts it
 (Vault's seal or managed keys, AWS CloudHSM custom key stores, Cloud
 HSM protection levels), which the roots above use without knowing.
 
+## Cluster key
+
+The cluster key (#310) is the first piece of the key service designed in
+[design-key-service.md](design-key-service.md): one 32-byte key for the
+whole cluster, versioned, that wraps the **named keys** kept in the
+`datax_keys` system table. Nothing user-visible encrypts data with it
+yet — the key service's SQL and sealed tables are later steps — but the
+key, its distribution and its table are in place.
+
+```
+root (per node)  wraps →  cluster key (one per cluster)  wraps →  named keys (datax_keys rows)
+```
+
+Each node keeps the cluster key **wrapped by its own root**, in
+`CLUSTER-KEY` beside `ENCRYPTION-STOREKEY`, and unwrapped only in held
+memory (see *Keys in memory*) while it runs. The file is not secret and
+cannot be edited: each entry is tagged under a key derived from the
+cluster key it wraps, and bound to the cluster and node it was wrapped
+for, as a wrapped store key is. The cluster's replicated record holds the
+key's id, its current version and a check value
+(HMAC-SHA256 under the key) — never the key — so a node can tell whether
+the copy it holds is the right one. The key is never logged, never in an
+event, and never in an API response except sealed for the CLI's own
+exchange during an export.
+
+### Enabling it
+
+```sh
+datax debug cluster-key init   --addr 10.0.0.1:26257 --certs-dir certs   # admin's client certificate
+datax debug cluster-key status --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+`init` is refused, saying why, unless:
+
+- the cluster is at v22, finalized;
+- the cluster is secure (the key moves between nodes over mutual TLS with
+  the node certificate, which an insecure cluster does not have);
+- every member that is not being decommissioned is **live** — a node that
+  is down cannot be given the key; start it, or decommission it;
+- every such member keeps its store key **under a root** (`--enc-root`).
+  A node with a key file (`--enc-key`) is named, with the remedy: move it
+  under a root with `datax debug enc-root adopt` (node stopped). A
+  plaintext node is named too; it cannot be moved under a root in place.
+
+The node `init` is sent to makes the key, keeps its own wrapped copy, and
+records the operation as in progress. It then hands the key to each
+member: it asks the member, at its registered address, for an exchange
+key, and sends the cluster key sealed for that one exchange (X25519, the
+construction peer unseal uses, under its own label). The member keeps the
+key only if its check value matches what the replicated record of the
+operation names — a peer cannot give it a key of its own choosing —
+writes its own wrapped copy durably, and only then acknowledges. When
+every member has acknowledged, the cluster key is recorded, the operation
+cleared, and `datax_keys` created. **Named keys can be created only once
+the key is recorded.**
+
+If a member cannot be reached, `init` reports which and stops; the key is
+recorded nowhere and nothing is under it. **Run `init` again**: from any
+node that already holds the key it hands out the same key to the rest. Run
+from a node that does not hold it (say, the original node has since lost
+its disk), it makes a replacement under a new id and hands that out
+instead; the abandoned key never wrapped anything, and nodes drop it once
+the replacement is recorded.
+
+### Joining and restarting nodes
+
+A node that restarts with its `CLUSTER-KEY` intact unwraps its copy
+through its root at start, as it unwraps its store key (a sealed node,
+once its root is unsealed). A node that lacks a version the record names
+— it joined after the key was made, its copy is gone, or its root cannot
+open it — asks its running peers for it every few seconds (a
+**hand-over**), and a peer hands it over when all of these hold:
+
+- the asker presents the cluster's **node** certificate over mutual TLS;
+- it names this cluster, is a member, and is not being decommissioned;
+- it does not report its store key outside a root;
+- the **liveness rule**: a node that is not live is answered, as under
+  peer unseal. A node that asks is running, so it is live by the time it
+  asks; it is answered only if its connection comes from the host the
+  cluster has it registered at. That is the running node itself. A second
+  copy of a running node elsewhere — someone holding a copy of its disk
+  and its node certificate — is answered nothing until the node it claims
+  to be has been silent for the liveness grace, which is peer unseal's
+  rule and reason.
+
+The key crosses sealed for the one exchange, the asker keeps it only if
+its check value matches the replicated record, and writes its own wrapped
+copy. Every request is audited on the node that answers, granted or
+refused with the reason, appears in the console's events, and is counted
+(`datax_cluster_key_handovers_total{outcome}`, and the security view's
+per-node counts). What a node received is counted as
+`datax_cluster_key_received_total{via}`.
+
+**Hand-over is not governed by the peer-unseal setting.** That setting
+decides whether a node's certificate alone may obtain the root key that
+opens a node's *disk*, and is for operators who keep the node key on the
+data disk. The cluster key opens no disk; a node that holds the node
+certificate can already read the cluster's data over the internode KV
+interface, which is why a node that lacks the cluster key cannot serve
+the tables later steps will seal, and why the checks above, not a
+setting, govern it. A node that a hand-over refuses (it is behind an
+address translation, so its connections do not come from its registered
+host) can be given the key by an operator:
+
+```sh
+datax debug cluster-key sync --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+pushes the key to every live member that does not report holding it, the
+way `init` does.
+
+### Rotating it
+
+```sh
+datax debug cluster-key rotate --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+makes a new version and hands it to every member under the same
+conditions as `init` (every member live and under a root), records it as
+current while the old version stays accepted, rewraps every `datax_keys`
+row under it (a few kilobytes per thousand keys, in small transactions),
+and then destroys the old version: it leaves the record and every node
+drops its copy from memory and from `CLUSTER-KEY`. No user data is
+rewritten. A rotation stopped anywhere — a node unreachable, the serving
+node restarted — is finished by running `rotate` again: before the new
+version is recorded it hands out the same new version; after, it
+finishes the rewrap and the retirement. A key written under the old
+version while the rewrap runs is caught: the retirement and the check that
+no row is still under the old version are one transaction.
+
+Rotating the cluster key is also how the exposure of old backups to a
+compromised root is bounded: the old version, once destroyed, is gone from
+every node (it remains, wrapped, in backups' `datax_keys` rows and in any
+export taken before).
+
+### Export, import and restore
+
+A backup carries `datax_keys` as it is stored: each named key sealed by
+the cluster key. Restoring it into **another** cluster needs that
+cluster key, so it is exported, wrapped under a root the operator
+supplies, and imported on the other side:
+
+```sh
+# on the source cluster
+datax debug cluster-key export --addr 10.0.0.1:26257 --certs-dir certs \
+  --to-root exec:/usr/local/bin/datax-wrap --out cluster-key.export
+# on the target cluster: its own key first, then the source's
+datax debug cluster-key init   --addr 10.1.0.1:26257 --certs-dir certs
+datax debug cluster-key import --addr 10.1.0.1:26257 --certs-dir certs \
+  --from-root exec:/usr/local/bin/datax-wrap --in cluster-key.export
+datax restore ...
+```
+
+- The export root is any root spec — `file:`, `exec:` or a KMS (not
+  `shares`) — and it is used **by the command, on the operator's machine**:
+  no request names a root to a node. The node hands the CLI the cluster's
+  keys (every version it still accepts, and keys it imported) sealed for
+  the CLI's own exchange, over mutual TLS, to an admin; the CLI wraps them
+  under the root and writes the file (mode 0600, never over an existing
+  file). The export is audited on the node and by the CLI.
+- `import` unwraps the file through the same root on the operator's
+  machine and sends the keys over mutual TLS (as a store key travels for
+  `rotate-enc-key`), to an admin; the target hands them to every member as
+  `init` does and records them as imported. It is refused before the
+  target's own cluster key is enabled — imported keys exist to be
+  rewrapped from — and for a key that is the target's own.
+- A **whole-cluster restore** of a backup holding named keys checks,
+  before applying anything, that this cluster holds every cluster key
+  they are sealed under, and refuses naming the missing ones otherwise.
+  After the data is in, the restored keys are rewrapped under the target's
+  current key and the summary says how many. (The `datax_keys` checksum in
+  the restore summary therefore differs from the backup's.)
+- Imported keys stay held by every node of the target (and are carried
+  through its rotations unchanged), so that further backups of the source
+  can be restored; nothing drops them in this version. A restore of tables (`--table`,
+  `--database`) does not bring `datax_keys` back, as it brings no system
+  table back.
+
+### Failure modes
+
+- **A member is down or unreachable**: `init`, `rotate` and `import`
+  refuse, or stop and say so; run them again once it is back (or
+  decommission it). Nothing half-applied is used.
+- **A node loses `CLUSTER-KEY`** (or its root can no longer open it): it
+  asks a peer and is handed the key; until then it says in
+  `/api/security` that it does not hold it, and later steps' sealed tables
+  will not be served from it.
+- **Every node loses its copy at once**, or every node's root is lost:
+  the cluster key is gone, and with it every named key. There is
+  deliberately no escrow; an export (above) is the only copy outside the
+  nodes, and an operator who wants one keeps it.
+- **A node is moved off `--enc-root`** after the key is enabled: it
+  cannot keep a copy, says so in its log, and is not handed the key.
+
+### What it protects, and what it does not
+
+- The cluster key is protected as each node's store key is: by that
+  node's root. A stolen disk, or a backup, holds it only wrapped.
+- Named keys in `datax_keys` are sealed under the cluster key with their
+  id, name, version and kind bound in: a row's material does not open
+  under another key's identity, and the wrapped bytes are useless without
+  the cluster key. **No SQL session can read `datax_keys`**, root and
+  admins included: a session that names it is shown a virtual table of
+  the same name with the keys' metadata (id, name, kind, state, versions,
+  generation, the cluster key version they are under, timestamps) and no
+  material column, to admins only; every other path to the real table is
+  refused.
+- It does not protect against a running node's memory (see *Keys in
+  memory*), nor against someone who holds a node certificate **and** can
+  reach the cluster while the node it claims to be is not live (the same
+  limit as peer unseal); and an export is exactly as safe as the root it
+  is wrapped under.
+
 ## Keys in memory
 
 The keys a node holds for as long as it runs — its store key, the data
@@ -1087,6 +1300,11 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   fronts it; PKCS#11 is not spoken directly.
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
+- **The cluster key needs every node under `--enc-root`, a secure
+  cluster, and every member live** to enable, rotate or import it. A node
+  whose connections do not come from its registered host (behind an
+  address translation) is handed the key only once its last heartbeat is
+  older than the liveness grace, or by `datax debug cluster-key sync`.
 - The node never rewrites the operator's key file: after an online
   rotation, a restart needs the new key in one of the `--enc-key`
   files (stage it beforehand, see Key rotation).
