@@ -722,6 +722,12 @@ type AlterTable struct {
 	// Purge is ALTER TABLE ... PURGE: collect the table's garbage now
 	// and report, replica by replica, that none is left.
 	Purge bool
+	// RotateKey is ALTER TABLE ... ROTATE ENCRYPTION KEY [KEEP OLD
+	// VERSIONS]: a sealed table's key gets a new version, and a
+	// background job rewrites the rows under the older ones; RotateKeepOld
+	// keeps the older versions once it is done.
+	RotateKey     bool
+	RotateKeepOld bool
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.
@@ -828,7 +834,8 @@ type GrantRevoke struct {
 
 	// Privilege form. Privileges are upper-cased (SELECT INSERT UPDATE
 	// DELETE TRUNCATE USAGE CREATE CONNECT; ALL stays "ALL"). ObjectKind
-	// is "table" (the default), "sequence", "database" or "schema";
+	// is "table" (the default), "sequence", "database", "schema" or
+	// "encryption key" (WRAP, UNWRAP, USAGE, ALL; issue #310);
 	// Objects the names, or — AllInSchema — every table / sequence of the
 	// public schema of the current database.
 	Privileges  []string

@@ -299,6 +299,58 @@ func RestoreProgressSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// DroppedTableKey holds the record DROP TABLE leaves for a table whose
+// rows are still on disk (JSON; issue #313): when it was dropped and
+// how long its history is kept. The reclaim job (pkg/server,
+// dropped_tables.go) clears the table's span once that window has
+// passed and then removes the record.
+func DroppedTableKey(tableID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("dropped"), tableID))
+}
+
+// DroppedTableSpan covers every dropped table's record.
+func DroppedTableSpan() (Key, Key) {
+	p := systemKey("dropped")
+	return p, p.PrefixEnd()
+}
+
+// SealJobKey holds the record of a table's seal job (JSON;
+// catalog.SealJob; issue #310 step 5): the background rewrite that seals
+// an existing table's plain rows, or moves a rotated key's rows to its
+// new version. One per table; the job on the node leading range 1
+// (pkg/server, sealjobs.go) works through it in batches, records its
+// progress in it, and removes it when done.
+func SealJobKey(tableID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("seal-job"), tableID))
+}
+
+// SealJobSpan covers every seal job's record.
+func SealJobSpan() (Key, Key) {
+	p := systemKey("seal-job")
+	return p, p.PrefixEnd()
+}
+
+// ViewDependencyKey records that view viewID's query reads relation
+// relID (issue #313): the reverse of TableDescriptor.ViewDepends, so the
+// views depending on a relation are a scan of ViewDependencySpan(relID)
+// rather than of every descriptor. The value is one byte, 1.
+func ViewDependencyKey(relID, viewID uint64) Key {
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(systemKey("viewdep"), relID), viewID))
+}
+
+// ViewDependencySpan covers the views recorded as reading relID.
+func ViewDependencySpan(relID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("viewdep"), relID))
+	return p, p.PrefixEnd()
+}
+
+// ViewDependencyIndexKey says the ViewDependencyKey records are complete:
+// written once every view of the cluster has its records, which is only
+// known once no binary that does not write them can be running (cluster
+// version v22). Until it exists, the views depending on a relation are
+// found by scanning every descriptor.
+func ViewDependencyIndexKey() Key { return systemKey("viewdep-ready") }
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")
@@ -321,6 +373,38 @@ func AuthSecretKey() Key { return systemKey("auth-secret") }
 // when running nodes must not hand the root key to a restarting peer
 // (issue #307). Absent means on.
 func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
+
+// ClusterSettingKey holds the value of the SQL cluster setting name (SET
+// CLUSTER SETTING; pkg/sql/clustersettings.go). Absent means its
+// default. The names have a dot (key_service.rate_limit), so they never
+// meet the settings above.
+func ClusterSettingKey(name string) Key { return systemKey("settings", name) }
+
+// ClusterKeyMarkerKey holds the cluster key's record (issue #310, JSON;
+// pkg/server/clusterkey.go): which cluster key is current, the versions
+// still accepted, imported keys, and for each a check value that tells a
+// node whether the key it holds is that one. Never the key. Absent means
+// the cluster key has not been enabled.
+func ClusterKeyMarkerKey() Key { return systemKey("cluster-key", "marker") }
+
+// ClusterKeyPendingKey holds an enabling, rotation or import of the
+// cluster key that has begun and not finished (issue #310): what is being
+// handed to every node, so that a retry finishes it rather than starting
+// another.
+func ClusterKeyPendingKey() Key { return systemKey("cluster-key", "pending") }
+
+// ClusterKeyHolderKey holds what one node reports of itself for the
+// cluster key (issue #310): the root its store key is under and the
+// cluster key versions it holds. Not secret.
+func ClusterKeyHolderKey(node int64) Key {
+	return Key(encoding.EncodeInt64(systemKey("cluster-key", "holder"), node))
+}
+
+// ClusterKeyHolderSpan covers every node's ClusterKeyHolderKey.
+func ClusterKeyHolderSpan() (Key, Key) {
+	p := systemKey("cluster-key", "holder")
+	return p, p.PrefixEnd()
+}
 
 // NodeIDGenKey is the counter for allocating node IDs.
 func NodeIDGenKey() Key { return systemKey("idgen", "node") }

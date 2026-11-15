@@ -82,15 +82,47 @@ func TestBoundedStalenessServesLocallyUnderPartition(t *testing.T) {
 	s0 := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
 	execSQL(t, ctx, s0, "CREATE TABLE bs (id INT8 PRIMARY KEY, v TEXT)")
 	execSQL(t, ctx, s0, "INSERT INTO bs VALUES (1, 'one'), (2, 'two')")
+	// Roles other than root (issue #312): their privileges and policies
+	// are checked as fresh as the data this node can serve, so their
+	// bounded reads stay local too. A reader with a grant; a tenant whom
+	// a policy confines to its own rows; and a role whose grant was
+	// revoked before the partition, the revoke replicated here.
+	for _, stmt := range []string{
+		"CREATE USER bs_reader PASSWORD 'reader-pw-1'",
+		"CREATE USER bs_tenant PASSWORD 'tenant-pw-1'",
+		"CREATE USER bs_revoked PASSWORD 'revoked-pw-1'",
+		"GRANT SELECT ON bs TO bs_reader, bs_revoked",
+		"CREATE TABLE bs_rls (id INT8 PRIMARY KEY, owner_name TEXT)",
+		"INSERT INTO bs_rls VALUES (1, 'bs_tenant'), (2, 'someone_else'), (3, 'bs_tenant')",
+		"GRANT SELECT ON bs_rls TO bs_tenant",
+		"ALTER TABLE bs_rls ENABLE ROW LEVEL SECURITY",
+		"CREATE POLICY own_rows ON bs_rls USING (owner_name = current_user)",
+		"REVOKE SELECT ON bs FROM bs_revoked",
+	} {
+		execSQL(t, ctx, s0, stmt)
+	}
 	writeTS := tc.Nodes[0].Clock().Now()
 
 	leader := tc.LeaderIndex(1)
 	gateway := (leader + 1) % 3
 	sg := sql.NewSession(tc.Nodes[gateway].DB(), catalog.NewAccessor())
+	// The reader plans through a leasing accessor, as a real gateway
+	// does: its check takes the leased descriptor. The others read the
+	// catalog at the node's closed timestamp.
+	n := tc.Nodes[gateway]
+	leased := catalog.NewAccessor()
+	if err := leased.StartLeasing(n.DB(), n.Clock(), n.Stopper(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	reader := sql.NewSessionForUser(n.DB(), leased, "bs_reader")
+	tenant := sql.NewSessionForUser(n.DB(), catalog.NewAccessor(), "bs_tenant")
+	revoked := sql.NewSessionForUser(n.DB(), catalog.NewAccessor(), "bs_revoked")
 	// Warm the gateway's descriptor lease cache and routing with a plain
 	// read BEFORE the partition (the reshard guard does a current-time
 	// lookup; warm caches keep it off the wire).
 	execSQL(t, ctx, sg, "SELECT count(*) FROM bs")
+	execSQL(t, ctx, reader, "SELECT count(*) FROM bs")
+	execSQL(t, ctx, tenant, "SELECT count(*) FROM bs_rls")
 	// Every replica the gateway holds must be servable past the insert.
 	waitAllClosed(t, tc.Nodes[gateway], writeTS)
 
@@ -112,6 +144,24 @@ func TestBoundedStalenessServesLocallyUnderPartition(t *testing.T) {
 	}
 	if after := testutil.ToFloat64(metrics.FollowerReads); after <= beforeLocal {
 		t.Fatalf("follower-read counter did not move (%v -> %v)", beforeLocal, after)
+	}
+	bounded := func(s *sql.Session, q string) (*sql.Result, *sql.Error) {
+		qctx, qcancel := context.WithTimeout(ctx, 20*time.Second)
+		defer qcancel()
+		return trySQL(qctx, s, q)
+	}
+	if res, serr := bounded(reader, "SELECT v FROM bs AS OF SYSTEM TIME with_max_staleness('10s') WHERE id = 2"); serr != nil {
+		t.Fatalf("a granted role's bounded read under partition: [%s] %s", serr.Code, serr.Msg)
+	} else if len(res.Rows) != 1 || res.Rows[0][0].S != "two" {
+		t.Fatalf("a granted role's bounded read rows: %+v", res.Rows)
+	}
+	if res, serr := bounded(tenant, "SELECT id FROM bs_rls AS OF SYSTEM TIME with_max_staleness('10s') ORDER BY id"); serr != nil {
+		t.Fatalf("a confined role's bounded read under partition: [%s] %s", serr.Code, serr.Msg)
+	} else if len(res.Rows) != 2 || res.Rows[0][0].I != 1 || res.Rows[1][0].I != 3 {
+		t.Fatalf("a confined role's bounded read rows (its own two): %+v", res.Rows)
+	}
+	if _, serr := bounded(revoked, "SELECT v FROM bs AS OF SYSTEM TIME with_max_staleness('10s') WHERE id = 2"); serr == nil || serr.Code != sql.CodeInsufficientPriv {
+		t.Fatalf("a revoked role's bounded read under partition: %v, want 42501", serr)
 	}
 
 	// A current-time read needs the partitioned leader and cannot finish.

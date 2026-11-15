@@ -376,10 +376,10 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		}
 		// TRUNCATE removes every row without reading one, so no policy
 		// can filter it. PostgreSQL lets a role with the TRUNCATE
-		// privilege do that past the table's row security; here the
-		// privilege is also what a DELETE grant from before v11 carries,
-		// and a role confined to its own rows must not be able to remove
-		// everyone's by either route. It is refused; the owner (unless
+		// privilege do that past the table's row security; here a role
+		// confined to its own rows must not be able to remove everyone's,
+		// however it came by the privilege (a DELETE grant made before
+		// v11 was converted to one). It is refused; the owner (unless
 		// forced) and exempt roles truncate as before.
 		if confined, err := s.rowSecurityActive(ctx, txn, shared); err != nil {
 			return nil, err
@@ -422,6 +422,19 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 			c, ok := child.ConstraintByID(ref.ConstraintID)
 			if !ok {
 				continue
+			}
+			// Every table the statement names has passed its privilege
+			// check. A referencing table it does not name is reported by
+			// name only to a role that may know of it (issue #312): one
+			// holding no privilege on it learns that a reference exists,
+			// which the refusal cannot avoid, and not whose.
+			if visible, err := s.mayKnowTable(ctx, txn, child); err != nil {
+				return nil, err
+			} else if !visible {
+				if t.Cascade {
+					return nil, newErrf(CodeInsufficientPriv, "permission denied: TRUNCATE ... CASCADE of table %q would truncate a table that references it, on which %q holds no privilege", desc.Name, s.actor())
+				}
+				return nil, newErrf(CodeFeatureNotSupported, "cannot truncate table %q because a table on which %q holds no privilege references it through a foreign key", desc.Name, s.actor())
 			}
 			if !t.Cascade {
 				return nil, newErrf(CodeFeatureNotSupported, "cannot truncate table %q because table %q references it through foreign key %q (use TRUNCATE ... CASCADE, or truncate both)", desc.Name, child.Name, c.Name)

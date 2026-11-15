@@ -793,6 +793,619 @@ vendor's tool or `pkcs11-tool` — or through a KMS that fronts it
 (Vault's seal or managed keys, AWS CloudHSM custom key stores, Cloud
 HSM protection levels), which the roots above use without knowing.
 
+## Cluster key
+
+The cluster key (#310) is the first piece of the key service designed in
+[design-key-service.md](design-key-service.md): one 32-byte key for the
+whole cluster, versioned, that wraps the **named keys** kept in the
+`datax_keys` system table. The key service (below, *The key service*)
+keeps applications' named keys under it, and sealed tables (below,
+*Sealed tables*) encrypt row values under named keys it wraps.
+
+```
+root (per node)  wraps →  cluster key (one per cluster)  wraps →  named keys (datax_keys rows)
+```
+
+Each node keeps the cluster key **wrapped by its own root**, in
+`CLUSTER-KEY` beside `ENCRYPTION-STOREKEY`, and unwrapped only in held
+memory (see *Keys in memory*) while it runs. The file is not secret and
+cannot be edited: each entry is tagged under a key derived from the
+cluster key it wraps, and bound to the cluster and node it was wrapped
+for, as a wrapped store key is. The cluster's replicated record holds the
+key's id, its current version and a check value
+(HMAC-SHA256 under the key) — never the key — so a node can tell whether
+the copy it holds is the right one. The key is never logged, never in an
+event, and never in an API response except sealed for the CLI's own
+exchange during an export.
+
+### Enabling it
+
+```sh
+datax debug cluster-key init   --addr 10.0.0.1:26257 --certs-dir certs   # admin's client certificate
+datax debug cluster-key status --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+`init` is refused, saying why, unless:
+
+- the cluster is at v22, finalized;
+- the cluster is secure (the key moves between nodes over mutual TLS with
+  the node certificate, which an insecure cluster does not have);
+- every member that is not being decommissioned is **live** — a node that
+  is down cannot be given the key; start it, or decommission it;
+- every such member keeps its store key **under a root** (`--enc-root`).
+  A node with a key file (`--enc-key`) is named, with the remedy: move it
+  under a root with `datax debug enc-root adopt` (node stopped). A
+  plaintext node is named too; it cannot be moved under a root in place.
+
+The node `init` is sent to makes the key, keeps its own wrapped copy, and
+records the operation as in progress. It then hands the key to each
+member: it asks the member, at its registered address, for an exchange
+key, and sends the cluster key sealed for that one exchange (X25519, the
+construction peer unseal uses, under its own label). The member keeps the
+key only if its check value matches what the replicated record of the
+operation names — a peer cannot give it a key of its own choosing —
+writes its own wrapped copy durably, and only then acknowledges. When
+every member has acknowledged, the cluster key is recorded, the operation
+cleared, and `datax_keys` created. **Named keys can be created only once
+the key is recorded.**
+
+If a member cannot be reached, `init` reports which and stops; the key is
+recorded nowhere and nothing is under it. **Run `init` again**: from any
+node that already holds the key it hands out the same key to the rest. Run
+from a node that does not hold it (say, the original node has since lost
+its disk), it makes a replacement under a new id and hands that out
+instead; the abandoned key never wrapped anything, and nodes drop it once
+the replacement is recorded.
+
+### Joining and restarting nodes
+
+A node that restarts with its `CLUSTER-KEY` intact unwraps its copy
+through its root at start, as it unwraps its store key (a sealed node,
+once its root is unsealed). A node that lacks a version the record names
+— it joined after the key was made, its copy is gone, or its root cannot
+open it — asks its running peers for it every few seconds (a
+**hand-over**), and a peer hands it over when all of these hold:
+
+- the asker presents the cluster's **node** certificate over mutual TLS;
+- it names this cluster, is a member, and is not being decommissioned;
+- it does not report its store key outside a root;
+- the **liveness rule**: a node that is not live is answered, as under
+  peer unseal. A node that asks is running, so it is live by the time it
+  asks; it is answered only if its connection comes from the host the
+  cluster has it registered at. That is the running node itself. A second
+  copy of a running node elsewhere — someone holding a copy of its disk
+  and its node certificate — is answered nothing until the node it claims
+  to be has been silent for the liveness grace, which is peer unseal's
+  rule and reason.
+
+The key crosses sealed for the one exchange, the asker keeps it only if
+its check value matches the replicated record, and writes its own wrapped
+copy. Every request is audited on the node that answers, granted or
+refused with the reason, appears in the console's events, and is counted
+(`datax_cluster_key_handovers_total{outcome}`, and the security view's
+per-node counts). What a node received is counted as
+`datax_cluster_key_received_total{via}`.
+
+**Hand-over is not governed by the peer-unseal setting.** That setting
+decides whether a node's certificate alone may obtain the root key that
+opens a node's *disk*, and is for operators who keep the node key on the
+data disk. The cluster key opens no disk; a node that holds the node
+certificate can already read the cluster's data over the internode KV
+interface, which is why a node that lacks the cluster key cannot serve
+the tables later steps will seal, and why the checks above, not a
+setting, govern it. A node that a hand-over refuses (it is behind an
+address translation, so its connections do not come from its registered
+host) can be given the key by an operator:
+
+```sh
+datax debug cluster-key sync --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+pushes the key to every live member that does not report holding it, the
+way `init` does.
+
+### Rotating it
+
+```sh
+datax debug cluster-key rotate --addr 10.0.0.1:26257 --certs-dir certs
+```
+
+makes a new version and hands it to every member under the same
+conditions as `init` (every member live and under a root), records it as
+current while the old version stays accepted, rewraps every `datax_keys`
+row under it (a few kilobytes per thousand keys, in small transactions),
+and then destroys the old version: it leaves the record and every node
+drops its copy from memory and from `CLUSTER-KEY`. No user data is
+rewritten. A rotation stopped anywhere — a node unreachable, the serving
+node restarted — is finished by running `rotate` again: before the new
+version is recorded it hands out the same new version; after, it
+finishes the rewrap and the retirement. A key written under the old
+version while the rewrap runs is caught: the retirement and the check that
+no row is still under the old version are one transaction.
+
+Rotating the cluster key is also how the exposure of old backups to a
+compromised root is bounded: the old version, once destroyed, is gone from
+every node (it remains, wrapped, in backups' `datax_keys` rows and in any
+export taken before).
+
+### Export, import and restore
+
+A backup carries `datax_keys` as it is stored: each named key sealed by
+the cluster key. Restoring it into **another** cluster needs that
+cluster key, so it is exported, wrapped under a root the operator
+supplies, and imported on the other side:
+
+```sh
+# on the source cluster
+datax debug cluster-key export --addr 10.0.0.1:26257 --certs-dir certs \
+  --to-root exec:/usr/local/bin/datax-wrap --out cluster-key.export
+# on the target cluster: its own key first, then the source's
+datax debug cluster-key init   --addr 10.1.0.1:26257 --certs-dir certs
+datax debug cluster-key import --addr 10.1.0.1:26257 --certs-dir certs \
+  --from-root exec:/usr/local/bin/datax-wrap --in cluster-key.export
+datax restore ...
+```
+
+- The export root is any root spec — `file:`, `exec:` or a KMS (not
+  `shares`) — and it is used **by the command, on the operator's machine**:
+  no request names a root to a node. The node hands the CLI the cluster's
+  keys (every version it still accepts, and keys it imported) sealed for
+  the CLI's own exchange, over mutual TLS, to an admin; the CLI wraps them
+  under the root and writes the file (mode 0600, never over an existing
+  file). The export is audited on the node and by the CLI.
+- `import` unwraps the file through the same root on the operator's
+  machine and sends the keys over mutual TLS (as a store key travels for
+  `rotate-enc-key`), to an admin; the target hands them to every member as
+  `init` does and records them as imported. It is refused before the
+  target's own cluster key is enabled — imported keys exist to be
+  rewrapped from — and for a key that is the target's own.
+- A **whole-cluster restore** of a backup holding named keys checks,
+  before applying anything, that this cluster holds every cluster key
+  they are sealed under, and refuses naming the missing ones otherwise.
+  After the data is in, the restored keys are rewrapped under the target's
+  current key and the summary says how many. (The `datax_keys` checksum in
+  the restore summary therefore differs from the backup's.)
+- Imported keys stay held by every node of the target (and are carried
+  through its rotations unchanged), so that further backups of the source
+  can be restored; nothing drops them in this version. A restore of tables (`--table`,
+  `--database`) does not bring `datax_keys` back, as it brings no system
+  table back.
+
+### Failure modes
+
+- **A member is down or unreachable**: `init`, `rotate` and `import`
+  refuse, or stop and say so; run them again once it is back (or
+  decommission it). Nothing half-applied is used.
+- **A node loses `CLUSTER-KEY`** (or its root can no longer open it): it
+  asks a peer and is handed the key; until then it says in
+  `/api/security` that it does not hold it, and later steps' sealed tables
+  will not be served from it.
+- **Every node loses its copy at once**, or every node's root is lost:
+  the cluster key is gone, and with it every named key. There is
+  deliberately no escrow; an export (above) is the only copy outside the
+  nodes, and an operator who wants one keeps it.
+- **A node is moved off `--enc-root`** after the key is enabled: it
+  cannot keep a copy, says so in its log, and is not handed the key.
+
+### What it protects, and what it does not
+
+- The cluster key is protected as each node's store key is: by that
+  node's root. A stolen disk, or a backup, holds it only wrapped.
+- Named keys in `datax_keys` are sealed under the cluster key with their
+  id, name, version and kind bound in: a row's material does not open
+  under another key's identity, and the wrapped bytes are useless without
+  the cluster key. **No SQL session can read `datax_keys`**, root and
+  admins included: a session that names it is shown a virtual table of
+  the same name with the keys' metadata (id, name, kind, state, versions,
+  generation, the cluster key version they are under, timestamps) and no
+  material column, to admins only; every other path to the real table is
+  refused.
+- It does not protect against a running node's memory (see *Keys in
+  memory*), nor against someone who holds a node certificate **and** can
+  reach the cluster while the node it claims to be is not live (the same
+  limit as peer unseal); and an export is exactly as safe as the root it
+  is wrapped under.
+
+### The key service
+
+Step 2 of #310: applications keep named keys in `datax_keys` (kind
+`wrapping`) and ask datax to wrap and unwrap their own data keys under
+them, the way they would ask a cloud KMS — `CREATE ENCRYPTION KEY`,
+`datax_key_wrap` / `datax_key_unwrap`, `datax_encrypt` /
+`datax_decrypt`, `GRANT WRAP | UNWRAP | USAGE ON ENCRYPTION KEY`. The
+statements, functions, privileges and error codes are in
+[sql.md](sql.md), "Encryption keys"; what an application should expect
+is in [encryption-keys-for-applications.md](encryption-keys-for-applications.md).
+
+```
+cluster key  wraps →  named key "documents" (v1, v2, ...)  wraps →  the application's data keys (blobs it stores)
+```
+
+- **A blob** names the key's id and version and is sealed with
+  AES-256-GCM under that version's material, bound to the caller's
+  context. It is useless without the named key, which is useless
+  without the cluster key, which is useless without a node's root.
+- **Material leaves `datax_keys` only into a gateway's held memory**
+  (see *Keys in memory*), cached per key and version under a lease of
+  10 seconds that checks the key's generation. Disabling, destroying,
+  revoking or changing the owner of a key reaches every gateway within
+  that lease, and the statement waits it out before returning. Named
+  keys' material is never returned to a client; data keys are.
+- **Disabled keys refuse everything**, unwrap and decrypt included.
+- **Every use is audited** (who, which key and version, what, the
+  outcome; never material, data or context) and rate-limited per role
+  on each node (`SET CLUSTER SETTING key_service.rate_limit`).
+- **Transport.** The functions are refused on a connection that is
+  neither TLS nor loopback. (The cluster key needs a secure cluster,
+  whose SQL listener refuses cleartext, so in practice every remote
+  connection is TLS.)
+
+What it does not protect against, stated with the feature:
+
+- **A role holding `UNWRAP` (or `USAGE`) on a key can recover every
+  data key ever wrapped under it**, and so read whatever those data
+  keys encrypt, wherever it is stored. That is what `unwrap` is for
+  (decided in the design); treat such a role's credentials like the
+  data itself, and give writers `WRAP` alone. The same goes for
+  `datax_decrypt` and every value encrypted under the key.
+- An admin can grant itself `UNWRAP` on any key. It does not hold it
+  without that grant, and the grant is a recorded, visible statement,
+  but the admin role is in the trusted base.
+- A data key, once unwrapped, is the application's: datax cannot take
+  it back from an application's memory or from wherever it was copied.
+  Disabling or dropping a key stops further unwraps, not earlier ones.
+- `DROP ENCRYPTION KEY` destroys every version and purges the key's
+  record's history; backups taken before still hold the key (wrapped by
+  the cluster key) until they expire — the documented dependency of the
+  design, *Erasure*.
+- A compromised gateway, while it holds a key's material in its cache.
+
+## Sealed tables
+
+A **sealed table** (`CREATE TABLE ... WITH (encryption_key = 'auto')`,
+cluster version v22, issue #310) has a key of its own: a named key of
+kind `table` in `datax_keys`, wrapped by the cluster key. Every row's
+value is encrypted under it in the gateway's SQL layer, at the boundary
+where rows become KV values (`pkg/sql/rowseal`), before anything below —
+KV, raft, the storage engine, replicas, snapshots, the consistency
+checker, backups — sees it. Those layers see ciphertext and are
+unchanged; file-level encryption still applies on top. Statements,
+grammar, notices and errors are in docs/sql.md, "Sealed tables"; what an
+application should expect, and how to shape a schema so that erasure
+means something, is in
+[encryption-keys-for-applications.md](encryption-keys-for-applications.md).
+
+```
+root (per node)  →  cluster key  →  the table's key (datax_keys, kind table)  →  each row's value
+```
+
+**What is sealed, and what is not.** The value of a row — every column
+that is neither in the primary key nor in an index — is sealed. Primary-
+key columns and every indexed column (`UNIQUE` constraints included,
+and for an `ivfflat` index the vector itself, which its entries keep)
+live in KV keys, must sort on every replica, and are protected by
+file-level encryption only. Row counts and value sizes are visible. The
+`CREATE TABLE` and `CREATE INDEX` notices name the plaintext columns.
+`LISTEN`/`NOTIFY` payloads and large objects are not sealed. Table
+statistics are not collected for sealed columns.
+
+**The sealed form.** A marker byte that no plain row value begins with
+(`0xD5`; every plain value begins with the row encoding's version byte),
+the key version (a uvarint), a random 12-byte nonce, and the AES-256-GCM
+ciphertext and tag: 30 bytes per value. The associated data binds the
+value to its place: the table's seal id (its id when it was created,
+kept by a table restore), the key's id and version, and the row's KV key
+after the table prefix. A value moved to another row or another table,
+or presented under another key or version, does not open (`XX001`).
+Nonces are random, so a key version should seal no more than about 2^32
+values; rotating the key (`ALTER TABLE ... ROTATE ENCRYPTION KEY`)
+starts a new version, and a background job moves the old rows to it
+(*Sealing an existing table and rotating keys*, below).
+
+**Keys on the gateway.** Each gateway keeps unwrapped table keys in held
+memory (see *Keys in memory*) in the cache it shares with the key
+service (`keystore.Cache`) under its lease — 10 seconds, the
+descriptor lease, by default. Past the lease the
+next use reads the key's generation from `datax_keys`, which every
+change of state moves; a key that was disabled, destroyed or rotated is
+dropped from the cache, and a disabled or destroyed key then gives
+nothing. A change to a table's key therefore reaches every gateway within
+10 seconds. A statement that touches a row whose key gives nothing fails
+with `XXK01` naming the table — never skipping the row, never returning
+ciphertext.
+
+**Dropping a sealed table destroys its key**, once the drop has
+committed: the key's record is tombstoned and its history purged (the
+purge of #295). The dropped table's rows stay in KV until the
+dropped-table job reclaims them once the table's history window has
+passed (#313), as any dropped table's do, but they are unreadable from then
+on, `AS OF SYSTEM TIME` reads of the table included — on the gateway that
+ran the drop at once, on every other within one key lease (10 seconds);
+the drop does not wait that lease out, since by the time it returns no
+gateway resolves the table's name any more. This was chosen
+over destroying the key when the data is reclaimed because a drop of a
+sealed table should be an erasure of it, at once, and a mistaken drop is
+what a table restore is for. A key that another table still names (a
+table restored beside the one it was taken from shares its key) is kept
+until the last of them is dropped. A janitor on every node destroys, every
+five minutes, any table key no table names: the backstop for a gateway
+that died between the drop's commit and the destruction.
+
+**Backups and restores.** A backup copies the sealed values as they
+are, and `datax_keys` with its rows wrapped by the cluster key (see
+*Cluster key*). A restore of everything brings both back. A table
+restore copies the sealed rows under the table's new id, keeps the key id
+and the seal id in the descriptor, and makes sure the key is usable:
+shared, when this cluster has it; brought back from the backup's
+`datax_keys` and resealed under this cluster's key, when this cluster
+lacks it (another cluster — the source's cluster key must be imported
+first) or has destroyed it (the table was dropped after the backup). That
+last case is the documented dependency on backup retention at work: a
+backup taken before a key was destroyed still holds it. A table restore
+whose key the backup does not hold, or holds already destroyed, is
+refused before anything is written.
+
+**What it protects, and what it does not.** Destroying a table's key —
+by dropping the table — makes its sealed values unreadable on every
+replica and, once every backup taken before has expired, everywhere. It
+does not protect what is not sealed (keys, indexes, counts, sizes), it is
+not access control (a role that may `SELECT` reads plaintext), and it
+does not protect a gateway's memory while it holds the key.
+
+**What it costs.** One AES-GCM operation and 30 bytes per row value
+written or read, and a cache lookup; no extra round trip once the key is
+cached (one read of `datax_keys` per key per lease per gateway, in a
+transaction of its own, never in the statement's). Measured with
+`datax bench --sealed` on one secure, encrypted on-disk node (a shared
+4-core VM with another build running, 16 workers, `--seed 7`; each run
+on freshly created tables, sealed and plain alternating which goes
+first; `bank` six rounds of 30 seconds, `kv` four of 20), with the
+server's counters per operation from `--server-url`:
+
+| Workload | Plain ops/s, median (range) | Sealed ops/s, median (range) | KV batches per op, plain / sealed | 40001s per op, plain / sealed |
+|---|---|---|---|---|
+| `kv`, 95% reads | 19,833 (18,881–21,235) | 18,775 (17,094–20,865) | 1.001 / 1.001 | 0 / 0 |
+| `kv`, 50% reads | 8,810 (7,259–8,847) | 8,010 (7,016–8,579) | 1.005 / 1.005 | 0 / 0 |
+| `bank` | 227 (201–240) | 216 (171–326) | 10.32 / 10.36 | 0.0171 / 0.0172 |
+
+Per committed transfer, `bank` did the same work on both tables: 6.10
+statements, 1.01 KV commits, 0.015 transaction restarts, 0.013 / 0.014
+refreshes, 0.017 serialization failures and 0.15 / 0.13 latch waits;
+the median p50 / p95 latency was 7.8 / 15.0 ms plain and 7.2 / 13.4 ms
+sealed. Both tables sat at the end of the keyspace on the one store and
+took the same one load split. What sets `bank`'s throughput is not the
+latency of the transfers that commit but the time spent in the attempts
+that end in a 40001: about three seconds each (2.85 s plain, 3.02 s
+sealed, median), 64–77% of all worker time in every run, sealed or
+plain. The number of those attempts and their length vary from run to
+run, and that accounts for the spread above — the fastest sealed run
+had the most 40001s and the shortest ones — and, most likely, for the
+−29% recorded earlier from five 10-second rounds (plain alone swung
+from 280 to 784 transfers/s between them). `bench` records that time as `retry_sec`.
+
+So sealing adds no KV requests, restarts or conflicts. What remains is
+CPU on the gateway: a server CPU profile puts the boundary — sealing,
+opening, the cache — at 1.4% of the server's CPU under `kv` 50%
+(earlier profiles: 1.1% under `kv` 50%, 1.05% under `kv` 95%, 0.93%
+under `bank`), and a seal plus an open of a 64-byte value costs about
+0.8 µs (`BenchmarkBoundary`). The medians are within this machine's
+noise for `bank` and `kv` 95%; under `kv` 50% the sealed run was lower
+in each of the four rounds (−2.5% to −9.6%) while a profiled pair run
+just after had it 2.6% faster. Whether that is below the 5% bar needs a
+dedicated machine to say.
+
+## Per-tenant keys
+
+A table created `WITH (encryption_key_by = '<column>')` is sealed **per
+tenant** (v22, issue #310 step 4): each distinct value of the column,
+which must lead the primary key, has a key of its own — a named key of
+kind `tenant` in `datax_keys`, made on the tenant's first write — so that
+one tenant's data can be erased by destroying its key, without touching
+anyone else's. Everything under *Sealed tables* holds; statements and
+errors are in docs/sql.md, "Per-tenant keys".
+
+```
+root (per node)  →  cluster key  →  a tenant's key (datax_keys, kind tenant)  →  that tenant's row values
+                                 →  the table's naming key (kind table)        →  the names of its tenants' keys
+```
+
+**Naming and making a tenant's key.** A tenant's key is named
+`tenant/<seal id>/<digest>`, the digest an HMAC-SHA256 under the table's
+*naming key* (a key of kind `table`, made with the table, that seals
+nothing) of the seal id and the tenant column's key encoding. The name
+is found through `datax_keys`' unique index on names — one point read
+however many tenants there are — and is the same on every gateway. The
+digest is keyed so that the names, which admins can list, do not let
+anyone test a guessed tenant id without the cluster's keys; once the
+table is dropped, which destroys the naming key, no one can. A tenant's
+first write makes its key in a transaction of its own, just before the
+write's: concurrent first writes of one tenant race on the name and
+converge on one key, and first writes of different tenants touch
+different rows and do not conflict. A write that then aborts leaves its
+tenant's key unused, for the tenant's next write.
+
+**The sealed form** names the key: the marker `0xD5`, the key's id (8
+bytes), the key version, a 12-byte nonce, and the AES-256-GCM ciphertext
+and tag — 38 bytes per value; the associated data is a sealed table's
+(seal id, key id and version, row key). A read opens each value under
+the key it names, without looking its tenant up.
+
+**On the gateway.** Tenants' key ids are cached (65,536 by default) and
+keys' material too (`keystore.Cache`, bounded at 10,000 keys by default
+— `datax start --key-cache-keys` — least recently used dropped first; its
+hit takes no lock). Size the bound above the number of tenants a node
+serves within one lease (10 seconds): a working set beyond it reads each
+key from `datax_keys` again on its next use (two reads) and is much
+slower (see *What it costs*). A cached
+tenant costs no KV work per row; each key is checked against
+`datax_keys` once per lease per gateway, as a table's key is, so a scan
+across many tenants does one key read per distinct tenant per lease,
+not one per row. Table statistics of a per-tenant table are collected
+from its keys alone when none of its indexes needs a sealed value, and
+a row of a destroyed tenant is counted without its values rather than
+failing the collection.
+
+**Erasing a tenant** (the application guide's procedure):
+
+1. Delete the tenant's rows from every table that holds them.
+2. `ALTER TABLE ... PURGE` each, so the deleted versions do not wait
+   out the table's GC window.
+3. `SELECT datax_destroy_tenant_key('items', $tenant)`. The key's record
+   is tombstoned, renamed out of the tenant's name and purged from
+   `datax_keys`' history; the call returns, with the key's id, once
+   every gateway has stopped using it (the key lease, 10 seconds).
+
+Stop the tenant's writes before step 3: a gateway may seal a write under
+the key until the lease runs out, and such a row is unreadable. A row
+of the tenant still sealed under the key fails with `XXK01`, on every
+node, once the call has returned, and a `DELETE` of it fails too (it
+reads the row first). Such rows — left by destroying the key first, or
+by a write in the lease — are removed with their index entries by
+`SELECT datax_remove_tenant_rows('items', $tenant)`, which needs no key:
+the tenant's rows are one span of primary keys, and every index entry
+carries its row's primary key, so it reads each secondary index (only
+the tenant's part of one whose leading column is the tenant column) for
+entries of the tenant's unreadable rows, removes them, and then the
+rows. That reads whole indexes, and a table referenced by foreign keys
+is refused, so deleting first stays the procedure; the function is the
+cleanup. `PURGE` afterwards as in step 2. The tenant's next write makes
+a fresh key. Backups taken before step 3 hold the key until they expire
+(the documented dependency, design *Erasure*): a table restore from such
+a backup brings the tenant back.
+
+**Dropping a per-tenant table** destroys its naming key after commit,
+at once, and every tenant key in the background: each node's janitor,
+woken by the drop and run every five minutes, reads the names of live
+tenant keys in order, seeks past each table that still exists, and
+destroys the keys of tables that do not, a page at a time under one
+purge of `datax_keys`. It leaves keys younger than ten minutes for a
+later pass (a tenant's first write can come before its table's `CREATE
+TABLE` commits) and the keys of a table restore in flight.
+
+**Table restore** of a per-tenant table brings back its naming key and
+every tenant key of the table the backup holds, as for a sealed table's
+key — shared when this cluster has it, brought back from the backup's
+`datax_keys` when it lacks or has destroyed it — 100 keys to a
+transaction before the table is published. A tenant whose key was
+destroyed before the backup was taken has no key in it; its rows come
+back unreadable, and its next write makes a fresh key.
+
+**What it costs.** One AES-GCM operation and 38 bytes per row value, a decode of
+the tenant column on a write, and cache lookups; no extra round trip
+for a tenant whose key is cached. Measured with `datax bench kv
+--tenants 1000` (a table keyed `(t, k)`, `t = k mod 1000`, 10,000 rows)
+plain and `--sealed=tenant`, on one secure, encrypted on-disk node (a
+shared 4-core VM, 16 workers, `--seed 7`, 20-second runs, four rounds
+alternating which goes first, the tables kept between rounds, the node
+started with `--key-cache-keys 40000`), with the server's KV batch
+count per operation from `--server-url`:
+
+| Workload | Plain ops/s, median (range) | Per-tenant ops/s, median (range) | KV batches per op, plain / per-tenant |
+|---|---|---|---|
+| `kv`, 95% reads | 18,489 (16,703–19,825) | 17,046 (13,640–20,320) | 1.001 / 1.001–1.016 |
+| `kv`, 50% reads | 8,461 (8,247–8,860) | 6,897 (4,770–7,664) | 1.002 / 1.003–1.035 |
+
+Two earlier sets of the same rounds, before the refresh below, put the
+per-tenant table 15% and 6% behind at 95% reads and level and 4% ahead
+at 50%: the spread between runs on that machine is wider than the
+difference. The KV counts are robust to it. A run that follows another
+on the same table does the same KV work as plain (1.001–1.003 batches
+per op); a run whose keys went idle first (the cache drops a key unused
+for a lease) reads each of its 1,000 keys again, twice, which is the
+rest. A server CPU profile of `kv` at 50% reads puts the boundary at
+2.2% of the server's CPU (opening 1.5%, sealing 0.7%; the key cache's
+part 1.0%), and `BenchmarkTenantBoundary` measures a seal and an open
+of a 64-byte value for a cached tenant at about 1.1 µs.
+
+Each gateway checks every key it uses against `datax_keys` once per
+lease; a background refresh does that every half lease for the keys in
+use, 500 to a read, so a busy key stays on the lock-free hit path. **A
+working set larger than the key cache** costs a key read per use: 20,000
+tenants on the default bound of 10,000 ran at 7,654 ops/s against 13,596
+plain, with 2.72 KV batches per operation; with `--key-cache-keys 40000`,
+17,533 and 19,533 against 19,574 and 20,490 plain, at 1.24 and 1.16 — the
+cost of reading 20,000 cold keys at the start of each run.
+
+## Sealing an existing table and rotating keys
+
+Two changes to a sealed table's keys leave rows written before them
+(v22, issue #310 step 5; statements in docs/sql.md, "Sealing an existing
+table and rotating keys"):
+
+- **Sealing a table that holds rows** — `ALTER TABLE t SET
+  (encryption_key = 'auto')`, or `(encryption_key_by = 'tenant_id')` —
+  gives the table its key, marks its descriptor `sealing`, and waits for
+  every gateway to adopt it; from then on every write is sealed, and the
+  rows already there are plain.
+- **Rotating a key** — `ALTER TABLE t ROTATE ENCRYPTION KEY [KEEP OLD
+  VERSIONS]` for a table sealed whole, `datax_rotate_tenant_key(table,
+  tenant [, keep_old])` for one tenant — adds a version, which every
+  gateway seals new writes under within the key lease; the rows already
+  there are under older versions.
+
+Reads take both meanwhile: a sealed value names its version (and, per
+tenant, its key), and a table being sealed reads its plain values as
+they are. A **seal job** then rewrites those rows, one job per table
+(`datax_encryption_jobs` shows it; a second change waits for it):
+
+- It runs on the node leading range 1, every 10 seconds, for up to that
+  long per table per turn, in **batches** of 100 rows: each batch is an
+  ordinary transaction that reads the next rows of the table's primary
+  index (of the tenant's span, for a tenant), opens and seals again the
+  ones it wants — plain values, or values of the rotated key below its
+  new version — and writes the job's record with where it got to. A
+  concurrent write to a row it rewrites conflicts with it and one of the
+  two retries, as between any two transactions. The record is
+  replicated, so a restart or a move of range 1's leadership resumes the
+  job from the last batch; for a moment two nodes may both act, and their
+  batches serialize on the record.
+- It does nothing until every gateway writes as it wants: for a seal job
+  until every descriptor lease is on the sealed descriptor (a gateway
+  still on the plain one could write a plain row behind the job), for a
+  rotation until the key lease has passed since it (a gateway could seal
+  under the old version until its cache sees the new one).
+- It works in **passes** over the span and is **done** when a whole pass
+  finds nothing to rewrite. A seal job then clears `sealing` in the
+  descriptor, in the same transaction, and strict reads are back — on
+  each gateway once its descriptor lease has the new descriptor, within
+  10 seconds: a plain value in the table is corruption (`XX001`) again. A rotation then
+  **destroys the key's older versions** — their material removed from
+  the key's record and the record's history purged — unless `KEEP OLD
+  VERSIONS` (or `keep_old`) was given; `datax_destroy_old_key_versions`
+  destroys them later.
+- A row it cannot open because its key is gone — a tenant's key
+  destroyed, an old version destroyed early — is stepped over and
+  counted (`rows_unreadable`); a key that is only unavailable on the
+  node (disabled, unreachable) fails the batch, which is retried on the
+  job's next turn, its error in `last_error`.
+
+**What stays behind.** Rewriting a row writes a new MVCC version; the
+old one stays in the table's history until garbage collection removes
+it (the table's `gc_ttl`). After sealing an existing table that history
+is the rows' **plaintext**, readable by `AS OF SYSTEM TIME` and on disk
+under file-level encryption only: the `ALTER TABLE` notice says so, and
+`ALTER TABLE t PURGE` once the job is done removes it at once (#295).
+After a rotation the history is under the old version, and once the job
+destroys that version it is unreadable — `AS OF SYSTEM TIME` reads below
+the rewrite fail with `XXK01` — which is the point of destroying it.
+Destroying an old version early, with `datax_destroy_old_key_versions`,
+is allowed and makes the rows still under it, and their history,
+unreadable; the job, if it runs, steps over them. Backups taken before
+hold the old version (and before sealing, the plaintext) until they
+expire, as always.
+
+**Unsealing is not supported.** `ALTER TABLE t RESET (encryption_key)`
+is refused: it would write the table's values back in plaintext, which
+is what a sealed table promises not to do, while its sealed history
+stayed readable under a key that would then have to be kept. A table is
+unsealed by copying its rows into a new, plain one.
+
+**Tables restored or recovered mid-job.** A table restore of a table
+being sealed brings `sealing` back and makes its job again under the new
+id. A table marked `sealing` without a job (a restore of everything
+brings back descriptors, not the jobs in flight) gets one from the
+sealed key janitor within five minutes.
+
 ## Keys in memory
 
 The keys a node holds for as long as it runs — its store key, the data
@@ -991,7 +1604,13 @@ operator's view):
 - **The key in transit.** The key is sent to the serving node in the
   admin request: over mutual TLS on a secure cluster, and on an insecure
   one accepted only from the node's own machine. It is not logged,
-  audited, or kept.
+  audited, or kept. A sealed backup is asked for as the admin op
+  `backup-sealed`, and a restore given keys as `restore-sealed` (issue
+  #313): under the plain `backup`, a node from before sealed backups —
+  one not yet upgraded in a rolling upgrade — would ignore the key it
+  does not know and write the backup in plaintext; under the new names
+  it refuses the op. A node still takes `backup` and `restore` with a
+  key, as commands from before the names send them.
 
 ## Recovery tooling
 
@@ -1063,6 +1682,14 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
+- **A sealed table's primary-key and indexed columns are never
+  sealed** (see *Sealed tables*). Sealing an existing table leaves its
+  rows' plaintext in MVCC history until garbage collection or `ALTER
+  TABLE ... PURGE`, and unsealing is not supported (see *Sealing an
+  existing table and rotating keys*). A row of a per-tenant table left
+  behind when its tenant's key is destroyed is removed by
+  `datax_remove_tenant_rows`, not by `DELETE`; a table referenced by
+  foreign keys needs `TRUNCATE` or `DROP TABLE` (see *Per-tenant keys*).
 - **Backups are sealed only when asked** (`datax backup --backup-key`);
   otherwise they are plaintext whatever the store is. A sealed backup
   shows its table count, table ids and file sizes; a rollback to an
@@ -1087,6 +1714,11 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   fronts it; PKCS#11 is not spoken directly.
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
+- **The cluster key needs every node under `--enc-root`, a secure
+  cluster, and every member live** to enable, rotate or import it. A node
+  whose connections do not come from its registered host (behind an
+  address translation) is handed the key only once its last heartbeat is
+  older than the liveness grace, or by `datax debug cluster-key sync`.
 - The node never rewrites the operator's key file: after an online
   rotation, a restart needs the new key in one of the `--enc-key`
   files (stage it beforehand, see Key rotation).

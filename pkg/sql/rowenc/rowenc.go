@@ -31,7 +31,20 @@ import (
 const PrimaryIndexID = 1
 
 // valueVersion tags the row-value encoding; bump on incompatible change.
+// It is the first byte of every EncodeValue output.
 const valueVersion byte = 1
+
+// SealedValueMarker is the first byte of a sealed row value: the value of
+// a sealed table's row, encrypted under the table's key (issue #310,
+// pkg/sql/rowseal). No EncodeValue output begins with it — every one
+// begins with valueVersion, which must never take this value — so a
+// value tells by its first byte which form it is in, and DecodeValue
+// handed a sealed value fails rather than misreading it.
+const SealedValueMarker byte = 0xD5
+
+// ValueVersion is valueVersion, for tests elsewhere that check the claim
+// above.
+const ValueVersion = valueVersion
 
 // Column payload tags. Each payload is self-describing so unknown columns
 // can be skipped.
@@ -230,6 +243,31 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 	return out, nil
 }
 
+// LeadingPKColumn returns the leading primary-key column of a row key of
+// desc at any of its indexes' prefixes (/t/<id>/<index>/...): the bytes
+// of its key encoding — what tells one value from another in KV — and the
+// value decoded. A per-tenant sealed table (issue #310) picks a row's key
+// by it.
+func LeadingPKColumn(desc *catalog.TableDescriptor, key keys.Key) ([]byte, types.Datum, error) {
+	p := keys.TableDataPrefix(desc.ID)
+	if !bytes.HasPrefix(key, p) || len(key) < len(p)+8 {
+		return nil, types.Datum{}, fmt.Errorf("key not in table %d's rows", desc.ID)
+	}
+	if len(desc.PrimaryKey) == 0 {
+		return nil, types.Datum{}, fmt.Errorf("table %d has no primary key", desc.ID)
+	}
+	col, ok := desc.ColByID(desc.PrimaryKey[0])
+	if !ok {
+		return nil, types.Datum{}, fmt.Errorf("table %d: unknown primary key column %d", desc.ID, desc.PrimaryKey[0])
+	}
+	at := []byte(key[len(p)+8:])
+	rest, d, err := decodeKeyDatum(at, col.Type)
+	if err != nil {
+		return nil, types.Datum{}, fmt.Errorf("decoding pk column %q: %w", col.Name, err)
+	}
+	return at[:len(at)-len(rest)], d, nil
+}
+
 // EncodeValue builds the binary row value from the full row (colID → datum).
 // PK columns are skipped (they live in the key); NULLs are omitted; columns
 // are emitted in ascending ID order (deterministic bytes for identical rows).
@@ -381,6 +419,9 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnID]types.Datum, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("corrupt row value: empty")
+	}
+	if raw[0] == SealedValueMarker {
+		return nil, fmt.Errorf("row value is sealed: it must be opened under its table's key before it is decoded")
 	}
 	if raw[0] != valueVersion {
 		return nil, fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])

@@ -44,6 +44,7 @@ const (
 	CodeObjectNotInState            = "55000"
 	CodeGeneratedAlways             = "428C9"
 	CodeDuplicateObject             = "42710"
+	CodeReservedName                = "42939"
 	CodeCheckViolation              = "23514"
 	CodeForeignKeyViolation         = "23503"
 	CodeProgramLimitExceeded        = "54000"
@@ -67,6 +68,21 @@ const (
 	CodeWrongObjectType           = "42809"
 	CodeInvalidGrantOperation     = "0LP01"
 	CodeInvalidObjectDefinition   = "42P17"
+
+	// CodeSnapshotTooOld is PostgreSQL's snapshot_too_old: a read whose
+	// timestamp lies below the history the cluster keeps.
+	CodeSnapshotTooOld = "72000"
+
+	// The key service (issue #310): a role past its rate limit
+	// (configuration_limit_exceeded: a configured limit, retry later); a
+	// blob that does not open (external_routine_invocation_exception, as
+	// pgcrypto's decrypt reports a wrong key or damaged data); a
+	// connection that may not carry key material
+	// (invalid_authorization_specification, as pg_hba refuses an
+	// unencrypted connection).
+	CodeConfigLimitExceeded  = "53400"
+	CodeExternalRoutine      = "39000"
+	CodeInvalidAuthorization = "28000"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.
@@ -94,6 +110,9 @@ func ToSQLError(err error) *Error {
 	if errors.As(err, &ve) {
 		return &Error{Code: ve.Code, Msg: ve.Msg}
 	}
+	if serr, ok := sealErrorToSQL(err); ok {
+		return serr
+	}
 	var syn *parser.SyntaxError
 	if errors.As(err, &syn) {
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}
@@ -102,6 +121,14 @@ func ToSQLError(err error) *Error {
 		return &Error{Code: CodeSerializationFailure, Msg: "restart transaction: " + err.Error()}
 	}
 	var kerr *kvpb.Error
+	if errors.As(err, &kerr) && kerr.IsBelowGCThreshold() {
+		// What is left of a GC-threshold refusal once a transaction that
+		// could restart has been given 40001 (kvclient): a read at a
+		// timestamp the client chose, below the history kept.
+		// PostgreSQL's code for that is snapshot_too_old; retrying at the
+		// same timestamp cannot succeed (issue #313).
+		return &Error{Code: CodeSnapshotTooOld, Msg: "snapshot too old: the history at the timestamp read has been garbage-collected (AS OF SYSTEM TIME must lie within the table's GC window): " + err.Error()}
+	}
 	if errors.As(err, &kerr) && kerr.TooLarge != nil {
 		return &Error{Code: CodeProgramLimitExceeded, Msg: fmt.Sprintf("the statement writes about %d MiB to one range in a single piece, and a single write can carry %d MiB: a row and what is written with it must stay well below that (store a large value as a large object: lo_create, lowrite)",
 			(kerr.TooLarge.Bytes+1<<19)>>20, kerr.TooLarge.Limit>>20)}

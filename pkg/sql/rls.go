@@ -221,7 +221,7 @@ func (s *Session) rowFilter(ctx context.Context, txn *kvclient.Txn, desc *catalo
 	if desc == nil || desc.Virtual != "" || s.system || s.actor() == catalog.RootRole {
 		return nil, false, nil
 	}
-	if txn != nil && txn.Historical() {
+	if txn != nil && txn.Historical() && txn != s.freshTxn {
 		return s.historicalRowFilter(ctx, txn, desc, cmds...)
 	}
 	return s.rowFilterIn(ctx, txn, desc, cmds...)
@@ -249,10 +249,13 @@ func (s *Session) rowFilterIn(ctx context.Context, txn *kvclient.Txn, desc *cata
 // table as it stood before row security was enabled, or under a policy
 // since tightened: every row it is now forbidden. The policies, the
 // owner and the roles that decide what a historical read may see are
-// therefore today's, read in a transaction of their own; the rows are
-// the past's. If today's descriptor cannot be read the statement fails
-// rather than run unfiltered. A table that no longer exists has no
-// policies today, and its own last word stands.
+// therefore today's — as fresh as this node can serve them, which for a
+// bounded-staleness read is the state its own replicas hold
+// (freshCatalog, shared with the privilege check) — read in a
+// transaction of their own; the rows are the past's. If that state
+// cannot be read the statement fails rather than run unfiltered. A
+// table that no longer exists has no policies today, and its own last
+// word stands.
 func (s *Session) historicalRowFilter(ctx context.Context, htxn *kvclient.Txn, hdesc *catalog.TableDescriptor, cmds ...string) ([]parser.Comparison, bool, error) {
 	// Once per statement and table: a join asks for every outer row.
 	key := policyKey{txn: htxn, desc: hdesc, actor: s.actor(), cmd: strings.Join(cmds, ",")}
@@ -261,9 +264,9 @@ func (s *Session) historicalRowFilter(ctx context.Context, htxn *kvclient.Txn, h
 	}
 	var out []parser.Comparison
 	var active bool
-	err := s.db.RunTxn(ctx, "asof-row-security", func(ctx context.Context, cur *kvclient.Txn) error {
+	err := s.freshCatalog(ctx, "asof-row-security", func(ctx context.Context, cur *kvclient.Txn) error {
 		out, active = nil, false
-		desc, err := catalog.ReadTable(ctx, cur, hdesc.ID)
+		desc, err := s.freshTable(ctx, cur, hdesc)
 		if err != nil {
 			return err
 		}

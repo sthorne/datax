@@ -111,6 +111,17 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 			return nil, err
 		}
 	}
+	// The sealed tables' keys go once every table is dropped, so that two
+	// tables sharing a key (a table and its restored copy) both count.
+	queued := map[int64]bool{}
+	for _, d := range tables {
+		if d.Sealed() && !queued[d.EncryptionKey.KeyID] {
+			queued[d.EncryptionKey.KeyID] = true
+			if err := s.queueKeyDestroy(ctx, txn, d); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := s.cat.DropDatabase(ctx, txn, db); err != nil {
 		return nil, err
 	}

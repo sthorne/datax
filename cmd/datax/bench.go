@@ -43,6 +43,13 @@ type benchResult struct {
 	RowsPerSec float64 `json:"rows_per_sec,omitempty"`
 	Errors     int64   `json:"errors"`
 	Retries    int64   `json:"retries"`
+	// RetrySec is the worker time spent in attempts that ended in a
+	// 40001 — on a contended workload this, not the latency of the
+	// operations that succeed, is what sets the throughput.
+	// RetrySamples counts the distinct messages behind Retries, as
+	// ErrorSamples does for Errors.
+	RetrySec     float64          `json:"retry_sec,omitempty"`
+	RetrySamples map[string]int64 `json:"retry_samples,omitempty"`
 	// ErrorSamples counts the distinct error messages behind Errors
 	// (the first 160 characters of each; at most 8 distinct kinds).
 	ErrorSamples map[string]int64 `json:"error_samples,omitempty"`
@@ -203,6 +210,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	vectorIndex := fs.String("vector-index", "ivfflat", "vector-knn workload: ivfflat (an approximate index serves the query) or none (every query scans the table and keeps the nearest); the table name embeds this, so A/B runs don't collide")
 	lists := fs.Int("lists", 100, "vector-knn workload: lists of the ivfflat index")
 	probes := fs.Int("probes", 0, "vector-knn workload: lists each query reads (0 = the server's default, the square root of --lists)")
+	var sealed sealedMode
+	fs.Var(&sealed, "sealed", "kv, bank, hot-row, ingest, scan: make the workload's table a sealed table, WITH (encryption_key = 'auto'), whose row values are encrypted under a key of its own; --sealed=tenant (kv, with --tenants) seals it per tenant, WITH (encryption_key_by = 't'), a key per tenant (needs the cluster key; the table name embeds this, so A/B runs don't collide)")
+	tenants := fs.Int("tenants", 0, "kv workload: key the table by (t, k) with t = k mod this many tenants (0 = by k alone); --sealed=tenant seals each tenant under a key of its own, and without --sealed the same shape runs plain, for comparison (the table name embeds this)")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
@@ -304,6 +314,32 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if *presplit > 1 {
 		rsuffix = fmt.Sprintf("_r%d", *presplit)
 	}
+	// withSealed closes the CREATE TABLE of a workload that can be run
+	// on a sealed table.
+	withSealed := ""
+	if *tenants < 0 || (*tenants > 0 && workload != "kv") {
+		return nil, fmt.Errorf("--tenants applies to kv, and takes a positive count")
+	}
+	if *tenants > 0 {
+		rsuffix += fmt.Sprintf("_t%d", *tenants)
+	}
+	switch sealed {
+	case "":
+	case "table":
+		switch workload {
+		case "kv", "bank", "hot-row", "ingest", "ingest-copy", "scan":
+		default:
+			return nil, fmt.Errorf("--sealed applies to kv, bank, hot-row, ingest, ingest-copy and scan")
+		}
+		rsuffix += "_sealed"
+		withSealed = " WITH (encryption_key = 'auto')"
+	case "tenant":
+		if workload != "kv" || *tenants <= 0 {
+			return nil, fmt.Errorf("--sealed=tenant applies to kv with --tenants")
+		}
+		rsuffix += "_tsealed"
+		withSealed = " WITH (encryption_key_by = 't')"
+	}
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
 	hotTable := "bench_hot" + rsuffix
@@ -390,7 +426,16 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 	switch workload {
 	case "kv":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"); err != nil {
+		if *tenants > 0 {
+			if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (t INT8, k INT8, v TEXT, PRIMARY KEY (t, k))"+withSealed); err != nil {
+				return nil, err
+			}
+			if err := preloadRows(kvTable, "t, k, v", func(j int) string { return fmt.Sprintf("(%d, %d, 'v%d')", j%*tenants, j, j) }); err != nil {
+				return nil, err
+			}
+			break
+		}
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(kvTable, int64(*preload), false); err != nil {
@@ -400,9 +445,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			return nil, err
 		}
 	case "ingest", "ingest-copy":
-		ddl := "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k INT8 PRIMARY KEY, pad TEXT)"
+		ddl := "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k INT8 PRIMARY KEY, pad TEXT)" + withSealed
 		if *keys == "uuid" {
-			ddl = "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k TEXT PRIMARY KEY, pad TEXT)"
+			ddl = "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k TEXT PRIMARY KEY, pad TEXT)" + withSealed
 		}
 		if _, err := setup.Exec(ctx, ddl); err != nil {
 			return nil, err
@@ -433,7 +478,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			}
 		}
 	case "bank":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+bankTable+" (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+bankTable+" (id INT8 PRIMARY KEY, balance INT8)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(bankTable, int64(*preload), false); err != nil {
@@ -445,7 +490,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	case "hot-row":
 		// One row updated --updates times inside one transaction: the
 		// depth of an intent's rewrite chain (issue #162).
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+hotTable+" (id INT8 PRIMARY KEY, n INT8)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+hotTable+" (id INT8 PRIMARY KEY, n INT8)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(hotTable, int64(*preload), false); err != nil {
@@ -577,7 +622,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		fmt.Printf("  plan:      %s\n  recall@%d: %.3f over %d queries\n", res.Vector.Plan, res.Vector.K, res.Vector.Recall, res.Vector.RecallQueries)
 	case "scan":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(scanTable, int64(*preload), false); err != nil {
@@ -595,6 +640,21 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	var firstLats []time.Duration // time to first row (scan, index-join)
 	var errSampleMu sync.Mutex
 	errSamples := map[string]int64{}
+	retrySamples := map[string]int64{}
+	var retryNanos atomic.Int64
+	noteRetry := func(err error, took time.Duration) {
+		retries.Add(1)
+		retryNanos.Add(int64(took))
+		msg := err.Error()
+		if len(msg) > 160 {
+			msg = msg[:160]
+		}
+		errSampleMu.Lock()
+		if _, ok := retrySamples[msg]; ok || len(retrySamples) < 8 {
+			retrySamples[msg]++
+		}
+		errSampleMu.Unlock()
+	}
 	noteError := func(err error) {
 		errs.Add(1)
 		msg := err.Error()
@@ -754,7 +814,19 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 					// pgx prepares each statement text once per connection
 					// and every execution after that is Bind/Execute of the
 					// same shape (issue #107).
-					if rng.Intn(100) < *readPct {
+					if *tenants > 0 {
+						k := int64(rng.Intn(*preload))
+						t := k % int64(*tenants)
+						if rng.Intn(100) < *readPct {
+							var v string
+							err = conn.QueryRow(ctx, "SELECT v FROM "+kvTable+" WHERE t = $1 AND k = $2", t, k).Scan(&v)
+							if err == pgx.ErrNoRows {
+								err = nil
+							}
+						} else {
+							_, err = conn.Exec(ctx, "UPDATE "+kvTable+" SET v = $1 WHERE t = $2 AND k = $3", fmt.Sprintf("u%d", rng.Int63()), t, k)
+						}
+					} else if rng.Intn(100) < *readPct {
 						var v string
 						err = conn.QueryRow(ctx, "SELECT v FROM "+kvTable+" WHERE k = $1", int64(rng.Intn(*preload))).Scan(&v)
 						if err == pgx.ErrNoRows {
@@ -847,7 +919,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 				}
 				if err != nil {
 					if strings.Contains(err.Error(), "40001") || strings.Contains(err.Error(), "restart transaction") {
-						retries.Add(1)
+						noteRetry(err, time.Since(start))
 					} else {
 						noteError(err)
 					}
@@ -868,7 +940,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if len(errSamples) > 0 {
 		res.ErrorSamples = errSamples
 	}
+	if len(retrySamples) > 0 {
+		res.RetrySamples = retrySamples
+	}
 	errSampleMu.Unlock()
+	res.RetrySec = time.Duration(retryNanos.Load()).Seconds()
 	fmt.Printf("\n%s results:\n", workload)
 	fmt.Printf("  ops:        %d (%.1f/s)\n", total, res.OpsPerSec)
 	switch {
@@ -881,7 +957,14 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		res.RowsPerSec = float64(res.Rows) / duration.Seconds()
 		fmt.Printf("  rows:       %d (%.0f/s)\n", res.Rows, res.RowsPerSec)
 	}
-	fmt.Printf("  40001s:     %d\n", res.Retries)
+	fmt.Printf("  40001s:     %d", res.Retries)
+	if res.Retries > 0 {
+		fmt.Printf(" (%.1f worker-seconds in the attempts that ended in them)", res.RetrySec)
+	}
+	fmt.Println()
+	for msg, n := range res.RetrySamples {
+		fmt.Printf("    %6d × %s\n", n, msg)
+	}
 	fmt.Printf("  errors:     %d\n", res.Errors)
 	for msg, n := range res.ErrorSamples {
 		fmt.Printf("    %6d × %s\n", n, msg)
@@ -889,6 +972,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if before != nil {
 		after := scrapeCounters(httpClient, *metricsURL)
 		res.Metrics = counterDeltas(before, after)
+		if total > 0 {
+			// Routed KV batches per operation: a count, so robust to a
+			// noisy machine where throughput is not (sealed tables, #310).
+			fmt.Printf("  kv batches: %.3f per op\n", res.Metrics["datax_kv_batch_latency_seconds_count"]/float64(total))
+		}
 		fmt.Printf("  hard write stalls: %+.0f (must be 0 at the target rate)\n", res.Metrics["datax_storage_write_stalls_total"])
 		fmt.Printf("  backpressured writes: %+.0f\n", res.Metrics["datax_storage_backpressure_total"])
 		for _, cause := range []string{"leader", "debt", "follower"} {
@@ -1575,3 +1663,27 @@ func benchTextQuery(table, kind string, topic, doc int) string {
 	}
 	return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d')", table, lhs, topic)
 }
+
+// sealedMode is --sealed: "" (off), "table" (--sealed, --sealed=true or
+// --sealed=table: a sealed table) or "tenant" (a table sealed per
+// tenant).
+type sealedMode string
+
+func (m *sealedMode) String() string { return string(*m) }
+
+func (m *sealedMode) Set(v string) error {
+	switch strings.ToLower(v) {
+	case "", "false", "0", "no":
+		*m = ""
+	case "true", "1", "yes", "table":
+		*m = "table"
+	case "tenant":
+		*m = "tenant"
+	default:
+		return fmt.Errorf("--sealed takes table or tenant (or a boolean), not %q", v)
+	}
+	return nil
+}
+
+// IsBoolFlag lets --sealed stand alone, as it did when it was a boolean.
+func (m *sealedMode) IsBoolFlag() bool { return true }

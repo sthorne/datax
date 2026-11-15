@@ -20,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/keystore"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
@@ -164,6 +165,19 @@ type Config struct {
 	// 0 = 1s; negative leaves the table alone, and audit records are in
 	// the log only.
 	AuditFlushInterval time.Duration
+	// KeyCacheLease is how long a gateway trusts its cache of named keys'
+	// material before checking the key again (issue #310; 0: 10 s, the
+	// descriptor lease). DROP, DISABLE and REVOKE on an encryption key
+	// wait it out. Tests shorten it.
+	KeyCacheLease time.Duration
+	// KeyCacheMaxKeys bounds how many named keys the gateway's cache
+	// holds (issue #310, step 4; 0: keystore.DefaultCacheMaxKeys, 10,000;
+	// negative: no bound).
+	KeyCacheMaxKeys int
+	// TenantKeyGrace is how old a tenant key of a table no descriptor
+	// names must be before the tenant key janitor destroys it (issue
+	// #310, step 4; 0: 10 minutes; negative: no wait). Tests shorten it.
+	TenantKeyGrace time.Duration
 	// AuditHousekeepingInterval paces the audit table's retention and
 	// anchoring; 0 = 10m.
 	AuditHousekeepingInterval time.Duration
@@ -190,6 +204,16 @@ type Config struct {
 	RowTTLInterval   time.Duration
 	RowTTLBatchSize  int
 	RowTTLBatchPause time.Duration
+	// SealJobInterval paces the seal jobs (sealjobs.go; issue #310, step
+	// 5): each tick, the node leading range 1 works on every table whose
+	// rows are being sealed or moved to a rotated key's new version (0 =
+	// default 10s; negative disables the jobs, which then wait).
+	// SealJobBatchSize is how many rows one transaction reads (0 = 100)
+	// and SealJobBatchPause the wait between two batches (0 = 20ms;
+	// negative = none).
+	SealJobInterval   time.Duration
+	SealJobBatchSize  int
+	SealJobBatchPause time.Duration
 	// LargeObjectSweepInterval paces the large-object sweeper
 	// (largeobject.go): each tick, the node leading range 1 deletes the
 	// pages of unlinked objects and of uploads that never committed
@@ -206,6 +230,11 @@ type Config struct {
 	// before the janitor reclaims it (0 = the GC TTL, matching the
 	// deepest admissible historical read).
 	ReshardRetireFor time.Duration
+	// DroppedTableReclaimInterval is how often the node leading range 1
+	// looks for dropped tables whose history window has passed and clears
+	// their spans (0 = default 1m; negative disables it, and a dropped
+	// table's rows then stay).
+	DroppedTableReclaimInterval time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -313,6 +342,13 @@ const (
 )
 
 type Node struct {
+	// reshardMu guards the re-shard janitor's view of the descriptors:
+	// the descriptors it has seen written, and of them the ones holding
+	// a retired layout (reshard_janitor.go).
+	reshardMu      sync.Mutex
+	reshardWatch   *descWatcher
+	reshardRetired map[uint64][]byte
+
 	cfg     Config
 	tlsCfgs *security.TLSConfigs // nil in insecure mode
 	// certs reports what TLS material this node loaded and which client
@@ -372,6 +408,17 @@ type Node struct {
 	// peerUnseal is what this node remembers as the answering side of
 	// peer unseal (peerunseal.go).
 	peerUnseal peerUnsealState
+	// clusterKey is this node's part in the cluster key (issue #310,
+	// clusterkey.go): the versions it holds, and its record as the
+	// answering side of hand-overs.
+	clusterKey clusterKeyState
+	// keyService is the key service (issue #310, step 2), made with the
+	// SQL server (keyServiceOnce).
+	keyServiceOnce sync.Once
+	keyService     *keystore.Service
+	// tenantKeyKick wakes the tenant key janitor (tenantkeys.go) early:
+	// a per-tenant table was dropped on this gateway.
+	tenantKeyKick chan struct{}
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener
@@ -510,7 +557,7 @@ type Node struct {
 // Start boots the node and returns once it is serving.
 func Start(cfg Config) (*Node, error) {
 	enableProfiling(cfg)
-	n := &Node{cfg: cfg, stopper: stop.NewStopper()}
+	n := &Node{cfg: cfg, stopper: stop.NewStopper(), tenantKeyKick: make(chan struct{}, 1)}
 	if err := n.start(); err != nil {
 		n.stopper.Stop()
 		return nil, err
@@ -709,6 +756,10 @@ func (n *Node) start() error {
 	if err := n.bindStoreKey(context.Background()); err != nil {
 		return err
 	}
+	// And its copies of the cluster key, through the same root (issue
+	// #310); a copy that does not open is asked of a peer later.
+	n.loadClusterKeys(context.Background())
+	n.stopper.AddCloser(n.releaseClusterKeys)
 
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
@@ -903,7 +954,16 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.droppedTableReclaimLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.viewDependencyRecordLoop); err != nil {
+		return err
+	}
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.sealJobLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.largeObjectSweepLoop); err != nil {
@@ -912,10 +972,16 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.sealedKeyJanitorLoop); err != nil {
+		return err
+	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.auditLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.clusterKeyLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
@@ -136,12 +138,33 @@ func statsHashDatum(d types.Datum) uint64 {
 
 // CollectTableStats sweeps the table's primary index at a frozen
 // timestamp and returns fresh statistics. Exported for the background
-// sampler in pkg/server; ANALYZE uses it too.
-func CollectTableStats(ctx context.Context, db *kvclient.DB, desc *catalog.TableDescriptor) (*catalog.TableStatistics, error) {
+// sampler in pkg/server; ANALYZE uses it too. A sealed table's rows are
+// opened through the gateway's boundary b; its sealed columns get no
+// statistics at all — a summary of their plaintext would outlive the
+// table's key — so only its row count and its primary-key and indexed
+// columns, which are plaintext anyway, are described.
+func CollectTableStats(ctx context.Context, db *kvclient.DB, b *rowseal.Boundary, desc *catalog.TableDescriptor) (*catalog.TableStatistics, error) {
 	boundary := db.Clock().Now()
 	cursor, end := rowenc.PrimarySpanFor(desc)
 
 	cols := desc.VisibleColumns()
+	if desc.Sealed() {
+		plain := rowseal.PlaintextColumns(desc)
+		kept := cols[:0:0]
+		for _, c := range cols {
+			if plain[c.ID] {
+				kept = append(kept, c)
+			}
+		}
+		cols = kept
+	}
+	// A sealed table whose described columns are all in the primary key
+	// is described from its keys alone: its values are not opened, so
+	// the sampler neither needs nor churns the gateway's keys.
+	pkOnly := desc.Sealed()
+	for _, c := range cols {
+		pkOnly = pkOnly && desc.IsPKCol(c.ID)
+	}
 	sketches := make(map[catalog.ColumnID]*kmvSketch, len(cols))
 	nulls := make(map[catalog.ColumnID]int64, len(cols))
 	for _, c := range cols {
@@ -158,10 +181,21 @@ func CollectTableStats(ctx context.Context, db *kvclient.DB, desc *catalog.Table
 			break
 		}
 		for _, kv := range kvs {
-			row, derr := decodeFullRow(desc, kv.Key, kv.Value)
+			var row map[catalog.ColumnID]types.Datum
+			var derr error
+			if pkOnly {
+				row, derr = decodePKRow(desc, kv.Key)
+			} else {
+				row, derr = decodeFullRow(ctx, b, desc, kv.Key, kv.Value)
+			}
 			if derr != nil {
-				// A row we cannot decode (concurrent schema change edge)
-				// still counts; its column values are skipped.
+				var ku *rowseal.KeyUnavailableError
+				if errors.As(derr, &ku) && !desc.SealedPerTenant() {
+					return nil, derr // no key: nothing to describe, not an empty table
+				}
+				// A row we cannot decode (concurrent schema change edge,
+				// or a row of a tenant whose key was destroyed) still
+				// counts; its column values are skipped.
 				rows++
 				continue
 			}
@@ -230,7 +264,7 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 	}
 
 	for _, desc := range descs {
-		st, err := CollectTableStats(ctx, s.db, desc)
+		st, err := CollectTableStats(ctx, s.db, s.rowSealer(), desc)
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
@@ -249,11 +283,15 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 }
 
 // execShowStats renders the stored statistics for a table: one row per
-// column, the table row count and collection time repeated (read-only,
-// no admin needed).
+// column, the table row count and collection time repeated. No admin
+// is needed, but the counts describe the table's rows, so it takes
+// SELECT on the table, as PostgreSQL's pg_stats does (issue #312).
 func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parser.ShowStats) (*Result, error) {
 	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 		return nil, err
 	}
 	res := &Result{Columns: []ResultColumn{
@@ -291,4 +329,17 @@ func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parse
 	}
 	res.Tag = fmt.Sprintf("SHOW STATS %d", len(res.Rows))
 	return res, nil
+}
+
+// decodePKRow decodes a primary row's key columns only.
+func decodePKRow(desc *catalog.TableDescriptor, key keys.Key) (map[catalog.ColumnID]types.Datum, error) {
+	vals, err := rowenc.DecodePK(desc, key)
+	if err != nil {
+		return nil, err
+	}
+	row := make(map[catalog.ColumnID]types.Datum, len(vals))
+	for i, id := range desc.PrimaryKey {
+		row[id] = vals[i]
+	}
+	return row, nil
 }

@@ -158,6 +158,111 @@ func TestGoldenRowSecurityDescriptor(t *testing.T) {
 	}
 }
 
+// goldenTableDescriptorSealed is a sealed table (cluster version v22,
+// issue #310). The field is omitempty: a table that is not sealed encodes
+// as it did before.
+const goldenTableDescriptorSealed = `{"id":12,"name":"notes","columns":[{"id":1,"name":"id","type":1,"not_null":true},{"id":2,"name":"body","type":3}],"primary_key":[1],"encryption_key":{"key_id":4242,"seal_id":12}}`
+
+func TestGoldenSealedDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Sealed() || d.EncryptionKey.KeyID != 4242 || d.EncryptionKey.SealID != 12 {
+		t.Fatalf("decoded %+v", d)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil || string(raw) != goldenTableDescriptorSealed {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenTableDescriptorSealed, err)
+	}
+	c := d.Clone()
+	c.EncryptionKey.KeyID = 1
+	if d.EncryptionKey.KeyID != 4242 {
+		t.Fatal("Clone shares the encryption key")
+	}
+	var old TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorV21), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Sealed() {
+		t.Fatalf("an older descriptor reads as sealed: %+v", old)
+	}
+}
+
+// goldenTableDescriptorSealedPerTenant is a table sealed per tenant
+// (issue #310, step 4): tenant_column is omitempty, so a table sealed
+// whole encodes as it did in step 3.
+const goldenTableDescriptorSealedPerTenant = `{"id":13,"name":"items","columns":[{"id":1,"name":"tenant_id","type":8,"not_null":true},{"id":2,"name":"id","type":1,"not_null":true},{"id":3,"name":"title","type":3}],"primary_key":[1,2],"encryption_key":{"key_id":4343,"seal_id":13,"tenant_column":1}}`
+
+func TestGoldenSealedPerTenantDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealedPerTenant), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.SealedPerTenant() || d.EncryptionKey.TenantColumn != 1 || d.EncryptionKey.KeyID != 4343 {
+		t.Fatalf("decoded %+v", d.EncryptionKey)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil || string(raw) != goldenTableDescriptorSealedPerTenant {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenTableDescriptorSealedPerTenant, err)
+	}
+	var whole TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &whole); err != nil {
+		t.Fatal(err)
+	}
+	if whole.SealedPerTenant() {
+		t.Fatal("a table sealed whole reads as sealed per tenant")
+	}
+	if raw, _ := json.Marshal(whole); string(raw) != goldenTableDescriptorSealed {
+		t.Fatalf("a table sealed whole encodes differently: %s", raw)
+	}
+	var plain *TableDescriptor
+	if plain.SealedPerTenant() {
+		t.Fatal("nil descriptor")
+	}
+}
+
+// goldenTableDescriptorSealing is a table being sealed (issue #310, step
+// 5): sealing is omitempty, so a table sealed at CREATE TABLE encodes as
+// it did in steps 3 and 4.
+const goldenTableDescriptorSealing = `{"id":14,"name":"old","columns":[{"id":1,"name":"id","type":1,"not_null":true}],"primary_key":[1],"encryption_key":{"key_id":4444,"seal_id":14,"sealing":true}}`
+
+func TestGoldenSealingDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealing), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Sealed() || !d.EncryptionKey.Sealing || d.SealedPerTenant() {
+		t.Fatalf("decoded %+v", d.EncryptionKey)
+	}
+	if raw, err := json.Marshal(d); err != nil || string(raw) != goldenTableDescriptorSealing {
+		t.Fatalf("encoding changed: %s (%v)", raw, err)
+	}
+	var whole TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &whole); err != nil {
+		t.Fatal(err)
+	}
+	if whole.EncryptionKey.Sealing {
+		t.Fatal("a table sealed at creation reads as being sealed")
+	}
+}
+
+// TestGoldenSealJob: the seal job's record round-trips, and its zero
+// fields are left out.
+func TestGoldenSealJob(t *testing.T) {
+	const golden = `{"table_id":14,"table":"old","kind":"rotate","key_id":7,"version":2,"keep_old":true,"not_before":5,"started":true,"resume":"AQI=","pass":1,"pass_rewritten":3,"rewritten":3,"created":4}`
+	j, err := DecodeSealJob([]byte(golden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Kind != SealJobRotate || j.KeyID != 7 || j.Version != 2 || !j.KeepOld || string(j.Resume) != "\x01\x02" || j.State() != "running" {
+		t.Fatalf("decoded %+v", j)
+	}
+	if raw, err := j.Encode(); err != nil || string(raw) != golden {
+		t.Fatalf("encoding changed: %s (%v)", raw, err)
+	}
+}
+
 // TestGoldenRoleBypassRLS: the BYPASSRLS attribute is omitempty, so a
 // role without it encodes as before.
 func TestGoldenRoleBypassRLS(t *testing.T) {

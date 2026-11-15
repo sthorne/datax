@@ -234,3 +234,21 @@ func TestBenchErrorCheck(t *testing.T) {
 		t.Fatalf("topBenchError: %q %d", msg, n)
 	}
 }
+
+// TestSealedModeFlag: --sealed alone still means a sealed table, and
+// --sealed=tenant asks for a table sealed per tenant (#310).
+func TestSealedModeFlag(t *testing.T) {
+	for in, want := range map[string]sealedMode{"true": "table", "table": "table", "tenant": "tenant", "false": "", "TENANT": "tenant"} {
+		var m sealedMode
+		if err := m.Set(in); err != nil || m != want {
+			t.Fatalf("--sealed=%s: %q %v, want %q", in, m, err, want)
+		}
+	}
+	var m sealedMode
+	if err := m.Set("everything"); err == nil {
+		t.Fatal("--sealed=everything accepted")
+	}
+	if !m.IsBoolFlag() {
+		t.Fatal("--sealed no longer stands alone")
+	}
+}

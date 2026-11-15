@@ -154,10 +154,13 @@ func sessionFuncFamily(name string) types.Family {
 		return types.Timestamp
 	case "current_date":
 		return types.Date
-	case "nextval", "currval", "lastval", "setval", "unique_rowid", "pg_backend_pid", "to_regtype":
+	case "nextval", "currval", "lastval", "setval", "unique_rowid", "pg_backend_pid", "to_regtype",
+		destroyTenantKeyFunc, rotateTenantKeyFunc, destroyOldKeyVersionsFunc, removeTenantRowsFunc:
 		return types.Int
 	case "gen_random_uuid", "uuid_generate_v4":
 		return types.Uuid
+	case "datax_key_wrap", "datax_key_unwrap", "datax_encrypt", "datax_decrypt":
+		return types.Bytes
 	case "pg_table_is_visible", "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible", "pg_relation_is_publishable",
 		"pg_cancel_backend", "pg_terminate_backend":
 		return types.Bool

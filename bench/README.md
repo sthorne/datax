@@ -66,7 +66,12 @@ a cluster that has not finalized v20 it does, within minutes, so there
 start the nodes with `--merge-size-threshold -1` for an idle-cluster
 measurement; 10,000 is
 the largest worth trying on a laptop. A record's `error_samples` lists
-the distinct error messages behind its `errors` count.
+the distinct error messages behind its `errors` count, and
+`retry_samples` those behind its `retries` (the 40001s). `retry_sec` is
+the worker time spent in the attempts that ended in a 40001: on a
+contended workload such as `bank` it, not the latency of the operations
+that succeed, sets the throughput, so compare two runs by retries per
+operation and `retry_sec` per retry before their operations per second.
 
 The `jsonb-contain` pair is sized to keep the set's run time down. The
 same comparison over a million documents (the preload is the slow part,

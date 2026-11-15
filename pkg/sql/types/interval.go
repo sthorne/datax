@@ -292,7 +292,12 @@ func parseClock(f string) (int64, error) {
 }
 
 func (iv *Interval) add(q float64, unit string) error {
-	u := strings.ToLower(strings.TrimSuffix(unit, "s"))
+	// Plurals take a trailing "s" off, but the abbreviations that end in
+	// one are units of their own: "ms" is milliseconds, not minutes.
+	u := strings.ToLower(unit)
+	if u != "ms" && u != "us" {
+		u = strings.TrimSuffix(u, "s")
+	}
 	switch u {
 	case "millennium", "millennia":
 		iv.Months += int64(q * 12000)

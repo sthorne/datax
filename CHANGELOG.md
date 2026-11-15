@@ -560,6 +560,132 @@ state or the internode protocol does, and an entry below says so.
   anywhere cannot drive an unbounded stream of distributed transactions.
   A console re-sending its own value never meets the bucket, because the
   suppression comes first.
+- **The key service** (#310, step 2; docs/design-key-service.md, "A. The key
+  service"). Applications keep named keys in datax and wrap and unwrap their
+  own data keys under them, as with a cloud KMS: `CREATE ENCRYPTION KEY k`
+  (admins; the creator owns it), `ALTER ENCRYPTION KEY k ROTATE | DISABLE |
+  ENABLE | OWNER TO role`, `DROP ENCRYPTION KEY [IF EXISTS] k` (destroys
+  every version and purges the key's record's history), `SHOW ENCRYPTION
+  KEYS`, and `GRANT | REVOKE WRAP | UNWRAP | USAGE ON ENCRYPTION KEY`.
+  `datax_key_wrap(name, data_key, context)` and `datax_key_unwrap(name,
+  wrapped, context)` return a blob and the data key; `datax_encrypt` and
+  `datax_decrypt` keep the key in datax for values up to 64 KiB. A blob
+  carries the key's id and version (unwrap needs no version, rotated keys
+  keep opening old blobs) and is AES-256-GCM bound to the key, version and
+  context; a wrong context, another key or a damaged blob all fail with one
+  error (`39000`). WRAP and UNWRAP are separate privileges and USAGE is
+  both; the owner holds both and an admin who does not own a key must be
+  granted them. A disabled key refuses every function. Every call is
+  audited in the audit table (role, key, version, operation, outcome; never
+  material or context; identical uses within a flush fold into one record
+  with a count) and rate-limited per role on each node by the new cluster
+  setting `key_service.rate_limit` (`SET CLUSTER SETTING`; default 100 a
+  second; refused with `53400`). Gateways cache key material under a
+  10-second lease that checks the key's generation, and `DROP`, `DISABLE`,
+  `REVOKE` and `OWNER TO` wait it out, so a key is out of use everywhere
+  when they return. The functions are refused on a connection that is
+  neither TLS nor loopback. `DROP ROLE` refuses a key's owner, `REASSIGN
+  OWNED` moves keys, `DROP OWNED` revokes grants on keys and refuses to
+  destroy owned keys. `datax_keys` gains `owner` and `privileges`. Needs
+  cluster version v22 and the cluster key enabled. See docs/sql.md,
+  "Encryption keys", docs/encryption.md, "The key service", and
+  docs/encryption-keys-for-applications.md.
+- **The cluster key and the `datax_keys` table** (#310, step 1 of the key
+  service in docs/design-key-service.md). `datax debug cluster-key init`
+  makes one 32-byte cluster key, hands it to every member over mutual TLS,
+  and records it (id, version and a check value, never the key) once every
+  member has kept its own copy, wrapped by its root, beside its wrapped
+  store key (`CLUSTER-KEY`); it is refused unless the cluster is at v22,
+  secure, and every member not being decommissioned is live and runs under
+  `--enc-root` (a key-file node is named, with the pointer to `datax debug
+  enc-root adopt`). An enabling that cannot reach every node is finished,
+  with the same key, by running it again. A node that joins later or loses
+  its copy is handed the key by a running peer under peer unseal's checks
+  (node certificate, member, not being decommissioned, and a live asker
+  only from the host it is registered at); every hand-over is audited and
+  counted (`datax_cluster_key_handovers_total`). `rotate` hands out a new
+  version, rewraps every named key and destroys the old version, resumably;
+  `sync` hands the key to live nodes that lack it; `export --to-root` writes
+  the cluster's keys to a file wrapped under a root the operator names, and
+  `import --from-root` gives them to another cluster, whose whole-cluster
+  restore of the first one's backups then rewraps the restored keys under
+  its own key (a restore of named keys this cluster cannot open is refused
+  before anything is applied). Named keys live in the new system table
+  `datax_keys`, each version sealed under the cluster key with its id, name,
+  version and kind as associated data; no SQL session may read the table,
+  root included, and `SELECT * FROM datax_keys` shows admins the keys'
+  metadata without the material. The Go API is `pkg/keystore` (create, get,
+  list, unwrap, rotate, disable, enable, destroy with a purge of the row's
+  history, and a per-key generation for later caches). `/api/security`
+  and the security view report the cluster key and which nodes hold it. Cluster protocol version v22. See
+  docs/encryption.md, "Cluster key".
+- **Sealed tables, one key per table** (#310, step 3). `CREATE TABLE ...
+  WITH (encryption_key = 'auto')` gives the table a key of its own in
+  `datax_keys`, and every row value is encrypted under it (AES-256-GCM, the
+  table, key, key version and row bound in) in the SQL layer before it
+  reaches KV; replicas, snapshots, backups and the consistency checker see
+  ciphertext. **Primary-key and indexed columns are not sealed**: `CREATE
+  TABLE` and `CREATE INDEX` say which columns stay plaintext in a `NOTICE`.
+  Queries, constraints and every index kind work as before; sealed columns
+  get no statistics. `DROP TABLE` destroys the key, so the table's rows are
+  unreadable at once, `AS OF SYSTEM TIME` included. A row whose key is
+  destroyed, disabled or unavailable fails the statement with `XXK01` naming
+  the table, within 10 seconds of the change on every gateway (the key
+  cache's lease). A table restore shares the source table's key, or brings
+  it back from the backup. Refused for time-series tables and before the
+  cluster key is enabled; per-tenant keys (`encryption_key_by`) and sealing
+  an existing table are later steps. `datax bench --sealed` runs a workload
+  on a sealed table. Cluster protocol version v22. See docs/sql.md and
+  docs/encryption.md, "Sealed tables".
+- **Per-tenant keys and crypto-shredding** (#310, step 4). `CREATE TABLE ...
+  WITH (encryption_key_by = 'tenant_id')`, the column leading the primary
+  key, seals each tenant's row values under a key of that tenant's own, made
+  on its first write (concurrent first writes of one tenant converge on one
+  key; tenants do not contend) — a million tenants are a million small rows
+  in `datax_keys`, not a million tables. `SELECT
+  datax_destroy_tenant_key('items', $tenant)` destroys one tenant's key and
+  purges its record, and returns once no gateway uses it (within 10
+  seconds); with the rows deleted and purged first, the tenant's data is
+  gone from the live cluster, and a row left behind fails with `XXK01`. The
+  function needs table ownership, runs outside a transaction block, is
+  audited, and is idempotent (`NULL` for a tenant that never wrote). A
+  tenant's next write gets a fresh key. `DROP TABLE` destroys every tenant
+  key in the background; a table restore brings them back in batches. The
+  gateway's key cache is bounded (10,000 keys, least recently used dropped;
+  `datax start --key-cache-keys`), its hit no longer takes a lock, and a
+  background refresh checks the keys in use in batches every half lease. `datax bench --sealed=tenant
+  --tenants N` runs `kv` per tenant, and every bench run with
+  `--server-url` reports KV batches per operation. See docs/sql.md and
+  docs/encryption.md, "Per-tenant keys".
+- **Sealing an existing table and online key rotation** (#310, step 5).
+  `ALTER TABLE t SET (encryption_key = 'auto')` and `SET (encryption_key_by
+  = 'col')` seal a table that already holds rows: new writes are sealed as
+  soon as the statement returns, reads accept plain and sealed rows while a
+  background job seals the existing ones, and once it is done a plain value
+  is corruption again. The rows' plaintext versions stay in history until GC
+  — the `NOTICE` says so, and `ALTER TABLE ... PURGE` after the job removes
+  them. `ALTER TABLE t ROTATE ENCRYPTION KEY [KEEP OLD VERSIONS]` and
+  `datax_rotate_tenant_key(table, tenant [, keep_old])` give a table's or a
+  tenant's key a new version for new writes, and the job rewrites the rows
+  under older versions and then destroys them;
+  `datax_destroy_old_key_versions` destroys them early (rows and history
+  still under them become unreadable). The job runs on the node leading
+  range 1 in batches of 100 rows, each an ordinary transaction that also
+  records its progress, so it resumes after restarts and leadership
+  changes; one per table; `datax_encryption_jobs` shows it. Unsealing (`RESET
+  (encryption_key)`) is refused. `datax_remove_tenant_rows(table, tenant)`
+  removes a tenant's rows left behind after its key was destroyed, with
+  their index entries, without the key (a table referenced by foreign keys
+  is refused). Key names beginning `table/`, `tenant/` or `destroyed/` are
+  reserved, and `SHOW ENCRYPTION KEYS`, `DROP OWNED`, `REASSIGN OWNED` and
+  `DROP ROLE` read only the key service's keys: 4 entries instead of 10,019
+  with 10,000 tenant keys. See docs/sql.md and docs/encryption.md, "Sealing
+  an existing table and rotating keys".
+- **The console's table page shows row-level security** (#312): whether it
+  is enabled and forced, and each policy — permissive or restrictive, the
+  statements and roles it applies to, its `USING` and `WITH CHECK`
+  expressions — and the reconstructed DDL reproduces them. `/api/schema`
+  gains `row_security`, `force_row_security` and `policies` per table.
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
@@ -985,6 +1111,59 @@ state or the internode protocol does, and an entry below says so.
   the CSV export label a key accordingly rather than hand a reader the
   shown form under a key's name (found in the console review of the
   combined PR, where #213 met #226's copy controls).
+- **Every role reads the catalogs** (#312). A role that was not an admin
+  was refused (`42501`) every `pg_catalog` and `information_schema` table,
+  so `psql`'s `\d`, ORM introspection and `pg_policies` worked for admins
+  only. They now follow PostgreSQL: any role reads them; `pg_catalog`
+  lists every table of the current database, `information_schema` the
+  tables the reader holds some privilege on, and `role_table_grants` the
+  grants to or by the reader's roles. Statistics (`reltuples`,
+  `n_live_tup`) are shown only for tables the reader may `SELECT` from and
+  row security does not filter, `pg_sequences.last_value` only for a
+  sequence it may read; no catalog carries a password, and another role's
+  statement text stays hidden. `SELECT ... FROM` a sequence checks the
+  sequence's `SELECT` privilege instead of requiring an admin. See
+  docs/user/security.md, "Roles and privileges".
+- **`EXPLAIN` takes `SELECT`** (#312). Plain `EXPLAIN` checked no
+  privilege, so a role with no grant on a table could see its plan, its
+  indexes and a row estimate drawn from its statistics. It now takes
+  `SELECT` on every table the statement reads — joined tables, derived
+  tables, subqueries and `WITH` members included — as running the
+  statement would; a view's query is checked as the view's owner.
+- **`SHOW STATS FOR t` takes `SELECT` on `t`** (#312). It checked no
+  privilege, so any role could read a table's row count and its columns'
+  distinct and NULL counts.
+- **A `TRUNCATE` refusal names a referencing table only to a role that may
+  know of it** (#312). A role holding `TRUNCATE` on a table and nothing on
+  a table whose foreign key references it was told the referencing
+  table's and constraint's names (`0A000`), or, under `CASCADE`, refused
+  by name. It is now told that such a reference exists, without naming
+  it (`0A000`; `42501` under `CASCADE`). A role with some privilege on the
+  referencing table gets the message as before. The privilege checks on
+  the tables the statement names already came first; `pg_constraint`
+  lists foreign keys to every role, as in PostgreSQL.
+- **`AS OF SYSTEM TIME` answers to today's privileges** (#312). A
+  historical read checked a table's privileges, and the reader's role
+  memberships, as of its timestamp, so a `REVOKE` did not stop a role
+  from reading the table as it stood before. Privileges are now decided
+  as row-security policies already were: by the table's grants and the
+  role's memberships now, the rows being the timestamp's. A table renamed
+  since answers to its grants under the new name; one dropped since is
+  readable historically by admins only. Catalogs read `AS OF SYSTEM TIME`
+  use today's roles and show statistics and sequence counters to admins
+  only. "Now" is as fresh as the data the node can serve: an exact
+  timestamp checks the current grants and policies; a bounded-staleness
+  read checks the newest state the node's own replicas hold (the leased
+  descriptor, or the catalog at its closed timestamp), so a `REVOKE` the
+  node has replicated stops it, one not yet replicated is invisible to it
+  as unreplicated rows are, and under a partition it is still served
+  locally for every role. Row-security policies under a bounded-staleness
+  read are read the same way; before, their check needed the
+  leaseholders and could not finish on a partitioned node. (A statement
+  prepared through the extended protocol still
+  resolves its tables by today's names when it is described, so a table
+  renamed or dropped since is reachable only through the simple
+  protocol, as before.)
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
@@ -1141,8 +1320,93 @@ state or the internode protocol does, and an entry below says so.
   choice for the tab and says plainly that it will not be kept. The table
   is included in backups: it is small, and unlike the metrics it cannot
   be regenerated from anything.
+- **`TRUNCATE` takes the `TRUNCATE` privilege; `DELETE` no longer covers
+  it** (#312). A `DELETE` grant let its holder `TRUNCATE` the table, a
+  fallback kept from before cluster version v11, when `DELETE` was what
+  `TRUNCATE` took — on every table, and for grants made long after v11.
+  Now the fallback holds only while a cluster is below v11, and
+  finalizing v11 grants `TRUNCATE` beside every `DELETE` grant in the
+  same transaction. **A cluster already at v11 or later is not
+  migrated**: a role that truncates a table on the strength of a `DELETE`
+  grant is refused (`42501`) and needs `GRANT TRUNCATE ON t TO role`
+  (`SHOW GRANTS` lists who holds `DELETE` without it). `ALL` and the
+  `write_all` role include `TRUNCATE` as before.
+- **`DROP TABLE` gives the table's space back** (#313). A dropped table's rows
+  used to stay on disk for good. They now stay for the table's history window
+  — its `gc_ttl`, a time-series table's retention, or the node's GC TTL (25h
+  by default) — so `AS OF SYSTEM TIME` below the drop keeps working, and then
+  a job on the node leading range 1 deletes them, purges the span and lets
+  its ranges merge away. The job is resumable: the drop leaves a record in
+  the system span, and a pass cut short by a restart is taken up again. A
+  short `gc_ttl` set before the drop makes the reclaim correspondingly
+  prompt. Tables dropped before this release are not reclaimed. The
+  operations view shows each reclaim as a `drop-reclaim`.
+- A restore of everything into a cluster that had dropped tables could mix
+  their leftover rows into a restored table carrying the same id (a fresh
+  cluster hands out the same first ids as any other); the restore now clears
+  such an id's rows first (#313).
+- The merge queue no longer merges two ranges whose GC thresholds are further
+  apart than the lower side's GC window. A purged range's threshold is the
+  purge's time, and a merged range adopts the higher threshold, so a purged
+  range merged into its neighbour — the system range included — made the
+  neighbour refuse `AS OF SYSTEM TIME` reads and incremental backups below
+  the purge (#313).
+- `datax backup --backup-key` asks the node for the admin op `backup-sealed`,
+  and `datax restore --backup-key` (without `--table`, `--database` or
+  `--as-of`) for `restore-sealed`, instead of `backup` and `restore` with
+  extra fields (#313). A node from before sealed backups — one not yet
+  upgraded in a rolling upgrade — ignored the key under the old names and
+  wrote the backup in plaintext; it refuses the new ones. Nodes still accept
+  `backup` and `restore` with keys from older commands. A command from this
+  release pointed at a node from before it fails with an unknown op: run it
+  against an upgraded node.
+- A read below a range's GC threshold now reaches the client with a SQLSTATE
+  that says what to do, instead of `XX000` (#313). A transaction the cluster
+  timestamped — one that ran longer than a table's `gc_ttl`, or began before
+  a `PURGE` of what it reads — is restarted like any other conflict: inside
+  the cluster's own transactions automatically, and over SQL as `40001`,
+  which succeeds when retried. `AS OF SYSTEM TIME` below the kept history
+  fails with `72000` (PostgreSQL's `snapshot_too_old`): retrying the same
+  timestamp cannot succeed. The KV error carries a typed detail
+  (`BelowGCThreshold`); one from a node that predates it is recognized by
+  its message.
+- **Fewer reads of every table descriptor** (#313, following #311). `DROP`,
+  `ALTER ... RENAME` and `DROP COLUMN` find the views reading a relation from
+  records kept under it rather than by reading every descriptor: at 5,000
+  tables a `DROP TABLE` read 5,004 descriptor rows and reads 2. The records
+  are written with each view; they are trusted from cluster protocol version
+  v22, once the node leading range 1 has recorded every existing view, and
+  until then the old check runs. The retention provider behind GC and the
+  re-shard janitor read every descriptor on their first pass and then only
+  the descriptors changed since (an incremental export of the descriptor
+  span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
+  measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
+  protocol version v22.
 
 ### Fixed
+- **A transaction whose commit failed kept its rows locked for up to five
+  seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
+  or its deadline had passed) stopped the transaction's heartbeat but left
+  its record pending and its intents in place, and the `ROLLBACK` that
+  followed found the transaction finished and did nothing, so everyone
+  who met one of its rows waited for the record to expire. The failed
+  commit now aborts the record and resolves its intents before it
+  returns.
+- **A transaction waited for a lock it could not outwait** (#315). Blocked
+  on another transaction's uncommitted write to a row it had itself read —
+  on the bank workload, a transfer whose account a newer transfer was
+  changing — a transaction polled until the other committed and then
+  failed with `40001` (usually "read within uncertainty interval"), since
+  the committed change invalidated its read. It now fails at once, unless
+  its priority lets it abort the other transaction, which it still does.
+  With the fix above, on the bank workload (one secure, encrypted on-disk
+  node, 16 workers, 1,000 accounts) committed transfers went from a median
+  of 238 a second to 974, and the attempts ending in a `40001` from 3.1 s
+  each and about 70 % of the workers' time to 0.02 s and under 3 %.
+- **`'1 ms'::interval` was a minute** and `'1 us'` was refused: interval
+  units were matched after a trailing "s" was taken off, so the
+  abbreviations `ms` and `us` read as `m` and `u`. Both now mean what
+  PostgreSQL means; plural units are unchanged.
 - **Online `CREATE INDEX` could keep entries for rows that changed while it
   was waiting for every gateway to adopt the index** (found while building
   #299). One gateway that had adopted the index wrote a row's entries,
@@ -1554,6 +1818,39 @@ state or the internode protocol does, and an entry below says so.
   one, no shared family clearing the floors in both — so every pair
   involving it is at least 15 apart, and a test computes the distances
   rather than trusting the numbers.
+- **`DROP OWNED BY r` takes `r` out of row-security policies** (#312). It
+  left the policies naming the role alone, so the `DROP ROLE` that
+  follows it was still refused (`2BP01`) until each policy was altered or
+  dropped by hand. As in PostgreSQL, the role is now removed from every
+  policy's `TO` list, and a policy that named only it is dropped (an
+  empty list would mean every role). Each such drop is audit-logged as
+  `policy-ddl`.
+- **Backups did not hold enum types** (#313). A backup carried the tables
+  whose columns are of an enum type, with the labels copied into each column,
+  but not the `CREATE TYPE` itself: a restore of everything brought the
+  columns back with no type behind them (`ALTER TYPE` and `'x'::mood` then
+  failed with "type does not exist"). Backups now carry type descriptors and
+  their names (manifest field `types`, held to the type key spans like the
+  other system records) and a restore of everything brings them back under
+  their ids, moving the id generator past them. A table restore no longer
+  refuses a table with an enum column whose type the target database lacks:
+  it creates the type there from the column's labels (which also works from a
+  backup taken before this change) and says so in the summary. Onto a type of
+  that name with the same labels it maps the column to it, as before; onto
+  one with other labels it is refused, naming both label lists.
+- A restore of everything from a plaintext backup did not hold the data files
+  to the manifest's record counts and checksums: it reported them afterwards
+  and enforced nothing, so a data file swapped for another backup's file of
+  the same table restored silently (#313). Every file is now checked against
+  its manifest — count, checksum and key order — in the pass made before
+  anything is written, as a table restore already did; a mismatch is refused
+  with the target left empty.
+- A backup that failed part way left the data files of the tables it had
+  already written in its destination, with no manifest (#313). The files are
+  now written into a hidden `.backup-in-progress-*` directory inside the
+  destination and moved into place only when every table has been written; a
+  failure removes them. Backup files are created 0600 and a directory the
+  backup creates 0700 (they were 0644 and 0755), sealed or not.
 
 ## 0.57.0 — unreleased
 

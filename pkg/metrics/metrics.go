@@ -339,6 +339,17 @@ var (
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
 	})
+	// ClusterKeyHandovers counts this node's answers to peers asking for
+	// the cluster key (issue #310), by outcome: granted or refused.
+	ClusterKeyHandovers = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_cluster_key_handovers_total", Help: "Requests from peers for the cluster key this node answered, by outcome (granted, refused).",
+	}, []string{"outcome"})
+	// ClusterKeyInstalls counts cluster keys this node received from a
+	// peer and kept, by how: handover (it asked) or push (a peer
+	// distributing an enabling, rotation, import or sync).
+	ClusterKeyInstalls = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_cluster_key_received_total", Help: "Cluster keys this node received from a peer and kept, by how (handover, push).",
+	}, []string{"via"})
 	MetricsRecordRows = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_metrics_record_rows_total", Help: "Rows this node has written to the datax_metrics table.",
 	})

@@ -277,9 +277,61 @@ const (
 	// omitempty and the family is appended, so every descriptor written
 	// before reads the same.
 	V21 Version = 21
+	// V22 introduces the cluster key and the datax_keys system table
+	// (issue #310, docs/design-key-service.md; pkg/keystore and
+	// pkg/server/clusterkey.go). The cluster key is one 32-byte key per
+	// cluster, versioned, kept by every node wrapped under its own root
+	// (--enc-root); its replicated record (keys.ClusterKeyMarkerKey)
+	// says which version is current and how to check a copy. datax_keys
+	// (pkg/sql/catalog.KeysTableName) holds named keys wrapped by it. A
+	// v21 node knows nothing of either: it would hand nothing over to a
+	// joining node, write no copy of its own, and treat datax_keys as an
+	// ordinary table whose owner may read or delete its rows. So
+	// `datax debug cluster-key init` is refused, nothing creates the
+	// table, and no node writes the record or its holder report until
+	// finalize (rule 4).
+	//
+	// V22 also introduces the reverse record of view dependencies (issue
+	// #313, keys.ViewDependencyKey): under each relation, the views whose
+	// query reads it, written in the transactions that create, replace
+	// and drop a view, so DROP, RENAME and DROP COLUMN find a relation's
+	// views without reading every descriptor. A v21 node creates views
+	// without the records, so they are not trusted until finalize: at
+	// v22 the node leading range 1 records every view once and marks the
+	// records complete (keys.ViewDependencyIndexKey), and until then the
+	// statements read every descriptor as before. The records are system
+	// keys a v21 node never reads.
+	//
+	// V22 also introduces the key service's statements and functions
+	// (CREATE / ALTER / DROP ENCRYPTION KEY, GRANT ... ON ENCRYPTION KEY,
+	// datax_key_wrap and the rest; pkg/sql/keyservice.go) and the owner
+	// and privileges columns of datax_keys, which a v21 node would not
+	// enforce: they are refused until finalize as well.
+	//
+	// V22 also introduces sealed tables (issue #310, step 3;
+	// pkg/sql/rowseal): the descriptor field encryption_key, omitempty,
+	// and row values a v21 node could not decode, so CREATE TABLE ...
+	// WITH (encryption_key) is refused until finalize too.
+	//
+	// V22 also introduces per-tenant keys (issue #310, step 4): the
+	// descriptor field encryption_key.tenant_column, omitempty, keys of
+	// kind tenant in datax_keys, and a sealed form naming its key; CREATE
+	// TABLE ... WITH (encryption_key_by) and datax_destroy_tenant_key are
+	// refused until finalize as well.
+	//
+	// V22 also introduces sealing an existing table and online key
+	// rotation (issue #310, step 5): the descriptor field
+	// encryption_key.sealing, omitempty; the seal job's records
+	// (keys.SealJobKey), system keys a v21 node never reads; and
+	// ALTER TABLE ... SET (encryption_key | encryption_key_by) on a table
+	// with rows, ALTER TABLE ... ROTATE ENCRYPTION KEY,
+	// datax_rotate_tenant_key, datax_destroy_old_key_versions and
+	// datax_remove_tenant_rows, all refused until finalize, and the job
+	// does not run before it.
+	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.
-	Current = V21
+	Current = V22
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

@@ -209,6 +209,14 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 	return t
 }
 
+// ReadTimestamp is the timestamp the transaction currently reads at. A
+// transaction commits at or above it.
+func (t *Txn) ReadTimestamp() hlc.Timestamp {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mu.txn.ReadTimestamp
+}
+
 // Historical reports whether this is a read-only transaction pinned at a
 // fixed past timestamp (NewHistoricalTxn). Catalog lookups key off it:
 // a historical transaction reads the descriptor version current AT its
@@ -776,6 +784,10 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			if opts.noWait {
 				return nil, &LockNotAvailableError{Intents: live}
 			}
+			if rerr := t.cannotOutwait(live); rerr != nil {
+				t.publishWait(ctx, nil)
+				return nil, rerr
+			}
 			pending := &live[0]
 			// We are blocked on a live transaction: publish the wait edge
 			// and walk the chain for a cycle before backing off.
@@ -838,10 +850,25 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			}
 			metrics.TxnRetries.Inc()
 			return nil, &RetryableError{Cause: kerr}
+		case t.restartsBelowGCThreshold(kerr):
+			metrics.TxnRetries.Inc()
+			return nil, &RetryableError{Cause: kerr}
 		default:
 			return nil, kerr
 		}
 	}
+}
+
+// restartsBelowGCThreshold reports whether kerr is a range refusing the
+// transaction's timestamp as at or below its GC threshold, and the
+// transaction is one a restart can help (issue #313). A transaction the
+// cluster timestamped — one that has run longer than a short gc_ttl, or
+// began before a purge of what it reads — succeeds when run again at a
+// new timestamp, so the refusal is a restart like any other conflict. A
+// historical transaction's timestamp is the client's, and the history at
+// it is gone: no restart can help, and the refusal stands.
+func (t *Txn) restartsBelowGCThreshold(kerr *kvpb.Error) bool {
+	return !t.historical && kerr.IsBelowGCThreshold()
 }
 
 // maxRefreshesPerOp bounds refresh loops under pathological contention.
@@ -1068,6 +1095,65 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 	return nil
 }
 
+// cannotOutwait returns a retryable error when waiting for the live
+// intents a batch ran into cannot end in this transaction committing,
+// and nil when it can (the caller then waits as usual).
+//
+// An intent above the read timestamp on a key the transaction has read
+// is such a wait (issue #315). If the intent's transaction commits, its
+// version lands above our read timestamp inside a span we read. We were
+// blocked on it either to write the key — the write then goes above that
+// version (WriteTooOld) — or to read it, the intent being inside our
+// uncertainty window — the read then finds the version uncertain. Either
+// way our timestamp must move past the version, and the refresh that
+// moves it re-reads the span, finds the version and fails. What the wait
+// could buy is the holder aborting, or, for a read, the holder being
+// pushed past our uncertainty limit before it commits (the read then
+// passes beneath its version); a pusher able to abort the holder has
+// already done so, since these intents survived the push. Both are rare,
+// and a restart is always safe: returning now gives them up for the wait
+// we would otherwise spend learning that the holder committed. On the
+// bank workload a transfer that met a newer transfer of an account it
+// had read waited a poll (100 ms) or more and then failed its read of
+// the account as uncertain, nearly every time.
+//
+// With the read set no longer tracked the same holds for any intent
+// above the read timestamp: every timestamp push then ends in a restart.
+func (t *Txn) cannotOutwait(live []storage.Intent) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	readTS := t.mu.txn.ReadTimestamp
+	for i := range live {
+		in := &live[i]
+		if !readTS.Less(in.Txn.WriteTimestamp) {
+			continue
+		}
+		if !t.mu.refreshUnusable && !readSpansCover(t.mu.readSpans, in.Key) {
+			continue
+		}
+		e := kvpb.NewErrorf("transaction %s must restart: transaction %s is writing key %s at %s, above the read timestamp %s at which it was read",
+			t.mu.txn.ID, in.Txn.ID, in.Key, in.Txn.WriteTimestamp, readTS)
+		e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: in.Txn.WriteTimestamp}
+		metrics.TxnRetries.Inc()
+		return &RetryableError{Cause: e}
+	}
+	return nil
+}
+
+// readSpansCover reports whether key lies in one of spans.
+func readSpansCover(spans []readSpan, key keys.Key) bool {
+	for _, sp := range spans {
+		if len(sp.end) == 0 {
+			if sp.start.Equal(key) {
+				return true
+			}
+		} else if !key.Less(sp.start) && key.Less(sp.end) {
+			return true
+		}
+	}
+	return false
+}
+
 // pushIntents pushes the owners of conflicting intents and returns the
 // intents whose transactions are still live. None means every intent was
 // resolved (the pushees were finalized, expired, or aborted by priority)
@@ -1180,13 +1266,51 @@ func (t *Txn) Commit(ctx context.Context) error {
 	})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
-		t.markFinished()
+		t.abortFailedCommit(ctx)
 		return err
 	}
 	t.markFinished()
 	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
 	return nil
+}
+
+// abortFailedCommit settles a commit that returned an error. Unless the
+// error was ambiguous the record is still PENDING (or STAGING), and the
+// transaction's intents still block every reader and writer of their
+// keys. The SQL session forgets the transaction on a failed COMMIT, and
+// a Rollback after it finds the transaction finished, so left alone the
+// intents would stay until the record expired — the heartbeat stops
+// with the transaction — and everyone queued behind them would wait out
+// kvserver.TxnExpiration (5s) for a transaction that had already given
+// up (issue #315). So the record is aborted here and the intents
+// resolved at once.
+//
+// The abort is the record's compare-and-set: it fails on a COMMITTED
+// record (an ambiguous commit that did apply), and a commit still in
+// flight cannot apply over the ABORTED record it leaves. The intents are
+// resolved as aborted only when the record says so; otherwise they are
+// left to the pushers that find them, which read the record's verdict.
+func (t *Txn) abortFailedCommit(ctx context.Context) {
+	t.mu.Lock()
+	anchored := t.mu.anchored
+	txn := t.mu.txn
+	t.mu.Unlock()
+	t.markFinished()
+	if !anchored {
+		return
+	}
+	// The commit may have failed because ctx did; the cleanup must not.
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	ba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
+	if _, kerr := t.db.Send(actx, ba); kerr != nil && kerr.TxnAborted == nil {
+		log.Debugf("aborting %s after its commit failed: %v (lazy resolution will cover)", txn.ID, kerr)
+		return
+	}
+	metrics.TxnAborts.Inc()
+	t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
 }
 
 // commit1PC attempts the one-phase fast path: when the deferred write
@@ -1312,6 +1436,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 			if len(live) == 0 {
 				continue
 			}
+			if rerr := t.cannotOutwait(live); rerr != nil {
+				return nil, true, rerr
+			}
 			if derr := t.detectDeadlock(ctx, &live[0]); derr != nil {
 				return nil, true, derr
 			}
@@ -1333,6 +1460,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 				metrics.TxnRefreshes.Inc()
 				continue
 			}
+			metrics.TxnRetries.Inc()
+			return nil, true, &RetryableError{Cause: kerr}
+		case t.restartsBelowGCThreshold(kerr):
 			metrics.TxnRetries.Inc()
 			return nil, true, &RetryableError{Cause: kerr}
 		default:
@@ -1411,13 +1541,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// Make the record's fate explicit before surfacing the error: a
 		// dangling STAGING record with all writes present would otherwise
 		// be RECOVERED AS COMMITTED, contradicting the error we return.
-		aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-		aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
-		if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
-			log.Debugf("aborting failed parallel commit of %s: %v", txn.ID, kerr)
-		}
-		t.markFinished()
-		t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+		t.abortFailedCommit(ctx)
 		if wbErr != nil {
 			return wbErr
 		}
@@ -1434,13 +1558,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// commit condition does not hold. Settle classically: refresh the
 		// reads to the writes' timestamp, then finalize at it.
 		if !t.maybeRefresh(ctx, writesTS) {
-			aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-			aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
-			if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
-				log.Debugf("aborting unrefreshable parallel commit of %s: %v", txn.ID, kerr)
-			}
-			t.markFinished()
-			t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+			t.abortFailedCommit(ctx)
 			e := kvpb.NewErrorf("parallel commit of %s forwarded to %s and refresh failed", txn.ID, writesTS)
 			e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: writesTS}
 			metrics.TxnRetries.Inc()
@@ -1454,7 +1572,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		})
 		fbr, err := t.send(ctx, fba, true)
 		if err != nil {
-			t.markFinished()
+			t.abortFailedCommit(ctx)
 			return err
 		}
 		t.markFinished()

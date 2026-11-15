@@ -623,6 +623,46 @@ type TableDescriptor struct {
 	RowSecurity      bool     `json:"row_security,omitempty"`
 	ForceRowSecurity bool     `json:"force_row_security,omitempty"`
 	Policies         []Policy `json:"policies,omitempty"`
+	// EncryptionKey marks a sealed table (cluster version v22, issue
+	// #310): every row's value is sealed under a named key of kind table
+	// before it is written to KV (pkg/sql/rowseal). nil for an ordinary
+	// table, which is every table written before.
+	EncryptionKey *TableEncryptionKey `json:"encryption_key,omitempty"`
+}
+
+// TableEncryptionKey is a sealed table's key.
+type TableEncryptionKey struct {
+	// KeyID is the table's key in datax_keys (pkg/keystore).
+	KeyID int64 `json:"key_id"`
+	// SealID is the table id bound into every sealed value's associated
+	// data: the table's id when it was created. A table restore gives the
+	// table a new id and keeps SealID (and KeyID), so the rows it copies
+	// open as they were written.
+	SealID uint64 `json:"seal_id"`
+	// TenantColumn, when set, makes the table sealed per tenant
+	// (encryption_key_by, issue #310 step 4): it is the leading
+	// primary-key column, and each of its values has a key of its own,
+	// of kind tenant, made on the value's first write; each sealed value
+	// names its key. KeyID is then the table's naming key: its material
+	// keys the digest that names the tenants' keys, and it seals nothing.
+	// Zero for a table sealed whole.
+	TenantColumn ColumnID `json:"tenant_column,omitempty"`
+	// Sealing is set while a table that held rows before it was sealed
+	// (ALTER TABLE ... SET (encryption_key | encryption_key_by), issue
+	// #310 step 5) may still hold plain values: reads accept both forms,
+	// and writes seal. The seal job (SealJob) clears it once no live row
+	// is plain, and strict reads — a plain value in a sealed table is
+	// corruption — are back.
+	Sealing bool `json:"sealing,omitempty"`
+}
+
+// Sealed reports whether the table's row values are sealed.
+func (d *TableDescriptor) Sealed() bool { return d != nil && d.EncryptionKey != nil }
+
+// SealedPerTenant reports whether the table's row values are sealed
+// under a key per value of its leading primary-key column.
+func (d *TableDescriptor) SealedPerTenant() bool {
+	return d.Sealed() && d.EncryptionKey.TenantColumn != 0
 }
 
 // Policy commands: the statement kinds a row-security policy governs.
@@ -763,6 +803,10 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 			out.RetiredLayouts[i].IndexIDs = append([]uint64(nil), rl.IndexIDs...)
 		}
 	}
+	if d.EncryptionKey != nil {
+		ek := *d.EncryptionKey
+		out.EncryptionKey = &ek
+	}
 	if d.RowTTL != nil {
 		ttl := *d.RowTTL
 		out.RowTTL = &ttl
@@ -837,6 +881,23 @@ func (d *TableDescriptor) IsPKCol(id ColumnID) bool {
 	return false
 }
 
+// SetRowSealer gives the accessor the gateway's sealed-table boundary
+// (pkg/sql/rowseal), which every session over it seals and opens rows
+// through. The catalog only carries it.
+func (a *Accessor) SetRowSealer(v any) { a.rowSealer.Store(&v) }
+
+// RowSealer returns what SetRowSealer stored, or nil.
+func (a *Accessor) RowSealer() any {
+	if a == nil {
+		return nil
+	}
+	p, _ := a.rowSealer.Load().(*any)
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // ErrTableNotFound is returned (wrapped) for missing tables.
 type ErrTableNotFound struct{ Name string }
 
@@ -856,6 +917,10 @@ func (e *ErrTableExists) Error() string { return fmt.Sprintf("table %q already e
 type Accessor struct {
 	mu    sync.Mutex
 	cache map[string]*cachedDesc // keyed by cacheKey(dbID, name)
+	// rowSealer is the gateway's sealed-table boundary (a
+	// *rowseal.Boundary, issue #310), set by the server; nil on an
+	// accessor without a key store, where sealed tables are unreadable.
+	rowSealer atomic.Value
 	// dbs caches database name → ID (0 = the default database before
 	// the v6 migration); invalidated by database DDL on this gateway and
 	// re-read on a miss, so another gateway's CREATE DATABASE is seen on
@@ -935,6 +1000,29 @@ func NewAccessor() *Accessor {
 // adopt the new version.
 func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
 	return a.LookupIn(ctx, txn, DefaultDatabase, name)
+}
+
+// Leased returns this gateway's leased copy of table id, cached under
+// name in database dbID, when the accessor leases and the lease is
+// live: the descriptor as current as any statement on this gateway may
+// use, read without a KV round trip. nil otherwise — an unleased
+// accessor's cache never expires, so it is never "current". The entry
+// is marked handed out, so a drain of a newer version waits for the
+// statement that used it, as for any planned statement (issue #185).
+func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor {
+	if !a.leasing {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.nowWallLocked()
+	c, ok := a.cache[cacheKey(dbID, name)]
+	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration {
+		return nil
+	}
+	c.handedOut = true
+	c.lastUsed = now
+	return c.desc
 }
 
 // LookupIn resolves a table by name within txn, in database db unless
@@ -1295,7 +1383,9 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 }
 
 // Drop removes a table's descriptor and namespace entry. Row data is left
-// behind (unreachable; space reclamation is a GC concern, out of scope).
+// behind, readable AS OF SYSTEM TIME below the drop, and a DroppedTable
+// record beside it, by which the reclaim job clears the table's span once
+// the table's history window has passed (issue #313).
 func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
 	return a.DropIn(ctx, txn, DefaultDatabase, name)
 }
@@ -1319,6 +1409,14 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	}
 	if err := txn.Delete(ctx, keys.TableDescKey(d.ID)); err != nil {
 		return nil, err
+	}
+	if err := recordDroppedTable(ctx, txn, d); err != nil {
+		return nil, err
+	}
+	if d.IsView() {
+		if err := DeleteViewDependencies(ctx, txn, d.ID, d.ViewDepends); err != nil {
+			return nil, err
+		}
 	}
 	a.Invalidate(name)
 	return d, nil

@@ -98,6 +98,7 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 // RetentionOverride TTL when one applies. Exported for tests
 // (time-compressed TTLs) and future debug tooling.
 func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
+	s.gcTTL.Store(ttl.Nanoseconds())
 	now := s.cfg.Clock.Now()
 	s.VisitReplicas(func(r *Replica) bool {
 		if ctx.Err() != nil {

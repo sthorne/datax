@@ -587,6 +587,10 @@ func TestUpgradeV11Roles(t *testing.T) {
 	execSQL(t, ctx, sess(0), `GRANT ADMIN TO legacy`)
 	execSQL(t, ctx, sess(0), `CREATE USER reader PASSWORD 'pw12345'`)
 	execSQL(t, ctx, sess(0), `GRANT SELECT ON t TO reader`)
+	// Before v11 a DELETE grant is what TRUNCATE takes.
+	execSQL(t, ctx, sess(0), `CREATE TABLE td (id INT8 PRIMARY KEY)`)
+	execSQL(t, ctx, sess(0), `GRANT DELETE ON td TO reader`)
+	execSQL(t, ctx, as(1, "reader"), `TRUNCATE td`)
 	expectCodeSQL(t, ctx, sess(1), `CREATE ROLE grp`, sql.CodeFeatureNotSupported)
 	expectCodeSQL(t, ctx, sess(1), `SET ROLE admin`, sql.CodeFeatureNotSupported)
 	legacyKeys := func() (users, admins, roles int) {
@@ -638,6 +642,16 @@ func TestUpgradeV11Roles(t *testing.T) {
 	if r := execSQL(t, ctx, as(1, "reader"), `SELECT id FROM t`); len(r.Rows) != 1 {
 		t.Fatalf("reader after finalize: %+v", r.Rows)
 	}
+	// The DELETE grant made before v11 carries TRUNCATE across finalize
+	// (issue #312); one made after does not.
+	execSQL(t, ctx, as(1, "reader"), `TRUNCATE td`)
+	if r := execSQL(t, ctx, sess(0), `SHOW GRANTS ON td FOR reader`); len(r.Rows) != 2 || r.Rows[1][4].S != "TRUNCATE" {
+		t.Fatalf("reader's grants on td after finalize: %+v", r.Rows)
+	}
+	execSQL(t, ctx, sess(0), `CREATE TABLE td2 (id INT8 PRIMARY KEY)`)
+	execSQL(t, ctx, sess(0), `GRANT DELETE ON td2 TO reader`)
+	execSQL(t, ctx, as(1, "reader"), `DELETE FROM td2`)
+	expectCodeSQL(t, ctx, as(1, "reader"), `TRUNCATE td2`, sql.CodeInsufficientPriv)
 	if r := execSQL(t, ctx, sess(0), `SHOW GRANTS ON ROLE admin`); len(r.Rows) != 2 || r.Rows[0][1].S != "legacy" || r.Rows[1][1].S != "root" {
 		t.Fatalf("admin memberships after finalize: %+v", r.Rows)
 	}

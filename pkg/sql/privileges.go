@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -205,6 +206,9 @@ func sealedTableError(name string) *Error {
 	if catalog.IsLargeObjectTable(name) {
 		return newErrf(CodeInsufficientPriv, "table %q holds the cluster's large objects: it is written through the lo_* functions alone and cannot be changed through SQL by any role", name)
 	}
+	if catalog.IsUnreadableSystemTable(name) {
+		return keysTableError(name)
+	}
 	return newErrf(CodeInsufficientPriv, "table %q is the cluster's audit record: it is written by the nodes alone and cannot be changed through SQL by any role (ALTER TABLE %s SET (retention = ...) sets how long records are kept)", name, name)
 }
 
@@ -232,6 +236,12 @@ func (s *Session) checkTableOwnerNoTxn(ctx context.Context, name string) *Error 
 // tablePrivAllowed reports whether the actor may exercise priv on the
 // table or view.
 func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) (bool, error) {
+	if txn != nil && txn.Historical() && txn != s.freshTxn && desc.Virtual == "" && !s.system && s.actor() != catalog.RootRole {
+		// root holds every privilege now as then (the sealed tables'
+		// rule is fixed), and asks nothing of today's state: a bounded
+		// staleness read it runs stays local under a partition.
+		return s.historicalTablePrivAllowed(ctx, txn, desc, priv)
+	}
 	if sealed := catalog.IsSealedSystemTable(desc.Name); sealed && s.system {
 		return true, nil
 	} else if sealed {
@@ -241,7 +251,9 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		// grant made for the purpose: the records name people and the
 		// addresses they came from, so the blanket read_all role does
 		// not reach it.
-		if priv != "SELECT" {
+		// The named keys (issue #310) are not even readable: a session is
+		// shown the virtual table of their metadata, which has the name.
+		if priv != "SELECT" || (catalog.IsUnreadableSystemTable(desc.Name) && desc.Virtual == "") {
 			return false, nil
 		}
 		if s.actor() == catalog.RootRole {
@@ -266,6 +278,21 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 	if set.IsAdmin() {
 		return true, nil
 	}
+	if db, _ := catalog.SplitTableName(desc.Virtual); vtable.IsSchema(db) {
+		// pg_catalog and information_schema: every role reads them, as
+		// in PostgreSQL; each lists what the reader may know of
+		// (virtualEnv). Nobody writes them.
+		return priv == "SELECT", nil
+	}
+	if desc.Virtual == "sequence" {
+		// A sequence read as a relation (SELECT last_value FROM seq):
+		// the sequence's own SELECT privilege.
+		sd, err := catalog.ReadSequence(ctx, txn, desc.ID)
+		if err != nil || sd == nil || priv != "SELECT" {
+			return false, err
+		}
+		return s.sequencePrivAllowed(ctx, txn, sd, "SELECT")
+	}
 	if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
 		// Only the cluster and its admins write the metrics table; a
 		// SELECT grant is how a reporting user reads it.
@@ -281,8 +308,13 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		allowed = true
 	case priv != "SELECT" && set.Has(catalog.WriteAllRole):
 		allowed = true
-	case priv == "TRUNCATE" && catalog.HasPrivilege(desc.Privileges, set, "DELETE"):
-		allowed = true // DELETE covered TRUNCATE before v11; ALL still grants both
+	case priv == "TRUNCATE" && !s.rolesFinalized() && catalog.HasPrivilege(desc.Privileges, set, "DELETE"):
+		// Before v11 TRUNCATE took DELETE, and a node of the older binary
+		// still decides so while the cluster is below v11. Finalizing v11
+		// grants TRUNCATE to every DELETE holder
+		// (catalog.GrantTruncateWithDelete); from then on DELETE no
+		// longer covers it (issue #312).
+		allowed = true
 	}
 	if !allowed {
 		return false, nil
@@ -293,6 +325,115 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		return false, err
 	}
 	return usage, nil
+}
+
+// historicalPrivKey is one memoized historicalTablePrivAllowed answer.
+type historicalPrivKey struct {
+	txn   *kvclient.Txn
+	table uint64
+	actor string
+	priv  string
+}
+
+// historicalTablePrivAllowed is tablePrivAllowed for an AS OF SYSTEM
+// TIME read (issue #312). Such a read resolves its descriptors, and
+// the role graph, as of its timestamp; checked against those, a REVOKE
+// would not stop a role from reading the rows as they stood before it.
+// Privileges are therefore decided as row-security policies are
+// (historicalRowFilter): by the table's descriptor, the role
+// memberships and the schema's USAGE as fresh as this node can know
+// them (freshCatalog); the rows are the timestamp's. The table is
+// found by ID, so one renamed since is checked under its grants
+// whichever name the statement used. One dropped since has no
+// privileges: only root and admins may read what is left of it.
+func (s *Session) historicalTablePrivAllowed(ctx context.Context, htxn *kvclient.Txn, hdesc *catalog.TableDescriptor, priv string) (bool, error) {
+	key := historicalPrivKey{txn: htxn, table: hdesc.ID, actor: s.actor(), priv: priv}
+	if ok, found := s.historicalPrivs[key]; found {
+		return ok, nil
+	}
+	var allowed bool
+	err := s.freshCatalog(ctx, "asof-privileges", func(ctx context.Context, cur *kvclient.Txn) error {
+		allowed = false
+		desc, err := s.freshTable(ctx, cur, hdesc)
+		if err != nil {
+			return err
+		}
+		if desc == nil {
+			allowed, err = s.isAdmin(ctx, cur)
+			return err
+		}
+		allowed, err = s.tablePrivAllowed(ctx, cur, desc, priv)
+		return err
+	})
+	// The role sets resolved above belong to that transaction.
+	s.invalidateRoles()
+	if err != nil {
+		return false, err
+	}
+	if s.historicalPrivs == nil {
+		s.historicalPrivs = map[historicalPrivKey]bool{}
+	}
+	s.historicalPrivs[key] = allowed
+	return allowed, nil
+}
+
+// freshCatalog runs fn against the freshest catalog state this node can
+// serve for a historical read's checks of privileges and policies —
+// "privileges are as fresh as the data the node can serve".
+//
+// An exact AS OF SYSTEM TIME read checks against today's state, read in
+// an ordinary transaction with the statement's context: it waits for
+// the leaseholders as any current read does. A bounded-staleness read
+// exists to be served by this node's own replicas when it is cut off,
+// so it checks against the state at the newest timestamp those
+// replicas can serve (the local closed timestamp, which bounded
+// staleness chose its own timestamp from, and never older than the
+// read): a REVOKE this node has not yet replicated is invisible to it,
+// the same staleness the data has, and one it has replicated stops the
+// read.
+func (s *Session) freshCatalog(ctx context.Context, name string, fn func(context.Context, *kvclient.Txn) error) error {
+	if !s.asofLocal {
+		return s.db.RunTxn(ctx, name, fn)
+	}
+	ts := s.asofTS
+	if lc := s.db.LocalClosedTimestamp(); ts.Less(lc) {
+		ts = lc
+	}
+	cur := s.db.NewHistoricalTxn(name, ts)
+	saved := s.freshTxn
+	s.freshTxn = cur
+	err := fn(ctx, cur)
+	s.freshTxn = saved
+	_ = cur.Commit(ctx) // read-only: releases nothing, marks finished
+	return err
+}
+
+// freshTable resolves, within a freshCatalog transaction, today's
+// descriptor of the table a historical read resolved as hdesc: the
+// gateway's leased copy when it holds a live lease on it under the same
+// name (no KV round trip, and as current as any statement here may
+// use), else the descriptor read by ID. nil when it has been dropped.
+func (s *Session) freshTable(ctx context.Context, cur *kvclient.Txn, hdesc *catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
+	if d := s.cat.Leased(hdesc.DatabaseID, hdesc.Name, hdesc.ID); d != nil {
+		return d, nil
+	}
+	return catalog.ReadTable(ctx, cur, hdesc.ID)
+}
+
+// currentRoleSet is roleSet, but for a historical transaction the
+// actor's roles as fresh as freshCatalog reads them rather than at its
+// timestamp (root's are fixed, and need no read).
+func (s *Session) currentRoleSet(ctx context.Context, txn *kvclient.Txn) (catalog.RoleSet, error) {
+	if txn == nil || !txn.Historical() || txn == s.freshTxn || s.actor() == catalog.RootRole {
+		return s.roleSet(ctx, txn)
+	}
+	var set catalog.RoleSet
+	err := s.freshCatalog(ctx, "asof-roles", func(ctx context.Context, cur *kvclient.Txn) error {
+		var err error
+		set, err = catalog.LazyRoleGraph(ctx, cur).Effective(s.actor())
+		return err
+	})
+	return set, err
 }
 
 // schemaUsageAllowed reports whether set may reach the objects of the
@@ -319,7 +460,7 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 		return err
 	}
 	if !ok {
-		if catalog.IsSealedSystemTable(desc.Name) && priv != "SELECT" {
+		if catalog.IsSealedSystemTable(desc.Name) && (priv != "SELECT" || (catalog.IsUnreadableSystemTable(desc.Name) && desc.Virtual == "")) {
 			return sealedTableError(desc.Name)
 		}
 		if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
@@ -332,6 +473,76 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 		return newErrf(CodeInsufficientPriv, "permission denied for %s %q (%s as user %q)", kind, desc.Name, priv, s.actor())
 	}
 	return nil
+}
+
+// checkSelectReads applies the SELECT check to every table a SELECT
+// reads — the base and joined tables of each member, derived table,
+// subquery and WITH member — without running it: the check EXPLAIN
+// owes (issue #312), since it plans by shape and evaluates nothing
+// that would check on its own. A view is checked as the reader, and
+// the tables its query reads as the view's owner (its WITH member,
+// bound by expandViews, carries the owner as Definer). Names that bind
+// to a WITH member or an enclosing relation are not tables; a name
+// that resolves to nothing is left for the statement to report.
+func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *parser.Select, seen map[uint64]bool) error {
+	shadowed := map[string]bool{}
+	var definers []parser.CTE
+	c := *sel
+	c.With = nil
+	for _, cte := range sel.With {
+		shadowed[strings.ToLower(cte.Name)] = true
+		if cte.Definer != "" {
+			definers = append(definers, cte)
+			continue
+		}
+		c.With = append(c.With, cte)
+	}
+	for _, name := range stmtTables(&c) {
+		lname := strings.ToLower(name)
+		db, bare := catalog.SplitTableName(lname)
+		if db == "" && shadowed[bare] {
+			continue
+		}
+		if r, bound := s.rels[bare]; bound && (db == "" || r.alias == lname) {
+			continue
+		}
+		desc, err := s.lookup(ctx, txn, name)
+		if err != nil || desc == nil {
+			continue
+		}
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return err
+		}
+		if desc.IsView() && desc.Virtual == "" && !seen[desc.ID] {
+			seen[desc.ID] = true
+			stmts, perr := parser.Parse(desc.ViewQuery)
+			if perr != nil || len(stmts) != 1 {
+				continue
+			}
+			if q, ok := stmts[0].(*parser.Select); ok {
+				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), q, seen); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, cte := range definers {
+		if q, ok := cte.Query.(*parser.Select); ok {
+			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, q, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkSelectReadsAs is checkSelectReads as another role: a view's
+// owner, for the tables the view reads.
+func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, sel *parser.Select, seen map[uint64]bool) error {
+	saved := s.privAs
+	s.privAs = role
+	defer func() { s.privAs = saved }()
+	return s.checkSelectReads(ctx, txn, sel, seen)
 }
 
 // sequencePrivAllowed reports whether the actor may exercise priv
@@ -879,6 +1090,20 @@ func (s *Session) execAlterDefaultPrivileges(ctx context.Context, txn *kvclient.
 // the same question over HTTP, and answered it differently (issue #197).
 func canSeeTable(set catalog.RoleSet, d *catalog.TableDescriptor) bool {
 	return catalog.CanSeeTable(set, d)
+}
+
+// mayKnowTable reports whether the actor may be told a table's name in
+// an error about a statement that did not name it: root, admins, and a
+// role holding some privilege on it (catalog.CanSeeTable).
+func (s *Session) mayKnowTable(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor) (bool, error) {
+	if s.actor() == catalog.RootRole || s.system {
+		return true, nil
+	}
+	set, err := s.roleSet(ctx, txn)
+	if err != nil {
+		return false, err
+	}
+	return canSeeTable(set, d), nil
 }
 
 // grantRows renders SHOW GRANTS: database_name, schema_name,

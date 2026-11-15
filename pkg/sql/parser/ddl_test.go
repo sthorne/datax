@@ -201,6 +201,17 @@ func TestParseResetAndPurge(t *testing.T) {
 	if at := parseOne(t, `ALTER TABLE IF EXISTS db.t PURGE`).(*AlterTable); !at.Purge || !at.IfExists || at.Table != "db.t" {
 		t.Fatalf("PURGE: %+v", at)
 	}
+	if at := parseOne(t, `ALTER TABLE t ROTATE ENCRYPTION KEY`).(*AlterTable); !at.RotateKey || at.RotateKeepOld || at.Table != "t" {
+		t.Fatalf("ROTATE: %+v", at)
+	}
+	if at := parseOne(t, `alter table db.t rotate encryption key keep old versions`).(*AlterTable); !at.RotateKey || !at.RotateKeepOld || at.Table != "db.t" {
+		t.Fatalf("ROTATE ... KEEP OLD VERSIONS: %+v", at)
+	}
+	for _, bad := range []string{`ALTER TABLE t ROTATE KEY`, `ALTER TABLE t ROTATE ENCRYPTION KEY KEEP`, `ALTER TABLE t ROTATE ENCRYPTION KEY KEEP OLD`} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%s parsed", bad)
+		}
+	}
 	at = parseOne(t, `ALTER TABLE t SET (ttl_column = created_at, ttl = '7 days', gc_ttl = '10m')`).(*AlterTable)
 	if at.SetOptions["ttl_column"] != "created_at" || at.SetOptions["ttl"] != "7 days" || at.SetOptions["gc_ttl"] != "10m" {
 		t.Fatalf("SET: %+v", at.SetOptions)

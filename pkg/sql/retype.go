@@ -323,7 +323,11 @@ func (s *Session) retypeBackfill(ctx context.Context, table string, tableID uint
 			}
 			var wb kvclient.WriteBatch
 			for _, kv := range kvs {
-				row, err := rowenc.DecodeValue(desc, kv.Value)
+				plain, err := s.rowSealer().OpenValue(ctx, desc, kv.Key, kv.Value)
+				if err != nil {
+					return err
+				}
+				row, err := rowenc.DecodeValue(desc, plain)
 				if err != nil {
 					return err
 				}
@@ -351,7 +355,11 @@ func (s *Session) retypeBackfill(ctx context.Context, table string, tableID uint
 				if err != nil {
 					return newErrf(CodeInvalidTextRepresentation, "%v", err)
 				}
-				wb.Put(kv.Key, value)
+				stored, err := s.rowSealer().SealValue(ctx, desc, kv.Key, value)
+				if err != nil {
+					return err
+				}
+				wb.Put(kv.Key, stored)
 			}
 			return txn.RunBatch(ctx, &wb)
 		}); err != nil {

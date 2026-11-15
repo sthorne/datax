@@ -1,9 +1,13 @@
 // Package vtable defines the virtual catalog tables (pg_catalog and
 // information_schema) that psql, drivers and ORMs introspect (issue #89).
 // Each is a column list plus a generator that produces rows from the
-// real catalog at the statement's read timestamp, under the session's
-// privileges: a non-admin sees the tables it can read, as PostgreSQL
-// shows what is visible. They are read-only and never indexed: the
+// real catalog at the statement's read timestamp. Every role may read
+// every one of them, as in PostgreSQL (issue #312), and they list what
+// PostgreSQL's list: pg_catalog every table, whoever asks;
+// information_schema the tables the reader holds some privilege on.
+// What would reveal row data — statistics, a sequence's counter,
+// another role's statement text — is shown only to a role that may
+// read it, and no catalog carries a password or verifier. They are read-only and never indexed: the
 // executor treats one as a full scan with a fixed row estimate.
 //
 // OIDs are derived from IDs so they are stable across nodes and
@@ -49,8 +53,10 @@ const (
 // and the session's identity.
 type Env struct {
 	Databases []*catalog.DatabaseDescriptor
-	// Tables holds the tables the session may see: those of its current
-	// database, or of every database for a table that lists them all
+	// Tables holds the tables the catalog lists (every one for
+	// pg_catalog, those the reader holds a privilege on for
+	// information_schema): those of its current database, or of every
+	// database for a table that lists them all
 	// (Table.AllDatabases). A generator that ranges over Tables directly
 	// rather than through currentTables must be one of the latter.
 	Tables []*catalog.TableDescriptor
@@ -70,6 +76,14 @@ type Env struct {
 	// one for an admin, its own otherwise); nil when the caller cannot
 	// read them. A function, because most catalog queries never ask.
 	LargeObjects func() ([]LargeObjectInfo, error)
+	// Keys lists the named keys of the key service (issue #310) as the
+	// datax_keys virtual table shows them: metadata only, for admins;
+	// nil when the caller cannot read them.
+	Keys func() ([]KeyInfo, error)
+	// SealJobs lists the seal jobs in progress (issue #310, step 5) as
+	// datax_encryption_jobs shows them; nil when the caller cannot read
+	// them.
+	SealJobs func() ([]SealJobInfo, error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	// Roles holds every role (catalog.ListRoles: root first, then by
@@ -79,6 +93,10 @@ type Env struct {
 	Settings [][2]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo
+
+	// RoleSet is the reader's effective roles (nil: unknown, treated as
+	// an admin's by the few views that filter by it).
+	RoleSet catalog.RoleSet
 
 	User        string // the current role (current_user)
 	SessionUser string // the authenticated user (session_user)
@@ -99,6 +117,46 @@ func ProcName(oid int64) (string, bool) {
 		return all[i].Name, true
 	}
 	return "", false
+}
+
+// KeyInfo is one named key as the datax_keys virtual table lists it:
+// everything but the key material, which no SQL session can read.
+type KeyInfo struct {
+	ID           int64
+	Name         string
+	Kind         string
+	Version      int64
+	Versions     int64
+	State        string
+	Generation   int64
+	ClusterKey   string
+	Created      int64 // Unix nanoseconds
+	Rotated      int64 // Unix nanoseconds; 0 = never
+	ExternalRoot string
+	// Owner is the owning role; Privileges the grants on the key, as
+	// grantee=PRIV,PRIV;... ("" when none).
+	Owner      string
+	Privileges string
+}
+
+// SealJobInfo is one seal job — the rewrite of a sealed table's rows
+// after it was sealed or its key rotated — as datax_encryption_jobs
+// lists it.
+type SealJobInfo struct {
+	TableID uint64
+	Table   string
+	Kind    string // seal | rotate
+	Tenant  bool   // the rotation of one tenant's key
+	KeyID   int64
+	Version int
+	KeepOld bool
+	State   string
+	Pass    int
+	// Rewritten counts every row the job rewrote; Unreadable the rows of
+	// the current pass it stepped over because their key is gone.
+	Rewritten, Unreadable int64
+	Created, Updated      int64 // Unix nanoseconds; Updated 0 = never
+	LastError             string
 }
 
 // LargeObjectInfo is one large object as pg_largeobject_metadata lists

@@ -188,6 +188,13 @@ eventual wipe as unreachable garbage.
 
 ## Limitations
 
+- Backups (issue #313): an expired row leaves no tombstone, so a restore
+  of a full backup and an incremental taken after rows expired brings
+  them back; and a restore writes every row at its own time, which is
+  when retention starts counting for it again. The remedy is a `DELETE`
+  of the rows older than the retention after the restore
+  (docs/user/operations.md, "Backup and restore").
+
 - Retention expiry is best-effort in timing (one housekeeping tick,
   default 30s, plus the ~30s descriptor cache); on mixed ranges it is
   row-granular but skips tables with secondary indexes. That is a

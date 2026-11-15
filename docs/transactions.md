@@ -99,6 +99,21 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   deletes the record. If the coordinator dies first, resolution happens lazily
   via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
+- A **commit that fails** — the refresh it needed failed, its deadline had
+  passed, a pusher had aborted it — aborts the record and resolves the
+  intents as aborted before the error is returned
+  (`Txn.abortFailedCommit`). Expiry is for coordinators that die; a live
+  coordinator that has given up says so at once. The abort is the
+  record's compare-and-set, so it cannot overrule a commit that did
+  apply (an ambiguous error): on a COMMITTED record it fails, and the
+  intents are left to the pushers, who read the verdict from the
+  record. Before issue #315 a failed commit only stopped the heartbeat,
+  and a SQL session's `ROLLBACK` after the failed `COMMIT` found the
+  transaction finished and did nothing, so the intents blocked their keys
+  until the record expired. On the bank workload (16 workers, 1,000
+  accounts) each such failure held its two accounts for up to five
+  seconds, and the transactions queued behind them, and behind those,
+  filled two thirds of the workers' time.
 
 ## Serializability: refresh, then retry
 
@@ -434,7 +449,9 @@ pushee's anchor range:
 - Record PENDING and live:
   - pusher has **higher priority** → write ABORTED into the record (the pushee
     discovers this at its next heartbeat or EndTxn),
-  - otherwise poll with backoff up to ~2s, then surface `40001` to the client.
+  - otherwise re-push every 100 ms, for at most 10 s (`conflictBudget`,
+    `pkg/kvclient/txn.go`), then surface `40001` to the client. A wait
+    that can only end in a restart does not wait at all (see below).
 
 Priorities are random at birth and bumped on retries, so starvation is
 unlikely. Genuine deadlocks are broken by **distributed detection over
@@ -452,6 +469,41 @@ a few poll rounds (hundreds of milliseconds). With detection in place the
 conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
 waiters queueing behind a slow-but-live lock holder are no longer aborted
 by the clock.
+
+A wait that cannot end in a commit is not waited (issue #315,
+`Txn.cannotOutwait`). A transaction blocked on a live intent **above
+its read timestamp on a key it has read** — a write to an account it
+read, or a second read of it that finds the intent inside the
+uncertainty window — can commit only if the holder aborts: once the
+holder commits, its version sits inside one of the waiter's read spans
+above its read timestamp, the waiter's write must go above it
+(WriteTooOld) or its read finds it uncertain, and the refresh that would
+move the waiter's timestamp past it re-reads that span and fails. (A
+read can also pass beneath the version if the holder is pushed past the
+reader's uncertainty limit before committing — rare, given the
+500 ms window.) So after a push that leaves such an intent live — a
+pusher with the priority to abort the holder has already done so — the
+operation returns a retryable error at once instead of polling until
+the holder's commit makes it fail anyway. The same holds for any intent
+above the read timestamp once the transaction has read too much for its
+read set to be tracked, since every timestamp move then restarts it. A
+restart is always safe; what the rule gives up is the rare wait whose
+holder would have aborted. Serializability is untouched, since the rule
+only ever makes a transaction restart, and so are priorities: a
+stronger writer still aborts the holder instead of restarting. On the bank workload these waits were most of the attempts
+that ended in a `40001`, each a 100 ms poll or more; they now end in
+the push's round trip.
+
+Measured together with the failed-commit fix above (one secure,
+encrypted on-disk node, 16 workers, 1,000 accounts, seed 7, four
+alternating 30 s rounds each): committed transfers went from a median
+of 238 a second (209–252) to 974 (832–1,271). An attempt that ended in a
+`40001` ran 3.1 s on average before and 0.02 s after, and those attempts
+went from about 70 % of the workers' time to under 3 %. There are a few
+more of them (0.018 per committed transfer against 0.016), since a
+waiter whose holder would have aborted now restarts too. kv 50 % reads
+and hot-row did the same KV work per operation as before and stayed
+within their run-to-run noise.
 
 Reads below a committed value's timestamp never block (MVCC). A foreign
 intent strictly above both the read timestamp and the uncertainty limit is
@@ -491,10 +543,18 @@ resolution only touches keys the enumeration skipped.
 
 Correctness rules enforced around the threshold:
 
-- **Reads at or below the threshold are rejected**, non-retryably — the
-  versions they would need may be gone. Live transactions never trip this
-  (TTL ≫ transaction lifetime, and refresh/uncertainty only move `readTS`
-  forward).
+- **Reads at or below the threshold are rejected** — the versions they
+  would need may be gone — with a typed detail
+  (`kvpb.BelowGCThresholdError`; a peer that predates it is recognized
+  by the message). What follows depends on who chose the timestamp
+  (issue #313). A transaction the cluster timestamped restarts at a new
+  one (`kvclient.RetryableError`; SQLSTATE `40001`), which succeeds: it
+  tripped because it outlived a short `gc_ttl` or began before a purge.
+  A historical transaction's timestamp is the client's, so the refusal
+  stands (SQLSTATE `72000`, PostgreSQL's `snapshot_too_old`): no retry
+  at that timestamp can succeed. With the default 25h window live
+  transactions never trip it (TTL ≫ transaction lifetime, and
+  refresh/uncertainty only move `readTS` forward).
 - **Resurrection guard**: `createTxnRecord` rejects any transaction whose
   `MinTimestamp` is at or below the threshold, so a zombie coordinator
   cannot recreate a reclaimed record as PENDING after having possibly been
@@ -592,6 +652,22 @@ flight; the log of a range the rows were written to before a split moved
 them (truncated on that range's own schedule); and the device beneath
 the file system. On an encrypted store the same files are rewritten and
 deleted, whichever data key they were written under.
+
+### A dropped table's span
+
+`DROP TABLE` leaves the rows and a record of the drop
+(`catalog.DroppedTable`); once the table's history window has passed,
+the reclaim job (`pkg/server/dropped_tables.go`) deletes the rows and
+purges the span, as above (issue #313; docs/sql.md, "A dropped table's
+rows"). The purge's threshold of now is what refuses a late `AS OF
+SYSTEM TIME` read of the table; the merge queue keeps the emptied range
+apart from any neighbour whose own window has not yet passed that
+threshold (`Store.mergeWouldHideHistory`), because a merged range
+adopts the higher of the two thresholds and would otherwise refuse
+reads the neighbour still promises. That rule covers every purged
+range, not only a dropped table's: before it, a purged range merged
+into its neighbour — the system range among them — as soon as it was
+small enough.
 
 ## Invariants (asserted in tests)
 

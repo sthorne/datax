@@ -315,6 +315,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.peekWord(1, "policy") {
 			return p.parseCreatePolicy()
 		}
+		if p.peekEncryptionKey(1) {
+			return p.parseCreateEncryptionKey()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
@@ -412,6 +415,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DROP":
 		if p.peekWord(1, "policy") {
 			return p.parseDropPolicy()
+		}
+		if p.peekEncryptionKey(1) {
+			return p.parseDropEncryptionKey()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseDropRole()
@@ -538,6 +544,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "ALTER":
 		if p.peekWord(1, "policy") {
 			return p.parseAlterPolicy()
+		}
+		if p.peekEncryptionKey(1) {
+			return p.parseAlterEncryptionKey()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseRoleStmt(true)
@@ -697,6 +706,14 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return a, nil
 	case "SHOW":
+		if p.peekWord(1, "cluster") && p.peekWord(2, "setting") {
+			p.i++
+			return p.parseClusterSetting(true)
+		}
+		if p.peekWord(1, "encryption") && p.peekWord(2, "keys") {
+			p.i += 3
+			return &ShowEncryptionKeys{}, p.expectEnd("SHOW ENCRYPTION KEYS")
+		}
 		p.i++
 		if p.consumeKeyword("TABLES") {
 			st := &ShowTables{}
@@ -844,6 +861,10 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &SetVar{Name: "show:" + strings.Join(words, "_")}, nil
 	case "SET":
+		if p.peekWord(1, "cluster") && p.peekWord(2, "setting") {
+			p.i++
+			return p.parseClusterSetting(false)
+		}
 		return p.parseSet()
 	case "reset": // not a reserved word; lexes as an identifier
 		p.i++
@@ -3733,6 +3754,19 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 	case p.consumeIdentWord("purge"):
 		at.Purge = true
+	case p.consumeIdentWord("rotate"):
+		if !p.peekEncryptionKey(0) {
+			return nil, p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
+		}
+		p.i += 2
+		at.RotateKey = true
+		if p.peekWord(0, "keep") {
+			if !p.peekWord(1, "old") || !p.peekWord(2, "versions") {
+				return nil, p.errf("expected KEEP OLD VERSIONS")
+			}
+			p.i += 3
+			at.RotateKeepOld = true
+		}
 	case p.consumeIdentWord("split"):
 		if !p.consumeIdentWord("at") {
 			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
@@ -3766,7 +3800,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
 	return at, nil
 }

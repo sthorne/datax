@@ -11,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -127,7 +128,7 @@ func (n *Node) statsRefreshOnce(ctx context.Context, staleness time.Duration) {
 	if pick == nil {
 		return
 	}
-	st, err := sql.CollectTableStats(ctx, n.db, pick)
+	st, err := sql.CollectTableStats(ctx, n.db, rowseal.For(n.cat), pick)
 	if err != nil {
 		log.Debugf("stats refresh: collect %q: %v", pick.Name, err)
 		return

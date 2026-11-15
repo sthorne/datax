@@ -97,7 +97,7 @@ CREATE TABLE t (
   PRIMARY KEY (a)                -- or: a INT8 PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS t (...);
-DROP TABLE [IF EXISTS] t;
+DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
@@ -668,6 +668,65 @@ every node by the time the statement returns. `SHOW CREATE TABLE`,
 `pg_roles.rolbypassrls` describe it. A column a policy reads cannot be
 dropped (`2BP01`); renaming it updates the policy. A role a policy
 names cannot be dropped until the policy stops naming it.
+
+### Sealed tables
+
+A sealed table's row values are encrypted under a key of the table's
+own, so that dropping the table makes its data unreadable everywhere —
+on every replica at once, and in backups once those taken before have
+expired:
+
+```sql
+CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto');
+-- NOTICE:  table "notes" is sealed: ... not sealed ...: id (primary key)
+```
+
+**Primary-key and indexed columns are not sealed**: they stay readable to
+anyone who can read the database's storage. `CREATE TABLE` and `CREATE
+INDEX` say which columns those are. Queries work as on any table. A
+statement that reads a row whose key has been destroyed or disabled fails
+with `XXK01`. It needs the cluster key (`datax debug cluster-key init`,
+see the operations guide) and is refused for time-series tables. How to
+shape a schema so that erasure means something:
+[encryption keys for applications](../encryption-keys-for-applications.md).
+
+A table that already holds rows is sealed with `ALTER TABLE`, and a
+sealed table's key is rotated the same way; in both cases new writes use
+the new key at once and a background job rewrites the existing rows
+(`datax_encryption_jobs` shows its progress):
+
+```sql
+ALTER TABLE notes SET (encryption_key = 'auto');   -- reads take plain and sealed rows until the job is done
+ALTER TABLE notes PURGE;                           -- after the job: drops the old plaintext versions now
+ALTER TABLE notes ROTATE ENCRYPTION KEY;           -- the old key version is destroyed when the job is done
+SELECT * FROM datax_encryption_jobs;
+```
+
+Until garbage collection or a `PURGE`, the old plaintext versions of the
+rows stay in the table's history. A sealed table cannot be unsealed
+(copy it into a plain table instead).
+
+A table can instead be sealed **per tenant**: each value of its leading
+primary-key column gets a key of its own on its first write, and one
+tenant's data can be erased without touching the others:
+
+```sql
+CREATE TABLE items (tenant_id UUID, id UUID, title TEXT,
+  PRIMARY KEY (tenant_id, id)) WITH (encryption_key_by = 'tenant_id');
+
+-- erase one tenant: delete its rows, purge, then destroy its key
+DELETE FROM items WHERE tenant_id = $1;
+ALTER TABLE items PURGE;
+SELECT datax_destroy_tenant_key('items', $1);  -- returns once no node uses the key
+```
+
+`datax_destroy_tenant_key` needs ownership of the table and runs outside
+a transaction block. A row of the tenant left behind fails with `XXK01`
+afterwards, and `DELETE` cannot remove it, so delete first; should rows
+be left behind, `SELECT datax_remove_tenant_rows('items', $1)` removes
+them and their index entries without the key. The tenant's next write
+gets a fresh key. One tenant's key is rotated with
+`datax_rotate_tenant_key('items', $1)`.
 
 ## Reading
 
@@ -1571,8 +1630,9 @@ SHOW STATS FOR users;
 writes, no locks) and stores the exact row count plus per-column
 distinct-value and NULL counts — distinct counts are exact up to 256
 values and a sketch estimate (±~10%) beyond. It cannot run inside
-`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
-shows what the planner sees, one row per column.
+`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any role
+holding `SELECT` on the table) shows what the planner sees, one row
+per column.
 
 A background sampler also keeps statistics fresh without ANALYZE: every
 minute (configurable) one node re-collects at most one table whose
@@ -1811,6 +1871,9 @@ publications, extensions, functions, triggers, ...), plus
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
+Every role may read them; `pg_catalog` lists every table and
+`information_schema` the tables the reader holds a privilege on, as in
+PostgreSQL ([security guide](security.md#roles-and-privileges)).
 This is what makes `psql`'s `\d`, `\dt`, `\dv`, `\di`, `\du`, `\l`, `\dn`, `\dp`
 and friends, and ORM schema introspection, work unmodified — see
 [Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).

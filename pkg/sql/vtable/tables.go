@@ -469,6 +469,78 @@ func init() {
 			}
 			return rows, nil
 		})
+	// datax_keys (issue #310): the named keys' metadata. The table of the
+	// same name that holds them is readable by no session; a session that
+	// names it is given this instead, which has no column for the key
+	// material. Admins see every key, anyone else none. owner and
+	// privileges are the key service's (#310 step 2).
+	pg("datax_keys", []catalog.Column{col("id", types.Int), col("name", types.String), col("kind", types.String),
+		col("version", types.Int), col("versions", types.Int), col("state", types.String), col("generation", types.Int),
+		col("cluster_key", types.String), col("created", types.Timestamp), col("rotated", types.Timestamp), col("external_root", types.String),
+		col("owner", types.String), col("privileges", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.Keys == nil || !env.IsAdmin {
+				return nil, nil
+			}
+			keys, err := env.Keys()
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]Row, 0, len(keys))
+			for _, k := range keys {
+				rotated := null()
+				if k.Rotated != 0 {
+					rotated = types.NewTimestamp(k.Rotated)
+				}
+				rows = append(rows, Row{i64(k.ID), str(k.Name), str(k.Kind), i64(k.Version), i64(k.Versions), str(k.State),
+					i64(k.Generation), textOrNull(k.ClusterKey), types.NewTimestamp(k.Created), rotated, textOrNull(k.ExternalRoot),
+					textOrNull(k.Owner), textOrNull(k.Privileges)})
+			}
+			return rows, nil
+		})
+	// datax_encryption_jobs (issue #310, step 5): the seal jobs in
+	// progress — the background rewrite of a table's rows after ALTER
+	// TABLE ... SET (encryption_key), ALTER TABLE ... ROTATE ENCRYPTION
+	// KEY or datax_rotate_tenant_key — for the tables of the current
+	// database the reader can see. A job's row goes when the job is done.
+	pg("datax_encryption_jobs", []catalog.Column{col("table_name", types.String), col("table_id", types.Int), col("kind", types.String),
+		col("scope", types.String), col("key_id", types.Int), col("version", types.Int), col("keep_old_versions", types.Bool),
+		col("state", types.String), col("pass", types.Int), col("rows_rewritten", types.Int), col("rows_unreadable", types.Int),
+		col("created", types.Timestamp), col("updated", types.Timestamp), col("last_error", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.SealJobs == nil {
+				return nil, nil
+			}
+			jobs, err := env.SealJobs()
+			if err != nil || len(jobs) == 0 {
+				return nil, err
+			}
+			names := map[uint64]string{}
+			for _, t := range env.currentTables() {
+				names[t.ID] = t.Name
+			}
+			var rows []Row
+			for _, j := range jobs {
+				name, ok := names[j.TableID]
+				if !ok {
+					continue
+				}
+				scope, keyID, ver := "table", null(), null()
+				if j.Tenant {
+					scope = "tenant"
+				}
+				if j.Kind == "rotate" {
+					keyID, ver = i64(j.KeyID), i64(int64(j.Version))
+				}
+				updated := null()
+				if j.Updated != 0 {
+					updated = types.NewTimestamp(j.Updated)
+				}
+				rows = append(rows, Row{str(name), i64(int64(j.TableID)), str(j.Kind), str(scope), keyID, ver, boolean(j.KeepOld),
+					str(j.State), i64(int64(j.Pass)), i64(j.Rewritten), i64(j.Unreadable), types.NewTimestamp(j.Created), updated, textOrNull(j.LastError)})
+			}
+			return rows, nil
+		})
 	pg("pg_db_role_setting", []catalog.Column{col("setdatabase", types.Int), col("setrole", types.Int), col("setconfig", types.String)}, empty)
 	pg("pg_foreign_data_wrapper", []catalog.Column{col("oid", types.Int), col("fdwname", types.String), col("fdwowner", types.Int), col("fdwhandler", types.Int), col("fdwvalidator", types.Int), col("fdwacl", types.String), col("fdwoptions", types.String)}, empty)
 	pg("pg_foreign_server", []catalog.Column{col("oid", types.Int), col("srvname", types.String), col("srvowner", types.Int), col("srvfdw", types.Int), col("srvtype", types.String), col("srvversion", types.String), col("srvacl", types.String), col("srvoptions", types.String)}, empty)
@@ -1045,6 +1117,12 @@ func init() {
 			for _, t := range env.currentTables() {
 				users := make([]string, 0, len(t.Privileges))
 				for u := range t.Privileges {
+					// PostgreSQL's view shows the grants whose grantee or
+					// grantor is one of the reader's roles (PUBLIC is
+					// everyone's).
+					if env.RoleSet != nil && !env.IsAdmin && !env.RoleSet.Has(u) && !env.RoleSet.Has(catalog.OwnerOf(t.Owner)) {
+						continue
+					}
 					users = append(users, u)
 				}
 				sort.Strings(users)

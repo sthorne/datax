@@ -654,7 +654,7 @@ func (s *Session) fetchByPrimaryKey(ctx context.Context, txn *kvclient.Txn, desc
 	if err != nil || raw == nil {
 		return nil, err
 	}
-	row, err := decodeFullRow(desc, pk, raw)
+	row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
 	if err != nil {
 		return nil, err
 	}

@@ -140,20 +140,37 @@ cluster (issue #311):
   keyed under them; a cluster with no policy reads only the database
   descriptors.
 
+- **The dependent-view check** on `DROP` and `ALTER` (issue #313) scans
+  the views recorded under the relation (`keys.ViewDependencySpan`,
+  written with each view) and reads those, from cluster version v22 once
+  the node leading range 1 has recorded every view; before that it reads
+  every descriptor.
+- **The retention provider behind GC and the re-shard janitor** (issue
+  #313) read every descriptor once and after that only what changed:
+  each pass is an incremental export of the descriptor span since the
+  last (`server.descWatcher`), the read an incremental backup makes, and
+  each keeps only what it needs (the tables with a GC window or a
+  retention; those with a retired layout). An idle pass returns no rows.
+- **The dropped-table reclaim** reads the records of dropped tables
+  waiting to be reclaimed, not the catalog.
+
 What still reads every table descriptor: `catalog.Accessor.List`, used
 by `information_schema.tables`, `.columns` and `.views` (which list
 every database), role DDL that must find everything a role owns or is
-granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`), the dependent-view
-check on `DROP` and `ALTER`, `ALTER TYPE ... ADD VALUE` and `DROP TYPE`,
+granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`),
+`ALTER TYPE ... ADD VALUE` and `DROP TYPE`,
 `regclass` name resolution, a build of the schema document, and the
 table gauges (`table.rows`, `table.ranges`, `datax_table_*`), which the
 leader of range 1 reads once per recorder tick and any node reads when
 `/metrics` is scraped — a series per table costs a row per table.
-Backup, recovery and three background passes scan the descriptor span
-directly and are unchanged: the statistics refresher (every minute),
-the retention provider behind GC (every 30 s while GC asks) and the
-re-shard janitor (every minute). Sequences, types and roles are still
-listed whole by the catalog views.
+Backup, recovery and the statistics refresher (every minute, which also
+reads every statistics record) scan the descriptor span directly.
+Sequences, types and roles are still listed whole by the catalog views.
+`TestCatalogScanScale` measures the passes above (rows read out of the
+descriptor span, one node): at 1,000 and 5,000 tables, DROP TABLE reads
+1,004 and 5,004 descriptor rows by the old check and 2 by the records;
+a retention refresh or a re-shard janitor pass reads about 1,000 and
+5,000 on its first pass and 0 on an idle one after (1 after a DROP).
 
 ## Versioning and rolling upgrades
 

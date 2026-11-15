@@ -116,6 +116,19 @@ func PeerIsLoopback(ctx context.Context) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// PeerHost returns the IP address the caller connected from, or "".
+func PeerHost(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
 // PeerCN returns the CommonName of the caller's CA-verified client
 // certificate, or "" on a cleartext (insecure-mode) connection. The
 // internode server requires and verifies client certificates, so in

@@ -66,6 +66,9 @@ func (n *Node) startSQL() error {
 		return found, nil
 	}
 	opts.Notify = n.notifyHub()
+	if ks := n.KeyService(); ks != nil {
+		opts.KeyService = ks
+	}
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier
@@ -137,6 +140,7 @@ func (n *Node) catalogAccessor() (*catalog.Accessor, error) {
 		cat := catalog.NewAccessor()
 		cat.EnableStats(n.db)
 		cat.SetCacheLimits(n.cfg.DescCacheSize, 0)
+		n.attachRowSealer(cat)
 		if n.cfg.DescLeaseTTL >= 0 {
 			if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
 				n.catErr = err

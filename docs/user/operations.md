@@ -816,7 +816,13 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   filesystem makes them portable).
 - A backup directory holds a `BACKUP.json` manifest plus one data file per
   table; the manifest is written last, so its presence marks the backup
-  complete. The summary prints per-table record counts and SHA-256
+  complete. The data files are written into a hidden
+  `.backup-in-progress-*` directory inside the destination and moved
+  beside the manifest only once every table is written: a backup that
+  fails removes what it wrote and leaves the destination as it found it,
+  and one whose node dies mid-way leaves only that directory (delete it).
+  The directory backup creates is mode 0700 and every file 0600, sealed
+  or not; a destination that already exists keeps its mode. The summary prints per-table record counts and SHA-256
   checksums over the live data. Restore reads only the names a backup
   writes, derived from each table's id, and only a regular file at one
   of them: a manifest naming any other file is refused before anything
@@ -824,7 +830,7 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   file's name is refused without being followed, so a directory prepared
   by someone else cannot point the node at a path of their choosing.
   The system records a backup carries (users, roles, databases,
-  sequences) are written back only to the key spans backup collected
+  sequences, enum types) are written back only to the key spans backup collected
   them from; a manifest carrying any other key — the cluster's
   authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
@@ -832,6 +838,22 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   base older than that is refused ("the base backup is older than the
   garbage-collection window"), because changes since it have been
   collected in part. Take a fresh full backup at least daily.
+- **Time-series retention and backups.** Retention expires rows beneath
+  SQL and leaves no tombstone, so an incremental taken after rows
+  expired has nothing to say about them: a restore of the full backup
+  and the incremental brings back the rows that expired in between
+  (with a revision-history incremental too). Every restored row is
+  written at the restore's time, and retention counts from a row's
+  write time, so restored rows — these and the rest — stay up to one
+  retention period after the restore rather than after they were first
+  written. To restore a time-series table as its retention would have
+  it, delete the old rows after the restore:
+  `DELETE FROM metrics WHERE at < now() - INTERVAL '7 days'` (the
+  retention, over the timestamp column). An incremental whose base the
+  retention has already passed is refused, like one older than the GC
+  window. (Issue #313; restore does not re-apply retention itself
+  because a backup holds no write times, and retention on a range of
+  its own goes by write time, not by the row's timestamp column.)
 - An incremental holds each changed key as it stood at the incremental's
   own timestamp. Taken with `--revision-history` it holds every version
   written since the base instead, and the chain restores to any moment
@@ -902,7 +924,11 @@ datax restore --addr 10.0.1.1:26257 --src /backups/full,/backups/inc1 \
   from its own machine: run the command there, against a loopback
   address. The key is never logged or written to the audit log (the
   audit record notes only that a key was given), is not stored on the
-  node, and is not written into the backup.
+  node, and is not written into the backup. During a rolling upgrade,
+  point a sealed backup or restore at an upgraded node: the command asks
+  for it under an op name (`backup-sealed`, `restore-sealed`) that a node
+  from before sealed backups refuses, where it would otherwise have
+  ignored the key and written plaintext.
 - **Losing the key loses the backup.** There is no escrow and no second
   way in. Keep the key apart from the backup location; a key stored
   beside the files it seals protects nothing.
@@ -920,10 +946,25 @@ datax restore --addr 10.0.1.1:26257 --src /backups/2026-08-31,/backups/2026-08-3
 
 Table IDs are preserved, so secondary indexes and timeseries shard layouts
 restore as-is with no backfill; the descriptor ID generator is bumped past
-every restored ID. Users, admin-role markers, and per-table grants come
+every restored ID. Enum types come back with their ids, so the restored
+columns are still of them. A backup taken before 0.59.0 holds no enum
+types: restoring everything from one brings back the enum columns
+(their labels travel with the column) but not the `CREATE TYPE`. A
+table restore (`--table`, `--database`) from such a backup makes the
+type from the column's labels, so that is the way to bring an enum
+column back from one with its type. Users, admin-role markers, and per-table grants come
 from the backup — after a restore, **credentials are the source cluster's**.
-The restore summary re-exports every table and prints fresh checksums:
-compare them against the backup's to verify the restore byte-for-byte.
+Before anything is written, every data file of the chain is read to its
+end and held to its manifest: the record count and checksum the backup
+recorded for it, its table's key span and key order. A damaged file, or
+one swapped for another backup's file of the same table, is refused and
+the target stays empty. (This is not a seal: whoever can rewrite a file
+can rewrite the manifest beside it. A sealed backup authenticates both.)
+The files are read once more as they are applied, and a file changed in
+between fails that check at its end, after its earlier rows are written;
+start again from an empty cluster. The restore summary re-exports every
+table and prints fresh checksums: compare them against the backup's to
+verify the restore byte-for-byte.
 
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.
@@ -970,7 +1011,10 @@ for any restore. Needs cluster version v21.
   continuing from the backup's counter; its grants and owner, for the
   roles this cluster has — grants to roles it lacks are left out and
   listed in the summary, and a table whose owner is missing is owned by
-  `root`. Statistics are not in a backup; the table is sampled like any
+  `root`. An enum column's type: the type of that name in the target
+  database when its labels are the same, in the same order; created
+  there from the backup when the database has none (the summary says
+  so). Statistics are not in a backup; the table is sampled like any
   new one.
 - **Foreign keys.** A foreign key to a table restored in the same run
   follows it: restore `orders` and `customers` together and the copy of
@@ -982,9 +1026,9 @@ for any restore. Needs cluster version v21.
   original keep referencing the original.
 - **What is refused,** each with the reason: a view (restore its tables
   and recreate it; a database restore skips views and prints their
-  definitions); a table with an enum column, unless it goes back into
-  the database that still has that same type with the same labels; a
-  table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
+  definitions); a table with an enum column whose target database has
+  a type of that name with other labels (a value is stored as its
+  label's position); a table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
   TYPE` when backed up; the cluster's own tables; and a table whose
   descriptor carries a feature this version's table restore does not
   know. For all of these, restore the whole backup into an empty

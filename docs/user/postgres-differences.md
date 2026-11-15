@@ -368,12 +368,15 @@ are the differences ([reference](sql.md#large-objects)):
 
 | SQLSTATE | Meaning | What to do |
 |---|---|---|
-| `40001` | serialization failure | retry the whole transaction |
+| `40001` | serialization failure — including a transaction that read data whose history was garbage-collected under it (it ran longer than a table's `gc_ttl`, or a `PURGE` of what it reads ran meanwhile) | retry the whole transaction |
+| `72000` | snapshot too old: `AS OF SYSTEM TIME` names a moment older than the table's GC window (`gc_ttl`, default 25h), or before a `PURGE` or a dropped table's reclaim | read at a later moment; retrying the same one cannot succeed |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
 | `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
 | `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
 | `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
+| `XXK01` | a row of a [sealed table](sql.md#sealed-tables) whose key — the table's, or its tenant's — is destroyed, disabled or unavailable (datax's own code) | not retryable: the key was destroyed (the data is erased) or must be re-enabled |
+| `XX001` | a sealed table's stored value does not authenticate (data corrupted) | report it; it is not a retry signal |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |
 | `42601` "statement nests too deeply" | more than 1,000 nesting levels (parentheses, subqueries, derived tables, `CASE`) | flatten the statement; PostgreSQL bounds the same recursion by stack depth (issue #135) |
@@ -409,6 +412,13 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
+- **Who may read them.** Every role, as in PostgreSQL: `pg_catalog`
+  lists every table of the current database to any reader, and
+  `information_schema` the tables the reader holds some privilege on.
+  Two differences: table statistics (`reltuples`, `n_live_tup`) read
+  `0` for a table the reader may not `SELECT` from, where PostgreSQL
+  shows them to everyone, and `pg_largeobject_metadata` lists the
+  reader's own large objects only.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 - **How many tables.** The `pg_catalog` views, `SHOW TABLES` and name
   resolution cost in proportion to the current database, not to the

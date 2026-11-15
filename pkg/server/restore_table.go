@@ -84,6 +84,11 @@ type restoreProgress struct {
 	// enough to have been given up on cannot publish over rows that are
 	// being taken away.
 	Reclaiming bool `json:"reclaiming,omitempty"`
+	// SealIDs are the seal ids of the per-tenant sealed tables being
+	// restored, whose tenant keys the restore brings back before it
+	// publishes: the tenant key janitor leaves them alone while the
+	// record exists (tenantkeys.go).
+	SealIDs []uint64 `json:"seal_ids,omitempty"`
 }
 
 const (
@@ -124,7 +129,12 @@ var (
 		// policies' roles cut to the ones this cluster has
 		// (restoredDescriptor), so the restored copy is no less
 		// protected than the table it was taken from.
-		"row_security", "force_row_security", "policies")
+		"row_security", "force_row_security", "policies",
+		// A sealed table's key is named by its id in datax_keys and its
+		// rows by the seal id, neither of which is the table's own id:
+		// both carry over, and the key is shared or brought back
+		// (restore_sealed.go).
+		"encryption_key")
 	restoreColumnFields = fieldSet("id", "name", "type", "precision", "scale", "width", "max_len", "char", "no_tz",
 		"enum_type", "enum_name", "enum_labels", "time_precision", "not_null", "default", "default_expr", "identity",
 		"sequence_id", "fill_default", "hidden", "comment", "retype_from")
@@ -134,8 +144,14 @@ var (
 	// the table prefix beside the indexes (keys.VectorCentroidPrefix): the
 	// field names them by a build identifier, not by the table's id, and
 	// carries over as it is.
-	restoreIndexFields      = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
-	restoreConstraintFields = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
+	// A sealed table's key: the naming key and seal id carry over (see
+	// "encryption_key" above), and a per-tenant table's tenant column is
+	// a column id.
+	// A table restored while it was being sealed carries sealing, and
+	// its seal job is made again under the new id at the publish.
+	restoreEncryptionKeyFields = fieldSet("key_id", "seal_id", "tenant_column", "sealing")
+	restoreIndexFields         = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
+	restoreConstraintFields    = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
 		"on_update", "index_id", "auto_index", "validated")
 )
 
@@ -164,6 +180,15 @@ func checkRestorableFields(name string, raw json.RawMessage) error {
 	}
 	if err := unknown("the descriptor field", top, restoreTableFields); err != nil {
 		return err
+	}
+	if raw := top["encryption_key"]; len(raw) > 0 && string(raw) != "null" {
+		var ek map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &ek); err != nil {
+			return fmt.Errorf("table %s: corrupt descriptor in the backup: %w", name, err)
+		}
+		if err := unknown("the encryption key field", ek, restoreEncryptionKeyFields); err != nil {
+			return err
+		}
 	}
 	for _, part := range []struct {
 		field, what string
@@ -223,6 +248,13 @@ type restorePlan struct {
 	// allocated when the restore publishes.
 	newDB *catalog.DatabaseDescriptor
 	notes []string
+	// sealed is what the restore of the plan's sealed tables needs (nil
+	// without one; restore_sealed.go).
+	sealed *sealedRestore
+	// types are the backup's enum type descriptors by id (empty for a
+	// backup from before types were backed up: the columns' own copies
+	// of the labels are what a missing type is made from).
+	types map[uint64]catalog.TypeDescriptor
 }
 
 // planTableRestore works out, from the chain's last manifest, which
@@ -271,7 +303,18 @@ func planTableRestore(final *backupManifest, opts RestoreOptions) (*restorePlan,
 		seqs = append(seqs, d)
 	}
 
-	plan := &restorePlan{}
+	plan := &restorePlan{types: map[uint64]catalog.TypeDescriptor{}}
+	typeDescStart, typeDescEnd := keys.TypeDescSpan()
+	for _, kv := range final.Types {
+		if !inAnySpan(keys.Key(kv.Key), [][2]keys.Key{{typeDescStart, typeDescEnd}}) {
+			continue // a name entry
+		}
+		var d catalog.TypeDescriptor
+		if err := json.Unmarshal(kv.Value, &d); err != nil {
+			return nil, fmt.Errorf("corrupt type descriptor in the backup: %w", err)
+		}
+		plan.types[d.ID] = d
+	}
 	add := func(t backupTable, intoDB, intoName string) error {
 		if err := checkRestorableFields(t.Name, t.Descriptor); err != nil {
 			return err
@@ -519,6 +562,18 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 	return d, notes
 }
 
+func sameLabels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func containsString(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
@@ -546,10 +601,18 @@ func restoredSequenceName(p *tableRestorePlan, s restoreSequence) string {
 type restoreTargets struct {
 	dbIDs map[string]uint64
 	roles map[string]bool
+	// types is where each enum type the restored columns are of goes:
+	// the id of the same type, same labels, already in the target
+	// database, or zero for a type the restore creates there.
+	types map[restoreTypeKey]uint64
 }
 
+// restoreTypeKey is an enum type of a table restore: the database it is
+// restored into and its name there.
+type restoreTypeKey struct{ db, name string }
+
 func (n *Node) readRestoreTargets(ctx context.Context, txn *kvclient.Txn, plan *restorePlan) (*restoreTargets, error) {
-	tg := &restoreTargets{dbIDs: map[string]uint64{}, roles: map[string]bool{}}
+	tg := &restoreTargets{dbIDs: map[string]uint64{}, roles: map[string]bool{}, types: map[restoreTypeKey]uint64{}}
 	if plan.newDB != nil {
 		if raw, err := txn.Get(ctx, keys.DatabaseNamespaceKey(plan.newDB.Name)); err != nil {
 			return nil, err
@@ -597,26 +660,64 @@ func (n *Node) readRestoreTargets(ctx context.Context, txn *kvclient.Txn, plan *
 			}
 		}
 	}
+	restored := map[restoreTypeKey]bool{} // the names the restored tables and sequences take
 	for _, p := range plan.tables {
-		// An enum column stores a label's position in its type. The type
-		// is not part of a backup's table, so the column is restorable
-		// only where the same type, with the same labels in the same
-		// order, already is.
+		restored[restoreTypeKey{p.intoDB, p.intoName}] = true
+		for _, s := range p.seqs {
+			restored[restoreTypeKey{p.intoDB, restoredSequenceName(p, s)}] = true
+		}
+	}
+	labelsOf := map[restoreTypeKey][]string{}
+	for _, p := range plan.tables {
+		// An enum column stores a label's position in its type, so it is
+		// restored only onto a type with the same labels in the same
+		// order: the one of that name in the target database, or, where
+		// the database has no type of that name, the type the restore
+		// creates there from the backup (issue #313).
 		for _, c := range p.srcDesc.Columns {
 			if c.EnumType == 0 {
 				continue
 			}
-			td, err := catalog.ReadType(ctx, txn, c.EnumType)
-			var nf *catalog.ErrTypeNotFound
-			if errors.As(err, &nf) {
-				td, err = nil, nil
+			tk := restoreTypeKey{p.intoDB, c.EnumName}
+			if prev, seen := labelsOf[tk]; seen {
+				if !sameLabels(prev, c.EnumLabels) {
+					return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and another table of this restore has a type of that name with other labels", p.from(), c.Name, c.EnumName)
+				}
+				continue
 			}
+			labelsOf[tk] = c.EnumLabels
+			if plan.newDB != nil {
+				tg.types[tk] = 0 // the database is new: the type is made in it
+				continue
+			}
+			dbID := tg.dbIDs[p.intoDB]
+			raw, err := txn.Get(ctx, keys.TypeNamespaceKey(dbID, c.EnumName))
 			if err != nil {
 				return nil, err
 			}
-			if td == nil || plan.newDB != nil || td.DatabaseID != tg.dbIDs[p.intoDB] || td.Name != c.EnumName || strings.Join(td.Labels, "\x00") != strings.Join(c.EnumLabels, "\x00") {
-				return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and a table is restored with its enum columns only into the database that still has that very type, labels unchanged; restore the whole backup into an empty cluster and copy the rows from there", p.from(), c.Name, c.EnumName)
+			if raw == nil {
+				for _, k := range []keys.Key{keys.TableNamespaceKey(dbID, c.EnumName), keys.SequenceNamespaceKey(dbID, c.EnumName)} {
+					if other, err := txn.Get(ctx, k); err != nil {
+						return nil, err
+					} else if other != nil {
+						return nil, fmt.Errorf("table %s: column %q is of the enum type %q, which %s does not have, and the restore cannot create it there because a table or sequence has that name", p.from(), c.Name, c.EnumName, p.intoDB)
+					}
+				}
+				if restored[tk] {
+					return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and the restore would give that name to a table or sequence too", p.from(), c.Name, c.EnumName)
+				}
+				tg.types[tk] = 0
+				continue
 			}
+			td, err := catalog.LookupType(ctx, txn, dbID, c.EnumName)
+			if err != nil {
+				return nil, err
+			}
+			if !sameLabels(td.Labels, c.EnumLabels) {
+				return nil, fmt.Errorf("table %s: column %q is of the enum type %q with the labels (%s), and %s has a type of that name with the labels (%s): a value is stored as its label's position, so the column cannot be restored onto it. Restore into another database (--into), or restore the whole backup into an empty cluster and copy the rows from there",
+					p.from(), c.Name, c.EnumName, strings.Join(c.EnumLabels, ", "), p.intoDB, strings.Join(td.Labels, ", "))
+			}
+			tg.types[tk] = td.ID
 		}
 		check := []string{catalog.OwnerOf(p.srcDesc.Owner)}
 		for g := range p.srcDesc.Privileges {
@@ -723,6 +824,9 @@ func (n *Node) runTableRestore(ctx context.Context, opID string, opts RestoreOpt
 	}); err != nil {
 		return nil, err
 	}
+	if plan.sealed, err = n.planSealedRestore(ctx, chain, plan); err != nil {
+		return nil, err
+	}
 
 	// Every data file the restore will read, read to its end before
 	// anything is written: held to its table's span and its order, and
@@ -752,7 +856,7 @@ func (n *Node) runTableRestore(ctx context.Context, opID string, opts RestoreOpt
 	key := activeRestoreKey{n, opID}
 	activeRestores.Store(key, struct{}{})
 	defer activeRestores.Delete(key)
-	progress := restoreProgress{OpID: opID, NodeID: n.ident.NodeID}
+	progress := restoreProgress{OpID: opID, NodeID: n.ident.NodeID, SealIDs: plan.sealed.tenantSealIDs()}
 	if err := n.db.RunTxn(ctx, "restore-table-begin", func(ctx context.Context, txn *kvclient.Txn) error {
 		top, err := txn.Increment(ctx, keys.DescIDGenKey(), int64(len(plan.tables)))
 		if err != nil {
@@ -953,6 +1057,13 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 		return nil, err
 	}
 	var notes []string
+	// The tenant keys of per-tenant tables, possibly many, come back in
+	// batches of their own before the publish (restore_sealed.go); the
+	// progress record names their seal ids, so the tenant key janitor
+	// leaves them alone until the restore publishes or is reclaimed.
+	if err := n.reinstateTenantKeys(ctx, plan.sealed); err != nil {
+		return nil, err
+	}
 	err = n.db.RunTxn(ctx, "restore-table-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		notes = notes[:0]
 		rec, err := readRestoreProgress(ctx, txn, opID)
@@ -1023,10 +1134,40 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 				tg.dbIDs[p.intoDB] = nd.ID
 			}
 		}
+		// The enum types the restored columns need and the target lacks,
+		// made from the backup: its labels are the columns' own copies,
+		// which are what the rows were written against; the owner is the
+		// backup's when that role exists here.
+		for _, p := range plan.tables {
+			for _, c := range p.srcDesc.Columns {
+				tk := restoreTypeKey{p.intoDB, c.EnumName}
+				if c.EnumType == 0 || tg.types[tk] != 0 {
+					continue
+				}
+				td := &catalog.TypeDescriptor{Name: c.EnumName, DatabaseID: tg.dbIDs[p.intoDB], Labels: append([]string(nil), c.EnumLabels...)}
+				if src, ok := plan.types[c.EnumType]; ok && src.Owner != "" && src.Owner != catalog.RootRole {
+					if rd, err := catalog.LookupRole(ctx, txn, src.Owner); err != nil {
+						return err
+					} else if rd != nil {
+						td.Owner = src.Owner
+					}
+				}
+				if err := catalog.CreateType(ctx, txn, td); err != nil {
+					return err
+				}
+				tg.types[tk] = td.ID
+				notes = append(notes, fmt.Sprintf("enum type %s.%s created for %s", p.intoDB, c.EnumName, p.into()))
+			}
+		}
 		ids := map[uint64]uint64{}
 		for _, p := range plan.tables {
 			ids[p.src.ID] = p.newID
 		}
+		knotes, err := n.reinstateSealedKeys(ctx, txn, plan.sealed)
+		if err != nil {
+			return err
+		}
+		notes = append(notes, knotes...)
 		roles := func(name string) bool { return tg.roles[name] }
 		for _, p := range plan.tables {
 			dbID := tg.dbIDs[p.intoDB]
@@ -1059,6 +1200,11 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 			}
 			d, dnotes := restoredDescriptor(p, dbID, ids, seqIDs, seqNames, roles)
 			notes = append(notes, dnotes...)
+			for i := range d.Columns {
+				if c := &d.Columns[i]; c.EnumType != 0 {
+					c.EnumType = tg.types[restoreTypeKey{p.intoDB, c.EnumName}]
+				}
+			}
 			raw, err := json.Marshal(d)
 			if err != nil {
 				return err
@@ -1068,6 +1214,13 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 			}
 			if err := txn.Put(ctx, keys.TableNamespaceKey(dbID, d.Name), []byte(fmt.Sprintf("%d", d.ID))); err != nil {
 				return err
+			}
+			if d.Sealed() && d.EncryptionKey.Sealing {
+				// Backed up while its rows were being sealed: the
+				// restored copy holds plain rows too, and needs the job.
+				if err := putSealJobFor(ctx, txn, d); err != nil {
+					return err
+				}
 			}
 		}
 		return txn.Delete(ctx, keys.RestoreProgressKey(opID))
@@ -1123,12 +1276,18 @@ func (n *Node) reclaimRestore(ctx context.Context, opID string) bool {
 }
 
 // wipeSpan deletes every key in [start, end) in transactions of
-// restoreChunk deletes.
+// restoreChunk deletes. Each transaction resumes after the last key the
+// one before it deleted, so a large span is walked once rather than
+// rescanned past its own tombstones from the start every time. The
+// callers' spans take no new writes (no descriptor names them), so
+// nothing appears behind the cursor.
 func (n *Node) wipeSpan(ctx context.Context, start, end keys.Key) error {
+	cur := start.Clone()
 	for {
 		var found int
-		err := n.db.RunTxn(ctx, "restore-table-wipe", func(ctx context.Context, txn *kvclient.Txn) error {
-			kvs, err := txn.Scan(ctx, start, end, restoreChunk)
+		var last keys.Key
+		err := n.db.RunTxn(ctx, "wipe-span", func(ctx context.Context, txn *kvclient.Txn) error {
+			kvs, err := txn.Scan(ctx, cur, end, restoreChunk)
 			if err != nil {
 				return err
 			}
@@ -1140,11 +1299,13 @@ func (n *Node) wipeSpan(ctx context.Context, start, end keys.Key) error {
 			if wb.Len() == 0 {
 				return nil
 			}
+			last = keys.Key(kvs[len(kvs)-1].Key).Clone()
 			return txn.RunBatch(ctx, &wb)
 		})
-		if err != nil || found == 0 {
+		if err != nil || found < restoreChunk {
 			return err
 		}
+		cur = last.Next()
 	}
 }
 
