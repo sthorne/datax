@@ -11,10 +11,13 @@ import (
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
 type AdminRequest struct {
 	// Op: "split", "ranges", "nodes", "rebalance", "transfer-lease",
-	// "decommission", "merge", "unsplit".
+	// "decommission", "merge", "unsplit", "purge".
 	Op string `json:"op"`
-	// Key for split and unsplit (raw key bytes).
-	Key []byte `json:"key,omitempty"`
+	// Key for split and unsplit (raw key bytes). Key and EndKey are the
+	// span of a purge; Table names it instead, as [database.]table.
+	Key    []byte `json:"key,omitempty"`
+	EndKey []byte `json:"end_key,omitempty"`
+	Table  string `json:"table,omitempty"`
 	// RangeID and target/source nodes for rebalance.
 	RangeID  base.RangeID `json:"range_id,omitempty"`
 	ToNode   base.NodeID  `json:"to_node,omitempty"`
@@ -166,6 +169,12 @@ type AdminResponse struct {
 	ClusterVersion int `json:"cluster_version,omitempty"`
 	// Reencryption answers reencrypt / reencrypt-status.
 	Reencryption *ReencryptionStatus `json:"reencryption,omitempty"`
+	// Purge answers purge: the per-replica report. PurgeRange and
+	// PurgeReplica answer the steps the purging node asks of the others
+	// (purge-range of a range's leader, purge-replica of each replica).
+	Purge        *kvpb.PurgeReport        `json:"purge,omitempty"`
+	PurgeRange   *PurgeRangeAnswer        `json:"purge_range,omitempty"`
+	PurgeReplica *kvpb.PurgeReplicaReport `json:"purge_replica,omitempty"`
 	// Status answers node-status: the serving node's /status document
 	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
 	// this package does not depend on the server package's types.
@@ -194,4 +203,14 @@ type BackupSummary struct {
 	Sealed bool                 `json:"sealed,omitempty"`
 	Tables []BackupTableSummary `json:"tables,omitempty"`
 	Users  int                  `json:"users,omitempty"`
+}
+
+// PurgeRangeAnswer is a leader's answer to purge-range: the range as it
+// stands, the threshold it collected at, how many versions that deleted,
+// and the applied index a replica must reach to hold the collection.
+type PurgeRangeAnswer struct {
+	Desc           kvpb.RangeDescriptor `json:"desc"`
+	ThresholdNanos int64                `json:"threshold_nanos"`
+	Removed        int64                `json:"removed"`
+	AppliedIndex   uint64               `json:"applied_index"`
 }

@@ -776,15 +776,51 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 		return res, nil
 	}
-	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.ResetOptions != nil || at.Purge) {
+		// RESET is one descriptor write and PURGE a range operation;
+		// both run outside any transaction, like SET (...) and SPLIT AT.
 		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+		}
+		if at.IfExists && !s.tableExists(ctx, at.Table) {
+			return &Result{Tag: "ALTER TABLE"}, nil
 		}
 		if _, bare := catalog.SplitTableName(at.Table); catalog.IsSealedSystemTable(bare) && !s.system {
 			return s.execSetAuditRetention(ctx, at)
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
+		}
+		if at.Purge {
+			return s.execPurge(ctx, at)
+		}
+		return s.execResetOptions(ctx, at)
+	}
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (...) cannot run inside a transaction block")
+		}
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
+		}
+		// The options any table takes are set first, in one descriptor
+		// write; what is left is the time-series pair below.
+		general, rest := map[string]string{}, map[string]string{}
+		for k, v := range at.SetOptions {
+			if generalTableOption(k) {
+				general[k] = v
+			} else {
+				rest[k] = v
+			}
+		}
+		if len(general) > 0 {
+			if serr := s.execSetGeneralOptions(ctx, at.Table, general); serr != nil {
+				return nil, serr
+			}
+			if len(rest) == 0 {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
+			at = &parser.AlterTable{Table: at.Table, SetOptions: rest}
 		}
 		if _, ok := at.SetOptions["retention"]; ok {
 			res, rerr := s.execSetRetention(ctx, at)

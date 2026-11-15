@@ -444,7 +444,14 @@ as a tiny replicated command, which buys two properties for free:
   bookkeeping, no side channel.
 - **It survives leader failure**: the closed timestamp is replicated state
   (persisted in the replica state), so a follower keeps serving reads
-  below T with the leader gone or an election in flight.
+  below T with the leader gone or an election in flight. It does not
+  survive the follower's own restart in that sense: a replica serves no
+  stale read until its closed timestamp has passed the time its process
+  started, because what it missed while down may have been a purge
+  (docs/transactions.md, "Purge"), and its persisted timestamp would
+  let it answer from rows the cluster has since destroyed. On a healthy
+  cluster that is a few seconds after a restart; a restarted follower
+  whose range has no leader serves nothing until it has one.
 
 Publication is made safe by the same machinery ordinary reads use: the
 leader takes a whole-range **shared latch** (draining in-flight writes,
@@ -549,7 +556,9 @@ truncIdx = leader's applied index − floor (64)
 ```
 
 clamped to the index of any in-flight snapshot stream, and proposes a
-truncation when at least 256 entries would be reclaimed. Each replica
+truncation when at least 256 entries would be reclaimed. (A purge
+proposes one with no floor and no minimum, since the entries it wants
+gone are the ones the floor keeps; docs/transactions.md, "Purge".) Each replica
 deletes its own (unreplicated) log prefix when the command applies, at
 which point it has durably applied everything at or below the index;
 `TruncatedIndex/Term` persist atomically with the applied index, so

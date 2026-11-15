@@ -112,6 +112,11 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 		if !ok || col.Hidden {
 			return newErrf(CodeUndefinedColumn, "column %q does not exist", st.Column)
 		}
+		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
+			// A rewrite gives the column a new ID, which the expiry
+			// would go on naming the old one of.
+			return newErrf(CodeDependentObjectsExist, "cannot change the type of column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", st.Column)
+		}
 		target := catalog.Column{
 			Type: st.Type, Precision: st.Precision, Scale: st.Scale,
 			Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,

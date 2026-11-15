@@ -20,6 +20,9 @@ const goldenTableDescriptor = `{"id":42,"name":"orders","columns":[{"id":1,"name
 // field must keep it valid (PrimaryIndex 0 = index 1, etc.).
 const goldenTableDescriptorV1 = `{"id":7,"name":"t","columns":[{"id":1,"name":"a","type":1,"not_null":true}],"primary_key":[1]}`
 
+// A descriptor carrying the v21 table options: a GC window and a row TTL.
+const goldenTableDescriptorV21 = `{"id":9,"name":"q","columns":[{"id":1,"name":"a","type":1,"not_null":true},{"id":2,"name":"at","type":6}],"primary_key":[1],"gc_ttl_seconds":600,"row_ttl":{"column_id":2,"after_seconds":86400}}`
+
 func TestGoldenTableDescriptor(t *testing.T) {
 	var d TableDescriptor
 	if err := json.Unmarshal([]byte(goldenTableDescriptor), &d); err != nil {
@@ -50,6 +53,25 @@ func TestGoldenTableDescriptor(t *testing.T) {
 	}
 	if string(raw) != goldenTableDescriptor {
 		t.Fatalf("encoding changed:\n got %s\nwant %s", raw, goldenTableDescriptor)
+	}
+
+	// The v21 fields are additive: absent from the golden above, and
+	// encoded as below when set.
+	if d.GCTTLSeconds != 0 || d.RowTTL != nil {
+		t.Fatalf("v21 fields set by an older descriptor: %+v", d)
+	}
+	var v21 TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorV21), &v21); err != nil {
+		t.Fatal(err)
+	}
+	if v21.GCTTLSeconds != 600 || v21.RowTTL == nil || v21.RowTTL.ColumnID != 2 || v21.RowTTL.AfterSeconds != 86400 {
+		t.Fatalf("decoded %+v", v21)
+	}
+	if c := v21.Clone(); c.RowTTL == v21.RowTTL || *c.RowTTL != *v21.RowTTL {
+		t.Fatalf("Clone shares or loses the row TTL: %+v", c.RowTTL)
+	}
+	if raw, err := json.Marshal(v21); err != nil || string(raw) != goldenTableDescriptorV21 {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenTableDescriptorV21, err)
 	}
 
 	var old TableDescriptor

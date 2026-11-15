@@ -140,7 +140,14 @@ trigger to the raft log, and a v19 replica applying either would end up
 with a different descriptor than its v20 peers — so until v20 is
 finalized no descriptor is written with the bit, manual splits are
 merged back like automatic ones, and unsplit is refused (see
-[replication-and-placement.md](replication-and-placement.md)).
+[replication-and-placement.md](replication-and-placement.md)). **v21**
+gates descriptor fields only — a table's GC window and its row expiry
+(`TableDescriptor.GCTTLSeconds`, `RowTTL`) — and the purge admin ops: a
+v20 node would act on such a table by the node's settings, and as a
+gateway would write the descriptor back without the fields, so the DDL
+and the purge are refused until finalize
+([transactions.md](transactions.md), "A window per table" and "Purge";
+[sql.md](sql.md), "Table options").
 
 ## Modules
 

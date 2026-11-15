@@ -9,7 +9,12 @@ transactions — all over the standard PostgreSQL wire protocol.
 ```
 CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
+    [WITH (gc_ttl = '10m')]                                         -- the table's own GC window (v21)
+    [WITH (ttl_expiration = col | ttl_column = col, ttl = '7 days')] -- row expiry (v21); see Table options below
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
+ALTER TABLE [IF EXISTS] t SET (gc_ttl = ... | ttl_expiration = col | ttl_column = col | ttl = '...' | retention = '...')
+ALTER TABLE [IF EXISTS] t RESET (gc_ttl | ttl | ttl_column | ttl_expiration | retention [, ...])
+ALTER TABLE [IF EXISTS] t PURGE         -- collect the table's garbage now, compact it away, report per replica
 ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN] a TO b | RENAME CONSTRAINT a TO b
     | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
@@ -151,6 +156,54 @@ SHOW STATS FOR t
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
+
+### Table options: GC window, row expiry, purge
+
+Three statements about how long a table's data lasts live in the table
+descriptor and the node, not in the executor (`pkg/sql/tableopts.go`;
+cluster version v21; issues #295 and #298).
+
+**`gc_ttl`** (`TableDescriptor.GCTTLSeconds`) is the table's own GC
+window. The retention provider that already resolves a range to a
+time-series table's retention (`pkg/server/retention.go`) resolves it to
+this too: a range wholly inside the table collects at the table's
+window, shorter or longer than the node's; a range the table shares
+with other data keeps the longest window of its tenants. The statement
+that sets it splits the table's two edges, and the merge queue leaves
+ranges with different windows apart, so the table's ranges are its own.
+Nothing else changes: collection is the same replicated command, the
+newest version of a row stays, and reads at or below the threshold are
+refused. A retention is itself a window, so a table has one or the
+other.
+
+**Row expiry** (`TableDescriptor.RowTTL`: a timestamp column and a
+lifetime counted from it, zero when the column names the expiry time
+itself) is a background job, `pkg/server/rowttl.go`, on the node leading
+range 1. It does not reuse the time-series expiry beneath SQL
+(`RowExpiry` in `kvserver.StoreConfig`), and cannot: that rule judges a
+key by a timestamp decoded from the key, which a secondary-index entry
+does not carry and a foreign key knows nothing of. The job finds expired
+rows with `SELECT pk, col FROM t WHERE col <= $cutoff ORDER BY col LIMIT
+$n OFFSET $skipped` — an ordered, limit-pushed scan of the index on the
+column, which the DDL creates if no index leads with it (online, when
+the table has rows) — and deletes each batch in one transaction of
+point `DELETE`s that repeat the `col <= $cutoff` test, so a row whose
+expiry was moved while the batch was in flight is left. A batch a
+foreign key refuses (`23503`) is retried row by row; the rows still
+refused are counted and stepped over (the `OFFSET`) for the rest of the
+pass. The cutoff is fixed for a pass. An expired row is visible until
+the job deletes it: there is no filter on reads.
+
+**`PURGE`** names the table's span to the node's purge
+(`kvclient.DB.Purge` → `server.Node.PurgeSpan`; `docs/transactions.md`,
+"Purge") and renders the per-replica report as rows: `range_id`,
+`node_id`, `live_keys`, `garbage_versions`, `tombstones`, `intents`,
+`compacted`, `status`. The tag is `PURGE <versions removed>` when every
+replica answered clean and `PURGE INCOMPLETE` otherwise — the statement
+succeeds either way, because the rows are the result.
+
+`SET`, `RESET` and `PURGE` run outside a transaction block (`25001`
+inside one) and need table ownership.
 
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,

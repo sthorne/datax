@@ -1239,7 +1239,7 @@ func (r *Replica) setApplied(idx uint64) {
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	// A stale read at or below the closed timestamp needs no leader and
 	// no wake: any replica serves it locally, a sleeping one included.
-	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) {
+	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) && r.heardSinceStart() {
 		return r.executeStaleRead(ba)
 	}
 	// Any other request wakes a sleeping replica: a leader resumes

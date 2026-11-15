@@ -122,3 +122,22 @@ func TestGoldenTransaction(t *testing.T) {
 		t.Fatalf("encoding changed:\n got %s\nwant %s", raw, goldenTransaction)
 	}
 }
+
+// A purge report travels on the admin channel and is written to the audit
+// log, where it is read long after the binary that wrote it.
+const goldenPurgeReport = `{"start_key":"BAM=","end_key":"BAQ=","purge_ts_nanos":17,"ranges":1,"versions_removed":5,"replicas":[{"range_id":2,"node_id":3,"live_keys":4,"garbage_versions":0,"tombstones":0,"intents":0,"compacted":true},{"range_id":2,"node_id":1,"error":"down","live_keys":0,"garbage_versions":0,"tombstones":0,"intents":0,"compacted":false}],"complete":false,"incomplete":["r2 on n1 is unconfirmed: down"],"not_covered":["backups"]}`
+
+func TestGoldenPurgeReport(t *testing.T) {
+	var r PurgeReport
+	if err := json.Unmarshal([]byte(goldenPurgeReport), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.PurgeTSNanos != 17 || r.VersionsRemoved != 5 || len(r.Replicas) != 2 || r.Replicas[0].NodeID != 3 ||
+		r.Replicas[0].LiveKeys != 4 || !r.Replicas[0].Compacted || r.Replicas[1].Error != "down" || r.Complete || len(r.Incomplete) != 1 {
+		t.Fatalf("decoded %+v", r)
+	}
+	raw, err := json.Marshal(r)
+	if err != nil || string(raw) != goldenPurgeReport {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenPurgeReport, err)
+	}
+}

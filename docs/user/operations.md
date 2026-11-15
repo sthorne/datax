@@ -488,6 +488,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
+| `datax_row_ttl_lag_seconds` | far above the 30s pass interval for long | expired rows are waiting to be deleted: the row expiry job is behind or stopped (see [Row expiry](#row-expiry)); `datax_row_ttl_rows_blocked_total` rising says foreign keys are holding rows |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 | `datax_store_disk_bytes{kind="free"}` | < 15% of `kind="total"` | the store's disk is filling; Pebble needs headroom to compact (a full disk is a hard stall) |
@@ -600,6 +601,7 @@ datax debug status --url http://127.0.0.1:8080/status
 datax debug split --table 100          # manual split (also: --key <hex>); sticky
 datax debug unsplit --table 100        # stop holding it (also: --key <hex>)
 datax debug merge --range 7            # manual merge of r7 with its right neighbor
+datax debug purge --table-name app.documents   # collect and compact deleted data now (also: --table <id>, --key/--end-key <hex>)
 datax debug transfer-lease --range 5 --node 2
 datax debug rebalance --range 5 [--from 1]
 ```
@@ -624,6 +626,108 @@ the range it is given whether or not its neighbor is sticky. Dropping or
 truncating a table releases its manual boundaries, so the emptied ranges
 merge away. All of this needs cluster version v20; before finalize a
 manual split is an ordinary one.
+
+### Purging deleted data
+
+`datax debug purge` is `ALTER TABLE ... PURGE`
+([SQL guide](sql.md#gc-window-and-purge)) for an operator, and for a key
+range that is not a whole table:
+
+```sh
+datax debug purge --table-name app.documents
+# purged /table/documents to /table/8 at 2026-11-15T09:12:44.31Z: 31 version(s) removed over 1 range(s)
+#   r12 n1  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+#   r12 n2  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+#   r12 n3  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+# not covered by a purge:
+#   - backups taken before the purge still hold the data; destroy or rewrite them separately
+#   - ...
+# complete: every replica answered and holds no superseded version, tombstone or intent in the span
+```
+
+What it does, in order: splits at the two ends of the span, so the
+ranges it touches hold nothing else; on each range's leader, garbage
+collects at a threshold of now and truncates the raft log; on every
+replica, waits for that to apply, compacts the span's sstables and the
+range's log, and counts the span's keys below the MVCC layer; on every
+node involved, retires the write-ahead log files written before the
+purge. The command exits non-zero unless the purge is **complete** —
+every replica answered, and none holds a superseded version, a
+tombstone or an intent in the span — so a script cannot mistake "ran"
+for "gone". The whole report goes to the audit log as a `purge` event,
+and the purge shows as an operation on the operations view.
+
+Things to know before relying on it:
+
+- **It cuts off older readers of the span.** The span's GC threshold
+  becomes the purge time: `AS OF SYSTEM TIME` before it, follower reads
+  before it, a transaction that began before it, and an incremental
+  backup whose base is older all fail on that span, with an error. Take
+  a full backup after a purge if you run incrementals.
+- **A node that is down** makes the purge incomplete, by name. When it
+  restarts it applies the collection from the log (or is given a
+  snapshot without the data) and serves no follower read until it has
+  heard from the range's leader again, so it never answers from its old
+  copy; run the purge again to compact it and get its count. A node
+  that is partitioned but still running is not covered by that rule
+  until it reconnects.
+- **Backups are untouched.** A backup taken before the purge contains
+  the data and restores it. Deleting those is a separate act.
+- **The span must be table data**; the cluster's own key space is
+  refused. A `--key`/`--end-key` purge splits at exactly those keys.
+- **Cost:** a flush and a compaction of the span on every replica, and
+  a few small flushes of each node's raft engine. Seconds for a small
+  table; for a large one, proportional to its size. `--connect-timeout`
+  aside, the command waits up to 30 minutes.
+- **Encrypted stores** purge the same way: the span's files are
+  rewritten and the old ones deleted whichever data key they were
+  written under.
+- A freed disk block is the file system's: the purge removes the data
+  from every file the database owns, not from the device beneath.
+
+`datax_purge_versions_removed_total` counts what purges on a node
+removed.
+
+**A GC window per table.** Garbage collection normally waits out the
+node's window (25h). `ALTER TABLE t SET (gc_ttl = '10m')` gives one
+table its own, shorter or longer; the housekeeping pass picks it up
+within its descriptor cache (~30s). The statement splits the table's
+edges so the window governs ranges that hold only that table, and those
+ranges are not merged into neighbours with a different window. A range
+that straddles the table and something else keeps the longest window of
+what it holds; when housekeeping finds one (a restored table, a split
+that failed) it asks for the edge splits again, at most once a minute
+per table, so the window takes hold a pass or two later. `debug ranges`
+shows whether the table's ranges start and end at its edges.
+
+### Row expiry
+
+Tables with a row TTL ([SQL guide](sql.md#row-expiry-ttl)) are served by
+one job for the cluster, on the node leading range 1. Every 30 seconds
+it visits each such table, reads expired rows oldest-first through the
+index on the expiry column, and deletes them 100 to a transaction with
+a 20ms pause between transactions — at most about 5,000 rows a second
+per table, and no more than one interval spent on a table before the
+next gets its turn. A backlog larger than that (a TTL just added to a
+big table) drains over several passes; steady expiry keeps up inside
+one.
+
+- **Lag** — how long after its expiry time a row is actually deleted —
+  is therefore about the interval under steady writes.
+  `datax_row_ttl_lag_seconds` is the most overdue row the last pass
+  deleted; alert on it staying far above 30.
+- `datax_row_ttl_rows_deleted_total` is the work done.
+  `datax_row_ttl_rows_blocked_total` counts expired rows a restricting
+  foreign key kept, once per pass they were found in: steadily rising
+  means rows that cannot expire until what references them goes.
+- Each pass that deleted or was blocked on something is a `row-ttl`
+  operation on the operations view, on the node that ran it, with the
+  table and the counts; a pass that failed says why.
+- The deletes are normal transactions: they appear in SQL statistics,
+  can conflict with your own writes to those rows (the job retries),
+  and leave old versions for garbage collection like any delete.
+- If range 1's leadership moves mid-pass, two nodes may delete for a
+  moment; the second finds the rows gone.
 
 Keys print as paths everywhere — logs, `datax debug`, the dashboard and
 its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range
@@ -845,6 +949,14 @@ Rules of the road:
   may merge the ranges back; boundaries made before finalize are not
   marked afterwards either — run the `SPLIT AT` again (it is idempotent)
   to mark them.
+- **v21 adds per-table GC windows, row expiry and purge.** Until it is
+  finalized the `gc_ttl` and `ttl` table options, `ALTER TABLE ...
+  PURGE` and `datax debug purge` are refused (`0A000`): a node on the
+  old binary would collect a table at the node's window rather than the
+  table's, expire nothing, and drop the options from the next
+  descriptor it rewrote. v21 binaries also change one thing without the
+  finalize: a restarted node serves no follower reads from a range
+  until it has heard from that range's leader again (a few seconds).
 
 ## Decommissioning a node
 

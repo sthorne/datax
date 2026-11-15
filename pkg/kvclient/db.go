@@ -112,6 +112,9 @@ type DB struct {
 	// them. Nil (tests, tools) reads as the binary's own version: a
 	// process without version plumbing never talks to older binaries.
 	versionGate atomic.Pointer[func() version.Version]
+	// purger runs a purge of a key span on behalf of SQL (ALTER TABLE ...
+	// PURGE); the node installs it. Nil on a store-less client.
+	purger atomic.Pointer[func(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error)]
 	// frozenWait bounds the wait on a range frozen for a merge
 	// (defaultFrozenRangeWait; tests shorten it).
 	frozenWait time.Duration
@@ -132,6 +135,22 @@ func (db *DB) SetNodeLister(f func() []base.NodeID) { db.nodeLister = f }
 // SetVersionGate wires the finalized-cluster-version source (the node's
 // mirror) consulted before sending version-gated request shapes.
 func (db *DB) SetVersionGate(f func() version.Version) { db.versionGate.Store(&f) }
+
+// SetPurger wires the node's purge (server.Node.PurgeSpan) so a SQL
+// session can ask for one.
+func (db *DB) SetPurger(f func(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error)) {
+	db.purger.Store(&f)
+}
+
+// Purge forces garbage collection and compaction over [start, end) and
+// returns the per-replica report (issue #295).
+func (db *DB) Purge(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error) {
+	f := db.purger.Load()
+	if f == nil {
+		return nil, fmt.Errorf("purge is not available on this client: it runs on a node")
+	}
+	return (*f)(ctx, start, end)
+}
 
 // ReverseScansOK reports whether reverse scans may be SENT: they were
 // introduced under cluster version v3, and a v2 node silently runs a

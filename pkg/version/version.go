@@ -197,6 +197,18 @@ const (
 	// is exactly what the table exists to rule out — so nothing creates
 	// it and audit records stay in the log alone before finalize
 	// (rule 4).
+	//
+	// V21 also introduces three table options and a purge (issues #295, #298):
+	// a per-table GC window (TableDescriptor.GCTTLSeconds), row expiry
+	// (TableDescriptor.RowTTL) and the purge admin ops. A v20 node reads
+	// the descriptor without the fields, so as a range's leader it would
+	// collect a table's history at the cluster's window rather than the
+	// table's, as the range-1 leader it would expire nothing, and as a
+	// gateway it would drop both fields from the next descriptor it
+	// rewrote; it answers a purge step with "unknown admin op". The DDL
+	// that writes either field and the purge are therefore refused until
+	// finalize (rule 4). The fields are omitempty, so a descriptor
+	// written before v21 reads the same at either version.
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

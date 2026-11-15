@@ -256,6 +256,18 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
 	}
+	general := false
+	for name := range t.Options {
+		general = general || generalTableOption(name)
+	}
+	if general {
+		if err := s.requireV21("the gc_ttl and row expiry options"); err != nil {
+			return nil, err
+		}
+		if _, err := applyGeneralOptions(desc, t.Options, false); err != nil {
+			return nil, err
+		}
+	}
 	if desc.ShardBuckets > 0 {
 		// The hidden bucket column leads the primary key; the executor
 		// fills it from the logical PK on every insert.
@@ -334,12 +346,21 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			return nil, err
 		}
 	}
-	if owned || constrained || len(likeIndexes) > 0 {
+	ttlIndexed := false
+	if desc.RowTTL != nil {
+		before := len(desc.Indexes)
+		addTTLIndex(desc)
+		ttlIndexed = len(desc.Indexes) != before
+	}
+	if owned || constrained || len(likeIndexes) > 0 || ttlIndexed {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}
 	}
 	s.presplitTimeseries(ctx, desc)
+	if desc.GCTTLSeconds > 0 {
+		s.splitAtTableEdges(ctx, desc)
+	}
 	s.presplitPlacement(ctx, txn, dbName, desc)
 	return &Result{Tag: "CREATE TABLE"}, nil
 }
@@ -380,20 +401,24 @@ func (s *Session) validateDefaultExpr(ctx context.Context, txn *kvclient.Txn, co
 // applyTableOptions validates the WITH (...) options and stamps the
 // timeseries fields onto desc (before the hidden shard column is added).
 func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string, pkNames []string) error {
-	if len(options) == 0 {
-		return nil
-	}
+	timeseries := false
 	for name := range options {
 		switch name {
 		case "timeseries", "retention", "shards":
+			timeseries = true
 		default:
-			return newErrf(CodeSyntaxError, "unknown table option %q", name)
+			if !generalTableOption(name) {
+				return newErrf(CodeSyntaxError, "unknown table option %q", name)
+			}
 		}
+	}
+	if !timeseries {
+		return nil // only options any table takes (applyGeneralOptions)
 	}
 	switch options["timeseries"] {
 	case "true":
 	case "", "false":
-		return newErrf(CodeSyntaxError, "table options require timeseries=true")
+		return newErrf(CodeSyntaxError, "the retention and shards options require timeseries=true")
 	default:
 		return newErrf(CodeSyntaxError, "timeseries must be true or false")
 	}
@@ -482,6 +507,9 @@ func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*
 		}
 		if !shared.Timeseries {
 			return newErrf(CodeFeatureNotSupported, "retention applies to timeseries tables (created WITH (timeseries = true))")
+		}
+		if shared.GCTTLSeconds > 0 {
+			return newErrf(CodeFeatureNotSupported, "table %q has a gc_ttl; a retention is itself the table's GC window (ALTER TABLE ... RESET (gc_ttl) first)", shared.Name)
 		}
 		desc := shared.Clone()
 		desc.RetentionSeconds = secs
@@ -2618,6 +2646,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	if _, bare := catalog.SplitTableName(t.Table); catalog.IsSystemTable(bare) && !s.system && t.SetOptions == nil {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
 	}
+	if t.ResetOptions != nil || t.Purge {
+		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -2731,6 +2762,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		if desc.IsPKCol(col.ID) {
 			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
+		}
+		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
+			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", t.DropCol)
 		}
 		if err := s.refuseIfViewed(ctx, txn, desc, "drop column "+t.DropCol); err != nil {
 			return nil, err

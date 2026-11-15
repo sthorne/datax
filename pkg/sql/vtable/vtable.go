@@ -675,15 +675,28 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		b.WriteString(text)
 	}
 	b.WriteString("\n)")
+	var opts []string
 	if d.Timeseries {
-		fmt.Fprintf(&b, " WITH (timeseries = true")
+		opts = append(opts, "timeseries = true")
 		if d.RetentionSeconds > 0 {
-			fmt.Fprintf(&b, ", retention = '%ds'", d.RetentionSeconds)
+			opts = append(opts, fmt.Sprintf("retention = '%ds'", d.RetentionSeconds))
 		}
 		if d.ShardBuckets > 0 {
-			fmt.Fprintf(&b, ", shards = %d", d.ShardBuckets)
+			opts = append(opts, fmt.Sprintf("shards = %d", d.ShardBuckets))
 		}
-		b.WriteString(")")
+	}
+	if d.GCTTLSeconds > 0 {
+		opts = append(opts, fmt.Sprintf("gc_ttl = '%ds'", d.GCTTLSeconds))
+	}
+	if d.RowTTL != nil {
+		if d.RowTTL.AfterSeconds > 0 {
+			opts = append(opts, fmt.Sprintf("ttl_column = %s", columnName(d, d.RowTTL.ColumnID)), fmt.Sprintf("ttl = '%ds'", d.RowTTL.AfterSeconds))
+		} else {
+			opts = append(opts, fmt.Sprintf("ttl_expiration = %s", columnName(d, d.RowTTL.ColumnID)))
+		}
+	}
+	if len(opts) > 0 {
+		fmt.Fprintf(&b, " WITH (%s)", strings.Join(opts, ", "))
 	}
 	return b.String()
 }

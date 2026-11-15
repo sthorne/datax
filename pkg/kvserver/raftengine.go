@@ -163,6 +163,14 @@ func (r *Replica) notePendingTruncate(index, term uint64) {
 	}
 }
 
+// truncatePending reports whether an applied TruncateLog still waits to
+// delete its entries from the raft engine.
+func (r *Replica) truncatePending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.pendingTrunc.Index != 0
+}
+
 // defaultTruncationFlushAfter is how long a pending truncation waits for
 // a natural state-engine flush before the housekeeping tick forces one.
 const defaultTruncationFlushAfter = 30 * time.Second

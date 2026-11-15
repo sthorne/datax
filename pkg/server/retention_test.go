@@ -15,12 +15,14 @@ import (
 // partial overlap takes max(default, retentions) without expiry; no
 // overlap defers to the default.
 func TestRetentionOverrideMatrix(t *testing.T) {
-	shortLo, shortHi := keys.TableDataSpan(10) // 1h retention
-	longLo, longHi := keys.TableDataSpan(11)   // 100h retention
+	shortLo, shortHi := keys.TableDataSpan(10)   // 1h retention
+	longLo, longHi := keys.TableDataSpan(11)     // 100h retention
+	windowLo, windowHi := keys.TableDataSpan(13) // 1m GC window (gc_ttl), no retention
 	p := &retentionProvider{defaultTTL: 24 * time.Hour}
 	p.spans = []retentionSpan{
-		{start: shortLo, end: shortHi, ttl: time.Hour},
-		{start: longLo, end: longHi, ttl: 100 * time.Hour},
+		{start: shortLo, end: shortHi, ttl: time.Hour, expire: true},
+		{start: longLo, end: longHi, ttl: 100 * time.Hour, expire: true},
+		{start: windowLo, end: windowHi, ttl: time.Minute}, // gc_ttl
 	}
 	p.fetchedAt = time.Now() // pin the cache; no node/db behind this test
 
@@ -44,6 +46,18 @@ func TestRetentionOverrideMatrix(t *testing.T) {
 	// over the default (keep longer).
 	if ttl, expire, ok := p.override(mixedStart, longHi); !ok || expire || ttl != 100*time.Hour {
 		t.Fatalf("mixed long: %v %v %v", ttl, expire, ok)
+	}
+
+	// Fully inside a table with a GC window of its own: that window,
+	// shorter than the default, and no expiry — the newest version of a
+	// row stays.
+	if ttl, expire, ok := p.override(windowLo, windowHi); !ok || expire || ttl != time.Minute {
+		t.Fatalf("gc_ttl containment: %v %v %v", ttl, expire, ok)
+	}
+	// A range that table shares with a neighbour keeps the default: a
+	// short window never reaches another table's history.
+	if ttl, expire, ok := p.override(keys.TableDataPrefix(12), windowHi); !ok || expire || ttl != 24*time.Hour {
+		t.Fatalf("gc_ttl on a mixed range: %v %v %v", ttl, expire, ok)
 	}
 
 	// No overlap: no override.
@@ -117,5 +131,18 @@ func TestRowExpiryPredicate(t *testing.T) {
 	// No overlap: no predicate.
 	if _, ok := p.rowExpiry(keys.Key("\x03"), keys.Key("\x03z")); ok {
 		t.Fatal("predicate offered for a non-overlapping range")
+	}
+}
+
+// TestSQLIdent: the row expiry job writes table and column names into SQL
+// text; a name that is not a plain lower-case word is quoted.
+func TestSQLIdent(t *testing.T) {
+	for in, want := range map[string]string{
+		"t": "t", "a_b2": "a_b2", "_x": "_x",
+		"2x": `"2x"`, "My Table": `"My Table"`, `we"ird`: `"we""ird"`, "": `""`,
+	} {
+		if got := sqlIdent(in); got != want {
+			t.Errorf("sqlIdent(%q) = %s, want %s", in, got, want)
+		}
 	}
 }

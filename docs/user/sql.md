@@ -997,7 +997,8 @@ so multi-range results stay consistent. Watch
 `datax_follower_read_fallbacks_total` (sent to a leader) to see whether
 your bound is doing its job.
 
-All forms: bounded by the GC window (25h) on the old side; not allowed
+All forms: bounded by the GC window on the old side (25h, or the
+table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); not allowed
 inside `BEGIN`; a freshly written row may be invisible until the closed
 timestamp passes its write (~the lag) — that is the staleness you signed
 up for.
@@ -1039,7 +1040,8 @@ CREATE TABLE metrics (
   range — inserts scale across nodes instead of hammering one tail.
 - `retention` (`30d`, `12h`, or interval text such as `'7 days'`; a
   month counts 30 days): rows older than this are garbage
-  collected automatically.
+  collected automatically. (Any other table expires rows with
+  [`ttl`](#row-expiry-ttl) instead.)
 - Queries are unchanged — `WHERE series = '...' AND at >= ...` fans out
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:
   measured ~2× point-read p50 at `shards=8`, in exchange for ~linear
@@ -1047,6 +1049,158 @@ CREATE TABLE metrics (
 - Re-shard online: `ALTER TABLE metrics SET (shards = 16);` — writes
   never stop, and secondary indexes on the table are rebuilt and swapped
   along with the rows.
+
+## Row expiry (TTL)
+
+A table can delete its own rows when their time is up. Either a column
+holds each row's expiry time, or rows live a fixed time counted from a
+timestamp column:
+
+```sql
+-- each row says when it goes
+CREATE TABLE quarantine (
+  id         INT8 PRIMARY KEY,
+  item       TEXT,
+  expires_at TIMESTAMPTZ
+) WITH (ttl_expiration = expires_at);
+
+-- every row lives 7 days from created_at
+CREATE TABLE review (
+  id         INT8 PRIMARY KEY,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  body       TEXT
+) WITH (ttl_column = created_at, ttl = '7 days');
+
+ALTER TABLE review SET (ttl = '30 days');           -- change the lifetime
+ALTER TABLE orders SET (ttl_expiration = purge_at); -- add expiry to a table with data
+ALTER TABLE review RESET (ttl);                     -- stop expiring
+```
+
+- The column is `TIMESTAMPTZ` or `TIMESTAMP`. A row whose value is NULL
+  never expires. `ttl` takes the forms `retention` does (`'7 days'`,
+  `12h`).
+- **A lifetime needs a column.** `WITH (ttl = '7 days')` alone is
+  refused: there is no hidden "last written" time to count from. Give
+  the table a `created_at TIMESTAMPTZ DEFAULT now()` and name it — and
+  note that this counts from the insert, not from the last update,
+  unless your updates set the column.
+- **Expired rows are deleted by a background job, not hidden.** A row
+  past its time is still returned by queries until the job reaches it —
+  normally within a pass, 30 seconds by default. A query that must never
+  see one says so: `WHERE expires_at > now()`.
+- The deletes are ordinary `DELETE`s in ordinary transactions, so
+  everything a `DELETE` does happens: secondary index entries go with
+  the row, `ON DELETE CASCADE` takes the referencing rows, and a
+  referencing row under a restricting foreign key keeps the expired row
+  in place — it is skipped, counted
+  (`datax_row_ttl_rows_blocked_total`), and deleted on a later pass
+  once nothing references it.
+- The job finds expired rows through an index on the column. The option
+  creates one, `<table>_ttl_idx`, unless an index (or the primary key)
+  already leads with the column; on a table with rows it is built online
+  first, so `ALTER TABLE ... SET` can take as long as a `CREATE INDEX`.
+  `RESET (ttl)` leaves the index — drop it if nothing else uses it. If
+  you drop the index while the expiry is set, the job still works, by
+  scanning the table.
+- The expiry column cannot be dropped or retyped while the expiry is
+  set. Time-series tables expire by `retention` and refuse these
+  options.
+- A deleted row is deleted the way any row is: its old versions stay
+  until garbage collection. Give the table a short `gc_ttl`, or `PURGE`
+  it, if expired data has to leave the disk (next section).
+- Not inside `BEGIN`; needs table ownership and cluster version v21.
+  `SHOW CREATE TABLE` shows the option, and a backup carries it.
+
+One job runs for the whole cluster. See the operations guide's
+[Row expiry](operations.md#row-expiry) for its pace, metrics and where
+to watch it.
+
+## GC window and purge
+
+Deleting or updating a row leaves the old version behind: it is what
+`AS OF SYSTEM TIME`, follower reads and incremental backups read. Old
+versions are garbage collected after the GC window — 25 hours unless the
+node says otherwise — and their bytes leave the files some time after
+that, when the storage engine next compacts those files.
+
+**A window per table:**
+
+```sql
+CREATE TABLE sessions (id UUID PRIMARY KEY, who INT8, data JSONB) WITH (gc_ttl = '10m');
+ALTER TABLE audit_log SET (gc_ttl = '90 days');
+ALTER TABLE sessions RESET (gc_ttl);          -- back to the node's window
+```
+
+The window applies to that table only; no other table's history gets
+shorter or longer. What a short window costs that table:
+
+- `AS OF SYSTEM TIME` and follower reads of it reach back only that far;
+  older reads fail with an error naming the GC threshold.
+- A transaction that has been open longer than the window fails when it
+  next touches the table.
+- An incremental backup needs its base to be younger than the shortest
+  window it covers; an older base is refused (`incremental base too
+  old`) and you take a full backup instead.
+
+The statement does not print a warning — it cannot, there is no notice
+channel — so this list is the warning. The minimum is one second; a
+time-series table with a `retention` already has its window and refuses
+`gc_ttl`.
+
+**Purge: gone now, with a report.**
+
+```sql
+DELETE FROM documents WHERE account = 4711;
+ALTER TABLE documents PURGE;
+```
+```
+ range_id | node_id | live_keys | garbage_versions | tombstones | intents | compacted | status
+----------+---------+-----------+------------------+------------+---------+-----------+--------
+       12 |       1 |     90210 |                0 |          0 |       0 | t         | clean
+       12 |       2 |     90210 |                0 |          0 |       0 | t         | clean
+       12 |       3 |     90210 |                0 |          0 |       0 | t         | clean
+PURGE 31
+```
+
+`PURGE` collects every old version and deletion marker in the table —
+rows and index entries — as of now instead of a window ago, compacts the
+table's files on every replica so the bytes are no longer in them,
+truncates the write-ahead copies, and returns what each replica holds
+afterwards, counted from the storage engine's keys rather than through a
+query. A replica with zeros in `garbage_versions`, `tombstones` and
+`intents` holds one version of each remaining row and nothing else.
+
+- **The tag is the verdict.** `PURGE n` (n versions removed): every
+  replica answered and is clean. `PURGE INCOMPLETE`: at least one is
+  `unconfirmed` (its node did not answer) or `not clean` (a transaction
+  was still writing there), and the `status` column says which. Run the
+  statement again when the node is back; it is safe to repeat.
+- **It removes what was deleted, not what is live.** Delete first.
+- **Older readers are cut off, loudly.** After a purge the table cannot
+  be read at any earlier time: `AS OF SYSTEM TIME` before it, and any
+  transaction that began before it, get an error on their next
+  statement against the table — never a result with rows missing. Retry
+  the transaction. Other tables are unaffected.
+- **A node that was down** applies the purge when it rejoins, before it
+  serves anything from before it, and is compacted and counted by the
+  next `PURGE`. A node that was cut off from the others but kept
+  running is the one gap: until it reconnects it can still answer a
+  follower read (`AS OF SYSTEM TIME`) from before the purge. It is
+  reported `unconfirmed`, which is why an incomplete purge is not a
+  finished one.
+- **What it does not reach:** backups taken earlier (they still hold the
+  data — expire or rewrite them yourself); a copy of the range being
+  sent to a new replica at that moment; and, for rows written before
+  the table had ranges of its own, the write-ahead log of the range
+  they were first written to, which is trimmed as that range takes
+  further writes. Create tables that will be purged with a `gc_ttl` —
+  that gives them their own ranges from the start — and this last case
+  does not arise.
+- It costs a compaction of the table on every replica. Use it for the
+  account-deletion case, not after every `DELETE`.
+- Not inside `BEGIN`; needs table ownership and cluster version v21. A
+  key range rather than a table: `datax debug purge`
+  ([operations guide](operations.md#purging-deleted-data)).
 
 ## Parameters
 

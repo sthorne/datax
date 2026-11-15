@@ -522,6 +522,26 @@ type TableDescriptor struct {
 	// window (the GC TTL by default), then the re-shard janitor wipes
 	// them and removes the entry.
 	RetiredLayouts []RetiredLayout `json:"retired_layouts,omitempty"`
+	// GCTTLSeconds is the table's own GC window (cluster version v21):
+	// how long superseded and deleted versions of its rows are kept
+	// before garbage collection, in place of the node setting. 0 = the
+	// node setting. It governs the ranges that lie wholly inside the
+	// table's span; a range the table shares with other data keeps the
+	// longest window of its tenants.
+	GCTTLSeconds int64 `json:"gc_ttl_seconds,omitempty"`
+	// RowTTL, when set, expires the table's rows (v21): a background
+	// job deletes each row once its expiry time has passed.
+	RowTTL *RowTTL `json:"row_ttl,omitempty"`
+}
+
+// RowTTL is a table's row expiry: a row expires at the value of its
+// ColumnID column plus AfterSeconds, and never if that column is NULL.
+// AfterSeconds is zero when the column itself names the expiry time
+// (the ttl_expiration option) and positive when it names the time the
+// lifetime is counted from (ttl_column with ttl).
+type RowTTL struct {
+	ColumnID     ColumnID `json:"column_id"`
+	AfterSeconds int64    `json:"after_seconds,omitempty"`
 }
 
 // RetiredLayout is one superseded re-shard layout awaiting reclamation.
@@ -613,6 +633,10 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 			out.RetiredLayouts[i] = rl
 			out.RetiredLayouts[i].IndexIDs = append([]uint64(nil), rl.IndexIDs...)
 		}
+	}
+	if d.RowTTL != nil {
+		ttl := *d.RowTTL
+		out.RowTTL = &ttl
 	}
 	return &out
 }

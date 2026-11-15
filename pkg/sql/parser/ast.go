@@ -690,9 +690,15 @@ type AlterTable struct {
 	DropDefault string
 	// SetType is ALTER [COLUMN] c [SET DATA] TYPE t (an online rewrite).
 	SetType *SetType
-	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
-	// shards = N, the online re-shard.
-	SetOptions map[string]string
+	// SetOptions is ALTER TABLE ... SET (name = value, ...): shards = N
+	// (the online re-shard), retention, gc_ttl and the row-expiry
+	// options. ResetOptions is ALTER TABLE ... RESET (name, ...), which
+	// returns gc_ttl or the row expiry to "not set".
+	SetOptions   map[string]string
+	ResetOptions []string
+	// Purge is ALTER TABLE ... PURGE: collect the table's garbage now
+	// and report, replica by replica, that none is left.
+	Purge bool
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.

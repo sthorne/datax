@@ -175,6 +175,16 @@ type Config struct {
 	// StatsStaleness is the statistics age that triggers a background
 	// re-collection (0 = default 10m).
 	StatsStaleness time.Duration
+	// RowTTLInterval paces the row expiry job (rowttl.go): each tick,
+	// the node leading range 1 deletes the expired rows of every table
+	// with a row TTL (0 = default 30s; negative disables the job, and
+	// expired rows then stay). RowTTLBatchSize is how many rows one
+	// transaction deletes (0 = 100) and RowTTLBatchPause the wait between
+	// two batches on one table (0 = 20ms; negative = none), which
+	// together cap the rate at which the job writes.
+	RowTTLInterval   time.Duration
+	RowTTLBatchSize  int
+	RowTTLBatchPause time.Duration
 	// ReshardRetireFor is how long a completed re-shard's superseded
 	// layout stays on disk serving AS OF SYSTEM TIME below the swap
 	// before the janitor reclaims it (0 = the GC TTL, matching the
@@ -386,6 +396,8 @@ type Node struct {
 	consoleVersion string
 	loginPage      []byte
 
+	// retention resolves a range to its table's GC window (retention.go).
+	retention *retentionProvider
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and
 	// refreshed by the heartbeat loop from the replicated row.
@@ -682,6 +694,7 @@ func (n *Node) start() error {
 		defaultGCTTL = base.DefaultGCTTL
 	}
 	retention := &retentionProvider{node: n, defaultTTL: defaultGCTTL}
+	n.retention = retention
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
 		NodeID:                  n.ident.NodeID,
 		Events:                  n.events,
@@ -733,6 +746,7 @@ func (n *Node) start() error {
 		return ids
 	})
 	n.store.SetSender(n.db)
+	n.db.SetPurger(n.PurgeSpan)
 
 	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
 	n.pinger = rpc.NewPinger(n.trans, n.ident.NodeID, func() []base.NodeID {
@@ -861,6 +875,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {

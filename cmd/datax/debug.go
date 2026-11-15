@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -297,7 +298,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|unsplit|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status|audit> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -326,6 +327,8 @@ func runDebug(args []string) error {
 	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); state-changing ops require an admin")
 	table := fs.Uint64("table", 0, "split, unsplit: the boundary of this table ID")
 	rawKey := fs.String("key", "", "split, unsplit: raw key (hex)")
+	endKey := fs.String("end-key", "", "purge: raw key (hex) the span ends before, with --key as its start")
+	tableName := fs.String("table-name", "", "purge: the table to purge, as [database.]table")
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
 	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID; upgrade: target cluster version")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
@@ -351,6 +354,23 @@ func runDebug(args []string) error {
 			req.Key = k
 		default:
 			return fmt.Errorf("%s requires --table or --key", sub)
+		}
+	case "purge":
+		switch {
+		case *tableName != "":
+			req.Table = *tableName
+		case *table != 0:
+			req.Key, req.EndKey = keys.TableDataSpan(*table)
+		case *rawKey != "" && *endKey != "":
+			var err error
+			if req.Key, err = hex.DecodeString(*rawKey); err != nil {
+				return fmt.Errorf("--key must be hex: %w", err)
+			}
+			if req.EndKey, err = hex.DecodeString(*endKey); err != nil {
+				return fmt.Errorf("--end-key must be hex: %w", err)
+			}
+		default:
+			return fmt.Errorf("purge requires --table-name, --table, or --key with --end-key")
 		}
 	case "rebalance", "transfer-lease":
 		req.RangeID = base.RangeID(*rangeID)
@@ -380,7 +400,12 @@ func runDebug(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	callTimeout := 30 * time.Second
+	if sub == "purge" {
+		// A purge compacts the span on every replica before it answers.
+		callTimeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
 	var resp cluster.AdminResponse
 	if err := trans.Call(ctx, *addr, "admin", req, &resp); err != nil {
@@ -418,6 +443,9 @@ func runDebug(args []string) error {
 			useTableNames(resp.TableNames)
 			fmt.Printf("unsplit: %s\n", &resp.Ranges[0])
 		}
+	case "purge":
+		useTableNames(resp.TableNames)
+		return printPurge(resp.Purge)
 	case "ranges":
 		useTableNames(resp.TableNames)
 		for _, d := range resp.Ranges {
@@ -520,4 +548,35 @@ func useTableNames(names map[uint64]string) {
 		name, ok := names[id]
 		return name, ok
 	})
+}
+
+// printPurge prints a purge's per-replica report and returns an error
+// when the purge is not complete, so a script that runs one cannot take
+// "the command ran" for "the data is gone".
+func printPurge(rep *kvpb.PurgeReport) error {
+	if rep == nil {
+		return fmt.Errorf("the node answered without a purge report")
+	}
+	fmt.Printf("purged %s to %s at %s: %d version(s) removed over %d range(s)\n",
+		keys.Key(rep.StartKey), keys.Key(rep.EndKey), time.Unix(0, rep.PurgeTSNanos).UTC().Format(time.RFC3339Nano), rep.VersionsRemoved, rep.Ranges)
+	for _, r := range rep.Replicas {
+		if r.Error != "" {
+			fmt.Printf("  r%d n%d  UNCONFIRMED: %s\n", r.RangeID, r.NodeID, r.Error)
+			continue
+		}
+		fmt.Printf("  r%d n%d  live keys %d, superseded versions %d, tombstones %d, intents %d, compacted %v\n",
+			r.RangeID, r.NodeID, r.LiveKeys, r.Garbage, r.Tombstones, r.Intents, r.Compacted)
+	}
+	fmt.Println("not covered by a purge:")
+	for _, line := range rep.NotCovered {
+		fmt.Printf("  - %s\n", line)
+	}
+	if !rep.Complete {
+		for _, line := range rep.Incomplete {
+			fmt.Printf("INCOMPLETE: %s\n", line)
+		}
+		return fmt.Errorf("the purge is incomplete; run it again once the replicas above can answer")
+	}
+	fmt.Println("complete: every replica answered and holds no superseded version, tombstone or intent in the span")
+	return nil
 }

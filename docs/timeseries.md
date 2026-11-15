@@ -190,7 +190,13 @@ eventual wipe as unreachable garbage.
 
 - Retention expiry is best-effort in timing (one housekeeping tick,
   default 30s, plus the ~30s descriptor cache); on mixed ranges it is
-  row-granular but skips tables with secondary indexes.
+  row-granular but skips tables with secondary indexes. That is a
+  property of expiring beneath SQL, by key, and is why ordinary tables
+  expire rows another way: a row TTL (`WITH (ttl_expiration = col)`,
+  docs/sql.md "Table options") deletes through SQL, so indexes and
+  foreign keys follow. The two do not combine: a time-series table
+  refuses the `ttl` options, and a table with a retention refuses
+  `gc_ttl`, since the retention is its GC window.
 - Secondary indexes on sharded tables are unsharded (their own hot-tail
   characteristics apply).
 

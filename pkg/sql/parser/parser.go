@@ -3513,6 +3513,25 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			return nil, err
 		}
 		at.SetOptions = opts
+	case p.consumeIdentWord("reset"):
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		for {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			at.ResetOptions = append(at.ResetOptions, name)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	case p.consumeIdentWord("purge"):
+		at.Purge = true
 	case p.consumeIdentWord("split"):
 		if !p.consumeIdentWord("at") {
 			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
@@ -3546,7 +3565,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
 	return at, nil
 }

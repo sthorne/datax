@@ -175,3 +175,29 @@ func TestParseSplitExpirationAndUnsplit(t *testing.T) {
 		}
 	}
 }
+
+// TestParseResetAndPurge: ALTER TABLE ... RESET (name, ...) and ALTER
+// TABLE ... PURGE (issues #295, #298), and the option values a row expiry
+// takes, which are column names rather than literals.
+func TestParseResetAndPurge(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t RESET (gc_ttl, ttl)`).(*AlterTable)
+	if len(at.ResetOptions) != 2 || at.ResetOptions[0] != "gc_ttl" || at.ResetOptions[1] != "ttl" || at.Purge {
+		t.Fatalf("RESET: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE IF EXISTS db.t PURGE`).(*AlterTable); !at.Purge || !at.IfExists || at.Table != "db.t" {
+		t.Fatalf("PURGE: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t SET (ttl_column = created_at, ttl = '7 days', gc_ttl = '10m')`).(*AlterTable)
+	if at.SetOptions["ttl_column"] != "created_at" || at.SetOptions["ttl"] != "7 days" || at.SetOptions["gc_ttl"] != "10m" {
+		t.Fatalf("SET: %+v", at.SetOptions)
+	}
+	ct := parseOne(t, `CREATE TABLE t (a INT8 PRIMARY KEY, e TIMESTAMPTZ) WITH (ttl_expiration = e)`).(*CreateTable)
+	if ct.Options["ttl_expiration"] != "e" {
+		t.Fatalf("CREATE ... WITH: %+v", ct.Options)
+	}
+	for _, bad := range []string{`ALTER TABLE t RESET gc_ttl`, `ALTER TABLE t RESET ()`, `ALTER TABLE t RESET (gc_ttl = '1h')`, `ALTER TABLE t PURGE NOW`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s parsed", bad)
+		}
+	}
+}

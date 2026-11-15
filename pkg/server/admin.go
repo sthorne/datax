@@ -64,6 +64,11 @@ var adminUnauditedOps = map[string]bool{
 	// notify is one node handing another its committed notifications: a
 	// record per batch would be a record per NOTIFY.
 	"notify": true,
+	// The steps of a purge, asked by the purging node of the others; the
+	// purge writes one record, with the whole report (purge.go).
+	"purge-range":   true,
+	"purge-replica": true,
+	"purge-scrub":   true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -395,6 +400,24 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			return cluster.AdminResponse{Error: err.Error()}
 		}
 		return cluster.AdminResponse{Status: raw}
+
+	case "purge":
+		start, end := keys.Key(req.Key), keys.Key(req.EndKey)
+		if req.Table != "" {
+			id, err := n.tableIDByName(ctx, req.Table)
+			if err != nil {
+				return cluster.AdminResponse{Error: err.Error()}
+			}
+			start, end = keys.TableDataSpan(id)
+		}
+		rep, err := n.PurgeSpan(ctx, start, end)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Purge: rep, TableNames: n.tableNames(ctx)}
+
+	case "purge-range", "purge-replica", "purge-scrub":
+		return n.servePurgeStep(ctx, req)
 
 	case "merge":
 		if req.RangeID == 0 {

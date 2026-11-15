@@ -507,6 +507,92 @@ Correctness rules enforced around the threshold:
   records stay collectible outright: a pusher finding a record-less
   TTL-old intent aborts it, which is the correct outcome either way.)
 
+### A window per table
+
+The window is the node's `GCTTL` unless the table says otherwise
+(`WITH (gc_ttl = ...)`, `TableDescriptor.GCTTLSeconds`, cluster version
+v21; issue #295). The leader resolves each range through the provider
+that already maps ranges to time-series retentions
+(`pkg/server/retention.go`):
+
+- a range wholly inside a table with a window collects at that window,
+  shorter or longer than the node's, by the ordinary rules above (the
+  survivor stays — this is not the expiry mode of a retention);
+- a range the table shares with other data collects at
+  `max(node window, every overlapping window)`. One table's short window
+  therefore cannot reach another table's history; the price is that it
+  does not bite on a shared range either, so the DDL splits the table's
+  edges, the provider asks for them again whenever a GC pass finds a
+  range straddling one (a restored table was never split), and the
+  merge queue — which already refuses to merge ranges whose windows
+  differ — keeps them apart.
+
+Nothing about a short window is unsafe, because nothing about the
+threshold assumes it is far in the past: every batch at or below it is
+refused (writes as well as reads, so a write cannot land beneath a
+collected tombstone), intents are never collected around, and a
+transaction record born at or below it cannot be recreated. What a short
+window does is make those refusals reachable by ordinary work — a long
+transaction, an old `AS OF SYSTEM TIME`, an incremental backup from an
+old base — and they surface as errors, never as short results.
+
+### Purge
+
+A purge (`ALTER TABLE ... PURGE`, `datax debug purge`;
+`server.Node.PurgeSpan`, `pkg/kvserver/purge.go`) is collection at a
+window of zero, followed by making the collected bytes leave the files.
+For each range of the span, after splitting at the span's ends:
+
+1. **Leader** (`Store.PurgeRange`). Resolve the intents of finished
+   transactions and wait a bounded time for the rest; collect at
+   `threshold = now` with the same `GCRequest` as any other pass; wait
+   for the followers to hold it; propose a `TruncateLog` at the applied
+   index, with none of housekeeping's floor. The log matters because a
+   value is a log entry before it is a version, and stays one until
+   truncation.
+2. **Each replica** (`Store.PurgeReplica`), once it has applied the
+   leader's index: flush and compact the range's MVCC span on the state
+   engine — the tombstones GC wrote and the versions under them meet in
+   that compaction and neither is written out — perform the deferred
+   log truncation the flush has made safe, compact the range's log span
+   on the raft engine, and count the span from the raw engine keys
+   (`storage.MVCCSpanCensus`): live keys, versions beneath a newer one,
+   tombstones, intents.
+3. **Each node** (`Store.ScrubLogs`). Pebble keeps obsolete write-ahead
+   log files to recycle, and a recycled file keeps its old bytes beyond
+   wherever the new writes have reached. The engine's file system
+   (`storage.logGate`) marks the log files present at the call and has
+   each one deleted or replaced by a fresh file rather than reused,
+   rolling the log until none is left.
+
+The purge is complete when every replica reports no superseded version,
+no tombstone and no intent. `TestPurgeRemovesDeletedRowsFromDisk` holds
+that to a byte search of three nodes' data directories for a marker
+value, and fails if either the truncation or the log scrub is removed.
+
+What keeps it correct is the threshold, as above: the collection is
+replicated, so from the moment it applies on a replica that replica
+refuses every batch at or below the purge time. A transaction older
+than the purge fails on its next request to the range. The purge does
+not wait for such readers; it refuses them.
+
+A replica that is **down** misses the command and applies it on return,
+from the log or by snapshot. Between returning and catching up it would
+still hold a persisted closed timestamp entitling it to serve follower
+reads below the purge from its old copy, so a restarted replica serves
+no stale read until its closed timestamp has passed the time its process
+started (`Replica.heardSinceStart`): a promise made after the start
+implies the log up to it, the collection included. A replica that is
+partitioned but running has no such signal and is the remaining gap; the
+purge names every replica that did not confirm, and is not complete
+until none is left.
+
+Not reached, and listed in every report: backups; a raft snapshot in
+flight; the log of a range the rows were written to before a split moved
+them (truncated on that range's own schedule); and the device beneath
+the file system. On an encrypted store the same files are rewritten and
+deleted, whichever data key they were written under.
+
 ## Invariants (asserted in tests)
 
 1. An intent is never resolved except per its record's state.

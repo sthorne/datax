@@ -144,8 +144,15 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 // version of a row the predicate ages out — above the threshold included
 // — without changing how the threshold ratchets.
 func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire bool, rowExpired func(keys.Key, hlc.Timestamp) bool) error {
+	_, err := r.collectGarbage(ctx, threshold, expire, rowExpired)
+	return err
+}
+
+// collectGarbage is runGC reporting how many versions it deleted (a
+// purge puts the number in its report).
+func (r *Replica) collectGarbage(ctx context.Context, threshold hlc.Timestamp, expire bool, rowExpired func(keys.Key, hlc.Timestamp) bool) (removed int, _ error) {
 	if threshold.LessEq(r.GCThreshold()) {
-		return nil
+		return 0, nil
 	}
 	desc := r.Desc()
 
@@ -159,7 +166,7 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire boo
 		err = cerr
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// A committed record is only reclaimable once every intent it wrote is
@@ -175,7 +182,7 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire boo
 	if len(versions) == 0 && len(records) == 0 {
 		// Nothing to reclaim; leave the threshold where it is (raising it
 		// would reject old reads for no benefit).
-		return nil
+		return 0, nil
 	}
 
 	for len(versions) > 0 || len(records) > 0 {
@@ -202,8 +209,9 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire boo
 			}}},
 		}
 		if _, kerr := r.Execute(ctx, ba); kerr != nil {
-			return kerr
+			return removed, kerr
 		}
+		removed += len(chunkV)
 		metrics.GCRuns.Inc()
 		log.Debugf("%s: gc reclaimed %d versions, %d txn records (threshold %s)",
 			r.rangeID, len(chunkV), len(chunkR), threshold)
@@ -211,7 +219,7 @@ func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire boo
 	if rowExpiredCount > 0 {
 		metrics.RetentionRowsExpired.Add(float64(rowExpiredCount))
 	}
-	return nil
+	return removed, nil
 }
 
 // enumerateGarbageVersions scans the range's MVCC span in one consistent

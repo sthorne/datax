@@ -186,6 +186,18 @@ var (
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
 	})
+	PurgeVersionsRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_purge_versions_removed_total", Help: "MVCC versions deleted by purges this node coordinated (ALTER TABLE ... PURGE, datax debug purge).",
+	})
+	RowTTLRowsDeleted = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_row_ttl_rows_deleted_total", Help: "Rows deleted by the row expiry job because their expiry time had passed.",
+	})
+	RowTTLRowsBlocked = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_row_ttl_rows_blocked_total", Help: "Expired rows the row expiry job could not delete because a foreign key still references them (counted each pass).",
+	})
+	RowTTLLagSeconds = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "datax_row_ttl_lag_seconds", Help: "How far past its expiry time the most overdue row was when the row expiry job last deleted it, over every table in its last pass.",
+	})
 	StatsRowsScanned = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_stats_rows_scanned_total", Help: "Rows swept by statistics collection.",
 	})
