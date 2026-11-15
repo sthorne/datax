@@ -872,6 +872,77 @@ func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, 
 	return k, rep, nil
 }
 
+// destroyManyBatch is how many keys one transaction of DestroyMany
+// destroys.
+const destroyManyBatch = 100
+
+// DestroyMany destroys keys ids as Destroy does — tombstoned, a tenant
+// key renamed — destroyManyBatch to a transaction, and then purges the
+// history of the whole table's rows once, rather than once per key: a
+// purge forces a garbage collection and a compaction, which dominates
+// the cost of destroying a key, and a dropped per-tenant table may have
+// millions. Keys already destroyed, or gone, are skipped. It returns how
+// many keys it destroyed and the purge's report; should the purge fail,
+// the keys are destroyed and their material lingers in history until the
+// table's GC window passes or a later purge (another Destroy) removes it.
+func (s *Store) DestroyMany(ctx context.Context, ids []int64) (int, *kvpb.PurgeReport, error) {
+	d, err := s.desc(ctx, false)
+	if err != nil {
+		return 0, nil, err
+	}
+	destroyed := 0
+	for at := 0; at < len(ids); at += destroyManyBatch {
+		batch := ids[at:min(at+destroyManyBatch, len(ids))]
+		var n int
+		err := s.cfg.DB.RunTxn(ctx, "keys-destroy-many", func(ctx context.Context, txn *kvclient.Txn) error {
+			n = 0
+			for _, id := range batch {
+				r, pk, err := s.read(ctx, txn, d, id, true)
+				if errors.Is(err, ErrNotFound) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				if r.State == StateDestroyed {
+					continue
+				}
+				was := r.Name
+				r.State, r.versions, r.ClusterKey = StateDestroyed, nil, enc.ClusterKeyRef{}
+				if r.Kind == KindTenant && !strings.HasPrefix(r.Name, DestroyedPrefix) {
+					r.Name = DestroyedName(r.Name, r.ID)
+					if err := s.rename(ctx, txn, d, r, was); err != nil {
+						return err
+					}
+				}
+				r.Generation++
+				val, err := r.encode(d)
+				if err != nil {
+					return err
+				}
+				if err := txn.Put(ctx, pk, val); err != nil {
+					return err
+				}
+				n++
+			}
+			return nil
+		})
+		if err != nil {
+			return destroyed, nil, err
+		}
+		destroyed += n
+	}
+	if destroyed == 0 {
+		return 0, nil, nil
+	}
+	lo, hi := keys.TableDataSpan(d.ID)
+	rep, err := s.cfg.DB.Purge(ctx, lo, hi)
+	if err != nil {
+		return destroyed, nil, fmt.Errorf("%d keys are destroyed, but purging their history failed: %w", destroyed, err)
+	}
+	return destroyed, rep, nil
+}
+
 // ListIn returns every key's metadata, in id order, read in txn.
 func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
 	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)

@@ -135,3 +135,15 @@ func (s *Store) Reinstate(ctx context.Context, txn *kvclient.Txn, backupDesc *ca
 	}
 	return r.Key, true, nil
 }
+
+// KeyOfRecord reads the metadata of one datax_keys row as backupDesc (a
+// backup's datax_keys descriptor) reads it: what a table restore needs
+// to pick the keys it brings back (a per-tenant table's tenant keys, by
+// name). It never carries material.
+func KeyOfRecord(backupDesc *catalog.TableDescriptor, key keys.Key, value []byte) (Key, error) {
+	r, err := decodeRow(backupDesc, key, value)
+	if err != nil {
+		return Key{}, err
+	}
+	return r.Key, nil
+}
