@@ -31,7 +31,20 @@ import (
 const PrimaryIndexID = 1
 
 // valueVersion tags the row-value encoding; bump on incompatible change.
+// It is the first byte of every EncodeValue output.
 const valueVersion byte = 1
+
+// SealedValueMarker is the first byte of a sealed row value: the value of
+// a sealed table's row, encrypted under the table's key (issue #310,
+// pkg/sql/rowseal). No EncodeValue output begins with it — every one
+// begins with valueVersion, which must never take this value — so a
+// value tells by its first byte which form it is in, and DecodeValue
+// handed a sealed value fails rather than misreading it.
+const SealedValueMarker byte = 0xD5
+
+// ValueVersion is valueVersion, for tests elsewhere that check the claim
+// above.
+const ValueVersion = valueVersion
 
 // Column payload tags. Each payload is self-describing so unknown columns
 // can be skipped.
@@ -381,6 +394,9 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnID]types.Datum, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("corrupt row value: empty")
+	}
+	if raw[0] == SealedValueMarker {
+		return nil, fmt.Errorf("row value is sealed: it must be opened under its table's key before it is decoded")
 	}
 	if raw[0] != valueVersion {
 		return nil, fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])

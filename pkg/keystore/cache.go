@@ -2,6 +2,8 @@ package keystore
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"errors"
 	"sync"
 	"time"
@@ -95,6 +97,10 @@ type heldMaterial struct {
 	m       *Material
 	refs    int
 	dropped bool
+	// aead is AES-256-GCM under m.Key, made on first use (AEAD).
+	aeadOnce sync.Once
+	aead     cipher.AEAD
+	aeadErr  error
 }
 
 func (e *cacheEntry) dropLocked() {
@@ -180,6 +186,36 @@ func (c *Cache) Refresh(ctx context.Context, id int64) (Key, error) {
 // disabled or destroyed key is refused (ErrDisabled, ErrDestroyed) as of
 // the last check, which is within the lease.
 func (c *Cache) With(ctx context.Context, id int64, version int, fn func(m *Material) error) error {
+	return c.withHeld(ctx, id, version, func(hm *heldMaterial) error { return fn(hm.m) })
+}
+
+// AEAD returns AES-256-GCM under version (0: the current one) of key id,
+// and the version it is: for a caller that encrypts with the key itself
+// rather than handling its material (the sealing of tables). The AEAD is
+// made once per cached version and holds its own key schedule, so it
+// stays usable for the operation in flight after the material is
+// released; a caller must not keep it beyond that operation, and asks
+// again for the next one, so that a disabled or destroyed key stops
+// being used within the lease. Refusals are With's.
+func (c *Cache) AEAD(ctx context.Context, id int64, version int) (cipher.AEAD, int, error) {
+	var out cipher.AEAD
+	var ver int
+	err := c.withHeld(ctx, id, version, func(hm *heldMaterial) error {
+		hm.aeadOnce.Do(func() {
+			block, err := aes.NewCipher(hm.m.Key)
+			if err != nil {
+				hm.aeadErr = err
+				return
+			}
+			hm.aead, hm.aeadErr = cipher.NewGCM(block)
+		})
+		out, ver = hm.aead, hm.m.Version
+		return hm.aeadErr
+	})
+	return out, ver, err
+}
+
+func (c *Cache) withHeld(ctx context.Context, id int64, version int, fn func(hm *heldMaterial) error) error {
 	for attempt := 0; ; attempt++ {
 		e, k, err := c.check(ctx, id, attempt > 0)
 		if err != nil {
@@ -206,7 +242,7 @@ func (c *Cache) With(ctx context.Context, id int64, version int, fn func(m *Mate
 			continue
 		}
 		defer c.release(e, hm)
-		return fn(hm.m)
+		return fn(hm)
 	}
 }
 

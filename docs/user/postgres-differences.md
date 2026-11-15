@@ -375,6 +375,8 @@ are the differences ([reference](sql.md#large-objects)):
 | `23505` | unique violation | application-level conflict |
 | `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
 | `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
+| `XXK01` | a row of a [sealed table](sql.md#sealed-tables) whose key is destroyed, disabled or unavailable (datax's own code) | not retryable: the key was destroyed (the data is erased) or must be re-enabled |
+| `XX001` | a sealed table's stored value does not authenticate (data corrupted) | report it; it is not a retry signal |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |
 | `42601` "statement nests too deeply" | more than 1,000 nesting levels (parentheses, subqueries, derived tables, `CASE`) | flatten the statement; PostgreSQL bounds the same recursion by stack depth (issue #135) |

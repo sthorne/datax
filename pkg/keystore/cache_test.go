@@ -208,3 +208,41 @@ func TestCacheConcurrent(t *testing.T) {
 	wg.Wait()
 	c.Close()
 }
+
+// TestCacheAEAD (issue #310, step 3): AEAD gives AES-GCM under a version
+// of a key — the current one, then a rotated one for new seals while the
+// old version still opens — made once per cached version, and refuses a
+// destroyed key after the lease as With does.
+func TestCacheAEAD(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{key: Key{ID: 9, State: StateEnabled, Version: 1, Generation: 1}, material: map[int][]byte{1: testMaterial(1), 2: testMaterial(2)}}
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	c := NewCache(src, CacheConfig{Lease: 10 * time.Second, Now: clk.Now})
+	defer c.Close()
+	a1, v, err := c.AEAD(ctx, 9, 0)
+	if err != nil || v != 1 {
+		t.Fatalf("current: v%d %v", v, err)
+	}
+	if again, _, _ := c.AEAD(ctx, 9, 1); again != a1 {
+		t.Fatal("the AEAD is made again for a cached version")
+	}
+	nonce := make([]byte, a1.NonceSize())
+	sealed := a1.Seal(nil, nonce, []byte("row"), nil)
+	src.change(func(k *Key) { k.Version = 2 })
+	clk.Add(10 * time.Second)
+	if _, v, err := c.AEAD(ctx, 9, 0); err != nil || v != 2 {
+		t.Fatalf("after rotation: v%d %v", v, err)
+	}
+	old, _, err := c.AEAD(ctx, 9, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := old.Open(nil, nonce, sealed, nil); err != nil || string(p) != "row" {
+		t.Fatalf("v1 after rotation: %q %v", p, err)
+	}
+	src.change(func(k *Key) { k.State = StateDestroyed })
+	clk.Add(10 * time.Second)
+	if _, _, err := c.AEAD(ctx, 9, 1); !errors.Is(err, ErrDestroyed) {
+		t.Fatalf("destroyed: %v", err)
+	}
+}

@@ -307,6 +307,11 @@ const (
 	// datax_key_wrap and the rest; pkg/sql/keyservice.go) and the owner
 	// and privileges columns of datax_keys, which a v21 node would not
 	// enforce: they are refused until finalize as well.
+	//
+	// V22 also introduces sealed tables (issue #310, step 3;
+	// pkg/sql/rowseal): the descriptor field encryption_key, omitempty,
+	// and row values a v21 node could not decode, so CREATE TABLE ...
+	// WITH (encryption_key) is refused until finalize too.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

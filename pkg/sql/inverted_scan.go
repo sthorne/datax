@@ -274,7 +274,7 @@ func (s *Session) executeInvertedScan(ctx context.Context, txn *kvclient.Txn, de
 				}
 				return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 			}
-			row, err := decodeFullRow(desc, pk, raw)
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
 			if err != nil {
 				return false, err
 			}

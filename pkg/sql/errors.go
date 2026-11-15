@@ -109,6 +109,9 @@ func ToSQLError(err error) *Error {
 	if errors.As(err, &ve) {
 		return &Error{Code: ve.Code, Msg: ve.Msg}
 	}
+	if serr, ok := sealErrorToSQL(err); ok {
+		return serr
+	}
 	var syn *parser.SyntaxError
 	if errors.As(err, &syn) {
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}

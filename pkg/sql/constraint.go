@@ -10,6 +10,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
@@ -885,7 +886,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 				if err := cg.enforceReferencing(ctx, txn, fr.row, updated, wb); err != nil {
 					return err
 				}
-				newKey, err := rewriteRow(ctx, txn, child, fr, updated, wb)
+				newKey, err := rewriteRow(ctx, g.s.rowSealer(), txn, child, fr, updated, wb)
 				if err != nil {
 					return err
 				}
@@ -915,23 +916,14 @@ func deleteRow(d *catalog.TableDescriptor, fr fetchedRow, wb *kvclient.WriteBatc
 // rewriteRow buffers a row's new value: in place when its key is
 // unchanged, else as a delete plus an insert at the new key, which it
 // returns.
-func rewriteRow(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor, fr fetchedRow, updated map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch) (keys.Key, error) {
+func rewriteRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, d *catalog.TableDescriptor, fr fetchedRow, updated map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch) (keys.Key, error) {
 	newKey, err := pkKey(d, updated)
 	if err != nil {
 		return nil, err
 	}
-	value, err := rowenc.EncodeValue(d, updated)
-	if err != nil {
-		return nil, err
-	}
 	if newKey.Equal(fr.key) {
-		wb.Put(fr.key, value)
-		if d.Reshard != nil {
-			shadow, err := reshardShadowKey(d, updated)
-			if err != nil {
-				return nil, err
-			}
-			wb.Put(shadow, value)
+		if err := putRowValue(ctx, b, d, wb, fr.key, updated); err != nil {
+			return nil, err
 		}
 		return newKey, updateIndexEntries(ctx, txn, d, fr.row, updated, wb, map[string]bool{}, nil)
 	}
@@ -943,13 +935,8 @@ func rewriteRow(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescript
 	if err := deleteRow(d, fr, wb); err != nil {
 		return nil, err
 	}
-	wb.Put(newKey, value)
-	if d.Reshard != nil {
-		shadow, err := reshardShadowKey(d, updated)
-		if err != nil {
-			return nil, err
-		}
-		wb.Put(shadow, value)
+	if err := putRowValue(ctx, b, d, wb, newKey, updated); err != nil {
+		return nil, err
 	}
 	return newKey, addIndexEntries(ctx, txn, d, updated, wb, map[string]bool{}, nil)
 }
@@ -1240,7 +1227,7 @@ func (s *Session) validateConstraintRows(ctx context.Context, table string, cID 
 				return err
 			}
 			for _, kv := range kvs {
-				row, err := decodeFullRow(desc, kv.Key, kv.Value)
+				row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 				if err != nil {
 					return err
 				}
@@ -1340,6 +1327,10 @@ type indexWipe struct {
 	// vectorBuild names the centres of a dropped vector index, which
 	// live outside its entries (catalog.VectorIndex).
 	vectorBuild string
+	// destroyKey, when set, is the key of a dropped sealed table (named
+	// table), destroyed instead of any entries being wiped (sealed.go).
+	destroyKey int64
+	table      string
 }
 
 // runPendingWipes reclaims the entries of indexes dropped by committed
@@ -1348,6 +1339,10 @@ func (s *Session) runPendingWipes(ctx context.Context) {
 	wipes := s.pendingWipes
 	s.pendingWipes = nil
 	for _, w := range wipes {
+		if w.destroyKey != 0 {
+			s.destroyTableKey(ctx, w)
+			continue
+		}
 		s.wipeIndexEntries(ctx, w.tableID, w.indexID)
 		if w.vectorBuild != "" {
 			s.dropVectorCentroids(ctx, w.tableID, w.vectorBuild)
@@ -1439,7 +1434,7 @@ func (s *Session) sweepRows(ctx context.Context, table string, visit func(*catal
 				return err
 			}
 			for _, kv := range kvs {
-				row, err := decodeFullRow(desc, kv.Key, kv.Value)
+				row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 				if err != nil {
 					return err
 				}

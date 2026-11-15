@@ -799,8 +799,8 @@ The cluster key (#310) is the first piece of the key service designed in
 [design-key-service.md](design-key-service.md): one 32-byte key for the
 whole cluster, versioned, that wraps the **named keys** kept in the
 `datax_keys` system table. The key service (below, *The key service*)
-keeps applications' named keys under it; sealed tables are a later
-step.
+keeps applications' named keys under it, and sealed tables (below,
+*Sealed tables*) encrypt row values under named keys it wraps.
 
 ```
 root (per node)  wraps →  cluster key (one per cluster)  wraps →  named keys (datax_keys rows)
@@ -1059,6 +1059,122 @@ What it does not protect against, stated with the feature:
   the cluster key) until they expire — the documented dependency of the
   design, *Erasure*.
 - A compromised gateway, while it holds a key's material in its cache.
+
+## Sealed tables
+
+A **sealed table** (`CREATE TABLE ... WITH (encryption_key = 'auto')`,
+cluster version v22, issue #310) has a key of its own: a named key of
+kind `table` in `datax_keys`, wrapped by the cluster key. Every row's
+value is encrypted under it in the gateway's SQL layer, at the boundary
+where rows become KV values (`pkg/sql/rowseal`), before anything below —
+KV, raft, the storage engine, replicas, snapshots, the consistency
+checker, backups — sees it. Those layers see ciphertext and are
+unchanged; file-level encryption still applies on top. Statements,
+grammar, notices and errors are in docs/sql.md, "Sealed tables"; what an
+application should expect, and how to shape a schema so that erasure
+means something, is in
+[encryption-keys-for-applications.md](encryption-keys-for-applications.md).
+
+```
+root (per node)  →  cluster key  →  the table's key (datax_keys, kind table)  →  each row's value
+```
+
+**What is sealed, and what is not.** The value of a row — every column
+that is neither in the primary key nor in an index — is sealed. Primary-
+key columns and every indexed column (`UNIQUE` constraints included,
+and for an `ivfflat` index the vector itself, which its entries keep)
+live in KV keys, must sort on every replica, and are protected by
+file-level encryption only. Row counts and value sizes are visible. The
+`CREATE TABLE` and `CREATE INDEX` notices name the plaintext columns.
+`LISTEN`/`NOTIFY` payloads and large objects are not sealed. Table
+statistics are not collected for sealed columns.
+
+**The sealed form.** A marker byte that no plain row value begins with
+(`0xD5`; every plain value begins with the row encoding's version byte),
+the key version (a uvarint), a random 12-byte nonce, and the AES-256-GCM
+ciphertext and tag: 30 bytes per value. The associated data binds the
+value to its place: the table's seal id (its id when it was created,
+kept by a table restore), the key's id and version, and the row's KV key
+after the table prefix. A value moved to another row or another table,
+or presented under another key or version, does not open (`XX001`).
+Nonces are random, so a key version should seal no more than about 2^32
+values; rotating the key starts a new version, and the online rotation
+job that rewrites old rows is a later step.
+
+**Keys on the gateway.** Each gateway keeps unwrapped table keys in held
+memory (see *Keys in memory*) in the cache it shares with the key
+service (`keystore.Cache`) under its lease — 10 seconds, the
+descriptor lease, by default. Past the lease the
+next use reads the key's generation from `datax_keys`, which every
+change of state moves; a key that was disabled, destroyed or rotated is
+dropped from the cache, and a disabled or destroyed key then gives
+nothing. A change to a table's key therefore reaches every gateway within
+10 seconds. A statement that touches a row whose key gives nothing fails
+with `XXK01` naming the table — never skipping the row, never returning
+ciphertext.
+
+**Dropping a sealed table destroys its key**, once the drop has
+committed: the key's record is tombstoned and its history purged (the
+purge of #295). The dropped table's rows stay in KV until the
+dropped-table job reclaims them once the table's history window has
+passed (#313), as any dropped table's do, but they are unreadable from then
+on, `AS OF SYSTEM TIME` reads of the table included — on the gateway that
+ran the drop at once, on every other within one key lease (10 seconds);
+the drop does not wait that lease out, since by the time it returns no
+gateway resolves the table's name any more. This was chosen
+over destroying the key when the data is reclaimed because a drop of a
+sealed table should be an erasure of it, at once, and a mistaken drop is
+what a table restore is for. A key that another table still names (a
+table restored beside the one it was taken from shares its key) is kept
+until the last of them is dropped. A janitor on every node destroys, every
+five minutes, any table key no table names: the backstop for a gateway
+that died between the drop's commit and the destruction.
+
+**Backups and restores.** A backup copies the sealed values as they
+are, and `datax_keys` with its rows wrapped by the cluster key (see
+*Cluster key*). A restore of everything brings both back. A table
+restore copies the sealed rows under the table's new id, keeps the key id
+and the seal id in the descriptor, and makes sure the key is usable:
+shared, when this cluster has it; brought back from the backup's
+`datax_keys` and resealed under this cluster's key, when this cluster
+lacks it (another cluster — the source's cluster key must be imported
+first) or has destroyed it (the table was dropped after the backup). That
+last case is the documented dependency on backup retention at work: a
+backup taken before a key was destroyed still holds it. A table restore
+whose key the backup does not hold, or holds already destroyed, is
+refused before anything is written.
+
+**What it protects, and what it does not.** Destroying a table's key —
+by dropping the table — makes its sealed values unreadable on every
+replica and, once every backup taken before has expired, everywhere. It
+does not protect what is not sealed (keys, indexes, counts, sizes), it is
+not access control (a role that may `SELECT` reads plaintext), and it
+does not protect a gateway's memory while it holds the key.
+
+**What it costs.** One AES-GCM operation and 30 bytes per row value
+written or read, and a cache lookup; no extra round trip once the key is
+cached (one read of `datax_keys` per key per lease per gateway).
+Measured with `datax bench --sealed` on one secure node (a shared
+4-core VM, on-disk store, 16 workers, 10-second runs, five rounds of
+sealed and plain tables alternating, medians):
+
+| Workload | Plain (ops/s) | Sealed (ops/s) | Change |
+|---|---|---|---|
+| `kv`, 95% reads | 21,250 | 20,476 | −3.6% |
+| `kv`, 50% reads | 8,135 | 8,336 | +2.5% |
+| `bank` | 522 | 370 | see below |
+
+The round-to-round spread on that machine (`kv` 95% plain: 13,150 to
+22,194) is wider than either difference. A server CPU profile under
+each workload puts the boundary — sealing, opening, the cache — at 1.1%
+(`kv` 50%), 1.05% (`kv` 95%) and 0.93% (`bank`) of the server's CPU, and
+a seal plus an open of a 64-byte value costs about 0.8 µs
+(`BenchmarkBoundary`). `bank` is a contended workload whose throughput
+swung from 280 to 784 transfers/s between plain runs alone; its sealed
+runs were lower in most rounds with the same p50 and p95 latency, which
+this machine could not separate from noise. It should be measured again
+on a dedicated machine before the feature is called done against the 5%
+bar.
 
 ## Keys in memory
 
@@ -1336,6 +1452,11 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
+- **Sealed tables have one key per table only.** Per-tenant keys
+  (`encryption_key_by`), sealing an existing table, and the background
+  job that rewrites rows still under an old key version after a rotation
+  are not built; a sealed table's primary-key and indexed columns are
+  never sealed (see *Sealed tables*).
 - **Backups are sealed only when asked** (`datax backup --backup-key`);
   otherwise they are plaintext whatever the store is. A sealed backup
   shows its table count, table ids and file sizes; a rollback to an

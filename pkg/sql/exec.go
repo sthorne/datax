@@ -19,6 +19,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -270,6 +271,10 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
 	}
+	sealed, err := s.checkSealOptions(ctx, desc, t.Options)
+	if err != nil {
+		return nil, err
+	}
 	general := false
 	for name := range t.Options {
 		general = general || generalTableOption(name)
@@ -371,7 +376,12 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		addTTLIndex(desc)
 		ttlIndexed = len(desc.Indexes) != before
 	}
-	if owned || constrained || len(likeIndexes) > 0 || ttlIndexed {
+	if sealed {
+		if err := s.sealNewTable(ctx, txn, desc); err != nil {
+			return nil, err
+		}
+	}
+	if owned || constrained || len(likeIndexes) > 0 || ttlIndexed || sealed {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}
@@ -381,7 +391,11 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		s.splitAtTableEdges(ctx, desc)
 	}
 	s.presplitPlacement(ctx, txn, dbName, desc)
-	return &Result{Tag: "CREATE TABLE"}, nil
+	res := &Result{Tag: "CREATE TABLE"}
+	if sealed {
+		res.Notices = append(res.Notices, sealedTableNotice(desc))
+	}
+	return res, nil
 }
 
 // validateDefaultExpr checks an expression default at DDL time — the v7
@@ -426,7 +440,7 @@ func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string,
 		case "timeseries", "retention", "shards":
 			timeseries = true
 		default:
-			if !generalTableOption(name) {
+			if !generalTableOption(name) && !sealOption(name) {
 				return newErrf(CodeSyntaxError, "unknown table option %q", name)
 			}
 		}
@@ -900,6 +914,9 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	// sampler's orphan sweep is the backstop for anything missed), and so
 	// do the sequences its columns own.
 	if desc != nil {
+		if err := s.queueKeyDestroy(ctx, txn, desc); err != nil {
+			return nil, err
+		}
 		s.releaseManualSplits(ctx, desc.ID)
 		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
 			return nil, err
@@ -1114,7 +1131,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 			return nil, err
 		}
 		if conflict == nil {
-			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
+			if row, err = insertRowReturning(ctx, s.rowSealer(), txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
 				return nil, err
 			}
 			if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
@@ -1240,12 +1257,12 @@ func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []c
 }
 
 // insertRowReturning is insertRow, handing back the row it wrote.
-func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, ps *probeSet) (map[catalog.ColumnID]types.Datum, error) {
+func insertRowReturning(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, ps *probeSet) (map[catalog.ColumnID]types.Datum, error) {
 	row, _, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return nil, err
 	}
-	if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, false, ps); err != nil {
+	if err := insertRow(ctx, b, txn, desc, target, vals, wb, inserted, false, ps); err != nil {
 		return nil, err
 	}
 	return row, nil
@@ -1276,7 +1293,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		return false, nil, err
 	} else if existing != nil {
 		oldKey = key
-		if oldRow, err = decodeFullRow(desc, key, existing); err != nil {
+		if oldRow, err = decodeFullRow(ctx, s.rowSealer(), desc, key, existing); err != nil {
 			return false, nil, err
 		}
 		arbiter = "pk"
@@ -1310,7 +1327,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 				continue // a dangling entry: let the insert path report it
 			}
 			oldKey = pk
-			if oldRow, err = decodeFullRow(desc, pk, raw); err != nil {
+			if oldRow, err = decodeFullRow(ctx, s.rowSealer(), desc, pk, raw); err != nil {
 				return false, nil, err
 			}
 			arbiter = idx.Name
@@ -1319,7 +1336,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	if oldRow == nil {
 		// No conflict: a plain insert (the PK read above already ran).
-		if err := insertRow(ctx, txn, desc, target, vals, wb, inserted, true, ps); err != nil {
+		if err := insertRow(ctx, s.rowSealer(), txn, desc, target, vals, wb, inserted, true, ps); err != nil {
 			return false, nil, err
 		}
 		if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
@@ -1388,17 +1405,8 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	if err := guard.checkUpdate(ctx, txn, oldRow, newRow, wb); err != nil {
 		return false, nil, err
 	}
-	value, err := rowenc.EncodeValue(desc, newRow)
-	if err != nil {
+	if err := putRowValue(ctx, s.rowSealer(), desc, wb, oldKey, newRow); err != nil {
 		return false, nil, err
-	}
-	wb.Put(oldKey, value)
-	if desc.Reshard != nil {
-		shadow, serr := reshardShadowKey(desc, newRow)
-		if serr != nil {
-			return false, nil, serr
-		}
-		wb.Put(shadow, value)
 	}
 	if err := updateIndexEntries(ctx, txn, desc, oldRow, newRow, wb, inserted, ps); err != nil {
 		return false, nil, err
@@ -1578,7 +1586,7 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 // when the caller already probed the key, pkKnownAbsent), value encoding,
 // the reshard shadow write, and secondary index entries — all buffered
 // into wb. vals must be positionally parallel to target.
-func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool, ps *probeSet) error {
+func insertRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool, ps *probeSet) error {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return err
@@ -1593,19 +1601,10 @@ func insertRow(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescri
 			return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
 		}
 	}
-	value, verr2 := rowenc.EncodeValue(desc, row)
-	if verr2 != nil {
-		return verr2
-	}
 	// Writes are buffered; the caller flushes the batch (one routed batch —
 	// one Raft proposal per touched range — per statement or chunk).
-	wb.Put(key, value)
-	if desc.Reshard != nil {
-		shadow, serr := reshardShadowKey(desc, row)
-		if serr != nil {
-			return serr
-		}
-		wb.Put(shadow, value)
+	if err := putRowValue(ctx, b, desc, wb, key, row); err != nil {
+		return err
 	}
 	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted, ps); err != nil {
 		return err
@@ -1779,7 +1778,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 					}
 					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 				}
-				row, err := decodeFullRow(desc, pk, raw)
+				row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
 				if err != nil {
 					return false, err
 				}
@@ -1913,7 +1912,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 	noteIndexRows(desc, desc.LivePrimaryIndex(), len(kvs))
 	var out []fetchedRow
 	for _, kv := range kvs {
-		row, err := decodeFullRow(desc, kv.Key, kv.Value)
+		row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -2031,7 +2030,45 @@ func (s *Session) cachePlan(stmt parser.Statement, desc *catalog.TableDescriptor
 	return nil
 }
 
-func decodeFullRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
+// putRowValue buffers row's value at key, and at the in-flight
+// re-shard's shadow key when there is one, each sealed for its own key
+// when the table is sealed (pkg/sql/rowseal). Every write of a row value
+// goes through here.
+func putRowValue(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, wb *kvclient.WriteBatch, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
+	value, err := rowenc.EncodeValue(desc, row)
+	if err != nil {
+		return err
+	}
+	stored, err := b.SealValue(ctx, desc, key, value)
+	if err != nil {
+		return err
+	}
+	wb.Put(key, stored)
+	if desc.Reshard != nil {
+		shadow, err := reshardShadowKey(desc, row)
+		if err != nil {
+			return err
+		}
+		if stored, err = b.SealValue(ctx, desc, shadow, value); err != nil {
+			return err
+		}
+		wb.Put(shadow, stored)
+	}
+	return nil
+}
+
+// rowSealer is the gateway's sealed-table boundary (nil without a key
+// store, where a sealed table can be neither read nor written).
+func (s *Session) rowSealer() *rowseal.Boundary { return rowseal.For(s.cat) }
+
+// decodeFullRow decodes a primary row — its value opened first when the
+// table is sealed — into every column, PK columns included. Every read
+// of a row value goes through here (or through openRowValue).
+func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
+	value, err := b.OpenValue(ctx, desc, key, value)
+	if err != nil {
+		return nil, err
+	}
 	row, err := rowenc.DecodeValue(desc, value)
 	if err != nil {
 		return nil, err
@@ -2628,18 +2665,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
-		value, verr := rowenc.EncodeValue(desc, fr.row)
-		if verr != nil {
-			return nil, verr
-		}
-		wb.Put(fr.key, value)
-		if desc.Reshard != nil {
-			// PK updates are unsupported, so the shadow key is stable.
-			shadow, serr := reshardShadowKey(desc, fr.row)
-			if serr != nil {
-				return nil, serr
-			}
-			wb.Put(shadow, value)
+		// PK updates are unsupported, so a re-shard's shadow key is stable.
+		if err := putRowValue(ctx, s.rowSealer(), desc, &wb, fr.key, fr.row); err != nil {
+			return nil, err
 		}
 		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen, ps); err != nil {
 			return nil, err

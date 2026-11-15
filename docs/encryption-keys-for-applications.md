@@ -1,16 +1,19 @@
 # Encryption keys for applications: what to expect
 
-**Status: the key service is built; sealed tables are not yet.** The
-key service — named keys, `datax_key_wrap` / `datax_key_unwrap`,
-`datax_encrypt` / `datax_decrypt` and their privileges — works as
-described under [Using the key service](#using-the-key-service), on a
-cluster at version v22 with its cluster key enabled. Sealed tables
-(per-table and per-tenant keys, `datax_destroy_tenant_key`) are the
-agreed design, not built yet: this guide describes how they will
-behave so that an application can shape its schema and its erasure
-process now. The design and its decisions are in
-[design-key-service.md](design-key-service.md) (issue #310). The
-sealed-table statement names below are the planned ones and may still
+**Status: the key service and sealed whole tables are built; per-tenant
+keys are not yet.** The key service — named keys, `datax_key_wrap` /
+`datax_key_unwrap`, `datax_encrypt` / `datax_decrypt` and their
+privileges — works as described under [Using the key
+service](#using-the-key-service), and sealed whole tables (`WITH
+(encryption_key = 'auto')`; docs/sql.md and docs/encryption.md, "Sealed
+tables") work as described for one key per table, on a cluster at
+version v22 with its cluster key enabled; dropping a sealed table
+destroys its key. Per-tenant keys (`encryption_key_by`,
+`datax_destroy_tenant_key`) are the agreed design, not built yet: this
+guide describes how they will behave so that an application can shape
+its schema and its erasure process now. The design and its decisions
+are in [design-key-service.md](design-key-service.md) (issue #310). The
+per-tenant statement names below are the planned ones and may still
 change in detail; the limits and guarantees will not.
 
 ## In one paragraph

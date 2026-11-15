@@ -11,6 +11,7 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (timeseries = true [, retention = '7d'] [, shards = N])]  -- see docs/timeseries.md
     [WITH (gc_ttl = '10m')]                                         -- the table's own GC window (v21)
     [WITH (ttl_expiration = col | ttl_column = col, ttl = '7 days')] -- row expiry (v21); see Table options below
+    [WITH (encryption_key = 'auto')]                                -- a sealed table (v22); see Sealed tables below
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
 ALTER TABLE [IF EXISTS] t SET (gc_ttl = ... | ttl_expiration = col | ttl_column = col | ttl = '...' | retention = '...')
 ALTER TABLE [IF EXISTS] t RESET (gc_ttl | ttl | ttl_column | ttl_expiration | retention [, ...])
@@ -344,6 +345,74 @@ no record; nor do the cluster's own tables, whose ids are reserved. A
 restore of everything clears the rows and record of any dropped table
 whose id a restored table takes. Tables dropped before this change have
 no record and are not reclaimed.
+### Sealed tables (v22)
+
+`CREATE TABLE ... WITH (encryption_key = 'auto')` makes a **sealed
+table** (issue #310; docs/encryption.md, "Sealed tables", for what it
+protects; docs/encryption-keys-for-applications.md for how to shape a
+schema for it). The table gets a named key of its own, kind `table`, in
+`datax_keys`, created in the `CREATE TABLE`'s transaction, and the
+descriptor records it (`TableDescriptor.EncryptionKey`: the key's id and
+the *seal id*, the table's id at creation). Every row value is sealed
+under the key before it is written to KV and opened after it is read
+(`pkg/sql/rowseal`). Primary-key and indexed columns are in KV keys and
+are **not** sealed.
+
+- **Refused** (`0A000`) before v22 is finalized, before the cluster key
+  is enabled (`datax debug cluster-key init`), for time-series tables,
+  and for `encryption_key_by` (per-tenant keys, not built yet). A value
+  other than `'auto'` is `22023`. `ALTER TABLE ... SET (encryption_key
+  = ...)` is refused as not built yet (`0A000`): sealing an existing
+  table rewrites its rows, which a later step does in the background.
+  Create a new sealed table and copy the rows into it.
+- **Notices.** `CREATE TABLE` of a sealed table sends a `NOTICE` naming
+  every column that stays plaintext and why (`id (primary key)`,
+  `email_hmac (index users_email_hmac_key)`); `CREATE INDEX` on a
+  sealed table sends one naming the columns the new index makes
+  plaintext (and, for `ivfflat`, that the entries keep each row's
+  vector). `Result.Notices` carries them; pgwire sends them before the
+  command completes.
+- **Queries** are unchanged: filters, sorts, `CHECK` constraints,
+  joins, `EXPLAIN` and every index kind work above the boundary, on
+  plaintext. A sealed column has no index unless one is created, and no
+  statistics: `ANALYZE` and the background sampler describe a sealed
+  table's row count and its primary-key and indexed columns only.
+- **Errors.** A statement that reads or writes a row whose key is
+  destroyed, disabled or unavailable on the gateway fails with
+  **`XXK01`** naming the table and why (`table "notes": its encryption
+  key has been destroyed; its sealed rows cannot be read or written`);
+  the row is never skipped and its ciphertext never returned. The class
+  is PostgreSQL's `XX` (the data cannot be read, and retrying will not
+  change that), the subclass datax's own, so that a client tells a key
+  that is gone — erasure doing what was asked — from corruption. A
+  sealed value that does not authenticate (moved, altered), or a plain
+  value in a sealed table, is **`XX001`** (`data_corrupted`).
+- **Keys and leases.** A gateway keeps a table's key in held memory
+  under a lease of at most 10 seconds, rechecked against the key's
+  generation in `datax_keys`; a key disabled or destroyed stops being
+  used everywhere within one lease. A rotation of the key (a new
+  version) reaches new writes within one lease; reads open every
+  version.
+- **`DROP TABLE`** (and `DROP DATABASE ... CASCADE`) destroys the
+  table's key once the drop has committed — the key's record is
+  tombstoned and its history purged — so the dropped table's rows, which
+  stay in KV until the dropped-table job reclaims them after the table's
+  history window (*A dropped table's rows*, above), are unreadable at
+  once: an `AS OF SYSTEM TIME` read below the drop, which finds an
+  ordinary dropped table's rows until the reclaim, fails with `XXK01`
+  for a sealed one. A key another table still names
+  (a table restored beside the one it was taken from shares its key) is
+  kept until the last of them is dropped. A node's janitor destroys any
+  table key no table names, in case a gateway died between the commit
+  and the destruction.
+- **Backup and restore.** Backups copy the sealed values as they are.
+  A restore of everything brings `datax_keys` back (docs/encryption.md,
+  "Cluster key"). A table restore copies the sealed rows under the new
+  id and keeps the key id and the seal id; the key is shared if the
+  cluster has it, and brought back from the backup's `datax_keys` if
+  the cluster lacks it or has destroyed it (refused before anything is
+  written when the backup does not hold it, holds it destroyed, or holds
+  it under a cluster key this cluster has not imported).
 
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,

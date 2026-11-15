@@ -669,6 +669,28 @@ every node by the time the statement returns. `SHOW CREATE TABLE`,
 dropped (`2BP01`); renaming it updates the policy. A role a policy
 names cannot be dropped until the policy stops naming it.
 
+### Sealed tables
+
+A sealed table's row values are encrypted under a key of the table's
+own, so that dropping the table makes its data unreadable everywhere —
+on every replica at once, and in backups once those taken before have
+expired:
+
+```sql
+CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto');
+-- NOTICE:  table "notes" is sealed: ... not sealed ...: id (primary key)
+```
+
+**Primary-key and indexed columns are not sealed**: they stay readable to
+anyone who can read the database's storage. `CREATE TABLE` and `CREATE
+INDEX` say which columns those are. Queries work as on any table. A
+statement that reads a row whose key has been destroyed or disabled fails
+with `XXK01`. It needs the cluster key (`datax debug cluster-key init`,
+see the operations guide) and is refused for time-series tables; sealing
+an existing table and per-tenant keys are not available yet. How to shape
+a schema so that erasure means something:
+[encryption keys for applications](../encryption-keys-for-applications.md).
+
 ## Reading
 
 ```sql

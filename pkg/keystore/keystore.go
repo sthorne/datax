@@ -19,8 +19,7 @@
 //     row within its descriptor lease (10 seconds) and drops the cached
 //     material when it has moved: that is how disabling or destroying a
 //     key reaches every gateway within one lease (design, "Key cache and
-//     revocation"). Nothing caches yet; the counter is here so the cache
-//     has something to check.
+//     revocation"). The cache is Cache (cache.go).
 //
 // The cluster key is the server's (pkg/server/clusterkey.go); it reaches
 // this package through ClusterKeys.
@@ -347,18 +346,48 @@ func (s *Store) Create(ctx context.Context, kind Kind, name string) (Key, error)
 
 // CreateOwned is Create with the key owned by owner (empty: root).
 func (s *Store) CreateOwned(ctx context.Context, kind Kind, name, owner string) (Key, error) {
+	if err := s.preCreate(ctx, kind, name); err != nil {
+		return Key{}, err
+	}
+	var out Key
+	err := s.cfg.DB.RunTxn(ctx, "keys-create", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		out, err = s.createIn(ctx, txn, kind, name, owner)
+		return err
+	})
+	return out, err
+}
+
+// CreateIn is Create in the caller's transaction, so that the key exists
+// exactly when what it was made for does (a sealed table's key commits
+// with its CREATE TABLE).
+func (s *Store) CreateIn(ctx context.Context, txn *kvclient.Txn, kind Kind, name string) (Key, error) {
+	if err := s.preCreate(ctx, kind, name); err != nil {
+		return Key{}, err
+	}
+	return s.createIn(ctx, txn, kind, name, "")
+}
+
+// preCreate is what Create checks and prepares outside any transaction:
+// the arguments, the cluster key being enabled, and the table existing.
+func (s *Store) preCreate(ctx context.Context, kind Kind, name string) error {
 	if !kind.valid() {
-		return Key{}, fmt.Errorf("unknown kind of key %q (want %s, %s or %s)", kind, KindWrapping, KindTable, KindTenant)
+		return fmt.Errorf("unknown kind of key %q (want %s, %s or %s)", kind, KindWrapping, KindTable, KindTenant)
 	}
 	if err := validName(name); err != nil {
-		return Key{}, err
+		return err
 	}
 	if s.cfg.Ready != nil {
 		if err := s.cfg.Ready(ctx); err != nil {
-			return Key{}, err
+			return err
 		}
 	}
-	d, err := s.desc(ctx, true)
+	_, err := s.desc(ctx, true)
+	return err
+}
+
+func (s *Store) createIn(ctx context.Context, txn *kvclient.Txn, kind Kind, name, owner string) (Key, error) {
+	d, err := s.desc(ctx, false)
 	if err != nil {
 		return Key{}, err
 	}
@@ -395,26 +424,23 @@ func (s *Store) CreateOwned(ctx context.Context, kind Kind, name, owner string) 
 	if err != nil {
 		return Key{}, err
 	}
-	err = s.cfg.DB.RunTxn(ctx, "keys-create", func(ctx context.Context, txn *kvclient.Txn) error {
-		got, err := txn.GetBatch(ctx, []keys.Key{ie.Key, pk})
-		if err != nil {
-			return err
-		}
-		if got[0] != nil {
-			return ErrExists
-		}
-		if got[1] != nil {
-			return fmt.Errorf("key id %d is taken; retry", id)
-		}
-		if err := s.accept(ctx, txn, ref); err != nil {
-			return err
-		}
-		var wb kvclient.WriteBatch
-		wb.Put(pk, val)
-		wb.Put(ie.Key, ie.Value)
-		return txn.RunBatch(ctx, &wb)
-	})
+	got, err := txn.GetBatch(ctx, []keys.Key{ie.Key, pk})
 	if err != nil {
+		return Key{}, err
+	}
+	if got[0] != nil {
+		return Key{}, ErrExists
+	}
+	if got[1] != nil {
+		return Key{}, fmt.Errorf("key id %d is taken; retry", id)
+	}
+	if err := s.accept(ctx, txn, ref); err != nil {
+		return Key{}, err
+	}
+	var wb kvclient.WriteBatch
+	wb.Put(pk, val)
+	wb.Put(ie.Key, ie.Value)
+	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return Key{}, err
 	}
 	return r.Key, nil

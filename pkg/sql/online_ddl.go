@@ -157,6 +157,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	}
 	// Step 1: publish write-only.
 	var indexID uint64
+	var notices []string
 	exists := false
 	err = s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		exists = false
@@ -239,6 +240,10 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
 		indexID = idx.ID
+		notices = nil
+		if desc.Sealed() {
+			notices = []string{sealedIndexNotice(desc, &idx)}
+		}
 		return s.cat.Update(ctx, txn, desc)
 	})
 	if vec != nil && (err != nil || exists) {
@@ -311,7 +316,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
-	return &Result{Tag: "CREATE INDEX"}, nil
+	return &Result{Tag: "CREATE INDEX", Notices: notices}, nil
 }
 
 // backfillIndex fills the index from the table's rows as of a fixed
@@ -452,7 +457,7 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 		var wb kvclient.WriteBatch
 		seen := map[string]string{}
 		for _, kv := range kvs {
-			row, err := decodeFullRow(desc, kv.Key, kv.Value)
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 			if err != nil {
 				return err
 			}

@@ -396,7 +396,7 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 			continue
 		}
 		for _, kv := range kvs {
-			row, err := decodeFullRow(it.desc, kv.Key, kv.Value)
+			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, kv.Key, kv.Value)
 			if err != nil {
 				return false, err
 			}
@@ -429,7 +429,7 @@ func (it *scanIter) fillIndexPage(ctx context.Context, kvs []kvpb.KeyValue) erro
 			if raw == nil {
 				return false, newErrf(CodeInternal, "index %q entry points at a missing row", it.plan.idx.Name)
 			}
-			row, err := decodeFullRow(it.desc, pk, raw)
+			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, pk, raw)
 			if err != nil {
 				return false, err
 			}
