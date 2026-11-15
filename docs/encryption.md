@@ -991,7 +991,13 @@ operator's view):
 - **The key in transit.** The key is sent to the serving node in the
   admin request: over mutual TLS on a secure cluster, and on an insecure
   one accepted only from the node's own machine. It is not logged,
-  audited, or kept.
+  audited, or kept. A sealed backup is asked for as the admin op
+  `backup-sealed`, and a restore given keys as `restore-sealed` (issue
+  #313): under the plain `backup`, a node from before sealed backups —
+  one not yet upgraded in a rolling upgrade — would ignore the key it
+  does not know and write the backup in plaintext; under the new names
+  it refuses the op. A node still takes `backup` and `restore` with a
+  key, as commands from before the names send them.
 
 ## Recovery tooling
 

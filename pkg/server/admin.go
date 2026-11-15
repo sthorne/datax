@@ -274,9 +274,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	case "decommission":
 		return n.serveDecommission(ctx, req)
 
-	case "backup":
+	case "backup", "backup-sealed":
+		// "backup-sealed" is a backup with a key under an op of its own,
+		// so a node from before sealed backups refuses it rather than
+		// ignore the key and write plaintext (issue #313). "backup" still
+		// takes a key, as a command from before the new name sends it.
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
+		}
+		if req.Op == "backup-sealed" && len(req.BackupKey) == 0 {
+			return cluster.AdminResponse{Error: "backup-sealed carries the backup key, and this request has none"}
 		}
 		if err := n.backupKeyAccepted(ctx, req); err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
@@ -341,7 +348,13 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		return cluster.AdminResponse{Backup: sum}
 
-	case "restore":
+	case "restore", "restore-sealed":
+		// "restore-sealed": a restore given keys, under an op an older
+		// node refuses rather than restore a plaintext directory in a
+		// sealed backup's place without the keys (issue #313).
+		if req.Op == "restore-sealed" && !requestCarriesBackupKey(req) {
+			return cluster.AdminResponse{Error: "restore-sealed carries the backup keys, and this request has none"}
+		}
 		if err := n.backupKeyAccepted(ctx, req); err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

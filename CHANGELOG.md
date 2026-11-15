@@ -1161,6 +1161,15 @@ state or the internode protocol does, and an entry below says so.
   range merged into its neighbour — the system range included — made the
   neighbour refuse `AS OF SYSTEM TIME` reads and incremental backups below
   the purge (#313).
+- `datax backup --backup-key` asks the node for the admin op `backup-sealed`,
+  and `datax restore --backup-key` (without `--table`, `--database` or
+  `--as-of`) for `restore-sealed`, instead of `backup` and `restore` with
+  extra fields (#313). A node from before sealed backups — one not yet
+  upgraded in a rolling upgrade — ignored the key under the old names and
+  wrote the backup in plaintext; it refuses the new ones. Nodes still accept
+  `backup` and `restore` with keys from older commands. A command from this
+  release pointed at a node from before it fails with an unknown op: run it
+  against an upgraded node.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it

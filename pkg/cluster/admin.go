@@ -44,6 +44,12 @@ type AdminRequest struct {
 	// IncludeMetrics backs up the datax_metrics system table too (bulky
 	// and regenerable, so excluded by default).
 	IncludeMetrics bool `json:"include_metrics,omitempty"`
+	// A request carrying BackupKey travels as "backup-sealed", and a
+	// restore of everything carrying BackupKeys as "restore-sealed"
+	// (issue #313), for the reason given next: a node from before sealed
+	// backups would otherwise ignore the keys. "backup" and "restore"
+	// still take them, from commands that predate the names.
+	//
 	// What "backup-history" and "restore-select" add to backup and
 	// restore (issues #301, #302). They travel under op names of their
 	// own because a node from before them would read "backup" or

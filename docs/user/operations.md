@@ -908,7 +908,11 @@ datax restore --addr 10.0.1.1:26257 --src /backups/full,/backups/inc1 \
   from its own machine: run the command there, against a loopback
   address. The key is never logged or written to the audit log (the
   audit record notes only that a key was given), is not stored on the
-  node, and is not written into the backup.
+  node, and is not written into the backup. During a rolling upgrade,
+  point a sealed backup or restore at an upgraded node: the command asks
+  for it under an op name (`backup-sealed`, `restore-sealed`) that a node
+  from before sealed backups refuses, where it would otherwise have
+  ignored the key and written plaintext.
 - **Losing the key loses the backup.** There is no escrow and no second
   way in. Keep the key apart from the backup location; a key stored
   beside the files it seals protects nothing.
