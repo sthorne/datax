@@ -525,6 +525,55 @@ func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	return a.waitForAdoption(ctx, desc.ID, desc.Version)
 }
 
+// LeasesAdopted reports whether no gateway can still use a version of
+// descriptor descID below version: every live lease is at version or
+// later, and none still has a statement planned against an earlier one.
+// One read of the leases, without waiting (FinishDDL waits); for a
+// background job that must not act before a schema change has reached
+// every gateway (the seal job, after ALTER TABLE ... SET
+// (encryption_key)), and that checks again later rather than give up on
+// a lease that does not move — such a lease expires. True on an accessor
+// without leasing.
+func (a *Accessor) LeasesAdopted(ctx context.Context, descID, version uint64) (bool, error) {
+	a.mu.Lock()
+	leasing := a.leasing
+	a.mu.Unlock()
+	if !leasing {
+		return true, nil
+	}
+	return a.adopted(ctx, descID, version)
+}
+
+func (a *Accessor) adopted(ctx context.Context, descID, version uint64) (bool, error) {
+	lo, hi := keys.DescLeaseSpan(descID)
+	rows, err := a.db.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return false, err
+	}
+	nowWall := a.clock.Now().WallTime
+	for _, kv := range rows {
+		var l descLease
+		if json.Unmarshal(kv.Value, &l) != nil {
+			continue
+		}
+		if l.Expiration <= nowWall {
+			continue // expired: unusable, nothing to wait for
+		}
+		if l.Version < version {
+			return false, nil
+		}
+		// The gateway is on the new version, but it handed the previous
+		// one to a statement that can still commit, up to the expiration
+		// that entry carried. Until then this gateway is not done with
+		// the old schema, whatever its published version says (issue
+		// #185).
+		if l.PriorExpiration > nowWall {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // waitForAdoption polls the descriptor's leases until every live one is at
 // version or later. A live lease stuck below the version past 2×TTL is
 // anomalous (renewal adopts within TTL/3); it is logged and no longer
@@ -535,35 +584,9 @@ func (a *Accessor) waitForAdoption(ctx context.Context, descID, version uint64) 
 	if poll < 10*time.Millisecond {
 		poll = 10 * time.Millisecond
 	}
-	lo, hi := keys.DescLeaseSpan(descID)
 	for {
-		rows, err := a.db.Scan(ctx, lo, hi, 0)
-		adopted := err == nil
-		if adopted {
-			nowWall := a.clock.Now().WallTime
-			for _, kv := range rows {
-				var l descLease
-				if json.Unmarshal(kv.Value, &l) != nil {
-					continue
-				}
-				if l.Expiration <= nowWall {
-					continue // expired: unusable, nothing to wait for
-				}
-				if l.Version < version {
-					adopted = false
-					break
-				}
-				// The gateway is on the new version, but it handed the
-				// previous one to a statement that can still commit, up
-				// to the expiration that entry carried. Until then this
-				// gateway is not done with the old schema, whatever its
-				// published version says (issue #185).
-				if l.PriorExpiration > nowWall {
-					adopted = false
-					break
-				}
-			}
-		}
+		adopted, err := a.adopted(ctx, descID, version)
+		adopted = adopted && err == nil
 		if adopted {
 			return nil
 		}
