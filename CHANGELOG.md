@@ -560,6 +560,11 @@ state or the internode protocol does, and an entry below says so.
   anywhere cannot drive an unbounded stream of distributed transactions.
   A console re-sending its own value never meets the bucket, because the
   suppression comes first.
+- **The console's table page shows row-level security** (#312): whether it
+  is enabled and forced, and each policy — permissive or restrictive, the
+  statements and roles it applies to, its `USING` and `WITH CHECK`
+  expressions — and the reconstructed DDL reproduces them. `/api/schema`
+  gains `row_security`, `force_row_security` and `policies` per table.
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server

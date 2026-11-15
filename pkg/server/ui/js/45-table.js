@@ -83,6 +83,9 @@ function tableDDL(t) {
     sql += `\nCREATE ${i.unique ? "UNIQUE " : ""}INDEX ${quoteIdent(i.name)} ON ${name} ${i.method ? "USING " + i.method.toUpperCase() + " " : ""}(${(i.columns || []).map(quoteIdent).join(", ")});`;
   }
   if (t.comment) sql += `\nCOMMENT ON TABLE ${name} IS '${t.comment.replace(/'/g, "''")}';`;
+  if (t.row_security) sql += `\nALTER TABLE ${name} ENABLE ROW LEVEL SECURITY;`;
+  if (t.force_row_security) sql += `\nALTER TABLE ${name} FORCE ROW LEVEL SECURITY;`;
+  for (const p of t.policies || []) sql += `\n${p.definition};`;
   return sql;
 }
 
@@ -98,10 +101,10 @@ function renderTableDetail(d) {
     setHTML(summary, (d.tables || []).length || (d.principal && d.principal.admin)
       ? `No table called <b>${esc(ui.table)}</b> is visible to you — it may not exist, or you may hold no privilege on it. ${back}`
       : `Waiting for the schema. ${back}`);
-    for (const id of ["table-columns", "table-indexes", "table-constraints", "table-grants", "table-shapes"]) {
+    for (const id of ["table-columns", "table-indexes", "table-constraints", "table-grants", "table-policies", "table-shapes"]) {
       setHTML(document.getElementById(id), "");
     }
-    for (const id of ["table-stats", "table-ranges", "table-columns-note", "table-indexes-note", "table-shapes-note", "table-ddl-note"]) {
+    for (const id of ["table-stats", "table-ranges", "table-rls", "table-columns-note", "table-indexes-note", "table-shapes-note", "table-ddl-note"]) {
       setHTML(document.getElementById(id), "");
     }
     setHTML(document.getElementById("table-ddl"), "");
@@ -123,6 +126,7 @@ function renderTableDetail(d) {
   renderTableStats(t);
   renderTableRanges(t);
   renderTableGrants(t);
+  renderTableRowSecurity(t);
   renderTableShapes(t);
   setHTML(document.getElementById("table-ddl"), esc(tableDDL(t)));
   setHTML(document.getElementById("table-ddl-note"),
@@ -286,6 +290,29 @@ function renderTableGrants(t) {
       <td data-label="privileges">${(privs || []).map(p => `<span class="kind">${esc(String(p).toLowerCase())}</span>`).join(" ")}</td>
     </tr>`,
   })) : [{ key: "none", html: `<tr data-key="none"><td colspan="2" class="muted">no grants — the owner and the admin role reach it, nobody else</td></tr>` }]);
+}
+
+// Row-level security (issue #312): whether it is enabled and forced,
+// and the policies, as pg_policies lists them. Policies on a table
+// whose row security is off are kept but do nothing, which is worth
+// saying.
+function renderTableRowSecurity(t) {
+  const el = document.getElementById("table-rls");
+  const ps = t.policies || [];
+  let s;
+  if (t.view) s = `<span class="muted">a view has no row security of its own: the policies of the tables its query reads apply to its owner.</span>`;
+  else if (!t.row_security) s = `<b>disabled</b> — every role that may read the table reads every row.` + (ps.length ? ` The policies below are kept but not applied until <code class="key">ALTER TABLE ${esc(qualifiedIdent(t))} ENABLE ROW LEVEL SECURITY</code>.` : "");
+  else s = `${tok("live", "enabled")}${t.force_row_security ? " and " + tok("live", "forced") : ""} — roles other than the owner${t.force_row_security ? "" : ", admins"} and BYPASSRLS roles see only the rows the policies admit` + (t.force_row_security ? "; forced, so the owner and admins are filtered too (root is not)." : "; the owner and admins are not filtered unless it is forced.") + (ps.length ? "" : ` No policy exists, so those roles see ${warn("draining", "no rows")}.`);
+  setHTML(el, s);
+  renderKeyed(document.getElementById("table-policies"), ps.length ? ps.map(p => ({
+    key: p.name,
+    html: `<tr data-key="${esc(p.name)}">
+      <td data-label="policy"><b>${esc(p.name)}</b> <span class="kind">${p.restrictive ? "restrictive" : "permissive"}</span></td>
+      <td data-label="applies to">${esc(String(p.command || "all").toUpperCase())}</td>
+      <td data-label="roles">${(p.roles && p.roles.length ? p.roles : ["public"]).map(esc).join(", ")}</td>
+      <td data-label="expressions" class="key" style="max-width:none;white-space:normal">${p.using ? "USING (" + esc(p.using) + ")" : ""}${p.using && p.check ? "<br>" : ""}${p.check ? "WITH CHECK (" + esc(p.check) + ")" : ""}</td>
+    </tr>`,
+  })) : [{ key: "none", html: `<tr data-key="none"><td colspan="4" class="muted">no policies</td></tr>` }]);
 }
 
 // Which statement shapes touch this table: a filter over the document

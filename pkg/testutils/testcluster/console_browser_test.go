@@ -82,6 +82,10 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
 		// A split is an event, and the views that list events are where
 		// a wrong "when" shows.
 		`ALTER TABLE ` + consoleLongTable + ` SPLIT AT VALUES (2)`,
+		// Its detail page then renders the row-security section with a
+		// policy in it.
+		`ALTER TABLE ` + consoleLongTable + ` ENABLE ROW LEVEL SECURITY`,
+		`CREATE POLICY only_x ON ` + consoleLongTable + ` USING (a_long_secondary_column_name = 'x')`,
 	} {
 		if _, err := conn.Exec(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
