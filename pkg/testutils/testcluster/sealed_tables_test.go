@@ -18,6 +18,8 @@ import (
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/keystore"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/storage/enc"
@@ -132,8 +134,14 @@ func sameStrings(t *testing.T, what string, got []string, want ...string) {
 func tableDesc(t *testing.T, ctx context.Context, c *ckCluster, name string) *catalog.TableDescriptor {
 	t.Helper()
 	lo, hi := keys.TableDescSpan()
-	kvs, err := c.tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
-	if err != nil {
+	// In a transaction, so an in-flight descriptor write (a statistics
+	// refresh, a lease) is pushed rather than failing the read.
+	var kvs []kvpb.KeyValue
+	if err := c.tc.Nodes[0].DB().RunTxn(ctx, "test-table-desc", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		kvs, err = txn.Scan(ctx, lo, hi, 0)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	for _, kv := range kvs {
