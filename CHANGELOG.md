@@ -1408,8 +1408,24 @@ state or the internode protocol does, and an entry below says so.
   idle (1,000 tables: 3,042 → 94). New harness `TestMetricsRecorderScale`
   (`DATAX_CATALOG_SCALE`). A plain SQL query of `datax_metrics` sees the
   sparse rows; docs/user/operations.md says how to read them.
+- **A dropped table is reclaimed with one raft command per range** (#316).
+  The reclaim deleted a dropped table row by row and then collected every
+  version; once the cluster has finalized v22 it empties each range of the
+  table's span with a replicated range clear: the leader checks the span is
+  a dropped table's, refuses an intent, and picks a time above every version
+  and every read served; every replica deletes the span with one range
+  deletion and raises the range's GC threshold to that time in the same
+  command. The purge still follows, to take the bytes out of the files and
+  the logs. A table of 100,000 rows on three nodes: 939 raft entries and
+  43.9 MB of log payload in 3.0 s before, 24 entries, 4.1 kB and 0.30 s
+  now. The consistency checker also compares each replica's size and GC
+  threshold. New metrics `datax_range_clears_total` and
+  `datax_raft_entry_bytes_appended_total`. Cluster protocol version v22.
 
 ### Fixed
+- Finding a range's leader for a purge gave up when a replica listed before
+  the leader was on a node that was down, though another replica could
+  answer; it now moves on to the next replica.
 - **A transaction whose commit failed kept its rows locked for up to five
   seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
   or its deadline had passed) stopped the transaction's heartbeat but left
