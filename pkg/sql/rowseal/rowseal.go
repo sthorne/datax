@@ -36,12 +36,12 @@
 // # Choosing the key: the resolver
 //
 // A Resolver says which key a row is sealed under, from the descriptor
-// and the row's KV key. A whole sealed table has one key (TableKey). The
-// per-tenant tables of step 4 plug in a resolver that decodes the leading
-// primary-key column from the row key and maps its value to that
-// tenant's key, creating it on a first write (forWrite); nothing else in
-// the boundary changes, since the key id is bound into the associated
-// data and the read path asks the same resolver.
+// and the row's KV key. A whole sealed table has one key (TableKey). A
+// per-tenant table (step 4, tenant.go) is resolved by TenantResolver,
+// which decodes the leading primary-key column from the row key and maps
+// its value to that tenant's key, creating it on a first write
+// (forWrite); its sealed values name their key, so reads need no
+// resolving.
 package rowseal
 
 import (
@@ -211,14 +211,17 @@ type Boundary struct {
 	keys     Keys
 	store    KeyStore
 	resolver Resolver
+	// tenant resolves the keys of per-tenant tables.
+	tenant *TenantResolver
 }
 
 // New returns a boundary over keys and store; a nil resolver is TableKey.
+// Per-tenant tables are resolved by a TenantResolver over keys and store.
 func New(k Keys, store KeyStore, r Resolver) *Boundary {
 	if r == nil {
 		r = TableKey{}
 	}
-	return &Boundary{keys: k, store: store, resolver: r}
+	return &Boundary{keys: k, store: store, resolver: r, tenant: NewTenantResolver(k, store, 0)}
 }
 
 // Store is the key store the boundary was made with (nil without one).
@@ -250,6 +253,9 @@ type KeyUnavailableError struct {
 	KeyID   int64
 	Version int // 0: the current version
 	Err     error
+	// Tenant: the key is one tenant's of a per-tenant table; Naming: it
+	// is a per-tenant table's naming key.
+	Tenant, Naming bool
 }
 
 func (e *KeyUnavailableError) Error() string {
@@ -263,6 +269,14 @@ func (e *KeyUnavailableError) Error() string {
 		why = "does not exist"
 	case errors.Is(e.Err, ErrKeyNoVersion):
 		why = fmt.Sprintf("has no version %d", e.Version)
+	}
+	switch {
+	case e.Tenant && e.KeyID != 0:
+		return fmt.Sprintf("table %q: the encryption key of a tenant (key %d) %s; that tenant's rows sealed under it cannot be read or written", e.Table, e.KeyID, why)
+	case e.Tenant:
+		return fmt.Sprintf("table %q: a tenant's encryption key %s", e.Table, why)
+	case e.Naming:
+		return fmt.Sprintf("table %q: its naming key, which names its tenants' keys, %s; its tenants' keys cannot be found or made", e.Table, why)
 	}
 	return fmt.Sprintf("table %q: its encryption key %s; its sealed rows cannot be read or written", e.Table, why)
 }
@@ -309,6 +323,9 @@ func (b *Boundary) SealValue(ctx context.Context, desc *catalog.TableDescriptor,
 	if err != nil {
 		return nil, err
 	}
+	if desc.SealedPerTenant() {
+		return b.sealTenant(ctx, desc, key, suffix, plain)
+	}
 	id, err := b.resolver.Resolve(ctx, desc, key, true)
 	if err != nil {
 		return nil, err
@@ -333,6 +350,16 @@ func (b *Boundary) OpenValue(ctx context.Context, desc *catalog.TableDescriptor,
 	}
 	if !IsSealed(value) {
 		return nil, &CorruptError{Table: desc.Name, Key: key, Reason: "is not sealed, and the table is"}
+	}
+	if b == nil && desc.SealedPerTenant() {
+		return nil, &KeyUnavailableError{Table: desc.Name, Tenant: true, Err: errors.New("this node has no key store")}
+	}
+	if desc.SealedPerTenant() {
+		suffix, err := rowKeySuffix(desc, key)
+		if err != nil {
+			return nil, err
+		}
+		return b.openTenant(ctx, desc, key, suffix, value)
 	}
 	v, err := Version(value)
 	if err != nil {

@@ -189,6 +189,39 @@ func TestGoldenSealedDescriptor(t *testing.T) {
 	}
 }
 
+// goldenTableDescriptorSealedPerTenant is a table sealed per tenant
+// (issue #310, step 4): tenant_column is omitempty, so a table sealed
+// whole encodes as it did in step 3.
+const goldenTableDescriptorSealedPerTenant = `{"id":13,"name":"items","columns":[{"id":1,"name":"tenant_id","type":8,"not_null":true},{"id":2,"name":"id","type":1,"not_null":true},{"id":3,"name":"title","type":3}],"primary_key":[1,2],"encryption_key":{"key_id":4343,"seal_id":13,"tenant_column":1}}`
+
+func TestGoldenSealedPerTenantDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealedPerTenant), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.SealedPerTenant() || d.EncryptionKey.TenantColumn != 1 || d.EncryptionKey.KeyID != 4343 {
+		t.Fatalf("decoded %+v", d.EncryptionKey)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil || string(raw) != goldenTableDescriptorSealedPerTenant {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenTableDescriptorSealedPerTenant, err)
+	}
+	var whole TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &whole); err != nil {
+		t.Fatal(err)
+	}
+	if whole.SealedPerTenant() {
+		t.Fatal("a table sealed whole reads as sealed per tenant")
+	}
+	if raw, _ := json.Marshal(whole); string(raw) != goldenTableDescriptorSealed {
+		t.Fatalf("a table sealed whole encodes differently: %s", raw)
+	}
+	var plain *TableDescriptor
+	if plain.SealedPerTenant() {
+		t.Fatal("nil descriptor")
+	}
+}
+
 // TestGoldenRoleBypassRLS: the BYPASSRLS attribute is omitempty, so a
 // role without it encodes as before.
 func TestGoldenRoleBypassRLS(t *testing.T) {

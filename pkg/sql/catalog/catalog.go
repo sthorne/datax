@@ -639,10 +639,24 @@ type TableEncryptionKey struct {
 	// table a new id and keeps SealID (and KeyID), so the rows it copies
 	// open as they were written.
 	SealID uint64 `json:"seal_id"`
+	// TenantColumn, when set, makes the table sealed per tenant
+	// (encryption_key_by, issue #310 step 4): it is the leading
+	// primary-key column, and each of its values has a key of its own,
+	// of kind tenant, made on the value's first write; each sealed value
+	// names its key. KeyID is then the table's naming key: its material
+	// keys the digest that names the tenants' keys, and it seals nothing.
+	// Zero for a table sealed whole.
+	TenantColumn ColumnID `json:"tenant_column,omitempty"`
 }
 
 // Sealed reports whether the table's row values are sealed.
 func (d *TableDescriptor) Sealed() bool { return d != nil && d.EncryptionKey != nil }
+
+// SealedPerTenant reports whether the table's row values are sealed
+// under a key per value of its leading primary-key column.
+func (d *TableDescriptor) SealedPerTenant() bool {
+	return d.Sealed() && d.EncryptionKey.TenantColumn != 0
+}
 
 // Policy commands: the statement kinds a row-security policy governs.
 const (
