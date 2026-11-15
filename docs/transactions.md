@@ -449,9 +449,51 @@ pushee's anchor range:
 - Record PENDING and live:
   - pusher has **higher priority** → write ABORTED into the record (the pushee
     discovers this at its next heartbeat or EndTxn),
-  - otherwise re-push every 100 ms, for at most 10 s (`conflictBudget`,
-    `pkg/kvclient/txn.go`), then surface `40001` to the client. A wait
-    that can only end in a restart does not wait at all (see below).
+  - otherwise wait for the pushee to finish and push again, for at most
+    10 s (`conflictBudget`, `pkg/kvclient/txn.go`), then surface `40001`
+    to the client. A wait that can only end in a restart does not wait
+    at all (see below).
+
+How a waiter learns that the pushee finished (`pkg/kvclient/conflictwait.go`):
+
+- **Woken, when the pushee's coordinator is on the same node** — every
+  conflict on a one-node cluster, and any between two sessions on the
+  same gateway. Each node's client keeps a table of the transactions its
+  blocked operations are waiting on, registered before the push so a
+  finish landing between the push and the wait is not missed. A
+  coordinator that commits or aborts wakes the waiters on its
+  transaction once the record is final and its intents resolved (a
+  parallel commit, once its asynchronous finalization has run), and the
+  waiter's next attempt usually goes straight through. A pusher that
+  finds a record final, or aborts it (by priority or as a deadlock
+  victim), wakes the others on that node waiting on the same
+  transaction.
+- **Polled, otherwise** — the pushee runs on another gateway, or a wake
+  was missed. The waiter pushes again after a backoff: 5 ms, doubling to
+  100 ms, each wait drawn at random from the upper half of its interval
+  so waiters queued behind one holder do not push in step. Most holders
+  finish within milliseconds, which the first short waits catch; a long
+  wait costs a push every 75 ms or so, about the fixed 100 ms poll this
+  replaces. A wake ends the backoff early.
+
+Nothing about this is replicated or crosses the wire: the wake is a
+channel in the waiting node's own process, and the pushes are the same
+`PushTxn` requests as before, so mixed-version clusters behave as either
+version does. A wake is only a hint to push again now, never a verdict;
+the push still reads the record.
+
+Measured on the bank workload (one secure, encrypted on-disk node, 16
+workers, 1,000 accounts, seed 7, six alternating 30 s rounds each on a
+shared, busy machine): p99 went from 111 ms (103–117) — the poll — to
+45 ms (24–54; 24 ms in the two quiet rounds, where p50 and p95 matched
+the old poll's to within 0.2 ms). Pushes per committed transfer went
+from 0.036 to 0.040 and `40001`s per transfer stayed at 0.018. Committed
+transfers a second were within the machine's noise (median 1,148 vs
+1,076, ranges 870–1,377 and 821–1,476). hot-row, whose transactions hold
+a row for ~30 ms, pushes more (0.007 to 0.018 per transaction: the
+backoff's first short waits mostly end before the holder does), still a
+push per fifty transactions; kv 50 % reads does the same work per
+operation as before.
 
 Priorities are random at birth and bumped on retries, so starvation is
 unlikely. Genuine deadlocks are broken by **distributed detection over
@@ -462,10 +504,13 @@ chain with query-only pushes — reads of the records along the way. A walk
 that arrives back at the walker has found a cycle; every walker picks the
 same victim deterministically (lowest priority, transaction ID as
 tie-break) and force-aborts it — a self-chosen victim aborts its own
-record at once so its partners unblock on their next poll. Wait edges are
+record at once and wakes its partners on its node, so they unblock
+without waiting out a poll. Wait edges are
 advisory and may be stale, so a phantom cycle costs at worst one spurious
-retryable abort, never an anomaly. Constructed 2- and 3-cycles resolve in
-a few poll rounds (hundreds of milliseconds). With detection in place the
+retryable abort, never an anomaly. Every round of a wait — each wake or
+backoff — runs the walk again; constructed 2- and 3-cycles resolve in a
+few rounds, and since the rounds now start at a few milliseconds rather
+than 100, in 10–20 ms on one node (they took hundreds). With detection in place the
 conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
 waiters queueing behind a slow-but-live lock holder are no longer aborted
 by the clock.

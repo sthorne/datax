@@ -1426,6 +1426,17 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A transaction blocked on another's lock noticed it was released up to
+  100 ms late.** It re-asked the lock holder's transaction record every
+  100 ms. Now the holder's coordinator wakes it as soon as the holder has
+  committed or aborted and released its rows, when both run on the same
+  node; otherwise it re-asks after 5 ms, doubling to 100 ms, with jitter so
+  waiters behind one holder do not ask in step. On the bank workload (one
+  node, 16 workers, 1,000 accounts) p99 latency fell from 111 ms to 45 ms
+  on a busy machine and to 24 ms on a quiet one, for about 10 % more pushes
+  per transfer; constructed deadlocks are broken in 10–20 ms instead of
+  hundreds. New metric `datax_txn_pushes_total`. Nothing replicated or on
+  the wire changed.
 - **A transaction whose commit failed kept its rows locked for up to five
   seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
   or its deadline had passed) stopped the transaction's heartbeat but left
