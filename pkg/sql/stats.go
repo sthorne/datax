@@ -158,6 +158,13 @@ func CollectTableStats(ctx context.Context, db *kvclient.DB, b *rowseal.Boundary
 		}
 		cols = kept
 	}
+	// A sealed table whose described columns are all in the primary key
+	// is described from its keys alone: its values are not opened, so
+	// the sampler neither needs nor churns the gateway's keys.
+	pkOnly := desc.Sealed()
+	for _, c := range cols {
+		pkOnly = pkOnly && desc.IsPKCol(c.ID)
+	}
 	sketches := make(map[catalog.ColumnID]*kmvSketch, len(cols))
 	nulls := make(map[catalog.ColumnID]int64, len(cols))
 	for _, c := range cols {
@@ -174,14 +181,21 @@ func CollectTableStats(ctx context.Context, db *kvclient.DB, b *rowseal.Boundary
 			break
 		}
 		for _, kv := range kvs {
-			row, derr := decodeFullRow(ctx, b, desc, kv.Key, kv.Value)
+			var row map[catalog.ColumnID]types.Datum
+			var derr error
+			if pkOnly {
+				row, derr = decodePKRow(desc, kv.Key)
+			} else {
+				row, derr = decodeFullRow(ctx, b, desc, kv.Key, kv.Value)
+			}
 			if derr != nil {
 				var ku *rowseal.KeyUnavailableError
-				if errors.As(derr, &ku) {
+				if errors.As(derr, &ku) && !desc.SealedPerTenant() {
 					return nil, derr // no key: nothing to describe, not an empty table
 				}
-				// A row we cannot decode (concurrent schema change edge)
-				// still counts; its column values are skipped.
+				// A row we cannot decode (concurrent schema change edge,
+				// or a row of a tenant whose key was destroyed) still
+				// counts; its column values are skipped.
 				rows++
 				continue
 			}
@@ -315,4 +329,17 @@ func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parse
 	}
 	res.Tag = fmt.Sprintf("SHOW STATS %d", len(res.Rows))
 	return res, nil
+}
+
+// decodePKRow decodes a primary row's key columns only.
+func decodePKRow(desc *catalog.TableDescriptor, key keys.Key) (map[catalog.ColumnID]types.Datum, error) {
+	vals, err := rowenc.DecodePK(desc, key)
+	if err != nil {
+		return nil, err
+	}
+	row := make(map[catalog.ColumnID]types.Datum, len(vals))
+	for i, id := range desc.PrimaryKey {
+		row[id] = vals[i]
+	}
+	return row, nil
 }

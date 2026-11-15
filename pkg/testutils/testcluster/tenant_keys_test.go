@@ -409,6 +409,12 @@ func TestSealedPerTenant(t *testing.T) {
 		// index entries are found from their values); TRUNCATE removes
 		// them, as a table restore would.
 		wantSQLErr(t, ctx, conn, fmt.Sprintf(`DELETE FROM items WHERE tenant_id = '%s' AND id <= 2`, td), "XXK01")
+		// Statistics still collect: the rows count, their values are
+		// skipped.
+		sealExec(t, ctx, conn, `ANALYZE items`)
+		if st := tableStats(t, ctx, c, d.ID); st.RowCount < 2000 {
+			t.Fatalf("statistics after a row was left behind: %d rows", st.RowCount)
+		}
 	})
 
 	t.Run("refusals", func(t *testing.T) {
