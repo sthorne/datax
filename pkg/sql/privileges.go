@@ -297,8 +297,13 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		allowed = true
 	case priv != "SELECT" && set.Has(catalog.WriteAllRole):
 		allowed = true
-	case priv == "TRUNCATE" && catalog.HasPrivilege(desc.Privileges, set, "DELETE"):
-		allowed = true // DELETE covered TRUNCATE before v11; ALL still grants both
+	case priv == "TRUNCATE" && !s.rolesFinalized() && catalog.HasPrivilege(desc.Privileges, set, "DELETE"):
+		// Before v11 TRUNCATE took DELETE, and a node of the older binary
+		// still decides so while the cluster is below v11. Finalizing v11
+		// grants TRUNCATE to every DELETE holder
+		// (catalog.GrantTruncateWithDelete); from then on DELETE no
+		// longer covers it (issue #312).
+		allowed = true
 	}
 	if !allowed {
 		return false, nil

@@ -144,4 +144,16 @@ func TestPrivilegeGaps(t *testing.T) {
 			t.Fatal("SHOW STATS of a readable table shows nothing")
 		}
 	})
+
+	t.Run("TRUNCATE takes TRUNCATE, not DELETE", func(t *testing.T) {
+		rlsExec(t, ctx, root, `CREATE TABLE del_t (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `INSERT INTO del_t VALUES (1), (2)`)
+		rlsExec(t, ctx, root, `GRANT SELECT, DELETE ON del_t TO alice`)
+		rlsExec(t, ctx, alice, `DELETE FROM del_t WHERE id = 1`)
+		rlsRefused(t, ctx, alice, "42501", `TRUNCATE del_t`)
+		rlsWant(t, ctx, alice, []string{"2"}, `SELECT id FROM del_t`)
+		rlsExec(t, ctx, root, `GRANT TRUNCATE ON del_t TO alice`)
+		rlsExec(t, ctx, alice, `TRUNCATE del_t`)
+		rlsWant(t, ctx, alice, []string{}, `SELECT id FROM del_t`)
+	})
 }

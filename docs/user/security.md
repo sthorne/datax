@@ -138,7 +138,9 @@ What each statement needs: creating tables, views, sequences and types
 takes `CREATE` on the database (or on `public`), or the admin role;
 `ALTER`, `DROP`, `COMMENT ON`, `CREATE INDEX` and `GRANT` on an object
 take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
-(a pre-v11 `DELETE` grant still covers it); `nextval` takes `USAGE` on
+— `DELETE` does not cover it (finalizing the v11 upgrade gave every
+`DELETE` grant made before it `TRUNCATE` too, since `DELETE` was what
+`TRUNCATE` took until then); `nextval` takes `USAGE` on
 the sequence — a `SERIAL` column's sequence follows `INSERT` on the
 table; `EXPLAIN` takes `SELECT` on every table the statement reads, as
 running it would, and `SHOW STATS FOR t` takes `SELECT` on `t`;

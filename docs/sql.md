@@ -1516,6 +1516,12 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `SELECT` as the reader, and checks a view's query as the view's
   owner. `SHOW STATS FOR t` takes `SELECT` on `t`: its counts describe
   the rows.
+  `TRUNCATE` takes the `TRUNCATE` privilege. Until cluster version v11
+  it took `DELETE`, and while a cluster is below v11 it still does (a
+  node of the older binary decides so); the finalize transaction that
+  moves the cluster to v11 adds `TRUNCATE` beside every `DELETE` grant
+  (`catalog.GrantTruncateWithDelete`), so grants made before keep their
+  meaning and later `DELETE` grants do not carry `TRUNCATE`.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

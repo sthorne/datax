@@ -376,10 +376,10 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		}
 		// TRUNCATE removes every row without reading one, so no policy
 		// can filter it. PostgreSQL lets a role with the TRUNCATE
-		// privilege do that past the table's row security; here the
-		// privilege is also what a DELETE grant from before v11 carries,
-		// and a role confined to its own rows must not be able to remove
-		// everyone's by either route. It is refused; the owner (unless
+		// privilege do that past the table's row security; here a role
+		// confined to its own rows must not be able to remove everyone's,
+		// however it came by the privilege (a DELETE grant made before
+		// v11 was converted to one). It is refused; the owner (unless
 		// forced) and exempt roles truncate as before.
 		if confined, err := s.rowSecurityActive(ctx, txn, shared); err != nil {
 			return nil, err

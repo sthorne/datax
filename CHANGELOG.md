@@ -1163,6 +1163,17 @@ state or the internode protocol does, and an entry below says so.
   choice for the tab and says plainly that it will not be kept. The table
   is included in backups: it is small, and unlike the metrics it cannot
   be regenerated from anything.
+- **`TRUNCATE` takes the `TRUNCATE` privilege; `DELETE` no longer covers
+  it** (#312). A `DELETE` grant let its holder `TRUNCATE` the table, a
+  fallback kept from before cluster version v11, when `DELETE` was what
+  `TRUNCATE` took — on every table, and for grants made long after v11.
+  Now the fallback holds only while a cluster is below v11, and
+  finalizing v11 grants `TRUNCATE` beside every `DELETE` grant in the
+  same transaction. **A cluster already at v11 or later is not
+  migrated**: a role that truncates a table on the strength of a `DELETE`
+  grant is refused (`42501`) and needs `GRANT TRUNCATE ON t TO role`
+  (`SHOW GRANTS` lists who holds `DELETE` without it). `ALL` and the
+  `write_all` role include `TRUNCATE` as before.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it

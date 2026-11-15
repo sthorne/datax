@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/rpc"
@@ -555,8 +556,28 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 		n.events.RecordEnd("upgrade", opID, "failed", "finalizing at %s failed: %s", target, msg)
 		return cluster.AdminResponse{Error: msg}
 	}
-	if err := n.db.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target)))); err != nil {
+	truncates := 0
+	if err := n.db.RunTxn(ctx, "finalize-cluster-version", func(ctx context.Context, txn *kvclient.Txn) error {
+		truncates = 0
+		if cur < version.V11 && target >= version.V11 {
+			// Before v11 a DELETE grant was what TRUNCATE took; from v11
+			// TRUNCATE is its own privilege and DELETE no longer covers
+			// it (issue #312). The grants made before keep their meaning:
+			// every holder of DELETE also gets TRUNCATE, in the
+			// transaction that moves the version, so no grant made in
+			// between is missed.
+			var err error
+			if truncates, err = catalog.GrantTruncateWithDelete(ctx, txn); err != nil {
+				return err
+			}
+		}
+		return txn.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target))))
+	}); err != nil {
 		return failed("%v", err)
+	}
+	if truncates > 0 {
+		log.Infof("privilege migration: TRUNCATE granted alongside DELETE on %d table(s)", truncates)
+		n.events.Record("upgrade", "privilege migration: TRUNCATE granted alongside DELETE on %d table(s)", truncates)
 	}
 	if target >= version.V6 {
 		// The v6 catalog migration: every pre-existing table moves under the
