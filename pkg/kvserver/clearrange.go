@@ -209,7 +209,6 @@ func (r *Replica) clearTimestamp(newest hlc.Timestamp) hlc.Timestamp {
 	if thr := r.GCThreshold(); !thr.Less(ts) {
 		ts = thr.Next()
 	}
-	_ = r.store.cfg.Clock.Update(ts)
 	return ts
 }
 

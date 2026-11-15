@@ -1301,6 +1301,14 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
 	}
+	for _, u := range ba.Requests {
+		if u.ClearRange != nil {
+			// Its checks and its timestamp are the leader's evaluation
+			// (Store.ClearRange); a batch that carries one is never
+			// proposed as it came.
+			return nil, kvpb.NewErrorf("%s: a range clear is proposed by the range's leader, not sent", r.rangeID)
+		}
+	}
 	spans, mode, serr := latchSpans(ba)
 	if serr != nil {
 		return nil, kvpb.NewError(serr)

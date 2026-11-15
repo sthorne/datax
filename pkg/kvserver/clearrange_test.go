@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ type clearTestEnv struct {
 	cat        *catalogSender
 	start, end keys.Key
 	clock      *hlc.Clock
-	cv         *version.Version
+	cv         atomic.Int64 // the cluster version the store sees
 }
 
 func startClearTestStore(t *testing.T) *clearTestEnv {
@@ -87,12 +88,11 @@ func startClearTestStore(t *testing.T) *clearTestEnv {
 		_ = eng.Close()
 	})
 	env := &clearTestEnv{cat: &catalogSender{vals: map[string][]byte{}}, clock: hlc.NewClock(nil, 250*time.Millisecond)}
-	cv := version.V22
-	env.cv = &cv
+	env.cv.Store(int64(version.V22))
 	env.store = NewStore(StoreConfig{
 		NodeID: 1, StoreID: 1, Engine: eng, Clock: env.clock, Stopper: stopper,
 		Transport: nopRaftTransport{}, RaftTickInterval: 10 * time.Millisecond,
-		ClusterVersion: func() version.Version { return *env.cv },
+		ClusterVersion: func() version.Version { return version.Version(env.cv.Load()) },
 	})
 	env.store.SetSender(env.cat)
 	env.start, env.end = keys.TableDataSpan(clearTestTable)
@@ -309,9 +309,9 @@ func TestClearRangeRefusesWhatIsNotADroppedTable(t *testing.T) {
 	expectRefusal("part of a table's span", "whole data span", env.start, env.key("row-003"))
 	wider := keys.TableDataPrefix(clearTestTable + 1).PrefixEnd()
 	expectRefusal("more than one table's span", "whole data span", env.start, wider)
-	*env.cv = version.V21
+	env.cv.Store(int64(version.V21))
 	expectRefusal("below v22", "cluster version", env.start, env.end)
-	*env.cv = version.V22
+	env.cv.Store(int64(version.V22))
 	if _, err := env.store.ClearRange(ctx, env.r.rangeID, env.start, env.end); err != nil {
 		t.Fatalf("the dropped table's span: %v", err)
 	}
@@ -380,6 +380,13 @@ func TestClearRangeAppliesOnce(t *testing.T) {
 	}
 	if !bytes.Equal(env.checksum(t), sum) || env.r.SizeBytes() != size || env.r.GCThreshold() != res.Timestamp {
 		t.Fatal("a clear that did not apply changed the range")
+	}
+	// A clear sent to the range like any other batch is refused: only the
+	// leader's own evaluation proposes one.
+	sent := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: env.clock.Now()}}
+	sent.Add(&kvpb.ClearRangeRequest{RequestHeader: kvpb.RequestHeader{Key: desc.StartKey, EndKey: desc.EndKey}, Timestamp: sent.Header.Timestamp, Generation: desc.Generation})
+	if _, kerr := env.exec(t, sent); kerr == nil || !strings.Contains(kerr.Error(), "proposed by the range's leader") {
+		t.Fatalf("a clear sent as a batch: %v", kerr)
 	}
 	// A clear in a batch with anything else is refused whole.
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: env.r.rangeID, Timestamp: env.clock.Now()}}
