@@ -472,10 +472,12 @@ func init() {
 	// datax_keys (issue #310): the named keys' metadata. The table of the
 	// same name that holds them is readable by no session; a session that
 	// names it is given this instead, which has no column for the key
-	// material. Admins see every key, anyone else none.
+	// material. Admins see every key, anyone else none. owner and
+	// privileges are the key service's (#310 step 2).
 	pg("datax_keys", []catalog.Column{col("id", types.Int), col("name", types.String), col("kind", types.String),
 		col("version", types.Int), col("versions", types.Int), col("state", types.String), col("generation", types.Int),
-		col("cluster_key", types.String), col("created", types.Timestamp), col("rotated", types.Timestamp), col("external_root", types.String)},
+		col("cluster_key", types.String), col("created", types.Timestamp), col("rotated", types.Timestamp), col("external_root", types.String),
+		col("owner", types.String), col("privileges", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			if env.Keys == nil || !env.IsAdmin {
 				return nil, nil
@@ -491,7 +493,8 @@ func init() {
 					rotated = types.NewTimestamp(k.Rotated)
 				}
 				rows = append(rows, Row{i64(k.ID), str(k.Name), str(k.Kind), i64(k.Version), i64(k.Versions), str(k.State),
-					i64(k.Generation), textOrNull(k.ClusterKey), types.NewTimestamp(k.Created), rotated, textOrNull(k.ExternalRoot)})
+					i64(k.Generation), textOrNull(k.ClusterKey), types.NewTimestamp(k.Created), rotated, textOrNull(k.ExternalRoot),
+					textOrNull(k.Owner), textOrNull(k.Privileges)})
 			}
 			return rows, nil
 		})

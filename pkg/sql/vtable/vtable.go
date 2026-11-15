@@ -119,6 +119,10 @@ type KeyInfo struct {
 	Created      int64 // Unix nanoseconds
 	Rotated      int64 // Unix nanoseconds; 0 = never
 	ExternalRoot string
+	// Owner is the owning role; Privileges the grants on the key, as
+	// grantee=PRIV,PRIV;... ("" when none).
+	Owner      string
+	Privileges string
 }
 
 // LargeObjectInfo is one large object as pg_largeobject_metadata lists

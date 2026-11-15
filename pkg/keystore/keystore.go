@@ -30,6 +30,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -149,6 +150,11 @@ type Key struct {
 	// ExternalRoot is reserved for a per-key external root (design,
 	// "Erasure"); always empty in this version.
 	ExternalRoot string `json:"external_root,omitempty"`
+	// Owner is the role that owns the key (empty: root); Privileges maps
+	// a grantee to what it was granted on the key (PrivWrap, PrivUnwrap).
+	// The key service's (service.go); keys of sealed tables have neither.
+	Owner      string              `json:"owner,omitempty"`
+	Privileges map[string][]string `json:"privileges,omitempty"`
 }
 
 // Material is one version of a key's material, in held memory. Release
@@ -231,7 +237,13 @@ func decodeRow(d *catalog.TableDescriptor, k keys.Key, v []byte) (*row, error) {
 		Created:      nanosToTime(vals[sql.KeysColCreated].I),
 		Rotated:      nanosToTime(vals[sql.KeysColRotated].I),
 		ExternalRoot: vals[sql.KeysColExternalRoot].S,
+		Owner:        vals[sql.KeysColOwner].S,
 	}}
+	if raw := vals[sql.KeysColPrivileges].S; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &r.Privileges); err != nil {
+			return nil, fmt.Errorf("key %d: corrupt privileges: %w", r.ID, err)
+		}
+	}
 	if ck := vals[sql.KeysColClusterKey].S; ck != "" {
 		if r.ClusterKey, err = enc.ParseClusterKeyRef(ck); err != nil {
 			return nil, fmt.Errorf("key %d: %w", r.ID, err)
@@ -273,6 +285,16 @@ func (r *row) encode(d *catalog.TableDescriptor) ([]byte, error) {
 	}
 	if r.ExternalRoot != "" {
 		vals[sql.KeysColExternalRoot] = types.NewString(r.ExternalRoot)
+	}
+	if r.Owner != "" {
+		vals[sql.KeysColOwner] = types.NewString(r.Owner)
+	}
+	if len(r.Privileges) > 0 {
+		raw, err := json.Marshal(r.Privileges)
+		if err != nil {
+			return nil, err
+		}
+		vals[sql.KeysColPrivileges] = types.NewString(string(raw))
 	}
 	return rowenc.EncodeValue(d, vals)
 }
@@ -320,6 +342,11 @@ func validName(name string) error {
 // Create makes a key of kind under name, with a first version of fresh
 // material sealed under the current cluster key.
 func (s *Store) Create(ctx context.Context, kind Kind, name string) (Key, error) {
+	return s.CreateOwned(ctx, kind, name, "")
+}
+
+// CreateOwned is Create with the key owned by owner (empty: root).
+func (s *Store) CreateOwned(ctx context.Context, kind Kind, name, owner string) (Key, error) {
 	if !kind.valid() {
 		return Key{}, fmt.Errorf("unknown kind of key %q (want %s, %s or %s)", kind, KindWrapping, KindTable, KindTenant)
 	}
@@ -354,7 +381,7 @@ func (s *Store) Create(ctx context.Context, kind Kind, name string) (Key, error)
 		return Key{}, err
 	}
 	now := s.cfg.Now().UTC()
-	r := &row{Key: Key{ID: id, Name: name, Kind: kind, State: StateEnabled, Version: 1, Generation: 1, ClusterKey: ref, Created: now}}
+	r := &row{Key: Key{ID: id, Name: name, Kind: kind, State: StateEnabled, Version: 1, Generation: 1, ClusterKey: ref, Created: now, Owner: owner}}
 	r.versions = []sealedVersion{{Version: 1, Sealed: sealed, Created: now.UnixNano()}}
 	val, err := r.encode(d)
 	if err != nil {
@@ -561,7 +588,7 @@ func (s *Store) Unwrap(ctx context.Context, id int64, version int) (*Material, e
 // update reads key id for update, lets change alter it, and writes it
 // back with its generation moved on.
 func (s *Store) update(ctx context.Context, name string, id int64, change func(r *row) error) (Key, error) {
-	d, err := s.desc(ctx, false)
+	d, err := s.desc(ctx, true)
 	if err != nil {
 		return Key{}, err
 	}
@@ -687,6 +714,85 @@ func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, 
 		return k, nil, fmt.Errorf("key %d is destroyed, but purging its history failed (destroy it again to retry the purge): %w", id, err)
 	}
 	return k, rep, nil
+}
+
+// ListIn returns every key's metadata, in id order, read in txn.
+func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
+	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
+	if err != nil || d == nil {
+		return nil, err
+	}
+	lo, hi := rowenc.PrimarySpanFor(d)
+	kvs, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Key, 0, len(kvs))
+	for _, kv := range kvs {
+		r, err := decodeRow(d, kv.Key, kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r.Key)
+	}
+	return out, nil
+}
+
+// SetAccess changes key id's owner or privileges: change edits k (only
+// Owner and Privileges are written back) and reports whether it changed
+// anything. A change bumps the key's generation, so a gateway's cache
+// sees it at its next lease check. txn nil runs in a transaction of its
+// own; otherwise the change is part of txn (DROP OWNED, REASSIGN OWNED).
+func (s *Store) SetAccess(ctx context.Context, txn *kvclient.Txn, id int64, change func(k *Key) (bool, error)) (Key, bool, error) {
+	d, err := s.desc(ctx, true)
+	if err != nil {
+		return Key{}, false, err
+	}
+	var out Key
+	var changed bool
+	apply := func(ctx context.Context, txn *kvclient.Txn) error {
+		r, pk, err := s.read(ctx, txn, d, id, true)
+		if err != nil {
+			return err
+		}
+		k := r.Key
+		k.Privileges = clonePrivileges(r.Privileges)
+		if changed, err = change(&k); err != nil || !changed {
+			out = r.Key
+			return err
+		}
+		r.Owner, r.Privileges = k.Owner, k.Privileges
+		if len(r.Privileges) == 0 {
+			r.Privileges = nil
+		}
+		r.Generation++
+		val, err := r.encode(d)
+		if err != nil {
+			return err
+		}
+		if err := txn.Put(ctx, pk, val); err != nil {
+			return err
+		}
+		out = r.Key
+		return nil
+	}
+	if txn != nil {
+		err = apply(ctx, txn)
+	} else {
+		err = s.cfg.DB.RunTxn(ctx, "keys-access", apply)
+	}
+	return out, changed, err
+}
+
+func clonePrivileges(m map[string][]string) map[string][]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(m))
+	for k, v := range m {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
 }
 
 // RewrapResult counts a rewrap pass.
