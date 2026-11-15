@@ -1,9 +1,13 @@
 // Package vtable defines the virtual catalog tables (pg_catalog and
 // information_schema) that psql, drivers and ORMs introspect (issue #89).
 // Each is a column list plus a generator that produces rows from the
-// real catalog at the statement's read timestamp, under the session's
-// privileges: a non-admin sees the tables it can read, as PostgreSQL
-// shows what is visible. They are read-only and never indexed: the
+// real catalog at the statement's read timestamp. Every role may read
+// every one of them, as in PostgreSQL (issue #312), and they list what
+// PostgreSQL's list: pg_catalog every table, whoever asks;
+// information_schema the tables the reader holds some privilege on.
+// What would reveal row data — statistics, a sequence's counter,
+// another role's statement text — is shown only to a role that may
+// read it, and no catalog carries a password or verifier. They are read-only and never indexed: the
 // executor treats one as a full scan with a fixed row estimate.
 //
 // OIDs are derived from IDs so they are stable across nodes and
@@ -49,8 +53,10 @@ const (
 // and the session's identity.
 type Env struct {
 	Databases []*catalog.DatabaseDescriptor
-	// Tables holds the tables the session may see: those of its current
-	// database, or of every database for a table that lists them all
+	// Tables holds the tables the catalog lists (every one for
+	// pg_catalog, those the reader holds a privilege on for
+	// information_schema): those of its current database, or of every
+	// database for a table that lists them all
 	// (Table.AllDatabases). A generator that ranges over Tables directly
 	// rather than through currentTables must be one of the latter.
 	Tables []*catalog.TableDescriptor
@@ -83,6 +89,10 @@ type Env struct {
 	Settings [][2]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo
+
+	// RoleSet is the reader's effective roles (nil: unknown, treated as
+	// an admin's by the few views that filter by it).
+	RoleSet catalog.RoleSet
 
 	User        string // the current role (current_user)
 	SessionUser string // the authenticated user (session_user)
@@ -119,6 +129,10 @@ type KeyInfo struct {
 	Created      int64 // Unix nanoseconds
 	Rotated      int64 // Unix nanoseconds; 0 = never
 	ExternalRoot string
+	// Owner is the owning role; Privileges the grants on the key, as
+	// grantee=PRIV,PRIV;... ("" when none).
+	Owner      string
+	Privileges string
 }
 
 // LargeObjectInfo is one large object as pg_largeobject_metadata lists

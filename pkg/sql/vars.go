@@ -658,7 +658,8 @@ func writeKind(stmt parser.Statement) string {
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
 		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
 		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze,
-		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy:
+		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy,
+		*parser.CreateEncryptionKey, *parser.AlterEncryptionKey, *parser.DropEncryptionKey, *parser.SetClusterSetting:
 		return "DDL"
 	}
 	return ""

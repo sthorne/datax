@@ -54,7 +54,6 @@ import (
 	"fmt"
 
 	"github.com/sthorne/datax/pkg/keys"
-	"github.com/sthorne/datax/pkg/keystore/keycache"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
@@ -149,11 +148,29 @@ func Open(aead cipher.AEAD, ad, sealed []byte) ([]byte, error) {
 	return plain, nil
 }
 
-// Keys is where the boundary gets key versions: the gateway's
-// keycache.Cache.
+// Key is one version of a key, ready to seal and open with.
+type Key struct {
+	Version int
+	// AEAD is AES-256-GCM under the version's material. It is used for
+	// one operation and not kept.
+	AEAD cipher.AEAD
+}
+
+// Why a key gives nothing. A Keys reports these (wrapped) so the
+// boundary can say why; pkg/keystore's errors are mapped to them by the
+// server.
+var (
+	ErrKeyNotFound  = errors.New("no such key")
+	ErrKeyDisabled  = errors.New("the key is disabled")
+	ErrKeyDestroyed = errors.New("the key has been destroyed")
+	ErrKeyNoVersion = errors.New("the key has no such version")
+)
+
+// Keys is where the boundary gets key versions: the gateway's shared
+// cache of named keys (keystore.Cache, adapted by the server).
 type Keys interface {
-	Current(ctx context.Context, id int64) (keycache.Key, error)
-	Version(ctx context.Context, id int64, v int) (keycache.Key, error)
+	Current(ctx context.Context, id int64) (Key, error)
+	Version(ctx context.Context, id int64, v int) (Key, error)
 	Invalidate(id int64)
 }
 
@@ -238,13 +255,13 @@ type KeyUnavailableError struct {
 func (e *KeyUnavailableError) Error() string {
 	why := "is unavailable on this node: " + e.Err.Error()
 	switch {
-	case errors.Is(e.Err, keycache.ErrDestroyed):
+	case errors.Is(e.Err, ErrKeyDestroyed):
 		why = "has been destroyed"
-	case errors.Is(e.Err, keycache.ErrDisabled):
+	case errors.Is(e.Err, ErrKeyDisabled):
 		why = "is disabled"
-	case errors.Is(e.Err, keycache.ErrNotFound):
+	case errors.Is(e.Err, ErrKeyNotFound):
 		why = "does not exist"
-	case errors.Is(e.Err, keycache.ErrNoVersion):
+	case errors.Is(e.Err, ErrKeyNoVersion):
 		why = fmt.Sprintf("has no version %d", e.Version)
 	}
 	return fmt.Sprintf("table %q: its encryption key %s; its sealed rows cannot be read or written", e.Table, why)

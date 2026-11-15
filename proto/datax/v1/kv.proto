@@ -515,6 +515,13 @@ message AmbiguousResultError {}
 // thresholds; the write was shed and should be retried with backoff.
 message StorageOverloadedError {}
 
+// BelowGCThresholdError: the batch reads (or writes) at or below the
+// range's GC threshold, whose history may have been collected.
+message BelowGCThresholdError {
+  Hlc timestamp = 1;
+  Hlc threshold = 2;
+}
+
 message Error {
   string message = 1;
   NotLeaderError not_leader = 2;
@@ -529,6 +536,7 @@ message Error {
   AmbiguousResultError ambiguous = 11;
   StorageOverloadedError storage_overloaded = 12;
   DescriptorChangedError descriptor_changed = 13;
+  BelowGCThresholdError below_gc_threshold = 14;
 }
 
 // BatchEnvelope is the Batch RPC's response body: outcome or wire error.

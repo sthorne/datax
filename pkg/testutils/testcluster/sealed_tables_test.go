@@ -191,7 +191,7 @@ func (c *ckCluster) checkConsistent(what string) {
 const sealedLease = time.Second
 
 func startSealedCluster(t *testing.T, ctx context.Context) *ckCluster {
-	c := startCKCluster(t, ctx, func(i int, cfg *server.Config) { cfg.SealedKeyLease = sealedLease })
+	c := startCKCluster(t, ctx, func(i int, cfg *server.Config) { cfg.KeyCacheLease = sealedLease })
 	c.waitReported(3)
 	return c
 }

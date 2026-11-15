@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/sthorne/datax/pkg/keys"
-	"github.com/sthorne/datax/pkg/keystore/keycache"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/tsearch"
@@ -41,19 +40,19 @@ type fakeKeys struct {
 	err  error
 }
 
-func (f *fakeKeys) Current(_ context.Context, id int64) (keycache.Key, error) {
+func (f *fakeKeys) Current(_ context.Context, id int64) (Key, error) {
 	return f.Version(context.Background(), id, f.cur[id])
 }
 
-func (f *fakeKeys) Version(_ context.Context, id int64, v int) (keycache.Key, error) {
+func (f *fakeKeys) Version(_ context.Context, id int64, v int) (Key, error) {
 	if f.err != nil {
-		return keycache.Key{}, f.err
+		return Key{}, f.err
 	}
 	a, ok := f.keys[id][v]
 	if !ok {
-		return keycache.Key{}, keycache.ErrNoVersion
+		return Key{}, ErrKeyNoVersion
 	}
-	return keycache.Key{ID: id, Version: v, AEAD: a}, nil
+	return Key{Version: v, AEAD: a}, nil
 }
 
 func (f *fakeKeys) Invalidate(int64) {}
@@ -245,10 +244,10 @@ func TestBoundaryBinding(t *testing.T) {
 	corrupt("presented as v2", err)
 
 	// A destroyed key: the statement fails, naming the table.
-	fk.err = keycache.ErrDestroyed
+	fk.err = ErrKeyDestroyed
 	_, err = b.OpenValue(ctx, t1, k1, s)
 	var ku *KeyUnavailableError
-	if !errors.As(err, &ku) || ku.Table != t1.Name || !errors.Is(err, keycache.ErrDestroyed) {
+	if !errors.As(err, &ku) || ku.Table != t1.Name || !errors.Is(err, ErrKeyDestroyed) {
 		t.Fatalf("destroyed key: %v", err)
 	}
 	if _, err := b.SealValue(ctx, t1, k1, plain); !errors.As(err, &ku) {

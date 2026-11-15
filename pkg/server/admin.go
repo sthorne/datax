@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/rpc"
@@ -282,9 +283,16 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	case "decommission":
 		return n.serveDecommission(ctx, req)
 
-	case "backup":
+	case "backup", "backup-sealed":
+		// "backup-sealed" is a backup with a key under an op of its own,
+		// so a node from before sealed backups refuses it rather than
+		// ignore the key and write plaintext (issue #313). "backup" still
+		// takes a key, as a command from before the new name sends it.
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
+		}
+		if req.Op == "backup-sealed" && len(req.BackupKey) == 0 {
+			return cluster.AdminResponse{Error: "backup-sealed carries the backup key, and this request has none"}
 		}
 		if err := n.backupKeyAccepted(ctx, req); err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
@@ -349,7 +357,13 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		return cluster.AdminResponse{Backup: sum}
 
-	case "restore":
+	case "restore", "restore-sealed":
+		// "restore-sealed": a restore given keys, under an op an older
+		// node refuses rather than restore a plaintext directory in a
+		// sealed backup's place without the keys (issue #313).
+		if req.Op == "restore-sealed" && !requestCarriesBackupKey(req) {
+			return cluster.AdminResponse{Error: "restore-sealed carries the backup keys, and this request has none"}
+		}
 		if err := n.backupKeyAccepted(ctx, req); err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
@@ -590,8 +604,28 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 		n.events.RecordEnd("upgrade", opID, "failed", "finalizing at %s failed: %s", target, msg)
 		return cluster.AdminResponse{Error: msg}
 	}
-	if err := n.db.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target)))); err != nil {
+	truncates := 0
+	if err := n.db.RunTxn(ctx, "finalize-cluster-version", func(ctx context.Context, txn *kvclient.Txn) error {
+		truncates = 0
+		if cur < version.V11 && target >= version.V11 {
+			// Before v11 a DELETE grant was what TRUNCATE took; from v11
+			// TRUNCATE is its own privilege and DELETE no longer covers
+			// it (issue #312). The grants made before keep their meaning:
+			// every holder of DELETE also gets TRUNCATE, in the
+			// transaction that moves the version, so no grant made in
+			// between is missed.
+			var err error
+			if truncates, err = catalog.GrantTruncateWithDelete(ctx, txn); err != nil {
+				return err
+			}
+		}
+		return txn.Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(target))))
+	}); err != nil {
 		return failed("%v", err)
+	}
+	if truncates > 0 {
+		log.Infof("privilege migration: TRUNCATE granted alongside DELETE on %d table(s)", truncates)
+		n.events.Record("upgrade", "privilege migration: TRUNCATE granted alongside DELETE on %d table(s)", truncates)
 	}
 	if target >= version.V6 {
 		// The v6 catalog migration: every pre-existing table moves under the

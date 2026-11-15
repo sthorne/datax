@@ -2,7 +2,10 @@ package sql
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -41,6 +44,8 @@ const KeysTableDDL = `CREATE TABLE IF NOT EXISTS ` + catalog.KeysTableName + ` (
   created TIMESTAMPTZ NOT NULL,
   rotated TIMESTAMPTZ,
   external_root TEXT,
+  owner TEXT,
+  privileges TEXT,
   PRIMARY KEY (id),
   UNIQUE (name)
 )`
@@ -59,7 +64,20 @@ const (
 	KeysColCreated      catalog.ColumnID = 10
 	KeysColRotated      catalog.ColumnID = 11
 	KeysColExternalRoot catalog.ColumnID = 12
+	// KeysColOwner and KeysColPrivileges are the key service's ownership
+	// and grants (#310 step 2): the owning role (empty: root), and a JSON
+	// object of grantee → privileges (WRAP, UNWRAP).
+	KeysColOwner      catalog.ColumnID = 13
+	KeysColPrivileges catalog.ColumnID = 14
 )
+
+// keysTableAddedColumns are the columns added to the table after it was
+// first defined, with their DDL: a table made before them is given them
+// by EnsureKeysTable.
+var keysTableAddedColumns = []struct{ name, ddl string }{
+	{"owner", "owner TEXT"},
+	{"privileges", "privileges TEXT"},
+}
 
 // LookupKeysTable resolves the named-keys table's descriptor, or nil
 // when it has not been created, in a transaction of its own.
@@ -89,8 +107,11 @@ func EnsureKeysTable(ctx context.Context, db *kvclient.DB, cat *catalog.Accessor
 		return nil, newErrf(CodeFeatureNotSupported, "named keys need cluster version %s: finalize the upgrade with `datax debug upgrade` first", version.V22)
 	}
 	d, err := LookupKeysTable(ctx, db, cat)
-	if err != nil || d != nil {
-		return d, err
+	if err != nil {
+		return nil, err
+	}
+	if d != nil {
+		return upgradeKeysTable(ctx, db, cat, d)
 	}
 	stmts, err := parser.Parse(KeysTableDDL)
 	if err != nil {
@@ -106,6 +127,31 @@ func EnsureKeysTable(ctx context.Context, db *kvclient.DB, cat *catalog.Accessor
 		return nil, newErrf(CodeInternal, "the %s table could not be created", catalog.KeysTableName)
 	}
 	return d, nil
+}
+
+// upgradeKeysTable adds to a table made before them the columns added
+// since (keysTableAddedColumns), so that every row written can carry
+// them. Idempotent: ADD COLUMN IF NOT EXISTS.
+func upgradeKeysTable(ctx context.Context, db *kvclient.DB, cat *catalog.Accessor, d *catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
+	added := false
+	for _, c := range keysTableAddedColumns {
+		if _, ok := d.Col(c.name); ok {
+			continue
+		}
+		stmts, err := parser.Parse("ALTER TABLE " + catalog.KeysTableName + " ADD COLUMN IF NOT EXISTS " + c.ddl)
+		if err != nil {
+			return nil, err
+		}
+		if _, serr := NewSystemSession(db, cat).Execute(ctx, stmts[0], nil); serr != nil {
+			return nil, serr
+		}
+		added = true
+	}
+	if !added {
+		return d, nil
+	}
+	cat.Invalidate(catalog.KeysTableName)
+	return LookupKeysTable(ctx, db, cat)
 }
 
 // keysVirtualTable is what a session that names the named-keys table is
@@ -156,9 +202,32 @@ func (s *Session) listKeys(ctx context.Context, txn *kvclient.Txn, set catalog.R
 			Rotated:      row[KeysColRotated].I,
 			ExternalRoot: row[KeysColExternalRoot].S,
 		}
+		if kind := row[KeysColKind].S; kind == "wrapping" {
+			k.Owner = catalog.OwnerOf(row[KeysColOwner].S)
+		}
+		if raw := row[KeysColPrivileges].S; raw != "" {
+			var m map[string][]string
+			if err := json.Unmarshal([]byte(raw), &m); err == nil {
+				k.Privileges = keyACLText(m)
+			}
+		}
 		out = append(out, k)
 	}
 	return out, nil
+}
+
+// keyACLText renders a key's privileges as grantee=PRIV,PRIV;... sorted.
+func keyACLText(m map[string][]string) string {
+	names := make([]string, 0, len(m))
+	for g := range m {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, g := range names {
+		parts = append(parts, g+"="+strings.Join(m[g], ","))
+	}
+	return strings.Join(parts, ";")
 }
 
 // keysTableError is the refusal every attempt to read or change the

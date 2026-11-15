@@ -23,7 +23,7 @@ CREATE INDEX [IF NOT EXISTS] i ON t USING gin (jsonb_col [jsonb_ops | jsonb_path
 CREATE INDEX [IF NOT EXISTS] i ON t USING ivfflat (vector_col [vector_l2_ops | vector_cosine_ops | vector_ip_ops]) [WITH (lists = n)]   -- see Vectors below
 CREATE EXTENSION [IF NOT EXISTS] vector  -- accepted, does nothing: the type is built in
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
-DROP TABLE t
+DROP TABLE t                             -- rows reclaimed once the table's GC window has passed (below)
 CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
 CREATE TABLE t [(names [, PRIMARY KEY (cols)])] AS SELECT ... [WITH [NO] DATA]   -- streamed through the COPY chunk path
 CREATE TABLE t (LIKE src [INCLUDING | EXCLUDING DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL], ...)
@@ -38,6 +38,11 @@ ALTER POLICY p ON t RENAME TO q  /  ALTER POLICY p ON t [TO role [, ...]] [USING
 DROP POLICY [IF EXISTS] p ON t [CASCADE | RESTRICT]
 CREATE | ALTER ROLE r ... [BYPASSRLS | NOBYPASSRLS]                                      -- exempt from every table's policies
 SET [LOCAL] class.name = value  /  RESET class.name  /  SHOW class.name                  -- custom session settings (app.tenant)
+CREATE ENCRYPTION KEY [IF NOT EXISTS] k  /  DROP ENCRYPTION KEY [IF EXISTS] k            -- the key service (v22); see Encryption keys below
+ALTER ENCRYPTION KEY k ROTATE | DISABLE | ENABLE | OWNER TO role
+GRANT | REVOKE WRAP | UNWRAP | USAGE | ALL ON ENCRYPTION KEY k [, ...] TO | FROM role [, ...]
+SHOW ENCRYPTION KEYS
+SET CLUSTER SETTING name = value | DEFAULT  /  SHOW CLUSTER SETTING name               -- key_service.rate_limit
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -172,7 +177,8 @@ SHOW STATS FOR t
   persists as append-only JSON at `/system/stats/<tableID>` — a separate
   key from the lease-hot descriptor — read through a per-gateway 30s
   stale-serving cache, deleted in the DROP TABLE transaction, and shown
-  by `SHOW STATS FOR t`. Statistics feed the planner (below); their
+  by `SHOW STATS FOR t` (to a role holding `SELECT` on `t`).
+  Statistics feed the planner (below); their
   absence means the structural fallback, byte-identical to the
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
@@ -255,7 +261,9 @@ confined role in `SHOW STATS`, `pg_class.reltuples`,
 console decodes no range boundary of such a table for it
 (`catalog.CanReadTable`). `DROP COLUMN` refuses a column a policy
 reads, `RENAME COLUMN` rewrites the policies, `DROP ROLE` refuses a
-role a policy names, and a table restore keeps row security and cuts
+role a policy names, `DROP OWNED BY` takes the role out of every
+policy's list and drops a policy it leaves empty (an empty list would
+mean PUBLIC; `stripPolicyRoles`, as PostgreSQL's DROP OWNED), and a table restore keeps row security and cuts
 each policy's roles to the ones the cluster has.
 
 **Custom settings.** `sessionVars.custom` holds two-part names
@@ -310,6 +318,33 @@ succeeds either way, because the rows are the result.
 `SET`, `RESET` and `PURGE` run outside a transaction block (`25001`
 inside one) and need table ownership.
 
+**A dropped table's rows** (issue #313). `DROP TABLE` removes the
+descriptor and the name and leaves the rows, with a record beside them
+(`catalog.DroppedTable` at `keys.DroppedTableKey`, written in the same
+transaction): the drop's time and the table's history window — its
+`gc_ttl`, a time-series table's retention, or the node's GC TTL. Until
+that window has passed the rows are still reachable, and must be: `AS
+OF SYSTEM TIME` below the drop resolves the table as it was and reads
+them, which is why PostgreSQL-like systems with history delay the
+reclaim. After it, the job on the node leading range 1
+(`pkg/server/dropped_tables.go`, every minute; it reads the records,
+not the catalog) deletes every row in chunked transactions, resuming
+after the last key, marks the record, purges the span (above), and
+removes the record. Each step is idempotent and the record is
+replicated, so a pass cut short by a restart or a move of range 1 is
+taken up on the next one. A read below the drop after the reclaim is
+refused as below the GC threshold, never answered short. The emptied
+ranges merge into their neighbours once the neighbours' own window has
+passed the purge: the merge queue keeps apart two ranges whose GC
+thresholds are further apart than that, since the merged range adopts
+the higher one. A table with a short `gc_ttl` is reclaimed that much
+sooner after its drop: `ALTER TABLE t SET (gc_ttl = '1s'); DROP TABLE t`
+gives its space back within a minute or two, and gives up `AS OF
+SYSTEM TIME` reads of it at the same rate. Views hold no rows and leave
+no record; nor do the cluster's own tables, whose ids are reserved. A
+restore of everything clears the rows and record of any dropped table
+whose id a restored table takes. Tables dropped before this change have
+no record and are not reclaimed.
 ### Sealed tables (v22)
 
 `CREATE TABLE ... WITH (encryption_key = 'auto')` makes a **sealed
@@ -361,8 +396,11 @@ are **not** sealed.
 - **`DROP TABLE`** (and `DROP DATABASE ... CASCADE`) destroys the
   table's key once the drop has committed — the key's record is
   tombstoned and its history purged — so the dropped table's rows, which
-  stay in KV until the table's data is reclaimed, are unreadable at
-  once, `AS OF SYSTEM TIME` included. A key another table still names
+  stay in KV until the dropped-table job reclaims them after the table's
+  history window (*A dropped table's rows*, above), are unreadable at
+  once: an `AS OF SYSTEM TIME` read below the drop, which finds an
+  ordinary dropped table's rows until the reclaim, fails with `XXK01`
+  for a sealed one. A key another table still names
   (a table restored beside the one it was taken from shares its key) is
   kept until the last of them is dropped. A node's janitor destroys any
   table key no table names, in case a gateway died between the commit
@@ -531,7 +569,9 @@ the view's query executes once as the member and the statement reads
 the materialized rows through the ordinary access path, so a view works
 wherever a table does and a view over a view expands as the member
 executes. Views record the relations they read (`ViewDepends`) for the
-drop / rename refusals; DML and physical DDL on a view are refused.
+drop / rename refusals, and from v22 each relation records the views
+reading it (`keys.ViewDependencyKey`, issue #313), which is what the
+refusals read once complete; DML and physical DDL on a view are refused.
 
 `ALTER COLUMN TYPE` is the third online state machine: publish a
 hidden shadow column (`RetypeFrom` names the original; every
@@ -757,6 +797,160 @@ sealed), and out-of-line storage of ordinary column values in the
 manner of TOAST — a different feature, which would make large `BYTEA`
 values cheaper to carry beside small columns but would still write and
 read each value whole.
+
+## Encryption keys (v22)
+
+`pkg/sql/keyservice.go` (statements, privileges), `pkg/keystore`
+(`service.go`: the functions, their rate limit and audit; `blob.go`: the
+blob format; `cache.go`: the gateway cache). The key service of issue
+#310, step 2 (docs/design-key-service.md, "A. The key service";
+written for application developers in
+docs/encryption-keys-for-applications.md): an application keeps named
+keys in datax and asks it to wrap and unwrap its own data keys under
+them. The keys are rows of `datax_keys` (docs/encryption.md, "Cluster
+key"), of kind `wrapping`; everything here needs cluster version v22
+finalized and the cluster key enabled (`datax debug cluster-key init`),
+and is refused before with `0A000` and `55000`.
+
+```
+CREATE ENCRYPTION KEY [IF NOT EXISTS] k          -- admins; the creator owns it
+ALTER ENCRYPTION KEY k ROTATE                    -- a new version for new wraps; old blobs still open
+ALTER ENCRYPTION KEY k DISABLE | ENABLE          -- every function refused / allowed again
+ALTER ENCRYPTION KEY k OWNER TO role
+DROP ENCRYPTION KEY [IF EXISTS] k                -- destroys every version; the name stays taken
+GRANT | REVOKE WRAP | UNWRAP | USAGE | ALL ON ENCRYPTION KEY k [, ...] TO | FROM role [, ...]
+SHOW ENCRYPTION KEYS
+
+datax_key_wrap(name text, data_key bytea, context bytea) → bytea     -- needs WRAP
+datax_key_unwrap(name text, wrapped bytea, context bytea) → bytea    -- needs UNWRAP; returns the data key
+datax_encrypt(name text, plaintext bytea, context bytea) → bytea     -- needs WRAP; at most 64 KiB
+datax_decrypt(name text, ciphertext bytea, context bytea) → bytea    -- needs UNWRAP
+```
+
+A key's name is an identifier in the statements (folded to lower case
+unless quoted) and the exact stored name in the functions. A dropped
+key keeps its row and its name, so the name cannot be reused (`42710`);
+dropping it again re-runs the purge of its record's history. The key
+statements write the `datax_keys` row in transactions of their own and
+are refused in a transaction block (`25001`).
+
+**Privileges.** `CREATE ENCRYPTION KEY` needs the admin role; the
+creating role owns the key. The owner and admins may `ALTER`, `DROP`
+and grant on it (no grant options). Using a key needs `WRAP`
+(`datax_key_wrap`, `datax_encrypt`) or `UNWRAP` (`datax_key_unwrap`,
+`datax_decrypt`); `USAGE` and `ALL` are both. The owner holds both. An
+admin who is not the owner holds neither until it grants them —
+usually to itself, in a statement the audit records — which keeps the
+roles that can recover data keys to the ones a key's grants name,
+rather than everyone with the admin role. A grant to `PUBLIC` is
+allowed. Ownership and grants are two columns of the key's row
+(`owner`, `privileges`: a JSON object of grantee → privileges), so they
+travel with `datax_keys` in backups and restores. `DROP ROLE` of a
+role that owns a key is refused (`2BP01`, "owner of encryption key
+k"); `REASSIGN OWNED` hands its keys on; `DROP OWNED` and `DROP ROLE`
+revoke the role's grants on keys. `DROP OWNED` of a role that owns a
+key is refused, as for a database it owns: dropping a key destroys
+everything wrapped under it, so it is never a side effect of removing
+a role — `DROP ENCRYPTION KEY` it, or `REASSIGN OWNED`, first.
+
+**The functions** are evaluated by the session once per call, before
+the statement's rows are read, as the large-object functions are: their
+arguments are constants or parameters, not columns (`0A000`, "read the
+value first and pass it as a parameter"). They are strict (a `NULL`
+argument gives `NULL`). Parameters type as `text, bytea, bytea`, so a
+driver sends a data key as bytea; pass data keys and values as
+parameters rather than literals, which would put them in the statement
+text that `pg_stat_activity` and the slow-statement list show.
+
+| Outcome | SQLSTATE |
+|---|---|
+| no key of that name | `42704` |
+| the role lacks the privilege | `42501` |
+| the key is disabled or destroyed | `55000` |
+| the blob does not open: the wrong key, the wrong context, a damaged or forged blob, the other kind of blob | `39000`, one message for all |
+| over the role's rate on this node | `53400` |
+| a value or context over 64 KiB | `54000` |
+| a connection neither TLS nor loopback | `28000` |
+| inside a transaction block (statements) | `25001` |
+
+A disabled key refuses unwrap and decrypt as well as wrap and encrypt,
+as a cloud KMS's disabled key refuses Decrypt: disabling is how an
+operator stops every use of a key at once without destroying it.
+
+**Blob format** (`pkg/keystore/blob.go`): one format byte (`0x01` a
+wrapped data key, `0x02` an encrypted value), the key's id (8 bytes)
+and version (4 bytes), a 12-byte random nonce, and the AES-256-GCM
+ciphertext and tag under that version's material — 41 bytes of
+overhead. The associated data is a fixed label, the format byte, the
+id, the version and the length-prefixed context. So unwrapping needs no
+version argument, a rotated key keeps opening blobs of its older
+versions, a blob opens only under the key whose id it carries (another
+key's name fails), only with its context, and only as its own kind (a
+wrapped key is not a value to `datax_decrypt`). Every way of not
+opening is the same error, so a caller probing contexts learns
+nothing from the message.
+
+**Transport.** The functions carry key material. The SQL server marks
+each session with whether its client is on TLS or on a loopback address
+or Unix socket (`Session.SetTransport`), and the functions are refused
+on a connection that is neither (`28000`). A secure cluster already
+refuses cleartext SQL, and the cluster key needs a secure cluster, so
+the rule bites only if that ever changes; the check is in the session
+so that it does not depend on it.
+
+**Gateway cache and leases** (`keystore.Cache`, shared with the
+sealing of tables in later steps). A gateway keeps unwrapped material
+per key and version in held memory and checks the key's row — its
+`generation`, which every change of state, version, owner or grants
+moves — at most a lease after its last check (10 s, the descriptor
+lease; `server.Config.KeyCacheLease`), dropping what it holds when the
+generation moved. The lease runs from when a check starts. So a change
+reaches every gateway within one lease, and the statements that take a
+use away — `DROP`, `DISABLE`, `REVOKE`, `OWNER TO`, and `DROP OWNED` /
+`REASSIGN OWNED` / `DROP ROLE` when they touch a key — wait out the
+lease after they commit before returning: once one returns, no gateway
+still uses what it removed. A refusal (no privilege, a disabled key) is
+checked against the row before it is given, so a `GRANT` or `ENABLE`
+made on another gateway takes effect at once. `ROTATE` does not wait:
+for up to a lease, other gateways still wrap under the previous
+version, which stays valid. A background sweep releases material no
+call has used for a lease.
+
+**Rate limit.** Each role has a token bucket on each node, a second's
+worth deep, refilled at the cluster setting `key_service.rate_limit`
+(operations a second; default 100; 0 is no limit; read by each gateway
+once a lease). A call past it is refused with `53400`
+(configuration_limit_exceeded): a configured limit was reached, and
+class 53 is what pools and drivers treat as "back off and retry", which
+is what the caller should do — and cache unwrapped data keys rather than
+unwrapping per read. 57P03 (cannot_connect_now) was the alternative and
+says the server is starting, which is false. The limit is per node, so
+the cluster-wide rate is at most the setting times the nodes a role
+reaches.
+
+`SET CLUSTER SETTING` is new with this step and knows only this
+setting; it is for admins, stored at `keys.ClusterSettingKey`, and
+audited (`cluster-setting`).
+
+**Audit.** Every call is recorded through `log.Audit` — the node's
+buffered path into the audit table — as `key-use` with the session user
+as principal, the key's name as target, and `role`, `op`, `key_id`,
+`version` and the outcome (`ok`, `denied`, `disabled`, `destroyed`,
+`failed` for a blob that did not open, `no-such-key`, `too-large`);
+never the data, the blob, the material or the context. The audit table
+folds repeats of the same record within one flush (a second) into one
+row with a `count`, so a hot loop is a row a second per distinct use,
+not a row per call; the log line is written for every call. A
+rate-limit refusal is `key-use-throttled`, one of the refusals the audit
+table records at a bounded rate and counts into `audit-gap` past it.
+The statements are recorded as `key-ddl`, `privilege-ddl` and
+`ownership-ddl`.
+
+**Catalog.** `SELECT * FROM datax_keys` (admins) shows each key's
+metadata, now with `owner` and `privileges`, and never material.
+`SHOW ENCRYPTION KEYS` lists name, state, version, owner, privileges
+and creation time: every key for an admin, the keys a role owns or
+holds a privilege on otherwise.
 
 ## Secondary indexes (v2)
 
@@ -1565,6 +1759,52 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   as schema changes: by the time GRANT returns, every gateway enforces
   it. In insecure (trust) mode the username is client-claimed, so
   enforcement there is advisory — anyone can claim `root`.
+  The virtual catalogs are read by every role (issue #312):
+  `tablePrivAllowed` grants `SELECT` on a `pg_catalog` or
+  `information_schema` descriptor to anyone and nothing else, and
+  `virtualEnv` decides what each lists — every table of the scope for
+  `pg_catalog`, the tables `catalog.CanSeeTable` admits (and whose
+  schema the reader may use) for `information_schema` — and gathers
+  statistics only for tables `catalog.CanSelectTable` admits and row
+  security does not confine, and a sequence's counter only past
+  `sequencePrivAllowed`. A sequence read as a relation (`SELECT
+  last_value FROM s`) checks the sequence's `SELECT`.
+  `EXPLAIN` (without `ANALYZE`, which runs the statement and checks as
+  it goes) plans by shape and evaluates nothing, so it checks first:
+  `checkSelectReads` walks every table the statement names
+  (`stmtTables`), skips WITH members and bound relations, checks
+  `SELECT` as the reader, and checks a view's query as the view's
+  owner. `SHOW STATS FOR t` takes `SELECT` on `t`: its counts describe
+  the rows.
+  `TRUNCATE` takes the `TRUNCATE` privilege. Until cluster version v11
+  it took `DELETE`, and while a cluster is below v11 it still does (a
+  node of the older binary decides so); the finalize transaction that
+  moves the cluster to v11 adds `TRUNCATE` beside every `DELETE` grant
+  (`catalog.GrantTruncateWithDelete`), so grants made before keep their
+  meaning and later `DELETE` grants do not carry `TRUNCATE`. The
+  tables a `TRUNCATE` names are all privilege-checked before any
+  foreign key is looked at, and a referencing table it does not name is
+  named in the refusal only to a role holding some privilege on it
+  (`mayKnowTable`); `pg_constraint` lists every foreign key to every
+  role, as PostgreSQL's does, so this keeps errors consistent rather
+  than secret. An `AS OF SYSTEM TIME` read resolves its
+  descriptors and the role graph as of its timestamp; privileges are
+  decided as of now instead (`historicalTablePrivAllowed`, the
+  counterpart of `historicalRowFilter`), memoized per statement. Both
+  read "now" through `freshCatalog`: for an exact timestamp, an
+  ordinary transaction (it waits for the leaseholders as any current
+  read does); for a bounded-staleness read, a historical transaction at
+  the newest timestamp the node serves locally (`max(read timestamp,
+  LocalClosedTimestamp)`), so privileges and policies are as fresh as
+  the data and the read stays local under a partition. The table is the
+  gateway's leased descriptor when it holds a live lease on it under
+  the same name (`Accessor.Leased`, no KV read), else read by ID; the
+  role graph and schema `USAGE` are read in that transaction (there is
+  no gateway role cache). Checks inside that transaction are not
+  redirected again (`Session.freshTxn`). A renamed table is checked under its grants
+  today; a dropped one, having none, is readable by admins only.
+  `virtualEnv` under a historical transaction uses today's role set and
+  withholds statistics and sequence counters from non-admins.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

@@ -981,6 +981,29 @@ func (a *Accessor) Lookup(ctx context.Context, txn *kvclient.Txn, name string) (
 	return a.LookupIn(ctx, txn, DefaultDatabase, name)
 }
 
+// Leased returns this gateway's leased copy of table id, cached under
+// name in database dbID, when the accessor leases and the lease is
+// live: the descriptor as current as any statement on this gateway may
+// use, read without a KV round trip. nil otherwise — an unleased
+// accessor's cache never expires, so it is never "current". The entry
+// is marked handed out, so a drain of a newer version waits for the
+// statement that used it, as for any planned statement (issue #185).
+func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor {
+	if !a.leasing {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.nowWallLocked()
+	c, ok := a.cache[cacheKey(dbID, name)]
+	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration {
+		return nil
+	}
+	c.handedOut = true
+	c.lastUsed = now
+	return c.desc
+}
+
 // LookupIn resolves a table by name within txn, in database db unless
 // name is qualified ("otherdb.t"), using the cache while its lease (if
 // any) is live.
@@ -1339,7 +1362,9 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 }
 
 // Drop removes a table's descriptor and namespace entry. Row data is left
-// behind (unreachable; space reclamation is a GC concern, out of scope).
+// behind, readable AS OF SYSTEM TIME below the drop, and a DroppedTable
+// record beside it, by which the reclaim job clears the table's span once
+// the table's history window has passed (issue #313).
 func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
 	return a.DropIn(ctx, txn, DefaultDatabase, name)
 }
@@ -1363,6 +1388,14 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	}
 	if err := txn.Delete(ctx, keys.TableDescKey(d.ID)); err != nil {
 		return nil, err
+	}
+	if err := recordDroppedTable(ctx, txn, d); err != nil {
+		return nil, err
+	}
+	if d.IsView() {
+		if err := DeleteViewDependencies(ctx, txn, d.ID, d.ViewDepends); err != nil {
+			return nil, err
+		}
 	}
 	a.Invalidate(name)
 	return d, nil

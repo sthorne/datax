@@ -3,13 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/keystore"
-	"github.com/sthorne/datax/pkg/keystore/keycache"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowseal"
@@ -19,33 +19,77 @@ import (
 
 // Sealed tables (issue #310, step 3): the gateway's boundary between a
 // sealed table's plaintext rows and the sealed values KV stores
-// (pkg/sql/rowseal), over a cache of the tables' keys in held memory
-// (pkg/keystore/keycache). The catalog accessor carries the boundary to
+// (pkg/sql/rowseal), over the cache of named keys this gateway shares
+// with the key service (keystore.Cache, Node.KeyService().Cache(), under
+// Config.KeyCacheLease). The catalog accessor carries the boundary to
 // every session of the node.
 
-// attachRowSealer gives cat the node's sealed-table boundary.
+// attachRowSealer gives cat the node's sealed-table boundary. It runs
+// while the accessor is being made, which the key service needs, so the
+// boundary reaches the service when it is first used.
 func (n *Node) attachRowSealer(cat *catalog.Accessor) {
-	ks := keystore.New(keystore.Config{
-		DB: n.db, Catalog: cat, ClusterKeys: nodeClusterKeys{n},
-		Ready:  n.clusterKeyReady,
-		Accept: n.clusterKeyAccept,
-	})
-	cache := keycache.New(ks.CacheSource(), keycache.Options{Lease: n.cfg.SealedKeyLease})
-	n.stopper.AddCloser(cache.Close)
-	n.keyCache = cache
-	cat.SetRowSealer(rowseal.New(cache, sealedTableKeys{n: n, ks: ks}, nil))
+	cat.SetRowSealer(rowseal.New(sealKeys{n}, sealedTableKeys{n}, nil))
 }
 
-// KeyCache is the node's cache of unwrapped named keys (nil before the
-// SQL layer is set up).
-func (n *Node) KeyCache() *keycache.Cache { return n.keyCache }
+// keyCache is the node's shared cache of named keys (nil before the
+// store is open).
+func (n *Node) keyCache() *keystore.Cache {
+	if svc := n.KeyService(); svc != nil {
+		return svc.Cache()
+	}
+	return nil
+}
+
+// sealKeys is the shared cache as the boundary's source of keys.
+type sealKeys struct{ n *Node }
+
+// sealKeyError maps the key store's reasons to the boundary's.
+func sealKeyError(err error) error {
+	for _, m := range []struct{ from, to error }{
+		{keystore.ErrDestroyed, rowseal.ErrKeyDestroyed},
+		{keystore.ErrDisabled, rowseal.ErrKeyDisabled},
+		{keystore.ErrNotFound, rowseal.ErrKeyNotFound},
+		{keystore.ErrNoVersion, rowseal.ErrKeyNoVersion},
+	} {
+		if errors.Is(err, m.from) {
+			return m.to
+		}
+	}
+	return err
+}
+
+func (k sealKeys) get(ctx context.Context, id int64, v int) (rowseal.Key, error) {
+	c := k.n.keyCache()
+	if c == nil {
+		return rowseal.Key{}, errors.New("the key store is not open yet")
+	}
+	aead, ver, err := c.AEAD(ctx, id, v)
+	if err != nil {
+		return rowseal.Key{}, sealKeyError(err)
+	}
+	return rowseal.Key{Version: ver, AEAD: aead}, nil
+}
+
+func (k sealKeys) Current(ctx context.Context, id int64) (rowseal.Key, error) {
+	return k.get(ctx, id, 0)
+}
+
+func (k sealKeys) Version(ctx context.Context, id int64, v int) (rowseal.Key, error) {
+	if v <= 0 {
+		return rowseal.Key{}, rowseal.ErrKeyNoVersion
+	}
+	return k.get(ctx, id, v)
+}
+
+func (k sealKeys) Invalidate(id int64) {
+	if c := k.n.keyCache(); c != nil {
+		c.Forget(id)
+	}
+}
 
 // sealedTableKeys is the key store as the SQL layer needs it for sealed
 // tables.
-type sealedTableKeys struct {
-	n  *Node
-	ks *keystore.Store
-}
+type sealedTableKeys struct{ n *Node }
 
 func (k sealedTableKeys) Ready(ctx context.Context) error {
 	err := k.n.clusterKeyReady(ctx)
@@ -59,13 +103,21 @@ func (k sealedTableKeys) Ready(ctx context.Context) error {
 }
 
 func (k sealedTableKeys) CreateTableKey(ctx context.Context, txn *kvclient.Txn, name string) (int64, error) {
-	key, err := k.ks.CreateIn(ctx, txn, keystore.KindTable, name)
+	ks, err := k.n.KeyStore()
+	if err != nil {
+		return 0, err
+	}
+	key, err := ks.CreateIn(ctx, txn, keystore.KindTable, name)
 	return key.ID, err
 }
 
 func (k sealedTableKeys) DestroyKey(ctx context.Context, id int64) error {
-	_, rep, err := k.ks.Destroy(ctx, id)
-	k.n.keyCache.Invalidate(id)
+	ks, err := k.n.KeyStore()
+	if err != nil {
+		return err
+	}
+	_, rep, err := ks.Destroy(ctx, id)
+	sealKeys(k).Invalidate(id)
 	if err != nil {
 		return err
 	}
@@ -151,7 +203,7 @@ func (n *Node) SweepOrphanTableKeys(ctx context.Context) (int, error) {
 		if _, _, err := ks.Destroy(ctx, k.ID); err != nil {
 			return destroyed, err
 		}
-		n.keyCache.Invalidate(k.ID)
+		sealKeys{n}.Invalidate(k.ID)
 		log.Infof("sealed key janitor: destroyed key %d (%s), which no table names", k.ID, k.Name)
 		destroyed++
 	}

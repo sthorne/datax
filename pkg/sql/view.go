@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -427,6 +428,12 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
+			if err := catalog.DeleteViewDependencies(ctx, txn, existing.ID, existing.ViewDepends); err != nil {
+				return nil, err
+			}
+			if err := catalog.PutViewDependencies(ctx, txn, nd); err != nil {
+				return nil, err
+			}
 			log.Audit("view-ddl", "stmt", "CREATE OR REPLACE VIEW", "target", bare, "principal", s.sessionUser, "role", s.user)
 			return &Result{Tag: "CREATE VIEW"}, nil
 		}
@@ -439,6 +446,9 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, err
 	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
+		return nil, err
+	}
+	if err := catalog.PutViewDependencies(ctx, txn, desc); err != nil {
 		return nil, err
 	}
 	log.Audit("view-ddl", "stmt", "CREATE VIEW", "target", bare, "principal", s.sessionUser, "role", s.user)
@@ -472,21 +482,58 @@ func (s *Session) viewDependsOn(ctx context.Context, txn *kvclient.Txn, deps []u
 }
 
 // viewsDependingOn lists the views whose query reads relation id.
+//
+// From cluster version v22 the views reading a relation are recorded
+// under it (catalog.PutViewDependencies; issue #313), and once the
+// records are complete (keys.ViewDependencyIndexKey, written by
+// catalog.RecordAllViewDependencies on the node leading range 1) this
+// reads them and the views they name: its cost follows the number of
+// views reading the relation, not the size of the catalog. Until then it
+// reads every descriptor. Each view a record names is read and held to
+// its own ViewDepends, so a record can only ever add a view to check.
 func (s *Session) viewsDependingOn(ctx context.Context, txn *kvclient.Txn, id uint64) ([]*catalog.TableDescriptor, error) {
+	var ready []byte
+	if s.db.ClusterVersion() >= version.V22 {
+		var err error
+		if ready, err = txn.Get(ctx, keys.ViewDependencyIndexKey()); err != nil {
+			return nil, err
+		}
+	}
+	dependsOnID := func(d *catalog.TableDescriptor) bool {
+		if d == nil || !d.IsView() {
+			return false
+		}
+		for _, dep := range d.ViewDepends {
+			if dep == id {
+				return true
+			}
+		}
+		return false
+	}
+	var out []*catalog.TableDescriptor
+	if ready != nil {
+		ids, err := catalog.ViewIDsRecordedFor(ctx, txn, id)
+		if err != nil {
+			return nil, err
+		}
+		for _, vid := range ids {
+			d, err := catalog.ReadTable(ctx, txn, vid)
+			if err != nil {
+				return nil, err
+			}
+			if dependsOnID(d) {
+				out = append(out, d)
+			}
+		}
+		return out, nil
+	}
 	all, err := s.cat.List(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
-	var out []*catalog.TableDescriptor
 	for _, d := range all {
-		if !d.IsView() {
-			continue
-		}
-		for _, dep := range d.ViewDepends {
-			if dep == id {
-				out = append(out, d)
-				break
-			}
+		if dependsOnID(d) {
+			out = append(out, d)
 		}
 	}
 	return out, nil

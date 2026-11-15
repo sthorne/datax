@@ -828,7 +828,8 @@ type GrantRevoke struct {
 
 	// Privilege form. Privileges are upper-cased (SELECT INSERT UPDATE
 	// DELETE TRUNCATE USAGE CREATE CONNECT; ALL stays "ALL"). ObjectKind
-	// is "table" (the default), "sequence", "database" or "schema";
+	// is "table" (the default), "sequence", "database", "schema" or
+	// "encryption key" (WRAP, UNWRAP, USAGE, ALL; issue #310);
 	// Objects the names, or — AllInSchema — every table / sequence of the
 	// public schema of the current database.
 	Privileges  []string

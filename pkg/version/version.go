@@ -289,10 +289,29 @@ const (
 	// ordinary table whose owner may read or delete its rows. So
 	// `datax debug cluster-key init` is refused, nothing creates the
 	// table, and no node writes the record or its holder report until
-	// finalize (rule 4). V22 also introduces sealed tables (issue #310,
-	// step 3; pkg/sql/rowseal): the descriptor field encryption_key,
-	// omitempty, and row values a v21 node could not decode, so CREATE
-	// TABLE ... WITH (encryption_key) is refused until finalize too.
+	// finalize (rule 4).
+	//
+	// V22 also introduces the reverse record of view dependencies (issue
+	// #313, keys.ViewDependencyKey): under each relation, the views whose
+	// query reads it, written in the transactions that create, replace
+	// and drop a view, so DROP, RENAME and DROP COLUMN find a relation's
+	// views without reading every descriptor. A v21 node creates views
+	// without the records, so they are not trusted until finalize: at
+	// v22 the node leading range 1 records every view once and marks the
+	// records complete (keys.ViewDependencyIndexKey), and until then the
+	// statements read every descriptor as before. The records are system
+	// keys a v21 node never reads.
+	//
+	// V22 also introduces the key service's statements and functions
+	// (CREATE / ALTER / DROP ENCRYPTION KEY, GRANT ... ON ENCRYPTION KEY,
+	// datax_key_wrap and the rest; pkg/sql/keyservice.go) and the owner
+	// and privileges columns of datax_keys, which a v21 node would not
+	// enforce: they are refused until finalize as well.
+	//
+	// V22 also introduces sealed tables (issue #310, step 3;
+	// pkg/sql/rowseal): the descriptor field encryption_key, omitempty,
+	// and row values a v21 node could not decode, so CREATE TABLE ...
+	// WITH (encryption_key) is refused until finalize too.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

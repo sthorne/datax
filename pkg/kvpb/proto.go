@@ -805,6 +805,9 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 	if d := e.DescriptorChanged; d != nil {
 		pb.DescriptorChanged = &rpcpb.DescriptorChangedError{RangeId: int64(d.RangeID), BuiltFrom: d.BuiltFrom, Current: d.Current}
 	}
+	if b := e.BelowGCThreshold; b != nil {
+		pb.BelowGcThreshold = &rpcpb.BelowGCThresholdError{Timestamp: tsToProto(b.Timestamp), Threshold: tsToProto(b.Threshold)}
+	}
 	return pb
 }
 
@@ -861,6 +864,9 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 	}
 	if d := pb.DescriptorChanged; d != nil {
 		e.DescriptorChanged = &DescriptorChangedError{RangeID: base.RangeID(d.RangeId), BuiltFrom: d.BuiltFrom, Current: d.Current}
+	}
+	if b := pb.BelowGcThreshold; b != nil {
+		e.BelowGCThreshold = &BelowGCThresholdError{Timestamp: tsFromProto(b.Timestamp), Threshold: tsFromProto(b.Threshold)}
 	}
 	return e, nil
 }

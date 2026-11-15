@@ -234,3 +234,80 @@ func TestRestoreSelectionFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestSealedOpNames (issue #313): a sealed backup travels under an admin
+// op of its own. Under "backup", a node from before sealed backups
+// ignores the backup_key field it does not know and writes the backup in
+// plaintext, reporting success; under "backup-sealed" it refuses the
+// unknown op. A restore given keys likewise travels as "restore-sealed":
+// an older node would ignore the keys and restore a plaintext directory
+// put in a sealed backup's place, which is what the keys refuse. The
+// serving node takes both the new ops and the old ones with keys, which
+// is what a command from before this change sends.
+func TestSealedOpNames(t *testing.T) {
+	key := bytes.Repeat([]byte{0xa1}, enc.KeyLen)
+	for _, c := range []struct {
+		what    string
+		req     cluster.AdminRequest
+		history bool
+		want    string
+	}{
+		{"plaintext", cluster.AdminRequest{}, false, "backup"},
+		{"sealed", cluster.AdminRequest{BackupKey: key}, false, "backup-sealed"},
+		{"plaintext on a sealed base", cluster.AdminRequest{BaseBackupKey: key}, false, "backup"},
+		{"with history", cluster.AdminRequest{}, true, "backup-history"},
+		{"sealed, with history", cluster.AdminRequest{BackupKey: key}, true, "backup-history"},
+	} {
+		if got := backupOp(c.req, c.history); got != c.want {
+			t.Errorf("backup %s: op %q, want %q", c.what, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		what string
+		keys [][]byte
+		want string
+	}{
+		{"no keys", nil, "restore"},
+		{"empty entries only", [][]byte{nil, nil}, "restore"},
+		{"one key", [][]byte{key}, "restore-sealed"},
+		{"a key for the second directory", [][]byte{nil, key}, "restore-sealed"},
+	} {
+		req := cluster.AdminRequest{Op: "restore", BackupKeys: c.keys}
+		if got := restoreOp(req); got != c.want {
+			t.Errorf("restore with %s: op %q, want %q", c.what, got, c.want)
+		}
+	}
+	if got := restoreOp(cluster.AdminRequest{Op: "restore-select", BackupKeys: [][]byte{key}}); got != "restore-select" {
+		t.Errorf("a selective restore with a key: op %q", got)
+	}
+
+	n := startBackupTestNode(t)
+	backupTestSQL(t, n, `CREATE TABLE op_names (id INT8 PRIMARY KEY)`)
+	work := t.TempDir()
+	call := func(req cluster.AdminRequest) string {
+		t.Helper()
+		resp, err := adminCall(n.Addr(), "", "root", 10*time.Second, req)
+		if err != nil {
+			return err.Error()
+		}
+		return resp.Error
+	}
+	if got := call(cluster.AdminRequest{Op: "backup-sealed", Path: filepath.Join(work, "nokey")}); !strings.Contains(got, "backup-sealed carries the backup key") {
+		t.Fatalf("backup-sealed without a key: %q", got)
+	}
+	sealed := filepath.Join(work, "sealed")
+	if got := call(cluster.AdminRequest{Op: "backup-sealed", Path: sealed, BackupKey: key}); got != "" {
+		t.Fatalf("backup-sealed: %s", got)
+	}
+	if got := call(cluster.AdminRequest{Op: "backup", Path: filepath.Join(work, "old-style"), BackupKey: key}); got != "" {
+		t.Fatalf("backup with a key, as an older command sends it: %s", got)
+	}
+	dst := startBackupTestNode(t)
+	if resp, err := adminCall(dst.Addr(), "", "root", 10*time.Second, cluster.AdminRequest{Op: "restore-sealed", Paths: []string{sealed}}); err == nil && !strings.Contains(resp.Error, "restore-sealed carries the backup keys") {
+		t.Fatalf("restore-sealed without keys: %q", resp.Error)
+	}
+	if resp, err := adminCall(dst.Addr(), "", "root", 10*time.Second, cluster.AdminRequest{Op: "restore-sealed", Paths: []string{sealed}, BackupKeys: [][]byte{key}}); err != nil || resp.Error != "" {
+		t.Fatalf("restore-sealed: %v %s", err, resp.Error)
+	}
+	backupTestSQL(t, dst, `SELECT * FROM op_names`)
+}

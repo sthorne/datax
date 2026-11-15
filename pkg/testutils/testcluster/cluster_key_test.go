@@ -231,6 +231,13 @@ func TestClusterKeyRefusals(t *testing.T) {
 		if _, err := c.keyStore(0).Create(ctx, keystore.KindWrapping, "k"); err == nil || !strings.Contains(err.Error(), "v22") {
 			t.Fatalf("a named key at v21: %v", err)
 		}
+		// The key service's statements and functions too (#310 step 2).
+		root := connectRoot(t, ctx, c)
+		defer root.Close(ctx)
+		_, err := root.Exec(ctx, `CREATE ENCRYPTION KEY k`)
+		wantState(t, "CREATE ENCRYPTION KEY at v21", err, "0A000", "need cluster version v22")
+		_, err = root.Exec(ctx, `SELECT datax_key_wrap('k', '\x00', 'c')`)
+		wantState(t, "datax_key_wrap at v21", err, "0A000", "need cluster version v22")
 	})
 
 	t.Run("key-file node then down node", func(t *testing.T) {
@@ -713,5 +720,129 @@ func TestClusterKeyExportImportRestore(t *testing.T) {
 			t.Fatalf("restored key %d version %d: %v", kv[0], kv[1], err)
 		}
 		m.Release()
+	}
+}
+
+// addNode starts a new node that joins the cluster through node 1, under
+// a file root of its own, and returns its index.
+func (c *ckCluster) addNode() int {
+	c.t.Helper()
+	i := len(c.dirs)
+	c.dirs = append(c.dirs, c.t.TempDir())
+	c.roots = append(c.roots, writeRootKey(c.t, c.t.TempDir(), "joiner.key"))
+	n, err := c.tc.AddNodeErr(func(cfg *server.Config) {
+		cfg.CertsDir = c.certsDir
+		cfg.Join = c.tc.addrs[0]
+		c.config(i, cfg)
+	})
+	if err != nil {
+		c.t.Fatalf("joining a node: %v", err)
+	}
+	c.tc.addrs = append(c.tc.addrs, n.Addr())
+	return i
+}
+
+// TestClusterKeyJoiningNode (issue #310): a node that joins after the
+// cluster key was enabled has no copy and is given none at join; it asks
+// a running peer and is handed the key (it is live, asking from the host
+// it is registered at), and unwraps a named key made before it existed.
+// A node that joins while a rotation is half done — the new version
+// recorded, the named keys not yet rewrapped — is handed both versions,
+// unwraps a key still under the old one, and is left with the new
+// version alone once the rotation is finished.
+func TestClusterKeyJoiningNode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
+	c := startCKCluster(t, ctx, nil)
+	c.waitReported(3)
+	errText, ans := c.op(0, "init")
+	if errText != "" {
+		t.Fatalf("init: %s", errText)
+	}
+	v1 := enc.ClusterKeyRef{ID: ans.Status.ID, Version: 1}
+	early, err := c.keyStore(0).Create(ctx, keystore.KindWrapping, "early")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := c.keyStore(0).Unwrap(ctx, early.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte(nil), m.Key...)
+	m.Release()
+
+	// A node joins after init.
+	j := c.addNode()
+	joinerID := c.tc.Nodes[j].NodeID()
+	c.waitFor("the joining node to be handed the key", 40*time.Second, func() bool {
+		refs := c.fileRefs(j)
+		return len(refs) == 1 && refs[0] == v1.String() && holdsCurrent(c.status(0), joinerID)
+	})
+	got, err := c.keyStore(j).Unwrap(ctx, early.ID, 0)
+	if err != nil || !bytes.Equal(got.Key, want) {
+		t.Fatalf("the joined node unwrapping a key made before it joined: %v", err)
+	}
+	got.Release()
+
+	// A rotation stops with v2 recorded and nothing rewrapped yet.
+	c.tc.Nodes[0].StopClusterKeyRotationBeforeRewrapForTesting(true)
+	errText, _ = c.op(0, "rotate")
+	wantErr(t, "a rotation stopped before the rewrap", errText, "stopped before the rewrap")
+	c.tc.Nodes[0].StopClusterKeyRotationBeforeRewrapForTesting(false)
+	v2 := enc.ClusterKeyRef{ID: v1.ID, Version: 2}
+	if st := c.status(0); st.Version != 2 || len(st.Previous) != 1 || st.Previous[0] != 1 {
+		t.Fatalf("after the stopped rotation: %+v", st)
+	}
+	if k, err := c.keyStore(1).GetByID(ctx, early.ID); err != nil || k.ClusterKey != v1 {
+		t.Fatalf("a key after the stopped rotation: %+v %v (want still under %s)", k, err, v1)
+	}
+
+	// A second node joins now: it needs both versions.
+	j2 := c.addNode()
+	joiner2 := c.tc.Nodes[j2].NodeID()
+	c.waitFor("the second joining node to be handed both versions", 40*time.Second, func() bool {
+		refs := c.fileRefs(j2)
+		return len(refs) == 2 && refs[0] == v1.String() && refs[1] == v2.String() && holdsCurrent(c.status(0), joiner2)
+	})
+	got, err = c.keyStore(j2).Unwrap(ctx, early.ID, 0)
+	if err != nil || !bytes.Equal(got.Key, want) {
+		t.Fatalf("the second joined node unwrapping a key still under v1: %v", err)
+	}
+	got.Release()
+	later, err := c.keyStore(j2).Create(ctx, keystore.KindWrapping, "later")
+	if err != nil || later.ClusterKey != v2 {
+		t.Fatalf("a key made on the joined node mid-rotation: %+v %v", later, err)
+	}
+
+	// Finishing the rotation leaves every node, the joiners included,
+	// with v2 alone, and both keys under it.
+	errText, ans = c.op(j2, "rotate")
+	if errText != "" {
+		t.Fatalf("finishing the rotation: %s", errText)
+	}
+	if ans.Status.Version != 2 || len(ans.Status.Previous) != 0 {
+		t.Fatalf("after finishing the rotation: %+v (%v)", ans.Status, ans.Notes)
+	}
+	c.waitFor("every node to drop v1", 20*time.Second, func() bool {
+		for i := range c.dirs {
+			if refs := c.fileRefs(i); len(refs) != 1 || refs[0] != v2.String() {
+				return false
+			}
+		}
+		return true
+	})
+	for _, id := range []int64{early.ID, later.ID} {
+		k, err := c.keyStore(j).GetByID(ctx, id)
+		if err != nil || k.ClusterKey != v2 {
+			t.Fatalf("key %d after the rotation: %+v %v", id, k, err)
+		}
+		got, err := c.keyStore(j).Unwrap(ctx, id, 0)
+		if err != nil {
+			t.Fatalf("key %d on the first joiner after the rotation: %v", id, err)
+		}
+		if id == early.ID && !bytes.Equal(got.Key, want) {
+			t.Fatal("the early key's material changed")
+		}
+		got.Release()
 	}
 }

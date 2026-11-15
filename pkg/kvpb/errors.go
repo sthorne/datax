@@ -3,6 +3,7 @@ package kvpb
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
@@ -35,9 +36,41 @@ type Error struct {
 	// DescriptorChanged: a split, merge or descriptor update was refused
 	// at apply because the range changed after the change was built.
 	DescriptorChanged *DescriptorChangedError `json:"descriptor_changed,omitempty"`
+	// BelowGCThreshold: the batch's timestamp is at or below the range's
+	// GC threshold (issue #313).
+	BelowGCThreshold *BelowGCThresholdError `json:"below_gc_threshold,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
+
+// BelowGCThresholdError: a batch at or below the range's GC threshold,
+// refused because the versions it would need may have been collected.
+// Who should act depends on who chose the timestamp: a transaction the
+// cluster timestamped succeeds when restarted at a new one, and a read
+// at a timestamp the client named (AS OF SYSTEM TIME) never will.
+type BelowGCThresholdError struct {
+	Timestamp hlc.Timestamp `json:"timestamp"`
+	Threshold hlc.Timestamp `json:"threshold"`
+}
+
+// belowGCThresholdText is in every such refusal's message; it is how
+// one from a peer that predates the typed detail is recognized.
+const belowGCThresholdText = "is below the GC threshold"
+
+// NewBelowGCThresholdError is the refusal of a batch at ts by a range
+// whose threshold is thr.
+func NewBelowGCThresholdError(rangeID base.RangeID, ts, thr hlc.Timestamp) *Error {
+	e := NewErrorf("%s: batch timestamp %s %s %s", rangeID, ts, belowGCThresholdText, thr)
+	e.BelowGCThreshold = &BelowGCThresholdError{Timestamp: ts, Threshold: thr}
+	return e
+}
+
+// IsBelowGCThreshold reports whether e refuses a batch at or below a GC
+// threshold — by the typed detail, or, from a peer that predates it, by
+// the message.
+func (e *Error) IsBelowGCThreshold() bool {
+	return e != nil && (e.BelowGCThreshold != nil || strings.Contains(e.Message, belowGCThresholdText))
+}
 
 // WriteTooLargeError: a write batch for one range is larger than one
 // replicated write may be. Bytes is its size and Limit the bound.

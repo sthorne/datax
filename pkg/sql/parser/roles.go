@@ -153,6 +153,8 @@ func (p *parser) parseDropRole() (Statement, error) {
 var privilegeWords = map[string]bool{
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true, "TRUNCATE": true,
 	"USAGE": true, "CREATE": true, "CONNECT": true, "ALL": true,
+	// The key service's (issue #310): on an encryption key only.
+	"WRAP": true, "UNWRAP": true,
 }
 
 // parseGrantRevoke parses GRANT / REVOKE in both forms.
@@ -177,6 +179,11 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 	first := p.peek()
 	isPriv := (first.kind == tkKeyword || first.kind == tkIdent) && privilegeWords[strings.ToUpper(first.text)] &&
 		!(strings.ToUpper(first.text) == "ALL" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkKeyword && p.toks[p.i+1].text == "TO")
+	if w := strings.ToUpper(first.text); isPriv && (w == "WRAP" || w == "UNWRAP") {
+		// Words that are no keyword anywhere else: a role may well be
+		// called wrap. The privilege form has an ON before its TO.
+		isPriv = p.privilegeFormAhead()
+	}
 	if !isPriv {
 		roles, err := p.parseRoleList()
 		if err != nil {
@@ -208,7 +215,7 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 		t := p.peek()
 		word := strings.ToUpper(t.text)
 		if (t.kind != tkKeyword && t.kind != tkIdent) || !privilegeWords[word] {
-			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, USAGE, CREATE, CONNECT, ALL), found %q", t.text)
+			return nil, p.errf("expected a privilege (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, USAGE, CREATE, CONNECT, WRAP, UNWRAP, ALL), found %q", t.text)
 		}
 		p.i++
 		if word == "ALL" {
@@ -238,6 +245,19 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 		}
 		if err := p.expectSchemaList(); err != nil {
 			return nil, err
+		}
+	case p.peekEncryptionKey(0):
+		p.i += 2
+		gr.ObjectKind = "encryption key"
+		for {
+			name, err := p.parseEncryptionKeyName()
+			if err != nil {
+				return nil, err
+			}
+			gr.Objects = append(gr.Objects, name)
+			if !p.consumeOp(",") {
+				break
+			}
 		}
 	case p.consumeWord("database"):
 		gr.ObjectKind = "database"

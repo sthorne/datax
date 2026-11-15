@@ -20,7 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
-	"github.com/sthorne/datax/pkg/keystore/keycache"
+	"github.com/sthorne/datax/pkg/keystore"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
@@ -136,10 +136,6 @@ type Config struct {
 	// five minutes). Tests shorten it to watch that happen (issues #223,
 	// #224); nothing else has a reason to set it.
 	HealthRateWindow time.Duration
-	// SealedKeyLease is how long the gateway uses a cached key of a sealed
-	// table before checking it against datax_keys again (0 = 10 seconds,
-	// also the most allowed); tests shorten it.
-	SealedKeyLease time.Duration
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
@@ -169,6 +165,11 @@ type Config struct {
 	// 0 = 1s; negative leaves the table alone, and audit records are in
 	// the log only.
 	AuditFlushInterval time.Duration
+	// KeyCacheLease is how long a gateway trusts its cache of named keys'
+	// material before checking the key again (issue #310; 0: 10 s, the
+	// descriptor lease). DROP, DISABLE and REVOKE on an encryption key
+	// wait it out. Tests shorten it.
+	KeyCacheLease time.Duration
 	// AuditHousekeepingInterval paces the audit table's retention and
 	// anchoring; 0 = 10m.
 	AuditHousekeepingInterval time.Duration
@@ -211,6 +212,11 @@ type Config struct {
 	// before the janitor reclaims it (0 = the GC TTL, matching the
 	// deepest admissible historical read).
 	ReshardRetireFor time.Duration
+	// DroppedTableReclaimInterval is how often the node leading range 1
+	// looks for dropped tables whose history window has passed and clears
+	// their spans (0 = default 1m; negative disables it, and a dropped
+	// table's rows then stay).
+	DroppedTableReclaimInterval time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -318,6 +324,13 @@ const (
 )
 
 type Node struct {
+	// reshardMu guards the re-shard janitor's view of the descriptors:
+	// the descriptors it has seen written, and of them the ones holding
+	// a retired layout (reshard_janitor.go).
+	reshardMu      sync.Mutex
+	reshardWatch   *descWatcher
+	reshardRetired map[uint64][]byte
+
 	cfg     Config
 	tlsCfgs *security.TLSConfigs // nil in insecure mode
 	// certs reports what TLS material this node loaded and which client
@@ -381,6 +394,10 @@ type Node struct {
 	// clusterkey.go): the versions it holds, and its record as the
 	// answering side of hand-overs.
 	clusterKey clusterKeyState
+	// keyService is the key service (issue #310, step 2), made with the
+	// SQL server (keyServiceOnce).
+	keyServiceOnce sync.Once
+	keyService     *keystore.Service
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener
@@ -477,10 +494,7 @@ type Node struct {
 	// metrics recorder share it); catOnce builds it on first use.
 	cat     *catalog.Accessor
 	catOnce sync.Once
-	// keyCache is the gateway's cache of unwrapped named keys, made with
-	// the catalog accessor (sealedtables.go).
-	keyCache *keycache.Cache
-	catErr   error
+	catErr  error
 	// authSecret is the cluster's authentication secret
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
@@ -917,6 +931,12 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.droppedTableReclaimLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.viewDependencyRecordLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {

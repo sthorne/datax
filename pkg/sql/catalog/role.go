@@ -375,6 +375,53 @@ func MigrateRoles(ctx context.Context, db *kvclient.DB) (moved int, err error) {
 	return moved, err
 }
 
+// GrantTruncateWithDelete gives every role holding DELETE on a table
+// TRUNCATE on it as well, and reports how many tables changed. Before
+// cluster version v11 TRUNCATE took the DELETE privilege; from v11 it
+// takes its own (issue #312). The finalize step that moves a cluster
+// to v11 runs this in the same transaction, so a grant made before
+// keeps the meaning it was made with. Each changed descriptor's
+// version moves on, so the leased copies are replaced.
+func GrantTruncateWithDelete(ctx context.Context, txn *kvclient.Txn) (int, error) {
+	lo, hi := keys.TableDescSpan()
+	rows, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return 0, err
+	}
+	order := []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"}
+	changed := 0
+	for _, kv := range rows {
+		var d TableDescriptor
+		if json.Unmarshal(kv.Value, &d) != nil {
+			continue
+		}
+		touched := false
+		for grantee, privs := range d.Privileges {
+			for _, p := range privs {
+				if p == "DELETE" {
+					var c bool
+					d.Privileges, c = AddPrivileges(d.Privileges, grantee, []string{"TRUNCATE"}, order)
+					touched = touched || c
+					break
+				}
+			}
+		}
+		if !touched {
+			continue
+		}
+		d.Version++
+		raw, err := json.Marshal(&d)
+		if err != nil {
+			return 0, err
+		}
+		if err := txn.Put(ctx, keys.Key(kv.Key), raw); err != nil {
+			return 0, err
+		}
+		changed++
+	}
+	return changed, nil
+}
+
 // RoleSet is a set of role names: the roles whose privileges an
 // identity holds.
 type RoleSet map[string]bool
@@ -564,6 +611,19 @@ func CanReadTable(set RoleSet, d *TableDescriptor) bool {
 	}
 	if RowSecurityConfines(set, d) {
 		return false
+	}
+	return CanSelectTable(set, d)
+}
+
+// CanSelectTable is CanReadTable without the row-security exception:
+// whether the set holds SELECT on the table, as the SQL authorizer
+// grants it — admins, the owner, read_all (but not on the audit table)
+// and a SELECT grant. A caller that knows the role asks
+// Session.rowSecurityActive next, as the catalogs do before showing a
+// table's statistics (issue #312).
+func CanSelectTable(set RoleSet, d *TableDescriptor) bool {
+	if IsSealedSystemTable(d.Name) {
+		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
 	}
 	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
 		HasPrivilege(d.Privileges, set, "SELECT")

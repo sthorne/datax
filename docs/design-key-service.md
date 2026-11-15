@@ -1,15 +1,17 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed; steps 1 and 3 built** (issue #310, the last piece of
-#292). The issue asked for a written design to be agreed before any
+Status: **agreed; steps 1, 2 and 3 built** (issue #310, the last piece
+of #292). The issue asked for a written design to be agreed before any
 code. This is that design; the owner settled its five open decisions on
 2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
 of work — the cluster key, `datax_keys`, hand-over, export and import —
 is built (docs/encryption.md, "Cluster key"); the choices it made where
-this design was open are under *Choices made in step 1*. Step 3, sealed
-whole tables, is built (docs/encryption.md, "Sealed tables"), with its
-choices under *Choices made in step 3*. Nothing else described here
-exists yet.
+this design was open are under *Choices made in step 1*. Step 2, the
+key service (A below), is built too (docs/sql.md, "Encryption keys");
+its choices are under *Choices made in step 2*. Step 3, sealed whole
+tables, is built (docs/encryption.md, "Sealed tables"), with its
+choices under *Choices made in step 3*. Per-tenant keys (step 4) and
+online rotation (step 5) do not exist yet.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -335,6 +337,43 @@ Where the design above left a choice open, step 1 made these
   whole-cluster restore refuses named keys it cannot open before applying
   anything, and rewraps them under the target's key after.
 
+## Choices made in step 2
+
+Where *A. The key service* left a choice open, step 2 made these
+(detail in docs/sql.md, "Encryption keys"):
+
+- **Who manages keys.** `CREATE ENCRYPTION KEY` needs the admin role;
+  the creator owns the key; the owner and admins alter, drop and grant
+  (no grant options), and `ALTER ENCRYPTION KEY ... OWNER TO` hands a
+  key on. Using a key needs `WRAP` or `UNWRAP`; the owner holds both,
+  an admin who is not the owner holds neither until granted. Owner and
+  grants are two new columns of the key's `datax_keys` row.
+- **Removing a role.** `DROP OWNED` refuses a role that owns a key
+  (dropping a key destroys what it wraps, so it is never a side effect);
+  `REASSIGN OWNED` moves keys; `DROP ROLE` refuses an owner and drops
+  the role's grants on keys.
+- **Disabled keys refuse unwrap and decrypt as well**, as a KMS's do.
+- **Blob format**: format byte, key id, version, nonce, AES-256-GCM;
+  41 bytes of overhead; the associated data binds the format, id,
+  version and context. One error (`39000`) for every blob that does not
+  open.
+- **Rate limit**: a token bucket per role per node, a second deep, at
+  the cluster setting `key_service.rate_limit` (default 100 a second; 0
+  none), introduced with `SET CLUSTER SETTING`; refused with `53400`.
+- **Audit volume**: each use is a `key-use` record through the buffered
+  audit path, and the audit table folds identical uses within a flush
+  into one row with a count; rate-limit refusals are refusals, recorded
+  at the audit table's bounded rate.
+- **Leases**: `DROP`, `DISABLE`, `REVOKE` and `OWNER TO` wait out the
+  gateway cache's lease (10 s) after committing; a refusal re-reads the
+  key first, so `GRANT` and `ENABLE` take effect at once; `ROTATE` does
+  not wait.
+- **The functions take constants or parameters**, evaluated once per
+  call like the large-object functions; a column argument is refused
+  with a pointer to pass the value as a parameter.
+- **The gateway cache is `keystore.Cache`**, meant to be shared with
+  sealed tables (step 3).
+
 ## Choices made in step 3
 
 - **Associated data names the seal id, not the table id.** The seal id
@@ -355,10 +394,13 @@ Where the design above left a choice open, step 1 made these
 - **`XXK01`** for a key that gives nothing (class `XX`, subclass in the
   implementation-defined range), **`XX001`** for a value that does not
   authenticate.
-- **The key cache** is `pkg/keystore/keycache`, beneath `pkg/keystore`
-  because the SQL layer uses it and `pkg/keystore` imports the SQL
-  layer. The statement that destroys a key invalidates its own gateway's
-  cache at once; other gateways stop within one lease.
+- **The key cache** is step 2's `keystore.Cache`, shared with the key
+  service (its `AEAD` gives the sealing an AES-GCM AEAD per cached
+  version). The SQL layer cannot import `pkg/keystore`, which imports
+  it, so it reaches the cache through `rowseal.Keys`, which the server
+  adapts. `DROP TABLE` forgets the key in its own gateway's cache at
+  once; other gateways stop within one lease, which the drop does not
+  wait out (no gateway resolves the dropped table's name by then).
 - **No `STORING` columns exist** in datax's indexes: a secondary index
   entry's value is the bare primary-key suffix or a presence byte, which
   is plaintext in the key anyway, so index values are not sealed. An

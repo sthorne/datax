@@ -110,6 +110,22 @@ type SchemaStats struct {
 	Stale bool `json:"stale"`
 }
 
+// SchemaPolicy is one row-security policy of a table.
+type SchemaPolicy struct {
+	Name string `json:"name"`
+	// Restrictive is AS RESTRICTIVE (false: permissive).
+	Restrictive bool `json:"restrictive,omitempty"`
+	// Command is all, select, insert, update or delete.
+	Command string `json:"command"`
+	// Roles are the roles it applies to; empty means PUBLIC.
+	Roles []string `json:"roles,omitempty"`
+	// Using and Check are the USING and WITH CHECK expressions' text.
+	Using string `json:"using,omitempty"`
+	Check string `json:"check,omitempty"`
+	// Definition is the CREATE POLICY statement that reproduces it.
+	Definition string `json:"definition"`
+}
+
 // SchemaTable is one table in the browser.
 type SchemaTable struct {
 	ID uint64 `json:"id"`
@@ -134,6 +150,13 @@ type SchemaTable struct {
 	Timeseries       bool  `json:"timeseries,omitempty"`
 	RetentionSeconds int64 `json:"retention_seconds,omitempty"`
 	Shards           int32 `json:"shards,omitempty"`
+	// RowSecurity and ForceRowSecurity are ENABLE / FORCE ROW LEVEL
+	// SECURITY; Policies the table's row-security policies, in the order
+	// the catalog keeps them (issue #312). Like pg_policies, they are
+	// shown to whoever the table is listed for.
+	RowSecurity      bool           `json:"row_security,omitempty"`
+	ForceRowSecurity bool           `json:"force_row_security,omitempty"`
+	Policies         []SchemaPolicy `json:"policies,omitempty"`
 	// Privileges maps a user to its grants on the table (root and admins
 	// bypass grants and are not listed).
 	Privileges map[string][]string `json:"privileges,omitempty"`
@@ -530,7 +553,16 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]*c
 			Timeseries: d.Timeseries, RetentionSeconds: d.RetentionSeconds, Shards: d.ShardBuckets,
 			Privileges: d.Privileges,
 			View:       d.IsView(), Definition: d.ViewQuery,
-			Comment: d.Comment,
+			Comment:     d.Comment,
+			RowSecurity: d.RowSecurity, ForceRowSecurity: d.ForceRowSecurity,
+		}
+		for i := range d.Policies {
+			p := &d.Policies[i]
+			t.Policies = append(t.Policies, SchemaPolicy{
+				Name: p.Name, Restrictive: p.Restrictive, Command: p.Command,
+				Roles: append([]string(nil), p.Roles...), Using: p.Using, Check: p.Check,
+				Definition: vtable.PolicyDef(d, p),
+			})
 		}
 		byID[d.ID] = d
 		colName := map[catalog.ColumnID]string{}
