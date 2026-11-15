@@ -85,6 +85,7 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 		Versions:      []GCVersion{{Key: keys.Key("k"), TS: mkts(5), Bytes: 33}},
 		TxnRecordKeys: []keys.Key{keys.Key("t")}})
 	ba.Add(&TruncateLogRequest{RequestHeader: h("a"), Index: 100, Term: 3})
+	ba.Add(&ClearRangeRequest{RequestHeader: hr("a", "z"), Timestamp: mkts(80), Generation: 7})
 	ba.Add(&AdminSplitRequest{RequestHeader: h("m")})
 	ba.Add(&AdminSplitRequest{RequestHeader: h("m"), StickyUntil: StickyForever})
 	ba.Add(&AdminUnsplitRequest{RequestHeader: h("m")})
@@ -129,6 +130,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v"), Timestamp: mkts(33)}, {Key: keys.Key("k"), Deleted: true, Timestamp: mkts(31)}}}},
 		{GC: &GCResponse{}},
 		{TruncateLog: &TruncateLogResponse{}},
+		{ClearRange: &ClearRangeResponse{Cleared: true}},
+		{ClearRange: &ClearRangeResponse{}},
 		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: testDesc()}},
 		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: stickyDesc()}},
 		{AdminUnsplit: &AdminUnsplitResponse{Desc: testDesc()}},

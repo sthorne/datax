@@ -210,6 +210,22 @@ type GCRequest struct {
 	TxnRecordKeys []keys.Key    `json:"txn_record_keys,omitempty"`
 }
 
+// ClearRangeRequest removes every MVCC key of one whole range in a single
+// replicated command: the reclaim of a dropped table's span (cluster
+// version v22, issue #316; kvserver.Store.ClearRange). It is never sent
+// by clients: the range's leader builds it under an exclusive latch on
+// the range, having found no intent in the span, and proposes it.
+// Applying it deletes the span's MVCC keys with one range deletion,
+// raises the range's GC threshold to Timestamp and sets the range's size
+// to zero (its MVCC span is empty). A replica whose range no longer has
+// these bounds at Generation, or whose threshold is already at or past
+// Timestamp, applies nothing and answers Cleared=false.
+type ClearRangeRequest struct {
+	RequestHeader               // Key/EndKey = the range's bounds
+	Timestamp     hlc.Timestamp `json:"timestamp"`
+	Generation    int64         `json:"generation,omitempty"`
+}
+
 // TruncateLogRequest discards the range's Raft log at or below Index
 // (whose term is Term). Proposed by the leader's housekeeping loop with
 // Index <= min(every voter's durably-appended Match, the leader's applied
@@ -340,6 +356,7 @@ type RequestUnion struct {
 	Unfreeze            *UnfreezeRequest            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaRequest          `json:"update_meta,omitempty"`
 	AdminUnsplit        *AdminUnsplitRequest        `json:"admin_unsplit,omitempty"`
+	ClearRange          *ClearRangeRequest          `json:"clear_range,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -391,6 +408,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.UpdateMeta
 	case u.AdminUnsplit != nil:
 		return u.AdminUnsplit
+	case u.ClearRange != nil:
+		return u.ClearRange
 	}
 	return nil
 }
@@ -427,6 +446,7 @@ func (h *SubsumeRequest) Header() RequestHeader             { return h.RequestHe
 func (h *UnfreezeRequest) Header() RequestHeader            { return h.RequestHeader }
 func (h *UpdateMetaRequest) Header() RequestHeader          { return h.RequestHeader }
 func (h *AdminUnsplitRequest) Header() RequestHeader        { return h.RequestHeader }
+func (h *ClearRangeRequest) Header() RequestHeader          { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -451,6 +471,7 @@ func (*SubsumeRequest) Method() string             { return "Subsume" }
 func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
 func (*UpdateMetaRequest) Method() string          { return "UpdateMeta" }
 func (*AdminUnsplitRequest) Method() string        { return "AdminUnsplit" }
+func (*ClearRangeRequest) Method() string          { return "ClearRange" }
 
 func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -475,6 +496,7 @@ func (*SubsumeRequest) IsReadOnly() bool             { return false }
 func (*UnfreezeRequest) IsReadOnly() bool            { return false }
 func (*UpdateMetaRequest) IsReadOnly() bool          { return false }
 func (*AdminUnsplitRequest) IsReadOnly() bool        { return false }
+func (*ClearRangeRequest) IsReadOnly() bool          { return false }
 
 // Response types.
 
@@ -586,6 +608,13 @@ type GCResponse struct{}
 
 type TruncateLogResponse struct{}
 
+// ClearRangeResponse: Cleared is false when the replica found the command
+// had already applied (its threshold is at or past the clear's
+// timestamp) or the range had changed since the leader evaluated it.
+type ClearRangeResponse struct {
+	Cleared bool `json:"cleared,omitempty"`
+}
+
 type AdminChangeReplicasResponse struct {
 	Desc RangeDescriptor `json:"desc"`
 }
@@ -643,6 +672,7 @@ type ResponseUnion struct {
 	Unfreeze            *UnfreezeResponse            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaResponse          `json:"update_meta,omitempty"`
 	AdminUnsplit        *AdminUnsplitResponse        `json:"admin_unsplit,omitempty"`
+	ClearRange          *ClearRangeResponse          `json:"clear_range,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -758,6 +788,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.UpdateMeta = t
 	case *AdminUnsplitRequest:
 		u.AdminUnsplit = t
+	case *ClearRangeRequest:
+		u.ClearRange = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}
