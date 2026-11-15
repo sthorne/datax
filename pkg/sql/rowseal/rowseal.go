@@ -52,6 +52,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -164,7 +165,19 @@ var (
 	ErrKeyDisabled  = errors.New("the key is disabled")
 	ErrKeyDestroyed = errors.New("the key has been destroyed")
 	ErrKeyNoVersion = errors.New("the key has no such version")
+	// ErrKeyVersionDestroyed: the version was destroyed after a rotation
+	// (its rows were rewritten under the new version, or the version was
+	// destroyed early); the key's later versions still open.
+	ErrKeyVersionDestroyed = errors.New("that version of the key has been destroyed")
 )
+
+// KeyGone reports whether err says a key gives nothing for good —
+// destroyed, missing, or the version destroyed or never made — rather
+// than for now (disabled, or unavailable on this node).
+func KeyGone(err error) bool {
+	return errors.Is(err, ErrKeyDestroyed) || errors.Is(err, ErrKeyNotFound) ||
+		errors.Is(err, ErrKeyVersionDestroyed) || errors.Is(err, ErrKeyNoVersion)
+}
 
 // Keys is where the boundary gets key versions: the gateway's shared
 // cache of named keys (keystore.Cache, adapted by the server).
@@ -185,6 +198,25 @@ type KeyStore interface {
 	CreateTableKey(ctx context.Context, txn *kvclient.Txn, name string) (int64, error)
 	// DestroyKey destroys a key and purges its record's history.
 	DestroyKey(ctx context.Context, id int64) error
+}
+
+// RotatingKeyStore is a KeyStore that also rotates keys and destroys
+// their older versions (issue #310, step 5: ALTER TABLE ... ROTATE
+// ENCRYPTION KEY, datax_rotate_tenant_key, and the seal job that
+// rewrites the rows under the older versions).
+type RotatingKeyStore interface {
+	// RotateKey gives key id a new version, which new writes seal under
+	// once each gateway's cache has seen it (within Lease), and returns
+	// it; older versions still open.
+	RotateKey(ctx context.Context, id int64) (int, error)
+	// DestroyKeyVersions destroys key id's versions below version (never
+	// its current one), purges its record's history, and returns how
+	// many it destroyed.
+	DestroyKeyVersions(ctx context.Context, id int64, below int) (int, error)
+	// Lease is how long a gateway may go on using what it cached of a
+	// key — its current version, a destroyed version's material — after
+	// the key changed.
+	Lease() time.Duration
 }
 
 // Resolver picks the key a row is sealed under. rowKey is the row's whole
@@ -269,6 +301,8 @@ func (e *KeyUnavailableError) Error() string {
 		why = "does not exist"
 	case errors.Is(e.Err, ErrKeyNoVersion):
 		why = fmt.Sprintf("has no version %d", e.Version)
+	case errors.Is(e.Err, ErrKeyVersionDestroyed):
+		why = fmt.Sprintf("version %d has been destroyed (the key was rotated, and the rows under its older versions were rewritten or given up)", e.Version)
 	}
 	switch {
 	case e.Tenant && e.KeyID != 0:
@@ -341,14 +375,19 @@ func (b *Boundary) SealValue(ctx context.Context, desc *catalog.TableDescriptor,
 }
 
 // OpenValue opens value, the stored value at key. A table that is not
-// sealed gets value back. A sealed table's value must be sealed: this
-// version writes no other kind, so a plain one is corruption (the
-// rewrite job that seals an existing table, later, relaxes this).
+// sealed gets value back. A sealed table's value must be sealed, and a
+// plain one is corruption — except while the table is being sealed
+// (TableEncryptionKey.Sealing: it held rows before it was sealed, and
+// the seal job has not yet rewritten them all), when a plain value is
+// returned as it is.
 func (b *Boundary) OpenValue(ctx context.Context, desc *catalog.TableDescriptor, key keys.Key, value []byte) ([]byte, error) {
 	if !desc.Sealed() {
 		return value, nil
 	}
 	if !IsSealed(value) {
+		if desc.EncryptionKey.Sealing {
+			return value, nil
+		}
 		return nil, &CorruptError{Table: desc.Name, Key: key, Reason: "is not sealed, and the table is"}
 	}
 	if b == nil && desc.SealedPerTenant() {
@@ -388,6 +427,39 @@ func (b *Boundary) OpenValue(ctx context.Context, desc *catalog.TableDescriptor,
 		return nil, &CorruptError{Table: desc.Name, Key: key, Reason: "does not authenticate as this row's sealed value"}
 	}
 	return plain, nil
+}
+
+// ValueKeyGone reports whether a stored value of desc is sealed under a
+// key, or a version of a key, that is gone for good (KeyGone): a row no
+// one can read again. A plain value, or one that does not parse, is not.
+// A key this gateway cannot reach for now is an error, not gone. A key
+// destroyed within the key cache's lease may still read as here.
+func (b *Boundary) ValueKeyGone(ctx context.Context, desc *catalog.TableDescriptor, value []byte) (bool, error) {
+	if !desc.Sealed() || !IsSealed(value) {
+		return false, nil
+	}
+	if b == nil || b.keys == nil {
+		return false, errors.New("this node has no key store")
+	}
+	var id int64
+	var v int
+	var err error
+	if desc.SealedPerTenant() {
+		id, v, err = TenantKeyOf(value)
+	} else {
+		id = desc.EncryptionKey.KeyID
+		v, err = Version(value)
+	}
+	if err != nil {
+		return false, nil
+	}
+	if _, err := b.keys.Version(ctx, id, v); err != nil {
+		if KeyGone(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
 
 // PlaintextColumns is the set of a table's columns that sealing does not

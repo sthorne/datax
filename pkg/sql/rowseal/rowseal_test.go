@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -262,6 +263,58 @@ func TestBoundaryBinding(t *testing.T) {
 	}
 	if _, err := (*Boundary)(nil).OpenValue(ctx, t1, k1, s); !errors.As(err, &ku) {
 		t.Fatalf("sealed through a nil boundary: %v", err)
+	}
+}
+
+// TestBoundarySealing (issue #310, step 5): a table being sealed reads
+// its plain values as they are and seals what it writes; once sealed, a
+// plain value is corruption again. ValueKeyGone tells a value whose key
+// version is gone for good from one that opens, a plain one, and a key
+// that is only unavailable for now.
+func TestBoundarySealing(t *testing.T) {
+	ctx := context.Background()
+	fk := &fakeKeys{keys: map[int64]map[int]cipher.AEAD{21: {1: newAEAD(t), 2: newAEAD(t)}}, cur: map[int64]int{21: 1}}
+	b := New(fk, nil, nil)
+	d := &catalog.TableDescriptor{ID: 61, Name: "old", Columns: []catalog.Column{{ID: 1, Name: "id", Type: types.Int}},
+		PrimaryKey: []catalog.ColumnID{1}, EncryptionKey: &catalog.TableEncryptionKey{KeyID: 21, SealID: 61, Sealing: true}}
+	k, _ := rowenc.EncodePK(d, []types.Datum{types.NewInt(1)})
+	plain := []byte{rowenc.ValueVersion, 7}
+	if got, err := b.OpenValue(ctx, d, k, plain); err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("a plain value while sealing: %v %v", got, err)
+	}
+	s, err := b.SealValue(ctx, d, k, plain)
+	if err != nil || !IsSealed(s) {
+		t.Fatalf("a write while sealing: %v", err)
+	}
+	if got, err := b.OpenValue(ctx, d, k, s); err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("a sealed value while sealing: %v", err)
+	}
+	if gone, err := b.ValueKeyGone(ctx, d, plain); gone || err != nil {
+		t.Fatalf("a plain value is never gone: %v %v", gone, err)
+	}
+	if gone, err := b.ValueKeyGone(ctx, d, s); gone || err != nil {
+		t.Fatalf("a value that opens: %v %v", gone, err)
+	}
+	d.EncryptionKey.Sealing = false
+	var ce *CorruptError
+	if _, err := b.OpenValue(ctx, d, k, plain); !errors.As(err, &ce) {
+		t.Fatalf("a plain value once sealed: %v", err)
+	}
+	// Version 1 destroyed after a rotation.
+	delete(fk.keys[21], 1)
+	fk.cur[21] = 2
+	if gone, err := b.ValueKeyGone(ctx, d, s); !gone || err != nil {
+		t.Fatalf("a value under a destroyed version: %v %v", gone, err)
+	}
+	fk.err = ErrKeyDisabled
+	if gone, err := b.ValueKeyGone(ctx, d, s); gone || err == nil {
+		t.Fatalf("a disabled key is not gone: %v %v", gone, err)
+	}
+	fk.err = ErrKeyVersionDestroyed
+	_, err = b.OpenValue(ctx, d, k, s)
+	var ku *KeyUnavailableError
+	if !errors.As(err, &ku) || !strings.Contains(err.Error(), "version 1 has been destroyed") || !KeyGone(ku.Err) {
+		t.Fatalf("reading under a destroyed version: %v", err)
 	}
 }
 
