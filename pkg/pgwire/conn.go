@@ -20,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -233,6 +234,17 @@ type conn struct {
 	// with a read deadline so the goroutine itself says goodbye.
 	mu sync.Mutex
 	st connState
+
+	// listener is the session's LISTEN subscriptions and its queue of
+	// undelivered notifications (nil without a hub). The rest is the
+	// machinery that pushes them to an idle client; see notify.go.
+	listener  *notify.Listener
+	pushMu    sync.Mutex
+	pushOK    bool
+	pushWake  chan struct{}
+	pushStart sync.Once
+	// done is closed when the connection's goroutine returns.
+	done chan struct{}
 }
 
 // connState is the drain-visible phase of a connection. idle means
@@ -247,6 +259,9 @@ type connState struct {
 	// a transaction; cut asks it to end at its next idle point regardless
 	// (the drain deadline).
 	draining, cut bool
+	// bye, when set, is the error the connection ends with instead of
+	// adminShutdown (a listener that missed notifications).
+	bye *pgproto3.ErrorResponse
 }
 
 // adminShutdown is the error a drained connection ends with: PostgreSQL's
@@ -290,7 +305,13 @@ func (c *conn) setIdle(idle bool) (goodbye bool) {
 // the caller returns and the deferred cleanup rolls back and closes.
 func (c *conn) goodbye() {
 	_ = c.nc.SetReadDeadline(time.Time{})
-	c.backend.Send(adminShutdown)
+	c.mu.Lock()
+	bye := c.st.bye
+	c.mu.Unlock()
+	if bye == nil {
+		bye = adminShutdown
+	}
+	c.backend.Send(bye)
 	_ = c.backend.Flush()
 }
 
@@ -347,14 +368,21 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	session := sql.NewSession(db, cat)
 	session.SetStreaming(true)
-	return &conn{
-		backend: pgproto3.NewBackend(nc, nc),
-		nc:      nc,
-		session: session,
-		opts:    opts,
-		stmts:   make(map[string]*prepared),
-		portals: make(map[string]*portal),
+	c := &conn{
+		backend:  pgproto3.NewBackend(nc, nc),
+		nc:       nc,
+		session:  session,
+		opts:     opts,
+		stmts:    make(map[string]*prepared),
+		portals:  make(map[string]*portal),
+		pushWake: make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
+	if opts.Notify != nil {
+		c.listener = opts.Notify.NewListener(c.wakePush, c.notifyEnd)
+		session.SetNotify(opts.Notify, c.listener)
+	}
+	return c
 }
 
 // errCancelServed ends a connection that carried a CancelRequest: it
@@ -375,6 +403,10 @@ func (c *conn) authTimeout() time.Duration {
 }
 
 func (c *conn) run(ctx context.Context) error {
+	defer close(c.done)
+	if c.listener != nil {
+		defer c.listener.Close()
+	}
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
 	if err := c.startup(ctx); err != nil {
@@ -397,11 +429,21 @@ func (c *conn) run(ctx context.Context) error {
 			_ = c.nc.SetReadDeadline(time.Now().Add(d))
 			idleArmed = true
 		}
+		// Idle outside a transaction is when notifications are pushed to
+		// the client as they arrive (notify.go).
+		pushing := boundary && c.listener != nil && c.session.State() == sql.StateIdle
+		if pushing {
+			c.allowPush()
+		}
 		msg, err := c.backend.Receive()
 		if idleArmed {
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}
-		if goodbye := c.setIdle(false); err != nil {
+		goodbye := c.setIdle(false)
+		if pushing && !c.endPush(err != nil) {
+			return err
+		}
+		if err != nil {
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
 				return nil
@@ -647,6 +689,11 @@ func (c *conn) sendReady() {
 		status = 'T'
 	case sql.StateFailed:
 		status = 'E'
+	}
+	if status == 'I' && c.listener != nil {
+		// Notifications wait for the end of a transaction, as in
+		// PostgreSQL, and precede the ReadyForQuery that ends it.
+		c.sendNotifications()
 	}
 	c.backend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 }

@@ -61,6 +61,9 @@ var adminUnauditedOps = map[string]bool{
 	"peer-unseal": true,
 	"node-status": true,
 	"node-detail": true,
+	// notify is one node handing another its committed notifications: a
+	// record per batch would be a record per NOTIFY.
+	"notify": true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -347,6 +350,19 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		raw, _ := json.Marshal(found)
 		return cluster.AdminResponse{Status: raw}
+
+	case "notify":
+		// Another node's committed notifications, for the sessions
+		// listening here (issue #297). Only a node sends these: the call
+		// is not audited (a record per batch would be a record per
+		// NOTIFY), so it is not left open to every admin certificate —
+		// an operator who wants to notify has NOTIFY, under their own
+		// name.
+		if n.tlsCfgs != nil && rpc.PeerCN(ctx) != security.NodePrincipal {
+			return cluster.AdminResponse{Error: "permission denied: notify is sent by nodes only"}
+		}
+		n.notifyHub().Deliver(req.Notify)
+		return cluster.AdminResponse{}
 
 	case "node-detail":
 		// This node's /api/node document, for another node's dashboard

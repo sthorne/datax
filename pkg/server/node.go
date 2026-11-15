@@ -28,6 +28,7 @@ import (
 	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/events"
@@ -300,7 +301,10 @@ type Node struct {
 	// which reads it to publish SQL activity: an atomic pointer, not a
 	// plain field.
 	pgServer atomic.Pointer[pgwire.Server] // set when PGListen/PGListener is configured
-	httpAddr string                        // set when HTTPListen/HTTPListener is configured
+	// notify is the LISTEN / NOTIFY hub (notifyHub builds it on first use).
+	notifyOnce sync.Once
+	notify     *notify.Hub
+	httpAddr   string // set when HTTPListen/HTTPListener is configured
 
 	// encKey is the loaded store encryption key; non-nil means the store is
 	// encrypted and node-written artifacts (metadata backup) are sealed too.

@@ -5,6 +5,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/sql/notify"
 )
 
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
@@ -76,6 +77,9 @@ type AdminRequest struct {
 	// Enable (peer-unseal-setting) turns peer unseal on or off; nil
 	// only reports it.
 	Enable *bool `json:"enable,omitempty"`
+	// Notify (notify) is a run of committed NOTIFYs from another node,
+	// for this node's listening sessions (issue #297).
+	Notify *notify.Batch `json:"notify,omitempty"`
 }
 
 // PeerUnsealRequest is what a sealed node sends a running peer: who it

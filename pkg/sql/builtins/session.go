@@ -25,6 +25,7 @@ func init() {
 		{Name: "lastval", Ret: types.Int, Vol: Stable, Doc: "The value nextval last returned in this session, whatever the sequence."},
 		{Name: "setval", Args: []types.Family{types.String, types.Int, types.Bool}, MinArgs: 2, Ret: types.Int, Vol: Volatile, Doc: "Sets the sequence's counter; with is_called false the value itself is the next one handed out."},
 		{Name: "unique_rowid", Ret: types.Int, Vol: Volatile, Doc: "A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence."},
+		{Name: "pg_notify", Args: []types.Family{types.String, types.String}, MinArgs: 2, Ret: types.String, Vol: Volatile, Doc: "Sends a notification to the sessions listening on the channel (NOTIFY with a computed channel or payload); delivered when the transaction commits. Evaluated once per statement: its arguments cannot name columns."},
 		{Name: "gen_random_uuid", Ret: types.Uuid, Vol: Volatile, Doc: "A random (version 4) UUID.", Aliases: []string{"uuid_generate_v4"}},
 	} {
 		b.Category = catSession

@@ -38,6 +38,7 @@ UPDATE t SET col = value, ... [WHERE conjunction]
 DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
+LISTEN channel / UNLISTEN channel | * / NOTIFY channel [, 'payload']   -- see LISTEN / NOTIFY below
 SHOW TABLES
 ANALYZE [t]                             -- collect table statistics (admin; not in a txn block)
 SHOW STATS FOR t
@@ -783,6 +784,81 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   me!), `55P03` lock_not_available (`lock_timeout`, `FOR UPDATE NOWAIT`),
   `42P01` undefined_table, `23505` unique_violation, `42601`
   syntax_error, `0A000` feature_not_supported.
+
+## LISTEN / NOTIFY
+
+`LISTEN channel`, `UNLISTEN channel | *`, `NOTIFY channel [, 'payload']`
+and `pg_notify(channel, payload)` (issue #297), with PostgreSQL's
+semantics on a node and delivery to listeners on every node.
+
+**In the session** (`pkg/sql/listen.go`). Inside a transaction block
+nothing takes effect: notifications (deduplicated on database, channel
+and payload) and subscription changes are recorded on the session, with
+a mirror of the transaction's savepoints so `ROLLBACK TO` forgets what
+came after one. When `COMMIT` succeeds the subscription changes are
+applied and then the notifications published, in order; a rollback, a
+failed commit or the end of the connection discards them. A statement
+outside a block goes through the same steps as its own transaction —
+`pg_notify` there is recorded per attempt (an automatic retry starts
+over) and published after the implicit commit, which for a streamed
+result is when the stream is drained. `pg_notify` is one of the
+functions the session resolves before execution, so it runs once per
+statement and takes constants and parameters, not columns. Channel
+names are limited to 63 bytes and payloads to 7999 (`22023`), and a
+channel belongs to the database the session is in. There are no
+privileges on channels, as in PostgreSQL.
+
+**On the node** (`pkg/sql/notify`). Each node has a hub: the listeners
+of each (database, channel), a bounded queue per listening session, and
+a bounded, ordered queue per peer node. Publishing queues the
+notifications for the local listeners and for every peer under one
+lock, so every node sees a given node's notifications in one order, and
+returns without waiting for anyone. Nothing is written to the store.
+
+**Between nodes.** A sender goroutine per peer drains that peer's queue
+in batches over the internode admin RPC (op `notify`; in secure mode
+accepted from the node certificate only, and not audited per call), retrying a batch with backoff until
+the peer has taken it. Batches carry the sender's incarnation and a
+sequence number, so a batch retried after its answer was lost is
+dropped by the receiver rather than delivered twice. The fan-out is a
+broadcast to every node in the registry whether or not anyone listens
+there: tracking interest per node would need a protocol of its own and
+would race with a `LISTEN` that had not propagated yet. A peer that
+answers "unknown admin op" — an older release, which cannot have
+listeners — has its batch dropped without retry, which is why the
+feature needs no cluster version gate.
+
+**The guarantee** is at-most-once delivery to the sessions listening at
+commit, strengthened so that loss is never silent for a session that
+stays connected. Two bounds can be exceeded, and both end the affected
+sessions with a FATAL instead of skipping notifications: a session's
+queue (16 MiB; a client that does not read, or sits in a transaction —
+`54000`), and a peer's queue (64 MiB, or five minutes without reaching the peer; the
+peer was unreachable, or a burst outran the link to it — the sender drops the queue, marks the next batch
+`lost`, and the receiver ends every listening session it has,
+`57P01`; once it has dropped a queue it queues nothing more for a peer
+it still cannot reach, so a dead peer holds no memory). A drained node flushes
+its peer queues before it stops. What is not covered: a node that
+crashes between a commit and the hand-off to a peer loses those
+notifications, and so does a commit whose result was ambiguous to the
+gateway; a node that joined within the last registry refresh is not
+yet a fan-out target. Notifications from different nodes are not
+ordered against each other.
+
+**On the wire** (`pkg/pgwire/notify.go`). Queued notifications are sent
+as `NotificationResponse` ahead of any `ReadyForQuery` with status `I`
+— so a session receives what its own `COMMIT` notified before the
+`COMMIT` is acknowledged, and a session in a transaction block receives
+nothing until the block ends — and, as PostgreSQL does, at any moment
+while the connection is idle outside a transaction. The connection's
+goroutine is blocked in a socket read then, so a second goroutine per
+listening connection writes them; a flag under a mutex, set only while
+the first is parked in that read at a cycle boundary with nothing
+buffered, keeps the two from ever writing at once, and the first
+clears it (waiting out a push in progress) before it answers the next
+message. A client that only reads its socket after `LISTEN` — pgx's
+`WaitForNotification`, lib/pq's `Listener` — is therefore notified
+without sending anything.
 
 ## Client compatibility
 

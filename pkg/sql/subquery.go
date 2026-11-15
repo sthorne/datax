@@ -152,6 +152,34 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		d := types.NewString("")
 		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_notify":
+		// pg_notify(channel, payload): NOTIFY as a function, so both can
+		// be computed or bound. Like every function resolved here it runs
+		// once per statement, not once per row, and its arguments cannot
+		// name columns.
+		if len(e.Args) != 2 {
+			return e, newErrf(CodeSyntaxError, "pg_notify() takes a channel and a payload")
+		}
+		channel, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		payload, err := evalExpr(e.Args[1], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		var ch, pl string
+		if !channel.Null {
+			ch = channel.Text()
+		}
+		if !payload.Null {
+			pl = payload.Text()
+		}
+		if serr := s.queueNotify(ch, pl); serr != nil {
+			return e, serr
+		}
+		d := types.NewString("")
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_cancel_backend", "pg_terminate_backend":
 		// Admin-only: cancel (or terminate) another session of this
 		// cluster by its wire PID.
@@ -925,7 +953,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
-	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
+	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,

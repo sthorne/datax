@@ -20,7 +20,7 @@ syntax error or `0A000` feature not supported):
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column- and row-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin` |
-| Triggers, stored procedures, `LISTEN/NOTIFY` | — |
+| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
 
 ## Things that exist but behave differently
 
@@ -138,6 +138,22 @@ syntax error or `0A000` feature not supported):
   cheap historical/follower reads, including bounded staleness:
   `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
   the local replicas can serve within the bound.
+- **`LISTEN` / `NOTIFY`** behave as in PostgreSQL on one node and
+  reach listeners on every node, with these differences
+  ([reference](sql.md#notifications-listen-and-notify)): a notification
+  goes to the sessions listening when it commits and is kept nowhere,
+  and a listening session receives every one or is disconnected with a
+  FATAL error — because it let 16 MiB of notifications pile up unread
+  (`54000`), or because another node had to drop notifications it could
+  not get to this one (`57P01`) — so a client that is still connected
+  has missed nothing, with one exception: a node that crashes can take
+  with it the notifications of the transactions it committed in its
+  last instant. Notifications from one node arrive in that node's
+  commit order; notifications from different nodes are not ordered
+  against each other (PostgreSQL has one order for the whole server).
+  `pg_notify` is evaluated once per statement and its arguments cannot
+  name columns. There is no `pg_listening_channels()` or
+  `pg_notification_queue_usage()`.
 - **`SET x = y`** honors the variables datax has ([Session
   settings](sql.md#session-settings): the timeouts, `TimeZone`,
   `application_name`, `search_path`, the read-only and isolation

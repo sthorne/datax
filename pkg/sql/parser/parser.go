@@ -250,6 +250,44 @@ func (p *parser) expectIdent() (string, error) {
 	return "", p.errf("expected identifier, found %q", t.text)
 }
 
+// parseListenNotify parses LISTEN channel, UNLISTEN channel | * and
+// NOTIFY channel [, 'payload']. The channel is an identifier, and — as
+// in PostgreSQL, where it is a ColId — may be a word this grammar
+// otherwise reserves.
+func (p *parser) parseListenNotify(verb string) (Statement, error) {
+	p.i++
+	if verb == "unlisten" && p.consumeOp("*") {
+		return &Unlisten{All: true}, nil
+	}
+	t := p.peek()
+	var channel string
+	switch t.kind {
+	case tkIdent:
+		channel = t.text
+	case tkKeyword:
+		channel = strings.ToLower(t.text)
+	default:
+		return nil, p.errf("expected a channel name, found %q", t.text)
+	}
+	p.i++
+	switch verb {
+	case "listen":
+		return &Listen{Channel: channel}, nil
+	case "unlisten":
+		return &Unlisten{Channel: channel}, nil
+	}
+	n := &Notify{Channel: channel}
+	if p.consumeOp(",") {
+		lit := p.peek()
+		if lit.kind != tkString {
+			return nil, p.errf("expected a string literal for the NOTIFY payload, found %q", lit.text)
+		}
+		p.i++
+		n.Payload = lit.text
+	}
+	return n, nil
+}
+
 func (p *parser) parseStatement() (Statement, error) {
 	if err := p.enter(); err != nil {
 		return nil, err
@@ -608,6 +646,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			return nil, err
 		}
 		return &ReleaseSavepoint{Name: name}, nil
+	case "listen", "unlisten", "notify": // not reserved words; they lex as identifiers
+		return p.parseListenNotify(t.text)
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -5116,7 +5156,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
-	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1,
+	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,

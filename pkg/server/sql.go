@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/version"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -63,6 +65,7 @@ func (n *Node) startSQL() error {
 		_ = json.Unmarshal(resp.Status, &found)
 		return found, nil
 	}
+	opts.Notify = n.notifyHub()
 	if n.tlsCfgs != nil {
 		opts.TLS = n.tlsCfgs.PGServer
 		opts.Auth = n.lookupVerifier
@@ -80,6 +83,50 @@ func (n *Node) startSQL() error {
 	n.pgServer.Store(srv)
 	log.Infof("node %s serving SQL at %s", n.ident.NodeID, srv.Addr())
 	return nil
+}
+
+// notifyHub is the node's LISTEN / NOTIFY exchange (issue #297), built
+// on first use: the SQL server publishes into it and the admin RPC
+// delivers into it what the other nodes publish.
+//
+// Fan-out is a broadcast: every committed notification is sent to every
+// node in the registry, whether or not anyone listens there, because
+// knowing who listens where would need its own protocol and its own
+// races (a LISTEN that has not reached the notifying node yet). A node
+// running a release from before the call answers "unknown admin op";
+// it cannot have listeners, so what was meant for it is dropped and
+// nothing is retried or counted as lost. That is the whole of the
+// mixed-version story, and why the feature needs no cluster version.
+func (n *Node) notifyHub() *notify.Hub {
+	n.notifyOnce.Do(func() {
+		n.notify = notify.NewHub(n.stopper.Ctx(), notify.Config{
+			NodeID: int32(n.ident.NodeID),
+			Peers: func() []int32 {
+				all := n.registry.All()
+				ids := make([]int32, 0, len(all))
+				for _, nd := range all {
+					if nd.NodeID != n.ident.NodeID {
+						ids = append(ids, int32(nd.NodeID))
+					}
+				}
+				return ids
+			},
+			Send: func(ctx context.Context, to int32, b *notify.Batch) error {
+				var resp cluster.AdminResponse
+				if err := n.trans.Admin(ctx, base.NodeID(to), cluster.AdminRequest{Op: "notify", Notify: b}, &resp); err != nil {
+					return err
+				}
+				switch {
+				case strings.HasPrefix(resp.Error, "unknown admin op"):
+					return notify.ErrUnsupported
+				case resp.Error != "":
+					return errors.New(resp.Error)
+				}
+				return nil
+			},
+		})
+	})
+	return n.notify
 }
 
 // catalogAccessor returns the node's catalog accessor, built on first use

@@ -109,6 +109,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `lastval() → int8` — The value nextval last returned in this session, whatever the sequence. *stable*
 - `nextval(text) → int8` — Advances the sequence and returns its next value; never rolled back. *volatile*
 - `now() → timestamptz` (also `current_timestamp`, `localtimestamp`, `statement_timestamp`, `transaction_timestamp`) — The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()). *stable*
+- `pg_notify(text, text) → text` — Sends a notification to the sessions listening on the channel (NOTIFY with a computed channel or payload); delivered when the transaction commits. Evaluated once per statement: its arguments cannot name columns. *volatile*
 - `session_user() → text` — The authenticated session user (unchanged by SET ROLE). *stable*
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*

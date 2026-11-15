@@ -850,6 +850,16 @@ type Savepoint struct{ Name string }
 type ReleaseSavepoint struct{ Name string }
 type RollbackToSavepoint struct{ Name string }
 
+// Listen, Unlisten and Notify are LISTEN channel, UNLISTEN channel | *
+// and NOTIFY channel [, 'payload'] (issue #297). A channel is an
+// identifier: folded to lower case unless quoted.
+type Listen struct{ Channel string }
+type Unlisten struct {
+	Channel string
+	All     bool // UNLISTEN *
+}
+type Notify struct{ Channel, Payload string }
+
 // ShowTables is SHOW TABLES [FROM database].
 type ShowTables struct{ Database string }
 
@@ -977,6 +987,9 @@ func (*Savepoint) stmt()              {}
 func (*ReleaseSavepoint) stmt()       {}
 func (*RollbackToSavepoint) stmt()    {}
 func (*Rollback) stmt()               {}
+func (*Listen) stmt()                 {}
+func (*Unlisten) stmt()               {}
+func (*Notify) stmt()                 {}
 func (*ShowTables) stmt()             {}
 func (*Analyze) stmt()                {}
 func (*ShowStats) stmt()              {}

@@ -830,6 +830,90 @@ both are refused wherever `FOR UPDATE` is (joins, aggregates,
 `DISTINCT`, subqueries, views, `AS OF SYSTEM TIME`). `FOR SHARE` and
 `FOR UPDATE OF table` are not supported.
 
+## Notifications: LISTEN and NOTIFY
+
+```sql
+LISTEN jobs;                          -- this session hears channel "jobs"
+NOTIFY jobs, 'order 42';              -- every listener gets (channel, payload, sender's pid)
+SELECT pg_notify('jobs', $1);         -- the same, with a computed or bound payload
+UNLISTEN jobs;   UNLISTEN *;
+```
+
+A session that has run `LISTEN` is sent a notification for every
+`NOTIFY` on that channel that commits, whichever node of the cluster the
+notifier and the listener are connected to. Drivers surface it the way
+they do against PostgreSQL — pgx's `conn.WaitForNotification(ctx)`,
+lib/pq's `Listener`, psycopg's `conn.notifies()` — and no polling
+statement is needed: the server pushes to a connection that is sitting
+idle.
+
+```go
+conn.Exec(ctx, "LISTEN jobs")
+for {
+    n, err := conn.WaitForNotification(ctx)   // blocks; sends nothing
+    if err != nil {
+        // reconnect, LISTEN again, then re-read the table: see below
+    }
+    handle(n.Channel, n.Payload)
+}
+```
+
+The rules are PostgreSQL's:
+
+- **Transactional.** A `NOTIFY` inside a transaction is delivered if and
+  when the transaction commits, never before and never if it rolls back
+  (`ROLLBACK TO SAVEPOINT` discards what was notified after the
+  savepoint). Identical notifications — same channel, same payload — in
+  one transaction are delivered once. `LISTEN` and `UNLISTEN` take
+  effect at commit too.
+- **Between statements.** A session receives notifications when it is
+  idle or as a command completes, never in the middle of a result; a
+  session inside a transaction block receives them when the block ends.
+  A session hears its own notifications if it listens on the channel.
+- **Channels** are identifiers (folded to lower case unless quoted, at
+  most 63 bytes) and belong to a database: a listener hears the
+  notifications of the database it was connected to when it listened.
+  There are no privileges on channels: any session may listen and
+  notify, so do not put secrets in a payload.
+- **Payloads** are text shorter than 8000 bytes (`22023` beyond that).
+  Send a key and let the listener read the row.
+- `pg_notify(channel, payload)` runs once per statement, not once per
+  row, and its arguments cannot name columns.
+
+What is guaranteed, and what is not:
+
+- A notification goes to the sessions that are listening when it
+  commits. Nothing is stored: a client that is not connected at that
+  moment never sees it, on datax as on PostgreSQL. Treat a notification
+  as "look now", and on every (re)connect run `LISTEN` and then read the
+  state the notifications describe.
+- **A session that stays connected receives every notification once**,
+  from every node, or it is disconnected — it is not left connected
+  having missed one. Two things end a listening session with a FATAL
+  error: it did not read its notifications (or sat in a transaction)
+  while 16 MiB of them piled up (`54000`), or another node could not
+  reach this one for so long that it had to drop notifications meant
+  for it — it keeps up to 64 MiB per unreachable node, for up to five minutes,
+  and delivers them, in order, when the node is back (`57P01`).
+- **A node restart or a partition** therefore costs notifications only
+  to sessions that were disconnected: the sessions on the restarted
+  node (their connections ended with it), and the listeners of a node
+  that was cut off for long enough. During a shorter partition
+  notifications are late, not lost. A node that is drained before it
+  stops hands over what it still owes first.
+- **The exception is a crash.** A node that dies in the instant between
+  committing a transaction and handing its notifications to the other
+  nodes takes them with it, and listeners elsewhere are not told. The
+  same goes for a `COMMIT` whose outcome the client never learned. A
+  worker that must not miss work should also poll at a long interval.
+- **Order.** All listeners see one node's notifications in the order
+  that node committed them, and one transaction's in the order it sent
+  them. Notifications committed on different nodes arrive in no
+  particular order relative to each other.
+- A node running a release from before this feature cannot serve
+  `LISTEN` (a syntax error) and is skipped by the others; during a
+  rolling upgrade, connect listeners to upgraded nodes.
+
 ## Session settings
 
 ```sql

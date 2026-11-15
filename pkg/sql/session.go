@@ -220,6 +220,9 @@ type Session struct {
 	// members, subqueries) materialize as they must.
 	streamTop bool
 
+	// notify is the session's LISTEN / NOTIFY state (listen.go).
+	notify notifyState
+
 	txn   *kvclient.Txn
 	state TxnState
 	// pendingDDL names tables changed inside the open explicit transaction;
@@ -526,6 +529,7 @@ func (s *Session) Close(ctx context.Context) {
 		_ = s.txn.Rollback(ctx)
 		s.txn = nil
 	}
+	s.discardNotify()
 	s.state = StateIdle
 }
 
@@ -614,9 +618,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err != nil {
 			s.forgetDDL()
 			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+			s.discardNotify()
 			return nil, ToSQLError(err)
 		}
 		s.pendingDDL = nil
+		// The transaction is durable: its subscriptions take effect and
+		// its notifications go out, whatever the steps below report.
+		s.commitNotify()
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
@@ -638,6 +646,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err := s.txn.Savepoint(t.Name); err != nil {
 			return nil, ToSQLError(err)
 		}
+		s.notifySavepoint(t.Name)
 		return &Result{Tag: "SAVEPOINT"}, nil
 
 	case *parser.ReleaseSavepoint:
@@ -647,6 +656,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err := s.txn.ReleaseSavepoint(t.Name); err != nil {
 			return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 		}
+		s.notifyReleaseSavepoint(t.Name)
 		return &Result{Tag: "RELEASE"}, nil
 
 	case *parser.RollbackToSavepoint:
@@ -670,8 +680,25 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		}
 		return &Result{Tag: "SET"}, nil
 
+	case *parser.Listen, *parser.Unlisten, *parser.Notify:
+		return s.execListenNotify(stmt)
+
 	default:
-		return s.executeData(ctx, stmt, params)
+		if s.state == StateOpen {
+			return s.executeData(ctx, stmt, params)
+		}
+		// A statement outside a block is its own transaction: what it
+		// notifies (pg_notify) goes out once it has committed. A streamed
+		// result has taken its notifications with it by now, and
+		// publishes them itself when it is drained.
+		s.discardNotify()
+		res, serr := s.executeData(ctx, stmt, params)
+		if serr != nil {
+			s.discardNotify()
+			return nil, serr
+		}
+		s.commitNotify()
+		return res, nil
 	}
 }
 
@@ -860,6 +887,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			// The stream commits the historical transaction once drained
 			// (no restarts: a pinned read has nothing to retry).
 			res.Stream.attachImplicit(txn, nil, nil)
+			res.Stream.notifs = s.takeNotify()
 			res.Stream.attempt = 20
 			return res, nil
 		}
@@ -901,6 +929,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		s.extraDDL, s.pendingWipes = nil, nil
+		s.discardNotify() // a retry starts the statement over
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		if err == nil && TestingBeforeImplicitCommit != nil {
 			TestingBeforeImplicitCommit()
@@ -934,10 +963,12 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 	txn.EnablePipelining()
 	for attempt := 0; ; attempt++ {
 		s.streamTop = true
+		s.discardNotify() // a retry starts the statement over
 		res, err := s.execStmt(ctx, txn, sel, params)
 		s.streamTop = false
 		if err == nil && res.Stream != nil {
 			res.Stream.attachImplicit(txn, sel, params)
+			res.Stream.notifs = s.takeNotify()
 			res.Stream.attempt = attempt
 			return res, nil
 		}
@@ -977,6 +1008,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.endTxnVars()
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+	s.discardNotify()
 	s.state = StateIdle
 }
 
@@ -2155,6 +2187,7 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 		}
 		return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 	}
+	s.notifyRollbackToSavepoint(name)
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
 }

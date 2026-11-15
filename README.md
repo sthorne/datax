@@ -81,7 +81,7 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   ([reference](docs/user/functions.md)) and aggregates, transactions,
   joins up to 8 tables,
   GROUP BY — including over joins, correlated subqueries to 4 levels,
-  UNION, `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
+  UNION, `COPY FROM STDIN`, `LISTEN` / `NOTIFY` across nodes, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over
   ten column types including exact DECIMAL and JSONB with `->`/`->>`
   extraction and `@>` containment, served over the Postgres wire protocol
