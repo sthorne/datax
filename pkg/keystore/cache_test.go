@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -464,7 +465,9 @@ func TestCacheHitRace(t *testing.T) {
 					}
 					return nil
 				})
-				if err != nil && !errors.Is(err, ErrNotFound) {
+				// A key rotated faster than it can be read is refused,
+				// as With documents; nothing else is.
+				if err != nil && !errors.Is(err, ErrNotFound) && !strings.Contains(err.Error(), "kept changing") {
 					t.Errorf("With: %v", err)
 				}
 				if a, _, err := c.AEAD(ctx, 9, 0); err == nil && a == nil {

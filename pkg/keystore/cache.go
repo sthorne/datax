@@ -462,8 +462,13 @@ func (c *Cache) MAC(ctx context.Context, id int64, version int, label string, da
 }
 
 func (c *Cache) withHeld(ctx context.Context, id int64, version int, fn func(hm *heldMaterial) error) error {
-	for attempt := 0; ; attempt++ {
-		e, k, err := c.check(ctx, id, attempt > 0)
+	// changed counts retries because the key moved on; an entry dropped
+	// from the map under the caller (an eviction, a sweep, Forget) is
+	// retried as well, more times, without reading the key again by
+	// force, since the key itself may not have changed at all.
+	changed, dropped := 0, 0
+	for {
+		e, k, err := c.check(ctx, id, changed > 0)
 		if err != nil {
 			return err
 		}
@@ -482,7 +487,14 @@ func (c *Cache) withHeld(ctx context.Context, id int64, version int, fn func(hm 
 			return err
 		}
 		if retry {
-			if attempt >= 2 {
+			e.mu.Lock()
+			gone := e.gone
+			e.mu.Unlock()
+			if gone && dropped < 16 {
+				dropped++
+				continue
+			}
+			if changed++; changed > 2 {
 				return errors.New("the key kept changing while it was being read; retry")
 			}
 			continue
