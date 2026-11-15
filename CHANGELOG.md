@@ -11,6 +11,29 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Roots in a key management service** (#308): `--enc-root` takes
+  `vault:<address>/<mount>/<key>` (HashiCorp Vault Transit),
+  `awskms:<key arn>`, `gcpkms:projects/…/cryptoKeys/<key>` and
+  `azurekv:<vault>/<key>[/<version>]`. Wrapping the store key is a call
+  to the service, whose key never reaches datax; no helper process and
+  no cloud SDK (standard library only). Options follow the key as
+  `?name=value&name=value`; credentials are never options (token file,
+  environment, instance identity). Requests have a timeout and bounded
+  retries with backoff; a node cannot start while its KMS is
+  unreachable and says which service, key and why; a running node is
+  unaffected. Each wrapped store key is bound to its cluster and node
+  (encryption context / associated data, and a digest inside the
+  ciphertext), so one node's is refused as another's; a new node's key
+  is bound once it has an id. The root's health is checked every minute
+  and shown in `/api/security` (`root.healthy`, `root.health_error`,
+  `root.bound`, `root.latest_key_id`), the console's security view, the
+  health document (`enc-root-unreachable`) and the gauge
+  `datax_enc_root_healthy`. The key id carries the service's key
+  version; after the service rotates its key,
+  `datax debug enc-root rewrap` moves a node to it. **Tested against
+  fakes of each API, not against the services themselves.** PKCS#11 is
+  not spoken: an HSM is reached through `exec`. See docs/encryption.md,
+  "A root in a key management service".
 - **`LISTEN` / `NOTIFY`** (#297). `LISTEN channel`, `UNLISTEN channel | *`,
   `NOTIFY channel [, 'payload']` and `pg_notify(channel, payload)`, delivered
   to listening sessions on every node of the cluster and pushed to an idle

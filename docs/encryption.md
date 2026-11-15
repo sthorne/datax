@@ -577,11 +577,10 @@ What this does and does not give, honestly:
   and it is separate credentials per node that keep one node from
   another's key.
 - For `file`, `exec` and `shares` the binding is checked by datax
-  alone, and is written only when you rewrap
-  (`datax debug enc-root rewrap`): an entry with a binding is refused
-  as altered by releases before 0.58, and datax does not make a store
-  unreadable to the release you might roll back to without being asked.
-  The offline tools keep whatever binding an entry has.
+  alone, and is written when you rewrap
+  (`datax debug enc-root rewrap`); a store's first entry under these
+  roots is unbound until then. The offline tools keep whatever binding
+  an entry has.
 
 **Health.** A running node does not need its root, so one that has
 become unreachable would otherwise be found at the next restart. Every

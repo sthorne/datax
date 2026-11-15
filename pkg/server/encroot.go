@@ -188,8 +188,7 @@ func (n *Node) serveRotateRootedStoreKey(ctx context.Context, req cluster.AdminR
 	n.encKeyMu.Unlock()
 	defer enc.Zero(current)
 	// The new key's entry is bound as the old one's was: a rotation does
-	// not change what a store's key is tied to, and so does not write an
-	// entry an older release could not read where there was none.
+	// not change what a store's key is tied to.
 	wctx := ctx
 	if _, takes := root.(enc.ContextRoot); bound || takes {
 		wctx = enc.WithBinding(ctx, n.storeKeyBinding())
