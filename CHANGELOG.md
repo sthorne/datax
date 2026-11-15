@@ -11,6 +11,25 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Large objects** (#303): values too big to be a row value — files,
+  recordings, tens of megabytes to many gigabytes — are stored in 256 KiB
+  pages and written and read as a stream through PostgreSQL's large-object
+  functions (`lo_create`, `lo_open`, `lowrite`, `loread`, `lo_lseek64`,
+  `lo_truncate64`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`), from SQL
+  (pgx's `tx.LargeObjects()`) and through the fast-path function call (libpq's
+  `lo_*`, psql's `\lo_import` / `\lo_export`). An object created and written
+  inside one transaction block can be of any size up to 1 TiB, holds no lock
+  while it uploads, and appears whole at `COMMIT`; a rollback or a lost
+  connection leaves no object, and a sweeper removes its pages and those of
+  unlinked objects. Changes to an existing object are ordinary transactional
+  writes, at most 64 MiB per transaction. A three-node cluster writes a 512 MiB
+  object with under 100 MiB of memory growth across the whole process, where a
+  32 MiB `BYTEA` INSERT takes over a gigabyte (1 GiB was measured on one node
+  only). Full and incremental backups, sealed or not, carry large objects;
+  `restore --table` does not. Ordinary `BYTEA`/`TEXT`/`JSONB` values are still
+  stored whole: there is no out-of-line storage for column values. Stored in
+  three reserved tables (`datax_largeobject*`); cluster protocol version v21.
+  See the SQL guide's "Large objects".
 - **Row-level security** (#294): a table shared between tenants can confine a
   role to its own rows. `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW
   LEVEL SECURITY`; `CREATE POLICY p ON t [AS PERMISSIVE | RESTRICTIVE] [FOR ALL
@@ -931,6 +950,10 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- A statement that writes more than 60 MiB to one range in a single piece (a
+  huge row) is refused with `54000`. Before, a write of 64 MiB failed with
+  `XX000` and left the range's leadership churning around an entry no follower
+  could receive (#303).
 - **The catalog's costs follow what is used, not every table in the
   cluster** (#311). Listing one database's tables (`SHOW TABLES`, `DROP
   DATABASE`, `GRANT ... ON ALL TABLES`, the `pg_catalog` views) reads that
@@ -1077,6 +1100,12 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- A store on the balanced profile could sit at its L0 backpressure gate
+  indefinitely after a long run of writes in key order: non-overlapping L0
+  files never triggered a compaction below the gate's file count (#303).
+- A transaction that made its first write more than five seconds after `BEGIN`
+  could be aborted by any transaction that met its row during the following
+  second: its record was created with a stale heartbeat (#303).
 - A gateway renewing its lease on a table that had been renamed could
   delete the lease it already held on the same table under its new name,
   leaving a cached descriptor no schema change waited for until the next
