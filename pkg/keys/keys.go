@@ -322,6 +322,32 @@ func AuthSecretKey() Key { return systemKey("auth-secret") }
 // (issue #307). Absent means on.
 func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
 
+// ClusterKeyMarkerKey holds the cluster key's record (issue #310, JSON;
+// pkg/server/clusterkey.go): which cluster key is current, the versions
+// still accepted, imported keys, and for each a check value that tells a
+// node whether the key it holds is that one. Never the key. Absent means
+// the cluster key has not been enabled.
+func ClusterKeyMarkerKey() Key { return systemKey("cluster-key", "marker") }
+
+// ClusterKeyPendingKey holds an enabling, rotation or import of the
+// cluster key that has begun and not finished (issue #310): what is being
+// handed to every node, so that a retry finishes it rather than starting
+// another.
+func ClusterKeyPendingKey() Key { return systemKey("cluster-key", "pending") }
+
+// ClusterKeyHolderKey holds what one node reports of itself for the
+// cluster key (issue #310): the root its store key is under and the
+// cluster key versions it holds. Not secret.
+func ClusterKeyHolderKey(node int64) Key {
+	return Key(encoding.EncodeInt64(systemKey("cluster-key", "holder"), node))
+}
+
+// ClusterKeyHolderSpan covers every node's ClusterKeyHolderKey.
+func ClusterKeyHolderSpan() (Key, Key) {
+	p := systemKey("cluster-key", "holder")
+	return p, p.PrefixEnd()
+}
+
 // NodeIDGenKey is the counter for allocating node IDs.
 func NodeIDGenKey() Key { return systemKey("idgen", "node") }
 

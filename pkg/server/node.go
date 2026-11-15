@@ -372,6 +372,10 @@ type Node struct {
 	// peerUnseal is what this node remembers as the answering side of
 	// peer unseal (peerunseal.go).
 	peerUnseal peerUnsealState
+	// clusterKey is this node's part in the cluster key (issue #310,
+	// clusterkey.go): the versions it holds, and its record as the
+	// answering side of hand-overs.
+	clusterKey clusterKeyState
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener
@@ -709,6 +713,10 @@ func (n *Node) start() error {
 	if err := n.bindStoreKey(context.Background()); err != nil {
 		return err
 	}
+	// And its copies of the cluster key, through the same root (issue
+	// #310); a copy that does not open is asked of a peer later.
+	n.loadClusterKeys(context.Background())
+	n.stopper.AddCloser(n.releaseClusterKeys)
 
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
@@ -916,6 +924,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.auditLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.clusterKeyLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
