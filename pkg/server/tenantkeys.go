@@ -11,6 +11,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/keystore"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -159,9 +160,20 @@ const tenantKeyPage = 256
 // of every table sealed per tenant, and those a table restore in flight
 // is bringing back (restoreProgress.SealIDs).
 func (n *Node) liveTenantSeals(ctx context.Context) (map[uint64]bool, error) {
+	var live map[uint64]bool
+	err := n.db.RunTxn(ctx, "tenant-keys-live", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		live, err = liveTenantSealsIn(ctx, txn)
+		return err
+	})
+	return live, err
+}
+
+// liveTenantSealsIn is liveTenantSeals read in txn.
+func liveTenantSealsIn(ctx context.Context, txn *kvclient.Txn) (map[uint64]bool, error) {
 	live := map[uint64]bool{}
 	lo, hi := keys.TableDescSpan()
-	kvs, err := n.db.Scan(ctx, lo, hi, 0)
+	kvs, err := txn.Scan(ctx, lo, hi, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +187,7 @@ func (n *Node) liveTenantSeals(ctx context.Context) (map[uint64]bool, error) {
 		}
 	}
 	plo, phi := keys.RestoreProgressSpan()
-	recs, err := n.db.Scan(ctx, plo, phi, 0)
+	recs, err := txn.Scan(ctx, plo, phi, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -213,8 +225,10 @@ func sealOfTenantKey(name string) (uint64, bool) {
 // in the number of per-tenant tables plus the keys it destroys, not the
 // number of tenants. It is resumable: a pass cut short leaves the rest
 // for the next. A key younger than tenantKeyGrace is left for a later
-// pass (see there), and a seal id is checked against the descriptors
-// again, read after its keys were, before any of its keys is destroyed.
+// pass (see there), and the transactions that destroy keys read the
+// descriptors and the restores in flight again, so a key is destroyed
+// only if no table and no restore names its seal id in the same
+// serializable transaction.
 func (n *Node) SweepOrphanTenantKeys(ctx context.Context) (int, error) {
 	if n.db.ClusterVersion() < version.V22 {
 		return 0, nil
@@ -272,8 +286,19 @@ func (n *Node) SweepOrphanTenantKeys(ctx context.Context) (int, error) {
 			}
 			orphans = append(orphans, k.ID)
 		}
-		// A page's keys in a few transactions and one purge.
-		got, _, err := ks.DestroyMany(ctx, orphans)
+		// A page's keys in a few transactions and one purge, each
+		// transaction reading again which tables and restores there are,
+		// so that a table restore that began meanwhile keeps its keys.
+		got, _, err := ks.DestroyMany(ctx, orphans, func(ctx context.Context, txn *kvclient.Txn) (func(keystore.Key) bool, error) {
+			now, err := liveTenantSealsIn(ctx, txn)
+			if err != nil {
+				return nil, err
+			}
+			return func(k keystore.Key) bool {
+				seal, ok := sealOfTenantKey(k.Name)
+				return !ok || k.Kind != keystore.KindTenant || now[seal]
+			}, nil
+		})
 		for _, id := range orphans {
 			sealKeys{n}.Invalidate(id)
 		}

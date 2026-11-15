@@ -885,7 +885,13 @@ const destroyManyBatch = 100
 // many keys it destroyed and the purge's report; should the purge fail,
 // the keys are destroyed and their material lingers in history until the
 // table's GC window passes or a later purge (another Destroy) removes it.
-func (s *Store) DestroyMany(ctx context.Context, ids []int64) (int, *kvpb.PurgeReport, error) {
+//
+// spare, when given, runs in each batch's transaction before anything is
+// written, and returns which keys to leave alone: what a caller deciding
+// that keys are unused reads again there, so that the decision and the
+// destruction are one serializable transaction (a table restore that
+// marks the keys as wanted orders before or after it, never between).
+func (s *Store) DestroyMany(ctx context.Context, ids []int64, spare func(ctx context.Context, txn *kvclient.Txn) (func(Key) bool, error)) (int, *kvpb.PurgeReport, error) {
 	d, err := s.desc(ctx, false)
 	if err != nil {
 		return 0, nil, err
@@ -896,6 +902,13 @@ func (s *Store) DestroyMany(ctx context.Context, ids []int64) (int, *kvpb.PurgeR
 		var n int
 		err := s.cfg.DB.RunTxn(ctx, "keys-destroy-many", func(ctx context.Context, txn *kvclient.Txn) error {
 			n = 0
+			keep := func(Key) bool { return false }
+			if spare != nil {
+				var err error
+				if keep, err = spare(ctx, txn); err != nil {
+					return err
+				}
+			}
 			for _, id := range batch {
 				r, pk, err := s.read(ctx, txn, d, id, true)
 				if errors.Is(err, ErrNotFound) {
@@ -904,7 +917,7 @@ func (s *Store) DestroyMany(ctx context.Context, ids []int64) (int, *kvpb.PurgeR
 				if err != nil {
 					return err
 				}
-				if r.State == StateDestroyed {
+				if r.State == StateDestroyed || keep(r.Key) {
 					continue
 				}
 				was := r.Name

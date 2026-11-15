@@ -533,7 +533,10 @@ func TestSealedPerTenantRestore(t *testing.T) {
 				notes = append(notes, n)
 			}
 		}
-		if len(notes) != 2 || !strings.Contains(strings.Join(notes, ";"), fmt.Sprintf("%d tenant keys brought back", tenants-1)) {
+		// The naming key, and the tenant keys (all of them unless the
+		// janitor was still destroying some as the restore began: those
+		// it spares, and the count below checks every one is live).
+		if len(notes) != 2 || !strings.Contains(strings.Join(notes, ";"), "tenant keys brought back") {
 			t.Fatalf("restore notes: %v", sum.Notes)
 		}
 		time.Sleep(sealedLease + 200*time.Millisecond)
