@@ -166,6 +166,23 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			return v, nil
 		}
 		return ToJSONB(d)
+	case "tsvector", "tsquery":
+		// Text is read as a literal of the type: no normalization (that
+		// is to_tsvector's and to_tsquery's job).
+		fam := types.Tsvector
+		if name == "tsquery" {
+			fam = types.Tsquery
+		}
+		if d.Fam == fam {
+			return d, nil
+		}
+		if d.Fam == types.String {
+			v, err := d.Coerce(fam)
+			if err != nil {
+				return types.Datum{}, errf("42601", "%v", err)
+			}
+			return v, nil
+		}
 	case "regclass", "name", "oid", "regtype", "regnamespace", "regproc", "regprocedure", "regrole", "regoper", "regoperator",
 		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring",
 		"aclitem", "pg_node_tree", "pg_lsn", "unknown", "any", "anyelement", "anyarray", "record", "void":

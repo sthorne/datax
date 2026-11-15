@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -77,7 +78,20 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		out.Sub, out.Lit = nil, &d
 	}
+	if callAs, ok := builtins.TextSearchDefaultArg(e.Func, len(e.Args)); ok {
+		// A text-search call that names no configuration gets the
+		// session's default as its first argument, once, here: the
+		// function itself is then a pure function of its arguments, and
+		// the planner sees the same to_tsvector('english', col) whether
+		// or not the statement spelled the configuration out.
+		d := types.NewString(s.textSearchConfig())
+		out.Func = callAs
+		out.Args = append([]parser.Expr{{Lit: &d}}, e.Args...)
+	}
 	switch e.Func {
+	case "get_current_ts_config":
+		d := types.NewString(s.textSearchConfig())
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "now", "current_timestamp", "localtimestamp", "statement_timestamp", "transaction_timestamp":
 		d := types.NewTimestamp(s.statementTime())
 		out.Func, out.Args, out.Lit = "", nil, &d
@@ -990,6 +1004,10 @@ var splicedFuncs = map[string]bool{
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
+	// The text-search functions take the session's default
+	// configuration when the call names none.
+	"to_tsvector": true, "to_tsquery": true, "plainto_tsquery": true, "phraseto_tsquery": true, "websearch_to_tsquery": true,
+	"ts_headline": true, "get_current_ts_config": true,
 }
 
 // regclassOID resolves a regclass literal: a number is the OID itself,

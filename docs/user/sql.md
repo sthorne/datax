@@ -23,11 +23,13 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
 | enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
-| `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
+| `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB`, `TSVECTOR` and `TSQUERY` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |
 | `UUID` | | |
 | `JSONB` | `JSON` | normalized on write: sorted keys, compact |
+| `TSVECTOR` | | a document reduced for searching: its distinct words (lexemes), sorted, each with the positions it occurs at and their weights — `'cat':3 'fat':2,11A`. Made by `to_tsvector`, or written as a literal (taken as written: no stemming). `tsvector` (OID 3614) on the wire, text and binary. Equality only; not a key, not in an ordinary index — a GIN index serves `@@`. See [Full-text search](#full-text-search). Cluster version v21 for a column |
+| `TSQUERY` | | a search: lexemes joined by `&`, `\|`, `!` and `<->` — `'fat' & ( 'cat' \| 'rat' )`. Made by `to_tsquery` and its relatives, or written as a literal. `tsquery` (OID 3615) on the wire, text and binary. Cluster version v21 for a column |
 
 - String literals coerce into every type: `WHERE at >= '2026-08-30 02:00:00Z'`,
   `WHERE tag = 'a0eebc99-...'` — and become index bounds.
@@ -79,8 +81,8 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   filters over every row; `CREATE INDEX ... USING GIN (j)` makes `@>`
   and the three key operators index lookups — see
   [JSONB indexes](#jsonb-indexes).
-- Every type except JSONB can appear in primary keys and ordinary
-  indexes.
+- Every type except JSONB, TSVECTOR and TSQUERY can appear in primary
+  keys and ordinary indexes.
 
 ## DDL
 
@@ -96,6 +98,7 @@ DROP TABLE [IF EXISTS] t;
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
+CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
 DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
@@ -173,6 +176,128 @@ Good to know:
 - `jsonb_path_ops` is accepted and builds the same index.
 - Needs cluster version v21; on a cluster that has not finalized it the
   statement is refused (`0A000`).
+
+### Full-text search
+
+```sql
+CREATE TABLE articles (id INT8 PRIMARY KEY, title TEXT, body TEXT);
+CREATE INDEX articles_body ON articles USING GIN (to_tsvector('english', body));
+
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ to_tsquery('english', 'index & (scan | lookup) & !slow');
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ phraseto_tsquery('english', 'full text search');   -- the words, adjacent, in order
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', $1);                -- what a user typed in a search box
+
+-- The ten best matches, best first, each with an excerpt.
+SELECT id, ts_rank(to_tsvector('english', body), to_tsquery('english', $1)) AS rank,
+       ts_headline('english', body, to_tsquery('english', $1)) AS excerpt
+  FROM articles
+ WHERE to_tsvector('english', body) @@ to_tsquery('english', $1)
+ ORDER BY rank DESC LIMIT 10;
+```
+
+Text is searched by reducing it to a **`tsvector`** — its words, cut
+down to *lexemes* so that "Indexes", "indexed" and "indexing" are all
+`index` — and matching that against a **`tsquery`** with the `@@`
+operator. A GIN index over the lexemes makes `@@` a lookup instead of a
+read of every row; `EXPLAIN` shows it:
+
+```
+inverted scan of index "articles_body" ("index" AND "scan") + primary key join, rows rechecked
+```
+
+**Configurations** decide how text becomes lexemes. There are two:
+`english` drops stop words (*the*, *of*, *and*: 127 of them) and stems
+the rest with the Snowball English stemmer; `simple` only lower-cases.
+Both split text the same way: a word is a run of letters and digits
+(Unicode letters count; case is folded, accents are kept), `3.14` is one
+number, `ann@example.com` and `example.com` are one token each, and
+everything else — spaces, punctuation, hyphens, underscores, apostrophes
+— separates words. A word with a digit in it, an address and a host name
+are never stemmed. `SET default_text_search_config = 'simple'` changes
+what a call that names no configuration uses (the default is `english`).
+
+**Queries.** `to_tsquery` takes the operators: `a & b`, `a | b`, `!a`,
+`a <-> b` (b directly after a), `a <3> b` (b three words after a),
+parentheses, `prefix:*` (any word starting with it) and `word:AB` (only
+at positions of weight A or B). `plainto_tsquery` requires every word of
+a plain text, `phraseto_tsquery` requires them in order, and
+`websearch_to_tsquery` reads search-box syntax (`"a phrase" -excluded
+this or that`) and never raises a syntax error. Stop words are dropped
+from a query as they are from a document; a phrase keeps the gap they
+leave (`phraseto_tsquery('the cats ate the rats')` is `'cat' <-> 'ate'
+<2> 'rat'`). A query made only of stop words matches nothing.
+
+**Two ways to index.**
+
+- `USING GIN (to_tsvector('english', body))` indexes a `TEXT` column
+  directly. Queries must use the same expression —
+  `to_tsvector('english', body) @@ ...` — and the same configuration
+  (`to_tsvector(body)` counts when the session's default is that
+  configuration). Nothing else needs maintaining: writing `body` updates
+  the index.
+- A `TSVECTOR` column with `USING GIN (v)`, for a vector that is not a
+  plain function of one column — a title weighted above a body, say:
+
+  ```sql
+  ALTER TABLE articles ADD COLUMN v TSVECTOR;
+  CREATE INDEX articles_v ON articles USING GIN (v);
+  UPDATE articles SET v = setweight(to_tsvector('english', title), 'A') || to_tsvector('english', body);
+  SELECT id FROM articles WHERE v @@ to_tsquery('english', 'index:A');   -- in the title
+  ```
+
+  The application keeps the column up to date: there are no generated
+  columns and no triggers, so every statement that writes `title` or
+  `body` must write `v` too.
+
+**Ranking and excerpts.** `ts_rank(vector, query)` scores a row by how
+often the query's words occur and, for words required together, how
+close they are; `ts_rank_cd` by the shortest stretches of the document
+that satisfy the query. Both take an optional leading array of four
+weights (for D, C, B, A positions) and a trailing normalization bit
+mask, as in PostgreSQL. `ts_headline([config,] text, query [, options])`
+returns a fragment of the text with the matching words wrapped in
+`<b>...</b>` (`StartSel`, `StopSel`, `MaxWords`, `MinWords`,
+`HighlightAll`). The other functions — `setweight`, `strip`, `numnode`,
+`tsvector_to_array`, `get_current_ts_config` — and `tsvector || tsvector`
+are in the [functions reference](functions.md#full-text-search).
+
+Good to know:
+
+- **Results are the same as without the index.** The index holds
+  lexemes only; positions and weights stay in the vector. It finds the
+  rows that hold the query's words, and each is then checked against the
+  whole `WHERE` clause — which is where a phrase's adjacency and a
+  weight are decided.
+- **What the index serves**: `@@` with the indexed column or expression
+  on the left and a query known before any row is read (a literal, a
+  parameter, a function of them) on the right; combined with `AND`
+  freely and with `OR` when every branch is such a condition. `a & b`
+  looks up both words, `a | b` either, `a <-> b` both (adjacency is
+  rechecked), `a:*` every word with the prefix (one range of the index).
+- **What it does not**: a negation says which words a row lacks, and the
+  index lists the rows that hold a word. So `a & !b` looks up `a` and
+  rechecks, and `!b` alone — or `a | !b`, or `NOT (v @@ ...)` — reads
+  the whole table. The query on the left (`query @@ vector`) also works
+  only as a filter.
+- **Ranked queries read every match.** `ORDER BY ts_rank(...) DESC LIMIT
+  10` fetches all matching rows, ranks them and keeps ten; there is no
+  index order by rank. A query that matches a large part of the table is
+  slow however small the `LIMIT`.
+- **`text @@ tsquery` is refused** (`0A000`): write `to_tsvector(config,
+  text) @@ query`. A string literal beside a typed operand is read as
+  the other type (`v @@ 'cat & dog'`).
+- **Writes** cost one KV write per distinct lexeme of the document, in
+  the same transaction as the row; an `UPDATE` rewrites only the entries
+  of the words that came or went.
+- **Limits**: a lexeme is at most 2,046 bytes (a longer word is skipped
+  by `to_tsvector`), positions run to 16,383 (later words are recorded
+  at 16,383), a lexeme keeps its first 256 positions, and a row in a
+  full-text index may have at most 8,192 distinct lexemes (`54000`
+  beyond that; the write is refused).
+- Needs cluster version v21 for the two column types and for the index.
 
 `TRUNCATE` is a descriptor change, not a delete: the table (and each of
 its indexes) moves to a fresh keyspace, so it costs the same for a
@@ -1202,6 +1327,7 @@ invalid value `22023`:
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
 | `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
+| `default_text_search_config` | `english` (default), `simple`; `pg_catalog.` may qualify either | the configuration `to_tsvector`, `to_tsquery` and their relatives use when a call names none; reported schema-qualified (`pg_catalog.english`), as PostgreSQL does |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 **Custom settings.** A name with a prefix and a dot (`app.tenant`,

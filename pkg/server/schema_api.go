@@ -431,7 +431,7 @@ func columnDefault(c catalog.Column) string {
 		return "NULL"
 	}
 	switch c.Default.Fam {
-	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Enum:
+	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Enum:
 		return "'" + strings.ReplaceAll(c.Default.Text(), "'", "''") + "'"
 	default:
 		return c.Default.Text()

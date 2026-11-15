@@ -3,8 +3,8 @@
 //
 // An ordinary secondary index has one entry per row. An inverted index
 // has one entry per ELEMENT of the indexed value per row: a JSONB
-// document's elements are its paths and values, a text document's would
-// be its terms. The entry's key is
+// document's elements are its paths and values, a text document's are
+// its lexemes. The entry's key is
 //
 //	/t/<tableID>/<indexID>/ + EncodeBytes(element) + <primary key>
 //
@@ -165,6 +165,14 @@ const (
 	OpAnd
 	// OpOr: the rows some child admits. With no children: no rows.
 	OpOr
+	// OpPrefix: the rows holding any element that starts with Element.
+	// The elements of an index are sorted, so they are one span, like a
+	// single element's rows — but the rows in it are ordered by element
+	// first, so the same row may come up more than once and not in
+	// primary-key order. A kind may use it only for elements it stores
+	// undigested (see Clamp): a digest shares no prefix with what it
+	// was made from.
+	OpPrefix
 )
 
 // Expr is a set of rows described by element lookups. A nil *Expr is
@@ -177,6 +185,13 @@ type Expr struct {
 
 // Leaf admits the rows holding the element.
 func Leaf(element []byte) *Expr { return &Expr{Op: OpLeaf, Element: element} }
+
+// Prefix admits the rows holding an element that starts with prefix.
+func Prefix(prefix []byte) *Expr { return &Expr{Op: OpPrefix, Element: prefix} }
+
+// isLookup: the node is read straight from the index (an element or a
+// prefix of elements).
+func (e *Expr) isLookup() bool { return e.Op == OpLeaf || e.Op == OpPrefix }
 
 // None admits no row.
 func None() *Expr { return &Expr{Op: OpOr} }
@@ -234,9 +249,9 @@ func dedup(kids []*Expr) []*Expr {
 	out := kids[:0:0]
 	for _, k := range kids {
 		dup := false
-		if k.Op == OpLeaf {
+		if k.isLookup() {
 			for _, o := range out {
-				if o.Op == OpLeaf && bytes.Equal(o.Element, k.Element) {
+				if o.Op == k.Op && bytes.Equal(o.Element, k.Element) {
 					dup = true
 					break
 				}
@@ -254,7 +269,7 @@ func (e *Expr) Leaves() int {
 	if e == nil {
 		return 0
 	}
-	if e.Op == OpLeaf {
+	if e.isLookup() {
 		return 1
 	}
 	n := 0
@@ -273,6 +288,8 @@ func (e *Expr) Format(describe func([]byte) string) string {
 	switch e.Op {
 	case OpLeaf:
 		return describe(e.Element)
+	case OpPrefix:
+		return describe(e.Element) + ":*"
 	case OpAnd, OpOr:
 		if len(e.Kids) == 0 {
 			return "none"
@@ -286,7 +303,7 @@ func (e *Expr) Format(describe func([]byte) string) string {
 			if i > 0 {
 				b.WriteString(sep)
 			}
-			if k.Op != OpLeaf {
+			if !k.isLookup() {
 				b.WriteString("(" + k.Format(describe) + ")")
 			} else {
 				b.WriteString(k.Format(describe))
@@ -300,11 +317,13 @@ func (e *Expr) Format(describe func([]byte) string) string {
 // ---------------------------------------------------------------------------
 // Evaluation.
 
-// ScanFunc reads the row references stored under one element, in
-// ascending order, at most limit of them (0 = all). A row reference is
-// whatever follows the element in the entry's key — the encoded primary
-// key — and is opaque here.
-type ScanFunc func(element []byte, limit int) ([][]byte, error)
+// ScanFunc reads the row references stored under one element — or, with
+// prefix, under every element that starts with it — reading at most
+// limit index entries (0 = all). The references come back sorted and
+// distinct; more reports that the limit cut the read short, so they are
+// not all of them. A row reference is whatever follows the element in
+// the entry's key — the encoded primary key — and is opaque here.
+type ScanFunc func(element []byte, prefix bool, limit int) (refs [][]byte, more bool, err error)
 
 // ProbeLimit is how many references a conjunction reads from each of
 // its elements before deciding which to use. See Eval.
@@ -324,8 +343,9 @@ const ProbeLimit = 1024
 // every branch is read in full.
 func (e *Expr) Eval(scan ScanFunc) ([][]byte, error) {
 	switch e.Op {
-	case OpLeaf:
-		return scan(e.Element, 0)
+	case OpLeaf, OpPrefix:
+		refs, _, err := scan(e.Element, e.Op == OpPrefix, 0)
+		return refs, err
 	case OpOr:
 		var acc [][]byte
 		for _, k := range e.Kids {
@@ -341,15 +361,15 @@ func (e *Expr) Eval(scan ScanFunc) ([][]byte, error) {
 		have := false
 		var common []*Expr
 		for _, k := range e.Kids {
-			if k.Op != OpLeaf {
+			if !k.isLookup() {
 				common = append(common, k)
 				continue
 			}
-			refs, err := scan(k.Element, ProbeLimit+1)
+			refs, more, err := scan(k.Element, k.Op == OpPrefix, ProbeLimit)
 			if err != nil {
 				return nil, err
 			}
-			if len(refs) > ProbeLimit {
+			if more {
 				common = append(common, k)
 				continue
 			}

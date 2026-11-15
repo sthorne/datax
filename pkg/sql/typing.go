@@ -80,6 +80,9 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 func arithFamily(op string, l, r types.Family) types.Family {
 	switch op {
 	case "||":
+		if l == types.Tsvector || r == types.Tsvector {
+			return types.Tsvector
+		}
 		if l.IsArray() {
 			return l
 		}

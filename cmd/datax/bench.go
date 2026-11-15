@@ -84,6 +84,7 @@ var benchWorkloads = []struct{ name, doc string }{
 	{"index-join", "secondary-index lookups fanning out to wide primary rows (--preload rows)"},
 	{"scan", "large result sets streamed through pgwire (--preload rows per scan)"},
 	{"jsonb-contain", "JSONB containment (doc @> ...) over --preload documents, through a GIN index or as a filter (--jsonb-index gin|none)"},
+	{"text-search", "full-text search (to_tsvector('english', body) @@ ...) over --preload documents, through a GIN index or as a filter (--text-index gin|none): one word, a phrase, a prefix, or the ten best-ranked matches (--text-query word|phrase|prefix|ranked)"},
 }
 
 func benchUsage(fs *flag.FlagSet) {
@@ -172,7 +173,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification on the HTTP port")
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
-	groups := fs.Int("groups", 1000, "index-join, jsonb-contain: distinct indexed values (rows per lookup = preload / groups)")
+	groups := fs.Int("groups", 1000, "index-join, jsonb-contain, text-search: distinct indexed values (rows per lookup = preload / groups)")
+	textIndex := fs.String("text-index", "gin", "text-search workload: gin (an inverted index serves the search) or none (every query reduces and filters the whole table); the table name embeds this, so A/B runs don't collide")
+	textQuery := fs.String("text-query", "word", "text-search workload: word (one selective word), phrase (two adjacent words, verified from positions), prefix (word:*), or ranked (a two-word OR, ordered by ts_rank, LIMIT 10)")
 	jsonbIndex := fs.String("jsonb-index", "gin", "jsonb-contain workload: gin (an inverted index serves the containment) or none (every query filters the whole table); the table name embeds this, so A/B runs don't collide")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
@@ -185,7 +188,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	fs.Usage = func() { benchUsage(fs) }
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, or jsonb-contain")
+		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, jsonb-contain, or text-search")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
@@ -284,6 +287,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	jsonbTable := "bench_jsonb" + rsuffix
 	if *jsonbIndex == "none" {
 		jsonbTable += "_noidx"
+	}
+	if *textIndex != "gin" && *textIndex != "none" {
+		return nil, fmt.Errorf("--text-index takes gin or none")
+	}
+	switch *textQuery {
+	case "word", "phrase", "prefix", "ranked":
+	default:
+		return nil, fmt.Errorf("--text-query takes word, phrase, prefix or ranked")
+	}
+	textTable := "bench_text" + rsuffix
+	if *textIndex == "none" {
+		textTable += "_noidx"
 	}
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
@@ -444,6 +459,38 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			if err := preloadRows(jsonbTable, "k, doc", func(j int) string {
 				return fmt.Sprintf(`(%d, '{"tenant": %d, "kind": "k%d", "tags": ["t%d", "t%d"], "attrs": {"seq": %d, "ok": %t}, "pad": "%s"}')`,
 					j, j%*groups, j%7, j%50, (j/50)%50, j, j%2 == 0, pad)
+			}); err != nil {
+				return nil, err
+			}
+		}
+	case "text-search":
+		// Short documents of English words. A query names one topic and
+		// matches preload/groups of them. With the index that is a read
+		// of the topic's entries and their rows, each then reduced to
+		// lexemes again for the recheck; without it every document is
+		// reduced for every query.
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+textTable+" (k INT8 PRIMARY KEY, body TEXT)"); err != nil {
+			return nil, err
+		}
+		if *textIndex == "gin" {
+			if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS "+textTable+"_body ON "+textTable+" USING GIN (to_tsvector('english', body))"); err != nil {
+				return nil, err
+			}
+		}
+		if err := split(textTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		// A million documents are worth not loading twice. The rows go
+		// in ascending, so the last one being there means they all are;
+		// asking for it is a point lookup, where counting the table
+		// would read all of it under the statement's memory limit.
+		var have int64
+		if err := setup.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s WHERE k = %d", textTable, *preload-1)).Scan(&have); err != nil {
+			return nil, err
+		}
+		if have == 0 {
+			if err := preloadRows(textTable, "k, body", func(j int) string {
+				return fmt.Sprintf("(%d, '%s')", j, benchTextDocument(j, *groups))
 			}); err != nil {
 				return nil, err
 			}
@@ -687,9 +734,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 						}
 					}
 					_, err = conn.Exec(ctx, sb.String())
-				case "index-join", "scan", "jsonb-contain":
+				case "index-join", "scan", "jsonb-contain", "text-search":
 					q := "SELECT k, pad FROM " + scanTable
 					switch workload {
+					case "text-search":
+						q = benchTextQuery(textTable, *textQuery, rng.Intn(*groups), rng.Intn(*preload))
 					case "index-join":
 						q = fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups))
 					case "jsonb-contain":
@@ -736,7 +785,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	switch {
 	case ivalReport:
 		res.Rows = total * rowsPerOp
-	case workload == "index-join" || workload == "scan" || workload == "jsonb-contain":
+	case workload == "index-join" || workload == "scan" || workload == "jsonb-contain" || workload == "text-search":
 		res.Rows = rowsOut.Load()
 	}
 	if res.Rows > 0 {
@@ -1289,4 +1338,48 @@ func loadBenchResults(path string) (map[string]*benchResult, error) {
 		out[r.Name] = &r
 	}
 	return out, nil
+}
+
+// benchTextFiller are the words that pad a text-search document; every
+// document draws from the same twenty, so none of them is selective.
+var benchTextFiller = []string{"quarterly", "figures", "were", "reviewed", "by", "the", "committee", "and", "found", "consistent",
+	"with", "earlier", "estimates", "although", "several", "regions", "reported", "delays", "in", "shipping"}
+
+// benchTextDocument is document j of the text-search corpus: sixteen
+// words. "topic<j mod groups>" selects preload/groups documents,
+// "serial<j>" one and "common" all of them; every document of a topic
+// holds "status" and the same "report<n>", half of them side by side
+// as a phrase and half apart.
+func benchTextDocument(j, groups int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "common topic%d serial%d", j%groups, j)
+	if j%2 == 0 {
+		fmt.Fprintf(&b, " status report%d", (j%groups)%97)
+	} else {
+		fmt.Fprintf(&b, " report%d filed status", (j%groups)%97)
+	}
+	for i := 0; i < 11; i++ {
+		b.WriteByte(' ')
+		b.WriteString(benchTextFiller[(j*7+i*3)%len(benchTextFiller)])
+	}
+	return b.String()
+}
+
+// benchTextQuery is one search of the text-search workload, for a topic
+// and a document number drawn at random.
+func benchTextQuery(table, kind string, topic, doc int) string {
+	const lhs = "to_tsvector('english', body)"
+	switch kind {
+	case "phrase":
+		// The topic narrows the lookup; the phrase is decided on the
+		// rows it returns, from their positions.
+		return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d & status <-> report%d')", table, lhs, topic, topic%97)
+	case "prefix":
+		// serial1234:* is serial1234, serial12340..12349, ...
+		return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'serial%d:*')", table, lhs, 1000+doc%9000)
+	case "ranked":
+		q := fmt.Sprintf("to_tsquery('english', 'topic%d | serial%d')", topic, doc)
+		return fmt.Sprintf("SELECT k, ts_rank(%s, %s) AS r FROM %s WHERE %s @@ %s ORDER BY r DESC LIMIT 10", lhs, q, table, lhs, q)
+	}
+	return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d')", table, lhs, topic)
 }

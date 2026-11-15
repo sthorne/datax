@@ -11,7 +11,7 @@ import (
 // categoryOrder is the reference's section order. A category that is
 // not listed follows these — one such is in order by itself, two would
 // take the order a map happens to yield, so a new category is listed.
-var categoryOrder = []string{catControl, catString, catMath, catTime, catJSON, catSession, catLargeObject}
+var categoryOrder = []string{catControl, catString, catMath, catTime, catJSON, catTextSearch, catSession, catLargeObject}
 
 // Reference renders the Functions reference (docs/user/functions.md)
 // from the registry: one section per category, one entry per canonical
@@ -27,7 +27,7 @@ func Reference() string {
 	b.WriteString("An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. ")
 	b.WriteString("Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. ")
 	b.WriteString("Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. ")
-	b.WriteString("The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`) and casts are described in [the SQL reference](sql.md#reading).\n\n")
+	b.WriteString("The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`) and casts are described in [the SQL reference](sql.md#reading).\n\n")
 	byCat := map[string][]*Builtin{}
 	for _, f := range All() {
 		if f.Hidden {

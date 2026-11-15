@@ -52,6 +52,7 @@ duration, so two runs draw the same keys:
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
 | `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
 | `jsonb-contain`, `jsonb-contain-filter` | JSONB containment (`doc @> '{"tenant": n}'`, 50 of 50,000 documents per query) through a GIN index and as a filter over every document (#300) |
+| `text-search`, `text-search-filter` | full-text search (`to_tsvector('english', body) @@ to_tsquery('english', 'topic<n>')`, 50 of 50,000 short documents per query) through a GIN index on the expression and as a filter that reduces every document to lexemes for every query (#299) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
@@ -73,6 +74,29 @@ and is skipped when the table already holds the rows):
 ```sh
 bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s
 bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s --jsonb-index none
+```
+
+## The large set
+
+`workloads-large.json` is a second checked-in set, for what does not
+show on a small table: full-text search over **a million documents**
+(#299) — one selective word (50 documents per query), the same narrowed
+by a phrase that is decided from positions, a prefix (`serial1234:*`, a
+range of the index), and the ten best of a two-word `OR` by `ts_rank`.
+The four share one table and the first to run loads it, which takes
+most of the run (about ten index entries per document; some ten minutes
+on a 4-core machine for the single node, longer for the cluster):
+
+```sh
+SET=bench/workloads-large.json OUT=/tmp/large make bench
+```
+
+It is not part of the nightly run, whose 40 minutes it would not fit
+in. The filter over the same million documents is in neither set — one
+query takes over twenty seconds — and can be timed by hand:
+
+```sh
+bin/datax bench text-search --preload 1000000 --groups 20000 --concurrency 1 --duration 120s --text-index none
 ```
 
 ## Errors fail a run

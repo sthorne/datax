@@ -166,3 +166,48 @@ func TestFillDefaultDecoding(t *testing.T) {
 		t.Fatalf("value decoded as %+v", got[3])
 	}
 }
+
+// TestTextSearchValueRoundTrip: tsvector and tsquery values are stored
+// under tags of their own, and a value read as the wrong column type is
+// dropped rather than mistaken for text.
+func TestTextSearchValueRoundTrip(t *testing.T) {
+	desc := &catalog.TableDescriptor{
+		ID: 8, Name: "t",
+		Columns: []catalog.Column{
+			{ID: 1, Name: "id", Type: types.Int, NotNull: true},
+			{ID: 2, Name: "v", Type: types.Tsvector},
+			{ID: 3, Name: "q", Type: types.Tsquery},
+			{ID: 4, Name: "s", Type: types.String},
+		},
+		PrimaryKey: []catalog.ColumnID{1},
+	}
+	v, _ := types.ParseTsvector("fat:2,11A cat:3 'two words'")
+	q, _ := types.ParseTsquery("fat & !cat:* <2> rat")
+	row := map[catalog.ColumnID]types.Datum{1: types.NewInt(1), 2: v, 3: q, 4: types.NewString("text")}
+	raw, err := EncodeValue(desc, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeValue(desc, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[catalog.ColumnID]types.Datum{2: v, 3: q, 4: types.NewString("text")} {
+		if got[id].Fam != want.Fam || got[id].S != want.S {
+			t.Errorf("column %d: %+v, want %+v", id, got[id], want)
+		}
+	}
+	swapped := *desc
+	swapped.Columns = append([]catalog.Column(nil), desc.Columns...)
+	swapped.Columns[1].Type, swapped.Columns[2].Type = types.String, types.Tsvector
+	got, err = DecodeValue(&swapped, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[2]; ok {
+		t.Errorf("a tsvector was read into a text column: %+v", got[2])
+	}
+	if _, ok := got[3]; ok {
+		t.Errorf("a tsquery was read into a tsvector column: %+v", got[3])
+	}
+}

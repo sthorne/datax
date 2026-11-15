@@ -308,6 +308,10 @@ func TypeOID(f types.Family) int64 {
 		return 1700
 	case types.Jsonb:
 		return 3802
+	case types.Tsvector:
+		return 3614
+	case types.Tsquery:
+		return 3615
 	case types.IntervalFam:
 		return 1186
 	case types.Time:
@@ -413,7 +417,7 @@ func typeNameOID(oid int64) string {
 	return "text"
 }
 
-var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time}
+var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery}
 
 // Families lists every type family, in pg_type order.
 func Families() []types.Family { return families }
@@ -444,6 +448,10 @@ func TypeName(f types.Family) string {
 		return "numeric"
 	case types.Jsonb:
 		return "jsonb"
+	case types.Tsvector:
+		return "tsvector"
+	case types.Tsquery:
+		return "tsquery"
 	case types.IntervalFam:
 		return "interval"
 	case types.Time:
@@ -562,6 +570,15 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	cols := make([]string, 0, len(idx.ColumnIDs))
 	for _, id := range idx.ColumnIDs {
 		cols = append(cols, columnName(d, id))
+	}
+	if kind, ok := inverted.Lookup(idx.Inverted); ok && len(cols) == 1 {
+		if c, ok := kind.(inverted.Computed); ok {
+			if fn, arg := c.Computes(); fn != "" {
+				// An index on to_tsvector('english', col), as PostgreSQL
+				// prints one.
+				cols[0] = fmt.Sprintf("%s('%s'::regconfig, %s)", fn, arg, cols[0])
+			}
+		}
 	}
 	unique := ""
 	if idx.Unique {
@@ -858,7 +875,7 @@ func renderDefault(d types.Datum) string {
 		return "NULL"
 	}
 	switch d.Fam {
-	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam:
+	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam:
 		return "'" + strings.ReplaceAll(d.Text(), "'", "''") + "'"
 	}
 	return d.Text()

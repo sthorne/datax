@@ -215,3 +215,43 @@ func TestParseResetAndPurge(t *testing.T) {
 		}
 	}
 }
+
+// TestParseTextSearch: the @@ operator, and the one expression CREATE
+// INDEX accepts as a key.
+func TestParseTextSearch(t *testing.T) {
+	sel := parseOne(t, `SELECT id FROM t WHERE v @@ to_tsquery('english', 'a & b') AND NOT (v @@ 'c')`).(*Select)
+	if len(sel.Where) != 2 || sel.Where[0].Column != "v" || sel.Where[0].Op != "@@" || sel.Where[0].Value.Func != "to_tsquery" || sel.Where[1].Op != "NOT @@" {
+		t.Fatalf("WHERE: %+v", sel.Where)
+	}
+	sel = parseOne(t, `SELECT id FROM t WHERE to_tsvector('english', body) @@ $1`).(*Select)
+	if c := sel.Where[0]; c.Op != "@@" || c.Expr == nil || c.Expr.Func != "to_tsvector" || len(c.Expr.Args) != 2 || c.Expr.Args[1].Column != "body" || c.Value.Param != 1 {
+		t.Fatalf("WHERE: %+v", sel.Where[0])
+	}
+	for src, want := range map[string]CreateIndex{
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body))`:             {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "english"},
+		`CREATE INDEX i ON t USING gin ((TO_TSVECTOR('simple'::regconfig, body)))`: {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "simple"},
+		`CREATE INDEX i ON t (lower('x', body))`:                                   {Name: "i", Table: "t", Columns: []string{"body"}, ExprFunc: "lower", ExprArg: "x"},
+		`CREATE INDEX i ON t USING GIN (v tsvector_ops)`:                           {Name: "i", Table: "t", Using: "gin", Columns: []string{"v"}, OpClasses: []string{"tsvector_ops"}},
+	} {
+		got := parseOne(t, src).(*CreateIndex)
+		if got.Name != want.Name || got.Table != want.Table || got.Using != want.Using || got.ExprFunc != want.ExprFunc || got.ExprArg != want.ExprArg ||
+			len(got.Columns) != 1 || got.Columns[0] != want.Columns[0] || len(got.OpClasses) != len(want.OpClasses) {
+			t.Errorf("%s: %+v", src, got)
+		}
+	}
+	for _, bad := range []string{
+		`CREATE INDEX i ON t USING GIN (to_tsvector(body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body), other)`,
+		`CREATE INDEX i ON t USING GIN (other, to_tsvector('english', body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', lower(body)))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body)`,
+		`CREATE INDEX i ON t USING GIN ((body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body) jsonb_ops)`,
+		`CREATE TABLE t (id INT8 PRIMARY KEY, v TSVECTOR[])`,
+		`CREATE TABLE t (id INT8 PRIMARY KEY, q TSQUERY ARRAY)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s parsed", bad)
+		}
+	}
+}

@@ -214,6 +214,13 @@ func admits(e *Expr, els [][]byte) bool {
 	switch e.Op {
 	case OpLeaf:
 		return has(els, e.Element)
+	case OpPrefix:
+		for _, el := range els {
+			if bytes.HasPrefix(el, e.Element) {
+				return true
+			}
+		}
+		return false
 	case OpAnd:
 		for _, k := range e.Kids {
 			if !admits(k, els) {
@@ -433,13 +440,31 @@ type fakeIndex struct {
 	scans    []string // element and limit of each scan, in order
 }
 
-func (f *fakeIndex) scan(element []byte, limit int) ([][]byte, error) {
+func (f *fakeIndex) scan(element []byte, prefix bool, limit int) ([][]byte, bool, error) {
 	f.scans = append(f.scans, fmt.Sprintf("%s/%d", element, limit))
 	refs := f.postings[string(element)]
-	if limit > 0 && len(refs) > limit {
+	if prefix {
+		// Entries in element order, as the index holds them.
+		var names []string
+		for name := range f.postings {
+			if strings.HasPrefix(name, string(element)) {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		refs = nil
+		for _, name := range names {
+			refs = append(refs, f.postings[name]...)
+		}
+	}
+	more := limit > 0 && len(refs) > limit
+	if more {
 		refs = refs[:limit]
 	}
-	return refs, nil
+	if prefix {
+		refs = SortDedup(append([][]byte(nil), refs...))
+	}
+	return refs, more, nil
 }
 
 func refsRange(lo, hi, step int) [][]byte {
@@ -506,5 +531,44 @@ func TestEval(t *testing.T) {
 	}
 	if n := count(None()); n != 0 {
 		t.Errorf("none = %d", n)
+	}
+
+	// A prefix reads every element that starts with it: rows found
+	// under two of them come back once, in order.
+	p := &fakeIndex{postings: map[string][][]byte{
+		"car":    refsRange(0, 10, 1),
+		"cart":   refsRange(5, 15, 1),
+		"carbon": refsRange(0, 3000, 1),
+		"dog":    refsRange(8, 12, 1),
+	}}
+	eval := func(e *Expr) int {
+		t.Helper()
+		refs, err := e.Eval(p.scan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < len(refs); i++ {
+			if bytes.Compare(refs[i-1], refs[i]) >= 0 {
+				t.Fatal("result is not sorted and distinct")
+			}
+		}
+		return len(refs)
+	}
+	if n := eval(Prefix([]byte("cart"))); n != 10 {
+		t.Errorf("cart:* = %d", n)
+	}
+	if n := eval(Prefix([]byte("car"))); n != 3000 {
+		t.Errorf("car:* = %d", n)
+	}
+	// A prefix too common to probe is left to the recheck beside a
+	// selective element, like a common element.
+	if n := eval(And(Prefix([]byte("car")), Leaf([]byte("dog")))); n != 4 {
+		t.Errorf("car:* AND dog = %d", n)
+	}
+	if n := eval(And(Prefix([]byte("cart")), Leaf([]byte("dog")))); n != 4 { // rows 8..11
+		t.Errorf("cart:* AND dog = %d", n)
+	}
+	if got := And(Prefix([]byte("ca")), Leaf([]byte("dog")), Prefix([]byte("ca"))).Format(func(b []byte) string { return string(b) }); got != "ca:* AND dog" {
+		t.Errorf("format: %s", got)
 	}
 }

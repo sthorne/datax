@@ -143,6 +143,11 @@ SHOW STATS FOR t
   ordinary index; a GIN index on the column serves it (and `?`, `?|`,
   `?&`) — see Inverted indexes below — and without one it is a
   post-fetch filter.
+- `TSVECTOR`, `TSQUERY` and the `@@` operator (either order of the two
+  types; a text operand beside a typed one is read as a literal of the
+  other type; `text @@ tsquery` is refused) — see Full-text search
+  below. `@@` is one more comparison operator to the parser, with `NOT
+  @@` as its negation.
 - Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
   omit the column store the default; an explicit NULL stays NULL.
 - WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`
@@ -736,6 +741,22 @@ commit fails the lease deadline and re-plans with the index (issue #110).
 A tail no chunk read would let such a write land in the past, below the
 boundary, and never reach the index.
 
+**The index is emptied between the drain and the backfill**
+(`clearDrainEntries`). While step 1's drain waits, gateways adopt the
+write-only index one at a time, so for up to a renewal interval some
+writers maintain it and some do not. One that does writes a row's
+entries; one that does not may then change or delete the row, and
+leaves them. The backfill only adds and a writer only removes what it
+believes a row had, so those entries would stay: a row returned for a
+value it no longer has, or `entry points at a missing row`. (This is the
+anomaly a delete-only state exists to prevent in other online schema
+change designs.) After the drain every writer that can still commit
+maintains the index, so one pass over the index's span deletes every
+such entry, along with good ones — which the backfill, reading every
+row after it, writes again. Found by the full-text search work (issue
+#299), whose test builds a second index under writers; it applies to
+every kind of index (`TestCreateIndexDiscardsEntriesWrittenDuringItsDrain`).
+
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.
 
@@ -761,10 +782,10 @@ on what is indexed; a `Kind` supplies the two things that do:
 
 That one-sided contract — the expression may admit rows the predicate
 rejects, never miss one — is the whole correctness argument, and it is
-tested as such (`TestJSONBQueryNeverMisses`). A second kind (terms of a
-text document, for full-text search) supplies the same two functions and
-inherits the rest: key layout, maintenance, backfill, re-shard,
-truncate, backup, evaluation, recheck, EXPLAIN.
+tested as such (`TestJSONBQueryNeverMisses`). The text-search kinds
+(below) supply the same two functions and inherit the rest: key layout,
+maintenance, backfill, re-shard, truncate, backup, evaluation, recheck,
+EXPLAIN.
 
 **Keys.** `/t/<tableID>/<indexID>/ + EncodeBytes(element) + <primary
 key>`, value a one-byte marker (`rowenc.IndexEntries`). The escaped
@@ -863,8 +884,141 @@ type it cannot key. `CREATE INDEX ... USING GIN` is refused until the
 cluster has finalized v21.
 
 Left for later: range lookups over a path's values (`doc->'n' > 5`),
-containment under a `->` path, `<@`, per-element statistics, and a
-second kind (full-text search, issue #299).
+containment under a `->` path, `<@`, and per-element statistics.
+
+## Full-text search (v21)
+
+Issue #299. `pkg/sql/tsearch` is the whole of it that is not SQL: it
+imports nothing of the SQL layer, so `pkg/sql/types` can parse and print
+the two types with it. Everything in it is a pure function.
+
+**Types.** `TSVECTOR` and `TSQUERY` are two families (`types.Tsvector`,
+`types.Tsquery`) whose datum holds the value's **canonical text** in
+`S`, as JSONB's does: lexemes sorted bytewise, positions sorted and
+distinct, one weight per position; a query printed the way PostgreSQL
+prints one. Equal values have equal text, which is all `=`, `GROUP BY`
+and `DISTINCT` need; there is no order. A value is parsed when it is
+used (a recheck parses the row's vector; a query is parsed once per
+row it is matched against — both are small next to fetching the row).
+Rows store them under value tags of their own (16, 17). On the wire:
+OIDs 3614 and 3615 (arrays 3643, 3645, never produced), text as stored,
+binary in PostgreSQL's `tsvectorsend` / `tsquerysend` layouts
+(`tsearch/binary.go`; pgx's `TSVector` codec round-trips against it in
+`TestTextSearchOverPgwire`).
+
+**From text to lexemes.** One tokenizer for every configuration
+(`Tokenize`): at each position, an e-mail address, else a host name
+(dotted labels ending in letters), else a decimal number, else a run of
+Unicode letters, digits and marks; everything else separates. Tokens are
+lower-cased by Unicode case mapping. It is much simpler than
+PostgreSQL's parser, by choice: 23 token types and a hand-written state
+machine buy little for prose, and every divergence is a documented rule
+rather than a bug to chase (`docs/user/postgres-differences.md`).
+A configuration then maps a token to a lexeme or drops it: `simple`
+keeps it; `english` drops the 127 Snowball stop words and stems
+all-letter word tokens with `Stem`. Positions count every token, stop
+words included, from 1.
+
+**The stemmer** (`tsearch/stem.go`) is Snowball English (Porter2)
+written from the algorithm's description — no new dependency. It is
+tested against the description's published sample (80 consecutive
+vocabulary words with their stems), its per-step examples, and a few
+hundred hand-derived pairs (`stem_test.go`). It has not been run against
+libstemmer or a PostgreSQL server; later Snowball revisions (PostgreSQL
+17+) changed a handful of words. An index and the queries against it use
+the same code, so a disagreement with PostgreSQL changes which words are
+conflated, never whether the index and the filter agree.
+
+**Queries.** A `tsquery` is a binary tree of `&`, `|`, `!`, `<N>` over
+operands (lexeme, prefix flag, weight set). `ParseQuery` reads the
+literal syntax; `ToQuery` the same syntax with each operand normalized
+by a configuration (several tokens become a phrase, a stop word a
+placeholder); `clean` then removes the placeholders the way PostgreSQL's
+`clean_stopword` does, widening the phrase distances around them.
+`PlainToQuery`, `PhraseToQuery` and `WebsearchToQuery` build trees
+directly.
+
+**Matching** (`tsearch/match.go`) follows PostgreSQL's `TS_execute`.
+Outside a phrase it is boolean logic over "the vector holds the lexeme"
+(with one of the operand's weights, if it names any). A phrase evaluates
+each side to the set of positions it ends at and keeps the positions of
+the right side that have the left side exactly `N` before them; a
+negation inside a phrase is a complemented set. A vector without
+positions matches words and never phrases. `TestMatchRandom` checks it
+against a brute-force definition that shares no code with it.
+
+**Session default.** `to_tsvector(text)` and its relatives depend on
+`default_text_search_config`. The session resolves that before the row
+loop, where it resolves `now()`: `resolveValueExpr` rewrites a call that
+names no configuration into the two-argument call with the session's
+value as a literal (`builtins.TextSearchDefaultArg`). The builtins are
+then pure, and the planner sees `to_tsvector('english', body)` whichever
+way the statement spelled it. `ts_headline`'s forms cannot be told apart
+by count — `(a, b, c)` is `(config, document, query)` or `(document,
+query, options)` — so it is rewritten to a hidden builtin that carries
+the default and decides from the argument types at run time.
+
+**Indexes.** Three inverted kinds (`pkg/sql/inverted/tsearch.go`), one
+implementation:
+
+- `tsvector_ops`, over a `TSVECTOR` column: `Elements` are the vector's
+  lexemes.
+- `to_tsvector_english`, `to_tsvector_simple`, over a `TEXT` column:
+  `Elements` are the lexemes of `to_tsvector(config, value)`. This is
+  how `CREATE INDEX ... USING GIN (to_tsvector('english', body))` is
+  stored — the parser accepts exactly `fn('constant', column)` as an
+  index key and the DDL maps it to the kind — because there are neither
+  expression indexes nor generated columns to build PostgreSQL's usual
+  shape from. It costs no descriptor field: the index's column is the
+  text column and `Inverted` names the kind. A kind that indexes a
+  function of its column says so (`inverted.Computed`), and the planner
+  then requires the conjunct's left-hand side to be that call on that
+  column (`invertedLHS`) instead of the column itself.
+
+An element is **the lexeme's bytes and nothing else** — no tag, no
+position, no weight. Positions stay in the vector, so the index answers
+"which rows hold this word" and the recheck answers everything finer.
+A lexeme over 128 bytes is stored *cut* to 128, not digested as JSONB's
+long elements are: a cut lexeme still starts with its own prefixes, and
+prefix search depends on that.
+
+`Query("@@", tsquery)` maps the tree onto lookups: an operand is a leaf,
+`&` is AND, `|` is OR, a phrase is the AND of its sides (adjacency is
+the recheck's), and a negation is `nil` — unconstrained — at any depth,
+because the index lists the rows that hold a word and not the ones that
+lack it. `And` drops unconstrained children and `Or` is unconstrained if
+any child is, so `a & !b` looks up `a`, and `!b` or `a | !b` scan.
+`TestTextSearchQueryNeverMisses` holds the kind to the contract on
+random documents and queries.
+
+**Prefix lookups** are the one addition to the kind-agnostic layer:
+`inverted.Prefix(p)` (`OpPrefix`) admits the rows holding any element
+that starts with `p`. Elements sort bytewise in the key space, so that
+is one span (`rowenc.InvertedPrefixSpan`: the escaped prefix without its
+terminator). Its rows come back ordered by element first, so the scan
+function sorts and de-duplicates them, and now reports whether a probe
+limit cut it short rather than leaving the caller to infer that from a
+count; a conjunction treats a prefix too common to probe like a common
+element. A kind may use `Prefix` only for elements it never digests.
+
+**Ranking** is computed on the rows the query returns: `ts_rank` and
+`ts_rank_cd` are ordinary functions (`tsearch/rank.go`, PostgreSQL's
+formulas). `ORDER BY rank DESC LIMIT k` therefore fetches and rechecks
+every match, ranks, sorts and cuts. A top-k that reads less needs
+per-entry scores or positions in the index (a RUM-style index); not
+attempted.
+
+**Version gate.** No descriptor field is new, so table restore's
+allow-lists are unchanged. The two families and their value tags are
+new, and a v20 node can decode neither: any statement that would give a
+table a column of either type (`CREATE TABLE`, `CREATE TABLE AS`, `ADD
+COLUMN`, `ALTER COLUMN TYPE`) is refused until v21 is finalized, as
+`USING GIN` already is. The functions and `@@` need no gate.
+
+Left for later: more configurations (a stemmer and a stop list each);
+PostgreSQL's richer token types; generated columns, which would make the
+weighted title-and-body vector maintainable by the database; `query @@
+vector` and negation-aware planning; ranked top-k.
 
 ## Execution
 

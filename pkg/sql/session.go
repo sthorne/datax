@@ -1272,6 +1272,10 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	}
 	switch op {
 	case "||":
+		if l.Fam == types.Tsvector || r.Fam == types.Tsvector {
+			d, err := builtins.ConcatTSVectors(l, r)
+			return d, builtinErr(err)
+		}
 		if l.Fam.IsArray() || r.Fam.IsArray() {
 			d, err := builtins.ConcatArrays(l, r)
 			return d, builtinErr(err)
@@ -2033,6 +2037,12 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		m := re.MatchString(lhs.Text())
 		return m == !strings.HasPrefix(op, "NOT"), nil
+	case "@@", "NOT @@":
+		ok, err := builtins.TSMatch(lhs, rhs)
+		if err != nil {
+			return false, builtinErr(err)
+		}
+		return ok == (op == "@@"), nil
 	case "@>", "NOT @>", "<@", "NOT <@", "&&", "NOT &&", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
 		ok, err := jsonOp(strings.TrimPrefix(op, "NOT "), lhs, rhs)
 		if err != nil {

@@ -86,7 +86,7 @@ syntax error or `0A000` feature not supported):
   existence `?` / `?|` / `?&` (single-table only), equality comparison,
   and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
   `HAVING` or after a computed left-hand side.
-- **GIN indexes are JSONB only, one kind.** `CREATE INDEX ... USING GIN
+- **GIN indexes: JSONB and full-text search.** `CREATE INDEX ... USING GIN
   (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
   each value with its path (closer to PostgreSQL's `jsonb_path_ops` than
   to `jsonb_ops`, but it serves the key operators too), so
@@ -94,12 +94,72 @@ syntax error or `0A000` feature not supported):
   `pg_get_indexdef` reports the index without an operator class. Not
   served, and evaluated as filters: `<@`, jsonpath (`@?`, `@@` do not
   exist), containment under a `->` path, and a right-hand side that is
-  not a constant or a parameter. No GIN over arrays, `tsvector` or
+  not a constant or a parameter. No GIN over arrays or
   `pg_trgm`; no multi-column or `UNIQUE` GIN; no `fastupdate` or other
   storage parameters. A document with more than 8,192 distinct indexed
   values is refused (`54000`) on a table with a GIN index. There is no
   bitmap scan: `EXPLAIN` reports an `inverted scan`, and
   `enable_bitmapscan` is not a setting (`inverted_index_scan` is).
+- **Full-text search is a subset, and its parser and stemmer are
+  datax's own.** `tsvector`, `tsquery`, `@@`, `to_tsvector`,
+  `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`,
+  `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`,
+  `setweight`, `strip`, `numnode`, `tsvector_to_array`,
+  `get_current_ts_config`, `tsvector || tsvector`, weights, phrases and
+  prefixes work, and a GIN index serves `@@`
+  ([reference](sql.md#full-text-search)). Where it differs:
+  - *Configurations*: `english` and `simple` only. No `CREATE TEXT
+    SEARCH ...`, no dictionaries, thesauri or `unaccent`; `regconfig` is
+    not a type (`'english'::regconfig` is accepted and is text).
+  - *Tokens*: the parser is simpler than PostgreSQL's. A hyphenated word
+    is its parts only (PostgreSQL also emits the whole: `well-known`
+    here is `well`, `known`); a URL is its scheme, host and path words,
+    not PostgreSQL's `url` / `host` / `url_path` tokens; signed and
+    scientific numbers, XML tags and entities are not recognized
+    (`-3` is `3`, `1e5` is the word `1e5`); a version number such as
+    `1.2.3` is `1.2` and `3`. Positions therefore differ from
+    PostgreSQL's wherever these occur. Plain prose tokenizes the same.
+  - *Stemming*: the Snowball English (Porter2) algorithm as long
+    published, with PostgreSQL's 127 English stop words. PostgreSQL 17
+    and later ship a newer revision of the Snowball sources that stems
+    a handful of words differently. The implementation is checked
+    against the algorithm's published sample vocabulary and hand-derived
+    stems, not against a PostgreSQL server.
+  - *Indexes*: `USING GIN (tsvector_column)` and `USING GIN
+    (to_tsvector('config', text_column))` — the one expression an index
+    may be built on; the configuration must be written out, as
+    PostgreSQL requires. No expression indexes otherwise (not over a
+    concatenation of columns, not `setweight(...) || ...`), no generated
+    columns and no triggers to maintain a `tsvector` column: the
+    application writes it. No GiST (`USING GIST` is refused), no
+    `fastupdate`, no `gin_pending_list_limit`.
+  - *Planning*: a negated term is never looked up, so a query that is
+    only a negation (or an `OR` with one) scans; `tsquery @@ tsvector`
+    (the query on the left) is evaluated as a filter. `ORDER BY ts_rank
+    ... LIMIT n` ranks every matching row: there is no top-k shortcut
+    (PostgreSQL has none with GIN either; RUM indexes do).
+  - *Operators and functions not provided*: `text @@ tsquery` and `text
+    @@ text` (refused with `0A000` rather than guessed at: wrap the text
+    in `to_tsvector`), `tsquery && tsquery`, `||`, `!!`, `@>`, `<@`,
+    `tsquery_phrase`, `querytree`, `ts_rewrite`, `ts_delete`,
+    `ts_filter`, `ts_stat`, `ts_debug`, `ts_lexize`, `ts_parse`,
+    `array_to_tsvector`, `unnest(tsvector)`, `length(tsvector)` (it
+    returns the length of the text), `json(b)_to_tsvector`, and the `\dF`
+    commands' catalogs (`pg_ts_config` and friends). No ordering of
+    `tsvector` or `tsquery` values (`ORDER BY`, `<`), only equality; no
+    arrays of them.
+  - *Output*: `to_tsquery` does not rewrite a phrase over an `|` or `&`
+    into PostgreSQL's normal form (`'a' <-> ( 'b' | 'c' )` stays as
+    written where PostgreSQL prints `'a' <-> 'b' | 'a' <-> 'c'`; the two
+    match the same documents). `ts_rank` and `ts_rank_cd` follow
+    PostgreSQL's formulas and return `float8` rounded to single
+    precision. `ts_headline` chooses its fragment by a simpler rule
+    (the window with the most distinct query words), always returns one
+    fragment (`MaxFragments`, `ShortWord` and `FragmentDelimiter` are
+    accepted and ignored), and does not strip markup.
+  - *Limits*: a row in a full-text index may have at most 8,192 distinct
+    lexemes (`54000`); PostgreSQL's limits on lexeme length (2,046
+    bytes), positions (16,383) and positions per lexeme (256) apply.
   One asymmetry to know: `@>` compares
   numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
   normalized text (`'{"a":1}' = '{"a":1.0}'` is false).

@@ -358,3 +358,18 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 	}
 	return res, nil
 }
+
+// requireTextSearchTypes gates a descriptor that gains a TSVECTOR or
+// TSQUERY column: a v20 node knows neither the type nor the value tag
+// its rows are stored under (version.V21).
+func (s *Session) requireTextSearchTypes(fams ...types.Family) error {
+	for _, f := range fams {
+		if f.IsArray() {
+			f = f.Elem()
+		}
+		if f == types.Tsvector || f == types.Tsquery {
+			return s.requireV21("the TSVECTOR and TSQUERY types")
+		}
+	}
+	return nil
+}

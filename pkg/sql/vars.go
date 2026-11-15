@@ -9,6 +9,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 )
@@ -44,6 +45,10 @@ type sessionVars struct {
 	// must (on) or must not (off) read an inverted index that can serve
 	// a statement. For comparing the two paths; auto is right otherwise.
 	invertedScan invertedMode
+	// textSearchConfig is default_text_search_config: the configuration
+	// the text-search functions use when a call names none ("" = the
+	// built-in default).
+	textSearchConfig string
 	// custom holds the custom settings (issue #294): two-part names an
 	// application defines for itself (app.tenant), which a row-security
 	// policy reads with current_setting(). The map is replaced, never
@@ -80,6 +85,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"client_encoding", "string", ""},
 	{"database", "string", ""},
 	{"DateStyle", "string", ""},
+	{"default_text_search_config", "string", ""},
 	{"default_transaction_read_only", "bool", ""},
 	{"foreign_key_cascade_limit", "integer", ""},
 	{"idle_in_transaction_session_timeout", "integer", "ms"},
@@ -136,6 +142,9 @@ func (s *Session) varValue(name string) string {
 		return s.database
 	case "DateStyle":
 		return v.dateStyle
+	case "default_text_search_config":
+		// Schema-qualified, as PostgreSQL reports it.
+		return "pg_catalog." + s.textSearchConfig()
 	case "default_transaction_read_only":
 		return onOff(v.defaultReadOnly)
 	case "foreign_key_cascade_limit":
@@ -367,6 +376,15 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 				return invalid("%v", err)
 			}
 			vars.txnReadOnly = b
+		}
+	case "default_text_search_config":
+		vars.textSearchConfig = ""
+		if !reset {
+			cfg, err := tsearch.LookupConfig(unquote(value))
+			if err != nil {
+				return invalid("%v (the configurations are %s)", err, strings.Join(tsearch.ConfigNames(), " and "))
+			}
+			vars.textSearchConfig = cfg.Name
 		}
 	case "inverted_index_scan":
 		vars.invertedScan = invertedAuto
@@ -638,4 +656,12 @@ func (s *Session) sessionRows(admin bool) [][]types.Datum {
 			types.NewString(si.ClientAddr), types.NewString(si.State), types.NewString(query), ts(si.BackendStart), ts(si.QueryStart), ts(si.XactStart)})
 	}
 	return rows
+}
+
+// textSearchConfig is the session's default text-search configuration.
+func (s *Session) textSearchConfig() string {
+	if s.vars.textSearchConfig == "" {
+		return tsearch.DefaultConfig
+	}
+	return s.vars.textSearchConfig
 }

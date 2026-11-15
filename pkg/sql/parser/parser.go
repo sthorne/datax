@@ -1393,6 +1393,9 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		if fam == types.Jsonb {
 			return spec, false, p.errf("JSONB[] is not supported: store a JSON array in a JSONB column")
 		}
+		if fam == types.Tsvector || fam == types.Tsquery {
+			return spec, false, p.errf("arrays of %s are not supported", fam)
+		}
 		spec.Family = types.ArrayOf(fam)
 	}
 	return spec, serial, nil
@@ -1991,6 +1994,20 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		return nil, err
 	}
 	for {
+		if fn, arg, col, ok, err := p.parseIndexExpr(); err != nil {
+			return nil, err
+		} else if ok {
+			if len(ci.Columns) > 0 || ci.ExprFunc != "" {
+				return nil, p.errf("an index on an expression takes that one expression and nothing else")
+			}
+			ci.ExprFunc, ci.ExprArg = fn, arg
+			ci.Columns = append(ci.Columns, col)
+			ci.OpClasses = append(ci.OpClasses, "")
+			if p.consumeOp(",") {
+				return nil, p.errf("an index on an expression takes that one expression and nothing else")
+			}
+			break
+		}
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, err
@@ -2018,6 +2035,52 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		return nil, err
 	}
 	return ci, nil
+}
+
+// parseIndexExpr reads an index key written as an expression,
+// fn('constant'[::type], column), optionally inside one more pair of
+// parentheses as PostgreSQL requires of expressions that are not
+// function calls. ok is false, with nothing consumed, when the key is a
+// plain column.
+func (p *parser) parseIndexExpr() (fn, arg, col string, ok bool, err error) {
+	save := p.i
+	parens := 0
+	for p.peek().kind == tkOp && p.peek().text == "(" {
+		p.i++
+		parens++
+	}
+	name := p.peek()
+	if name.kind != tkIdent || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
+		if parens > 0 {
+			return "", "", "", false, p.errf("an index key is a column, or to_tsvector('config', column) under USING GIN")
+		}
+		p.i = save
+		return "", "", "", false, nil
+	}
+	p.i += 2
+	lit := p.peek()
+	if lit.kind != tkString {
+		return "", "", "", false, p.errf("an index on %s(...) needs the configuration written out as its first argument: %s('english', column)", name.text, name.text)
+	}
+	p.i++
+	if p.consumeOp("::") {
+		// 'english'::regconfig, as pg_dump writes it.
+		if _, err := p.expectIdent(); err != nil {
+			return "", "", "", false, err
+		}
+	}
+	if err := p.expectOp(","); err != nil {
+		return "", "", "", false, err
+	}
+	if col, err = p.expectIdent(); err != nil {
+		return "", "", "", false, err
+	}
+	for i := 0; i <= parens; i++ {
+		if err := p.expectOp(")"); err != nil {
+			return "", "", "", false, err
+		}
+	}
+	return strings.ToLower(name.text), lit.text, col, true, nil
 }
 
 func (p *parser) parseDropTable() (Statement, error) {
@@ -4606,6 +4669,7 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"TRUE": "FALSE", "FALSE": "TRUE",
 		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@", "&&": "NOT &&", "NOT &&": "&&",
 		"?": "NOT ?", "NOT ?": "?", "?|": "NOT ?|", "NOT ?|": "?|", "?&": "NOT ?&", "NOT ?&": "?&",
+		"@@": "NOT @@", "NOT @@": "@@",
 		"LIKE": "NOT LIKE", "NOT LIKE": "LIKE", "ILIKE": "NOT ILIKE", "NOT ILIKE": "ILIKE",
 		"SIMILAR TO": "NOT SIMILAR TO", "NOT SIMILAR TO": "SIMILAR TO",
 		"~": "!~", "!~": "~", "~*": "!~*", "!~*": "~*",
@@ -4675,7 +4739,7 @@ func (p *parser) parseExistsCond() (Comparison, bool, error) {
 
 func isCmpOp(op string) bool {
 	switch op {
-	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&":
+	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&", "@@":
 		return true
 	}
 	return false

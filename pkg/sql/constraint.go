@@ -387,6 +387,10 @@ func sampleRow(d *catalog.TableDescriptor) map[catalog.ColumnID]types.Datum {
 			v = types.NewDate(0)
 		case types.Jsonb:
 			v = types.NewJsonb("{}")
+		case types.Tsvector:
+			v = types.Datum{Fam: types.Tsvector, S: "'x'"}
+		case types.Tsquery:
+			v = types.Datum{Fam: types.Tsquery, S: "'x'"}
 		case types.IntervalFam:
 			v = types.NewInterval(types.Interval{Days: 1})
 		case types.Time:

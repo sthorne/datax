@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
@@ -34,6 +35,8 @@ const (
 	Time               // TIME: nanoseconds since midnight (in I)
 	Array              // the base of an array family: ArrayOf(elem) = Array | elem<<8 (elements in A)
 	Enum               // a user-defined enum: the label's ordinal (in I) and the label (in S)
+	Tsvector           // TSVECTOR: the canonical text of a text-search vector (in S)
+	Tsquery            // TSQUERY: the canonical text of a text-search query (in S)
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
@@ -70,6 +73,10 @@ func (f Family) String() string {
 		return "TIME"
 	case Enum:
 		return "ENUM"
+	case Tsvector:
+		return "TSVECTOR"
+	case Tsquery:
+		return "TSQUERY"
 	}
 	return "UNKNOWN"
 }
@@ -128,6 +135,10 @@ func ParseType(name string) (Family, error) {
 		return IntervalFam, nil
 	case "TIME":
 		return Time, nil
+	case "TSVECTOR":
+		return Tsvector, nil
+	case "TSQUERY":
+		return Tsquery, nil
 	}
 	return Unknown, fmt.Errorf("unsupported type %q", name)
 }
@@ -192,6 +203,31 @@ func NewDecimal(canonical string) Datum { return Datum{Fam: Decimal, S: canonica
 // NewJsonb holds NORMALIZED compact JSON text (callers must normalize via
 // ParseJSONB — sorted object keys, no insignificant whitespace).
 func NewJsonb(normalized string) Datum { return Datum{Fam: Jsonb, S: normalized} }
+
+// NewTsvector holds a text-search vector as its canonical text (sorted
+// lexemes, sorted positions): two equal vectors have equal text.
+func NewTsvector(v tsearch.Vector) Datum { return Datum{Fam: Tsvector, S: v.String()} }
+
+// NewTsquery holds a text-search query as its canonical text.
+func NewTsquery(q tsearch.Query) Datum { return Datum{Fam: Tsquery, S: q.String()} }
+
+// ParseTsvector parses a tsvector literal into its datum.
+func ParseTsvector(s string) (Datum, error) {
+	v, err := tsearch.ParseVector(s)
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewTsvector(v), nil
+}
+
+// ParseTsquery parses a tsquery literal into its datum.
+func ParseTsquery(s string) (Datum, error) {
+	q, err := tsearch.ParseQuery(s)
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewTsquery(q), nil
+}
 
 // timestampFormats are the accepted TIMESTAMPTZ input layouts (a bare
 // timestamp is UTC).
@@ -338,7 +374,9 @@ func ParseJSONB(s string) (Datum, error) {
 
 // IsIndexable reports whether the family has an order-preserving key
 // encoding (usable in primary keys and indexes).
-func IsIndexable(f Family) bool { return f != Jsonb && f != Unknown && !f.IsArray() }
+func IsIndexable(f Family) bool {
+	return f != Jsonb && f != Tsvector && f != Tsquery && f != Unknown && !f.IsArray()
+}
 
 // DecimalVal parses the canonical form back out of a Decimal datum.
 func (d Datum) DecimalVal() (decimal.Dec, error) {
@@ -444,6 +482,10 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		return NewFloat(v.Float64()), nil
 	case d.Fam == String && target == Jsonb:
 		return ParseJSONB(d.S)
+	case d.Fam == String && target == Tsvector:
+		return ParseTsvector(d.S)
+	case d.Fam == String && target == Tsquery:
+		return ParseTsquery(d.S)
 	case d.Fam == String && target == IntervalFam:
 		iv, err := ParseInterval(d.S)
 		if err != nil {
@@ -548,6 +590,12 @@ func (d Datum) Compare(o Datum) (int, error) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("JSONB values have no order")
+	case Tsvector, Tsquery:
+		// Equality by canonical text, like JSONB.
+		if d.S == o.S {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("%s values have no order", d.Fam)
 	}
 	return 0, fmt.Errorf("cannot compare %s values", d.Fam)
 }
@@ -669,7 +717,7 @@ func (d Datum) Text() string {
 			return padDecimalScale(d.S, d.Dscale)
 		}
 		return d.S // canonical text IS the wire text
-	case Jsonb:
+	case Jsonb, Tsvector, Tsquery:
 		return d.S // normalized text IS the wire text
 	case IntervalFam:
 		return d.IntervalVal().String()

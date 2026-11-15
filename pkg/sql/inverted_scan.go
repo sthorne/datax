@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -10,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
@@ -18,10 +20,11 @@ import (
 // The planner asks each public inverted index of the table what the
 // WHERE clause says about its column, as an inverted.Expr: a tree of
 // AND/OR over element lookups. The operators that can say anything are
-// the index kind's business (for JSONB: @>, ?, ?| and ?&, with the
-// column alone on the left and a value known before any row is read on
-// the right); the shape of the clause is handled here, the same for
-// every kind:
+// the index kind's business (for JSONB: @>, ?, ?| and ?&; for text
+// search: @@), with the column alone on the left — or, for a kind that
+// indexes a function of its column, that function of it (invertedLHS) —
+// and a value known before any row is read on the right; the shape of
+// the clause is handled here, the same for every kind:
 //
 //   - the top-level conjuncts are ANDed, and a conjunct the index cannot
 //     use is simply left out (fewer terms admit more rows, never fewer);
@@ -85,11 +88,7 @@ func invertedExprFor(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor
 			terms = append(terms, inverted.Or(branches...))
 			continue
 		}
-		if cmp.Column == "" || cmp.Expr != nil || len(cmp.Path) > 0 {
-			continue
-		}
-		col, ok := desc.Col(cmp.Column)
-		if !ok || col.ID != idx.ColumnIDs[0] {
+		if !invertedLHS(desc, idx, kind, cmp) {
 			continue
 		}
 		// The value must be known without a row: a column reference on
@@ -106,6 +105,49 @@ func invertedExprFor(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor
 		terms = append(terms, e)
 	}
 	return inverted.And(terms...), nil
+}
+
+// invertedLHS reports whether the conjunct's left-hand side is what the
+// index holds the elements of: the indexed column itself, or — for a
+// kind that indexes a function of the column — exactly that function of
+// it, with its constant argument (to_tsvector('english', body); a call
+// that named no configuration has had the session's default written in
+// by now).
+func invertedLHS(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, kind inverted.Kind, cmp parser.Comparison) bool {
+	column := cmp.Column
+	if c, ok := kind.(inverted.Computed); ok {
+		if fn, arg := c.Computes(); fn != "" {
+			e := cmp.Expr
+			if e == nil || e.Func != fn || len(e.Args) != 2 || e.Left != nil || e.BinOp != "" || e.Cast != "" || len(e.Path) > 0 {
+				return false
+			}
+			cfg, col := e.Args[0], e.Args[1]
+			if cfg.Lit == nil || cfg.Lit.Null || cfg.BinOp != "" || !sameTextSearchConfig(cfg.Lit.Text(), arg) {
+				return false
+			}
+			if col.Column == "" || col.BinOp != "" || col.Cast != "" || len(col.Path) > 0 || col.Left != nil {
+				return false
+			}
+			column = col.Column
+			if i := strings.LastIndexByte(column, '.'); i >= 0 {
+				column = column[i+1:]
+			}
+			c, ok := desc.Col(column)
+			return ok && c.ID == idx.ColumnIDs[0]
+		}
+	}
+	if column == "" || cmp.Expr != nil || len(cmp.Path) > 0 {
+		return false
+	}
+	col, ok := desc.Col(column)
+	return ok && col.ID == idx.ColumnIDs[0]
+}
+
+// sameTextSearchConfig: the name a statement wrote resolves to the
+// configuration the index was built with.
+func sameTextSearchConfig(written, indexed string) bool {
+	cfg, err := tsearch.LookupConfig(written)
+	return err == nil && cfg.Name == indexed
 }
 
 // pickInverted finds the inverted index that serves the WHERE clause:
@@ -155,33 +197,53 @@ const invertedScanPage = 4096
 func (s *Session) executeInvertedScan(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
 	noteIndexScan(desc, plan.idx.ID)
 	entries := 0
-	scan := func(element []byte, max int) ([][]byte, error) {
+	scan := func(element []byte, prefix bool, max int) ([][]byte, bool, error) {
 		start, end := rowenc.InvertedElementSpan(desc, plan.idx, element)
-		// Every key in the span is start followed by the row's encoded
-		// primary key.
+		if prefix {
+			start, end = rowenc.InvertedPrefixSpan(desc, plan.idx, element)
+		}
+		// Every key in an element's span is start followed by the row's
+		// encoded primary key. A prefix span holds many elements, so
+		// each key is split where its own element ends.
 		at := len(start)
 		var refs [][]byte
 		cursor := start
 		for {
 			page := int64(invertedScanPage)
-			if max > 0 && int64(max-len(refs)) < page {
-				page = int64(max - len(refs))
+			if max > 0 && int64(max+1-len(refs)) < page {
+				// One past the limit tells "exactly max" from "more".
+				page = int64(max + 1 - len(refs))
 			}
 			kvs, err := txn.Scan(ctx, cursor, end, page)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			for _, kv := range kvs {
-				refs = append(refs, kv.Key[at:])
+				if !prefix {
+					refs = append(refs, kv.Key[at:])
+					continue
+				}
+				_, ref, err := rowenc.InvertedEntryElement(desc, plan.idx, kv.Key)
+				if err != nil {
+					return nil, false, err
+				}
+				refs = append(refs, ref)
 			}
 			entries += len(kvs)
 			// The references are held until the rows are fetched: they
 			// count against the statement's memory like rows do.
 			if err := s.charge(int64(len(kvs)) * int64(24+len(desc.PrimaryKey)*9)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			if int64(len(kvs)) < page || (max > 0 && len(refs) >= max) {
-				return refs, nil
+			more := max > 0 && len(refs) > max
+			if int64(len(kvs)) < page || more {
+				if more {
+					refs = refs[:max]
+				}
+				if prefix {
+					refs = inverted.SortDedup(refs)
+				}
+				return refs, more, nil
 			}
 			cursor = kvs[len(kvs)-1].Key.Next()
 		}

@@ -2,7 +2,7 @@
 
 <!-- Generated from pkg/sql/builtins by `go generate ./pkg/sql/builtins`; do not edit by hand. -->
 
-Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`) and casts are described in [the SQL reference](sql.md#reading).
+Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`) and casts are described in [the SQL reference](sql.md#reading).
 
 ## Conditionals
 
@@ -97,6 +97,22 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `jsonb_strip_nulls(jsonb) → jsonb` — The document with every object field whose value is null removed. *immutable*
 - `jsonb_typeof(jsonb) → text` (also `json_typeof`) — object, array, string, number, boolean or null. *immutable*
 - `to_jsonb(any) → jsonb` (also `to_json`) — The value as jsonb: text becomes a JSON string, numbers and booleans themselves, jsonb stays. *immutable*
+
+## Full-text search
+
+- `get_current_ts_config() → text` — The session's default text-search configuration (default_text_search_config). *stable*
+- `numnode(tsquery) → int8` — numnode(tsquery): the number of lexemes and operators in the query; 0 for a query that reduced to nothing (only stop words). *immutable*
+- `phraseto_tsquery(text, [text]) → tsquery` — phraseto_tsquery([config,] text): a tsquery requiring the words of the text in that order (joined by <->, wider where stop words were dropped). *stable*
+- `plainto_tsquery(text, [text]) → tsquery` — plainto_tsquery([config,] text): a tsquery requiring every word of the text (the words normalized and joined by &); punctuation and operators in the text mean nothing. *stable*
+- `setweight(tsvector, text) → tsvector` — setweight(tsvector, weight): the vector with every position labelled A, B, C or D, for ranking the parts of a document differently (a title A, a body D). *immutable*
+- `strip(tsvector) → tsvector` — strip(tsvector): the vector without positions and weights — smaller, still matched by & | !, never by a phrase. *immutable*
+- `to_tsquery(text, [text]) → tsquery` — to_tsquery([config,] text): a tsquery from its text form — words joined by & (and), | (or), ! (not) and <-> or <N> (followed by), with parentheses, word:* for a prefix and word:AB for weights — each word normalized by the configuration; stop words are dropped. *stable*
+- `to_tsvector(text, [text]) → tsvector` — to_tsvector([config,] text): the text reduced to a tsvector — its lexemes under the configuration (simple or english; default_text_search_config when omitted), each with the positions it occurs at. *stable*
+- `ts_headline(any, any, [any], [any]) → text` — ts_headline([config,] document, tsquery [, options]): a fragment of the document with the query's words marked. options is 'Name=value, ...' with StartSel and StopSel (<b> and </b>), MaxWords (35), MinWords (15) and HighlightAll (false); ShortWord, MaxFragments and FragmentDelimiter are accepted and ignored. With three arguments the first is the configuration unless the second is a tsquery value. *stable*
+- `ts_rank(any, any, [any], [any]) → float8` — ts_rank([weights,] tsvector, tsquery [, normalization]): a relevance score from how often the query's lexemes occur in the vector and, for a query that requires them together, how near each other. weights is an array of four numbers scoring D, C, B and A positions ({0.1, 0.2, 0.4, 1.0} by default); normalization is a bit mask (1 divides by 1 + log of the document length, 2 by the length, 8 by the number of unique words, 16 by 1 + its log, 32 by the rank + 1). *immutable*
+- `ts_rank_cd(any, any, [any], [any]) → float8` — ts_rank_cd([weights,] tsvector, tsquery [, normalization]): cover density ranking — a score from the shortest stretches of the document that satisfy the query, higher the fewer other words they hold. Arguments as ts_rank; normalization 4 also divides by the mean harmonic distance between the stretches. Needs positions: a stripped vector scores as if every word stood at one place. *immutable*
+- `tsvector_to_array(tsvector) → text[]` — tsvector_to_array(tsvector): the vector's lexemes, sorted, as a text array. *immutable*
+- `websearch_to_tsquery(text, [text]) → tsquery` — websearch_to_tsquery([config,] text): a tsquery from search-box syntax — words are required, "quoted text" is a phrase, or separates alternatives and -word excludes; never raises a syntax error. *stable*
 
 ## Session and system
 

@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -44,6 +45,9 @@ import (
 func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDescriptor) (inverted.Kind, error) {
 	switch t.Using {
 	case "", "btree":
+		if t.ExprFunc != "" {
+			return nil, newErrf(CodeFeatureNotSupported, "indexes on expressions are not supported, except USING GIN (to_tsvector('config', column))")
+		}
 		for i, oc := range t.OpClasses {
 			if oc != "" {
 				return nil, newErrf(CodeFeatureNotSupported, "operator class %q is not supported for column %q of an ordinary index", oc, t.Columns[i])
@@ -67,6 +71,24 @@ func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDesc
 	if !ok {
 		return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.Columns[0])
 	}
+	if t.ExprFunc != "" {
+		// The one expression an index can be built on: the lexemes of a
+		// text column under a named configuration. It is stored as an
+		// inverted kind of its own over the column (pkg/sql/inverted),
+		// and serves predicates written with the same expression.
+		if t.ExprFunc != "to_tsvector" {
+			return nil, newErrf(CodeFeatureNotSupported, "indexes on expressions are not supported, except USING GIN (to_tsvector('config', column))")
+		}
+		cfg, err := tsearch.LookupConfig(t.ExprArg)
+		if err != nil {
+			return nil, newErrf(CodeUndefinedObject, "%v", err)
+		}
+		kind, _ := inverted.Lookup(inverted.TextSearchKindName(cfg.Name))
+		if col.Type != kind.Family() {
+			return nil, newErrf(CodeFeatureNotSupported, "to_tsvector(config, column) indexes a TEXT column; %q is %s", col.Name, col.Type)
+		}
+		return kind, nil
+	}
 	opclass := ""
 	if len(t.OpClasses) > 0 {
 		opclass = t.OpClasses[0]
@@ -79,17 +101,36 @@ func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDesc
 	}
 	if opclass != "" {
 		kind, ok := inverted.Lookup(opclass)
+		if ok && isComputedKind(kind) {
+			// Reached only through its expression, never by name.
+			ok = false
+		}
 		if !ok {
 			return nil, newErrf(CodeUndefinedObject, "operator class %q does not exist for access method \"gin\"", opclass)
 		}
 		return kind, nil
 	}
 	for _, name := range inverted.Names() {
-		if kind, _ := inverted.Lookup(name); kind.Family() == col.Type {
+		if kind, _ := inverted.Lookup(name); kind.Family() == col.Type && !isComputedKind(kind) {
 			return kind, nil
 		}
 	}
-	return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot have a GIN index (JSONB columns can)", col.Name, col.Type)
+	if col.Type == types.String {
+		return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s has no GIN index of its own: for full-text search, index to_tsvector('english', %s)", col.Name, col.Type, col.Name)
+	}
+	return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot have a GIN index (JSONB and TSVECTOR columns can)", col.Name, col.Type)
+}
+
+// isComputedKind: the kind indexes a function of its column (see
+// inverted.Computed), so it is chosen by that expression and not by the
+// column's type or an operator class.
+func isComputedKind(kind inverted.Kind) bool {
+	c, ok := kind.(inverted.Computed)
+	if !ok {
+		return false
+	}
+	fn, _ := c.Computes()
+	return fn != ""
 }
 
 // backfillChunkSize bounds each backfill chunk: rows scanned, KV batch
@@ -140,7 +181,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 				return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 			}
 			if kind == nil && !types.IsIndexable(col.Type) {
-				if col.Type == types.Jsonb {
+				if col.Type == types.Jsonb || col.Type == types.Tsvector {
 					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
 				}
 				return newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
@@ -248,20 +289,27 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 // entries are always derived from rows that exist at the chunk's commit —
 // no resurrection of concurrently deleted rows. Refresh spans stay one
 // chunk wide, so writes elsewhere in the table never restart a chunk.
+//
+// Before any of that the index is emptied (clearDrainEntries): what it
+// holds when the drain ends is not to be trusted.
 func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint64) error {
-	boundary := s.db.Clock().Now()
-
+	var tableID uint64
 	var cursor, end keys.Key
 	if err := s.db.RunTxn(ctx, "create-index-plan", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}
+		tableID = desc.ID
 		cursor, end = rowenc.PrimarySpanFor(desc)
 		return nil
 	}); err != nil {
 		return err
 	}
+	if err := s.clearDrainEntries(ctx, tableID, indexID); err != nil {
+		return err
+	}
+	boundary := s.db.Clock().Now()
 	for {
 		plan, err := s.db.ScanAt(ctx, cursor, end, backfillChunkSize, boundary)
 		if err != nil {
@@ -286,6 +334,59 @@ func (s *Session) backfillIndex(ctx context.Context, table string, indexID uint6
 			return nil
 		}
 		cursor = chunkEnd
+	}
+}
+
+// clearDrainEntries deletes every entry the index holds when the drain
+// of its write-only state has ended, in one pass over its span.
+//
+// While the drain waits, gateways adopt the index one by one, so for a
+// while some writers maintain it and some do not. A writer that does
+// writes a row's entries; a writer that does not may then change or
+// delete that row and leaves those entries where they are. Nothing
+// later would remove them: the backfill only adds what each row has,
+// and a writer only removes what it believes the row had. They would
+// stay as entries for rows that no longer hold the value — a row
+// returned for a value it does not have by a covering read, or "entry
+// points at a missing row" — so the index starts from nothing instead.
+//
+// After the drain every writer that can still commit maintains the
+// index, so no such entry is made from here on, and one pass is enough:
+// every stale entry already exists when the pass starts. The pass also
+// deletes good entries, and may delete one a writer has just written;
+// all of that is before the backfill's boundary, and the backfill then
+// writes every entry of every row as it reads it.
+func (s *Session) clearDrainEntries(ctx context.Context, tableID, indexID uint64) error {
+	// The keys are read outside the transaction that deletes them. Read
+	// inside it, they would be a span the transaction must find
+	// unchanged at commit, and under a stream of writers adding entries
+	// to that span it never would. Nothing needs the two to be one
+	// snapshot: a key written after the read is a live writer's, and a
+	// delete of a key rewritten since the read is one more deletion the
+	// backfill makes good.
+	const chunk = 256
+	lo, hi := keys.TableIndexSpan(tableID, indexID)
+	for {
+		kvs, err := s.db.Scan(ctx, lo, hi, chunk)
+		if err != nil {
+			return err
+		}
+		if len(kvs) == 0 {
+			return nil
+		}
+		if err := s.db.RunTxn(ctx, "create-index-clear", func(ctx context.Context, txn *kvclient.Txn) error {
+			var wb kvclient.WriteBatch
+			for _, kv := range kvs {
+				wb.Delete(kv.Key)
+			}
+			return txn.RunBatch(ctx, &wb)
+		}); err != nil {
+			return err
+		}
+		if len(kvs) < chunk {
+			return nil
+		}
+		lo = kvs[len(kvs)-1].Key.Next()
 	}
 }
 

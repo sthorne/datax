@@ -220,6 +220,18 @@ const (
 	// it cannot key. CREATE INDEX ... USING GIN is therefore refused
 	// until finalize (rule 4).
 	//
+	// V21 also introduces full-text search (issue #299, pkg/sql/tsearch):
+	// the column types TSVECTOR and TSQUERY (two new types.Family values
+	// and two new row value tags) and three more inverted kinds — one over
+	// a tsvector column, and one per text-search configuration over the
+	// lexemes of a text column. No descriptor field is new: the types are
+	// new values of a column's type and the kinds new values of
+	// IndexDescriptor.Inverted. A v20 node cannot decode a row holding
+	// either type and knows none of the kinds, so a statement that would
+	// give a table a column of either type is refused until finalize, as
+	// CREATE INDEX ... USING GIN already is (rule 4). The functions and
+	// the @@ operator write nothing and need no gate.
+	//
 	// V21 also introduces two things backups and restores rely on (issues
 	// #301, #302). Exports of every revision
 	// (kvpb.ExportRequest.AllRevisions): a v20 replica does not read the

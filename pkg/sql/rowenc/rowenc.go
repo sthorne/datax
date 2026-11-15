@@ -56,6 +56,10 @@ const (
 	// (self-delimiting for every scalar family).
 	tagArray byte = 14
 	tagEnum  byte = 15 // uvarint ordinal, uvarint length + label
+	// tagTsvector and tagTsquery: uvarint length + the value's canonical
+	// text, as JSONB is stored.
+	tagTsvector byte = 16
+	tagTsquery  byte = 17
 )
 
 // PrimaryKeyPrefix is the key prefix of a table's ORIGINAL primary rows
@@ -328,9 +332,13 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		case types.Float:
 			out = append(out, tagFloat)
 			out = binary.BigEndian.AppendUint64(out, math.Float64bits(d.F))
-		case types.String, types.Bytes, types.Decimal, types.Jsonb:
+		case types.String, types.Bytes, types.Decimal, types.Jsonb, types.Tsvector, types.Tsquery:
 			tag := tagString
 			switch col.Type {
+			case types.Tsvector:
+				tag = tagTsvector
+			case types.Tsquery:
+				tag = tagTsquery
 			case types.Bytes:
 				tag = tagBytes
 			case types.Decimal:
@@ -481,7 +489,7 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if known && col.Type == types.Float {
 				out[colID] = types.NewFloat(v)
 			}
-		case tagString, tagBytes, tagDecimal, tagJsonb:
+		case tagString, tagBytes, tagDecimal, tagJsonb, tagTsvector, tagTsquery:
 			var n uint64
 			var err error
 			rest, n, err = encoding.DecodeUvarint(rest)
@@ -498,6 +506,10 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 				want = types.Decimal
 			case tagJsonb:
 				want = types.Jsonb
+			case tagTsvector:
+				want = types.Tsvector
+			case tagTsquery:
+				want = types.Tsquery
 			}
 			if known && col.Type == want {
 				out[colID] = types.Datum{Fam: want, S: v}
@@ -691,6 +703,16 @@ func encodePKSuffix(desc *catalog.TableDescriptor, row map[catalog.ColumnID]type
 // in primary-key order.
 func InvertedElementSpan(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, element []byte) (start, end keys.Key) {
 	start = keys.Key(encoding.EncodeBytes(keys.TableIndexPrefix(desc.ID, idx.ID), element))
+	return start, start.PrefixEnd()
+}
+
+// InvertedPrefixSpan is the span holding the entries of every element
+// that starts with prefix. An element's key encoding is its bytes
+// (escaped) and then a terminator, so the elements sharing a prefix are
+// the keys sharing the prefix's encoding without its terminator.
+func InvertedPrefixSpan(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, prefix []byte) (start, end keys.Key) {
+	enc := encoding.EncodeBytes(keys.TableIndexPrefix(desc.ID, idx.ID), prefix)
+	start = keys.Key(enc[:len(enc)-2])
 	return start, start.PrefixEnd()
 }
 

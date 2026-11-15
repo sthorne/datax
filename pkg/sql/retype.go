@@ -78,7 +78,7 @@ func retypeAllowed(from, to types.Family) bool {
 		return to == types.IntervalFam
 	case types.String:
 		switch to {
-		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time:
+		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery:
 			return true
 		}
 	}
@@ -142,6 +142,9 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			}
 			widened = true
 			return s.cat.Update(ctx, txn, desc)
+		}
+		if err := s.requireTextSearchTypes(st.Type); err != nil {
+			return err
 		}
 		if !retypeAllowed(col.Type, st.Type) {
 			return newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.TypeSQL(), target.TypeSQL())

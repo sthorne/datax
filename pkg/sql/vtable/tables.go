@@ -276,7 +276,7 @@ func init() {
 				cat = "D"
 			case types.IntervalFam:
 				cat = "T"
-			case types.Bytes, types.Uuid, types.Jsonb:
+			case types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery:
 				cat = "U"
 			}
 			name := TypeName(f)

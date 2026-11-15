@@ -332,6 +332,13 @@ type CreateIndex struct {
 	// operator class, is parallel to Columns ("" = none for that column).
 	Using     string
 	OpClasses []string
+	// ExprFunc and ExprArg are set for the one expression an index may
+	// be built on, fn('constant', column) — in practice
+	// to_tsvector('english', body) under USING GIN. Columns then holds
+	// that one column. There are no expression indexes in general; the
+	// executor decides which functions it can index by.
+	ExprFunc string
+	ExprArg  string
 }
 
 // DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on

@@ -172,6 +172,16 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 						typ = types.ArrayOf(typ)
 					}
 				}
+				if cmp.Op == "@@" || cmp.Op == "NOT @@" {
+					// vector @@ $1: the parameter is the other of the
+					// two text-search types.
+					switch typ {
+					case types.Tsvector:
+						typ = types.Tsquery
+					case types.Tsquery:
+						typ = types.Tsvector
+					}
+				}
 				assign(cmp.Value, typ)
 				for _, v := range cmp.Values {
 					assign(v, typ)

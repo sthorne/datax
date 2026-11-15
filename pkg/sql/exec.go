@@ -307,6 +307,11 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err
 	}
+	for _, c := range desc.Columns {
+		if err := s.requireTextSearchTypes(c.Type); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		var ex *catalog.ErrTableExists
 		if t.IfNotExists {
@@ -2870,6 +2875,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			// decode as the default; NULLs written afterwards are stored
 			// explicitly so they stay NULL.
 			col.Default, col.FillDefault = &d, true
+		}
+		if err := s.requireTextSearchTypes(col.Type); err != nil {
+			return nil, err
 		}
 		desc.Columns = append(desc.Columns, col)
 		desc.NextColumnID++

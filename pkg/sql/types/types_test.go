@@ -133,3 +133,44 @@ func TestDecimalDscaleText(t *testing.T) {
 		}
 	}
 }
+
+// TestTextSearchTypes: the two text-search types hold their canonical
+// text, parse from text, compare for equality only, and are not keys.
+func TestTextSearchTypes(t *testing.T) {
+	for name, want := range map[string]Family{"tsvector": Tsvector, "TSQUERY": Tsquery} {
+		if f, err := ParseType(name); err != nil || f != want {
+			t.Errorf("ParseType(%q) = %v, %v", name, f, err)
+		}
+	}
+	if Tsvector.String() != "TSVECTOR" || Tsquery.String() != "TSQUERY" || IsIndexable(Tsvector) || IsIndexable(Tsquery) {
+		t.Error("names or indexability")
+	}
+	v, err := NewString("fat:2 cat:3A fat:1").Coerce(Tsvector)
+	if err != nil || v.Fam != Tsvector || v.Text() != "'cat':3A 'fat':1,2" {
+		t.Fatalf("text to tsvector: %+v, %v", v, err)
+	}
+	q, err := NewString("fat&( cat|rat )").Coerce(Tsquery)
+	if err != nil || q.Fam != Tsquery || q.Text() != "'fat' & ( 'cat' | 'rat' )" {
+		t.Fatalf("text to tsquery: %+v, %v", q, err)
+	}
+	for _, c := range []struct {
+		text string
+		fam  Family
+	}{{"a:", Tsvector}, {"a &", Tsquery}} {
+		if _, err := NewString(c.text).Coerce(c.fam); err == nil {
+			t.Errorf("%q was accepted as %s", c.text, c.fam)
+		}
+	}
+	// Two spellings of one vector are equal; there is no order.
+	same, _ := ParseTsvector("'cat':3A  fat:2,1")
+	if c, err := v.Compare(same); err != nil || c != 0 {
+		t.Errorf("equal vectors compare %d, %v", c, err)
+	}
+	other, _ := ParseTsvector("cat")
+	if _, err := v.Compare(other); err == nil {
+		t.Error("different vectors have an order")
+	}
+	if s, err := v.ConvertTo(String); err != nil || s.S != v.S {
+		t.Errorf("tsvector to text: %+v, %v", s, err)
+	}
+}
