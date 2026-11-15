@@ -99,6 +99,21 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   deletes the record. If the coordinator dies first, resolution happens lazily
   via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
+- A **commit that fails** — the refresh it needed failed, its deadline had
+  passed, a pusher had aborted it — aborts the record and resolves the
+  intents as aborted before the error is returned
+  (`Txn.abortFailedCommit`). Expiry is for coordinators that die; a live
+  coordinator that has given up says so at once. The abort is the
+  record's compare-and-set, so it cannot overrule a commit that did
+  apply (an ambiguous error): on a COMMITTED record it fails, and the
+  intents are left to the pushers, who read the verdict from the
+  record. Before issue #315 a failed commit only stopped the heartbeat,
+  and a SQL session's `ROLLBACK` after the failed `COMMIT` found the
+  transaction finished and did nothing, so the intents blocked their keys
+  until the record expired. On the bank workload (16 workers, 1,000
+  accounts) each such failure held its two accounts for up to five
+  seconds, and the transactions queued behind them, and behind those,
+  filled two thirds of the workers' time.
 
 ## Serializability: refresh, then retry
 

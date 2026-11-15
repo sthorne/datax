@@ -1340,6 +1340,14 @@ state or the internode protocol does, and an entry below says so.
   protocol version v22.
 
 ### Fixed
+- **A transaction whose commit failed kept its rows locked for up to five
+  seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
+  or its deadline had passed) stopped the transaction's heartbeat but left
+  its record pending and its intents in place, and the `ROLLBACK` that
+  followed found the transaction finished and did nothing, so everyone
+  who met one of its rows waited for the record to expire. The failed
+  commit now aborts the record and resolves its intents before it
+  returns.
 - **`'1 ms'::interval` was a minute** and `'1 us'` was refused: interval
   units were matched after a trailing "s" was taken off, so the
   abbreviations `ms` and `us` read as `m` and `u`. Both now mean what

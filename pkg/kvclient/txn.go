@@ -1203,13 +1203,51 @@ func (t *Txn) Commit(ctx context.Context) error {
 	})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
-		t.markFinished()
+		t.abortFailedCommit(ctx)
 		return err
 	}
 	t.markFinished()
 	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
 	return nil
+}
+
+// abortFailedCommit settles a commit that returned an error. Unless the
+// error was ambiguous the record is still PENDING (or STAGING), and the
+// transaction's intents still block every reader and writer of their
+// keys. The SQL session forgets the transaction on a failed COMMIT, and
+// a Rollback after it finds the transaction finished, so left alone the
+// intents would stay until the record expired — the heartbeat stops
+// with the transaction — and everyone queued behind them would wait out
+// kvserver.TxnExpiration (5s) for a transaction that had already given
+// up (issue #315). So the record is aborted here and the intents
+// resolved at once.
+//
+// The abort is the record's compare-and-set: it fails on a COMMITTED
+// record (an ambiguous commit that did apply), and a commit still in
+// flight cannot apply over the ABORTED record it leaves. The intents are
+// resolved as aborted only when the record says so; otherwise they are
+// left to the pushers that find them, which read the record's verdict.
+func (t *Txn) abortFailedCommit(ctx context.Context) {
+	t.mu.Lock()
+	anchored := t.mu.anchored
+	txn := t.mu.txn
+	t.mu.Unlock()
+	t.markFinished()
+	if !anchored {
+		return
+	}
+	// The commit may have failed because ctx did; the cleanup must not.
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	ba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
+	if _, kerr := t.db.Send(actx, ba); kerr != nil && kerr.TxnAborted == nil {
+		log.Debugf("aborting %s after its commit failed: %v (lazy resolution will cover)", txn.ID, kerr)
+		return
+	}
+	metrics.TxnAborts.Inc()
+	t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
 }
 
 // commit1PC attempts the one-phase fast path: when the deferred write
@@ -1437,13 +1475,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// Make the record's fate explicit before surfacing the error: a
 		// dangling STAGING record with all writes present would otherwise
 		// be RECOVERED AS COMMITTED, contradicting the error we return.
-		aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-		aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
-		if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
-			log.Debugf("aborting failed parallel commit of %s: %v", txn.ID, kerr)
-		}
-		t.markFinished()
-		t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+		t.abortFailedCommit(ctx)
 		if wbErr != nil {
 			return wbErr
 		}
@@ -1460,13 +1492,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// commit condition does not hold. Settle classically: refresh the
 		// reads to the writes' timestamp, then finalize at it.
 		if !t.maybeRefresh(ctx, writesTS) {
-			aba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-			aba.Add(&kvpb.EndTxnRequest{RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()}, Commit: false})
-			if _, kerr := t.db.Send(ctx, aba); kerr != nil && kerr.TxnAborted == nil {
-				log.Debugf("aborting unrefreshable parallel commit of %s: %v", txn.ID, kerr)
-			}
-			t.markFinished()
-			t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+			t.abortFailedCommit(ctx)
 			e := kvpb.NewErrorf("parallel commit of %s forwarded to %s and refresh failed", txn.ID, writesTS)
 			e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: writesTS}
 			metrics.TxnRetries.Inc()
@@ -1480,7 +1506,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		})
 		fbr, err := t.send(ctx, fba, true)
 		if err != nil {
-			t.markFinished()
+			t.abortFailedCommit(ctx)
 			return err
 		}
 		t.markFinished()
