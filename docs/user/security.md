@@ -296,6 +296,154 @@ records (`msg=audit`), each with the acting principal:
   and the current role (`role`, different after `SET ROLE`)
 - `datax debug unsafe-recover` (offline: records the OS user)
 
+## Audit table
+
+Once the cluster has finalized v21 the same records are also kept in the
+cluster, in the `datax_audit` system table: durable, readable with SQL,
+exportable, and built so that a record removed or changed afterwards
+shows. The log lines stay exactly as they were; the table is the copy
+that outlives a node's log rotation and can be handed to a reviewer.
+
+```sql
+SELECT at, node, principal, event, target, outcome, detail
+  FROM datax_audit WHERE at > now() - INTERVAL '1 day' ORDER BY at;
+```
+
+| column | |
+|---|---|
+| `node`, `seq` | the node that recorded it and the record's position in that node's chain (the primary key) |
+| `at` | when the event happened (not when it was written) |
+| `event` | the kind of record — the names the log uses: `role-ddl`, `privilege-ddl`, `sql-auth-failure`, `admin-op`, `admin-denied`, `unseal-share`, ... |
+| `principal` | who acted; `node:<id>` for the records the table writes about itself |
+| `target` | what it acted on: the role, table or database of a DDL statement, the op of an admin call, the path of an HTTP request |
+| `outcome` | `ok`, `failed` (authentication), `denied` (a refusal), or what the operation itself reported (`error`, `refused`, `accepted`, ...) |
+| `detail` | the record's remaining attributes, a JSON object |
+| `prev_hash`, `hash` | the hash of the node's previous record, and this record's own (SHA-256 over every other column) |
+
+**Who can read it.** Admins, and any role given the table by name:
+`GRANT SELECT ON datax_audit TO siem_export` (an admin grants it, and
+not `WITH GRANT OPTION`). The records name people and the addresses they
+connected from, so `read_all` does not include it.
+
+**Who can change it.** Nobody, through SQL. `INSERT`, `UPDATE`,
+`DELETE`, `TRUNCATE`, `DROP TABLE`, every `ALTER TABLE` but the one
+below, `CREATE INDEX`, a foreign key that references it, a change of
+owner, and any grant but `SELECT` are refused for every role — `root`
+and admins included — with `42501`. Only the nodes write it.
+
+**How long records are kept.** 90 days unless set otherwise:
+
+```sql
+ALTER TABLE datax_audit SET (retention = '400d');   -- admins; at least '1d'
+```
+
+The change is itself a record (`audit-retention-set`). Each node ages
+out the old end of its own chain (every ten minutes, a bounded number of
+records a pass), and before it removes anything it writes an
+`audit-retention` record saying which node's chain was cut and at which
+record. The chain of a node that has left the cluster is aged out by the
+node leading range 1.
+
+**What is never in it.** No call site passes a credential to the audit
+stream — a role's password, an unseal share, a backup key and a store
+key are not in the log either — and the table drops any attribute named
+like one as a second line of defence. It also holds no row values: the
+one place the log carries one (the boundary key of a manual split) is
+recorded in the table as `[not recorded]`. Statement text is not
+recorded at all; a DDL record is its kind and its target.
+
+**When the table cannot be written.** Recording an event never waits on
+the cluster and never fails the thing being recorded: the node writes
+the log line, puts the event in a buffer in memory (4096 events), and a
+background loop writes the buffer to the table, about once a second. A
+node that has lost quorum, or is partitioned, keeps what the buffer
+holds and writes it — in order, with the times the events happened —
+when it can. Past the buffer's bound events are dropped from the table
+(never from the log) and counted; the count becomes an `audit-gap`
+record when writing resumes. A node that is killed loses what its buffer
+held: the log is then the only record of those events, which is why the
+log lines stay.
+
+Refusals are the one kind of event a stranger can produce without
+limit, so they are bounded separately: repeats of the same refusal
+(same event, principal, address) within a flush become one record with
+a `count`, and distinct refusals are recorded at no more than 20 a
+second per node after a burst of 200; the rest are counted into the
+next `audit-gap` record as `suppressed`. The counters
+(`datax_auth_failures_total` and the others above) and the log see
+every one.
+
+`/api/security` reports the serving node's state under `audit`: the
+head of its chain, the events buffered, dropped and suppressed, and the
+last write error. The metrics are `datax_audit_records_total`,
+`datax_audit_buffered`, `datax_audit_dropped_total{cause}`,
+`datax_audit_write_errors_total` and `datax_audit_aged_out_total`.
+
+### Tamper evidence
+
+Each node keeps one chain: a record carries the hash of the node's
+previous record, and its own hash covers all of its columns. There is a
+chain per node rather than one for the cluster so that no node waits on
+another, or on a single hot row, to record an event, and so a node can
+go on recording into its buffer while partitioned.
+
+```sh
+datax debug audit export --url postgres://siem_export@db:26433/datax > audit.jsonl
+datax debug audit heads  --url ... > heads-2026-11-15.json    # keep this somewhere else
+datax debug audit verify --url ... --heads heads-2026-11-01.json
+datax debug audit verify --file audit.jsonl                   # no cluster needed
+```
+
+`export` writes every record as one JSON object per line (the columns
+above, with `at_us` — microseconds since the epoch — for the time).
+`verify` recomputes every hash and follows every link, from the cluster
+or from an export, and exits non-zero if anything is wrong. It finds:
+
+- a record **altered** (its hash no longer matches);
+- a record **removed** from inside a chain (a gap in `seq`), or from its
+  old end without an `audit-retention` record that accounts for it;
+- records **reordered** or replaced (a record's `prev_hash` is not its
+  predecessor's hash).
+
+The newest records of a chain can be removed without breaking any link.
+Three things catch that. The node itself remembers the head it last
+wrote, checks it on every write, and if the table no longer has it
+writes an `audit-chain-restart` record giving the head it lost before
+carrying on. The node leading range 1 writes every chain's head into its
+own chain every ten minutes (`audit-anchor`), and `verify` holds each
+chain to what the others recorded of it. And `verify --heads` holds the
+chains to heads you saved earlier.
+
+That last one matters, and here is the limit of the rest: the hashes
+are not keyed, so someone who can write the table's keys directly —
+which SQL allows nobody, but an operator with the node certificate and
+KV access can — could rewrite every chain from some point on,
+consistently, and `verify` against the table alone would pass. What they
+cannot rewrite is a head that has left the cluster. Export the heads on
+a schedule (`datax debug audit heads`, a few lines of JSON) to wherever
+your other audit evidence goes; verification against a saved head proves
+that every record up to it is the one that was there when it was saved.
+`verify` says which of the two it did.
+
+What happens to a chain:
+
+- **A node restart** continues it: the node reads its head from the
+  table and the next record follows it.
+- **A decommissioned node's** chain simply ends. It stays verifiable,
+  and ages out under the retention like any other.
+- **A restore** replaces the audit table with the backup's (backups
+  include it). Records the target cluster had written are removed from
+  the table — they remain in its nodes' logs — and each node then finds
+  that the head it remembers is gone and writes `audit-chain-restart`
+  before carrying on from the restored chain. Heads saved from the
+  source cluster up to the backup still verify.
+
+What the table does not record: the offline commands (`datax debug
+unsafe-recover`, `rotate-enc-key`, `enc-root`), which run with no
+cluster to write to and stay in the log of the machine they ran on;
+successful SQL logins and individual statements, which the audit log
+does not record either; and anything from before v21 was finalized.
+
 ## What secure mode does not do
 
 - No column- or row-level SQL privileges — grants are per table (or

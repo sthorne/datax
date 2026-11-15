@@ -780,6 +780,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
 		}
+		if _, bare := catalog.SplitTableName(at.Table); catalog.IsSealedSystemTable(bare) && !s.system {
+			return s.execSetAuditRetention(ctx, at)
+		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}

@@ -444,6 +444,32 @@ a restore into a cluster whose nodes have already created the table
 proceeds (the table sits at a reserved descriptor ID no user table can
 collide with, and a backup that carries it lands on top).
 
+## Audit table
+
+`datax_audit` is the other table the nodes write on their own account:
+every audit record, one hash chain per node. What it holds, who may
+read it and how to verify it are in [Security → Audit
+table](security.md#audit-table); what an operator needs to know:
+
+- **Volume.** A record is a few hundred bytes. An ordinary cluster
+  writes a handful an hour (DDL, role changes, admin operations,
+  sign-ins); a cluster under a password-guessing attack writes at most
+  20 refusal records a second per node, and usually far fewer because
+  repeats are folded. Writes are batched, one `INSERT` a second per node
+  at most.
+- **Retention.** 90 days by default; `ALTER TABLE datax_audit SET
+  (retention = '400d')` changes it (admins, at least a day). Ageing out
+  is done by the nodes, ten minutes apart, at most 10,000 records per
+  chain per pass.
+- **Backups** include the table. A restore replaces it: see the
+  security guide for what that does to the chains.
+- **Export the heads.** `datax debug audit heads` prints the last record
+  of every chain. Saved outside the cluster on a schedule, it is what
+  makes `datax debug audit verify --heads` proof against someone
+  rewriting the table underneath SQL.
+- **`--audit-table=false`** on `datax start` leaves the table alone on
+  that node; its audit records are then in its log only.
+
 ## Metrics worth alerting on
 
 Full list: scrape `/metrics`. The load-bearing ones:
@@ -476,6 +502,8 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
 | `datax_replica_gc_removed_total` | increasing | the housekeeping pass found replicas that `/meta` says are members of nothing — preseeds whose membership change never landed — and removed them with their data; expected after a refused replica change, otherwise worth a look at the log for which ranges |
 | `datax_raft_nonmember_messages_dropped_total` | increasing steadily | a replica id the range has moved past keeps sending — a removed replica that has not noticed, or a leftover replica GC has not yet collected (60 s grace) |
+| `datax_audit_write_errors_total`, `datax_audit_buffered` | errors increasing while the buffer grows | the node cannot write its audit records to `datax_audit` (no quorum, a partition, the table's range unavailable); they are in its log and wait in memory to be written — see `audit.last_error` in `/api/security` |
+| `datax_audit_dropped_total{cause="buffer-full"}` | increasing | the audit table has been unwritable for long enough that this node's buffer filled: these events are in the node's log only, and the table will carry an `audit-gap` record saying how many. `cause="rate"` is refusals (failed logins, denied calls) arriving faster than they are recorded — look at who is knocking |
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
@@ -807,6 +835,11 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v21 starts the audit table.** Until it is finalized audit records
+  are in the node logs only, as before; from finalize on every node also
+  writes them to `datax_audit` (see [Security → Audit
+  table](security.md#audit-table)). Records from before finalize are not
+  copied in.
 - **v20 makes manual splits sticky.** Until it is finalized `ALTER TABLE
   ... SPLIT AT` and `datax debug split` split as before and housekeeping
   may merge the ranges back; boundaries made before finalize are not

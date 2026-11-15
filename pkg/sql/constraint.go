@@ -211,6 +211,11 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err := mustBeReal(shared); err != nil {
 			return nil, nil, err
 		}
+		if catalog.IsSealedSystemTable(shared.Name) && !s.system {
+			// A reference would write the audit table's descriptor, and
+			// then stand in the way of its records ageing out.
+			return nil, nil, sealedTableError(shared.Name)
+		}
 		ref := desc // self-reference: one descriptor, written once
 		if shared.ID != desc.ID {
 			if shared.DatabaseID != desc.DatabaseID {

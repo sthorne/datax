@@ -154,6 +154,18 @@ type Config struct {
 	// node's metrics into the datax_metrics system table (see
 	// metrics_recorder.go). 0 = 10s; negative disables recording.
 	MetricsRecordInterval time.Duration
+	// AuditFlushInterval paces the loop that writes this node's audit
+	// events into the datax_audit system table (see audit_table.go).
+	// 0 = 1s; negative leaves the table alone, and audit records are in
+	// the log only.
+	AuditFlushInterval time.Duration
+	// AuditHousekeepingInterval paces the audit table's retention and
+	// anchoring; 0 = 10m.
+	AuditHousekeepingInterval time.Duration
+	// AuditRetention, when positive, overrides the retention stored with
+	// the table (ALTER TABLE datax_audit SET (retention = ...), which
+	// accepts nothing under a day). Tests only.
+	AuditRetention time.Duration
 	// StatsRefreshInterval paces the background statistics sampler: each
 	// tick, the node leading range 1 re-collects statistics for at most
 	// ONE table whose stats are missing or older than StatsStaleness
@@ -447,6 +459,9 @@ type Node struct {
 	// prefsReady is set once the datax_ui_prefs table is known to exist,
 	// so setting a preference does no DDL in the common case (issue #204).
 	prefsReady atomic.Bool
+	// audit is this node's writer for the datax_audit table (issue
+	// #293); nil when Config.AuditFlushInterval turns it off.
+	audit *auditTable
 	// metricsLastWarn rate-limits the recorder's write-failure warning
 	// (recorder goroutine only).
 	metricsLastWarn time.Time
@@ -476,6 +491,10 @@ func (n *Node) start() error {
 	if n.clock == nil {
 		n.clock = hlc.NewClock(nil, n.cfg.MaxOffset)
 	}
+	// First of all: a sealed start waits here for its shares before
+	// there is a store, and who gave them is exactly what the audit
+	// table is for. The events wait in memory until it can be written.
+	n.startAuditTable()
 
 	var err error
 	if paths := enc.SplitKeyPaths(n.cfg.EncKeyPath); len(paths) > 0 {
@@ -845,6 +864,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.auditLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {

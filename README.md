@@ -121,7 +121,10 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   endpoint takes HTTP Basic credentials of a database user — Prometheus
   `basic_auth` with the `metrics` role — or a client certificate.
   Authentication failures, denied and executed admin ops, and role and
-  privilege DDL are audit-logged with their principal. Insecure mode
+  privilege DDL are audit-logged with their principal, and kept in the
+  cluster in `datax_audit`: a table SQL can read and no role can change,
+  each node's records hash-chained and verifiable from outside
+  (`datax debug audit verify`). Insecure mode
   stays open, like pgwire trust auth.
 
 **User documentation** — installing, deploying, securing, and operating a
@@ -257,7 +260,7 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads are opt-in per statement — exact-timestamp `AS OF SYSTEM TIME` or bounded staleness `with_max_staleness('10s')` |
 | SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing (`@>` always filters — no inverted indexes — and is single-table only) |
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
-| Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
+| Ops | audit records signed or shipped off the cluster by the cluster itself (they are in the node's log and in the hash-chained `datax_audit` table; exporting the chain heads is the operator's job); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |
 | Backup | backup keys held by a KMS or an `--enc-root` root (a sealed backup, `--backup-key`, takes a key file); hiding a sealed backup's table count, table ids and file sizes; restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
 | Encryption | a KMS or HSM spoken to directly (an `exec` root reaches one through its command line; keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |

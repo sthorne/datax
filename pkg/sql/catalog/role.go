@@ -542,7 +542,14 @@ func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
 // everything, not read everything (issue #253). It is the table half of
 // the SQL authorizer's read question only: SQL also requires USAGE on
 // the table's schema, which this does not ask (issue #259).
+//
+// The audit table is the exception to read_all, here as in the SQL
+// authorizer: its records name people, so reading it takes an admin or
+// a SELECT grant on the table itself (issue #293).
 func CanReadTable(set RoleSet, d *TableDescriptor) bool {
+	if IsSealedSystemTable(d.Name) {
+		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
+	}
 	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
 		HasPrivilege(d.Privileges, set, "SELECT")
 }

@@ -102,6 +102,7 @@ func startCluster(t testing.TB, numNodes int, localities []string, opt func(*ser
 		}
 		cfg := server.Config{
 			MetricsRecordInterval: -1,               // off by default: tests own their range set; the metrics tests opt in
+			AuditFlushInterval:    -1,               // likewise: the audit table tests opt in
 			TruncationFlushAfter:  time.Millisecond, // a test's housekeeping call truncates at once
 			Listener:              listeners[i],
 			PGListener:            pglis,
@@ -182,6 +183,7 @@ func StartWithEngineOptions(t testing.TB, numNodes int, storageOpts storage.Opti
 	for i := 0; i < numNodes; i++ {
 		cfg := server.Config{
 			MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+			AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 			TruncationFlushAfter:  time.Millisecond,
 			Listener:              listeners[i],
 			Engine:                engines[i],
@@ -236,6 +238,7 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 	}
 	n, err := server.Start(server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		TruncationFlushAfter:  time.Millisecond,
 		Listener:              lis,
 		PGListener:            pglis,
@@ -261,6 +264,7 @@ func (tc *TestCluster) AddNodeErr(opts ...func(*server.Config)) (*server.Node, e
 	}
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		TruncationFlushAfter:  time.Millisecond,
 		Listener:              lis,
 		Join:                  tc.Nodes[0].Addr(),
@@ -292,6 +296,7 @@ func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*
 	}
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		Listener:              lis,
 		Engine:                eng,
 		RaftEngine:            tc.raftEngineFor(i, eng),
@@ -350,6 +355,7 @@ func tryStartDiskNode(t testing.TB, dir string, bootstrap bool, join string, opt
 	lis := listenerForDir(t, dir)
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		TruncationFlushAfter:  time.Millisecond,
 		Dir:                   dir,
 		Listener:              lis,
@@ -423,6 +429,7 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 	}
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		Listener:              lis,
 		Engine:                eng,
 		RaftEngine:            tc.raftEngineFor(i, eng),
@@ -468,6 +475,7 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 	}
 	cfg := server.Config{
 		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
 		Listener:              lis,
 		Engine:                eng,
 		RaftEngine:            tc.raftEngineFor(i, eng),

@@ -1113,6 +1113,14 @@ on it are refused. Admins may read and delete from it and set its
 `retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
 another user read it, and no grant lets a non-admin write to it.
 
+`datax_audit` is stricter. It is the cluster's audit record (see the
+security guide's "Audit table"): admins and roles granted `SELECT` on it
+read it, and no role — `root` and admins included — can `INSERT`,
+`UPDATE`, `DELETE`, `TRUNCATE`, `DROP` or `ALTER` it, index it, or
+reference it from a foreign key. The one statement it accepts is
+`ALTER TABLE datax_audit SET (retention = '<period>')`, from an admin,
+with a period of at least a day.
+
 ## Views
 
 ```sql

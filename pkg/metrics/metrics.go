@@ -296,6 +296,25 @@ var (
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
 	})
+	// The audit table (issue #293). A record that could not be written
+	// is never the caller's problem, so these are how an operator learns
+	// the table is behind the log.
+	AuditRecords = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_records_total", Help: "Audit records this node wrote to the datax_audit table.",
+	})
+	AuditDropped = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_audit_dropped_total",
+		Help: "Audit events this node did not write to the datax_audit table (they are in its log), by cause: buffer-full (the table could not be written for long enough to fill the buffer), rate (refusals — failed logins, denied calls — past the rate at which they are recorded).",
+	}, []string{"cause"})
+	AuditWriteErrors = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_write_errors_total", Help: "Failed writes to the datax_audit table; the events stay buffered and are retried.",
+	})
+	AuditBuffered = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "datax_audit_buffered", Help: "Audit events waiting to be written to the datax_audit table.",
+	})
+	AuditRetained = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_aged_out_total", Help: "Audit records this node removed from the datax_audit table because they were older than its retention.",
+	})
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
 	})
@@ -340,6 +359,9 @@ func init() {
 	// replaced was (issue #203 review).
 	for _, cause := range AuthThrottleCauses {
 		AuthThrottled.WithLabelValues(cause)
+	}
+	for _, cause := range []string{"buffer-full", "rate"} {
+		AuditDropped.WithLabelValues(cause)
 	}
 	for _, cause := range SQLPreAuthCauses {
 		SQLPreAuthClosed.WithLabelValues(cause)

@@ -175,6 +175,11 @@ type SecurityStatus struct {
 	// node's is on its own page; a cluster-wide sweep would be a fan-out
 	// this view does not make.
 	Stores []SecurityStore `json:"stores"`
+	// Audit is the serving node's audit table state (issue #293): the
+	// head of its chain, and whether it is keeping up. Open to any
+	// authenticated user, like the counters above: a hash and some
+	// counts name nobody.
+	Audit SecurityAudit `json:"audit"`
 	// Error notes a partial document; what is present is still valid.
 	Error string `json:"error,omitempty"`
 }
@@ -203,6 +208,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 	doc.ThrottledRateLimit = counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit))
 	doc.ThrottledVerifyRate = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate))
 	doc.ThrottledVerifyFull = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
+	doc.Audit = n.AuditStatus()
 	doc.AuthThrottled = doc.ThrottledRateLimit + doc.ThrottledVerifyRate + doc.ThrottledVerifyFull
 
 	// Certificates. The loaded material is operational and open; the

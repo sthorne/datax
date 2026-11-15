@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/audit"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -492,6 +493,52 @@ func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
+// MinAuditRetentionSeconds is the shortest retention the audit table
+// accepts. Retention is the one way records leave the table, so a
+// period of seconds would be a DELETE by another name; a day leaves the
+// change, which is itself recorded, time to be seen before anything
+// goes.
+const MinAuditRetentionSeconds = 24 * 3600
+
+// execSetAuditRetention is ALTER TABLE datax_audit SET (retention =
+// ...), the single change SQL may make to the audit table (issue #293):
+// admins only, nothing but the retention, and the change is an audit
+// record of its own. The table is not a timeseries table and the
+// storage layer's retention does not apply to it — the nodes age their
+// own chains out, each saying in its chain where it was cut — so the
+// period is only stored here for them to read.
+func (s *Session) execSetAuditRetention(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
+	if len(t.SetOptions) != 1 || t.SetOptions["retention"] == "" {
+		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention = ...) is allowed", t.Table)
+	}
+	secs, perr := parseRetention(t.SetOptions["retention"])
+	if perr != nil {
+		return nil, newErrf(CodeSyntaxError, "retention: %v", perr)
+	}
+	if secs < MinAuditRetentionSeconds {
+		return nil, newErrf(CodeInvalidParameterValue, "retention: audit records are kept for at least one day")
+	}
+	var before int64
+	err := s.db.RunTxn(ctx, "set-audit-retention", func(ctx context.Context, txn *kvclient.Txn) error {
+		if err := s.checkAdmin(ctx, txn); err != nil {
+			return err
+		}
+		shared, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return err
+		}
+		desc := shared.Clone()
+		before = desc.RetentionSeconds
+		desc.RetentionSeconds = secs
+		return s.cat.Update(ctx, txn, desc)
+	})
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	log.Audit(audit.EventRetentionSet, "target", catalog.AuditTableName, "seconds", secs, "was_seconds", before, "principal", s.sessionUser, "role", s.user)
+	return &Result{Tag: "ALTER TABLE"}, nil
+}
+
 // presplitTimeseries pre-carves a fresh timeseries table's key space:
 // splits at the table's span boundaries (so ranges rarely straddle the
 // table edge — the common case for per-table retention GC is then "range
@@ -775,7 +822,9 @@ func (s *Session) splitExpiration(e parser.Expr, params []types.Datum) (int64, e
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
-	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
+	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSealedSystemTable(bare) && !s.system {
+		return nil, sealedTableError(bare)
+	} else if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
 	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {

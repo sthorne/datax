@@ -297,7 +297,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|unsplit|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status|audit> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -317,6 +317,8 @@ func runDebug(args []string) error {
 		return runDebugPeerUnseal(rest)
 	case "profile":
 		return runDebugProfile(rest)
+	case "audit":
+		return runDebugAudit(rest)
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")

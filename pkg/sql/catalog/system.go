@@ -18,6 +18,9 @@ package catalog
 //   - datax_statement_shapes (issue #209) maps a fingerprint to the
 //     normalised shape it stands for — literals replaced, so it carries
 //     no data — which is what lets a chart of a fingerprint be read.
+//   - datax_audit (issue #293) is the audit table: every node's chain of
+//     audit records. Unlike the others it is sealed — see
+//     IsSealedSystemTable.
 
 // MetricsTableName is the reserved name of the metrics table.
 const MetricsTableName = "datax_metrics"
@@ -50,6 +53,14 @@ const (
 	StatementShapesTableID uint64 = 1<<40 + 3
 )
 
+// AuditTableName is the reserved name of the audit table and
+// AuditTableID its fixed descriptor ID, the next above
+// StatementShapesTableID (issue #293).
+const (
+	AuditTableName        = "datax_audit"
+	AuditTableID   uint64 = 1<<40 + 4
+)
+
 // systemTableIDs is every reserved name and the ID it is created at.
 // Adding an entry here is the whole registration: the DDL path assigns
 // the ID from it, and the privilege, rename, drop and backup rules read
@@ -59,6 +70,7 @@ var systemTableIDs = map[string]uint64{
 	PrefsTableName:           PrefsTableID,
 	ShapesMetricsTableName:   ShapesMetricsTableID,
 	StatementShapesTableName: StatementShapesTableID,
+	AuditTableName:           AuditTableID,
 }
 
 // SystemTableName is the reserved name whose table is created at id, or
@@ -101,4 +113,14 @@ func IsSystemTableID(id uint64) bool {
 		}
 	}
 	return false
+}
+
+// IsSealedSystemTable reports whether name is a system table that no
+// SQL session but the node's own may change in any way: not its rows,
+// not its shape, not its ownership — whatever role asks, root and
+// admins included. The other system tables are the cluster's but an
+// admin may still tidy them; an audit trail an admin can edit is not
+// one, so the audit table is held apart (issue #293).
+func IsSealedSystemTable(name string) bool {
+	return name == AuditTableName
 }

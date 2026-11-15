@@ -49,6 +49,7 @@ type serverFlags struct {
 	authTimeout   time.Duration
 	maxPending    int
 	metricsRecord time.Duration
+	auditTable    bool
 	drainTimeout  time.Duration
 }
 
@@ -82,6 +83,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication, HTTP request headers) before it is closed (0 = default 60s, negative = never)")
 	f.fs.IntVar(&f.maxPending, "sql-max-pending-auth", 0, "maximum SQL connections in the pre-authentication state; past it new connections are refused rather than held (0 = default 512, negative = no cap). Also the widest burst of concurrent password guesses one address can land at once, every one of which is charged: raising it past 600 lengthens how long a guessing address is held afterwards, and removing it removes that bound")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
+	f.fs.BoolVar(&f.auditTable, "audit-table", true, "also write this node's audit records to the datax_audit table (false: they are in its log only)")
 	f.fs.DurationVar(&f.drainTimeout, "drain-timeout", server.DefaultDrainTimeout, "on SIGTERM or Ctrl-C, how long to spend handing leases to peers and letting SQL connections finish before stopping (0 stops at once)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
@@ -119,6 +121,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		AuthTimeout:              f.authTimeout,
 		SQLMaxPendingAuth:        f.maxPending,
 		MetricsRecordInterval:    metricsRecordInterval(f.metricsRecord),
+		AuditFlushInterval:       auditFlushInterval(f.auditTable),
 		DrainTimeout:             f.drainTimeout,
 		RebalanceBytesThreshold:  f.bytesThr,
 		Dir:                      f.dir,
@@ -160,6 +163,15 @@ func parseBytes(s string) (int64, error) {
 		return 0, fmt.Errorf("unknown unit %q in %q", unit, s)
 	}
 	return int64(n * m), nil
+}
+
+// auditFlushInterval maps --audit-table onto the config's convention
+// (0 = the default pace, negative = off).
+func auditFlushInterval(on bool) time.Duration {
+	if on {
+		return 0
+	}
+	return -1
 }
 
 // metricsRecordInterval maps the flag (0 = off) onto the config's

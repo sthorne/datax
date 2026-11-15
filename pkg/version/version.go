@@ -189,9 +189,18 @@ const (
 	// (rule 4). The field itself is omitempty, so a descriptor written
 	// before v20 reads the same at either version.
 	V20 Version = 20
+	// V21 introduces the datax_audit system table (issue #293, see
+	// pkg/sql/catalog.AuditTableName): every node's hash-chained audit
+	// records, readable over SQL and writable by nobody. A v20 node
+	// knows nothing of the reservation and would treat the table as an
+	// ordinary one — its owner could delete from it or drop it, which
+	// is exactly what the table exists to rule out — so nothing creates
+	// it and audit records stay in the log alone before finalize
+	// (rule 4).
+	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.
-	Current = V20
+	Current = V21
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

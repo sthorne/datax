@@ -184,11 +184,23 @@ func (s *Session) checkOwner(ctx context.Context, txn *kvclient.Txn, kind, name,
 
 // checkTableOwner resolves a table or view and applies checkOwner.
 func (s *Session) checkTableOwner(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor) error {
+	if catalog.IsSealedSystemTable(desc.Name) && !s.system {
+		// Every statement that needs to own a table changes it or its
+		// descriptor. Refusing here, rather than statement by statement,
+		// is what keeps a DDL added later from being a way in.
+		return sealedTableError(desc.Name)
+	}
 	kind := "table"
 	if desc.IsView() {
 		kind = "view"
 	}
 	return s.checkOwner(ctx, txn, kind, desc.Name, desc.Owner)
+}
+
+// sealedTableError is the refusal every attempt to change a sealed
+// system table gets, whoever makes it.
+func sealedTableError(name string) *Error {
+	return newErrf(CodeInsufficientPriv, "table %q is the cluster's audit record: it is written by the nodes alone and cannot be changed through SQL by any role (ALTER TABLE %s SET (retention = ...) sets how long records are kept)", name, name)
 }
 
 // checkTableOwnerNoTxn is checkTableOwner for the online DDL paths that
@@ -215,6 +227,27 @@ func (s *Session) checkTableOwnerNoTxn(ctx context.Context, name string) *Error 
 // tablePrivAllowed reports whether the actor may exercise priv on the
 // table or view.
 func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) (bool, error) {
+	if sealed := catalog.IsSealedSystemTable(desc.Name); sealed && s.system {
+		return true, nil
+	} else if sealed {
+		// The audit table (issue #293). Nothing but reading it is open to
+		// any role, root and admins included — this sits above the root
+		// shortcut on purpose. Reading it takes an admin or a SELECT
+		// grant made for the purpose: the records name people and the
+		// addresses they came from, so the blanket read_all role does
+		// not reach it.
+		if priv != "SELECT" {
+			return false, nil
+		}
+		if s.actor() == catalog.RootRole {
+			return true, nil
+		}
+		set, err := s.roleSet(ctx, txn)
+		if err != nil {
+			return false, err
+		}
+		return set.IsAdmin() || catalog.HasPrivilege(desc.Privileges, set, priv), nil
+	}
 	if s.actor() == catalog.RootRole {
 		return true, nil
 	}
@@ -281,6 +314,9 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 		return err
 	}
 	if !ok {
+		if catalog.IsSealedSystemTable(desc.Name) && priv != "SELECT" {
+			return sealedTableError(desc.Name)
+		}
 		if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
 			return newErrf(CodeInsufficientPriv, "permission denied for table %q: only admins may %s it", desc.Name, priv)
 		}
@@ -576,6 +612,17 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 			}
 		}
 		for i, shared := range descs {
+			if catalog.IsSealedSystemTable(shared.Name) && !s.system {
+				// The audit table: SELECT is the only privilege that
+				// means anything on it, an admin the only one who hands
+				// it out, and a reader may not pass it on.
+				if len(privs) != 1 || privs[0] != "SELECT" || t.GrantOption {
+					return nil, newErrf(CodeInsufficientPriv, "only SELECT can be granted on table %q, and not WITH GRANT OPTION", shared.Name)
+				}
+				if err := s.checkAdmin(ctx, txn); err != nil {
+					return nil, err
+				}
+			}
 			ok, err := s.canGrantOn(ctx, txn, shared.Owner, shared.GrantOptions, privs)
 			if err != nil {
 				return nil, err

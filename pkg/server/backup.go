@@ -981,6 +981,11 @@ func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][
 	}
 	n.metricsPaused.Store(true)
 	defer n.metricsPaused.Store(false)
+	restoresAudit := false
+	for _, t := range final.Tables {
+		restoresAudit = restoresAudit || t.ID == catalog.AuditTableID
+	}
+	defer n.pauseAuditForRestore(ctx, restoresAudit)()
 
 	// Metadata from the final manifest: descriptors + namespace entries,
 	// users, admin markers — one small transaction.
