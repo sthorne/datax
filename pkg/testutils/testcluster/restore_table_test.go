@@ -711,3 +711,55 @@ func TestTableRestoreNeedsV21(t *testing.T) {
 		t.Fatalf("a plain incremental at v20: %v", err)
 	}
 }
+
+// TestTableRestoreCarriesNewerTableFeatures: a table with a GIN index, a
+// GC window of its own and row expiry comes back from a table restore
+// with all three, and the inverted index answers under the new table id
+// — its entries are keyed under the table like any index's, so re-keying
+// the table re-keys them.
+func TestTableRestoreCarriesNewerTableFeatures(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s)
+
+	execSQL(t, ctx, s, `CREATE TABLE docs (id INT8 PRIMARY KEY, doc JSONB, expires_at TIMESTAMPTZ)
+		WITH (gc_ttl = '2h', ttl_expiration = expires_at)`)
+	execSQL(t, ctx, s, `CREATE INDEX docs_gin ON docs USING GIN (doc)`)
+	for i := 0; i < 60; i++ {
+		execSQL(t, ctx, s, `INSERT INTO docs VALUES (`+itoa(i)+`, '{"kind": "k`+itoa(i%6)+`", "n": `+itoa(i)+`}', '2099-01-01 00:00:00Z')`)
+	}
+	want := rowsText(t, ctx, s, `SELECT id FROM docs WHERE doc @> '{"kind": "k3"}' ORDER BY id`)
+	if len(want) != 10 {
+		t.Fatalf("the source query returned %d rows, want 10", len(want))
+	}
+	dir := t.TempDir()
+	if _, err := tc.Nodes[0].RunBackup(ctx, dir, "", false, false); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if _, err := tc.Nodes[1].RunRestoreOpts(ctx, server.RestoreOptions{
+		Srcs: []string{dir}, Tables: []server.RestoreTable{{Name: "docs", Into: "docs_back"}},
+	}); err != nil {
+		t.Fatalf("table restore: %v", err)
+	}
+	rs := sql.NewSession(tc.Nodes[2].DB(), catalog.NewAccessor())
+	execSQL(t, ctx, rs, `SET inverted_index_scan = on`)
+	requireSameRows(t, "containment through the restored GIN index",
+		rowsText(t, ctx, rs, `SELECT id FROM docs_back WHERE doc @> '{"kind": "k3"}' ORDER BY id`), want)
+	plan := strings.Join(rowsText(t, ctx, rs, `EXPLAIN SELECT id FROM docs_back WHERE doc @> '{"kind": "k3"}'`), "\n")
+	if !strings.Contains(plan, "inverted scan") {
+		t.Fatalf("the restored table's containment query does not use its GIN index:\n%s", plan)
+	}
+	// The index is maintained on the restored table.
+	execSQL(t, ctx, rs, `INSERT INTO docs_back VALUES (1000, '{"kind": "k3"}', '2099-01-01 00:00:00Z')`)
+	if got := rowsText(t, ctx, rs, `SELECT id FROM docs_back WHERE doc @> '{"kind": "k3"}' ORDER BY id`); len(got) != 11 {
+		t.Fatalf("after an insert the restored index finds %d rows, want 11", len(got))
+	}
+	def := strings.Join(rowsText(t, ctx, rs, `SHOW CREATE TABLE docs_back`), "\n")
+	for _, opt := range []string{"gc_ttl", "ttl_expiration"} {
+		if !strings.Contains(def, opt) {
+			t.Fatalf("the restored table lost its %s option:\n%s", opt, def)
+		}
+	}
+}

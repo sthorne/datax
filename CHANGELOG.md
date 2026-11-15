@@ -11,6 +11,39 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Restore a table, or a database, into a running cluster** (#301): `datax
+  restore --table db.t [--into name]` and `--database db [--into name]` bring
+  tables back from a backup chain beside what is there; nothing else is
+  touched. A restored table takes a new table id and its rows are re-keyed to
+  it (indexes, GIN indexes included, come back as stored, no backfill).
+  Everything is checked before anything is written; rows load in ordinary
+  transactions under an id nothing names, are read back against the backup's
+  checksum, and one transaction makes the tables visible, complete. A failed
+  restore removes its rows; one whose node died is cleaned up by a janitor on
+  any node (`restore-reclaim` in the operations view) and is run again, not
+  resumed. A name that exists is refused — there is no replace flag; drop and
+  rename with SQL. A foreign key to a table outside the restore is refused
+  unless `--drop-foreign-keys`. Owned sequences come back as new sequences;
+  grants come back for roles the cluster has. Views, enum columns into another
+  database, and tables backed up mid-schema-change are refused. Cluster
+  protocol version v21. See docs/user/operations.md, "Restoring a table into
+  a running cluster".
+- **Point-in-time restore** (#302): `datax backup --base … --revision-history`
+  keeps every version written since the base, and `datax restore --as-of
+  <time>` (RFC 3339 or Unix nanoseconds, the timestamp `AS OF SYSTEM TIME`
+  takes) restores to any moment of such an interval, or to exactly the end of
+  any backup in a chain — everything into an empty cluster, or chosen tables
+  into a running one. Transactions are restored whole or not at all. A moment
+  before the full backup, after the last backup, or inside an interval taken
+  without history is refused with what the chain restores to. A history
+  incremental must be taken within the GC TTL of its base and is refused
+  otherwise; nothing holds garbage collection back for a chain. Table
+  definitions, roles and sequences are kept as of each backup's end: a table
+  created or altered inside the interval restored into is refused. A history
+  backup's manifest has a new magic (`DXBK2`), which earlier binaries refuse;
+  plain backups are unchanged. Taking one needs cluster protocol version v21.
+  Sealed chains work the same. Backup and restore summaries print the
+  backup's timestamp, and for a history backup the version count per table.
 - **GIN indexes on JSONB columns** (#300). `CREATE INDEX name ON t USING GIN
   (doc)` builds an inverted index — one entry for every value in each
   document with the path to it, and one for every top-level key — and
