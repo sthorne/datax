@@ -7,7 +7,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,35 +57,7 @@ func runCatalogScanScale(t *testing.T, tables int) {
 	waitForDatabases(t, ctx, root)
 
 	start := time.Now()
-	const workers = 8
-	var wg sync.WaitGroup
-	errs := make(chan string, workers)
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			s := sql.NewSession(n.DB(), catalog.NewAccessor())
-			for i := w; i < tables; i += workers {
-				stmt := fmt.Sprintf(`CREATE TABLE scan_t_%05d (id INT8 PRIMARY KEY, v TEXT)`, i)
-				for attempt := 0; ; attempt++ {
-					_, serr := trySQL(ctx, s, stmt)
-					if serr == nil {
-						break
-					}
-					if serr.Code != sql.CodeSerializationFailure || attempt == 50 {
-						errs <- fmt.Sprintf("%s: [%s] %s", stmt, serr.Code, serr.Msg)
-						return
-					}
-				}
-			}
-		}(w)
-	}
-	wg.Wait()
-	select {
-	case e := <-errs:
-		t.Fatal(e)
-	default:
-	}
+	createScaleTables(t, ctx, n, "scan_t", tables)
 	execSQL(t, ctx, root, `CREATE TABLE scan_ttl (id INT8 PRIMARY KEY) WITH (gc_ttl = '1h')`)
 	execSQL(t, ctx, root, `CREATE VIEW scan_v AS SELECT id FROM scan_t_00000`)
 	t.Logf("scan[%d tables] created in %s", tables, time.Since(start).Round(time.Second))

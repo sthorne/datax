@@ -397,6 +397,23 @@ recorded, not an index nobody uses: a node with recording off, a
 workload whose cycle is longer than seven days, or a cluster younger
 than the window all leave a used index at zero.
 
+Once the cluster has finalized v22, the per-table and per-index series
+(`table.*`, `index.*`) are written only when they change — plus once
+every 60 ticks (ten minutes at the default interval) whatever happens,
+at a tick that depends on the series' name — rather than every tick: a
+cluster of thousands of mostly quiet tables otherwise wrote a row per
+table and two per index it had read, every tick, repeating the last
+values. A series that ends (its table dropped or renamed, its index
+dropped) gets one row with a NULL value, and every tick writes a
+`recorder.tick` row for each node it records for (node 0 too, on the
+leader of range 1). `/api/metrics` and the dashboard put the values
+back — at each `recorder.tick` without a row of its own, a series takes
+its last value, when that is no older than the 60-tick period and not
+NULL — so an idle table charts its value at every tick, as before, and
+a restart still shows as a gap. A plain SQL query sees the rows as
+written: to read an idle table's value at a moment, take the newest row
+at or before it, within the last ten minutes, and treat NULL as "ended".
+
 Statement shapes (`stmt.count{fp=…}`, `stmt.total_us{fp=…}`,
 `stmt.rows_scanned{fp=…}`, `stmt.retries{fp=…}`) are the fingerprint
 table's counters with a time dimension: every tick each node writes
@@ -426,7 +443,8 @@ ORDER BY at;
 ```
 
 Cost, bounded by construction: about 50 series per node every 10 s is
-5·N rows per second; a 3-node cluster writes 15 rows per second and
+5·N rows per second (plus, per tick, the table and index rows that
+changed and a sixtieth of the rest); a 3-node cluster writes 15 rows per second and
 keeps about 13 M rows at 7 days, tens of MB after compaction. The
 recorder writes through the SQL layer on the node's own KV client, under
 backpressure like any writer: when the store sheds writes it skips the

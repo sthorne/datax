@@ -328,6 +328,13 @@ const (
 	// datax_rotate_tenant_key, datax_destroy_old_key_versions and
 	// datax_remove_tenant_rows, all refused until finalize, and the job
 	// does not run before it.
+	//
+	// V22 also makes the metrics recorder write the per-table and
+	// per-index series only when they change, with a keyframe every 60
+	// ticks, a NULL row when a series ends and a recorder.tick marker
+	// per tick (issue #316, pkg/server/metrics_sparse.go). A v21 node's
+	// /api/metrics would chart the unwritten ticks as gaps, so the
+	// recorder writes every series every tick until finalize.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

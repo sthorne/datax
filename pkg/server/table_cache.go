@@ -57,6 +57,14 @@ type tableDescCache struct {
 // (nil when it has not, or there is none) and arranges for a missing or
 // aging one to be read.
 func (n *Node) tableDesc(id uint64) *catalog.TableDescriptor {
+	desc, _ := n.tableDescKnown(id)
+	return desc
+}
+
+// tableDescKnown is tableDesc, also saying whether the answer is known:
+// false for an ID the cache has not read yet (or has let go of), where
+// a nil descriptor means only "not read", not "no such table".
+func (n *Node) tableDescKnown(id uint64) (*catalog.TableDescriptor, bool) {
 	c := &n.tableDescs
 	now := time.Now()
 	c.mu.Lock()
@@ -90,9 +98,11 @@ func (n *Node) tableDesc(id uint64) *catalog.TableDescriptor {
 		// Not read yet. If the schema document has been built on this
 		// node it knows the table: someone who has just looked at the
 		// schema page sees the same names on the next page at once.
-		desc = n.schemaDescs()[id]
+		var known bool
+		desc, known = n.schemaDescs()[id]
+		return desc, known
 	}
-	return desc
+	return desc, true
 }
 
 // fetchTableDescs reads the pending IDs until there are none. A read

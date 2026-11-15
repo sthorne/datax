@@ -254,3 +254,24 @@ func (c *tableGaugeCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 }
+
+// TestingRefreshTableGauges takes a reading of the table gauges now and
+// waits for it to land, so a test need not wait out schemaCacheFor.
+func (n *Node) TestingRefreshTableGauges() {
+	for {
+		n.gauges.mu.Lock()
+		busy := n.gauges.refreshing
+		if busy == nil {
+			n.gauges.at = time.Time{}
+		}
+		n.gauges.mu.Unlock()
+		if busy != nil {
+			<-busy // a reading taken before the call may predate what the test did
+			continue
+		}
+		if ch := n.refreshTableGauges(); ch != nil {
+			<-ch
+		}
+		return
+	}
+}
