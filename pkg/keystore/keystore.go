@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -486,6 +487,42 @@ func (s *Store) GetByID(ctx context.Context, id int64) (Key, error) {
 	return out, err
 }
 
+// GetByIDs returns the metadata of the keys of ids that exist, read in
+// one transaction and one batch: what a gateway's cache checks the keys
+// it is using with (BatchSource).
+func (s *Store) GetByIDs(ctx context.Context, ids []int64) (map[int64]Key, error) {
+	d, err := s.desc(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	pks := make([]keys.Key, len(ids))
+	for i, id := range ids {
+		if pks[i], err = pkKey(d, id); err != nil {
+			return nil, err
+		}
+	}
+	out := map[int64]Key{}
+	err = s.cfg.DB.RunTxn(ctx, "keys-get-many", func(ctx context.Context, txn *kvclient.Txn) error {
+		clear(out)
+		vals, err := txn.GetBatch(ctx, pks)
+		if err != nil {
+			return err
+		}
+		for i, v := range vals {
+			if v == nil {
+				continue
+			}
+			r, err := decodeRow(d, pks[i], v)
+			if err != nil {
+				return err
+			}
+			out[r.ID] = r.Key
+		}
+		return nil
+	})
+	return out, err
+}
+
 // Get returns the metadata of the key named name.
 func (s *Store) Get(ctx context.Context, name string) (Key, error) {
 	d, err := s.desc(ctx, false)
@@ -612,7 +649,8 @@ func (s *Store) Unwrap(ctx context.Context, id int64, version int) (*Material, e
 }
 
 // update reads key id for update, lets change alter it, and writes it
-// back with its generation moved on.
+// back with its generation moved on. A change of the key's name moves
+// its entry in the name index.
 func (s *Store) update(ctx context.Context, name string, id int64, change func(r *row) error) (Key, error) {
 	d, err := s.desc(ctx, true)
 	if err != nil {
@@ -624,8 +662,14 @@ func (s *Store) update(ctx context.Context, name string, id int64, change func(r
 		if err != nil {
 			return err
 		}
+		was := r.Name
 		if err := change(r); err != nil {
 			return err
+		}
+		if r.Name != was {
+			if err := s.rename(ctx, txn, d, r, was); err != nil {
+				return err
+			}
 		}
 		if !r.ClusterKey.IsZero() {
 			if err := s.accept(ctx, txn, r.ClusterKey); err != nil {
@@ -711,14 +755,133 @@ func (s *Store) Enable(ctx context.Context, id int64) (Key, error) {
 	})
 }
 
+// rename moves key r's name index entry from was to r.Name, refusing a
+// name another key holds.
+func (s *Store) rename(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor, r *row, was string) error {
+	ie, err := r.indexEntry(d)
+	if err != nil {
+		return err
+	}
+	if v, err := txn.Get(ctx, ie.Key); err != nil {
+		return err
+	} else if v != nil {
+		return ErrExists
+	}
+	old := &row{Key: Key{ID: r.ID, Name: was}}
+	oe, err := old.indexEntry(d)
+	if err != nil {
+		return err
+	}
+	var wb kvclient.WriteBatch
+	wb.Delete(oe.Key)
+	wb.Put(ie.Key, ie.Value)
+	return txn.RunBatch(ctx, &wb)
+}
+
+// The names of tenant keys (issue #310, step 4). A per-tenant sealed
+// table's tenant keys are named TenantKeyPrefix, the table's seal id, a
+// slash, and a keyed digest of the tenant's value (pkg/sql/rowseal makes
+// the name; this package does not read it). A destroyed tenant key is
+// renamed DestroyedPrefix + its name + "/" + its id, so that the name is
+// free for the tenant's next key and so that the names of live tenant
+// keys — what a scan for a table's tenant keys reads — are not crowded
+// by tombstones.
+const (
+	TenantKeyPrefix = "tenant/"
+	DestroyedPrefix = "destroyed/"
+)
+
+// DestroyedName is the name a destroyed tenant key named name takes.
+func DestroyedName(name string, id int64) string {
+	return DestroyedPrefix + name + "/" + strconv.FormatInt(id, 10)
+}
+
+// PrefixEnd is the first name after every name that begins with prefix
+// (prefix with its last byte moved on): the end of a scan of KeysByName
+// for the prefix. An empty prefix or one of 0xff bytes has no end ("").
+func PrefixEnd(prefix string) string {
+	b := []byte(prefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xff {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return ""
+}
+
+// KeysByName returns the metadata of the keys whose names are in [from,
+// to), in name order, at most limit of them (limit > 0): a scan of the
+// name index, so that a caller looking for the keys of one table or one
+// tenant does not read every key.
+func (s *Store) KeysByName(ctx context.Context, from, to string, limit int) ([]Key, error) {
+	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
+	if err != nil || d == nil {
+		return nil, err
+	}
+	idx, err := nameIndex(d)
+	if err != nil {
+		return nil, err
+	}
+	lo, err := rowenc.EncodeIndexPrefix(d, idx, []types.Datum{types.NewString(from)})
+	if err != nil {
+		return nil, err
+	}
+	hi := keys.TableIndexPrefix(d.ID, idx.ID).PrefixEnd()
+	if to != "" {
+		if hi, err = rowenc.EncodeIndexPrefix(d, idx, []types.Datum{types.NewString(to)}); err != nil {
+			return nil, err
+		}
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	var out []Key
+	err = s.cfg.DB.RunTxn(ctx, "keys-by-name", func(ctx context.Context, txn *kvclient.Txn) error {
+		out = nil
+		ents, err := txn.Scan(ctx, lo, hi, int64(limit))
+		if err != nil {
+			return err
+		}
+		pks := make([]keys.Key, 0, len(ents))
+		for _, kv := range ents {
+			pk, err := rowenc.IndexEntryPrimaryKey(d, idx, kv.Key, kv.Value)
+			if err != nil {
+				return err
+			}
+			pks = append(pks, pk)
+		}
+		if len(pks) == 0 {
+			return nil
+		}
+		vals, err := txn.GetBatch(ctx, pks)
+		if err != nil {
+			return err
+		}
+		for i, v := range vals {
+			if v == nil {
+				continue
+			}
+			r, err := decodeRow(d, pks[i], v)
+			if err != nil {
+				return err
+			}
+			out = append(out, r.Key)
+		}
+		return nil
+	})
+	return out, err
+}
+
 // Destroy destroys key id: its state becomes destroyed and its material
 // is overwritten with nothing (the row stays, so the name is not given
-// to another key), and then the row's history is purged (the purge of
-// issue #295), so the material does not linger in older MVCC versions
-// until the GC window passes. The purge's report is returned; an
-// incomplete one can be completed by destroying again, which purges
-// again. Backups taken before stay as they were (the design's
-// "documented dependency").
+// to another key — except a tenant key's, which is renamed DestroyedName
+// so that its tenant's next write makes a fresh key), and then the row's
+// history is purged (the purge of issue #295), so the material does not
+// linger in older MVCC versions until the GC window passes. The purge's
+// report is returned; an incomplete one can be completed by destroying
+// again, which purges again. Backups taken before stay as they were (the
+// design's "documented dependency").
 func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, error) {
 	d, err := s.desc(ctx, false)
 	if err != nil {
@@ -726,6 +889,9 @@ func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, 
 	}
 	k, err := s.update(ctx, "keys-destroy", id, func(r *row) error {
 		r.State, r.versions, r.ClusterKey = StateDestroyed, nil, enc.ClusterKeyRef{}
+		if r.Kind == KindTenant && !strings.HasPrefix(r.Name, DestroyedPrefix) {
+			r.Name = DestroyedName(r.Name, r.ID)
+		}
 		return nil
 	})
 	if err != nil {
@@ -740,6 +906,90 @@ func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, 
 		return k, nil, fmt.Errorf("key %d is destroyed, but purging its history failed (destroy it again to retry the purge): %w", id, err)
 	}
 	return k, rep, nil
+}
+
+// destroyManyBatch is how many keys one transaction of DestroyMany
+// destroys.
+const destroyManyBatch = 100
+
+// DestroyMany destroys keys ids as Destroy does — tombstoned, a tenant
+// key renamed — destroyManyBatch to a transaction, and then purges the
+// history of the whole table's rows once, rather than once per key: a
+// purge forces a garbage collection and a compaction, which dominates
+// the cost of destroying a key, and a dropped per-tenant table may have
+// millions. Keys already destroyed, or gone, are skipped. It returns how
+// many keys it destroyed and the purge's report; should the purge fail,
+// the keys are destroyed and their material lingers in history until the
+// table's GC window passes or a later purge (another Destroy) removes it.
+//
+// spare, when given, runs in each batch's transaction before anything is
+// written, and returns which keys to leave alone: what a caller deciding
+// that keys are unused reads again there, so that the decision and the
+// destruction are one serializable transaction (a table restore that
+// marks the keys as wanted orders before or after it, never between).
+func (s *Store) DestroyMany(ctx context.Context, ids []int64, spare func(ctx context.Context, txn *kvclient.Txn) (func(Key) bool, error)) (int, *kvpb.PurgeReport, error) {
+	d, err := s.desc(ctx, false)
+	if err != nil {
+		return 0, nil, err
+	}
+	destroyed := 0
+	for at := 0; at < len(ids); at += destroyManyBatch {
+		batch := ids[at:min(at+destroyManyBatch, len(ids))]
+		var n int
+		err := s.cfg.DB.RunTxn(ctx, "keys-destroy-many", func(ctx context.Context, txn *kvclient.Txn) error {
+			n = 0
+			keep := func(Key) bool { return false }
+			if spare != nil {
+				var err error
+				if keep, err = spare(ctx, txn); err != nil {
+					return err
+				}
+			}
+			for _, id := range batch {
+				r, pk, err := s.read(ctx, txn, d, id, true)
+				if errors.Is(err, ErrNotFound) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				if r.State == StateDestroyed || keep(r.Key) {
+					continue
+				}
+				was := r.Name
+				r.State, r.versions, r.ClusterKey = StateDestroyed, nil, enc.ClusterKeyRef{}
+				if r.Kind == KindTenant && !strings.HasPrefix(r.Name, DestroyedPrefix) {
+					r.Name = DestroyedName(r.Name, r.ID)
+					if err := s.rename(ctx, txn, d, r, was); err != nil {
+						return err
+					}
+				}
+				r.Generation++
+				val, err := r.encode(d)
+				if err != nil {
+					return err
+				}
+				if err := txn.Put(ctx, pk, val); err != nil {
+					return err
+				}
+				n++
+			}
+			return nil
+		})
+		if err != nil {
+			return destroyed, nil, err
+		}
+		destroyed += n
+	}
+	if destroyed == 0 {
+		return 0, nil, nil
+	}
+	lo, hi := keys.TableDataSpan(d.ID)
+	rep, err := s.cfg.DB.Purge(ctx, lo, hi)
+	if err != nil {
+		return destroyed, nil, fmt.Errorf("%d keys are destroyed, but purging their history failed: %w", destroyed, err)
+	}
+	return destroyed, rep, nil
 }
 
 // ListIn returns every key's metadata, in id order, read in txn.

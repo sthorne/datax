@@ -52,18 +52,68 @@ const (
 )
 
 // checkSealOptions validates a CREATE TABLE's sealing options against
-// desc before the table is created, and reports whether it is to be
-// sealed.
-func (s *Session) checkSealOptions(ctx context.Context, desc *catalog.TableDescriptor, options map[string]string) (bool, error) {
-	if _, ok := options[optEncryptionKeyBy]; ok {
-		return false, newErrf(CodeFeatureNotSupported, "per-tenant keys (encryption_key_by) are not built yet: seal the whole table with encryption_key = 'auto'")
+// desc, whose primary key will be pkNames, before the table is created,
+// and reports whether it is to be sealed and, for a table sealed per
+// tenant, the tenant column (encryption_key_by).
+func (s *Session) checkSealOptions(ctx context.Context, desc *catalog.TableDescriptor, options map[string]string, pkNames []string) (bool, catalog.ColumnID, error) {
+	by, perTenant := options[optEncryptionKeyBy]
+	v, whole := options[optEncryptionKey]
+	if !perTenant && !whole {
+		return false, 0, nil
 	}
-	v, ok := options[optEncryptionKey]
+	if perTenant && whole {
+		return false, 0, newErrf(CodeInvalidParameterValue, "a table is sealed either whole (encryption_key = 'auto') or per tenant (encryption_key_by = '<column>'), not both")
+	}
+	if whole && !strings.EqualFold(strings.TrimSpace(v), "auto") {
+		return false, 0, newErrf(CodeInvalidParameterValue, "encryption_key must be 'auto' (a key of the table's own, made now), not %q", v)
+	}
+	if ok, err := s.checkSealable(ctx, desc, perTenant); !ok || err != nil {
+		return false, 0, err
+	}
+	if !perTenant {
+		return true, 0, nil
+	}
+	tenantCol, serr := tenantColumn(desc, by, pkNames)
+	if serr != nil {
+		return false, 0, serr
+	}
+	return true, tenantCol, nil
+}
+
+// tenantColumn checks encryption_key_by's column: it must lead the
+// primary key, so a tenant's rows are one key span, and be of a type a
+// tenant is identified by.
+func tenantColumn(desc *catalog.TableDescriptor, by string, pkNames []string) (catalog.ColumnID, *Error) {
+	name := strings.TrimSpace(by)
+	if name == "" {
+		return 0, newErrf(CodeInvalidParameterValue, "encryption_key_by names the tenant column: the leading primary-key column, whose values each get a key of their own")
+	}
+	col, ok := desc.Col(name)
 	if !ok {
-		return false, nil
+		col, ok = desc.Col(strings.ToLower(name))
 	}
-	if !strings.EqualFold(strings.TrimSpace(v), "auto") {
-		return false, newErrf(CodeInvalidParameterValue, "encryption_key must be 'auto' (a key of the table's own, made now), not %q", v)
+	if !ok {
+		return 0, newErrf(CodeUndefinedColumn, "encryption_key_by: column %q does not exist", name)
+	}
+	if len(pkNames) == 0 || !strings.EqualFold(pkNames[0], col.Name) {
+		return 0, newErrf(CodeInvalidObjectDefinition, "encryption_key_by: column %q must be the leading primary-key column (PRIMARY KEY (%s, ...)), so that each tenant's rows are one span of keys", col.Name, col.Name)
+	}
+	if !rowseal.TenantColumnTypeOK(col.Type) {
+		return 0, newErrf(CodeFeatureNotSupported, "encryption_key_by: column %q is of type %s; a tenant column must be an integer, text, bytea or uuid column", col.Name, col.Type)
+	}
+	if desc.ShardBuckets > 0 {
+		return 0, newErrf(CodeFeatureNotSupported, "a sharded table cannot be sealed per tenant: its hidden shard column would lead the primary key")
+	}
+	return col.ID, nil
+}
+
+// checkSealable refuses sealing desc where it cannot be: a time-series
+// table, a system table, before v22, without a key store, before the
+// cluster key.
+func (s *Session) checkSealable(ctx context.Context, desc *catalog.TableDescriptor, perTenant bool) (bool, error) {
+	what := "sealed tables"
+	if perTenant {
+		what = "per-tenant keys (encryption_key_by)"
 	}
 	if desc.Timeseries {
 		return false, newErrf(CodeFeatureNotSupported, "table %q is a time-series table, and time-series tables cannot be sealed: their rows are stored in chunks that mix series. Keep personal data in an ordinary sealed table that references it", desc.Name)
@@ -72,11 +122,14 @@ func (s *Session) checkSealOptions(ctx context.Context, desc *catalog.TableDescr
 		return false, newErrf(CodeInsufficientPriv, "the cluster's own tables cannot be sealed")
 	}
 	if s.db.ClusterVersion() < version.V22 {
-		return false, newErrf(CodeFeatureNotSupported, "sealed tables need cluster version %s: finalize the upgrade with `datax debug upgrade` first", version.V22)
+		return false, newErrf(CodeFeatureNotSupported, "%s need cluster version %s: finalize the upgrade with `datax debug upgrade` first", what, version.V22)
 	}
 	store := s.rowSealer().Store()
 	if store == nil {
-		return false, newErrf(CodeFeatureNotSupported, "sealed tables need a key store, and this node has none")
+		return false, newErrf(CodeFeatureNotSupported, "%s need a key store, and this node has none", what)
+	}
+	if _, ok := store.(rowseal.TenantKeyStore); perTenant && !ok {
+		return false, newErrf(CodeFeatureNotSupported, "%s need a key store that keeps tenant keys, and this node has none", what)
 	}
 	if err := store.Ready(ctx); err != nil {
 		return false, newErrf(CodeFeatureNotSupported, "%v", err)
@@ -85,14 +138,20 @@ func (s *Session) checkSealOptions(ctx context.Context, desc *catalog.TableDescr
 }
 
 // sealNewTable makes the new table's key, in the creating transaction,
-// and records it in desc (which the caller writes).
-func (s *Session) sealNewTable(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor) error {
+// and records it in desc (which the caller writes). A table sealed per
+// tenant (tenantCol set) gets the same kind of key, as its naming key:
+// its tenants' keys are made on their first writes.
+func (s *Session) sealNewTable(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, tenantCol catalog.ColumnID) error {
 	id, err := s.rowSealer().Store().CreateTableKey(ctx, txn, fmt.Sprintf("table/%d", desc.ID))
 	if err != nil {
 		return newErrf(CodeFeatureNotSupported, "making the key of sealed table %q: %v", desc.Name, err)
 	}
-	desc.EncryptionKey = &catalog.TableEncryptionKey{KeyID: id, SealID: desc.ID}
-	log.Audit("sealed-table", "stmt", "CREATE TABLE", "target", desc.Name, "key_id", fmt.Sprint(id), "principal", s.sessionUser, "role", s.user)
+	desc.EncryptionKey = &catalog.TableEncryptionKey{KeyID: id, SealID: desc.ID, TenantColumn: tenantCol}
+	mode := "table"
+	if tenantCol != 0 {
+		mode = "tenant"
+	}
+	log.Audit("sealed-table", "stmt", "CREATE TABLE", "target", desc.Name, "key_id", fmt.Sprint(id), "keys", mode, "principal", s.sessionUser, "role", s.user)
 	return nil
 }
 
@@ -137,6 +196,14 @@ func plaintextColumnNames(desc *catalog.TableDescriptor) []string {
 
 // sealedTableNotice is CREATE TABLE's NOTICE for a sealed table.
 func sealedTableNotice(desc *catalog.TableDescriptor) string {
+	if desc.SealedPerTenant() {
+		tenant := "?"
+		if c, ok := desc.ColByID(desc.EncryptionKey.TenantColumn); ok {
+			tenant = c.Name
+		}
+		return fmt.Sprintf("table %q is sealed per tenant: the row values of each value of %s are encrypted under a key of that tenant's own, made on its first write, and destroyed with datax_destroy_tenant_key. Primary-key and indexed columns are not sealed and stay readable to anyone who can read the database's storage: %s",
+			desc.Name, tenant, strings.Join(plaintextColumnNames(desc), ", "))
+	}
 	return fmt.Sprintf("table %q is sealed: its row values are encrypted under a key of its own. Primary-key and indexed columns are not sealed and stay readable to anyone who can read the database's storage: %s",
 		desc.Name, strings.Join(plaintextColumnNames(desc), ", "))
 }
@@ -173,7 +240,11 @@ func (s *Session) queueKeyDestroy(ctx context.Context, txn *kvclient.Txn, droppe
 			return nil
 		}
 	}
-	s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: dropped.ID, destroyKey: dropped.EncryptionKey.KeyID, table: dropped.Name})
+	w := indexWipe{tableID: dropped.ID, destroyKey: dropped.EncryptionKey.KeyID, table: dropped.Name}
+	if dropped.SealedPerTenant() {
+		w.tenantSeal = dropped.EncryptionKey.SealID
+	}
+	s.pendingWipes = append(s.pendingWipes, w)
 	return nil
 }
 
@@ -185,6 +256,15 @@ func (s *Session) destroyTableKey(ctx context.Context, w indexWipe) {
 	if store == nil {
 		log.Warnf("sealed table %q dropped, but this node has no key store to destroy its key %d", w.table, w.destroyKey)
 		return
+	}
+	if w.tenantSeal != 0 {
+		// The tenants' keys, possibly many, go in the background (the
+		// node's tenant key janitor, which also finds them if this
+		// gateway dies first); the naming key goes now, after which no
+		// tenant's key can be told from its name.
+		if ts, ok := store.(rowseal.TenantKeyStore); ok {
+			ts.DestroyTenantKeys(w.tenantSeal)
+		}
 	}
 	if err := store.DestroyKey(ctx, w.destroyKey); err != nil {
 		log.Warnf("sealed table %q dropped, but destroying its key %d failed: %v", w.table, w.destroyKey, err)

@@ -170,6 +170,14 @@ type Config struct {
 	// descriptor lease). DROP, DISABLE and REVOKE on an encryption key
 	// wait it out. Tests shorten it.
 	KeyCacheLease time.Duration
+	// KeyCacheMaxKeys bounds how many named keys the gateway's cache
+	// holds (issue #310, step 4; 0: keystore.DefaultCacheMaxKeys, 10,000;
+	// negative: no bound).
+	KeyCacheMaxKeys int
+	// TenantKeyGrace is how old a tenant key of a table no descriptor
+	// names must be before the tenant key janitor destroys it (issue
+	// #310, step 4; 0: 10 minutes; negative: no wait). Tests shorten it.
+	TenantKeyGrace time.Duration
 	// AuditHousekeepingInterval paces the audit table's retention and
 	// anchoring; 0 = 10m.
 	AuditHousekeepingInterval time.Duration
@@ -398,6 +406,9 @@ type Node struct {
 	// SQL server (keyServiceOnce).
 	keyServiceOnce sync.Once
 	keyService     *keystore.Service
+	// tenantKeyKick wakes the tenant key janitor (tenantkeys.go) early:
+	// a per-tenant table was dropped on this gateway.
+	tenantKeyKick chan struct{}
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener
@@ -536,7 +547,7 @@ type Node struct {
 // Start boots the node and returns once it is serving.
 func Start(cfg Config) (*Node, error) {
 	enableProfiling(cfg)
-	n := &Node{cfg: cfg, stopper: stop.NewStopper()}
+	n := &Node{cfg: cfg, stopper: stop.NewStopper(), tenantKeyKick: make(chan struct{}, 1)}
 	if err := n.start(); err != nil {
 		n.stopper.Stop()
 		return nil, err

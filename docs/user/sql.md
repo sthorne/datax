@@ -687,9 +687,28 @@ INDEX` say which columns those are. Queries work as on any table. A
 statement that reads a row whose key has been destroyed or disabled fails
 with `XXK01`. It needs the cluster key (`datax debug cluster-key init`,
 see the operations guide) and is refused for time-series tables; sealing
-an existing table and per-tenant keys are not available yet. How to shape
-a schema so that erasure means something:
+an existing table is not available yet. How to shape a schema so that
+erasure means something:
 [encryption keys for applications](../encryption-keys-for-applications.md).
+
+A table can instead be sealed **per tenant**: each value of its leading
+primary-key column gets a key of its own on its first write, and one
+tenant's data can be erased without touching the others:
+
+```sql
+CREATE TABLE items (tenant_id UUID, id UUID, title TEXT,
+  PRIMARY KEY (tenant_id, id)) WITH (encryption_key_by = 'tenant_id');
+
+-- erase one tenant: delete its rows, purge, then destroy its key
+DELETE FROM items WHERE tenant_id = $1;
+ALTER TABLE items PURGE;
+SELECT datax_destroy_tenant_key('items', $1);  -- returns once no node uses the key
+```
+
+`datax_destroy_tenant_key` needs ownership of the table and runs outside
+a transaction block. A row of the tenant left behind fails with `XXK01`
+afterwards (and cannot be deleted one by one), so delete first; the
+tenant's next write gets a fresh key.
 
 ## Reading
 

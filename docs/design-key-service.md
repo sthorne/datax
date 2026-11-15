@@ -1,6 +1,6 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed; steps 1, 2 and 3 built** (issue #310, the last piece
+Status: **agreed; steps 1 to 4 built** (issue #310, the last piece
 of #292). The issue asked for a written design to be agreed before any
 code. This is that design; the owner settled its five open decisions on
 2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
@@ -10,8 +10,9 @@ this design was open are under *Choices made in step 1*. Step 2, the
 key service (A below), is built too (docs/sql.md, "Encryption keys");
 its choices are under *Choices made in step 2*. Step 3, sealed whole
 tables, is built (docs/encryption.md, "Sealed tables"), with its
-choices under *Choices made in step 3*. Per-tenant keys (step 4) and
-online rotation (step 5) do not exist yet.
+choices under *Choices made in step 3*. Per-tenant keys (step 4) are
+built (docs/encryption.md, "Per-tenant keys"), with their choices under
+*Choices made in step 4*. Online rotation (step 5) does not exist yet.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -408,3 +409,76 @@ Where *A. The key service* left a choice open, step 2 made these
 - **A sealed table reads only sealed values**; the acceptance of plain
   values the design describes for sealing an existing table comes with
   that step.
+
+## Choices made in step 4
+
+- **A tenant's key is found by a deterministic name, through the
+  existing unique index on `datax_keys`' names**: `tenant/<seal id>/<hex
+  HMAC-SHA256(naming key, label ‖ seal id ‖ the tenant column's key
+  encoding)>`. No second index and no scan: one point read per tenant
+  per gateway (then cached), however many tenants. The digest is keyed
+  rather than plain because names are listed to admins (`datax_keys`'
+  metadata view) and survive as tombstones, and a plain hash of a
+  guessable tenant id could be tested; the key is the table's *naming
+  key*, a key of kind `table` made with the table (the descriptor's
+  `KeyID`; `tenant_column` marks the table per-tenant), which seals
+  nothing. Dropping the table destroys it, after which no tenant key's
+  name can be linked to a tenant. The key encoding is what KV tells
+  tenants apart by, so a tenant's key and its row span always agree.
+- **A tenant's key is made before the user's write, in a transaction of
+  its own.** Inside the user's transaction every tenant's first write
+  would write `datax_keys` (one range) inside an application
+  transaction; outside it, the creation is a short transaction that
+  races only with another first write of the same tenant — the loser
+  conflicts on the name's index entry, retries and finds the winner's
+  key. An aborted user transaction leaves an unused key, which the
+  tenant's next write uses and the table's drop destroys.
+- **The sealed value names its key** (the key id after the marker, 38
+  bytes of overhead instead of 30). Reads then need no tenant lookup —
+  one cache hit per value — and a row sealed under a destroyed key
+  reports that key even after the tenant has a fresh one, which a
+  resolver mapping the tenant to its *current* key could not do.
+- **Destroying a tenant key renames it** (`destroyed/<name>/<id>`), so
+  the tenant's next write can make a fresh key under the name, scans of
+  live tenant keys skip tombstones, and a repeated destroy finds the
+  tombstones to purge again. Destroyed wrapping and table keys keep
+  their names, as before.
+- **`datax_destroy_tenant_key(table, tenant)` returns the destroyed
+  key's id** (`bigint`), and `NULL` for a tenant that never had a key,
+  rather than an error, so an erasure can run it for every table a
+  tenant might have written to. It needs table ownership (or admin), is
+  refused in a transaction block like the key service's statements,
+  waits out the key lease, and fails with `55000` after the wait when
+  the purge did not complete (calling again retries it).
+- **The gateway's key cache is bounded** (10,000 keys by default,
+  least-recently-used dropped) and its hit path takes no lock (an atomic
+  snapshot per entry, atomic reference counts), measured with
+  `BenchmarkCacheHitParallel`, and a background refresh checks the keys
+  in use, 500 to a read, every half lease, so a gateway with many
+  tenants does not check each key on a statement's path (`datax start
+  --key-cache-keys` sets the bound; a working set beyond it reads keys
+  per use). The tenant-to-key-id map is a separate LRU of 65,536.
+  Statistics of a per-tenant table are collected from its keys alone
+  when no index needs a sealed value, and a destroyed tenant's row is
+  counted without its values instead of failing the collection. A mapping has no lease: a tenant's key id changes only
+  when the key is destroyed, which the key cache's lease check reports,
+  and the write then resolves the tenant again.
+- **`DROP TABLE` destroys tenant keys in the background**: the naming
+  key at the drop, the tenant keys by each node's janitor, woken by the
+  drop, which reads live tenant key names in order, seeks past every
+  table that exists, and destroys a page at a time under one purge of
+  `datax_keys` (`Store.DestroyMany`; a purge per key was about 0.3 s).
+  It spares keys younger than ten minutes (a first write can precede its
+  table's commit) and the seal ids of table restores in flight.
+- **Table restore brings tenant keys back before the publish**, 100 to a
+  transaction (all of a large table's keys would not fit one), its
+  progress record naming the seal id so the janitor leaves them alone; a
+  failed restore's keys go to the janitor once its record is reclaimed.
+- **Tenant columns are integers, text, `bytea` or `uuid`**: the types an
+  application identifies tenants by, whose key encodings are canonical.
+  Sharded tables are refused (the hidden shard column leads the key).
+- **A row left behind cannot be deleted by itself** after its tenant's
+  key is destroyed: `DELETE` reads a row before removing it (its index
+  entries are found from its values). The procedure deletes first;
+  `TRUNCATE` and `DROP TABLE` remove such rows. A blind delete of a
+  destroyed tenant's span is possible later if it is needed.

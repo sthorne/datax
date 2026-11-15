@@ -312,6 +312,12 @@ const (
 	// pkg/sql/rowseal): the descriptor field encryption_key, omitempty,
 	// and row values a v21 node could not decode, so CREATE TABLE ...
 	// WITH (encryption_key) is refused until finalize too.
+	//
+	// V22 also introduces per-tenant keys (issue #310, step 4): the
+	// descriptor field encryption_key.tenant_column, omitempty, keys of
+	// kind tenant in datax_keys, and a sealed form naming its key; CREATE
+	// TABLE ... WITH (encryption_key_by) and datax_destroy_tenant_key are
+	// refused until finalize as well.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

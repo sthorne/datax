@@ -210,7 +210,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	vectorIndex := fs.String("vector-index", "ivfflat", "vector-knn workload: ivfflat (an approximate index serves the query) or none (every query scans the table and keeps the nearest); the table name embeds this, so A/B runs don't collide")
 	lists := fs.Int("lists", 100, "vector-knn workload: lists of the ivfflat index")
 	probes := fs.Int("probes", 0, "vector-knn workload: lists each query reads (0 = the server's default, the square root of --lists)")
-	sealed := fs.Bool("sealed", false, "kv, bank, hot-row, ingest, scan: make the workload's table a sealed table, WITH (encryption_key = 'auto'), whose row values are encrypted under a key of its own (needs the cluster key; the table name embeds this, so A/B runs don't collide)")
+	var sealed sealedMode
+	fs.Var(&sealed, "sealed", "kv, bank, hot-row, ingest, scan: make the workload's table a sealed table, WITH (encryption_key = 'auto'), whose row values are encrypted under a key of its own; --sealed=tenant (kv, with --tenants) seals it per tenant, WITH (encryption_key_by = 't'), a key per tenant (needs the cluster key; the table name embeds this, so A/B runs don't collide)")
+	tenants := fs.Int("tenants", 0, "kv workload: key the table by (t, k) with t = k mod this many tenants (0 = by k alone); --sealed=tenant seals each tenant under a key of its own, and without --sealed the same shape runs plain, for comparison (the table name embeds this)")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
@@ -315,7 +317,15 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	// withSealed closes the CREATE TABLE of a workload that can be run
 	// on a sealed table.
 	withSealed := ""
-	if *sealed {
+	if *tenants < 0 || (*tenants > 0 && workload != "kv") {
+		return nil, fmt.Errorf("--tenants applies to kv, and takes a positive count")
+	}
+	if *tenants > 0 {
+		rsuffix += fmt.Sprintf("_t%d", *tenants)
+	}
+	switch sealed {
+	case "":
+	case "table":
 		switch workload {
 		case "kv", "bank", "hot-row", "ingest", "ingest-copy", "scan":
 		default:
@@ -323,6 +333,12 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		rsuffix += "_sealed"
 		withSealed = " WITH (encryption_key = 'auto')"
+	case "tenant":
+		if workload != "kv" || *tenants <= 0 {
+			return nil, fmt.Errorf("--sealed=tenant applies to kv with --tenants")
+		}
+		rsuffix += "_tsealed"
+		withSealed = " WITH (encryption_key_by = 't')"
 	}
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
@@ -410,6 +426,15 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 	switch workload {
 	case "kv":
+		if *tenants > 0 {
+			if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (t INT8, k INT8, v TEXT, PRIMARY KEY (t, k))"+withSealed); err != nil {
+				return nil, err
+			}
+			if err := preloadRows(kvTable, "t, k, v", func(j int) string { return fmt.Sprintf("(%d, %d, 'v%d')", j%*tenants, j, j) }); err != nil {
+				return nil, err
+			}
+			break
+		}
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"+withSealed); err != nil {
 			return nil, err
 		}
@@ -789,7 +814,19 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 					// pgx prepares each statement text once per connection
 					// and every execution after that is Bind/Execute of the
 					// same shape (issue #107).
-					if rng.Intn(100) < *readPct {
+					if *tenants > 0 {
+						k := int64(rng.Intn(*preload))
+						t := k % int64(*tenants)
+						if rng.Intn(100) < *readPct {
+							var v string
+							err = conn.QueryRow(ctx, "SELECT v FROM "+kvTable+" WHERE t = $1 AND k = $2", t, k).Scan(&v)
+							if err == pgx.ErrNoRows {
+								err = nil
+							}
+						} else {
+							_, err = conn.Exec(ctx, "UPDATE "+kvTable+" SET v = $1 WHERE t = $2 AND k = $3", fmt.Sprintf("u%d", rng.Int63()), t, k)
+						}
+					} else if rng.Intn(100) < *readPct {
 						var v string
 						err = conn.QueryRow(ctx, "SELECT v FROM "+kvTable+" WHERE k = $1", int64(rng.Intn(*preload))).Scan(&v)
 						if err == pgx.ErrNoRows {
@@ -935,6 +972,11 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if before != nil {
 		after := scrapeCounters(httpClient, *metricsURL)
 		res.Metrics = counterDeltas(before, after)
+		if total > 0 {
+			// Routed KV batches per operation: a count, so robust to a
+			// noisy machine where throughput is not (sealed tables, #310).
+			fmt.Printf("  kv batches: %.3f per op\n", res.Metrics["datax_kv_batch_latency_seconds_count"]/float64(total))
+		}
 		fmt.Printf("  hard write stalls: %+.0f (must be 0 at the target rate)\n", res.Metrics["datax_storage_write_stalls_total"])
 		fmt.Printf("  backpressured writes: %+.0f\n", res.Metrics["datax_storage_backpressure_total"])
 		for _, cause := range []string{"leader", "debt", "follower"} {
@@ -1621,3 +1663,27 @@ func benchTextQuery(table, kind string, topic, doc int) string {
 	}
 	return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d')", table, lhs, topic)
 }
+
+// sealedMode is --sealed: "" (off), "table" (--sealed, --sealed=true or
+// --sealed=table: a sealed table) or "tenant" (a table sealed per
+// tenant).
+type sealedMode string
+
+func (m *sealedMode) String() string { return string(*m) }
+
+func (m *sealedMode) Set(v string) error {
+	switch strings.ToLower(v) {
+	case "", "false", "0", "no":
+		*m = ""
+	case "true", "1", "yes", "table":
+		*m = "table"
+	case "tenant":
+		*m = "tenant"
+	default:
+		return fmt.Errorf("--sealed takes table or tenant (or a boolean), not %q", v)
+	}
+	return nil
+}
+
+// IsBoolFlag lets --sealed stand alone, as it did when it was a boolean.
+func (m *sealedMode) IsBoolFlag() bool { return true }

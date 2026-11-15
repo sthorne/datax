@@ -127,6 +127,11 @@ func (k sealedTableKeys) DestroyKey(ctx context.Context, id int64) error {
 	return nil
 }
 
+// tableKeyPrefix begins the name of every sealed table's key ("table/"
+// and the table's id when it was created; a restored key may carry a
+// suffix).
+const tableKeyPrefix = "table/"
+
 // sealedKeyJanitorInterval is how often a node looks for table keys no
 // table names.
 const sealedKeyJanitorInterval = 5 * time.Minute
@@ -142,10 +147,14 @@ func (n *Node) sealedKeyJanitorLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
+		case <-n.tenantKeyKick: // a per-tenant table was dropped here
 		}
 		wait = sealedKeyJanitorInterval
 		if _, err := n.SweepOrphanTableKeys(ctx); err != nil {
 			log.Debugf("sealed key janitor: %v", err)
+		}
+		if _, err := n.SweepOrphanTenantKeys(ctx); err != nil {
+			log.Debugf("tenant key janitor: %v", err)
 		}
 	}
 }
@@ -167,15 +176,24 @@ func (n *Node) SweepOrphanTableKeys(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	all, err := ks.List(ctx)
-	if err != nil {
-		return 0, err
-	}
+	// Table keys are named table/<id> (pkg/sql/sealed.go): read those
+	// names, not every key — a cluster with per-tenant tables has a key
+	// per tenant.
 	var live []keystore.Key
-	for _, k := range all {
-		if k.Kind == keystore.KindTable && k.State != keystore.StateDestroyed {
-			live = append(live, k)
+	for from, end := tableKeyPrefix, keystore.PrefixEnd(tableKeyPrefix); ; {
+		page, err := ks.KeysByName(ctx, from, end, 1000)
+		if err != nil {
+			return 0, err
 		}
+		if len(page) == 0 {
+			break
+		}
+		for _, k := range page {
+			if k.Kind == keystore.KindTable && k.State != keystore.StateDestroyed {
+				live = append(live, k)
+			}
+		}
+		from = page[len(page)-1].Name + "\x00"
 	}
 	if len(live) == 0 {
 		return 0, nil

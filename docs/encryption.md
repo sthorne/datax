@@ -1193,6 +1193,130 @@ in each of the four rounds (−2.5% to −9.6%) while a profiled pair run
 just after had it 2.6% faster. Whether that is below the 5% bar needs a
 dedicated machine to say.
 
+## Per-tenant keys
+
+A table created `WITH (encryption_key_by = '<column>')` is sealed **per
+tenant** (v22, issue #310 step 4): each distinct value of the column,
+which must lead the primary key, has a key of its own — a named key of
+kind `tenant` in `datax_keys`, made on the tenant's first write — so that
+one tenant's data can be erased by destroying its key, without touching
+anyone else's. Everything under *Sealed tables* holds; statements and
+errors are in docs/sql.md, "Per-tenant keys".
+
+```
+root (per node)  →  cluster key  →  a tenant's key (datax_keys, kind tenant)  →  that tenant's row values
+                                 →  the table's naming key (kind table)        →  the names of its tenants' keys
+```
+
+**Naming and making a tenant's key.** A tenant's key is named
+`tenant/<seal id>/<digest>`, the digest an HMAC-SHA256 under the table's
+*naming key* (a key of kind `table`, made with the table, that seals
+nothing) of the seal id and the tenant column's key encoding. The name
+is found through `datax_keys`' unique index on names — one point read
+however many tenants there are — and is the same on every gateway. The
+digest is keyed so that the names, which admins can list, do not let
+anyone test a guessed tenant id without the cluster's keys; once the
+table is dropped, which destroys the naming key, no one can. A tenant's
+first write makes its key in a transaction of its own, just before the
+write's: concurrent first writes of one tenant race on the name and
+converge on one key, and first writes of different tenants touch
+different rows and do not conflict. A write that then aborts leaves its
+tenant's key unused, for the tenant's next write.
+
+**The sealed form** names the key: the marker `0xD5`, the key's id (8
+bytes), the key version, a 12-byte nonce, and the AES-256-GCM ciphertext
+and tag — 38 bytes per value; the associated data is a sealed table's
+(seal id, key id and version, row key). A read opens each value under
+the key it names, without looking its tenant up.
+
+**On the gateway.** Tenants' key ids are cached (65,536 by default) and
+keys' material too (`keystore.Cache`, bounded at 10,000 keys by default
+— `datax start --key-cache-keys` — least recently used dropped first; its
+hit takes no lock). Size the bound above the number of tenants a node
+serves within one lease (10 seconds): a working set beyond it reads each
+key from `datax_keys` again on its next use (two reads) and is much
+slower (see *What it costs*). A cached
+tenant costs no KV work per row; each key is checked against
+`datax_keys` once per lease per gateway, as a table's key is, so a scan
+across many tenants does one key read per distinct tenant per lease,
+not one per row. Table statistics of a per-tenant table are collected
+from its keys alone when none of its indexes needs a sealed value, and
+a row of a destroyed tenant is counted without its values rather than
+failing the collection.
+
+**Erasing a tenant** (the application guide's procedure):
+
+1. Delete the tenant's rows from every table that holds them.
+2. `ALTER TABLE ... PURGE` each, so the deleted versions do not wait
+   out the table's GC window.
+3. `SELECT datax_destroy_tenant_key('items', $tenant)`. The key's record
+   is tombstoned, renamed out of the tenant's name and purged from
+   `datax_keys`' history; the call returns, with the key's id, once
+   every gateway has stopped using it (the key lease, 10 seconds).
+
+Stop the tenant's writes before step 3: a gateway may seal a write under
+the key until the lease runs out, and such a row is unreadable. A row
+of the tenant still sealed under the key fails with `XXK01`, on every
+node, once the call has returned — and cannot then be deleted by itself
+(a `DELETE` reads the row first); only `TRUNCATE` or `DROP TABLE` remove
+it, which is why rows are deleted first. The tenant's next write makes a
+fresh key. Backups taken before step 3 hold the key until they expire
+(the documented dependency, design *Erasure*): a table restore from such
+a backup brings the tenant back.
+
+**Dropping a per-tenant table** destroys its naming key after commit,
+at once, and every tenant key in the background: each node's janitor,
+woken by the drop and run every five minutes, reads the names of live
+tenant keys in order, seeks past each table that still exists, and
+destroys the keys of tables that do not, a page at a time under one
+purge of `datax_keys`. It leaves keys younger than ten minutes for a
+later pass (a tenant's first write can come before its table's `CREATE
+TABLE` commits) and the keys of a table restore in flight.
+
+**Table restore** of a per-tenant table brings back its naming key and
+every tenant key of the table the backup holds, as for a sealed table's
+key — shared when this cluster has it, brought back from the backup's
+`datax_keys` when it lacks or has destroyed it — 100 keys to a
+transaction before the table is published. A tenant whose key was
+destroyed before the backup was taken has no key in it; its rows come
+back unreadable, and its next write makes a fresh key.
+
+**What it costs.** One AES-GCM operation and 38 bytes per row value, a decode of
+the tenant column on a write, and cache lookups; no extra round trip
+for a tenant whose key is cached. Measured with `datax bench kv
+--tenants 1000` (a table keyed `(t, k)`, `t = k mod 1000`, 10,000 rows)
+plain and `--sealed=tenant`, on one secure, encrypted on-disk node (a
+shared 4-core VM, 16 workers, `--seed 7`, 20-second runs, four rounds
+alternating which goes first, the tables kept between rounds, the node
+started with `--key-cache-keys 40000`), with the server's KV batch
+count per operation from `--server-url`:
+
+| Workload | Plain ops/s, median (range) | Per-tenant ops/s, median (range) | KV batches per op, plain / per-tenant |
+|---|---|---|---|
+| `kv`, 95% reads | 18,489 (16,703–19,825) | 17,046 (13,640–20,320) | 1.001 / 1.001–1.016 |
+| `kv`, 50% reads | 8,461 (8,247–8,860) | 6,897 (4,770–7,664) | 1.002 / 1.003–1.035 |
+
+Two earlier sets of the same rounds, before the refresh below, put the
+per-tenant table 15% and 6% behind at 95% reads and level and 4% ahead
+at 50%: the spread between runs on that machine is wider than the
+difference. The KV counts are robust to it. A run that follows another
+on the same table does the same KV work as plain (1.001–1.003 batches
+per op); a run whose keys went idle first (the cache drops a key unused
+for a lease) reads each of its 1,000 keys again, twice, which is the
+rest. A server CPU profile of `kv` at 50% reads puts the boundary at
+2.2% of the server's CPU (opening 1.5%, sealing 0.7%; the key cache's
+part 1.0%), and `BenchmarkTenantBoundary` measures a seal and an open
+of a 64-byte value for a cached tenant at about 1.1 µs.
+
+Each gateway checks every key it uses against `datax_keys` once per
+lease; a background refresh does that every half lease for the keys in
+use, 500 to a read, so a busy key stays on the lock-free hit path. **A
+working set larger than the key cache** costs a key read per use: 20,000
+tenants on the default bound of 10,000 ran at 7,654 ops/s against 13,596
+plain, with 2.72 KV batches per operation; with `--key-cache-keys 40000`,
+17,533 and 19,533 against 19,574 and 20,490 plain, at 1.24 and 1.16 — the
+cost of reading 20,000 cold keys at the start of each run.
+
 ## Keys in memory
 
 The keys a node holds for as long as it runs — its store key, the data
@@ -1469,11 +1593,12 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
-- **Sealed tables have one key per table only.** Per-tenant keys
-  (`encryption_key_by`), sealing an existing table, and the background
-  job that rewrites rows still under an old key version after a rotation
-  are not built; a sealed table's primary-key and indexed columns are
-  never sealed (see *Sealed tables*).
+- **Sealing an existing table**, and the background job that rewrites
+  rows still under an old key version after a rotation, are not built; a
+  sealed table's primary-key and indexed columns are never sealed (see
+  *Sealed tables*). A row of a per-tenant table left behind when its
+  tenant's key is destroyed cannot be deleted by itself, only with the
+  whole table (`TRUNCATE`, `DROP TABLE`); see *Per-tenant keys*.
 - **Backups are sealed only when asked** (`datax backup --backup-key`);
   otherwise they are plaintext whatever the store is. A sealed backup
   shows its table count, table ids and file sizes; a rollback to an

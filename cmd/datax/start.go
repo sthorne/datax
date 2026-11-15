@@ -48,6 +48,7 @@ type serverFlags struct {
 	slowStmt      time.Duration
 	authTimeout   time.Duration
 	maxPending    int
+	keyCacheKeys  int
 	metricsRecord time.Duration
 	auditTable    bool
 	drainTimeout  time.Duration
@@ -81,6 +82,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.DurationVar(&f.slowStmt, "slow-statement-threshold", 0, "SQL statements slower than this are kept for the dashboard's slow list (0 = default 500ms)")
 	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication, HTTP request headers) before it is closed (0 = default 60s, negative = never)")
+	f.fs.IntVar(&f.keyCacheKeys, "key-cache-keys", 0, "named keys (a sealed table's, a tenant's, the key service's) this node keeps unwrapped at once, the least recently used dropped beyond it (0 = default 10000, negative = no bound); size it above the tenants a node serves within ten seconds")
 	f.fs.IntVar(&f.maxPending, "sql-max-pending-auth", 0, "maximum SQL connections in the pre-authentication state; past it new connections are refused rather than held (0 = default 512, negative = no cap). Also the widest burst of concurrent password guesses one address can land at once, every one of which is charged: raising it past 600 lengthens how long a guessing address is held afterwards, and removing it removes that bound")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
 	f.fs.BoolVar(&f.auditTable, "audit-table", true, "also write this node's audit records to the datax_audit table (false: they are in its log only)")
@@ -120,6 +122,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		SlowStatementThreshold:   f.slowStmt,
 		AuthTimeout:              f.authTimeout,
 		SQLMaxPendingAuth:        f.maxPending,
+		KeyCacheMaxKeys:          f.keyCacheKeys,
 		MetricsRecordInterval:    metricsRecordInterval(f.metricsRecord),
 		AuditFlushInterval:       auditFlushInterval(f.auditTable),
 		DrainTimeout:             f.drainTimeout,

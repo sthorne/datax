@@ -495,8 +495,24 @@ func TestClusterKeyLifecycle(t *testing.T) {
 	if _, err := ks2.Unwrap(ctx, tenant.ID, 0); !errors.Is(err, keystore.ErrDestroyed) {
 		t.Fatalf("unwrap of a destroyed key: %v", err)
 	}
-	if _, err := ks2.Create(ctx, keystore.KindTenant, "items/4f6c"); !errors.Is(err, keystore.ErrExists) {
-		t.Fatalf("a destroyed key's name was given again: %v", err)
+	// A destroyed tenant key is renamed out of the way (issue #310, step
+	// 4), so that its tenant's next write can make a fresh key under the
+	// name; destroyed keys of other kinds keep their names.
+	if got, err := ks2.GetByID(ctx, tenant.ID); err != nil || got.Name != keystore.DestroyedName("items/4f6c", tenant.ID) {
+		t.Fatalf("a destroyed tenant key's name: %+v %v", got, err)
+	}
+	if _, err := ks2.Create(ctx, keystore.KindTenant, "items/4f6c"); err != nil {
+		t.Fatalf("a destroyed tenant key's name was not freed: %v", err)
+	}
+	wk, err := ks1.Create(ctx, keystore.KindWrapping, "kept-name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ks1.Destroy(ctx, wk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ks2.Create(ctx, keystore.KindWrapping, "kept-name"); !errors.Is(err, keystore.ErrExists) {
+		t.Fatalf("a destroyed wrapping key's name was given again: %v", err)
 	}
 
 	// A node being decommissioned is refused a hand-over.

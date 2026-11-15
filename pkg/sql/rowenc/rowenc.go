@@ -243,6 +243,31 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 	return out, nil
 }
 
+// LeadingPKColumn returns the leading primary-key column of a row key of
+// desc at any of its indexes' prefixes (/t/<id>/<index>/...): the bytes
+// of its key encoding — what tells one value from another in KV — and the
+// value decoded. A per-tenant sealed table (issue #310) picks a row's key
+// by it.
+func LeadingPKColumn(desc *catalog.TableDescriptor, key keys.Key) ([]byte, types.Datum, error) {
+	p := keys.TableDataPrefix(desc.ID)
+	if !bytes.HasPrefix(key, p) || len(key) < len(p)+8 {
+		return nil, types.Datum{}, fmt.Errorf("key not in table %d's rows", desc.ID)
+	}
+	if len(desc.PrimaryKey) == 0 {
+		return nil, types.Datum{}, fmt.Errorf("table %d has no primary key", desc.ID)
+	}
+	col, ok := desc.ColByID(desc.PrimaryKey[0])
+	if !ok {
+		return nil, types.Datum{}, fmt.Errorf("table %d: unknown primary key column %d", desc.ID, desc.PrimaryKey[0])
+	}
+	at := []byte(key[len(p)+8:])
+	rest, d, err := decodeKeyDatum(at, col.Type)
+	if err != nil {
+		return nil, types.Datum{}, fmt.Errorf("decoding pk column %q: %w", col.Name, err)
+	}
+	return at[:len(at)-len(rest)], d, nil
+}
+
 // EncodeValue builds the binary row value from the full row (colID → datum).
 // PK columns are skipped (they live in the key); NULLs are omitted; columns
 // are emitted in ascending ID order (deterministic bytes for identical rows).

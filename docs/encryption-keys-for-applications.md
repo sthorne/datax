@@ -1,25 +1,25 @@
 # Encryption keys for applications: what to expect
 
-**Status: the key service and sealed whole tables are built; per-tenant
-keys are not yet.** The key service — named keys, `datax_key_wrap` /
-`datax_key_unwrap`, `datax_encrypt` / `datax_decrypt` and their
-privileges — works as described under [Using the key
-service](#using-the-key-service), and sealed whole tables (`WITH
-(encryption_key = 'auto')`; docs/sql.md and docs/encryption.md, "Sealed
-tables") work as described for one key per table, on a cluster at
-version v22 with its cluster key enabled; dropping a sealed table
-destroys its key. Per-tenant keys (`encryption_key_by`,
-`datax_destroy_tenant_key`) are the agreed design, not built yet: this
-guide describes how they will behave so that an application can shape
-its schema and its erasure process now. The design and its decisions
-are in [design-key-service.md](design-key-service.md) (issue #310). The
-per-tenant statement names below are the planned ones and may still
-change in detail; the limits and guarantees will not.
+**Status: the key service, sealed whole tables and per-tenant keys are
+built**, on a cluster at version v22 with its cluster key enabled. The
+key service — named keys, `datax_key_wrap` / `datax_key_unwrap`,
+`datax_encrypt` / `datax_decrypt` and their privileges — works as
+described under [Using the key service](#using-the-key-service); sealed
+whole tables (`WITH (encryption_key = 'auto')`) and per-tenant tables
+(`WITH (encryption_key_by = '<column>')`, `datax_destroy_tenant_key`)
+work as this guide describes (docs/sql.md and docs/encryption.md,
+"Sealed tables" and "Per-tenant keys"). Two details the guide leaves
+open are settled: `datax_destroy_tenant_key` returns the id of the key it
+destroyed, and `NULL` for a tenant that never wrote to the table (so an
+erasure can call it for every table); and a row left behind after its
+tenant's key is destroyed cannot be deleted on its own — delete first,
+as the procedure says. The design and its decisions are in
+[design-key-service.md](design-key-service.md) (issue #310).
 
 ## In one paragraph
 
-datax will be able to encrypt each row's **values** under a key that
-belongs to one tenant (or one table), and destroy that key to make the
+datax encrypts each row's **values** under a key that
+belongs to one tenant (or one table), and destroys that key to make the
 tenant's values unreadable everywhere: on every replica, and in every
 backup once the backups taken before the destruction have expired. What
 it **cannot** encrypt this way are the columns that make up the primary

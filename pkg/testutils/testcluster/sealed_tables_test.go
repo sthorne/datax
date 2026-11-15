@@ -248,8 +248,6 @@ func TestSealedTables(t *testing.T) {
 
 		wantSQLErr(t, ctx, conn, `CREATE TABLE ts (s INT8, at TIMESTAMPTZ, v FLOAT8, PRIMARY KEY (s, at)) WITH (timeseries = true, encryption_key = 'auto')`,
 			"0A000", "time-series tables cannot be sealed")
-		wantSQLErr(t, ctx, conn, `CREATE TABLE items (tenant UUID, id UUID, PRIMARY KEY (tenant, id)) WITH (encryption_key_by = 'tenant')`,
-			"0A000", "not built yet")
 		wantSQLErr(t, ctx, conn, `CREATE TABLE bad (id INT8 PRIMARY KEY) WITH (encryption_key = 'mine')`, "22023", "'auto'")
 		wantSQLErr(t, ctx, conn, `ALTER TABLE notes SET (encryption_key = 'auto')`, "0A000", "not built yet")
 		sealExec(t, ctx, conn, `CREATE TABLE plain (id INT8 PRIMARY KEY, body TEXT)`)
@@ -436,13 +434,15 @@ func TestSealedTables(t *testing.T) {
 	})
 }
 
-// TestSealedTablesNeedV22: before v22 is finalized the option is refused.
+// TestSealedTablesNeedV22: before v22 is finalized the options are
+// refused, per-tenant keys' too (step 4).
 func TestSealedTablesNeedV22(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	c := startCKCluster(t, ctx, func(i int, cfg *server.Config) { cfg.BinaryVersionOverride = version.V21 })
 	conn := sealedConn(t, ctx, c, 0, nil)
 	wantSQLErr(t, ctx, conn, `CREATE TABLE notes (id INT8 PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto')`, "0A000", "need cluster version v22")
+	wantSQLErr(t, ctx, conn, `CREATE TABLE items (t UUID, id INT8, body TEXT, PRIMARY KEY (t, id)) WITH (encryption_key_by = 't')`, "0A000", "need cluster version v22")
 }
 
 // exportClusterKey exports src's cluster key the way the CLI does,
