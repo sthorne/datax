@@ -222,6 +222,47 @@ func TestGoldenSealedPerTenantDescriptor(t *testing.T) {
 	}
 }
 
+// goldenTableDescriptorSealing is a table being sealed (issue #310, step
+// 5): sealing is omitempty, so a table sealed at CREATE TABLE encodes as
+// it did in steps 3 and 4.
+const goldenTableDescriptorSealing = `{"id":14,"name":"old","columns":[{"id":1,"name":"id","type":1,"not_null":true}],"primary_key":[1],"encryption_key":{"key_id":4444,"seal_id":14,"sealing":true}}`
+
+func TestGoldenSealingDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealing), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Sealed() || !d.EncryptionKey.Sealing || d.SealedPerTenant() {
+		t.Fatalf("decoded %+v", d.EncryptionKey)
+	}
+	if raw, err := json.Marshal(d); err != nil || string(raw) != goldenTableDescriptorSealing {
+		t.Fatalf("encoding changed: %s (%v)", raw, err)
+	}
+	var whole TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &whole); err != nil {
+		t.Fatal(err)
+	}
+	if whole.EncryptionKey.Sealing {
+		t.Fatal("a table sealed at creation reads as being sealed")
+	}
+}
+
+// TestGoldenSealJob: the seal job's record round-trips, and its zero
+// fields are left out.
+func TestGoldenSealJob(t *testing.T) {
+	const golden = `{"table_id":14,"table":"old","kind":"rotate","key_id":7,"version":2,"keep_old":true,"not_before":5,"started":true,"resume":"AQI=","pass":1,"pass_rewritten":3,"rewritten":3,"created":4}`
+	j, err := DecodeSealJob([]byte(golden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Kind != SealJobRotate || j.KeyID != 7 || j.Version != 2 || !j.KeepOld || string(j.Resume) != "\x01\x02" || j.State() != "running" {
+		t.Fatalf("decoded %+v", j)
+	}
+	if raw, err := j.Encode(); err != nil || string(raw) != golden {
+		t.Fatalf("encoding changed: %s (%v)", raw, err)
+	}
+}
+
 // TestGoldenRoleBypassRLS: the BYPASSRLS attribute is omitempty, so a
 // role without it encodes as before.
 func TestGoldenRoleBypassRLS(t *testing.T) {

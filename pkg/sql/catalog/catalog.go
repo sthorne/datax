@@ -647,6 +647,13 @@ type TableEncryptionKey struct {
 	// keys the digest that names the tenants' keys, and it seals nothing.
 	// Zero for a table sealed whole.
 	TenantColumn ColumnID `json:"tenant_column,omitempty"`
+	// Sealing is set while a table that held rows before it was sealed
+	// (ALTER TABLE ... SET (encryption_key | encryption_key_by), issue
+	// #310 step 5) may still hold plain values: reads accept both forms,
+	// and writes seal. The seal job (SealJob) clears it once no live row
+	// is plain, and strict reads — a plain value in a sealed table is
+	// corruption — are back.
+	Sealing bool `json:"sealing,omitempty"`
 }
 
 // Sealed reports whether the table's row values are sealed.

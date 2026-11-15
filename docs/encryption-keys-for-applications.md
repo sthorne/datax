@@ -1,20 +1,28 @@
 # Encryption keys for applications: what to expect
 
-**Status: the key service, sealed whole tables and per-tenant keys are
-built**, on a cluster at version v22 with its cluster key enabled. The
+**Status: everything in this guide is built** (issue #310, all five
+steps), on a cluster at version v22 with its cluster key enabled. The
 key service — named keys, `datax_key_wrap` / `datax_key_unwrap`,
 `datax_encrypt` / `datax_decrypt` and their privileges — works as
 described under [Using the key service](#using-the-key-service); sealed
 whole tables (`WITH (encryption_key = 'auto')`) and per-tenant tables
 (`WITH (encryption_key_by = '<column>')`, `datax_destroy_tenant_key`)
 work as this guide describes (docs/sql.md and docs/encryption.md,
-"Sealed tables" and "Per-tenant keys"). Two details the guide leaves
-open are settled: `datax_destroy_tenant_key` returns the id of the key it
-destroyed, and `NULL` for a tenant that never wrote to the table (so an
-erasure can call it for every table); and a row left behind after its
-tenant's key is destroyed cannot be deleted on its own — delete first,
-as the procedure says. The design and its decisions are in
-[design-key-service.md](design-key-service.md) (issue #310).
+"Sealed tables" and "Per-tenant keys"). So do sealing a table that
+already holds rows (`ALTER TABLE ... SET (encryption_key = 'auto')` or
+`(encryption_key_by = '<column>')`) and rotating a table's or a
+tenant's key (`ALTER TABLE ... ROTATE ENCRYPTION KEY`,
+`datax_rotate_tenant_key`): new writes use the new key at once and a
+background job rewrites the existing rows (see [Adopting sealing and
+rotating keys](#adopting-sealing-and-rotating-keys)). Details the guide
+leaves open are settled: `datax_destroy_tenant_key` returns the id of
+the key it destroyed, and `NULL` for a tenant that never wrote to the
+table (so an erasure can call it for every table); and a row left behind
+after its tenant's key is destroyed cannot be removed by `DELETE`, but
+`datax_remove_tenant_rows` removes it — delete first all the same, as
+the procedure says. Key names beginning `table/`, `tenant/` or
+`destroyed/` are reserved for the keys datax makes. The design and its
+decisions are in [design-key-service.md](design-key-service.md).
 
 ## In one paragraph
 
@@ -183,6 +191,19 @@ After that, the tenant's data is gone from the live cluster. A query
 that still touches a row sealed under a destroyed key fails rather than
 returning it; that is why step 1 comes first.
 
+**If rows were left behind** — the key was destroyed first, or the
+tenant wrote again during step 3 (stop its writes first) — a `DELETE`
+of them fails too, because a `DELETE` reads the rows it removes. Remove
+them with `SELECT datax_remove_tenant_rows('items', $tenant_id)`: it
+needs no key, removes the tenant's unreadable rows and their index
+entries, leaves its readable ones (a fresh key's), and returns how many
+it removed; then purge as in step 2. It reads every index of the table
+that does not lead with the tenant column, so on a large table it is
+slow, and it refuses a table that other tables reference by foreign
+key (their `ON DELETE` actions need the rows' values) — another reason
+to keep the order above and treat this as the cleanup, not the
+procedure.
+
 **Backups are the remaining copy, and the agreed behaviour is a
 documented dependency:** a backup taken before step 3 still contains
 the tenant's key (wrapped by the cluster's key) and its data. **The
@@ -200,6 +221,38 @@ be built if it is needed.
 What survives erasure in any case: the fact that a tenant id existed
 (if it appears elsewhere), and, in backups until they expire, row
 counts and value sizes.
+
+## Adopting sealing and rotating keys
+
+A table that already holds data is sealed in place:
+
+```sql
+ALTER TABLE items SET (encryption_key_by = 'tenant_id');   -- or (encryption_key = 'auto')
+```
+
+New writes are sealed as soon as the statement returns; the existing
+rows are sealed by a background job, and reads return correct data from
+both kinds of row meanwhile. `SELECT * FROM datax_encryption_jobs` shows
+the job until it is done. **The rows' old plaintext versions stay in the
+table's history** until garbage collection (`gc_ttl`) removes them: run
+`ALTER TABLE items PURGE` once the job is done to remove them now, and
+remember that backups taken before hold them until they expire. Sealing
+cannot be undone in place; copy the rows to a plain table if you must.
+
+Keys are rotated the same way — a new version for new writes at once,
+the old rows rewritten in the background, then the old version
+destroyed:
+
+```sql
+ALTER TABLE notes ROTATE ENCRYPTION KEY;              -- a table sealed whole
+SELECT datax_rotate_tenant_key('items', $tenant_id);  -- one tenant
+```
+
+Add `KEEP OLD VERSIONS` (or `true` as the function's third argument) to
+keep the old version, and `datax_destroy_old_key_versions` to destroy it
+later. Once an old version is destroyed, history written under it —
+`AS OF SYSTEM TIME` reads from before the rewrite — is unreadable. A
+table runs one such job at a time.
 
 ## Using the key service
 
@@ -313,7 +366,10 @@ rotate, disable, drop and grant on it; the owner may also use it.
 - [ ] Timestamps that reveal behaviour are not in keys.
 - [ ] No personal data in time-series tables or in `NOTIFY` payloads.
 - [ ] The erasure procedure deletes rows (including lookup rows),
-      purges, then destroys the key — and is tested.
+      purges, then destroys the key — and is tested; leftover rows are
+      removed with `datax_remove_tenant_rows`.
+- [ ] A table sealed after it held data is purged once its seal job is
+      done.
 - [ ] The privacy terms state the erasure delay as the backup
       retention period.
 - [ ] Writer-only services hold `WRAP`, not `UNWRAP` or `USAGE`.

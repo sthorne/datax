@@ -686,10 +686,25 @@ anyone who can read the database's storage. `CREATE TABLE` and `CREATE
 INDEX` say which columns those are. Queries work as on any table. A
 statement that reads a row whose key has been destroyed or disabled fails
 with `XXK01`. It needs the cluster key (`datax debug cluster-key init`,
-see the operations guide) and is refused for time-series tables; sealing
-an existing table is not available yet. How to shape a schema so that
-erasure means something:
+see the operations guide) and is refused for time-series tables. How to
+shape a schema so that erasure means something:
 [encryption keys for applications](../encryption-keys-for-applications.md).
+
+A table that already holds rows is sealed with `ALTER TABLE`, and a
+sealed table's key is rotated the same way; in both cases new writes use
+the new key at once and a background job rewrites the existing rows
+(`datax_encryption_jobs` shows its progress):
+
+```sql
+ALTER TABLE notes SET (encryption_key = 'auto');   -- reads take plain and sealed rows until the job is done
+ALTER TABLE notes PURGE;                           -- after the job: drops the old plaintext versions now
+ALTER TABLE notes ROTATE ENCRYPTION KEY;           -- the old key version is destroyed when the job is done
+SELECT * FROM datax_encryption_jobs;
+```
+
+Until garbage collection or a `PURGE`, the old plaintext versions of the
+rows stay in the table's history. A sealed table cannot be unsealed
+(copy it into a plain table instead).
 
 A table can instead be sealed **per tenant**: each value of its leading
 primary-key column gets a key of its own on its first write, and one
@@ -707,8 +722,11 @@ SELECT datax_destroy_tenant_key('items', $1);  -- returns once no node uses the 
 
 `datax_destroy_tenant_key` needs ownership of the table and runs outside
 a transaction block. A row of the tenant left behind fails with `XXK01`
-afterwards (and cannot be deleted one by one), so delete first; the
-tenant's next write gets a fresh key.
+afterwards, and `DELETE` cannot remove it, so delete first; should rows
+be left behind, `SELECT datax_remove_tenant_rows('items', $1)` removes
+them and their index entries without the key. The tenant's next write
+gets a fresh key. One tenant's key is rotated with
+`datax_rotate_tenant_key('items', $1)`.
 
 ## Reading
 

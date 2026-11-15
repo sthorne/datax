@@ -204,6 +204,16 @@ type Config struct {
 	RowTTLInterval   time.Duration
 	RowTTLBatchSize  int
 	RowTTLBatchPause time.Duration
+	// SealJobInterval paces the seal jobs (sealjobs.go; issue #310, step
+	// 5): each tick, the node leading range 1 works on every table whose
+	// rows are being sealed or moved to a rotated key's new version (0 =
+	// default 10s; negative disables the jobs, which then wait).
+	// SealJobBatchSize is how many rows one transaction reads (0 = 100)
+	// and SealJobBatchPause the wait between two batches (0 = 20ms;
+	// negative = none).
+	SealJobInterval   time.Duration
+	SealJobBatchSize  int
+	SealJobBatchPause time.Duration
 	// LargeObjectSweepInterval paces the large-object sweeper
 	// (largeobject.go): each tick, the node leading range 1 deletes the
 	// pages of unlinked objects and of uploads that never committed
@@ -951,6 +961,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.sealJobLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.largeObjectSweepLoop); err != nil {

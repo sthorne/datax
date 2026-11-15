@@ -1098,8 +1098,9 @@ kept by a table restore), the key's id and version, and the row's KV key
 after the table prefix. A value moved to another row or another table,
 or presented under another key or version, does not open (`XX001`).
 Nonces are random, so a key version should seal no more than about 2^32
-values; rotating the key starts a new version, and the online rotation
-job that rewrites old rows is a later step.
+values; rotating the key (`ALTER TABLE ... ROTATE ENCRYPTION KEY`)
+starts a new version, and a background job moves the old rows to it
+(*Sealing an existing table and rotating keys*, below).
 
 **Keys on the gateway.** Each gateway keeps unwrapped table keys in held
 memory (see *Keys in memory*) in the cache it shares with the key
@@ -1257,10 +1258,18 @@ failing the collection.
 Stop the tenant's writes before step 3: a gateway may seal a write under
 the key until the lease runs out, and such a row is unreadable. A row
 of the tenant still sealed under the key fails with `XXK01`, on every
-node, once the call has returned — and cannot then be deleted by itself
-(a `DELETE` reads the row first); only `TRUNCATE` or `DROP TABLE` remove
-it, which is why rows are deleted first. The tenant's next write makes a
-fresh key. Backups taken before step 3 hold the key until they expire
+node, once the call has returned, and a `DELETE` of it fails too (it
+reads the row first). Such rows — left by destroying the key first, or
+by a write in the lease — are removed with their index entries by
+`SELECT datax_remove_tenant_rows('items', $tenant)`, which needs no key:
+the tenant's rows are one span of primary keys, and every index entry
+carries its row's primary key, so it reads each secondary index (only
+the tenant's part of one whose leading column is the tenant column) for
+entries of the tenant's unreadable rows, removes them, and then the
+rows. That reads whole indexes, and a table referenced by foreign keys
+is refused, so deleting first stays the procedure; the function is the
+cleanup. `PURGE` afterwards as in step 2. The tenant's next write makes
+a fresh key. Backups taken before step 3 hold the key until they expire
 (the documented dependency, design *Erasure*): a table restore from such
 a backup brings the tenant back.
 
@@ -1316,6 +1325,86 @@ tenants on the default bound of 10,000 ran at 7,654 ops/s against 13,596
 plain, with 2.72 KV batches per operation; with `--key-cache-keys 40000`,
 17,533 and 19,533 against 19,574 and 20,490 plain, at 1.24 and 1.16 — the
 cost of reading 20,000 cold keys at the start of each run.
+
+## Sealing an existing table and rotating keys
+
+Two changes to a sealed table's keys leave rows written before them
+(v22, issue #310 step 5; statements in docs/sql.md, "Sealing an existing
+table and rotating keys"):
+
+- **Sealing a table that holds rows** — `ALTER TABLE t SET
+  (encryption_key = 'auto')`, or `(encryption_key_by = 'tenant_id')` —
+  gives the table its key, marks its descriptor `sealing`, and waits for
+  every gateway to adopt it; from then on every write is sealed, and the
+  rows already there are plain.
+- **Rotating a key** — `ALTER TABLE t ROTATE ENCRYPTION KEY [KEEP OLD
+  VERSIONS]` for a table sealed whole, `datax_rotate_tenant_key(table,
+  tenant [, keep_old])` for one tenant — adds a version, which every
+  gateway seals new writes under within the key lease; the rows already
+  there are under older versions.
+
+Reads take both meanwhile: a sealed value names its version (and, per
+tenant, its key), and a table being sealed reads its plain values as
+they are. A **seal job** then rewrites those rows, one job per table
+(`datax_encryption_jobs` shows it; a second change waits for it):
+
+- It runs on the node leading range 1, every 10 seconds, for up to that
+  long per table per turn, in **batches** of 100 rows: each batch is an
+  ordinary transaction that reads the next rows of the table's primary
+  index (of the tenant's span, for a tenant), opens and seals again the
+  ones it wants — plain values, or values of the rotated key below its
+  new version — and writes the job's record with where it got to. A
+  concurrent write to a row it rewrites conflicts with it and one of the
+  two retries, as between any two transactions. The record is
+  replicated, so a restart or a move of range 1's leadership resumes the
+  job from the last batch; for a moment two nodes may both act, and their
+  batches serialize on the record.
+- It does nothing until every gateway writes as it wants: for a seal job
+  until every descriptor lease is on the sealed descriptor (a gateway
+  still on the plain one could write a plain row behind the job), for a
+  rotation until the key lease has passed since it (a gateway could seal
+  under the old version until its cache sees the new one).
+- It works in **passes** over the span and is **done** when a whole pass
+  finds nothing to rewrite. A seal job then clears `sealing` in the
+  descriptor, in the same transaction, and strict reads are back — on
+  each gateway once its descriptor lease has the new descriptor, within
+  10 seconds: a plain value in the table is corruption (`XX001`) again. A rotation then
+  **destroys the key's older versions** — their material removed from
+  the key's record and the record's history purged — unless `KEEP OLD
+  VERSIONS` (or `keep_old`) was given; `datax_destroy_old_key_versions`
+  destroys them later.
+- A row it cannot open because its key is gone — a tenant's key
+  destroyed, an old version destroyed early — is stepped over and
+  counted (`rows_unreadable`); a key that is only unavailable on the
+  node (disabled, unreachable) fails the batch, which is retried on the
+  job's next turn, its error in `last_error`.
+
+**What stays behind.** Rewriting a row writes a new MVCC version; the
+old one stays in the table's history until garbage collection removes
+it (the table's `gc_ttl`). After sealing an existing table that history
+is the rows' **plaintext**, readable by `AS OF SYSTEM TIME` and on disk
+under file-level encryption only: the `ALTER TABLE` notice says so, and
+`ALTER TABLE t PURGE` once the job is done removes it at once (#295).
+After a rotation the history is under the old version, and once the job
+destroys that version it is unreadable — `AS OF SYSTEM TIME` reads below
+the rewrite fail with `XXK01` — which is the point of destroying it.
+Destroying an old version early, with `datax_destroy_old_key_versions`,
+is allowed and makes the rows still under it, and their history,
+unreadable; the job, if it runs, steps over them. Backups taken before
+hold the old version (and before sealing, the plaintext) until they
+expire, as always.
+
+**Unsealing is not supported.** `ALTER TABLE t RESET (encryption_key)`
+is refused: it would write the table's values back in plaintext, which
+is what a sealed table promises not to do, while its sealed history
+stayed readable under a key that would then have to be kept. A table is
+unsealed by copying its rows into a new, plain one.
+
+**Tables restored or recovered mid-job.** A table restore of a table
+being sealed brings `sealing` back and makes its job again under the new
+id. A table marked `sealing` without a job (a restore of everything
+brings back descriptors, not the jobs in flight) gets one from the
+sealed key janitor within five minutes.
 
 ## Keys in memory
 
@@ -1593,12 +1682,14 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
-- **Sealing an existing table**, and the background job that rewrites
-  rows still under an old key version after a rotation, are not built; a
-  sealed table's primary-key and indexed columns are never sealed (see
-  *Sealed tables*). A row of a per-tenant table left behind when its
-  tenant's key is destroyed cannot be deleted by itself, only with the
-  whole table (`TRUNCATE`, `DROP TABLE`); see *Per-tenant keys*.
+- **A sealed table's primary-key and indexed columns are never
+  sealed** (see *Sealed tables*). Sealing an existing table leaves its
+  rows' plaintext in MVCC history until garbage collection or `ALTER
+  TABLE ... PURGE`, and unsealing is not supported (see *Sealing an
+  existing table and rotating keys*). A row of a per-tenant table left
+  behind when its tenant's key is destroyed is removed by
+  `datax_remove_tenant_rows`, not by `DELETE`; a table referenced by
+  foreign keys needs `TRUNCATE` or `DROP TABLE` (see *Per-tenant keys*).
 - **Backups are sealed only when asked** (`datax backup --backup-key`);
   otherwise they are plaintext whatever the store is. A sealed backup
   shows its table count, table ids and file sizes; a rollback to an

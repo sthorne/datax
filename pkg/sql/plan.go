@@ -242,10 +242,14 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 						fam = types.Int
 					case "pg_sleep":
 						fam = types.Float
-					case destroyTenantKeyFunc:
-						// (table text, tenant): the tenant is coerced to
-						// the table's tenant column, so it binds as text.
+					case destroyTenantKeyFunc, rotateTenantKeyFunc, destroyOldKeyVersionsFunc, removeTenantRowsFunc:
+						// (table text, tenant [, keep_old bool]): the
+						// tenant is coerced to the table's tenant column,
+						// so it binds as text.
 						fam = types.String
+						if i == 2 {
+							fam = types.Bool
+						}
 					case "datax_key_wrap", "datax_key_unwrap", "datax_encrypt", "datax_decrypt":
 						// (name text, data bytea, context bytea)
 						fam = types.Bytes

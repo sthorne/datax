@@ -362,10 +362,9 @@ are **not** sealed.
 - **Refused** (`0A000`) before v22 is finalized, before the cluster key
   is enabled (`datax debug cluster-key init`), and for time-series
   tables. A value other than `'auto'` is `22023`, and so is giving both
-  `encryption_key` and `encryption_key_by`. `ALTER TABLE ... SET (encryption_key
-  = ...)` is refused as not built yet (`0A000`): sealing an existing
-  table rewrites its rows, which a later step does in the background.
-  Create a new sealed table and copy the rows into it.
+  `encryption_key` and `encryption_key_by`. A table that holds rows is
+  sealed with `ALTER TABLE ... SET (encryption_key = 'auto')` (*Sealing
+  an existing table and rotating keys*, below).
 - **Notices.** `CREATE TABLE` of a sealed table sends a `NOTICE` naming
   every column that stays plaintext and why (`id (primary key)`,
   `email_hmac (index users_email_hmac_key)`); `CREATE INDEX` on a
@@ -387,13 +386,15 @@ are **not** sealed.
   change that), the subclass datax's own, so that a client tells a key
   that is gone — erasure doing what was asked — from corruption. A
   sealed value that does not authenticate (moved, altered), or a plain
-  value in a sealed table, is **`XX001`** (`data_corrupted`).
+  value in a sealed table (once it is sealed: a table being sealed
+  reads its plain rows), is **`XX001`** (`data_corrupted`).
 - **Keys and leases.** A gateway keeps a table's key in held memory
   under a lease of at most 10 seconds, rechecked against the key's
   generation in `datax_keys`; a key disabled or destroyed stops being
   used everywhere within one lease. A rotation of the key (a new
-  version) reaches new writes within one lease; reads open every
-  version.
+  version, `ALTER TABLE ... ROTATE ENCRYPTION KEY`) reaches new writes
+  within one lease; reads open every version that has not been
+  destroyed.
 - **`DROP TABLE`** (and `DROP DATABASE ... CASCADE`) destroys the
   table's key once the drop has committed — the key's record is
   tombstoned and its history purged — so the dropped table's rows, which
@@ -465,9 +466,27 @@ SELECT datax_destroy_tenant_key('items', $1);   -- crypto-shred one tenant
 - **After the destruction** a statement that reads a row of the tenant
   still sealed under the key fails with `XXK01` naming the table and the
   key, on every gateway; so does a `DELETE` of such a row, which reads
-  the row first (only `TRUNCATE` or `DROP TABLE` remove it). Delete the tenant's rows
-  (and purge) first: docs/encryption.md, "Erasing a tenant". The
-  tenant's next write makes a fresh key.
+  the row first. `datax_remove_tenant_rows` removes such rows (below),
+  as do `TRUNCATE` and `DROP TABLE`. Delete the tenant's rows (and
+  purge) first: docs/encryption.md, "Erasing a tenant". The tenant's
+  next write makes a fresh key.
+- **`datax_remove_tenant_rows(table text, tenant) → bigint`** removes
+  the tenant's rows that no one can read any more — sealed under a key
+  that was destroyed — and their secondary index entries, without the
+  key, and returns how many rows it removed. The tenant's readable rows
+  (under its current key) are left for `DELETE`. It reads the tenant's
+  span of every secondary index whose leading column is the tenant
+  column and the whole of every other secondary index (an entry's row is
+  known from the primary key it carries), in transactions of 200
+  entries; then the tenant's rows. A call cut short is finished by
+  calling again. A table that other tables reference by foreign key is
+  refused (`0A000`: the foreign keys' actions need the rows' values);
+  a table not sealed per tenant is `42809`. Ownership, constants, no
+  transaction block and auditing as for `datax_destroy_tenant_key`.
+  `DELETE ... WHERE tenant_id = $1` is not made to do this itself: a
+  `DELETE` evaluates row-security policies and foreign-key actions on
+  the rows' values and counts the rows it removes, none of which it can
+  do for a row it cannot read.
 - **`DROP TABLE`** destroys the naming key at once, after commit, and
   every tenant key of the table in the background: a janitor on every
   node, woken by the drop and run every five minutes, destroys the
@@ -480,6 +499,81 @@ SELECT datax_destroy_tenant_key('items', $1);   -- crypto-shred one tenant
   100 to a transaction before the table is published. A tenant destroyed
   before the backup was taken has no key in it, and its rows stay
   unreadable after the restore.
+
+### Sealing an existing table and rotating keys (v22)
+
+Issue #310, step 5 (docs/encryption.md, "Sealing an existing table and
+rotating keys"):
+
+```sql
+ALTER TABLE notes SET (encryption_key = 'auto');           -- seal a table that holds rows
+ALTER TABLE items SET (encryption_key_by = 'tenant_id');   -- the same, a key per tenant
+ALTER TABLE notes ROTATE ENCRYPTION KEY [KEEP OLD VERSIONS];
+SELECT datax_rotate_tenant_key('items', $1 [, keep_old]);  -- → the new version
+SELECT datax_destroy_old_key_versions('notes');            -- → versions destroyed
+SELECT datax_destroy_old_key_versions('items', $1);
+SELECT * FROM datax_encryption_jobs;                       -- the jobs in progress
+```
+
+- **Sealing an existing table** gives it its key in one descriptor write,
+  with the refusals of `CREATE TABLE ... WITH (encryption_key |
+  encryption_key_by)` (v22, the cluster key, time-series tables, the
+  tenant column's rules), and waits until every gateway has the new
+  descriptor: from then on every write is sealed. The rows already there
+  are sealed by a background job; until it is done reads accept both
+  plain and sealed values (the descriptor is marked `sealing`), after it
+  (on each gateway within its descriptor lease) a plain value is
+  `XX001` again. The statement sends the table's
+  plaintext-columns `NOTICE` and a second one: the rows' **plaintext
+  versions stay in the table's MVCC history** until garbage collection
+  removes them (the table's `gc_ttl`) — `ALTER TABLE ... PURGE`, once
+  the job is done, removes them now. The option is set in a statement of
+  its own (`0A000` with any other option); a table sealed already is
+  `55000`.
+- **Unsealing** — `ALTER TABLE ... RESET (encryption_key |
+  encryption_key_by)` — is refused (`0A000`): it would write a sealed
+  table's values back in plaintext. Copy the rows into a new table
+  instead.
+- **`ALTER TABLE t ROTATE ENCRYPTION KEY`** gives a table sealed whole a
+  new key version, which every gateway seals new writes under within the
+  key lease (10 seconds); a background job rewrites the rows under older
+  versions and then **destroys the older versions** (the key's record
+  rewritten and its history purged), unless `KEEP OLD VERSIONS` was
+  given. A per-tenant table's tenants are rotated one at a time
+  (`42809` pointing to the function); a table not sealed is `55000`.
+  Not in a transaction block (`25001`); needs ownership (`42501`).
+- **`datax_rotate_tenant_key(table text, tenant [, keep_old boolean]) →
+  integer`** does the same for one tenant's key and that tenant's rows;
+  `NULL` for a tenant without a key.
+- **`datax_destroy_old_key_versions(table text [, tenant]) → bigint`**
+  destroys every version of the table's key (of the tenant's, for a
+  per-tenant table) but the current one, now, and returns once every
+  gateway has stopped using them. Rows still sealed under a destroyed
+  version — and MVCC history written under it — are unreadable from then
+  on (`XXK01`, "version n has been destroyed"); a job in progress steps
+  over them. A rotation's job does this itself when it is done, when no
+  live row is left under an older version; history under it then goes
+  unreadable, which an `AS OF SYSTEM TIME` read below the rewrite meets.
+- **The seal job.** One per table, recorded with the change; while it
+  runs, a second change to the table's sealing (another rotation, a
+  tenant's rotation, sealing) is refused (`55006`). The node leading
+  range 1 runs it in batches of 100 rows, each an ordinary transaction
+  that rewrites the rows it wants (`UPDATE`-like: concurrent writes to
+  the same rows conflict and retry as usual) and records the job's
+  progress, so a restart or a change of leader resumes it from the last
+  batch. It works in passes over the table's rows (one tenant's, for a
+  tenant's rotation) and is done when a whole pass finds nothing to
+  rewrite, having started only once every gateway writes as it wants (the
+  descriptor adopted everywhere; the key lease passed since the
+  rotation). `datax_encryption_jobs` (`table_name`, `kind` seal |
+  rotate, `scope` table | tenant, `key_id`, `version`,
+  `keep_old_versions`, `state` waiting | running | retrying, `pass`,
+  `rows_rewritten`, `rows_unreadable`, `created`, `updated`,
+  `last_error`) lists the jobs of the current database's tables; a job's
+  row goes when it is done. Each run of batches is an operation in the
+  node's events (`seal-job`). `datax start` has no flags for it; the
+  pace is `server.Config.SealJobInterval`, `SealJobBatchSize` and
+  `SealJobBatchPause`.
 
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,
@@ -919,6 +1013,16 @@ revoke the role's grants on keys. `DROP OWNED` of a role that owns a
 key is refused, as for a database it owns: dropping a key destroys
 everything wrapped under it, so it is never a side effect of removing
 a role — `DROP ENCRYPTION KEY` it, or `REASSIGN OWNED`, first.
+
+**Reserved names.** Names beginning `table/`, `tenant/` or `destroyed/`
+are the keys of sealed tables and their tenants, and `CREATE ENCRYPTION
+KEY` refuses them (`42939`). That is what lets `SHOW ENCRYPTION KEYS`,
+`DROP OWNED`, `REASSIGN OWNED` and `DROP ROLE` read the key service's
+keys alone — the names between those prefixes, through the unique index
+on names — rather than every row of `datax_keys`, which holds a key per
+tenant of every per-tenant table: with 10,000 tenant keys, `SHOW
+ENCRYPTION KEYS` reads 4 entries for two keys of the key service (it
+read 10,019 rows before).
 
 **The functions** are evaluated by the session once per call, before
 the statement's rows are read, as the large-object functions are: their

@@ -147,7 +147,9 @@ var (
 	// A sealed table's key: the naming key and seal id carry over (see
 	// "encryption_key" above), and a per-tenant table's tenant column is
 	// a column id.
-	restoreEncryptionKeyFields = fieldSet("key_id", "seal_id", "tenant_column")
+	// A table restored while it was being sealed carries sealing, and
+	// its seal job is made again under the new id at the publish.
+	restoreEncryptionKeyFields = fieldSet("key_id", "seal_id", "tenant_column", "sealing")
 	restoreIndexFields         = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
 	restoreConstraintFields    = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
 		"on_update", "index_id", "auto_index", "validated")
@@ -1212,6 +1214,13 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 			}
 			if err := txn.Put(ctx, keys.TableNamespaceKey(dbID, d.Name), []byte(fmt.Sprintf("%d", d.ID))); err != nil {
 				return err
+			}
+			if d.Sealed() && d.EncryptionKey.Sealing {
+				// Backed up while its rows were being sealed: the
+				// restored copy holds plain rows too, and needs the job.
+				if err := putSealJobFor(ctx, txn, d); err != nil {
+					return err
+				}
 			}
 		}
 		return txn.Delete(ctx, keys.RestoreProgressKey(opID))

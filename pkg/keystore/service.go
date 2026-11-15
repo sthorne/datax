@@ -175,8 +175,13 @@ func (s *Service) Lookup(ctx context.Context, name string) (sql.EncryptionKey, e
 	return toSQLKey(k), nil
 }
 
-// Create makes a wrapping key owned by owner.
+// Create makes a wrapping key owned by owner. Names under the prefixes
+// the keys of sealed tables are named under are refused (42939, as
+// PostgreSQL refuses a reserved name).
 func (s *Service) Create(ctx context.Context, name, owner string) (sql.EncryptionKey, error) {
+	if ReservedName(name) {
+		return sql.EncryptionKey{}, &sql.Error{Code: sql.CodeReservedName, Msg: fmt.Sprintf("encryption key name %q is reserved: names beginning %s are the keys of sealed tables and their tenants", name, strings.Join(quoteAll(ReservedPrefixes), ", "))}
+	}
 	k, err := s.store.CreateOwned(ctx, KindWrapping, name, owner)
 	if err != nil {
 		return sql.EncryptionKey{}, stateError(name, err)
@@ -247,17 +252,25 @@ func (s *Service) SetAccess(ctx context.Context, txn *kvclient.Txn, id int64, ch
 	return toSQLKey(k), changed, nil
 }
 
-// List returns every key of the key service, read in txn.
+func quoteAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = strconv.Quote(s)
+	}
+	return out
+}
+
+// List returns every key of the key service, read in txn. It reads the
+// key service's keys only (Store.WrappingKeysIn), not the keys of sealed
+// tables and their tenants.
 func (s *Service) List(ctx context.Context, txn *kvclient.Txn) ([]sql.EncryptionKey, error) {
-	ks, err := s.store.ListIn(ctx, txn)
+	ks, err := s.store.WrappingKeysIn(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]sql.EncryptionKey, 0, len(ks))
 	for _, k := range ks {
-		if k.Kind == KindWrapping {
-			out = append(out, toSQLKey(k))
-		}
+		out = append(out, toSQLKey(k))
 	}
 	return out, nil
 }

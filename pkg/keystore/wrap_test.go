@@ -108,3 +108,23 @@ func TestRewrapVersions(t *testing.T) {
 		t.Fatalf("no material: %v %v", got, err)
 	}
 }
+
+// TestReservedNames (issue #310, step 5): the names of sealed tables'
+// and tenants' keys are reserved, so that a listing of the key service's
+// keys can skip them; the prefixes are in name order, which is what
+// WrappingKeysIn's spans between them need.
+func TestReservedNames(t *testing.T) {
+	for name, want := range map[string]bool{
+		"billing": false, "tenants": false, "table": false, "destroyed": false,
+		"tenant/1/ab": true, "table/12": true, "destroyed/tenant/1/ab/7": true, "destroyed/x": true,
+	} {
+		if got := ReservedName(name); got != want {
+			t.Fatalf("ReservedName(%q) = %v", name, got)
+		}
+	}
+	for i := 1; i < len(ReservedPrefixes); i++ {
+		if ReservedPrefixes[i-1] >= ReservedPrefixes[i] || PrefixEnd(ReservedPrefixes[i-1]) > ReservedPrefixes[i] {
+			t.Fatalf("reserved prefixes out of order: %q", ReservedPrefixes)
+		}
+	}
+}

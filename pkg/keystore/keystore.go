@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -85,6 +86,10 @@ var (
 	ErrDestroyed = errors.New("the key has been destroyed")
 	// ErrNoVersion: the key has no such version.
 	ErrNoVersion = errors.New("the key has no such version")
+	// ErrVersionDestroyed: the version existed and was destroyed
+	// (DestroyVersions), after a rotation; the key's later versions
+	// still unwrap.
+	ErrVersionDestroyed = errors.New("that version of the key has been destroyed")
 )
 
 // ClusterKeys gives the store the cluster key. Keys returned are copies
@@ -118,6 +123,16 @@ type Config struct {
 type Store struct {
 	cfg Config
 }
+
+// listRowsRead counts the datax_keys entries the listings of every store
+// of the process read (rows and name index entries): ListRowsRead.
+var listRowsRead atomic.Int64
+
+// ListRowsRead is how many datax_keys entries — rows and name index
+// entries — the listings (ListIn, WrappingKeysIn) of every store of the
+// process have read since it started: for tests and diagnostics that
+// check a listing's cost does not grow with the number of tenant keys.
+func ListRowsRead() int64 { return listRowsRead.Load() }
 
 // New returns a store.
 func New(cfg Config) *Store {
@@ -632,6 +647,11 @@ func (s *Store) Unwrap(ctx context.Context, id int64, version int) (*Material, e
 		}
 	}
 	if sealed == nil {
+		if version > 0 && version < r.Version {
+			// Versions are numbered from 1 and only DestroyVersions
+			// takes one away.
+			return nil, ErrVersionDestroyed
+		}
 		return nil, ErrNoVersion
 	}
 	ck, err := s.cfg.ClusterKeys.Key(ctx, r.ClusterKey)
@@ -789,7 +809,28 @@ func (s *Store) rename(ctx context.Context, txn *kvclient.Txn, d *catalog.TableD
 const (
 	TenantKeyPrefix = "tenant/"
 	DestroyedPrefix = "destroyed/"
+	// TableKeyPrefix begins the name of every sealed table's key (and a
+	// per-tenant table's naming key): "table/" and the table's id when
+	// it was created (pkg/sql/sealed.go).
+	TableKeyPrefix = "table/"
 )
+
+// ReservedPrefixes are the name prefixes the keys of sealed tables and
+// their tenants are named under. A key of the key service may not take
+// a name under them (ReservedName), so that the key service's keys are
+// the names outside them: what WrappingKeysIn reads, without reading a
+// cluster's tenant keys, which may number millions. In name order.
+var ReservedPrefixes = []string{DestroyedPrefix, TableKeyPrefix, TenantKeyPrefix}
+
+// ReservedName reports whether name is under a reserved prefix.
+func ReservedName(name string) bool {
+	for _, p := range ReservedPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // DestroyedName is the name a destroyed tenant key named name takes.
 func DestroyedName(name string, id int64) string {
@@ -908,6 +949,69 @@ func (s *Store) Destroy(ctx context.Context, id int64) (Key, *kvpb.PurgeReport, 
 	return k, rep, nil
 }
 
+// DestroyVersions destroys every version of key id below version
+// (issue #310, step 5: what a rotation's rewrite does once no row is
+// sealed under the old versions): their material is removed from the
+// row, which keeps its later versions and stays enabled, and then the
+// row's history is purged, as Destroy's is, so the old material does not
+// linger in older MVCC versions. It returns the key and how many
+// versions it destroyed; with none to destroy it writes and purges
+// nothing. A version at or above the key's current one is never
+// destroyed this way (Destroy destroys a whole key). Unwrap of a
+// destroyed version is refused with ErrVersionDestroyed; the move of the
+// key's generation reaches every gateway's cache within its lease.
+func (s *Store) DestroyVersions(ctx context.Context, id int64, below int) (Key, int, *kvpb.PurgeReport, error) {
+	d, err := s.desc(ctx, false)
+	if err != nil {
+		return Key{}, 0, nil, err
+	}
+	var n int
+	var noop bool
+	k, err := s.update(ctx, "keys-destroy-versions", id, func(r *row) error {
+		n, noop = 0, false
+		if r.State == StateDestroyed {
+			return ErrDestroyed
+		}
+		limit := min(below, r.Version)
+		var keep []sealedVersion
+		var info []VersionInfo
+		for _, sv := range r.versions {
+			if sv.Version < limit {
+				n++
+				continue
+			}
+			keep = append(keep, sv)
+			info = append(info, VersionInfo{Version: sv.Version, Created: nanosToTime(sv.Created)})
+		}
+		if n == 0 {
+			noop = true
+			return errNothingToDo
+		}
+		r.versions, r.Versions = keep, info
+		return nil
+	})
+	if noop {
+		k, err = s.GetByID(ctx, id)
+		return k, 0, nil, err
+	}
+	if err != nil {
+		return Key{}, 0, nil, err
+	}
+	pk, err := pkKey(d, id)
+	if err != nil {
+		return k, n, nil, err
+	}
+	rep, err := s.cfg.DB.Purge(ctx, pk, pk.PrefixEnd())
+	if err != nil {
+		return k, n, nil, fmt.Errorf("%d versions of key %d are destroyed, but purging their history failed (their material lingers in the row's history until it is garbage-collected): %w", n, id, err)
+	}
+	return k, n, rep, nil
+}
+
+// errNothingToDo ends an update that would change nothing, without
+// writing.
+var errNothingToDo = errors.New("nothing to do")
+
 // destroyManyBatch is how many keys one transaction of DestroyMany
 // destroys.
 const destroyManyBatch = 100
@@ -992,6 +1096,79 @@ func (s *Store) DestroyMany(ctx context.Context, ids []int64, spare func(ctx con
 	return destroyed, rep, nil
 }
 
+// WrappingKeysIn returns the metadata of the key service's keys (kind
+// wrapping), in name order, read in txn: a scan of the name index over
+// the names outside ReservedPrefixes, then a point read of each row. Its
+// cost is the number of key service keys (and of any key named outside
+// the prefixes), not the number of keys: what SHOW ENCRYPTION KEYS, DROP
+// OWNED, REASSIGN OWNED and DROP ROLE list by, on a cluster whose
+// per-tenant tables may have millions of tenant keys.
+func (s *Store) WrappingKeysIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
+	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
+	if err != nil || d == nil {
+		return nil, err
+	}
+	idx, err := nameIndex(d)
+	if err != nil {
+		return nil, err
+	}
+	at := func(name string) (keys.Key, error) {
+		return rowenc.EncodeIndexPrefix(d, idx, []types.Datum{types.NewString(name)})
+	}
+	// The spans between the reserved prefixes: [start, first), [end of
+	// first, second), ..., [end of last, end of the index).
+	var spans [][2]keys.Key
+	lo := keys.TableIndexPrefix(d.ID, idx.ID)
+	for _, p := range ReservedPrefixes {
+		hi, err := at(p)
+		if err != nil {
+			return nil, err
+		}
+		spans = append(spans, [2]keys.Key{lo, hi})
+		if lo, err = at(PrefixEnd(p)); err != nil {
+			return nil, err
+		}
+	}
+	spans = append(spans, [2]keys.Key{lo, keys.TableIndexPrefix(d.ID, idx.ID).PrefixEnd()})
+	var pks []keys.Key
+	for _, sp := range spans {
+		ents, err := txn.Scan(ctx, sp[0], sp[1], 0)
+		if err != nil {
+			return nil, err
+		}
+		listRowsRead.Add(int64(len(ents)))
+		for _, kv := range ents {
+			pk, err := rowenc.IndexEntryPrimaryKey(d, idx, kv.Key, kv.Value)
+			if err != nil {
+				return nil, err
+			}
+			pks = append(pks, pk)
+		}
+	}
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	vals, err := txn.GetBatch(ctx, pks)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Key, 0, len(pks))
+	for i, v := range vals {
+		if v == nil {
+			continue
+		}
+		listRowsRead.Add(1)
+		r, err := decodeRow(d, pks[i], v)
+		if err != nil {
+			return nil, err
+		}
+		if r.Kind == KindWrapping {
+			out = append(out, r.Key)
+		}
+	}
+	return out, nil
+}
+
 // ListIn returns every key's metadata, in id order, read in txn.
 func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
 	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
@@ -1003,6 +1180,7 @@ func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
 	if err != nil {
 		return nil, err
 	}
+	listRowsRead.Add(int64(len(kvs)))
 	out := make([]Key, 0, len(kvs))
 	for _, kv := range kvs {
 		r, err := decodeRow(d, kv.Key, kv.Value)

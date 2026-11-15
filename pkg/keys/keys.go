@@ -314,6 +314,22 @@ func DroppedTableSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// SealJobKey holds the record of a table's seal job (JSON;
+// catalog.SealJob; issue #310 step 5): the background rewrite that seals
+// an existing table's plain rows, or moves a rotated key's rows to its
+// new version. One per table; the job on the node leading range 1
+// (pkg/server, sealjobs.go) works through it in batches, records its
+// progress in it, and removes it when done.
+func SealJobKey(tableID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("seal-job"), tableID))
+}
+
+// SealJobSpan covers every seal job's record.
+func SealJobSpan() (Key, Key) {
+	p := systemKey("seal-job")
+	return p, p.PrefixEnd()
+}
+
 // ViewDependencyKey records that view viewID's query reads relation
 // relID (issue #313): the reverse of TableDescriptor.ViewDepends, so the
 // views depending on a relation are a scan of ViewDependencySpan(relID)

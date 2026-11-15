@@ -498,6 +498,49 @@ func init() {
 			}
 			return rows, nil
 		})
+	// datax_encryption_jobs (issue #310, step 5): the seal jobs in
+	// progress — the background rewrite of a table's rows after ALTER
+	// TABLE ... SET (encryption_key), ALTER TABLE ... ROTATE ENCRYPTION
+	// KEY or datax_rotate_tenant_key — for the tables of the current
+	// database the reader can see. A job's row goes when the job is done.
+	pg("datax_encryption_jobs", []catalog.Column{col("table_name", types.String), col("table_id", types.Int), col("kind", types.String),
+		col("scope", types.String), col("key_id", types.Int), col("version", types.Int), col("keep_old_versions", types.Bool),
+		col("state", types.String), col("pass", types.Int), col("rows_rewritten", types.Int), col("rows_unreadable", types.Int),
+		col("created", types.Timestamp), col("updated", types.Timestamp), col("last_error", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.SealJobs == nil {
+				return nil, nil
+			}
+			jobs, err := env.SealJobs()
+			if err != nil || len(jobs) == 0 {
+				return nil, err
+			}
+			names := map[uint64]string{}
+			for _, t := range env.currentTables() {
+				names[t.ID] = t.Name
+			}
+			var rows []Row
+			for _, j := range jobs {
+				name, ok := names[j.TableID]
+				if !ok {
+					continue
+				}
+				scope, keyID, ver := "table", null(), null()
+				if j.Tenant {
+					scope = "tenant"
+				}
+				if j.Kind == "rotate" {
+					keyID, ver = i64(j.KeyID), i64(int64(j.Version))
+				}
+				updated := null()
+				if j.Updated != 0 {
+					updated = types.NewTimestamp(j.Updated)
+				}
+				rows = append(rows, Row{str(name), i64(int64(j.TableID)), str(j.Kind), str(scope), keyID, ver, boolean(j.KeepOld),
+					str(j.State), i64(int64(j.Pass)), i64(j.Rewritten), i64(j.Unreadable), types.NewTimestamp(j.Created), updated, textOrNull(j.LastError)})
+			}
+			return rows, nil
+		})
 	pg("pg_db_role_setting", []catalog.Column{col("setdatabase", types.Int), col("setrole", types.Int), col("setconfig", types.String)}, empty)
 	pg("pg_foreign_data_wrapper", []catalog.Column{col("oid", types.Int), col("fdwname", types.String), col("fdwowner", types.Int), col("fdwhandler", types.Int), col("fdwvalidator", types.Int), col("fdwacl", types.String), col("fdwoptions", types.String)}, empty)
 	pg("pg_foreign_server", []catalog.Column{col("oid", types.Int), col("srvname", types.String), col("srvowner", types.Int), col("srvfdw", types.Int), col("srvtype", types.String), col("srvversion", types.String), col("srvacl", types.String), col("srvoptions", types.String)}, empty)

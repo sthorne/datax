@@ -1,6 +1,6 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed; steps 1 to 4 built** (issue #310, the last piece
+Status: **agreed; built** (all five steps) (issue #310, the last piece
 of #292). The issue asked for a written design to be agreed before any
 code. This is that design; the owner settled its five open decisions on
 2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
@@ -12,7 +12,10 @@ its choices are under *Choices made in step 2*. Step 3, sealed whole
 tables, is built (docs/encryption.md, "Sealed tables"), with its
 choices under *Choices made in step 3*. Per-tenant keys (step 4) are
 built (docs/encryption.md, "Per-tenant keys"), with their choices under
-*Choices made in step 4*. Online rotation (step 5) does not exist yet.
+*Choices made in step 4*. Online rotation and sealing an existing
+table (step 5) are built too (docs/encryption.md, "Sealing an existing
+table and rotating keys"), with their choices under *Choices made in
+step 5*.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -482,3 +485,79 @@ Where *A. The key service* left a choice open, step 2 made these
   entries are found from its values). The procedure deletes first;
   `TRUNCATE` and `DROP TABLE` remove such rows. A blind delete of a
   destroyed tenant's span is possible later if it is needed.
+
+## Choices made in step 5
+
+- **Syntax.** `ALTER TABLE t SET (encryption_key = 'auto')` and `SET
+  (encryption_key_by = 'col')` seal a table that holds rows, with
+  `CREATE TABLE`'s refusals, in a statement of their own. `ALTER TABLE t
+  ROTATE ENCRYPTION KEY [KEEP OLD VERSIONS]` rotates a table sealed
+  whole, mirroring `ALTER ENCRYPTION KEY k ROTATE`;
+  `datax_rotate_tenant_key(table, tenant [, keep_old])` rotates one
+  tenant's key (a per-tenant table's naming key is never rotated: names
+  are digests under its version 1). `datax_destroy_old_key_versions(table
+  [, tenant])` destroys old versions early. `datax_encryption_jobs`
+  lists the jobs in progress.
+- **One job per table, its state in a record of its own**
+  (`keys.SealJobKey`, `catalog.SealJob`), not in the descriptor: the
+  record changes every batch, and a descriptor write invalidates every
+  gateway's lease. The descriptor carries only `encryption_key.sealing`,
+  which relaxes reads, and is written twice: when sealing starts and
+  when it is done. A second change to a table's keys waits for the job
+  (`55006`); for many tenants rotated one after another that serializes
+  them, which is accepted as the price of a single record per table.
+- **The job is the row-TTL job's shape**: the node leading range 1, a
+  turn per tick per table, batches of 100 rows, each an ordinary
+  transaction that rewrites the rows it wants and writes the record's
+  resume key — so a batch and its progress commit together, a restart or
+  a change of leader loses at most the batch in flight, and two nodes
+  briefly both acting serialize on the record. Batches are rewritten at
+  the KV boundary (open, seal, put) rather than through `UPDATE`
+  statements: the sealed value is all that changes, so no index entry,
+  constraint or trigger is involved, and the job reads each row once.
+- **When it may start, and when it is done.** A seal job waits until
+  every descriptor lease has adopted the sealed descriptor (a gateway on
+  the plain one could write a plain row behind it), checked by the job
+  itself (`Accessor.LeasesAdopted`) rather than trusted to the
+  statement, whose gateway may die before its drain; a rotation waits
+  for the key cache's lease plus a second. It is done when a whole pass,
+  begun after that, finds nothing to rewrite — a pass that rewrote
+  anything is followed by one more, which costs a read of the table and
+  removes any doubt about a straggler. Completion is the same
+  transaction as that last batch, which writes no row: the descriptor
+  loses `sealing`, or the rotation is marked done, its older versions
+  destroyed (`Store.DestroyVersions`: the material removed, the row's
+  history purged) and the record removed.
+- **Rows whose key is gone** (a destroyed tenant key, an old version
+  destroyed early) are stepped over and counted; a key that is only
+  unavailable fails the batch, so a node that cannot reach a key never
+  concludes that no row is under it and destroys the version.
+- **Unsealing is refused.** A reverse job would write values back in
+  plaintext and keep the key alive for the sealed history; copying into
+  a plain table says what it does.
+- **Leftover rows of a destroyed tenant** are removed by
+  `datax_remove_tenant_rows(table, tenant)`, not by a blind `DELETE`: a
+  `DELETE` evaluates row-security policies and foreign-key actions on
+  values and counts what it removes, and a `DELETE` that silently did
+  less for some rows would be worse than one that fails. The function
+  removes the index entries first — found by reading each secondary
+  index (the tenant's prefix of one led by the tenant column) for entries
+  whose primary key, which every entry carries, is in the tenant's span
+  and whose row is unreadable or absent — then the rows, each chunk a
+  transaction that decides on what it reads. A row under a destroyed key
+  is never written again (every write reads it first), so no concurrent
+  writer can make a decision wrong, and a fresh row of the tenant is
+  readable and stays. A table referenced by foreign keys is refused.
+- **Key listings read only the key service's keys.** The prefixes the
+  keys of tables and tenants are named under (`table/`, `tenant/`,
+  `destroyed/`) are reserved, and `SHOW ENCRYPTION KEYS`, `DROP OWNED`,
+  `REASSIGN OWNED` and `DROP ROLE` read the name index between them. No
+  index on kind was added: `datax_keys` is a system table whose shape is
+  fixed by v22, and the names already separate the kinds. With 10,000
+  tenant keys `SHOW ENCRYPTION KEYS` read 10,019 rows before and 4
+  entries after (two keys of the key service: two index entries, two
+  rows); `DROP ROLE` 8 (it lists twice).
+- **Restores.** A table restore of a table being sealed brings `sealing`
+  back and writes its job under the new id; a table marked `sealing`
+  without a job (a whole-cluster restore restores descriptors, not jobs)
+  gets one from the sealed key janitor.
