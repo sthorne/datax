@@ -231,6 +231,13 @@ func TestClusterKeyRefusals(t *testing.T) {
 		if _, err := c.keyStore(0).Create(ctx, keystore.KindWrapping, "k"); err == nil || !strings.Contains(err.Error(), "v22") {
 			t.Fatalf("a named key at v21: %v", err)
 		}
+		// The key service's statements and functions too (#310 step 2).
+		root := connectRoot(t, ctx, c)
+		defer root.Close(ctx)
+		_, err := root.Exec(ctx, `CREATE ENCRYPTION KEY k`)
+		wantState(t, "CREATE ENCRYPTION KEY at v21", err, "0A000", "need cluster version v22")
+		_, err = root.Exec(ctx, `SELECT datax_key_wrap('k', '\x00', 'c')`)
+		wantState(t, "datax_key_wrap at v21", err, "0A000", "need cluster version v22")
 	})
 
 	t.Run("key-file node then down node", func(t *testing.T) {
