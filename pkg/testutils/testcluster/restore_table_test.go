@@ -713,8 +713,8 @@ func TestTableRestoreNeedsV21(t *testing.T) {
 }
 
 // TestTableRestoreCarriesNewerTableFeatures: a table with a GIN index, a
-// GC window of its own and row expiry comes back from a table restore
-// with all three, and the inverted index answers under the new table id
+// GC window of its own, row expiry and a row-security policy comes back
+// from a table restore with all of them, and the inverted index answers under the new table id
 // — its entries are keyed under the table like any index's, so re-keying
 // the table re-keys them.
 func TestTableRestoreCarriesNewerTableFeatures(t *testing.T) {
@@ -727,6 +727,8 @@ func TestTableRestoreCarriesNewerTableFeatures(t *testing.T) {
 	execSQL(t, ctx, s, `CREATE TABLE docs (id INT8 PRIMARY KEY, doc JSONB, expires_at TIMESTAMPTZ)
 		WITH (gc_ttl = '2h', ttl_expiration = expires_at)`)
 	execSQL(t, ctx, s, `CREATE INDEX docs_gin ON docs USING GIN (doc)`)
+	execSQL(t, ctx, s, `ALTER TABLE docs ENABLE ROW LEVEL SECURITY`)
+	execSQL(t, ctx, s, `CREATE POLICY own_rows ON docs USING (id >= 0)`)
 	for i := 0; i < 60; i++ {
 		execSQL(t, ctx, s, `INSERT INTO docs VALUES (`+itoa(i)+`, '{"kind": "k`+itoa(i%6)+`", "n": `+itoa(i)+`}', '2099-01-01 00:00:00Z')`)
 	}
@@ -757,7 +759,7 @@ func TestTableRestoreCarriesNewerTableFeatures(t *testing.T) {
 		t.Fatalf("after an insert the restored index finds %d rows, want 11", len(got))
 	}
 	def := strings.Join(rowsText(t, ctx, rs, `SHOW CREATE TABLE docs_back`), "\n")
-	for _, opt := range []string{"gc_ttl", "ttl_expiration"} {
+	for _, opt := range []string{"gc_ttl", "ttl_expiration", "ROW LEVEL SECURITY", "own_rows"} {
 		if !strings.Contains(def, opt) {
 			t.Fatalf("the restored table lost its %s option:\n%s", opt, def)
 		}

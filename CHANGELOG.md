@@ -11,6 +11,28 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Row-level security** (#294): a table shared between tenants can confine a
+  role to its own rows. `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW
+  LEVEL SECURITY`; `CREATE POLICY p ON t [AS PERMISSIVE | RESTRICTIVE] [FOR ALL
+  | SELECT | INSERT | UPDATE | DELETE] [TO roles] [USING (expr)] [WITH CHECK
+  (expr)]`, `ALTER POLICY`, `DROP POLICY`; the `BYPASSRLS` role attribute.
+  PostgreSQL's rules: default deny, permissive policies OR-ed and restrictive
+  ones AND-ed, `42501` for a refused row. The policy is applied as a leading
+  WHERE condition on every read of the table — scans, every index, joins,
+  subqueries, aggregates, `ON CONFLICT`, `COPY`, `RETURNING`, locking reads,
+  prepared statements, `AS OF SYSTEM TIME` (filtered by today's policies) — and
+  bounds the scan, so a tenant-keyed policy reads one tenant's span. The owner
+  and admins are exempt unless `FORCE`; `root`, `BYPASSRLS` roles and the
+  node's own jobs always. Custom session settings (`SET app.tenant = ...`,
+  `current_setting`, `set_config`) name the tenant for a connection. A filtered
+  role is refused `TRUNCATE` and is shown no table statistics, no decoded range
+  boundaries in the console, and — like every non-admin now — no other role's
+  statement text in `SHOW SESSIONS` / `pg_stat_activity`. Foreign keys and
+  unique indexes still see the whole table, as in PostgreSQL. Not supported:
+  subqueries in a policy, security-invoker views. Behaviour follows
+  PostgreSQL's documented rules; it was not compared against a running
+  PostgreSQL. Cluster protocol version v21. See docs/user/security.md,
+  "Row-level security".
 - **Restore a table, or a database, into a running cluster** (#301): `datax
   restore --table db.t [--into name]` and `--database db [--into name]` bring
   tables back from a backup chain beside what is there; nothing else is
