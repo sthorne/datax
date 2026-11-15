@@ -298,7 +298,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|cluster-key|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -312,6 +312,8 @@ func runDebug(args []string) error {
 		return runDebugRotateEncKey(rest)
 	case "enc-root":
 		return runDebugEncRoot(rest)
+	case "cluster-key":
+		return runDebugClusterKey(rest)
 	case "seal-status":
 		return runDebugSealStatus(rest)
 	case "peer-unseal":
