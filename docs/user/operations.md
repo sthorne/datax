@@ -838,6 +838,22 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   base older than that is refused ("the base backup is older than the
   garbage-collection window"), because changes since it have been
   collected in part. Take a fresh full backup at least daily.
+- **Time-series retention and backups.** Retention expires rows beneath
+  SQL and leaves no tombstone, so an incremental taken after rows
+  expired has nothing to say about them: a restore of the full backup
+  and the incremental brings back the rows that expired in between
+  (with a revision-history incremental too). Every restored row is
+  written at the restore's time, and retention counts from a row's
+  write time, so restored rows — these and the rest — stay up to one
+  retention period after the restore rather than after they were first
+  written. To restore a time-series table as its retention would have
+  it, delete the old rows after the restore:
+  `DELETE FROM metrics WHERE at < now() - INTERVAL '7 days'` (the
+  retention, over the timestamp column). An incremental whose base the
+  retention has already passed is refused, like one older than the GC
+  window. (Issue #313; restore does not re-apply retention itself
+  because a backup holds no write times, and retention on a range of
+  its own goes by write time, not by the row's timestamp column.)
 - An incremental holds each changed key as it stood at the incremental's
   own timestamp. Taken with `--revision-history` it holds every version
   written since the base instead, and the chain restores to any moment
