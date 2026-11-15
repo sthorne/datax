@@ -470,7 +470,7 @@ Where *A. The key service* left a choice open, step 2 made these
   `datax_keys` (`Store.DestroyMany`; a purge per key was about 0.3 s).
   It spares keys younger than ten minutes (a first write can precede its
   table's commit) and the seal ids of table restores in flight.
-- **Table restore brings tenant keys back before the publish**, 500 to a
+- **Table restore brings tenant keys back before the publish**, 100 to a
   transaction (all of a large table's keys would not fit one), its
   progress record naming the seal id so the janitor leaves them alone; a
   failed restore's keys go to the janitor once its record is reclaimed.

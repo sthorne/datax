@@ -477,7 +477,7 @@ SELECT datax_destroy_tenant_key('items', $1);   -- crypto-shred one tenant
   last table that names them.
 - **Table restore** brings back the naming key, and every tenant key of
   the table the backup holds and this cluster lacks or has destroyed,
-  500 to a transaction before the table is published. A tenant destroyed
+  100 to a transaction before the table is published. A tenant destroyed
   before the backup was taken has no key in it, and its rows stay
   unreadable after the restore.
 

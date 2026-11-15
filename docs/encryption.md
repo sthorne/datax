@@ -1259,7 +1259,7 @@ TABLE` commits) and the keys of a table restore in flight.
 **Table restore** of a per-tenant table brings back its naming key and
 every tenant key of the table the backup holds, as for a sealed table's
 key — shared when this cluster has it, brought back from the backup's
-`datax_keys` when it lacks or has destroyed it — 500 keys to a
+`datax_keys` when it lacks or has destroyed it — 100 keys to a
 transaction before the table is published. A tenant whose key was
 destroyed before the backup was taken has no key in it; its rows come
 back unreadable, and its next write makes a fresh key.

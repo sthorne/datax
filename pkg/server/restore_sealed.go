@@ -78,9 +78,11 @@ func (sr *sealedRestore) tenantSealIDs() []uint64 {
 }
 
 // tenantReinstateBatch is how many tenant keys one transaction of a
-// table restore brings back: a few hundred kilobytes of datax_keys rows,
-// far under what one transaction may write to a range.
-const tenantReinstateBatch = 500
+// table restore brings back: some tens of kilobytes of datax_keys rows,
+// far under what one transaction may write to a range, and short enough
+// a transaction not to be pushed out by the reads of other gateways'
+// janitors and caches on a slow machine.
+const tenantReinstateBatch = 100
 
 // backupKeyRecords reads the chain's datax_keys rows: the backup's
 // descriptor of the table and, by key id, each key's last record.
