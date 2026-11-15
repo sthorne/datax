@@ -871,7 +871,12 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   retention has already passed is refused, like one older than the GC
   window. (Issue #313; restore does not re-apply retention itself
   because a backup holds no write times, and retention on a range of
-  its own goes by write time, not by the row's timestamp column.)
+  its own goes by write time, not by the row's timestamp column. A
+  restore that dropped rows by their timestamp column instead would
+  also drop a row backfilled with an old timestamp shortly before the
+  backup, which the source still held; telling the expired rows apart
+  would take every incremental listing every live key of every
+  time-series table, a full export each time. Issue #316 left it so.)
 - An incremental holds each changed key as it stood at the incremental's
   own timestamp. Taken with `--revision-history` it holds every version
   written since the base instead, and the chain restores to any moment
