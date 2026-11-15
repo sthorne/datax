@@ -226,6 +226,17 @@ changed since its timestamp, as any later pass does.
   version), or when GC has passed its timestamp (the export is refused
   below the GC threshold). These are the same full reads as before
   records existed.
+- *Checked against a full read.* However a state was resumed, each
+  follower checks it against a full read at least once a day (plus up
+  to a quarter of jitter, per node and job, so that the reads do not
+  coincide; the time of the last check travels in the record, so
+  restarts do not postpone it). That pass reads what changed and
+  everything as of one timestamp; if the two states differ the follower
+  logs a warning, counts it in
+  `datax_catalog_follower_divergence_total{job}` and keeps the full
+  read's. A bug that leaves a state wrong is therefore corrected within
+  about a day, as a restart's full read used to correct it, and is
+  visible: the counter should stay at zero.
 - *Cost.* A record is written after a pass at most every minute (the
   retention provider: a few hundred bytes on the node's engine), ten
   minutes (the janitor: usually an empty list) or hour (the sampler,
@@ -236,8 +247,11 @@ changed since its timestamp, as any later pass does.
   descriptors (1 MB at their smallest) and as many statistics records.
 
 `TestCatalogScanScale` measures the first passes after a restart, and
-`TestCatalogFollowersResumeAfterRestart` and
-`TestCatalogFollowersFallBack` check that the states equal a full read.
+`TestCatalogFollowersResumeAfterRestart`,
+`TestCatalogFollowersLeadershipMove` and `TestCatalogFollowersFallBack`
+check that the states equal a full read, and
+`TestCatalogFollowerFullReadCorrects` that the daily check finds and
+replaces a wrong one.
 
 ## Versioning and rolling upgrades
 

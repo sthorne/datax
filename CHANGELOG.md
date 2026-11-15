@@ -1420,7 +1420,10 @@ state or the internode protocol does, and an entry below says so.
   that is missing, of another format version, or older than the GC threshold
   leaves a full read, as before. The sampler's record, about 45 KB at 5,000
   tables, is written hourly; the others, a few hundred bytes, every minute
-  and every ten minutes.
+  and every ten minutes. Each job still checks its state against a full read
+  about once a day (jittered); a difference is logged as a warning, counted in
+  the new `datax_catalog_follower_divergence_total{job}`, and replaced by the
+  full read's.
 
 ### Fixed
 - **A transaction whose commit failed kept its rows locked for up to five
