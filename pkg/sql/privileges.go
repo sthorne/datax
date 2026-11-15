@@ -350,6 +350,76 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 	return nil
 }
 
+// checkSelectReads applies the SELECT check to every table a SELECT
+// reads — the base and joined tables of each member, derived table,
+// subquery and WITH member — without running it: the check EXPLAIN
+// owes (issue #312), since it plans by shape and evaluates nothing
+// that would check on its own. A view is checked as the reader, and
+// the tables its query reads as the view's owner (its WITH member,
+// bound by expandViews, carries the owner as Definer). Names that bind
+// to a WITH member or an enclosing relation are not tables; a name
+// that resolves to nothing is left for the statement to report.
+func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *parser.Select, seen map[uint64]bool) error {
+	shadowed := map[string]bool{}
+	var definers []parser.CTE
+	c := *sel
+	c.With = nil
+	for _, cte := range sel.With {
+		shadowed[strings.ToLower(cte.Name)] = true
+		if cte.Definer != "" {
+			definers = append(definers, cte)
+			continue
+		}
+		c.With = append(c.With, cte)
+	}
+	for _, name := range stmtTables(&c) {
+		lname := strings.ToLower(name)
+		db, bare := catalog.SplitTableName(lname)
+		if db == "" && shadowed[bare] {
+			continue
+		}
+		if r, bound := s.rels[bare]; bound && (db == "" || r.alias == lname) {
+			continue
+		}
+		desc, err := s.lookup(ctx, txn, name)
+		if err != nil || desc == nil {
+			continue
+		}
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return err
+		}
+		if desc.IsView() && desc.Virtual == "" && !seen[desc.ID] {
+			seen[desc.ID] = true
+			stmts, perr := parser.Parse(desc.ViewQuery)
+			if perr != nil || len(stmts) != 1 {
+				continue
+			}
+			if q, ok := stmts[0].(*parser.Select); ok {
+				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), q, seen); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, cte := range definers {
+		if q, ok := cte.Query.(*parser.Select); ok {
+			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, q, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkSelectReadsAs is checkSelectReads as another role: a view's
+// owner, for the tables the view reads.
+func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, sel *parser.Select, seen map[uint64]bool) error {
+	saved := s.privAs
+	s.privAs = role
+	defer func() { s.privAs = saved }()
+	return s.checkSelectReads(ctx, txn, sel, seen)
+}
+
 // sequencePrivAllowed reports whether the actor may exercise priv
 // (USAGE, SELECT, UPDATE) on the sequence: root, admins, the owner,
 // grantees, read_all (SELECT) and write_all (USAGE, UPDATE) — and, for a

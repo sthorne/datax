@@ -2969,6 +2969,12 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if t.Analyze {
 		return s.execExplainAnalyze(ctx, txn, sel, params)
 	}
+	// A plan shows a table's shape, its indexes and a row estimate drawn
+	// from its statistics: it takes the privilege the statement would,
+	// as in PostgreSQL. EXPLAIN ANALYZE runs the statement, which checks.
+	if err := s.checkSelectReads(ctx, txn, sel, map[uint64]bool{}); err != nil {
+		return nil, err
+	}
 	if len(sel.With) > 0 {
 		// The members bind by shape only: EXPLAIN runs nothing.
 		restore, err := s.bindWith(ctx, txn, sel.With, params, true, nil)

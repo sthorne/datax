@@ -19,6 +19,16 @@ func privCluster(t *testing.T) *TestCluster {
 	return StartWithOptions(t, 1, func(cfg *server.Config) { cfg.DescLeaseTTL = time.Second })
 }
 
+// privNotNaming asserts that a refusal's message mentions none of names.
+func privNotNaming(t *testing.T, msg string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if strings.Contains(msg, n) {
+			t.Fatalf("refusal names %q: %s", n, msg)
+		}
+	}
+}
+
 func TestPrivilegeGaps(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -103,5 +113,28 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsWant(t, ctx, alice, []string{"secret"},
 			`SELECT relname FROM pg_class WHERE oid IN (SELECT polrelid FROM pg_policy)`)
 		rlsRows(t, ctx, alice, `EXPLAIN SELECT * FROM pg_class`)
+	})
+
+	t.Run("EXPLAIN takes SELECT", func(t *testing.T) {
+		for _, q := range []string{
+			`EXPLAIN SELECT * FROM secret`,
+			`EXPLAIN SELECT v FROM secret WHERE id = 1`,
+			`EXPLAIN SELECT * FROM open_t JOIN secret ON open_t.id = secret.id`,
+			`EXPLAIN WITH s AS (SELECT * FROM secret) SELECT * FROM s`,
+			`EXPLAIN SELECT * FROM open_t JOIN (SELECT id FROM secret) AS d ON d.id = open_t.id`,
+			`EXPLAIN SELECT * FROM (SELECT id FROM secret) AS d`,
+		} {
+			msg := rlsRefused(t, ctx, alice, "42501", q)
+			privNotNaming(t, msg, "rows]")
+		}
+		rlsRows(t, ctx, alice, `EXPLAIN SELECT * FROM open_t`)
+		rlsRows(t, ctx, alice, `EXPLAIN WITH s AS (SELECT * FROM open_t) SELECT * FROM s`)
+		// A view is the reader's to explain if it may read the view: the
+		// view's query reads as its owner, as when it runs.
+		rlsExec(t, ctx, root, `CREATE VIEW secret_ids AS SELECT id FROM secret`)
+		rlsRefused(t, ctx, alice, "42501", `EXPLAIN SELECT * FROM secret_ids`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON secret_ids TO alice`)
+		rlsRows(t, ctx, alice, `EXPLAIN SELECT * FROM secret_ids`)
+		rlsRows(t, ctx, alice, `SELECT * FROM secret_ids`)
 	})
 }

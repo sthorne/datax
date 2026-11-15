@@ -140,7 +140,8 @@ takes `CREATE` on the database (or on `public`), or the admin role;
 take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
 (a pre-v11 `DELETE` grant still covers it); `nextval` takes `USAGE` on
 the sequence — a `SERIAL` column's sequence follows `INSERT` on the
-table; `CREATE DATABASE`, role management and `ANALYZE` take the admin
+table; `EXPLAIN` takes `SELECT` on every table the statement reads, as
+running it would; `CREATE DATABASE`, role management and `ANALYZE` take the admin
 role. A view's query runs with its **owner's** privileges (PostgreSQL's
 rule): a reader needs `SELECT` on the view only. `DROP ROLE` refuses a
 role that owns objects (`2BP01`); `REASSIGN OWNED` or `DROP OWNED` first.

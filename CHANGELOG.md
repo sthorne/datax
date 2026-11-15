@@ -998,6 +998,12 @@ state or the internode protocol does, and an entry below says so.
   statement text stays hidden. `SELECT ... FROM` a sequence checks the
   sequence's `SELECT` privilege instead of requiring an admin. See
   docs/user/security.md, "Roles and privileges".
+- **`EXPLAIN` takes `SELECT`** (#312). Plain `EXPLAIN` checked no
+  privilege, so a role with no grant on a table could see its plan, its
+  indexes and a row estimate drawn from its statistics. It now takes
+  `SELECT` on every table the statement reads — joined tables, derived
+  tables, subqueries and `WITH` members included — as running the
+  statement would; a view's query is checked as the view's owner.
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the

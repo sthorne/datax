@@ -1508,6 +1508,12 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   security does not confine, and a sequence's counter only past
   `sequencePrivAllowed`. A sequence read as a relation (`SELECT
   last_value FROM s`) checks the sequence's `SELECT`.
+  `EXPLAIN` (without `ANALYZE`, which runs the statement and checks as
+  it goes) plans by shape and evaluates nothing, so it checks first:
+  `checkSelectReads` walks every table the statement names
+  (`stmtTables`), skips WITH members and bound relations, checks
+  `SELECT` as the reader, and checks a view's query as the view's
+  owner.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;
