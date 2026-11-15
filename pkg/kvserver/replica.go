@@ -724,6 +724,13 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		}
 	}
 	metrics.RaftEntriesAppended.Add(float64(len(rd.Entries)))
+	if len(rd.Entries) > 0 {
+		var n int
+		for i := range rd.Entries {
+			n += len(rd.Entries[i].Data)
+		}
+		metrics.RaftEntryBytesAppended.Add(float64(n))
+	}
 	return r.rs.append(b, rd.Entries)
 }
 

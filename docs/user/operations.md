@@ -580,7 +580,9 @@ stopped ticking and heartbeating; on a quiet cluster this approaches
 how many heartbeats each message carried),
 `datax_raft_entries_appended_total` / `datax_raft_entries_applied_total`
 (the log's write and apply rates; applied lagging appended for long is a
-store whose apply workers cannot keep up), `datax_raft_apply_seconds`
+store whose apply workers cannot keep up),
+`datax_raft_entry_bytes_appended_total` (the payload bytes of the entries
+written), `datax_raft_apply_seconds`
 (per-entry apply time — the single-range write ceiling is its inverse,
 see [Capacity planning](#capacity-planning)),
 `datax_raft_apply_backpressure_total` (raft passes deferred because a

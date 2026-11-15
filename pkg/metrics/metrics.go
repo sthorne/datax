@@ -141,6 +141,9 @@ var (
 	RaftEntriesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_appended_total", Help: "Raft log entries written by this store (leader proposals and follower appends).",
 	})
+	RaftEntryBytesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entry_bytes_appended_total", Help: "Payload bytes of the raft log entries written by this store (leader proposals and follower appends).",
+	})
 	RaftEntriesApplied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_applied_total", Help: "Committed raft entries applied to the state machine.",
 	})
