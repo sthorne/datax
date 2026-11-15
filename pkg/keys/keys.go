@@ -111,6 +111,13 @@ func StorePeerUnsealKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-peer-unseal")...)
 }
 
+// StoreCatalogResumeKey is CatalogResumeKey for a job every node runs on
+// its own behalf (the retention provider behind GC): kept on the node's
+// own engine.
+func StoreCatalogResumeKey(job string) Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-catalog-resume/"+job)...)
+}
+
 // StoreEncryptionMarkerKey holds the store's own record of its switch to
 // authenticated encryption (JSON; issue #248): written after each
 // transition the sealed key registry records, so a registry rolled back
@@ -319,6 +326,13 @@ func DroppedTableSpan() (Key, Key) {
 // (JSON; issue #316, pkg/server/dropped_sweep.go). It sits outside
 // DroppedTableSpan.
 func DroppedTableSweepKey() Key { return systemKey("dropped-sweep") }
+
+// CatalogResumeKey holds where a background job that follows range 1's
+// leader resumes following the catalog (issue #316, pkg/server
+// desc_watch.go): its state and the timestamp it is as of, so that a
+// node that starts, or takes over the leadership, reads what changed
+// since rather than every descriptor.
+func CatalogResumeKey(job string) Key { return systemKey("catalog-resume", job) }
 
 // SealJobKey holds the record of a table's seal job (JSON;
 // catalog.SealJob; issue #310 step 5): the background rewrite that seals

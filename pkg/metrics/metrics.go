@@ -202,6 +202,10 @@ var (
 	StatsRefreshes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_stats_refreshes_total", Help: "Table statistics collections completed (ANALYZE and the background sampler).",
 	})
+	CatalogFollowerDivergence = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_catalog_follower_divergence_total",
+		Help: "Times a background job that follows the catalog (retention, reshard, stats) found the state it kept from what changed, or resumed after a start, differing from a full read, which it then used (issue #316). Any is a bug.",
+	}, []string{"job"})
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
 	})

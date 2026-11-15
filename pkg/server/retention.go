@@ -19,8 +19,9 @@ import (
 // key span to the GC TTL implied by timeseries tables' retention options
 // and by the gc_ttl option any table may carry (issue #295).
 // The table set is refreshed from the descriptors at most every
-// retentionRefreshInterval — the first time by reading them all, after
-// that by reading what changed (descWatcher) — and served stale on errors — GC policy may
+// retentionRefreshInterval — the first time by reading them all, or
+// what changed since the state this node persisted (catalogFollower),
+// after that by reading what changed — and served stale on errors — GC policy may
 // lag a CREATE/DROP by one interval, which is harmless (retention is
 // best-effort aging, not a deadline).
 type retentionProvider struct {
@@ -30,9 +31,9 @@ type retentionProvider struct {
 	mu        sync.Mutex
 	fetchedAt time.Time
 	spans     []retentionSpan
-	// byID is spans by table id, kept up to date from watch.
-	byID  map[uint64]retentionSpan
-	watch *descWatcher
+	// follow keeps the descriptors of the tables with a window up to
+	// date, and where to resume after a start (catalogFollower).
+	follow *catalogFollower
 	// edgeSplitAt is when the edges of a table with a GC window were
 	// last asked for, by the table's first key (see splitEdges).
 	edgeSplitAt map[string]time.Time
@@ -147,47 +148,59 @@ func (p *retentionProvider) get() []retentionSpan {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// What changed since the last refresh, not every descriptor (issue
-	// #313): see descWatcher.
-	if p.watch == nil {
-		p.watch = &descWatcher{n: p.node}
+	// #313): see catalogFollower.
+	if p.follow == nil {
+		p.follow = newRetentionFollower(p.node)
 	}
-	full, recs, err := p.watch.next(ctx)
+	full, changed, err := p.follow.pass(ctx)
 	if err != nil {
 		log.Debugf("retention refresh: descriptors: %v", err)
 		return p.spans // stale-serve
 	}
-	if full || p.byID == nil {
-		p.byID = map[uint64]retentionSpan{}
-	}
-	changed := full
-	for _, rec := range recs {
-		id, ok := descIDOfKey(rec.Key)
-		if !ok {
-			continue
-		}
-		_, had := p.byID[id]
-		delete(p.byID, id)
-		if !rec.Deleted {
-			var d catalog.TableDescriptor
-			if json.Unmarshal(rec.Value, &d) == nil && d.ID != 0 {
-				if rs, ok := retentionSpanFor(&d); ok {
-					p.byID[id] = rs
-					had = true
-				}
-			}
-		}
-		changed = changed || had
-	}
-	if changed {
-		spans := make([]retentionSpan, 0, len(p.byID))
-		for _, rs := range p.byID {
-			spans = append(spans, rs)
-		}
-		sort.Slice(spans, func(i, j int) bool { return spans[i].start.Compare(spans[j].start) < 0 })
-		p.spans = spans
+	if full || changed {
+		p.spans = retentionSpansOf(p.follow.state.(*rawDescs))
 	}
 	p.fetchedAt = time.Now()
 	return p.spans
+}
+
+// retentionResumeVersion is the format of the retention provider's
+// resume record; bump it when what retentionSpanFor accepts changes, so
+// that a node resuming under the new rule reads every descriptor again.
+const retentionResumeVersion = 1
+
+// retentionResumeEvery is how often the provider writes its resume
+// record: on the node's own engine, a value of a few descriptors.
+const retentionResumeEvery = time.Minute
+
+func newRetentionFollower(n *Node) *catalogFollower {
+	fresh := func() followedState {
+		s := &rawDescs{keep: func(d *catalog.TableDescriptor) bool {
+			_, ok := retentionSpanFor(d)
+			return ok
+		}}
+		s.reset()
+		return s
+	}
+	return newCatalogFollower("retention", n, nil, fresh, localResume{n, keys.StoreCatalogResumeKey("retention")},
+		retentionResumeVersion, retentionResumeEvery)
+}
+
+// retentionSpansOf is the provider's windows for the descriptors it
+// keeps, by start key.
+func retentionSpansOf(s *rawDescs) []retentionSpan {
+	spans := make([]retentionSpan, 0, len(s.byID))
+	for _, raw := range s.byID {
+		var d catalog.TableDescriptor
+		if json.Unmarshal(raw, &d) != nil {
+			continue
+		}
+		if rs, ok := retentionSpanFor(&d); ok {
+			spans = append(spans, rs)
+		}
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start.Compare(spans[j].start) < 0 })
+	return spans
 }
 
 // retentionSpanFor is what the provider keeps for table d: its window, if
