@@ -277,9 +277,23 @@ const (
 	// omitempty and the family is appended, so every descriptor written
 	// before reads the same.
 	V21 Version = 21
+	// V22 introduces the cluster key and the datax_keys system table
+	// (issue #310, docs/design-key-service.md; pkg/keystore and
+	// pkg/server/clusterkey.go). The cluster key is one 32-byte key per
+	// cluster, versioned, kept by every node wrapped under its own root
+	// (--enc-root); its replicated record (keys.ClusterKeyMarkerKey)
+	// says which version is current and how to check a copy. datax_keys
+	// (pkg/sql/catalog.KeysTableName) holds named keys wrapped by it. A
+	// v21 node knows nothing of either: it would hand nothing over to a
+	// joining node, write no copy of its own, and treat datax_keys as an
+	// ordinary table whose owner may read or delete its rows. So
+	// `datax debug cluster-key init` is refused, nothing creates the
+	// table, and no node writes the record or its holder report until
+	// finalize (rule 4).
+	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.
-	Current = V21
+	Current = V22
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.
