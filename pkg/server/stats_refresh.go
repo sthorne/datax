@@ -98,10 +98,13 @@ const statsResumeVersion = 1
 
 // statsResumeEvery is how often the sampler writes its resume record.
 // The record holds an entry per table and per statistics record — about
-// 60 KB at 5,000 tables — and the sampler, collecting a table a tick,
-// changes it every tick, so it is written seldom: the first pass after a
-// start reads back the at most ten records collected since.
-const statsResumeEvery = 10 * time.Minute
+// 45 KB at 5,000 tables, against the 5,000 descriptors (1 MB at their
+// smallest) and as many statistics records a full read returns — and the
+// sampler, collecting a table a tick, changes it every tick, so it is
+// written seldom: about 1 MB a day at 5,000 tables, and the first pass
+// after a start reads back at most the hour's sixty records collected
+// since, besides the DDL.
+const statsResumeEvery = time.Hour
 
 func newStatsFollower(n *Node) *catalogFollower {
 	dlo, dhi := keys.TableDescSpan()
