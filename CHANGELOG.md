@@ -1004,6 +1004,9 @@ state or the internode protocol does, and an entry below says so.
   `SELECT` on every table the statement reads — joined tables, derived
   tables, subqueries and `WITH` members included — as running the
   statement would; a view's query is checked as the view's owner.
+- **`SHOW STATS FOR t` takes `SELECT` on `t`** (#312). It checked no
+  privilege, so any role could read a table's row count and its columns'
+  distinct and NULL counts.
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the

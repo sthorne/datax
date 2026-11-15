@@ -171,7 +171,8 @@ SHOW STATS FOR t
   persists as append-only JSON at `/system/stats/<tableID>` — a separate
   key from the lease-hot descriptor — read through a per-gateway 30s
   stale-serving cache, deleted in the DROP TABLE transaction, and shown
-  by `SHOW STATS FOR t`. Statistics feed the planner (below); their
+  by `SHOW STATS FOR t` (to a role holding `SELECT` on `t`).
+  Statistics feed the planner (below); their
   absence means the structural fallback, byte-identical to the
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
@@ -1513,7 +1514,8 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `checkSelectReads` walks every table the statement names
   (`stmtTables`), skips WITH members and bound relations, checks
   `SELECT` as the reader, and checks a view's query as the view's
-  owner.
+  owner. `SHOW STATS FOR t` takes `SELECT` on `t`: its counts describe
+  the rows.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

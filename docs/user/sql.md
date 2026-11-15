@@ -1571,8 +1571,9 @@ SHOW STATS FOR users;
 writes, no locks) and stores the exact row count plus per-column
 distinct-value and NULL counts — distinct counts are exact up to 256
 values and a sketch estimate (±~10%) beyond. It cannot run inside
-`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
-shows what the planner sees, one row per column.
+`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any role
+holding `SELECT` on the table) shows what the planner sees, one row
+per column.
 
 A background sampler also keeps statistics fresh without ANALYZE: every
 minute (configurable) one node re-collects at most one table whose

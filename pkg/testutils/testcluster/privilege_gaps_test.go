@@ -137,4 +137,11 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsRows(t, ctx, alice, `EXPLAIN SELECT * FROM secret_ids`)
 		rlsRows(t, ctx, alice, `SELECT * FROM secret_ids`)
 	})
+
+	t.Run("SHOW STATS takes SELECT", func(t *testing.T) {
+		rlsRefused(t, ctx, alice, "42501", `SHOW STATS FOR secret`)
+		if got := rlsRows(t, ctx, alice, `SHOW STATS FOR open_t`); len(got) == 0 {
+			t.Fatal("SHOW STATS of a readable table shows nothing")
+		}
+	})
 }
