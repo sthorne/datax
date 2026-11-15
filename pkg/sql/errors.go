@@ -44,6 +44,7 @@ const (
 	CodeObjectNotInState            = "55000"
 	CodeGeneratedAlways             = "428C9"
 	CodeDuplicateObject             = "42710"
+	CodeReservedName                = "42939"
 	CodeCheckViolation              = "23514"
 	CodeForeignKeyViolation         = "23503"
 	CodeProgramLimitExceeded        = "54000"
