@@ -338,9 +338,10 @@ func (n *Node) KeyService() *keystore.Service {
 			return
 		}
 		n.keyService = keystore.NewService(keystore.ServiceConfig{
-			Store: ks,
-			Lease: n.cfg.KeyCacheLease,
-			Rate:  keystore.ClusterSettingRate(n.db),
+			Store:   ks,
+			Lease:   n.cfg.KeyCacheLease,
+			Rate:    keystore.ClusterSettingRate(n.db),
+			MaxKeys: n.cfg.KeyCacheMaxKeys,
 		})
 		if err := n.stopper.RunWorker(n.keyService.Run); err != nil {
 			log.Debugf("key cache sweeper: %v", err)

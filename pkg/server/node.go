@@ -170,6 +170,10 @@ type Config struct {
 	// descriptor lease). DROP, DISABLE and REVOKE on an encryption key
 	// wait it out. Tests shorten it.
 	KeyCacheLease time.Duration
+	// KeyCacheMaxKeys bounds how many named keys the gateway's cache
+	// holds (issue #310, step 4; 0: keystore.DefaultCacheMaxKeys, 10,000;
+	// negative: no bound).
+	KeyCacheMaxKeys int
 	// TenantKeyGrace is how old a tenant key of a table no descriptor
 	// names must be before the tenant key janitor destroys it (issue
 	// #310, step 4; 0: 10 minutes; negative: no wait). Tests shorten it.

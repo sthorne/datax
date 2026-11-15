@@ -215,10 +215,11 @@ func (e *cacheEntry) dropLocked() {
 	e.publishLocked()
 }
 
-// touch records a use of the entry, for eviction; only a bounded cache
-// needs it, and a timestamp already this recent is not written again.
+// touch records a use of the entry, for eviction, the sweep and the
+// background refresh; a timestamp already this recent is not written
+// again.
 func (c *Cache) touch(e *cacheEntry, now int64) {
-	if c.maxKeys > 0 && now-e.used.Load() > int64(time.Millisecond) {
+	if now-e.used.Load() > int64(time.Millisecond) {
 		e.used.Store(now)
 	}
 }
@@ -536,13 +537,17 @@ func (c *Cache) Forget(id int64) {
 	e.drop()
 }
 
-// Sweep drops every key whose last check is older than the lease: their
-// material is released rather than kept until something asks again.
+// Sweep drops every key nobody has used for a lease and whose last check
+// is older than the lease: their material is released rather than kept
+// until something asks again.
 func (c *Cache) Sweep() {
 	var stale []int64
 	now := c.now()
 	c.keys.Range(func(k, v any) bool {
 		e := v.(*cacheEntry)
+		if now.UnixNano()-e.used.Load() < int64(c.lease) {
+			return true
+		}
 		e.mu.Lock()
 		if e.checked.IsZero() || now.Sub(e.checked) >= c.lease {
 			stale = append(stale, k.(int64))
@@ -555,18 +560,94 @@ func (c *Cache) Sweep() {
 	}
 }
 
-// Run sweeps the cache every lease until ctx is done, then releases
-// everything it holds.
+// BatchSource is a Source that also reads many keys' metadata in one go
+// (*Store is one): with it, the cache's background refresh checks the
+// keys in use in batches, so that a gateway using many keys — a
+// per-tenant table's — does not check each one synchronously, on a
+// statement's path, every lease.
+type BatchSource interface {
+	// GetByIDs returns the metadata of the keys of ids that exist.
+	GetByIDs(ctx context.Context, ids []int64) (map[int64]Key, error)
+}
+
+// refreshBatch is how many keys one read of the background refresh
+// checks.
+const refreshBatch = 500
+
+// RefreshInUse checks, in batches, every key used within the last lease
+// whose last check is older than half the lease, as a statement's check
+// would: a key whose generation moved is dropped, a key that is gone is
+// forgotten, and the rest are confirmed from the moment the batch's read
+// began. Keys in use then stay on the hit path. It returns how many keys
+// it checked; it needs a BatchSource (0 otherwise).
+func (c *Cache) RefreshInUse(ctx context.Context) int {
+	bs, ok := c.src.(BatchSource)
+	if !ok {
+		return 0
+	}
+	now := c.now().UnixNano()
+	var ids []int64
+	c.keys.Range(func(k, v any) bool {
+		e := v.(*cacheEntry)
+		s := e.snap.Load()
+		if s == nil || s.checked == 0 || now-s.checked < int64(c.lease)/2 || now-e.used.Load() >= int64(c.lease) {
+			return true
+		}
+		ids = append(ids, k.(int64))
+		return true
+	})
+	checked := 0
+	for at := 0; at < len(ids); at += refreshBatch {
+		chunk := ids[at:min(at+refreshBatch, len(ids))]
+		start := c.now()
+		got, err := bs.GetByIDs(ctx, chunk)
+		if err != nil {
+			return checked // the statements' own checks carry on
+		}
+		for _, id := range chunk {
+			k, ok := got[id]
+			if !ok {
+				c.Forget(id)
+				continue
+			}
+			e := c.lookup(id)
+			if e == nil {
+				continue
+			}
+			e.mu.Lock()
+			if !e.gone && start.After(e.checked) {
+				if e.key.Generation != k.Generation || e.key.ID != k.ID {
+					for v, hm := range e.held {
+						delete(e.held, v)
+						hm.unref()
+					}
+				}
+				e.key, e.checked = k, start
+				e.publishLocked()
+			}
+			e.mu.Unlock()
+			checked++
+		}
+	}
+	return checked
+}
+
+// Run refreshes the keys in use every half lease (RefreshInUse) and
+// sweeps the cache every lease, until ctx is done; then it releases
+// everything the cache holds.
 func (c *Cache) Run(ctx context.Context) {
-	t := time.NewTicker(c.lease)
+	t := time.NewTicker(c.lease / 2)
 	defer t.Stop()
-	for {
+	for tick := 0; ; tick++ {
 		select {
 		case <-ctx.Done():
 			c.Close()
 			return
 		case <-t.C:
-			c.Sweep()
+			c.RefreshInUse(ctx)
+			if tick%2 == 1 {
+				c.Sweep()
+			}
 		}
 	}
 }

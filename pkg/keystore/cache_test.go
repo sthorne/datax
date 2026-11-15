@@ -498,3 +498,102 @@ func TestCacheHitRace(t *testing.T) {
 		t.Fatalf("With of a destroyed key after the lease: %v", err)
 	}
 }
+
+// batchSource is manySource with GetByIDs, counting batches.
+type batchSource struct {
+	manySource
+	batches int
+	gen     map[int64]int64
+	gone    map[int64]bool
+}
+
+func (b *batchSource) GetByID(ctx context.Context, id int64) (Key, error) {
+	k, err := b.manySource.GetByID(ctx, id)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gone[id] {
+		return Key{}, ErrNotFound
+	}
+	k.Generation += b.gen[id]
+	return k, err
+}
+
+func (b *batchSource) GetByIDs(ctx context.Context, ids []int64) (map[int64]Key, error) {
+	b.mu.Lock()
+	b.batches++
+	b.mu.Unlock()
+	out := map[int64]Key{}
+	for _, id := range ids {
+		b.mu.Lock()
+		gone := b.gone[id]
+		b.mu.Unlock()
+		if gone {
+			continue
+		}
+		k := Key{ID: id, State: StateEnabled, Version: 1, Generation: 1}
+		b.mu.Lock()
+		k.Generation += b.gen[id]
+		b.mu.Unlock()
+		out[id] = k
+	}
+	return out, nil
+}
+
+// TestCacheRefreshInUse (issue #310, step 4): the background refresh
+// checks the keys in use in batches, so they never fall off the hit path
+// at the end of a lease; a key whose generation moved loses its
+// material, a key that is gone is forgotten, an idle key is left to
+// lapse; Sweep keeps keys in use.
+func TestCacheRefreshInUse(t *testing.T) {
+	ctx := context.Background()
+	src := &batchSource{gen: map[int64]int64{}, gone: map[int64]bool{}}
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	c := NewCache(src, CacheConfig{Lease: 10 * time.Second, Now: clk.Now})
+	defer c.Close()
+	const n = 1200
+	use := func(id int64) {
+		t.Helper()
+		if _, _, err := c.AEAD(ctx, id, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id := int64(1); id <= n; id++ {
+		use(id)
+	}
+	gets := src.gets
+	for round := 0; round < 6; round++ {
+		clk.Add(6 * time.Second) // past half the lease
+		for id := int64(1); id <= n; id++ {
+			if id != 7 { // key 7 goes idle
+				use(id)
+			}
+		}
+		if got := c.RefreshInUse(ctx); round > 0 && got != n-1 {
+			t.Fatalf("round %d refreshed %d keys, want %d", round, got, n-1)
+		}
+		c.Sweep()
+	}
+	// Every key but the idle one stayed on the hit path: one synchronous
+	// check each (the first), and the idle one's lapse.
+	if extra := src.gets - gets; extra > 1 {
+		t.Fatalf("%d synchronous checks of keys in use", extra)
+	}
+	if src.batches < 3*6 {
+		t.Fatalf("%d batches", src.batches)
+	}
+	if e := c.lookup(7); e != nil {
+		t.Fatal("an idle key outlived the sweep")
+	}
+	// A change and a removal are seen by the refresh.
+	src.mu.Lock()
+	src.gen[1], src.gone[2] = 1, true
+	src.mu.Unlock()
+	clk.Add(6 * time.Second)
+	c.RefreshInUse(ctx)
+	if c.lookup(2) != nil {
+		t.Fatal("a key that is gone is still cached")
+	}
+	if s := c.lookup(1).snap.Load(); s == nil || s.generation != 2 || len(s.held) != 0 {
+		t.Fatalf("a key whose generation moved: %+v", s)
+	}
+}

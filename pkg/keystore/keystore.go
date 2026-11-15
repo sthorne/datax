@@ -487,6 +487,42 @@ func (s *Store) GetByID(ctx context.Context, id int64) (Key, error) {
 	return out, err
 }
 
+// GetByIDs returns the metadata of the keys of ids that exist, read in
+// one transaction and one batch: what a gateway's cache checks the keys
+// it is using with (BatchSource).
+func (s *Store) GetByIDs(ctx context.Context, ids []int64) (map[int64]Key, error) {
+	d, err := s.desc(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	pks := make([]keys.Key, len(ids))
+	for i, id := range ids {
+		if pks[i], err = pkKey(d, id); err != nil {
+			return nil, err
+		}
+	}
+	out := map[int64]Key{}
+	err = s.cfg.DB.RunTxn(ctx, "keys-get-many", func(ctx context.Context, txn *kvclient.Txn) error {
+		clear(out)
+		vals, err := txn.GetBatch(ctx, pks)
+		if err != nil {
+			return err
+		}
+		for i, v := range vals {
+			if v == nil {
+				continue
+			}
+			r, err := decodeRow(d, pks[i], v)
+			if err != nil {
+				return err
+			}
+			out[r.ID] = r.Key
+		}
+		return nil
+	})
+	return out, err
+}
+
 // Get returns the metadata of the key named name.
 func (s *Store) Get(ctx context.Context, name string) (Key, error) {
 	d, err := s.desc(ctx, false)
