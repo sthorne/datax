@@ -237,6 +237,17 @@ type Session struct {
 	// notify is the session's LISTEN / NOTIFY state (listen.go).
 	notify notifyState
 
+	// keys is the node's key service (keyservice.go; nil: none here).
+	// transportMarked / transportOK record whether the SQL server said
+	// how the client is connected, and whether that may carry key
+	// material. keyLeaseAfterCommit marks a statement that took a use of
+	// a key away inside the session's transaction (DROP OWNED, REASSIGN
+	// OWNED, DROP ROLE): it waits out the key lease once committed.
+	keys                KeyService
+	transportMarked     bool
+	transportOK         bool
+	keyLeaseAfterCommit bool
+
 	txn   *kvclient.Txn
 	state TxnState
 	// pendingDDL names tables changed inside the open explicit transaction;
@@ -706,6 +717,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err != nil {
 			s.forgetDDL()
 			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+			s.keyLeaseAfterCommit = false
 			s.discardNotify()
 			return nil, ToSQLError(err)
 		}
@@ -721,6 +733,9 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			}
 		}
 		s.runPendingWipes(ctx)
+		if serr := s.finishKeyLease(ctx); serr != nil {
+			return nil, serr
+		}
 		return &Result{Tag: "COMMIT"}, nil
 
 	case *parser.Rollback:
@@ -793,6 +808,11 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 // executeData runs a data statement in the session transaction (explicit)
 // or an auto-retrying implicit one.
 func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+	// The key service's statements (keyservice.go) change the datax_keys
+	// row in transactions of their own.
+	if isKeyStatement(stmt) {
+		return s.execKeyStatement(ctx, stmt)
+	}
 	// CREATE INDEX is a multi-transaction state machine (publish
 	// write-only → drain → backfill+publish → drain), so — like
 	// PostgreSQL's CREATE INDEX CONCURRENTLY — it cannot run inside an
@@ -1056,6 +1076,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		s.extraDDL, s.pendingWipes = nil, nil
+		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		if err == nil && TestingBeforeImplicitCommit != nil {
@@ -1078,6 +1099,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 	}
 	s.runPendingWipes(ctx)
+	if serr := s.finishKeyLease(ctx); serr != nil {
+		return nil, serr
+	}
 	return res, nil
 }
 
@@ -1136,6 +1160,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.endTxnVars()
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+	s.keyLeaseAfterCommit = false
 	s.discardNotify()
 	s.state = StateIdle
 }

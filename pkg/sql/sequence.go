@@ -460,6 +460,11 @@ var volatileFuncs = map[string]bool{"nextval": true, "currval": true, "lastval":
 func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (parser.Expr, error) {
 	out := e
 	if e.Func != "" && volatileFuncs[e.Func] {
+		if _, ok := keyFuncs[e.Func]; ok {
+			if serr := keyArgsConstant(e); serr != nil {
+				return e, serr
+			}
+		}
 		args := make([]types.Datum, len(e.Args))
 		for i, a := range e.Args {
 			d, err := evalExpr(a, nil, nil, params)
@@ -469,6 +474,14 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 			args[i] = d
 		}
 		var d types.Datum
+		if _, ok := keyFuncs[e.Func]; ok {
+			v, err := s.evalKeyFunc(ctx, txn, e.Func, args)
+			if err != nil {
+				return e, err
+			}
+			out.Func, out.Args, out.Lit = "", nil, &v
+			return out, nil
+		}
 		if largeObjectFuncs[e.Func] {
 			v, err := s.evalLargeObjectFunc(ctx, txn, e.Func, args)
 			if err != nil {

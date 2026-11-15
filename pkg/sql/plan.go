@@ -242,6 +242,12 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 						fam = types.Int
 					case "pg_sleep":
 						fam = types.Float
+					case "datax_key_wrap", "datax_key_unwrap", "datax_encrypt", "datax_decrypt":
+						// (name text, data bytea, context bytea)
+						fam = types.Bytes
+						if i == 0 {
+							fam = types.String
+						}
 					default:
 						if b, ok := builtins.Lookup(e.Func); ok {
 							if f := b.ArgFamily(i); f != builtins.Any {
@@ -631,6 +637,11 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 
 	case *parser.Analyze:
 		return nil, nil
+
+	case *parser.ShowEncryptionKeys:
+		return showEncryptionKeysColumns(), nil
+	case *parser.ShowClusterSetting:
+		return []ResultColumn{{Name: t.Name, Type: types.String}}, nil
 
 	case *parser.SetVar:
 		if len(t.Name) > 5 && t.Name[:5] == "show:" {
