@@ -972,6 +972,20 @@ func canSeeTable(set catalog.RoleSet, d *catalog.TableDescriptor) bool {
 	return catalog.CanSeeTable(set, d)
 }
 
+// mayKnowTable reports whether the actor may be told a table's name in
+// an error about a statement that did not name it: root, admins, and a
+// role holding some privilege on it (catalog.CanSeeTable).
+func (s *Session) mayKnowTable(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor) (bool, error) {
+	if s.actor() == catalog.RootRole || s.system {
+		return true, nil
+	}
+	set, err := s.roleSet(ctx, txn)
+	if err != nil {
+		return false, err
+	}
+	return canSeeTable(set, d), nil
+}
+
 // grantRows renders SHOW GRANTS: database_name, schema_name,
 // relation_name, grantee, privilege_type, is_grantable.
 func (s *Session) grantRows(ctx context.Context, txn *kvclient.Txn, t *parser.Show) ([][]string, error) {

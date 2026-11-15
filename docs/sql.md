@@ -1521,7 +1521,13 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   node of the older binary decides so); the finalize transaction that
   moves the cluster to v11 adds `TRUNCATE` beside every `DELETE` grant
   (`catalog.GrantTruncateWithDelete`), so grants made before keep their
-  meaning and later `DELETE` grants do not carry `TRUNCATE`.
+  meaning and later `DELETE` grants do not carry `TRUNCATE`. The
+  tables a `TRUNCATE` names are all privilege-checked before any
+  foreign key is looked at, and a referencing table it does not name is
+  named in the refusal only to a role holding some privilege on it
+  (`mayKnowTable`); `pg_constraint` lists every foreign key to every
+  role, as PostgreSQL's does, so this keeps errors consistent rather
+  than secret.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

@@ -156,4 +156,33 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsExec(t, ctx, alice, `TRUNCATE del_t`)
 		rlsWant(t, ctx, alice, []string{}, `SELECT id FROM del_t`)
 	})
+
+	t.Run("TRUNCATE checks privileges before foreign keys", func(t *testing.T) {
+		rlsExec(t, ctx, root, `CREATE TABLE fk_parent (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `CREATE TABLE fk_hidden_child (id INT8 PRIMARY KEY, p INT8, CONSTRAINT hidden_ref FOREIGN KEY (p) REFERENCES fk_parent (id))`)
+		// No privilege on the parent at all: the privilege refusal, and
+		// nothing about who references it.
+		msg := rlsRefused(t, ctx, alice, "42501", `TRUNCATE fk_parent`)
+		privNotNaming(t, msg, "fk_hidden_child", "hidden_ref")
+		msg = rlsRefused(t, ctx, alice, "42501", `TRUNCATE fk_parent CASCADE`)
+		privNotNaming(t, msg, "fk_hidden_child", "hidden_ref")
+		// TRUNCATE on the parent and nothing on the child: refused, and
+		// the child it cannot see is not named.
+		rlsExec(t, ctx, root, `GRANT TRUNCATE ON fk_parent TO alice`)
+		_, err := alice.Exec(ctx, `TRUNCATE fk_parent`)
+		if err == nil {
+			t.Fatal("TRUNCATE of a referenced table accepted")
+		}
+		privNotNaming(t, err.Error(), "fk_hidden_child", "hidden_ref")
+		msg = rlsRefused(t, ctx, alice, "42501", `TRUNCATE fk_parent CASCADE`)
+		privNotNaming(t, msg, "fk_hidden_child", "hidden_ref")
+		// A child it may see is named, as before.
+		rlsExec(t, ctx, root, `GRANT SELECT ON fk_hidden_child TO alice`)
+		if _, err := alice.Exec(ctx, `TRUNCATE fk_parent`); err == nil || !strings.Contains(err.Error(), "fk_hidden_child") {
+			t.Fatalf("TRUNCATE of a parent with a visible child: %v", err)
+		}
+		rlsRefused(t, ctx, alice, "42501", `TRUNCATE fk_parent CASCADE`)
+		rlsExec(t, ctx, root, `GRANT TRUNCATE ON fk_hidden_child TO alice`)
+		rlsExec(t, ctx, alice, `TRUNCATE fk_parent CASCADE`)
+	})
 }

@@ -1007,6 +1007,15 @@ state or the internode protocol does, and an entry below says so.
 - **`SHOW STATS FOR t` takes `SELECT` on `t`** (#312). It checked no
   privilege, so any role could read a table's row count and its columns'
   distinct and NULL counts.
+- **A `TRUNCATE` refusal names a referencing table only to a role that may
+  know of it** (#312). A role holding `TRUNCATE` on a table and nothing on
+  a table whose foreign key references it was told the referencing
+  table's and constraint's names (`0A000`), or, under `CASCADE`, refused
+  by name. It is now told that such a reference exists, without naming
+  it (`0A000`; `42501` under `CASCADE`). A role with some privilege on the
+  referencing table gets the message as before. The privilege checks on
+  the tables the statement names already came first; `pg_constraint`
+  lists foreign keys to every role, as in PostgreSQL.
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the

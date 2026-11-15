@@ -423,6 +423,19 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 			if !ok {
 				continue
 			}
+			// Every table the statement names has passed its privilege
+			// check. A referencing table it does not name is reported by
+			// name only to a role that may know of it (issue #312): one
+			// holding no privilege on it learns that a reference exists,
+			// which the refusal cannot avoid, and not whose.
+			if visible, err := s.mayKnowTable(ctx, txn, child); err != nil {
+				return nil, err
+			} else if !visible {
+				if t.Cascade {
+					return nil, newErrf(CodeInsufficientPriv, "permission denied: TRUNCATE ... CASCADE of table %q would truncate a table that references it, on which %q holds no privilege", desc.Name, s.actor())
+				}
+				return nil, newErrf(CodeFeatureNotSupported, "cannot truncate table %q because a table on which %q holds no privilege references it through a foreign key", desc.Name, s.actor())
+			}
 			if !t.Cascade {
 				return nil, newErrf(CodeFeatureNotSupported, "cannot truncate table %q because table %q references it through foreign key %q (use TRUNCATE ... CASCADE, or truncate both)", desc.Name, child.Name, c.Name)
 			}
