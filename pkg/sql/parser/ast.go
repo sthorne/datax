@@ -722,6 +722,12 @@ type AlterTable struct {
 	// Purge is ALTER TABLE ... PURGE: collect the table's garbage now
 	// and report, replica by replica, that none is left.
 	Purge bool
+	// RotateKey is ALTER TABLE ... ROTATE ENCRYPTION KEY [KEEP OLD
+	// VERSIONS]: a sealed table's key gets a new version, and a
+	// background job rewrites the rows under the older ones; RotateKeepOld
+	// keeps the older versions once it is done.
+	RotateKey     bool
+	RotateKeepOld bool
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.

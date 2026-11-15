@@ -3754,6 +3754,19 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 	case p.consumeIdentWord("purge"):
 		at.Purge = true
+	case p.consumeIdentWord("rotate"):
+		if !p.peekEncryptionKey(0) {
+			return nil, p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
+		}
+		p.i += 2
+		at.RotateKey = true
+		if p.peekWord(0, "keep") {
+			if !p.peekWord(1, "old") || !p.peekWord(2, "versions") {
+				return nil, p.errf("expected KEEP OLD VERSIONS")
+			}
+			p.i += 3
+			at.RotateKeepOld = true
+		}
 	case p.consumeIdentWord("split"):
 		if !p.consumeIdentWord("at") {
 			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
@@ -3787,7 +3800,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
 	return at, nil
 }
