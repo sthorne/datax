@@ -121,6 +121,9 @@ type DB struct {
 	// attemptTimeout bounds one attempt at one replica (perAttemptTimeout;
 	// tests shorten it).
 	attemptTimeout time.Duration
+	// waits wakes transactions blocked on another transaction's intents
+	// when that transaction finishes (see conflictwait.go).
+	waits txnWaits
 	// skipPushes remembers when each transaction whose lock a SKIP LOCKED
 	// read stepped around was last pushed (see resolveAbandonedLocks).
 	skipPushes struct {
