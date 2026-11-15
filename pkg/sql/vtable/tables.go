@@ -10,7 +10,6 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
-	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // The tables. Column sets follow PostgreSQL 16's, trimmed to what psql,
@@ -309,12 +308,14 @@ func init() {
 		// and the element row's typarray forward.
 		for i := range rows {
 			elem := rows[i][0].I
-			if elem == vector.OID {
-				// vector[] is not a type datax has (typarray stays 0): a
-				// row for it would take the text array's OID.
+			arr, ok := arrayTypeOIDs[elem]
+			if !ok {
+				// Not an element type datax has arrays of (tsvector,
+				// tsquery, vector, enums): typarray stays 0. A row for one
+				// would take ArrayTypeOID's fallback, the text array's OID,
+				// and pg_type would hold two rows for 1009.
 				continue
 			}
-			arr := ArrayTypeOID(elem)
 			rows[i][12] = i64(arr)
 			name := "_" + rows[i][1].S
 			rows = append(rows, Row{i64(arr), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str("A"),

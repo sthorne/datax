@@ -235,6 +235,21 @@ func SetTableNamer(f func(uint64) (string, bool)) {
 	tableNamer.Store(&f)
 }
 
+// PrettyForTable is Pretty for a key of a table whose name the caller
+// knows: that table is named whether or not the installed namer has
+// caught up with it yet. A statement that has just resolved the table
+// itself — ALTER TABLE ... SPLIT AT, say — reports its boundaries under
+// the name it was given, rather than under the id for the few seconds
+// before a node's table cache learns a new table (issue #311).
+func PrettyForTable(k Key, id uint64, name string) string {
+	s := Pretty(k)
+	numbered := fmt.Sprintf("/table/%d", id)
+	if name != "" && strings.HasPrefix(s, numbered) && (len(s) == len(numbered) || s[len(numbered)] == '/') {
+		return "/table/" + name + s[len(numbered):]
+	}
+	return s
+}
+
 // TableName resolves a table ID through the installed namer.
 func TableName(id uint64) (string, bool) {
 	if f := tableNamer.Load(); f != nil {

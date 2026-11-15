@@ -256,7 +256,10 @@ func TestSplitAtIsSticky(t *testing.T) {
 	}
 	var first, last keys.Key
 	for _, d := range all {
-		switch keys.Pretty(d.StartKey) {
+		// Named the way the statement names them: the node's table-name
+		// cache may not have caught up with a table this new.
+		id, _ := keys.TableIDOf(d.StartKey)
+		switch keys.PrettyForTable(d.StartKey, id, "st") {
 		case res.Rows[0][0].Text():
 			first = d.StartKey
 		case res.Rows[2][0].Text():

@@ -664,7 +664,7 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 		if _, err := s.db.AdminSplitSticky(ctx, key, stickyUntil); err != nil {
 			return nil, err
 		}
-		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.PrettyForTable(key, desc.ID, desc.Name))})
 	}
 	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
 	return res, nil
@@ -709,7 +709,7 @@ func (s *Session) execUnsplit(ctx context.Context, t *parser.AlterTable, params 
 		if _, err := s.db.AdminUnsplit(ctx, key); err != nil {
 			return nil, err
 		}
-		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.PrettyForTable(key, desc.ID, desc.Name))})
 	}
 	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
 	return res, nil
