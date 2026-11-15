@@ -1099,6 +1099,11 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		}
 	}
 	final := chain.final()
+	// Named keys come back only where their cluster key can open them
+	// (issue #310): refused before anything is applied.
+	if err := n.checkRestoreClusterKeys(ctx, chain); err != nil {
+		return nil, err
+	}
 	if !chain.cutoff.IsEmpty() {
 		// The cut falls inside the last backup's interval, whose manifest
 		// describes the schema at the interval's end.
@@ -1266,9 +1271,15 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		}
 	}
 
+	// Restored named keys are sealed under this cluster's key (issue #310).
+	keyNotes, err := n.rewrapRestoredKeys(ctx, chain)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verification: a fresh full export of every restored table, hashed the
 	// same way — the caller compares against the source's checksums.
-	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users) + len(final.Roles), EndTS: formatBackupTS(chain.asOf())}
+	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users) + len(final.Roles), EndTS: formatBackupTS(chain.asOf()), Notes: keyNotes}
 	verifyTS := n.clock.Now()
 	for _, t := range final.Tables {
 		h := sha256.New()
