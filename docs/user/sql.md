@@ -1571,8 +1571,9 @@ SHOW STATS FOR users;
 writes, no locks) and stores the exact row count plus per-column
 distinct-value and NULL counts — distinct counts are exact up to 256
 values and a sketch estimate (±~10%) beyond. It cannot run inside
-`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any user)
-shows what the planner sees, one row per column.
+`BEGIN`. The statistics feed the query planner; `SHOW STATS` (any role
+holding `SELECT` on the table) shows what the planner sees, one row
+per column.
 
 A background sampler also keeps statistics fresh without ANALYZE: every
 minute (configurable) one node re-collects at most one table whose
@@ -1811,6 +1812,9 @@ publications, extensions, functions, triggers, ...), plus
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
+Every role may read them; `pg_catalog` lists every table and
+`information_schema` the tables the reader holds a privilege on, as in
+PostgreSQL ([security guide](security.md#roles-and-privileges)).
 This is what makes `psql`'s `\d`, `\dt`, `\dv`, `\di`, `\du`, `\l`, `\dn`, `\dp`
 and friends, and ORM schema introspection, work unmodified — see
 [Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).

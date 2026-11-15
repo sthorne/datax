@@ -409,6 +409,13 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
+- **Who may read them.** Every role, as in PostgreSQL: `pg_catalog`
+  lists every table of the current database to any reader, and
+  `information_schema` the tables the reader holds some privilege on.
+  Two differences: table statistics (`reltuples`, `n_live_tup`) read
+  `0` for a table the reader may not `SELECT` from, where PostgreSQL
+  shows them to everyone, and `pg_largeobject_metadata` lists the
+  reader's own large objects only.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 - **How many tables.** The `pg_catalog` views, `SHOW TABLES` and name
   resolution cost in proportion to the current database, not to the

@@ -171,7 +171,8 @@ SHOW STATS FOR t
   persists as append-only JSON at `/system/stats/<tableID>` — a separate
   key from the lease-hot descriptor — read through a per-gateway 30s
   stale-serving cache, deleted in the DROP TABLE transaction, and shown
-  by `SHOW STATS FOR t`. Statistics feed the planner (below); their
+  by `SHOW STATS FOR t` (to a role holding `SELECT` on `t`).
+  Statistics feed the planner (below); their
   absence means the structural fallback, byte-identical to the
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
@@ -254,7 +255,9 @@ confined role in `SHOW STATS`, `pg_class.reltuples`,
 console decodes no range boundary of such a table for it
 (`catalog.CanReadTable`). `DROP COLUMN` refuses a column a policy
 reads, `RENAME COLUMN` rewrites the policies, `DROP ROLE` refuses a
-role a policy names, and a table restore keeps row security and cuts
+role a policy names, `DROP OWNED BY` takes the role out of every
+policy's list and drops a policy it leaves empty (an empty list would
+mean PUBLIC; `stripPolicyRoles`, as PostgreSQL's DROP OWNED), and a table restore keeps row security and cuts
 each policy's roles to the ones the cluster has.
 
 **Custom settings.** `sessionVars.custom` holds two-part names
@@ -1498,6 +1501,52 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   as schema changes: by the time GRANT returns, every gateway enforces
   it. In insecure (trust) mode the username is client-claimed, so
   enforcement there is advisory — anyone can claim `root`.
+  The virtual catalogs are read by every role (issue #312):
+  `tablePrivAllowed` grants `SELECT` on a `pg_catalog` or
+  `information_schema` descriptor to anyone and nothing else, and
+  `virtualEnv` decides what each lists — every table of the scope for
+  `pg_catalog`, the tables `catalog.CanSeeTable` admits (and whose
+  schema the reader may use) for `information_schema` — and gathers
+  statistics only for tables `catalog.CanSelectTable` admits and row
+  security does not confine, and a sequence's counter only past
+  `sequencePrivAllowed`. A sequence read as a relation (`SELECT
+  last_value FROM s`) checks the sequence's `SELECT`.
+  `EXPLAIN` (without `ANALYZE`, which runs the statement and checks as
+  it goes) plans by shape and evaluates nothing, so it checks first:
+  `checkSelectReads` walks every table the statement names
+  (`stmtTables`), skips WITH members and bound relations, checks
+  `SELECT` as the reader, and checks a view's query as the view's
+  owner. `SHOW STATS FOR t` takes `SELECT` on `t`: its counts describe
+  the rows.
+  `TRUNCATE` takes the `TRUNCATE` privilege. Until cluster version v11
+  it took `DELETE`, and while a cluster is below v11 it still does (a
+  node of the older binary decides so); the finalize transaction that
+  moves the cluster to v11 adds `TRUNCATE` beside every `DELETE` grant
+  (`catalog.GrantTruncateWithDelete`), so grants made before keep their
+  meaning and later `DELETE` grants do not carry `TRUNCATE`. The
+  tables a `TRUNCATE` names are all privilege-checked before any
+  foreign key is looked at, and a referencing table it does not name is
+  named in the refusal only to a role holding some privilege on it
+  (`mayKnowTable`); `pg_constraint` lists every foreign key to every
+  role, as PostgreSQL's does, so this keeps errors consistent rather
+  than secret. An `AS OF SYSTEM TIME` read resolves its
+  descriptors and the role graph as of its timestamp; privileges are
+  decided as of now instead (`historicalTablePrivAllowed`, the
+  counterpart of `historicalRowFilter`), memoized per statement. Both
+  read "now" through `freshCatalog`: for an exact timestamp, an
+  ordinary transaction (it waits for the leaseholders as any current
+  read does); for a bounded-staleness read, a historical transaction at
+  the newest timestamp the node serves locally (`max(read timestamp,
+  LocalClosedTimestamp)`), so privileges and policies are as fresh as
+  the data and the read stays local under a partition. The table is the
+  gateway's leased descriptor when it holds a live lease on it under
+  the same name (`Accessor.Leased`, no KV read), else read by ID; the
+  role graph and schema `USAGE` are read in that transaction (there is
+  no gateway role cache). Checks inside that transaction are not
+  redirected again (`Session.freshTxn`). A renamed table is checked under its grants
+  today; a dropped one, having none, is readable by admins only.
+  `virtualEnv` under a historical transaction uses today's role set and
+  withholds statistics and sequence counters from non-admins.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

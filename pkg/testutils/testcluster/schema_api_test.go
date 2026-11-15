@@ -331,6 +331,11 @@ func TestSchemaAPIDescribesATableFully(t *testing.T) {
 		CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE
 	)`)
 	execSQL(t, ctx, s, `COMMENT ON TABLE orders IS 'one row per order'`)
+	execSQL(t, ctx, s, `CREATE ROLE clerks`)
+	execSQL(t, ctx, s, `ALTER TABLE orders ENABLE ROW LEVEL SECURITY`)
+	execSQL(t, ctx, s, `ALTER TABLE orders FORCE ROW LEVEL SECURITY`)
+	execSQL(t, ctx, s, `CREATE POLICY open_orders ON orders FOR SELECT TO clerks USING (status = 'pending')`)
+	execSQL(t, ctx, s, `CREATE POLICY no_refunds ON orders AS RESTRICTIVE FOR INSERT WITH CHECK (total >= 0)`)
 
 	// The document is cached for schemaCacheFor, so the tables created
 	// above appear on the first rebuild after that, not necessarily on
@@ -409,5 +414,22 @@ func TestSchemaAPIDescribesATableFully(t *testing.T) {
 	}
 	if fk.OnDelete != catalog.FKCascade {
 		t.Errorf("foreign key ON DELETE: got %q, want %q", fk.OnDelete, catalog.FKCascade)
+	}
+
+	// Row-level security and its policies (issue #312): the detail view
+	// shows them, and its DDL reproduces them.
+	if !ord.RowSecurity || !ord.ForceRowSecurity {
+		t.Errorf("orders row security: enabled %v, forced %v", ord.RowSecurity, ord.ForceRowSecurity)
+	}
+	if len(ord.Policies) != 2 {
+		t.Fatalf("orders policies: %+v", ord.Policies)
+	}
+	if p := ord.Policies[0]; p.Name != "open_orders" || p.Restrictive || p.Command != "select" ||
+		len(p.Roles) != 1 || p.Roles[0] != "clerks" || p.Using != "status = 'pending'" || p.Check != "" ||
+		p.Definition != "CREATE POLICY open_orders ON orders FOR SELECT TO clerks USING (status = 'pending')" {
+		t.Errorf("first policy: %+v", p)
+	}
+	if p := ord.Policies[1]; p.Name != "no_refunds" || !p.Restrictive || p.Command != "insert" || len(p.Roles) != 0 || p.Check != "total >= 0" {
+		t.Errorf("second policy: %+v", p)
 	}
 }

@@ -590,6 +590,11 @@ state or the internode protocol does, and an entry below says so.
   are later steps. `/api/security` and the security view report the
   cluster key and which nodes hold it. Cluster protocol version v22. See
   docs/encryption.md, "Cluster key".
+- **The console's table page shows row-level security** (#312): whether it
+  is enabled and forced, and each policy — permissive or restrictive, the
+  statements and roles it applies to, its `USING` and `WITH CHECK`
+  expressions — and the reconstructed DDL reproduces them. `/api/schema`
+  gains `row_security`, `force_row_security` and `policies` per table.
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
@@ -1015,6 +1020,59 @@ state or the internode protocol does, and an entry below says so.
   the CSV export label a key accordingly rather than hand a reader the
   shown form under a key's name (found in the console review of the
   combined PR, where #213 met #226's copy controls).
+- **Every role reads the catalogs** (#312). A role that was not an admin
+  was refused (`42501`) every `pg_catalog` and `information_schema` table,
+  so `psql`'s `\d`, ORM introspection and `pg_policies` worked for admins
+  only. They now follow PostgreSQL: any role reads them; `pg_catalog`
+  lists every table of the current database, `information_schema` the
+  tables the reader holds some privilege on, and `role_table_grants` the
+  grants to or by the reader's roles. Statistics (`reltuples`,
+  `n_live_tup`) are shown only for tables the reader may `SELECT` from and
+  row security does not filter, `pg_sequences.last_value` only for a
+  sequence it may read; no catalog carries a password, and another role's
+  statement text stays hidden. `SELECT ... FROM` a sequence checks the
+  sequence's `SELECT` privilege instead of requiring an admin. See
+  docs/user/security.md, "Roles and privileges".
+- **`EXPLAIN` takes `SELECT`** (#312). Plain `EXPLAIN` checked no
+  privilege, so a role with no grant on a table could see its plan, its
+  indexes and a row estimate drawn from its statistics. It now takes
+  `SELECT` on every table the statement reads — joined tables, derived
+  tables, subqueries and `WITH` members included — as running the
+  statement would; a view's query is checked as the view's owner.
+- **`SHOW STATS FOR t` takes `SELECT` on `t`** (#312). It checked no
+  privilege, so any role could read a table's row count and its columns'
+  distinct and NULL counts.
+- **A `TRUNCATE` refusal names a referencing table only to a role that may
+  know of it** (#312). A role holding `TRUNCATE` on a table and nothing on
+  a table whose foreign key references it was told the referencing
+  table's and constraint's names (`0A000`), or, under `CASCADE`, refused
+  by name. It is now told that such a reference exists, without naming
+  it (`0A000`; `42501` under `CASCADE`). A role with some privilege on the
+  referencing table gets the message as before. The privilege checks on
+  the tables the statement names already came first; `pg_constraint`
+  lists foreign keys to every role, as in PostgreSQL.
+- **`AS OF SYSTEM TIME` answers to today's privileges** (#312). A
+  historical read checked a table's privileges, and the reader's role
+  memberships, as of its timestamp, so a `REVOKE` did not stop a role
+  from reading the table as it stood before. Privileges are now decided
+  as row-security policies already were: by the table's grants and the
+  role's memberships now, the rows being the timestamp's. A table renamed
+  since answers to its grants under the new name; one dropped since is
+  readable historically by admins only. Catalogs read `AS OF SYSTEM TIME`
+  use today's roles and show statistics and sequence counters to admins
+  only. "Now" is as fresh as the data the node can serve: an exact
+  timestamp checks the current grants and policies; a bounded-staleness
+  read checks the newest state the node's own replicas hold (the leased
+  descriptor, or the catalog at its closed timestamp), so a `REVOKE` the
+  node has replicated stops it, one not yet replicated is invisible to it
+  as unreplicated rows are, and under a partition it is still served
+  locally for every role. Row-security policies under a bounded-staleness
+  read are read the same way; before, their check needed the
+  leaseholders and could not finish on a partitioned node. (A statement
+  prepared through the extended protocol still
+  resolves its tables by today's names when it is described, so a table
+  renamed or dropped since is reachable only through the simple
+  protocol, as before.)
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
@@ -1171,6 +1229,17 @@ state or the internode protocol does, and an entry below says so.
   choice for the tab and says plainly that it will not be kept. The table
   is included in backups: it is small, and unlike the metrics it cannot
   be regenerated from anything.
+- **`TRUNCATE` takes the `TRUNCATE` privilege; `DELETE` no longer covers
+  it** (#312). A `DELETE` grant let its holder `TRUNCATE` the table, a
+  fallback kept from before cluster version v11, when `DELETE` was what
+  `TRUNCATE` took — on every table, and for grants made long after v11.
+  Now the fallback holds only while a cluster is below v11, and
+  finalizing v11 grants `TRUNCATE` beside every `DELETE` grant in the
+  same transaction. **A cluster already at v11 or later is not
+  migrated**: a role that truncates a table on the strength of a `DELETE`
+  grant is refused (`42501`) and needs `GRANT TRUNCATE ON t TO role`
+  (`SHOW GRANTS` lists who holds `DELETE` without it). `ALL` and the
+  `write_all` role include `TRUNCATE` as before.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it
@@ -1584,6 +1653,13 @@ state or the internode protocol does, and an entry below says so.
   one, no shared family clearing the floors in both — so every pair
   involving it is at least 15 apart, and a test computes the distances
   rather than trusting the numbers.
+- **`DROP OWNED BY r` takes `r` out of row-security policies** (#312). It
+  left the policies naming the role alone, so the `DROP ROLE` that
+  follows it was still refused (`2BP01`) until each policy was altered or
+  dropped by hand. As in PostgreSQL, the role is now removed from every
+  policy's `TO` list, and a policy that named only it is dropped (an
+  empty list would mean every role). Each such drop is audit-logged as
+  `policy-ddl`.
 
 ## 0.57.0 — unreleased
 

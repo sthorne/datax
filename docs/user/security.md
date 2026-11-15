@@ -138,15 +138,69 @@ What each statement needs: creating tables, views, sequences and types
 takes `CREATE` on the database (or on `public`), or the admin role;
 `ALTER`, `DROP`, `COMMENT ON`, `CREATE INDEX` and `GRANT` on an object
 take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
-(a pre-v11 `DELETE` grant still covers it); `nextval` takes `USAGE` on
+— `DELETE` does not cover it (finalizing the v11 upgrade gave every
+`DELETE` grant made before it `TRUNCATE` too, since `DELETE` was what
+`TRUNCATE` took until then); `nextval` takes `USAGE` on
 the sequence — a `SERIAL` column's sequence follows `INSERT` on the
-table; `CREATE DATABASE`, role management and `ANALYZE` take the admin
-role. A view's query runs with its **owner's** privileges (PostgreSQL's
+table; `EXPLAIN` takes `SELECT` on every table the statement reads, as
+running it would, and `SHOW STATS FOR t` takes `SELECT` on `t`;
+`CREATE DATABASE`, role management and `ANALYZE` take the admin role.
+A view's query runs with its **owner's** privileges (PostgreSQL's
 rule): a reader needs `SELECT` on the view only. `DROP ROLE` refuses a
-role that owns objects (`2BP01`); `REASSIGN OWNED` or `DROP OWNED` first.
+role that owns objects or that a row-security policy names (`2BP01`);
+`REASSIGN OWNED` or `DROP OWNED` first. `DROP OWNED` also takes the role
+out of every policy's `TO` list, dropping a policy that named it alone,
+as PostgreSQL does.
 Its grants and memberships go with it. Grants take effect cluster-wide
 by the time the statement returns; a membership change is seen by the
 next statement everywhere.
+
+**Historical reads answer to today's privileges.** A `SELECT ... AS OF
+SYSTEM TIME` reads the rows as they stood at the timestamp, but whether
+the role may read a table is decided by the table's grants and the
+role's memberships as they are now, as its row-security policies are: a
+`REVOKE` stops reads at every earlier timestamp too, and a grant made
+since opens them. The table is found as of the timestamp and checked by
+its identity, so one renamed since answers to its grants under the new
+name; one dropped since has no grants left, and only an admin may read
+what remains of it. Catalogs read as of a timestamp list that
+timestamp's schema under today's roles, and show statistics and sequence
+counters to admins only.
+
+"Now" is as fresh as the data the node can serve. An exact `AS OF
+SYSTEM TIME '...'` read checks the grants and policies in force now,
+reading them as any current statement would. A bounded-staleness read
+(`with_max_staleness`) exists to be answered by the node's own replicas
+when it is cut off from the rest, so it checks against the newest
+state those replicas hold (the gateway's leased copy of the table, or
+the catalog at the node's closed timestamp, never older than the read
+itself): a `REVOKE` the node has replicated stops the read, and one it
+has not yet replicated is invisible to it — the same staleness bound
+the rows themselves have. Under a partition such a read is still served
+locally, for every role.
+
+**The catalogs are every role's.** As in PostgreSQL, any role may read
+`pg_catalog` and `information_schema`, so `psql`'s `\d` and ORM
+introspection work for an ordinary role. What they list follows
+PostgreSQL: `pg_class`, `pg_attribute`, `pg_constraint`, `pg_indexes`,
+`pg_tables`, `pg_views`, `pg_policies` and the rest describe every
+table of the current database — names, columns, defaults, constraints,
+view definitions and policy expressions — whatever the reader holds;
+`information_schema.tables`, `columns` and the other views list the
+tables the reader holds some privilege on (and not those of a database
+whose `public` schema it may not use), and `role_table_grants` the
+grants made to or by one of its roles. What would describe the rows
+rather than the schema is shown only to a role that may read them:
+`reltuples` and `n_live_tup` read `0` for a table the reader holds no
+`SELECT` on (or whose row security filters it), `pg_sequences.last_value`
+is `NULL` without `SELECT` or `USAGE` on the sequence, and
+`pg_largeobject_metadata` lists the reader's own large objects (all of
+them for an admin). No catalog carries a password or verifier:
+`pg_roles.rolpassword` and `pg_user.passwd` read `********`, and there is
+no `pg_authid` or `pg_shadow`. Another role's statement text in
+`pg_stat_activity` reads `<insufficient privilege>` unless the reader is
+an admin. Reading a table's rows — the audit table's included — still
+takes its privileges.
 
 A cluster upgraded from an earlier version keeps its users and `ADMIN`
 grants: `datax debug upgrade` rewrites them as roles in the same
@@ -280,7 +334,8 @@ It does not:
   schema briefly, so a table whose row security was just enabled may
   show a filtered role its range boundaries for that long.
 - **Policies are evaluated with today's definitions.** A historical
-  read does not bring back an older, laxer policy.
+  read does not bring back an older, laxer policy — nor older, laxer
+  privileges (see below).
 
 Policy changes and `BYPASSRLS` grants are audit-logged (`policy-ddl`,
 `role-ddl`) with their principal.

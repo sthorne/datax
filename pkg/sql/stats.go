@@ -249,11 +249,15 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 }
 
 // execShowStats renders the stored statistics for a table: one row per
-// column, the table row count and collection time repeated (read-only,
-// no admin needed).
+// column, the table row count and collection time repeated. No admin
+// is needed, but the counts describe the table's rows, so it takes
+// SELECT on the table, as PostgreSQL's pg_stats does (issue #312).
 func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parser.ShowStats) (*Result, error) {
 	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 		return nil, err
 	}
 	res := &Result{Columns: []ResultColumn{
