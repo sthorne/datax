@@ -11,6 +11,25 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **GIN indexes on JSONB columns** (#300). `CREATE INDEX name ON t USING GIN
+  (doc)` builds an inverted index — one entry for every value in each
+  document with the path to it, and one for every top-level key — and
+  `doc @> '...'`, `doc ? 'k'`, `doc ?| '{a,b}'` and `doc ?& '{a,b}'` read it
+  instead of scanning the table (`EXPLAIN` shows an `inverted scan` and its
+  lookups). Results are those of the filter: every row the index finds is
+  checked against the whole `WHERE` clause. The index is built online,
+  maintained in the row's transaction (an `UPDATE` rewrites only the entries
+  of the values that changed), and follows the table through `TRUNCATE`,
+  re-sharding, backup and restore. One column, never `UNIQUE`;
+  `jsonb_path_ops` is accepted and builds the same index; a document with
+  more than 8,192 distinct values is refused (`54000`) on an indexed table.
+  `<@`, negations, extracted-value comparisons and containment under a `->`
+  path still filter. `SET inverted_index_scan = on | off | auto` overrides
+  the planner's choice. On 50,000 documents a containment matching 50 rows
+  takes 0.6 ms through the index against 240 ms as a filter (not measured at
+  a million documents). Cluster protocol version v21: `CREATE INDEX ...
+  USING GIN` is refused until the upgrade is finalized. `datax bench
+  jsonb-contain` measures both paths.
 - **A GC window per table** (#295). `CREATE TABLE … WITH (gc_ttl = '10m')` and
   `ALTER TABLE … SET / RESET (gc_ttl)` give one table its own GC window,
   shorter or longer than the node's 25h. It governs the ranges that hold only
