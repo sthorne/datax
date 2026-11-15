@@ -314,6 +314,12 @@ func DroppedTableSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// DroppedTableSweepKey holds the progress of the one-time sweep for the
+// rows of tables dropped before DROP TABLE left a DroppedTableKey record
+// (JSON; issue #316, pkg/server/dropped_sweep.go). It sits outside
+// DroppedTableSpan.
+func DroppedTableSweepKey() Key { return systemKey("dropped-sweep") }
+
 // SealJobKey holds the record of a table's seal job (JSON;
 // catalog.SealJob; issue #310 step 5): the background rewrite that seals
 // an existing table's plain rows, or moves a rotated key's rows to its

@@ -335,6 +335,14 @@ const (
 	// per tick (issue #316, pkg/server/metrics_sparse.go). A v21 node's
 	// /api/metrics would chart the unwritten ticks as gaps, so the
 	// recorder writes every series every tick until finalize.
+	//
+	// V22 also starts the one-time sweep for tables dropped before DROP
+	// TABLE left a record (issue #316, pkg/server/dropped_sweep.go): an
+	// id that holds rows and names nothing is recorded as dropped, for
+	// the reclaim job. Only at v22 can no binary that drops tables
+	// without records be running, so only then does "no record" mean
+	// "dropped before records"; the sweep's own record
+	// (keys.DroppedTableSweepKey) is a system key a v21 node never reads.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

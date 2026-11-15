@@ -1382,6 +1382,15 @@ state or the internode protocol does, and an entry below says so.
   span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
   measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
   protocol version v22.
+- **Tables dropped before dropped-table records are reclaimed** (#316). A table
+  dropped by a binary from before #313 left its rows under its id with
+  nothing naming them. Once the cluster has finalized v22, the node leading
+  range 1 sweeps once for ids that hold rows and have no descriptor, no
+  dropped-table record and no table restore in flight — never a reserved id,
+  never one issued after the sweep began — and records each as dropped when
+  it first sees it; the reclaim job clears it once the GC TTL has passed from
+  then. The sweep is resumable and records nothing twice. Cluster protocol
+  version v22.
 - **The statistics sampler reads only what changed** (#316). Its tick read every
   descriptor and every statistics record to pick the stalest table; it now
   reads both once and then only what was written since its last tick, as of

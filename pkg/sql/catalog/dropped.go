@@ -34,6 +34,20 @@ type DroppedTable struct {
 	// Cleared is set once every row has been deleted; what is left is
 	// collecting the deletions, after which the record goes.
 	Cleared bool `json:"cleared,omitempty"`
+	// Swept marks a record DROP TABLE did not write: the one-time sweep
+	// (issue #316) found rows under an id with no table and no record —
+	// a table dropped before DROP TABLE left records — and wrote it.
+	// Name is empty and DroppedAt is when the sweep found the rows: the
+	// drop was at or before it.
+	Swept bool `json:"swept,omitempty"`
+}
+
+// Label names the dropped table for a log line or an event.
+func (r *DroppedTable) Label() string {
+	if r.Name == "" {
+		return "(dropped before its record existed)"
+	}
+	return r.Name
 }
 
 // HistoryWindowSeconds is how long a table keeps its history: its own
