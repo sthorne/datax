@@ -1045,6 +1045,12 @@ func init() {
 			for _, t := range env.currentTables() {
 				users := make([]string, 0, len(t.Privileges))
 				for u := range t.Privileges {
+					// PostgreSQL's view shows the grants whose grantee or
+					// grantor is one of the reader's roles (PUBLIC is
+					// everyone's).
+					if env.RoleSet != nil && !env.IsAdmin && !env.RoleSet.Has(u) && !env.RoleSet.Has(catalog.OwnerOf(t.Owner)) {
+						continue
+					}
 					users = append(users, u)
 				}
 				sort.Strings(users)

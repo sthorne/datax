@@ -985,6 +985,19 @@ state or the internode protocol does, and an entry below says so.
   the CSV export label a key accordingly rather than hand a reader the
   shown form under a key's name (found in the console review of the
   combined PR, where #213 met #226's copy controls).
+- **Every role reads the catalogs** (#312). A role that was not an admin
+  was refused (`42501`) every `pg_catalog` and `information_schema` table,
+  so `psql`'s `\d`, ORM introspection and `pg_policies` worked for admins
+  only. They now follow PostgreSQL: any role reads them; `pg_catalog`
+  lists every table of the current database, `information_schema` the
+  tables the reader holds some privilege on, and `role_table_grants` the
+  grants to or by the reader's roles. Statistics (`reltuples`,
+  `n_live_tup`) are shown only for tables the reader may `SELECT` from and
+  row security does not filter, `pg_sequences.last_value` only for a
+  sequence it may read; no catalog carries a password, and another role's
+  statement text stays hidden. `SELECT ... FROM` a sequence checks the
+  sequence's `SELECT` privilege instead of requiring an admin. See
+  docs/user/security.md, "Roles and privileges".
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the

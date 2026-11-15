@@ -148,6 +148,29 @@ Its grants and memberships go with it. Grants take effect cluster-wide
 by the time the statement returns; a membership change is seen by the
 next statement everywhere.
 
+**The catalogs are every role's.** As in PostgreSQL, any role may read
+`pg_catalog` and `information_schema`, so `psql`'s `\d` and ORM
+introspection work for an ordinary role. What they list follows
+PostgreSQL: `pg_class`, `pg_attribute`, `pg_constraint`, `pg_indexes`,
+`pg_tables`, `pg_views`, `pg_policies` and the rest describe every
+table of the current database — names, columns, defaults, constraints,
+view definitions and policy expressions — whatever the reader holds;
+`information_schema.tables`, `columns` and the other views list the
+tables the reader holds some privilege on (and not those of a database
+whose `public` schema it may not use), and `role_table_grants` the
+grants made to or by one of its roles. What would describe the rows
+rather than the schema is shown only to a role that may read them:
+`reltuples` and `n_live_tup` read `0` for a table the reader holds no
+`SELECT` on (or whose row security filters it), `pg_sequences.last_value`
+is `NULL` without `SELECT` or `USAGE` on the sequence, and
+`pg_largeobject_metadata` lists the reader's own large objects (all of
+them for an admin). No catalog carries a password or verifier:
+`pg_roles.rolpassword` and `pg_user.passwd` read `********`, and there is
+no `pg_authid` or `pg_shadow`. Another role's statement text in
+`pg_stat_activity` reads `<insufficient privilege>` unless the reader is
+an admin. Reading a table's rows — the audit table's included — still
+takes its privileges.
+
 A cluster upgraded from an earlier version keeps its users and `ADMIN`
 grants: `datax debug upgrade` rewrites them as roles in the same
 finalize transaction, and until then the old statements keep working

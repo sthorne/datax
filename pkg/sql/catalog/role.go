@@ -562,6 +562,19 @@ func CanReadTable(set RoleSet, d *TableDescriptor) bool {
 	if RowSecurityConfines(set, d) {
 		return false
 	}
+	return CanSelectTable(set, d)
+}
+
+// CanSelectTable is CanReadTable without the row-security exception:
+// whether the set holds SELECT on the table, as the SQL authorizer
+// grants it — admins, the owner, read_all (but not on the audit table)
+// and a SELECT grant. A caller that knows the role asks
+// Session.rowSecurityActive next, as the catalogs do before showing a
+// table's statistics (issue #312).
+func CanSelectTable(set RoleSet, d *TableDescriptor) bool {
+	if IsSealedSystemTable(d.Name) {
+		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
+	}
 	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
 		HasPrivilege(d.Privileges, set, "SELECT")
 }

@@ -1498,6 +1498,16 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   as schema changes: by the time GRANT returns, every gateway enforces
   it. In insecure (trust) mode the username is client-claimed, so
   enforcement there is advisory — anyone can claim `root`.
+  The virtual catalogs are read by every role (issue #312):
+  `tablePrivAllowed` grants `SELECT` on a `pg_catalog` or
+  `information_schema` descriptor to anyone and nothing else, and
+  `virtualEnv` decides what each lists — every table of the scope for
+  `pg_catalog`, the tables `catalog.CanSeeTable` admits (and whose
+  schema the reader may use) for `information_schema` — and gathers
+  statistics only for tables `catalog.CanSelectTable` admits and row
+  security does not confine, and a sequence's counter only past
+  `sequencePrivAllowed`. A sequence read as a relation (`SELECT
+  last_value FROM s`) checks the sequence's `SELECT`.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

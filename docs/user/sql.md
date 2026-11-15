@@ -1811,6 +1811,9 @@ publications, extensions, functions, triggers, ...), plus
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
+Every role may read them; `pg_catalog` lists every table and
+`information_schema` the tables the reader holds a privilege on, as in
+PostgreSQL ([security guide](security.md#roles-and-privileges)).
 This is what makes `psql`'s `\d`, `\dt`, `\dv`, `\di`, `\du`, `\l`, `\dn`, `\dp`
 and friends, and ORM schema introspection, work unmodified — see
 [Differences from PostgreSQL](postgres-differences.md#what-psql-and-orms-can-see).

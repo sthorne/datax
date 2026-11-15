@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -265,6 +266,21 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	if set.IsAdmin() {
 		return true, nil
+	}
+	if db, _ := catalog.SplitTableName(desc.Virtual); vtable.IsSchema(db) {
+		// pg_catalog and information_schema: every role reads them, as
+		// in PostgreSQL; each lists what the reader may know of
+		// (virtualEnv). Nobody writes them.
+		return priv == "SELECT", nil
+	}
+	if desc.Virtual == "sequence" {
+		// A sequence read as a relation (SELECT last_value FROM seq):
+		// the sequence's own SELECT privilege.
+		sd, err := catalog.ReadSequence(ctx, txn, desc.ID)
+		if err != nil || sd == nil || priv != "SELECT" {
+			return false, err
+		}
+		return s.sequencePrivAllowed(ctx, txn, sd, "SELECT")
 	}
 	if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
 		// Only the cluster and its admins write the metrics table; a

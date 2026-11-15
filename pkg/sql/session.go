@@ -435,10 +435,15 @@ const (
 )
 
 // virtualEnv gathers what the virtual tables render: every database,
-// the tables the session may see within scope (all of them for admins;
-// for others, the tables they hold a privilege on), statistics, users
-// and admins.
-func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables) (*vtable.Env, error) {
+// the tables within scope, statistics, users and admins. Every role
+// reads the catalogs, as in PostgreSQL (issue #312); what each one
+// lists follows PostgreSQL too. pg_catalog lists every table, whatever
+// privileges the reader holds (filtered false); information_schema
+// lists those the reader holds some privilege on (filtered true). The
+// statistics, which describe a table's rows rather than its shape, are
+// gathered only for the tables the reader may read rows of, and a
+// sequence's counter only for one it may read.
+func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables, filtered bool) (*vtable.Env, error) {
 	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
@@ -451,18 +456,29 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	if env.Types, err = catalog.ListTypes(ctx, txn, 0); err != nil {
 		return nil, err
 	}
-	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) { return s.sequenceValue(ctx, sd) }
 	set, err := s.roleSet(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
+	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) {
+		// PostgreSQL's pg_sequences shows last_value only to a role that
+		// may read the sequence.
+		if ok, err := s.sequencePrivAllowed(ctx, txn, sd, "SELECT"); err != nil || !ok {
+			return 0, false, err
+		}
+		return s.sequenceValue(ctx, sd)
+	}
 	env.IsAdmin = set.IsAdmin()
+	env.RoleSet = set
 	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
-	// A table whose schema the session may not use is not listed, as
-	// the console does not list it (issue #259): both ask
-	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
-	// the listing question the same way (issue #197).
+	// information_schema does not list a table whose schema the session
+	// may not use, as the console does not list it (issue #259): both
+	// ask catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema
+	// answer the listing question the same way (issue #197).
 	denied := catalog.SchemaUsageDenied(dbs, set)
+	listed := func(d *catalog.TableDescriptor) bool {
+		return !filtered || (canSeeTable(set, d) && !denied[d.DatabaseID])
+	}
 	var all []*catalog.TableDescriptor
 	switch scope {
 	case envAllTables:
@@ -483,20 +499,24 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		// rule as the listing.
 		env.ReadTable = func(id uint64) *catalog.TableDescriptor {
 			d, err := catalog.ReadTable(ctx, txn, id)
-			if err != nil || d == nil || !canSeeTable(set, d) || denied[d.DatabaseID] {
+			if err != nil || d == nil || !listed(d) {
 				return nil
 			}
 			return d
 		}
 	}
 	for _, d := range all {
-		if !canSeeTable(set, d) || denied[d.DatabaseID] {
+		if !listed(d) {
 			continue
 		}
 		env.Tables = append(env.Tables, d)
-		// Statistics count every row of a table. A role its row-security
-		// policies confine sees none: reltuples and n_live_tup read as
-		// "not analyzed" rather than as the size of everyone's data.
+		// Statistics count every row of a table: a role that may not read
+		// the rows sees none, and neither does one its row-security
+		// policies confine. reltuples and n_live_tup read as "not
+		// analyzed" rather than as the size of data it cannot read.
+		if !catalog.CanSelectTable(set, d) || denied[d.DatabaseID] {
+			continue
+		}
 		if confined, err := s.rowSecurityActive(ctx, txn, d); err != nil {
 			return nil, err
 		} else if confined {
@@ -551,7 +571,7 @@ func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *cat
 	if vt.AllDatabases() {
 		scope = envAllTables
 	}
-	env, err := s.virtualEnv(ctx, txn, scope)
+	env, err := s.virtualEnv(ctx, txn, scope, vt.Schema == vtable.InformationSchema)
 	if err != nil {
 		return nil, err
 	}
