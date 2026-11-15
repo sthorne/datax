@@ -1382,6 +1382,12 @@ state or the internode protocol does, and an entry below says so.
   span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
   measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
   protocol version v22.
+- **The statistics sampler reads only what changed** (#316). Its tick read every
+  descriptor and every statistics record to pick the stalest table; it now
+  reads both once and then only what was written since its last tick, as of
+  one timestamp: at 5,000 tables a tick read 5,000 rows and reads 2 while it
+  is collecting (the record it wrote last tick and the descriptor it
+  collects), none with nothing to collect.
 - **The metrics recorder writes the table and index series only when they
   change** (#316). Every tick wrote a `table.ranges` (and `table.rows`) row per
   table and an `index.scans` and `index.rows` row per index the node had
