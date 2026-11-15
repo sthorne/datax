@@ -20,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/keystore/keycache"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
@@ -135,6 +136,10 @@ type Config struct {
 	// five minutes). Tests shorten it to watch that happen (issues #223,
 	// #224); nothing else has a reason to set it.
 	HealthRateWindow time.Duration
+	// SealedKeyLease is how long the gateway uses a cached key of a sealed
+	// table before checking it against datax_keys again (0 = 10 seconds,
+	// also the most allowed); tests shorten it.
+	SealedKeyLease time.Duration
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
@@ -472,7 +477,10 @@ type Node struct {
 	// metrics recorder share it); catOnce builds it on first use.
 	cat     *catalog.Accessor
 	catOnce sync.Once
-	catErr  error
+	// keyCache is the gateway's cache of unwrapped named keys, made with
+	// the catalog accessor (sealedtables.go).
+	keyCache *keycache.Cache
+	catErr   error
 	// authSecret is the cluster's authentication secret
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
@@ -918,6 +926,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.sealedKeyJanitorLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
