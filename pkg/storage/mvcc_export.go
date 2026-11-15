@@ -14,8 +14,11 @@ type ExportedRecord struct {
 	Key     keys.Key
 	Value   []byte
 	Deleted bool
-	// Timestamp is the version's own timestamp. Set only by an export of
-	// every revision, where one key yields several records.
+	// Timestamp is the version's own timestamp: its commit time. An
+	// export of every revision yields several records per key, each with
+	// its own; an export of the newest versions carries the newest one's,
+	// which is what a backup of a time-series table keeps so that a
+	// restore can apply the table's retention (issue #316).
 	Timestamp hlc.Timestamp
 }
 
@@ -118,9 +121,7 @@ func mvccExport(r Reader, start, end keys.Key, startTS, endTS hlc.Timestamp, max
 				if !tombstone {
 					rec.Value = append([]byte(nil), data...)
 				}
-				if revisions {
-					rec.Timestamp = cvts
-				}
+				rec.Timestamp = cvts
 				res.Records = append(res.Records, rec)
 				if !revisions && max > 0 && int64(len(res.Records)) == max {
 					res.Resume = cur.Next()

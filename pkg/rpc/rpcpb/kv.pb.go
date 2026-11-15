@@ -1478,7 +1478,7 @@ type ExportRecord struct {
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
 	Deleted       bool                   `protobuf:"varint,3,opt,name=deleted,proto3" json:"deleted,omitempty"` // tombstone: the key was deleted in the window
-	Ts            *Hlc                   `protobuf:"bytes,4,opt,name=ts,proto3" json:"ts,omitempty"`            // the version's timestamp; all_revisions exports only
+	Ts            *Hlc                   `protobuf:"bytes,4,opt,name=ts,proto3" json:"ts,omitempty"`            // the version's timestamp; on every record from a v22 replica, all_revisions exports only before
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
