@@ -327,6 +327,11 @@ type CreateIndex struct {
 	Name        string
 	Table       string
 	Columns     []string
+	// Using is the access method of USING (lower-cased; "" = none
+	// given, an ordinary index). OpClasses, when any column names an
+	// operator class, is parallel to Columns ("" = none for that column).
+	Using     string
+	OpClasses []string
 }
 
 // DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on

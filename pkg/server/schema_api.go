@@ -17,6 +17,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 )
 
 // /api/schema — the schema browser behind the dashboard: every table
@@ -66,6 +67,9 @@ type SchemaIndex struct {
 	// State is "" or "public" for a readable index, "write-only" while a
 	// CREATE INDEX backfill is in progress.
 	State string `json:"state,omitempty"`
+	// Method is the access method of an index that is not an ordinary
+	// (btree) one: "gin" for an inverted index.
+	Method string `json:"method,omitempty"`
 }
 
 // SchemaConstraint is one table constraint beyond the primary key and
@@ -531,6 +535,9 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 		for _, idx := range d.Indexes {
 			si := SchemaIndex{Name: idx.Name, Unique: idx.Unique, State: idx.State}
+			if idx.IsInverted() {
+				si.Method = vtable.IndexMethod(&idx)
+			}
 			for _, id := range idx.ColumnIDs {
 				si.Columns = append(si.Columns, colName[id])
 			}

@@ -1942,6 +1942,15 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		return nil, err
 	}
 	ci.Table = table
+	// USING method: btree (the ordinary index) or gin (an inverted
+	// index). The executor decides what it supports.
+	if p.consumeIdentWord("using") {
+		method, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ci.Using = strings.ToLower(method)
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -1951,9 +1960,23 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			return nil, err
 		}
 		ci.Columns = append(ci.Columns, col)
+		// An operator class after the column: (doc jsonb_ops).
+		opclass := ""
+		if p.peek().kind == tkIdent {
+			opclass = strings.ToLower(p.peek().text)
+			p.i++
+		}
+		ci.OpClasses = append(ci.OpClasses, opclass)
 		if !p.consumeOp(",") {
 			break
 		}
+	}
+	named := false
+	for _, oc := range ci.OpClasses {
+		named = named || oc != ""
+	}
+	if !named {
+		ci.OpClasses = nil
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err

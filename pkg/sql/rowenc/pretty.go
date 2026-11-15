@@ -7,6 +7,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
@@ -44,6 +45,21 @@ func PrettyKey(desc *catalog.TableDescriptor, k keys.Key) string {
 	switch {
 	case indexID == desc.LivePrimaryIndex() || (idx == nil && indexID == PrimaryIndexID):
 		b.WriteString("/primary")
+		fams = pkFamilies(desc)
+	case idx != nil && idx.IsInverted():
+		// An inverted entry: the element, as its kind describes it, then
+		// the primary key.
+		b.WriteString("/" + idx.Name)
+		tail, element, err := encoding.DecodeBytes(rest)
+		if err != nil {
+			return b.String() + keys.PrettyDatums(rest)
+		}
+		if kind, ok := inverted.Lookup(idx.Inverted); ok {
+			b.WriteString("/" + kind.Describe(element))
+		} else {
+			fmt.Fprintf(&b, "/%x", element)
+		}
+		rest = tail
 		fams = pkFamilies(desc)
 	case idx != nil:
 		b.WriteString("/" + idx.Name)

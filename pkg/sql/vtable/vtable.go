@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
@@ -512,7 +513,30 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	if idx.Unique {
 		unique = "UNIQUE "
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING btree (%s)", unique, idx.Name, d.Name, strings.Join(cols, ", "))
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "))
+}
+
+// Access method OIDs, as PostgreSQL numbers them.
+const (
+	OIDBtree = 403
+	OIDGin   = 2742
+)
+
+// IndexMethod names an index's access method: btree, or the method of
+// its inverted kind (gin).
+func IndexMethod(idx *catalog.IndexDescriptor) string {
+	if kind, ok := inverted.Lookup(idx.Inverted); ok {
+		return kind.Method()
+	}
+	return "btree"
+}
+
+// IndexMethodOID is pg_class.relam for an index.
+func IndexMethodOID(idx *catalog.IndexDescriptor) int64 {
+	if IndexMethod(idx) == "gin" {
+		return OIDGin
+	}
+	return OIDBtree
 }
 
 // PrimaryKeyDef renders pg_get_constraintdef() for the primary key.

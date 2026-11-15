@@ -40,6 +40,10 @@ type sessionVars struct {
 	memoryLimit int64
 	// role is SET ROLE's role ("" = none: the session user).
 	role string
+	// invertedScan is inverted_index_scan: whether the planner may (auto),
+	// must (on) or must not (off) read an inverted index that can serve
+	// a statement. For comparing the two paths; auto is right otherwise.
+	invertedScan invertedMode
 }
 
 func defaultVars() sessionVars {
@@ -57,6 +61,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"foreign_key_cascade_limit", "integer", ""},
 	{"idle_in_transaction_session_timeout", "integer", "ms"},
 	{"integer_datetimes", "bool", ""},
+	{"inverted_index_scan", "enum", ""},
 	{"lock_timeout", "integer", "ms"},
 	{"role", "string", ""},
 	{"search_path", "string", ""},
@@ -116,6 +121,8 @@ func (s *Session) varValue(name string) string {
 		return strconv.FormatInt(v.idleInTxnTimeout.Milliseconds(), 10)
 	case "integer_datetimes", "standard_conforming_strings":
 		return "on"
+	case "inverted_index_scan":
+		return v.invertedScan.String()
 	case "lock_timeout":
 		return strconv.FormatInt(v.lockTimeout.Milliseconds(), 10)
 	case "search_path":
@@ -330,6 +337,19 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 				return invalid("%v", err)
 			}
 			vars.txnReadOnly = b
+		}
+	case "inverted_index_scan":
+		vars.invertedScan = invertedAuto
+		if !reset {
+			switch strings.ToLower(unquote(value)) {
+			case "auto", "default":
+			case "on", "true":
+				vars.invertedScan = invertedOn
+			case "off", "false":
+				vars.invertedScan = invertedOff
+			default:
+				return invalid("must be auto, on or off, not %q", value)
+			}
 		}
 	case "foreign_key_cascade_limit":
 		vars.cascadeLimit, vars.cascadeLimitIsSet = 0, false

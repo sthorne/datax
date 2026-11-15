@@ -1646,6 +1646,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		return rows, nil
 
+	case planInvertedScan:
+		return s.executeInvertedScan(ctx, txn, desc, plan, where, params, limit)
+
 	case planIndexScan:
 		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
@@ -1933,7 +1936,7 @@ func (s *Session) planAccess(desc *catalog.TableDescriptor, st *catalog.TableSta
 			return plan, nil
 		}
 	}
-	return pickPlanWithStats(desc, st, where, params)
+	return pickPlanMode(desc, st, where, params, s.vars.invertedScan)
 }
 
 // cachePlan records what a statement planned against.
@@ -2886,7 +2889,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		}, nil
 	}
 	st, _ := s.cat.Stats(ctx, desc.ID)
-	plan, err := pickPlanWithStats(desc, st, sel.Where, params)
+	plan, err := pickPlanMode(desc, st, sel.Where, params, s.vars.invertedScan)
 	if err != nil {
 		return nil, err
 	}

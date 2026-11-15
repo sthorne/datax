@@ -209,6 +209,16 @@ const (
 	// that writes either field and the purge are therefore refused until
 	// finalize (rule 4). The fields are omitempty, so a descriptor
 	// written before v21 reads the same at either version.
+	//
+	// V21 also introduces inverted indexes (issue #300, pkg/sql/inverted): an
+	// index descriptor may name an inverted kind
+	// (catalog.IndexDescriptor.Inverted), and such an index holds one
+	// entry per element of the indexed value rather than one per row. The
+	// field is omitempty, so every descriptor written before reads the
+	// same; but a v20 node drops the field it does not know and would
+	// maintain and read the index as an ordinary one over a column type
+	// it cannot key. CREATE INDEX ... USING GIN is therefore refused
+	// until finalize (rule 4).
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

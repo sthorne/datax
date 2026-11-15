@@ -897,6 +897,8 @@ func innerPathDesc(plan accessPlan) string {
 		return fmt.Sprintf("range scan of primary key (%d column prefix)", len(plan.idxVals))
 	case planIndexScan:
 		return fmt.Sprintf("scan of index %q (%d column prefix) + primary key join", plan.idx.Name, len(plan.idxVals))
+	case planInvertedScan:
+		return invertedPlanString(plan)
 	}
 	return "full table scan"
 }

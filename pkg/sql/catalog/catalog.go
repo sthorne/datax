@@ -351,7 +351,8 @@ func (c *Column) Typmod() int32 {
 // IndexDescriptor describes a secondary index. Entries live at
 // /t/<tableID>/<ID>/ (see pkg/sql/rowenc): non-unique keys append the
 // primary key columns after the indexed ones; unique keys carry the encoded
-// primary key as the entry's value.
+// primary key as the entry's value. An inverted index (Inverted) has one
+// entry per element of its column's value instead.
 type IndexDescriptor struct {
 	ID        uint64     `json:"id"`
 	Name      string     `json:"name"`
@@ -363,7 +364,17 @@ type IndexDescriptor struct {
 	// "write-only" = maintained by writers but invisible to the planner
 	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
 	State string `json:"state,omitempty"`
+	// Inverted names the kind of an inverted index (pkg/sql/inverted:
+	// "jsonb_ops"); "" is an ordinary index. An inverted index has one
+	// column and one entry per element of that column's value per row,
+	// each key ending in the row's primary key, so it is never unique.
+	// Cluster version v21: a node that does not know the field would
+	// maintain the index as an ordinary one.
+	Inverted string `json:"inverted,omitempty"`
 }
+
+// IsInverted reports whether the index is an inverted one.
+func (idx *IndexDescriptor) IsInverted() bool { return idx.Inverted != "" }
 
 // Constraint kinds.
 const (

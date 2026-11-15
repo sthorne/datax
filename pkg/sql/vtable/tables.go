@@ -157,7 +157,7 @@ func init() {
 				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 			for _, idx := range t.Indexes {
-				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, idx.ID)), i64(0),
+				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(IndexMethodOID(&idx)), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment)})
 			}
@@ -343,10 +343,10 @@ func init() {
 		return rows, nil
 	})
 
-	// pg_am: btree, the only access method.
+	// pg_am: btree, gin (inverted indexes) and the heap.
 	pg("pg_am", []catalog.Column{col("oid", types.Int), col("amname", types.String), col("amhandler", types.String), col("amtype", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
-			return []Row{{i64(403), str("btree"), str("bthandler"), str("i")}, {i64(2), str("heap"), str("heap_tableam_handler"), str("t")}}, nil
+			return []Row{{i64(OIDBtree), str("btree"), str("bthandler"), str("i")}, {i64(OIDGin), str("gin"), str("ginhandler"), str("i")}, {i64(2), str("heap"), str("heap_tableam_handler"), str("t")}}, nil
 		})
 
 	// pg_collation: the default collation only (psql's \d consults it to

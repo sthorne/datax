@@ -1125,8 +1125,9 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 	var natural []catalog.ColumnID
 	fanned := false
 	switch plan.kind {
-	case planFullScan, planPKPoint:
-		// Physical order — on a sharded table that leads with the hidden
+	case planFullScan, planPKPoint, planInvertedScan:
+		// Physical order (an inverted scan sorts the primary keys it
+		// found before fetching the rows) — on a sharded table that leads with the hidden
 		// shard column, which no ORDER BY names, so it stays unsatisfied.
 		natural = desc.PrimaryKey
 	case planPKScan:

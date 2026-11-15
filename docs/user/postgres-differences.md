@@ -80,11 +80,25 @@ syntax error or `0A000` feature not supported):
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
 - **JSONB**: `->`/`->>` extraction (single-table queries and joins;
-  grouped SELECT lists refuse), containment `@>` (single-table only),
-  equality comparison, and `IS [NOT] NULL`. No indexing on
-  JSONB columns (`@>` always filters — no inverted indexes), no ordering
-  comparisons, no `<@`/`?`/`?|`/`?&`. `@>` is not accepted in `HAVING` or
-  after a computed left-hand side. One asymmetry to know: `@>` compares
+  grouped SELECT lists refuse), containment `@>` / `<@` and key
+  existence `?` / `?|` / `?&` (single-table only), equality comparison,
+  and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
+  `HAVING` or after a computed left-hand side.
+- **GIN indexes are JSONB only, one kind.** `CREATE INDEX ... USING GIN
+  (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
+  each value with its path (closer to PostgreSQL's `jsonb_path_ops` than
+  to `jsonb_ops`, but it serves the key operators too), so
+  `jsonb_path_ops` is accepted as a synonym of `jsonb_ops`, and
+  `pg_get_indexdef` reports the index without an operator class. Not
+  served, and evaluated as filters: `<@`, jsonpath (`@?`, `@@` do not
+  exist), containment under a `->` path, and a right-hand side that is
+  not a constant or a parameter. No GIN over arrays, `tsvector` or
+  `pg_trgm`; no multi-column or `UNIQUE` GIN; no `fastupdate` or other
+  storage parameters. A document with more than 8,192 distinct indexed
+  values is refused (`54000`) on a table with a GIN index. There is no
+  bitmap scan: `EXPLAIN` reports an `inverted scan`, and
+  `enable_bitmapscan` is not a setting (`inverted_index_scan` is).
+  One asymmetry to know: `@>` compares
   numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
   normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
 - **`OR` is supported with full boolean grouping**, but `OR` conditions

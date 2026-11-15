@@ -51,6 +51,7 @@ duration, so two runs draw the same keys:
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
 | `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
+| `jsonb-contain`, `jsonb-contain-filter` | JSONB containment (`doc @> '{"tenant": n}'`, 50 of 50,000 documents per query) through a GIN index and as a filter over every document (#300) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
@@ -64,6 +65,15 @@ start the nodes with `--merge-size-threshold -1` for an idle-cluster
 measurement; 10,000 is
 the largest worth trying on a laptop. A record's `error_samples` lists
 the distinct error messages behind its `errors` count.
+
+The `jsonb-contain` pair is sized to keep the set's run time down. The
+same comparison over a million documents (the preload is the slow part,
+and is skipped when the table already holds the rows):
+
+```sh
+bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s
+bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s --jsonb-index none
+```
 
 ## Errors fail a run
 

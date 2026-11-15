@@ -957,6 +957,10 @@ Rules of the road:
   descriptor it rewrote. v21 binaries also change one thing without the
   finalize: a restarted node serves no follower reads from a range
   until it has heard from that range's leader again (a few seconds).
+- **v21 also allows GIN indexes on JSONB columns.** Until it is finalized
+  `CREATE INDEX ... USING GIN` is refused (`0A000`): a node on the older
+  binary would maintain such an index as an ordinary one. No existing data is
+  rewritten.
 
 ## Decommissioning a node
 
@@ -1045,6 +1049,7 @@ datax bench ingest --keys random|sequential|uuid --batch 100 --payload-bytes 256
 datax bench timeseries --series 1000 --shards 8
 datax bench index-join --preload 20000 --groups 1000   # secondary-index fan-out to wide rows
 datax bench scan --preload 20000                        # large result sets through pgwire
+datax bench jsonb-contain --preload 50000 [--jsonb-index none]   # JSONB containment: through a GIN index, or as a filter
 ```
 
 `ingest` writes batches of keys (random for LSM stress); `timeseries`

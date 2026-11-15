@@ -17,7 +17,8 @@ ALTER TABLE [IF EXISTS] t RESET (gc_ttl | ttl | ttl_column | ttl_expiration | re
 ALTER TABLE [IF EXISTS] t PURGE         -- collect the table's garbage now, compact it away, report per replica
 ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN] a TO b | RENAME CONSTRAINT a TO b
     | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t [USING btree] (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
+CREATE INDEX [IF NOT EXISTS] i ON t USING gin (jsonb_col [jsonb_ops | jsonb_path_ops])
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
 CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
@@ -131,8 +132,10 @@ SHOW STATS FOR t
   `->` path on the left, which must still produce jsonb); not in HAVING
   or after a computed left-hand side; refused in join queries with
   `0A000` (both in the filter and before base-scan pushdown — an
-  unhandled op there would silently drop rows). Never an index bound —
-  always a post-fetch filter; inverted indexes are out of scope.
+  unhandled op there would silently drop rows). Never a key bound of an
+  ordinary index; a GIN index on the column serves it (and `?`, `?|`,
+  `?&`) — see Inverted indexes below — and without one it is a
+  post-fetch filter.
 - Columns may declare `DEFAULT <literal>` (constants only): INSERTs that
   omit the column store the default; an explicit NULL stays NULL.
 - WHERE: conjunctions (`AND`) of `col op value`, ops `= != < <= > >=`
@@ -242,8 +245,9 @@ typmods on other types than DECIMAL, the integer widths, `VARCHAR(n)` /
 `TIME WITH TIME ZONE`, multidimensional arrays and array slices, indexes
 on array columns, `JSONB[]`, enum `ADD VALUE BEFORE` / `AFTER` and
 `RENAME VALUE`, arrays of enums,
-JSONB indexing (`@>`, `<@`, `?` and friends evaluate as filters; no
-inverted indexes),
+JSONB indexing beyond `@>`, `?`, `?|` and `?&` on the bare column
+(`<@`, the negations, comparisons of an extracted value and containment
+under a `->` path evaluate as filters),
 expressions over aggregates (`SUM(a) / COUNT(*)`), user-defined functions,
 DEFAULT expressions that reference other columns.
 
@@ -503,6 +507,133 @@ boundary, and never reach the index.
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.
 
+## Inverted indexes (v21)
+
+`CREATE INDEX name ON table USING GIN (jsonb_col)` adds an **inverted**
+index (issue #300): one entry per *element* of the column's value per
+row, rather than one per row. It is an `IndexDescriptor` like any other
+with `Inverted` naming its kind (`"jsonb_ops"`), so it shares the
+ordinary index's key space, lifecycle and DDL; `UNIQUE`, more than one
+column and a non-JSONB column are refused. `jsonb_ops` may be named, and
+`jsonb_path_ops` is accepted as the same thing (PostgreSQL's smaller
+class serves `@>` only; the one kind here serves it as selectively).
+
+**The split.** `pkg/sql/inverted` holds everything that does not depend
+on what is indexed; a `Kind` supplies the two things that do:
+
+- `Elements(value)` — the distinct elements of a value, as opaque
+  bytes (write path, backfill);
+- `Query(op, rhs)` — for `column op rhs`, an `Expr`: a tree of AND/OR
+  over element lookups that **every matching value satisfies** (read
+  path). `nil` means the predicate says nothing the index can use.
+
+That one-sided contract — the expression may admit rows the predicate
+rejects, never miss one — is the whole correctness argument, and it is
+tested as such (`TestJSONBQueryNeverMisses`). A second kind (terms of a
+text document, for full-text search) supplies the same two functions and
+inherits the rest: key layout, maintenance, backfill, re-shard,
+truncate, backup, evaluation, recheck, EXPLAIN.
+
+**Keys.** `/t/<tableID>/<indexID>/ + EncodeBytes(element) + <primary
+key>`, value a one-byte marker (`rowenc.IndexEntries`). The escaped
+element is self-delimiting, so the primary key reads back from any
+entry, and all rows holding one element are one contiguous span in
+primary-key order — which is what makes intersecting two elements a
+merge of two sorted lists.
+
+**JSONB elements** (`pkg/sql/inverted/jsonb.go`). A *path* element is
+one scalar with the way to it:
+
+```
+0x02 | step... | value
+step   0x10 + EncodeString(key)   into an object
+       0x11                       into an array (any position)
+value  0x20 null | 0x21 false | 0x22 true
+       0x23 + EncodeDecimal(n)    a number
+       0x24 + text                a number the decimal type refuses
+       0x25 + bytes               a string (to the end)
+```
+
+- An array step has no position: containment ignores order and
+  repetition, so `[1,2,1]` has two elements.
+- The value's type is its own tag: `"1"`, `1` and `true` never meet.
+- Numbers use the order-preserving decimal encoding, so `1`, `1.0` and
+  `1e0` are one element — `@>` compares numerically — and the numbers
+  under a path sort numerically. Elements order by path, then type, then
+  value; nothing reads ranges yet, but the layout allows it.
+- Empty objects and arrays are not elements.
+- A *key* element, `0x01 + string`, is one string the `?` operator
+  finds at the top level: an object key, a string in a top-level array,
+  or the document itself when it is a string. It exists so a key whose
+  value is a container is one lookup, not a scan of every path under it.
+- An element over 128 bytes (a long string, a deep path) is stored as
+  `0xfe` + the first 20 bytes of its SHA-256. Keys therefore have a
+  bounded length whatever the document; lookups are by exact element, so
+  a digest finds what a digest stored, and a collision is a false
+  candidate the recheck drops.
+- A document with more than 8,192 distinct elements is refused at write
+  (`54000`) rather than half indexed. Nesting is bounded only by the
+  JSON parser (10,000 levels): depth costs digests, not key length.
+- A NULL document has no entries.
+
+**Queries.** For `doc @> v`: each scalar of `v` must be in the document
+at the same path, ANDed. A top-level scalar is contained by itself or by
+a top-level array holding it (two lookups, ORed) — the top-level-only
+rule. An empty object or array in `v` asks only for a shape and
+contributes nothing, except that a top-level key holding one still
+requires the key (`doc @> '{"a": {}}'` looks up key `a`). `doc ? k` is
+one key lookup, `?|` their OR, `?&` their AND. The clause's own shape is
+handled once for every kind (`invertedExprFor`): top-level conjuncts are
+ANDed and a conjunct the index cannot use is left out; an `OR` is the
+union of its branches and usable only when **every** branch constrains
+the index. The column must stand alone on the left and the right-hand
+side must be known before any row is read (a literal or a parameter).
+
+**The recheck.** Every row the index returns is filtered with the
+complete WHERE clause. This is required, not belt and braces: digests
+collide, positions are dropped (`'{"a":[{"b":1},{"c":2}]}'` holds both
+elements of `'{"a":[{"b":1,"c":2}]}'` without containing it), empty
+containers are not elements, and a conjunction may skip terms (next).
+No `LIMIT` is pushed below it.
+
+**Evaluation** (`inverted.Expr.Eval`). There are no per-element
+statistics, so a conjunction finds its selective elements by looking:
+each element is read up to 1,024 entries. Those that end within the
+limit are intersected; those that do not are common elements, and are
+left to the recheck — sound because fewer terms admit more rows. Only
+when every term is common are all read in full and intersected. A
+disjunction reads every branch. The result is a sorted list of primary
+keys, fetched in batches like any index join, so rows arrive in
+primary-key order.
+
+**Maintenance.** `IndexEntries` returns every entry a row has in an
+index — none or one for an ordinary index, one per element for an
+inverted one — and the write path, the backfill and the re-shard copy
+all go through it. `UPDATE` computes both rows' entries and writes only
+the difference, so changing one value of a document touches the entries
+of that value. Entries ride the row's write batch: same transaction,
+same intents, atomic with the row. The online build is the ordinary one;
+its argument holds for many entries per row because a chunk still
+derives every entry from a row it read serializably, and a concurrent
+writer's blind delete of an entry the chunk is about to write pushes the
+chunk past the writer and fails its refresh.
+
+**Planning.** An inverted scan ranks below both point lookups. Without
+statistics it ranks below a scan that pins a key column by equality and
+above a range alone or a full scan; with statistics it is costed like an
+index scan at an assumed selectivity of 1/100. `SET inverted_index_scan
+= on | off | auto` forces or forbids it (`on` still yields to a point
+lookup) — for comparing the two paths, as the differential test does.
+
+**Version gate.** `Inverted` is an `omitempty` descriptor field: a v20
+node would drop it and treat the index as an ordinary one over a column
+type it cannot key. `CREATE INDEX ... USING GIN` is refused until the
+cluster has finalized v21.
+
+Left for later: range lookups over a path's values (`doc->'n' > 5`),
+containment under a `->` path, `<@`, per-element statistics, and a
+second kind (full-text search, issue #299).
+
 ## Execution
 
 The executor ranks access paths:
@@ -516,6 +647,10 @@ The executor ranks access paths:
    key span). Without statistics, paths score 2 per pinned column plus 1
    for a range; ties prefer the primary key (no index join).
 4. Otherwise → full `Scan` of the primary rows with in-memory filtering.
+
+An inverted index that the WHERE clause constrains is considered between
+steps 2 and 4: taken unless step 3 pinned a key column by equality (see
+Inverted indexes above).
 
 With table statistics present (ANALYZE or the background sampler),
 step 3 ranks competing scans by **estimated cost** instead of the

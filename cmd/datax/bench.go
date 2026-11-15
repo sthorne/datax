@@ -83,6 +83,7 @@ var benchWorkloads = []struct{ name, doc string }{
 	{"timeseries", "per-series monotone timestamps (--series, --shards), then windowed reads"},
 	{"index-join", "secondary-index lookups fanning out to wide primary rows (--preload rows)"},
 	{"scan", "large result sets streamed through pgwire (--preload rows per scan)"},
+	{"jsonb-contain", "JSONB containment (doc @> ...) over --preload documents, through a GIN index or as a filter (--jsonb-index gin|none)"},
 }
 
 func benchUsage(fs *flag.FlagSet) {
@@ -171,7 +172,8 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification on the HTTP port")
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
-	groups := fs.Int("groups", 1000, "index-join workload: distinct indexed values (rows per lookup = preload / groups)")
+	groups := fs.Int("groups", 1000, "index-join, jsonb-contain: distinct indexed values (rows per lookup = preload / groups)")
+	jsonbIndex := fs.String("jsonb-index", "gin", "jsonb-contain workload: gin (an inverted index serves the containment) or none (every query filters the whole table); the table name embeds this, so A/B runs don't collide")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
@@ -183,7 +185,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	fs.Usage = func() { benchUsage(fs) }
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan")
+		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, or jsonb-contain")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
@@ -194,7 +196,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		known = known || w.name == workload
 	}
 	if !known {
-		return nil, fmt.Errorf("unknown workload %q (want kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan)", workload)
+		return nil, fmt.Errorf("unknown workload %q (want kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, or jsonb-contain)", workload)
 	}
 	switch *keys {
 	case "random", "sequential", "uuid":
@@ -276,6 +278,13 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
 	hotTable := "bench_hot" + rsuffix
+	if *jsonbIndex != "gin" && *jsonbIndex != "none" {
+		return nil, fmt.Errorf("--jsonb-index takes gin or none")
+	}
+	jsonbTable := "bench_jsonb" + rsuffix
+	if *jsonbIndex == "none" {
+		jsonbTable += "_noidx"
+	}
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
 	tsBase := time.Now().UTC().Truncate(time.Second)
@@ -408,6 +417,36 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		if err := preloadRows(ijTable, "k, g, pad", func(j int) string { return fmt.Sprintf("(%d, %d, '%s')", j, j%*groups, pad) }); err != nil {
 			return nil, err
+		}
+	case "jsonb-contain":
+		// Documents of a dozen values each; a query names one tenant and
+		// matches preload/groups of them. With the index that is a read
+		// of the tenant's entries and their rows; without it, a read of
+		// every document.
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+jsonbTable+" (k INT8 PRIMARY KEY, doc JSONB)"); err != nil {
+			return nil, err
+		}
+		if *jsonbIndex == "gin" {
+			if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS "+jsonbTable+"_doc ON "+jsonbTable+" USING GIN (doc)"); err != nil {
+				return nil, err
+			}
+		}
+		if err := split(jsonbTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		// A large preload is worth not repeating: a table already holding
+		// the rows is used as it is.
+		var have int64
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM "+jsonbTable).Scan(&have); err != nil {
+			return nil, err
+		}
+		if have < int64(*preload) {
+			if err := preloadRows(jsonbTable, "k, doc", func(j int) string {
+				return fmt.Sprintf(`(%d, '{"tenant": %d, "kind": "k%d", "tags": ["t%d", "t%d"], "attrs": {"seq": %d, "ok": %t}, "pad": "%s"}')`,
+					j, j%*groups, j%7, j%50, (j/50)%50, j, j%2 == 0, pad)
+			}); err != nil {
+				return nil, err
+			}
 		}
 	case "scan":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
@@ -648,10 +687,13 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 						}
 					}
 					_, err = conn.Exec(ctx, sb.String())
-				case "index-join", "scan":
+				case "index-join", "scan", "jsonb-contain":
 					q := "SELECT k, pad FROM " + scanTable
-					if workload == "index-join" {
+					switch workload {
+					case "index-join":
 						q = fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups))
+					case "jsonb-contain":
+						q = fmt.Sprintf(`SELECT k FROM %s WHERE doc @> '{"tenant": %d}'`, jsonbTable, rng.Intn(*groups))
 					}
 					var n int64
 					var first time.Duration
@@ -694,7 +736,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	switch {
 	case ivalReport:
 		res.Rows = total * rowsPerOp
-	case workload == "index-join" || workload == "scan":
+	case workload == "index-join" || workload == "scan" || workload == "jsonb-contain":
 		res.Rows = rowsOut.Load()
 	}
 	if res.Rows > 0 {

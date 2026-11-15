@@ -83,3 +83,32 @@ func TestGoldenTableDescriptor(t *testing.T) {
 		t.Fatalf("v1 descriptor decoded %+v", old)
 	}
 }
+
+// goldenInvertedIndex is an index descriptor naming an inverted kind
+// (cluster version v21). The field is omitempty: an ordinary index
+// encodes exactly as it did before the field existed.
+const goldenInvertedIndex = `{"id":3,"name":"docs_gin","column_ids":[2],"inverted":"jsonb_ops"}`
+
+func TestGoldenInvertedIndexDescriptor(t *testing.T) {
+	var idx IndexDescriptor
+	if err := json.Unmarshal([]byte(goldenInvertedIndex), &idx); err != nil {
+		t.Fatal(err)
+	}
+	if !idx.IsInverted() || idx.Inverted != "jsonb_ops" || idx.ID != 3 || len(idx.ColumnIDs) != 1 || !idx.Public() {
+		t.Fatalf("decoded %+v", idx)
+	}
+	raw, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != goldenInvertedIndex {
+		t.Fatalf("encoding changed:\n got %s\nwant %s", raw, goldenInvertedIndex)
+	}
+	plain, err := json.Marshal(IndexDescriptor{ID: 2, Name: "by_city", ColumnIDs: []ColumnID{2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != `{"id":2,"name":"by_city","column_ids":[2]}` || (&IndexDescriptor{}).IsInverted() {
+		t.Fatalf("an ordinary index gained a field: %s", plain)
+	}
+}

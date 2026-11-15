@@ -443,12 +443,12 @@ func (s *Session) reshardChunk(ctx context.Context, table string, start, end key
 					if i >= len(desc.Reshard.NewIndexIDs) {
 						return newErrf(CodeInternal, "re-shard shadow index set diverged from the table's indexes")
 					}
-					ik, iv, skip, err := rowenc.EncodeIndexEntryAt(desc, &desc.Indexes[i], desc.Reshard.NewIndexIDs[i], shadowRow)
+					entries, err := rowenc.IndexEntriesAt(desc, &desc.Indexes[i], desc.Reshard.NewIndexIDs[i], shadowRow)
 					if err != nil {
 						return newErrf(CodeInternal, "re-shard index %q: %v", desc.Indexes[i].Name, err)
 					}
-					if !skip {
-						wb.Put(ik, iv)
+					for _, e := range entries {
+						wb.Put(e.Key, e.Value)
 					}
 				}
 			}

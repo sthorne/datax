@@ -76,6 +76,20 @@ func TestParseDDLCompleteness(t *testing.T) {
 	if !ci.Unique || !ci.IfNotExists || ci.Name != "by_email" || ci.Table != "users" {
 		t.Fatalf("create index if not exists: %+v", ci)
 	}
+	// USING names the access method; an operator class may follow a
+	// column.
+	ci = parseOne(t, `CREATE INDEX docs_gin ON docs USING GIN (doc)`).(*CreateIndex)
+	if ci.Using != "gin" || len(ci.Columns) != 1 || ci.Columns[0] != "doc" || ci.OpClasses != nil || ci.Unique {
+		t.Fatalf("create index using gin: %+v", ci)
+	}
+	ci = parseOne(t, `CREATE INDEX IF NOT EXISTS docs_gin ON app.docs USING gin (doc jsonb_path_ops)`).(*CreateIndex)
+	if ci.Using != "gin" || ci.Table != "app.docs" || len(ci.OpClasses) != 1 || ci.OpClasses[0] != "jsonb_path_ops" {
+		t.Fatalf("create index with an operator class: %+v", ci)
+	}
+	ci = parseOne(t, `CREATE INDEX by_ab ON t USING btree (a, b)`).(*CreateIndex)
+	if ci.Using != "btree" || len(ci.Columns) != 2 || ci.OpClasses != nil {
+		t.Fatalf("create index using btree: %+v", ci)
+	}
 	cu := parseOne(t, `CREATE USER IF NOT EXISTS ann PASSWORD 'pw'`).(*CreateRole)
 	if cu.Name != "ann" || !cu.IfNotExists || cu.Alter || !cu.IsUser || cu.Password == nil || *cu.Password != "pw" {
 		t.Fatalf("create user if not exists: %+v", cu)

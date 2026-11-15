@@ -66,7 +66,8 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
-  JSONB cannot be a primary key or indexed. `->`/`->>` (by key or array
+  JSONB cannot be a primary key or part of an ordinary index; a GIN
+  index serves containment and key existence (below). `->`/`->>` (by key or array
   index) and `#>`/`#>>` (by path: `j #>> '{a,0,b}'`) work everywhere an
   expression does — single-table queries, joins, grouped select lists
   and HAVING; a LEFT-joined NULL side extracts to NULL.
@@ -74,9 +75,12 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   (objects contain recursively, arrays contain each right element
   somewhere, a top-level array contains a matching scalar), numbers
   compared numerically (`1` contains `1.0`) — and key existence `j ?
-  'k'`, `j ?| '{a,b}'`, `j ?& '{a,b}'`. All are filters (no index
-  acceleration): pair them with an indexable condition on large tables.
-- Every type except JSONB can appear in primary keys and indexes.
+  'k'`, `j ?| '{a,b}'`, `j ?& '{a,b}'`. Without an index they are
+  filters over every row; `CREATE INDEX ... USING GIN (j)` makes `@>`
+  and the three key operators index lookups — see
+  [JSONB indexes](#jsonb-indexes).
+- Every type except JSONB can appear in primary keys and ordinary
+  indexes.
 
 ## DDL
 
@@ -91,6 +95,7 @@ CREATE TABLE IF NOT EXISTS t (...);
 DROP TABLE [IF EXISTS] t;
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
@@ -120,6 +125,54 @@ the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the
 schema at once and its entries are reclaimed after the statement's
 transaction commits and every gateway has adopted the change.
+
+### JSONB indexes
+
+```sql
+CREATE INDEX docs_doc ON docs USING GIN (doc);            -- or (doc jsonb_ops)
+
+SELECT id FROM docs WHERE doc @> '{"owner": {"team": "search"}}';
+SELECT id FROM docs WHERE doc @> '{"tags": ["pii", "eu"]}';     -- both tags, any order
+SELECT id FROM docs WHERE doc ? 'expires_at';                    -- has the top-level key
+SELECT id FROM docs WHERE doc ?| '{warn,block}' AND doc @> $1;  -- combined; parameters work
+```
+
+A GIN index on a JSONB column holds one entry for every value in each
+document, together with the path to it, and one for every top-level key.
+Four operators use it, with the column alone on the left and a literal
+or parameter on the right: `@>`, `?`, `?|` and `?&`. They may be combined
+with `AND` (and with any other condition), and with `OR` as long as every
+branch of the `OR` is one of them. `EXPLAIN` shows the lookups:
+
+```
+inverted scan of index "docs_doc" ("owner"."team" = "search") + primary key join, rows rechecked
+```
+
+Good to know:
+
+- **Results are the same as without the index.** The index finds
+  candidate rows; each is then checked against the whole `WHERE` clause.
+- **What it does not serve**: `<@`, `NOT (doc @> ...)`, a comparison of
+  an extracted value (`doc->>'n' = '5'`), containment under a path
+  (`doc->'a' @> ...`), and a right-hand side taken from another column.
+  A query for an empty container alone (`doc @> '{}'`, `doc @> '[]'`)
+  matches by shape, not by value, and scans. These all still work, as
+  filters.
+- **Writes** cost one KV write per value in the document, in the same
+  transaction as the row. An `UPDATE` rewrites only the entries of the
+  values that changed.
+- **Limits**: a document may have at most 8,192 distinct indexed values
+  and keys (`54000` beyond that; the write is refused). Long strings and
+  deep paths are indexed by a digest, so there is no limit on their
+  length. A GIN index takes one column and cannot be `UNIQUE`.
+- **Choosing**: with a condition that pins an indexed or primary-key
+  column by equality in the same query, the planner prefers that
+  condition unless table statistics say otherwise. `SET
+  inverted_index_scan = off` (or `on`) overrides the choice for a
+  session, which is the way to compare the two plans.
+- `jsonb_path_ops` is accepted and builds the same index.
+- Needs cluster version v21; on a cluster that has not finalized it the
+  statement is refused (`0A000`).
 
 `TRUNCATE` is a descriptor change, not a delete: the table (and each of
 its indexes) moves to a fresh keyspace, so it costs the same for a
@@ -949,6 +1002,7 @@ invalid value `22023`:
 | `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
+| `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 `SET LOCAL` and `SET TRANSACTION` apply to the current block and end

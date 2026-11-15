@@ -20,6 +20,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/encoding"
@@ -568,7 +569,8 @@ func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescript
 // non-empty: an empty MVCC read is indistinguishable from absence).
 var nonUniqueIndexValue = []byte{0}
 
-// EncodeIndexEntry builds the index KV pair for a full row. skip=true when
+// EncodeIndexEntry builds an ordinary index's KV pair for a full row
+// (IndexEntries serves both kinds of index). skip=true when
 // an indexed column is NULL: the row simply has no entry in that index
 // (SQL equality never matches NULL, so equality lookups stay correct;
 // unique indexes reject NULLs at the executor instead).
@@ -597,14 +599,9 @@ func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescrip
 	if err != nil {
 		return nil, nil, false, err
 	}
-	// Encoded PK column values (without any prefix).
-	var pkEnc keys.Key
-	for _, colID := range desc.PrimaryKey {
-		col, _ := desc.ColByID(colID)
-		pkEnc, err = appendDatum(pkEnc, col.Type, row[colID])
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("pk column %q: %w", col.Name, err)
-		}
+	pkEnc, err := encodePKSuffix(desc, row)
+	if err != nil {
+		return nil, nil, false, err
 	}
 	if idx.Unique {
 		return k, pkEnc, false, nil
@@ -612,8 +609,114 @@ func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescrip
 	return append(k, pkEnc...), nonUniqueIndexValue, false, nil
 }
 
+// IndexEntry is one KV pair of a secondary index.
+type IndexEntry struct {
+	Key   keys.Key
+	Value []byte
+}
+
+// IndexEntries returns every entry the row has in the index, at the
+// index's own ID: none or one for an ordinary index, one per element of
+// the indexed value for an inverted one. It is what the write path, the
+// backfill and the re-shard copy all encode with, so no caller needs to
+// know which kind of index it holds.
+func IndexEntries(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) ([]IndexEntry, error) {
+	return IndexEntriesAt(desc, idx, idx.ID, row)
+}
+
+// IndexEntriesAt is IndexEntries with the entries' index ID overridden
+// (see EncodeIndexEntryAt).
+func IndexEntriesAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) ([]IndexEntry, error) {
+	if !idx.IsInverted() {
+		key, val, skip, err := EncodeIndexEntryAt(desc, idx, entryID, row)
+		if err != nil || skip {
+			return nil, err
+		}
+		return []IndexEntry{{Key: key, Value: val}}, nil
+	}
+	elements, err := invertedElements(desc, idx, row)
+	if err != nil || len(elements) == 0 {
+		return nil, err
+	}
+	pkEnc, err := encodePKSuffix(desc, row)
+	if err != nil {
+		return nil, err
+	}
+	prefix := keys.TableIndexPrefix(desc.ID, entryID)
+	out := make([]IndexEntry, len(elements))
+	for i, el := range elements {
+		k := make(keys.Key, 0, len(prefix)+encoding.EncodedBytesLen(el)+len(pkEnc))
+		k = append(k, prefix...)
+		k = encoding.EncodeBytes(k, el)
+		out[i] = IndexEntry{Key: append(k, pkEnc...), Value: nonUniqueIndexValue}
+	}
+	return out, nil
+}
+
+// invertedElements returns the sorted, distinct elements of the row's
+// value in an inverted index's column. A NULL value has none: no
+// predicate the index serves is true of NULL.
+func invertedElements(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) ([][]byte, error) {
+	kind, ok := inverted.Lookup(idx.Inverted)
+	if !ok {
+		return nil, fmt.Errorf("index %q: unknown inverted index kind %q", idx.Name, idx.Inverted)
+	}
+	if len(idx.ColumnIDs) != 1 {
+		return nil, fmt.Errorf("inverted index %q must have exactly one column", idx.Name)
+	}
+	d, ok := row[idx.ColumnIDs[0]]
+	if !ok || d.Null {
+		return nil, nil
+	}
+	return kind.Elements(d)
+}
+
+// encodePKSuffix encodes the row's primary key column values, without
+// any prefix: what follows the indexed part in a non-unique entry's key.
+func encodePKSuffix(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) (keys.Key, error) {
+	var pkEnc keys.Key
+	for _, colID := range desc.PrimaryKey {
+		col, _ := desc.ColByID(colID)
+		var err error
+		pkEnc, err = appendDatum(pkEnc, col.Type, row[colID])
+		if err != nil {
+			return nil, fmt.Errorf("pk column %q: %w", col.Name, err)
+		}
+	}
+	return pkEnc, nil
+}
+
+// InvertedElementSpan is the span of an inverted index holding the
+// entries of one element: one key per row whose value has the element,
+// in primary-key order.
+func InvertedElementSpan(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, element []byte) (start, end keys.Key) {
+	start = keys.Key(encoding.EncodeBytes(keys.TableIndexPrefix(desc.ID, idx.ID), element))
+	return start, start.PrefixEnd()
+}
+
+// InvertedEntryElement splits an inverted index entry's key into its
+// element and the encoded primary key that follows it.
+func InvertedEntryElement(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key) (element, pkSuffix []byte, err error) {
+	prefix := keys.TableIndexPrefix(desc.ID, idx.ID)
+	if !bytes.HasPrefix(key, prefix) {
+		return nil, nil, fmt.Errorf("key not in index %q", idx.Name)
+	}
+	pkSuffix, element, err = encoding.DecodeBytes(key[len(prefix):])
+	if err != nil {
+		return nil, nil, fmt.Errorf("index %q entry: %w", idx.Name, err)
+	}
+	return element, pkSuffix, nil
+}
+
 // IndexEntryPrimaryKey recovers the primary row key from an index entry.
 func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key, value []byte) (keys.Key, error) {
+	if idx.IsInverted() {
+		_, pkSuffix, err := InvertedEntryElement(desc, idx, key)
+		if err != nil {
+			return nil, err
+		}
+		return append(PrimaryKeyPrefixFor(desc), pkSuffix...), nil
+	}
 	if idx.Unique {
 		return append(PrimaryKeyPrefixFor(desc), value...), nil
 	}

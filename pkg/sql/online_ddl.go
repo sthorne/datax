@@ -6,9 +6,11 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Online CREATE INDEX (three steps, driven by the session outside any
@@ -35,6 +37,60 @@ import (
 // waits for that expiration too (issue #185, catalog.descLease), so a
 // write that misses the index cannot commit above the boundary this
 // backfill is about to take.
+
+// invertedKindFor resolves CREATE INDEX's access method and operator
+// class to an inverted index kind; nil is an ordinary index. USING GIN
+// with no operator class takes the kind of the column's type.
+func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDescriptor) (inverted.Kind, error) {
+	switch t.Using {
+	case "", "btree":
+		for i, oc := range t.OpClasses {
+			if oc != "" {
+				return nil, newErrf(CodeFeatureNotSupported, "operator class %q is not supported for column %q of an ordinary index", oc, t.Columns[i])
+			}
+		}
+		return nil, nil
+	case "gin":
+	default:
+		return nil, newErrf(CodeFeatureNotSupported, "access method %q is not supported (btree and gin are)", t.Using)
+	}
+	if s.db.ClusterVersion() < version.V21 {
+		return nil, newErrf(CodeFeatureNotSupported, "CREATE INDEX ... USING GIN needs cluster version %s (finalize the upgrade first)", version.V21)
+	}
+	if t.Unique {
+		return nil, newErrf(CodeFeatureNotSupported, "a GIN index cannot be UNIQUE: its entries are the elements of a value, not the value")
+	}
+	if len(t.Columns) != 1 {
+		return nil, newErrf(CodeFeatureNotSupported, "a GIN index takes exactly one column")
+	}
+	col, ok := desc.Col(t.Columns[0])
+	if !ok {
+		return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.Columns[0])
+	}
+	opclass := ""
+	if len(t.OpClasses) > 0 {
+		opclass = t.OpClasses[0]
+	}
+	if opclass == "jsonb_path_ops" {
+		// PostgreSQL's smaller class serves @> only. The one kind here
+		// serves @> at least as selectively and the key operators too,
+		// so a schema that names the class gets it.
+		opclass = inverted.JSONBOps
+	}
+	if opclass != "" {
+		kind, ok := inverted.Lookup(opclass)
+		if !ok {
+			return nil, newErrf(CodeUndefinedObject, "operator class %q does not exist for access method \"gin\"", opclass)
+		}
+		return kind, nil
+	}
+	for _, name := range inverted.Names() {
+		if kind, _ := inverted.Lookup(name); kind.Family() == col.Type {
+			return kind, nil
+		}
+	}
+	return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot have a GIN index (JSONB columns can)", col.Name, col.Type)
+}
 
 // backfillChunkSize bounds each backfill chunk: rows scanned, KV batch
 // size, raft entry size, and refresh-span width per transaction.
@@ -72,6 +128,10 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			}
 			return newErrf(CodeDuplicateObject, "index %q already exists", t.Name)
 		}
+		kind, err := s.invertedKindFor(t, desc)
+		if err != nil {
+			return err
+		}
 		var colIDs []catalog.ColumnID
 		seenCol := map[catalog.ColumnID]bool{}
 		for _, name := range t.Columns {
@@ -79,8 +139,14 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			if !ok {
 				return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 			}
-			if !types.IsIndexable(col.Type) {
+			if kind == nil && !types.IsIndexable(col.Type) {
+				if col.Type == types.Jsonb {
+					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
+				}
 				return newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
+			}
+			if kind != nil && col.Type != kind.Family() {
+				return newErrf(CodeFeatureNotSupported, "operator class %q does not index column %q of type %s", kind.Name(), name, col.Type)
 			}
 			if seenCol[col.ID] {
 				return newErrf(CodeSyntaxError, "duplicate column %q in index", name)
@@ -94,6 +160,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		idx := catalog.IndexDescriptor{
 			ID: desc.NextIndexID, Name: t.Name, Unique: t.Unique,
 			ColumnIDs: colIDs, State: catalog.IndexStateWriteOnly,
+		}
+		if kind != nil {
+			idx.Inverted = kind.Name()
 		}
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
@@ -248,17 +317,27 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 			if err != nil {
 				return err
 			}
-			key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+			entries, err := rowenc.IndexEntries(desc, idx, row)
 			if err != nil {
-				return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+				return invertedEntryErr(idx, err)
 			}
-			if skip {
+			if len(entries) == 0 {
 				if idx.Unique {
 					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
 				}
 				continue
 			}
-			if idx.Unique {
+			if !idx.Unique {
+				// One entry, or one per element of an inverted index's
+				// value. A row with many elements makes this chunk's batch
+				// that many times larger; MaxElementsPerValue bounds it.
+				for _, e := range entries {
+					wb.Put(e.Key, e.Value)
+				}
+				continue
+			}
+			key, val := entries[0].Key, entries[0].Value
+			{
 				// Duplicates within the chunk, then against entries earlier
 				// chunks (or concurrent writers) committed: a unique entry's
 				// value is the encoded primary key, so an existing entry

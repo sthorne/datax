@@ -84,7 +84,7 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   UNION, `COPY FROM STDIN`, `LISTEN` / `NOTIFY` across nodes, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over
   ten column types including exact DECIMAL and JSONB with `->`/`->>`
-  extraction and `@>` containment, served over the Postgres wire protocol
+  extraction, `@>` containment and GIN indexes for it, served over the Postgres wire protocol
   with TLS + SCRAM-SHA-256 authentication in secure mode; databases,
   the `pg_catalog` / `information_schema` views and the `SHOW` family,
   so `psql`'s `\d` commands and ORM introspection work as they do
@@ -258,7 +258,7 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Ranges | load statistics are leader-local samples: a lease transfer hands the measured rate to the new leader, but reservoir split-key samples start fresh (splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements); zone and lease preferences are parsed and stored but not acted on automatically |
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads are opt-in per statement — exact-timestamp `AS OF SYSTEM TIME` or bounded staleness `with_max_staleness('10s')` |
-| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing (`@>` always filters — no inverted indexes — and is single-table only) |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing beyond `@>` and key existence (`?`, `?|`, `?&`) through a GIN index: `<@`, extracted-value comparisons and containment under a path filter; `@>` is single-table only |
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
 | Ops | audit records signed or shipped off the cluster by the cluster itself (they are in the node's log and in the hash-chained `datax_audit` table; exporting the chain heads is the operator's job); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |

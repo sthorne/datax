@@ -352,7 +352,8 @@ func indexCovers(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 		return true
 	}
 	for i := range d.Indexes {
-		if prefix(d.Indexes[i].ColumnIDs) {
+		// An inverted index has no key order over its column's values.
+		if !d.Indexes[i].IsInverted() && prefix(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
