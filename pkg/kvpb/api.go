@@ -510,7 +510,8 @@ type ExportRecord struct {
 	Key     keys.Key `json:"key"`
 	Value   []byte   `json:"value,omitempty"`
 	Deleted bool     `json:"deleted,omitempty"`
-	// Timestamp is the version's timestamp; set only in answer to an
+	// Timestamp is the version's timestamp. A replica at cluster version
+	// v22 sets it on every record; before, only in answer to an
 	// AllRevisions export.
 	Timestamp hlc.Timestamp `json:"ts,omitzero"`
 }

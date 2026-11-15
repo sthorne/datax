@@ -1904,6 +1904,24 @@ state or the internode protocol does, and an entry below says so.
   destination and moved into place only when every table has been written; a
   failure removes them. Backup files are created 0600 and a directory the
   backup creates 0700 (they were 0644 and 0755), sealed or not.
+- **A restore brought back time-series rows that retention had expired, and
+  kept every restored row a retention period too long** (#316). Retention
+  expires rows by commit time and leaves no tombstone, so a full backup and
+  an incremental taken after rows expired restored them again; and a restore
+  writes every row at its own time, from which retention counted. A backup
+  now keeps each time-series row's commit time (its manifest has the magic
+  `DXBK3`, which older binaries refuse), and a restore of everything, a table
+  restore and a point-in-time restore leave out the rows committed at or
+  before the chain's end less the table's retention, then write the rest in
+  sixteen bands of commit time and record the bands in the descriptor
+  (`restored_rows`), so retention expires each restored row when the source
+  would have, at most a sixteenth of the retention late. A row backfilled
+  with an old timestamp is kept or dropped by its commit time, as the source
+  did. A time-series table's files are read once per band. A chain with a
+  backup from before has its time-series tables restored as before, and the
+  restore's summary says so. Backups record commit times, and restores
+  record bands, at cluster protocol version v22. See docs/user/operations.md,
+  "Time-series retention and backups".
 
 ## 0.57.0 — unreleased
 

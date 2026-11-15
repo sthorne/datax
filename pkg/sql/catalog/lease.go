@@ -518,6 +518,23 @@ func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	}); err != nil {
 		return err
 	}
+	return a.finishDDL(ctx, dbID, name)
+}
+
+// FinishDDLByID is FinishDDL for a table named by its database's id and
+// its bare name, as its descriptor has them: for a change made outside a
+// statement (a restore recording its bands, issue #316).
+func (a *Accessor) FinishDDLByID(ctx context.Context, dbID uint64, name string) error {
+	a.mu.Lock()
+	leasing := a.leasing
+	a.mu.Unlock()
+	if !leasing {
+		return nil
+	}
+	return a.finishDDL(ctx, dbID, name)
+}
+
+func (a *Accessor) finishDDL(ctx context.Context, dbID uint64, name string) error {
 	desc, err := a.refreshOne(ctx, cacheKey(dbID, name))
 	if err != nil || desc == nil {
 		return err

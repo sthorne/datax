@@ -188,12 +188,21 @@ eventual wipe as unreachable garbage.
 
 ## Limitations
 
-- Backups (issue #313): an expired row leaves no tombstone, so a restore
-  of a full backup and an incremental taken after rows expired brings
-  them back; and a restore writes every row at its own time, which is
-  when retention starts counting for it again. The remedy is a `DELETE`
-  of the rows older than the retention after the restore
-  (docs/user/operations.md, "Backup and restore").
+- Backups (issues #313, #316): an expired row leaves no tombstone, so an
+  incremental taken after rows expired says nothing about them. Backups
+  keep each row's commit time instead, and a restore leaves out the rows
+  whose commit time the retention had passed by the chain's end — by
+  commit time, so a row backfilled with an old timestamp is kept as the
+  source kept it. A restore writes every row at its own time; it writes
+  the rows in sixteen bands of commit time and records the bands in the
+  descriptor (`restored_rows`), and retention ages a restored version by
+  its band's source commit time, so restored rows expire on the source's
+  schedule, at most a sixteenth of the retention late. On a range wholly
+  inside the table that is a row-level predicate beside expire mode; it
+  collects restored versions above the range's threshold without moving
+  it, like row-level expiry on mixed ranges. Backups from before cluster
+  version v22 restore as before (docs/user/operations.md, "Backup and
+  restore").
 
 - Retention expiry is best-effort in timing (one housekeeping tick,
   default 30s, plus the ~30s descriptor cache); on mixed ranges it is

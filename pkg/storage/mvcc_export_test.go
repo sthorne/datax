@@ -174,14 +174,20 @@ func TestMVCCExportRevisions(t *testing.T) {
 	}
 	check(res.Records, want[2:])
 
-	// An ordinary export leaves its records without a timestamp.
+	// An ordinary export stamps each record with the newest version's
+	// timestamp, its commit time (issue #316): a's v3 at 30 and c's v2
+	// at 38.
 	res, err = MVCCExport(eng, keys.Key("a"), keys.Key("z"), ts(20, 0), ts(40, 0), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantTS := map[string]hlc.Timestamp{"a": ts(30, 0), "c": ts(38, 0)}
+	if len(res.Records) != len(wantTS) {
+		t.Fatalf("ordinary export: %+v", res.Records)
+	}
 	for _, rec := range res.Records {
-		if !rec.Timestamp.IsEmpty() {
-			t.Fatalf("an ordinary export stamped %s with %s", rec.Key, rec.Timestamp)
+		if rec.Timestamp != wantTS[string(rec.Key)] {
+			t.Fatalf("an ordinary export stamped %s with %s, want %s", rec.Key, rec.Timestamp, wantTS[string(rec.Key)])
 		}
 	}
 }

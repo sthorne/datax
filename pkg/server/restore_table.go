@@ -121,6 +121,9 @@ var (
 		"constraints", "next_constraint_id", "inbound_fks", "next_column_id", "comment", "view_query", "view_depends",
 		"owner", "privileges", "grant_options", "version", "timeseries", "retention_seconds", "shard_buckets",
 		"primary_index", "reshard", "resharded_at", "retired_layouts",
+		// A restore's bands are the source cluster's timestamps: the
+		// restored copy gets its own load's (restoredDescriptor).
+		"restored_rows",
 		// A GC window is a number and a row expiry names a column by id:
 		// neither refers to the table's id, so both carry over as they are.
 		"gc_ttl_seconds", "row_ttl",
@@ -229,6 +232,11 @@ type tableRestorePlan struct {
 	// the backup's own key space: what the loaded rows must match.
 	records, bytes int64
 	sha            string
+	// expiry applies a time-series table's retention to the rows
+	// (restore_retention.go); bands are those its load wrote, recorded in
+	// the published descriptor.
+	expiry *commitTimeExpiry
+	bands  []catalog.RestoredRowsBand
 }
 
 // restoreSequence is a sequence a restored table's column owns.
@@ -477,6 +485,7 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 	var notes []string
 	d := p.srcDesc.Clone()
 	d.ID, d.DatabaseID, d.Name, d.Version = p.newID, dbID, p.intoName, 1
+	d.RestoredRows = p.bands
 	kept := d.Constraints[:0:0]
 	for _, c := range d.Constraints {
 		if c.Kind == catalog.ConstraintForeign {
@@ -838,8 +847,16 @@ func (n *Node) runTableRestore(ctx context.Context, opID string, opts RestoreOpt
 				return nil, err
 			}
 		}
+		e, note := n.planCommitTimeExpiry(chain, p.src.ID, p.srcDesc, p.from())
+		p.expiry = e
+		if note != "" {
+			plan.notes = append(plan.notes, note)
+		}
 		h := sha256.New()
 		if err := mergeTable(chain, p.src.ID, func(rec kvpb.ExportRecord) error {
+			if p.expiry != nil && !p.expiry.keep(rec) {
+				return nil // expired at the source by the chain's end
+			}
 			p.records++
 			p.bytes += int64(len(rec.Key) + len(rec.Value))
 			hashLiveRecord(h, rec)
@@ -986,6 +1003,17 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 
 	for _, p := range plan.tables {
 		oldPrefix, newPrefix := keys.TableDataPrefix(p.src.ID), keys.TableDataPrefix(p.newID)
+		if p.expiry != nil {
+			bands, expired, err := n.loadByCommitTime(ctx, chain, p.src.ID, p.expiry, "restore-table-data", func(k keys.Key) keys.Key {
+				return append(newPrefix.Clone(), k[len(oldPrefix):]...)
+			})
+			if err != nil {
+				return nil, fmt.Errorf("restoring table %s: %w", p.from(), err)
+			}
+			p.bands = bands
+			plan.notes = append(plan.notes, expiryNote(p.from(), p.expiry, expired))
+			continue
+		}
 		var wb kvclient.WriteBatch
 		flush := func() error {
 			if wb.Len() == 0 {

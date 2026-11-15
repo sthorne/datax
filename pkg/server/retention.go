@@ -54,6 +54,21 @@ type retentionSpan struct {
 	// see rowExpiry for the eligibility rules).
 	prefixes []keys.Key     // primary-index prefixes, every retained generation
 	pkFams   []types.Family // PK column families in physical order (last: the timestamp)
+	// restored is the table's RestoredRows: the versions a restore wrote,
+	// aged by when their rows were first written (issue #316).
+	restored []catalog.RestoredRowsBand
+}
+
+// writtenAt is when the version at vts was written, for retention: its
+// own timestamp, or for a version a restore wrote, the source's commit
+// time of the rows in its band.
+func (ts retentionSpan) writtenAt(vts hlc.Timestamp) int64 {
+	return catalog.RestoredWrittenAt(ts.restored, vts)
+}
+
+// restoredVersion says the version at vts is one a restore wrote.
+func (ts retentionSpan) restoredVersion(vts hlc.Timestamp) bool {
+	return len(ts.restored) > 0 && !ts.restored[len(ts.restored)-1].Through.Less(vts)
 }
 
 const retentionRefreshInterval = 30 * time.Second
@@ -215,7 +230,7 @@ func retentionSpanFor(d *catalog.TableDescriptor) (retentionSpan, bool) {
 		}
 		return retentionSpan{}, false
 	}
-	rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true}
+	rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true, restored: d.RestoredRows}
 	// Row-level expiry eligibility: the timestamp must be decodable
 	// from the key alone (it always is — the last PK column), and the
 	// table must carry no secondary indexes (their entries hold no
@@ -257,6 +272,15 @@ func retentionSpanFor(d *catalog.TableDescriptor) (retentionSpan, bool) {
 // backfilled ancient row expires promptly. Keys that match no eligible
 // retention table (foreign tenants of the mixed range, secondary-index
 // entries) are never touched.
+//
+// A version a restore wrote is aged by when its row was first written at
+// the source rather than by its own timestamp (retentionSpan.writtenAt,
+// issue #316), on a mixed range and on one wholly inside the table
+// alike: expire-mode GC goes by the versions' own timestamps, so for a
+// range inside a table that has restored rows the predicate is what
+// expires them on the source's schedule rather than a period after the
+// restore. Every key of the table is held to it there, as expire mode
+// holds every key, index entries included.
 func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.Timestamp) bool, bool) {
 	spans := p.get()
 	var overlapping []retentionSpan
@@ -265,7 +289,13 @@ func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.T
 			continue
 		}
 		if ts.start.Compare(start) <= 0 && end.Compare(ts.end) <= 0 {
-			return nil, false // fully contained: expire-mode GC handles it
+			if len(ts.restored) == 0 {
+				return nil, false // fully contained: expire-mode GC handles it
+			}
+			cutoff := time.Now().UnixNano() - ts.ttl.Nanoseconds()
+			return func(_ keys.Key, vts hlc.Timestamp) bool {
+				return ts.restoredVersion(vts) && ts.writtenAt(vts) <= cutoff
+			}, true
 		}
 		if len(ts.prefixes) > 0 {
 			overlapping = append(overlapping, ts)
@@ -281,7 +311,7 @@ func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.T
 				continue
 			}
 			cutoff := nowNanos - ts.ttl.Nanoseconds()
-			if vts.WallTime > cutoff {
+			if ts.writtenAt(vts) > cutoff {
 				return false // written too recently, whatever the row says
 			}
 			for _, prefix := range ts.prefixes {

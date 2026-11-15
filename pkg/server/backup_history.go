@@ -168,7 +168,8 @@ func (rd *backupReader) next() (rec kvpb.ExportRecord, ok bool, err error) {
 // file's records as they are for a backup without history, and for one
 // with history the newest version of each key at or below cutoff (the
 // newest of all when cutoff is zero). A key with no version at or below
-// the cutoff did not change by then and yields nothing.
+// the cutoff did not change by then and yields nothing. A record carries
+// its commit time when the file has one (backupTable.timed).
 //
 // Every record is held to the table's span before it is acted on
 // (checkBackupRecord, issue #255), and a history file to its own shape:
@@ -202,7 +203,7 @@ type tableStream struct {
 }
 
 func openTableStream(path string, dataKey []byte, t backupTable, cutoff hlc.Timestamp, ordered bool) (*tableStream, error) {
-	rd, err := openBackupRecords(path, dataKey, t.history)
+	rd, err := openBackupRecords(path, dataKey, t.timed())
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +250,8 @@ func (s *tableStream) read() (kvpb.ExportRecord, bool, error) {
 	if err := checkBackupRecord(s.rd.path, s.t, rec); err != nil {
 		return rec, false, err
 	}
-	if s.t.history {
+	if s.t.timed() {
+		// A commit time too: a full backup's interval starts at zero.
 		if ts := rec.Timestamp; !s.t.window[0].Less(ts) || s.t.window[1].Less(ts) {
 			return rec, false, fmt.Errorf("%s: table %s's data file carries a version at %s, outside the backup's own interval (%s, %s]",
 				s.rd.path, s.t.Name, ts, s.t.window[0], s.t.window[1])

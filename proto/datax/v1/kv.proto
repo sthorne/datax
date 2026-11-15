@@ -198,7 +198,7 @@ message ExportRecord {
   bytes key = 1;
   bytes value = 2;
   bool deleted = 3; // tombstone: the key was deleted in the window
-  Hlc ts = 4; // the version's timestamp; all_revisions exports only
+  Hlc ts = 4; // the version's timestamp; on every record from a v22 replica, all_revisions exports only before
 }
 
 message ExportResponse {

@@ -343,6 +343,18 @@ const (
 	// without records be running, so only then does "no record" mean
 	// "dropped before records"; the sweep's own record
 	// (keys.DroppedTableSweepKey) is a system key a v21 node never reads.
+	//
+	// V22 also carries time-series retention across backups (issue #316,
+	// pkg/server/restore_retention.go). A v22 replica stamps every export
+	// record with its version's commit time, where a v21 one does so only
+	// for revision exports, so only at v22 does a backup keep the commit
+	// times of a time-series table's rows (its manifest then has the magic
+	// DXBK3, which older binaries refuse). And a restore records, in the
+	// descriptor field restored_rows, omitempty, when the rows it wrote
+	// were first written, which v22 retention ages them by; a v21 node
+	// would age them by the restore's time, a period late, so the restore
+	// records no bands until finalize. Dropping the rows retention had
+	// already expired needs neither and is done at any version.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.
