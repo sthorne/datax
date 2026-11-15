@@ -928,8 +928,17 @@ table restore (`--table`, `--database`) from such a backup makes the
 type from the column's labels, so that is the way to bring an enum
 column back from one with its type. Users, admin-role markers, and per-table grants come
 from the backup — after a restore, **credentials are the source cluster's**.
-The restore summary re-exports every table and prints fresh checksums:
-compare them against the backup's to verify the restore byte-for-byte.
+Before anything is written, every data file of the chain is read to its
+end and held to its manifest: the record count and checksum the backup
+recorded for it, its table's key span and key order. A damaged file, or
+one swapped for another backup's file of the same table, is refused and
+the target stays empty. (This is not a seal: whoever can rewrite a file
+can rewrite the manifest beside it. A sealed backup authenticates both.)
+The files are read once more as they are applied, and a file changed in
+between fails that check at its end, after its earlier rows are written;
+start again from an empty cluster. The restore summary re-exports every
+table and prints fresh checksums: compare them against the backup's to
+verify the restore byte-for-byte.
 
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.

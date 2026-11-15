@@ -1587,6 +1587,13 @@ state or the internode protocol does, and an entry below says so.
   backup taken before this change) and says so in the summary. Onto a type of
   that name with the same labels it maps the column to it, as before; onto
   one with other labels it is refused, naming both label lists.
+- A restore of everything from a plaintext backup did not hold the data files
+  to the manifest's record counts and checksums: it reported them afterwards
+  and enforced nothing, so a data file swapped for another backup's file of
+  the same table restored silently (#313). Every file is now checked against
+  its manifest — count, checksum and key order — in the pass made before
+  anything is written, as a table restore already did; a mismatch is refused
+  with the target left empty.
 
 ## 0.57.0 — unreleased
 

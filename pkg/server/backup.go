@@ -388,9 +388,10 @@ func checkBackupFiles(dir string, man *backupManifest) error {
 // appended to table_N.dxbk could otherwise have it write — or, as a
 // tombstone, delete — any key in the cluster, the authentication secret
 // first among them, with the manifest left byte-for-byte as backup
-// wrote it: the manifest's checksums are reported after a restore for
-// the operator to compare, never enforced before one (issue #255,
-// #238's other half). A table's file legitimately carries only keys in
+// wrote it (issue #255, #238's other half). The same pass holds each
+// file to its manifest's record count and checksum (issue #313): not a
+// seal — whoever can rewrite a file can rewrite the manifest — but a
+// damaged or swapped file is refused before anything is written. A table's file legitimately carries only keys in
 // keys.TableDataSpan(t.ID), the span backup exported it from. Checked
 // here, alongside the file names, so a crafted file is refused before
 // the first chunk is committed rather than after the chunks before it.
@@ -412,7 +413,12 @@ func checkBackupRecords(dir string, dataKey []byte, man *backupManifest) error {
 }
 
 // readCheckedBackupRecords reads path's records, refusing any key outside
-// t's data span before fn sees it (issue #255). Both of restore's reads
+// t's data span before fn sees it (issue #255), a file out of key order,
+// and — at its end — a file that is not the one its manifest describes:
+// another record count or checksum (issue #313; before it a restore of
+// everything reported the checksums for the operator to compare and
+// enforced nothing, so a data file swapped for another backup's file of
+// the same table restored silently). Both of restore's reads
 // of a data file — the pass before anything is applied and the apply
 // loop — go through here, so neither can be written without the check:
 // the second read is deliberate, for a file rewritten between the two,
@@ -420,7 +426,7 @@ func checkBackupRecords(dir string, dataKey []byte, man *backupManifest) error {
 // reader beneath is named for what it lacks, so a call site that reaches
 // past this one reads as what it is.
 func readCheckedBackupRecords(path string, dataKey []byte, t backupTable, fn func(kvpb.ExportRecord) error) error {
-	return readTableRecords(path, dataKey, t, hlc.Timestamp{}, false, fn)
+	return readTableRecords(path, dataKey, t, hlc.Timestamp{}, true, fn)
 }
 
 // checkBackupRecord refuses a record of table t's data file whose key
@@ -1272,8 +1278,12 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			// #255): the pass above read the file once already, and
 			// a file rewritten since is refused rather than applied.
 			// readTableRecords is readCheckedBackupRecords with the cut
-			// a point-in-time restore reads the last backup to.
-			err := readTableRecords(path, dataKeys[i], t, chain.cutoffFor(i), false, func(rec kvpb.ExportRecord) error {
+			// a point-in-time restore reads the last backup to. A
+			// file changed since the first pass fails its manifest
+			// check at its end, by which point its earlier chunks are
+			// applied: the restore then stops with the target part
+			// written, as a failed restore of everything always has.
+			err := readTableRecords(path, dataKeys[i], t, chain.cutoffFor(i), true, func(rec kvpb.ExportRecord) error {
 				if rec.Deleted {
 					wb.Delete(keys.Key(rec.Key))
 				} else {

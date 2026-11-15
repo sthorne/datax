@@ -21,7 +21,9 @@ func writeSealedBackup(t *testing.T, backupKey []byte, man backupManifest, recor
 	dir = t.TempDir()
 	dataKey = bytes.Repeat([]byte{0x5a}, enc.KeyLen)
 	man.Magic = backupManifestMagic
+	man.Tables = append([]backupTable(nil), man.Tables...)
 	for i := range man.Tables {
+		man.Tables[i] = describeBackupTable(man.Tables[i], records[man.Tables[i].ID]...)
 		man.Tables[i].File = backupDataFile(man.Tables[i].ID)
 		f, err := os.Create(filepath.Join(dir, man.Tables[i].File))
 		if err != nil {

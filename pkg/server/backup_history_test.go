@@ -311,16 +311,17 @@ func TestHistoryFileShape(t *testing.T) {
 			t.Errorf("%s: got %v, want a refusal saying %q", c.what, err, c.want)
 		}
 	}
-	// A plain file is not held to key order by a restore of everything
-	// (it never was), and is by the merge a table restore makes.
+	// A plain file is held to key order by a restore of everything
+	// (since issue #313, which holds it to its manifest too), as by the
+	// merge a table restore makes.
 	dir := testBackupDir(t, nil, backupManifest{ClusterID: "c", EndTS: hts(100), Tables: []backupTable{{ID: id, Name: "t"}}},
 		map[uint64][]kvpb.ExportRecord{id: {rec("b", "1", 0), rec("a", "2", 0)}})
 	man, _, err := openBackupManifest(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkBackupRecords(dir, nil, man); err != nil {
-		t.Fatalf("a restore of everything refused an unordered plain file: %v", err)
+	if err := checkBackupRecords(dir, nil, man); err == nil || !strings.Contains(err.Error(), "out of key order") {
+		t.Fatalf("a restore of everything took an unordered plain file: %v", err)
 	}
 	chain, err := openRestoreChain([]string{dir}, nil, hlc.Timestamp{})
 	if err != nil {
