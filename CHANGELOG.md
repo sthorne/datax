@@ -1340,6 +1340,25 @@ state or the internode protocol does, and an entry below says so.
   protocol version v22.
 
 ### Fixed
+- **A transaction whose commit failed kept its rows locked for up to five
+  seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
+  or its deadline had passed) stopped the transaction's heartbeat but left
+  its record pending and its intents in place, and the `ROLLBACK` that
+  followed found the transaction finished and did nothing, so everyone
+  who met one of its rows waited for the record to expire. The failed
+  commit now aborts the record and resolves its intents before it
+  returns.
+- **A transaction waited for a lock it could not outwait** (#315). Blocked
+  on another transaction's uncommitted write to a row it had itself read —
+  on the bank workload, a transfer whose account a newer transfer was
+  changing — a transaction polled until the other committed and then
+  failed with `40001` (usually "read within uncertainty interval"), since
+  the committed change invalidated its read. It now fails at once, unless
+  its priority lets it abort the other transaction, which it still does.
+  With the fix above, on the bank workload (one secure, encrypted on-disk
+  node, 16 workers, 1,000 accounts) committed transfers went from a median
+  of 238 a second to 974, and the attempts ending in a `40001` from 3.1 s
+  each and about 70 % of the workers' time to 0.02 s and under 3 %.
 - **`'1 ms'::interval` was a minute** and `'1 us'` was refused: interval
   units were matched after a trailing "s" was taken off, so the
   abbreviations `ms` and `us` read as `m` and `u`. Both now mean what
