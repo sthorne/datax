@@ -460,7 +460,7 @@ var volatileFuncs = map[string]bool{"nextval": true, "currval": true, "lastval":
 func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (parser.Expr, error) {
 	out := e
 	if e.Func != "" && volatileFuncs[e.Func] {
-		if _, ok := keyFuncs[e.Func]; ok || e.Func == destroyTenantKeyFunc {
+		if _, ok := keyFuncs[e.Func]; ok || sealFuncs[e.Func] {
 			if serr := keyArgsConstant(e); serr != nil {
 				return e, serr
 			}
@@ -482,8 +482,8 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 			out.Func, out.Args, out.Lit = "", nil, &v
 			return out, nil
 		}
-		if e.Func == destroyTenantKeyFunc {
-			v, err := s.evalDestroyTenantKey(ctx, txn, args)
+		if sealFuncs[e.Func] {
+			v, err := s.evalSealFunc(ctx, txn, e.Func, args)
 			if err != nil {
 				return e, err
 			}

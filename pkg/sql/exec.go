@@ -377,7 +377,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		ttlIndexed = len(desc.Indexes) != before
 	}
 	if sealed {
-		if err := s.sealNewTable(ctx, txn, desc, tenantCol); err != nil {
+		if err := s.sealNewTable(ctx, txn, desc, tenantCol, "CREATE TABLE"); err != nil {
 			return nil, err
 		}
 	}
@@ -2820,8 +2820,8 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	if _, bare := catalog.SplitTableName(t.Table); catalog.IsSystemTable(bare) && !s.system && t.SetOptions == nil {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
 	}
-	if t.ResetOptions != nil || t.Purge {
-		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+	if t.ResetOptions != nil || t.Purge || t.RotateKey {
+		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET, PURGE and ROTATE ENCRYPTION KEY cannot run inside a transaction block")
 	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {

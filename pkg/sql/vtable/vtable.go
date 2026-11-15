@@ -80,6 +80,10 @@ type Env struct {
 	// datax_keys virtual table shows them: metadata only, for admins;
 	// nil when the caller cannot read them.
 	Keys func() ([]KeyInfo, error)
+	// SealJobs lists the seal jobs in progress (issue #310, step 5) as
+	// datax_encryption_jobs shows them; nil when the caller cannot read
+	// them.
+	SealJobs func() ([]SealJobInfo, error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	// Roles holds every role (catalog.ListRoles: root first, then by
@@ -133,6 +137,26 @@ type KeyInfo struct {
 	// grantee=PRIV,PRIV;... ("" when none).
 	Owner      string
 	Privileges string
+}
+
+// SealJobInfo is one seal job — the rewrite of a sealed table's rows
+// after it was sealed or its key rotated — as datax_encryption_jobs
+// lists it.
+type SealJobInfo struct {
+	TableID uint64
+	Table   string
+	Kind    string // seal | rotate
+	Tenant  bool   // the rotation of one tenant's key
+	KeyID   int64
+	Version int
+	KeepOld bool
+	State   string
+	Pass    int
+	// Rewritten counts every row the job rewrote; Unreadable the rows of
+	// the current pass it stepped over because their key is gone.
+	Rewritten, Unreadable int64
+	Created, Updated      int64 // Unix nanoseconds; Updated 0 = never
+	LastError             string
 }
 
 // LargeObjectInfo is one large object as pg_largeobject_metadata lists

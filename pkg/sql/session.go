@@ -517,6 +517,7 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	env.RoleSet = set
 	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
 	env.Keys = func() ([]vtable.KeyInfo, error) { return s.listKeys(ctx, txn, set) }
+	env.SealJobs = func() ([]vtable.SealJobInfo, error) { return s.listSealJobs(ctx, txn) }
 	// information_schema does not list a table whose schema the session
 	// may not use, as the console does not list it (issue #259): both
 	// ask catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema
@@ -931,11 +932,13 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 		return res, nil
 	}
-	if at, ok := stmt.(*parser.AlterTable); ok && (at.ResetOptions != nil || at.Purge) {
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.ResetOptions != nil || at.Purge || at.RotateKey) {
 		// RESET is one descriptor write and PURGE a range operation;
 		// both run outside any transaction, like SET (...) and SPLIT AT.
+		// So does ROTATE ENCRYPTION KEY, which rotates the key in a
+		// transaction of the key store's and then schedules its job.
 		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET, PURGE and ROTATE ENCRYPTION KEY cannot run inside a transaction block")
 		}
 		if at.IfExists && !s.tableExists(ctx, at.Table) {
 			return &Result{Tag: "ALTER TABLE"}, nil
@@ -943,8 +946,14 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}
-		if at.Purge {
+		switch {
+		case at.Purge:
 			return s.execPurge(ctx, at)
+		case at.RotateKey:
+			return s.execRotateTableKey(ctx, at)
+		}
+		if serr := refuseResetSeal(at.ResetOptions); serr != nil {
+			return nil, serr
 		}
 		return s.execResetOptions(ctx, at)
 	}
@@ -958,8 +967,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}
-		if serr := refuseAlterSeal(at.SetOptions); serr != nil {
-			return nil, serr
+		for k := range at.SetOptions {
+			if sealOption(k) {
+				return s.execAlterSeal(ctx, at)
+			}
 		}
 		// The options any table takes are set first, in one descriptor
 		// write; what is left is the time-series pair below.

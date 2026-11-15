@@ -118,7 +118,7 @@ func (s *Session) checkSealable(ctx context.Context, desc *catalog.TableDescript
 	if desc.Timeseries {
 		return false, newErrf(CodeFeatureNotSupported, "table %q is a time-series table, and time-series tables cannot be sealed: their rows are stored in chunks that mix series. Keep personal data in an ordinary sealed table that references it", desc.Name)
 	}
-	if desc.ID != 0 {
+	if catalog.IsSystemTableID(desc.ID) || desc.Virtual != "" {
 		return false, newErrf(CodeInsufficientPriv, "the cluster's own tables cannot be sealed")
 	}
 	if s.db.ClusterVersion() < version.V22 {
@@ -141,7 +141,7 @@ func (s *Session) checkSealable(ctx context.Context, desc *catalog.TableDescript
 // and records it in desc (which the caller writes). A table sealed per
 // tenant (tenantCol set) gets the same kind of key, as its naming key:
 // its tenants' keys are made on their first writes.
-func (s *Session) sealNewTable(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, tenantCol catalog.ColumnID) error {
+func (s *Session) sealNewTable(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, tenantCol catalog.ColumnID, stmt string) error {
 	id, err := s.rowSealer().Store().CreateTableKey(ctx, txn, fmt.Sprintf("table/%d", desc.ID))
 	if err != nil {
 		return newErrf(CodeFeatureNotSupported, "making the key of sealed table %q: %v", desc.Name, err)
@@ -151,19 +151,7 @@ func (s *Session) sealNewTable(ctx context.Context, txn *kvclient.Txn, desc *cat
 	if tenantCol != 0 {
 		mode = "tenant"
 	}
-	log.Audit("sealed-table", "stmt", "CREATE TABLE", "target", desc.Name, "key_id", fmt.Sprint(id), "keys", mode, "principal", s.sessionUser, "role", s.user)
-	return nil
-}
-
-// refuseAlterSeal refuses turning sealing on, off or over on an
-// existing table: its rows would have to be rewritten, which the
-// background job of a later step does.
-func refuseAlterSeal(options map[string]string) *Error {
-	for k := range options {
-		if sealOption(k) {
-			return newErrf(CodeFeatureNotSupported, "ALTER TABLE ... SET (%s = ...) is not built yet: sealing an existing table needs its rows rewritten. Create a new table WITH (encryption_key = 'auto') and copy the rows into it", k)
-		}
-	}
+	log.Audit("sealed-table", "stmt", stmt, "target", desc.Name, "key_id", fmt.Sprint(id), "keys", mode, "principal", s.sessionUser, "role", s.user)
 	return nil
 }
 
