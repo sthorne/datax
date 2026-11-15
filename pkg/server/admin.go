@@ -377,11 +377,11 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if req.RangeID == 0 || req.CheckID == "" {
 			return cluster.AdminResponse{Error: "collect-checksum requires a range and check ID"}
 		}
-		sum, idx, ok := n.store.LookupChecksum(ctx, req.RangeID, req.CheckID)
+		sum, stats, idx, ok := n.store.LookupChecksum(ctx, req.RangeID, req.CheckID)
 		if !ok {
 			return cluster.AdminResponse{Error: "checksum not available"}
 		}
-		return cluster.AdminResponse{Checksum: sum, AppliedIndex: idx}
+		return cluster.AdminResponse{Checksum: sum, ChecksumStats: stats, AppliedIndex: idx}
 
 	case "wait-applied":
 		// The merge driver's pre-proposal check (see kvserver.adminMerge):

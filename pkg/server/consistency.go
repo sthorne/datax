@@ -110,7 +110,14 @@ func (n *Node) collectAndCompare(ctx context.Context, probe *kvserver.Consistenc
 				probe.CheckID, probe.RangeID, rep.NodeID, err, resp.Error)
 			continue
 		}
-		if !bytes.Equal(resp.Checksum, probe.LocalSum) {
+		// Statistics are compared when both sides report them (a node
+		// that predates them reports none).
+		statsDiffer := resp.ChecksumStats != "" && probe.LocalStats != "" && resp.ChecksumStats != probe.LocalStats
+		if statsDiffer {
+			log.Errorf("CONSISTENCY FAILURE on %s (check %s at applied index %d): leader n%d has statistics %s, replica n%d has %s",
+				probe.RangeID, probe.CheckID, probe.Index, n.ident.NodeID, probe.LocalStats, rep.NodeID, resp.ChecksumStats)
+		}
+		if statsDiffer || !bytes.Equal(resp.Checksum, probe.LocalSum) {
 			mismatch = true
 			metrics.ConsistencyFailures.Inc()
 			n.consistencyFailures.Add(1)

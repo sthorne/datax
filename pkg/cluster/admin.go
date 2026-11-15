@@ -262,9 +262,11 @@ type AdminResponse struct {
 	// Backup/restore summary.
 	Backup *BackupSummary `json:"backup,omitempty"`
 	// Checksum answers collect-checksum: this node's digest for the probe,
-	// and the applied index it was computed at.
-	Checksum     []byte `json:"checksum,omitempty"`
-	AppliedIndex uint64 `json:"applied_index,omitempty"`
+	// its replicated statistics at the same point (empty from a node that
+	// predates them, issue #316), and the applied index it was computed at.
+	Checksum      []byte `json:"checksum,omitempty"`
+	ChecksumStats string `json:"checksum_stats,omitempty"`
+	AppliedIndex  uint64 `json:"applied_index,omitempty"`
 	// ClusterVersion reports the finalized cluster version (nodes,
 	// upgrade-cluster).
 	ClusterVersion int `json:"cluster_version,omitempty"`
