@@ -352,10 +352,9 @@ type Node struct {
 	// series it writes only on change.
 	metricsSparse metricsSparseState
 	// statsRefresh is the statistics sampler's view of the catalog.
-	statsRefresh   statsRefreshState
-	reshardMu      sync.Mutex
-	reshardWatch   *descWatcher
-	reshardRetired map[uint64][]byte
+	statsRefresh  statsRefreshState
+	reshardMu     sync.Mutex
+	reshardFollow *catalogFollower
 
 	cfg     Config
 	tlsCfgs *security.TLSConfigs // nil in insecure mode
