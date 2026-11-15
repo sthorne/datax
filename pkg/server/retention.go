@@ -15,7 +15,8 @@ import (
 )
 
 // retentionProvider backs kvserver's RetentionOverride: it maps a range's
-// key span to the GC TTL implied by timeseries tables' retention options.
+// key span to the GC TTL implied by timeseries tables' retention options
+// and by the gc_ttl option any table may carry (issue #295).
 // The table set is refreshed from the descriptors (a KV scan) at most every
 // retentionRefreshInterval, and served stale on scan errors — GC policy may
 // lag a CREATE/DROP by one interval, which is harmless (retention is
@@ -27,11 +28,22 @@ type retentionProvider struct {
 	mu        sync.Mutex
 	fetchedAt time.Time
 	spans     []retentionSpan
+	// edgeSplitAt is when the edges of a table with a GC window were
+	// last asked for, by the table's first key (see splitEdges).
+	edgeSplitAt map[string]time.Time
 }
+
+// edgeSplitInterval is how often a table's edge splits are asked for
+// again while one of its ranges still straddles an edge.
+const edgeSplitInterval = time.Minute
 
 type retentionSpan struct {
 	start, end keys.Key
 	ttl        time.Duration
+	// expire: the window is a retention (rows older than it go, newest
+	// version included). False for a gc_ttl, which is an ordinary GC
+	// window of a different length: the newest version of a row stays.
+	expire bool
 	// Row-level expiry inputs (nil prefixes disables it for this table —
 	// see rowExpiry for the eligibility rules).
 	prefixes []keys.Key     // primary-index prefixes, every retained generation
@@ -46,10 +58,16 @@ const retentionRefreshInterval = 30 * time.Second
 //   - the range lies fully inside one retention table's span → that
 //     table's TTL with expire=true: rows past retention are collected
 //     outright (survivors included);
-//   - the range partially overlaps any retention span (it also holds
-//     other data) → max(default TTL, every overlapping retention) with
-//     ordinary survivor-keeping GC — a mixed range is never GC'd earlier
-//     than any of its tenants allows, and never expires rows;
+//   - the range lies fully inside one gc_ttl table's span → that table's
+//     window, shorter or longer than the default, with ordinary
+//     survivor-keeping GC;
+//   - the range partially overlaps any such span (it also holds other
+//     data) → max(default TTL, every overlapping window) with ordinary
+//     survivor-keeping GC — a mixed range is never GC'd earlier than any
+//     of its tenants allows, and never expires rows. This is what keeps
+//     one table's short window from reaching another table's history;
+//     the statement that sets a gc_ttl splits the table's edges so that
+//     its ranges are its own;
 //   - no overlap → no override.
 func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, bool) {
 	spans := p.get()
@@ -62,11 +80,14 @@ func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, 
 		if ts.start.Compare(start) <= 0 && end.Compare(ts.end) <= 0 {
 			// Table spans are disjoint: fully inside one means no other
 			// span can overlap.
-			return ts.ttl, true, true
+			return ts.ttl, ts.expire, true
 		}
 		overlaps = true
 		if ts.ttl > maxTTL {
 			maxTTL = ts.ttl
+		}
+		if !ts.expire {
+			p.splitEdges(ts)
 		}
 	}
 	if !overlaps {
@@ -76,6 +97,37 @@ func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, 
 		maxTTL = p.defaultTTL
 	}
 	return maxTTL, false, true
+}
+
+// splitEdges asks, in the background and at most once per
+// edgeSplitInterval, for range boundaries at the two ends of a table
+// with a GC window, when a range has been found straddling one. The DDL
+// that sets a window splits the edges itself, but best-effort, and a
+// table that arrives by restore was never split at all; without this its
+// window would be set and, on a shared range, never applied.
+func (p *retentionProvider) splitEdges(ts retentionSpan) {
+	p.mu.Lock()
+	if p.edgeSplitAt == nil {
+		p.edgeSplitAt = map[string]time.Time{}
+	}
+	last := p.edgeSplitAt[string(ts.start)]
+	due := p.node != nil && p.node.db != nil && time.Since(last) >= edgeSplitInterval
+	if due {
+		p.edgeSplitAt[string(ts.start)] = time.Now()
+	}
+	p.mu.Unlock()
+	if !due {
+		return
+	}
+	_ = p.node.stopper.RunWorker(func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		for _, k := range []keys.Key{ts.start, ts.end} {
+			if _, err := p.node.db.AdminSplit(ctx, k); err != nil {
+				log.Debugf("splitting at %s for a table's GC window: %v", k, err)
+			}
+		}
+	})
 }
 
 func (p *retentionProvider) get() []retentionSpan {
@@ -98,11 +150,19 @@ func (p *retentionProvider) get() []retentionSpan {
 	var spans []retentionSpan
 	for _, kv := range rows {
 		var d catalog.TableDescriptor
-		if json.Unmarshal(kv.Value, &d) != nil || !d.Timeseries || d.RetentionSeconds <= 0 || d.ID == 0 {
+		if json.Unmarshal(kv.Value, &d) != nil || d.ID == 0 {
 			continue
 		}
 		start, end := keys.TableDataSpan(d.ID)
-		rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second}
+		if !d.Timeseries || d.RetentionSeconds <= 0 {
+			// The DDL refuses a gc_ttl beside a retention, so the two
+			// never compete for one table.
+			if d.GCTTLSeconds > 0 {
+				spans = append(spans, retentionSpan{start: start, end: end, ttl: time.Duration(d.GCTTLSeconds) * time.Second})
+			}
+			continue
+		}
+		rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true}
 		// Row-level expiry eligibility: the timestamp must be decodable
 		// from the key alone (it always is — the last PK column), and the
 		// table must carry no secondary indexes (their entries hold no
@@ -185,4 +245,13 @@ func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.T
 		}
 		return false
 	}, true
+}
+
+// TestingRefreshRetention makes the next GC pass read the table
+// descriptors again instead of serving the cached windows, so a test
+// need not wait out the refresh interval after changing one.
+func (n *Node) TestingRefreshRetention() {
+	n.retention.mu.Lock()
+	n.retention.fetchedAt = time.Time{}
+	n.retention.mu.Unlock()
 }

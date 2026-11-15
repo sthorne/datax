@@ -21,8 +21,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // Schemas the virtual tables live in.
@@ -46,8 +49,16 @@ const (
 // and the session's identity.
 type Env struct {
 	Databases []*catalog.DatabaseDescriptor
-	// Tables holds every table the session may see, in every database.
+	// Tables holds the tables the session may see: those of its current
+	// database, or of every database for a table that lists them all
+	// (Table.AllDatabases). A generator that ranges over Tables directly
+	// rather than through currentTables must be one of the latter.
 	Tables []*catalog.TableDescriptor
+	// ReadTable resolves a table that Tables does not hold — the
+	// referenced table of a foreign key into another database — as the
+	// session may see it (nil when it may not, or there is none). Nil
+	// when Tables already holds every database's.
+	ReadTable func(id uint64) *catalog.TableDescriptor
 	// Sequences holds every sequence, in every database.
 	Sequences []*catalog.SequenceDescriptor
 	// Types holds every user-defined type (enum), in every database.
@@ -55,6 +66,10 @@ type Env struct {
 	// SequenceValue reads a sequence's last value (called reports whether
 	// nextval has run); nil when the caller cannot read counters.
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
+	// LargeObjects lists the large objects the session may open (every
+	// one for an admin, its own otherwise); nil when the caller cannot
+	// read them. A function, because most catalog queries never ask.
+	LargeObjects func() ([]LargeObjectInfo, error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	// Roles holds every role (catalog.ListRoles: root first, then by
@@ -71,6 +86,28 @@ type Env struct {
 	IsAdmin     bool
 }
 
+// procOIDBase is where pg_proc's OIDs start: a builtin's OID is the
+// base plus its position in builtins.All().
+const procOIDBase = int64(1 << 28)
+
+// ProcName resolves a pg_proc OID back to the function it was listed
+// for (the fast-path protocol names a function by the OID a client read
+// from pg_proc).
+func ProcName(oid int64) (string, bool) {
+	all := builtins.All()
+	if i := oid - procOIDBase; i >= 0 && i < int64(len(all)) {
+		return all[i].Name, true
+	}
+	return "", false
+}
+
+// LargeObjectInfo is one large object as pg_largeobject_metadata lists
+// it.
+type LargeObjectInfo struct {
+	OID   int64
+	Owner string
+}
+
 // RoleOID is a role's stable catalog OID (pg_roles.oid, pg_auth_members,
 // pg_class.relowner): a hash of the name in the range above every
 // descriptor OID; root is 10 as in PostgreSQL.
@@ -82,6 +119,10 @@ func RoleOID(name string) int64 {
 	_, _ = h.Write([]byte(name))
 	return int64(h.Sum32()&0x3fffffff) | 0x40000000
 }
+
+// QueryHidden stands in for the statement text of another role's
+// session when the reader is not an admin (PostgreSQL's wording).
+const QueryHidden = "<insufficient privilege>"
 
 // SessionInfo is one session of this node as SHOW SESSIONS and
 // pg_stat_activity report it.
@@ -108,6 +149,21 @@ type Table struct {
 	Columns []catalog.Column
 	Rows    func(ctx context.Context, env *Env) ([]Row, error)
 }
+
+// allDatabaseTables are the virtual tables that list the tables of
+// every database rather than the session's current one.
+var allDatabaseTables = map[string]bool{
+	InformationSchema + ".tables":  true,
+	InformationSchema + ".views":   true,
+	InformationSchema + ".columns": true,
+}
+
+// AllDatabases reports whether the table's rows describe the tables of
+// every database. Every other virtual table renders the current
+// database's, so its Env is built from that database alone and reading
+// it costs the same however many tables the rest of the cluster holds
+// (issue #311).
+func (t *Table) AllDatabases() bool { return allDatabaseTables[t.Schema+"."+t.Name] }
 
 // Descriptor renders the table as a catalog descriptor the planner and
 // executor understand: a table with a primary key on a hidden ordinal
@@ -253,10 +309,16 @@ func TypeOID(f types.Family) int64 {
 		return 1700
 	case types.Jsonb:
 		return 3802
+	case types.Tsvector:
+		return 3614
+	case types.Tsquery:
+		return 3615
 	case types.IntervalFam:
 		return 1186
 	case types.Time:
 		return 1083
+	case types.Vector:
+		return vector.OID
 	}
 	return 25
 }
@@ -358,7 +420,7 @@ func typeNameOID(oid int64) string {
 	return "text"
 }
 
-var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time}
+var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery, types.Vector}
 
 // Families lists every type family, in pg_type order.
 func Families() []types.Family { return families }
@@ -389,10 +451,16 @@ func TypeName(f types.Family) string {
 		return "numeric"
 	case types.Jsonb:
 		return "jsonb"
+	case types.Tsvector:
+		return "tsvector"
+	case types.Tsquery:
+		return "tsquery"
 	case types.IntervalFam:
 		return "interval"
 	case types.Time:
 		return "time"
+	case types.Vector:
+		return "vector"
 	}
 	return "text"
 }
@@ -448,6 +516,11 @@ func FormatType(c *catalog.Column) string {
 			return fmt.Sprintf("numeric(%d,%d)", c.Precision, c.Scale)
 		}
 		return "numeric"
+	case types.Vector:
+		if c.MaxLen > 0 {
+			return fmt.Sprintf("vector(%d)", c.MaxLen)
+		}
+		return "vector"
 	}
 	return TypeName(c.Type)
 }
@@ -465,7 +538,7 @@ func ColumnTypeSQL(c *catalog.Column) string {
 		return ColumnTypeSQL(&elem) + "[]"
 	}
 	switch c.Type {
-	case types.Int, types.String, types.Timestamp, types.Time:
+	case types.Int, types.String, types.Timestamp, types.Time, types.Vector:
 		return c.TypeSQL()
 	case types.Decimal:
 		if c.Precision > 0 {
@@ -508,11 +581,51 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	for _, id := range idx.ColumnIDs {
 		cols = append(cols, columnName(d, id))
 	}
+	if kind, ok := inverted.Lookup(idx.Inverted); ok && len(cols) == 1 {
+		if c, ok := kind.(inverted.Computed); ok {
+			if fn, arg := c.Computes(); fn != "" {
+				// An index on to_tsvector('english', col), as PostgreSQL
+				// prints one.
+				cols[0] = fmt.Sprintf("%s('%s'::regconfig, %s)", fn, arg, cols[0])
+			}
+		}
+	}
 	unique := ""
 	if idx.Unique {
 		unique = "UNIQUE "
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING btree (%s)", unique, idx.Name, d.Name, strings.Join(cols, ", "))
+	if v := idx.Vector; v != nil {
+		// As pgvector renders it: the operator class names the distance
+		// and lists is the storage parameter.
+		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", idx.Name, d.Name, v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "))
+}
+
+// Access method OIDs, as PostgreSQL numbers them.
+const (
+	OIDBtree = 403
+	OIDGin   = 2742
+)
+
+// IndexMethod names an index's access method: btree, or the method of
+// its inverted kind (gin).
+func IndexMethod(idx *catalog.IndexDescriptor) string {
+	if idx.IsVector() {
+		return idx.Vector.Method
+	}
+	if kind, ok := inverted.Lookup(idx.Inverted); ok {
+		return kind.Method()
+	}
+	return "btree"
+}
+
+// IndexMethodOID is pg_class.relam for an index.
+func IndexMethodOID(idx *catalog.IndexDescriptor) int64 {
+	if IndexMethod(idx) == "gin" {
+		return OIDGin
+	}
+	return OIDBtree
 }
 
 // PrimaryKeyDef renders pg_get_constraintdef() for the primary key.
@@ -591,6 +704,9 @@ func (env *Env) tableByID(id uint64) *catalog.TableDescriptor {
 		if t.ID == id {
 			return t
 		}
+	}
+	if env.ReadTable != nil {
+		return env.ReadTable(id)
 	}
 	return nil
 }
@@ -675,17 +791,84 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		b.WriteString(text)
 	}
 	b.WriteString("\n)")
+	var opts []string
 	if d.Timeseries {
-		fmt.Fprintf(&b, " WITH (timeseries = true")
+		opts = append(opts, "timeseries = true")
 		if d.RetentionSeconds > 0 {
-			fmt.Fprintf(&b, ", retention = '%ds'", d.RetentionSeconds)
+			opts = append(opts, fmt.Sprintf("retention = '%ds'", d.RetentionSeconds))
 		}
 		if d.ShardBuckets > 0 {
-			fmt.Fprintf(&b, ", shards = %d", d.ShardBuckets)
+			opts = append(opts, fmt.Sprintf("shards = %d", d.ShardBuckets))
 		}
-		b.WriteString(")")
+	}
+	if d.GCTTLSeconds > 0 {
+		opts = append(opts, fmt.Sprintf("gc_ttl = '%ds'", d.GCTTLSeconds))
+	}
+	if d.RowTTL != nil {
+		if d.RowTTL.AfterSeconds > 0 {
+			opts = append(opts, fmt.Sprintf("ttl_column = %s", columnName(d, d.RowTTL.ColumnID)), fmt.Sprintf("ttl = '%ds'", d.RowTTL.AfterSeconds))
+		} else {
+			opts = append(opts, fmt.Sprintf("ttl_expiration = %s", columnName(d, d.RowTTL.ColumnID)))
+		}
+	}
+	if len(opts) > 0 {
+		fmt.Fprintf(&b, " WITH (%s)", strings.Join(opts, ", "))
 	}
 	return b.String()
+}
+
+// PolicyCmdChar is pg_policy.polcmd for a policy command: r, a, w, d,
+// or * for ALL.
+func PolicyCmdChar(cmd string) string {
+	switch cmd {
+	case catalog.PolicySelect:
+		return "r"
+	case catalog.PolicyInsert:
+		return "a"
+	case catalog.PolicyUpdate:
+		return "w"
+	case catalog.PolicyDelete:
+		return "d"
+	}
+	return "*"
+}
+
+// PolicyDef renders a policy as the CREATE POLICY statement that makes it.
+func PolicyDef(d *catalog.TableDescriptor, p *catalog.Policy) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE POLICY %s ON %s", p.Name, d.Name)
+	if p.Restrictive {
+		b.WriteString(" AS RESTRICTIVE")
+	}
+	if p.Command != catalog.PolicyAll {
+		fmt.Fprintf(&b, " FOR %s", strings.ToUpper(p.Command))
+	}
+	if len(p.Roles) > 0 {
+		fmt.Fprintf(&b, " TO %s", strings.Join(p.Roles, ", "))
+	}
+	if p.Using != "" {
+		fmt.Fprintf(&b, " USING (%s)", p.Using)
+	}
+	if p.Check != "" {
+		fmt.Fprintf(&b, " WITH CHECK (%s)", p.Check)
+	}
+	return b.String()
+}
+
+// RowSecurityDefs renders the statements that reproduce a table's row
+// security after its CREATE TABLE: ENABLE / FORCE and each policy.
+func RowSecurityDefs(d *catalog.TableDescriptor) []string {
+	var out []string
+	if d.RowSecurity {
+		out = append(out, fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", d.Name))
+	}
+	if d.ForceRowSecurity {
+		out = append(out, fmt.Sprintf("ALTER TABLE %s FORCE ROW LEVEL SECURITY", d.Name))
+	}
+	for i := range d.Policies {
+		out = append(out, PolicyDef(d, &d.Policies[i]))
+	}
+	return out
 }
 
 // ColumnDefault renders a column's default as the catalogs show it:
@@ -710,7 +893,7 @@ func renderDefault(d types.Datum) string {
 		return "NULL"
 	}
 	switch d.Fam {
-	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam:
+	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Vector:
 		return "'" + strings.ReplaceAll(d.Text(), "'", "''") + "'"
 	}
 	return d.Text()

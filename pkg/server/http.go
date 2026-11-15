@@ -221,6 +221,9 @@ func (n *Node) startHTTP() error {
 			return 0
 		}))
 		nodeReg.MustRegister(&writtenCollector{vec: written, node: n})
+		if n.cfg.EncRoot != "" {
+			nodeReg.MustRegister(&rootHealthCollector{node: n})
+		}
 		if eng.Encrypted() {
 			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",
@@ -244,12 +247,12 @@ func (n *Node) startHTTP() error {
 	if n.tlsCfgs != nil {
 		nodeReg.MustRegister(newCertExpiryCollector(n))
 	}
+	nodeReg.MustRegister(newTableGaugeCollector(n))
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", n.requireMetrics(promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
 	mux.HandleFunc("/status", func(w http.ResponseWriter, req *http.Request) {
-		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")

@@ -194,12 +194,17 @@ func TestSchemaAPISecureFiltering(t *testing.T) {
 	names := func(doc server.SchemaStatus) []string {
 		var out []string
 		for _, tb := range doc.Tables {
-			out = append(out, tb.Name)
+			// The cluster's own tables come and go with what its nodes
+			// have had to record (an admin sees datax_audit once there
+			// is an audit record); this test is about the user's.
+			if !catalog.IsSystemTable(tb.Name) {
+				out = append(out, tb.Name)
+			}
 		}
 		return out
 	}
 	asRoot := fetch("root", "topsecret")
-	if !asRoot.Principal.Admin || len(asRoot.Tables) != 2 || len(asRoot.Users) != 2 {
+	if !asRoot.Principal.Admin || len(names(asRoot)) != 2 || len(asRoot.Users) != 2 {
 		t.Fatalf("root's view: principal=%+v tables=%v users=%+v", asRoot.Principal, names(asRoot), asRoot.Users)
 	}
 	asReader := fetch("reader", "reader-pw")

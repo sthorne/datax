@@ -47,6 +47,12 @@ type Column struct {
 	// MaxLen is a String column's VARCHAR(n) / CHAR(n) length in
 	// characters (0 = unbounded TEXT); a longer value is refused (22001)
 	// unless the excess is spaces.
+	//
+	// On a Vector column it is the declared dimension, vector(n), which
+	// every value must have (0 = any dimension; such a column cannot be
+	// indexed). A dimension is the same kind of thing as a length — the
+	// one number the type takes — and keeping it here carries it through
+	// every place a declared type is copied.
 	MaxLen int32 `json:"max_len,omitempty"`
 	// Char marks CHAR(n): values are stored with trailing spaces trimmed
 	// and render blank-padded to MaxLen.
@@ -115,7 +121,7 @@ func (e *ValueError) Error() string { return e.Msg }
 // write path must apply (DECIMAL(p,s), an integer width, a character
 // length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
 func (c *Column) HasTypmod() bool {
-	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum || c.Type == types.Vector
 }
 
 // EnumValue converts a label (or an enum datum of the type) to the
@@ -253,6 +259,18 @@ func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 			d.I = types.RoundTimestamp(d.I, p)
 		}
 		return d, nil
+	case types.Vector:
+		if d.Fam != types.Vector {
+			v, err := d.Coerce(types.Vector)
+			if err != nil {
+				return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("column %q: %v", c.Name, err)}
+			}
+			d = v
+		}
+		if c.MaxLen > 0 && d.VectorDims() != int(c.MaxLen) {
+			return d, &ValueError{Code: "22000", Msg: fmt.Sprintf("column %q: expected %d dimensions, not %d", c.Name, c.MaxLen, d.VectorDims())}
+		}
+		return d, nil
 	}
 	return d, nil
 }
@@ -318,6 +336,11 @@ func (c *Column) TypeSQL() string {
 			return fmt.Sprintf("DECIMAL(%d,%d)", c.Precision, c.Scale)
 		}
 		return "DECIMAL"
+	case types.Vector:
+		if c.MaxLen > 0 {
+			return fmt.Sprintf("VECTOR(%d)", c.MaxLen)
+		}
+		return "VECTOR"
 	}
 	return c.Type.String()
 }
@@ -344,6 +367,8 @@ func (c *Column) Typmod() int32 {
 		if p, ok := c.FracDigits(); ok {
 			return p
 		}
+	case types.Vector:
+		return c.MaxLen // pgvector's typmod is the dimension itself
 	}
 	return 0
 }
@@ -351,7 +376,8 @@ func (c *Column) Typmod() int32 {
 // IndexDescriptor describes a secondary index. Entries live at
 // /t/<tableID>/<ID>/ (see pkg/sql/rowenc): non-unique keys append the
 // primary key columns after the indexed ones; unique keys carry the encoded
-// primary key as the entry's value.
+// primary key as the entry's value. An inverted index (Inverted) has one
+// entry per element of its column's value instead.
 type IndexDescriptor struct {
 	ID        uint64     `json:"id"`
 	Name      string     `json:"name"`
@@ -363,7 +389,62 @@ type IndexDescriptor struct {
 	// "write-only" = maintained by writers but invisible to the planner
 	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
 	State string `json:"state,omitempty"`
+	// Inverted names the kind of an inverted index (pkg/sql/inverted:
+	// "jsonb_ops"); "" is an ordinary index. An inverted index has one
+	// column and one entry per element of that column's value per row,
+	// each key ending in the row's primary key, so it is never unique.
+	// Cluster version v21: a node that does not know the field would
+	// maintain the index as an ordinary one.
+	Inverted string `json:"inverted,omitempty"`
+	// Vector marks an approximate nearest-neighbour index over a VECTOR
+	// column (issue #304; see VectorIndex). Like an inverted index it
+	// has one column and is never unique. Cluster version v21: a node
+	// that does not know the field would key the entries by the column's
+	// value, which has no key encoding. The value is never changed once
+	// the index is published, so clones of a descriptor share it.
+	Vector *VectorIndex `json:"vector,omitempty"`
 }
+
+// VectorIndex describes an IVF ("inverted file") index: the vectors of
+// a sample of the table are clustered into Lists centres when the index
+// is built, every row's vector is filed under the centre nearest to it,
+// and a query reads only the lists whose centres are nearest the query
+// vector. Entries live at
+//
+//	/t/<tableID>/<indexID>/<list>/<primary key>  →  the row's vector
+//
+// so each list is one contiguous key span, and the centres at
+//
+//	/t/<tableID>/0/"ivf"/<Build>/<list>          →  the centre
+//
+// (keys.VectorCentroidPrefix): under the table, so that a backup, a
+// table restore and DROP TABLE carry or remove them with the rows, but
+// outside every index ID, so that TRUNCATE and a re-shard — which move
+// the indexes to fresh IDs — leave them where they are.
+type VectorIndex struct {
+	// Method is the access method as declared: "ivfflat".
+	Method string `json:"method"`
+	// Metric is the distance the index serves: "l2" (<->), "cosine"
+	// (<=>) or "ip" (<#>).
+	Metric string `json:"metric"`
+	// Lists is the number of centres actually trained — at most the
+	// number asked for (fewer when the table had fewer distinct vectors).
+	Lists int `json:"lists"`
+	// Dims is the column's dimension when the index was built.
+	Dims int `json:"dims"`
+	// Build names the training run whose centres the entries are filed
+	// by: a random identifier, new for every CREATE INDEX. The centres
+	// of a build never change (a delete finds a row's entry by
+	// recomputing its list), so anything derived from them may be cached
+	// under this name forever.
+	Build string `json:"build"`
+}
+
+// IsInverted reports whether the index is an inverted one.
+func (idx *IndexDescriptor) IsInverted() bool { return idx.Inverted != "" }
+
+// IsVector reports whether the index is a vector (IVF) index.
+func (idx *IndexDescriptor) IsVector() bool { return idx.Vector != nil }
 
 // Constraint kinds.
 const (
@@ -522,6 +603,74 @@ type TableDescriptor struct {
 	// window (the GC TTL by default), then the re-shard janitor wipes
 	// them and removes the entry.
 	RetiredLayouts []RetiredLayout `json:"retired_layouts,omitempty"`
+	// GCTTLSeconds is the table's own GC window (cluster version v21):
+	// how long superseded and deleted versions of its rows are kept
+	// before garbage collection, in place of the node setting. 0 = the
+	// node setting. It governs the ranges that lie wholly inside the
+	// table's span; a range the table shares with other data keeps the
+	// longest window of its tenants.
+	GCTTLSeconds int64 `json:"gc_ttl_seconds,omitempty"`
+	// RowTTL, when set, expires the table's rows (v21): a background
+	// job deletes each row once its expiry time has passed.
+	RowTTL *RowTTL `json:"row_ttl,omitempty"`
+	// RowSecurity marks a table with row-level security enabled (cluster
+	// version v21, issue #294): a role that is not exempt reads and
+	// writes only the rows its policies allow, and none when no policy
+	// applies to it. ForceRowSecurity applies the policies to the
+	// table's owner (and to admins) as well. Policies are the table's
+	// policies in creation order; they stay in the descriptor while row
+	// security is disabled and take effect again when it is re-enabled.
+	RowSecurity      bool     `json:"row_security,omitempty"`
+	ForceRowSecurity bool     `json:"force_row_security,omitempty"`
+	Policies         []Policy `json:"policies,omitempty"`
+}
+
+// Policy commands: the statement kinds a row-security policy governs.
+const (
+	PolicyAll    = "all"
+	PolicySelect = "select"
+	PolicyInsert = "insert"
+	PolicyUpdate = "update"
+	PolicyDelete = "delete"
+)
+
+// Policy is one row-security policy of a table (CREATE POLICY). A
+// permissive policy admits a row; a restrictive one narrows what the
+// permissive policies admit. Using filters the rows a statement reads
+// or targets; Check must hold for every row it writes (when empty,
+// Using stands in for it, as in PostgreSQL).
+type Policy struct {
+	Name        string `json:"name"`
+	Restrictive bool   `json:"restrictive,omitempty"`
+	// Command is PolicyAll or one of the four statement kinds.
+	Command string `json:"command"`
+	// Roles are the roles the policy applies to; empty means PUBLIC
+	// (every role).
+	Roles []string `json:"roles,omitempty"`
+	// Using and Check are the expressions as SQL text, parsed and bound
+	// to the session by every statement that applies them.
+	Using string `json:"using,omitempty"`
+	Check string `json:"check,omitempty"`
+}
+
+// Policy returns the named policy.
+func (d *TableDescriptor) Policy(name string) (*Policy, bool) {
+	for i := range d.Policies {
+		if d.Policies[i].Name == name {
+			return &d.Policies[i], true
+		}
+	}
+	return nil, false
+}
+
+// RowTTL is a table's row expiry: a row expires at the value of its
+// ColumnID column plus AfterSeconds, and never if that column is NULL.
+// AfterSeconds is zero when the column itself names the expiry time
+// (the ttl_expiration option) and positive when it names the time the
+// lifetime is counted from (ttl_column with ttl).
+type RowTTL struct {
+	ColumnID     ColumnID `json:"column_id"`
+	AfterSeconds int64    `json:"after_seconds,omitempty"`
 }
 
 // RetiredLayout is one superseded re-shard layout awaiting reclamation.
@@ -612,6 +761,17 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		for i, rl := range d.RetiredLayouts {
 			out.RetiredLayouts[i] = rl
 			out.RetiredLayouts[i].IndexIDs = append([]uint64(nil), rl.IndexIDs...)
+		}
+	}
+	if d.RowTTL != nil {
+		ttl := *d.RowTTL
+		out.RowTTL = &ttl
+	}
+	if d.Policies != nil {
+		out.Policies = make([]Policy, len(d.Policies))
+		for i, p := range d.Policies {
+			out.Policies[i] = p
+			out.Policies[i].Roles = append([]string(nil), p.Roles...)
 		}
 	}
 	return &out
@@ -711,6 +871,14 @@ type Accessor struct {
 	ttl     time.Duration
 	// renewalPaused makes the renewal loop skip its ticks (tests only).
 	renewalPaused atomic.Bool
+	// maxEntries bounds the cache of a leasing accessor and idleAfter is
+	// how long an entry may go unused before its lease is given up; zero
+	// means the defaults (lease.go, "Eviction"). acquiring counts the
+	// lookups that have reserved a slot and are taking the lease for it,
+	// so that concurrent first uses cannot overshoot the bound.
+	maxEntries int
+	idleAfter  time.Duration
+	acquiring  int
 
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
@@ -736,6 +904,18 @@ type cachedDesc struct {
 	priorExpiration     int64
 	handedOut           bool
 	handedOutExpiration int64
+	// lastUsed is the wall time a statement last resolved the table
+	// through this cache key; a renewal carries it over unchanged, so an
+	// entry nobody uses grows old however often its lease is renewed.
+	lastUsed int64
+}
+
+// outstanding reports whether a statement that was handed this entry, or
+// one of the entries it replaced, may still commit under the deadline it
+// took: the three expirations a drain waits for on this gateway. Such an
+// entry is never evicted, because the cache is where they are remembered.
+func (c *cachedDesc) outstanding(nowWall int64) bool {
+	return (c.handedOut && c.expiration > nowWall) || c.handedOutExpiration > nowWall || c.priorExpiration > nowWall
 }
 
 func NewAccessor() *Accessor {
@@ -773,13 +953,15 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	}
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
-	if c, ok := a.cache[key]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
+	now := a.nowWallLocked()
+	if c, ok := a.cache[key]; ok && (c.expiration == 0 || now < c.expiration) {
 		// This statement plans against a descriptor it did not read in
 		// its own transaction, so its only bound is the deadline below.
 		// Mark the entry: until it expires, a drain that sees this
 		// gateway adopt a newer version must still wait for this
 		// statement (issue #185).
 		c.handedOut = true
+		c.lastUsed = now
 		desc := c.desc
 		exp := c.expiration
 		a.mu.Unlock()
@@ -791,28 +973,45 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	if err != nil {
 		return nil, err
 	}
-	entry := &cachedDesc{desc: d}
-	if a.leasing {
-		// The lease is taken in its own transaction, with the descriptor
-		// it covers read there (acquireLease): the cache holds what the
-		// lease record claims. This statement keeps d, the version its
-		// own transaction read — if that is older than the leased one,
-		// its read of the descriptor conflicts with the schema change
-		// at commit, as any stale read does.
-		ld, info, err := a.acquireLease(ctx, dbID, name, key)
-		if err != nil || ld == nil {
-			// Without a lease the cache may not be trusted beyond this
-			// statement; return the descriptor uncached. d was read
-			// inside txn, so a schema change committing after that read
-			// fails the transaction's refresh — the deadline is what the
-			// CACHED path needs, and this path did not take one.
-			return d, nil
-		}
-		entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
+	entry := &cachedDesc{desc: d, lastUsed: now}
+	if !a.leasing {
+		a.mu.Lock()
+		a.cache[key] = entry
+		a.mu.Unlock()
+		return d, nil
 	}
-	a.mu.Lock()
-	a.cache[key] = entry
-	a.mu.Unlock()
+	// A full cache takes no new entry and no new lease: the statement
+	// keeps d, which it read inside its own transaction, exactly as it
+	// does when the lease cannot be taken (below). The renewal loop makes
+	// room by giving up the leases nobody is using.
+	reserved, ok := a.reserveSlot(key)
+	if !ok {
+		return d, nil
+	}
+	// The lease is taken in its own transaction, with the descriptor
+	// it covers read there (acquireLease): the cache holds what the
+	// lease record claims. This statement keeps d, the version its
+	// own transaction read — if that is older than the leased one,
+	// its read of the descriptor conflicts with the schema change
+	// at commit, as any stale read does.
+	ld, info, err := a.acquireLease(ctx, dbID, name, key)
+	if err != nil || ld == nil {
+		// Without a lease the cache may not be trusted beyond this
+		// statement; return the descriptor uncached. d was read
+		// inside txn, so a schema change committing after that read
+		// fails the transaction's refresh — the deadline is what the
+		// CACHED path needs, and this path did not take one.
+		a.releaseSlot(reserved)
+		return d, nil
+	}
+	entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration, lastUsed: now}
+	if !a.install(key, entry, reserved) {
+		// The entry this lookup meant to replace went away while the
+		// lease was being taken, and the cache filled meanwhile. Nothing
+		// was handed out under the lease, so it is given back.
+		a.releaseLease(ctx, ld.ID, info.expiration)
+		return d, nil
+	}
 	pinDeadline(txn, entry.expiration)
 	return d, nil
 }
@@ -1125,7 +1324,9 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	return d, nil
 }
 
-// List returns all table descriptors.
+// List returns all table descriptors, of every database, by scanning
+// the whole descriptor span: its cost is the size of the cluster's
+// catalog. A caller that wants one database's tables asks ListIn.
 func (a *Accessor) List(ctx context.Context, txn *kvclient.Txn) ([]*TableDescriptor, error) {
 	start, end := keys.TableDescSpan()
 	rows, err := txn.Scan(ctx, start, end, 0)

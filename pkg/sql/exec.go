@@ -3,6 +3,7 @@ package sql
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime/debug"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/audit"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -20,6 +22,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // execStmt runs one statement in txn. It is the panic barrier of the
@@ -90,6 +93,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterTable(ctx, txn, t)
 	case *parser.DropIndex:
 		return s.execDropIndex(ctx, txn, t)
+	case *parser.CreateExtension:
+		// pgvector's type, operators and index method are built in, so
+		// the statement that would install them has nothing to do; any
+		// other extension is something datax does not have.
+		if t.Name != "vector" {
+			return nil, newErrf(CodeFeatureNotSupported, "extension %q is not available (datax has no extensions; \"vector\" is accepted because its type and operators are built in)", t.Name)
+		}
+		return &Result{Tag: "CREATE EXTENSION"}, nil
 	case *parser.CreateView:
 		return s.execCreateView(ctx, txn, t)
 	case *parser.CommentOn:
@@ -112,6 +123,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDropOwned(ctx, txn, t)
 	case *parser.AlterDefaultPrivileges:
 		return s.execAlterDefaultPrivileges(ctx, txn, t)
+	case *parser.CreatePolicy:
+		return s.execCreatePolicy(ctx, txn, t)
+	case *parser.AlterPolicy:
+		return s.execAlterPolicy(ctx, txn, t)
+	case *parser.DropPolicy:
+		return s.execDropPolicy(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -253,6 +270,18 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
 	}
+	general := false
+	for name := range t.Options {
+		general = general || generalTableOption(name)
+	}
+	if general {
+		if err := s.requireV21("the gc_ttl and row expiry options"); err != nil {
+			return nil, err
+		}
+		if _, err := applyGeneralOptions(desc, t.Options, false); err != nil {
+			return nil, err
+		}
+	}
 	if desc.ShardBuckets > 0 {
 		// The hidden bucket column leads the primary key; the executor
 		// fills it from the logical PK on every insert.
@@ -285,6 +314,11 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	desc.NextColumnID = catalog.ColumnID(len(desc.Columns) + 1)
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err
+	}
+	for _, c := range desc.Columns {
+		if err := s.requireTextSearchTypes(c.Type); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.cat.Create(ctx, txn, desc); err != nil {
 		var ex *catalog.ErrTableExists
@@ -331,12 +365,21 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			return nil, err
 		}
 	}
-	if owned || constrained || len(likeIndexes) > 0 {
+	ttlIndexed := false
+	if desc.RowTTL != nil {
+		before := len(desc.Indexes)
+		addTTLIndex(desc)
+		ttlIndexed = len(desc.Indexes) != before
+	}
+	if owned || constrained || len(likeIndexes) > 0 || ttlIndexed {
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, err
 		}
 	}
 	s.presplitTimeseries(ctx, desc)
+	if desc.GCTTLSeconds > 0 {
+		s.splitAtTableEdges(ctx, desc)
+	}
 	s.presplitPlacement(ctx, txn, dbName, desc)
 	return &Result{Tag: "CREATE TABLE"}, nil
 }
@@ -377,20 +420,24 @@ func (s *Session) validateDefaultExpr(ctx context.Context, txn *kvclient.Txn, co
 // applyTableOptions validates the WITH (...) options and stamps the
 // timeseries fields onto desc (before the hidden shard column is added).
 func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string, pkNames []string) error {
-	if len(options) == 0 {
-		return nil
-	}
+	timeseries := false
 	for name := range options {
 		switch name {
 		case "timeseries", "retention", "shards":
+			timeseries = true
 		default:
-			return newErrf(CodeSyntaxError, "unknown table option %q", name)
+			if !generalTableOption(name) {
+				return newErrf(CodeSyntaxError, "unknown table option %q", name)
+			}
 		}
+	}
+	if !timeseries {
+		return nil // only options any table takes (applyGeneralOptions)
 	}
 	switch options["timeseries"] {
 	case "true":
 	case "", "false":
-		return newErrf(CodeSyntaxError, "table options require timeseries=true")
+		return newErrf(CodeSyntaxError, "the retention and shards options require timeseries=true")
 	default:
 		return newErrf(CodeSyntaxError, "timeseries must be true or false")
 	}
@@ -480,6 +527,9 @@ func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*
 		if !shared.Timeseries {
 			return newErrf(CodeFeatureNotSupported, "retention applies to timeseries tables (created WITH (timeseries = true))")
 		}
+		if shared.GCTTLSeconds > 0 {
+			return newErrf(CodeFeatureNotSupported, "table %q has a gc_ttl; a retention is itself the table's GC window (ALTER TABLE ... RESET (gc_ttl) first)", shared.Name)
+		}
 		desc := shared.Clone()
 		desc.RetentionSeconds = secs
 		return s.cat.Update(ctx, txn, desc)
@@ -487,6 +537,52 @@ func (s *Session) execSetRetention(ctx context.Context, t *parser.AlterTable) (*
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
+	return &Result{Tag: "ALTER TABLE"}, nil
+}
+
+// MinAuditRetentionSeconds is the shortest retention the audit table
+// accepts. Retention is the one way records leave the table, so a
+// period of seconds would be a DELETE by another name; a day leaves the
+// change, which is itself recorded, time to be seen before anything
+// goes.
+const MinAuditRetentionSeconds = 24 * 3600
+
+// execSetAuditRetention is ALTER TABLE datax_audit SET (retention =
+// ...), the single change SQL may make to the audit table (issue #293):
+// admins only, nothing but the retention, and the change is an audit
+// record of its own. The table is not a timeseries table and the
+// storage layer's retention does not apply to it — the nodes age their
+// own chains out, each saying in its chain where it was cut — so the
+// period is only stored here for them to read.
+func (s *Session) execSetAuditRetention(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
+	if len(t.SetOptions) != 1 || t.SetOptions["retention"] == "" {
+		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention = ...) is allowed", t.Table)
+	}
+	secs, perr := parseRetention(t.SetOptions["retention"])
+	if perr != nil {
+		return nil, newErrf(CodeSyntaxError, "retention: %v", perr)
+	}
+	if secs < MinAuditRetentionSeconds {
+		return nil, newErrf(CodeInvalidParameterValue, "retention: audit records are kept for at least one day")
+	}
+	var before int64
+	err := s.db.RunTxn(ctx, "set-audit-retention", func(ctx context.Context, txn *kvclient.Txn) error {
+		if err := s.checkAdmin(ctx, txn); err != nil {
+			return err
+		}
+		shared, err := s.lookup(ctx, txn, t.Table)
+		if err != nil {
+			return err
+		}
+		desc := shared.Clone()
+		before = desc.RetentionSeconds
+		desc.RetentionSeconds = secs
+		return s.cat.Update(ctx, txn, desc)
+	})
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	log.Audit(audit.EventRetentionSet, "target", catalog.AuditTableName, "seconds", secs, "was_seconds", before, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
@@ -520,14 +616,169 @@ func (s *Session) presplitTimeseries(ctx context.Context, desc *catalog.TableDes
 	}
 }
 
-// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ...: carve a
-// range boundary at each primary-key tuple (a prefix of the key is
-// allowed), so a bulk load or a benchmark spreads over many ranges from
-// the start instead of waiting for size- and load-based splits. Rows are
-// the boundaries as key paths. A sharded timeseries table's key begins
-// with its shard bucket, so it is split by shard (SET (shards = N)), not
-// here.
+// execSplitAt is ALTER TABLE t SPLIT AT VALUES (k, ...), ... [WITH
+// EXPIRATION e]: carve a range boundary at each primary-key tuple (a
+// prefix of the key is allowed), so a bulk load or a benchmark spreads
+// over many ranges from the start instead of waiting for size- and
+// load-based splits. Rows are the boundaries as key paths. A sharded
+// timeseries table's key begins with its shard bucket, so it is split by
+// shard (SET (shards = N)), not here.
+//
+// The boundaries are sticky (issue #265): the halves of a pre-split are
+// empty, which is exactly what the merge queue folds back together, so
+// each is recorded on its range as made on purpose and stays until
+// UNSPLIT or its expiration. Before the cluster has finalized v20 the
+// record cannot be written; the split is then an ordinary one, as it was
+// before, and an expiration — which would promise something the cluster
+// cannot keep — is refused.
 func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	desc, err := s.splitTable(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	stickyUntil := int64(kvpb.StickyForever)
+	if t.SplitExpiration != nil {
+		if !s.db.StickyBitsOK() {
+			return nil, newErrf(CodeFeatureNotSupported, "SPLIT AT ... WITH EXPIRATION needs cluster version %s (finalize the upgrade first)", version.V20)
+		}
+		if stickyUntil, err = s.splitExpiration(*t.SplitExpiration, params); err != nil {
+			return nil, err
+		}
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	for _, tuple := range t.SplitAt {
+		key, err := splitKey(desc, "SPLIT AT", tuple, params)
+		if err != nil {
+			return nil, err
+		}
+		// An existing boundary is the state asked for (a re-run of a
+		// load script or a benchmark's set-up) and the KV split treats
+		// it so, marking it sticky. The KV layer also carries the two
+		// waits this statement used to fail on or spin for: a range
+		// frozen for a merge in flight is waited out by the client, and
+		// a range that another split or merge changed first is re-read
+		// and split again by the leader (issue #290).
+		if _, err := s.db.AdminSplitSticky(ctx, key, stickyUntil); err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.PrettyForTable(key, desc.ID, desc.Name))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
+// execUnsplit is ALTER TABLE t UNSPLIT AT VALUES (k, ...), ... and
+// UNSPLIT ALL: stop holding manual range boundaries against merging.
+// Nothing merges here; the merge queue folds the ranges back when they
+// are small enough, as it does any others. UNSPLIT AT names boundaries
+// the way SPLIT AT does and fails on a key that is not one; UNSPLIT ALL
+// releases every sticky boundary inside the table. Rows are the
+// boundaries released.
+func (s *Session) execUnsplit(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, error) {
+	desc, err := s.splitTable(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		return &Result{Tag: "ALTER TABLE"}, nil
+	}
+	if !s.db.StickyBitsOK() {
+		return nil, newErrf(CodeFeatureNotSupported, "UNSPLIT needs cluster version %s (finalize the upgrade first)", version.V20)
+	}
+	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	var unsplit []keys.Key
+	if t.UnsplitAll {
+		// Every range that starts strictly inside the table's primary
+		// index: the table's own edges are not SPLIT AT boundaries.
+		lo := rowenc.PrimaryKeyPrefixFor(desc)
+		if unsplit, err = s.stickyBoundaries(ctx, lo, lo.PrefixEnd()); err != nil {
+			return nil, err
+		}
+	}
+	for _, tuple := range t.UnsplitAt {
+		key, err := splitKey(desc, "UNSPLIT AT", tuple, params)
+		if err != nil {
+			return nil, err
+		}
+		unsplit = append(unsplit, key)
+	}
+	for _, key := range unsplit {
+		if _, err := s.db.AdminUnsplit(ctx, key); err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.PrettyForTable(key, desc.ID, desc.Name))})
+	}
+	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
+	return res, nil
+}
+
+// stickyBoundaries lists, from the range addressing records, the start
+// keys of the ranges that begin strictly inside (lo, hi) and carry a
+// sticky bit (expired or not: an expired bit is as well cleared).
+func (s *Session) stickyBoundaries(ctx context.Context, lo, hi keys.Key) ([]keys.Key, error) {
+	const page = 256
+	_, metaEnd := keys.MetaSpan()
+	var out []keys.Key
+	// A range's record is keyed by its end key, so the first record past
+	// lo's own is the range holding lo.
+	for cursor := keys.Key(keys.RangeMetaKey(lo)).Next(); ; {
+		rows, err := s.db.Scan(ctx, cursor, metaEnd, page)
+		if err != nil {
+			return nil, err
+		}
+		for _, kv := range rows {
+			var d kvpb.RangeDescriptor
+			if err := json.Unmarshal(kv.Value, &d); err != nil {
+				return nil, fmt.Errorf("corrupt range addressing record at %s: %w", kv.Key, err)
+			}
+			if d.StartKey.Compare(hi) >= 0 {
+				return out, nil
+			}
+			if d.StartKey.Compare(lo) > 0 && d.StickyUntil != 0 {
+				out = append(out, d.StartKey)
+			}
+		}
+		if len(rows) < page {
+			return out, nil
+		}
+		cursor = rows[len(rows)-1].Key.Next()
+	}
+}
+
+// releaseManualSplits stops holding every manual range boundary inside a
+// table's data, for DROP TABLE and TRUNCATE: both leave the table's old
+// key space empty for good (a truncated table continues under new index
+// IDs), and a sticky boundary there would keep an empty range alive with
+// no table left to name it in an UNSPLIT. Best-effort and outside the
+// statement's transaction, like the splits themselves: a failure is
+// logged and the boundary stays (datax debug unsplit can release it),
+// and a statement that then rolls back has given up boundaries it could
+// have kept — they merge only if their ranges are small, and SPLIT AT
+// makes them again.
+func (s *Session) releaseManualSplits(ctx context.Context, tableID uint64) {
+	if tableID == 0 || !s.db.StickyBitsOK() {
+		return
+	}
+	lo, hi := keys.TableDataSpan(tableID)
+	sticky, err := s.stickyBoundaries(ctx, lo, hi)
+	if err != nil {
+		log.Debugf("releasing manual splits of table %d: %v", tableID, err)
+		return
+	}
+	for _, key := range sticky {
+		if _, err := s.db.AdminUnsplit(ctx, key); err != nil {
+			log.Debugf("releasing manual split at %s: %v", keys.Pretty(key), err)
+		}
+	}
+}
+
+// splitTable resolves the table of a SPLIT AT or UNSPLIT and checks that
+// its key space is one those statements carve. A nil descriptor with a
+// nil error is IF EXISTS on a table that does not exist.
+func (s *Session) splitTable(ctx context.Context, t *parser.AlterTable) (*catalog.TableDescriptor, error) {
 	var desc *catalog.TableDescriptor
 	if err := s.db.RunTxn(ctx, "split-at", func(ctx context.Context, txn *kvclient.Txn) error {
 		shared, err := s.lookup(ctx, txn, t.Table)
@@ -539,7 +790,7 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 	}); err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {
-			return &Result{Tag: "ALTER TABLE"}, nil
+			return nil, nil
 		}
 		return nil, err
 	}
@@ -549,58 +800,78 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 	if desc.ShardBuckets > 1 {
 		return nil, newErrf(CodeFeatureNotSupported, "%q is sharded: its key space is carved by shard (ALTER TABLE ... SET (shards = N)), not by primary key", desc.Name)
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
-	for _, tuple := range t.SplitAt {
-		if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
-			return nil, newErrf(CodeSyntaxError, "SPLIT AT: a tuple names 1 to %d primary key values (%q has %d)", len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
-		}
-		key := rowenc.PrimaryKeyPrefixFor(desc)
-		for i, e := range tuple {
-			col, _ := desc.ColByID(desc.PrimaryKey[i])
-			d, err := evalExpr(e, nil, nil, params)
-			if err != nil {
-				return nil, err
-			}
-			if d, err = col.Conform(d); err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
-			}
-			if d.Null {
-				return nil, newErrf(CodeSyntaxError, "SPLIT AT: column %q: a split key cannot be NULL", col.Name)
-			}
-			if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "SPLIT AT: column %q: %v", col.Name, err)
-			}
-		}
-		// An existing boundary is the state asked for (a re-run of a
-		// load script or a benchmark's set-up), not an error. A range
-		// frozen for a merge in flight (the housekeeping loop folding
-		// empty neighbors back together) is split once the merge lands.
-		var err error
-		for attempt := 0; attempt < 50; attempt++ {
-			if _, err = s.db.AdminSplit(ctx, key); err == nil || strings.Contains(err.Error(), "already a range boundary") {
-				err = nil
-				break
-			}
-			if !strings.Contains(err.Error(), "frozen for a merge") {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
+	return desc, nil
+}
+
+// splitKey encodes one SPLIT AT / UNSPLIT AT tuple as a key of desc's
+// primary index; what names the statement in errors.
+func splitKey(desc *catalog.TableDescriptor, what string, tuple []parser.Expr, params []types.Datum) (keys.Key, error) {
+	if len(tuple) == 0 || len(tuple) > len(desc.PrimaryKey) {
+		return nil, newErrf(CodeSyntaxError, "%s: a tuple names 1 to %d primary key values (%q has %d)", what, len(desc.PrimaryKey), desc.Name, len(desc.PrimaryKey))
+	}
+	key := rowenc.PrimaryKeyPrefixFor(desc)
+	for i, e := range tuple {
+		col, _ := desc.ColByID(desc.PrimaryKey[i])
+		d, err := evalExpr(e, nil, nil, params)
 		if err != nil {
 			return nil, err
 		}
-		res.Rows = append(res.Rows, []types.Datum{types.NewString(keys.Pretty(key))})
+		if d, err = col.Conform(d); err != nil {
+			return nil, newErrf(CodeInvalidParameterValue, "%s: column %q: %v", what, col.Name, err)
+		}
+		if d.Null {
+			return nil, newErrf(CodeSyntaxError, "%s: column %q: a split key cannot be NULL", what, col.Name)
+		}
+		if key, err = rowenc.AppendKeyDatum(key, col.Type, d); err != nil {
+			return nil, newErrf(CodeInvalidParameterValue, "%s: column %q: %v", what, col.Name, err)
+		}
 	}
-	res.Tag = fmt.Sprintf("ALTER TABLE %d", len(res.Rows))
-	return res, nil
+	return key, nil
+}
+
+// splitExpiration evaluates SPLIT AT ... WITH EXPIRATION e to the
+// wall-clock time, in nanoseconds, at which the boundaries stop being
+// held: a timestamp (or text that reads as one) is that moment, an
+// interval is that long from now. It must lie in the future — a boundary
+// that is already expired is a plain split, and saying so is kinder than
+// making one silently.
+func (s *Session) splitExpiration(e parser.Expr, params []types.Datum) (int64, error) {
+	d, err := evalExpr(e, nil, nil, params)
+	if err != nil {
+		return 0, err
+	}
+	now := s.db.Clock().Now().WallTime
+	var until int64
+	switch {
+	case d.Null:
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration cannot be NULL (leave WITH EXPIRATION out for a boundary that does not expire)")
+	case d.Fam == types.Timestamp:
+		until = d.I
+	case d.Fam == types.Date:
+		until = d.I * int64(24*time.Hour)
+	case d.Fam == types.IntervalFam:
+		until = d.IntervalVal().AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+	case d.Fam == types.String:
+		if until, err = types.ParseTimestamp(d.S); err != nil {
+			iv, ierr := types.ParseInterval(d.S)
+			if ierr != nil {
+				return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration %q is neither a timestamp nor an interval", d.S)
+			}
+			until = iv.AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+		}
+	default:
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration must be a timestamp or an interval, not %s", d.Fam)
+	}
+	if until <= now {
+		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration %s is not in the future", time.Unix(0, until).UTC().Format(time.RFC3339))
+	}
+	return until, nil
 }
 
 func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parser.DropTable) (*Result, error) {
-	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSystemTable(bare) && !s.system {
+	if _, bare := catalog.SplitTableName(t.Name); catalog.IsSealedSystemTable(bare) && !s.system {
+		return nil, sealedTableError(bare)
+	} else if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
 	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
@@ -629,6 +900,7 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	// sampler's orphan sweep is the backstop for anything missed), and so
 	// do the sequences its columns own.
 	if desc != nil {
+		s.releaseManualSplits(ctx, desc.ID)
 		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
 			return nil, err
 		}
@@ -751,6 +1023,22 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	// Row security: every proposed row must pass the INSERT policies'
+	// WITH CHECK, whether it ends up inserted or — through ON CONFLICT DO
+	// UPDATE — only names the row to update; that path checks the UPDATE
+	// policies too. With RETURNING, or a DO UPDATE (which reads the
+	// existing row), a written row must also be one the role may see.
+	doUpdate := conflict != nil && !conflict.oc.DoNothing
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, true, doUpdate, t.Returning != nil || doUpdate)
+	if err != nil {
+		return nil, err
+	}
+	var conflictVisible []parser.Comparison
+	if rowSec != nil && doUpdate {
+		if conflictVisible, _, err = s.rowFilter(ctx, txn, desc, catalog.PolicyUpdate, catalog.PolicySelect); err != nil {
+			return nil, err
+		}
+	}
 	count := 0
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
@@ -819,6 +1107,12 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	for _, b := range built {
 		rowTarget, rowVals := b.target, b.vals
 		var row map[catalog.ColumnID]types.Datum
+		// The policy check comes before any probe of the table: a row the
+		// role may not write is refused as such, whether or not a row
+		// with its key exists.
+		if err := rowSec.checkInsert(b.row); err != nil {
+			return nil, err
+		}
 		if conflict == nil {
 			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
 				return nil, err
@@ -827,7 +1121,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 				return nil, err
 			}
 		} else {
-			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps)
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps, rowSec, conflictVisible)
 			if err != nil {
 				return nil, err
 			}
@@ -962,7 +1256,7 @@ func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 // It reports whether a row was written (inserted or updated) and that
 // row. A conflict on a unique key other than the arbiter is the usual
 // unique violation, as in PostgreSQL.
-func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard, ps *probeSet) (bool, map[catalog.ColumnID]types.Datum, error) {
+func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard, ps *probeSet, rowSec *rowCheck, conflictVisible []parser.Comparison) (bool, map[catalog.ColumnID]types.Datum, error) {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return false, nil, err
@@ -1043,6 +1337,20 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	if plan.oc.DoNothing {
 		return false, nil, nil
 	}
+	// DO UPDATE under row security: the existing row must be one the
+	// role's UPDATE and SELECT policies admit. It is an error rather than
+	// a skipped row, as in PostgreSQL — the statement asked to change a
+	// row it may not touch — and it is checked before SET or WHERE can
+	// compute anything from that row.
+	if rowSec != nil {
+		ok, err := matchesWhere(conflictVisible, desc, oldRow, nil)
+		if err != nil {
+			return false, nil, err
+		}
+		if !ok {
+			return false, nil, rowSecurityError(desc)
+		}
+	}
 	// DO UPDATE: SET and WHERE see the existing row by its columns and
 	// the proposed one as excluded.*.
 	env := conflictEnv{desc: desc, table: desc.Name, old: oldRow, excluded: row}
@@ -1073,6 +1381,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			return false, nil, err
 		}
 		newRow[col.ID] = d
+	}
+	if err := rowSec.checkUpdate(newRow); err != nil {
+		return false, nil, err
 	}
 	if err := guard.checkUpdate(ctx, txn, oldRow, newRow, wb); err != nil {
 		return false, nil, err
@@ -1318,13 +1629,27 @@ type fetchedRow struct {
 	row map[catalog.ColumnID]types.Datum
 }
 
+// fetchRows reads the rows of desc that match where, as a query would:
+// when row security applies to the actor, only the rows its SELECT
+// policies admit (rls.go). Every read made on behalf of a query — a
+// join's sides, an aggregate's input, an index lookup — comes through
+// here, which is what applies the policy to each table reference.
 func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, accessPlan, error) {
-	return s.fetchRowsFor(ctx, txn, desc, where, params, limit, nil)
+	where, _, err := s.securedWhere(ctx, txn, desc, where, catalog.PolicySelect)
+	if err != nil {
+		return nil, accessPlan{}, err
+	}
+	return s.fetchRowsRaw(ctx, txn, desc, where, params, limit, nil)
 }
 
-// fetchRowsFor is fetchRows for a statement whose plan may be cached
-// (stmt: the UPDATE or DELETE as prepared; nil plans in full).
-func (s *Session) fetchRowsFor(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64, stmt parser.Statement) ([]fetchedRow, accessPlan, error) {
+// fetchRowsRaw reads the rows of desc that match where and nothing else:
+// no row-security policy is added. Its callers either have put the
+// policy in where themselves (UPDATE and DELETE, whose filter is their
+// own command's) or must not apply one (the foreign-key checks and
+// cascades, which see the whole of the other table). stmt is the
+// statement whose plan may be cached (the UPDATE or DELETE as prepared);
+// nil plans in full.
+func (s *Session) fetchRowsRaw(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64, stmt parser.Statement) ([]fetchedRow, accessPlan, error) {
 	st, _ := s.cat.Stats(ctx, desc.ID)
 	var pe *planEntry
 	if stmt != nil {
@@ -1355,6 +1680,12 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		// filter (its "primary key" is the hidden ordinal).
 		return s.fetchVirtual(ctx, txn, desc, where, params, limit)
 	}
+	if top := plan.top; top != nil {
+		if top.vec != nil {
+			return s.executeVectorScan(ctx, txn, desc, top.vec, where, params, top.keep)
+		}
+		return s.scanTopK(ctx, txn, desc, plan, where, top.order, params, top.keep)
+	}
 	switch plan.kind {
 	case planPKPoint:
 		key, err := rowenc.EncodePK(desc, plan.pkVals)
@@ -1382,14 +1713,19 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		if err != nil {
 			return nil, err
 		}
-		if rows == nil {
+		if rows == nil && kvclient.LockWaitFrom(ctx) != kvclient.LockWaitSkip {
 			// The entry and the row commit atomically; a dangling entry is
 			// corruption, not an empty result — unless the row was filtered.
+			// (Under SKIP LOCKED a locked row reads as absent, so absence
+			// proves nothing there.)
 			if raw, gerr := txn.Get(ctx, pk); gerr == nil && raw == nil {
 				return nil, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 			}
 		}
 		return rows, nil
+
+	case planInvertedScan:
+		return s.executeInvertedScan(ctx, txn, desc, plan, where, params, limit)
 
 	case planIndexScan:
 		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
@@ -1438,6 +1774,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			for i, raw := range raws {
 				pk := pks[first+i]
 				if raw == nil {
+					if kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip {
+						continue // locked by another transaction: passed over
+					}
 					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
 				}
 				row, err := decodeFullRow(desc, pk, raw)
@@ -1675,7 +2014,7 @@ func (s *Session) planAccess(desc *catalog.TableDescriptor, st *catalog.TableSta
 			return plan, nil
 		}
 	}
-	return pickPlanWithStats(desc, st, where, params)
+	return pickPlanMode(desc, st, where, params, s.vars.invertedScan)
 }
 
 // cachePlan records what a statement planned against.
@@ -1927,6 +2266,23 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Distinct && t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with DISTINCT")
 	}
+	// Row security: the policy's conjuncts lead the WHERE clause, so the
+	// access path is chosen with them and every row read below — by key,
+	// through an index, streamed, or passed over by SKIP LOCKED — is
+	// filtered by them. A locking read must pass the UPDATE policies as
+	// well. The filtered statement is a copy, which also keeps it out of
+	// the plan cache (keyed on the statement as prepared).
+	rlsCmds := []string{catalog.PolicySelect}
+	if t.ForUpdate {
+		rlsCmds = append(rlsCmds, catalog.PolicyUpdate)
+	}
+	if where, secured, serr := s.securedWhere(ctx, txn, desc, t.Where, rlsCmds...); serr != nil {
+		return nil, serr
+	} else if secured {
+		c := *t
+		c.Where = where
+		t = &c
+	}
 	st, _ := s.cat.Stats(ctx, desc.ID)
 	var pe *planEntry
 	if t == orig {
@@ -1964,7 +2320,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 	}
 	needSort := false
-	order := resolveOrderAliases(t)
+	order := foldDistanceConstants(desc, resolveOrderAliases(t), params)
 	if len(order) > 0 {
 		dec := orderPlan(desc, plan, order, s.db.ReverseScansOK())
 		needSort = !dec.satisfied
@@ -1980,47 +2336,70 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if s.streamable(top, desc, plan, t, needSort, corr, corrProjs) {
 		return s.newScanStream(txn, desc, plan, t, proj, t.Where, params, fetchLimit)
 	}
-	rows, err := s.executePlan(ctx, txn, desc, plan, t.Where, params, fetchLimit)
-	if err != nil {
-		return nil, err
+	var rows []fetchedRow
+	if topKEligible(desc, plan, t, needSort, corr) {
+		// ORDER BY ... LIMIT over a scan: only the rows that can still
+		// make the limit are kept (topk.go) — read out of a vector index
+		// when the order is a distance one serves, else out of the scan
+		// itself. It is a directive on the plan, like the scan direction,
+		// so the fetch below goes through executePlan as every fetch
+		// does; the rows it returns then take the ordinary sort, over at
+		// most the limit's worth of them.
+		plan.top = &topKSpec{order: order, keep: keepCount(t), vec: s.pickVectorIndex(desc, plan, order, params)}
 	}
-	if len(corr) > 0 {
-		memo := corrMemo{}
-		kept := rows[:0]
-		for _, fr := range rows {
-			match, cerr := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
-			if cerr != nil {
-				return nil, cerr
-			}
-			if match {
-				kept = append(kept, fr)
-			}
-		}
-		rows = kept
-		if !needSort && !t.Distinct {
-			rows = cutRows(rows, keepCount(t))
-		}
-	}
-	if t.ForUpdate {
-		// Lock each selected row: the locking read re-verifies the row at
-		// the transaction's read timestamp server-side (any newer committed
-		// version surfaces as a retryable conflict), so the fetch-then-lock
-		// gap cannot admit a stale read.
-		lockKeys := make([]keys.Key, len(rows))
-		for i, fr := range rows {
-			lockKeys[i] = fr.key
-		}
-		if _, lerr := txn.GetBatchForUpdate(ctx, lockKeys); lerr != nil {
-			return nil, lerr
-		}
-	}
-	if needSort {
-		if err := sortRows(desc, rows, order, params); err != nil {
+	if t.ForUpdate && t.LockWait == parser.LockWaitSkipLocked {
+		rows, err = s.fetchSkipLocked(ctx, txn, desc, plan, t, params, fetchLimit, corr, needSort, order)
+		if err != nil {
 			return nil, err
 		}
-		s.note("sort: %d rows in memory", len(rows))
-		if !t.Distinct {
-			rows = cutRows(rows, keepCount(t))
+	} else {
+		nowait := t.ForUpdate && t.LockWait == parser.LockWaitNoWait
+		fetchCtx := ctx
+		if nowait {
+			// The fetch must not wait either: a plain read queues behind
+			// an intent at or below its timestamp.
+			fetchCtx = kvclient.WithLockWait(ctx, kvclient.LockWaitError)
+		}
+		rows, err = s.executePlan(fetchCtx, txn, desc, plan, t.Where, params, fetchLimit)
+		if err != nil {
+			return nil, rowLockErr(desc, err)
+		}
+		if len(corr) > 0 {
+			rows, err = s.filterCorrelated(ctx, txn, corr, desc, rows, params)
+			if err != nil {
+				return nil, err
+			}
+			if !needSort && !t.Distinct {
+				rows = cutRows(rows, keepCount(t))
+			}
+		}
+		if t.ForUpdate {
+			// Lock each selected row: the locking read re-verifies the row at
+			// the transaction's read timestamp server-side (any newer committed
+			// version surfaces as a retryable conflict), so the fetch-then-lock
+			// gap cannot admit a stale read.
+			lockKeys := make([]keys.Key, len(rows))
+			for i, fr := range rows {
+				lockKeys[i] = fr.key
+			}
+			var lerr error
+			if nowait {
+				_, lerr = txn.GetBatchForUpdateNoWait(ctx, lockKeys, false)
+			} else {
+				_, lerr = txn.GetBatchForUpdate(ctx, lockKeys)
+			}
+			if lerr != nil {
+				return nil, rowLockErr(desc, lerr)
+			}
+		}
+		if needSort {
+			if err := sortRows(desc, rows, order, params); err != nil {
+				return nil, err
+			}
+			s.note("sort: %d rows in memory", len(rows))
+			if !t.Distinct {
+				rows = cutRows(rows, keepCount(t))
+			}
 		}
 	}
 	res := &Result{}
@@ -2133,7 +2512,24 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if t == orig {
 		planKeyStmt = t
 	}
-	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
+	// Row security: the UPDATE policies' USING filters the target rows,
+	// and — when the statement had to read the table to find or compute
+	// them — so does the SELECT policies'. The new version of each row
+	// must pass WITH CHECK below. A statement so filtered plans in full:
+	// the plan cache cannot tell roles or settings apart.
+	reads := updateReadsTable(t, corr)
+	cmds := []string{catalog.PolicyUpdate}
+	if reads {
+		cmds = append(cmds, catalog.PolicySelect)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, t.Where, cmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		planKeyStmt = nil
+	}
+	rows, _, err := s.fetchRowsRaw(ctx, txn, desc, where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2152,6 +2548,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		rows = kept
 	}
 	ret, err := s.returningProjection(desc, t.Table, t.Returning)
+	if err != nil {
+		return nil, err
+	}
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, reads)
 	if err != nil {
 		return nil, err
 	}
@@ -2222,6 +2622,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	}
 	for i, fr := range rows {
 		oldRow := oldRows[i]
+		if err := rowSec.checkUpdate(fr.row); err != nil {
+			return nil, err
+		}
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
@@ -2294,7 +2697,21 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if t == orig {
 		planKeyStmt = t
 	}
-	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
+	// Row security: the DELETE policies' USING filters the target rows,
+	// with the SELECT policies' when the statement reads the table (a
+	// WHERE clause or RETURNING).
+	cmds := []string{catalog.PolicyDelete}
+	if len(t.Where) > 0 || len(corr) > 0 || t.Returning != nil {
+		cmds = append(cmds, catalog.PolicySelect)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, t.Where, cmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		planKeyStmt = nil
+	}
+	rows, _, err := s.fetchRowsRaw(ctx, txn, desc, where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2375,6 +2792,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 	if _, bare := catalog.SplitTableName(t.Table); catalog.IsSystemTable(bare) && !s.system && t.SetOptions == nil {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster: only ALTER TABLE ... SET (retention | shards) is allowed", t.Table)
 	}
+	if t.ResetOptions != nil || t.Purge {
+		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
@@ -2400,6 +2820,10 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		desc.NextColumnID = max + 1
 	}
 	switch {
+	case t.RowSecurity != "":
+		if err := s.applyRowSecurity(desc, t.RowSecurity); err != nil {
+			return nil, err
+		}
 	case t.AddConstraint != nil || t.ValidateConstraint != "" || t.SetNotNull != "":
 		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 	case t.DropConstraint != "":
@@ -2476,6 +2900,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			// explicitly so they stay NULL.
 			col.Default, col.FillDefault = &d, true
 		}
+		if err := s.requireTextSearchTypes(col.Type); err != nil {
+			return nil, err
+		}
 		desc.Columns = append(desc.Columns, col)
 		desc.NextColumnID++
 	case t.DropCol != "":
@@ -2489,6 +2916,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		if desc.IsPKCol(col.ID) {
 			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
 		}
+		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
+			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", t.DropCol)
+		}
 		if err := s.refuseIfViewed(ctx, txn, desc, "drop column "+t.DropCol); err != nil {
 			return nil, err
 		}
@@ -2496,6 +2926,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			return nil, err
 		} else if len(uses) > 0 {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by constraint %s (drop the constraint first)", t.DropCol, strings.Join(uses, ", "))
+		}
+		if uses := policyColumnUses(desc, col.Name); len(uses) > 0 {
+			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by policy %s (drop the policy first)", t.DropCol, strings.Join(uses, ", "))
 		}
 		for _, idx := range desc.Indexes {
 			for _, id := range idx.ColumnIDs {
@@ -2608,16 +3041,34 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			Tag:     "EXPLAIN",
 		}, nil
 	}
+	// Row security shows in the plan as it runs: the policy's conjuncts
+	// bound the scan. The row estimate is left out for a role the policy
+	// confines — it is drawn from statistics over every tenant's rows.
+	rlsCmds := []string{catalog.PolicySelect}
+	if sel.ForUpdate {
+		rlsCmds = append(rlsCmds, catalog.PolicyUpdate)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, sel.Where, rlsCmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		c := *sel
+		c.Where = where
+		sel = &c
+	}
 	st, _ := s.cat.Stats(ctx, desc.ID)
-	plan, err := pickPlanWithStats(desc, st, sel.Where, params)
+	plan, err := pickPlanMode(desc, st, sel.Where, params, s.vars.invertedScan)
 	if err != nil {
 		return nil, err
 	}
 	text := plan.String()
-	if plan.estRows > 0 {
+	if plan.estRows > 0 && !secured {
 		text += fmt.Sprintf(" [~%.0f rows]", plan.estRows)
 	}
-	if e := s.plans.peek(sel, s.database); e != nil && e.desc == desc && e.stats == st {
+	if secured {
+		text += "; row-level security policy applied"
+	} else if e := s.plans.peek(sel, s.database); e != nil && e.desc == desc && e.stats == st {
 		text += " (cached plan)"
 	} else if sel == t.Stmt {
 		// EXPLAIN plans exactly as execution would: the next execution of
@@ -2631,8 +3082,21 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	}
 	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
 	dec := orderPlan(desc, plan, sel.OrderBy, s.db.ReverseScansOK())
+	// The top-k paths, decided as execSelect decides them.
+	topK := !grouped && topKEligible(desc, plan, sel, len(sel.OrderBy) > 0 && !dec.satisfied, corr)
+	viaVector := false
+	if topK {
+		if vp := s.pickVectorIndex(desc, plan, resolveOrderAliases(sel), params); vp != nil {
+			text = vp.String() + strings.TrimPrefix(text, plan.String())
+			viaVector = true
+		}
+	}
 	if len(sel.OrderBy) > 0 && !grouped {
 		switch {
+		case viaVector:
+			text += fmt.Sprintf("; top-k: the nearest %d candidates that pass the filter kept, in index distance order", keepCount(sel))
+		case topK:
+			text += fmt.Sprintf("; top-k heap: the first %d rows in order kept while scanning, no full sort", keepCount(sel))
 		case dec.satisfied && dec.mergeFan:
 			text += "; order satisfied by K-way merge across shard buckets"
 			if dec.reverse {
@@ -3009,11 +3473,15 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			return d
 		}
-		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDefWith(desc, byID))})
+		def := vtable.CreateTableDefWith(desc, byID)
+		if rls := vtable.RowSecurityDefs(desc); len(rls) > 0 {
+			def += ";\n" + strings.Join(rls, ";\n")
+		}
+		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(def)})
 	case "users", "roles":
 		// SHOW USERS: the login roles; SHOW ROLES: every role, the built-in
 		// ones included.
-		env, err := s.virtualEnv(ctx, txn)
+		env, err := s.virtualEnv(ctx, txn, envNoTables)
 		if err != nil {
 			return nil, err
 		}
@@ -3085,7 +3553,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		for i := 7; i < 10; i++ {
 			res.Columns[i].Type = types.Timestamp
 		}
-		res.Rows = s.sessionRows()
+		admin, err := s.isAdmin(ctx, txn)
+		if err != nil {
+			return nil, err
+		}
+		res.Rows = s.sessionRows(admin)
 	default:
 		return nil, newErrf(CodeInternal, "unknown SHOW form %q", t.Kind)
 	}
@@ -3136,6 +3608,153 @@ func resolveLimitParams(t *parser.Select, params []types.Datum) (*parser.Select,
 		}
 	}
 	return &c, nil
+}
+
+// filterCorrelated keeps the rows the statement's correlated subquery
+// filters accept.
+func (s *Session) filterCorrelated(ctx context.Context, txn *kvclient.Txn, corr []correlatedConjunct, desc *catalog.TableDescriptor, rows []fetchedRow, params []types.Datum) ([]fetchedRow, error) {
+	memo := corrMemo{}
+	kept := rows[:0]
+	for _, fr := range rows {
+		match, err := s.evalCorrelated(ctx, txn, corr, desc, fr.row, params, memo)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			kept = append(kept, fr)
+		}
+	}
+	return kept, nil
+}
+
+// rowLockErr gives a NOWAIT failure PostgreSQL's wording, naming the
+// table; any other error passes through.
+func rowLockErr(desc *catalog.TableDescriptor, err error) error {
+	if kvclient.IsLockNotAvailable(err) {
+		return newErrf(CodeLockNotAvailable, "could not obtain lock on row in relation %q", desc.Name)
+	}
+	return err
+}
+
+// skipLockedGrowth and skipLockedBoundedRounds shape the refetch of a
+// SKIP LOCKED statement whose limited fetch came back full and still
+// left the limit unmet: each round asks for four times as many rows,
+// and after the bounded rounds the fetch is unlimited.
+const (
+	skipLockedGrowth        = 4
+	skipLockedBoundedRounds = 3
+)
+
+// fetchSkipLocked fetches and locks the rows of a SELECT ... FOR UPDATE
+// SKIP LOCKED, leaving out every row it cannot lock at once, and returns
+// them in the statement's order, cut to LIMIT+OFFSET.
+//
+// The fetch reads under kvclient.LockWaitSkip, so rows carrying another
+// transaction's intent never come back, and a pushed-down limit counts
+// only rows that were free when the scan passed them. The rows are then
+// locked in order, only as many as the statement returns — a row locked
+// and then cut by LIMIT would be hidden from every other SKIP LOCKED
+// reader for nothing. A row that cannot be locked after all (taken
+// between the fetch and the lock, or changed and committed since this
+// transaction's snapshot) is passed over like one locked from the start,
+// and the next candidate takes its place. When a limited fetch runs out
+// of candidates that way, it is repeated with a larger limit: the rows
+// already locked come back (this transaction reads its own intents), the
+// ones passed over are not tried again.
+//
+// Every row passed over is then taken out of the transaction's read set
+// (Txn.ForgetReads): another transaction is about to change it, and it
+// is no part of this statement's result. So is a row that was fetched
+// but lay beyond the limit in an ordered scan — a fetch that could have
+// stopped exactly at the limit would never have read it.
+func (s *Session) fetchSkipLocked(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, t *parser.Select, params []types.Datum, fetchLimit int64, corr []correlatedConjunct, needSort bool, order []parser.OrderCol) ([]fetchedRow, error) {
+	if t.Limit == 0 {
+		return nil, nil // nothing is returned, so nothing is locked
+	}
+	want := keepCount(t)
+	skipCtx := kvclient.WithLockWait(ctx, kvclient.LockWaitSkip)
+	mark := txn.ReadMark()
+	held := map[string]bool{}   // locked by this statement
+	passed := map[string]bool{} // could not be locked: not tried again
+	limit := fetchLimit
+	for round := 1; ; round++ {
+		rows, err := s.executePlan(skipCtx, txn, desc, plan, t.Where, params, limit)
+		if err != nil {
+			return nil, err
+		}
+		exhausted := limit == 0 || int64(len(rows)) < limit
+		if len(corr) > 0 {
+			if rows, err = s.filterCorrelated(ctx, txn, corr, desc, rows, params); err != nil {
+				return nil, err
+			}
+		}
+		if needSort {
+			if err := sortRows(desc, rows, order, params); err != nil {
+				return nil, err
+			}
+			s.note("sort: %d rows in memory", len(rows))
+		}
+		var kept []fetchedRow
+		next := 0
+		for next < len(rows) && (want == 0 || int64(len(kept)) < want) {
+			// Lock as many candidates as are still wanted, in one batch.
+			n := len(rows) - next
+			if want > 0 && want-int64(len(kept)) < int64(n) {
+				n = int(want - int64(len(kept)))
+			}
+			chunk := rows[next : next+n]
+			next += n
+			var lockKeys []keys.Key
+			for _, fr := range chunk {
+				if k := string(fr.key); !held[k] && !passed[k] {
+					lockKeys = append(lockKeys, fr.key)
+				}
+			}
+			got, err := txn.GetBatchForUpdateNoWait(ctx, lockKeys, true)
+			if err != nil {
+				return nil, err
+			}
+			var refused []keys.Key
+			for i, k := range lockKeys {
+				if got[i] {
+					held[string(k)] = true
+				} else {
+					passed[string(k)] = true
+					refused = append(refused, k)
+				}
+			}
+			// At once, not at the end: the very next read of this
+			// statement may have to refresh, and the transaction that
+			// took the row has likely committed by then.
+			txn.ForgetReads(mark, refused)
+			for _, fr := range chunk {
+				if held[string(fr.key)] {
+					kept = append(kept, fr)
+				}
+			}
+		}
+		if want > 0 && int64(len(kept)) < want && !exhausted {
+			if round >= skipLockedBoundedRounds {
+				limit = 0
+			} else {
+				limit *= skipLockedGrowth
+			}
+			continue
+		}
+		var forget []keys.Key
+		for k := range passed {
+			forget = append(forget, keys.Key(k))
+		}
+		if !needSort {
+			for _, fr := range rows[next:] {
+				if !held[string(fr.key)] {
+					forget = append(forget, fr.key)
+				}
+			}
+		}
+		txn.ForgetReads(mark, forget)
+		return kept, nil
+	}
 }
 
 // keepCount is how many leading rows a stage must keep for the query's

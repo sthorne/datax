@@ -91,6 +91,10 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, newErrf(CodeObjectInUse, "index %q is still being built", idx.Name)
 	}
 	indexID, indexName := idx.ID, idx.Name
+	wipe := indexWipe{tableID: desc.ID, indexID: indexID}
+	if idx.IsVector() {
+		wipe.vectorBuild = idx.Vector.Build
+	}
 	kept := desc.Indexes[:0]
 	for _, ix := range desc.Indexes {
 		if ix.ID != indexID {
@@ -102,7 +106,7 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, err
 	}
 	s.noteDDL(desc.Name)
-	s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
+	s.pendingWipes = append(s.pendingWipes, wipe)
 	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP INDEX"}, nil
 }
@@ -227,6 +231,9 @@ func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc 
 			return nil, newErrf(CodeInternal, "constraint %q: %v", c.Name, err)
 		}
 		c.Expr = text
+	}
+	if err := renamePolicyColumn(desc, r.From, r.To); err != nil {
+		return nil, err
 	}
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
@@ -367,6 +374,18 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		if err := s.checkTablePriv(ctx, txn, shared, "TRUNCATE"); err != nil {
 			return nil, err
 		}
+		// TRUNCATE removes every row without reading one, so no policy
+		// can filter it. PostgreSQL lets a role with the TRUNCATE
+		// privilege do that past the table's row security; here the
+		// privilege is also what a DELETE grant from before v11 carries,
+		// and a role confined to its own rows must not be able to remove
+		// everyone's by either route. It is refused; the owner (unless
+		// forced) and exempt roles truncate as before.
+		if confined, err := s.rowSecurityActive(ctx, txn, shared); err != nil {
+			return nil, err
+		} else if confined {
+			return nil, newErrf(CodeInsufficientPriv, "permission denied for table %q: row-level security applies to %q, and TRUNCATE would remove rows its policies do not show it", shared.Name, s.actor())
+		}
 		desc := shared.Clone()
 		if desc.Reshard != nil {
 			return nil, newErrf(CodeObjectInUse, "cannot truncate table %q while a re-shard is in progress", desc.Name)
@@ -422,6 +441,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 	var names []string
 	for _, id := range order {
 		desc := descs[id]
+		s.releaseManualSplits(ctx, desc.ID)
 		if err := truncateLayout(desc, now); err != nil {
 			return nil, err
 		}

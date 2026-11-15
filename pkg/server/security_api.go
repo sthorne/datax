@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/google/uuid"
 	"net/http"
 	"sort"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
 // /api/security (issue #156). Security state was scattered: audit
@@ -65,6 +67,54 @@ type SecurityStore struct {
 	// whether the old format is refused, and how many files of the old
 	// format remain in between.
 	Authenticated *AuthenticatedEncryption `json:"authenticated,omitempty"`
+	// Root is what the store's key is kept under (issue #305); nil for a
+	// store opened with a key file, or a plaintext one.
+	Root *SecurityRoot `json:"root,omitempty"`
+	// KeyMemory says how the node holds its keys while it runs (issue
+	// #309): whether their memory is locked against swap and left out of
+	// core dumps, and whether the process can be dumped at all.
+	KeyMemory *enc.KeyMemoryStatus `json:"key_memory,omitempty"`
+	// PeerUnseal, for a store under a root key held as shares, says
+	// whether this node hands that key to restarting peers and how often
+	// it has been asked (issue #307).
+	PeerUnseal *SecurityPeerUnseal `json:"peer_unseal,omitempty"`
+}
+
+// SecurityPeerUnseal is a node's record as the answering side of peer
+// unseal, since it started.
+type SecurityPeerUnseal struct {
+	Enabled bool  `json:"enabled"`
+	Granted int64 `json:"granted"`
+	Refused int64 `json:"refused"`
+}
+
+// SecurityRoot names the root a store key is wrapped by, and says what
+// is known of it. Nothing here is secret: the kind, the name the root
+// gives its key, and the root's own words when it fails.
+type SecurityRoot struct {
+	Kind string `json:"kind"`
+	// KeyID is the root's key, with the service's key version where the
+	// service names one: the version the store key is wrapped under.
+	KeyID string `json:"key_id,omitempty"`
+	// Bound: the wrapped store key is tied to this cluster and node
+	// (issue #308). False for a store from before bindings, and for a
+	// root that does not take the binding until the key is rewrapped.
+	Bound bool `json:"bound"`
+	// Healthy is the outcome of the latest check that the root is
+	// reachable and can use its key; absent for a root that cannot be
+	// checked (file, exec, shares). A root that is not healthy does not
+	// affect the running node: it is the next restart that would fail.
+	Healthy *bool `json:"healthy,omitempty"`
+	// HealthError is the root's reason, when it is not healthy.
+	HealthError string `json:"health_error,omitempty"`
+	// HealthCheckedAt and LastHealthyAt are when the root was last
+	// asked, and last answered (RFC 3339).
+	HealthCheckedAt string `json:"health_checked_at,omitempty"`
+	LastHealthyAt   string `json:"last_healthy_at,omitempty"`
+	// LatestKeyID is set when the service has a newer version of the
+	// key than the one the store key is wrapped under: a rewrap
+	// (`datax debug enc-root rewrap`) moves the store key to it.
+	LatestKeyID string `json:"latest_key_id,omitempty"`
 }
 
 // AuthenticatedEncryption is a store's position in the switch to the
@@ -125,6 +175,11 @@ type SecurityStatus struct {
 	// node's is on its own page; a cluster-wide sweep would be a fan-out
 	// this view does not make.
 	Stores []SecurityStore `json:"stores"`
+	// Audit is the serving node's audit table state (issue #293): the
+	// head of its chain, and whether it is keeping up. Open to any
+	// authenticated user, like the counters above: a hash and some
+	// counts name nobody.
+	Audit SecurityAudit `json:"audit"`
 	// Error notes a partial document; what is present is still valid.
 	Error string `json:"error,omitempty"`
 }
@@ -153,6 +208,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 	doc.ThrottledRateLimit = counterValue(metrics.AuthThrottled.WithLabelValues(throttleRateLimit))
 	doc.ThrottledVerifyRate = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate))
 	doc.ThrottledVerifyFull = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
+	doc.Audit = n.AuditStatus()
 	doc.AuthThrottled = doc.ThrottledRateLimit + doc.ThrottledVerifyRate + doc.ThrottledVerifyFull
 
 	// Certificates. The loaded material is operational and open; the
@@ -192,14 +248,7 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 	}
 
 	// The serving node's store.
-	if n.engine != nil {
-		st := SecurityStore{NodeID: int(n.ident.NodeID), Encrypted: n.engine.Encrypted()}
-		if st.Encrypted {
-			st.Reencryption = n.reencryptionStatus()
-			st.Authenticated = n.authenticatedEncryption()
-		}
-		doc.Stores = append(doc.Stores, st)
-	}
+	doc.Stores = append(doc.Stores, n.SecurityStores()...)
 	return doc
 }
 
@@ -236,3 +285,26 @@ func (n *Node) securityRoles(ctx context.Context, doc *SecurityStatus) []Securit
 	}
 	return out
 }
+
+// SecurityStores is this node's own store encryption state, as
+// /api/security reports it.
+func (n *Node) SecurityStores() []SecurityStore {
+	if n.engine != nil {
+		st := SecurityStore{NodeID: int(n.ident.NodeID), Encrypted: n.engine.Encrypted()}
+		if st.Encrypted {
+			st.Reencryption = n.reencryptionStatus()
+			st.Authenticated = n.authenticatedEncryption()
+			st.Root = n.securityRoot()
+			km := enc.KeyMemory()
+			st.KeyMemory = &km
+			if st.Root != nil && st.Root.Kind == "shares" {
+				st.PeerUnseal = &SecurityPeerUnseal{Enabled: !n.peerUnseal.off.Load(), Granted: n.peerUnseal.granted.Load(), Refused: n.peerUnseal.refused.Load()}
+			}
+		}
+		return []SecurityStore{st}
+	}
+	return nil
+}
+
+// ClusterID is the id of the cluster this node belongs to.
+func (n *Node) ClusterID() uuid.UUID { return n.ident.ClusterID }

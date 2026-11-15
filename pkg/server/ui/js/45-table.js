@@ -80,7 +80,7 @@ function tableDDL(t) {
   }
   let sql = `CREATE TABLE ${name} (\n${parts.join(",\n")}\n)${opts};`;
   for (const i of t.indexes || []) {
-    sql += `\nCREATE ${i.unique ? "UNIQUE " : ""}INDEX ${quoteIdent(i.name)} ON ${name} (${(i.columns || []).map(quoteIdent).join(", ")});`;
+    sql += `\nCREATE ${i.unique ? "UNIQUE " : ""}INDEX ${quoteIdent(i.name)} ON ${name} ${i.method ? "USING " + i.method.toUpperCase() + " " : ""}(${(i.columns || []).map(quoteIdent).join(", ")});`;
   }
   if (t.comment) sql += `\nCOMMENT ON TABLE ${name} IS '${t.comment.replace(/'/g, "''")}';`;
   return sql;
@@ -202,7 +202,7 @@ function renderTableIndexes(t) {
     key: i.name,
     html: `<tr data-key="${esc(i.name)}">
       <td data-label="index"><b>${esc(i.name)}</b></td>
-      <td data-label="columns" class="key">${(i.columns || []).map(esc).join(", ")}</td>
+      <td data-label="columns" class="key">${(i.columns || []).map(esc).join(", ")}${i.method ? ` <span class="muted">(${esc(i.method)})</span>` : ""}</td>
       <td data-label="unique">${i.unique ? "unique" : "—"}</td>
       <td data-label="build state">${i.state === "write-only"
         ? tok("draining", "building")
@@ -333,7 +333,11 @@ function wireTableDetail() {
   const tbody = document.getElementById("schema");
   const nameOf = ev => { const tr = ev.target.closest("tr[data-table]"); return tr && tbody.contains(tr) ? tr.dataset.table : null; };
   tbody.addEventListener("click", ev => {
-    if (ev.target.closest("a, button")) return;
+    // The row stands down for a click on the name, which is a link and
+    // goes there itself, and for one the browser reads as "elsewhere"
+    // (issue #286): a new tab opened from the name must not also move
+    // this one.
+    if (ev.target.closest("a, button") || modifiedClick(ev)) return;
     const name = nameOf(ev);
     if (name) go("schema/" + encodeURIComponent(name));
   });

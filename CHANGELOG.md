@@ -11,6 +11,362 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Vector columns and nearest-neighbour search** (#304): `vector(n)` columns
+  compatible with pgvector (float4 elements, up to 16,000 dimensions; text
+  `'[1,2,3]'` and pgvector's binary format; a fixed type OID found through
+  `to_regtype('vector')` or `pg_type`, so pgvector clients' type registration
+  works; `CREATE EXTENSION vector` is accepted and does nothing). Distance
+  operators `<->` (L2), `<=>` (cosine) and `<#>` (negative inner product),
+  `l2_distance`, `cosine_distance`, `inner_product`, `l1_distance`,
+  `vector_dims`, `vector_norm`, `l2_normalize`, element-wise `+`/`-`.
+  `ORDER BY embedding <-> $1 LIMIT k` is exact without an index. `CREATE
+  INDEX ... USING ivfflat (col vector_l2_ops | vector_cosine_ops |
+  vector_ip_ops) WITH (lists = n)` adds an approximate index, built online and
+  tuned with `SET ivfflat.probes` (default √lists; recall@10 0.98 on a
+  synthetic clustered test set — real embeddings were not measured).
+  `vector_index_scan = off` forces exact answers. The index's centres are
+  trained once and never move: after much change, build a new index and drop
+  the old. HNSW is refused (`0A000`) rather than mapped to IVF. Vectors cannot
+  be primary keys or in a btree index. New bench workloads `vector-knn` and
+  `vector-knn-exact` record recall and build time. Cluster protocol version
+  v21. See docs/user/sql.md, "Vectors".
+- **Full-text search** (#299): the `TSVECTOR` and `TSQUERY` types and the `@@`
+  operator, with `to_tsvector`, `to_tsquery`, `plainto_tsquery`,
+  `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`,
+  `ts_headline`, `setweight`, `strip`, `numnode`, `tsvector_to_array` and
+  `tsvector || tsvector`. Queries support and, or, not, phrases (`<->`,
+  `<N>`), prefixes (`word:*`) and weights. Two configurations: `simple`, and
+  `english` with a Snowball stemmer and stop words, chosen by
+  `default_text_search_config`. A GIN index on a `TSVECTOR` column, or on
+  `to_tsvector('english', text_column)`, makes `@@` an index lookup (`EXPLAIN`
+  shows an `inverted scan`); every row it finds is rechecked, so a phrase's
+  word order and a weight are verified against the real document. Ranking is
+  computed on the matching rows: `ORDER BY ts_rank(...) LIMIT k` reads every
+  match. The tokenizer and stemmer are datax's own and differ from
+  PostgreSQL's in places (hyphenated words, URLs, some numbers; the stemmer was
+  not checked against PostgreSQL's): see docs/user/postgres-differences.md.
+  Columns of the new types and full-text indexes need cluster protocol
+  version v21. The bench suite gains a `text-search` workload, and
+  `bench/workloads-large.json` runs it over a million documents.
+- **Large objects** (#303): values too big to be a row value — files,
+  recordings, tens of megabytes to many gigabytes — are stored in 256 KiB
+  pages and written and read as a stream through PostgreSQL's large-object
+  functions (`lo_create`, `lo_open`, `lowrite`, `loread`, `lo_lseek64`,
+  `lo_truncate64`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`), from SQL
+  (pgx's `tx.LargeObjects()`) and through the fast-path function call (libpq's
+  `lo_*`, psql's `\lo_import` / `\lo_export`). An object created and written
+  inside one transaction block can be of any size up to 1 TiB, holds no lock
+  while it uploads, and appears whole at `COMMIT`; a rollback or a lost
+  connection leaves no object, and a sweeper removes its pages and those of
+  unlinked objects. Changes to an existing object are ordinary transactional
+  writes, at most 64 MiB per transaction. A three-node cluster writes a 512 MiB
+  object with under 100 MiB of memory growth across the whole process, where a
+  32 MiB `BYTEA` INSERT takes over a gigabyte (1 GiB was measured on one node
+  only). Full and incremental backups, sealed or not, carry large objects;
+  `restore --table` does not. Ordinary `BYTEA`/`TEXT`/`JSONB` values are still
+  stored whole: there is no out-of-line storage for column values. Stored in
+  three reserved tables (`datax_largeobject*`); cluster protocol version v21.
+  See the SQL guide's "Large objects".
+- **Row-level security** (#294): a table shared between tenants can confine a
+  role to its own rows. `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW
+  LEVEL SECURITY`; `CREATE POLICY p ON t [AS PERMISSIVE | RESTRICTIVE] [FOR ALL
+  | SELECT | INSERT | UPDATE | DELETE] [TO roles] [USING (expr)] [WITH CHECK
+  (expr)]`, `ALTER POLICY`, `DROP POLICY`; the `BYPASSRLS` role attribute.
+  PostgreSQL's rules: default deny, permissive policies OR-ed and restrictive
+  ones AND-ed, `42501` for a refused row. The policy is applied as a leading
+  WHERE condition on every read of the table — scans, every index, joins,
+  subqueries, aggregates, `ON CONFLICT`, `COPY`, `RETURNING`, locking reads,
+  prepared statements, `AS OF SYSTEM TIME` (filtered by today's policies) — and
+  bounds the scan, so a tenant-keyed policy reads one tenant's span. The owner
+  and admins are exempt unless `FORCE`; `root`, `BYPASSRLS` roles and the
+  node's own jobs always. Custom session settings (`SET app.tenant = ...`,
+  `current_setting`, `set_config`) name the tenant for a connection. A filtered
+  role is refused `TRUNCATE` and is shown no table statistics, no decoded range
+  boundaries in the console, and — like every non-admin now — no other role's
+  statement text in `SHOW SESSIONS` / `pg_stat_activity`. Foreign keys and
+  unique indexes still see the whole table, as in PostgreSQL. Not supported:
+  subqueries in a policy, security-invoker views. Behaviour follows
+  PostgreSQL's documented rules; it was not compared against a running
+  PostgreSQL. Cluster protocol version v21. See docs/user/security.md,
+  "Row-level security".
+- **Restore a table, or a database, into a running cluster** (#301): `datax
+  restore --table db.t [--into name]` and `--database db [--into name]` bring
+  tables back from a backup chain beside what is there; nothing else is
+  touched. A restored table takes a new table id and its rows are re-keyed to
+  it (indexes, GIN indexes included, come back as stored, no backfill).
+  Everything is checked before anything is written; rows load in ordinary
+  transactions under an id nothing names, are read back against the backup's
+  checksum, and one transaction makes the tables visible, complete. A failed
+  restore removes its rows; one whose node died is cleaned up by a janitor on
+  any node (`restore-reclaim` in the operations view) and is run again, not
+  resumed. A name that exists is refused — there is no replace flag; drop and
+  rename with SQL. A foreign key to a table outside the restore is refused
+  unless `--drop-foreign-keys`. Owned sequences come back as new sequences;
+  grants come back for roles the cluster has. Views, enum columns into another
+  database, and tables backed up mid-schema-change are refused. Cluster
+  protocol version v21. See docs/user/operations.md, "Restoring a table into
+  a running cluster".
+- **Point-in-time restore** (#302): `datax backup --base … --revision-history`
+  keeps every version written since the base, and `datax restore --as-of
+  <time>` (RFC 3339 or Unix nanoseconds, the timestamp `AS OF SYSTEM TIME`
+  takes) restores to any moment of such an interval, or to exactly the end of
+  any backup in a chain — everything into an empty cluster, or chosen tables
+  into a running one. Transactions are restored whole or not at all. A moment
+  before the full backup, after the last backup, or inside an interval taken
+  without history is refused with what the chain restores to. A history
+  incremental must be taken within the GC TTL of its base and is refused
+  otherwise; nothing holds garbage collection back for a chain. Table
+  definitions, roles and sequences are kept as of each backup's end: a table
+  created or altered inside the interval restored into is refused. A history
+  backup's manifest has a new magic (`DXBK2`), which earlier binaries refuse;
+  plain backups are unchanged. Taking one needs cluster protocol version v21.
+  Sealed chains work the same. Backup and restore summaries print the
+  backup's timestamp, and for a history backup the version count per table.
+- **GIN indexes on JSONB columns** (#300). `CREATE INDEX name ON t USING GIN
+  (doc)` builds an inverted index — one entry for every value in each
+  document with the path to it, and one for every top-level key — and
+  `doc @> '...'`, `doc ? 'k'`, `doc ?| '{a,b}'` and `doc ?& '{a,b}'` read it
+  instead of scanning the table (`EXPLAIN` shows an `inverted scan` and its
+  lookups). Results are those of the filter: every row the index finds is
+  checked against the whole `WHERE` clause. The index is built online,
+  maintained in the row's transaction (an `UPDATE` rewrites only the entries
+  of the values that changed), and follows the table through `TRUNCATE`,
+  re-sharding, backup and restore. One column, never `UNIQUE`;
+  `jsonb_path_ops` is accepted and builds the same index; a document with
+  more than 8,192 distinct values is refused (`54000`) on an indexed table.
+  `<@`, negations, extracted-value comparisons and containment under a `->`
+  path still filter. `SET inverted_index_scan = on | off | auto` overrides
+  the planner's choice. On 50,000 documents a containment matching 50 rows
+  takes 0.6 ms through the index against 240 ms as a filter (not measured at
+  a million documents). Cluster protocol version v21: `CREATE INDEX ...
+  USING GIN` is refused until the upgrade is finalized. `datax bench
+  jsonb-contain` measures both paths.
+- **A GC window per table** (#295). `CREATE TABLE … WITH (gc_ttl = '10m')` and
+  `ALTER TABLE … SET / RESET (gc_ttl)` give one table its own GC window,
+  shorter or longer than the node's 25h. It governs the ranges that hold only
+  that table (the statement splits the table's edges, and housekeeping asks
+  again if a range still straddles one); a range shared with other data keeps
+  the longest window of what it holds, so no other table's history changes.
+  A short window shortens `AS OF SYSTEM TIME`, follower reads, long
+  transactions and the age an incremental backup's base may have, for that
+  table: older reads fail with an error. Not per database. Cluster protocol
+  version v21.
+- **Purge** (#295). `ALTER TABLE t PURGE` and `datax debug purge` (a table or
+  a key range) collect deleted and superseded versions now instead of a GC
+  window later, truncate the raft log, compact the span on every replica,
+  retire the write-ahead logs written before it, and return what each replica
+  then holds, counted from the storage engine's keys. The result — complete
+  only when every replica answered with no superseded version, tombstone or
+  intent — is written whole to the audit log; an incomplete purge says which
+  replica and why, and can be run again. Readers older than the purge are
+  refused on that span, never answered short. A replica that was down applies
+  the purge when it rejoins and serves no follower read until it has heard
+  from its range's leader again; one that is partitioned but still running is
+  not covered until it reconnects. Backups taken earlier still hold the data.
+  Cluster protocol version v21.
+- **Row expiry on ordinary tables** (#298). `WITH (ttl_expiration = col)`, or
+  `WITH (ttl_column = col, ttl = '7 days')`, on any table that is not a
+  time-series one; `ALTER TABLE … SET / RESET` on a table with data. One
+  background job for the cluster deletes expired rows in batches with ordinary
+  `DELETE`s, so secondary indexes, `ON DELETE CASCADE` and restricting foreign
+  keys behave as for any delete (a row still referenced is skipped, counted and
+  retried). An expired row is visible until the job deletes it, normally
+  within 30 seconds. The option creates an index on the column if none leads
+  with it. `ttl` without a column is refused: a lifetime is counted from a
+  timestamp column you name. Metrics `datax_row_ttl_rows_deleted_total`,
+  `datax_row_ttl_rows_blocked_total`, `datax_row_ttl_lag_seconds`; passes
+  appear in the operations view. Cluster protocol version v21.
+- **An audit table** (#293). Audit records are now also kept in the cluster,
+  in the `datax_audit` system table, once v21 is finalized: readable with SQL
+  by admins and by roles granted `SELECT` on it (not `read_all`), and not
+  changeable through SQL by any role, `root` included — only
+  `ALTER TABLE datax_audit SET (retention = ...)` (admins, at least a day;
+  default 90 days) is accepted. Each node's records form a hash chain;
+  `datax debug audit export | heads | verify` exports them as JSON lines and
+  verifies them outside the cluster, detecting removed, altered and reordered
+  records, and — against heads saved earlier — a chain rewritten underneath
+  SQL. Recording never delays or fails the audited action: events are
+  buffered in memory and written about once a second, a node without quorum
+  writes them when it can, and what a full buffer drops is counted
+  (`datax_audit_dropped_total`) and recorded as an `audit-gap`; the log lines
+  remain. Offline commands (which run with no cluster) stay log-only, and a
+  node that is killed loses what it had buffered. `/api/security` reports
+  each node's chain head. New flag `--audit-table=false`.
+  Cluster protocol version: v21.
+- **Roots in a key management service** (#308): `--enc-root` takes
+  `vault:<address>/<mount>/<key>` (HashiCorp Vault Transit),
+  `awskms:<key arn>`, `gcpkms:projects/…/cryptoKeys/<key>` and
+  `azurekv:<vault>/<key>[/<version>]`. Wrapping the store key is a call
+  to the service, whose key never reaches datax; no helper process and
+  no cloud SDK (standard library only). Options follow the key as
+  `?name=value&name=value`; credentials are never options (token file,
+  environment, instance identity). Requests have a timeout and bounded
+  retries with backoff; a node cannot start while its KMS is
+  unreachable and says which service, key and why; a running node is
+  unaffected. Each wrapped store key is bound to its cluster and node
+  (encryption context / associated data, and a digest inside the
+  ciphertext), so one node's is refused as another's; a new node's key
+  is bound once it has an id. The root's health is checked every minute
+  and shown in `/api/security` (`root.healthy`, `root.health_error`,
+  `root.bound`, `root.latest_key_id`), the console's security view, the
+  health document (`enc-root-unreachable`) and the gauge
+  `datax_enc_root_healthy`. The key id carries the service's key
+  version; after the service rotates its key,
+  `datax debug enc-root rewrap` moves a node to it. **Tested against
+  fakes of each API, not against the services themselves.** PKCS#11 is
+  not spoken: an HSM is reached through `exec`. See docs/encryption.md,
+  "A root in a key management service".
+- **`LISTEN` / `NOTIFY`** (#297). `LISTEN channel`, `UNLISTEN channel | *`,
+  `NOTIFY channel [, 'payload']` and `pg_notify(channel, payload)`, delivered
+  to listening sessions on every node of the cluster and pushed to an idle
+  connection, so pgx's `WaitForNotification` and other drivers' listeners
+  work as they do against PostgreSQL. The semantics are PostgreSQL's: a
+  `NOTIFY` in a transaction is delivered if and when it commits (`ROLLBACK`
+  and `ROLLBACK TO SAVEPOINT` discard it), identical notifications in one
+  transaction collapse, `LISTEN` takes effect at commit, a session hears
+  itself, channels belong to a database, a payload is under 8000 bytes
+  (`22023`), and there are no privileges on channels. Nothing is stored: a
+  notification goes to the sessions listening when it commits, at most once.
+  A session that stays connected receives every one or is disconnected — with
+  FATAL `54000` if it let 16 MiB pile up unread, or `57P01` if another node
+  had to drop what it could not deliver to this one (it keeps 64 MiB per
+  unreachable node for up to five minutes, and delivers late otherwise). The
+  exception is a node that crashes between a commit and handing the
+  notification to its peers. Notifications from one node arrive in its commit
+  order; those from different nodes are not ordered against each other.
+  `pg_notify` runs once per statement and its arguments cannot name columns.
+  No cluster version change: a node on an older release is skipped by the
+  fan-out and cannot serve `LISTEN`.
+- **`SELECT ... FOR UPDATE SKIP LOCKED` and `NOWAIT`** (#296). `SKIP
+  LOCKED` leaves out rows another transaction holds — or changed and
+  committed since this transaction's snapshot — and locks the rest;
+  `LIMIT n` counts the rows returned, so `SELECT id FROM jobs ORDER BY
+  id LIMIT 1 FOR UPDATE SKIP LOCKED` is a job queue whose workers do not
+  wait on each other. Skipped rows are not reads of the transaction and
+  cannot fail it with `40001` later (on a primary-key scan; a queue
+  ordered by a secondary index can still see one). `NOWAIT` fails at
+  once with `55P03`. Neither aborts a lock holder. Adds a read-only
+  `skip_locked` field to Get and Scan; no cluster version change (an
+  older node ignores it and the read waits as before).
+- **Sealed backups** (#291). `datax backup --backup-key <file>` seals every
+  file of a backup — the manifest included — with AES-256-GCM under a key
+  given at backup time (32 raw bytes or 64 hex characters), and
+  `datax restore --backup-key` reads it. Each backup has its own random data
+  key, wrapped under the backup key; each file is sealed in 64 KiB chunks
+  under a key derived from the data key and the file's name, with the name,
+  each chunk's position and the end of the file authenticated, so a changed
+  byte, a truncated file, swapped files or another backup's manifest are
+  refused before restore applies anything. A sealed backup is never read
+  without its key and a plaintext backup is refused when a key is given.
+  Chains may mix keys: restore takes one key for the chain or a
+  comma-separated list matching `--src` (an empty entry for a plaintext
+  backup); `--base-key` opens a base sealed under a different key. On an
+  encrypted store `--backup-key` satisfies the plaintext gate;
+  `--allow-plaintext` remains the explicit way to write an unsealed backup,
+  and the two together are refused. The key is sent in the admin request:
+  over mutual TLS, or on an insecure node only from the node's own machine;
+  it is never logged or audited. Summary checksums are over the plaintext
+  and match an unsealed backup of the same data. Still visible in a sealed
+  directory: table count, table ids, file sizes. Backup keys are key files
+  only (no `--enc-root`/KMS yet).
+- **A manual split sticks** (#265). A range boundary made on purpose —
+  `ALTER TABLE ... SPLIT AT`, `datax debug split` — was folded back by
+  housekeeping within seconds whenever the two halves were small, which
+  the halves of a pre-split always are. Such a boundary is now marked
+  on its range (a sticky bit on the descriptor, replicated like the rest
+  of it) and the merge queue leaves it alone. `SPLIT AT ... WITH
+  EXPIRATION <timestamp or interval>` holds it only until then;
+  `ALTER TABLE ... UNSPLIT AT VALUES (...)`, `UNSPLIT ALL` and `datax
+  debug unsplit` release it, after which the ranges merge when they are
+  small, and `DROP TABLE` and `TRUNCATE` release a table's boundaries
+  with it. Splitting at a boundary that exists marks it. Splits the
+  cluster makes for itself — by size, by load, and the pre-splits of
+  timeseries tables, re-shards, placement and restore — are not sticky
+  and merge back as before; `datax debug merge` merges a range whether
+  or not its neighbor is sticky. `datax debug ranges`, `/api/cluster`
+  and `/api/range` show the mark.
+  Cluster protocol version: v20. Until it is finalized a manual split
+  is an ordinary one and `UNSPLIT` and `WITH EXPIRATION` are refused;
+  boundaries made before finalize are marked by running the `SPLIT AT`
+  again.
+- **bench: errors during a measured run fail the run** (#267). `datax
+  bench run` runs every workload of the set, then exits non-zero if any
+  did not complete or counted more errors than `--max-errors` (default
+  0; `-1` disables; a workload's `"max_errors"` in the set takes
+  precedence), naming each failing workload with its error count and
+  most frequent error. The single-workload commands take the same flag.
+  Serialization retries (40001) are not errors. `bench/run.sh` runs both
+  targets before failing, and the nightly is red on that status; its
+  summary and artifact are produced on red nights too.
+- **A root key split among operators, and a sealed start** (#306, the
+  second piece of #292). `datax debug enc-root split --shares 2/3`
+  makes a root key, hands out three shares of which any two rebuild it
+  (Shamir's scheme, standard library only), and keeps nothing. A node
+  started with `--enc-root shares` starts **sealed**: it listens on its
+  RPC address but its store, SQL port and console stay closed — to the
+  cluster it is down — until enough share-holders have each run `datax
+  unseal --addr <node>` and typed a share, which is asked for without
+  echo and is never a flag. `datax debug seal-status` shows how many
+  shares are in and whose. A mistyped share, a repeated one, a share of
+  another cluster's key or of another split is refused as it arrives,
+  and a set that does not rebuild the key it names never opens
+  anything. Only the root user's certificate may unseal (a sealed node
+  cannot read its roles); without TLS, only the node's own machine.
+  `enc-root resplit` makes a new split of the same key; to replace the
+  root key itself, the new key's shares are submitted to the running
+  nodes and each store key is rewrapped under it. Shares and root keys
+  are never written to disk, logged, or put in an event.
+- **Peer unseal: a restarting node gets the root key from the running
+  cluster** (#307). Under a root key held as shares, a sealed node asks
+  its peers before waiting for people, so a rolling restart needs no
+  operator and a cold start needs share-holders for one node only. A
+  node hands the key over only to the cluster's node certificate, for
+  this cluster and its own root key, for a member that is not being
+  decommissioned and is not live (a second copy of a running node gets
+  nothing); the key crosses sealed under a key agreed for the one
+  exchange. Every request is audited and counted, granted or refused.
+  `datax debug peer-unseal --off` makes every start need shares. With it
+  on, whoever holds a node's certificate key and can reach the cluster
+  while that node is down is a node; the documentation says what that
+  means for where the node key is kept.
+- **Keys are held in locked memory, and an encrypted node cannot be
+  core-dumped** (#309). The store key, the registry's data keys and
+  root keys live in memory that is `mlock`ed and marked
+  `MADV_DONTDUMP` on Linux and zeroed on release, instead of on the
+  heap. A node started with `--enc-key` or `--enc-root` sets its
+  core-file limit to zero and marks itself not dumpable
+  (`--allow-core-dumps` undoes that for debugging). A memory-lock limit
+  too low to lock 16 KiB is a start-up warning with the remedy, or a
+  refusal with `--require-locked-keys`; `/api/security` and the
+  console's security view report the state. A cipher's expanded key and
+  copies on a stack are not covered, and the documentation says so.
+- **Console: rows that open are real links, cards sort on a phone, and
+  time axes tick at round moments** (#286, #289). A table's name in the
+  schema list and a range's id in the ranges table are anchors, so
+  ctrl-, cmd- and middle-click open a new tab and the address can be
+  copied; the row is still the single tab stop. On a narrow screen the
+  nodes, failure domains and schema cards have a "sort by" list and a
+  direction button sharing the header's sort state. A chart's time axis
+  is labelled at multiples of a round step on the reader's clock, three
+  to seven ticks. A heading that holds a filter or "copy as CSV" is
+  underlined under its words only.
+- **A store key can be kept under a root instead of in a file** (#305,
+  the first piece of #292). `--enc-root file:<path>` or `--enc-root
+  exec:<command>` is the alternative to `--enc-key`: the node makes its
+  own store key and the data directory holds it only wrapped — by a
+  wrapping key kept elsewhere, or by a command the operator supplies
+  that talks to a TPM, a cloud KMS's CLI or an HSM tool. A store key is
+  then in the clear only in the node's memory. Rotation under a root
+  involves no key file and no key in transit: the node makes the new
+  key, the root wraps it, and the request carries only the operation's
+  name. `datax debug enc-root` re-wraps a key (after the root's own key
+  rotates, or to move to another root), adopts a root on a key-file
+  store, releases one, and reports what wrapped a store's key; the
+  console's security view says where each store's key lives. A root
+  that fails, hangs, or hands the key back unwrapped is refused before
+  anything is written; a crash at any point of a rotation leaves a
+  store that opens; and no request can name a command for a node to
+  run. `--enc-key` is unchanged.
 - **Tables sort from their headers, and the data view has one table of
   ranges** (#282, #283). The nodes, failure domains, schema and ranges
   tables sort by a column from a small arrow beside the header's words
@@ -631,6 +987,40 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
+  first `n` (plus `OFFSET`) rows in a heap instead of sorting every row, so it
+  runs in bounded memory; `EXPLAIN` shows `top-k heap` (#304).
+- Floating-point comparison is a total order, as in PostgreSQL: `NaN` equals
+  `NaN` and sorts after every number. Before, a sort containing `NaN` had no
+  consistent order (#304).
+- A statement that writes more than 60 MiB to one range in a single piece (a
+  huge row) is refused with `54000`. Before, a write of 64 MiB failed with
+  `XX000` and left the range's leadership churning around an entry no follower
+  could receive (#303).
+- **The catalog's costs follow what is used, not every table in the
+  cluster** (#311). Listing one database's tables (`SHOW TABLES`, `DROP
+  DATABASE`, `GRANT ... ON ALL TABLES`, the `pg_catalog` views) reads that
+  database's names and descriptors instead of scanning every descriptor:
+  102 rows at 1,000 tables and at 5,000, where it was 1,005 and 5,005.
+  The console's schema document is built when requested, cached for five
+  seconds and shared by concurrent requests, rather than rebuilt on a
+  timer on every node; a build is seven KV requests whatever the table
+  count. Range labels, placement, index-usage names and the table gauges
+  no longer depend on it. A gateway's descriptor cache holds at most
+  1,024 descriptors (`DescCacheSize`) and gives up the lease of a table
+  unused for three lease periods, so a schema change on an idle table
+  waits for nothing; a table resolved while the cache is full is read
+  from the catalog by each statement. `datax_table_rows`,
+  `datax_table_ranges` and `datax_table_stats_age_seconds` are now read
+  when `/metrics` is scraped. `information_schema.tables`, `.columns`
+  and `.views`, role DDL and the per-table gauges still read every
+  descriptor. Measured at 1,000 and 5,000 tables, not beyond. No cluster
+  version change.
+- A restarted node serves no follower reads from a range until that range's
+  closed timestamp has passed the node's start time (a few seconds on a
+  healthy cluster; not at all while the range has no leader). Before, it
+  served from the closed timestamp it had persisted, which could predate a
+  purge it had missed (#295).
 - **The console, tidied** (#278, #279, #280, #281). A pass over what a
   person reads and reaches for, none of it new capability.
   - *The event timeline.* A split or merge names its keys the way the
@@ -753,6 +1143,79 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **Online `CREATE INDEX` could keep entries for rows that changed while it
+  was waiting for every gateway to adopt the index** (found while building
+  #299). One gateway that had adopted the index wrote a row's entries,
+  another that had not yet changed or deleted the row, and the entries
+  stayed: queries through the index then reported "index entry points at a
+  missing row" or returned a row under a value it no longer held. The build
+  now empties the index after the wait and before its backfill, which
+  rewrites every row's entries. A build of a heavily written table does one
+  more pass over the new index.
+- A store on the balanced profile could sit at its L0 backpressure gate
+  indefinitely after a long run of writes in key order: non-overlapping L0
+  files never triggered a compaction below the gate's file count (#303).
+- A transaction that made its first write more than five seconds after `BEGIN`
+  could be aborted by any transaction that met its row during the following
+  second: its record was created with a stale heartbeat (#303).
+- A gateway renewing its lease on a table that had been renamed could
+  delete the lease it already held on the same table under its new name,
+  leaving a cached descriptor no schema change waited for until the next
+  renewal (#311).
+- **A write in flight across a planned lease transfer is answered with
+  its outcome** (#271). When the balancer shed a lease, writes proposed
+  just before the hand-over were told at once "leadership lost with
+  proposal in flight" — an unknown outcome, which a one-phase commit
+  cannot resend, so a client occasionally saw `XX000`. For a transfer
+  the replica itself asked for, those entries are in the new leader's
+  log (raft hands over only to a follower holding the whole log), so
+  their proposers now wait for the entries' own apply, bounded at two
+  seconds. An unplanned loss of leadership is answered at once, as
+  before.
+- **A merge freeze left behind by an attempt that died no longer keeps
+  the range out of service** (#266). A range frozen for a merge by an
+  attempt that crashed, lost its leader or ended with its proposal's
+  fate unknown stayed frozen for as long as a later pass could not
+  finish the merge — with a replica behind, indefinitely. Such a freeze
+  is now unwound safely: the left-hand range's generation is moved on
+  first, which rules out that attempt's merge on every replica (a merge
+  applies only at the generation it was built from, and a freeze now
+  names the generation it was made for), and then the freeze is
+  cleared. The range serves again and the merge is retried afresh;
+  `datax_range_merges_unwound_total` counts these. One merge driver
+  runs at a time per range on a node, and an attempt giving up on its
+  own freeze can no longer clear one a later attempt made. Needs
+  cluster version v20.
+- **A replica change that lands on a range frozen for a merge is
+  refused** (#268). The change is checked before it is proposed, but a
+  merge's freeze could apply in between, and a freeze moves no
+  generation, so the change applied anyway. A removal applied that way
+  let a node drop its replica of the frozen range while keeping the
+  range it was merging into, and the merge's apply there then stopped
+  the node ("local RHS replica missing"). The change is now refused at
+  apply, on every replica at the same entry, and the proposer retries.
+- **`ALTER TABLE ... SPLIT AT` no longer fails because the range
+  changed first** (#290). A split is built from the range's descriptor
+  and applied a moment later; when another split or a merge landed in
+  between, the statement failed with "split against generation 0 but
+  range is at 1". The range's leader now looks at the range again and
+  carries on — splits it, finds the boundary already there, or sends
+  the request on to the range that holds the key now — for every caller
+  of a split, not only SQL. The refusal is a typed error
+  (`DescriptorChangedError`) instead of a message to match, a split
+  that meets a range frozen for a merge waits the merge out like any
+  other request, and the frozen mark now survives the trip between
+  nodes: it was missing from the binary error encoding, so a gateway on
+  another node than the range's leader re-resolved the range instead of
+  waiting. A split at a key that is already a range boundary is success
+  rather than an error.
+- **A re-encryption pass reports the bytes its seed's compaction
+  rewrote** (#287). Flushing a pass's seed can set off an automatic
+  compaction that retires the stale file before the pass's own
+  compaction runs; the pass then reported zero bytes, which the sweep
+  reads as "nothing left that a compaction can rewrite" and could stop
+  early. The pass now measures from before the seed is written. This
+  was the cause of the flaky `TestReencryptPass`.
 - **Clicking a term in the console explains it again.** A column
   header, a section heading, a tile's label and the header's controls
   each open the glossary's entry for the term when clicked, and carry it

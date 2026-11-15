@@ -19,6 +19,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/util/stop"
 )
@@ -111,6 +112,11 @@ type ServerOptions struct {
 	// carries one to the node a process ID names (nil: local only).
 	NodeID  int32
 	Forward func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error)
+	// Notify is the node's LISTEN / NOTIFY hub, which carries
+	// notifications between this server's sessions and to and from the
+	// other nodes (nil: a hub of this server's own, reaching no other
+	// node).
+	Notify *notify.Hub
 }
 
 // Server accepts SQL client connections.
@@ -140,6 +146,9 @@ func (s *Server) Activity() *Activity { return s.act }
 
 // Serve starts accepting connections on lis (returns immediately).
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
+	if opts.Notify == nil {
+		opts.Notify = notify.NewHub(stopper.Ctx(), notify.Config{NodeID: opts.NodeID})
+	}
 	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold), cancel: newCancelRegistry()}
 	stopper.AddCloser(func() { _ = lis.Close() })
 	go s.acceptLoop()

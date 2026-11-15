@@ -64,6 +64,11 @@ function routeTo(path, params) {
   return "#/" + path + (q ? "?" + q : "");
 }
 function go(path, params) { location.hash = routeTo(path, params); }
+// modifiedClick reports a click the browser means for somewhere other
+// than this tab — a new tab, a new window — or one that is not the
+// primary button. A row that opens on click leaves those to the link
+// inside it (issue #286).
+function modifiedClick(ev) { return ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button !== 0; }
 // rangeRoute is the link that opens one range's detail in the data view.
 // The range rides as r=, a name of its own: "range" is the time window,
 // and while the two shared it a link built by routeTo lost its range

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -77,7 +78,20 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		out.Sub, out.Lit = nil, &d
 	}
+	if callAs, ok := builtins.TextSearchDefaultArg(e.Func, len(e.Args)); ok {
+		// A text-search call that names no configuration gets the
+		// session's default as its first argument, once, here: the
+		// function itself is then a pure function of its arguments, and
+		// the planner sees the same to_tsvector('english', col) whether
+		// or not the statement spelled the configuration out.
+		d := types.NewString(s.textSearchConfig())
+		out.Func = callAs
+		out.Args = append([]parser.Expr{{Lit: &d}}, e.Args...)
+	}
 	switch e.Func {
+	case "get_current_ts_config":
+		d := types.NewString(s.textSearchConfig())
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "now", "current_timestamp", "localtimestamp", "statement_timestamp", "transaction_timestamp":
 		d := types.NewTimestamp(s.statementTime())
 		out.Func, out.Args, out.Lit = "", nil, &d
@@ -131,6 +145,37 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			return e, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", nameArg.Text())
 		}
 		out.Func, out.Args, out.Lit = "", nil, &d
+	case "set_config":
+		// set_config(name, value, is_local): SET as a function, so the
+		// value can be bound as a parameter — what a connection pool does
+		// to name the tenant a request runs for. Returns the value.
+		if len(e.Args) != 3 {
+			return e, newErrf(CodeSyntaxError, "set_config() takes a name, a value and is_local")
+		}
+		var vals [3]types.Datum
+		for i := range vals {
+			d, err := evalExpr(e.Args[i], nil, nil, params)
+			if err != nil {
+				return e, err
+			}
+			vals[i] = d
+		}
+		if vals[0].Null {
+			return e, newErrf(CodeInvalidParameterValue, "set_config: the setting's name is NULL")
+		}
+		value := ""
+		if !vals[1].Null {
+			value = vals[1].Text()
+		}
+		local, cerr := vals[2].Coerce(types.Bool)
+		if cerr != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "set_config: is_local: %v", cerr)
+		}
+		if _, serr := s.execSetVar(ctx, &parser.SetVar{Name: vals[0].Text(), Value: value, Local: !local.Null && local.B}); serr != nil {
+			return e, serr
+		}
+		d := types.NewString(value)
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_sleep":
 		// pg_sleep(seconds): waits, honoring cancellation and the
 		// statement timeout.
@@ -149,6 +194,34 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		case <-ctx.Done():
 			return e, ctx.Err()
 		case <-time.After(time.Duration(secs.F * float64(time.Second))):
+		}
+		d := types.NewString("")
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_notify":
+		// pg_notify(channel, payload): NOTIFY as a function, so both can
+		// be computed or bound. Like every function resolved here it runs
+		// once per statement, not once per row, and its arguments cannot
+		// name columns.
+		if len(e.Args) != 2 {
+			return e, newErrf(CodeSyntaxError, "pg_notify() takes a channel and a payload")
+		}
+		channel, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		payload, err := evalExpr(e.Args[1], nil, nil, params)
+		if err != nil {
+			return e, err
+		}
+		var ch, pl string
+		if !channel.Null {
+			ch = channel.Text()
+		}
+		if !payload.Null {
+			pl = payload.Text()
+		}
+		if serr := s.queueNotify(ch, pl); serr != nil {
+			return e, serr
 		}
 		d := types.NewString("")
 		out.Func, out.Args, out.Lit = "", nil, &d
@@ -925,12 +998,16 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
-	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
+	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
-	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
+	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
+	// The text-search functions take the session's default
+	// configuration when the call names none.
+	"to_tsvector": true, "to_tsquery": true, "plainto_tsquery": true, "phraseto_tsquery": true, "websearch_to_tsquery": true,
+	"ts_headline": true, "get_current_ts_config": true,
 }
 
 // regclassOID resolves a regclass literal: a number is the OID itself,

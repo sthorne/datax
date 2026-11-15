@@ -35,11 +35,13 @@ type ReplicaDetail struct {
 
 // RangeDetail is the /api/range document.
 type RangeDetail struct {
-	RangeID    int64           `json:"range_id"`
-	StartKey   string          `json:"start_key"`
-	EndKey     string          `json:"end_key"`
-	Generation int64           `json:"generation"`
-	Replicas   []ReplicaDetail `json:"replicas"`
+	RangeID    int64  `json:"range_id"`
+	StartKey   string `json:"start_key"`
+	EndKey     string `json:"end_key"`
+	Generation int64  `json:"generation"`
+	// StickyUntil: see ClusterRange.StickyUntil.
+	StickyUntil int64           `json:"sticky_until,omitempty"`
+	Replicas    []ReplicaDetail `json:"replicas"`
 }
 
 func (n *Node) serveRangeAPI(w http.ResponseWriter, req *http.Request) {
@@ -54,10 +56,11 @@ func (n *Node) serveRangeAPI(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	doc := RangeDetail{
-		RangeID:    int64(desc.RangeID),
-		StartKey:   n.prettyKey(desc.StartKey),
-		EndKey:     n.prettyKey(desc.EndKey),
-		Generation: desc.Generation,
+		RangeID:     int64(desc.RangeID),
+		StartKey:    n.prettyKey(desc.StartKey),
+		EndKey:      n.prettyKey(desc.EndKey),
+		Generation:  desc.Generation,
+		StickyUntil: desc.StickyUntil,
 	}
 
 	now := n.clock.Now().WallTime

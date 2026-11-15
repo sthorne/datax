@@ -219,6 +219,15 @@ type Store struct {
 	senderMu sync.Mutex
 	sender   Sender
 
+	// purgeMu serializes a purge's per-replica step and its log scrub
+	// (purge.go): both flush and roll logs, and two at once would only
+	// wait on each other's flushes.
+	purgeMu sync.Mutex
+
+	// startedAt is the clock's reading when this process opened the
+	// store; see Replica.heardSinceStart.
+	startedAt hlc.Timestamp
+
 	mu struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
@@ -270,6 +279,9 @@ func NewStore(cfg StoreConfig) *Store {
 		cfg.SplitSizeThreshold = 64 << 20
 	}
 	s := &Store{cfg: cfg}
+	if cfg.Clock != nil {
+		s.startedAt = cfg.Clock.Now()
+	}
 	s.mu.replicas = make(map[base.RangeID]*Replica)
 	s.sched = newRaftScheduler(s, cfg.RaftWorkers)
 	s.hbq.beats = make(map[base.NodeID][]RaftHeartbeat)

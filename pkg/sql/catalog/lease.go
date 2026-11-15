@@ -57,6 +57,172 @@ import (
 // transaction, so a schema change committing after that read fails the
 // transaction's refresh.
 
+// Eviction (issue #311). A gateway holds a lease, and renews it every
+// TTL/3, for each descriptor in its cache; left alone, the cache and the
+// renewal traffic grow with every table the gateway has ever resolved.
+// Two rules bound both.
+//
+// An entry no statement has used for idleLeasePeriods lease periods is
+// dropped by the renewal loop, and its lease record deleted rather than
+// renewed. That is safe because of what "unused" means here: lastUsed
+// moves whenever the entry is handed to a statement, a hand-out carries a
+// deadline of at most one TTL, and so every deadline taken under the
+// entry or its predecessors passed long ago (the loop checks outstanding
+// rather than trust the arithmetic). With no statement left that could
+// commit under the lease, deleting the record tells a drain the truth —
+// this gateway is not using the descriptor — and a schema change on an
+// idle table waits for nothing, where a record merely left to lapse would
+// have held it up for the rest of a TTL. The next use is an ordinary
+// first use: the descriptor is read and the lease taken in one
+// transaction, so it is the current version.
+//
+// The delete is conditional on the record still being the evicted
+// entry's (releaseLease). A lookup may take a fresh lease on the same
+// descriptor between the entry leaving the cache and the delete running;
+// deleting that record would leave a cached descriptor no drain waits
+// for, which is the failure leases exist to prevent.
+//
+// And the cache holds at most maxEntries descriptors. A lookup that finds
+// it full neither caches nor leases: the statement plans against the
+// descriptor its own transaction read, the path a failed acquisition has
+// always taken, at the price of two point reads per statement until idle
+// entries make room. Nothing in use is ever pushed out to admit a
+// newcomer, because an entry in use is the record of deadlines a drain
+// must still wait for.
+
+// DefaultDescCacheSize is how many descriptors a leasing gateway caches,
+// and so the most leases it renews: at the default TTL, about three
+// hundred lease writes a second when full.
+const DefaultDescCacheSize = 1024
+
+// idleLeasePeriods is how many lease TTLs an entry may go unused before
+// the renewal loop evicts it.
+const idleLeasePeriods = 3
+
+// SetCacheLimits overrides the cache bound and the idle time after which
+// an unused entry is evicted (zero keeps the default for either). Call
+// before serving sessions.
+func (a *Accessor) SetCacheLimits(maxEntries int, idleAfter time.Duration) {
+	a.mu.Lock()
+	a.maxEntries, a.idleAfter = maxEntries, idleAfter
+	a.mu.Unlock()
+}
+
+func (a *Accessor) maxEntriesLocked() int {
+	if a.maxEntries > 0 {
+		return a.maxEntries
+	}
+	return DefaultDescCacheSize
+}
+
+// reserveSlot claims room in the cache for key before its lease is
+// taken. An entry already there (expired, about to be replaced) needs
+// none; otherwise the slot is counted until install or releaseSlot, so
+// that lookups racing for the last slots cannot together exceed the
+// bound. ok is false when the cache is full.
+func (a *Accessor) reserveSlot(key string) (reserved, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, present := a.cache[key]; present {
+		return false, true
+	}
+	if len(a.cache)+a.acquiring >= a.maxEntriesLocked() {
+		return false, false
+	}
+	a.acquiring++
+	return true, true
+}
+
+func (a *Accessor) releaseSlot(reserved bool) {
+	if !reserved {
+		return
+	}
+	a.mu.Lock()
+	a.acquiring--
+	a.mu.Unlock()
+}
+
+// install puts a leased entry in the cache, consuming the reservation if
+// there was one. It reports false, caching nothing, only when the lookup
+// had counted on replacing an entry that has since gone and the cache
+// has no room left.
+func (a *Accessor) install(key string, entry *cachedDesc, reserved bool) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if reserved {
+		a.acquiring--
+	} else if _, present := a.cache[key]; !present && len(a.cache)+a.acquiring >= a.maxEntriesLocked() {
+		return false
+	}
+	a.cache[key] = entry
+	return true
+}
+
+// evictIdle removes the entries no statement has used for the idle time
+// and returns them, for their leases to be released.
+func (a *Accessor) evictIdle() []*cachedDesc {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	idle := a.idleAfter
+	if idle <= 0 {
+		idle = idleLeasePeriods * a.ttl
+	}
+	now := a.nowWallLocked()
+	var out []*cachedDesc
+	for key, c := range a.cache {
+		if now-c.lastUsed < idle.Nanoseconds() || c.outstanding(now) {
+			continue
+		}
+		delete(a.cache, key)
+		out = append(out, c)
+	}
+	return out
+}
+
+// testingBeforeLeaseRelease, when set, runs after an entry has left the
+// cache and before its lease record is released: where a test parks an
+// eviction while the table is used again or its schema changed.
+var testingBeforeLeaseRelease atomic.Pointer[func(a *Accessor, descID uint64)]
+
+// SetTestingBeforeLeaseRelease installs (or, with nil, removes) the hook.
+func SetTestingBeforeLeaseRelease(f func(a *Accessor, descID uint64)) {
+	if f == nil {
+		testingBeforeLeaseRelease.Store(nil)
+		return
+	}
+	testingBeforeLeaseRelease.Store(&f)
+}
+
+// releaseLease deletes this gateway's lease record on a descriptor,
+// provided the record is still the one carrying expiration — the lease of
+// the entry being given up, and not one taken since. Read and delete are
+// one transaction, so an acquisition that commits in between fails the
+// read's validation and the retry finds a record that is no longer ours
+// to delete. (Two leases of one gateway on one descriptor cannot share an
+// expiration: each is the HLC's reading inside its own transaction plus
+// the TTL.) A failure leaves the record to lapse at its expiration, which
+// is all a drain ever waits for.
+func (a *Accessor) releaseLease(ctx context.Context, descID uint64, expiration int64) {
+	if hook := testingBeforeLeaseRelease.Load(); hook != nil {
+		(*hook)(a, descID)
+	}
+	key := keys.DescLeaseKey(descID, a.gateway)
+	err := a.db.RunTxn(ctx, "lease-release", func(ctx context.Context, txn *kvclient.Txn) error {
+		raw, err := txn.Get(ctx, key)
+		if err != nil || raw == nil {
+			return err
+		}
+		var l descLease
+		if json.Unmarshal(raw, &l) != nil || l.Expiration != expiration {
+			return nil
+		}
+		return txn.Delete(ctx, key)
+	})
+	if err != nil {
+		log.Debugf("releasing the lease on descriptor %d: %v", descID, err)
+	}
+}
+
 // DefaultDescLeaseTTL is how long a gateway's descriptor lease (and cache
 // entry) lives without renewal.
 const DefaultDescLeaseTTL = 10 * time.Second
@@ -86,6 +252,21 @@ func (a *Accessor) TestingPauseRenewal(paused bool) { a.renewalPaused.Store(paus
 // a tick — so a test can put a renewal exactly where it wants one
 // (issue #234). Errors are returned rather than logged.
 func (a *Accessor) TestingRenewNow(ctx context.Context) error { return a.renewAll(ctx) }
+
+// TestingGatewayID is the identity this accessor's lease records are
+// keyed by (keys.DescLeaseKey).
+func (a *Accessor) TestingGatewayID() uuid.UUID {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.gateway
+}
+
+// TestingCacheSize is the number of descriptors this accessor caches.
+func (a *Accessor) TestingCacheSize() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.cache)
+}
 
 // StartLeasing enables leasing on this accessor and starts the renewal
 // loop. Call once, before serving sessions. ttl <= 0 uses the default.
@@ -121,10 +302,15 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 	}
 }
 
-// renewAll renews this gateway's lease on every cached table, adopting
-// any new version; the first error is returned after every table has
-// been tried.
+// renewAll gives up the leases of the tables no statement has used
+// lately (see "Eviction" above) and renews this gateway's lease on every
+// other cached table, adopting any new version; the first error is
+// returned after every table has been tried.
 func (a *Accessor) renewAll(ctx context.Context) error {
+	for _, c := range a.evictIdle() {
+		a.releaseLease(ctx, c.desc.ID, c.expiration)
+	}
+	a.pruneStats()
 	a.mu.Lock()
 	names := make([]string, 0, len(a.cache))
 	for name := range a.cache {
@@ -156,13 +342,32 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		delete(a.cache, name)
 		a.mu.Unlock()
 		if had {
-			_ = a.db.Delete(ctx, keys.DescLeaseKey(old.desc.ID, a.gateway))
+			// Only if the record is still this entry's: after a rename
+			// the same descriptor may already be cached, and leased,
+			// under its new name.
+			a.releaseLease(ctx, old.desc.ID, old.expiration)
 		}
 		return nil, nil
 	}
+	entry := &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
 	a.mu.Lock()
-	a.cache[name] = &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
+	old, had := a.cache[name]
+	if had {
+		// A renewal is not a use.
+		entry.lastUsed = old.lastUsed
+	} else {
+		entry.lastUsed = a.nowWallLocked()
+	}
+	fits := had || len(a.cache)+a.acquiring < a.maxEntriesLocked()
+	if fits {
+		a.cache[name] = entry
+	}
 	a.mu.Unlock()
+	if !fits {
+		// A schema change on a table this gateway does not cache, with
+		// the cache full: the lease just taken covers nothing.
+		a.releaseLease(ctx, desc.ID, info.expiration)
+	}
 	return desc, nil
 }
 

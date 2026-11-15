@@ -206,6 +206,630 @@ to what the store has, and rise again as the store re-completes the
 switch (writes within seconds; the old format refused after the sweep
 and a restart, as above).
 
+## Roots: where the store key lives
+
+`--enc-key` makes the store key a file the operator writes. `--enc-root`
+is the alternative: the node makes its own store key, and what the data
+directory holds (`ENCRYPTION-STOREKEY`, beside the registry) is that key
+**wrapped** by a *root* — something outside the data directory that can
+encrypt a small blob and decrypt it again.
+
+```
+root          wraps    store key    seals    registry of data keys    which encrypt    files
+(--enc-root)           (per node)            (per node)
+```
+
+Nothing below the store key changes. What changes is that a store key
+exists in the clear only in the node's memory: not in a file, and not
+in the request that rotates it.
+
+```sh
+datax init  --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
+datax start --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
+```
+
+The two simplest roots:
+
+- **`file:<path>`** — a 32-byte wrapping key in a file (raw or hex, as a
+  key file is). This moves the problem one step: the wrapping key is a
+  file where the store key was. It is for a wrapping key kept on
+  storage other than the data's, for tests, and as a step when moving a
+  store to another root.
+- **`exec:<command> [args...]`** — the node runs the operator's command
+  to do the wrapping. This is the bridge to anything with a command
+  line: a TPM (`tpm2-tools`), a cloud KMS's CLI, an HSM vendor's tool.
+  The command is run directly (no shell), with the node's environment,
+  with one more argument:
+
+  | verb | standard input | standard output |
+  |---|---|---|
+  | `wrap` | the store key, 32 raw bytes | the wrapped key, any bytes up to 64 KiB |
+  | `unwrap` | the wrapped key, exactly as `wrap` wrote it | the store key: 32 raw bytes or 64 hex characters |
+  | `key-id` | — | a one-line name for the wrapping key (optional; a non-zero exit means "unnamed") |
+
+  Exit status zero is success; anything else is a failure, and the
+  command's standard error is the reason the operator is shown. Each
+  call is cut off after 30 seconds. A sketch for AWS KMS:
+
+  ```sh
+  #!/bin/sh
+  KEY=arn:aws:kms:eu-west-1:111122223333:key/…
+  case "$1" in
+    key-id) echo "$KEY" ;;
+    wrap)   aws kms encrypt --key-id "$KEY" --plaintext fileb:///dev/stdin \
+              --query CiphertextBlob --output text ;;
+    unwrap) base64 -d | aws kms decrypt --ciphertext-blob fileb:///dev/stdin \
+              --query Plaintext --output text | base64 -d ;;
+  esac
+  ```
+
+What the node does with a root, and refuses:
+
+- A root's answer is checked before anything is sealed under it: the
+  wrapped form must not contain the key, must be non-empty and bounded,
+  and must unwrap to the same key. A root that fails, hangs or returns
+  the key unwrapped is refused, and no wrapped-key file is written.
+- The wrapped-key file is not secret, but it cannot be edited: each
+  entry carries a tag, keyed from the store key it wraps, over the
+  root's kind, its key id and the wrapped bytes.
+- A node that cannot reach its root cannot start. A running node is
+  unaffected: it unwrapped its key at start.
+- A wrapped store key can be bound to the cluster and node it was
+  wrapped for, and is then refused as any other node's. The KMS roots
+  bind it themselves; for the others a rewrap does (see *A root in a
+  key management service*).
+- `--enc-key` and `--enc-root` together are refused. A root does not
+  take over a store it did not make: one opened with a key file is
+  refused with a pointer to `datax debug enc-root adopt`, and a
+  plaintext one is refused as with `--enc-key`.
+- The command line of an `exec` root comes from the node's own flags
+  only. No request can name a command for a node to run; an online
+  re-wrap names its target by position in the node's `--enc-root` list.
+- `/api/security` and the console's security view say, per store,
+  whether its key is under a root (kind and key id) or from a key file.
+  Every unwrap at start, and every rotation and re-wrap, is audited.
+
+What a root does and does not give depends on the root. A `file` root
+on the same disk as the data protects nothing a key file would not. An
+`exec` root is as strong as what its command talks to. Neither changes
+the fact that the store key is in the node's memory while it runs.
+A root key split among operators is the next section, the handing of
+it between running nodes the one after, and a root that is a key
+management service spoken to directly — Vault, AWS KMS, Google Cloud
+KMS, Azure Key Vault — the one after that.
+
+### A root key held as shares
+
+`--enc-root shares` keeps the root key nowhere. The key is made once,
+split into `n` shares of which any `k` rebuild it, the shares are given
+to people, and the key is forgotten:
+
+```
+datax debug enc-root split --shares 2/3 --out-dir /dev/shm/shares
+```
+
+prints or writes three shares (`datax-share-…`, one per file, mode
+0600, never over an existing file) and keeps nothing. The split is
+Shamir's scheme over GF(256): each byte of the key is the constant term
+of its own random polynomial of degree `k-1`, and a share is the
+polynomials' values at one point. `k` shares determine the key; `k-1`
+are consistent with every key equally, so they say nothing about it.
+One root key serves a whole cluster: each node's store key is its own,
+wrapped under the same root.
+
+A node started with `--enc-root shares` cannot open its store, and
+starts **sealed**:
+
+```
+$ datax start --dir data1 --enc-root shares --certs-dir certs ...
+datax node is SEALED: its store key is under a root key held as shares ...
+
+$ datax unseal --addr 10.0.0.1:26257 --certs-dir certs      # one share-holder
+share:                                                       # typed, not echoed
+share accepted
+sealed: 1 of 2 shares in (share 3); waiting for shares of root key 644fe2bbf57d9721
+
+$ datax unseal --addr 10.0.0.1:26257 --certs-dir certs      # another
+share accepted: unsealed. The node is opening its store (root key 644fe2bbf57d9721)
+```
+
+- **Sealed means closed.** A sealed node has loaded its certificates
+  and listens on its RPC address, where it serves `unseal` and
+  `datax debug seal-status` and refuses everything else. Its SQL port
+  and console are not open and it runs no raft: to the cluster it is a
+  node that is down, and is counted as one. A new node starts sealed
+  too — it needs the root key to wrap the store key it makes — and its
+  first share says which root key it will be under.
+- **Who may unseal.** The root user's client certificate. A sealed node
+  cannot read its role table, so membership of the admin role cannot be
+  checked until it is open. On a cluster without TLS a share is accepted
+  only from the node's own machine, since it would otherwise cross the
+  network in the clear.
+- **A share is never a flag.** `datax unseal` asks for it without echo,
+  or reads one line of standard input (for a password manager's CLI);
+  it does not accept one as an argument or from the environment. Shares
+  and the root key are never written to disk, logged, or put in an
+  event. Every submission is audited — who, which share by its number,
+  the outcome — without the share.
+- **What is refused, and when.** A share carries a check over its own
+  bytes and the id of the root key it is a share of. A mistyped or
+  damaged share, a share of another cluster's key, a share already
+  submitted and a share of a different split of the key are each
+  refused as they arrive, with the reason. If a set of shares that all
+  pass still does not rebuild the key they name — one was forged — the
+  node stays sealed and discards them rather than open on a wrong key.
+  More than ten refusals in a minute pause submissions; a share is 256
+  random bits, so this is against noise, not guessing.
+- **In memory while running.** Once unsealed the node holds the root
+  key in memory, as it holds the store key: that is what lets it rotate
+  its store key without the share-holders. A restart seals it again.
+- **Offline tools ask for shares.** `datax debug metadata`,
+  `rotate-enc-key --dir`, `unsafe-recover` and `enc-root
+  adopt|rewrap|release` given `--enc-root shares` prompt for shares
+  until they have a quorum.
+
+Changing who holds shares, or how many:
+
+```
+datax debug enc-root resplit --shares 3/5 --out-dir /dev/shm/new   # asks for a quorum of the current shares
+```
+
+makes a new split of the **same** root key. The old shares still
+rebuild it among themselves — a new split cancels nothing — so this is
+for a holder trusted to have destroyed their share. To shut out one
+who is not, replace the root key: make a new one with `split`, have its
+holders submit shares to each **running** node with `datax unseal`
+(there, shares assemble a second root key beside the one in use), then
+move each store key under it and restart on the new shares when
+convenient:
+
+```
+datax debug seal-status --addr 10.0.0.1:26257 --certs-dir certs       # "a new root key (…) is held as root 2"
+datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs --to-root 2
+```
+
+What this root gives: a disk, every disk, or a powered-off machine
+opens nothing, and no one person can open it either. What it costs: a
+cold start of the cluster needs `k` people (a restart of one node does
+not: see *Peer unseal*), and losing more than `n-k` shares
+loses the root key — after which a node that is running can still be
+moved to a new root key, and one that is stopped cannot be opened by
+anyone.
+
+### Peer unseal
+
+With shares alone, every start of every node would need a quorum of
+people. A running node holds the root key in memory, so a sealed node
+asks the peers it knew for it before it settles down to wait for
+shares, and a rolling restart needs nobody.
+
+A running node hands the root key over only when all of these hold:
+
+- the asker presents the cluster's **node** certificate over mutual TLS
+  (a client certificate, root's included, is refused; a cluster without
+  TLS has no peer unseal);
+- it names this cluster, and the root key the answering node itself
+  runs under;
+- its node id is a member of the cluster and is not being
+  decommissioned;
+- that node is **not live**: the last heartbeat the answering node
+  knows of is older than the liveness grace (15 s by default), so a
+  second copy of a running node is handed nothing. A node restarted at
+  once therefore waits, asking every two seconds — for the grace less
+  however stale the answering node's knowledge was, which is up to two
+  heartbeat periods (six seconds);
+- peer unseal is on.
+
+The key crosses inside the TLS connection sealed under a key agreed for
+that one exchange (X25519, bound to the cluster, node and key ids), so
+something that terminates and forwards the TLS sees no key; that layer
+is against reading, not impersonation, which is the certificate's job.
+The asker takes the key only if it is the one its own wrapped store key
+names. Every request is audited on the node that answers, granted or
+refused with the reason, appears in the console's events, and is
+counted in the security view. The node keeps, unencrypted in its data
+directory, the little it needs to ask before its store is open
+(`SEAL-IDENTITY`: cluster id, node id, peers' addresses — none secret,
+and trusted for nothing but where to ask).
+
+```
+datax debug peer-unseal --addr 10.0.0.1:26257 --certs-dir certs          # report
+datax debug peer-unseal --addr 10.0.0.1:26257 --certs-dir certs --off    # every start needs shares
+```
+
+The setting is the cluster's; each node keeps a copy so it can answer
+during a cold start, before there is a quorum to read it from.
+
+What peer unseal keeps and gives up:
+
+- It keeps the promise that matters for encryption at rest: a disk that
+  leaves the building cannot open itself, because it cannot reach the
+  cluster.
+- It does **not** protect against someone who holds a node's
+  certificate and private key **and** can reach the cluster while that
+  node is down: that is a node, as far as the cluster can tell. With
+  peer unseal on, a node key kept on the same disk as the data is all
+  that stands between a stolen disk and its contents for an attacker on
+  the network. Where that is in scope, keep the node key elsewhere (or
+  in hardware), or turn peer unseal off.
+- A cold start of the whole cluster still needs the share-holders, by
+  design — for one node; the others take the key from it.
+- A node that has never been a member (a new node joining) has no id
+  to be vouched for and is unsealed with shares.
+
+### A root in a key management service
+
+Four roots are a key management service spoken to directly (#308).
+Wrapping and unwrapping the store key are calls to the service; the
+service's key never reaches datax, and what the data directory holds is
+the service's ciphertext of the store key.
+
+| root | spec |
+|---|---|
+| HashiCorp Vault, Transit engine | `vault:<address>/<mount>/<key>` |
+| AWS KMS | `awskms:<key arn>` |
+| Google Cloud KMS | `gcpkms:projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>` |
+| Azure Key Vault | `azurekv:<vault>/<key>[/<version>]` |
+
+```sh
+datax start --dir data1 --enc-root 'vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token' ...
+```
+
+They are written against each service's REST API with Go's standard
+library; datax links no cloud SDK. **They are tested against fakes of
+each API (`pkg/storage/enc/kmstest`), and have not been run against the
+real services.** Try a root against your service — a node started on an
+empty directory wraps a key, unwraps it and compares, and refuses to
+start if any of that fails — before relying on it. The `exec` root
+reaches the same services through their own command-line tools, and
+remains the choice where you would rather trust the vendor's client.
+
+**Options** ride on the spec the way a URL's query does, because
+`--enc-root` separates several roots with commas:
+
+```
+<kind>:<key>?name=value&name=value
+```
+
+A value that needs a comma, `&` or `?` writes it percent-encoded
+(`%2C`, `%26`, `%3F`). An option nobody recognises is an error. **No
+option carries a secret.** A credential is a file an option names, or
+comes from where the service's own tools look — the environment, the
+instance's identity — so a spec can be put in a unit file, logged and
+shown. Every KMS root takes:
+
+| option | meaning | default |
+|---|---|---|
+| `timeout` | how long one request may take | `10s` |
+| `retries` | how many times a request that failed transiently is tried again | `3` |
+| `ca` | PEM file of the certificate authorities to trust, in place of the system's | — |
+
+Requests go through the proxy the environment names (`HTTPS_PROXY`,
+`NO_PROXY`), except those to an instance's metadata service. Plain
+HTTP is accepted only to the machine itself (a local agent): every
+request carries a credential. Redirects are not followed.
+
+**What a node does when the service does not answer.** Each request has
+the timeout above. A failure that may pass — no connection, no answer
+in time, HTTP 429, any 5xx, and AWS's throttling errors — is tried
+again, `retries` times, after a pause that doubles from 200 ms (with
+jitter, capped at 5 s). A refusal — any other 4xx: denied, no such key,
+a ciphertext the key did not make — is not tried again; the one
+exception is a 401 from Google or Azure, where the cached token is
+dropped and the call made again with a fresh one. Then:
+
+- **A node cannot start while its KMS is unreachable**, and says which
+  service, which key and why, in the service's own words:
+
+  ```
+  unwrapping the store key: the vault root could not unwrap the store key: Vault Transit key transit/datax at
+  https://vault.example:8200: decrypt failed after 4 attempts: could not reach vault.example:8200: dial tcp
+  10.0.0.9:8200: connect: connection refused
+  ```
+
+  With the defaults a start gives up after at most about 45 seconds.
+- **A running node is unaffected.** It unwrapped its key at start and
+  holds it; it does not ask again until a rotation or a rewrap.
+
+**Credentials are yours to place**, and datax keeps them nowhere: not
+in the cluster, not in the data directory. No token, secret, signature
+or signed assertion appears in a log line, an error, an event or
+`/api/security`; a root strikes whatever it has sent from any message
+it produces, including a service's own error text.
+
+**Binding to the cluster and node.** A KMS is reachable by every node
+holding a credential for it, so a wrapped store key copied from one
+node's directory would unwrap for another as readily. Each wrapped key
+is therefore bound to its cluster id and node id, in three places:
+
+1. *In the call to the service*, as its encryption context or
+   associated data (below, per service). The service refuses to unwrap
+   under any other, records it in its audit log, and — AWS — lets a key
+   policy condition on it.
+2. *Inside what the service encrypts*: datax wraps a digest of the
+   binding together with the key, and checks it after every unwrap. This
+   holds for a service that has no notion of associated data (RSA
+   wrapping in Azure Key Vault) and for one that would answer for a
+   context it was not asked about.
+3. *In the wrapped-key file*, under the entry's tag, for every root
+   including `file`, `exec` and `shares`.
+
+What this does and does not give, honestly:
+
+- A store key is first wrapped **before its node has an id**: the id is
+  in the store, and the store cannot open without the key. That first
+  wrap is bound to nothing. A node on a KMS root binds its key at the
+  same start, the moment it has bootstrapped or joined (one more wrap
+  and unwrap); if the service fails just then, the node runs with an
+  unbound key, says so (a warning, and `"bound": false` in
+  `/api/security`), and a rewrap binds it. A key policy that *requires*
+  the context therefore refuses a new node's first start: grant the
+  unconditioned call for commissioning, or condition only once the
+  nodes are bound.
+- An unbound entry is accepted, from any node. It has to be: that is
+  what a store from before bindings, and a new node, has.
+- At a restart the node does not yet know who it is, so it presents the
+  binding its own wrapped-key file records, and compares that with the
+  store's identity once the store is open — refusing to run on a
+  mismatch. The binding is not a secret. What stops a holder of node
+  B's credential from unwrapping node A's key by presenting A's context
+  is the service's policy, where the service can condition on it; where
+  it cannot (Vault without per-node tokens, Google, Azure), the binding
+  catches a wrapped key *misplaced* and is recorded in the audit log,
+  and it is separate credentials per node that keep one node from
+  another's key.
+- For `file`, `exec` and `shares` the binding is checked by datax
+  alone, and is written when you rewrap
+  (`datax debug enc-root rewrap`); a store's first entry under these
+  roots is unbound until then. The offline tools keep whatever binding
+  an entry has.
+
+**Health.** A running node does not need its root, so one that has
+become unreachable would otherwise be found at the next restart. Every
+minute a node on a KMS root has the service wrap and unwrap a
+throwaway 32-byte value — never the store key — which is exactly what
+a restart needs to work and requires no permission beyond the two a
+node already has. The outcome is:
+
+- in `/api/security`, per store: `root.healthy`, `root.health_error`
+  (the service's reason), `root.health_checked_at`,
+  `root.last_healthy_at`;
+- in the console's security view, said only when the root is not
+  usable;
+- a warning in the health document (`enc-root-unreachable`), and an
+  event when the root goes and when it returns;
+- the gauges `datax_enc_root_healthy` (1 or 0) and
+  `datax_enc_root_last_healthy_timestamp_seconds`. Alert on the first:
+  a node at 0 is serving, and would not come back from a restart.
+
+A check costs two requests to the service a minute per node, which the
+service bills and logs.
+
+**The service's own key rotation.** The key id a node reports carries
+the service's key version where the service names one
+(`transit/datax@v3`). After the service rotates its key, everything
+already wrapped still unwraps; the health check notices the new version
+(`root.latest_key_id`, and a line in the console), and a rewrap moves
+the node's store key onto it, after which the old version can be
+retired in the service:
+
+```sh
+datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs   # per node
+datax debug enc-root status --dir data1                                # stopped node: root, key id, binding
+```
+
+AWS KMS rotates a key's material behind one key id and names no
+version, so there is nothing to see move: a rewrap re-encrypts under
+the current material, and the key id stays the ARN.
+
+#### HashiCorp Vault (Transit)
+
+```
+vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token
+```
+
+The address is the scheme and host; the last path element is the key
+and what lies between is the mount. (A Vault served under a path prefix
+is not supported.) Calls: `POST /v1/<mount>/encrypt/<key>` and
+`/decrypt/<key>`. Redirects are not followed, so name the active node,
+a load balancer, or a cluster whose standbys forward requests (Vault's
+default) — a standby that answers with a redirect is a refusal.
+
+| option | environment | meaning |
+|---|---|---|
+| `token_file` | `VAULT_TOKEN_FILE` | file holding the token; **read on every call**, so a token Vault Agent renews is picked up |
+| — | `VAULT_TOKEN`, then `~/.vault-token` | the token, when no file is named |
+| `namespace` | `VAULT_NAMESPACE` | Vault Enterprise namespace |
+| `ca` | `VAULT_CACERT` | CA that signed Vault's certificate |
+| `derived` | — | `true` for a key created with `derived=true` |
+
+The binding is sent as `associated_data`, which Vault authenticates for
+its AEAD key types (`aes256-gcm96`, `chacha20-poly1305`); with
+`derived=true` it is sent as the key-derivation `context` instead,
+which a derived key requires. A Vault too old to know
+`associated_data` ignores it, and the binding then rests on the digest
+inside the ciphertext. The key version is the `v<N>` of Vault's
+ciphertext. Minimum policy:
+
+```hcl
+path "transit/encrypt/datax" { capabilities = ["update"] }
+path "transit/decrypt/datax" { capabilities = ["update"] }
+```
+
+Nothing else: not `transit/keys/*` (the node never reads, creates or
+rotates the key) and not `rewrap`.
+
+#### AWS KMS
+
+```
+awskms:arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab
+```
+
+The region is the ARN's. A symmetric key (`SYMMETRIC_DEFAULT`). Calls:
+`Encrypt` and `Decrypt` (the JSON protocol), signed with Signature
+Version 4; `Decrypt` names the key, so a ciphertext made under some
+other key the credential can use is refused. Credentials are looked for
+in this order:
+
+1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (and
+   `AWS_SESSION_TOKEN`);
+2. `AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN` — the role is
+   assumed through STS (EKS service accounts);
+3. the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`, or
+   `~/.aws/credentials`), profile `AWS_PROFILE` or `default`;
+4. the container credentials endpoint
+   (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`: ECS, EKS
+   Pod Identity);
+5. the instance's role, from the instance metadata service — version 2
+   only; version 1 is never fallen back to.
+
+Temporary credentials are cached until two minutes before they expire.
+Not supported: SSO, `credential_process`, and roles assumed through a
+profile in `~/.aws/config`; use the `exec` root, or run something that
+writes the shared credentials file.
+
+| option | environment | meaning |
+|---|---|---|
+| `profile` | `AWS_PROFILE` | profile of the shared credentials file |
+| `credentials_file` | `AWS_SHARED_CREDENTIALS_FILE` | the shared credentials file |
+| `endpoint` | — | the KMS endpoint (a VPC or FIPS endpoint) |
+| `sts_endpoint` | — | the STS endpoint, for web identity |
+| `imds` | `AWS_EC2_METADATA_SERVICE_ENDPOINT` | the instance metadata endpoint |
+| `ca` | `AWS_CA_BUNDLE` | CA bundle |
+
+The binding is the encryption context
+`{"datax-cluster": "<cluster id>", "datax-node": "<node id>"}`, which
+appears in CloudTrail with every call. Minimum policy for a node's
+role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["kms:Encrypt", "kms:Decrypt"],
+    "Resource": "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  }]
+}
+```
+
+To hold a role to one cluster, add
+`"Condition": {"StringEquals": {"kms:EncryptionContext:datax-cluster": "<cluster id>"}}`
+(and `datax-node` for one role per node) — after the nodes have
+started once, for the reason given under *Binding* above.
+
+#### Google Cloud KMS
+
+```
+gcpkms:projects/acme/locations/europe-west1/keyRings/datax/cryptoKeys/store-root
+```
+
+The key's resource name, without a version; a symmetric
+(`ENCRYPT_DECRYPT`) key. Calls: `cryptoKeys.encrypt` and
+`cryptoKeys.decrypt`. The access token comes from a service-account
+key file when one is named — a JWT signed with the account's key
+(RS256) is exchanged at the file's `token_uri` — and otherwise from
+the metadata server, as the instance's or the pod's service account
+(Workload Identity on GKE). Tokens are cached until two minutes before
+they expire. Not supported: workload identity federation
+(`external_account` files), user credentials and impersonation.
+
+| option | environment | meaning |
+|---|---|---|
+| `credentials` | `GOOGLE_APPLICATION_CREDENTIALS` | a service-account key file |
+| `endpoint` | — | the KMS endpoint |
+| `metadata` | `GCE_METADATA_HOST` | the metadata server |
+
+The binding is the request's `additionalAuthenticatedData`. The key
+version is the one `encrypt` reports (`…/cryptoKeys/store-root@3`).
+Minimum IAM, on the key and nothing wider:
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` — that is,
+`cloudkms.cryptoKeyVersions.useToEncrypt` and
+`cloudkms.cryptoKeyVersions.useToDecrypt`.
+
+#### Azure Key Vault
+
+```
+azurekv:datax-prod/store-root
+azurekv:datax-prod/store-root/0123456789abcdef0123456789abcdef
+```
+
+The vault by name (`https://<name>.vault.azure.net`) or, for another
+cloud, by full host name; an **RSA** key (2048 bits or more). With a
+version in the spec the root wraps under that version always; without,
+under the key's current one. Calls: `wrapKey` and `unwrapKey` with
+`RSA-OAEP-256`; an unwrap names the version that wrapped, which the
+wrapped key records. The access token comes from the client-secret
+variables when all three are set (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+`AZURE_CLIENT_SECRET`) and otherwise from the instance's managed
+identity. Not supported: workload identity federation, certificate
+credentials, and Managed HSM (its token audience differs).
+
+| option | environment | meaning |
+|---|---|---|
+| `client_id` | `AZURE_CLIENT_ID` | the user-assigned managed identity to use |
+| `endpoint` | — | the vault's URL, in place of the one its name gives |
+| `login` | `AZURE_AUTHORITY_HOST` | the token authority |
+| `imds` | — | the instance metadata endpoint |
+
+**RSA wrapping has no associated data**: Key Vault is told nothing of
+the binding, cannot enforce it and gives a policy nothing to condition
+on. The binding rests on the digest inside what is wrapped, which datax
+checks after every unwrap, and on the wrapped-key file's tag. That
+catches a wrapped key moved between nodes; it does not stop a holder of
+any credential for the key from unwrapping any node's blob with their
+own tool. Minimum access, on the key: the data actions
+`Microsoft.KeyVault/vaults/keys/wrap/action` and
+`…/unwrap/action` (the built-in role *Key Vault Crypto Service
+Encryption User* is those two and reading the key's metadata), or, with
+access policies, the key permissions `wrapKey` and `unwrapKey`.
+
+#### HSMs and PKCS#11
+
+datax does not speak PKCS#11: it would need cgo and a vendor's
+library in the process, and the project builds without either. An HSM
+is reached through the `exec` root — a small command around the
+vendor's tool or `pkcs11-tool` — or through a KMS that fronts it
+(Vault's seal or managed keys, AWS CloudHSM custom key stores, Cloud
+HSM protection levels), which the roots above use without knowing.
+
+## Keys in memory
+
+The keys a node holds for as long as it runs — its store key, the data
+keys of its registry, a `file` root's wrapping key, a root key rebuilt
+from shares — are kept in memory set aside for them rather than on the
+ordinary heap (#309). On Linux that memory is `mlock`ed, so it is never
+written to swap, and marked `MADV_DONTDUMP`, so it is left out of core
+dumps; a key is zeroed when it is released (a store closing, a root
+discarded). Short-lived copies made on the way — a key file's bytes as
+read, a candidate key that did not match — are zeroed when done with.
+
+A node started with `--enc-key` or `--enc-root` also turns core dumps
+off for the whole process: its core-file limit is set to zero and it is
+marked not dumpable, which additionally stops another process of the
+same user from reading its memory. `--allow-core-dumps` leaves the
+process dumpable, for debugging.
+
+The start log says how this went, and `/api/security` (`key_memory`)
+and the console's security view report it per store. Locking can fail
+under a low memory-lock limit (16 KiB is needed; `ulimit -l`, or
+`LimitMEMLOCK=` in a systemd unit): by default that is a warning that
+names the remedy and the node runs; `--require-locked-keys` makes it,
+and a failure to disable core dumps, a refusal to start.
+
+What this does not cover:
+
+- A cipher built from a key holds its own expanded copy, and the Go
+  runtime may copy a key onto a stack; those copies are on ordinary
+  memory. Disabling core dumps is what covers them against a dump, and
+  nothing covers them against swap short of encrypted swap or none.
+- A privileged user on the host, or anything that can read this
+  process's memory, can read the keys regardless.
+- Plaintext data in the block cache is not key material and is not
+  locked.
+- On platforms other than Linux keys are held on the heap and reported
+  as not locked.
+
 ## Key rotation
 
 - **Data keys** rotate themselves: every node start mints a new active
@@ -242,6 +866,41 @@ and a restart, as above).
   store. After a rotation the node logs which of its key files holds
   the new key, or a warning that none does (then a restart before the
   file is added fails with "none of the store keys given matches").
+
+- **Under a root** (`--enc-root`), rotation involves no key file and
+  no key in transit:
+
+  ```sh
+  datax debug rotate-enc-key --addr 10.0.0.1:26257 --certs-dir certs   # online
+  datax debug rotate-enc-key --dir data1 --enc-root exec:/usr/local/bin/datax-wrap   # node stopped
+  ```
+
+  The node makes the new store key, has the root wrap it, and reseals
+  the registry and the metadata backup. The request carries nothing but
+  the operation's name, so it is served on any cluster. The order makes
+  a crash anywhere survivable: the wrapped-key file is first rewritten
+  to hold the new key's entry and the old one's, then the registry is
+  resealed, then the old entry is dropped; a start in between unwraps
+  both, uses the one the registry reached, finishes a split store's
+  second registry if it was left behind, and drops the other.
+
+  When the root's own key has rotated, or to move a store to another
+  root, the store key is **re-wrapped** — one small file replaced in
+  one rename, nothing else touched:
+
+  ```sh
+  datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs              # same root, its new key
+  datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs --to-root 2  # to the node's second --enc-root
+  ```
+
+  To move roots online, restart the node with both (`--enc-root
+  old,new`), re-wrap with `--to-root 2`, and from the next restart name
+  the new one alone. `datax debug enc-root` also has `status` (what
+  wrapped the key in a data directory; nothing secret is printed),
+  `adopt` (put a key-file store's key under a root: node stopped, then
+  start with `--enc-root` and rotate, so the key that was in the file
+  opens nothing) and `release` (the way back: the store key is written
+  to a new file, mode 0600, and the wrapped copy removed).
 
 - **Background re-encryption** retires old-data-key exposure on cold
   data. `datax debug reencrypt --addr ... [--wait]` starts a paced pass
@@ -287,6 +946,52 @@ and a restart, as above).
   through, and the compaction itself elides the seed. One caveat: a
   stale file spanning a single user key admits no interior seed and
   waits for natural churn.
+
+## Backups
+
+A backup (`datax backup`) is written outside the store, and the store
+key has no part in it: without `--backup-key` its files are plaintext,
+which is why an encrypted store refuses to write one unless told
+`--allow-plaintext`. With `--backup-key <file>` the backup is sealed
+under a key the operator supplies for it, in the same construction as
+authenticated store files with the gaps a file that travels cannot
+afford closed (docs/user/operations.md, *Sealed backups*, has the
+operator's view):
+
+- **Keys.** Each backup has a random 32-byte data key. `BACKUP.json` is
+  an envelope: the data key sealed under the backup key (AES-256-GCM,
+  magic `DXBW`), and the manifest sealed under the data key. Each file's
+  key is HKDF-SHA256(data key, the file's random salt, a label and the
+  file's name). The backup key therefore encrypts 32 bytes per backup
+  and is never used on bulk data.
+- **Files.** A sealed file is a `DXE2` stream: the 32-byte `DXE2` header
+  (flags *bound* and *stream*, data-key id 0, 64 KiB chunks), then
+  chunks of `nonce ‖ ciphertext ‖ tag`. Every tag covers the header, the
+  file's name and a marker saying whether the chunk is the last; the
+  chunk's index is in its nonce. So, unlike a store's sstable, a sealed
+  backup file cut exactly between chunks is refused: the chunk it now
+  ends on was not sealed as a last one.
+- **What is refused.** A changed byte in any file; a file truncated
+  anywhere, extended, or with chunks reordered; a file under another
+  file's name; a file or the manifest from a different backup (its data
+  key differs) — each before restore applies anything, because restore
+  reads every file to its end first. A sealed backup without its key,
+  and a plaintext backup presented with a key, are refused as well.
+- **What is not protected.** The number of tables, their numeric ids
+  (file names) and file sizes are visible. A whole sealed backup
+  replaced by an **older sealed backup under the same key** opens: it is
+  a genuine backup, and nothing tells restore which one was meant —
+  compare the summary's cluster id, tables and checksums with what you
+  recorded when the backup was taken. A chain is checked for continuity
+  (each incremental's base timestamp against its predecessor's end), not
+  for being the newest. Someone who holds the key can write any backup;
+  the checks restore makes of every backup (file names, key spans)
+  apply to sealed ones too, but a key holder can restore rows of their
+  choosing, exactly as someone who can write a plaintext backup can.
+- **The key in transit.** The key is sent to the serving node in the
+  admin request: over mutual TLS on a secure cluster, and on an insecure
+  one accepted only from the node's own machine. It is not logged,
+  audited, or kept.
 
 ## Recovery tooling
 
@@ -358,7 +1063,28 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   own frame.
 - The `LOCK` file and directory entries (file names, sizes) are not
   encrypted; file names are Pebble's numeric names and leak no user data.
-- Keys live in memory unprotected (no mlock/HSM integration).
+- **Backups are sealed only when asked** (`datax backup --backup-key`);
+  otherwise they are plaintext whatever the store is. A sealed backup
+  shows its table count, table ids and file sizes; a rollback to an
+  older backup sealed under the same key is not detected; and a backup
+  key is a key file only — it cannot yet be held by an `--enc-root`
+  root (a KMS command or shares).
+- **Keys in memory are narrowed, not hidden** (see *Keys in memory*).
+  The held copies are locked and out of core dumps; a cipher's expanded
+  key, and a key on its way through a stack, are on the ordinary heap,
+  and anyone who can read the process's memory can read all of it.
+- **The KMS roots have been tested against fakes of each service's
+  API, not against the services.** Their request signing is held to
+  AWS's published examples and their behaviour to what each API
+  documents; the first start against a real service is the test that
+  counts, and it fails closed.
+- **A wrapped store key's binding to its node is enforced by the
+  service only where the service's policy can condition on it** (AWS
+  KMS encryption context). Elsewhere it catches a misplaced key and is
+  audited; Azure Key Vault's RSA wrapping carries none at the service
+  at all. A new node's first wrap is unbound until the node has an id.
+- An HSM is reachable through an `exec` root's command or a KMS that
+  fronts it; PKCS#11 is not spoken directly.
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
 - The node never rewrites the operator's key file: after an online

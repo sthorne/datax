@@ -168,6 +168,8 @@ type likeIndex struct {
 	name   string
 	unique bool
 	cols   []string
+	// inverted is the source index's inverted kind ("" = ordinary).
+	inverted string
 }
 
 // expandLike replaces each LIKE clause of a CREATE TABLE with the source
@@ -259,11 +261,17 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					if owned[idx.ID] || !idx.Public() {
 						continue
 					}
+					if idx.IsVector() {
+						// A vector index is its trained centres, which belong
+						// to the source table's data; the copy starts empty
+						// and is indexed once it has rows of its own.
+						continue
+					}
 					var names []string
 					for _, id := range idx.ColumnIDs {
 						names = append(names, byID[id])
 					}
-					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names})
+					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted})
 				}
 			}
 		}
@@ -292,7 +300,7 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 		if desc.NextIndexID < 2 {
 			desc.NextIndexID = 2
 		}
-		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic})
+		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted})
 		desc.NextIndexID++
 	}
 	return nil

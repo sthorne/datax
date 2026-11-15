@@ -222,6 +222,12 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	}
 	if s.ForUpdate {
 		f.kw("FOR UPDATE")
+		switch s.LockWait {
+		case LockWaitSkipLocked:
+			f.kw("SKIP LOCKED")
+		case LockWaitNoWait:
+			f.kw("NOWAIT")
+		}
 	}
 	if s.AsOf != "" || s.AsOfMaxStaleness != "" {
 		f.kw("AS OF SYSTEM TIME ?")
@@ -614,6 +620,12 @@ func statementSubject(s Statement) string {
 			return t.Names[0]
 		}
 	case *CopyFrom:
+		return t.Table
+	case *CreatePolicy:
+		return t.Table
+	case *AlterPolicy:
+		return t.Table
+	case *DropPolicy:
 		return t.Table
 	}
 	return ""

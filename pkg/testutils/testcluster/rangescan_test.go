@@ -216,9 +216,11 @@ func TestLimitPushdown(t *testing.T) {
 		t.Fatalf("scanned %v rows, want 100", n)
 	}
 
-	// An ORDER BY needing a sort disables it too (all rows feed the sort).
+	// An ORDER BY the path does not deliver disables it too: every row
+	// is read, though only the first five in order are kept (the top-k
+	// heap) rather than all of them sorted.
 	q = `SELECT id FROM big ORDER BY v LIMIT 5`
-	if p := explainPlan(t, ctx, s, q); p != "full table scan; in-memory sort" {
+	if p := explainPlan(t, ctx, s, q); p != "full table scan; top-k heap: the first 5 rows in order kept while scanning, no full sort" {
 		t.Fatalf("plan: %s", p)
 	}
 	if n := scanned(q); n != 100 {

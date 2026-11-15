@@ -24,6 +24,25 @@ var (
 	TxnRetries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_retries_total", Help: "Retryable transaction errors surfaced to clients (40001s).",
 	})
+	// Large objects (issue #303; pkg/sql/largeobject.go).
+	LargeObjectsCreated = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobjects_created_total", Help: "Large objects created (lo_create, lo_from_bytea), whether or not their transaction went on to commit.",
+	})
+	LargeObjectsUnlinked = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobjects_unlinked_total", Help: "Large objects unlinked (lo_unlink).",
+	})
+	LargeObjectBytesWritten = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_bytes_written_total", Help: "Bytes written to large-object pages by this gateway.",
+	})
+	LargeObjectBytesRead = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_bytes_read_total", Help: "Bytes read from large objects through this gateway.",
+	})
+	LargeObjectContentsReclaimed = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_contents_reclaimed_total", Help: "Large-object contents the sweeper reclaimed: unlinked objects and uploads that never committed.",
+	})
+	LargeObjectPagesReclaimed = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_pages_reclaimed_total", Help: "Large-object pages the sweeper deleted.",
+	})
 	TxnAmbiguousResends = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_ambiguous_resends_total", Help: "Transactional batches re-sent because a leadership change left their proposal's fate unknown.",
 	})
@@ -85,6 +104,10 @@ var (
 	RangeMergesDeferred = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_range_merges_deferred_total",
 		Help: "Merges not attempted because a replica of the right-hand range was missing or behind when the driver checked, before freezing anything (issue #263); each is retried on a later housekeeping pass. A count that keeps growing means a replica is chronically behind and its ranges are not being merged. A merge abandoned after its freeze (the confirmation failed anyway) is not counted here; it is logged by the unwind.",
+	})
+	RangeMergesUnwound = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_merges_unwound_total",
+		Help: "Merge freezes left behind by an attempt that died (a crash, a lost leader, a proposal whose fate was unknown) and cleared by a later pass after ruling that attempt's merge out, so the range serves again (issue #266). The merge itself is retried afresh.",
 	})
 	DescriptorChangeRefusals = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_descriptor_change_refused_total",
@@ -182,6 +205,18 @@ var (
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
 	})
+	PurgeVersionsRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_purge_versions_removed_total", Help: "MVCC versions deleted by purges this node coordinated (ALTER TABLE ... PURGE, datax debug purge).",
+	})
+	RowTTLRowsDeleted = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_row_ttl_rows_deleted_total", Help: "Rows deleted by the row expiry job because their expiry time had passed.",
+	})
+	RowTTLRowsBlocked = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_row_ttl_rows_blocked_total", Help: "Expired rows the row expiry job could not delete because a foreign key still references them (counted each pass).",
+	})
+	RowTTLLagSeconds = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "datax_row_ttl_lag_seconds", Help: "How far past its expiry time the most overdue row was when the row expiry job last deleted it, over every table in its last pass.",
+	})
 	StatsRowsScanned = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_stats_rows_scanned_total", Help: "Rows swept by statistics collection.",
 	})
@@ -246,16 +281,6 @@ var (
 		Name: "datax_sql_memory_limit_hits_total", Help: "Statements refused with 53200 for exceeding statement_memory_limit.",
 	})
 
-	TableRanges = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "datax_table_ranges", Help: "Ranges covering each table's key space (refreshed with the schema browser's cache).",
-	}, []string{"table"})
-	TableRows = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "datax_table_rows", Help: "Row count from each table's statistics, as of their collection.",
-	}, []string{"table"})
-	TableStatsAge = promauto.With(Registry).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "datax_table_stats_age_seconds", Help: "Age of each table's statistics; the planner falls back to structural estimates without them.",
-	}, []string{"table"})
-
 	StorageBackpressureCause = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_storage_backpressure_cause_total",
 		Help: "Table-data writes shed, by cause: leader (this node's engine gates), debt (this node's latched compaction-debt gate), follower (an overloaded quorum member's piggybacked verdict).",
@@ -291,6 +316,25 @@ var (
 	}, []string{"cause"})
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
+	})
+	// The audit table (issue #293). A record that could not be written
+	// is never the caller's problem, so these are how an operator learns
+	// the table is behind the log.
+	AuditRecords = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_records_total", Help: "Audit records this node wrote to the datax_audit table.",
+	})
+	AuditDropped = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_audit_dropped_total",
+		Help: "Audit events this node did not write to the datax_audit table (they are in its log), by cause: buffer-full (the table could not be written for long enough to fill the buffer), rate (refusals — failed logins, denied calls — past the rate at which they are recorded).",
+	}, []string{"cause"})
+	AuditWriteErrors = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_write_errors_total", Help: "Failed writes to the datax_audit table; the events stay buffered and are retried.",
+	})
+	AuditBuffered = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "datax_audit_buffered", Help: "Audit events waiting to be written to the datax_audit table.",
+	})
+	AuditRetained = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_audit_aged_out_total", Help: "Audit records this node removed from the datax_audit table because they were older than its retention.",
 	})
 	AdminDenied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_admin_denied_total", Help: "Admin operations refused because the principal lacks the admin role.",
@@ -336,6 +380,9 @@ func init() {
 	// replaced was (issue #203 review).
 	for _, cause := range AuthThrottleCauses {
 		AuthThrottled.WithLabelValues(cause)
+	}
+	for _, cause := range []string{"buffer-full", "rate"} {
+		AuditDropped.WithLabelValues(cause)
 	}
 	for _, cause := range SQLPreAuthCauses {
 		SQLPreAuthClosed.WithLabelValues(cause)

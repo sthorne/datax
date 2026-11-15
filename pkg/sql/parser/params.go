@@ -82,6 +82,13 @@ func CountParams(stmt Statement) int {
 				}
 			}
 			visitWhere(m.Where)
+			// ORDER BY embedding <-> $1: a sort key may hold the only
+			// reference to a parameter.
+			for _, oc := range m.OrderBy {
+				if oc.Expr != nil {
+					visit(*oc.Expr)
+				}
+			}
 			if m.LimitParam > max {
 				max = m.LimitParam
 			}

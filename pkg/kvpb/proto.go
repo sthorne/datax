@@ -198,6 +198,7 @@ func RangeDescriptorToProto(d RangeDescriptor) *rpcpb.RangeDescriptor {
 		EndKey:        d.EndKey,
 		NextReplicaId: int64(d.NextReplicaID),
 		Generation:    d.Generation,
+		StickyUntil:   d.StickyUntil,
 	}
 	for _, r := range d.Replicas {
 		pb.Replicas = append(pb.Replicas, &rpcpb.ReplicaDescriptor{
@@ -218,6 +219,7 @@ func RangeDescriptorFromProto(p *rpcpb.RangeDescriptor) RangeDescriptor {
 		EndKey:        p.EndKey,
 		NextReplicaID: base.ReplicaID(p.NextReplicaId),
 		Generation:    p.Generation,
+		StickyUntil:   p.StickyUntil,
 	}
 	for _, r := range p.Replicas {
 		d.Replicas = append(d.Replicas, ReplicaDescriptor{
@@ -244,7 +246,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	out := &rpcpb.RequestUnion{}
 	switch r := u.GetInner().(type) {
 	case *GetRequest:
-		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate}}
+		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate, SkipLocked: r.SkipLocked}}
 	case *PutRequest:
 		out.Value = &rpcpb.RequestUnion_Put{Put: &rpcpb.PutRequest{Header: reqHeaderToProto(r.RequestHeader), Value: r.Value}}
 	case *DeleteRequest:
@@ -252,9 +254,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *IncrementRequest:
 		out.Value = &rpcpb.RequestUnion_Increment{Increment: &rpcpb.IncrementRequest{Header: reqHeaderToProto(r.RequestHeader), By: r.By}}
 	case *ScanRequest:
-		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse}}
+		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse, SkipLocked: r.SkipLocked}}
 	case *ExportRequest:
-		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords}}
+		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords, AllRevisions: r.AllRevisions}}
 	case *EndTxnRequest:
 		pb := &rpcpb.EndTxnRequest{Header: reqHeaderToProto(r.RequestHeader), Commit: r.Commit, All: r.All}
 		for _, k := range r.IntentKeys {
@@ -314,7 +316,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *TruncateLogRequest:
 		out.Value = &rpcpb.RequestUnion_TruncateLog{TruncateLog: &rpcpb.TruncateLogRequest{Header: reqHeaderToProto(r.RequestHeader), Index: r.Index, Term: r.Term}}
 	case *AdminSplitRequest:
-		out.Value = &rpcpb.RequestUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+		out.Value = &rpcpb.RequestUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitRequest{Header: reqHeaderToProto(r.RequestHeader), StickyUntil: r.StickyUntil}}
+	case *AdminUnsplitRequest:
+		out.Value = &rpcpb.RequestUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitRequest{Header: reqHeaderToProto(r.RequestHeader)}}
 	case *AdminChangeReplicasRequest:
 		out.Value = &rpcpb.RequestUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasRequest{
 			Header: reqHeaderToProto(r.RequestHeader), AddNode: int64(r.AddNode), RemoveNode: int64(r.RemoveNode),
@@ -326,9 +330,9 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *AdminMergeRequest:
 		out.Value = &rpcpb.RequestUnion_AdminMerge{AdminMerge: &rpcpb.AdminMergeRequest{Header: reqHeaderToProto(r.RequestHeader)}}
 	case *SubsumeRequest:
-		out.Value = &rpcpb.RequestUnion_Subsume{Subsume: &rpcpb.SubsumeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeInto: int64(r.MergeInto)}}
+		out.Value = &rpcpb.RequestUnion_Subsume{Subsume: &rpcpb.SubsumeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeInto: int64(r.MergeInto), MergeEpoch: r.MergeEpoch}}
 	case *UnfreezeRequest:
-		out.Value = &rpcpb.RequestUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+		out.Value = &rpcpb.RequestUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeRequest{Header: reqHeaderToProto(r.RequestHeader), MergeEpoch: r.MergeEpoch}}
 	case *UpdateMetaRequest:
 		var desc []byte
 		if r.Desc != nil {
@@ -353,7 +357,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	var u RequestUnion
 	switch v := p.Value.(type) {
 	case *rpcpb.RequestUnion_Get:
-		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate}
+		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate, SkipLocked: v.Get.SkipLocked}
 	case *rpcpb.RequestUnion_Put:
 		u.Put = &PutRequest{RequestHeader: reqHeaderFromProto(v.Put.Header), Value: v.Put.Value}
 	case *rpcpb.RequestUnion_Delete:
@@ -361,9 +365,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Increment:
 		u.Increment = &IncrementRequest{RequestHeader: reqHeaderFromProto(v.Increment.Header), By: v.Increment.By}
 	case *rpcpb.RequestUnion_Scan:
-		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse}
+		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse, SkipLocked: v.Scan.SkipLocked}
 	case *rpcpb.RequestUnion_Export:
-		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords}
+		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords, AllRevisions: v.Export.AllRevisions}
 	case *rpcpb.RequestUnion_EndTxn:
 		r := &EndTxnRequest{RequestHeader: reqHeaderFromProto(v.EndTxn.Header), Commit: v.EndTxn.Commit, All: v.EndTxn.All}
 		for _, k := range v.EndTxn.IntentKeys {
@@ -447,7 +451,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_TruncateLog:
 		u.TruncateLog = &TruncateLogRequest{RequestHeader: reqHeaderFromProto(v.TruncateLog.Header), Index: v.TruncateLog.Index, Term: v.TruncateLog.Term}
 	case *rpcpb.RequestUnion_AdminSplit:
-		u.AdminSplit = &AdminSplitRequest{RequestHeader: reqHeaderFromProto(v.AdminSplit.Header)}
+		u.AdminSplit = &AdminSplitRequest{RequestHeader: reqHeaderFromProto(v.AdminSplit.Header), StickyUntil: v.AdminSplit.StickyUntil}
+	case *rpcpb.RequestUnion_AdminUnsplit:
+		u.AdminUnsplit = &AdminUnsplitRequest{RequestHeader: reqHeaderFromProto(v.AdminUnsplit.Header)}
 	case *rpcpb.RequestUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasRequest{
 			RequestHeader: reqHeaderFromProto(v.AdminChangeReplicas.Header),
@@ -462,9 +468,9 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_AdminMerge:
 		u.AdminMerge = &AdminMergeRequest{RequestHeader: reqHeaderFromProto(v.AdminMerge.Header)}
 	case *rpcpb.RequestUnion_Subsume:
-		u.Subsume = &SubsumeRequest{RequestHeader: reqHeaderFromProto(v.Subsume.Header), MergeInto: base.RangeID(v.Subsume.MergeInto)}
+		u.Subsume = &SubsumeRequest{RequestHeader: reqHeaderFromProto(v.Subsume.Header), MergeInto: base.RangeID(v.Subsume.MergeInto), MergeEpoch: v.Subsume.MergeEpoch}
 	case *rpcpb.RequestUnion_Unfreeze:
-		u.Unfreeze = &UnfreezeRequest{RequestHeader: reqHeaderFromProto(v.Unfreeze.Header)}
+		u.Unfreeze = &UnfreezeRequest{RequestHeader: reqHeaderFromProto(v.Unfreeze.Header), MergeEpoch: v.Unfreeze.MergeEpoch}
 	case *rpcpb.RequestUnion_UpdateMeta:
 		req := &UpdateMetaRequest{
 			RequestHeader: reqHeaderFromProto(v.UpdateMeta.Header),
@@ -542,7 +548,11 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	out := &rpcpb.ResponseUnion{}
 	switch {
 	case u.Get != nil:
-		out.Value = &rpcpb.ResponseUnion_Get{Get: &rpcpb.GetResponse{Value: u.Get.Value, Found: u.Get.Value != nil}}
+		pb := &rpcpb.GetResponse{Value: u.Get.Value, Found: u.Get.Value != nil}
+		if in := u.Get.Skipped; in != nil {
+			pb.Skipped = &rpcpb.Intent{Key: in.Key, Txn: txnMetaToProto(in.Txn)}
+		}
+		out.Value = &rpcpb.ResponseUnion_Get{Get: pb}
 	case u.Put != nil:
 		out.Value = &rpcpb.ResponseUnion_Put{Put: &rpcpb.PutResponse{}}
 	case u.Delete != nil:
@@ -554,11 +564,14 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		for _, kv := range u.Scan.Rows {
 			pb.Rows = append(pb.Rows, &rpcpb.KeyValue{Key: kv.Key, Value: kv.Value})
 		}
+		for _, in := range u.Scan.Skipped {
+			pb.Skipped = append(pb.Skipped, &rpcpb.Intent{Key: in.Key, Txn: txnMetaToProto(in.Txn)})
+		}
 		out.Value = &rpcpb.ResponseUnion_Scan{Scan: pb}
 	case u.Export != nil:
 		pb := &rpcpb.ExportResponse{Resume: u.Export.Resume}
 		for _, rec := range u.Export.Records {
-			pb.Records = append(pb.Records, &rpcpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+			pb.Records = append(pb.Records, &rpcpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted, Ts: tsToProto(rec.Timestamp)})
 		}
 		out.Value = &rpcpb.ResponseUnion_Export{Export: pb}
 	case u.EndTxn != nil:
@@ -590,6 +603,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		out.Value = &rpcpb.ResponseUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitResponse{
 			Left: RangeDescriptorToProto(u.AdminSplit.Left), Right: RangeDescriptorToProto(u.AdminSplit.Right),
 		}}
+	case u.AdminUnsplit != nil:
+		out.Value = &rpcpb.ResponseUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitResponse{Desc: RangeDescriptorToProto(u.AdminUnsplit.Desc)}}
 	case u.AdminChangeReplicas != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasResponse{Desc: RangeDescriptorToProto(u.AdminChangeReplicas.Desc)}}
 	case u.AdminTransferLease != nil:
@@ -597,7 +612,7 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	case u.AdminMerge != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminMerge{AdminMerge: &rpcpb.AdminMergeResponse{Desc: RangeDescriptorToProto(u.AdminMerge.Desc)}}
 	case u.Subsume != nil:
-		out.Value = &rpcpb.ResponseUnion_Subsume{Subsume: &rpcpb.SubsumeResponse{}}
+		out.Value = &rpcpb.ResponseUnion_Subsume{Subsume: &rpcpb.SubsumeResponse{AlreadyFrozen: u.Subsume.AlreadyFrozen, MergeEpoch: u.Subsume.MergeEpoch}}
 	case u.Unfreeze != nil:
 		out.Value = &rpcpb.ResponseUnion_Unfreeze{Unfreeze: &rpcpb.UnfreezeResponse{}}
 	case u.UpdateMeta != nil:
@@ -617,6 +632,13 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			val = []byte{}
 		}
 		u.Get = &GetResponse{Value: val}
+		if v.Get.Skipped != nil {
+			meta, err := txnMetaFromProto(v.Get.Skipped.Txn)
+			if err != nil {
+				return u, err
+			}
+			u.Get.Skipped = &storage.Intent{Key: v.Get.Skipped.Key, Txn: meta}
+		}
 	case *rpcpb.ResponseUnion_Put:
 		u.Put = &PutResponse{}
 	case *rpcpb.ResponseUnion_Delete:
@@ -628,11 +650,18 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		for _, kv := range v.Scan.Rows {
 			r.Rows = append(r.Rows, KeyValue{Key: kv.Key, Value: kv.Value})
 		}
+		for _, in := range v.Scan.Skipped {
+			meta, err := txnMetaFromProto(in.Txn)
+			if err != nil {
+				return u, err
+			}
+			r.Skipped = append(r.Skipped, storage.Intent{Key: in.Key, Txn: meta})
+		}
 		u.Scan = r
 	case *rpcpb.ResponseUnion_Export:
 		r := &ExportResponse{Resume: v.Export.Resume}
 		for _, rec := range v.Export.Records {
-			r.Records = append(r.Records, ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+			r.Records = append(r.Records, ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted, Timestamp: tsFromProto(rec.Ts)})
 		}
 		u.Export = r
 	case *rpcpb.ResponseUnion_EndTxn:
@@ -669,6 +698,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			Left:  RangeDescriptorFromProto(v.AdminSplit.Left),
 			Right: RangeDescriptorFromProto(v.AdminSplit.Right),
 		}
+	case *rpcpb.ResponseUnion_AdminUnsplit:
+		u.AdminUnsplit = &AdminUnsplitResponse{Desc: RangeDescriptorFromProto(v.AdminUnsplit.Desc)}
 	case *rpcpb.ResponseUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasResponse{Desc: RangeDescriptorFromProto(v.AdminChangeReplicas.Desc)}
 	case *rpcpb.ResponseUnion_AdminTransferLease:
@@ -676,7 +707,7 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 	case *rpcpb.ResponseUnion_AdminMerge:
 		u.AdminMerge = &AdminMergeResponse{Desc: RangeDescriptorFromProto(v.AdminMerge.Desc)}
 	case *rpcpb.ResponseUnion_Subsume:
-		u.Subsume = &SubsumeResponse{}
+		u.Subsume = &SubsumeResponse{AlreadyFrozen: v.Subsume.AlreadyFrozen, MergeEpoch: v.Subsume.MergeEpoch}
 	case *rpcpb.ResponseUnion_Unfreeze:
 		u.Unfreeze = &UnfreezeResponse{}
 	case *rpcpb.ResponseUnion_UpdateMeta:
@@ -737,7 +768,7 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 		pb.RangeNotFound = &rpcpb.RangeNotFoundError{RangeId: int64(e.RangeNotFound.RangeID)}
 	}
 	if e.RangeKeyMismatch != nil {
-		m := &rpcpb.RangeKeyMismatchError{RequestKey: e.RangeKeyMismatch.RequestKey}
+		m := &rpcpb.RangeKeyMismatchError{RequestKey: e.RangeKeyMismatch.RequestKey, Frozen: e.RangeKeyMismatch.Frozen}
 		for _, d := range e.RangeKeyMismatch.ActualDescriptors {
 			m.ActualDescriptors = append(m.ActualDescriptors, RangeDescriptorToProto(d))
 		}
@@ -771,6 +802,9 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 	if e.StorageOverloaded != nil {
 		pb.StorageOverloaded = &rpcpb.StorageOverloadedError{}
 	}
+	if d := e.DescriptorChanged; d != nil {
+		pb.DescriptorChanged = &rpcpb.DescriptorChangedError{RangeId: int64(d.RangeID), BuiltFrom: d.BuiltFrom, Current: d.Current}
+	}
 	return pb
 }
 
@@ -787,7 +821,7 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 		e.RangeNotFound = &RangeNotFoundError{RangeID: base.RangeID(pb.RangeNotFound.RangeId)}
 	}
 	if pb.RangeKeyMismatch != nil {
-		m := &RangeKeyMismatchError{RequestKey: pb.RangeKeyMismatch.RequestKey}
+		m := &RangeKeyMismatchError{RequestKey: pb.RangeKeyMismatch.RequestKey, Frozen: pb.RangeKeyMismatch.Frozen}
 		for _, d := range pb.RangeKeyMismatch.ActualDescriptors {
 			m.ActualDescriptors = append(m.ActualDescriptors, RangeDescriptorFromProto(d))
 		}
@@ -824,6 +858,9 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 	}
 	if pb.StorageOverloaded != nil {
 		e.StorageOverloaded = &StorageOverloadedError{}
+	}
+	if d := pb.DescriptorChanged; d != nil {
+		e.DescriptorChanged = &DescriptorChangedError{RangeID: base.RangeID(d.RangeId), BuiltFrom: d.BuiltFrom, Current: d.Current}
 	}
 	return e, nil
 }

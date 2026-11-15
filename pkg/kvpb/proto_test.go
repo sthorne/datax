@@ -47,6 +47,13 @@ func testDesc() RangeDescriptor {
 	}
 }
 
+// stickyDesc is testDesc with its start boundary held against merging.
+func stickyDesc() RangeDescriptor {
+	d := testDesc()
+	d.StickyUntil = 1725000000000000000
+	return d
+}
+
 // TestBatchRequestProtoRoundTrip: every request type survives the proto
 // round trip byte-for-byte at the Go struct level.
 func TestBatchRequestProtoRoundTrip(t *testing.T) {
@@ -65,16 +72,22 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	ba.Add(&IncrementRequest{RequestHeader: h("i"), By: -4})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10, Reverse: true})
+	ba.Add(&GetRequest{RequestHeader: h("g"), SkipLocked: true})
+	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 1, SkipLocked: true})
 	ba.Add(&EndTxnRequest{RequestHeader: h("e"), Commit: true, IntentKeys: []keys.Key{keys.Key("x")}})
 	ba.Add(&HeartbeatTxnRequest{RequestHeader: h("h"), Now: mkts(60)})
 	ba.Add(&PushTxnRequest{RequestHeader: h("q"), PusherTxn: testTxn(), PusheeTxn: testTxn().TxnMeta, PushAbort: true, Now: mkts(61)})
 	ba.Add(&ResolveIntentRequest{RequestHeader: h("r"), TxnID: uuid.New(), Status: enginepb.COMMITTED, CommitTS: mkts(62)})
 	ba.Add(&RefreshRequest{RequestHeader: hr("c", "d"), FromTS: mkts(40)})
+	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5})
+	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5, AllRevisions: true})
 	ba.Add(&GCRequest{RequestHeader: hr("a", "z"), Threshold: mkts(10),
 		Versions:      []GCVersion{{Key: keys.Key("k"), TS: mkts(5), Bytes: 33}},
 		TxnRecordKeys: []keys.Key{keys.Key("t")}})
 	ba.Add(&TruncateLogRequest{RequestHeader: h("a"), Index: 100, Term: 3})
 	ba.Add(&AdminSplitRequest{RequestHeader: h("m")})
+	ba.Add(&AdminSplitRequest{RequestHeader: h("m"), StickyUntil: StickyForever})
+	ba.Add(&AdminUnsplitRequest{RequestHeader: h("m")})
 	ba.Add(&AdminChangeReplicasRequest{RequestHeader: h("n"), AddNode: 4, RemoveNode: 2})
 	ba.Add(&AdminTransferLeaseRequest{RequestHeader: h("o"), Target: 3})
 	ba.Add(&AdminMergeRequest{RequestHeader: h("u")})
@@ -105,14 +118,20 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Delete: &DeleteResponse{}},
 		{Increment: &IncrementResponse{NewValue: 9}},
 		{Scan: &ScanResponse{Rows: []KeyValue{{Key: keys.Key("k"), Value: []byte("v")}}, Resume: keys.Key("r")}},
+		{Get: &GetResponse{Skipped: &storage.Intent{Key: keys.Key("g"), Txn: testTxn().TxnMeta}}},
+		{Scan: &ScanResponse{Skipped: []storage.Intent{{Key: keys.Key("s"), Txn: testTxn().TxnMeta}, {Key: keys.Key("u")}}}},
 		{EndTxn: &EndTxnResponse{CommitTimestamp: mkts(71)}},
 		{HeartbeatTxn: &HeartbeatTxnResponse{Status: enginepb.ABORTED}},
 		{PushTxn: &PushTxnResponse{Status: enginepb.COMMITTED, CommitTS: mkts(72)}},
 		{ResolveIntent: &ResolveIntentResponse{}},
 		{Refresh: &RefreshResponse{}},
+		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v")}, {Key: keys.Key("d"), Deleted: true}}, Resume: keys.Key("r")}},
+		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v"), Timestamp: mkts(33)}, {Key: keys.Key("k"), Deleted: true, Timestamp: mkts(31)}}}},
 		{GC: &GCResponse{}},
 		{TruncateLog: &TruncateLogResponse{}},
 		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: testDesc()}},
+		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: stickyDesc()}},
+		{AdminUnsplit: &AdminUnsplitResponse{Desc: testDesc()}},
 		{AdminChangeReplicas: &AdminChangeReplicasResponse{Desc: testDesc()}},
 		{AdminTransferLease: &AdminTransferLeaseResponse{Desc: testDesc()}},
 		{AdminMerge: &AdminMergeResponse{Desc: testDesc()}},
@@ -125,6 +144,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Message: "nl", NotLeader: &NotLeaderError{RangeID: 3, LeaderHint: 2}},
 		{Message: "rnf", RangeNotFound: &RangeNotFoundError{RangeID: 5}},
 		{Message: "rkm", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), ActualDescriptors: []RangeDescriptor{testDesc()}}},
+		{Message: "frozen", RangeKeyMismatch: &RangeKeyMismatchError{RequestKey: keys.Key("k"), Frozen: true}},
+		{Message: "dc", DescriptorChanged: &DescriptorChangedError{RangeID: 7, BuiltFrom: 3, Current: 4}},
 		{Message: "wi", WriteIntent: &WriteIntentError{Intents: []storage.Intent{{Key: keys.Key("k"), Txn: testTxn().TxnMeta}}}},
 		{Message: "wto", WriteTooOld: &WriteTooOldError{Timestamp: mkts(1), ActualTimestamp: mkts(2)}},
 		{Message: "unc", Uncertainty: &UncertaintyError{ReadTimestamp: mkts(1), ExistingTimestamp: mkts(2)}},

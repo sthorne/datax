@@ -80,6 +80,10 @@ message RangeDescriptor {
   repeated ReplicaDescriptor replicas = 4;
   int64 next_replica_id = 5;
   int64 generation = 6;
+  // sticky_until marks the start boundary as set on purpose: wall-clock
+  // nanoseconds until which the merge queue leaves it alone (0 = not
+  // sticky). Written only once the cluster has finalized v20.
+  int64 sticky_until = 7;
 }
 
 message KeyValue {
@@ -102,6 +106,12 @@ message RequestHeader {
 message GetRequest {
   RequestHeader header = 1;
   bool for_update = 2; // locking read (see pkg/kvpb)
+  // skip_locked reports a key holding another transaction's intent as
+  // absent (with the intent in the response) instead of conflicting.
+  // Read path only. Not version-gated: a node that predates the field
+  // ignores it and answers with the write-intent conflict, which the
+  // sender handles by waiting as it always has.
+  bool skip_locked = 3;
 }
 
 message PutRequest {
@@ -127,6 +137,9 @@ message ScanRequest {
   // field and would run a forward scan, so senders must not set it until
   // the upgrade is finalized (pkg/version rule 4).
   bool reverse = 4;
+  // skip_locked leaves keys holding another transaction's intent out of
+  // the rows and lists the intents in the response (see GetRequest).
+  bool skip_locked = 5;
 }
 
 message EndTxnRequest {
@@ -178,12 +191,14 @@ message ExportRequest {
   RequestHeader header = 1;
   Hlc start_ts = 2; // export keys changed in (start_ts, batch timestamp]
   int64 max_records = 3;
+  bool all_revisions = 4; // every version in the window, not the newest (v21)
 }
 
 message ExportRecord {
   bytes key = 1;
   bytes value = 2;
   bool deleted = 3; // tombstone: the key was deleted in the window
+  Hlc ts = 4; // the version's timestamp; all_revisions exports only
 }
 
 message ExportResponse {
@@ -212,6 +227,16 @@ message TruncateLogRequest {
 
 message AdminSplitRequest {
   RequestHeader header = 1;
+  // sticky_until makes this a manual split: the boundary is recorded as
+  // sticky until this wall-clock time, and an existing boundary is
+  // marked instead of refused. 0 = an ordinary (automatic) split.
+  int64 sticky_until = 2;
+}
+
+// AdminUnsplitRequest clears the sticky bit of the range starting at the
+// header's key (cluster version v20).
+message AdminUnsplitRequest {
+  RequestHeader header = 1;
 }
 
 message AdminChangeReplicasRequest {
@@ -232,10 +257,17 @@ message AdminMergeRequest {
 message SubsumeRequest {
   RequestHeader header = 1;
   int64 merge_into = 2;
+  // merge_epoch ties the freeze to the left-hand range as the driver
+  // saw it: that range's generation plus one, or 0 from a driver that
+  // does not say (before cluster version v20).
+  int64 merge_epoch = 3;
 }
 
 message UnfreezeRequest {
   RequestHeader header = 1;
+  // merge_epoch, when not 0, names the freeze to clear: a range frozen
+  // under another epoch is left frozen.
+  int64 merge_epoch = 2;
 }
 
 // UpdateMetaRequest writes (or, with an empty desc, deletes) the range
@@ -273,6 +305,7 @@ message RequestUnion {
     UnfreezeRequest unfreeze = 18;
     ExportRequest export = 21;
     UpdateMetaRequest update_meta = 22;
+    AdminUnsplitRequest admin_unsplit = 23;
   }
 }
 
@@ -297,6 +330,10 @@ message BatchRequest {
 message GetResponse {
   bytes value = 1;
   bool found = 2; // distinguishes empty value from not-found
+  // skipped: the key was passed over under skip_locked; this is the
+  // intent it holds, or the key alone when it was passed over for a
+  // committed version inside the read's uncertainty window.
+  Intent skipped = 3;
 }
 
 message PutResponse {}
@@ -310,6 +347,8 @@ message IncrementResponse {
 message ScanResponse {
   repeated KeyValue rows = 1;
   bytes resume = 2;
+  // skipped: the keys passed over under skip_locked (see GetResponse).
+  repeated Intent skipped = 3;
 }
 
 message EndTxnResponse {
@@ -357,6 +396,10 @@ message AdminSplitResponse {
   RangeDescriptor right = 2;
 }
 
+message AdminUnsplitResponse {
+  RangeDescriptor desc = 1;
+}
+
 message AdminChangeReplicasResponse {
   RangeDescriptor desc = 1;
 }
@@ -369,7 +412,12 @@ message AdminMergeResponse {
   RangeDescriptor desc = 1;
 }
 
-message SubsumeResponse {}
+message SubsumeResponse {
+  bool already_frozen = 1;
+  // merge_epoch is the epoch of the freeze the range is under now: the
+  // request's when this Subsume made it, the earlier one's otherwise.
+  int64 merge_epoch = 2;
+}
 
 message UnfreezeResponse {}
 
@@ -401,6 +449,7 @@ message ResponseUnion {
     UnfreezeResponse unfreeze = 18;
     ExportResponse export = 21;
     UpdateMetaResponse update_meta = 22;
+    AdminUnsplitResponse admin_unsplit = 23;
   }
 }
 
@@ -424,6 +473,18 @@ message RangeNotFoundError {
 message RangeKeyMismatchError {
   bytes request_key = 1;
   repeated RangeDescriptor actual_descriptors = 2;
+  // frozen: the range covers the key but is frozen for a merge; the
+  // client waits on its descriptor instead of re-resolving.
+  bool frozen = 3;
+}
+
+// DescriptorChangedError: a split, merge or descriptor update was built
+// from a descriptor the range has since moved past, and was refused at
+// apply.
+message DescriptorChangedError {
+  int64 range_id = 1;
+  int64 built_from = 2; // generation the change was built from
+  int64 current = 3;    // generation the range held at apply
 }
 
 message WriteIntentError {
@@ -467,6 +528,7 @@ message Error {
   TxnNotFoundError txn_not_found = 10;
   AmbiguousResultError ambiguous = 11;
   StorageOverloadedError storage_overloaded = 12;
+  DescriptorChangedError descriptor_changed = 13;
 }
 
 // BatchEnvelope is the Batch RPC's response body: outcome or wire error.
@@ -497,6 +559,14 @@ message RaftCommand {
   // at this command's applied index (identical by construction across
   // replicas) — the consistency checker's probe.
   ChecksumTrigger checksum = 7;
+  // descriptor_update replaces the range descriptor with one that differs
+  // only in its sticky bit and generation (cluster version v20; an older
+  // replica would ignore it, so it is never proposed before finalize).
+  DescriptorUpdateTrigger descriptor_update = 8;
+}
+
+message DescriptorUpdateTrigger {
+  RangeDescriptor desc = 1;
 }
 
 message LoadHandoff {

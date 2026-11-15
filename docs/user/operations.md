@@ -65,7 +65,14 @@ serves, on that address:
   domains and schema tables it sorts from a column's header: the small
   arrow beside the header's words sorts by that column, again reverses
   it, and a third time returns the table's own order; a row with no
-  figure in that column stays last either way. All of it is computed from the range descriptors
+  figure in that column stays last either way. On a narrow screen the
+  nodes, failure domains and schema tables are drawn one card per row
+  with no header, so a **sort by** list above the cards offers the same
+  columns, with a button beside it that reverses the direction; it is
+  the same choice as the header's, and carries when the window widens.
+  A range's id there, like a table's name in the schema list, is a real
+  link: the row still opens on a click or Enter, and a ctrl-, cmd- or
+  middle-click on the name opens it in a new tab. All of it is computed from the range descriptors
   and the nodes' declared localities that the page already fetches, so
   it costs no fan-out and answers from a partitioned node. **sql**: connections by state with
   the oldest idle transaction, statements per second by kind, `40001`
@@ -143,7 +150,10 @@ serves, on that address:
   line per node, from the `datax_metrics` table described under [Metrics
   history](#metrics-history); every tile on the overview links to its own
   series charted, and the tiles' sparklines are the last 15 minutes from
-  that table. The charts can mark the events that explain a change in
+  that table. Both axes are labelled at round values: the time axis at
+  multiples of a round step for the window (every 15 seconds, every 10
+  minutes, every 6 hours, each midnight) on the reader's own clock,
+  three to seven of them. The charts can mark the events that explain a change in
   shape: a dashed line at each event in the window, the structural kinds
   (splits, merges, rebalances, lease transfers, repairs, restarts,
   upgrades) by default and any other kind on request. The marks come
@@ -259,7 +269,10 @@ serves, on that address:
   finalized v5 it is a 503.
 - **`/api/schema`** — JSON: the schema browser's document. In secure mode
   root and admins see every table and the user list; another user sees
-  the tables it holds a grant on. Rebuilt at most every 5 s per node.
+  the tables it holds a grant on. Built when requested and cached for
+  5 s per node, with concurrent requests sharing one build: a table
+  created while the page is open shows within that, and a node whose
+  console nobody has open does not read the catalog for it.
 
 In secure mode an unauthenticated browser gets a sign-in page, and the
 console's user menu shows who you are, how you got in, which roles you
@@ -434,6 +447,32 @@ a restore into a cluster whose nodes have already created the table
 proceeds (the table sits at a reserved descriptor ID no user table can
 collide with, and a backup that carries it lands on top).
 
+## Audit table
+
+`datax_audit` is the other table the nodes write on their own account:
+every audit record, one hash chain per node. What it holds, who may
+read it and how to verify it are in [Security → Audit
+table](security.md#audit-table); what an operator needs to know:
+
+- **Volume.** A record is a few hundred bytes. An ordinary cluster
+  writes a handful an hour (DDL, role changes, admin operations,
+  sign-ins); a cluster under a password-guessing attack writes at most
+  20 refusal records a second per node, and usually far fewer because
+  repeats are folded. Writes are batched, one `INSERT` a second per node
+  at most.
+- **Retention.** 90 days by default; `ALTER TABLE datax_audit SET
+  (retention = '400d')` changes it (admins, at least a day). Ageing out
+  is done by the nodes, ten minutes apart, at most 10,000 records per
+  chain per pass.
+- **Backups** include the table. A restore replaces it: see the
+  security guide for what that does to the chains.
+- **Export the heads.** `datax debug audit heads` prints the last record
+  of every chain. Saved outside the cluster on a schedule, it is what
+  makes `datax debug audit verify --heads` proof against someone
+  rewriting the table underneath SQL.
+- **`--audit-table=false`** on `datax start` leaves the table alone on
+  that node; its audit records are then in its log only.
+
 ## Metrics worth alerting on
 
 Full list: scrape `/metrics`. The load-bearing ones:
@@ -452,6 +491,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
+| `datax_row_ttl_lag_seconds` | far above the 30s pass interval for long | expired rows are waiting to be deleted: the row expiry job is behind or stopped (see [Row expiry](#row-expiry)); `datax_row_ttl_rows_blocked_total` rising says foreign keys are holding rows |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
 | `datax_ranges` vs `datax_range_leaders` per node | leaders very skewed | lease shedding isn't keeping up (check `datax_lease_sheds_total`) |
 | `datax_store_disk_bytes{kind="free"}` | < 15% of `kind="total"` | the store's disk is filling; Pebble needs headroom to compact (a full disk is a hard stall) |
@@ -461,11 +501,14 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_clock_offset_seconds{peer}` | \|offset\| > half of `--max-offset` (0.25 s by default) | a node's clock is drifting; past the tolerance the node refuses the peer's timestamps and exits — fix NTP now (the node also logs a warning at this point) |
 | `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
-| `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
+| `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally. Like `datax_table_rows` and `datax_table_ranges` it is read from the catalog when `/metrics` is scraped (at most every 5 s; a scrape waits up to 2 s for the reading, then serves the previous one), so every node reports the same current value and a node nobody scrapes reads nothing for it |
 | `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard). `SET idle_in_transaction_session_timeout` (per session, or in the application's connection setup) ends such a connection and releases its intents; `SELECT pg_cancel_backend(pid)` / `pg_terminate_backend(pid)` with the pid from `pg_stat_activity` does it by hand, and `SET lock_timeout` bounds how long the blocked writers wait ([Session settings](sql.md#session-settings)) |
+| `datax_largeobject_pages_reclaimed_total` flat while `SELECT count(*) FROM datax_largeobject_pending` stays above zero | for more than a few minutes | the large-object sweeper is not reclaiming: unlinked objects and failed uploads are keeping their disk (see [Large objects](#large-objects)) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
 | `datax_replica_gc_removed_total` | increasing | the housekeeping pass found replicas that `/meta` says are members of nothing — preseeds whose membership change never landed — and removed them with their data; expected after a refused replica change, otherwise worth a look at the log for which ranges |
 | `datax_raft_nonmember_messages_dropped_total` | increasing steadily | a replica id the range has moved past keeps sending — a removed replica that has not noticed, or a leftover replica GC has not yet collected (60 s grace) |
+| `datax_audit_write_errors_total`, `datax_audit_buffered` | errors increasing while the buffer grows | the node cannot write its audit records to `datax_audit` (no quorum, a partition, the table's range unavailable); they are in its log and wait in memory to be written — see `audit.last_error` in `/api/security` |
+| `datax_audit_dropped_total{cause="buffer-full"}` | increasing | the audit table has been unwritable for long enough that this node's buffer filled: these events are in the node's log only, and the table will carry an `audit-gap` record saying how many. `cause="rate"` is refusals (failed logins, denied calls) arriving faster than they are recorded — look at who is knocking |
 | `datax_metrics_record_errors_total` | increasing | the node cannot write its metrics history; the table was dropped and recreated, or writes to it fail (check `datax_metrics_record_skipped_total` for backpressure first) |
 | `datax_health_problems{severity="critical"}` | > 0 | a health check found something page-worthy; `check` names it and the dashboard's problems panel says where (see [Health checks](#health-checks)) |
 | `datax_sql_statement_latency_seconds` | p99 far above `datax_kv_batch_latency_seconds` | time is going into planning, retries or result materialization rather than replication; check the slow statements on `/api/activity` |
@@ -506,7 +549,8 @@ mixed ranges),
 bytes still under retired data keys — 0 attests re-encryption is
 complete),
 `datax_auto_splits_total` / `datax_load_splits_total` /
-`datax_range_merges_total`, `datax_range_merges_deferred_total`, `datax_gc_runs_total`,
+`datax_range_merges_total`, `datax_range_merges_deferred_total`,
+`datax_range_merges_unwound_total`, `datax_gc_runs_total`,
 `datax_raft_scheduler_latency_seconds` (how long replicas wait for a raft
 worker — a growing tail means the store's raft workers are saturated),
 `datax_raft_log_syncs_total` / `datax_raft_readies_per_sync` (one synced
@@ -554,10 +598,14 @@ applies to `datax sql` and `datax debug status`.
 datax debug nodes                      # liveness, locality, last heartbeat
 datax debug ranges                     # every range: span, replicas, leader
 #   r7 [/table/orders/primary/1000, /table/orders/by_city) gen=3 replicas=[...]
+#   r8 [...) gen=4 replicas=[...] sticky         <- starts at a manual split
+#   r9 [...) gen=4 replicas=[...] sticky-until=2026-12-01T00:00:00Z
 datax debug status --url http://127.0.0.1:8080/status
 
-datax debug split --table 100          # manual split (also: --key <hex>)
-datax debug merge --key <hex>          # manual merge
+datax debug split --table 100          # manual split (also: --key <hex>); sticky
+datax debug unsplit --table 100        # stop holding it (also: --key <hex>)
+datax debug merge --range 7            # manual merge of r7 with its right neighbor
+datax debug purge --table-name app.documents   # collect and compact deleted data now (also: --table <id>, --key/--end-key <hex>)
 datax debug transfer-lease --range 5 --node 2
 datax debug rebalance --range 5 [--from 1]
 ```
@@ -568,6 +616,170 @@ load and for tests. From SQL, `ALTER TABLE t SPLIT AT VALUES (1000),
 (2000), ...` carves a table at primary-key tuples (a prefix of the key is
 allowed) and returns the boundaries; `datax bench ... --presplit N` uses
 it to spread a workload over N ranges from the start.
+
+A manual split is **sticky**: housekeeping merges adjacent ranges that
+are both small, which would undo a pre-split within seconds, so a
+boundary made by `debug split` or `SPLIT AT` is marked and left alone
+(`debug ranges` shows `sticky`; `/api/cluster` and `/api/range` carry
+`sticky_until`). It stays until it is released — `datax debug unsplit`,
+`ALTER TABLE t UNSPLIT AT VALUES (...)` / `UNSPLIT ALL` — or until the
+expiration given with `SPLIT AT ... WITH EXPIRATION`; releasing merges
+nothing by itself, it only lets housekeeping merge the ranges again when
+they are small. Automatic splits are never sticky. `debug merge` merges
+the range it is given whether or not its neighbor is sticky. Dropping or
+truncating a table releases its manual boundaries, so the emptied ranges
+merge away. All of this needs cluster version v20; before finalize a
+manual split is an ordinary one.
+
+### Purging deleted data
+
+`datax debug purge` is `ALTER TABLE ... PURGE`
+([SQL guide](sql.md#gc-window-and-purge)) for an operator, and for a key
+range that is not a whole table:
+
+```sh
+datax debug purge --table-name app.documents
+# purged /table/documents to /table/8 at 2026-11-15T09:12:44.31Z: 31 version(s) removed over 1 range(s)
+#   r12 n1  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+#   r12 n2  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+#   r12 n3  live keys 90210, superseded versions 0, tombstones 0, intents 0, compacted true
+# not covered by a purge:
+#   - backups taken before the purge still hold the data; destroy or rewrite them separately
+#   - ...
+# complete: every replica answered and holds no superseded version, tombstone or intent in the span
+```
+
+What it does, in order: splits at the two ends of the span, so the
+ranges it touches hold nothing else; on each range's leader, garbage
+collects at a threshold of now and truncates the raft log; on every
+replica, waits for that to apply, compacts the span's sstables and the
+range's log, and counts the span's keys below the MVCC layer; on every
+node involved, retires the write-ahead log files written before the
+purge. The command exits non-zero unless the purge is **complete** —
+every replica answered, and none holds a superseded version, a
+tombstone or an intent in the span — so a script cannot mistake "ran"
+for "gone". The whole report goes to the audit log as a `purge` event,
+and the purge shows as an operation on the operations view.
+
+Things to know before relying on it:
+
+- **It cuts off older readers of the span.** The span's GC threshold
+  becomes the purge time: `AS OF SYSTEM TIME` before it, follower reads
+  before it, a transaction that began before it, and an incremental
+  backup whose base is older all fail on that span, with an error. Take
+  a full backup after a purge if you run incrementals.
+- **A node that is down** makes the purge incomplete, by name. When it
+  restarts it applies the collection from the log (or is given a
+  snapshot without the data) and serves no follower read until it has
+  heard from the range's leader again, so it never answers from its old
+  copy; run the purge again to compact it and get its count. A node
+  that is partitioned but still running is not covered by that rule
+  until it reconnects.
+- **Backups are untouched.** A backup taken before the purge contains
+  the data and restores it. Deleting those is a separate act.
+- **The span must be table data**; the cluster's own key space is
+  refused. A `--key`/`--end-key` purge splits at exactly those keys.
+- **Cost:** a flush and a compaction of the span on every replica, and
+  a few small flushes of each node's raft engine. Seconds for a small
+  table; for a large one, proportional to its size. `--connect-timeout`
+  aside, the command waits up to 30 minutes.
+- **Encrypted stores** purge the same way: the span's files are
+  rewritten and the old ones deleted whichever data key they were
+  written under.
+- A freed disk block is the file system's: the purge removes the data
+  from every file the database owns, not from the device beneath.
+
+`datax_purge_versions_removed_total` counts what purges on a node
+removed.
+
+**A GC window per table.** Garbage collection normally waits out the
+node's window (25h). `ALTER TABLE t SET (gc_ttl = '10m')` gives one
+table its own, shorter or longer; the housekeeping pass picks it up
+within its descriptor cache (~30s). The statement splits the table's
+edges so the window governs ranges that hold only that table, and those
+ranges are not merged into neighbours with a different window. A range
+that straddles the table and something else keeps the longest window of
+what it holds; when housekeeping finds one (a restored table, a split
+that failed) it asks for the edge splits again, at most once a minute
+per table, so the window takes hold a pass or two later. `debug ranges`
+shows whether the table's ranges start and end at its edges.
+
+### Row expiry
+
+Tables with a row TTL ([SQL guide](sql.md#row-expiry-ttl)) are served by
+one job for the cluster, on the node leading range 1. Every 30 seconds
+it visits each such table, reads expired rows oldest-first through the
+index on the expiry column, and deletes them 100 to a transaction with
+a 20ms pause between transactions — at most about 5,000 rows a second
+per table, and no more than one interval spent on a table before the
+next gets its turn. A backlog larger than that (a TTL just added to a
+big table) drains over several passes; steady expiry keeps up inside
+one.
+
+- **Lag** — how long after its expiry time a row is actually deleted —
+  is therefore about the interval under steady writes.
+  `datax_row_ttl_lag_seconds` is the most overdue row the last pass
+  deleted; alert on it staying far above 30.
+- `datax_row_ttl_rows_deleted_total` is the work done.
+  `datax_row_ttl_rows_blocked_total` counts expired rows a restricting
+  foreign key kept, once per pass they were found in: steadily rising
+  means rows that cannot expire until what references them goes.
+- Each pass that deleted or was blocked on something is a `row-ttl`
+  operation on the operations view, on the node that ran it, with the
+  table and the counts; a pass that failed says why.
+- The deletes are normal transactions: they appear in SQL statistics,
+  can conflict with your own writes to those rows (the job retries),
+  and leave old versions for garbage collection like any delete.
+- If range 1's leadership moves mid-pass, two nodes may delete for a
+  moment; the second finds the rows gone.
+
+### Large objects
+
+[Large objects](sql.md#large-objects) are rows of three system tables
+— `datax_largeobject` (the pages, 256 KiB each),
+`datax_largeobject_metadata` (one row per object) and
+`datax_largeobject_pending` (contents waiting to be removed) — created
+by the nodes a few seconds after the cluster reaches v21. What that
+means for running a cluster:
+
+- **Ranges.** Pages are keyed by content and page number, so one object
+  is a contiguous run of keys and a busy cluster's uploads interleave by
+  content, not by time. The page table splits by size like any table; a
+  range boundary may fall inside an object and nothing notices. A range
+  of pages holds about 250 of them at the default range size, and no
+  page is ever too big to split around — which a single multi-megabyte
+  row value is.
+- **Disk.** An object takes its size times the replication factor, plus
+  the Raft log's copy until the log is truncated (briefly about twice
+  that during an upload). Overwritten pages and the pages of unlinked
+  objects stay as old versions until the page table's GC window passes;
+  `ALTER TABLE` is refused on these tables, so that window is the
+  node's (25h by default).
+- **The sweeper.** One job for the cluster, on the node leading range 1,
+  runs every minute and deletes the pages of contents that no object
+  stands for: unlinked objects, uploads that rolled back or lost their
+  connection (marked on the way out, so reclaimed on the next pass), and
+  uploads that have shown no sign of life for 10 minutes (a gateway that
+  died mid-upload). `datax_largeobject_contents_reclaimed_total` and
+  `datax_largeobject_pages_reclaimed_total` count its work, and a pass
+  that reclaimed something logs one line. A non-empty
+  `datax_largeobject_pending` that does not drain means the sweeper is
+  not running (no range-1 leader) or cannot write.
+- **Load.** An upload is a stream of 256 KiB replicated writes, about
+  20 MiB/s per upload on modest disks; it holds no locks while it runs
+  and does not delay backups. Several at once are a bulk load like any
+  other and meet the same [backpressure](#backpressure).
+  `datax_largeobject_bytes_written_total` and `..._read_total` are the
+  traffic, per gateway.
+- **Backups.** A full or incremental backup carries the three tables;
+  a full restore brings the objects back, and the restored cluster's
+  sweeper finishes whatever removals were pending at the backup's time.
+  An object whose upload had not committed at the backup's time is not
+  in the backup. `datax restore --table` restores user tables only: it
+  does not bring back the large objects a restored table's rows refer
+  to (restore everything into a scratch cluster and copy them out).
+- **Memory.** Gateways need nothing extra: a transfer holds a page or a
+  read's worth at a time.
 
 Keys print as paths everywhere — logs, `datax debug`, the dashboard and
 its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range
@@ -616,12 +828,88 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   them from; a manifest carrying any other key — the cluster's
   authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
-  included — and must chain within the MVCC GC window (25h by default): an
-  older base is refused with "incremental base too old". Take a fresh full
-  backup at least daily.
-- On an encrypted store, backup files are written in plaintext; the
-  command refuses unless you pass `--allow-plaintext`. Protect the backup
-  location accordingly.
+  included — and must chain within the MVCC GC window (25h by default): a
+  base older than that is refused ("the base backup is older than the
+  garbage-collection window"), because changes since it have been
+  collected in part. Take a fresh full backup at least daily.
+- An incremental holds each changed key as it stood at the incremental's
+  own timestamp. Taken with `--revision-history` it holds every version
+  written since the base instead, and the chain restores to any moment
+  in between (see [Restoring to a point in time](#restoring-to-a-point-in-time)).
+- Without a key, backup files are written in plaintext. On an encrypted
+  store the command refuses to do that silently: pass `--backup-key` to
+  seal the backup (below), or `--allow-plaintext` to write an unsealed
+  one and protect the backup location yourself. Passing both is refused.
+
+### Sealed backups
+
+A backup is where a cluster's data leaves the protection of its stores:
+rows, and also everything about them — which tables and accounts exist,
+how many rows each holds, role names and password verifiers.
+`--backup-key <file>` seals every file of the backup, the manifest
+included, with authenticated encryption (AES-256-GCM) under a key you
+supply. The key file is 32 raw bytes or 64 hex characters, like a store
+key file (`openssl rand -hex 32 > backup.key`); it is a key of its own,
+not the store key, and works the same on an unencrypted store.
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/full --backup-key backup.key
+datax backup  --addr 10.0.0.1:26257 --dest /backups/inc1 --base /backups/full \
+              --backup-key backup.key
+datax restore --addr 10.0.1.1:26257 --src /backups/full,/backups/inc1 \
+              --backup-key backup.key
+```
+
+- **What is sealed.** `BACKUP.json` becomes a small envelope holding the
+  backup's own random data key, wrapped under your key, and the sealed
+  manifest; each `table_<id>.dxbk` is sealed in 64 KiB chunks under a
+  key derived from the data key and the file's name. The file's name,
+  each chunk's position and whether it is the last are part of what is
+  authenticated, so a changed byte, a truncated file (at a chunk
+  boundary too), chunks reordered, two files exchanged, or a file or
+  manifest taken from another backup all fail to open. The summary's
+  record counts and checksums are computed over the plaintext, so a
+  sealed backup and an unsealed one of the same data print the same.
+- **What is still visible** to someone holding the directory: that it is
+  a sealed datax backup, how many tables it has, their numeric ids (in
+  the file names — never their names), and each file's size.
+- **Restore refuses before it applies.** Every manifest is opened and
+  every data file read to its end and authenticated before the first
+  record is written. A wrong key, a missing key, or any of the damage
+  above leaves the target cluster untouched.
+- **Sealed and plaintext do not stand in for each other.** A sealed
+  backup is never read without its key, and a plaintext directory given
+  to a restore together with a key is refused — anyone who can write
+  the backup location can write a plaintext backup, and only a holder
+  of the key can write a sealed one, so a plaintext directory where you
+  named a key is not the backup you meant.
+- **Keys in a chain.** Each backup of a chain may have its own key. For
+  restore, `--backup-key` takes one key file, used for every directory
+  in `--src`, or a comma-separated list with exactly one entry per
+  directory, in the same order. Keys are paired by position; none is
+  tried against another directory. An empty entry says that directory
+  is a plaintext backup: `--src /backups/old-full,/backups/inc1
+  --backup-key ,backup.key`.
+- **An incremental's base.** `--base` is read only for its cluster id and
+  end timestamp. A sealed base is opened with `--backup-key`; if it was
+  sealed under a different key, name that with `--base-key <file>`. With
+  `--base-key`, the base must be sealed under it; without, a plaintext
+  base is accepted (so sealing can start mid-chain).
+- **How the key travels.** The serving node writes and reads the backup,
+  so the command reads the key file and sends the key in the admin
+  request. On a secure cluster that is mutual TLS. On an insecure
+  cluster the request is cleartext, so a node accepts a backup key only
+  from its own machine: run the command there, against a loopback
+  address. The key is never logged or written to the audit log (the
+  audit record notes only that a key was given), is not stored on the
+  node, and is not written into the backup.
+- **Losing the key loses the backup.** There is no escrow and no second
+  way in. Keep the key apart from the backup location; a key stored
+  beside the files it seals protects nothing.
+- `--enc-root` roots (a KMS command, operator shares) do not hold backup
+  keys yet: a backup key is always a key file.
+
+### Restoring everything
 
 `datax restore` applies a chain (full first, then incrementals in order)
 into an **empty** cluster — it refuses if any table exists:
@@ -639,6 +927,194 @@ compare them against the backup's to verify the restore byte-for-byte.
 
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.
+
+### Restoring a table into a running cluster
+
+`--table` brings named tables back from a chain into a cluster that is
+serving traffic, beside what is there. Nothing else is touched: no other
+table, no user or role, no setting.
+
+```sh
+# one table, under a new name, to compare and copy rows from
+datax restore --addr 10.0.0.1:26257 --src /backups/full,/backups/inc1 \
+              --table shop.orders --into orders_restored
+
+# several at once (names pair up in order; an empty --into entry keeps the name)
+datax restore --addr 10.0.0.1:26257 --src /backups/full,/backups/inc1 \
+              --table shop.orders,shop.customers --into orders_r,customers_r
+
+# every table of a database, as a new database
+datax restore --addr 10.0.0.1:26257 --src /backups/full --database shop --into shop_restored
+```
+
+A table is named `db.table` (or `table`, in the default database
+`datax`). `--into` takes `table` to stay in the same database or
+`db.table` to land in another, which must exist. `--backup-key` works as
+for any restore. Needs cluster version v21.
+
+- **It never overwrites.** A name that exists is refused. To replace a
+  live table with its restored copy, restore under another name, check
+  it, then `DROP TABLE orders; ALTER TABLE orders_restored RENAME TO
+  orders`. There is no flag that does the swap for you. A database is
+  always restored as a new one: `--database shop` without `--into` is
+  for a database that is gone.
+- **A new table id.** The restored table takes a fresh id and its rows
+  are re-keyed to it; index ids are kept, so secondary indexes come
+  back as stored, with no backfill. The summary prints the new id, the
+  table it came from, and a checksum computed over the restored rows
+  *under the keys the backup knows them by* — the same checksum a full
+  backup of the source taken at that moment prints for the table.
+- **What comes with a table.** Its columns, indexes, constraints,
+  comment, timeseries options and retention; the sequences its `SERIAL`
+  and identity columns own, as new sequences named for the new table,
+  continuing from the backup's counter; its grants and owner, for the
+  roles this cluster has — grants to roles it lacks are left out and
+  listed in the summary, and a table whose owner is missing is owned by
+  `root`. Statistics are not in a backup; the table is sampled like any
+  new one.
+- **Foreign keys.** A foreign key to a table restored in the same run
+  follows it: restore `orders` and `customers` together and the copy of
+  `orders` references the copy of `customers`. A foreign key to a table
+  that is *not* being restored is **refused** — the restored rows would
+  be checked against a table that has moved on since the backup. Pass
+  `--drop-foreign-keys` to restore the table without those constraints
+  (the summary lists each one dropped). Tables that referenced the
+  original keep referencing the original.
+- **What is refused,** each with the reason: a view (restore its tables
+  and recreate it; a database restore skips views and prints their
+  definitions); a table with an enum column, unless it goes back into
+  the database that still has that same type with the same labels; a
+  table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
+  TYPE` when backed up; the cluster's own tables; and a table whose
+  descriptor carries a feature this version's table restore does not
+  know. For all of these, restore the whole backup into an empty
+  cluster and copy the rows from there.
+- **Checked before anything is written.** The chain, the names, the
+  foreign keys, and every data file the restore needs: each is read to
+  its end first — which authenticates a sealed file — and held to its
+  manifest's record count and checksum, to its table's key span, and to
+  key order. A refusal leaves nothing behind, not even a table id.
+- **Appears all at once, or not at all.** Rows are loaded under the new
+  id in ordinary transactions of 1024 writes — replicated, encrypted
+  and versioned like any write, and unreachable by any statement,
+  because no table has that id yet. They are then read back and their
+  checksum compared with the backup's. One transaction publishes
+  everything: descriptors, names, sequences, the database. Before it
+  commits the tables do not exist; after it they are complete.
+- **If it is interrupted.** A restore that fails removes what it loaded.
+  If the node running it dies, the rows stay invisible and a janitor
+  removes them: the node itself shortly after it restarts, or any other
+  node five minutes after the restore's last sign of life. Either way
+  the operations view shows a `restore-reclaim`. A restore is not
+  resumed: run it again.
+- **Cost.** The data files are read twice (checked, then loaded) and the
+  loaded rows once more. The load is ordinary write
+  traffic on new ranges and competes with other writes like any bulk
+  insert. Placement policy applies to the new table once it is
+  published; a database restore brings the database's policy with it.
+- A timeseries table with a retention keeps it: rows already past it
+  are restored and then expire as they would have.
+
+### Restoring to a point in time
+
+A chain restores to the end of any backup in it. Incrementals taken with
+`--revision-history` also keep every version written since their base,
+and `--as-of` then reaches any moment of that interval:
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/sun-full
+datax backup  --addr 10.0.0.1:26257 --dest /backups/mon-06 --base /backups/sun-full --revision-history
+datax backup  --addr 10.0.0.1:26257 --dest /backups/mon-12 --base /backups/mon-06   --revision-history
+
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --as-of 2026-11-16T09:41:00Z --table shop.orders --into orders_0941
+```
+
+- `--as-of` takes an RFC 3339 time or Unix nanoseconds — the same
+  timestamp `AS OF SYSTEM TIME` takes, so a moment you checked with a
+  query is the moment you restore to. Backup and restore summaries
+  print their timestamps in the nanosecond form (`as of: ...`), with
+  `,<n>` appended in the rare case the clock's logical counter was not
+  zero; pass that back verbatim to restore to exactly a backup's end.
+- It works with `--table` / `--database` (into a running cluster) and
+  without (everything, into an empty one).
+- **The restored data is the committed data at that moment.** A
+  transaction's writes all carry its commit timestamp, so a restore
+  shows every transaction whole or not at all, across however many
+  ranges it wrote.
+- **What is refused,** with the times the chain does restore to: a
+  moment before the full backup, after the last backup, or inside an
+  interval whose incremental was taken without `--revision-history`.
+  `--revision-history` on a full backup is refused too: a full backup
+  is the floor of the window.
+- **History costs space in proportion to the write rate**: a history
+  incremental holds one record per version, where a plain one holds one
+  per changed key. The summary prints both (`records`, `versions`).
+- **History must still exist to be backed up.** Versions older than the
+  GC TTL (25h by default) are collected. An incremental whose base is
+  older than that is refused rather than written with a hole in it — so
+  take history incrementals more often than the GC TTL, and leave
+  margin: nothing holds collection back for a chain that falls behind.
+  If one is refused, the chain ends at its last backup and a new full
+  backup starts the next. Rows a timeseries table's retention has
+  expired are gone from history like any other collected version.
+- **The schema is not versioned.** A backup holds each table's
+  definition, and the cluster's roles and sequences, as of the backup's
+  end. A restore to a moment *inside* an interval therefore refuses a
+  table that was created or altered in that interval (grants and
+  comments do not count) — restore it to either end of the interval
+  instead — and a table dropped in the interval is restorable up to the
+  last backup that still has it. For a restore of everything, one such
+  table refuses the restore; use `--table` for the others. Roles,
+  grants and sequence counters come from the interval's end.
+- Needs cluster version v21 to take; a sealed chain restores to a moment
+  exactly like a plaintext one. A binary from before v21 refuses a
+  history backup ("not a datax backup") rather than misreading it.
+
+**Worked example: a dropped table.** `shop.orders` was dropped at about
+14:20; the last backup before that is `/backups/mon-12`.
+
+```sh
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --table shop.orders --drop-foreign-keys
+```
+
+The name is free, so the table comes back under it, as of 12:00, with
+its indexes, its `SERIAL` sequence and its grants. `--drop-foreign-keys`
+is there because `orders` referenced `customers`, which is live and is
+not being restored; put the constraint back once you have looked at the
+rows (`ALTER TABLE orders ADD CONSTRAINT ... FOREIGN KEY ...`). Rows
+written between 12:00 and the drop are in no backup: a table dropped
+inside an interval is restorable to the interval's start, not into it.
+
+**Worked example: a bad UPDATE.** At 09:42 an `UPDATE orders SET status =
+'cancelled'` ran without its `WHERE`. The 12:00 incremental was taken
+with history, so:
+
+```sh
+# 1. find the moment: the last time the data was right
+datax sql -e "SELECT count(*) FROM shop.orders AS OF SYSTEM TIME '2026-11-16T09:41:00Z' WHERE status = 'cancelled'"
+
+# 2. bring the table back as of then, beside the live one
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --as-of 2026-11-16T09:41:00Z --table shop.orders --into orders_0941 --drop-foreign-keys
+```
+
+```sql
+-- 3. compare, then put back what the UPDATE destroyed
+SELECT count(*) FROM orders_0941 WHERE status <> 'cancelled';
+BEGIN;
+DELETE FROM orders WHERE id IN (SELECT id FROM orders_0941);
+INSERT INTO orders SELECT * FROM orders_0941;
+COMMIT;
+DROP TABLE orders_0941;
+```
+
+Orders created after 09:41 are not in `orders_0941` and are left as they
+are. While step 1 still works — the mistake is younger than the GC TTL —
+the cluster has the history itself and can be queried `AS OF SYSTEM
+TIME` directly; the backup is for when it no longer does, and for
+having the old rows as a table to join against.
 
 ## Stopping a node
 
@@ -710,6 +1186,43 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v21 starts the audit table.** Until it is finalized audit records
+  are in the node logs only, as before; from finalize on every node also
+  writes them to `datax_audit` (see [Security → Audit
+  table](security.md#audit-table)). Records from before finalize are not
+  copied in.
+- **v21 also gates two backup features**: `datax backup --revision-history`
+  and `datax restore --table` / `--database` are refused until it is
+  finalized. Plain backups and restores work as before on either side.
+- **v20 makes manual splits sticky.** Until it is finalized `ALTER TABLE
+  ... SPLIT AT` and `datax debug split` split as before and housekeeping
+  may merge the ranges back; boundaries made before finalize are not
+  marked afterwards either — run the `SPLIT AT` again (it is idempotent)
+  to mark them.
+- **v21 adds per-table GC windows, row expiry and purge.** Until it is
+  finalized the `gc_ttl` and `ttl` table options, `ALTER TABLE ...
+  PURGE` and `datax debug purge` are refused (`0A000`): a node on the
+  old binary would collect a table at the node's window rather than the
+  table's, expire nothing, and drop the options from the next
+  descriptor it rewrote. v21 binaries also change one thing without the
+  finalize: a restarted node serves no follower reads from a range
+  until it has heard from that range's leader again (a few seconds).
+- **v21 also allows GIN indexes on JSONB columns.** Until it is finalized
+  `CREATE INDEX ... USING GIN` is refused (`0A000`): a node on the older
+  binary would maintain such an index as an ordinary one. No existing data is
+  rewritten.
+- **v21 also allows full-text search columns and indexes.** Until it is
+  finalized a table cannot be given a `TSVECTOR` or `TSQUERY` column
+  (`CREATE TABLE`, `ADD COLUMN`, `ALTER COLUMN TYPE` and `CREATE TABLE
+  AS` are refused with `0A000`), and neither kind of full-text GIN index
+  can be created: a node on the older binary cannot decode such a row.
+  The functions and the `@@` operator store nothing and work at once.
+- **v21 also adds `VECTOR` columns and their `ivfflat` index.** Until
+  it is finalized a `vector` column (`CREATE TABLE`, `ADD COLUMN`,
+  `ALTER COLUMN TYPE`) and `CREATE INDEX ... USING ivfflat` are refused
+  (`0A000`): a node on the older binary cannot read a row holding a
+  vector, and would maintain the index as an ordinary one. The distance
+  operators and functions work on values at either version.
 
 ## Decommissioning a node
 
@@ -740,6 +1253,24 @@ datax debug unsafe-recover --dir /var/lib/datax --yes    # [--range N]
 This can lose recently committed writes on the dead replicas — hence
 "unsafe". `datax debug metadata --dir ...` inspects a store's metadata
 (works on encrypted stores with `--enc-key`).
+
+- **v21 also adds large objects.** Until it is finalized the `lo_*`
+  functions are refused (`0A000`) and nothing creates their tables: a
+  node on the older binary knows nothing of the reservation and would
+  let the tables' owner delete pages out from under an object.
+- **This release changes three behaviours without a version gate**, all
+  found by measuring large values and all safe in a mixed cluster. A
+  gateway refuses a write batch of more than 60 MiB for one range
+  (`54000` to the SQL client) instead of sending it: such a batch could
+  not be replicated, failed with `XX000`, and left the range's
+  leadership churning around the entry. A
+  store on the balanced profile now starts an L0 compaction at 200
+  files rather than 500: files that do not overlap (a stream of writes
+  in key order) used to pile up to the 400-file backpressure gate and
+  stay there, shedding writes for good. And a transaction's record is
+  created with a current heartbeat: a transaction that made its first
+  write more than five seconds after `BEGIN` could be aborted by any
+  other transaction that met its row in the following second.
 
 ## Backpressure
 
@@ -798,6 +1329,9 @@ datax bench ingest --keys random|sequential|uuid --batch 100 --payload-bytes 256
 datax bench timeseries --series 1000 --shards 8
 datax bench index-join --preload 20000 --groups 1000   # secondary-index fan-out to wide rows
 datax bench scan --preload 20000                        # large result sets through pgwire
+datax bench jsonb-contain --preload 50000 [--jsonb-index none]   # JSONB containment: through a GIN index, or as a filter
+datax bench text-search --preload 1000000 --groups 20000 [--text-query word|phrase|prefix|ranked] [--text-index none]   # full-text search: through a GIN index, or as a filter
+datax bench vector-knn --preload 50000 --dims 64 [--vector-index none] [--lists 200] [--probes 5]   # nearest neighbours: through an ivfflat index (with its recall and build time), or exactly
 ```
 
 `ingest` writes batches of keys (random for LSM stress); `timeseries`
@@ -816,6 +1350,14 @@ writes a record per workload; `datax bench compare BEFORE AFTER` prints
 the deltas and flags anything beyond ±5 %. `bench/README.md` says how a
 PR records its before/after; a nightly workflow runs the set on `main`
 and keeps the records as an artifact.
+
+A run exits non-zero when its measured phase counts more errors than
+`--max-errors` (default 0; `-1` to never fail on errors). Serialization
+retries (40001) are counted separately and are not errors. `datax bench
+run` still runs every workload of the set and then names the ones that
+failed, each with its error count and most frequent error; a workload
+in the set can carry its own tolerance (`"max_errors"`). The nightly is
+red on exactly that exit status.
 
 Two counters show which commit fast path your workload rides:
 `datax_one_phase_commits_total` (single-range implicit transactions — one
@@ -855,6 +1397,30 @@ Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
 - **Secondary indexes multiply write cost**: each row insert writes every
   index too, and each **unique** index adds a read-before-write check.
   Unique-index-heavy tables ingest at point-read speed, not write speed.
+- **Many tables cost the catalog little; many ranges cost what ranges
+  cost.** Listing one database's tables and resolving one table read
+  the same number of keys with 1,000 tables in the cluster as with
+  5,000 (measured on an in-process three-node cluster, fifty tables to
+  a database: 53 point reads and one scan to list a database, 4 point
+  reads to resolve a table cold). A gateway caches at most 1,024
+  descriptors and gives up the lease of any it has not used for 30 s,
+  so one that touched every table once is back to no lease traffic half
+  a minute later; a workload that keeps more than 1,024 tables hot on
+  one gateway pays two point reads per statement for the overflow. The
+  schema page costs one build per five seconds while somebody has it
+  open — 51 ms and 1 MB of descriptors at 5,000 tables — and it, the
+  catalog-wide `information_schema` views, the per-table gauges and a
+  few background passes (statistics refresh, retention, backup) are
+  what still read every descriptor. Small tables do not get a range
+  each: ranges split by size, and 5,000 one-row tables shared nine
+  ranges in that test, at roughly 4–16 KiB of heap per table per node
+  (the lower figure after this change; it includes storage engine and
+  raft state and is an observation, not a guarantee). A table does
+  occupy at least one range of its own when it is a timeseries table or
+  its database carries a placement policy, and a range is a raft group
+  on three nodes; tens of thousands of such tables are a range-count
+  question (see the range and raft numbers above), not a catalog one.
+  Beyond 5,000 tables is untested.
 - **Reads scale with replicas** for historical (`AS OF SYSTEM TIME`)
   queries, which any replica can serve; current reads go to leaseholders,
   which the load balancer spreads by QPS.

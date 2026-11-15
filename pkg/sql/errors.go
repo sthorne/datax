@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 )
@@ -100,6 +101,11 @@ func ToSQLError(err error) *Error {
 	if kvclient.IsRetryable(err) {
 		return &Error{Code: CodeSerializationFailure, Msg: "restart transaction: " + err.Error()}
 	}
+	var kerr *kvpb.Error
+	if errors.As(err, &kerr) && kerr.TooLarge != nil {
+		return &Error{Code: CodeProgramLimitExceeded, Msg: fmt.Sprintf("the statement writes about %d MiB to one range in a single piece, and a single write can carry %d MiB: a row and what is written with it must stay well below that (store a large value as a large object: lo_create, lowrite)",
+			(kerr.TooLarge.Bytes+1<<19)>>20, kerr.TooLarge.Limit>>20)}
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{Code: CodeQueryCanceled, Msg: "canceling statement due to statement timeout"}
 	}
@@ -108,6 +114,9 @@ func ToSQLError(err error) *Error {
 	}
 	if kvclient.IsLockTimeout(err) {
 		return &Error{Code: CodeLockNotAvailable, Msg: "canceling statement due to lock timeout"}
+	}
+	if kvclient.IsLockNotAvailable(err) {
+		return &Error{Code: CodeLockNotAvailable, Msg: "could not obtain lock on row"}
 	}
 	var nf *catalog.ErrTableNotFound
 	if errors.As(err, &nf) {

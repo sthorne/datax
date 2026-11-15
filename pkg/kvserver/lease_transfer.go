@@ -17,6 +17,16 @@ import (
 // proposals fail with ambiguous "leadership lost" errors.
 
 // adminTransferLease executes an AdminTransferLeaseRequest on the leader.
+// A leadership change within transferSettleWindow of this replica asking
+// for one is taken to be that transfer (raft gives up on a transfer
+// after an election timeout, one second by default). Proposals in
+// flight across it are given transferSettleGrace to apply here before
+// their proposers are told the outcome is unknown.
+const (
+	transferSettleWindow = 3 * time.Second
+	transferSettleGrace  = 2 * time.Second
+)
+
 func (r *Replica) adminTransferLease(ctx context.Context, req *kvpb.AdminTransferLeaseRequest) (*kvpb.AdminTransferLeaseResponse, *kvpb.Error) {
 	desc := r.Desc()
 	if req.Target == r.store.cfg.NodeID {
@@ -37,6 +47,9 @@ func (r *Replica) adminTransferLease(ctx context.Context, req *kvpb.AdminTransfe
 			cmdTriggers{load: &loadHandoff{QPS: q, AtNanos: r.store.loadNow()}})
 	}
 
+	r.mu.Lock()
+	r.mu.transferAt = time.Now()
+	r.mu.Unlock()
 	r.transferLeader(uint64(rep.ReplicaID))
 
 	// Raft aborts a transfer that cannot complete within one election

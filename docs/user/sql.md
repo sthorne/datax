@@ -23,11 +23,13 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
 | enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
-| `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
+| `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB`, `TSVECTOR` and `TSQUERY` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
 | `DATE` | | |
-| `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
+| `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |
 | `UUID` | | |
 | `JSONB` | `JSON` | normalized on write: sorted keys, compact |
+| `TSVECTOR` | | a document reduced for searching: its distinct words (lexemes), sorted, each with the positions it occurs at and their weights — `'cat':3 'fat':2,11A`. Made by `to_tsvector`, or written as a literal (taken as written: no stemming). `tsvector` (OID 3614) on the wire, text and binary. Equality only; not a key, not in an ordinary index — a GIN index serves `@@`. See [Full-text search](#full-text-search). Cluster version v21 for a column |
+| `TSQUERY` | | a search: lexemes joined by `&`, `\|`, `!` and `<->` — `'fat' & ( 'cat' \| 'rat' )`. Made by `to_tsquery` and its relatives, or written as a literal. `tsquery` (OID 3615) on the wire, text and binary. Cluster version v21 for a column |
 
 - String literals coerce into every type: `WHERE at >= '2026-08-30 02:00:00Z'`,
   `WHERE tag = 'a0eebc99-...'` — and become index bounds.
@@ -66,7 +68,8 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - JSONB stores normalized text; numbers keep their exact ingest form.
   Extraction: `j -> 'key'` (jsonb), `j ->> 'key'` (text, must be last),
   chainable: `j -> 'a' ->> 'b'`. Missing keys and non-objects yield NULL.
-  JSONB cannot be a primary key or indexed. `->`/`->>` (by key or array
+  JSONB cannot be a primary key or part of an ordinary index; a GIN
+  index serves containment and key existence (below). `->`/`->>` (by key or array
   index) and `#>`/`#>>` (by path: `j #>> '{a,0,b}'`) work everywhere an
   expression does — single-table queries, joins, grouped select lists
   and HAVING; a LEFT-joined NULL side extracts to NULL.
@@ -74,9 +77,15 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   (objects contain recursively, arrays contain each right element
   somewhere, a top-level array contains a matching scalar), numbers
   compared numerically (`1` contains `1.0`) — and key existence `j ?
-  'k'`, `j ?| '{a,b}'`, `j ?& '{a,b}'`. All are filters (no index
-  acceleration): pair them with an indexable condition on large tables.
-- Every type except JSONB can appear in primary keys and indexes.
+  'k'`, `j ?| '{a,b}'`, `j ?& '{a,b}'`. Without an index they are
+  filters over every row; `CREATE INDEX ... USING GIN (j)` makes `@>`
+  and the three key operators index lookups — see
+  [JSONB indexes](#jsonb-indexes).
+- `VECTOR(n)` (pgvector's `vector`) holds `n` float4 elements, for
+  embeddings: `'[0.1, 2, -3.5]'`. See [Vectors](#vectors) for the
+  distance operators, nearest-neighbour queries and the index.
+- Every type except JSONB, TSVECTOR, TSQUERY and VECTOR can appear in
+  primary keys and ordinary indexes.
 
 ## DDL
 
@@ -91,6 +100,9 @@ CREATE TABLE IF NOT EXISTS t (...);
 DROP TABLE [IF EXISTS] t;
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
+CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
+CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
 DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
@@ -103,6 +115,9 @@ ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
 TRUNCATE [TABLE] t [, t2] [RESTART IDENTITY] [CASCADE]; -- one descriptor write, however many ranges
 ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE DECIMAL(12, 2);   -- online rewrite; widening and text conversions
 ALTER TABLE t SPLIT AT VALUES (1000), (2000, 'x');      -- carve ranges at primary-key tuples (a prefix allowed); returns the boundaries
+ALTER TABLE t SPLIT AT VALUES (3000) WITH EXPIRATION INTERVAL '1 day';  -- ...held until then (an interval from now, or a timestamp)
+ALTER TABLE t UNSPLIT AT VALUES (1000);                 -- stop holding a boundary; the ranges merge back when small
+ALTER TABLE t UNSPLIT ALL;                              -- ...every manual boundary in the table
 CREATE TABLE t2 (LIKE t INCLUDING ALL);                  -- columns, defaults, constraints, indexes, comments
 CREATE TABLE big AS SELECT id, qty FROM t WHERE qty > 10;          -- a hidden rowid key
 CREATE TABLE keyed (order_id, qty, PRIMARY KEY (order_id)) AS SELECT id, qty FROM t [WITH NO DATA];
@@ -117,6 +132,176 @@ the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the
 schema at once and its entries are reclaimed after the statement's
 transaction commits and every gateway has adopted the change.
+
+### JSONB indexes
+
+```sql
+CREATE INDEX docs_doc ON docs USING GIN (doc);            -- or (doc jsonb_ops)
+
+SELECT id FROM docs WHERE doc @> '{"owner": {"team": "search"}}';
+SELECT id FROM docs WHERE doc @> '{"tags": ["pii", "eu"]}';     -- both tags, any order
+SELECT id FROM docs WHERE doc ? 'expires_at';                    -- has the top-level key
+SELECT id FROM docs WHERE doc ?| '{warn,block}' AND doc @> $1;  -- combined; parameters work
+```
+
+A GIN index on a JSONB column holds one entry for every value in each
+document, together with the path to it, and one for every top-level key.
+Four operators use it, with the column alone on the left and a literal
+or parameter on the right: `@>`, `?`, `?|` and `?&`. They may be combined
+with `AND` (and with any other condition), and with `OR` as long as every
+branch of the `OR` is one of them. `EXPLAIN` shows the lookups:
+
+```
+inverted scan of index "docs_doc" ("owner"."team" = "search") + primary key join, rows rechecked
+```
+
+Good to know:
+
+- **Results are the same as without the index.** The index finds
+  candidate rows; each is then checked against the whole `WHERE` clause.
+- **What it does not serve**: `<@`, `NOT (doc @> ...)`, a comparison of
+  an extracted value (`doc->>'n' = '5'`), containment under a path
+  (`doc->'a' @> ...`), and a right-hand side taken from another column.
+  A query for an empty container alone (`doc @> '{}'`, `doc @> '[]'`)
+  matches by shape, not by value, and scans. These all still work, as
+  filters.
+- **Writes** cost one KV write per value in the document, in the same
+  transaction as the row. An `UPDATE` rewrites only the entries of the
+  values that changed.
+- **Limits**: a document may have at most 8,192 distinct indexed values
+  and keys (`54000` beyond that; the write is refused). Long strings and
+  deep paths are indexed by a digest, so there is no limit on their
+  length. A GIN index takes one column and cannot be `UNIQUE`.
+- **Choosing**: with a condition that pins an indexed or primary-key
+  column by equality in the same query, the planner prefers that
+  condition unless table statistics say otherwise. `SET
+  inverted_index_scan = off` (or `on`) overrides the choice for a
+  session, which is the way to compare the two plans.
+- `jsonb_path_ops` is accepted and builds the same index.
+- Needs cluster version v21; on a cluster that has not finalized it the
+  statement is refused (`0A000`).
+
+### Full-text search
+
+```sql
+CREATE TABLE articles (id INT8 PRIMARY KEY, title TEXT, body TEXT);
+CREATE INDEX articles_body ON articles USING GIN (to_tsvector('english', body));
+
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ to_tsquery('english', 'index & (scan | lookup) & !slow');
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ phraseto_tsquery('english', 'full text search');   -- the words, adjacent, in order
+SELECT id FROM articles
+ WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', $1);                -- what a user typed in a search box
+
+-- The ten best matches, best first, each with an excerpt.
+SELECT id, ts_rank(to_tsvector('english', body), to_tsquery('english', $1)) AS rank,
+       ts_headline('english', body, to_tsquery('english', $1)) AS excerpt
+  FROM articles
+ WHERE to_tsvector('english', body) @@ to_tsquery('english', $1)
+ ORDER BY rank DESC LIMIT 10;
+```
+
+Text is searched by reducing it to a **`tsvector`** — its words, cut
+down to *lexemes* so that "Indexes", "indexed" and "indexing" are all
+`index` — and matching that against a **`tsquery`** with the `@@`
+operator. A GIN index over the lexemes makes `@@` a lookup instead of a
+read of every row; `EXPLAIN` shows it:
+
+```
+inverted scan of index "articles_body" ("index" AND "scan") + primary key join, rows rechecked
+```
+
+**Configurations** decide how text becomes lexemes. There are two:
+`english` drops stop words (*the*, *of*, *and*: 127 of them) and stems
+the rest with the Snowball English stemmer; `simple` only lower-cases.
+Both split text the same way: a word is a run of letters and digits
+(Unicode letters count; case is folded, accents are kept), `3.14` is one
+number, `ann@example.com` and `example.com` are one token each, and
+everything else — spaces, punctuation, hyphens, underscores, apostrophes
+— separates words. A word with a digit in it, an address and a host name
+are never stemmed. `SET default_text_search_config = 'simple'` changes
+what a call that names no configuration uses (the default is `english`).
+
+**Queries.** `to_tsquery` takes the operators: `a & b`, `a | b`, `!a`,
+`a <-> b` (b directly after a), `a <3> b` (b three words after a),
+parentheses, `prefix:*` (any word starting with it) and `word:AB` (only
+at positions of weight A or B). `plainto_tsquery` requires every word of
+a plain text, `phraseto_tsquery` requires them in order, and
+`websearch_to_tsquery` reads search-box syntax (`"a phrase" -excluded
+this or that`) and never raises a syntax error. Stop words are dropped
+from a query as they are from a document; a phrase keeps the gap they
+leave (`phraseto_tsquery('the cats ate the rats')` is `'cat' <-> 'ate'
+<2> 'rat'`). A query made only of stop words matches nothing.
+
+**Two ways to index.**
+
+- `USING GIN (to_tsvector('english', body))` indexes a `TEXT` column
+  directly. Queries must use the same expression —
+  `to_tsvector('english', body) @@ ...` — and the same configuration
+  (`to_tsvector(body)` counts when the session's default is that
+  configuration). Nothing else needs maintaining: writing `body` updates
+  the index.
+- A `TSVECTOR` column with `USING GIN (v)`, for a vector that is not a
+  plain function of one column — a title weighted above a body, say:
+
+  ```sql
+  ALTER TABLE articles ADD COLUMN v TSVECTOR;
+  CREATE INDEX articles_v ON articles USING GIN (v);
+  UPDATE articles SET v = setweight(to_tsvector('english', title), 'A') || to_tsvector('english', body);
+  SELECT id FROM articles WHERE v @@ to_tsquery('english', 'index:A');   -- in the title
+  ```
+
+  The application keeps the column up to date: there are no generated
+  columns and no triggers, so every statement that writes `title` or
+  `body` must write `v` too.
+
+**Ranking and excerpts.** `ts_rank(vector, query)` scores a row by how
+often the query's words occur and, for words required together, how
+close they are; `ts_rank_cd` by the shortest stretches of the document
+that satisfy the query. Both take an optional leading array of four
+weights (for D, C, B, A positions) and a trailing normalization bit
+mask, as in PostgreSQL. `ts_headline([config,] text, query [, options])`
+returns a fragment of the text with the matching words wrapped in
+`<b>...</b>` (`StartSel`, `StopSel`, `MaxWords`, `MinWords`,
+`HighlightAll`). The other functions — `setweight`, `strip`, `numnode`,
+`tsvector_to_array`, `get_current_ts_config` — and `tsvector || tsvector`
+are in the [functions reference](functions.md#full-text-search).
+
+Good to know:
+
+- **Results are the same as without the index.** The index holds
+  lexemes only; positions and weights stay in the vector. It finds the
+  rows that hold the query's words, and each is then checked against the
+  whole `WHERE` clause — which is where a phrase's adjacency and a
+  weight are decided.
+- **What the index serves**: `@@` with the indexed column or expression
+  on the left and a query known before any row is read (a literal, a
+  parameter, a function of them) on the right; combined with `AND`
+  freely and with `OR` when every branch is such a condition. `a & b`
+  looks up both words, `a | b` either, `a <-> b` both (adjacency is
+  rechecked), `a:*` every word with the prefix (one range of the index).
+- **What it does not**: a negation says which words a row lacks, and the
+  index lists the rows that hold a word. So `a & !b` looks up `a` and
+  rechecks, and `!b` alone — or `a | !b`, or `NOT (v @@ ...)` — reads
+  the whole table. The query on the left (`query @@ vector`) also works
+  only as a filter.
+- **Ranked queries read every match.** `ORDER BY ts_rank(...) DESC LIMIT
+  10` fetches all matching rows, ranks them and keeps ten; there is no
+  index order by rank. A query that matches a large part of the table is
+  slow however small the `LIMIT`.
+- **`text @@ tsquery` is refused** (`0A000`): write `to_tsvector(config,
+  text) @@ query`. A string literal beside a typed operand is read as
+  the other type (`v @@ 'cat & dog'`).
+- **Writes** cost one KV write per distinct lexeme of the document, in
+  the same transaction as the row; an `UPDATE` rewrites only the entries
+  of the words that came or went.
+- **Limits**: a lexeme is at most 2,046 bytes (a longer word is skipped
+  by `to_tsvector`), positions run to 16,383 (later words are recorded
+  at 16,383), a lexeme keeps its first 256 positions, and a row in a
+  full-text index may have at most 8,192 distinct lexemes (`54000`
+  beyond that; the write is refused).
+- Needs cluster version v21 for the two column types and for the index.
 
 `TRUNCATE` is a descriptor change, not a delete: the table (and each of
 its indexes) moves to a fresh keyspace, so it costs the same for a
@@ -199,9 +384,53 @@ COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
 TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
 drain and sweep (or stream) in several transactions of their own and
-are refused inside a block with `25001`; so is `SPLIT AT`, a range
-operation rather than a descriptor write (idempotent: an existing
-boundary is fine; a sharded timeseries table is carved by shard instead).
+are refused inside a block with `25001`; so are `SPLIT AT` and
+`UNSPLIT`, range operations rather than descriptor writes.
+
+#### SPLIT AT and UNSPLIT
+
+`ALTER TABLE t SPLIT AT VALUES (k, ...), ...` puts a range boundary at
+each primary-key tuple (a prefix of the key is allowed) and returns the
+boundaries as key paths. It is for pre-splitting: carving a table that is
+about to take a bulk load or a benchmark into ranges up front, instead of
+waiting for size- and load-based splits to catch up.
+
+- **The boundaries stay.** Left to itself the cluster merges adjacent
+  ranges that are both small, and the halves of a pre-split are empty —
+  so a boundary made by `SPLIT AT` is marked as made on purpose (it is
+  *sticky*) and housekeeping leaves it alone, however small the ranges
+  on either side. Splits the cluster makes for itself, by size or load,
+  are not marked and merge back when the data shrinks, as before.
+- **`WITH EXPIRATION e`** holds the boundaries only until `e`: a
+  timestamp, or an interval counted from now (`INTERVAL '1 day'`). After
+  that they are ordinary boundaries again. The expiration must be in the
+  future; without the clause a boundary is held until it is unsplit.
+- **`UNSPLIT AT VALUES (k, ...), ...`** is the way back: it stops holding
+  the boundaries named, and `UNSPLIT ALL` every manual boundary in the
+  table. Neither merges anything itself — the ranges fold together on
+  housekeeping's next passes if they are small enough, and stay split if
+  they have since filled up. `UNSPLIT AT` fails on a key that is not a
+  range boundary and does nothing to one that is not sticky; both return
+  the boundaries they released.
+- **Idempotent.** Splitting at a boundary that exists is not an error: it
+  marks the boundary sticky (or changes its expiration to the one given).
+  A load script can run its `SPLIT AT` every time.
+- **Concurrent with everything.** If the range changes while the split
+  is on its way — another split lands first, housekeeping is merging the
+  range — the statement waits or re-reads the range and carries on; it
+  does not fail because someone else got there first.
+- A sharded timeseries table is carved by shard (`SET (shards = N)`), not
+  by key, and refuses both statements. The splits a timeseries table gets
+  at `CREATE` are the cluster's own and are not sticky.
+- `DROP TABLE` and `TRUNCATE` release the table's manual boundaries:
+  its old key space is empty for good (a truncated table continues in a
+  fresh one), so the emptied ranges are left to merge away. Split again
+  after a `TRUNCATE` to pre-split the reload. The release is immediate
+  and is not undone if the statement's transaction rolls back.
+- Sticky boundaries, `WITH EXPIRATION` and `UNSPLIT` need cluster version
+  v20. On a cluster that has not finalized it, `SPLIT AT` splits as it
+  always did — the boundary is not held — and the other two are refused
+  with `0A000`.
 
 ### Defaults, SERIAL, identity columns and sequences
 
@@ -364,6 +593,82 @@ constraint.
 Constraints need **cluster version v8** (`0A000` until `datax debug
 upgrade` finalizes it): a v7 node would write rows unchecked.
 
+### Row-level security
+
+```sql
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;      -- from now on: only what a policy allows
+CREATE POLICY tenant_isolation ON docs
+    USING (tenant_id = current_setting('app.tenant')::uuid);
+CREATE POLICY own_rows ON notes FOR UPDATE TO editors
+    USING (author = current_user) WITH CHECK (author = current_user);
+CREATE POLICY not_archived ON docs AS RESTRICTIVE FOR SELECT USING (NOT archived);
+ALTER POLICY own_rows ON notes TO editors, admins USING (author = current_user OR shared);
+ALTER POLICY own_rows ON notes RENAME TO authors;
+DROP POLICY [IF EXISTS] not_archived ON docs;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;       -- the owner and admins are filtered too
+ALTER TABLE docs NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE docs DISABLE ROW LEVEL SECURITY;     -- policies kept, not applied
+ALTER ROLE auditor BYPASSRLS;                    -- admins only: exempt from every policy
+```
+
+With row security enabled, a role reads and changes only the rows the
+table's policies allow it, on top of the table privileges it still
+needs. The rules are PostgreSQL's:
+
+- **Default deny.** Enabled with no policy that applies to the role, it
+  sees no rows and can write none.
+- **`USING`** filters the rows a statement reads or targets; **`WITH
+  CHECK`** must be true for every row it writes (when omitted, `USING`
+  stands in). A row that fails the check is `42501`: `new row violates
+  row-level security policy for table "docs"`. An expression that is
+  NULL counts as false in both.
+- **`FOR`** names the statement kind a policy governs (`ALL` by
+  default). `SELECT ... FOR UPDATE` needs the `UPDATE` policies as well
+  as the `SELECT` ones; an `UPDATE` or `DELETE` with a `WHERE` clause or
+  `RETURNING` needs the `SELECT` policies as well as its own.
+- **Permissive** policies (the default) are OR-ed together;
+  **restrictive** ones are AND-ed on top. Restrictive policies alone
+  admit nothing.
+- **`TO`** limits a policy to roles — held directly or through
+  membership; without it, or with `PUBLIC`, it applies to everyone.
+- **Exempt**: the table's owner and members of `admin`, unless the table
+  is `FORCE`d; `root` and roles with `BYPASSRLS`, always.
+
+A policy expression may use the row's columns (unqualified), constants,
+the ordinary functions and operators, and `current_user`,
+`session_user`, `current_setting(...)`, `current_database()` and
+`now()`. Subqueries are not supported in a policy.
+
+The policy is applied like a `WHERE` condition written first, so it
+uses indexes: with the tenant column leading the primary key, a
+tenant's queries scan that tenant's rows only. `EXPLAIN` shows it:
+
+```
+> EXPLAIN SELECT * FROM docs WHERE id = 7;
+point lookup on primary key; row-level security policy applied
+> EXPLAIN SELECT * FROM docs;
+range scan of primary key (tenant_id = 11111111-1111-1111-1111-111111111111); row-level security policy applied
+```
+
+It covers every statement kind — joins and subqueries (each table
+reference is filtered), aggregates, `INSERT ... SELECT`, `INSERT ... ON
+CONFLICT` (the proposed row and, for `DO UPDATE`, the existing one),
+`UPSERT`, `COPY FROM`, `RETURNING`, locking reads with `SKIP LOCKED` or
+`NOWAIT`, prepared statements, and `AS OF SYSTEM TIME` reads, which are
+filtered by the policies in force now rather than at the read's
+timestamp. `TRUNCATE` is refused to a role the policies apply to.
+Foreign-key checks and cascades look at the whole table regardless, as
+in PostgreSQL. The [security guide](security.md#row-level-security) has
+a multi-tenant recipe and the limits of what this protects.
+
+Policy DDL takes the table's owner (or an admin), and takes effect on
+every node by the time the statement returns. `SHOW CREATE TABLE`,
+`pg_policies`, `pg_policy`, `pg_class.relrowsecurity` /
+`relforcerowsecurity`, `pg_tables.rowsecurity` and
+`pg_roles.rolbypassrls` describe it. A column a policy reads cannot be
+dropped (`2BP01`); renaming it updates the policy. A role a policy
+names cannot be dropped until the policy stops naming it.
+
 ## Reading
 
 ```sql
@@ -439,7 +744,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
-  `current_user`, `current_schema()`, `current_setting(name)`,
+  `current_user`, `current_schema()`, `current_setting(name)`, `set_config`,
   `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`,
   `pg_get_expr`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`,
   ...) as well as the sequence and id functions `nextval`, `currval`,
@@ -556,7 +861,10 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   delivers the order — ascending along the key, descending via a
   reverse scan, and on sharded timeseries tables either direction via a
   K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
-  dashboards stop early instead of scanning everything).
+  dashboards stop early instead of scanning everything). A sort with a
+  `LIMIT` over a single table's scan keeps only the limit's rows while
+  it reads (`top-k heap` in `EXPLAIN`): every matching row is still
+  read, but memory is the limit's rows, not the table's.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when
@@ -676,6 +984,282 @@ the failing row and the committed count), and COPY cannot run inside
 `BEGIN`. Only the `FORMAT text|csv|binary` option is supported; `COPY TO`
 is not.
 
+## Large objects
+
+A column value — `BYTEA`, `TEXT`, `JSONB` — is written, replicated and
+read in one piece, and a statement holds it in memory several times
+over. That is the right shape up to a few megabytes. Past that it costs
+memory out of proportion (a 32 MiB value takes over a gigabyte across
+the cluster to insert), and a statement that writes more than 60 MiB to
+one range in one piece is refused with `54000`: it could not be
+replicated (see [Limits](#large-object-limits)). Files, recordings and other
+things of tens of megabytes to many gigabytes go in a **large object**
+instead: a value stored in pages and written and read as a stream, so
+that no node ever holds more than a little of it.
+
+The interface is PostgreSQL's large objects, which drivers already
+speak: the functions are callable from SQL
+([functions reference](functions.md#large-objects)), which is how pgx's
+`tx.LargeObjects()` uses them, and through the protocol's fast-path
+function call, which is how libpq's `lo_*` API does — and with it
+psql's `\lo_import`, `\lo_export`, `\lo_list` and `\lo_unlink`.
+
+```sql
+BEGIN;
+SELECT lo_create(0);                  -- → 3141592653: a new, empty object
+SELECT lo_open(3141592653, 131072);   -- → 0: a descriptor, opened for writing (INV_WRITE)
+SELECT lowrite(0, $1);                -- any number of times, any sizes
+SELECT lo_close(0);
+INSERT INTO documents (id, body) VALUES (7, 3141592653);   -- keep the id where you will find it
+COMMIT;                               -- the object exists from here
+
+BEGIN;
+SELECT lo_open(3141592653, 262144);   -- INV_READ
+SELECT loread(0, 1048576);            -- until it returns fewer bytes than asked for
+COMMIT;
+
+SELECT lo_unlink(3141592653);         -- remove it
+```
+
+```go
+tx, _ := conn.Begin(ctx)
+los := tx.LargeObjects()
+oid, _ := los.Create(ctx, 0)
+obj, _ := los.Open(ctx, oid, pgx.LargeObjectModeWrite)
+io.CopyBuffer(obj, file, make([]byte, 1<<20))   // streams: memory stays flat
+tx.Commit(ctx)
+```
+
+What to know:
+
+- **A large upload is a new object written in one transaction block.**
+  `lo_create` inside `BEGIN` makes an object nobody else can see yet;
+  what is written to it before `COMMIT` is stored as it arrives, outside
+  the transaction, so the upload can be of any size and holds no lock
+  while it runs. `COMMIT` makes the whole object appear at once.
+  `ROLLBACK`, an error, or a lost connection leaves no object, and the
+  pages already stored are removed in the background.
+- **Let the upload's transaction be about the upload.** At `COMMIT` the
+  transaction is moved forward to the present, past the pages it
+  stored, and like any transaction that has to move it fails with
+  `40001` if something it read has changed meanwhile. Rows it read
+  earlier in the block count, and so does the catalog: libpq looks the
+  functions up in `pg_proc` inside the transaction, once per
+  connection, so an upload on a fresh libpq connection (every psql
+  `\lo_import` is one) fails at its commit if a table or role was
+  created or altered while it ran. Repeat it.
+- **Changes to an object that already exists are ordinary transactional
+  writes** — isolated, rolled back with their transaction, visible at
+  its commit — and for that reason bounded: one transaction may write at
+  most 64 MiB into existing objects (`54000` beyond). The same holds for
+  the one-statement forms outside a block (`lo_from_bytea`, `lo_put`).
+  To replace a large object, write a new one and unlink the old in the
+  same transaction.
+- **Read in pieces.** `loread` returns up to the length asked for; what
+  one call returns counts against `statement_memory_limit` (twice: it is
+  assembled from pages), so with the default 64 MiB limit ask for no
+  more than about 30 MiB a call — 1 MiB is a good size. `lo_get(oid)`
+  returns a whole object as one value and is for small ones.
+- **Descriptors live until the transaction ends**, as in PostgreSQL;
+  outside a transaction block a descriptor is gone when its statement
+  returns, so `lo_open` is only useful inside `BEGIN`.
+- **Nothing ties an object to the rows that mention its id**, as in
+  PostgreSQL: deleting the row does not unlink the object. Unlink it in
+  the same transaction that deletes or repoints the row.
+- **The functions run once per statement, on constant arguments**
+  (literals and parameters), like `nextval`: `SELECT lo_unlink(body)
+  FROM documents` is refused. Select the ids, then unlink each.
+- An object belongs to the role that created it; the owner and admins
+  may read, write and unlink it. There are no per-object grants.
+- `lo_lseek64` / `lo_tell64` position a descriptor; writing past the end
+  leaves a hole that reads as zeros and takes no space;
+  `lo_truncate64` cuts or extends.
+- An upload that goes quiet — no large-object call in its transaction —
+  for more than 10 minutes is taken for abandoned: its pages are
+  removed, and if the client does come back its next call or its
+  `COMMIT` fails with `55000`. Start the upload again.
+- `ROLLBACK TO SAVEPOINT` closes the transaction's descriptors and
+  undoes its changes to existing objects. It cannot undo what was
+  streamed into a new object, so a transaction that created one and then
+  rolls back to a savepoint can no longer commit (`25P02`); roll it back.
+
+### Large object limits
+
+| | |
+|---|---|
+| Object size | up to 1 TiB (`54000` beyond). Tested to 1 GiB |
+| Page size | 256 KiB, fixed. A 1 GiB object is 4,096 rows of `datax_largeobject` |
+| Written by one transaction into existing objects | 64 MiB |
+| Returned by one `loread` or `lo_get` | half of `statement_memory_limit` (about 30 MiB by default) |
+| Upload idle time | 10 minutes |
+| A single column value, for comparison | a statement may write at most 60 MiB to one range in one piece — a row with its index entries, or the rows of one `INSERT` that land in one range — and is refused with `54000` beyond; keep row values to a few MiB |
+
+Throughput on a three-node cluster on one machine is about 20 MiB/s
+written (each page is a replicated write of its own) and over 100 MiB/s
+read; the process's memory grows by tens of megabytes whatever the
+object's size.
+
+Large objects are stored in three [reserved tables](#reserved-tables),
+so full backups and restores carry them, encryption at rest covers
+them, and their pages spread over ranges like any table's rows. Cluster
+version v21.
+
+## Vectors
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;     -- accepted and does nothing: the type is built in
+CREATE TABLE items (id INT8 PRIMARY KEY, tenant INT8, embedding vector(3));
+INSERT INTO items VALUES (1, 7, '[1, 2, 3]'), (2, 7, ARRAY[4, 6, 3]);
+
+SELECT id FROM items ORDER BY embedding <-> '[3, 1, 2]' LIMIT 5;        -- the 5 nearest, Euclidean
+SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 5;                 -- cosine distance
+SELECT id FROM items ORDER BY embedding <#> $1 LIMIT 5;                 -- largest inner product
+SELECT id, embedding <-> $1 AS d FROM items WHERE tenant = 7 ORDER BY d LIMIT 5;
+```
+
+This follows [pgvector](https://github.com/pgvector/pgvector), so its
+clients and ORM integrations work; what differs is listed under
+[PostgreSQL differences](postgres-differences.md).
+
+**The type.** `vector(n)` holds exactly `n` elements, each a float4
+(about seven significant digits); `vector` without `(n)` takes any
+dimension, but only a column with a declared dimension can be indexed.
+A value is written `'[1, 2.5, -3e2]'`, or converted from a numeric
+array. Up to 16,000 dimensions; every element must be a finite number
+(`NaN` and `Infinity` are refused, `22P02`), and a value of the wrong
+dimension for its column is refused (`22000`). A 1,536-dimension vector
+takes about 6 KiB in its row. Vectors compare for equality and order
+element by element (`=`, `<>`, `<`, `ORDER BY v`, `GROUP BY v`,
+`DISTINCT`), but a vector cannot be a primary key or part of an ordinary
+or unique index. `ALTER TABLE ... ALTER COLUMN ... TYPE vector(n)`
+converts a text column whose values are vectors.
+
+**Operators and functions.**
+
+| | |
+|---|---|
+| `a <-> b` | Euclidean (L2) distance; `l2_distance(a, b)` |
+| `a <=> b` | cosine distance, `1 − cos(a, b)`, from 0 (same direction) to 2 (opposite); `NaN` when either is the zero vector, and `NaN` sorts after every number; `cosine_distance(a, b)` |
+| `a <#> b` | **negative** inner product, so that ascending order is nearest first; `inner_product(a, b)` is the product itself |
+| `a + b`, `a - b` | element-wise |
+| `vector_dims(a)`, `vector_norm(a)`, `l2_normalize(a)`, `l1_distance(a, b)` | [functions reference](functions.md#vectors) |
+
+Either operand may be a column, a `'[...]'` literal, a parameter or a
+numeric array. The two operands must have the same dimension (`22000`).
+A distance with a NULL operand is NULL, and sorts last. The distance
+operators bind more loosely than `+` and `-` and more tightly than
+comparisons, as in PostgreSQL: `embedding <-> $1 < 0.5` compares the
+distance.
+
+**Casts.** `'[1,2,3]'::vector`, `::vector(3)` (checks the dimension),
+`ARRAY[1,2,3]::vector`, `v::text`, `v::float8[]`.
+
+**Clients.** In text, a vector is its `'[...]'` form: send a string,
+read a string. For binary, a client registers the type by OID, and
+looks the OID up by name first, because in PostgreSQL an extension's
+type has no fixed one: `SELECT to_regtype('vector')::oid` and `SELECT
+oid FROM pg_type WHERE typname = 'vector'` both answer (16000, the same
+on every node and in every database). With pgx, `pgvector-go`'s
+`pgxvec.RegisterTypes(ctx, conn)` does exactly that, after which
+`pgvector.NewVector(...)` values are sent and scanned in pgvector's
+binary format. A parameter that is an operand of a distance operator or
+is assigned to a vector column is described as a vector.
+
+**Exact search.** Without an index, `ORDER BY <distance> LIMIT k`
+returns exactly the `k` nearest rows. The table (or the part of it the
+`WHERE` clause selects through a key or an index) is scanned once and
+only the best `k` rows seen so far are kept, so memory is `k` rows
+however large the table; `EXPLAIN` says so:
+
+```
+full table scan; top-k heap: the first 5 rows in order kept while scanning, no full sort
+```
+
+(The same holds for any `ORDER BY ... LIMIT` the access path cannot
+deliver in order, not only distances.) Time is linear in the rows
+scanned — about 3 µs a row for 64 dimensions on one core — which is
+fine for tens of thousands of rows per query and is what the index is
+for beyond that. Ties are returned in primary-key order.
+
+**Approximate search: the ivfflat index.**
+
+```sql
+CREATE INDEX items_embedding ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
+--                                                   vector_cosine_ops for <=>, vector_ip_ops for <#>
+SET ivfflat.probes = 10;      -- per session; SET LOCAL per transaction; RESET for the default
+```
+
+The index groups the table's vectors into `lists` clusters when it is
+built. A query reads only the `ivfflat.probes` clusters whose centres
+are nearest the query vector, ranks the rows in them by their true
+distance, and returns the nearest `k`. `EXPLAIN` shows it:
+
+```
+vector scan of index "items_embedding" (ivfflat, <->: the nearest 10 of 100 lists probed, approximate) + primary key join, rows rechecked; top-k: ...
+```
+
+- **Results are approximate.** Every row returned is a real row with
+  its true distance, in true distance order — but a row nearer than
+  some of those returned may be missing, if it sits in a cluster that
+  was not read. *Recall* is the share of the true `k` nearest that come
+  back. It rises with `ivfflat.probes` and reaches 1 (exact) when
+  `probes` equals `lists`; the cost rises with it, in proportion.
+- **`ivfflat.probes`** defaults to the square root of the index's
+  `lists` (`auto`: 10 for 100 lists). Measured on 50,000 clustered
+  64-dimension vectors, `lists = 200`, `k = 10`, one node:
+
+  | `ivfflat.probes` | recall@10 | median latency |
+  |---|---|---|
+  | 1 | 0.85 | 0.9 ms |
+  | 5 | 0.96 | 3 ms |
+  | 15 (`auto`) | 0.99 | 10 ms |
+  | 40 | 1.00 | 29 ms |
+  | no index (exact) | 1 | 164 ms |
+
+  Your data decides these numbers: vectors with little cluster
+  structure need more probes for the same recall. Measure on your own
+  with `datax bench vector-knn`, or by comparing a query's result with
+  the same query under `SET vector_index_scan = off`, which answers it
+  exactly.
+- **`lists`** (1 to 32,768, default 100): about `rows / 1000` is the
+  usual starting point, and at least 10 × `lists` rows in the table when
+  the index is built. More lists make each probe cheaper and need more
+  probes for the same recall.
+- **Build the index after loading data.** The clusters are found from
+  a sample of the rows present when `CREATE INDEX` runs, and never
+  move afterwards. An index built on an empty table has one cluster
+  holding everything: correct, and no faster than a scan. The same
+  happens gradually when the data changes character after the build
+  (or after `TRUNCATE`, which keeps the clusters): the index stays
+  correct, recall at a given `probes` falls. Rebuild it — create a
+  second index, then drop the first; there is no `REINDEX`.
+- **One operator class per index, and the query must use its operator**:
+  an index built with `vector_cosine_ops` serves `ORDER BY v <=> ...`
+  only. Create one per distance you query by.
+- **The query shape it serves**: `ORDER BY column <op> value LIMIT k`
+  (optionally `OFFSET`), ascending, as the only sort key, the value a
+  literal, a parameter or a scalar subquery. Without a `LIMIT`, with a
+  second sort key, in a join, a grouped query or with `DISTINCT` or `FOR
+  UPDATE`, the query runs exactly, without the index.
+- **Filters.** A `WHERE` clause is applied to the candidates nearest
+  first until `k` rows pass, so a filter never costs answers within the
+  clusters read. A selective filter may still leave fewer than `k` rows
+  in them: raise `ivfflat.probes`. When the filter can use the primary
+  key or an ordinary index (`WHERE tenant = 7` with an index on
+  `tenant`), the planner uses that instead and the answer is exact over
+  the rows it selects.
+- **NULL vectors** are not in the index: an indexed query does not
+  return them, while the exact scan returns them last.
+- **Writes** cost one extra KV write per index, holding a copy of the
+  vector, in the row's own transaction: an indexed table stores each
+  vector twice per index. The index is built online, under concurrent
+  writes, like any other.
+- **Limits**: one column, at most 2,000 dimensions, not `UNIQUE`.
+  `USING hnsw` is refused (`0A000`); use `ivfflat`.
+- `vector_index_scan = off` makes every nearest-neighbour query exact
+  for the session, whatever indexes exist.
+- Needs cluster version v21, as does the type itself.
+
 ## Transactions and retries
 
 ```sql
@@ -715,6 +1299,158 @@ transaction is poisoned (`25P02`) until `ROLLBACK` — or
 
 Deadlocks are detected and broken automatically (one victim gets `40001`).
 
+### Not waiting for a lock: SKIP LOCKED and NOWAIT
+
+`FOR UPDATE` waits for a row another transaction holds. Two suffixes
+say not to:
+
+```sql
+SELECT id FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;  -- the first job nobody else has
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;           -- 55P03 if someone holds it
+```
+
+**`SKIP LOCKED`** leaves out every row it cannot lock at once and locks
+and returns the rest. `LIMIT n` counts the rows returned: the scan goes
+on past the rows it skips until it has locked `n` or run out, and only
+the rows returned are locked. This is the job-queue statement — each
+worker takes the first job no other worker has, and none of them waits:
+
+```sql
+BEGIN;
+SELECT id, payload FROM jobs ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+-- ... do the work ...
+DELETE FROM jobs WHERE id = $1;
+COMMIT;
+```
+
+What counts as "cannot lock":
+
+- a row another transaction has locked or written and not yet finished
+  with (`FOR UPDATE`, `UPDATE`, `DELETE`, or a row it is inserting);
+- a row another transaction changed and **committed** after this
+  transaction's snapshot was taken (or so close to it that the clocks
+  cannot order the two). Plain `FOR UPDATE` treats that as a conflict
+  and may fail with `40001`; `SKIP LOCKED` passes the row over. In a
+  queue it is a job another worker took and finished a moment ago.
+
+The result is therefore not a consistent picture of the table — that is
+the point of the clause, as in PostgreSQL — and rows that were skipped
+are not reads of the transaction: whatever happens to them later cannot
+fail it. The transaction still reads at its snapshot, so a block that
+began long ago does not see rows inserted since; take the snapshot late
+(run the `SELECT` first in its block, or on its own) when draining a
+queue. A lock whose transaction died without finishing does not hide
+its row for good: skipping readers notice it once it has expired
+(about five seconds) and release it.
+
+Keep the retry loop: skipped rows cost no `40001`, but the rows the
+transaction did read and write are under the same rules as anywhere
+else. A queue drained this way sees `40001` rarely, not never. Give the
+query an order the table or an index delivers (`ORDER BY` the primary
+key, or an indexed column): with an in-memory sort every matching free
+row is read before the first is chosen, and each of those is a read
+another worker's `DELETE` can invalidate.
+
+**`NOWAIT`** fails the statement with SQLSTATE **`55P03`**
+(`could not obtain lock on row in relation "..."`) when it meets a row
+another transaction holds, and locks nothing more. It is an ordinary
+statement error — the block is poisoned until `ROLLBACK` or
+`ROLLBACK TO SAVEPOINT` — and not a retry signal like `40001`: the row
+is busy, and trying again at once will most likely find it busy still.
+Unlike in PostgreSQL the refusal can come from a row the statement had
+to read on the way and would then have filtered out (a full scan with a
+`WHERE` no index serves reads every row); a lookup by key or by index
+meets only the rows it selects.
+
+Neither suffix lets a transaction take a lock away from its holder, and
+both are refused wherever `FOR UPDATE` is (joins, aggregates,
+`DISTINCT`, subqueries, views, `AS OF SYSTEM TIME`). `FOR SHARE` and
+`FOR UPDATE OF table` are not supported.
+
+## Notifications: LISTEN and NOTIFY
+
+```sql
+LISTEN jobs;                          -- this session hears channel "jobs"
+NOTIFY jobs, 'order 42';              -- every listener gets (channel, payload, sender's pid)
+SELECT pg_notify('jobs', $1);         -- the same, with a computed or bound payload
+UNLISTEN jobs;   UNLISTEN *;
+```
+
+A session that has run `LISTEN` is sent a notification for every
+`NOTIFY` on that channel that commits, whichever node of the cluster the
+notifier and the listener are connected to. Drivers surface it the way
+they do against PostgreSQL — pgx's `conn.WaitForNotification(ctx)`,
+lib/pq's `Listener`, psycopg's `conn.notifies()` — and no polling
+statement is needed: the server pushes to a connection that is sitting
+idle.
+
+```go
+conn.Exec(ctx, "LISTEN jobs")
+for {
+    n, err := conn.WaitForNotification(ctx)   // blocks; sends nothing
+    if err != nil {
+        // reconnect, LISTEN again, then re-read the table: see below
+    }
+    handle(n.Channel, n.Payload)
+}
+```
+
+The rules are PostgreSQL's:
+
+- **Transactional.** A `NOTIFY` inside a transaction is delivered if and
+  when the transaction commits, never before and never if it rolls back
+  (`ROLLBACK TO SAVEPOINT` discards what was notified after the
+  savepoint). Identical notifications — same channel, same payload — in
+  one transaction are delivered once. `LISTEN` and `UNLISTEN` take
+  effect at commit too.
+- **Between statements.** A session receives notifications when it is
+  idle or as a command completes, never in the middle of a result; a
+  session inside a transaction block receives them when the block ends.
+  A session hears its own notifications if it listens on the channel.
+- **Channels** are identifiers (folded to lower case unless quoted, at
+  most 63 bytes) and belong to a database: a listener hears the
+  notifications of the database it was connected to when it listened.
+  There are no privileges on channels: any session may listen and
+  notify, so do not put secrets in a payload.
+- **Payloads** are text shorter than 8000 bytes (`22023` beyond that).
+  Send a key and let the listener read the row.
+- `pg_notify(channel, payload)` runs once per statement, not once per
+  row, and its arguments cannot name columns.
+
+What is guaranteed, and what is not:
+
+- A notification goes to the sessions that are listening when it
+  commits. Nothing is stored: a client that is not connected at that
+  moment never sees it, on datax as on PostgreSQL. Treat a notification
+  as "look now", and on every (re)connect run `LISTEN` and then read the
+  state the notifications describe.
+- **A session that stays connected receives every notification once**,
+  from every node, or it is disconnected — it is not left connected
+  having missed one. Two things end a listening session with a FATAL
+  error: it did not read its notifications (or sat in a transaction)
+  while 16 MiB of them piled up (`54000`), or another node could not
+  reach this one for so long that it had to drop notifications meant
+  for it — it keeps up to 64 MiB per unreachable node, for up to five minutes,
+  and delivers them, in order, when the node is back (`57P01`).
+- **A node restart or a partition** therefore costs notifications only
+  to sessions that were disconnected: the sessions on the restarted
+  node (their connections ended with it), and the listeners of a node
+  that was cut off for long enough. During a shorter partition
+  notifications are late, not lost. A node that is drained before it
+  stops hands over what it still owes first.
+- **The exception is a crash.** A node that dies in the instant between
+  committing a transaction and handing its notifications to the other
+  nodes takes them with it, and listeners elsewhere are not told. The
+  same goes for a `COMMIT` whose outcome the client never learned. A
+  worker that must not miss work should also poll at a long interval.
+- **Order.** All listeners see one node's notifications in the order
+  that node committed them, and one transaction's in the order it sent
+  them. Notifications committed on different nodes arrive in no
+  particular order relative to each other.
+- A node running a release from before this feature cannot serve
+  `LISTEN` (a syntax error) and is skipped by the others; during a
+  rolling upgrade, connect listeners to upgraded nodes.
+
 ## Session settings
 
 ```sql
@@ -729,6 +1465,9 @@ SET TRANSACTION READ ONLY;                    -- this block refuses writes (2500
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;
+SET app.tenant = 'acme';                      -- a custom setting: any class.name
+SELECT set_config('app.tenant', $1, false);   -- the same, with the value as a parameter
+SELECT current_setting('app.tenant');         -- 42704 if never set; current_setting(name, true) gives NULL
 ```
 
 `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
@@ -741,7 +1480,7 @@ invalid value `22023`:
 |---|---|---|
 | `statement_timeout` | ms, or `'5s'`, `'1min'`, `'500ms'`; `0` = none | a statement past it is cancelled: `57014`, its transaction block failed |
 | `statement_memory_limit` | bytes, or `'64MB'`, `'1GB'`, `'512kB'`; `0` = none; default `64MB` | what one statement may hold in memory on the gateway (rows it sorts, aggregates, joins or otherwise collects); past it the statement fails with `53200` instead of growing without bound. Streamed `SELECT`s are unaffected (see [Streaming](#reading)) |
-| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`) |
+| `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`); to not wait at all, see [`FOR UPDATE NOWAIT` and `SKIP LOCKED`](#not-waiting-for-a-lock-skip-locked-and-nowait) |
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
 | `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
@@ -750,7 +1489,23 @@ invalid value `22023`:
 | `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
+| `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
+| `default_text_search_config` | `english` (default), `simple`; `pg_catalog.` may qualify either | the configuration `to_tsvector`, `to_tsquery` and their relatives use when a call names none; reported schema-qualified (`pg_catalog.english`), as PostgreSQL does |
+| `ivfflat.probes` | `auto` (default: the square root of the index's lists) or 1 to 32768 | how many clusters of an ivfflat index a nearest-neighbour query reads: more is higher recall and slower ([Vectors](#vectors)) |
+| `vector_index_scan` | `on` (default), `off` | `off` answers every nearest-neighbour query exactly, by scanning, whatever vector index exists |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
+
+**Custom settings.** A name with a prefix and a dot (`app.tenant`,
+`myapp.user_id`) is a setting of your own: `SET`, `SET LOCAL`, `RESET`
+and `SHOW` take it, it holds any text, and `current_setting('app.tenant')`
+reads it — which is how a [row-level security](#row-level-security)
+policy learns which tenant a connection is working for.
+`set_config(name, value, is_local)` sets one from an expression or a
+parameter (`is_local` true is `SET LOCAL`). A custom setting does not
+exist until it is first set: reading it before is `42704`, or NULL with
+`current_setting(name, true)`. `RESET` leaves it set and empty. It
+belongs to the session, so a pooled connection must set it again (or
+`SET LOCAL` it per transaction) for each request.
 
 `SET LOCAL` and `SET TRANSACTION` apply to the current block and end
 with it (outside a block they do nothing, as in PostgreSQL). A changed
@@ -798,7 +1553,8 @@ so multi-range results stay consistent. Watch
 `datax_follower_read_fallbacks_total` (sent to a leader) to see whether
 your bound is doing its job.
 
-All forms: bounded by the GC window (25h) on the old side; not allowed
+All forms: bounded by the GC window on the old side (25h, or the
+table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); not allowed
 inside `BEGIN`; a freshly written row may be invisible until the closed
 timestamp passes its write (~the lag) — that is the staleness you signed
 up for.
@@ -840,7 +1596,8 @@ CREATE TABLE metrics (
   range — inserts scale across nodes instead of hammering one tail.
 - `retention` (`30d`, `12h`, or interval text such as `'7 days'`; a
   month counts 30 days): rows older than this are garbage
-  collected automatically.
+  collected automatically. (Any other table expires rows with
+  [`ttl`](#row-expiry-ttl) instead.)
 - Queries are unchanged — `WHERE series = '...' AND at >= ...` fans out
   over the buckets (visible in `EXPLAIN`). Fan-out costs read latency:
   measured ~2× point-read p50 at `shards=8`, in exchange for ~linear
@@ -848,6 +1605,158 @@ CREATE TABLE metrics (
 - Re-shard online: `ALTER TABLE metrics SET (shards = 16);` — writes
   never stop, and secondary indexes on the table are rebuilt and swapped
   along with the rows.
+
+## Row expiry (TTL)
+
+A table can delete its own rows when their time is up. Either a column
+holds each row's expiry time, or rows live a fixed time counted from a
+timestamp column:
+
+```sql
+-- each row says when it goes
+CREATE TABLE quarantine (
+  id         INT8 PRIMARY KEY,
+  item       TEXT,
+  expires_at TIMESTAMPTZ
+) WITH (ttl_expiration = expires_at);
+
+-- every row lives 7 days from created_at
+CREATE TABLE review (
+  id         INT8 PRIMARY KEY,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  body       TEXT
+) WITH (ttl_column = created_at, ttl = '7 days');
+
+ALTER TABLE review SET (ttl = '30 days');           -- change the lifetime
+ALTER TABLE orders SET (ttl_expiration = purge_at); -- add expiry to a table with data
+ALTER TABLE review RESET (ttl);                     -- stop expiring
+```
+
+- The column is `TIMESTAMPTZ` or `TIMESTAMP`. A row whose value is NULL
+  never expires. `ttl` takes the forms `retention` does (`'7 days'`,
+  `12h`).
+- **A lifetime needs a column.** `WITH (ttl = '7 days')` alone is
+  refused: there is no hidden "last written" time to count from. Give
+  the table a `created_at TIMESTAMPTZ DEFAULT now()` and name it — and
+  note that this counts from the insert, not from the last update,
+  unless your updates set the column.
+- **Expired rows are deleted by a background job, not hidden.** A row
+  past its time is still returned by queries until the job reaches it —
+  normally within a pass, 30 seconds by default. A query that must never
+  see one says so: `WHERE expires_at > now()`.
+- The deletes are ordinary `DELETE`s in ordinary transactions, so
+  everything a `DELETE` does happens: secondary index entries go with
+  the row, `ON DELETE CASCADE` takes the referencing rows, and a
+  referencing row under a restricting foreign key keeps the expired row
+  in place — it is skipped, counted
+  (`datax_row_ttl_rows_blocked_total`), and deleted on a later pass
+  once nothing references it.
+- The job finds expired rows through an index on the column. The option
+  creates one, `<table>_ttl_idx`, unless an index (or the primary key)
+  already leads with the column; on a table with rows it is built online
+  first, so `ALTER TABLE ... SET` can take as long as a `CREATE INDEX`.
+  `RESET (ttl)` leaves the index — drop it if nothing else uses it. If
+  you drop the index while the expiry is set, the job still works, by
+  scanning the table.
+- The expiry column cannot be dropped or retyped while the expiry is
+  set. Time-series tables expire by `retention` and refuse these
+  options.
+- A deleted row is deleted the way any row is: its old versions stay
+  until garbage collection. Give the table a short `gc_ttl`, or `PURGE`
+  it, if expired data has to leave the disk (next section).
+- Not inside `BEGIN`; needs table ownership and cluster version v21.
+  `SHOW CREATE TABLE` shows the option, and a backup carries it.
+
+One job runs for the whole cluster. See the operations guide's
+[Row expiry](operations.md#row-expiry) for its pace, metrics and where
+to watch it.
+
+## GC window and purge
+
+Deleting or updating a row leaves the old version behind: it is what
+`AS OF SYSTEM TIME`, follower reads and incremental backups read. Old
+versions are garbage collected after the GC window — 25 hours unless the
+node says otherwise — and their bytes leave the files some time after
+that, when the storage engine next compacts those files.
+
+**A window per table:**
+
+```sql
+CREATE TABLE sessions (id UUID PRIMARY KEY, who INT8, data JSONB) WITH (gc_ttl = '10m');
+ALTER TABLE audit_log SET (gc_ttl = '90 days');
+ALTER TABLE sessions RESET (gc_ttl);          -- back to the node's window
+```
+
+The window applies to that table only; no other table's history gets
+shorter or longer. What a short window costs that table:
+
+- `AS OF SYSTEM TIME` and follower reads of it reach back only that far;
+  older reads fail with an error naming the GC threshold.
+- A transaction that has been open longer than the window fails when it
+  next touches the table.
+- An incremental backup needs its base to be younger than the shortest
+  window it covers; an older base is refused (`incremental base too
+  old`) and you take a full backup instead.
+
+The statement does not print a warning — it cannot, there is no notice
+channel — so this list is the warning. The minimum is one second; a
+time-series table with a `retention` already has its window and refuses
+`gc_ttl`.
+
+**Purge: gone now, with a report.**
+
+```sql
+DELETE FROM documents WHERE account = 4711;
+ALTER TABLE documents PURGE;
+```
+```
+ range_id | node_id | live_keys | garbage_versions | tombstones | intents | compacted | status
+----------+---------+-----------+------------------+------------+---------+-----------+--------
+       12 |       1 |     90210 |                0 |          0 |       0 | t         | clean
+       12 |       2 |     90210 |                0 |          0 |       0 | t         | clean
+       12 |       3 |     90210 |                0 |          0 |       0 | t         | clean
+PURGE 31
+```
+
+`PURGE` collects every old version and deletion marker in the table —
+rows and index entries — as of now instead of a window ago, compacts the
+table's files on every replica so the bytes are no longer in them,
+truncates the write-ahead copies, and returns what each replica holds
+afterwards, counted from the storage engine's keys rather than through a
+query. A replica with zeros in `garbage_versions`, `tombstones` and
+`intents` holds one version of each remaining row and nothing else.
+
+- **The tag is the verdict.** `PURGE n` (n versions removed): every
+  replica answered and is clean. `PURGE INCOMPLETE`: at least one is
+  `unconfirmed` (its node did not answer) or `not clean` (a transaction
+  was still writing there), and the `status` column says which. Run the
+  statement again when the node is back; it is safe to repeat.
+- **It removes what was deleted, not what is live.** Delete first.
+- **Older readers are cut off, loudly.** After a purge the table cannot
+  be read at any earlier time: `AS OF SYSTEM TIME` before it, and any
+  transaction that began before it, get an error on their next
+  statement against the table — never a result with rows missing. Retry
+  the transaction. Other tables are unaffected.
+- **A node that was down** applies the purge when it rejoins, before it
+  serves anything from before it, and is compacted and counted by the
+  next `PURGE`. A node that was cut off from the others but kept
+  running is the one gap: until it reconnects it can still answer a
+  follower read (`AS OF SYSTEM TIME`) from before the purge. It is
+  reported `unconfirmed`, which is why an incomplete purge is not a
+  finished one.
+- **What it does not reach:** backups taken earlier (they still hold the
+  data — expire or rewrite them yourself); a copy of the range being
+  sent to a new replica at that moment; and, for rows written before
+  the table had ranges of its own, the write-ahead log of the range
+  they were first written to, which is trimmed as that range takes
+  further writes. Create tables that will be purged with a `gc_ttl` —
+  that gives them their own ranges from the start — and this last case
+  does not arise.
+- It costs a compaction of the table on every replica. Use it for the
+  account-deletion case, not after every `DELETE`.
+- Not inside `BEGIN`; needs table ownership and cluster version v21. A
+  key range rather than a table: `datax debug purge`
+  ([operations guide](operations.md#purging-deleted-data)).
 
 ## Parameters
 
@@ -893,9 +1802,10 @@ The PostgreSQL catalogs are there too, as read-only virtual tables over
 the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
 `pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
-`pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`
+`pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`,
+`pg_policy`, `pg_policies`
 (and empty stand-ins for the catalogs of features datax lacks —
-policies, publications, extensions, functions, triggers, ...), plus
+publications, extensions, functions, triggers, ...), plus
 `information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
@@ -913,6 +1823,22 @@ their metrics into it (see the operations guide's "Metrics history").
 on it are refused. Admins may read and delete from it and set its
 `retention` and `shards`; `GRANT SELECT ON datax_metrics TO <user>` lets
 another user read it, and no grant lets a non-admin write to it.
+
+`datax_audit` is stricter. It is the cluster's audit record (see the
+security guide's "Audit table"): admins and roles granted `SELECT` on it
+read it, and no role — `root` and admins included — can `INSERT`,
+`UPDATE`, `DELETE`, `TRUNCATE`, `DROP` or `ALTER` it, index it, or
+reference it from a foreign key. The one statement it accepts is
+`ALTER TABLE datax_audit SET (retention = '<period>')`, from an admin,
+with a period of at least a day.
+
+`datax_largeobject`, `datax_largeobject_metadata` and
+`datax_largeobject_pending` hold [large objects](#large-objects): the
+pages, the objects, and the contents waiting to be removed. They are
+written through the `lo_*` functions alone — no role can change them
+with SQL — and read by admins and by roles granted `SELECT` on them
+(which shows every object's bytes, whoever owns it).
+`pg_largeobject_metadata` lists the objects.
 
 ## Views
 

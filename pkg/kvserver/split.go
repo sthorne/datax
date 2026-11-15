@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Splits. The split itself is a replicated command on the left-hand range:
@@ -23,73 +24,255 @@ import (
 // that lands, stale routing is corrected by RangeKeyMismatch errors that
 // carry fresh descriptors.
 
+// maxDescriptorChangeAttempts bounds how often an admin split (or a
+// sticky-bit update) rebuilds its change after the range moved under it.
+// Each retry means some other descriptor change landed in between, so the
+// loop only spins while the range is being reshaped by others; the bound
+// is there so a caller is told rather than held.
+const maxDescriptorChangeAttempts = 10
+
+// frozenError is the refusal of a request on a range frozen for a merge:
+// a RangeKeyMismatch marked Frozen, which the KV client waits out on the
+// same descriptor and then follows to the merged range (or back here, if
+// the merge is abandoned) — see checkFrozen.
+func (r *Replica) frozenError(key keys.Key, format string, args ...any) *kvpb.Error {
+	e := kvpb.NewErrorf(format, args...)
+	e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: key, Frozen: true}
+	return e
+}
+
+// descriptorChangedError is the refusal of a descriptor change that was
+// built from generation builtFrom when the range is at current.
+func (r *Replica) descriptorChangedError(op string, builtFrom, current int64) *kvpb.Error {
+	e := kvpb.NewErrorf("%s: %s against generation %d but range is at %d; the range changed under it, retry against the current descriptor",
+		r.rangeID, op, builtFrom, current)
+	e.DescriptorChanged = &kvpb.DescriptorChangedError{RangeID: r.rangeID, BuiltFrom: builtFrom, Current: current}
+	return e
+}
+
 // adminSplit executes an AdminSplitRequest on the leader.
-func (r *Replica) adminSplit(ctx context.Context, splitKey keys.Key) (*kvpb.AdminSplitResponse, *kvpb.Error) {
-	if r.isFrozen() {
-		return nil, kvpb.NewErrorf("%s: cannot split: range is frozen for a merge", r.rangeID)
-	}
-	desc := r.Desc()
-	if splitKey.Equal(desc.StartKey) {
-		return nil, kvpb.NewErrorf("%s: split key %s is already a range boundary", r.rangeID, splitKey)
-	}
-	if !desc.ContainsKey(splitKey) {
-		e := kvpb.NewErrorf("%s: split key %s outside range", r.rangeID, splitKey)
-		e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: splitKey, ActualDescriptors: []kvpb.RangeDescriptor{desc}}
-		return nil, e
+//
+// What the caller asks for is a state — a range boundary at the key, and
+// for a manual split a sticky one — so the request stays meaningful when
+// the range changes between reading its descriptor and applying the
+// split. A split refused at apply for that reason is rebuilt here from
+// the current descriptor (issue #290: a statement's split used to fail
+// with "split against generation 0 but range is at 1" when another split
+// or a merge landed first): the key may still be inside the range (split
+// again), may have become its start (the boundary exists; done), or may
+// have left it (a RangeKeyMismatch sends the client to the range that
+// holds it now). A range frozen for a merge answers the way it answers
+// any request, so the client waits the merge out and asks again.
+func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (*kvpb.AdminSplitResponse, *kvpb.Error) {
+	splitKey := req.Key
+	stickyUntil := req.StickyUntil
+	if !r.store.stickyBitsOK() {
+		stickyUntil = 0
 	}
 	sender := r.store.getSender()
 	if sender == nil {
 		return nil, kvpb.NewErrorf("store has no client; cannot split")
 	}
+	var newID base.RangeID
+	var lastErr *kvpb.Error
+	for attempt := 0; attempt < maxDescriptorChangeAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, kvpb.NewError(err)
+		}
+		if r.isFrozen() {
+			return nil, r.frozenError(splitKey, "%s: cannot split: range is frozen for a merge", r.rangeID)
+		}
+		desc := r.Desc()
+		if splitKey.Equal(desc.StartKey) {
+			// The boundary is there already: the state asked for. A
+			// manual split still has its bit to record.
+			if stickyUntil != 0 && desc.StickyUntil != stickyUntil {
+				updated, kerr := r.setStickyBit(ctx, stickyUntil)
+				if kerr != nil {
+					return nil, kerr
+				}
+				desc = updated
+			}
+			return &kvpb.AdminSplitResponse{Right: desc}, nil
+		}
+		if !desc.ContainsKey(splitKey) {
+			e := kvpb.NewErrorf("%s: split key %s outside range", r.rangeID, splitKey)
+			e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: splitKey, ActualDescriptors: []kvpb.RangeDescriptor{desc}}
+			return nil, e
+		}
 
-	// Allocate the new range ID through the replicated counter.
-	inc := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: r.store.cfg.Clock.Now()}}
-	inc.Add(&kvpb.IncrementRequest{RequestHeader: kvpb.RequestHeader{Key: keys.RangeIDGenKey()}, By: 1})
-	ibr, kerr := sender.Send(ctx, inc)
+		// Allocate the new range ID through the replicated counter, once:
+		// a retry reuses it (the refused split created nothing).
+		if newID == 0 {
+			inc := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: r.store.cfg.Clock.Now()}}
+			inc.Add(&kvpb.IncrementRequest{RequestHeader: kvpb.RequestHeader{Key: keys.RangeIDGenKey()}, By: 1})
+			ibr, kerr := sender.Send(ctx, inc)
+			if kerr != nil {
+				return nil, kerr
+			}
+			newID = base.RangeID(ibr.Responses[0].Increment.NewValue)
+		}
+
+		// The left half keeps the parent's sticky bit — it describes the
+		// start boundary, which does not move. The right half's start
+		// boundary is the one being made, sticky only if asked for.
+		left := desc
+		left.StartKey = desc.StartKey.Clone()
+		left.EndKey = splitKey.Clone()
+		left.Generation = desc.Generation + 1
+		right := kvpb.RangeDescriptor{
+			RangeID:       newID,
+			StartKey:      splitKey.Clone(),
+			EndKey:        desc.EndKey.Clone(),
+			Replicas:      append([]kvpb.ReplicaDescriptor(nil), desc.Replicas...),
+			NextReplicaID: desc.NextReplicaID,
+			Generation:    desc.Generation + 1,
+			StickyUntil:   stickyUntil,
+		}
+		// The RHS inherits the parent's closed timestamp: reads served at or
+		// below it covered the RHS span, so no post-split write may land there.
+		trig := &splitTrigger{Left: left, Right: right, ClosedTS: r.ClosedTimestamp()}
+		if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
+			k(r.rangeID, "split")
+		}
+
+		// Serialize against everything: nothing may be in flight through the
+		// old bounds while the split lands.
+		guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
+		if gerr != nil {
+			return nil, kvpb.NewError(gerr)
+		}
+		_, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{split: trig})
+		guard.Release()
+		if kerr != nil {
+			if kerr.DescriptorChanged != nil {
+				// Refused at apply on every replica: nothing was split.
+				// Look at the range again.
+				lastErr = kerr
+				continue
+			}
+			return nil, kerr
+		}
+
+		// Repair the addressing records (one batch, both on the meta range, so
+		// the update is atomic). Done outside the latch: if the split was on
+		// the meta-carrying range itself this would deadlock inside it.
+		if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), left, right); err != nil {
+			// Routing still works via mismatch corrections; log and continue.
+			log.Warnf("%s: split committed but meta update failed: %v", r.rangeID, err)
+		}
+		return &kvpb.AdminSplitResponse{Left: left, Right: right}, nil
+	}
+	return nil, lastErr
+}
+
+// stickyBitsOK reports whether a descriptor may carry a sticky bit and a
+// descriptor-update trigger may be proposed (cluster version v20): an
+// older replica would drop the one and ignore the other.
+func (s *Store) stickyBitsOK() bool {
+	if s.cfg.ClusterVersion == nil {
+		return true
+	}
+	return s.cfg.ClusterVersion() >= version.V20
+}
+
+// descriptorTrigger is carried by the replicated command that replaces a
+// range's descriptor without changing its bounds or membership — today,
+// setting or clearing the sticky bit. Desc is the whole new descriptor,
+// one generation past the one it was built from.
+type descriptorTrigger struct {
+	Desc kvpb.RangeDescriptor `json:"desc"`
+}
+
+// setStickyBit replicates a new value of the range's sticky bit (0 clears
+// it) and repairs the addressing record, returning the descriptor as it
+// stands afterwards. The update is a descriptor change like any other: it
+// takes a generation, so a split or merge built from the descriptor
+// before it is refused instead of silently writing the old bit back, and
+// it is itself refused — and rebuilt here — if one of those lands first.
+// It stops, returning the current descriptor untouched, if the range's
+// start key moved in the meantime (only a merge of this range away does
+// that, and then the replica is gone).
+func (r *Replica) setStickyBit(ctx context.Context, stickyUntil int64) (kvpb.RangeDescriptor, *kvpb.Error) {
+	if !r.store.stickyBitsOK() {
+		return kvpb.RangeDescriptor{}, kvpb.NewErrorf("%s: sticky range boundaries need cluster version %s (finalize the upgrade first)", r.rangeID, version.V20)
+	}
+	var lastErr *kvpb.Error
+	for attempt := 0; attempt < maxDescriptorChangeAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return kvpb.RangeDescriptor{}, kvpb.NewError(err)
+		}
+		desc := r.Desc()
+		if r.isFrozen() {
+			return desc, r.frozenError(desc.StartKey, "%s: cannot change the sticky bit: range is frozen for a merge", r.rangeID)
+		}
+		if desc.StickyUntil == stickyUntil {
+			return desc, nil
+		}
+		next := desc
+		next.Generation = desc.Generation + 1
+		next.StickyUntil = stickyUntil
+		if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
+			k(r.rangeID, "sticky")
+		}
+		_, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{descriptor: &descriptorTrigger{Desc: next}})
+		if kerr != nil {
+			if kerr.DescriptorChanged != nil {
+				lastErr = kerr
+				continue
+			}
+			return desc, kerr
+		}
+		if sender := r.store.getSender(); sender != nil {
+			if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), next); err != nil {
+				log.Warnf("%s: sticky bit committed but meta update failed: %v", r.rangeID, err)
+			}
+		}
+		return next, nil
+	}
+	return r.Desc(), lastErr
+}
+
+// adminUnsplit executes an AdminUnsplitRequest on the leader: the range
+// starting at the key gives up its sticky bit, and the merge queue is
+// free to fold it into its left neighbor when both are small. Nothing
+// merges here — the boundary simply stops being held.
+func (r *Replica) adminUnsplit(ctx context.Context, req *kvpb.AdminUnsplitRequest) (*kvpb.AdminUnsplitResponse, *kvpb.Error) {
+	desc := r.Desc()
+	if !req.Key.Equal(desc.StartKey) {
+		if !desc.ContainsKey(req.Key) {
+			e := kvpb.NewErrorf("%s: key %s outside range", r.rangeID, req.Key)
+			e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: req.Key, ActualDescriptors: []kvpb.RangeDescriptor{desc}}
+			return nil, e
+		}
+		return nil, kvpb.NewErrorf("%s: cannot unsplit at %s: not a range boundary (the range containing it starts at %s)", r.rangeID, req.Key, desc.StartKey)
+	}
+	updated, kerr := r.setStickyBit(ctx, 0)
 	if kerr != nil {
 		return nil, kerr
 	}
-	newID := base.RangeID(ibr.Responses[0].Increment.NewValue)
+	return &kvpb.AdminUnsplitResponse{Desc: updated}, nil
+}
 
-	left := desc
-	left.StartKey = desc.StartKey.Clone()
-	left.EndKey = splitKey.Clone()
-	left.Generation = desc.Generation + 1
-	right := kvpb.RangeDescriptor{
-		RangeID:       newID,
-		StartKey:      splitKey.Clone(),
-		EndKey:        desc.EndKey.Clone(),
-		Replicas:      append([]kvpb.ReplicaDescriptor(nil), desc.Replicas...),
-		NextReplicaID: desc.NextReplicaID,
-		Generation:    desc.Generation + 1,
+// stageDescriptorUpdate applies a descriptorTrigger on a replica, refused
+// deterministically — like a split — if the range is frozen for a merge
+// or is no longer at the generation the update was built from.
+func (r *Replica) stageDescriptorUpdate(b *storage.Batch, trig *descriptorTrigger) error {
+	if r.isFrozen() {
+		metrics.DescriptorChangeRefusals.WithLabelValues("sticky").Inc()
+		return r.frozenError(trig.Desc.StartKey, "%s: cannot change the sticky bit: range is frozen for a merge (the freeze applied after the change was proposed)", r.rangeID)
 	}
-	// The RHS inherits the parent's closed timestamp: reads served at or
-	// below it covered the RHS span, so no post-split write may land there.
-	trig := &splitTrigger{Left: left, Right: right, ClosedTS: r.ClosedTimestamp()}
-	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
-		k(r.rangeID, "split")
+	if cur := r.Desc().Generation; staleDescriptorChange(cur, trig.Desc.Generation) {
+		metrics.DescriptorChangeRefusals.WithLabelValues("sticky").Inc()
+		return r.descriptorChangedError("sticky-bit update", trig.Desc.Generation-1, cur)
 	}
+	return PutRangeDescriptor(b, trig.Desc)
+}
 
-	// Serialize against everything: nothing may be in flight through the
-	// old bounds while the split lands.
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
-	if gerr != nil {
-		return nil, kvpb.NewError(gerr)
-	}
-	if _, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{split: trig}); kerr != nil {
-		guard.Release()
-		return nil, kerr
-	}
-	guard.Release()
-
-	// Repair the addressing records (one batch, both on the meta range, so
-	// the update is atomic). Done outside the latch: if the split was on
-	// the meta-carrying range itself this would deadlock inside it.
-	if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), left, right); err != nil {
-		// Routing still works via mismatch corrections; log and continue.
-		log.Warnf("%s: split committed but meta update failed: %v", r.rangeID, err)
-	}
-	return &kvpb.AdminSplitResponse{Left: left, Right: right}, nil
+func (r *Replica) finishDescriptorUpdate(trig *descriptorTrigger) {
+	r.mu.Lock()
+	r.mu.desc = trig.Desc
+	r.mu.Unlock()
 }
 
 // putMetaRecords writes the /meta addressing records for the given
@@ -122,7 +305,8 @@ func putMetaRecords(ctx context.Context, sender Sender, now hlc.Timestamp, order
 // membership — both sides of the trigger are wrong (the merged span's
 // right part would belong to no range at all, or the new member would
 // vanish from the descriptor), so the split is refused deterministically
-// and the caller retries against the current descriptor (issue #200).
+// and the caller retries against the current descriptor (issue #200;
+// adminSplit does, issue #290).
 // stageMerge guards the same way with a different comparison: a split
 // trigger's Left carries the generation the split PRODUCES, a merge
 // trigger's Left the generation the merge was BUILT FROM (the pre-merge
@@ -141,12 +325,11 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	// that applies in between.
 	if r.isFrozen() {
 		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
-		return kvpb.NewErrorf("%s: cannot split: range is frozen for a merge (the freeze applied after the split was proposed); retry once the merge lands", r.rangeID)
+		return r.frozenError(trig.Right.StartKey, "%s: cannot split: range is frozen for a merge (the freeze applied after the split was proposed); retry once the merge lands", r.rangeID)
 	}
 	if cur := r.Desc().Generation; staleDescriptorChange(cur, trig.Left.Generation) {
 		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
-		return kvpb.NewErrorf("%s: split against generation %d but range is at %d; the range changed under it, retry against the current descriptor",
-			r.rangeID, trig.Left.Generation-1, cur)
+		return r.descriptorChangedError("split", trig.Left.Generation-1, cur)
 	}
 	if err := PutRangeDescriptor(b, trig.Left); err != nil {
 		return err

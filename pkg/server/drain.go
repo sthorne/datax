@@ -83,6 +83,13 @@ func (n *Node) Drain(ctx context.Context) DrainReport {
 	}()
 	rep.LeasesTransferred, rep.LeasesKept = n.shedLeases(ctx)
 	wg.Wait()
+	// The sessions are gone, so nothing more will be notified from here:
+	// hand the peers what the last commits published before stopping,
+	// or their listeners would never hear of it. A peer that cannot be
+	// reached is not waited for.
+	fctx, fcancel := context.WithTimeout(ctx, 2*time.Second)
+	n.notifyHub().Flush(fctx)
+	fcancel()
 	if err := ctx.Err(); err != nil {
 		rep.Incomplete = err.Error()
 	}

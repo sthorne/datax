@@ -8,9 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -28,6 +31,15 @@ import (
 // carried r125@106"). These tests hold each operation between building
 // and proposing, change the range underneath it, and check the stale
 // operation is refused and the range is whole.
+//
+// A split goes one step further since issue #290: what its caller asked
+// for — a boundary at the key — still makes sense on the changed range,
+// so the leader rebuilds the refused split from the current descriptor
+// instead of handing the refusal to the caller (a statement's
+// ALTER TABLE ... SPLIT AT used to fail with "split against generation 0
+// but range is at 1"). The hold makes that race happen every time: the
+// split tests below check both that nothing of the stale trigger landed
+// and that the caller got its boundary.
 
 // descriptorHold arms the BeforeProposeDescriptorChange knob so that the
 // first `op` on the armed range blocks until release is closed.
@@ -184,12 +196,14 @@ func (f *raceFixture) shedReplica(t *testing.T, ctx context.Context) base.NodeID
 	return id
 }
 
-// TestSplitBuiltBeforeAMergeIsRefused: a split of the LHS built before the
-// LHS absorbs its neighbour, applied after. The split must be refused; the
-// merged range must keep its full span on every replica and in /meta, every
-// key on both sides must stay reachable, and a split built afresh must go
-// through.
-func TestSplitBuiltBeforeAMergeIsRefused(t *testing.T) {
+// TestSplitBuiltBeforeAMergeIsRebuilt: a split of the LHS built before the
+// LHS absorbs its neighbour, applied after. The stale trigger must be
+// refused — applied, it would cut the merged range back to its pre-merge
+// span and orphan the absorbed half — and the split must then be rebuilt
+// from the merged descriptor and succeed, without the caller seeing the
+// refusal (issue #290). Both halves together must cover the merged span
+// on every replica and in /meta, and every key must stay reachable.
+func TestSplitBuiltBeforeAMergeIsRebuilt(t *testing.T) {
 	hold := newDescriptorHold()
 	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -198,10 +212,15 @@ func TestSplitBuiltBeforeAMergeIsRefused(t *testing.T) {
 
 	hold.arm(f.lhs.RangeID, "split")
 	lead := tc.LeaderIndex(f.lhs.RangeID)
-	splitErr := make(chan error, 1)
+	refusedBefore := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("split"))
+	type splitResult struct {
+		resp *kvpb.AdminSplitResponse
+		err  error
+	}
+	done := make(chan splitResult, 1)
 	go func() {
-		_, err := tc.Nodes[lead].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
-		splitErr <- err
+		resp, err := tc.Nodes[lead].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
+		done <- splitResult{resp, err}
 	}()
 	hold.waitArrived(t, "the split")
 
@@ -211,37 +230,34 @@ func TestSplitBuiltBeforeAMergeIsRefused(t *testing.T) {
 	}
 	close(hold.release)
 
+	var sr *kvpb.AdminSplitResponse
 	select {
-	case err := <-splitErr:
-		if err == nil || !strings.Contains(err.Error(), "split against generation") {
-			t.Fatalf("stale split: got %v, want refusal", err)
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("split built before the merge: %v, want it rebuilt against the merged range", res.err)
 		}
+		sr = res.resp
 	case <-time.After(60 * time.Second):
-		t.Fatal("stale split never returned")
+		t.Fatal("the held split never returned")
 	}
-
-	// Nothing of the stale split landed: every replica and /meta hold the
-	// merged span at the merged generation, and both sides are readable.
-	for i, d := range f.localDescriptors(f.lhs.RangeID) {
-		if d.Generation != merged.Generation || !d.EndKey.Equal(merged.EndKey) {
-			t.Fatalf("node %d holds %v after the refused split, want %v", i, d, merged)
+	// The trigger built from the pre-merge descriptor was refused at
+	// apply (by every replica; the count is process-wide)...
+	if got := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("split")) - refusedBefore; got < 1 {
+		t.Fatalf("the stale split trigger was not refused at apply (refusals grew by %v)", got)
+	}
+	// ...and the one that landed was built from the merged range: one
+	// generation past it, its right half ending where the merged range
+	// did — not at the pre-merge boundary the stale trigger carried.
+	if sr.Left.RangeID != f.lhs.RangeID || sr.Left.Generation != merged.Generation+1 || !sr.Right.EndKey.Equal(merged.EndKey) {
+		t.Fatalf("split produced %v / %v, want generation %d ending at %s", sr.Left, sr.Right, merged.Generation+1, merged.EndKey)
+	}
+	for _, half := range []kvpb.RangeDescriptor{sr.Left, sr.Right} {
+		waitDescriptorEverywhere(t, f, half)
+		if m := f.metaRecord(t, ctx, half.RangeID); !sameRangeDescriptor(m, half) {
+			t.Fatalf("/meta holds %v after the rebuilt split, want %v", m, half)
 		}
 	}
-	if m := f.metaRecord(t, ctx, f.lhs.RangeID); m.Generation != merged.Generation || !m.EndKey.Equal(merged.EndKey) {
-		t.Fatalf("/meta holds %v after the refused split, want %v", m, merged)
-	}
-	f.everyKeyReadable(t, ctx, "after the refused split")
-
-	// A split built from the current descriptor goes through, and both
-	// sides together cover the merged span.
-	sr, err := tc.Nodes[tc.LeaderIndex(f.lhs.RangeID)].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
-	if err != nil {
-		t.Fatalf("fresh split: %v", err)
-	}
-	if sr.Left.Generation != merged.Generation+1 || !sr.Right.EndKey.Equal(merged.EndKey) {
-		t.Fatalf("fresh split produced %v / %v, want generation %d ending at %s", sr.Left, sr.Right, merged.Generation+1, merged.EndKey)
-	}
-	f.everyKeyReadable(t, ctx, "after the fresh split")
+	f.everyKeyReadable(t, ctx, "after the rebuilt split")
 }
 
 // TestReplicaChangeBuiltBeforeAMergeIsRefused: a replica addition on the
@@ -321,13 +337,13 @@ func TestReplicaChangeBuiltBeforeAMergeIsRefused(t *testing.T) {
 	f.everyKeyReadable(t, ctx, "after the fresh replica change")
 }
 
-// TestSplitBuiltBeforeAReplicaChangeIsRefused: a split built before a
-// replica is added to the range, applied after. Unrefused, both halves
-// would carry the old membership, and the new member would vanish from the
-// descriptor while staying in the raft group. The split must be refused,
-// the four-replica descriptor must survive, and a split built afresh must
-// give both halves all four replicas.
-func TestSplitBuiltBeforeAReplicaChangeIsRefused(t *testing.T) {
+// TestSplitBuiltBeforeAReplicaChangeIsRebuilt: a split built before a
+// replica is added to the range, applied after. Applied as built, both
+// halves would carry the old membership, and the new member would vanish
+// from the descriptor while staying in the raft group. The stale trigger
+// must be refused and the split rebuilt from the four-replica descriptor,
+// giving both halves all four replicas (issue #290).
+func TestSplitBuiltBeforeAReplicaChangeIsRebuilt(t *testing.T) {
 	hold := newDescriptorHold()
 	tc := StartWithOptions(t, 4, func(c *server.Config) {
 		c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob
@@ -340,10 +356,14 @@ func TestSplitBuiltBeforeAReplicaChangeIsRefused(t *testing.T) {
 
 	hold.arm(f.lhs.RangeID, "split")
 	lead := tc.LeaderIndex(f.lhs.RangeID)
-	splitErr := make(chan error, 1)
+	type splitResult struct {
+		resp *kvpb.AdminSplitResponse
+		err  error
+	}
+	done := make(chan splitResult, 1)
 	go func() {
-		_, err := tc.Nodes[lead].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
-		splitErr <- err
+		resp, err := tc.Nodes[lead].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
+		done <- splitResult{resp, err}
 	}()
 	hold.waitArrived(t, "the split")
 
@@ -356,30 +376,23 @@ func TestSplitBuiltBeforeAReplicaChangeIsRefused(t *testing.T) {
 	}
 	close(hold.release)
 
+	var sr *kvpb.AdminSplitResponse
 	select {
-	case err := <-splitErr:
-		if err == nil || !strings.Contains(err.Error(), "split against generation") {
-			t.Fatalf("stale split: got %v, want refusal", err)
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("split built before the replica change: %v, want it rebuilt against the current range", res.err)
 		}
+		sr = res.resp
 	case <-time.After(60 * time.Second):
-		t.Fatal("stale split never returned")
+		t.Fatal("the held split never returned")
 	}
-
-	for i, d := range f.localDescriptors(f.lhs.RangeID) {
-		if d.Generation != added.Desc.Generation || len(d.Replicas) != 4 || !d.EndKey.Equal(f.lhs.EndKey) {
-			t.Fatalf("node %d holds %v after the refused split, want %v", i, d, added.Desc)
-		}
+	if len(sr.Left.Replicas) != 4 || len(sr.Right.Replicas) != 4 || sr.Left.Generation != added.Desc.Generation+1 || !sr.Right.EndKey.Equal(f.lhs.EndKey) {
+		t.Fatalf("split produced %v / %v, want four replicas each at generation %d", sr.Left, sr.Right, added.Desc.Generation+1)
 	}
-	f.everyKeyReadable(t, ctx, "after the refused split")
-
-	sr, err := tc.Nodes[tc.LeaderIndex(f.lhs.RangeID)].DB().AdminSplit(ctx, append(f.prefix.Clone(), "a03"...))
-	if err != nil {
-		t.Fatalf("fresh split: %v", err)
+	for _, half := range []kvpb.RangeDescriptor{sr.Left, sr.Right} {
+		waitDescriptorEverywhere(t, f, half)
 	}
-	if len(sr.Left.Replicas) != 4 || len(sr.Right.Replicas) != 4 || sr.Left.Generation != added.Desc.Generation+1 {
-		t.Fatalf("fresh split produced %v / %v, want four replicas each at generation %d", sr.Left, sr.Right, added.Desc.Generation+1)
-	}
-	f.everyKeyReadable(t, ctx, "after the fresh split")
+	f.everyKeyReadable(t, ctx, "after the rebuilt split")
 }
 
 // TestLeftoverOverlappingALiveReplicaIsNotReplaced: the one irreversible
@@ -461,15 +474,18 @@ func TestLeftoverOverlappingALiveReplicaIsNotReplaced(t *testing.T) {
 	f.everyKeyReadable(t, ctx, "after the refused preseed")
 }
 
-// TestSplitProposedBeforeAFreezeIsRefused: a split of the RHS built and
+// TestSplitProposedBeforeAFreezeWaitsItOut: a split of the RHS built and
 // about to be proposed when a Subsume freezes the range — adminSplit's
 // own frozen check ran before the freeze applied and let it through. At
 // apply the split finds the range frozen and must be refused: the merge
 // driver has read the frozen descriptor as final, and a split landing
 // after it would hand half the span to a new range the merge then
 // absorbs as well (seen once in CI on #264's branch under merge churn).
-// Unfrozen, the same split goes through.
-func TestSplitProposedBeforeAFreezeIsRefused(t *testing.T) {
+// The refusal is the one a frozen range gives any request, so the caller
+// waits on it; when the merge is abandoned and the range unfrozen, the
+// same call makes its split (issue #290 — the SQL statement used to
+// recognise this refusal by its text and retry it itself).
+func TestSplitProposedBeforeAFreezeWaitsItOut(t *testing.T) {
 	hold := newDescriptorHold()
 	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -479,10 +495,14 @@ func TestSplitProposedBeforeAFreezeIsRefused(t *testing.T) {
 	hold.arm(f.rhs.RangeID, "split")
 	lead := tc.LeaderIndex(f.rhs.RangeID)
 	splitKey := append(f.prefix.Clone(), "z07"...)
-	splitErr := make(chan error, 1)
+	type splitResult struct {
+		resp *kvpb.AdminSplitResponse
+		err  error
+	}
+	done := make(chan splitResult, 1)
 	go func() {
-		_, err := tc.Nodes[lead].DB().AdminSplit(ctx, splitKey)
-		splitErr <- err
+		resp, err := tc.Nodes[lead].DB().AdminSplit(ctx, splitKey)
+		done <- splitResult{resp, err}
 	}()
 	hold.waitArrived(t, "the split")
 
@@ -496,15 +516,24 @@ func TestSplitProposedBeforeAFreezeIsRefused(t *testing.T) {
 	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
 		t.Fatalf("freezing the RHS: %v", kerr)
 	}
+	refusedBefore := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("split"))
 	close(hold.release)
 
-	select {
-	case err := <-splitErr:
-		if err == nil || !strings.Contains(err.Error(), "frozen for a merge") {
-			t.Fatalf("split applied on a frozen range: got %v, want the frozen refusal", err)
+	// The split is proposed, applies on the frozen range and is refused
+	// there; wait for that before lifting the freeze, so that it is the
+	// refusal the caller is waiting out and not a split that simply
+	// arrived late.
+	deadline := time.Now().Add(30 * time.Second)
+	for testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("split")) == refusedBefore {
+		if time.Now().After(deadline) {
+			t.Fatal("the split was never refused on the frozen range")
 		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("the held split never returned")
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("the split returned while the range was frozen: %v / %v", res.resp, res.err)
+	case <-time.After(300 * time.Millisecond):
 	}
 	// Nothing of it landed: every replica holds the frozen descriptor as
 	// the merge driver read it.
@@ -514,18 +543,117 @@ func TestSplitProposedBeforeAFreezeIsRefused(t *testing.T) {
 		}
 	}
 
-	// Unfrozen (an abandoned merge), the same split goes through.
+	// Unfrozen (an abandoned merge), the waiting split goes through.
 	unf := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
 	unf.Add(&kvpb.UnfreezeRequest{RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey}})
 	if _, kerr := rhs.Execute(ctx, unf); kerr != nil {
 		t.Fatalf("unfreezing the RHS: %v", kerr)
 	}
-	sr, err := tc.Nodes[lead].DB().AdminSplit(ctx, splitKey)
-	if err != nil {
-		t.Fatalf("split after the unfreeze: %v", err)
-	}
-	if sr.Left.Generation != f.rhs.Generation+1 || !sr.Right.EndKey.Equal(f.rhs.EndKey) {
-		t.Fatalf("split produced %v / %v, want generation %d ending at %s", sr.Left, sr.Right, f.rhs.Generation+1, f.rhs.EndKey)
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("split after the unfreeze: %v", res.err)
+		}
+		if sr := res.resp; sr.Left.Generation != f.rhs.Generation+1 || !sr.Right.EndKey.Equal(f.rhs.EndKey) {
+			t.Fatalf("split produced %v / %v, want generation %d ending at %s", sr.Left, sr.Right, f.rhs.Generation+1, f.rhs.EndKey)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the split never returned after the unfreeze")
 	}
 	f.everyKeyReadable(t, ctx, "after the split")
+}
+
+// waitDescriptorEverywhere waits until every node that holds a replica of
+// want's range holds exactly want: a follower applies a split a moment
+// after the leader acknowledges it.
+func waitDescriptorEverywhere(t *testing.T, f *raceFixture, want kvpb.RangeDescriptor) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		held := f.localDescriptors(want.RangeID)
+		ok := len(held) == len(want.Replicas)
+		for _, d := range held {
+			ok = ok && sameRangeDescriptor(d, want)
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replicas hold %v, want %v on each of %d", held, want, len(want.Replicas))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestReplicaChangeProposedBeforeAFreezeIsRefused (issue #268): a removal
+// is held just before it is proposed, the range is frozen for a merge
+// underneath it, and the removal then applies on a frozen range. It must
+// be refused there — on every replica, at the same entry — because a
+// node that dropped its replica of a frozen range would have nothing to
+// subsume when the merge applied on it. The membership is unchanged, the
+// caller is told to retry, and the merge the freeze was for goes through.
+func TestReplicaChangeProposedBeforeAFreezeIsRefused(t *testing.T) {
+	hold := newDescriptorHold()
+	tc := StartWithOptions(t, 3, func(c *server.Config) { c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob })
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	f := newRaceFixture(t, ctx, tc, 868)
+
+	lead := tc.LeaderIndex(f.rhs.RangeID)
+	var victim base.NodeID
+	for _, n := range tc.Nodes {
+		if n.NodeID() != tc.Nodes[lead].NodeID() {
+			victim = n.NodeID()
+			break
+		}
+	}
+	hold.arm(f.rhs.RangeID, "replica-change")
+	changeErr := make(chan error, 1)
+	go func() {
+		_, err := tc.Nodes[lead].DB().AdminChangeReplicas(ctx, f.rhs.StartKey, 0, victim)
+		changeErr <- err
+	}()
+	hold.waitArrived(t, "the replica change")
+
+	rhs, ok := tc.Nodes[lead].Store().GetReplica(f.rhs.RangeID)
+	if !ok {
+		t.Fatalf("n%d holds no replica of %s", tc.Nodes[lead].NodeID(), f.rhs.RangeID)
+	}
+	sub := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: f.rhs.RangeID, Timestamp: tc.Nodes[lead].Clock().Now()}}
+	sub.Add(&kvpb.SubsumeRequest{RequestHeader: kvpb.RequestHeader{Key: f.rhs.StartKey, EndKey: f.rhs.EndKey}, MergeInto: f.lhs.RangeID})
+	if _, kerr := rhs.Execute(ctx, sub); kerr != nil {
+		t.Fatalf("freezing the RHS: %v", kerr)
+	}
+	refusedBefore := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("replica-change"))
+	close(hold.release)
+	select {
+	case err := <-changeErr:
+		if err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("a removal applied on a frozen range: got %v, want a refusal", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the replica change never returned")
+	}
+	if got := testutil.ToFloat64(metrics.DescriptorChangeRefusals.WithLabelValues("replica-change")); got == refusedBefore {
+		t.Fatal("the refusal was not counted")
+	}
+	// Every node still holds the range, at the generation and with the
+	// membership the merge driver froze.
+	descs := f.localDescriptors(f.rhs.RangeID)
+	if len(descs) != len(tc.Nodes) {
+		t.Fatalf("%d of %d nodes hold the frozen range after the refused removal", len(descs), len(tc.Nodes))
+	}
+	for i, d := range descs {
+		if d.Generation != f.rhs.Generation || len(d.Replicas) != len(f.rhs.Replicas) {
+			t.Fatalf("node %d holds %v after the refused removal, want %v", i, d, f.rhs)
+		}
+	}
+	// The merge the freeze was for lands on every node, which is what a
+	// removal applied on the frozen range would have made fatal.
+	// (The freeze was made by hand and names no epoch, so the first pass
+	// unwinds it and a later one merges afresh; mergeRanges retries.)
+	if merged := mergeRanges(t, ctx, tc, f.lhs.RangeID); !merged.EndKey.Equal(f.rhs.EndKey) {
+		t.Fatalf("the merge after the refused removal produced %v, want end %s", merged, f.rhs.EndKey)
+	}
+	f.everyKeyReadable(t, ctx, "after the merge")
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 
@@ -171,6 +172,114 @@ func TestReencryptPass(t *testing.T) {
 	}
 	if len(stale) != 0 {
 		t.Fatalf("%d live sstables still stale (active key %d)", len(stale), activeID)
+	}
+}
+
+// staleStore builds an encrypted store holding one flushed sstable of
+// MVCC rows and reopens it, so that file is stale under the new session's
+// data key. The caller closes the engine.
+func staleStore(t *testing.T) *Engine {
+	t.Helper()
+	dir := t.TempDir()
+	key := testKey(t)
+	e, err := Open(dir, Options{EncryptionKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	val := make([]byte, 100)
+	for i := 0; i < 1000; i++ {
+		k := EncodeMVCCKey(keys.Key(fmt.Sprintf("k-%06d", i)), hlc.Timestamp{WallTime: int64(i + 1)})
+		if err := e.Put(k, val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = Open(dir, Options{EncryptionKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// TestReencryptPassRewritesAlone: with automatic compactions off, nothing
+// but the pass can touch the stale file, so one pass must itself replace
+// it — the file is gone, the bytes it reports are the compaction it ran,
+// and nothing stale remains.
+func TestReencryptPassRewritesAlone(t *testing.T) {
+	testingPebbleOptions = func(o *pebble.Options) { o.DisableAutomaticCompactions = true }
+	defer func() { testingPebbleOptions = nil }()
+	e := staleStore(t)
+	defer func() { _ = e.Close() }()
+	stale, err := e.staleTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 {
+		t.Fatalf("want one stale file after the restart, have %+v", stale)
+	}
+	before := e.compactedBytes()
+	targeted, rem, files, err := e.ReencryptPass(context.Background(), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rem != 0 || files != 0 {
+		t.Fatalf("one pass left %d bytes in %d files stale", rem, files)
+	}
+	if got := e.compactedBytes() - before; targeted == 0 || targeted != got {
+		t.Fatalf("pass reports %d bytes rewritten; Pebble compacted %d", targeted, got)
+	}
+	levels, err := e.db.SSTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, level := range levels {
+		for _, f := range level {
+			if uint64(f.FileNum) == stale[0].fileNum {
+				t.Fatalf("stale file %d is still live: it was moved, not rewritten", f.FileNum)
+			}
+		}
+	}
+}
+
+// TestReencryptPassCreditsSeedCompaction: flushing the seed leaves two
+// files in L0, which is enough for Pebble to compact them on its own. The
+// pass is held after the flush until that automatic compaction has
+// finished, so its own Compact finds nothing to do; the bytes rewritten
+// on the pass's behalf must still be reported. Unheld, this ordering is
+// the one a loaded machine produced about once in a thousand runs, where
+// the pass reported zero bytes for a file it had retired. Issue #287.
+func TestReencryptPassCreditsSeedCompaction(t *testing.T) {
+	e := staleStore(t)
+	defer func() { _ = e.Close() }()
+	settled := false
+	testingAfterSeedFlush = func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if m := e.db.Metrics(); m.Compact.Count > 0 && m.Compact.NumInProgress == 0 {
+				settled = true
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	defer func() { testingAfterSeedFlush = nil }()
+	targeted, rem, files, err := e.ReencryptPass(context.Background(), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settled {
+		t.Fatal("no automatic compaction followed the seed flush; the ordering under test did not happen")
+	}
+	if rem != 0 || files != 0 {
+		t.Fatalf("one pass left %d bytes in %d files stale", rem, files)
+	}
+	if targeted == 0 {
+		t.Fatal("the pass reports no bytes rewritten for a file the seed's compaction retired")
 	}
 }
 

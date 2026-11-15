@@ -51,17 +51,100 @@ duration, so two runs draw the same keys:
 | `timeseries` | per-series monotone timestamps across 8 shard buckets, then windowed reads |
 | `index-join`, `index-join-1pct`, `index-join-10pct` | secondary-index lookups fanning out to wide primary rows: 20, 200 and 2,000 rows per lookup (the batched primary fetch of #103) |
 | `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
+| `jsonb-contain`, `jsonb-contain-filter` | JSONB containment (`doc @> '{"tenant": n}'`, 50 of 50,000 documents per query) through a GIN index and as a filter over every document (#300) |
+| `text-search`, `text-search-filter` | full-text search (`to_tsvector('english', body) @@ to_tsquery('english', 'topic<n>')`, 50 of 50,000 short documents per query) through a GIN index on the expression and as a filter that reduces every document to lexemes for every query (#299) |
+| `vector-knn`, `vector-knn-exact` | the 10 nearest of 50,000 vectors of 64 dimensions (`ORDER BY v <-> q LIMIT 10`) through an `ivfflat` index of 200 lists and by the exact top-k scan (#304); the records carry the index build time and recall@10 (`vector.build_sec`, `vector.recall`) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
 into N ranges before the run (`ALTER TABLE ... SPLIT AT` at evenly
 spaced keys; a sharded timeseries table is carved by `--shards`
 instead), so a run measures many raft groups on one store rather than
-one hot range. The housekeeping loop merges empty neighbors back
-together within minutes, so start the nodes with
-`--merge-size-threshold -1` for an idle-cluster measurement; 10,000 is
+one hot range. The boundaries are sticky (cluster version v20), so the
+housekeeping loop does not merge the empty neighbors back together; on
+a cluster that has not finalized v20 it does, within minutes, so there
+start the nodes with `--merge-size-threshold -1` for an idle-cluster
+measurement; 10,000 is
 the largest worth trying on a laptop. A record's `error_samples` lists
 the distinct error messages behind its `errors` count.
+
+The `jsonb-contain` pair is sized to keep the set's run time down. The
+same comparison over a million documents (the preload is the slow part,
+and is skipped when the table already holds the rows):
+
+```sh
+bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s
+bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s --jsonb-index none
+```
+
+The `vector-knn` pair loads vectors drawn around `--groups` Gaussian
+centres from the seed (so it needs no download and two runs see the
+same table), builds the index after the load, and before the measured
+phase answers 100 queries both through the index and exactly, recording
+recall@10 beside the build time. It is a synthetic set, not one of the
+public ANN benchmarks: clustered data flatters a clustering index, and
+recall on real embeddings should be measured on them. `--probes` sets
+`ivfflat.probes` (default: the server's, the square root of `--lists`),
+`--dims` the dimension, `--vector-index none` the exact scan. Recorded
+on one node, 4 cores, 50,000 × 64, `--lists 200`, one worker: recall
+0.85 / 0.96 / 0.99 / 1.00 at 1 / 5 / 15 (default) / 40 probes with a
+median of 0.9 / 3 / 10 / 29 ms, against 164 ms for the exact scan; the
+index built in 3.9 s.
+
+```sh
+bin/datax bench vector-knn --preload 50000 --dims 64 --groups 1000 --lists 200 --probes 5 --concurrency 1 --duration 20s
+bin/datax bench vector-knn --preload 50000 --dims 64 --groups 1000 --vector-index none --concurrency 1 --duration 20s
+```
+
+## The large set
+
+`workloads-large.json` is a second checked-in set, for what does not
+show on a small table: full-text search over **a million documents**
+(#299) — one selective word (50 documents per query), the same narrowed
+by a phrase that is decided from positions, a prefix (`serial1234:*`, a
+range of the index), and the ten best of a two-word `OR` by `ts_rank`.
+The four share one table and the first to run loads it, which takes
+most of the run (about ten index entries per document; some ten minutes
+on a 4-core machine for the single node, longer for the cluster):
+
+```sh
+SET=bench/workloads-large.json OUT=/tmp/large make bench
+```
+
+It is not part of the nightly run, whose 40 minutes it would not fit
+in. The filter over the same million documents is in neither set — one
+query takes over twenty seconds — and can be timed by hand:
+
+```sh
+bin/datax bench text-search --preload 1000000 --groups 20000 --concurrency 1 --duration 120s --text-index none
+```
+
+## Errors fail a run
+
+An operation that errors during the measured run is not measured, so a
+run that shed some describes a different workload than the one asked
+for. `datax bench <workload>` and `datax bench run` therefore exit
+non-zero when a run counts more errors than `--max-errors` (default 0;
+`-1` never fails on errors). The record and the printed results are
+written either way; only the exit status changes.
+
+- A serialization conflict (SQLSTATE 40001, "restart transaction") is
+  not an error: it is counted under `retries`, and a contended workload
+  such as `bank` produces them on every honest run. Everything else is
+  an error — a routing failure, a dropped connection, a timeout. The
+  whole set against a healthy 3-node local cluster counts none.
+- `datax bench run` runs every workload of the set whatever the earlier
+  ones did, so one bad workload does not cost the records of the rest,
+  and gives its verdict at the end: one `FAIL` line per workload that
+  did not complete (its setup failed) or went over its tolerance, with
+  the error count and the most frequent error message.
+- A workload that is expected to shed a few operations can carry its own
+  tolerance in the set, which takes precedence over the runner's flag:
+  `{"name": "...", "args": [...], "max_errors": 5}`. None of the
+  checked-in workloads has one.
+- `bench/run.sh` runs both targets even when the first fails, repeats
+  the `FAIL` lines of both as its last lines, and then exits non-zero.
+  `MAX_ERRORS=-1 make bench` records a set without the check.
 
 `bench/run.sh` starts a fresh single-node on-disk store
 (`datax init --dir`) and a fresh in-memory 3-node cluster (`datax demo`)
@@ -121,3 +204,11 @@ of the same shape (`datax bench ingest --keys sequential --batch B
 `.github/workflows/bench.yaml` runs the set on `main` every night on a
 hosted runner and uploads the records as an artifact. Runner noise makes
 it a trend line, not a gate: a PR still records its own before/after.
+
+A night is red when `bench/run.sh` exits non-zero: a workload did not
+complete, or counted errors in its measured run beyond its tolerance
+(above). The records are uploaded and summarized on a red night too, and
+the standing issue the workflow files or updates
+(`.github/scripts/standing-issue.sh`) quotes the run's last lines, which
+name each failing workload, its error count and its most frequent
+error. A clean night closes the issue.

@@ -897,6 +897,8 @@ func innerPathDesc(plan accessPlan) string {
 		return fmt.Sprintf("range scan of primary key (%d column prefix)", len(plan.idxVals))
 	case planIndexScan:
 		return fmt.Sprintf("scan of index %q (%d column prefix) + primary key join", plan.idx.Name, len(plan.idxVals))
+	case planInvertedScan:
+		return invertedPlanString(plan)
 	}
 	return "full table scan"
 }
@@ -925,13 +927,29 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 	// Statistics are threaded exactly as execution threads them (fetchRows
 	// does the same lookup), so EXPLAIN shows the paths execution takes;
 	// a statistics-based estimate annotates each side that has one.
+	// Row security bounds each side's scan as it does in execution
+	// (fetchRows adds the policy); the estimates, drawn from statistics
+	// over every row, are left out when a side is confined.
+	anySecured := false
+	baseWhere, secured, err := s.securedWhere(ctx, txn, sides[0].desc, baseWhere, catalog.PolicySelect)
+	if err != nil {
+		return "", err
+	}
+	anySecured = anySecured || secured
+	for k := 1; k < len(sides); k++ {
+		active, aerr := s.rowSecurityActive(ctx, txn, sides[k].desc)
+		if aerr != nil {
+			return "", aerr
+		}
+		anySecured = anySecured || active
+	}
 	baseStats, _ := s.cat.Stats(ctx, sides[0].desc.ID)
 	basePlan, err := pickPlanWithStats(sides[0].desc, baseStats, baseWhere, params)
 	if err != nil {
 		return "", err
 	}
 	estimate := func(plan accessPlan) string {
-		if plan.estRows > 0 {
+		if plan.estRows > 0 && !anySecured {
 			return fmt.Sprintf(" [~%.0f rows]", plan.estRows)
 		}
 		return ""
@@ -948,6 +966,10 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 			synth = append(synth, parser.Comparison{
 				Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
 			})
+		}
+		synth, _, err := s.securedWhere(ctx, txn, sides[k].desc, synth, catalog.PolicySelect)
+		if err != nil {
+			return "", err
 		}
 		sideStats, _ := s.cat.Stats(ctx, sides[k].desc.ID)
 		plan, err := pickPlanWithStats(sides[k].desc, sideStats, synth, nil)
@@ -972,6 +994,9 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 	}
 	if jq.reordered {
 		b.WriteString("; join reordered by cost")
+	}
+	if anySecured {
+		b.WriteString("; row-level security policy applied")
 	}
 	return b.String(), nil
 }

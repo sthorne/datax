@@ -79,6 +79,10 @@ type RoleDescriptor struct {
 	// NoInherit: the role does not automatically hold the privileges of
 	// the roles it belongs to (SET ROLE still reaches them).
 	NoInherit bool `json:"noinherit,omitempty"`
+	// BypassRLS: the role reads and writes every row of a table whatever
+	// its row-security policies say (cluster version v21). The attribute
+	// belongs to the role itself and is not inherited through membership.
+	BypassRLS bool `json:"bypassrls,omitempty"`
 	// Verifier is the SCRAM verifier (security.MarshalVerifier's JSON;
 	// never a plaintext password); empty for a role without a password.
 	Verifier json.RawMessage `json:"verifier,omitempty"`
@@ -542,9 +546,42 @@ func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
 // everything, not read everything (issue #253). It is the table half of
 // the SQL authorizer's read question only: SQL also requires USAGE on
 // the table's schema, which this does not ask (issue #259).
+//
+// The audit table is the exception to read_all, here as in the SQL
+// authorizer: its records name people, so reading it takes an admin or
+// a SELECT grant on the table itself (issue #293).
+//
+// Row security is the other exception (issue #294): a role the table's
+// policies confine may read some of its rows and not others, and a
+// range boundary is whichever row the split fell on — as likely
+// another tenant's as its own. Such a role is shown none of them.
 func CanReadTable(set RoleSet, d *TableDescriptor) bool {
+	if IsSealedSystemTable(d.Name) {
+		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
+	}
+	if RowSecurityConfines(set, d) {
+		return false
+	}
 	return set.IsAdmin() || set.Has(OwnerOf(d.Owner)) || set.Has(ReadAllRole) ||
 		HasPrivilege(d.Privileges, set, "SELECT")
+}
+
+// RowSecurityConfines reports whether a table's row-security policies
+// apply to a role set, as far as the set alone can tell: the table has
+// row security enabled and the set is neither root nor — unless the
+// table forces row security — an admin or the owner. The BYPASSRLS
+// attribute belongs to one role and is not part of a role set, so a
+// caller that has only the set treats such a role as confined: the
+// direction a missing fact should fail. The SQL layer, which knows the
+// role, asks Session.rowSecurityActive.
+func RowSecurityConfines(set RoleSet, d *TableDescriptor) bool {
+	if !d.RowSecurity || set.Has(RootRole) {
+		return false
+	}
+	if d.ForceRowSecurity {
+		return true
+	}
+	return !set.IsAdmin() && !set.Has(OwnerOf(d.Owner))
 }
 
 func OwnerOf(owner string) string {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vtable"
 )
@@ -40,6 +41,46 @@ type sessionVars struct {
 	memoryLimit int64
 	// role is SET ROLE's role ("" = none: the session user).
 	role string
+	// invertedScan is inverted_index_scan: whether the planner may (auto),
+	// must (on) or must not (off) read an inverted index that can serve
+	// a statement. For comparing the two paths; auto is right otherwise.
+	invertedScan invertedMode
+	// textSearchConfig is default_text_search_config: the configuration
+	// the text-search functions use when a call names none ("" = the
+	// built-in default).
+	textSearchConfig string
+	// custom holds the custom settings (issue #294): two-part names an
+	// application defines for itself (app.tenant), which a row-security
+	// policy reads with current_setting(). The map is replaced, never
+	// changed in place, on every SET: sessionVars is copied by value to
+	// save a transaction's SET LOCAL, and the copy must keep the old one.
+	custom map[string]string
+	// ivfProbes is ivfflat.probes: how many lists of a vector index a
+	// query reads (0 = the square root of the index's lists, the default).
+	ivfProbes int
+	// noVectorScan is vector_index_scan = off: nearest-neighbour queries
+	// are answered exactly, by scanning, whatever index exists.
+	noVectorScan bool
+}
+
+// isCustomVar reports whether name is a custom setting's: PostgreSQL's
+// rule, a name with a class prefix (class.name) — unless the name is a
+// setting datax defines itself under such a prefix (ivfflat.probes, as
+// pgvector names it), which is typed and checked like any other, as an
+// extension's settings are in PostgreSQL once it is loaded.
+func isCustomVar(name string) bool {
+	i := strings.IndexByte(name, '.')
+	return i > 0 && i < len(name)-1 && canonicalVar(name) == ""
+}
+
+// setCustomVar sets a custom setting on vars.
+func setCustomVar(vars *sessionVars, name, value string) {
+	next := make(map[string]string, len(vars.custom)+1)
+	for k, v := range vars.custom {
+		next[k] = v
+	}
+	next[name] = value
+	vars.custom = next
 }
 
 func defaultVars() sessionVars {
@@ -53,10 +94,13 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"client_encoding", "string", ""},
 	{"database", "string", ""},
 	{"DateStyle", "string", ""},
+	{"default_text_search_config", "string", ""},
 	{"default_transaction_read_only", "bool", ""},
 	{"foreign_key_cascade_limit", "integer", ""},
 	{"idle_in_transaction_session_timeout", "integer", "ms"},
 	{"integer_datetimes", "bool", ""},
+	{"inverted_index_scan", "enum", ""},
+	{"ivfflat.probes", "integer", ""},
 	{"lock_timeout", "integer", "ms"},
 	{"role", "string", ""},
 	{"search_path", "string", ""},
@@ -68,6 +112,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"TimeZone", "string", ""},
 	{"transaction_isolation", "string", ""},
 	{"transaction_read_only", "bool", ""},
+	{"vector_index_scan", "bool", ""},
 }
 
 // canonicalVar resolves a SET / SHOW name (case-insensitively, with the
@@ -108,6 +153,9 @@ func (s *Session) varValue(name string) string {
 		return s.database
 	case "DateStyle":
 		return v.dateStyle
+	case "default_text_search_config":
+		// Schema-qualified, as PostgreSQL reports it.
+		return "pg_catalog." + s.textSearchConfig()
 	case "default_transaction_read_only":
 		return onOff(v.defaultReadOnly)
 	case "foreign_key_cascade_limit":
@@ -116,6 +164,15 @@ func (s *Session) varValue(name string) string {
 		return strconv.FormatInt(v.idleInTxnTimeout.Milliseconds(), 10)
 	case "integer_datetimes", "standard_conforming_strings":
 		return "on"
+	case "inverted_index_scan":
+		return v.invertedScan.String()
+	case "ivfflat.probes":
+		if v.ivfProbes == 0 {
+			return "auto"
+		}
+		return strconv.Itoa(v.ivfProbes)
+	case "vector_index_scan":
+		return onOff(!v.noVectorScan)
 	case "lock_timeout":
 		return strconv.FormatInt(v.lockTimeout.Milliseconds(), 10)
 	case "search_path":
@@ -156,6 +213,13 @@ func (s *Session) settings() [][2]string {
 
 // setting resolves a SHOW name to the setting's canonical name and value.
 func (s *Session) setting(name string) (string, string, bool) {
+	if isCustomVar(name) {
+		// A custom setting exists once it has been set; before that it is
+		// unrecognized (current_setting's missing_ok turns that into NULL).
+		lname := strings.ToLower(strings.TrimSpace(name))
+		v, ok := s.vars.custom[lname]
+		return lname, v, ok
+	}
 	c := canonicalVar(name)
 	if c == "" {
 		return "", "", false
@@ -331,6 +395,46 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			}
 			vars.txnReadOnly = b
 		}
+	case "default_text_search_config":
+		vars.textSearchConfig = ""
+		if !reset {
+			cfg, err := tsearch.LookupConfig(unquote(value))
+			if err != nil {
+				return invalid("%v (the configurations are %s)", err, strings.Join(tsearch.ConfigNames(), " and "))
+			}
+			vars.textSearchConfig = cfg.Name
+		}
+	case "inverted_index_scan":
+		vars.invertedScan = invertedAuto
+		if !reset {
+			switch strings.ToLower(unquote(value)) {
+			case "auto", "default":
+			case "on", "true":
+				vars.invertedScan = invertedOn
+			case "off", "false":
+				vars.invertedScan = invertedOff
+			default:
+				return invalid("must be auto, on or off, not %q", value)
+			}
+		}
+	case "ivfflat.probes":
+		vars.ivfProbes = 0
+		if !reset && !strings.EqualFold(unquote(value), "auto") {
+			n, err := strconv.Atoi(unquote(value))
+			if err != nil || n < 1 || n > maxVectorLists {
+				return invalid("must be auto or an integer between 1 and %d, not %q", maxVectorLists, value)
+			}
+			vars.ivfProbes = n
+		}
+	case "vector_index_scan":
+		vars.noVectorScan = false
+		if !reset {
+			b, err := parseOnOff(value)
+			if err != nil {
+				return invalid("%v", err)
+			}
+			vars.noVectorScan = !b
+		}
 	case "foreign_key_cascade_limit":
 		vars.cascadeLimit, vars.cascadeLimitIsSet = 0, false
 		if !reset {
@@ -454,6 +558,26 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 			return &Result{Tag: tag}, nil
 		}
 	}
+	if isCustomVar(t.Name) {
+		// A custom setting takes any text; RESET leaves it set and empty,
+		// as PostgreSQL does. SET LOCAL lasts until the block ends.
+		if t.Local && s.state != StateOpen {
+			return &Result{Tag: tag}, nil
+		}
+		if t.Local && s.localVars == nil {
+			saved := s.vars
+			s.localVars = &saved
+		}
+		value := t.Value
+		if t.Reset {
+			value = ""
+		}
+		setCustomVar(&s.vars, strings.ToLower(t.Name), value)
+		// set_config() arrives here mid-statement: whatever the statement
+		// reads next binds its policies to the new value.
+		s.policyMemo = nil
+		return &Result{Tag: tag}, nil
+	}
 	name := canonicalVar(t.Name)
 	if name == "" {
 		return nil, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", t.Name)
@@ -533,7 +657,8 @@ func writeKind(stmt parser.Statement) string {
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateType, *parser.AlterType, *parser.DropType,
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
 		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
-		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze:
+		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze,
+		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy:
 		return "DDL"
 	}
 	return ""
@@ -543,8 +668,11 @@ func writeKind(stmt parser.Statement) string {
 // pg_stat_activity report it.
 type SessionInfo = vtable.SessionInfo
 
-// sessionRows renders the sessions the hook reports.
-func (s *Session) sessionRows() [][]types.Datum {
+// sessionRows renders the sessions the hook reports. A statement's text
+// carries its literals — another tenant's keys, on a table shared under
+// row security — so a role that is not an admin reads the text of its
+// own sessions only, as in PostgreSQL.
+func (s *Session) sessionRows(admin bool) [][]types.Datum {
 	if s.SessionsHook == nil {
 		return nil
 	}
@@ -556,8 +684,20 @@ func (s *Session) sessionRows() [][]types.Datum {
 			}
 			return types.NewTimestamp(t.UnixNano())
 		}
+		query := si.Query
+		if !admin && si.User != s.sessionUser {
+			query = vtable.QueryHidden
+		}
 		rows = append(rows, []types.Datum{types.NewInt(int64(si.PID)), types.NewString(si.User), types.NewString(si.Database), types.NewString(si.Application),
-			types.NewString(si.ClientAddr), types.NewString(si.State), types.NewString(si.Query), ts(si.BackendStart), ts(si.QueryStart), ts(si.XactStart)})
+			types.NewString(si.ClientAddr), types.NewString(si.State), types.NewString(query), ts(si.BackendStart), ts(si.QueryStart), ts(si.XactStart)})
 	}
 	return rows
+}
+
+// textSearchConfig is the session's default text-search configuration.
+func (s *Session) textSearchConfig() string {
+	if s.vars.textSearchConfig == "" {
+		return tsearch.DefaultConfig
+	}
+	return s.vars.textSearchConfig
 }

@@ -14,6 +14,9 @@ type ExportedRecord struct {
 	Key     keys.Key
 	Value   []byte
 	Deleted bool
+	// Timestamp is the version's own timestamp. Set only by an export of
+	// every revision, where one key yields several records.
+	Timestamp hlc.Timestamp
 }
 
 // ExportResult is the outcome of an MVCCExport.
@@ -40,6 +43,24 @@ type ExportResult struct {
 // beneath. Export is always non-transactional and never uncertain — endTS
 // is a past timestamp the caller chose.
 func MVCCExport(r Reader, start, end keys.Key, startTS, endTS hlc.Timestamp, max int64) (ExportResult, error) {
+	return mvccExport(r, start, end, startTS, endTS, max, false)
+}
+
+// MVCCExportRevisions is MVCCExport keeping the history: for every user
+// key it emits every version in (startTS, endTS], newest first, each with
+// its timestamp — what a point-in-time restore replays up to a chosen
+// moment (issue #302). The window is whole only while garbage collection
+// has not passed startTS; the caller refuses the export otherwise (the
+// replica does, against its GC threshold).
+//
+// A key's versions are never split across calls: max is checked when a
+// key is finished, so a result may run past it by the versions of its
+// last key, and Resume always names a key boundary.
+func MVCCExportRevisions(r Reader, start, end keys.Key, startTS, endTS hlc.Timestamp, max int64) (ExportResult, error) {
+	return mvccExport(r, start, end, startTS, endTS, max, true)
+}
+
+func mvccExport(r Reader, start, end keys.Key, startTS, endTS hlc.Timestamp, max int64, revisions bool) (ExportResult, error) {
 	lower := EncodeMVCCKey(start, hlc.Timestamp{})
 	upper := EncodeMVCCKey(end, hlc.Timestamp{})
 	it := r.NewIter(lower, upper)
@@ -97,13 +118,24 @@ func MVCCExport(r Reader, start, end keys.Key, startTS, endTS hlc.Timestamp, max
 				if !tombstone {
 					rec.Value = append([]byte(nil), data...)
 				}
+				if revisions {
+					rec.Timestamp = cvts
+				}
 				res.Records = append(res.Records, rec)
-				if max > 0 && int64(len(res.Records)) == max {
+				if !revisions && max > 0 && int64(len(res.Records)) == max {
 					res.Resume = cur.Next()
 					return res, nil
 				}
 			}
-			break
+			if !revisions {
+				break
+			}
+			// Older versions of cur follow in the iterator's order.
+			ok = it.Next()
+		}
+		if revisions && max > 0 && int64(len(res.Records)) >= max {
+			res.Resume = cur.Next()
+			return res, nil
 		}
 
 		ok = it.SeekGE(EncodeMVCCKey(cur.Next(), hlc.Timestamp{}))

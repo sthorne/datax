@@ -2,7 +2,7 @@
 
 <!-- Generated from pkg/sql/builtins by `go generate ./pkg/sql/builtins`; do not edit by hand. -->
 
-Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`) and casts are described in [the SQL reference](sql.md#reading).
+Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`, the vector distances `<->`, `<=>`, `<#>`) and casts are described in [the SQL reference](sql.md#reading).
 
 ## Conditionals
 
@@ -98,21 +98,66 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `jsonb_typeof(jsonb) → text` (also `json_typeof`) — object, array, string, number, boolean or null. *immutable*
 - `to_jsonb(any) → jsonb` (also `to_json`) — The value as jsonb: text becomes a JSON string, numbers and booleans themselves, jsonb stays. *immutable*
 
+## Full-text search
+
+- `get_current_ts_config() → text` — The session's default text-search configuration (default_text_search_config). *stable*
+- `numnode(tsquery) → int8` — numnode(tsquery): the number of lexemes and operators in the query; 0 for a query that reduced to nothing (only stop words). *immutable*
+- `phraseto_tsquery(text, [text]) → tsquery` — phraseto_tsquery([config,] text): a tsquery requiring the words of the text in that order (joined by <->, wider where stop words were dropped). *stable*
+- `plainto_tsquery(text, [text]) → tsquery` — plainto_tsquery([config,] text): a tsquery requiring every word of the text (the words normalized and joined by &); punctuation and operators in the text mean nothing. *stable*
+- `setweight(tsvector, text) → tsvector` — setweight(tsvector, weight): the vector with every position labelled A, B, C or D, for ranking the parts of a document differently (a title A, a body D). *immutable*
+- `strip(tsvector) → tsvector` — strip(tsvector): the vector without positions and weights — smaller, still matched by & | !, never by a phrase. *immutable*
+- `to_tsquery(text, [text]) → tsquery` — to_tsquery([config,] text): a tsquery from its text form — words joined by & (and), | (or), ! (not) and <-> or <N> (followed by), with parentheses, word:* for a prefix and word:AB for weights — each word normalized by the configuration; stop words are dropped. *stable*
+- `to_tsvector(text, [text]) → tsvector` — to_tsvector([config,] text): the text reduced to a tsvector — its lexemes under the configuration (simple or english; default_text_search_config when omitted), each with the positions it occurs at. *stable*
+- `ts_headline(any, any, [any], [any]) → text` — ts_headline([config,] document, tsquery [, options]): a fragment of the document with the query's words marked. options is 'Name=value, ...' with StartSel and StopSel (<b> and </b>), MaxWords (35), MinWords (15) and HighlightAll (false); ShortWord, MaxFragments and FragmentDelimiter are accepted and ignored. With three arguments the first is the configuration unless the second is a tsquery value. *stable*
+- `ts_rank(any, any, [any], [any]) → float8` — ts_rank([weights,] tsvector, tsquery [, normalization]): a relevance score from how often the query's lexemes occur in the vector and, for a query that requires them together, how near each other. weights is an array of four numbers scoring D, C, B and A positions ({0.1, 0.2, 0.4, 1.0} by default); normalization is a bit mask (1 divides by 1 + log of the document length, 2 by the length, 8 by the number of unique words, 16 by 1 + its log, 32 by the rank + 1). *immutable*
+- `ts_rank_cd(any, any, [any], [any]) → float8` — ts_rank_cd([weights,] tsvector, tsquery [, normalization]): cover density ranking — a score from the shortest stretches of the document that satisfy the query, higher the fewer other words they hold. Arguments as ts_rank; normalization 4 also divides by the mean harmonic distance between the stretches. Needs positions: a stripped vector scores as if every word stood at one place. *immutable*
+- `tsvector_to_array(tsvector) → text[]` — tsvector_to_array(tsvector): the vector's lexemes, sorted, as a text array. *immutable*
+- `websearch_to_tsquery(text, [text]) → tsquery` — websearch_to_tsquery([config,] text): a tsquery from search-box syntax — words are required, "quoted text" is a phrase, or separates alternatives and -word excludes; never raises a syntax error. *stable*
+
+## Vectors
+
+- `cosine_distance(vector, vector) → float8` — One minus the cosine of the angle between two vectors (the `<=>` operator); NaN when either is the zero vector. *immutable*
+- `inner_product(vector, vector) → float8` — Inner (dot) product of two vectors; the `<#>` operator is its negation, so that smaller is nearer. *immutable*
+- `l1_distance(vector, vector) → float8` — Taxicab distance between two vectors: the sum of the absolute element differences. *immutable*
+- `l2_distance(vector, vector) → float8` — Euclidean distance between two vectors of the same dimension (the `<->` operator). *immutable*
+- `l2_normalize(vector) → vector` — The vector scaled to unit length (the zero vector stays zero). *immutable*
+- `vector_dims(vector) → int8` — The number of elements of a vector. *immutable*
+- `vector_norm(vector) → float8` — The Euclidean length of a vector. *immutable*
+
 ## Session and system
 
 - `current_database() → text` — The session's database. *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
+- `current_setting(text, [bool]) → text` — The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Evaluated once per statement. *stable*
 - `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
 - `lastval() → int8` — The value nextval last returned in this session, whatever the sequence. *stable*
 - `nextval(text) → int8` — Advances the sequence and returns its next value; never rolled back. *volatile*
 - `now() → timestamptz` (also `current_timestamp`, `localtimestamp`, `statement_timestamp`, `transaction_timestamp`) — The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()). *stable*
+- `pg_notify(text, text) → text` — Sends a notification to the sessions listening on the channel (NOTIFY with a computed channel or payload); delivered when the transaction commits. Evaluated once per statement: its arguments cannot name columns. *volatile*
 - `session_user() → text` — The authenticated session user (unchanged by SET ROLE). *stable*
+- `set_config(text, text, bool) → text` — Sets a session setting, as SET does (SET LOCAL when is_local is true), and returns the value: SET with a value that can be a parameter. Evaluated once per statement: its arguments cannot name columns. *volatile*
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*
+
+## Large objects
+
+- `lo_close(int8) → int8` — Closes a large-object descriptor (the end of the transaction closes those left open). *volatile*
+- `lo_creat(int8) → int8` — Creates an empty large object with a free id (the argument is ignored, as in PostgreSQL) and returns the id. *volatile*
+- `lo_create(int8) → int8` — Creates an empty large object with the given id (0 picks a free one) and returns the id. Created inside a transaction block, the object can then be written as a stream of any length. *volatile*
+- `lo_from_bytea(int8, bytes) → int8` — Creates a large object holding the given bytes (id 0 picks a free one) and returns its id. *volatile*
+- `lo_get(int8, [int8], [int8]) → bytes` — The object's bytes, or the given number of them from an offset, as one value (bounded by statement_memory_limit; read large objects with loread). *volatile*
+- `lo_lseek64(int8, int8, int8) → int8` (also `lo_lseek`) — Moves the descriptor's position to an offset from the start (whence 0), the current position (1) or the end (2) and returns it. *volatile*
+- `lo_open(int8, int8) → int8` — Opens a large object and returns a descriptor valid until the transaction ends; mode 131072 (INV_WRITE) allows writing, 262144 (INV_READ) is read-only. *volatile*
+- `lo_put(int8, int8, bytes) → text` — Writes the bytes into the object at an offset. *volatile*
+- `lo_tell64(int8) → int8` (also `lo_tell`) — The descriptor's position. *volatile*
+- `lo_truncate64(int8, int8) → int8` (also `lo_truncate`) — Cuts the large object to the given length, or extends it with zeros. *volatile*
+- `lo_unlink(int8) → int8` — Removes a large object; its storage is reclaimed in the background. *volatile*
+- `loread(int8, int8) → bytes` — Reads up to the given number of bytes at the descriptor's position and advances it; fewer bytes mean the end of the object. *volatile*
+- `lowrite(int8, bytes) → int8` — Writes the bytes at the descriptor's position, advances it, and returns the number written. *volatile*
 
 ## Arrays
 

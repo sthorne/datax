@@ -125,6 +125,98 @@ online rotation is served only over mutual TLS (a secure cluster); on an
 insecure cluster, and for damaged stores, use the offline form
 (`--dir /var/lib/datax`, node stopped).
 
+To keep the store key off the node's disks altogether, start the node
+with `--enc-root` in place of `--enc-key`: the node makes its own store
+key and keeps it only wrapped by a *root* — a command you supply that
+talks to a TPM, a cloud KMS or an HSM (`exec:<command>`), or a wrapping
+key file kept elsewhere (`file:<path>`). Rotation then needs no key
+file and sends no key over the network
+(`datax debug rotate-enc-key --addr ...`). See
+[encryption](../encryption.md#roots-where-the-store-key-lives).
+
+A root can also be a key management service spoken to directly — no
+helper command, and datax's own timeouts, retries, health check and
+audit:
+
+```sh
+--enc-root 'vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token'
+--enc-root 'awskms:arn:aws:kms:eu-west-1:111122223333:key/1234abcd-…'
+--enc-root 'gcpkms:projects/acme/locations/europe-west1/keyRings/datax/cryptoKeys/store-root'
+--enc-root 'azurekv:datax-prod/store-root'
+```
+
+Options follow the key as `?name=value&name=value`; credentials are
+never among them — they are a file an option names (a Vault token file,
+a service-account key file), or the environment, or the instance's own
+identity. What to know before choosing one:
+
+- **A node cannot start while its KMS is unreachable** (it gives up
+  after about 45 seconds and says which service and why). A running
+  node is unaffected. Do not put the KMS behind the database.
+- Each node checks its KMS every minute and exports
+  `datax_enc_root_healthy`; alert on 0 — that node is serving and would
+  not survive a restart. The console's security view and
+  `/api/security` say the same.
+- Grant each node encrypt and decrypt on the one key and nothing else;
+  the minimum policy for each service is in
+  [encryption](../encryption.md#a-root-in-a-key-management-service).
+- Each wrapped store key is bound to its cluster and node, so one
+  node's is refused as another's. Give each node its own credential
+  where you can: that, not the binding, is what keeps a compromised
+  node from asking the KMS for a neighbour's key.
+- After the service rotates its key, run
+  `datax debug enc-root rewrap --addr <node>` on each node; the
+  console says when there is a newer version to move to.
+- These roots are tested against fakes of each service's API and have
+  not been run against the services themselves: prove the root on a
+  scratch node first. For an HSM (PKCS#11), use `exec:<command>`.
+
+To keep the root key off every machine, split it among people:
+`datax debug enc-root split --shares 2/3` makes a root key, prints
+three shares of which any two rebuild it, and keeps nothing. Nodes
+started with `--enc-root shares` come up **sealed** — store closed, SQL
+and console ports not open — until two share-holders have each run
+`datax unseal --addr <node>` and typed their share. See
+[a root key held as shares](../encryption.md#a-root-key-held-as-shares).
+
+A node that restarts while the rest of the cluster is up needs nobody:
+a running peer hands it the root key once it has been down longer than
+the liveness grace (*peer unseal*; `datax debug peer-unseal --off`
+turns that off, and then every start needs shares). Read
+[what peer unseal gives up](../encryption.md#peer-unseal) before
+relying on it: with it on, protect the node certificate's key as you
+would the data.
+
+*Runbook: cold start of a sealed cluster.* Start every node; each
+prints that it is sealed. With peer unseal on, unseal one node as below
+and the others follow by themselves; with it off, do this for each
+node. Two share-holders run
+`datax unseal --addr <node> --certs-dir certs` (the root user's client
+certificate) and enter their share; `datax debug seal-status --addr
+<node>` shows how many are in and whose. A node opens as soon as its
+second share arrives; the cluster serves once a majority of nodes are
+open. A refused share says why (mistyped, already submitted, another
+cluster's) and does not count.
+
+*Runbook: a lost share.* With a 2-of-3 split, one lost share costs
+nothing yet, and a second lost share costs the root key — so act on the
+first. If the share is merely lost, run `datax debug enc-root resplit
+--shares 2/3` with two of the remaining holders and hand out the new
+shares; destroy the old ones. If it may be in someone else's hands,
+replace the root key instead: `split` a new one, have its holders
+`datax unseal` each running node, then `datax debug enc-root rewrap
+--addr <node> --to-root 2` on each; the old shares then open nothing.
+Do this while the nodes are running: a stopped node whose root key
+cannot be rebuilt cannot be opened.
+
+An encrypted node keeps its keys in locked memory and turns core dumps
+off for its process. Give the service a memory-lock limit of at least
+16 KiB (`LimitMEMLOCK=64K` in a systemd unit is ample); with less, the
+node warns at start and runs with its keys swappable. Add
+`--require-locked-keys` to refuse to start instead, and
+`--allow-core-dumps` only while debugging a crash. See
+[keys in memory](../encryption.md#keys-in-memory).
+
 Files written under retired data keys are re-encrypted on demand:
 
 ```sh

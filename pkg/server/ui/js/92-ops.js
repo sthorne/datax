@@ -193,7 +193,7 @@ function eventRow(e) {
 // records, and that sequence is what the timeline is for. Folding is for
 // churn — lease moves, rebalances, splits — where the count is the news.
 const FOLD_MIN = 4, FOLD_GAP_MS = 60000;
-const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation"]);
+const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation", "peer-unseal", "enc-root"]);
 const openFolds = new Set();
 function foldEvents(evs) {
   const out = [];
@@ -285,7 +285,7 @@ function renderOps() {
 
 // AUDIT_KINDS are the security-relevant records; they are shown on the
 // security view instead of mixed into the operational timeline.
-const AUDIT_KINDS = new Set(["key-rotation"]);
+const AUDIT_KINDS = new Set(["key-rotation", "peer-unseal"]);
 
 // secDoc is the last /api/security document (issue #156). It is fetched
 // on its own cadence, so the parts of the view drawn from the cluster
@@ -396,10 +396,40 @@ function renderSecurityDoc() {
       const state = !st.encrypted ? tok("draining", "plaintext")
         : au && au.only ? tok("live", encryptionState(au))
           : warn("draining", encryptionState(au) + (au ? "" : " (older binary)"));
+      // Where the store's key lives (issue #305): under a root, named by
+      // its kind and the name the root gives its key, or in a key file
+      // on the node — which is the answer a reviewer is asking for.
+      const keyHome = !st.encrypted ? ""
+        : st.root ? ` <span class="muted">· store key under a ${esc(st.root.kind)} root${st.root.key_id ? ` (${esc(st.root.key_id)})` : ""}</span>`
+          : ` <span class="muted">· store key from a key file</span>`;
+      // A root that is a service (issue #308) is asked now and then
+      // whether it still works. Said only when it does not, or when the
+      // service has a newer version of its key than the store key is
+      // wrapped under: the node runs either way, and what is at stake is
+      // its next restart, which is what the words say.
+      const rt = st.root;
+      const rootHealth = !st.encrypted || !rt ? ""
+        : (rt.healthy === false
+          ? ` <span class="muted">· ${warn("draining", "root not usable")} — this node could not restart now${rt.health_error ? ": " + esc(rt.health_error) : ""}${rt.last_healthy_at ? ` (last usable ${esc(rt.last_healthy_at)})` : ""}</span>`
+          : "")
+          + (rt.latest_key_id
+            ? ` <span class="muted">· the root's key has a newer version (${esc(rt.latest_key_id)}); rewrap to move to it</span>`
+            : "");
+      // How the keys are held while the node runs (issue #309): said
+      // only when short of the ordinary case, with the reason the node
+      // gave, since "locked" on every row would be noise.
+      const km = st.key_memory;
+      const keyMem = !st.encrypted || !km || (km.locked && km.no_dump) ? ""
+        : ` <span class="muted">· ${warn("draining", "key memory not " + (km.locked ? "kept out of core dumps" : "locked"))}${km.reason ? " — " + esc(km.reason) : ""}</span>`;
+      // Under a root key held as shares: whether this node hands the key
+      // to a restarting peer, and how often it has been asked (#307).
+      const pu = st.peer_unseal;
+      const peerUnseal = !pu ? ""
+        : ` <span class="muted">· peer unseal ${pu.enabled ? "on" : "off"}${pu.granted || pu.refused ? ` (${pu.granted} granted, ${pu.refused} refused)` : ""}</span>`;
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${state}</td>
+        <td data-label="state">${state}${keyHome}${rootHealth}${keyMem}${peerUnseal}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

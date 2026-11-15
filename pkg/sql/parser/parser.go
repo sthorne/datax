@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // maxJoinTables caps a SELECT's FROM+JOIN table count: the executor is a
@@ -250,6 +251,44 @@ func (p *parser) expectIdent() (string, error) {
 	return "", p.errf("expected identifier, found %q", t.text)
 }
 
+// parseListenNotify parses LISTEN channel, UNLISTEN channel | * and
+// NOTIFY channel [, 'payload']. The channel is an identifier, and — as
+// in PostgreSQL, where it is a ColId — may be a word this grammar
+// otherwise reserves.
+func (p *parser) parseListenNotify(verb string) (Statement, error) {
+	p.i++
+	if verb == "unlisten" && p.consumeOp("*") {
+		return &Unlisten{All: true}, nil
+	}
+	t := p.peek()
+	var channel string
+	switch t.kind {
+	case tkIdent:
+		channel = t.text
+	case tkKeyword:
+		channel = strings.ToLower(t.text)
+	default:
+		return nil, p.errf("expected a channel name, found %q", t.text)
+	}
+	p.i++
+	switch verb {
+	case "listen":
+		return &Listen{Channel: channel}, nil
+	case "unlisten":
+		return &Unlisten{Channel: channel}, nil
+	}
+	n := &Notify{Channel: channel}
+	if p.consumeOp(",") {
+		lit := p.peek()
+		if lit.kind != tkString {
+			return nil, p.errf("expected a string literal for the NOTIFY payload, found %q", lit.text)
+		}
+		p.i++
+		n.Payload = lit.text
+	}
+	return n, nil
+}
+
 func (p *parser) parseStatement() (Statement, error) {
 	if err := p.enter(); err != nil {
 		return nil, err
@@ -273,6 +312,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	}
 	switch t.text {
 	case "CREATE":
+		if p.peekWord(1, "policy") {
+			return p.parseCreatePolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
@@ -284,6 +326,33 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
 			return p.parseCreateType()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+			// CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s]
+			// [VERSION v] [CASCADE]: the trailing options say where and
+			// which, and there is nowhere and nothing to choose.
+			p.i += 2
+			ce := &CreateExtension{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("NOT"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			ce.Name = strings.ToLower(name)
+			for !p.atStatementEnd() {
+				if t := p.peek(); t.kind != tkIdent && t.kind != tkKeyword && t.kind != tkString {
+					return nil, p.errf("unexpected %q in CREATE EXTENSION", t.text)
+				}
+				p.i++
+			}
+			return ce, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
 			return p.parseCreateView(false)
@@ -341,6 +410,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &Explain{Stmt: inner, Analyze: analyze}, nil
 	case "DROP":
+		if p.peekWord(1, "policy") {
+			return p.parseDropPolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseDropRole()
 		}
@@ -464,6 +536,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DELETE":
 		return p.parseDelete()
 	case "ALTER":
+		if p.peekWord(1, "policy") {
+			return p.parseAlterPolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseRoleStmt(true)
 		}
@@ -608,6 +683,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			return nil, err
 		}
 		return &ReleaseSavepoint{Name: name}, nil
+	case "listen", "unlisten", "notify": // not reserved words; they lex as identifiers
+		return p.parseListenNotify(t.text)
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -746,6 +823,14 @@ func (p *parser) parseStatement() (Statement, error) {
 		// SHOW <variable>: multi-word names join with "_" (SHOW TIME ZONE,
 		// SHOW TRANSACTION ISOLATION LEVEL); the session resolves them.
 		var words []string
+		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "." {
+			// SHOW class.name: a custom setting.
+			name, err := p.parseVarName()
+			if err != nil {
+				return nil, err
+			}
+			return &SetVar{Name: "show:" + name}, nil
+		}
 		for !p.atStatementEnd() {
 			t := p.peek()
 			if t.kind != tkIdent && t.kind != tkKeyword {
@@ -773,7 +858,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			sv.Name = "TimeZone"
 			return sv, nil
 		}
-		name, err := p.expectIdent()
+		name, err := p.parseVarName()
 		if err != nil {
 			return nil, err
 		}
@@ -788,6 +873,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		return &Use{Name: name}, nil
 	}
 	return nil, p.errf("unsupported statement %q", t.text)
+}
+
+// parseVarName parses a setting's name: an identifier, or a custom
+// setting's class.name (PostgreSQL's two-part names: app.tenant), whose
+// parts may be words this grammar otherwise reserves.
+func (p *parser) parseVarName() (string, error) {
+	name, err := p.expectIdent()
+	if err != nil {
+		return "", err
+	}
+	for p.consumeOp(".") {
+		t := p.peek()
+		if t.kind != tkIdent && t.kind != tkKeyword {
+			return "", p.errf("expected a name after %q., found %q", name, t.text)
+		}
+		p.i++
+		name += "." + strings.ToLower(t.text)
+	}
+	return name, nil
 }
 
 func (p *parser) atStatementEnd() bool {
@@ -1254,6 +1358,16 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 				return spec, false, p.errf("%s(%s) precision must be between 0 and 6", strings.ToLower(upper), mods[0])
 			}
 			spec.TimePrecision = int32(n) + 1
+		case fam == types.Vector && len(mods) == 1:
+			// vector(n): the dimension every value must have, kept where
+			// a string's declared length is (MaxLen).
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 1 || n > vector.MaxDims {
+				return spec, false, p.errf("dimensions for type vector must be between 1 and %d", vector.MaxDims)
+			}
+			spec.MaxLen = int32(n)
+		case fam == types.Vector:
+			return spec, false, p.errf("type vector takes one modifier, its dimension: vector(n)")
 		}
 	}
 	// TIME [WITHOUT TIME ZONE]; TIME WITH TIME ZONE is refused.
@@ -1316,6 +1430,12 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		}
 		if fam == types.Jsonb {
 			return spec, false, p.errf("JSONB[] is not supported: store a JSON array in a JSONB column")
+		}
+		if fam == types.Tsvector || fam == types.Tsquery {
+			return spec, false, p.errf("arrays of %s are not supported", fam)
+		}
+		if fam == types.Vector {
+			return spec, false, p.errf("arrays of vectors are not supported")
 		}
 		spec.Family = types.ArrayOf(fam)
 	}
@@ -1602,7 +1722,7 @@ func (p *parser) parseSet() (Statement, error) {
 			return sv, nil
 		}
 	default:
-		name, err := p.expectIdent()
+		name, err := p.parseVarName()
 		if err != nil {
 			return nil, err
 		}
@@ -1902,23 +2022,139 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		return nil, err
 	}
 	ci.Table = table
+	// USING method: btree (the ordinary index) or gin (an inverted
+	// index). The executor decides what it supports.
+	if p.consumeIdentWord("using") {
+		method, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ci.Using = strings.ToLower(method)
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
 	for {
+		if fn, arg, col, ok, err := p.parseIndexExpr(); err != nil {
+			return nil, err
+		} else if ok {
+			if len(ci.Columns) > 0 || ci.ExprFunc != "" {
+				return nil, p.errf("an index on an expression takes that one expression and nothing else")
+			}
+			ci.ExprFunc, ci.ExprArg = fn, arg
+			ci.Columns = append(ci.Columns, col)
+			ci.OpClasses = append(ci.OpClasses, "")
+			if p.consumeOp(",") {
+				return nil, p.errf("an index on an expression takes that one expression and nothing else")
+			}
+			break
+		}
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
 		ci.Columns = append(ci.Columns, col)
+		// An operator class after the column: (doc jsonb_ops).
+		opclass := ""
+		if p.peek().kind == tkIdent {
+			opclass = strings.ToLower(p.peek().text)
+			p.i++
+		}
+		ci.OpClasses = append(ci.OpClasses, opclass)
 		if !p.consumeOp(",") {
 			break
 		}
 	}
+	named := false
+	for _, oc := range ci.OpClasses {
+		named = named || oc != ""
+	}
+	if !named {
+		ci.OpClasses = nil
+	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
 	}
+	// WITH (name = value, ...): the access method's storage parameters
+	// (an IVF index's lists). The executor decides which it knows.
+	if p.consumeIdentWord("with") {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		ci.With = map[string]string{}
+		for {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("="); err != nil {
+				return nil, err
+			}
+			v := p.peek()
+			if v.kind != tkNumber && v.kind != tkString && v.kind != tkIdent {
+				return nil, p.errf("expected a value for index parameter %q, found %q", name, v.text)
+			}
+			p.i++
+			name = strings.ToLower(name)
+			if _, dup := ci.With[name]; dup {
+				return nil, p.errf("index parameter %q specified more than once", name)
+			}
+			ci.With[name] = v.text
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	}
 	return ci, nil
+}
+
+// parseIndexExpr reads an index key written as an expression,
+// fn('constant'[::type], column), optionally inside one more pair of
+// parentheses as PostgreSQL requires of expressions that are not
+// function calls. ok is false, with nothing consumed, when the key is a
+// plain column.
+func (p *parser) parseIndexExpr() (fn, arg, col string, ok bool, err error) {
+	save := p.i
+	parens := 0
+	for p.peek().kind == tkOp && p.peek().text == "(" {
+		p.i++
+		parens++
+	}
+	name := p.peek()
+	if name.kind != tkIdent || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
+		if parens > 0 {
+			return "", "", "", false, p.errf("an index key is a column, or to_tsvector('config', column) under USING GIN")
+		}
+		p.i = save
+		return "", "", "", false, nil
+	}
+	p.i += 2
+	lit := p.peek()
+	if lit.kind != tkString {
+		return "", "", "", false, p.errf("an index on %s(...) needs the configuration written out as its first argument: %s('english', column)", name.text, name.text)
+	}
+	p.i++
+	if p.consumeOp("::") {
+		// 'english'::regconfig, as pg_dump writes it.
+		if _, err := p.expectIdent(); err != nil {
+			return "", "", "", false, err
+		}
+	}
+	if err := p.expectOp(","); err != nil {
+		return "", "", "", false, err
+	}
+	if col, err = p.expectIdent(); err != nil {
+		return "", "", "", false, err
+	}
+	for i := 0; i <= parens; i++ {
+		if err := p.expectOp(")"); err != nil {
+			return "", "", "", false, err
+		}
+	}
+	return strings.ToLower(name.text), lit.text, col, true, nil
 }
 
 func (p *parser) parseDropTable() (Statement, error) {
@@ -2588,6 +2824,19 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, p.errf("FOR UPDATE requires a FROM clause")
 		}
 		sel.ForUpdate = true
+		// SKIP LOCKED | NOWAIT (neither is reserved; both lex as
+		// identifiers).
+		if t := p.peek(); t.kind == tkIdent && t.text == "skip" {
+			p.i++
+			if n := p.peek(); n.kind != tkIdent || n.text != "locked" {
+				return nil, p.errf("expected LOCKED after FOR UPDATE SKIP, found %q", n.text)
+			}
+			p.i++
+			sel.LockWait = LockWaitSkipLocked
+		} else if t.kind == tkIdent && t.text == "nowait" {
+			p.i++
+			sel.LockWait = LockWaitNoWait
+		}
 	}
 	if err := p.parseSetOps(sel); err != nil {
 		return nil, err
@@ -3286,6 +3535,11 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		return nil, err
 	}
 	at.Table = name
+	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
+		return nil, err
+	} else if at.RowSecurity != "" {
+		return at, nil
+	}
 	switch {
 	case p.consumeIdentWord("owner"):
 		return p.parseOwnerTo("table", name)
@@ -3460,40 +3714,93 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			return nil, err
 		}
 		at.SetOptions = opts
-	case p.consumeIdentWord("split"):
-		if !p.consumeIdentWord("at") {
-			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
-		}
-		if err := p.expectKeyword("VALUES"); err != nil {
+	case p.consumeIdentWord("reset"):
+		if err := p.expectOp("("); err != nil {
 			return nil, err
 		}
 		for {
-			if err := p.expectOp("("); err != nil {
+			name, err := p.expectIdent()
+			if err != nil {
 				return nil, err
 			}
-			var tuple []Expr
-			for {
-				e, err := p.parseValueOrColumnExpr()
-				if err != nil {
-					return nil, err
-				}
-				tuple = append(tuple, e)
-				if !p.consumeOp(",") {
-					break
-				}
-			}
-			if err := p.expectOp(")"); err != nil {
-				return nil, err
-			}
-			at.SplitAt = append(at.SplitAt, tuple)
+			at.ResetOptions = append(at.ResetOptions, name)
 			if !p.consumeOp(",") {
 				break
 			}
 		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	case p.consumeIdentWord("purge"):
+		at.Purge = true
+	case p.consumeIdentWord("split"):
+		if !p.consumeIdentWord("at") {
+			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
+		}
+		tuples, err := p.parseSplitTuples()
+		if err != nil {
+			return nil, err
+		}
+		at.SplitAt = tuples
+		if p.consumeIdentWord("with") {
+			if !p.consumeIdentWord("expiration") {
+				return nil, p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
+			}
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			at.SplitExpiration = &e
+		}
+	case p.consumeIdentWord("unsplit"):
+		if p.consumeIdentWord("all") {
+			at.UnsplitAll = true
+			break
+		}
+		if !p.consumeIdentWord("at") {
+			return nil, p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
+		}
+		tuples, err := p.parseSplitTuples()
+		if err != nil {
+			return nil, err
+		}
+		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET or SPLIT AT, found %q", p.peek().text)
+		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
 	return at, nil
+}
+
+// parseSplitTuples parses VALUES (k, ...), (k, ...): the key tuples of
+// ALTER TABLE ... SPLIT AT and UNSPLIT AT.
+func (p *parser) parseSplitTuples() ([][]Expr, error) {
+	if err := p.expectKeyword("VALUES"); err != nil {
+		return nil, err
+	}
+	var tuples [][]Expr
+	for {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		var tuple []Expr
+		for {
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			tuple = append(tuple, e)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		tuples = append(tuples, tuple)
+		if !p.consumeOp(",") {
+			return tuples, nil
+		}
+	}
 }
 
 // tryBareColumnList parses `a, b [, PRIMARY KEY (cols)])` — the name
@@ -3949,7 +4256,7 @@ func (p *parser) continuesValue() bool {
 	t := p.peek()
 	if t.kind == tkOp {
 		switch t.text {
-		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>":
+		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>", "<->", "<=>", "<#>":
 			return true
 		}
 	}
@@ -4436,6 +4743,7 @@ func negateComparison(c Comparison) (Comparison, error) {
 		"TRUE": "FALSE", "FALSE": "TRUE",
 		"@>": "NOT @>", "NOT @>": "@>", "<@": "NOT <@", "NOT <@": "<@", "&&": "NOT &&", "NOT &&": "&&",
 		"?": "NOT ?", "NOT ?": "?", "?|": "NOT ?|", "NOT ?|": "?|", "?&": "NOT ?&", "NOT ?&": "?&",
+		"@@": "NOT @@", "NOT @@": "@@",
 		"LIKE": "NOT LIKE", "NOT LIKE": "LIKE", "ILIKE": "NOT ILIKE", "NOT ILIKE": "ILIKE",
 		"SIMILAR TO": "NOT SIMILAR TO", "NOT SIMILAR TO": "SIMILAR TO",
 		"~": "!~", "!~": "~", "~*": "!~*", "!~*": "~*",
@@ -4505,7 +4813,7 @@ func (p *parser) parseExistsCond() (Comparison, bool, error) {
 
 func isCmpOp(op string) bool {
 	switch op {
-	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&":
+	case "=", "!=", "<", "<=", ">", ">=", "~", "!~", "~*", "!~*", "@>", "<@", "&&", "?", "?|", "?&", "@@":
 		return true
 	}
 	return false
@@ -4990,7 +5298,31 @@ func (p *parser) parseValueOrColumnExpr() (Expr, error) {
 // the usual precedence (* / bind tighter than + -). A single binary op
 // keeps the flat historical Expr shape; further chaining nests the
 // accumulated expression through Left.
+//
+// The vector distance operators sit one level above: PostgreSQL gives
+// every operator it has no rule for the same precedence, looser than
+// + and - and tighter than the comparisons, so a <-> b + c is
+// a <-> (b + c) and a <-> b < 0.5 compares the distance.
 func (p *parser) parseAddExpr() (Expr, error) {
+	e, err := p.parseSumExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		op := p.peek()
+		if op.kind != tkOp || (op.text != "<->" && op.text != "<=>" && op.text != "<#>") {
+			return e, nil
+		}
+		p.i++
+		rhs, err := p.parseSumExpr()
+		if err != nil {
+			return e, err
+		}
+		e = foldBinOp(e, op.text, rhs)
+	}
+}
+
+func (p *parser) parseSumExpr() (Expr, error) {
 	e, err := p.parseMulExpr()
 	if err != nil {
 		return e, err
@@ -5069,9 +5401,9 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
-	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1,
+	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "set_config": 3, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
-	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
+	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1, "to_regtype": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
 	"pg_get_statisticsobjdef_columns": 1, "pg_relation_is_publishable": 1,
 	"pg_size_pretty": 1, "pg_table_size": 1, "pg_total_relation_size": 1, "pg_relation_size": -1, "pg_database_size": 1,

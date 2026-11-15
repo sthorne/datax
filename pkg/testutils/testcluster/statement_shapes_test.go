@@ -247,7 +247,15 @@ func TestShapeTextIsForAdmins(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &cat); err != nil {
 			t.Fatal(err)
 		}
-		if len(cat.LabelText["fp"]) > 0 {
+		// Wait for the SELECT's own shape: another statement's (the
+		// CREATE TABLE) can be in the catalog first.
+		seen := false
+		for _, text := range cat.LabelText["fp"] {
+			if strings.Contains(text, "SELECT v FROM secrets") {
+				seen = true
+			}
+		}
+		if seen {
 			break
 		}
 		if time.Now().After(deadline) {

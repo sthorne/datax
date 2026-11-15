@@ -151,12 +151,21 @@ func lex(src string) ([]token, error) {
 				l.pos += 3
 				continue
 			}
+			// The vector distance operators (<-> Euclidean, <=> cosine,
+			// <#> negative inner product). None of the three is a prefix
+			// of valid SQL otherwise: after "<-", "<=" or "<" + "#", a
+			// ">" could only begin an operand, and no operand begins so.
+			if three := l.src[l.pos:]; strings.HasPrefix(three, "<->") || strings.HasPrefix(three, "<=>") || strings.HasPrefix(three, "<#>") {
+				l.toks = append(l.toks, token{kind: tkOp, text: three[:3], pos: start})
+				l.pos += 3
+				continue
+			}
 			two := ""
 			if l.pos+1 < len(l.src) {
 				two = l.src[l.pos : l.pos+2]
 			}
 			switch two {
-			case "!=", "<>", "<=", ">=", "::", "->", "@>", "!~", "~*", "||", "#>", "<@", "?|", "?&", "&&":
+			case "!=", "<>", "<=", ">=", "::", "->", "@>", "!~", "~*", "||", "#>", "<@", "?|", "?&", "&&", "@@":
 				op := two
 				if op == "<>" {
 					op = "!="

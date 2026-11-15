@@ -3,27 +3,120 @@ package server
 import (
 	"context"
 	"sort"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/placement"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
 // Per-range replica placement (issue #176). A database carries a policy;
 // its tables inherit it; a range belongs to the table its start key
-// names. Resolution is therefore a map lookup on the table ID, off the
-// same catalog scan that builds the schema cache — the allocator runs on
-// every tick of the replication loop and must not read the catalog to
-// decide where one replica goes.
+// names. Resolution is therefore a map lookup on the table ID — the
+// allocator runs on every tick of the replication loop and must not read
+// the catalog to decide where one replica goes.
+//
+// The map is refreshed in the background (refreshPlacement) from the
+// database descriptors and, for the databases that carry a policy, the
+// names keyed under them: no table descriptor is read, and a cluster
+// that has never written a policy reads its database descriptors and
+// nothing else. It used to be a by-product of the schema document's scan
+// of every descriptor, which every node therefore repeated every few
+// seconds (issue #311).
 //
 // A range that resolves to nothing — a system range, a meta range, a
 // table whose database has no policy, or any range at all before the
-// first catalog scan lands — gets the zero policy, which is exactly the
+// first refresh lands — gets the zero policy, which is exactly the
 // behaviour every range had before this existed: the cluster default
 // replication factor, and any node.
+
+// placementCache is the table ID → policy map and its refresh state.
+type placementCache struct {
+	mu sync.Mutex
+	// policy holds the tables whose database carries a policy. A table
+	// that is absent has the zero policy.
+	policy     map[uint64]base.PlacementPolicy
+	at         time.Time
+	read       bool
+	refreshing bool
+}
+
+// refreshPlacement starts a background refresh of the placement map when
+// it is older than schemaCacheFor, and returns at once: the replication
+// loop that calls it must not wait on the catalog. A policy written a
+// moment ago takes effect a tick or two later.
+func (n *Node) refreshPlacement() {
+	c := &n.placement
+	c.mu.Lock()
+	if c.refreshing || (c.read && time.Since(c.at) < schemaCacheFor) {
+		c.mu.Unlock()
+		return
+	}
+	c.refreshing = true
+	c.mu.Unlock()
+	done := func() {
+		c.mu.Lock()
+		c.refreshing = false
+		c.mu.Unlock()
+	}
+	if err := n.stopper.RunWorker(func(ctx context.Context) {
+		defer done()
+		n.loadPlacement(ctx)
+	}); err != nil {
+		done()
+	}
+}
+
+// loadPlacement reads the placement map and installs it. A read that
+// fails keeps the map it had: a node cut off from the catalog goes on
+// placing by the policies it last knew.
+func (n *Node) loadPlacement(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, schemaBuildTimeout)
+	defer cancel()
+	policy := map[uint64]base.PlacementPolicy{}
+	err := n.db.RunTxn(ctx, "placement-policies", func(ctx context.Context, txn *kvclient.Txn) error {
+		clear(policy)
+		dbs, err := catalog.ListDatabases(ctx, txn)
+		if err != nil {
+			return err
+		}
+		for _, db := range dbs {
+			// ID 0 is the default database before it has a descriptor,
+			// which cannot carry a policy; and a table still named in the
+			// flat namespace belongs to no database's policy either.
+			if db.ID == 0 || db.Placement.IsZero() {
+				continue
+			}
+			p := db.Placement.Clone()
+			lo, hi := keys.TableNamespaceSpan(db.ID)
+			rows, err := txn.Scan(ctx, lo, hi, 0)
+			if err != nil {
+				return err
+			}
+			for _, kv := range rows {
+				if id, err := strconv.ParseUint(string(kv.Value), 10, 64); err == nil {
+					policy[id] = p
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Debugf("placement: reading policies: %v", err)
+		return
+	}
+	c := &n.placement
+	c.mu.Lock()
+	c.policy, c.at, c.read = policy, time.Now(), true
+	c.mu.Unlock()
+}
 
 // placementFor returns the policy governing the span [start, end). A
 // range must lie WHOLLY inside one table's key space to inherit that
@@ -40,9 +133,9 @@ func (n *Node) placementFor(start, end keys.Key) base.PlacementPolicy {
 	if lo, hi := keys.TableDataSpan(id); start.Compare(lo) < 0 || (len(end) > 0 && end.Compare(hi) > 0) {
 		return base.PlacementPolicy{}
 	}
-	n.schema.mu.Lock()
-	defer n.schema.mu.Unlock()
-	return n.schema.placement[id]
+	n.placement.mu.Lock()
+	defer n.placement.mu.Unlock()
+	return n.placement.policy[id]
 }
 
 // placementOf is placementFor for a range descriptor.
@@ -69,9 +162,9 @@ func (n *Node) placementBarrier(start, end keys.Key) string {
 // never used placement, which is every cluster until someone writes a
 // policy.
 func (n *Node) anyPlacementPolicy() bool {
-	n.schema.mu.Lock()
-	defer n.schema.mu.Unlock()
-	return len(n.schema.placement) > 0
+	n.placement.mu.Lock()
+	defer n.placement.mu.Unlock()
+	return len(n.placement.policy) > 0
 }
 
 // localitiesOf maps node ID to locality for a set of registry entries.

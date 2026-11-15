@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
+	"net"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
@@ -58,6 +59,9 @@ type Server struct {
 	// secure records whether the listener requires client certificates;
 	// the node-only surfaces fail closed on it (see requireNode).
 	secure bool
+	// sealed marks the server a node runs before its store is open (see
+	// NewSealedServer): only Admin is served.
+	sealed bool
 }
 
 // MaxMessageBytes bounds one internode message in either direction:
@@ -77,6 +81,39 @@ func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *g
 	gs := grpc.NewServer(opts...)
 	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers, secure: tlsCfg != nil})
 	return gs
+}
+
+// SealedMessage is what a sealed node answers to everything but the
+// admin calls that unseal it.
+const SealedMessage = "this node is sealed: its store is closed until enough shares of the root key have been submitted (datax unseal)"
+
+// NewSealedServer returns the server a node runs while it is sealed: its
+// store is not open, so there is nothing to serve but the admin calls
+// that unseal it. Every other method answers Unavailable, which is what
+// a peer sees of a node that is down — and for the cluster's purposes a
+// sealed node is down.
+func NewSealedServer(clock *hlc.Clock, admin PayloadHandler, tlsCfg *tls.Config) *grpc.Server {
+	var opts []grpc.ServerOption
+	if tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	gs := grpc.NewServer(opts...)
+	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: ServerHandlers{Admin: admin}, secure: tlsCfg != nil, sealed: true})
+	return gs
+}
+
+// PeerIsLoopback reports whether the caller connected from this machine.
+func PeerIsLoopback(ctx context.Context) bool {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // PeerCN returns the CommonName of the caller's CA-verified client
@@ -108,6 +145,9 @@ func PeerCN(ctx context.Context) string {
 // would bypass every SQL privilege check. Insecure mode has no
 // identities to check, matching pgwire's trust semantics.
 func (s *Server) requireNode(ctx context.Context, method string) error {
+	if s.sealed {
+		return status.Errorf(codes.Unavailable, "%s: %s", method, SealedMessage)
+	}
 	if !s.secure {
 		return nil
 	}

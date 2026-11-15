@@ -30,6 +30,9 @@ type raftCommand struct {
 	Batch kvpb.BatchRequest `json:"batch"`
 	Split *splitTrigger     `json:"split,omitempty"`
 	Merge *mergeTrigger     `json:"merge,omitempty"`
+	// Descriptor replaces the range descriptor in place (the sticky bit;
+	// see descriptorTrigger). Proposed only at cluster version v20.
+	Descriptor *descriptorTrigger `json:"descriptor,omitempty"`
 	// ClosedTS publishes "no write at or below this timestamp will ever
 	// commit on this range". Riding the log makes the applied-index
 	// condition automatic: applying this command implies every earlier
@@ -62,11 +65,12 @@ type checksumTrigger struct {
 // cmdTriggers bundles the optional replicated side effects a proposal may
 // carry alongside (or instead of) its write batch.
 type cmdTriggers struct {
-	split    *splitTrigger
-	merge    *mergeTrigger
-	closedTS hlc.Timestamp
-	load     *loadHandoff
-	checksum *checksumTrigger
+	split      *splitTrigger
+	merge      *mergeTrigger
+	descriptor *descriptorTrigger
+	closedTS   hlc.Timestamp
+	load       *loadHandoff
+	checksum   *checksumTrigger
 }
 
 // splitTrigger is carried by the replicated split command (Phase 3).
@@ -120,6 +124,9 @@ type Replica struct {
 	// yet visible. Disjoint requests run in parallel. See latch.go for the
 	// L1/L2 invariants.
 	latches *latchManager
+	// mergeDriveMu admits one merge driver at a time with this replica as
+	// the left-hand side (adminMerge).
+	mergeDriveMu sync.Mutex
 
 	// leaseReads is whether ReadIndex runs lease-based (no quorum round
 	// trip per read); fixed at replica creation.
@@ -191,6 +198,12 @@ type Replica struct {
 		// it to learn that its own proposal was the one refused.
 		confChangeRefusals uint64
 		mergedInto         base.RangeID
+		// transferAt is when this replica last asked raft to hand its
+		// leadership to another (adminTransferLease); see stageReady.
+		transferAt time.Time
+		// mergeEpoch mirrors replicaState.MergeEpoch: which generation of
+		// the left-hand range the freeze was made for.
+		mergeEpoch int64
 		// closedTS mirrors replicaState.ClosedTS: the range's replicated
 		// closed timestamp, below which this replica may serve reads
 		// locally without being the leader.
@@ -308,6 +321,7 @@ func newReplica(s *Store, desc kvpb.RangeDescriptor, replicaID base.ReplicaID, b
 	r.mu.snapInFlight = make(map[uint64]uint64)
 	r.mu.frozen = st.Frozen
 	r.mu.mergedInto = st.MergedInto
+	r.mu.mergeEpoch = st.MergeEpoch
 	r.mu.closedTS = st.ClosedTS
 	if !st.ClosedTS.IsEmpty() {
 		// The closed timestamp is a promise about the whole range; the
@@ -594,6 +608,7 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		term                         uint64
 		handoff                      *loadHandoff
 		pending                      []chan proposalResult
+		settling                     []string
 		reads                        []chan uint64
 	)
 	r.mu.Lock()
@@ -616,7 +631,24 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		handoff, r.mu.loadHandoff = r.mu.loadHandoff, nil
 	}
 	if lostLeadership {
+		// Leadership this replica gave away on purpose (a lease transfer
+		// it asked for moments ago, and it is no longer the leader) is a
+		// different case from leadership it lost: raft hands over only to
+		// a follower holding the leader's whole log and takes no new
+		// proposal while the transfer is pending, so every entry in
+		// flight here is in the new leader's log and will commit under
+		// it. Those proposers are left waiting and answered from their
+		// entries' own apply on this replica, which follows within a round
+		// trip, instead of being told an outcome is unknown that is in
+		// fact decided (issue #271: a one-phase commit cannot be resent,
+		// so the client saw the error). A bound covers the transfer that
+		// did not go as raft promised.
+		planned := !isLeader && !r.mu.transferAt.IsZero() && time.Since(r.mu.transferAt) < transferSettleWindow
 		for id, ch := range r.mu.proposals {
+			if planned {
+				settling = append(settling, id)
+				continue
+			}
 			pending = append(pending, ch)
 			delete(r.mu.proposals, id)
 		}
@@ -653,6 +685,25 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 			Message:   "leadership lost with proposal in flight",
 			Ambiguous: &kvpb.AmbiguousResultError{},
 		}}
+	}
+	if len(settling) > 0 {
+		time.AfterFunc(transferSettleGrace, func() {
+			var late []chan proposalResult
+			r.mu.Lock()
+			for _, id := range settling {
+				if ch, ok := r.mu.proposals[id]; ok {
+					late = append(late, ch)
+					delete(r.mu.proposals, id)
+				}
+			}
+			r.mu.Unlock()
+			for _, ch := range late {
+				ch <- proposalResult{err: &kvpb.Error{
+					Message:   "leadership transferred with proposal in flight, and the proposal did not apply in time",
+					Ambiguous: &kvpb.AmbiguousResultError{},
+				}}
+			}
+		})
 	}
 	for _, ch := range reads {
 		close(ch) // issueReadIndex answers NotLeader
@@ -942,7 +993,7 @@ func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cmdTriggers) (*kvpb.BatchResponse, *kvpb.Error) {
 	cmd := raftCommand{
 		ID: uuid.NewString(), Batch: *ba,
-		Split: trig.split, Merge: trig.merge, ClosedTS: trig.closedTS,
+		Split: trig.split, Merge: trig.merge, Descriptor: trig.descriptor, ClosedTS: trig.closedTS,
 		Load: trig.load, Checksum: trig.checksum,
 	}
 	data, err := encodeRaftCommand(&cmd)
@@ -1188,7 +1239,7 @@ func (r *Replica) setApplied(idx uint64) {
 func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	// A stale read at or below the closed timestamp needs no leader and
 	// no wake: any replica serves it locally, a sleeping one included.
-	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) {
+	if ba.Header.StaleRead && ba.IsReadOnly() && readTimestamp(ba).LessEq(r.ClosedTimestamp()) && r.heardSinceStart() {
 		return r.executeStaleRead(ba)
 	}
 	// Any other request wakes a sleeping replica: a leader resumes
@@ -1206,11 +1257,18 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return nil, r.notLeaderError()
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminSplit != nil {
-		resp, err := r.adminSplit(ctx, ba.Requests[0].AdminSplit.Key)
+		resp, err := r.adminSplit(ctx, ba.Requests[0].AdminSplit)
 		if err != nil {
 			return nil, err
 		}
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminSplit: resp}}}, nil
+	}
+	if len(ba.Requests) == 1 && ba.Requests[0].AdminUnsplit != nil {
+		resp, err := r.adminUnsplit(ctx, ba.Requests[0].AdminUnsplit)
+		if err != nil {
+			return nil, err
+		}
+		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminUnsplit: resp}}}, nil
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminChangeReplicas != nil {
 		resp, err := r.adminChangeReplicas(ctx, ba.Requests[0].AdminChangeReplicas)
@@ -1227,7 +1285,7 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 		return &kvpb.BatchResponse{Responses: []kvpb.ResponseUnion{{AdminTransferLease: resp}}}, nil
 	}
 	if len(ba.Requests) == 1 && ba.Requests[0].AdminMerge != nil {
-		resp, err := r.adminMerge(ctx)
+		resp, err := r.adminMerge(ctx, false)
 		if err != nil {
 			return nil, err
 		}

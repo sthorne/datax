@@ -20,8 +20,11 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // PostgreSQL type OIDs for datax's SQL types.
@@ -41,8 +44,11 @@ const (
 	oidUUID        = 2950
 	oidNumeric     = 1700
 	oidJsonb       = 3802
+	oidTsvector    = 3614
+	oidTsquery     = 3615
 	oidTime        = 1083
 	oidInterval    = 1186
+	oidVector      = vector.OID
 )
 
 // pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
@@ -102,7 +108,7 @@ func colSize(col sql.ResultColumn) int16 {
 var arrayOIDs = map[uint32]uint32{
 	oidBool: 1000, oidBytea: 1001, oidInt2: 1005, oidInt4: 1007, oidInt8: 1016, oidText: 1009, oidVarchar: 1015, oidBpchar: 1014,
 	oidFloat8: 1022, oidNumeric: 1231, oidDate: 1182, oidTimestamp: 1115, oidTimestamptz: 1185, oidUUID: 2951, oidJsonb: 3807,
-	oidInterval: 1187, oidTime: 1183,
+	oidInterval: 1187, oidTime: 1183, oidTsvector: 3643, oidTsquery: 3645,
 }
 
 func typeOID(f types.Family) uint32 {
@@ -131,10 +137,16 @@ func typeOID(f types.Family) uint32 {
 		return oidNumeric
 	case types.Jsonb:
 		return oidJsonb
+	case types.Tsvector:
+		return oidTsvector
+	case types.Tsquery:
+		return oidTsquery
 	case types.IntervalFam:
 		return oidInterval
 	case types.Time:
 		return oidTime
+	case types.Vector:
+		return oidVector
 	case types.Enum:
 		return oidText // a value without its type describes as text
 	default:
@@ -233,6 +245,17 @@ type conn struct {
 	// with a read deadline so the goroutine itself says goodbye.
 	mu sync.Mutex
 	st connState
+
+	// listener is the session's LISTEN subscriptions and its queue of
+	// undelivered notifications (nil without a hub). The rest is the
+	// machinery that pushes them to an idle client; see notify.go.
+	listener  *notify.Listener
+	pushMu    sync.Mutex
+	pushOK    bool
+	pushWake  chan struct{}
+	pushStart sync.Once
+	// done is closed when the connection's goroutine returns.
+	done chan struct{}
 }
 
 // connState is the drain-visible phase of a connection. idle means
@@ -247,6 +270,9 @@ type connState struct {
 	// a transaction; cut asks it to end at its next idle point regardless
 	// (the drain deadline).
 	draining, cut bool
+	// bye, when set, is the error the connection ends with instead of
+	// adminShutdown (a listener that missed notifications).
+	bye *pgproto3.ErrorResponse
 }
 
 // adminShutdown is the error a drained connection ends with: PostgreSQL's
@@ -290,7 +316,13 @@ func (c *conn) setIdle(idle bool) (goodbye bool) {
 // the caller returns and the deferred cleanup rolls back and closes.
 func (c *conn) goodbye() {
 	_ = c.nc.SetReadDeadline(time.Time{})
-	c.backend.Send(adminShutdown)
+	c.mu.Lock()
+	bye := c.st.bye
+	c.mu.Unlock()
+	if bye == nil {
+		bye = adminShutdown
+	}
+	c.backend.Send(bye)
 	_ = c.backend.Flush()
 }
 
@@ -347,14 +379,21 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	session := sql.NewSession(db, cat)
 	session.SetStreaming(true)
-	return &conn{
-		backend: pgproto3.NewBackend(nc, nc),
-		nc:      nc,
-		session: session,
-		opts:    opts,
-		stmts:   make(map[string]*prepared),
-		portals: make(map[string]*portal),
+	c := &conn{
+		backend:  pgproto3.NewBackend(nc, nc),
+		nc:       nc,
+		session:  session,
+		opts:     opts,
+		stmts:    make(map[string]*prepared),
+		portals:  make(map[string]*portal),
+		pushWake: make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
+	if opts.Notify != nil {
+		c.listener = opts.Notify.NewListener(c.wakePush, c.notifyEnd)
+		session.SetNotify(opts.Notify, c.listener)
+	}
+	return c
 }
 
 // errCancelServed ends a connection that carried a CancelRequest: it
@@ -375,6 +414,10 @@ func (c *conn) authTimeout() time.Duration {
 }
 
 func (c *conn) run(ctx context.Context) error {
+	defer close(c.done)
+	if c.listener != nil {
+		defer c.listener.Close()
+	}
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
 	if err := c.startup(ctx); err != nil {
@@ -397,11 +440,21 @@ func (c *conn) run(ctx context.Context) error {
 			_ = c.nc.SetReadDeadline(time.Now().Add(d))
 			idleArmed = true
 		}
+		// Idle outside a transaction is when notifications are pushed to
+		// the client as they arrive (notify.go).
+		pushing := boundary && c.listener != nil && c.session.State() == sql.StateIdle
+		if pushing {
+			c.allowPush()
+		}
 		msg, err := c.backend.Receive()
 		if idleArmed {
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}
-		if goodbye := c.setIdle(false); err != nil {
+		goodbye := c.setIdle(false)
+		if pushing && !c.endPush(err != nil) {
+			return err
+		}
+		if err != nil {
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
 				return nil
@@ -415,7 +468,7 @@ func (c *conn) run(ctx context.Context) error {
 			return err
 		}
 		switch msg.(type) {
-		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.Terminate:
+		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.Terminate, *pgproto3.FunctionCall:
 			boundary = true
 		default:
 			boundary = false
@@ -429,6 +482,17 @@ func (c *conn) run(ctx context.Context) error {
 			c.handleSimpleQuery(ctx, m.String)
 			if c.session.State() != sql.StateOpen {
 				c.reapPortals() // a simple-query COMMIT/ROLLBACK ends them
+			}
+			c.sendReady()
+			if err := c.backend.Flush(); err != nil {
+				return err
+			}
+
+		case *pgproto3.FunctionCall:
+			c.skipToSync = false
+			c.handleFunctionCall(ctx, m)
+			if c.session.State() != sql.StateOpen {
+				c.reapPortals()
 			}
 			c.sendReady()
 			if err := c.backend.Flush(); err != nil {
@@ -648,6 +712,11 @@ func (c *conn) sendReady() {
 	case sql.StateFailed:
 		status = 'E'
 	}
+	if status == 'I' && c.listener != nil {
+		// Notifications wait for the end of a transaction, as in
+		// PostgreSQL, and precede the ReadyForQuery that ends it.
+		c.sendNotifications()
+	}
 	c.backend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 }
 
@@ -862,6 +931,18 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	case types.Jsonb:
 		// Binary jsonb: version byte 1 + the UTF-8 text.
 		return append([]byte{1}, d.S...)
+	case types.Tsvector:
+		// tsvectorsend's layout (pkg/sql/tsearch). A stored value always
+		// parses; were one not to, its text is the best that can be sent.
+		if v, err := tsearch.ParseVector(d.S); err == nil {
+			return v.AppendBinary(nil)
+		}
+		return []byte(d.S)
+	case types.Tsquery:
+		if q, err := tsearch.ParseQuery(d.S); err == nil {
+			return q.AppendBinary(nil)
+		}
+		return []byte(d.S)
 	case types.IntervalFam:
 		// Binary interval: microseconds (int64), days (int32), months (int32).
 		out := binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
@@ -870,6 +951,8 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	case types.Time:
 		// Binary time: microseconds since midnight.
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
+	case types.Vector:
+		return vector.EncodeBinary(d.S)
 	default:
 		return []byte(d.Text()) // an enum's binary form is its label
 	}
@@ -1025,6 +1108,18 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.Datum{}, fmt.Errorf("bad binary jsonb version")
 		}
 		return types.ParseJSONB(string(raw[1:]))
+	case types.Tsvector:
+		v, err := tsearch.ParseVectorBinary(raw)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		return types.NewTsvector(v), nil
+	case types.Tsquery:
+		q, err := tsearch.ParseQueryBinary(raw)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		return types.NewTsquery(q), nil
 	case types.IntervalFam:
 		if len(raw) != 16 {
 			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
@@ -1039,6 +1134,12 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
 		}
 		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
+	case types.Vector:
+		stored, err := vector.DecodeBinary(raw)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		return types.Datum{Fam: types.Vector, S: stored}, nil
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}
@@ -1080,6 +1181,13 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 		if serr != nil {
 			c.extError(serr)
 			return
+		}
+		// A parameter the client declared a vector is one, wherever it
+		// stands in the statement: its binary form is not text.
+		for i, oid := range m.ParameterOIDs {
+			if oid == oidVector && i < len(fams) && fams[i] == types.Unknown {
+				fams[i] = types.Vector
+			}
 		}
 		p.paramFams = fams
 	default:

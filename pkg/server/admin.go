@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -40,6 +41,7 @@ var adminReadOnlyOps = map[string]bool{
 	"collect-checksum": true,
 	"wait-applied":     true,
 	"reencrypt-status": true,
+	"seal-status":      true,
 }
 
 // adminUnauditedOps skip the audit log: the read-only ops (collect-checksum
@@ -53,8 +55,20 @@ var adminUnauditedOps = map[string]bool{
 	"collect-checksum": true,
 	"wait-applied":     true,
 	"reencrypt-status": true,
-	"node-status":      true,
-	"node-detail":      true,
+	"seal-status":      true,
+	// peer-unseal writes its own record, with the node asked about and
+	// the reason for a refusal.
+	"peer-unseal": true,
+	"node-status": true,
+	"node-detail": true,
+	// notify is one node handing another its committed notifications: a
+	// record per batch would be a record per NOTIFY.
+	"notify": true,
+	// The steps of a purge, asked by the purging node of the others; the
+	// purge writes one record, with the whole report (purge.go).
+	"purge-range":   true,
+	"purge-replica": true,
+	"purge-scrub":   true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -150,6 +164,27 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	if req.Version != 0 {
 		kv = append(kv, "version", int64(req.Version))
 	}
+	// What a restore was asked to bring back, and to when.
+	if req.AsOf != "" {
+		kv = append(kv, "as_of", req.AsOf)
+	}
+	if len(req.Tables) != 0 {
+		kv = append(kv, "tables", strings.Join(req.Tables, ","))
+	}
+	if len(req.Into) != 0 {
+		kv = append(kv, "into", strings.Join(req.Into, ","))
+	}
+	if req.Database != "" {
+		kv = append(kv, "database", req.Database, "into_database", req.IntoDatabase)
+	}
+	if req.DropForeignKeys {
+		kv = append(kv, "drop_foreign_keys", true)
+	}
+	// That a backup key came with the request is worth a record; the key
+	// is not, and no field of it is listed here.
+	if requestCarriesBackupKey(req) {
+		kv = append(kv, "backup_key", "given")
+	}
 	if resp.Error != "" {
 		kv = append(kv, "outcome", "error", "error", resp.Error)
 	} else {
@@ -159,6 +194,31 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	return resp
 }
 
+func requestCarriesBackupKey(req cluster.AdminRequest) bool {
+	return len(req.BackupKey) != 0 || len(req.BaseBackupKey) != 0 || len(req.BackupKeys) != 0
+}
+
+// backupKeyAccepted is the gate on a backup key arriving in a request
+// (issue #291). The backup is written, and read back, by the serving
+// node, so the key has to reach it; over mutual TLS it does so encrypted,
+// from an authenticated admin. Without TLS it would cross the network in
+// the clear, to be read by anyone on the path — after which the sealed
+// backup is sealed against nobody — so it is accepted only from the
+// node's own machine, the rule a root key's shares follow
+// (sealAuthorized). rotate-store-key refuses an insecure cluster
+// outright; this does not, because a single-machine cluster without TLS
+// is a real deployment whose backups leave the machine all the same.
+func (n *Node) backupKeyAccepted(ctx context.Context, req cluster.AdminRequest) error {
+	return backupKeyTransportOK(requestCarriesBackupKey(req), n.tlsCfgs != nil, rpc.PeerIsLoopback(ctx))
+}
+
+func backupKeyTransportOK(carriesKey, secure, loopback bool) error {
+	if !carriesKey || secure || loopback {
+		return nil
+	}
+	return errors.New("this node runs without TLS: a backup key would cross the network in the clear, so it is accepted only from the node's own machine (run the command there, against a loopback address) or over a secure cluster's mutual TLS")
+}
+
 // serveAdminOp dispatches an admin op the caller is already authorized for.
 func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
 	switch req.Op {
@@ -166,18 +226,35 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if len(req.Key) == 0 {
 			return cluster.AdminResponse{Error: "split requires a key"}
 		}
-		sr, err := n.db.AdminSplit(ctx, keys.Key(req.Key))
+		// An operator's split is a manual one: sticky, so the merge
+		// queue does not fold two small halves back together (issue
+		// #265). `datax debug unsplit` releases it.
+		sr, err := n.db.AdminSplitSticky(ctx, keys.Key(req.Key), kvpb.StickyForever)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Left: &sr.Left, Right: &sr.Right, TableNames: n.tableNames(ctx)}
+		resp := cluster.AdminResponse{Right: &sr.Right, TableNames: n.tableNamesFor(ctx, sr.Left, sr.Right)}
+		if sr.Left.RangeID != 0 {
+			resp.Left = &sr.Left
+		}
+		return resp
+
+	case "unsplit":
+		if len(req.Key) == 0 {
+			return cluster.AdminResponse{Error: "unsplit requires a key"}
+		}
+		ur, err := n.db.AdminUnsplit(ctx, keys.Key(req.Key))
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Ranges: []kvpb.RangeDescriptor{ur.Desc}, TableNames: n.tableNamesFor(ctx, ur.Desc)}
 
 	case "ranges":
 		descs, err := n.listRanges(ctx)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Ranges: descs, TableNames: n.tableNames(ctx)}
+		return cluster.AdminResponse{Ranges: descs, TableNames: n.tableNamesFor(ctx, descs...)}
 
 	case "nodes":
 		return cluster.AdminResponse{
@@ -201,14 +278,74 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if req.Path == "" {
 			return cluster.AdminResponse{Error: "backup requires a destination path"}
 		}
-		sum, err := n.RunBackup(ctx, req.Path, req.BasePath, req.AllowPlaintext, req.IncludeMetrics)
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunBackupWith(ctx, BackupOptions{
+			Dest: req.Path, BasePath: req.BasePath, Key: req.BackupKey, BaseKey: req.BaseBackupKey,
+			AllowPlaintext: req.AllowPlaintext, IncludeMetrics: req.IncludeMetrics,
+		})
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
+	case "backup-history":
+		// "backup" with revision history: an op of its own, so a node
+		// from before it refuses rather than write a plain incremental.
+		if req.Path == "" {
+			return cluster.AdminResponse{Error: "backup requires a destination path"}
+		}
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunBackupWith(ctx, BackupOptions{
+			Dest: req.Path, BasePath: req.BasePath, Key: req.BackupKey, BaseKey: req.BaseBackupKey,
+			AllowPlaintext: req.AllowPlaintext, IncludeMetrics: req.IncludeMetrics, RevisionHistory: true,
+		})
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
+	case "restore-select":
+		// "restore" of chosen tables, or to a chosen moment; an op of its
+		// own for the same reason.
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		opts := RestoreOptions{
+			Srcs: req.Paths, Keys: req.BackupKeys, Database: req.Database, IntoDatabase: req.IntoDatabase,
+			DropForeignKeys: req.DropForeignKeys,
+		}
+		if req.AsOf != "" {
+			ts, err := ParseBackupTS(req.AsOf)
+			if err != nil {
+				return cluster.AdminResponse{Error: "--as-of: " + err.Error()}
+			}
+			opts.AsOf = ts
+		}
+		if len(req.Into) != 0 && len(req.Into) != len(req.Tables) {
+			return cluster.AdminResponse{Error: "restore: one --into per --table, in the same order"}
+		}
+		for i, name := range req.Tables {
+			rt := RestoreTable{Name: name}
+			if len(req.Into) != 0 {
+				rt.Into = req.Into[i]
+			}
+			opts.Tables = append(opts.Tables, rt)
+		}
+		sum, err := n.RunRestoreOpts(ctx, opts)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
 		return cluster.AdminResponse{Backup: sum}
 
 	case "restore":
-		sum, err := n.RunRestore(ctx, req.Paths)
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunRestoreWith(ctx, req.Paths, req.BackupKeys)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
@@ -242,6 +379,21 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	case "rotate-store-key":
 		return n.serveRotateStoreKey(ctx, req)
 
+	case "rewrap-store-key":
+		return n.serveRewrapStoreKey(ctx, req)
+
+	case "seal-status":
+		return n.serveSealStatus()
+
+	case "unseal":
+		return n.serveStageShare(ctx, req)
+
+	case "peer-unseal":
+		return n.servePeerUnseal(ctx, req)
+
+	case "peer-unseal-setting":
+		return n.servePeerUnsealSetting(ctx, req)
+
 	case "reencrypt":
 		return n.serveReencrypt(req)
 
@@ -270,6 +422,19 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		raw, _ := json.Marshal(found)
 		return cluster.AdminResponse{Status: raw}
+
+	case "notify":
+		// Another node's committed notifications, for the sessions
+		// listening here (issue #297). Only a node sends these: the call
+		// is not audited (a record per batch would be a record per
+		// NOTIFY), so it is not left open to every admin certificate —
+		// an operator who wants to notify has NOTIFY, under their own
+		// name.
+		if n.tlsCfgs != nil && rpc.PeerCN(ctx) != security.NodePrincipal {
+			return cluster.AdminResponse{Error: "permission denied: notify is sent by nodes only"}
+		}
+		n.notifyHub().Deliver(req.Notify)
+		return cluster.AdminResponse{}
 
 	case "node-detail":
 		// This node's /api/node document, for another node's dashboard
@@ -302,6 +467,24 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			return cluster.AdminResponse{Error: err.Error()}
 		}
 		return cluster.AdminResponse{Status: raw}
+
+	case "purge":
+		start, end := keys.Key(req.Key), keys.Key(req.EndKey)
+		if req.Table != "" {
+			id, err := n.tableIDByName(ctx, req.Table)
+			if err != nil {
+				return cluster.AdminResponse{Error: err.Error()}
+			}
+			start, end = keys.TableDataSpan(id)
+		}
+		rep, err := n.PurgeSpan(ctx, start, end)
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Purge: rep, TableNames: n.tableNamesFor(ctx, kvpb.RangeDescriptor{StartKey: start, EndKey: end})}
+
+	case "purge-range", "purge-replica", "purge-scrub":
+		return n.servePurgeStep(ctx, req)
 
 	case "merge":
 		if req.RangeID == 0 {

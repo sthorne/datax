@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
 )
 
@@ -258,5 +260,87 @@ func TestCrashedCoordinatorCleanup(t *testing.T) {
 	}
 	if string(final) != "recovered" {
 		t.Fatalf("final value %q", final)
+	}
+}
+
+// TestLateFirstWriteIsNotExpired: a transaction that makes its first
+// write long after it began — longer than a record may go without a
+// heartbeat — is alive, and a transaction that runs into its intent
+// straight away must wait for it, not abort it. The record used to be
+// created with the heartbeat of the transaction's birth, so it read as
+// expired until the first heartbeat a second later (issue #303 met it
+// as a large upload aborted at its commit).
+func TestLateFirstWriteIsNotExpired(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db := tc.Nodes[0].DB()
+	key := append(keys.TableDataPrefix(bankTable), "late"...)
+
+	late := db.NewTxn("late")
+	late.SetPriorityForTesting(1 << 25) // no contender wins on priority
+	time.Sleep(kvserver.TxnExpiration + 500*time.Millisecond)
+	if err := late.Put(ctx, key, []byte("late")); err != nil {
+		t.Fatal(err)
+	}
+
+	other := tc.Nodes[1].DB().NewTxn("other")
+	other.SetPriorityForTesting(1)
+	err := other.Put(kvclient.WithLockTimeout(ctx, 300*time.Millisecond), key, []byte("other"))
+	if !kvclient.IsLockTimeout(err) {
+		t.Fatalf("a writer behind a live transaction's fresh intent: %v (want a lock timeout)", err)
+	}
+	_ = other.Rollback(ctx)
+	if err := late.Commit(ctx); err != nil {
+		t.Fatalf("the late writer's commit: %v", err)
+	}
+	if v, err := db.Get(ctx, key); err != nil || string(v) != "late" {
+		t.Fatalf("read back %q, %v", v, err)
+	}
+}
+
+// TestOversizedWriteRefusedAtGateway: a write too large to be one Raft
+// entry's worth is refused where it is sent, with an error that says
+// so, and the range it was bound for is none the worse — before, the
+// entry was appended to the leader's log, could not be sent to any
+// follower, and leadership churned around it (issue #303).
+func TestOversizedWriteRefusedAtGateway(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db := tc.Nodes[1].DB()
+	key := append(keys.TableDataPrefix(bankTable), "big"...)
+
+	tooBig := make([]byte, kvclient.MaxWriteBatchBytes+1)
+	start := time.Now()
+	err := db.Put(ctx, key, tooBig)
+	var kerr *kvpb.Error
+	if !errors.As(err, &kerr) || kerr.TooLarge == nil {
+		t.Fatalf("a %d-byte put: %v (want the too-large refusal)", len(tooBig), err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the refusal took %s: it should not have left the gateway", d)
+	}
+	// In a transaction too, and as one batch of values that are each
+	// small enough.
+	txn := db.NewTxn("big")
+	var wb kvclient.WriteBatch
+	piece := tooBig[:len(tooBig)/4+1]
+	for i := 0; i < 4; i++ {
+		wb.Put(append(key.Clone(), byte('0'+i)), piece)
+	}
+	if err := txn.RunBatch(ctx, &wb); !errors.As(err, &kerr) || kerr.TooLarge == nil {
+		t.Fatalf("a transactional batch of %d bytes: %v (want the too-large refusal)", 4*len(piece), err)
+	}
+	_ = txn.Rollback(ctx)
+
+	// The range is as it was: writes and reads go through at once.
+	for i := 0; i < 3; i++ {
+		if err := tc.Nodes[i].DB().Put(ctx, key, []byte("small")); err != nil {
+			t.Fatalf("n%d: a write after the refusal: %v", i+1, err)
+		}
+	}
+	if v, err := db.Get(ctx, key); err != nil || string(v) != "small" {
+		t.Fatalf("read back %q, %v", v, err)
 	}
 }

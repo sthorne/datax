@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
@@ -23,9 +24,19 @@ type RequestHeader struct {
 // an absent one — so no other transaction can change the key until this
 // one finishes. A committed version above the read timestamp fails the
 // lock with WriteTooOld (the snapshot is stale), exactly like a write.
+//
+// With SkipLocked set (plain reads only; the write path ignores it) a key
+// holding another transaction's intent is not a conflict: the response
+// reports it absent and carries the intent in Skipped; so is a key with a
+// committed version inside the read's uncertainty window, which would
+// otherwise fail the read with an UncertaintyError. Not version-gated:
+// a server that predates the field ignores it and answers with the
+// write-intent conflict, which the sender handles by waiting as it always
+// has.
 type GetRequest struct {
 	RequestHeader
-	ForUpdate bool `json:"for_update,omitempty"`
+	ForUpdate  bool `json:"for_update,omitempty"`
+	SkipLocked bool `json:"skip_locked,omitempty"`
 }
 
 // PutRequest writes a value.
@@ -55,12 +66,15 @@ type IncrementRequest struct {
 // exclusive END of the next page); Reverse may only be SENT once the
 // cluster version has reached v3 — an older node ignores the field and
 // runs a forward scan (pkg/version rule 4). Reverse+ForUpdate is not
-// supported.
+// supported. With SkipLocked set (plain scans only) rows holding another
+// transaction's intent are left out of Rows and their intents listed in
+// the response's Skipped (see GetRequest).
 type ScanRequest struct {
 	RequestHeader
-	MaxRows   int64 `json:"max_rows,omitempty"`
-	ForUpdate bool  `json:"for_update,omitempty"`
-	Reverse   bool  `json:"reverse,omitempty"`
+	MaxRows    int64 `json:"max_rows,omitempty"`
+	ForUpdate  bool  `json:"for_update,omitempty"`
+	Reverse    bool  `json:"reverse,omitempty"`
+	SkipLocked bool  `json:"skip_locked,omitempty"`
 }
 
 // ExportRequest returns, for every key in [Key, EndKey) that changed in
@@ -75,6 +89,14 @@ type ExportRequest struct {
 	RequestHeader
 	StartTS    hlc.Timestamp `json:"start_ts,omitempty"`
 	MaxRecords int64         `json:"max_records,omitempty"`
+	// AllRevisions asks for every version in the window rather than the
+	// newest, each record carrying its timestamp (a backup with revision
+	// history, issue #302). A key's versions are never split across
+	// responses, so a response may exceed MaxRecords by the versions of
+	// its last key. A replica that predates the field ignores it and
+	// answers with the newest versions only, so it is sent only once the
+	// cluster has finalized v21 (version.V21).
+	AllRevisions bool `json:"all_revisions,omitempty"`
 }
 
 // EndTxnRequest commits or aborts the transaction: the atomic flip of the
@@ -202,8 +224,28 @@ type TruncateLogRequest struct {
 }
 
 // AdminSplitRequest splits the range containing SplitKey at SplitKey.
+//
+// StickyUntil makes it a manual split — one an operator asked for, as
+// opposed to the size- and load-based splits and the pre-splits DDL makes
+// for itself. The new right-hand range records the bit
+// (RangeDescriptor.StickyUntil) and the merge queue leaves its start
+// boundary alone until then; and because a manual split asks for a state
+// ("a sticky boundary at this key") rather than an action, a key that is
+// already a boundary is not an error: the range starting there gets the
+// bit. Zero is an ordinary split, merged back when both halves are small.
+// A leader below cluster version v20 splits without recording the bit.
 type AdminSplitRequest struct {
-	RequestHeader // Key = split key
+	RequestHeader       // Key = split key
+	StickyUntil   int64 `json:"sticky_until,omitempty"`
+}
+
+// AdminUnsplitRequest clears the sticky bit of the range that starts at
+// Key, so the merge queue may fold it into its left neighbor again. The
+// key must be a range boundary; a boundary that is not sticky is left as
+// it is. Sent only once the cluster has finalized v20 (older leaders do
+// not know the request).
+type AdminUnsplitRequest struct {
+	RequestHeader // Key = the range's start key
 }
 
 // AdminChangeReplicasRequest adds and/or removes one replica of the range
@@ -228,6 +270,14 @@ type AdminTransferLeaseRequest struct {
 type SubsumeRequest struct {
 	RequestHeader              // Key = start key, EndKey = end key
 	MergeInto     base.RangeID `json:"merge_into"`
+	// MergeEpoch ties the freeze to the left-hand range as the driver saw
+	// it: that range's generation plus one (0: not stated — a driver from
+	// before cluster version v20). A merge may be built under a freeze
+	// only while the left-hand range is still at that generation, which
+	// is what lets a freeze left behind by a dead attempt be unwound
+	// safely: move the left-hand range's generation on, and nothing built
+	// or yet to be built under the old freeze can apply (issue #266).
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 // UpdateMetaRequest writes the range addressing record at Key — or, with
@@ -252,6 +302,11 @@ type UpdateMetaRequest struct {
 // UnfreezeRequest clears a Subsume freeze (the merge was abandoned).
 type UnfreezeRequest struct {
 	RequestHeader // Key = start key, EndKey = end key
+	// MergeEpoch, when not 0, names the freeze to clear (see
+	// SubsumeRequest.MergeEpoch): a range frozen under another epoch is
+	// left as it is. An attempt giving up on its own freeze must not
+	// clear the freeze a later attempt has made since.
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 // AdminMergeRequest merges the range containing Key with its right
@@ -284,6 +339,7 @@ type RequestUnion struct {
 	Subsume             *SubsumeRequest             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeRequest            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaRequest          `json:"update_meta,omitempty"`
+	AdminUnsplit        *AdminUnsplitRequest        `json:"admin_unsplit,omitempty"`
 }
 
 // GetInner returns the wrapped request.
@@ -333,6 +389,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Unfreeze
 	case u.UpdateMeta != nil:
 		return u.UpdateMeta
+	case u.AdminUnsplit != nil:
+		return u.AdminUnsplit
 	}
 	return nil
 }
@@ -368,6 +426,7 @@ func (h *AdminMergeRequest) Header() RequestHeader          { return h.RequestHe
 func (h *SubsumeRequest) Header() RequestHeader             { return h.RequestHeader }
 func (h *UnfreezeRequest) Header() RequestHeader            { return h.RequestHeader }
 func (h *UpdateMetaRequest) Header() RequestHeader          { return h.RequestHeader }
+func (h *AdminUnsplitRequest) Header() RequestHeader        { return h.RequestHeader }
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
@@ -391,6 +450,7 @@ func (*AdminMergeRequest) Method() string          { return "AdminMerge" }
 func (*SubsumeRequest) Method() string             { return "Subsume" }
 func (*UnfreezeRequest) Method() string            { return "Unfreeze" }
 func (*UpdateMetaRequest) Method() string          { return "UpdateMeta" }
+func (*AdminUnsplitRequest) Method() string        { return "AdminUnsplit" }
 
 func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
@@ -414,11 +474,17 @@ func (*AdminMergeRequest) IsReadOnly() bool          { return false }
 func (*SubsumeRequest) IsReadOnly() bool             { return false }
 func (*UnfreezeRequest) IsReadOnly() bool            { return false }
 func (*UpdateMetaRequest) IsReadOnly() bool          { return false }
+func (*AdminUnsplitRequest) IsReadOnly() bool        { return false }
 
 // Response types.
 
 type GetResponse struct {
 	Value []byte `json:"value,omitempty"` // nil = not found
+	// Skipped is set when a SkipLocked read passed the key over (Value
+	// is then nil): the intent it holds, or just the key (an empty Txn)
+	// when it was passed over for a committed version the read could not
+	// order itself against.
+	Skipped *storage.Intent `json:"skipped,omitempty"`
 }
 
 type PutResponse struct{}
@@ -432,6 +498,9 @@ type IncrementResponse struct {
 type ScanResponse struct {
 	Rows   []KeyValue `json:"rows,omitempty"`
 	Resume keys.Key   `json:"resume,omitempty"`
+	// Skipped lists the rows a SkipLocked scan passed over (see
+	// GetResponse.Skipped).
+	Skipped []storage.Intent `json:"skipped,omitempty"`
 }
 
 // ExportRecord is one exported key: its newest visible value at the export
@@ -441,6 +510,9 @@ type ExportRecord struct {
 	Key     keys.Key `json:"key"`
 	Value   []byte   `json:"value,omitempty"`
 	Deleted bool     `json:"deleted,omitempty"`
+	// Timestamp is the version's timestamp; set only in answer to an
+	// AllRevisions export.
+	Timestamp hlc.Timestamp `json:"ts,omitzero"`
 }
 
 type ExportResponse struct {
@@ -495,9 +567,17 @@ type ResolveIntentResponse struct{}
 
 type RollbackIntentResponse struct{}
 
+// AdminSplitResponse carries both halves. When a manual split found its
+// key already a boundary, nothing was split: Right is the range starting
+// at the key and Left is empty (RangeID 0).
 type AdminSplitResponse struct {
 	Left  RangeDescriptor `json:"left"`
 	Right RangeDescriptor `json:"right"`
+}
+
+// AdminUnsplitResponse carries the range's descriptor after the call.
+type AdminUnsplitResponse struct {
+	Desc RangeDescriptor `json:"desc"`
 }
 
 type RefreshResponse struct{}
@@ -524,6 +604,10 @@ type AdminMergeResponse struct {
 // must not unwind it (issue #263).
 type SubsumeResponse struct {
 	AlreadyFrozen bool `json:"already_frozen,omitempty"`
+	// MergeEpoch is the epoch of the freeze the range is under after this
+	// Subsume: the request's own when it made the freeze, the earlier
+	// freeze's when the range was frozen already.
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 }
 
 type UnfreezeResponse struct{}
@@ -558,6 +642,7 @@ type ResponseUnion struct {
 	Subsume             *SubsumeResponse             `json:"subsume,omitempty"`
 	Unfreeze            *UnfreezeResponse            `json:"unfreeze,omitempty"`
 	UpdateMeta          *UpdateMetaResponse          `json:"update_meta,omitempty"`
+	AdminUnsplit        *AdminUnsplitResponse        `json:"admin_unsplit,omitempty"`
 }
 
 // BatchHeader carries batch-wide state.
@@ -671,6 +756,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Unfreeze = t
 	case *UpdateMetaRequest:
 		u.UpdateMeta = t
+	case *AdminUnsplitRequest:
+		u.AdminUnsplit = t
 	default:
 		panic(fmt.Sprintf("unknown request type %T", r))
 	}

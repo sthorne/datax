@@ -327,6 +327,29 @@ type CreateIndex struct {
 	Name        string
 	Table       string
 	Columns     []string
+	// Using is the access method of USING (lower-cased; "" = none
+	// given, an ordinary index). OpClasses, when any column names an
+	// operator class, is parallel to Columns ("" = none for that column).
+	Using     string
+	OpClasses []string
+	// ExprFunc and ExprArg are set for the one expression an index may
+	// be built on, fn('constant', column) — in practice
+	// to_tsvector('english', body) under USING GIN. Columns then holds
+	// that one column. There are no expression indexes in general; the
+	// executor decides which functions it can index by.
+	ExprFunc string
+	ExprArg  string
+	// With holds the WITH (name = value) storage parameters, names
+	// lower-cased (USING ivfflat ... WITH (lists = 100)).
+	With map[string]string
+}
+
+// CreateExtension is CREATE EXTENSION [IF NOT EXISTS] name. There are
+// no extensions to install; the statement exists so that a schema
+// written for PostgreSQL with pgvector ("CREATE EXTENSION vector")
+// loads, and the executor refuses any other name.
+type CreateExtension struct {
+	Name string
 }
 
 // DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on
@@ -643,7 +666,21 @@ type Select struct {
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool
+	// LockWait is what FOR UPDATE does about a row another transaction
+	// holds locked: wait for it (the default), leave it out of the result
+	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
+	// ForUpdate.
+	LockWait LockWait
 }
+
+// LockWait is the wait policy of a FOR UPDATE clause.
+type LockWait int
+
+const (
+	LockWaitBlock      LockWait = iota // FOR UPDATE
+	LockWaitSkipLocked                 // FOR UPDATE SKIP LOCKED
+	LockWaitNoWait                     // FOR UPDATE NOWAIT
+)
 
 type Update struct {
 	With      []CTE
@@ -676,9 +713,15 @@ type AlterTable struct {
 	DropDefault string
 	// SetType is ALTER [COLUMN] c [SET DATA] TYPE t (an online rewrite).
 	SetType *SetType
-	// SetOptions is ALTER TABLE ... SET (name = value, ...) — today only
-	// shards = N, the online re-shard.
-	SetOptions map[string]string
+	// SetOptions is ALTER TABLE ... SET (name = value, ...): shards = N
+	// (the online re-shard), retention, gc_ttl and the row-expiry
+	// options. ResetOptions is ALTER TABLE ... RESET (name, ...), which
+	// returns gc_ttl or the row expiry to "not set".
+	SetOptions   map[string]string
+	ResetOptions []string
+	// Purge is ALTER TABLE ... PURGE: collect the table's garbage now
+	// and report, replica by replica, that none is left.
+	Purge bool
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.
@@ -693,6 +736,17 @@ type AlterTable struct {
 	// SplitAt is SPLIT AT VALUES (k, ...), (k, ...): one primary-key
 	// tuple (a prefix of the key is allowed) per range boundary to carve.
 	SplitAt [][]Expr
+	// SplitExpiration is SPLIT AT ... WITH EXPIRATION e: when the
+	// boundaries stop being held against merging (a timestamp, or an
+	// interval from now). Nil holds them until UNSPLIT.
+	SplitExpiration *Expr
+	// UnsplitAt is UNSPLIT AT VALUES (k, ...), ...: the boundaries to
+	// stop holding; UnsplitAll is UNSPLIT ALL, every one in the table.
+	UnsplitAt  [][]Expr
+	UnsplitAll bool
+	// RowSecurity is ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL
+	// SECURITY: "enable", "disable", "force" or "no force".
+	RowSecurity string
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
@@ -732,8 +786,8 @@ type Delete struct {
 
 // CreateRole is CREATE ROLE / CREATE USER / ALTER ROLE / ALTER USER
 // (issue #98). CREATE USER is CREATE ROLE ... LOGIN; the options are
-// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT and
-// IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
+// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT,
+// BYPASSRLS | NOBYPASSRLS and IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
 // alone; CREATE applies the default).
 type CreateRole struct {
 	Name string
@@ -747,6 +801,9 @@ type CreateRole struct {
 	// Password: nil = not spelled; "" = PASSWORD NULL (no password).
 	Password *string
 	Inherit  *bool
+	// BypassRLS is BYPASSRLS / NOBYPASSRLS: whether the role is exempt
+	// from row-security policies.
+	BypassRLS *bool
 	// InRoles are the roles the new role is made a member of (IN ROLE).
 	InRoles []string
 }
@@ -827,6 +884,16 @@ type Rollback struct{}
 type Savepoint struct{ Name string }
 type ReleaseSavepoint struct{ Name string }
 type RollbackToSavepoint struct{ Name string }
+
+// Listen, Unlisten and Notify are LISTEN channel, UNLISTEN channel | *
+// and NOTIFY channel [, 'payload'] (issue #297). A channel is an
+// identifier: folded to lower case unless quoted.
+type Listen struct{ Channel string }
+type Unlisten struct {
+	Channel string
+	All     bool // UNLISTEN *
+}
+type Notify struct{ Channel, Payload string }
 
 // ShowTables is SHOW TABLES [FROM database].
 type ShowTables struct{ Database string }
@@ -928,6 +995,7 @@ func (*AlterSequence) stmt()          {}
 func (*ShowSequences) stmt()          {}
 func (*ShowFunctions) stmt()          {}
 func (*CreateIndex) stmt()            {}
+func (*CreateExtension) stmt()        {}
 func (*DropIndex) stmt()              {}
 func (*CreateView) stmt()             {}
 func (*CommentOn) stmt()              {}
@@ -955,6 +1023,9 @@ func (*Savepoint) stmt()              {}
 func (*ReleaseSavepoint) stmt()       {}
 func (*RollbackToSavepoint) stmt()    {}
 func (*Rollback) stmt()               {}
+func (*Listen) stmt()                 {}
+func (*Unlisten) stmt()               {}
+func (*Notify) stmt()                 {}
 func (*ShowTables) stmt()             {}
 func (*Analyze) stmt()                {}
 func (*ShowStats) stmt()              {}

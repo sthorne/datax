@@ -78,7 +78,7 @@ func retypeAllowed(from, to types.Family) bool {
 		return to == types.IntervalFam
 	case types.String:
 		switch to {
-		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time:
+		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery, types.Vector:
 			return true
 		}
 	}
@@ -112,6 +112,11 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 		if !ok || col.Hidden {
 			return newErrf(CodeUndefinedColumn, "column %q does not exist", st.Column)
 		}
+		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
+			// A rewrite gives the column a new ID, which the expiry
+			// would go on naming the old one of.
+			return newErrf(CodeDependentObjectsExist, "cannot change the type of column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", st.Column)
+		}
 		target := catalog.Column{
 			Type: st.Type, Precision: st.Precision, Scale: st.Scale,
 			Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,
@@ -137,6 +142,9 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			}
 			widened = true
 			return s.cat.Update(ctx, txn, desc)
+		}
+		if err := s.requireTextSearchTypes(st.Type); err != nil {
+			return err
 		}
 		if !retypeAllowed(col.Type, st.Type) {
 			return newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.TypeSQL(), target.TypeSQL())

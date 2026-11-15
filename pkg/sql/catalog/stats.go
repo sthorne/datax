@@ -113,3 +113,21 @@ func (a *Accessor) InvalidateStats(tableID uint64) {
 	delete(a.statsCache, tableID)
 	a.statsMu.Unlock()
 }
+
+// statsIdleFor is how long a cached statistics entry may go unread
+// before pruneStats drops it; it would have been re-read on its next use
+// in any case (statsRefreshInterval).
+const statsIdleFor = 10 * statsRefreshInterval
+
+// pruneStats drops the statistics of tables no plan has asked about
+// lately, so the cache follows the tables in use and not every table the
+// gateway ever planned against.
+func (a *Accessor) pruneStats() {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	for id, c := range a.statsCache {
+		if time.Since(c.fetchedAt) > statsIdleFor {
+			delete(a.statsCache, id)
+		}
+	}
+}

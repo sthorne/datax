@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -111,12 +112,37 @@ type DB struct {
 	// them. Nil (tests, tools) reads as the binary's own version: a
 	// process without version plumbing never talks to older binaries.
 	versionGate atomic.Pointer[func() version.Version]
+	// purger runs a purge of a key span on behalf of SQL (ALTER TABLE ...
+	// PURGE); the node installs it. Nil on a store-less client.
+	purger atomic.Pointer[func(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error)]
 	// frozenWait bounds the wait on a range frozen for a merge
 	// (defaultFrozenRangeWait; tests shorten it).
 	frozenWait time.Duration
 	// attemptTimeout bounds one attempt at one replica (perAttemptTimeout;
 	// tests shorten it).
 	attemptTimeout time.Duration
+	// skipPushes remembers when each transaction whose lock a SKIP LOCKED
+	// read stepped around was last pushed (see resolveAbandonedLocks).
+	skipPushes struct {
+		sync.Mutex
+		last map[uuid.UUID]time.Time
+	}
+	// sendObserver, when set, is shown every routed batch and its
+	// response (TestingSetSendObserver).
+	sendObserver atomic.Pointer[func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse)]
+}
+
+// TestingSetSendObserver installs (or, with nil, removes) a function
+// shown every batch this DB routes, with its response (nil on error):
+// how a test counts the KV requests and rows an operation costs, which a
+// shared machine's wall clock cannot say. The observer runs on the
+// sender's goroutine and must not send.
+func (db *DB) TestingSetSendObserver(f func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse)) {
+	if f == nil {
+		db.sendObserver.Store(nil)
+		return
+	}
+	db.sendObserver.Store(&f)
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
@@ -125,6 +151,22 @@ func (db *DB) SetNodeLister(f func() []base.NodeID) { db.nodeLister = f }
 // SetVersionGate wires the finalized-cluster-version source (the node's
 // mirror) consulted before sending version-gated request shapes.
 func (db *DB) SetVersionGate(f func() version.Version) { db.versionGate.Store(&f) }
+
+// SetPurger wires the node's purge (server.Node.PurgeSpan) so a SQL
+// session can ask for one.
+func (db *DB) SetPurger(f func(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error)) {
+	db.purger.Store(&f)
+}
+
+// Purge forces garbage collection and compaction over [start, end) and
+// returns the per-replica report (issue #295).
+func (db *DB) Purge(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport, error) {
+	f := db.purger.Load()
+	if f == nil {
+		return nil, fmt.Errorf("purge is not available on this client: it runs on a node")
+	}
+	return (*f)(ctx, start, end)
+}
 
 // ReverseScansOK reports whether reverse scans may be SENT: they were
 // introduced under cluster version v3, and a v2 node silently runs a
@@ -233,10 +275,29 @@ func replicaNodeIDs(desc kvpb.RangeDescriptor) []base.NodeID {
 // Note that a non-transactional batch that crosses ranges is NOT atomic —
 // atomicity across ranges is the transaction layer's job.
 func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	br, kerr := db.send(ctx, ba)
+	if obs := db.sendObserver.Load(); obs != nil {
+		(*obs)(ctx, ba, br)
+	}
+	return br, kerr
+}
+
+func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, kvpb.NewErrorf("empty batch")
 	}
 	defer func(start time.Time) { metrics.KVBatchLatency.Observe(time.Since(start).Seconds()) }(time.Now())
+
+	if ba.Header.CreateTxnRecord && ba.Header.Txn != nil {
+		// A record is born with the heartbeat this batch carries. The
+		// transaction's own copy still says when it began, and a
+		// transaction that makes its first write more than
+		// kvserver.TxnExpiration after it began — a block that read for a
+		// while, or streamed a large object, before writing — would have
+		// a record that reads as expired until its first heartbeat a
+		// second later, for any pusher that came by to abort.
+		ba.Header.Txn.LastHeartbeat = ba.Header.Txn.LastHeartbeat.Forward(db.clock.Now())
+	}
 
 	// Transactional batches of point requests spanning several ranges fan
 	// out concurrently — one range's consensus round no longer waits for
@@ -741,7 +802,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		if desc.EndKey.Less(end) {
 			end = desc.EndKey
 		}
-		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining, ForUpdate: req.ForUpdate}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, MaxRows: remaining, ForUpdate: req.ForUpdate, SkipLocked: req.SkipLocked}
 		// The transaction record is created on the anchor key's range only:
 		// scope the flag to the one segment covering it (locking scans may
 		// be a transaction's first, anchoring operation).
@@ -767,6 +828,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
+		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {
@@ -818,7 +880,7 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 			segStart, segEnd, desc = s, e, d
 			s = e
 		}
-		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: segStart, EndKey: segEnd}, MaxRows: remaining, Reverse: true}
+		sub := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: segStart, EndKey: segEnd}, MaxRows: remaining, Reverse: true, SkipLocked: req.SkipLocked}
 		// Anchor scoping, as in the forward path.
 		gh := header
 		if gh.CreateTxnRecord && gh.Txn != nil {
@@ -841,6 +903,7 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 		}
 		sr := br.Responses[0].Scan
 		out.Rows = append(out.Rows, sr.Rows...)
+		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
 			if remaining <= 0 {
@@ -880,7 +943,7 @@ func (db *DB) sendExport(ctx context.Context, header kvpb.BatchHeader, req *kvpb
 		if desc.EndKey.Less(end) {
 			end = desc.EndKey
 		}
-		sub := &kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, StartTS: req.StartTS, MaxRecords: remaining}
+		sub := &kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, StartTS: req.StartTS, MaxRecords: remaining, AllRevisions: req.AllRevisions}
 		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Export: sub}}, desc)
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
@@ -1033,10 +1096,38 @@ func overloadBackoff(n int) time.Duration {
 	return d/2 + time.Duration(rand.Int64N(int64(d)))
 }
 
+// MaxWriteBatchBytes bounds the keys and values one write batch may
+// carry to one range. The batch becomes one Raft entry, and an entry is
+// sent to a follower in one message: one that does not fit under
+// rpc.MaxMessageBytes is appended to the leader's log and can never
+// leave it — the client's statement fails with "leadership lost with
+// proposal in flight", and the range's leadership churns around an
+// entry nobody can replicate (issue #303 measured it with a 64 MiB
+// value). Refusing the batch on the gateway costs the statement and
+// nothing else. The margin below the message limit is for what travels
+// with the payload: the transaction, the entry's framing.
+const MaxWriteBatchBytes = rpc.MaxMessageBytes - 4<<20
+
+// writeBatchBytes is the payload a batch would put into a Raft entry.
+func writeBatchBytes(ba *kvpb.BatchRequest) int64 {
+	var n int64
+	for i := range ba.Requests {
+		if p := ba.Requests[i].Put; p != nil {
+			n += int64(len(p.Key) + len(p.Value))
+		}
+	}
+	return n
+}
+
 // sendToRange tries the range's replicas — leader hint first, local replica
 // next — retrying around NotLeader and transport errors until ctx expires.
 func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (*kvpb.BatchResponse, *kvpb.Error) {
 	ba.Header.RangeID = desc.RangeID
+	if n := writeBatchBytes(ba); n > MaxWriteBatchBytes {
+		e := kvpb.NewErrorf("a write of %d bytes to r%d is larger than a single replicated write can be (%d bytes)", n, desc.RangeID, int64(MaxWriteBatchBytes))
+		e.TooLarge = &kvpb.WriteTooLargeError{Bytes: n, Limit: MaxWriteBatchBytes}
+		return nil, e
+	}
 	// Follower-read fallback accounting: a stale read the gateway cannot
 	// serve from its own replica goes to the leader instead. Counted at
 	// most once per sub-batch — either the gateway holds no replica of
@@ -1341,6 +1432,35 @@ func (db *DB) ExportSpan(ctx context.Context, start, end keys.Key, startTS, ts h
 	return br.Responses[0].Export, nil
 }
 
+// RevisionExportsOK reports whether exports of every revision may be sent
+// (cluster version v21): an older replica ignores the flag and answers
+// with the newest versions only, which a backup would then record as the
+// whole history.
+func (db *DB) RevisionExportsOK() bool {
+	return db.ClusterVersion() >= version.V21
+}
+
+// ExportSpanRevisions is ExportSpan keeping the history: every version of
+// every key in (startTS, ts], newest first within a key, each with its
+// timestamp. startTS must be set — the history below it is not asked for
+// — and a range whose GC threshold has passed it refuses, since versions
+// in the window may already be gone.
+func (db *DB) ExportSpanRevisions(ctx context.Context, start, end keys.Key, startTS, ts hlc.Timestamp, max int64) (*kvpb.ExportResponse, error) {
+	if !db.RevisionExportsOK() {
+		return nil, fmt.Errorf("exports with revision history need cluster version %s (finalize the upgrade first)", version.V21)
+	}
+	if startTS.IsEmpty() {
+		return nil, fmt.Errorf("an export with revision history needs a start timestamp")
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: ts}}
+	ba.Add(&kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, StartTS: startTS, MaxRecords: max, AllRevisions: true})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	return br.Responses[0].Export, nil
+}
+
 // Increment atomically adds by to the counter at key, returning the new
 // value.
 func (db *DB) Increment(ctx context.Context, key keys.Key, by int64) (int64, error) {
@@ -1396,17 +1516,60 @@ func (db *DB) AdminMerge(ctx context.Context, key keys.Key) (*kvpb.AdminMergeRes
 	return resp, nil
 }
 
-// AdminSplit splits the range containing key at key.
+// AdminSplit splits the range containing key at key — an ordinary split,
+// which the merge queue undoes when both halves are small. A key that is
+// already a range boundary is success (Left is then empty).
 func (db *DB) AdminSplit(ctx context.Context, key keys.Key) (*kvpb.AdminSplitResponse, error) {
+	return db.AdminSplitSticky(ctx, key, 0)
+}
+
+// AdminSplitSticky is a manual split: the boundary at key is made, or if
+// it exists marked, sticky until the wall-clock time stickyUntil
+// (kvpb.StickyForever for no expiry), and the merge queue leaves it alone
+// until then or until AdminUnsplit. Below cluster version v20 the bit
+// cannot be recorded and the split is an ordinary one; StickyBitsOK tells
+// the caller which it will be.
+func (db *DB) AdminSplitSticky(ctx context.Context, key keys.Key, stickyUntil int64) (*kvpb.AdminSplitResponse, error) {
+	if !db.StickyBitsOK() {
+		stickyUntil = 0
+	}
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
-	ba.Add(&kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	ba.Add(&kvpb.AdminSplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}, StickyUntil: stickyUntil})
 	br, kerr := db.Send(ctx, ba)
 	if kerr != nil {
 		return nil, kerr
 	}
 	resp := br.Responses[0].AdminSplit
-	db.cache.Evict(resp.Left.RangeID)
-	db.cache.Insert(resp.Left, resp.Right)
+	if resp.Left.RangeID != 0 {
+		db.cache.Evict(resp.Left.RangeID)
+		db.cache.Insert(resp.Left)
+	}
+	db.cache.Insert(resp.Right)
+	return resp, nil
+}
+
+// StickyBitsOK reports whether manual splits are recorded as sticky and
+// AdminUnsplit may be sent (cluster version v20).
+func (db *DB) StickyBitsOK() bool {
+	return db.ClusterVersion() >= version.V20
+}
+
+// AdminUnsplit clears the sticky bit of the range starting at key, which
+// must be a range boundary; a boundary that is not sticky is left as it
+// is. The request is new in v20 and is not sent before the cluster has
+// finalized it.
+func (db *DB) AdminUnsplit(ctx context.Context, key keys.Key) (*kvpb.AdminUnsplitResponse, error) {
+	if !db.StickyBitsOK() {
+		return nil, fmt.Errorf("unsplit needs cluster version %s (finalize the upgrade first)", version.V20)
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
+	ba.Add(&kvpb.AdminUnsplitRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	resp := br.Responses[0].AdminUnsplit
+	db.cache.Insert(resp.Desc)
 	return resp, nil
 }
 

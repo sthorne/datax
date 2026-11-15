@@ -58,6 +58,31 @@ type benchResult struct {
 	Metrics map[string]float64 `json:"metrics,omitempty"`
 	// ReadPhase is the timeseries workload's windowed-read phase.
 	ReadPhase *benchReadPhase `json:"read_phase,omitempty"`
+	// Vector is the vector-knn workload's own record: the index build
+	// and the recall the measured queries ran at.
+	Vector *benchVector `json:"vector,omitempty"`
+
+	// maxErrors is the run's --max-errors: how many Errors the command
+	// tolerates before it exits non-zero. Not part of the record.
+	maxErrors int64
+}
+
+// benchVector records what a vector-knn run measured besides latency:
+// how long CREATE INDEX took over the preloaded rows (0 when the index
+// was already there or the run has none), and recall@K — the share of
+// the true K nearest rows, found by the exact scan, that the measured
+// query shape returned, averaged over RecallQueries queries.
+type benchVector struct {
+	Rows          int     `json:"rows"`
+	Dims          int     `json:"dims"`
+	Index         string  `json:"index"`
+	Lists         int     `json:"lists,omitempty"`
+	Probes        string  `json:"probes,omitempty"`
+	BuildSec      float64 `json:"build_sec,omitempty"`
+	K             int     `json:"k"`
+	Recall        float64 `json:"recall"`
+	RecallQueries int     `json:"recall_queries"`
+	Plan          string  `json:"plan"`
 }
 
 type benchReadPhase struct {
@@ -79,10 +104,13 @@ var benchWorkloads = []struct{ name, doc string }{
 	{"timeseries", "per-series monotone timestamps (--series, --shards), then windowed reads"},
 	{"index-join", "secondary-index lookups fanning out to wide primary rows (--preload rows)"},
 	{"scan", "large result sets streamed through pgwire (--preload rows per scan)"},
+	{"jsonb-contain", "JSONB containment (doc @> ...) over --preload documents, through a GIN index or as a filter (--jsonb-index gin|none)"},
+	{"text-search", "full-text search (to_tsvector('english', body) @@ ...) over --preload documents, through a GIN index or as a filter (--text-index gin|none): one word, a phrase, a prefix, or the ten best-ranked matches (--text-query word|phrase|prefix|ranked)"},
+	{"vector-knn", "the 10 nearest of --preload vectors of --dims dimensions (ORDER BY v <-> q LIMIT 10), through an ivfflat index or by the exact scan (--vector-index ivfflat|none, --lists, --probes); records build time and recall@10"},
 }
 
 func benchUsage(fs *flag.FlagSet) {
-	fmt.Fprintf(fs.Output(), "Usage: datax bench <workload> [flags]\n       datax bench run --set bench/workloads.json --out DIR [flags]\n       datax bench compare BEFORE AFTER [--threshold 5]\n\nWorkloads:\n")
+	fmt.Fprintf(fs.Output(), "Usage: datax bench <workload> [flags]\n       datax bench run --set bench/workloads.json --out DIR [flags]\n       datax bench compare BEFORE AFTER [--threshold 5]\n\nA run whose measured phase counts more errors than --max-errors exits non-zero.\n\nWorkloads:\n")
 	for _, w := range benchWorkloads {
 		fmt.Fprintf(fs.Output(), "  %-12s %s\n", w.name, w.doc)
 	}
@@ -101,8 +129,45 @@ func runBench(args []string) error {
 			return runBenchCompare(args[1:])
 		}
 	}
-	_, err := runBenchWorkload(args)
-	return err
+	res, err := runBenchWorkload(args)
+	if err != nil {
+		return err
+	}
+	// The record and the printed results are already out: the exit status
+	// is the only thing an error count changes.
+	return checkBenchErrors(res, res.maxErrors)
+}
+
+// benchMaxErrorsDoc is the --max-errors help shared by the single-workload
+// commands and the set runner.
+const benchMaxErrorsDoc = "exit non-zero when the measured run counts more errors than this (serialization retries, the 40001s, are not errors); -1 never fails on errors"
+
+// topBenchError returns the most frequent message of a record's error
+// samples and its count; the lexically first message wins a tie, so the
+// same record always names the same one.
+func topBenchError(samples map[string]int64) (msg string, n int64) {
+	for m, c := range samples {
+		if c > n || (c == n && m < msg) {
+			msg, n = m, c
+		}
+	}
+	return msg, n
+}
+
+// checkBenchErrors is the exit rule (issue #267): a run that counted more
+// errors in its measured phase than maxErrors failed, however good its
+// throughput looks — an operation that errors is not measured, and the
+// numbers of a run that shed 80 of them describe a different workload.
+// A negative maxErrors tolerates any count.
+func checkBenchErrors(res *benchResult, maxErrors int64) error {
+	if maxErrors < 0 || res.Errors <= maxErrors {
+		return nil
+	}
+	detail := ""
+	if msg, n := topBenchError(res.ErrorSamples); n > 0 {
+		detail = fmt.Sprintf("; most frequent, %d times: %s", n, msg)
+	}
+	return fmt.Errorf("%d errors during the measured run (--max-errors %d)%s", res.Errors, maxErrors, detail)
 }
 
 // runBenchWorkload runs one workload and returns its record.
@@ -130,9 +195,17 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	insecureTLS := fs.Bool("insecure-skip-verify", false, "skip TLS certificate verification on the HTTP port")
 	series := fs.Int("series", 1000, "timeseries workload: number of distinct series")
 	shards := fs.Int("shards", 0, "timeseries workload: shard buckets for the table (0 = unsharded; the table name embeds this, so A/B runs don't collide)")
-	groups := fs.Int("groups", 1000, "index-join workload: distinct indexed values (rows per lookup = preload / groups)")
+	groups := fs.Int("groups", 1000, "index-join, jsonb-contain, text-search: distinct indexed values (rows per lookup = preload / groups)")
+	textIndex := fs.String("text-index", "gin", "text-search workload: gin (an inverted index serves the search) or none (every query reduces and filters the whole table); the table name embeds this, so A/B runs don't collide")
+	textQuery := fs.String("text-query", "word", "text-search workload: word (one selective word), phrase (two adjacent words, verified from positions), prefix (word:*), or ranked (a two-word OR, ordered by ts_rank, LIMIT 10)")
+	jsonbIndex := fs.String("jsonb-index", "gin", "jsonb-contain workload: gin (an inverted index serves the containment) or none (every query filters the whole table); the table name embeds this, so A/B runs don't collide")
+	dims := fs.Int("dims", 64, "vector-knn workload: dimensions of each vector")
+	vectorIndex := fs.String("vector-index", "ivfflat", "vector-knn workload: ivfflat (an approximate index serves the query) or none (every query scans the table and keeps the nearest); the table name embeds this, so A/B runs don't collide")
+	lists := fs.Int("lists", 100, "vector-knn workload: lists of the ivfflat index")
+	probes := fs.Int("probes", 0, "vector-knn workload: lists each query reads (0 = the server's default, the square root of --lists)")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
+	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
 	name := fs.String("name", "", "label in the JSON record (default: the workload)")
 	jsonOut := fs.String("json", "", "write the run's record to this file")
 	cpuProfile := fs.String("cpuprofile", "", "write the client's CPU profile here")
@@ -141,7 +214,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	fs.Usage = func() { benchUsage(fs) }
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fs.Usage()
-		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan")
+		return nil, fmt.Errorf("bench requires a workload: kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, jsonb-contain, text-search, or vector-knn")
 	}
 	workload := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
@@ -152,7 +225,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		known = known || w.name == workload
 	}
 	if !known {
-		return nil, fmt.Errorf("unknown workload %q (want kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, or scan)", workload)
+		return nil, fmt.Errorf("unknown workload %q (want kv, bank, hot-row, ingest, ingest-copy, timeseries, index-join, scan, jsonb-contain, text-search, or vector-knn)", workload)
 	}
 	switch *keys {
 	case "random", "sequential", "uuid":
@@ -208,7 +281,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 
 	res := &benchResult{Workload: workload, Args: args, Seed: *seed, Concurrency: *concurrency, DurationSec: duration.Seconds(),
-		StartedAt: time.Now().UTC(), Version: version, GoVersion: runtime.Version()}
+		StartedAt: time.Now().UTC(), Version: version, GoVersion: runtime.Version(), maxErrors: *maxErrors}
 	res.Name = *name
 	if res.Name == "" {
 		res.Name = workload
@@ -234,6 +307,35 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
 	hotTable := "bench_hot" + rsuffix
+	if *jsonbIndex != "gin" && *jsonbIndex != "none" {
+		return nil, fmt.Errorf("--jsonb-index takes gin or none")
+	}
+	jsonbTable := "bench_jsonb" + rsuffix
+	if *jsonbIndex == "none" {
+		jsonbTable += "_noidx"
+	}
+	if *textIndex != "gin" && *textIndex != "none" {
+		return nil, fmt.Errorf("--text-index takes gin or none")
+	}
+	switch *textQuery {
+	case "word", "phrase", "prefix", "ranked":
+	default:
+		return nil, fmt.Errorf("--text-query takes word, phrase, prefix or ranked")
+	}
+	textTable := "bench_text" + rsuffix
+	if *textIndex == "none" {
+		textTable += "_noidx"
+	}
+	if *vectorIndex != "ivfflat" && *vectorIndex != "none" {
+		return nil, fmt.Errorf("--vector-index takes ivfflat or none")
+	}
+	if *dims < 1 || *dims > 2000 {
+		return nil, fmt.Errorf("--dims must be between 1 and 2000")
+	}
+	vecTable := fmt.Sprintf("bench_vec_d%d%s", *dims, rsuffix)
+	if *vectorIndex == "none" {
+		vecTable += "_noidx"
+	}
 	// The write phase appends whole seconds per series starting here; the
 	// read phase then queries windows below this watermark.
 	tsBase := time.Now().UTC().Truncate(time.Second)
@@ -367,6 +469,113 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		if err := preloadRows(ijTable, "k, g, pad", func(j int) string { return fmt.Sprintf("(%d, %d, '%s')", j, j%*groups, pad) }); err != nil {
 			return nil, err
 		}
+	case "jsonb-contain":
+		// Documents of a dozen values each; a query names one tenant and
+		// matches preload/groups of them. With the index that is a read
+		// of the tenant's entries and their rows; without it, a read of
+		// every document.
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+jsonbTable+" (k INT8 PRIMARY KEY, doc JSONB)"); err != nil {
+			return nil, err
+		}
+		if *jsonbIndex == "gin" {
+			if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS "+jsonbTable+"_doc ON "+jsonbTable+" USING GIN (doc)"); err != nil {
+				return nil, err
+			}
+		}
+		if err := split(jsonbTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		// A large preload is worth not repeating: a table already holding
+		// the rows is used as it is.
+		var have int64
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM "+jsonbTable).Scan(&have); err != nil {
+			return nil, err
+		}
+		if have < int64(*preload) {
+			if err := preloadRows(jsonbTable, "k, doc", func(j int) string {
+				return fmt.Sprintf(`(%d, '{"tenant": %d, "kind": "k%d", "tags": ["t%d", "t%d"], "attrs": {"seq": %d, "ok": %t}, "pad": "%s"}')`,
+					j, j%*groups, j%7, j%50, (j/50)%50, j, j%2 == 0, pad)
+			}); err != nil {
+				return nil, err
+			}
+		}
+	case "text-search":
+		// Short documents of English words. A query names one topic and
+		// matches preload/groups of them. With the index that is a read
+		// of the topic's entries and their rows, each then reduced to
+		// lexemes again for the recheck; without it every document is
+		// reduced for every query.
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+textTable+" (k INT8 PRIMARY KEY, body TEXT)"); err != nil {
+			return nil, err
+		}
+		if *textIndex == "gin" {
+			if _, err := setup.Exec(ctx, "CREATE INDEX IF NOT EXISTS "+textTable+"_body ON "+textTable+" USING GIN (to_tsvector('english', body))"); err != nil {
+				return nil, err
+			}
+		}
+		if err := split(textTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		// A million documents are worth not loading twice. The rows go
+		// in ascending, so the last one being there means they all are;
+		// asking for it is a point lookup, where counting the table
+		// would read all of it under the statement's memory limit.
+		var have int64
+		if err := setup.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s WHERE k = %d", textTable, *preload-1)).Scan(&have); err != nil {
+			return nil, err
+		}
+		if have == 0 {
+			if err := preloadRows(textTable, "k, body", func(j int) string {
+				return fmt.Sprintf("(%d, '%s')", j, benchTextDocument(j, *groups))
+			}); err != nil {
+				return nil, err
+			}
+		}
+	case "vector-knn":
+		// Vectors drawn around --groups Gaussian centres (benchVectorAt):
+		// the shape a corpus of embeddings with topics has. The index is
+		// built after the load, as it should be in use — its centres are
+		// trained on the rows present — and the build is timed.
+		if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (k INT8 PRIMARY KEY, v vector(%d))", vecTable, *dims)); err != nil {
+			return nil, err
+		}
+		if err := split(vecTable, int64(*preload), false); err != nil {
+			return nil, err
+		}
+		var have int64
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM "+vecTable).Scan(&have); err != nil {
+			return nil, err
+		}
+		if have < int64(*preload) {
+			if err := preloadRows(vecTable, "k, v", func(j int) string {
+				return fmt.Sprintf("(%d, '%s')", j, benchVectorText(benchVectorAt(*seed, int64(j), *groups, *dims)))
+			}); err != nil {
+				return nil, err
+			}
+		}
+		res.Vector = &benchVector{Rows: *preload, Dims: *dims, Index: *vectorIndex, K: 10}
+		if *vectorIndex == "ivfflat" {
+			res.Vector.Lists = *lists
+			var exists int64
+			if err := setup.QueryRow(ctx, "SELECT count(*) FROM pg_indexes WHERE indexname = '"+vecTable+"_v'").Scan(&exists); err != nil {
+				return nil, err
+			}
+			if exists == 0 {
+				fmt.Printf("building the ivfflat index (lists = %d)...\n", *lists)
+				built := time.Now()
+				if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE INDEX %s_v ON %s USING ivfflat (v vector_l2_ops) WITH (lists = %d)", vecTable, vecTable, *lists)); err != nil {
+					return nil, err
+				}
+				res.Vector.BuildSec = time.Since(built).Seconds()
+				fmt.Printf("  built in %.1fs\n", res.Vector.BuildSec)
+			}
+		}
+		// Recall of the query shape the run measures, against the exact
+		// scan's answer to the same queries.
+		if err := benchVectorRecall(ctx, setup, res.Vector, vecTable, *seed, *groups, *probes); err != nil {
+			return nil, err
+		}
+		fmt.Printf("  plan:      %s\n  recall@%d: %.3f over %d queries\n", res.Vector.Plan, res.Vector.K, res.Vector.Recall, res.Vector.RecallQueries)
 	case "scan":
 		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
 			return nil, err
@@ -524,10 +733,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			}
 			conn, err := connect()
 			if err != nil {
-				errs.Add(1)
+				// A worker that never connected is an error with a message
+				// like any other: the count alone does not say why.
+				noteError(fmt.Errorf("worker could not connect: %w", err))
 				return
 			}
 			defer func() { _ = conn.Close(ctx) }()
+			if workload == "vector-knn" && *probes > 0 {
+				if _, err := conn.Exec(ctx, fmt.Sprintf("SET ivfflat.probes = %d", *probes)); err != nil {
+					noteError(err)
+					return
+				}
+			}
 			for time.Now().Before(deadline) {
 				start := time.Now()
 				var err error
@@ -604,10 +821,17 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 						}
 					}
 					_, err = conn.Exec(ctx, sb.String())
-				case "index-join", "scan":
+				case "index-join", "scan", "jsonb-contain", "text-search", "vector-knn":
 					q := "SELECT k, pad FROM " + scanTable
-					if workload == "index-join" {
+					switch workload {
+					case "text-search":
+						q = benchTextQuery(textTable, *textQuery, rng.Intn(*groups), rng.Intn(*preload))
+					case "vector-knn":
+						q = fmt.Sprintf("SELECT k FROM %s ORDER BY v <-> '%s' LIMIT 10", vecTable, benchVectorText(benchVectorQuery(rng, *seed, *groups, *dims)))
+					case "index-join":
 						q = fmt.Sprintf("SELECT k, pad FROM %s WHERE g = %d", ijTable, rng.Intn(*groups))
+					case "jsonb-contain":
+						q = fmt.Sprintf(`SELECT k FROM %s WHERE doc @> '{"tenant": %d}'`, jsonbTable, rng.Intn(*groups))
 					}
 					var n int64
 					var first time.Duration
@@ -650,7 +874,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	switch {
 	case ivalReport:
 		res.Rows = total * rowsPerOp
-	case workload == "index-join" || workload == "scan":
+	case workload == "index-join" || workload == "scan" || workload == "jsonb-contain" || workload == "text-search" || workload == "vector-knn":
 		res.Rows = rowsOut.Load()
 	}
 	if res.Rows > 0 {
@@ -754,6 +978,109 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		fmt.Printf("  record:     %s\n", *jsonOut)
 	}
 	return res, nil
+}
+
+// benchVectorAt is row j's vector: a point around one of `groups`
+// Gaussian centres, a function of the seed and j alone, so a table
+// loaded by one run is the table another run of the same seed expects.
+func benchVectorAt(seed, j int64, groups, dims int) []float32 {
+	if groups < 1 {
+		groups = 1
+	}
+	centre := rand.New(rand.NewSource(seed*1_000_003 + j%int64(groups)))
+	noise := rand.New(rand.NewSource(seed*7919 + j + 1<<40))
+	v := make([]float32, dims)
+	for i := range v {
+		v[i] = float32(centre.NormFloat64() + 0.6*noise.NormFloat64())
+	}
+	return v
+}
+
+// benchVectorQuery draws a query from the same distribution as the
+// rows: a fresh point around one of the centres.
+func benchVectorQuery(rng *rand.Rand, seed int64, groups, dims int) []float32 {
+	return benchVectorAt(seed, 1<<41+rng.Int63n(1<<40), groups, dims)
+}
+
+func benchVectorText(v []float32) string {
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, x := range v {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "%g", x)
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// benchVectorRecall measures recall@K of the run's query shape: each
+// query is answered as the workers will ask it and again with the
+// vector index switched off, which is the exact answer.
+func benchVectorRecall(ctx context.Context, conn *pgx.Conn, rec *benchVector, table string, seed int64, groups, probes int) error {
+	const queries = 100
+	ids := func(q string) (map[int64]bool, error) {
+		rows, err := conn.Query(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := map[int64]bool{}
+		for rows.Next() {
+			var k int64
+			if err := rows.Scan(&k); err != nil {
+				return nil, err
+			}
+			out[k] = true
+		}
+		return out, rows.Err()
+	}
+	if probes > 0 {
+		rec.Probes = fmt.Sprint(probes)
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET ivfflat.probes = %d", probes)); err != nil {
+			return err
+		}
+	} else if rec.Index != "none" {
+		rec.Probes = "auto"
+	}
+	rng := rand.New(rand.NewSource(seed + 304))
+	var sum float64
+	for i := 0; i < queries; i++ {
+		q := fmt.Sprintf("SELECT k FROM %s ORDER BY v <-> '%s' LIMIT %d", table, benchVectorText(benchVectorQuery(rng, seed, groups, rec.Dims)), rec.K)
+		if i == 0 {
+			if err := conn.QueryRow(ctx, "EXPLAIN "+q).Scan(&rec.Plan); err != nil {
+				return err
+			}
+		}
+		got, err := ids(q)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Exec(ctx, "SET vector_index_scan = off"); err != nil {
+			return err
+		}
+		want, err := ids(q)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Exec(ctx, "SET vector_index_scan = on"); err != nil {
+			return err
+		}
+		hit := 0
+		for k := range got {
+			if want[k] {
+				hit++
+			}
+		}
+		if len(want) > 0 {
+			sum += float64(hit) / float64(len(want))
+		} else {
+			sum++
+		}
+	}
+	rec.Recall, rec.RecallQueries = sum/queries, queries
+	return nil
 }
 
 // execRetrying runs a setup statement, retrying transient failures (a
@@ -955,11 +1282,28 @@ type benchSet struct {
 type benchSetEntry struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
+	// MaxErrors, when present, is this workload's error tolerance in
+	// place of the runner's --max-errors (-1: any count).
+	MaxErrors *int64 `json:"max_errors,omitempty"`
 }
 
 // runBenchSet runs every workload of a set against one cluster, writing
 // a JSON record per workload into --out.
 func runBenchSet(args []string) error {
+	return runBenchSetWith(args, runBenchWorkload)
+}
+
+// runBenchSetWith is runBenchSet over the given single-workload runner
+// (the tests substitute one that needs no cluster).
+//
+// Every workload runs, whatever the ones before it did: a set stopped at
+// its first bad workload leaves no record for the rest, and the night
+// that most needs comparing is the one with nothing to compare. The
+// verdict comes at the end — the runner fails if any workload did not
+// complete, or counted more errors in its measured run than its
+// tolerance (issue #267: a night with 80 routing errors in one workload
+// was green, because only a failed setup used to reach the exit status).
+func runBenchSetWith(args []string, run func([]string) (*benchResult, error)) error {
 	fs := flag.NewFlagSet("bench run", flag.ContinueOnError)
 	set := fs.String("set", "bench/workloads.json", "the workload set")
 	url := fs.String("url", "postgres://root@127.0.0.1:26433/datax?sslmode=disable", "database URL")
@@ -967,8 +1311,9 @@ func runBenchSet(args []string) error {
 	out := fs.String("out", "bench-results", "directory for the JSON records")
 	only := fs.String("only", "", "run only the workloads whose name contains this")
 	durationScale := fs.Float64("duration-scale", 1, "multiply every workload's --duration (a quick smoke run: 0.1)")
+	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc+`; a workload's "max_errors" in the set takes precedence`)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: datax bench run --set bench/workloads.json --url ... [--server-url ...] --out DIR\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: datax bench run --set bench/workloads.json --url ... [--server-url ...] --out DIR\n\nRuns every workload of the set, then exits non-zero if any did not complete or\ncounted more errors than its tolerance.\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -982,25 +1327,60 @@ func runBenchSet(args []string) error {
 	if err := json.Unmarshal(raw, &bs); err != nil {
 		return fmt.Errorf("%s: %v", *set, err)
 	}
+	// A malformed set is refused before anything runs, not discovered
+	// halfway through the night.
+	for _, w := range bs.Workloads {
+		if len(w.Args) == 0 {
+			return fmt.Errorf("workload %q has no args", w.Name)
+		}
+		for _, a := range w.Args {
+			if name, _, _ := strings.Cut(a, "="); name == "--max-errors" || name == "-max-errors" {
+				return fmt.Errorf("workload %q: set the tolerance with \"max_errors\" beside \"args\", not with --max-errors inside them", w.Name)
+			}
+		}
+	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
+	ran := 0
+	var failures []string
 	for _, w := range bs.Workloads {
 		if *only != "" && !strings.Contains(w.Name, *only) {
 			continue
 		}
-		if len(w.Args) == 0 {
-			return fmt.Errorf("workload %q has no args", w.Name)
-		}
+		ran++
 		wargs := append([]string{w.Args[0]}, "--url", *url, "--name", w.Name, "--json", filepath.Join(*out, w.Name+".json"))
 		if *serverURL != "" {
 			wargs = append(wargs, "--server-url", *serverURL)
 		}
 		wargs = append(wargs, scaleDurations(w.Args[1:], *durationScale)...)
 		fmt.Printf("\n=== %s: datax bench %s\n", w.Name, strings.Join(wargs, " "))
-		if _, err := runBenchWorkload(wargs); err != nil {
-			return fmt.Errorf("%s: %w", w.Name, err)
+		res, err := run(wargs)
+		if err != nil {
+			fmt.Printf("%s did not complete: %v\n", w.Name, err)
+			failures = append(failures, fmt.Sprintf("FAIL %s: did not complete: %v", w.Name, err))
+			continue
 		}
+		tolerance := *maxErrors
+		if w.MaxErrors != nil {
+			tolerance = *w.MaxErrors
+		}
+		if tolerance >= 0 && res.Errors > tolerance {
+			line := fmt.Sprintf("FAIL %s: %d errors (tolerance %d)", w.Name, res.Errors, tolerance)
+			if msg, n := topBenchError(res.ErrorSamples); n > 0 {
+				line += fmt.Sprintf("; most frequent, %d times: %s", n, msg)
+			}
+			failures = append(failures, line)
+		}
+	}
+	// The verdict is the run's last lines on purpose: the nightly's
+	// standing issue quotes the tail of the output.
+	fmt.Printf("\n=== bench run: %d of %d workloads clean (records in %s)\n", ran-len(failures), ran, *out)
+	for _, f := range failures {
+		fmt.Println(f)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d workloads failed", len(failures), ran)
 	}
 	return nil
 }
@@ -1150,4 +1530,48 @@ func loadBenchResults(path string) (map[string]*benchResult, error) {
 		out[r.Name] = &r
 	}
 	return out, nil
+}
+
+// benchTextFiller are the words that pad a text-search document; every
+// document draws from the same twenty, so none of them is selective.
+var benchTextFiller = []string{"quarterly", "figures", "were", "reviewed", "by", "the", "committee", "and", "found", "consistent",
+	"with", "earlier", "estimates", "although", "several", "regions", "reported", "delays", "in", "shipping"}
+
+// benchTextDocument is document j of the text-search corpus: sixteen
+// words. "topic<j mod groups>" selects preload/groups documents,
+// "serial<j>" one and "common" all of them; every document of a topic
+// holds "status" and the same "report<n>", half of them side by side
+// as a phrase and half apart.
+func benchTextDocument(j, groups int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "common topic%d serial%d", j%groups, j)
+	if j%2 == 0 {
+		fmt.Fprintf(&b, " status report%d", (j%groups)%97)
+	} else {
+		fmt.Fprintf(&b, " report%d filed status", (j%groups)%97)
+	}
+	for i := 0; i < 11; i++ {
+		b.WriteByte(' ')
+		b.WriteString(benchTextFiller[(j*7+i*3)%len(benchTextFiller)])
+	}
+	return b.String()
+}
+
+// benchTextQuery is one search of the text-search workload, for a topic
+// and a document number drawn at random.
+func benchTextQuery(table, kind string, topic, doc int) string {
+	const lhs = "to_tsvector('english', body)"
+	switch kind {
+	case "phrase":
+		// The topic narrows the lookup; the phrase is decided on the
+		// rows it returns, from their positions.
+		return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d & status <-> report%d')", table, lhs, topic, topic%97)
+	case "prefix":
+		// serial1234:* is serial1234, serial12340..12349, ...
+		return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'serial%d:*')", table, lhs, 1000+doc%9000)
+	case "ranked":
+		q := fmt.Sprintf("to_tsquery('english', 'topic%d | serial%d')", topic, doc)
+		return fmt.Sprintf("SELECT k, ts_rank(%s, %s) AS r FROM %s WHERE %s @@ %s ORDER BY r DESC LIMIT 10", lhs, q, table, lhs, q)
+	}
+	return fmt.Sprintf("SELECT k FROM %s WHERE %s @@ to_tsquery('english', 'topic%d')", table, lhs, topic)
 }

@@ -92,6 +92,9 @@ type Engine struct {
 	// (a split store's structural points, shutdown) is not the memtable
 	// rotation the flush-begin fault point means to catch.
 	explicitFlush atomic.Int32
+	// logGate is the file system the engine runs over; ScrubLogs uses it
+	// to keep marked write-ahead logs from being recycled (purge.go).
+	logGate *logGate
 	// prefixBloom: the engine runs the MVCC comparer and prefix bloom
 	// filters (Options.PrefixBloom, comparer.go).
 	prefixBloom bool
@@ -199,7 +202,8 @@ func Open(dir string, o Options) (*Engine, error) {
 			}
 		}
 	}
-	opts.FS = fs
+	e.logGate = newLogGate(fs, dir)
+	opts.FS = e.logGate
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		releaseCache()
@@ -278,6 +282,10 @@ func (e *Engine) Close() error {
 		}
 	}
 	err := e.db.Close()
+	if err == nil {
+		// Every file is closed: nothing reads through the data keys now.
+		e.encKeys.Release()
+	}
 	if e.cacheHeld {
 		e.cacheHeld = false
 		releaseCache()

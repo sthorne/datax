@@ -25,6 +25,33 @@ jobs:
       # "Code generated ... DO NOT EDIT." header staticcheck skips.
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+      # Every package but the in-process cluster tests, which run in the
+      # cluster job below.
+      - name: test
+        run: go test -race -timeout 30m $(go list ./... | grep -v '/pkg/testutils/testcluster$')
+
+  # The in-process cluster tests are most of the suite's time, and under
+  # the race detector one package outgrew the 30-minute limit. They run
+  # as two jobs side by side: one takes the tests named Test[A-L]..., the
+  # other skips exactly those, so every test runs once and a test added
+  # later lands in one of the two whatever its name.
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: a-l
+            select: -run '^Test[A-L]'
+          - shard: m-z
+            select: -skip '^Test[A-L]'
+    name: cluster (${{ matrix.shard }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       # DATAX_REQUIRE_BROWSER (issue #276): the console's browser test
       # skips where there is no Chrome, which is right on a laptop and
       # wrong here — the runner image ships one, and if that ever stops
@@ -32,4 +59,4 @@ jobs:
       - name: test
         env:
           DATAX_REQUIRE_BROWSER: "1"
-        run: go test -race -timeout 30m ./...
+        run: go test -race -timeout 30m ${{ matrix.select }} ./pkg/testutils/testcluster/

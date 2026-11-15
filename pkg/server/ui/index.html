@@ -190,9 +190,11 @@
      the table said it; the name was plain text, while the same range ids
      one table up, in the hotspots, were links. The cell that names the
      thing takes the link's colour and underline, and the row answers the
-     pointer. The row stays the control — one tab stop, with its role —
-     so this is how it looks, not a second link inside it. */
-  tr.clickable .opens { color: LinkText; text-decoration: underline; text-underline-offset: 2px; }
+     pointer. The row stays the control — one tab stop, with its role.
+     The name is a real link as well (issue #286), out of the tab order,
+     so a new tab and "copy link address" work on it; it keeps the one
+     colour visited or not, because the row is what was opened. */
+  tr.clickable .opens, tr.clickable .opens:visited { color: LinkText; text-decoration: underline; text-underline-offset: 2px; }
   tr.clickable:hover td { background: color-mix(in srgb, var(--series-1) 7%, transparent); }
   tr.fold td { background: color-mix(in srgb, var(--border) 22%, transparent); }
   /* The sort control (issue #282): a small button beside a header's
@@ -208,6 +210,13 @@
   th[aria-sort="ascending"] button.sort, th[aria-sort="descending"] button.sort { color: var(--text); }
   th[aria-sort="ascending"] button.sort::before { content: "↑"; }
   th[aria-sort="descending"] button.sort::before { content: "↓"; }
+  /* The same choice for the card layout (issue #289): under 640px the
+     tables drawn as cards have no header, so nothing to sort from. This
+     sits above the cards there and nowhere else. */
+  .cardsort { display: none; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 13px; color: var(--text-2); }
+  .cardsort select, .cardsort button { font: inherit; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); }
+  .cardsort select { min-width: 0; flex: 0 1 auto; }
+  .cardsort button:disabled { color: var(--text-3); }
   /* .linkish: a button that reads as a link — it acts in place rather
      than going somewhere. The class was on the ranges table's "show
      all" buttons with no rule behind it, so they were the browser's own
@@ -361,6 +370,7 @@
     .narrow-only { display: block; }
     table.cards, table.cards tbody, table.cards tr { display: block; }
     table.cards thead { display: none; }
+    .cardsort { display: flex; }
     table.cards tr { padding: 8px 12px; }
     table.cards tr + tr { border-top: 1px solid var(--border); }
     table.cards td { display: flex; justify-content: space-between; gap: 12px; white-space: normal; padding: 2px 0; border: 0 !important; text-align: left; }
@@ -405,6 +415,7 @@
   }
   .chart svg { display: block; width: 100%; height: auto; margin-top: 6px; }
   .chart .grid line { stroke: var(--border); stroke-width: 1; }
+  .chart .axis line { stroke: var(--text-3); stroke-width: 1; }
   .chart .axis text { fill: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
   .chart path.line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .chart .xhair { stroke: var(--text-3); stroke-width: 1; display: none; }
@@ -494,6 +505,14 @@
      table column no width. */
   .helpable { text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; cursor: help; }
   .helpable:hover { text-decoration-color: var(--series-1); }
+  /* A heading that also holds controls — a filter box, "copy as CSV" —
+     was underlined under the gaps between them: the decoration is the
+     whole element's, and the spaces between two controls are its text
+     (issue #289). There the underline is on the words alone, which
+     wireHelp wraps; the heading is still what a click on them reaches. */
+  .helpable.holds { text-decoration: none; }
+  .helpable.holds .helpwords { text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; }
+  .helpable.holds:hover .helpwords { text-decoration-color: var(--series-1); }
   #help-pop {
     position: absolute; z-index: 60; width: min(340px, calc(100vw - 16px));
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;

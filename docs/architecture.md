@@ -29,6 +29,15 @@ Raft group. The layout (see `pkg/keys`):
 | `/system/seqdesc/<seqID>`, `/system/seqns/<dbID>/<name>`, `/system/seq/<seqID>` | sequences (v7): descriptors, names per database, and each sequence's counter, advanced by non-transactional increments of one `CACHE` block at a time | range 1 |
 | `/t/<tableID>/<pk...>` | user table rows | user ranges |
 
+A row is one key and one value: every non-key column of the row is in
+that value (`docs/sql.md`, "Row encoding"), written, replicated and read
+as a unit. Nothing is stored out of line, so a row is as large as its
+largest column value, and the practical ceiling on a value is what one
+Raft proposal and one internode message can carry (see "Large objects"
+in `docs/sql.md`). Values meant to be larger than that are large
+objects: pages of 256 KiB, each an ordinary row of a system table under
+`/t/<1<<40 + 5>/...`.
+
 Range 1 initially spans the whole keyspace; splits carve off new ranges.
 Because all replicas of all ranges on a node share one Pebble store, and range
 membership of a key is purely logical (descriptor bounds), **splitting a range
@@ -101,6 +110,51 @@ These are the load-bearing rules; tests assert them.
    still equals its read timestamp; anything that bumps the write timestamp
    forces a retry (see [transactions.md](transactions.md)).
 
+## The catalog, and what its costs follow
+
+The catalog lives in range 1, and most of what reads it is meant to cost
+in proportion to what is asked for, not to the number of tables in the
+cluster (issue #311):
+
+- **Resolving a table** is four point reads cold (the database's name
+  and descriptor, the table's name, its descriptor) and none from a
+  gateway's cache.
+- **Listing a database's tables** (`catalog.Accessor.ListIn`: `SHOW
+  TABLES`, `DROP DATABASE`, `GRANT ... ON ALL TABLES`, `ANALYZE`, the
+  `pg_catalog` views) scans that database's names under
+  `/system/nsdb/<dbID>/` — plus the flat pre-v6 namespace for the
+  default database — and reads those descriptors in batched point
+  reads.
+- **Descriptor leases** follow the tables a gateway is using: an entry
+  unused for three lease TTLs is evicted and its lease deleted, and the
+  cache holds at most 1,024 descriptors (see
+  [sql.md](sql.md), "versions and leases").
+- **The console's schema document** is built when `/api/schema` (or a
+  page that needs it) is requested, cached for five seconds, and shared
+  by concurrent requests. No node builds it on a timer.
+- **Names for range labels, rendered keys, log lines and index-usage
+  series** come from a per-node cache of descriptors read by ID, holding
+  only the tables that node has been asked about.
+- **Placement** is a per-node map refreshed every few seconds from the
+  database descriptors and, for databases that carry a policy, the names
+  keyed under them; a cluster with no policy reads only the database
+  descriptors.
+
+What still reads every table descriptor: `catalog.Accessor.List`, used
+by `information_schema.tables`, `.columns` and `.views` (which list
+every database), role DDL that must find everything a role owns or is
+granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`), the dependent-view
+check on `DROP` and `ALTER`, `ALTER TYPE ... ADD VALUE` and `DROP TYPE`,
+`regclass` name resolution, a build of the schema document, and the
+table gauges (`table.rows`, `table.ranges`, `datax_table_*`), which the
+leader of range 1 reads once per recorder tick and any node reads when
+`/metrics` is scraped — a series per table costs a row per table.
+Backup, recovery and three background passes scan the descriptor span
+directly and are unchanged: the statistics refresher (every minute),
+the retention provider behind GC (every 30 s while GC asks) and the
+re-shard janitor (every minute). Sequences, types and roles are still
+listed whole by the catalog views.
+
 ## Versioning and rolling upgrades
 
 Each binary has an integer protocol version with a supported window
@@ -133,7 +187,49 @@ pre-v3 plan (an in-memory sort). The second is the ordered
 range-addressing repair (`UpdateMetaRequest`, introduced under **v4**):
 a v3 leader of the meta range does not know the request, so until v4 is
 finalized splits and merges repair `/meta` with the blind writes they
-always used.
+always used. The sticky bit of a manual split (**v20**) is gated the
+same way and for a second reason: besides a new request
+(`AdminUnsplitRequest`) it adds a field to the range descriptor and a
+trigger to the raft log, and a v19 replica applying either would end up
+with a different descriptor than its v20 peers — so until v20 is
+finalized no descriptor is written with the bit, manual splits are
+merged back like automatic ones, and unsplit is refused (see
+[replication-and-placement.md](replication-and-placement.md)). **v21**
+gates descriptor fields only — a table's GC window and its row expiry
+(`TableDescriptor.GCTTLSeconds`, `RowTTL`) — and the purge admin ops: a
+v20 node would act on such a table by the node's settings, and as a
+gateway would write the descriptor back without the fields, so the DDL
+and the purge are refused until finalize
+([transactions.md](transactions.md), "A window per table" and "Purge";
+[sql.md](sql.md), "Table options").
+
+Exports are the read a backup is made of (`ExportRequest`, evaluated by
+`storage.MVCCExport` as a consistent read at the backup's timestamp):
+for each key that changed in a window `(start, end]`, its newest version
+at `end`, tombstones included. With `AllRevisions` (**v21**) the same
+walk returns every version in the window, newest first within a key,
+each with its timestamp — what a backup with revision history stores and
+a point-in-time restore replays up to a chosen moment. A key's versions
+are never split across responses. The window is whole only while garbage
+collection has not passed its start, so a replica refuses an export
+whose start timestamp is below its GC threshold; that refusal, already
+there for incrementals (a collected tombstone is a missed deletion), is
+what keeps a history backup from being written with versions missing.
+The flag is gated like the others: a v20 replica would ignore it and
+answer with the newest versions only, which a backup would record as
+the whole history.
+
+A table restore into a running cluster writes through the ordinary
+transactional path, under table ids nothing names until one transaction
+publishes the descriptors; a replicated progress record
+(`/system/restore/<op>`, also **v21**) lets any node remove the rows of
+a restore whose node died (see `pkg/server/restore_table.go`).
+
+Large objects (**v21**) are three system tables at reserved ids and the
+`lo_*` functions over them; nothing below SQL is new. The gate exists
+for the tables: a v20 node knows nothing of the reservation, would
+treat them as ordinary tables their owner may write, and could delete
+pages out from under an object.
 
 ## Modules
 

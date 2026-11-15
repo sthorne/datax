@@ -20,6 +20,11 @@ func TestProfileOptions(t *testing.T) {
 		gate.debtHigh != 2<<30 || gate.debtLow != 1<<30 {
 		t.Fatalf("balanced gate: %+v", gate)
 	}
+	// The one option balanced does set: L0 compactions by file count must
+	// start below the gate's file count, or the gate is never left.
+	if balanced.L0CompactionFileThreshold <= 0 || balanced.L0CompactionFileThreshold >= gate.l0Files {
+		t.Fatalf("balanced: L0 compactions start at %d files, the gate sheds writes at %d", balanced.L0CompactionFileThreshold, gate.l0Files)
+	}
 
 	var ingest pebble.Options
 	gate = ProfileIngest.apply(&ingest)
@@ -170,5 +175,48 @@ func TestStorageMetricsLive(t *testing.T) {
 	}
 	if over, why := e.Overloaded(); over {
 		t.Fatalf("tiny engine overloaded: %s", why)
+	}
+}
+
+// TestSequentialFlushesDrainL0: a stream of writes in key order, flushed
+// often, leaves L0 files that do not overlap — one sublevel however
+// many there are, so only the file count can ask for a compaction. The
+// count must be drained before it reaches the write-shedding gate;
+// before the threshold was set below the gate, the store sat at the
+// gate for good (issue #303: a large object's pages are such a stream).
+func TestSequentialFlushesDrainL0(t *testing.T) {
+	e, err := Open("", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+	gate := e.health.gate.l0Files
+	val := make([]byte, 4<<10)
+	peak := int64(0)
+	for i := 0; i < gate+gate/4; i++ {
+		key := []byte{'s', byte(i >> 16), byte(i >> 8), byte(i)}
+		if err := e.Put(key, val); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if n := e.db.Metrics().Levels[0].TablesCount; n > peak {
+			peak = n
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		n := e.db.Metrics().Levels[0].TablesCount
+		if n < int64(gate)/2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("L0 holds %d files (peak %d) and is not draining; the gate is at %d", n, peak, gate)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if peak >= int64(gate) {
+		t.Fatalf("L0 reached %d files, at or past the gate (%d), before a compaction took them", peak, gate)
 	}
 }

@@ -177,9 +177,109 @@ const (
 	// and would treat them as ordinary user tables, so nothing creates
 	// them before finalize (rule 4).
 	V19 Version = 19
+	// V20 introduces sticky range boundaries (issues #265, #290): a
+	// range descriptor may record that its start boundary was set on
+	// purpose (kvpb.RangeDescriptor.StickyUntil), which the merge queue
+	// honours, and two things travel to carry it — a descriptor-update
+	// trigger in the raft log and kvpb.AdminUnsplitRequest. A v19 replica
+	// drops the field from a split trigger and ignores the new trigger
+	// outright, so its copy of the descriptor would differ from a v20
+	// replica's; a v19 leader would merge the range back. Until finalize,
+	// therefore, a manual split is an ordinary one and UNSPLIT is refused
+	// (rule 4). The field itself is omitempty, so a descriptor written
+	// before v20 reads the same at either version.
+	V20 Version = 20
+	// V21 introduces the datax_audit system table (issue #293, see
+	// pkg/sql/catalog.AuditTableName): every node's hash-chained audit
+	// records, readable over SQL and writable by nobody. A v20 node
+	// knows nothing of the reservation and would treat the table as an
+	// ordinary one — its owner could delete from it or drop it, which
+	// is exactly what the table exists to rule out — so nothing creates
+	// it and audit records stay in the log alone before finalize
+	// (rule 4).
+	//
+	// V21 also introduces three table options and a purge (issues #295, #298):
+	// a per-table GC window (TableDescriptor.GCTTLSeconds), row expiry
+	// (TableDescriptor.RowTTL) and the purge admin ops. A v20 node reads
+	// the descriptor without the fields, so as a range's leader it would
+	// collect a table's history at the cluster's window rather than the
+	// table's, as the range-1 leader it would expire nothing, and as a
+	// gateway it would drop both fields from the next descriptor it
+	// rewrote; it answers a purge step with "unknown admin op". The DDL
+	// that writes either field and the purge are therefore refused until
+	// finalize (rule 4). The fields are omitempty, so a descriptor
+	// written before v21 reads the same at either version.
+	//
+	// V21 also introduces inverted indexes (issue #300, pkg/sql/inverted): an
+	// index descriptor may name an inverted kind
+	// (catalog.IndexDescriptor.Inverted), and such an index holds one
+	// entry per element of the indexed value rather than one per row. The
+	// field is omitempty, so every descriptor written before reads the
+	// same; but a v20 node drops the field it does not know and would
+	// maintain and read the index as an ordinary one over a column type
+	// it cannot key. CREATE INDEX ... USING GIN is therefore refused
+	// until finalize (rule 4).
+	//
+	// V21 also introduces full-text search (issue #299, pkg/sql/tsearch):
+	// the column types TSVECTOR and TSQUERY (two new types.Family values
+	// and two new row value tags) and three more inverted kinds — one over
+	// a tsvector column, and one per text-search configuration over the
+	// lexemes of a text column. No descriptor field is new: the types are
+	// new values of a column's type and the kinds new values of
+	// IndexDescriptor.Inverted. A v20 node cannot decode a row holding
+	// either type and knows none of the kinds, so a statement that would
+	// give a table a column of either type is refused until finalize, as
+	// CREATE INDEX ... USING GIN already is (rule 4). The functions and
+	// the @@ operator write nothing and need no gate.
+	//
+	// V21 also introduces two things backups and restores rely on (issues
+	// #301, #302). Exports of every revision
+	// (kvpb.ExportRequest.AllRevisions): a v20 replica does not read the
+	// flag and answers with the newest version of each key, which a
+	// backup would then record as the whole history of its window, so a
+	// backup with revision history is refused until finalize. And the
+	// progress record of a table restore (keys.RestoreProgressKey), which
+	// every node's janitor reads to reclaim the rows of a restore whose
+	// node died: a v20 node knows nothing of the record and would leave
+	// them, so restoring a table into a running cluster is refused until
+	// finalize too (rule 4).
+	//
+	// V21 also introduces row-level security (issue #294): a table
+	// descriptor may carry RowSecurity, ForceRowSecurity and Policies, and
+	// a role descriptor BypassRLS. The fields are omitempty, so every
+	// descriptor written before reads the same; but a v20 gateway drops
+	// the fields it does not know and would serve every row of a
+	// protected table to a role its policies confine, and would write the
+	// descriptor back without them. ENABLE and FORCE ROW LEVEL SECURITY,
+	// CREATE and ALTER POLICY and the BYPASSRLS role attribute are
+	// therefore refused until finalize (rule 4).
+	//
+	// V21 also introduces large objects (issue #303, pkg/sql/largeobject.go):
+	// three more system tables (pkg/sql/catalog.LargeObjectTableName and
+	// its two companions) holding objects cut into pages, behind
+	// PostgreSQL's lo_* functions. Nothing below SQL changes — a page is
+	// an ordinary row — so the gate is the one every system table has: a
+	// v20 node knows nothing of the reservations and would treat the
+	// tables as ordinary ones, whose owner may delete rows, which here are
+	// pages of somebody's object. Nothing creates the tables and the
+	// functions are refused until finalize (rule 4).
+	//
+	// V21 also introduces the VECTOR column type and its index (issue #304,
+	// pkg/sql/vector). A column of the new type family has a row-value
+	// tag of its own, which a v20 node meets as a corrupt row; and an
+	// index descriptor may describe a vector index
+	// (catalog.IndexDescriptor.Vector), whose entries are keyed by the
+	// list a row's vector is filed under and whose centres live beside
+	// the table's indexes (keys.VectorCentroidPrefix). A v20 node drops
+	// the field and would maintain the index as an ordinary one over a
+	// type it cannot key. A VECTOR column and CREATE INDEX ... USING
+	// ivfflat are therefore refused until finalize (rule 4). The field is
+	// omitempty and the family is appended, so every descriptor written
+	// before reads the same.
+	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.
-	Current = V19
+	Current = V21
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

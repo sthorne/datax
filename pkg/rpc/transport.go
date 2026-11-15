@@ -444,6 +444,30 @@ func snapshotSendError(stream rpcpb.Internode_SnapshotClient, err error) error {
 	return fmt.Errorf("receiver ended the snapshot stream before it was complete")
 }
 
+// Admin performs an admin RPC against a node over the cached connection
+// to it — the path for calls made often enough (notification fan-out)
+// that Call's connection per call would be the cost. It honours the
+// partition hook, as the other traffic to a node does.
+func (t *Transport) Admin(ctx context.Context, to base.NodeID, req, resp any) error {
+	if t.dropTo(to) {
+		return fmt.Errorf("to n%d: injected partition", to)
+	}
+	cc, err := t.Dial(to)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	out, err := rpcpb.NewInternodeClient(cc).Admin(ctx, &rpcpb.Payload{Json: data, Now: t.now()})
+	if err != nil {
+		return err
+	}
+	t.updateClock(out.Now)
+	return json.Unmarshal(out.Json, resp)
+}
+
 // Call performs a unary JSON RPC (join/admin) against an address.
 func (t *Transport) Call(ctx context.Context, addr string, method string, req, resp any) error {
 	cc, err := DialAddr(addr, t.tlsCfg)

@@ -9,6 +9,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -26,7 +27,8 @@ type colBound struct {
 // equality-pinned column + 1 point for a range on the next column, ties
 // preferring the primary key) > full scan. With statistics (ANALYZE or
 // the background sampler), competing constrained scans and the full scan
-// are ranked by estimated cost instead — see pickPlanWithStats.
+// are ranked by estimated cost instead — see pickPlanWithStats. Where a
+// scan of an inverted index fits in is said at pickPlanMode.
 type accessPlan struct {
 	kind    planKind
 	idx     *catalog.IndexDescriptor
@@ -64,6 +66,17 @@ type accessPlan struct {
 	// after limit rows instead of concatenating whole buckets.
 	reverse  bool
 	mergeFan bool
+
+	// top, also stamped by execSelect, asks the fetch to return only
+	// the rows that sort first under the query's ORDER BY, up to its
+	// LIMIT: by a top-k scan of the plan's span, or through a vector
+	// index. See topk.go.
+	top *topKSpec
+
+	// inv (planInvertedScan) is what the WHERE clause says about the
+	// inverted index's column: the element lookups whose result contains
+	// every matching row. See inverted_scan.go.
+	inv *inverted.Expr
 }
 
 type planKind int
@@ -74,6 +87,9 @@ const (
 	planUniquePoint
 	planIndexScan
 	planPKScan // primary-key prefix/range scan (no join needed)
+	// planInvertedScan reads row references out of an inverted index,
+	// fetches the rows and rechecks each against the WHERE clause.
+	planInvertedScan
 )
 
 // hasBounds reports whether the plan carries a range constraint.
@@ -129,6 +145,8 @@ func (p accessPlan) String() string {
 			out += fmt.Sprintf(" (fan-out over %d shard buckets)", p.fanBuckets)
 		}
 		return out
+	case planInvertedScan:
+		return invertedPlanString(p)
 	case planIndexScan:
 		if p.hasBounds() {
 			return fmt.Sprintf("scan of index %q (%s) + primary key join", p.idx.Name, p.boundsString())
@@ -276,6 +294,18 @@ const (
 // (estimated rows × per-row cost) instead of the structural score, and a
 // low-selectivity index scan loses to the full scan it would out-fetch.
 func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum) (accessPlan, error) {
+	return pickPlanMode(desc, st, where, params, invertedAuto)
+}
+
+// pickPlanMode is pickPlanWithStats under an inverted_index_scan
+// setting. Where an inverted index ranks: below both point lookups
+// always. Without statistics, below a scan that pins a key column by
+// equality and above everything else — a range alone or a full scan —
+// since a containment or key test is usually the selective part of the
+// clause it appears in. With statistics, by estimated cost like any
+// other index scan, at a fixed assumed selectivity.
+func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, where []parser.Comparison, params []types.Datum, mode invertedMode) (accessPlan, error) {
+	userWhere := where
 	where = withLikeBounds(where)
 	if pkVals, ok, err := pkPointValues(desc, where, params); err != nil {
 		return accessPlan{}, err
@@ -304,9 +334,10 @@ func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistic
 			continue
 		}
 		switch cmp.Op {
-		// Any other operator — including JSONB containment @>/NOT @> — is
-		// structurally unusable for key bounds and runs as a post-fetch
-		// filter (no inverted indexes).
+		// Any other operator is structurally unusable for key bounds and
+		// runs as a post-fetch filter. (JSONB containment and key
+		// existence can be served by an inverted index instead: see
+		// pickInverted.)
 		case "=", "<", "<=", ">", ">=":
 			// A value that cannot be evaluated without a row (a column
 			// reference on the right-hand side) is simply unusable for
@@ -352,7 +383,7 @@ func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistic
 	// Unique index fully pinned by equality → point lookup.
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
-		if !idx.Public() || !idx.Unique {
+		if !idx.Public() || !idx.Unique || idx.IsInverted() {
 			continue
 		}
 		vals := make([]types.Datum, 0, len(idx.ColumnIDs))
@@ -478,6 +509,14 @@ func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistic
 		if !idx.Public() {
 			continue // write-only: maintained, but not readable yet
 		}
+		if idx.IsInverted() {
+			continue // no key order to bound; considered below
+		}
+		if idx.IsVector() {
+			// Keyed by list, not by value: it serves ORDER BY distance
+			// (pickVectorIndex), never a WHERE clause.
+			continue
+		}
 		if !idx.Unique {
 			// A non-unique index has no entry for rows with a NULL in ANY
 			// indexed column: it is a complete row source only when every
@@ -507,6 +546,34 @@ func pickPlanWithStats(desc *catalog.TableDescriptor, st *catalog.TableStatistic
 		// (the PK candidate came first — no index→PK join on a tie).
 		if cand.score > 0 && (best.score == 0 || costFor(cand) < bestCost) {
 			best, bestCost = cand, costFor(cand)
+		}
+	}
+
+	if mode != invertedOff {
+		idx, inv, err := pickInverted(desc, userWhere, params)
+		if err != nil {
+			return accessPlan{}, err
+		}
+		if idx != nil {
+			// Nothing is guaranteed by the lookups: every conjunct stays
+			// residual, so no limit is pushed below the recheck.
+			plan := accessPlan{kind: planInvertedScan, idx: idx, inv: inv, residual: userWhere}
+			use := mode == invertedOn
+			switch {
+			case use:
+			case st == nil:
+				use = best.score < 2
+			default:
+				plan.estRows = tableRows * invertedSelectivity
+				if plan.estRows < 1 {
+					plan.estRows = 1
+				}
+				cost := plan.estRows * indexJoinCostMultiplier
+				use = cost < tableRows && (best.score == 0 || cost < bestCost)
+			}
+			if use {
+				return plan, nil
+			}
 		}
 	}
 
@@ -602,30 +669,64 @@ func (s *Session) fetchByPrimaryKey(ctx context.Context, txn *kvclient.Txn, desc
 // Index maintenance. All entries ride the statement's WriteBatch, so index
 // and row mutations commit atomically with the transaction.
 
-// reshardMirrorIndex applies the shadow-layout mirror of one index-entry
-// mutation during a re-shard's dual-write window: the same entry encoded
-// at the index's shadow ID from shadowRow (which carries the new bucket
-// in its hidden shard column). shadowRow == nil means no re-shard is
-// pending — a no-op. Mirrors carry no uniqueness checks of their own:
-// they duplicate the live copy, whose checks already ran.
-func reshardMirrorIndex(desc *catalog.TableDescriptor, i int, shadowRow map[catalog.ColumnID]types.Datum, del bool, wb *kvclient.WriteBatch) error {
+// invertedEntryErr turns a failure to list a row's inverted-index
+// entries into the statement's error: the one a user can cause is a
+// document with more elements than an index holds for one row.
+func invertedEntryErr(idx *catalog.IndexDescriptor, err error) error {
+	if idx.IsInverted() {
+		return newErrf(CodeProgramLimitExceeded, "index %q: %v", idx.Name, err)
+	}
+	return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+}
+
+// reshardMirrorEntries returns the shadow-layout copies of a row's
+// entries in index i during a re-shard's dual-write window: the same
+// entries encoded at the index's shadow ID from shadowRow (which carries
+// the new bucket in its hidden shard column). shadowRow == nil means no
+// re-shard is pending — none. Mirrors carry no uniqueness checks of
+// their own: they duplicate the live copy, whose checks already ran.
+func reshardMirrorEntries(desc *catalog.TableDescriptor, i int, shadowRow map[catalog.ColumnID]types.Datum) ([]rowenc.IndexEntry, error) {
 	if shadowRow == nil || desc.Reshard == nil || i >= len(desc.Reshard.NewIndexIDs) {
-		return nil
+		return nil, nil
 	}
 	idx := &desc.Indexes[i]
-	key, val, skip, err := rowenc.EncodeIndexEntryAt(desc, idx, desc.Reshard.NewIndexIDs[i], shadowRow)
+	entries, err := rowenc.IndexEntriesAt(desc, idx, desc.Reshard.NewIndexIDs[i], shadowRow)
 	if err != nil {
-		return newErrf(CodeInternal, "re-shard mirror of index %q: %v", idx.Name, err)
+		return nil, newErrf(CodeInternal, "re-shard mirror of index %q: %v", idx.Name, err)
 	}
-	if skip {
-		return nil
+	return entries, nil
+}
+
+// entryDiff splits two entry lists, each sorted by key with distinct
+// keys, into the entries only the old one has and the entries only the
+// new one has. An ordinary index has at most one entry per row, so this
+// is "did the entry move"; an inverted index has one per element, and
+// an UPDATE that changes one field of a document touches only the
+// entries of that field. An entry whose key stays but whose value
+// changes — a vector index's entry carries the row's vector, and a new
+// vector is often filed under the same list — is written again: it
+// counts as added, and the write replaces what is there.
+func entryDiff(old, new []rowenc.IndexEntry) (removed, added []rowenc.IndexEntry) {
+	i, j := 0, 0
+	for i < len(old) && j < len(new) {
+		switch c := bytes.Compare(old[i].Key, new[j].Key); {
+		case c == 0:
+			if !bytes.Equal(old[i].Value, new[j].Value) {
+				added = append(added, new[j])
+			}
+			i++
+			j++
+		case c < 0:
+			removed = append(removed, old[i])
+			i++
+		default:
+			added = append(added, new[j])
+			j++
+		}
 	}
-	if del {
-		wb.Delete(key)
-	} else {
-		wb.Put(key, val)
-	}
-	return nil
+	removed = append(removed, old[i:]...)
+	added = append(added, new[j:]...)
+	return removed, added
 }
 
 // addIndexEntries buffers the row's entries in every secondary index.
@@ -639,17 +740,18 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
-		key, val, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+		entries, err := rowenc.IndexEntries(desc, idx, row)
 		if err != nil {
-			return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+			return invertedEntryErr(idx, err)
 		}
-		if skip {
+		if len(entries) == 0 {
 			if idx.Unique {
 				return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
 			}
 			continue
 		}
 		if idx.Unique {
+			key := entries[0].Key
 			if seen[string(key)] {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
@@ -660,9 +762,15 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			}
 			seen[string(key)] = true
 		}
-		wb.Put(key, val)
-		if err := reshardMirrorIndex(desc, i, shadowRow, false, wb); err != nil {
+		for _, e := range entries {
+			wb.Put(e.Key, e.Value)
+		}
+		mirror, err := reshardMirrorEntries(desc, i, shadowRow)
+		if err != nil {
 			return err
+		}
+		for _, e := range mirror {
+			wb.Put(e.Key, e.Value)
 		}
 	}
 	return nil
@@ -676,23 +784,31 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
-		key, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
+		entries, err := rowenc.IndexEntries(desc, idx, row)
 		if err != nil {
-			return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+			return invertedEntryErr(idx, err)
 		}
-		if !skip {
-			wb.Delete(key)
-			if err := reshardMirrorIndex(desc, i, shadowRow, true, wb); err != nil {
-				return err
-			}
+		if len(entries) == 0 {
+			continue
+		}
+		for _, e := range entries {
+			wb.Delete(e.Key)
+		}
+		mirror, err := reshardMirrorEntries(desc, i, shadowRow)
+		if err != nil {
+			return err
+		}
+		for _, e := range mirror {
+			wb.Delete(e.Key)
 		}
 	}
 	return nil
 }
 
-// updateIndexEntries buffers the delete-old/put-new pair for every index
-// whose entry changed between oldRow and newRow (the primary key is
-// immutable under UPDATE, so only indexed-column changes move entries).
+// updateIndexEntries buffers, for every index, the deletion of the
+// entries only oldRow has and the write of the entries only newRow has
+// (the primary key is immutable under UPDATE, so only indexed-column
+// changes move entries).
 func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool, ps *probeSet) error {
 	shadowOld, serr := reshardShadowRow(desc, oldRow)
 	if serr != nil {
@@ -704,45 +820,67 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
-		oldKey, _, oldSkip, err := rowenc.EncodeIndexEntry(desc, idx, oldRow)
-		if err != nil {
-			return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+		if idx.IsVector() && len(idx.ColumnIDs) == 1 {
+			// Filing a vector compares it with every centre. An UPDATE
+			// that leaves the vector alone leaves its entry alone, and
+			// need not work out twice where that entry is.
+			o, n := oldRow[idx.ColumnIDs[0]], newRow[idx.ColumnIDs[0]]
+			if o.Null == n.Null && o.Fam == n.Fam && o.S == n.S {
+				continue
+			}
 		}
-		newKey, newVal, newSkip, err := rowenc.EncodeIndexEntry(desc, idx, newRow)
+		oldEntries, err := rowenc.IndexEntries(desc, idx, oldRow)
 		if err != nil {
-			return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+			return invertedEntryErr(idx, err)
 		}
-		if newSkip && idx.Unique {
+		newEntries, err := rowenc.IndexEntries(desc, idx, newRow)
+		if err != nil {
+			return invertedEntryErr(idx, err)
+		}
+		if len(newEntries) == 0 && idx.Unique {
 			return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
 		}
-		if !oldSkip && !newSkip && bytes.Equal(oldKey, newKey) {
-			// Entry unchanged. The shadow entry is unchanged too: the
-			// indexed columns and the (immutable-under-UPDATE) primary key
-			// are what both keys encode.
+		removed, added := entryDiff(oldEntries, newEntries)
+		if len(removed) == 0 && len(added) == 0 {
+			// Entries unchanged. The shadow entries are unchanged too:
+			// the indexed columns and the (immutable-under-UPDATE)
+			// primary key are what both layouts' keys encode.
 			continue
 		}
-		if !oldSkip {
-			wb.Delete(oldKey)
-			if err := reshardMirrorIndex(desc, i, shadowOld, true, wb); err != nil {
-				return err
-			}
+		for _, e := range removed {
+			wb.Delete(e.Key)
 		}
-		if !newSkip {
-			if idx.Unique {
-				if seen[string(newKey)] {
-					return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
-				}
-				if existing, err := ps.get(ctx, txn, newKey); err != nil {
-					return err
-				} else if existing != nil {
-					return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
-				}
-				seen[string(newKey)] = true
+		if idx.Unique && len(added) > 0 {
+			newKey := added[0].Key
+			if seen[string(newKey)] {
+				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
-			wb.Put(newKey, newVal)
-			if err := reshardMirrorIndex(desc, i, shadowNew, false, wb); err != nil {
+			if existing, err := ps.get(ctx, txn, newKey); err != nil {
 				return err
+			} else if existing != nil {
+				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
+			seen[string(newKey)] = true
+		}
+		for _, e := range added {
+			wb.Put(e.Key, e.Value)
+		}
+		// The shadow layout takes the same difference, computed over its
+		// own keys.
+		mirrorOld, err := reshardMirrorEntries(desc, i, shadowOld)
+		if err != nil {
+			return err
+		}
+		mirrorNew, err := reshardMirrorEntries(desc, i, shadowNew)
+		if err != nil {
+			return err
+		}
+		mirrorRemoved, mirrorAdded := entryDiff(mirrorOld, mirrorNew)
+		for _, e := range mirrorRemoved {
+			wb.Delete(e.Key)
+		}
+		for _, e := range mirrorAdded {
+			wb.Put(e.Key, e.Value)
 		}
 	}
 	return nil

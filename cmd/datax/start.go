@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage"
+	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
 	pversion "github.com/sthorne/datax/pkg/version"
 )
@@ -32,6 +33,9 @@ type serverFlags struct {
 	profile       string
 	cacheSize     string
 	encKeyPath    string
+	encRoot       string
+	allowDumps    bool
+	requireLocked bool
 	acceptEncRB   bool
 	loadSplit     float64
 	mergeThr      int64
@@ -45,6 +49,7 @@ type serverFlags struct {
 	authTimeout   time.Duration
 	maxPending    int
 	metricsRecord time.Duration
+	auditTable    bool
 	drainTimeout  time.Duration
 }
 
@@ -64,6 +69,9 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.cacheSize, "cache-size", "", "block cache size, e.g. 2GiB or 512MB (default: the profile's share of memory — 25% capped at 8GiB for balanced, 10% capped at 2GiB for ingest)")
 	f.fs.BoolVar(&f.acceptEncRB, "accept-encryption-rollback", false, "start a store whose switch to authenticated encryption was rolled back (its key registry or the whole store restored from before the switch), lowering the records that caught the rollback to what the store has; for the one start after a rollback that was meant")
 	f.fs.StringVar(&f.encKeyPath, "enc-key", "", "file holding the 32-byte store encryption key (raw or hex); enables encryption at rest (empty = plaintext). A comma-separated list is tried in order against the store, so a new key can be staged beside the current one before an online rotation")
+	f.fs.BoolVar(&f.allowDumps, "allow-core-dumps", false, "encrypted node: leave the process dumpable. By default a node with --enc-key or --enc-root sets its core-file limit to zero and marks itself not dumpable, because a core dump holds its keys")
+	f.fs.BoolVar(&f.requireLocked, "require-locked-keys", false, "encrypted node: refuse to start unless key memory could be locked against swap and left out of core dumps (by default that is a warning with the remedy)")
+	f.fs.StringVar(&f.encRoot, "enc-root", "", "the alternative to --enc-key: what the store key is kept under, file:<path> (a 32-byte wrapping key), exec:<command> (run with wrap, unwrap or key-id), shares (a root key split among operators: the node starts sealed until enough run `datax unseal`), or a key management service spoken to directly: vault:<address>/<mount>/<key>, awskms:<key arn>, gcpkms:projects/.../cryptoKeys/<key> or azurekv:<vault>/<key>[/<version>], each taking options as ?name=value&name=value (credentials are never options: they are files the options name, or come from the environment or the instance's identity); see docs/encryption.md. A node whose KMS cannot be reached does not start. The store key is made on the node and kept in the data directory only wrapped. A comma-separated list names candidates; the one that wrapped the store's key is used")
 	f.fs.Float64Var(&f.loadSplit, "load-split-threshold", 0, "sustained per-range QPS that triggers a load-based split (0 = default 500, negative = disabled)")
 	f.fs.IntVar(&f.raftWorkers, "raft-workers", 0, "workers driving this node's raft groups (0 = one per CPU)")
 	f.fs.BoolVar(&f.quiescence, "raft-quiescence", true, "let idle ranges stop ticking and heartbeating (cluster version v12)")
@@ -75,6 +83,7 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication, HTTP request headers) before it is closed (0 = default 60s, negative = never)")
 	f.fs.IntVar(&f.maxPending, "sql-max-pending-auth", 0, "maximum SQL connections in the pre-authentication state; past it new connections are refused rather than held (0 = default 512, negative = no cap). Also the widest burst of concurrent password guesses one address can land at once, every one of which is charged: raising it past 600 lengthens how long a guessing address is held afterwards, and removing it removes that bound")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
+	f.fs.BoolVar(&f.auditTable, "audit-table", true, "also write this node's audit records to the datax_audit table (false: they are in its log only)")
 	f.fs.DurationVar(&f.drainTimeout, "drain-timeout", server.DefaultDrainTimeout, "on SIGTERM or Ctrl-C, how long to spend handing leases to peers and letting SQL connections finish before stopping (0 stops at once)")
 	f.fs.BoolVar(&f.verbose, "v", false, "verbose (debug) logging")
 	return f
@@ -98,6 +107,9 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		StorageProfile:           prof,
 		StorageCacheSize:         cacheSize,
 		EncKeyPath:               f.encKeyPath,
+		EncRoot:                  f.encRoot,
+		RequireLockedKeys:        f.requireLocked,
+		AllowCoreDumps:           f.allowDumps,
 		AcceptEncryptionRollback: f.acceptEncRB,
 		LoadSplitThreshold:       f.loadSplit,
 		MergeSizeThreshold:       f.mergeThr,
@@ -109,6 +121,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		AuthTimeout:              f.authTimeout,
 		SQLMaxPendingAuth:        f.maxPending,
 		MetricsRecordInterval:    metricsRecordInterval(f.metricsRecord),
+		AuditFlushInterval:       auditFlushInterval(f.auditTable),
 		DrainTimeout:             f.drainTimeout,
 		RebalanceBytesThreshold:  f.bytesThr,
 		Dir:                      f.dir,
@@ -152,6 +165,15 @@ func parseBytes(s string) (int64, error) {
 	return int64(n * m), nil
 }
 
+// auditFlushInterval maps --audit-table onto the config's convention
+// (0 = the default pace, negative = off).
+func auditFlushInterval(on bool) time.Duration {
+	if on {
+		return 0
+	}
+	return -1
+}
+
 // metricsRecordInterval maps the flag (0 = off) onto the config's
 // convention (negative = off, 0 = default).
 func metricsRecordInterval(d time.Duration) time.Duration {
@@ -162,6 +184,18 @@ func metricsRecordInterval(d time.Duration) time.Duration {
 }
 
 func runServer(cfg server.Config) error {
+	if (cfg.EncKeyPath != "" || cfg.EncRoot != "") && !cfg.AllowCoreDumps {
+		// Before any key is read: a dump of this process would hold them.
+		if err := enc.DisableCoreDumps(); err != nil {
+			if cfg.RequireLockedKeys {
+				return fmt.Errorf("--require-locked-keys: core dumps could not be disabled: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "warning: core dumps could not be disabled (%v); a dump of this process would hold its keys\n", err)
+		}
+	}
+	cfg.OnSealed = func(addr string) {
+		fmt.Printf("datax node is SEALED: its store key is under a root key held as shares, and the store stays closed until enough are submitted\n  submit a share: datax unseal --addr %s\n  progress:       datax debug seal-status --addr %s\n", addr, addr)
+	}
 	n, err := server.Start(cfg)
 	if err != nil {
 		return err

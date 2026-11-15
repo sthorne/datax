@@ -11,6 +11,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -61,6 +62,9 @@ type RowStream struct {
 	cols   []ResultColumn
 
 	iter *scanIter
+	// notifs are the notifications the statement recorded (pg_notify),
+	// published when the stream's implicit transaction commits.
+	notifs []notify.Notification
 	// rows serves a materialized result through the stream interface
 	// (a restart whose re-execution did not stream).
 	rows [][]types.Datum
@@ -186,6 +190,10 @@ func (st *RowStream) finish(ctx context.Context) error {
 			st.err = err
 			return err
 		}
+		if st.s.notify.hub != nil {
+			st.s.notify.hub.Publish(st.notifs)
+		}
+		st.notifs = nil
 	}
 	return nil
 }
@@ -227,8 +235,10 @@ func (st *RowStream) restart(ctx context.Context) error {
 		}
 		st.txn = next
 		st.s.streamTop = true
+		st.s.discardNotify() // the statement starts over
 		res, err := st.s.execStmt(ctx, next, st.stmt, st.params)
 		st.s.streamTop = false
+		st.notifs = st.s.takeNotify()
 		if err != nil {
 			if kvclient.IsRetryable(err) && ctx.Err() == nil && st.attempt < 20 {
 				continue
@@ -249,6 +259,10 @@ func (st *RowStream) restart(ctx context.Context) error {
 				return err
 			}
 			st.txn = nil
+			if st.s.notify.hub != nil {
+				st.s.notify.hub.Publish(st.notifs)
+			}
+			st.notifs = nil
 		}
 		return nil
 	}

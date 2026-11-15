@@ -115,10 +115,14 @@ func (p *parser) parseRoleStmt(alter bool) (Statement, error) {
 				return nil, err
 			}
 			cr.InRoles = append(cr.InRoles, roles...)
-		case "nosuperuser", "nocreatedb", "nocreaterole", "noreplication", "nobypassrls":
+		case "bypassrls":
+			set(&cr.BypassRLS, true)
+		case "nobypassrls":
+			set(&cr.BypassRLS, false)
+		case "nosuperuser", "nocreatedb", "nocreaterole", "noreplication":
 			// The defaults, which tools spell out; nothing to record.
-		case "superuser", "createdb", "createrole", "replication", "bypassrls", "connection", "valid", "sysid", "role", "admin":
-			return nil, p.errf("role option %s is not supported (roles: LOGIN, NOLOGIN, PASSWORD, INHERIT, NOINHERIT, IN ROLE)", strings.ToUpper(word))
+		case "superuser", "createdb", "createrole", "replication", "connection", "valid", "sysid", "role", "admin":
+			return nil, p.errf("role option %s is not supported (roles: LOGIN, NOLOGIN, PASSWORD, INHERIT, NOINHERIT, BYPASSRLS, NOBYPASSRLS, IN ROLE)", strings.ToUpper(word))
 		default:
 			return nil, p.errf("unexpected %q in role options", t.text)
 		}

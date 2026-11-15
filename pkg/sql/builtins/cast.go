@@ -166,6 +166,40 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			return v, nil
 		}
 		return ToJSONB(d)
+	case "tsvector", "tsquery":
+		// Text is read as a literal of the type: no normalization (that
+		// is to_tsvector's and to_tsquery's job).
+		fam := types.Tsvector
+		if name == "tsquery" {
+			fam = types.Tsquery
+		}
+		if d.Fam == fam {
+			return d, nil
+		}
+		if d.Fam == types.String {
+			v, err := d.Coerce(fam)
+			if err != nil {
+				return types.Datum{}, errf("42601", "%v", err)
+			}
+			return v, nil
+		}
+	case "vector":
+		// Text in the '[1,2,3]' form and numeric arrays become vectors;
+		// vector(n) also checks the dimension.
+		v := d
+		if d.Fam != types.Vector {
+			a, err := asVector(d)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			v = types.NewVector(a)
+		}
+		if len(mods) == 1 {
+			if n, err := strconv.Atoi(mods[0]); err == nil && n != v.VectorDims() {
+				return types.Datum{}, errf(CodeDataException, "expected %d dimensions, not %d", n, v.VectorDims())
+			}
+		}
+		return v, nil
 	case "regclass", "name", "oid", "regtype", "regnamespace", "regproc", "regprocedure", "regrole", "regoper", "regoperator",
 		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring",
 		"aclitem", "pg_node_tree", "pg_lsn", "unknown", "any", "anyelement", "anyarray", "record", "void":

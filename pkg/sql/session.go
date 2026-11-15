@@ -162,6 +162,16 @@ type Session struct {
 	// (privileges.go).
 	roleCache    map[string]catalog.RoleSet
 	roleCacheTxn *kvclient.Txn
+	// bypassCache holds, per actor, whether the role carries BYPASSRLS,
+	// resolved in bypassCacheTxn (rls.go).
+	bypassCache    map[string]bool
+	bypassCacheTxn *kvclient.Txn
+	// policyMemo holds the row-security conjuncts bound so far by the
+	// statement being executed (rls.go). It never outlives a statement:
+	// the next one may run as another role or under another value of a
+	// setting a policy reads, and must bind afresh.
+	policyMemo     map[policyKey][]parser.Comparison
+	historicalMemo map[policyKey]historicalFilter
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -219,6 +229,13 @@ type Session struct {
 	// selects it runs underneath (WITH members, derived tables, set
 	// members, subqueries) materialize as they must.
 	streamTop bool
+
+	// lo is the session's large-object state: the descriptors open in
+	// its transaction (largeobject.go), made on first use.
+	lo *loState
+
+	// notify is the session's LISTEN / NOTIFY state (listen.go).
+	notify notifyState
 
 	txn   *kvclient.Txn
 	state TxnState
@@ -341,6 +358,13 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 			memo.m[name] = d
 		}
 	}
+	if err == nil && d != nil {
+		// Whatever the statement goes on to do with the table, the row
+		// encoder can file its rows in the table's vector indexes.
+		if verr := s.loadVectorCentroids(ctx, d); verr != nil {
+			return nil, verr
+		}
+	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -396,10 +420,25 @@ func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
 	}
 }
 
+// envTables is which tables a virtual environment gathers.
+type envTables int
+
+const (
+	// envNoTables: the reader wants roles or settings only.
+	envNoTables envTables = iota
+	// envCurrentTables: the session's current database, which is all
+	// that pg_catalog and most of information_schema describe.
+	envCurrentTables
+	// envAllTables: every database's, for the few views that list them
+	// all (vtable.Table.AllDatabases). This one reads the whole catalog.
+	envAllTables
+)
+
 // virtualEnv gathers what the virtual tables render: every database,
-// the tables the session may see (all of them for admins; for others,
-// the tables they hold a privilege on), statistics, users and admins.
-func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.Env, error) {
+// the tables the session may see within scope (all of them for admins;
+// for others, the tables they hold a privilege on), statistics, users
+// and admins.
+func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables) (*vtable.Env, error) {
 	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
@@ -418,20 +457,51 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 		return nil, err
 	}
 	env.IsAdmin = set.IsAdmin()
-	all, err := s.cat.List(ctx, txn)
-	if err != nil {
-		return nil, err
-	}
+	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
 	// A table whose schema the session may not use is not listed, as
 	// the console does not list it (issue #259): both ask
 	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
 	// the listing question the same way (issue #197).
 	denied := catalog.SchemaUsageDenied(dbs, set)
+	var all []*catalog.TableDescriptor
+	switch scope {
+	case envAllTables:
+		if all, err = s.cat.List(ctx, txn); err != nil {
+			return nil, err
+		}
+	case envCurrentTables:
+		for _, db := range dbs {
+			if db.Name != s.database {
+				continue
+			}
+			if all, err = s.cat.ListIn(ctx, txn, db); err != nil {
+				return nil, err
+			}
+		}
+		// A foreign key may reference a table of another database; it is
+		// resolved by ID when a row needs it, under the same visibility
+		// rule as the listing.
+		env.ReadTable = func(id uint64) *catalog.TableDescriptor {
+			d, err := catalog.ReadTable(ctx, txn, id)
+			if err != nil || d == nil || !canSeeTable(set, d) || denied[d.DatabaseID] {
+				return nil
+			}
+			return d
+		}
+	}
 	for _, d := range all {
 		if !canSeeTable(set, d) || denied[d.DatabaseID] {
 			continue
 		}
 		env.Tables = append(env.Tables, d)
+		// Statistics count every row of a table. A role its row-security
+		// policies confine sees none: reltuples and n_live_tup read as
+		// "not analyzed" rather than as the size of everyone's data.
+		if confined, err := s.rowSecurityActive(ctx, txn, d); err != nil {
+			return nil, err
+		} else if confined {
+			continue
+		}
 		if st, _ := s.cat.Stats(ctx, d.ID); st != nil {
 			env.Stats[d.ID] = st
 		}
@@ -477,7 +547,11 @@ func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *cat
 	if !ok {
 		return nil, newErrf(CodeInternal, "virtual table %q vanished", desc.Virtual)
 	}
-	env, err := s.virtualEnv(ctx, txn)
+	scope := envCurrentTables
+	if vt.AllDatabases() {
+		scope = envAllTables
+	}
+	env, err := s.virtualEnv(ctx, txn, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -524,8 +598,10 @@ func (s *Session) statementTime() int64 {
 func (s *Session) Close(ctx context.Context) {
 	if s.txn != nil {
 		_ = s.txn.Rollback(ctx)
+		s.loEndTxn(ctx, false)
 		s.txn = nil
 	}
+	s.discardNotify()
 	s.state = StateIdle
 }
 
@@ -534,6 +610,7 @@ func (s *Session) Close(ctx context.Context) {
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
 	s.memUsed = 0
+	s.policyMemo, s.historicalMemo = nil, nil
 	s.invalidateRoles()
 	var deadline time.Time
 	if d := s.vars.statementTimeout; d > 0 {
@@ -606,7 +683,14 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if s.state != StateOpen {
 			return &Result{Tag: "COMMIT"}, nil // PG: warning, not error
 		}
+		// Large-object pages still buffered are written first; if they
+		// cannot be, there is nothing to commit.
+		if lerr := s.loBeforeCommit(ctx); lerr != nil {
+			s.rollback(ctx)
+			return nil, ToSQLError(lerr)
+		}
 		err := s.txn.Commit(ctx)
+		s.loEndTxn(ctx, err == nil)
 		s.txn = nil
 		s.state = StateIdle
 		s.endTxnVars()
@@ -614,9 +698,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err != nil {
 			s.forgetDDL()
 			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+			s.discardNotify()
 			return nil, ToSQLError(err)
 		}
 		s.pendingDDL = nil
+		// The transaction is durable: its subscriptions take effect and
+		// its notifications go out, whatever the steps below report.
+		s.commitNotify()
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
@@ -638,6 +726,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err := s.txn.Savepoint(t.Name); err != nil {
 			return nil, ToSQLError(err)
 		}
+		s.notifySavepoint(t.Name)
 		return &Result{Tag: "SAVEPOINT"}, nil
 
 	case *parser.ReleaseSavepoint:
@@ -647,6 +736,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err := s.txn.ReleaseSavepoint(t.Name); err != nil {
 			return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 		}
+		s.notifyReleaseSavepoint(t.Name)
 		return &Result{Tag: "RELEASE"}, nil
 
 	case *parser.RollbackToSavepoint:
@@ -670,8 +760,25 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		}
 		return &Result{Tag: "SET"}, nil
 
+	case *parser.Listen, *parser.Unlisten, *parser.Notify:
+		return s.execListenNotify(stmt)
+
 	default:
-		return s.executeData(ctx, stmt, params)
+		if s.state == StateOpen {
+			return s.executeData(ctx, stmt, params)
+		}
+		// A statement outside a block is its own transaction: what it
+		// notifies (pg_notify) goes out once it has committed. A streamed
+		// result has taken its notifications with it by now, and
+		// publishes them itself when it is drained.
+		s.discardNotify()
+		res, serr := s.executeData(ctx, stmt, params)
+		if serr != nil {
+			s.discardNotify()
+			return nil, serr
+		}
+		s.commitNotify()
+		return res, nil
 	}
 }
 
@@ -724,11 +831,12 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 	}
 
-	if at, ok := stmt.(*parser.AlterTable); ok && at.SplitAt != nil {
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.SplitAt != nil || at.UnsplitAt != nil || at.UnsplitAll) {
 		// A split is a range operation, not a descriptor write: it runs
 		// outside any transaction, like the manual datax debug split.
+		// So does giving one up.
 		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SPLIT AT cannot run inside a transaction block")
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SPLIT AT and UNSPLIT cannot run inside a transaction block")
 		}
 		if at.IfExists && !s.tableExists(ctx, at.Table) {
 			return &Result{Tag: "ALTER TABLE"}, nil
@@ -736,18 +844,63 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}
-		res, err := s.execSplitAt(ctx, at, params)
+		var res *Result
+		var err error
+		if at.SplitAt != nil {
+			res, err = s.execSplitAt(ctx, at, params)
+		} else {
+			res, err = s.execUnsplit(ctx, at, params)
+		}
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
 		return res, nil
 	}
-	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
+	if at, ok := stmt.(*parser.AlterTable); ok && (at.ResetOptions != nil || at.Purge) {
+		// RESET is one descriptor write and PURGE a range operation;
+		// both run outside any transaction, like SET (...) and SPLIT AT.
 		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (shards) cannot run inside a transaction block")
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... RESET and PURGE cannot run inside a transaction block")
+		}
+		if at.IfExists && !s.tableExists(ctx, at.Table) {
+			return &Result{Tag: "ALTER TABLE"}, nil
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
+		}
+		if at.Purge {
+			return s.execPurge(ctx, at)
+		}
+		return s.execResetOptions(ctx, at)
+	}
+	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (...) cannot run inside a transaction block")
+		}
+		if _, bare := catalog.SplitTableName(at.Table); bare == catalog.AuditTableName && !s.system {
+			return s.execSetAuditRetention(ctx, at)
+		}
+		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
+		}
+		// The options any table takes are set first, in one descriptor
+		// write; what is left is the time-series pair below.
+		general, rest := map[string]string{}, map[string]string{}
+		for k, v := range at.SetOptions {
+			if generalTableOption(k) {
+				general[k] = v
+			} else {
+				rest[k] = v
+			}
+		}
+		if len(general) > 0 {
+			if serr := s.execSetGeneralOptions(ctx, at.Table, general); serr != nil {
+				return nil, serr
+			}
+			if len(rest) == 0 {
+				return &Result{Tag: "ALTER TABLE"}, nil
+			}
+			at = &parser.AlterTable{Table: at.Table, SetOptions: rest}
 		}
 		if _, ok := at.SetOptions["retention"]; ok {
 			res, rerr := s.execSetRetention(ctx, at)
@@ -853,6 +1006,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			// The stream commits the historical transaction once drained
 			// (no restarts: a pinned read has nothing to retry).
 			res.Stream.attachImplicit(txn, nil, nil)
+			res.Stream.notifs = s.takeNotify()
 			res.Stream.attempt = 20
 			return res, nil
 		}
@@ -894,6 +1048,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		s.extraDDL, s.pendingWipes = nil, nil
+		s.discardNotify() // a retry starts the statement over
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		if err == nil && TestingBeforeImplicitCommit != nil {
 			TestingBeforeImplicitCommit()
@@ -927,10 +1082,12 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 	txn.EnablePipelining()
 	for attempt := 0; ; attempt++ {
 		s.streamTop = true
+		s.discardNotify() // a retry starts the statement over
 		res, err := s.execStmt(ctx, txn, sel, params)
 		s.streamTop = false
 		if err == nil && res.Stream != nil {
 			res.Stream.attachImplicit(txn, sel, params)
+			res.Stream.notifs = s.takeNotify()
 			res.Stream.attempt = attempt
 			return res, nil
 		}
@@ -965,11 +1122,13 @@ func (s *Session) noteDDL(name string) {
 func (s *Session) rollback(ctx context.Context) {
 	if s.txn != nil {
 		_ = s.txn.Rollback(ctx)
+		s.loEndTxn(ctx, false)
 		s.txn = nil
 	}
 	s.endTxnVars()
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+	s.discardNotify()
 	s.state = StateIdle
 }
 
@@ -1118,8 +1277,17 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	if d, ok, err := builtins.DateArith(l, op, r); ok {
 		return d, builtinErr(err)
 	}
+	if l.Fam == types.Vector || r.Fam == types.Vector || builtins.IsVectorOp(op) {
+		if d, ok, err := builtins.VectorOp(l, op, r); ok {
+			return d, builtinErr(err)
+		}
+	}
 	switch op {
 	case "||":
+		if l.Fam == types.Tsvector || r.Fam == types.Tsvector {
+			d, err := builtins.ConcatTSVectors(l, r)
+			return d, builtinErr(err)
+		}
 		if l.Fam.IsArray() || r.Fam.IsArray() {
 			d, err := builtins.ConcatArrays(l, r)
 			return d, builtinErr(err)
@@ -1258,6 +1426,22 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		return types.NewString(`"` + strings.ReplaceAll(args[0].Text(), `"`, `""`) + `"`), nil
 	case "pg_typeof":
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
+	case "to_regtype":
+		// The type's OID when the name is a type's, NULL when it is not:
+		// how a client finds the vector type, whose OID no client knows
+		// in advance (to_regtype('vector')::oid).
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		name := strings.ToLower(strings.TrimSpace(args[0].Text()))
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		fam, err := types.ParseType(name)
+		if err != nil {
+			return types.DNull, nil
+		}
+		return types.NewInt(vtable.TypeOID(fam)), nil
 	case "format_type":
 		if args[0].Null {
 			return types.DNull, nil
@@ -1881,6 +2065,12 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		m := re.MatchString(lhs.Text())
 		return m == !strings.HasPrefix(op, "NOT"), nil
+	case "@@", "NOT @@":
+		ok, err := builtins.TSMatch(lhs, rhs)
+		if err != nil {
+			return false, builtinErr(err)
+		}
+		return ok == (op == "@@"), nil
 	case "@>", "NOT @>", "<@", "NOT <@", "&&", "NOT &&", "?", "NOT ?", "?|", "NOT ?|", "?&", "NOT ?&":
 		ok, err := jsonOp(strings.TrimPrefix(op, "NOT "), lhs, rhs)
 		if err != nil {
@@ -2148,6 +2338,8 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 		}
 		return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 	}
+	s.notifyRollbackToSavepoint(name)
+	s.loRollbackToSavepoint()
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
 }

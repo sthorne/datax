@@ -388,6 +388,25 @@ func (r *Replica) closedTimestampNeedsLog() bool {
 	return idx != r.mu.closedTSLogged
 }
 
+// heardSinceStart reports whether the range's closed timestamp has passed
+// the time this process opened the store, which is the evidence that the
+// replica has applied everything the range committed while the node was
+// down. A closed timestamp is persisted, so a replica comes back from a
+// restart still entitled, by its own records, to serve reads at or below
+// the one it had — records that predate anything it missed. If what it
+// missed was a purge (issue #295), those reads would return rows the rest
+// of the cluster has destroyed and now refuses to read. A closed
+// timestamp above the start time was promised after the start, and
+// accepting it took the log up to the promise, the purge's collection
+// included; from then on the replica's own GC threshold does the
+// refusing. Until then it sends stale reads to the leader. The cost is a
+// few seconds without follower reads after a restart, and none at all on
+// a node whose range has lost its leader, which is the case the persisted
+// timestamp was for: there a restarted follower no longer serves.
+func (r *Replica) heardSinceStart() bool {
+	return r.store.startedAt.Less(r.ClosedTimestamp())
+}
+
 // executeStaleRead serves a read-only batch pinned at a fixed timestamp on
 // a NON-leader replica, legal exactly when the timestamp is at or below
 // the range's closed timestamp. No latches: entries apply here without
@@ -406,8 +425,9 @@ func (r *Replica) executeStaleRead(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, 
 	if thr := r.GCThreshold(); !thr.IsEmpty() && ts.LessEq(thr) {
 		return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, ts, thr)
 	}
-	if closed := r.ClosedTimestamp(); closed.Less(ts) {
-		// Not provably closed here (yet): the leader serves it.
+	if closed := r.ClosedTimestamp(); closed.Less(ts) || !r.heardSinceStart() {
+		// Not provably closed here (yet), or closed only by a promise
+		// from before this node was last down: the leader serves it.
 		return nil, r.notLeaderError()
 	}
 	br, rerr := r.evalReadOnly(ba)

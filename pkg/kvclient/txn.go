@@ -433,14 +433,21 @@ func (t *Txn) Get(ctx context.Context, key keys.Key) ([]byte, error) {
 	if err := t.flushDeferred(ctx); err != nil {
 		return nil, err
 	}
+	wait := LockWaitFrom(ctx)
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: key}})
-	br, err := t.send(ctx, ba, false)
+	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: key}, SkipLocked: wait == LockWaitSkip})
+	br, err := t.sendWith(ctx, ba, false, sendOpts{noWait: wait == LockWaitError})
 	if err != nil {
 		return nil, err
 	}
+	resp := br.Responses[0].Get
+	if resp.Skipped != nil {
+		// Passed over, not read: the key stays out of the read set.
+		t.db.resolveAbandonedLocks(ctx, []storage.Intent{*resp.Skipped})
+		return nil, nil
+	}
 	t.recordRead(key, nil)
-	return br.Responses[0].Get.Value, nil
+	return resp.Value, nil
 }
 
 // GetBatch reads many keys in ONE routed batch — the per-range sub-batches
@@ -454,19 +461,27 @@ func (t *Txn) GetBatch(ctx context.Context, ks []keys.Key) ([][]byte, error) {
 	if err := t.flushDeferred(ctx); err != nil {
 		return nil, err
 	}
+	wait := LockWaitFrom(ctx)
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
 	for _, k := range ks {
-		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}})
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k.Clone()}, SkipLocked: wait == LockWaitSkip})
 	}
-	br, err := t.send(ctx, ba, false)
+	br, err := t.sendWith(ctx, ba, false, sendOpts{noWait: wait == LockWaitError})
 	if err != nil {
 		return nil, err
 	}
 	vals := make([][]byte, len(ks))
+	var skipped []storage.Intent
 	for i, k := range ks {
+		resp := br.Responses[i].Get
+		if resp.Skipped != nil {
+			skipped = append(skipped, *resp.Skipped)
+			continue
+		}
 		t.recordRead(k, nil)
-		vals[i] = br.Responses[i].Get.Value
+		vals[i] = resp.Value
 	}
+	t.db.resolveAbandonedLocks(ctx, skipped)
 	return vals, nil
 }
 
@@ -475,9 +490,10 @@ func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 	if err := t.flushDeferred(ctx); err != nil {
 		return nil, err
 	}
+	wait := LockWaitFrom(ctx)
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max})
-	br, err := t.send(ctx, ba, false)
+	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max, SkipLocked: wait == LockWaitSkip})
+	br, err := t.sendWith(ctx, ba, false, sendOpts{noWait: wait == LockWaitError})
 	if err != nil {
 		return nil, err
 	}
@@ -486,7 +502,7 @@ func (t *Txn) Scan(ctx context.Context, start, end keys.Key, max int64) ([]kvpb.
 	if len(resp.Resume) > 0 {
 		observedEnd = resp.Resume // only [start, resume) was observed
 	}
-	t.recordRead(start, observedEnd)
+	t.recordScan(ctx, start, observedEnd, resp.Skipped)
 	return resp.Rows, nil
 }
 
@@ -500,9 +516,10 @@ func (t *Txn) ReverseScan(ctx context.Context, start, end keys.Key, max int64) (
 	if err := t.flushDeferred(ctx); err != nil {
 		return nil, err
 	}
+	wait := LockWaitFrom(ctx)
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: t.proto()}}
-	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max, Reverse: true})
-	br, err := t.send(ctx, ba, false)
+	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, MaxRows: max, Reverse: true, SkipLocked: wait == LockWaitSkip})
+	br, err := t.sendWith(ctx, ba, false, sendOpts{noWait: wait == LockWaitError})
 	if err != nil {
 		return nil, err
 	}
@@ -511,7 +528,7 @@ func (t *Txn) ReverseScan(ctx context.Context, start, end keys.Key, max int64) (
 	if len(resp.Resume) > 0 {
 		observedStart = resp.Resume // only [resume, end) was observed
 	}
-	t.recordRead(observedStart, end)
+	t.recordScan(ctx, observedStart, end, resp.Skipped)
 	return resp.Rows, nil
 }
 
@@ -697,6 +714,26 @@ func (t *Txn) recordWrite(key keys.Key) {
 // are waited out briefly; timestamp conflicts trigger a read refresh and,
 // only if that fails, surface as RetryableError.
 func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*kvpb.BatchResponse, error) {
+	return t.sendWith(ctx, ba, isWrite, sendOpts{})
+}
+
+// sendOpts changes how send treats the two conflicts a locking read under
+// NOWAIT or SKIP LOCKED must not handle the ordinary way.
+type sendOpts struct {
+	// noWait fails the batch with a LockNotAvailableError naming the
+	// intents of live transactions instead of waiting for them. Their
+	// owners are still pushed — that is how an abandoned intent is told
+	// from a held lock, and resolved — but never with the power to abort:
+	// declining to wait for a lock is no reason to take it by force.
+	noWait bool
+	// noRefresh returns a stale-snapshot conflict (a version committed
+	// above the read timestamp) to the caller as it is, without the
+	// refresh that would move the whole transaction forward or fail it:
+	// SKIP LOCKED passes such a row over.
+	noRefresh bool
+}
+
+func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool, opts sendOpts) (*kvpb.BatchResponse, error) {
 	if t.historical {
 		// Pinned-timestamp reads are follower-servable and need no
 		// uncertainty interval.
@@ -727,15 +764,19 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 		}
 		switch {
 		case kerr.WriteIntent != nil:
-			resolvedAll, pending, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite)
+			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite && !opts.noWait)
 			if err != nil {
 				t.publishWait(ctx, nil)
 				return nil, err
 			}
-			if resolvedAll {
+			if len(live) == 0 {
 				t.publishWait(ctx, nil)
 				continue
 			}
+			if opts.noWait {
+				return nil, &LockNotAvailableError{Intents: live}
+			}
+			pending := &live[0]
 			// We are blocked on a live transaction: publish the wait edge
 			// and walk the chain for a cycle before backing off.
 			if waited > 0 && waited%(2*time.Second) == 0 {
@@ -785,6 +826,9 @@ func (t *Txn) send(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool) (*k
 			// / commit equality): try to move the read timestamp forward by
 			// proving our read spans saw no writes in the window, instead
 			// of restarting.
+			if opts.noRefresh && (kerr.WriteTooOld != nil || kerr.Uncertainty != nil) {
+				return nil, &RetryableError{Cause: kerr}
+			}
 			newTS := kerr.RetryTimestamp(t.db.clock.Now())
 			if refreshes < maxRefreshesPerOp && t.maybeRefresh(ctx, newTS) {
 				refreshes++
@@ -863,6 +907,28 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	t.mu.txn.ReadTimestamp = newTS
 	t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(newTS)
 	return true
+}
+
+// AdvanceTo moves the transaction forward so that it commits at or above
+// ts, by the same proof a timestamp conflict takes: every span it has
+// read saw no foreign write up to ts. A transaction whose commit must
+// not precede writes made outside it uses this — a large object's pages
+// are written outside the transaction that creates the object, and the
+// row that makes the object visible must not carry a timestamp below
+// theirs (pkg/sql/largeobject.go). When the proof fails the transaction
+// cannot commit and the error is retryable.
+func (t *Txn) AdvanceTo(ctx context.Context, ts hlc.Timestamp) error {
+	if t.historical {
+		return fmt.Errorf("cannot advance a read-only historical transaction")
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return err
+	}
+	if !t.maybeRefresh(ctx, ts) {
+		metrics.TxnRetries.Inc()
+		return &RetryableError{Cause: &kvpb.Error{Message: fmt.Sprintf("transaction could not be moved forward to %s: something it read has changed since (or it has read too much to tell)", ts)}}
+	}
+	return nil
 }
 
 // publishWait records the transaction this one is blocked on (nil = no
@@ -1002,10 +1068,10 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 	return nil
 }
 
-// pushIntents pushes the owners of conflicting intents. Returns true if
-// every intent was resolved (the pushees were finalized, expired, or
-// aborted by priority) and the operation can be retried immediately;
-// otherwise pending names one still-live blocker.
+// pushIntents pushes the owners of conflicting intents and returns the
+// intents whose transactions are still live. None means every intent was
+// resolved (the pushees were finalized, expired, or aborted by priority)
+// and the operation can be retried immediately.
 //
 // Each conflicting transaction is pushed once, however many of its
 // intents the batch ran into, and the intents of every finalized pushee
@@ -1014,9 +1080,8 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 // re-shard backfill chunk retried after its first attempt was aborted —
 // then costs one push and one resolve round, not one of each per key
 // (issue #74).
-func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbort bool) (bool, *storage.Intent, error) {
-	all := true
-	var pending *storage.Intent
+func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbort bool) ([]storage.Intent, error) {
+	var live []storage.Intent
 	type verdict struct {
 		status   enginepb.TxnStatus
 		commitTS hlc.Timestamp
@@ -1037,7 +1102,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 			})
 			br, kerr := t.db.Send(ctx, ba)
 			if kerr != nil {
-				return false, nil, kerr
+				return nil, kerr
 			}
 			push := br.Responses[0].PushTxn
 			if push.Status == enginepb.STAGING {
@@ -1046,7 +1111,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				t.db.recoverStagedTxn(ctx, intent.Txn, push)
 				br, kerr = t.db.Send(ctx, ba)
 				if kerr != nil {
-					return false, nil, kerr
+					return nil, kerr
 				}
 				push = br.Responses[0].PushTxn
 			}
@@ -1055,11 +1120,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 			verdicts[intent.Txn.ID] = v
 		}
 		if v.live {
-			all = false // pushee alive; caller waits
-			if pending == nil {
-				p := intent
-				pending = &p
-			}
+			live = append(live, intent) // pushee alive; caller waits
 			continue
 		}
 		rba.Add(&kvpb.ResolveIntentRequest{
@@ -1071,10 +1132,10 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 	}
 	if len(rba.Requests) > 0 {
 		if _, kerr := t.db.Send(ctx, rba); kerr != nil {
-			return false, nil, kerr
+			return nil, kerr
 		}
 	}
-	return all, pending, nil
+	return live, nil
 }
 
 // Commit atomically commits the transaction: one replicated flip of its
@@ -1228,6 +1289,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		gh := ba.Header
 		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
 		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)
+		if obs := t.db.sendObserver.Load(); obs != nil {
+			(*obs)(ctx, ba, br) // this path bypasses DB.Send
+		}
 		if regroup {
 			return nil, false, nil
 		}
@@ -1241,14 +1305,14 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		}
 		switch {
 		case kerr.WriteIntent != nil:
-			resolvedAll, pending, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, true)
+			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, true)
 			if err != nil {
 				return nil, true, err
 			}
-			if resolvedAll {
+			if len(live) == 0 {
 				continue
 			}
-			if derr := t.detectDeadlock(ctx, pending); derr != nil {
+			if derr := t.detectDeadlock(ctx, &live[0]); derr != nil {
 				return nil, true, derr
 			}
 			if waited >= conflictBudget {

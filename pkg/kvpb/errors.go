@@ -28,9 +28,22 @@ type Error struct {
 	// StorageOverloaded accompanies TxnRetry when the leader's engine shed
 	// the write under backpressure: retry, but with backoff.
 	StorageOverloaded *StorageOverloadedError `json:"storage_overloaded,omitempty"`
+	// TooLarge: the gateway refused to send a write batch that no
+	// replica could have replicated (kvclient.MaxWriteBatchBytes). It is
+	// raised and read on the gateway and never crosses the wire.
+	TooLarge *WriteTooLargeError `json:"-"`
+	// DescriptorChanged: a split, merge or descriptor update was refused
+	// at apply because the range changed after the change was built.
+	DescriptorChanged *DescriptorChangedError `json:"descriptor_changed,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
+
+// WriteTooLargeError: a write batch for one range is larger than one
+// replicated write may be. Bytes is its size and Limit the bound.
+type WriteTooLargeError struct {
+	Bytes, Limit int64
+}
 
 // NotLeaderError: the replica is not the Raft leader; retry at LeaderHint's
 // replica if known.
@@ -59,6 +72,20 @@ type RangeKeyMismatchError struct {
 	RequestKey        keys.Key          `json:"request_key"`
 	ActualDescriptors []RangeDescriptor `json:"actual_descriptors,omitempty"`
 	Frozen            bool              `json:"frozen,omitempty"`
+}
+
+// DescriptorChangedError: a descriptor change — a split, a merge, a
+// sticky-bit update — was built from the range at generation BuiltFrom,
+// but by the time it applied another change had landed and the range was
+// at Current, so it was refused on every replica alike (issue #200).
+// Nothing happened; the request is still meaningful against the current
+// descriptor, and whoever built the change re-reads it and tries again
+// (the admin split does so itself, issue #290). A peer that predates the
+// detail sees only the message.
+type DescriptorChangedError struct {
+	RangeID   base.RangeID `json:"range_id"`
+	BuiltFrom int64        `json:"built_from"`
+	Current   int64        `json:"current"`
 }
 
 // WriteIntentError mirrors storage.WriteIntentError across the wire.

@@ -278,9 +278,10 @@ func (e *Engine) ReencryptionStatus() (remainingBytes int64, remainingFiles int,
 //     compactions for the same largest compaction.
 //
 // The budget and the rewritten total count what Pebble actually wrote
-// during each compaction (its per-level compacted-bytes counters, so a
-// background compaction running at the same time is credited too), not
-// an estimate over the span. Files a compaction leaves in place (a
+// from the moment a file's seed is written until its manual compaction
+// returns (its per-level compacted-bytes counters, so a background
+// compaction in that window — the one the seed's own flush can set off
+// included — is credited too), not an estimate over the span. Files a compaction leaves in place (a
 // single-user-key file admits no seed, a local-key-only file resting in
 // L6 is never an input) are recorded in attempted and skipped by later
 // passes of the same run, so they neither starve the files behind them
@@ -302,6 +303,11 @@ func (e *Engine) ReencryptPass(ctx context.Context, maxBytes int64, attempted ma
 	return targeted, remainingBytes, remainingFiles, nil
 }
 
+// testingAfterSeedFlush, when set, runs after a pass has flushed a seed
+// and before it calls Compact — the window in which an automatic
+// compaction can rewrite the file first. Never set in production.
+var testingAfterSeedFlush func()
+
 // compactStale rewrites up to maxBytes (0 = unlimited) of the given
 // live sstables through manual compactions, as ReencryptPass describes;
 // files in attempted are skipped and every file targeted is added to it.
@@ -319,6 +325,17 @@ func (e *Engine) compactStale(ctx context.Context, stale []staleTable, maxBytes 
 		if attempted != nil {
 			attempted[t.fileNum] = true
 		}
+		// The baseline is read before the seed is written, not just before
+		// Compact: flushing the seed puts a second file in L0 over the stale
+		// one, which is itself enough for Pebble to schedule an automatic
+		// compaction of the pair. On a busy machine that compaction can
+		// finish before Compact is called, which then finds nothing left to
+		// do; a baseline read after the flush counted the rewrite as zero
+		// bytes, and the sweep, which reads a pass of zero bytes as "nothing
+		// left that a compaction can rewrite", would stop with files still
+		// stale (issue #287). Flushes are not in these counters, so the seed
+		// itself adds nothing.
+		before := e.compactedBytes()
 		if _, _, derr := DecodeMVCCKey(t.smallest); derr == nil {
 			seed := append(append([]byte(nil), t.smallest...), 0)
 			// The seed must fall inside the file's bounds to overlap it (a
@@ -334,6 +351,9 @@ func (e *Engine) compactStale(ctx context.Context, stale []staleTable, maxBytes 
 				if ferr := e.db.Flush(); ferr != nil {
 					return targeted, ferr
 				}
+				if testingAfterSeedFlush != nil {
+					testingAfterSeedFlush()
+				}
 			}
 		}
 		// The span: the file's own bounds below L0, the narrowest overlapping
@@ -345,7 +365,6 @@ func (e *Engine) compactStale(ctx context.Context, stale []staleTable, maxBytes 
 		} else {
 			end = append(append([]byte(nil), t.largest...), 0)
 		}
-		before := e.compactedBytes()
 		if cerr := e.db.Compact(context.Background(), t.smallest, end, false); cerr != nil {
 			return targeted, cerr
 		}

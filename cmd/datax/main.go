@@ -39,6 +39,8 @@ func main() {
 		err = runBackupCmd(os.Args[2:])
 	case "restore":
 		err = runRestoreCmd(os.Args[2:])
+	case "unseal":
+		err = runUnseal(os.Args[2:])
 	case "debug":
 		err = runDebug(os.Args[2:])
 	case "help", "--help", "-h":
@@ -69,6 +71,7 @@ Usage:
                                        manage TLS certificates (secure mode)
   datax backup  --dest <dir>           write a consistent cluster backup (on the serving node)
   datax restore --src <dir[,dir...]>   restore a backup chain into an empty cluster
+  datax unseal --addr <node>           give a sealed node one share of its root key (asked for, not a flag)
   datax debug  <subcommand>            cluster inspection and admin commands
   datax version                        print version
 

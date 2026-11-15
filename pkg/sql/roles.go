@@ -83,7 +83,7 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := reservedRoleName(name); err != nil {
 		return nil, err
 	}
-	selfPassword := t.Alter && name == s.user && t.Login == nil && t.Inherit == nil && len(t.InRoles) == 0 && t.Password != nil && *t.Password != ""
+	selfPassword := t.Alter && name == s.user && t.Login == nil && t.Inherit == nil && t.BypassRLS == nil && len(t.InRoles) == 0 && t.Password != nil && *t.Password != ""
 	if !selfPassword {
 		if err := s.checkAdmin(ctx, txn); err != nil {
 			return nil, err
@@ -120,6 +120,16 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 	if t.Inherit != nil {
 		d.NoInherit = !*t.Inherit
 	}
+	if t.BypassRLS != nil {
+		// Admins only (checked above): the attribute lifts every table's
+		// row-security policies for the role.
+		if *t.BypassRLS {
+			if err := s.requireV21RLS("the BYPASSRLS role attribute"); err != nil {
+				return nil, err
+			}
+		}
+		d.BypassRLS = *t.BypassRLS
+	}
 	if t.Password != nil {
 		if *t.Password == "" {
 			if name == catalog.RootRole {
@@ -148,14 +158,14 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, err
 	}
 	s.invalidateRoles()
-	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "principal", s.sessionUser, "role", s.user)
+	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "bypassrls", d.BypassRLS, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: tag}, nil
 }
 
 // execCreateRoleLegacy is the pre-v11 form: a login user with a
 // password, written to the old layout so every node can authenticate it.
 func (s *Session) execCreateRoleLegacy(ctx context.Context, txn *kvclient.Txn, t *parser.CreateRole, name, tag string) (*Result, error) {
-	if t.Login != nil && !*t.Login || t.Inherit != nil || len(t.InRoles) > 0 || !t.IsUser && t.Login == nil || t.Password != nil && *t.Password == "" {
+	if t.Login != nil && !*t.Login || t.Inherit != nil || t.BypassRLS != nil && *t.BypassRLS || len(t.InRoles) > 0 || !t.IsUser && t.Login == nil || t.Password != nil && *t.Password == "" {
 		return nil, s.requireV11("roles (NOLOGIN, INHERIT, IN ROLE, PASSWORD NULL)")
 	}
 	key := keys.UserKey(name)
@@ -372,6 +382,14 @@ func (s *Session) execDropRole(ctx context.Context, txn *kvclient.Txn, t *parser
 		if len(deps) > 0 {
 			return nil, newErrf(CodeDependentObjectsExist, "role %q cannot be dropped because some objects depend on it: %s (REASSIGN OWNED BY %s TO ... or DROP OWNED BY %s first)",
 				name, strings.Join(deps, "; "), name, name)
+		}
+		// A policy's TO list names the role: dropping it would leave the
+		// policy applying to nobody, or to whoever is next given the name.
+		if uses, err := s.rolePolicyUses(ctx, txn, name); err != nil {
+			return nil, err
+		} else if len(uses) > 0 {
+			return nil, newErrf(CodeDependentObjectsExist, "role %q cannot be dropped because some objects depend on it: %s (ALTER POLICY ... TO, or DROP POLICY, first)",
+				name, strings.Join(uses, "; "))
 		}
 		if _, err := s.revokeAllFrom(ctx, txn, map[string]bool{name: true}); err != nil {
 			return nil, err

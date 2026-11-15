@@ -211,6 +211,11 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err := mustBeReal(shared); err != nil {
 			return nil, nil, err
 		}
+		if catalog.IsSealedSystemTable(shared.Name) && !s.system {
+			// A reference would write the audit table's descriptor, and
+			// then stand in the way of its records ageing out.
+			return nil, nil, sealedTableError(shared.Name)
+		}
 		ref := desc // self-reference: one descriptor, written once
 		if shared.ID != desc.ID {
 			if shared.DatabaseID != desc.DatabaseID {
@@ -347,7 +352,9 @@ func indexCovers(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 		return true
 	}
 	for i := range d.Indexes {
-		if prefix(d.Indexes[i].ColumnIDs) {
+		// An inverted index has no key order over its column's values,
+		// and neither has a vector index.
+		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && prefix(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
@@ -381,6 +388,10 @@ func sampleRow(d *catalog.TableDescriptor) map[catalog.ColumnID]types.Datum {
 			v = types.NewDate(0)
 		case types.Jsonb:
 			v = types.NewJsonb("{}")
+		case types.Tsvector:
+			v = types.Datum{Fam: types.Tsvector, S: "'x'"}
+		case types.Tsquery:
+			v = types.Datum{Fam: types.Tsquery, S: "'x'"}
 		case types.IntervalFam:
 			v = types.NewInterval(types.Interval{Days: 1})
 		case types.Time:
@@ -564,6 +575,11 @@ func (g *rowGuard) table(ctx context.Context, txn *kvclient.Txn, id uint64) (*ca
 	if d == nil {
 		return nil, newErrf(CodeInternal, "table %d referenced by a constraint of %q does not exist", id, g.desc.Name)
 	}
+	// A cascade writes this table's rows: its vector indexes need their
+	// centres, as after a lookup by name.
+	if err := g.s.loadVectorCentroids(ctx, d); err != nil {
+		return nil, err
+	}
 	g.parents[id] = d
 	return d, nil
 }
@@ -693,7 +709,7 @@ func (g *rowGuard) checkForeignKeys(ctx context.Context, txn *kvclient.Txn, oldR
 			return newErrf(CodeForeignKeyViolation, "%s %q violates foreign key constraint %q: key %s is not present in table %q",
 				what, g.desc.Name, fk.Name, keyText(g.desc, fk.Columns, row), parent.Name)
 		}
-		rows, _, err := g.s.fetchRows(ctx, txn, parent, equalityConds(parent, fk.RefColumns, vals), nil, 1)
+		rows, _, err := g.s.fetchRowsRaw(ctx, txn, parent, equalityConds(parent, fk.RefColumns, vals), nil, 1, nil)
 		if err != nil {
 			return err
 		}
@@ -796,7 +812,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 		if action != catalog.FKRestrict && action != "" {
 			limit = int64(g.st.budget) + 1
 		}
-		rows, _, err := g.s.fetchRows(ctx, txn, child, equalityConds(child, fk.Columns, vals), nil, limit)
+		rows, _, err := g.s.fetchRowsRaw(ctx, txn, child, equalityConds(child, fk.Columns, vals), nil, limit, nil)
 		if err != nil {
 			return err
 		}
@@ -1319,7 +1335,12 @@ func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, des
 
 // indexWipe is an index whose entries are reclaimed once the dropping
 // transaction has committed.
-type indexWipe struct{ tableID, indexID uint64 }
+type indexWipe struct {
+	tableID, indexID uint64
+	// vectorBuild names the centres of a dropped vector index, which
+	// live outside its entries (catalog.VectorIndex).
+	vectorBuild string
+}
 
 // runPendingWipes reclaims the entries of indexes dropped by committed
 // statements (best effort; the entries are unreachable either way).
@@ -1328,6 +1349,9 @@ func (s *Session) runPendingWipes(ctx context.Context) {
 	s.pendingWipes = nil
 	for _, w := range wipes {
 		s.wipeIndexEntries(ctx, w.tableID, w.indexID)
+		if w.vectorBuild != "" {
+			s.dropVectorCentroids(ctx, w.tableID, w.vectorBuild)
+		}
 	}
 }
 

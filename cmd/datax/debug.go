@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -40,6 +41,32 @@ func loadKeyCandidates(value string) ([][]byte, error) {
 	return enc.LoadKeyFiles(paths)
 }
 
+// storeKeyCandidates resolves the store key of a stopped store for the
+// offline tools: from key files (--enc-key), or by unwrapping what the
+// data directory holds through a root (--enc-root). Either way the
+// result is candidates for enc.MatchStoreKey.
+func storeKeyCandidates(dir, keyPaths, rootSpec string) ([][]byte, error) {
+	if rootSpec == "" {
+		return loadKeyCandidates(keyPaths)
+	}
+	if keyPaths != "" {
+		return nil, fmt.Errorf("--enc-key and --enc-root are alternatives")
+	}
+	roots, err := parseRootsOffline(dir, rootSpec)
+	if err != nil {
+		return nil, err
+	}
+	got, err := enc.UnwrapStoreKeys(context.Background(), vfs.Default, dir, roots)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([][]byte, len(got))
+	for i := range got {
+		keys[i] = got[i].Key
+	}
+	return keys, nil
+}
+
 // runDebugMetadata prints the node's periodic metadata export (written to
 // the data directory every heartbeat; the recovery artifact for a cluster
 // whose metadata range lost quorum).
@@ -47,6 +74,7 @@ func runDebugMetadata(args []string) error {
 	fs := flag.NewFlagSet("debug metadata", flag.ContinueOnError)
 	dir := fs.String("dir", "", "data directory of a (stopped or running) node")
 	keyPath := fs.String("enc-key", "", "store encryption key file (for an encrypted store's sealed backup); a comma-separated list is tried in order")
+	rootSpec := fs.String("enc-root", "", "for a store whose key is kept under a root: the root, as given to the node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,12 +86,12 @@ func runDebugMetadata(args []string) error {
 		return fmt.Errorf("no metadata backup found: %w", err)
 	}
 	if len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
-		keys, err := loadKeyCandidates(*keyPath)
+		keys, err := storeKeyCandidates(*dir, *keyPath, *rootSpec)
 		if err != nil {
 			return err
 		}
 		if len(keys) == 0 {
-			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key is required")
+			return fmt.Errorf("metadata backup is sealed (encrypted store); --enc-key or --enc-root is required")
 		}
 		var plain []byte
 		for _, key := range keys {
@@ -92,17 +120,64 @@ func runDebugRotateEncKey(args []string) error {
 	addr := fs.String("addr", "", "online mode: RPC address of the RUNNING node to rotate")
 	oldPath := fs.String("old-key", "", "current store encryption key file")
 	newPath := fs.String("new-key", "", "new store encryption key file")
+	rootSpec := fs.String("enc-root", "", "offline mode, for a store whose key is kept under a root: the root, as given to the node (the new key is made here and wrapped by it; no key file is involved)")
 	certsDir := fs.String("certs-dir", "", "online mode, secure cluster: certificate directory (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "online mode: username whose client certificate authenticates the call; must be an admin")
 	timeout := connectTimeoutFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *oldPath == "" || *newPath == "" {
-		return fmt.Errorf("rotate-enc-key requires --old-key and --new-key")
+	rooted := *rootSpec != "" || (*addr != "" && *oldPath == "" && *newPath == "")
+	if !rooted && (*oldPath == "" || *newPath == "") {
+		return fmt.Errorf("rotate-enc-key requires --old-key and --new-key (or, for a store whose key is kept under a root: neither with --addr, or --enc-root with --dir)")
+	}
+	if rooted && (*oldPath != "" || *newPath != "") {
+		return fmt.Errorf("a store whose key is kept under a root makes its new key itself: --old-key and --new-key do not apply")
 	}
 	if (*dir == "") == (*addr == "") {
 		return fmt.Errorf("rotate-enc-key requires exactly one of --dir (stopped node) or --addr (running node)")
+	}
+	if rooted && *addr != "" {
+		// Nothing secret is sent: the node makes the key.
+		if _, err := adminCall(*addr, *certsDir, *certUser, *timeout, cluster.AdminRequest{Op: "rotate-store-key"}); err != nil {
+			return err
+		}
+		fmt.Println("store key rotated online; the node made the new key and its root wrapped it (nothing to keep: a restart unwraps it through the same root)")
+		return nil
+	}
+	if rooted {
+		roots, err := parseRootsOffline(*dir, *rootSpec)
+		if err != nil {
+			return err
+		}
+		ctx := context.Background()
+		got, err := enc.UnwrapStoreKeys(ctx, vfs.Default, *dir, roots)
+		if err != nil {
+			return err
+		}
+		cands := make([][]byte, len(got))
+		for i := range got {
+			cands[i] = got[i].Key
+		}
+		idx, err := enc.MatchStoreKey(vfs.Default, *dir, cands)
+		if err != nil {
+			return err
+		}
+		if err := enc.PruneWrappedKeys(vfs.Default, *dir, got[idx].Index); err != nil {
+			return err
+		}
+		// The new key's entry is bound as the old one's was.
+		if _, err := enc.RotateWrappedStoreKey(enc.WithBinding(ctx, got[idx].Binding), vfs.Default, *dir, got[idx].Root, cands[idx], func(o, n []byte) error {
+			if err := enc.RotateStoreKey(vfs.Default, *dir, o, n); err != nil {
+				return err
+			}
+			return server.ResealMetadataBackup(*dir, o, n)
+		}); err != nil {
+			return err
+		}
+		log.Audit("store-key-rotate", "dir", *dir, "root", got[idx].Root.Kind(), "key_id", got[idx].Root.KeyID(), "principal", "os:"+osUsername())
+		fmt.Println("store key rotated; restart the node with the same --enc-root")
+		return nil
 	}
 	if *addr != "" {
 		if *certsDir == "" {
@@ -136,23 +211,8 @@ func runDebugRotateEncKey(args []string) error {
 		return err
 	}
 	// Reseal the metadata backup too, so one key opens everything.
-	bakPath := filepath.Join(*dir, server.MetadataBackupFile)
-	if raw, err := os.ReadFile(bakPath); err == nil &&
-		len(raw) >= len(server.MetadataBackupMagic) && string(raw[:len(server.MetadataBackupMagic)]) == server.MetadataBackupMagic {
-		plain, err := enc.Unseal(server.MetadataBackupMagic, oldKey, raw)
-		if err != nil {
-			return fmt.Errorf("resealing metadata backup: %w", err)
-		}
-		sealed, err := enc.Seal(server.MetadataBackupMagic, newKey, plain)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(bakPath+".tmp", sealed, 0o600); err != nil {
-			return err
-		}
-		if err := os.Rename(bakPath+".tmp", bakPath); err != nil {
-			return err
-		}
+	if err := server.ResealMetadataBackup(*dir, oldKey, newKey); err != nil {
+		return err
 	}
 	fmt.Println("store key rotated; restart the node with the new key")
 	return nil
@@ -165,6 +225,7 @@ func runDebugUnsafeRecover(args []string) error {
 	dir := fs.String("dir", "", "data directory of the STOPPED surviving node")
 	rangeID := fs.Int64("range", 0, "recover only this range (default: every range on the store)")
 	keyPath := fs.String("enc-key", "", "store encryption key file (required for an encrypted store); a comma-separated list is tried in order")
+	rootSpec := fs.String("enc-root", "", "for a store whose key is kept under a root: the root, as given to the node")
 	yes := fs.Bool("yes", false, "confirm: I understand this discards the other replicas")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -183,7 +244,7 @@ nodes join.
 
 Re-run with --yes to proceed`)
 	}
-	keys, err := loadKeyCandidates(*keyPath)
+	keys, err := storeKeyCandidates(*dir, *keyPath, *rootSpec)
 	if err != nil {
 		return err
 	}
@@ -237,7 +298,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|merge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -249,15 +310,25 @@ func runDebug(args []string) error {
 		return runDebugUnsafeRecover(rest)
 	case "rotate-enc-key":
 		return runDebugRotateEncKey(rest)
+	case "enc-root":
+		return runDebugEncRoot(rest)
+	case "seal-status":
+		return runDebugSealStatus(rest)
+	case "peer-unseal":
+		return runDebugPeerUnseal(rest)
 	case "profile":
 		return runDebugProfile(rest)
+	case "audit":
+		return runDebugAudit(rest)
 	}
 	fs := flag.NewFlagSet("debug "+sub, flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:26257", "RPC address of any cluster node")
 	certsDir := fs.String("certs-dir", "", "certificate directory for a secure cluster (presents client.<user>.crt)")
 	certUser := fs.String("user", "root", "username whose client certificate authenticates this call (with --certs-dir); state-changing ops require an admin")
-	table := fs.Uint64("table", 0, "split: split at the boundary of this table ID")
-	rawKey := fs.String("key", "", "split: raw split key (hex)")
+	table := fs.Uint64("table", 0, "split, unsplit: the boundary of this table ID")
+	rawKey := fs.String("key", "", "split, unsplit: raw key (hex)")
+	endKey := fs.String("end-key", "", "purge: raw key (hex) the span ends before, with --key as its start")
+	tableName := fs.String("table-name", "", "purge: the table to purge, as [database.]table")
 	rangeID := fs.Int64("range", 0, "rebalance, transfer-lease: range ID")
 	toNode := fs.Int64("to", 0, "rebalance, transfer-lease: destination node ID; upgrade: target cluster version")
 	fromNode := fs.Int64("from", 0, "rebalance: source node ID (default: chosen automatically)")
@@ -271,7 +342,7 @@ func runDebug(args []string) error {
 
 	req := cluster.AdminRequest{Op: sub}
 	switch sub {
-	case "split":
+	case "split", "unsplit":
 		switch {
 		case *table != 0:
 			req.Key = keys.TableDataPrefix(*table)
@@ -282,7 +353,24 @@ func runDebug(args []string) error {
 			}
 			req.Key = k
 		default:
-			return fmt.Errorf("split requires --table or --key")
+			return fmt.Errorf("%s requires --table or --key", sub)
+		}
+	case "purge":
+		switch {
+		case *tableName != "":
+			req.Table = *tableName
+		case *table != 0:
+			req.Key, req.EndKey = keys.TableDataSpan(*table)
+		case *rawKey != "" && *endKey != "":
+			var err error
+			if req.Key, err = hex.DecodeString(*rawKey); err != nil {
+				return fmt.Errorf("--key must be hex: %w", err)
+			}
+			if req.EndKey, err = hex.DecodeString(*endKey); err != nil {
+				return fmt.Errorf("--end-key must be hex: %w", err)
+			}
+		default:
+			return fmt.Errorf("purge requires --table-name, --table, or --key with --end-key")
 		}
 	case "rebalance", "transfer-lease":
 		req.RangeID = base.RangeID(*rangeID)
@@ -312,7 +400,12 @@ func runDebug(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	callTimeout := 30 * time.Second
+	if sub == "purge" {
+		// A purge compacts the span on every replica before it answers.
+		callTimeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
 	var resp cluster.AdminResponse
 	if err := trans.Call(ctx, *addr, "admin", req, &resp); err != nil {
@@ -339,7 +432,20 @@ func runDebug(args []string) error {
 	switch sub {
 	case "split":
 		useTableNames(resp.TableNames)
+		if resp.Left == nil {
+			// The key was a boundary already; the split only marked it.
+			fmt.Printf("already split; boundary is now sticky:\n  right: %s\n", resp.Right)
+			break
+		}
 		fmt.Printf("split done:\n  left:  %s\n  right: %s\n", resp.Left, resp.Right)
+	case "unsplit":
+		if len(resp.Ranges) == 1 {
+			useTableNames(resp.TableNames)
+			fmt.Printf("unsplit: %s\n", &resp.Ranges[0])
+		}
+	case "purge":
+		useTableNames(resp.TableNames)
+		return printPurge(resp.Purge)
 	case "ranges":
 		useTableNames(resp.TableNames)
 		for _, d := range resp.Ranges {
@@ -442,4 +548,35 @@ func useTableNames(names map[uint64]string) {
 		name, ok := names[id]
 		return name, ok
 	})
+}
+
+// printPurge prints a purge's per-replica report and returns an error
+// when the purge is not complete, so a script that runs one cannot take
+// "the command ran" for "the data is gone".
+func printPurge(rep *kvpb.PurgeReport) error {
+	if rep == nil {
+		return fmt.Errorf("the node answered without a purge report")
+	}
+	fmt.Printf("purged %s to %s at %s: %d version(s) removed over %d range(s)\n",
+		keys.Key(rep.StartKey), keys.Key(rep.EndKey), time.Unix(0, rep.PurgeTSNanos).UTC().Format(time.RFC3339Nano), rep.VersionsRemoved, rep.Ranges)
+	for _, r := range rep.Replicas {
+		if r.Error != "" {
+			fmt.Printf("  r%d n%d  UNCONFIRMED: %s\n", r.RangeID, r.NodeID, r.Error)
+			continue
+		}
+		fmt.Printf("  r%d n%d  live keys %d, superseded versions %d, tombstones %d, intents %d, compacted %v\n",
+			r.RangeID, r.NodeID, r.LiveKeys, r.Garbage, r.Tombstones, r.Intents, r.Compacted)
+	}
+	fmt.Println("not covered by a purge:")
+	for _, line := range rep.NotCovered {
+		fmt.Printf("  - %s\n", line)
+	}
+	if !rep.Complete {
+		for _, line := range rep.Incomplete {
+			fmt.Printf("INCOMPLETE: %s\n", line)
+		}
+		return fmt.Errorf("the purge is incomplete; run it again once the replicas above can answer")
+	}
+	fmt.Println("complete: every replica answered and holds no superseded version, tombstone or intent in the span")
+	return nil
 }

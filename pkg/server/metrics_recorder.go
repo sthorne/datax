@@ -409,16 +409,16 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 	}
 
 	if leader {
-		n.refreshSchema()
-		if doc := n.cachedSchemaDoc(); doc != nil {
-			for _, t := range doc.Tables {
-				if catalog.IsSystemTable(t.Name) {
-					continue
-				}
-				rows = append(rows, metricRow{node: 0, name: labelledSeries("table.ranges", "table", t.Name), value: float64(t.Ranges)})
-				if t.Stats != nil {
-					rows = append(rows, metricRow{node: 0, name: labelledSeries("table.rows", "table", t.Name), value: float64(t.Stats.RowCount)})
-				}
+		// The reading is taken in the background and this tick records
+		// the last one: the recorder does not wait on a catalog scan.
+		n.refreshTableGauges()
+		for _, g := range n.cachedTableGauges() {
+			if catalog.IsSystemTable(g.Name) {
+				continue
+			}
+			rows = append(rows, metricRow{node: 0, name: labelledSeries("table.ranges", "table", g.Name), value: float64(g.Ranges)})
+			if g.Stats != nil {
+				rows = append(rows, metricRow{node: 0, name: labelledSeries("table.rows", "table", g.Name), value: float64(g.Stats.RowCount)})
 			}
 		}
 	}

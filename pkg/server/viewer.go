@@ -82,7 +82,7 @@ func (n *Node) keyViewerFor(ctx context.Context, p ClusterPrincipal) keyViewer {
 	if err != nil {
 		return keyViewer{err: err, redacted: new(atomic.Bool)}
 	}
-	return keyViewer{set: set, descs: n.tableDescs(), denied: denied, redacted: new(atomic.Bool)}
+	return keyViewer{set: set, descs: n.viewerDescs(ctx), denied: denied, redacted: new(atomic.Bool)}
 }
 
 // schemaUsageDenied is the set of databases whose schema the role set may

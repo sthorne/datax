@@ -748,3 +748,140 @@ func TestMVCCScanTargetBytes(t *testing.T) {
 		t.Fatalf("max rows: %d rows, resume %q, %v", len(res.KVs), res.Resume, err)
 	}
 }
+
+// TestMVCCSkipLocked: a SkipLocked read reports a key holding another
+// transaction's intent as absent and hands the intent back — whether the
+// intent is below the read timestamp (an ordinary read conflicts) or
+// above it (an ordinary read looks beneath) — while the transaction's
+// own intents read as usual, and a scan's row limit counts only the rows
+// it returns.
+func TestMVCCSkipLocked(t *testing.T) {
+	eng := openTestEngine(t)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		mustPut(t, eng, k, ts(10, 0), "v"+k, nil)
+	}
+	below, above, own := newTxn(ts(20, 0)), newTxn(ts(40, 0)), newTxn(ts(30, 0))
+	mustPut(t, eng, "a", below.WriteTimestamp, "va-prov", below)
+	mustPut(t, eng, "c", above.WriteTimestamp, "vc-prov", above)
+	mustPut(t, eng, "d", own.WriteTimestamp, "vd-own", own)
+
+	keysOf := func(res ScanResult) string {
+		var out string
+		for _, kv := range res.KVs {
+			out += string(kv.Key)
+		}
+		return out
+	}
+	intentsOf := func(ins []Intent) string {
+		var out string
+		for _, in := range ins {
+			out += string(in.Key)
+		}
+		return out
+	}
+
+	var skipped []Intent
+	opts := MVCCGetOptions{Txn: own, SkipLocked: &skipped}
+	res, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 0, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keysOf(res) != "bde" || intentsOf(skipped) != "ac" || string(res.KVs[1].Value) != "vd-own" {
+		t.Fatalf("scan: rows %q (d = %q), skipped %q; want bde (vd-own), ac", keysOf(res), res.KVs[1].Value, intentsOf(skipped))
+	}
+	if skipped[0].Txn.ID != below.ID || skipped[1].Txn.ID != above.ID {
+		t.Fatalf("skipped intents name the wrong transactions: %+v", skipped)
+	}
+
+	// LIMIT 1 is the first row that is free, not an empty page.
+	skipped = nil
+	res, err = MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 1, opts)
+	if err != nil || keysOf(res) != "b" || intentsOf(skipped) != "a" || !bytes.Equal(res.Resume, keys.Key("b").Next()) {
+		t.Fatalf("limited scan: rows %q, skipped %q, resume %q, err %v", keysOf(res), intentsOf(skipped), res.Resume, err)
+	}
+
+	skipped = nil
+	res, err = MVCCReverseScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 2, opts)
+	if err != nil || keysOf(res) != "ed" || len(skipped) != 0 {
+		t.Fatalf("reverse scan: rows %q, skipped %q, err %v", keysOf(res), intentsOf(skipped), err)
+	}
+	res, err = MVCCReverseScan(eng, keys.Key("a"), res.Resume, ts(30, 0), 2, opts)
+	if err != nil || keysOf(res) != "b" || intentsOf(skipped) != "ca" {
+		t.Fatalf("reverse scan, second page: rows %q, skipped %q, err %v", keysOf(res), intentsOf(skipped), err)
+	}
+
+	for _, k := range []string{"a", "c"} {
+		skipped = nil
+		if v := mustGet(t, eng, k, ts(30, 0), opts); v != nil || intentsOf(skipped) != k {
+			t.Fatalf("get %s: value %q, skipped %q", k, v, intentsOf(skipped))
+		}
+	}
+	skipped = nil
+	if v := mustGet(t, eng, "d", ts(30, 0), opts); string(v) != "vd-own" || len(skipped) != 0 {
+		t.Fatalf("get of own intent: %q, skipped %q", v, intentsOf(skipped))
+	}
+
+	// Without the option nothing changed: the intent below the read
+	// timestamp is a conflict.
+	var wie *WriteIntentError
+	if _, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 0, MVCCGetOptions{Txn: own}); !errors.As(err, &wie) {
+		t.Fatalf("plain scan over a foreign intent: %v", err)
+	}
+}
+
+// TestMVCCSkipLockedUncertain: a SkipLocked read passes over a key with a
+// committed version inside its uncertainty window, listing it without a
+// transaction, where a plain read fails with an UncertaintyError.
+func TestMVCCSkipLockedUncertain(t *testing.T) {
+	eng := openTestEngine(t)
+	mustPut(t, eng, "a", ts(10, 0), "va", nil)
+	mustPut(t, eng, "b", ts(10, 0), "vb", nil)
+	mustDelete(t, eng, "b", ts(35, 0), nil) // committed just above the read
+	mustPut(t, eng, "c", ts(10, 0), "vc", nil)
+	mustPut(t, eng, "c", ts(90, 0), "vc2", nil) // above the window: the old value is read
+
+	plain := MVCCGetOptions{UncertaintyLimit: ts(50, 0)}
+	var ue *UncertaintyError
+	if _, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 0, plain); !errors.As(err, &ue) {
+		t.Fatalf("plain scan: %v, want an uncertainty error", err)
+	}
+
+	var skipped []Intent
+	opts := plain
+	opts.SkipLocked = &skipped
+	res, err := MVCCScan(eng, keys.Key("a"), keys.Key("z"), ts(30, 0), 0, opts)
+	if err != nil || len(res.KVs) != 2 || string(res.KVs[0].Key) != "a" || string(res.KVs[1].Value) != "vc" {
+		t.Fatalf("scan: %v, %v", res.KVs, err)
+	}
+	if len(skipped) != 1 || string(skipped[0].Key) != "b" || skipped[0].Txn.ID != uuid.Nil {
+		t.Fatalf("skipped: %+v, want b with no transaction", skipped)
+	}
+	skipped = nil
+	if v := mustGet(t, eng, "b", ts(30, 0), opts); v != nil || len(skipped) != 1 || skipped[0].Txn.ID != uuid.Nil {
+		t.Fatalf("get: %q, skipped %+v", v, skipped)
+	}
+}
+
+// TestMVCCSkipLockedScanPages: a scan that steps around more intents
+// than one page may report ends early with a resume key, and the
+// continuation picks up exactly where it stopped.
+func TestMVCCSkipLockedScanPages(t *testing.T) {
+	eng := openTestEngine(t)
+	locker := newTxn(ts(20, 0))
+	const locked = maxSkippedPerScan + 10
+	for i := 0; i < locked; i++ {
+		mustPut(t, eng, fmt.Sprintf("k%04d", i), locker.WriteTimestamp, "v", locker)
+	}
+	mustPut(t, eng, "kfree", ts(10, 0), "v", nil)
+
+	var skipped []Intent
+	opts := MVCCGetOptions{SkipLocked: &skipped}
+	res, err := MVCCScan(eng, keys.Key("k"), keys.Key("l"), ts(30, 0), 0, opts)
+	if err != nil || len(res.KVs) != 0 || len(skipped) != maxSkippedPerScan || res.Resume == nil {
+		t.Fatalf("first page: %d rows, %d skipped, resume %q, err %v", len(res.KVs), len(skipped), res.Resume, err)
+	}
+	res, err = MVCCScan(eng, res.Resume, keys.Key("l"), ts(30, 0), 0, opts)
+	if err != nil || len(res.KVs) != 1 || string(res.KVs[0].Key) != "kfree" || len(skipped) != locked || res.Resume != nil {
+		t.Fatalf("second page: %d rows, %d skipped in all, resume %q, err %v", len(res.KVs), len(skipped), res.Resume, err)
+	}
+}

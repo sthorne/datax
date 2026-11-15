@@ -168,7 +168,7 @@ const HELP = {
 
   // ---- Operations and events ----
   "recent operations": "What the cluster has been doing to itself — splits, merges, rebalances, lease moves, decommissions, backups — newest first. An operation still running is listed ahead of the ones that have finished, and the heading says when there is one. These explain load that no client asked for.",
-  "in flight": "Operations running now, with how long each has been going. Backups, restores, decommissions, re-encryption, consistency sweeps, re-shard reclaims and upgrade finalize are paired and appear here; splits, merges and rebalances are individually short and continuous, so they stay in the event feed as instants and are watched as a rate on the Metrics view instead.",
+  "in flight": "Operations running now, with how long each has been going. Backups, restores, decommissions, re-encryption, consistency sweeps, re-shard reclaims, purges, row expiry passes and upgrade finalize are paired and appear here; splits, merges and rebalances are individually short and continuous, so they stay in the event feed as instants and are watched as a rate on the Metrics view instead.",
   "recently completed": "Operations that finished, with their outcome. An operation that keeps failing and restarting is why something never settles.",
   "operation": "What the cluster is doing and to which range or node. Nothing here was asked for by a client — this is the cluster maintaining itself.",
   "kind": "The kind of operation: a split, a merge, a rebalance, a lease move, a decommission, a backup.",
@@ -298,6 +298,29 @@ function labelText(el) {
   for (const ctl of copy.querySelectorAll("select, button, input, label, .sr-only, .cue")) ctl.remove();
   return copy.textContent;
 }
+// wrapHelpWords puts the words of a term that also holds controls in a
+// span of their own, which is what the underline is then drawn on
+// (issue #289). The underline of the whole heading ran under the spaces
+// between its filter box and its "copy as CSV", a dotted stub that
+// belonged to neither. Only an element with controls is touched, and
+// only its own text: the white space between controls stays bare. A
+// column header's sort button does not count — it sits against the
+// words with no gap to underline.
+const HELP_CONTROLS = "select, input, button:not(.sort)";
+function wrapHelpWords(el) {
+  if (!el.querySelector(HELP_CONTROLS)) return;
+  el.classList.add("holds");
+  for (const node of [...el.childNodes]) {
+    if (node.nodeType !== Node.TEXT_NODE || !node.nodeValue.trim()) continue;
+    // The spaces around the words stay outside the span, or the stub
+    // would only be shorter.
+    const [, lead, words, trail] = node.nodeValue.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    const span = document.createElement("span");
+    span.className = "helpwords";
+    span.textContent = words;
+    node.replaceWith(lead, span, trail);
+  }
+}
 // The elements that carry a term. Marking them is idempotent: renders
 // replace markup constantly, and every pass re-marks only what is new.
 const HELP_TARGETS = "th, h2, .tile .label, [data-help]";
@@ -308,6 +331,7 @@ function wireHelp(root) {
     if (!text) continue;
     el.dataset.helped = "1";
     el.classList.add("helpable");
+    wrapHelpWords(el);
     // title carries it to a hover and to a screen reader without any
     // script running; the click below is the same text, laid out.
     if (!el.hasAttribute("title")) el.setAttribute("title", text);

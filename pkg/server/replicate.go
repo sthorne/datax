@@ -54,16 +54,16 @@ func (n *Node) upreplicationLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		// The allocator, on the leader of range 1, and the merge barrier,
+		// on every node, resolve a range's placement policy through the
+		// placement map (pkg/server/placement.go), so keep it fresh. The
+		// refresh runs in the background and never blocks this tick; a
+		// policy written a moment ago takes effect a tick or two later.
+		n.refreshPlacement()
 		r1, ok := n.store.GetReplica(1)
 		if !ok || !r1.IsLeader() {
 			continue
 		}
-		// The allocator resolves a range's placement policy through the
-		// schema cache (pkg/server/placement.go), so keep it fresh. The
-		// refresh is a background rebuild that never blocks this tick; a
-		// policy written a moment ago takes effect a tick or two later,
-		// which is the same latency every other catalog change has here.
-		n.refreshSchema()
 		wctx, cancel := context.WithTimeout(ctx, interval*4)
 		n.upreplicateOnce(wctx)
 		n.repairDeadOnce(wctx)

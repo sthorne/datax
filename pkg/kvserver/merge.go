@@ -82,7 +82,8 @@ type mergeTrigger struct {
 
 // RunRangeMergeOnce merges adjacent underfull ranges: for every range this
 // store leads, if its right neighbor is local, colocated (identical node
-// sets), and both are below the merge threshold, drive the merge — first
+// sets), not held by a sticky bit (a manual split; issue #265), and both
+// are below the merge threshold, drive the merge — first
 // pulling the RHS's leadership here if needed. Also re-drives (or unwinds)
 // merges interrupted by a crash. Called by the housekeeping loop.
 func (s *Store) RunRangeMergeOnce(ctx context.Context) {
@@ -111,11 +112,22 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 				// Crashed mid-merge and membership diverged since (only
 				// possible if the freeze landed after a conf change raced
 				// it): unwind so the RHS serves again.
-				s.tryUnfreeze(ctx, rhs)
+				lhs.unwindInheritedFreeze(ctx, rhs, rhs.mergeEpochValue())
 			}
 			return true
 		}
 		redrive := rhs.isFrozen() && rhs.mergedIntoRange() == lhs.rangeID
+		// Never undo a manual split: the boundary between the two is the
+		// RHS's start, and an unexpired sticky bit on the RHS says an
+		// operator put it there on purpose (ALTER TABLE ... SPLIT AT,
+		// datax debug split) — typically ahead of a load, when both
+		// halves are still empty and would otherwise be folded back
+		// within seconds (issue #265). UNSPLIT clears the bit. An
+		// interrupted merge still finishes: its RHS is frozen and serves
+		// nothing until it does.
+		if !redrive && rhsDesc.Sticky(s.cfg.Clock.Now().WallTime) {
+			return true
+		}
 		if !redrive && (lhs.SizeBytes() >= threshold || rhs.SizeBytes() >= threshold) {
 			return true
 		}
@@ -174,7 +186,7 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 			}
 			return true
 		}
-		if _, err := lhs.adminMerge(ctx); err != nil {
+		if _, err := lhs.adminMerge(ctx, true); err != nil {
 			log.Warnf("%s: merge with %s: %v", lhs.rangeID, rhsDesc.RangeID, err)
 		}
 		return true
@@ -220,7 +232,18 @@ func (r *Replica) mergedIntoRange() base.RangeID {
 
 // adminMerge merges this (leading, unfrozen) range with its right
 // neighbor, which must be local, led by this node, and colocated.
-func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kvpb.Error) {
+// honorSticky is set by the merge queue and not by an operator's explicit
+// merge (datax debug merge), which overrides a manual split: with it, a
+// sticky bit found on the RHS once it is frozen abandons the merge. The
+// queue checks the bit before calling, but a manual split of the boundary
+// can land between that check and the freeze; after the freeze none can.
+func (r *Replica) adminMerge(ctx context.Context, honorSticky bool) (*kvpb.AdminMergeResponse, *kvpb.Error) {
+	// One driver at a time per left-hand replica: housekeeping and `datax
+	// debug merge` both lead here, and the reasoning below about whose
+	// freeze the right-hand range is under is simpler, and its unwinding
+	// safer, when two of them on this node cannot interleave.
+	r.mergeDriveMu.Lock()
+	defer r.mergeDriveMu.Unlock()
 	desc := r.Desc()
 	if r.isFrozen() {
 		return nil, kvpb.NewErrorf("%s: cannot merge: range is itself frozen", r.rangeID)
@@ -258,8 +281,21 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		cancel()
 		if err != nil {
 			metrics.RangeMergesDeferred.Inc()
+			// A right-hand range already frozen for this merge is out of
+			// service, and this pass cannot finish the merge: put it back
+			// in service rather than hold it frozen for a replica that may
+			// be behind for a long time (issue #266).
+			if rhs.isFrozen() && rhs.mergedIntoRange() == r.rangeID {
+				r.unwindInheritedFreeze(ctx, rhs, rhs.mergeEpochValue())
+			}
 			return nil, kvpb.NewErrorf("%s: not merging %s now: %v (retried by housekeeping)", r.rangeID, rhsDesc.RangeID, err)
 		}
+	}
+	// The freeze is tied to this range as it stands: its generation, plus
+	// one. See SubsumeRequest.MergeEpoch.
+	var epoch int64
+	if r.store.stickyBitsOK() {
+		epoch = int64(desc.Generation) + 1
 	}
 
 	// Phase 1: freeze the RHS (idempotent for re-drives).
@@ -267,6 +303,7 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	sub.Add(&kvpb.SubsumeRequest{
 		RequestHeader: kvpb.RequestHeader{Key: rhsDesc.StartKey, EndKey: rhsDesc.EndKey},
 		MergeInto:     r.rangeID,
+		MergeEpoch:    epoch,
 	})
 	subResp, kerr := rhs.Execute(ctx, sub)
 	if kerr != nil {
@@ -280,25 +317,30 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// them). Only the attempt that made the freeze may unwind it; an
 	// answer that does not say (it always does) is read as not ours.
 	fresh := false
+	var freezeEpoch int64
 	if len(subResp.Responses) == 1 && subResp.Responses[0].Subsume != nil {
 		fresh = !subResp.Responses[0].Subsume.AlreadyFrozen
+		freezeEpoch = subResp.Responses[0].Subsume.MergeEpoch
 	}
 	if k := r.store.cfg.TestingKnobs.AfterMergeSubsume; k != nil {
 		k(r.rangeID, rhsDesc.RangeID)
 	}
-	// abandon gives up on a merge that definitely did not happen. A freeze
-	// this attempt made is unwound at once so the RHS serves again
-	// (housekeeping tries the merge afresh later); one inherited from an
-	// earlier attempt is left alone, since that attempt's merge may still
-	// land and must find the RHS frozen at the subsume. Every exit between
-	// the freeze and the proposal goes through here; after the proposal,
-	// only a definitive failure does — an ambiguous one (the context ran
-	// out or the group stopped with the proposal in flight) may still
-	// apply, so the RHS stays frozen for it and the re-drive finishes or
-	// unwinds the merge.
+	// abandon gives up on a merge that definitely did not happen, and
+	// puts the RHS back in service (housekeeping tries the merge afresh
+	// later). A freeze this attempt made is simply cleared: nothing was
+	// proposed under it. One inherited from an earlier attempt needs more
+	// care, since that attempt's merge may still be on its way and must
+	// not find the RHS serving — unwindInheritedFreeze first makes sure
+	// it cannot apply. Every exit between the freeze and the proposal
+	// goes through here; after the proposal, only a definitive failure
+	// does — an ambiguous one (the context ran out or the group stopped
+	// with the proposal in flight) may still apply, so the RHS stays
+	// frozen for it and the re-drive finishes or unwinds the merge.
 	abandon := func(kerr *kvpb.Error) (*kvpb.AdminMergeResponse, *kvpb.Error) {
 		if fresh {
-			r.store.tryUnfreeze(ctx, rhs)
+			r.store.tryUnfreeze(ctx, rhs, freezeEpoch)
+		} else {
+			r.unwindInheritedFreeze(ctx, rhs, freezeEpoch)
 		}
 		return nil, kerr
 	}
@@ -313,6 +355,20 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 	// apply, but the spans must still meet here.
 	desc = r.Desc()
 	rhsDesc = rhs.Desc()
+	// A merge is built under a freeze only while this range is at the
+	// generation the freeze was made for. That is the whole of what makes
+	// an abandoned freeze safe to unwind: moving this range's generation
+	// on rules out every merge under the old freeze — one already in the
+	// log is refused at apply, and one not yet built stops here. A freeze
+	// that does not say (made before cluster version v20) is not built
+	// under at all once the epoch is in use.
+	if epoch != 0 && freezeEpoch != int64(desc.Generation)+1 {
+		return abandon(kvpb.NewErrorf("%s: not merging %s now: it is frozen for this range at another generation (epoch %d, this range is at generation %d); the freeze is unwound and housekeeping retries",
+			r.rangeID, rhsDesc.RangeID, freezeEpoch, desc.Generation))
+	}
+	if honorSticky && fresh && rhsDesc.Sticky(r.store.cfg.Clock.Now().WallTime) {
+		return abandon(kvpb.NewErrorf("%s: not merging %s: its start boundary %s was split manually (sticky)", r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey))
+	}
 	if !rhsDesc.StartKey.Equal(desc.EndKey) {
 		return abandon(kvpb.NewErrorf("%s: cannot merge: right neighbor %s now starts at %s, not at this range's end %s; retried by housekeeping",
 			r.rangeID, rhsDesc.RangeID, rhsDesc.StartKey, desc.EndKey))
@@ -354,6 +410,9 @@ func (r *Replica) adminMerge(ctx context.Context) (*kvpb.AdminMergeResponse, *kv
 		Replicas:      append([]kvpb.ReplicaDescriptor(nil), desc.Replicas...),
 		NextReplicaID: desc.NextReplicaID,
 		Generation:    gen + 1,
+		// The merged range starts where the LHS did, so it keeps the
+		// LHS's sticky bit; the RHS's described a boundary that is gone.
+		StickyUntil: desc.StickyUntil,
 	}
 	if k := r.store.cfg.TestingKnobs.BeforeProposeDescriptorChange; k != nil {
 		k(r.rangeID, "merge")
@@ -414,21 +473,109 @@ func confirmRHSApplied(ctx context.Context, wait func(context.Context, base.Node
 	return nil
 }
 
-// tryUnfreeze abandons a stuck merge by clearing the RHS freeze (needs RHS
-// leadership on this node; otherwise retried on a later pass).
-func (s *Store) tryUnfreeze(ctx context.Context, rhs *Replica) {
+// mergeEpochValue returns the epoch of the freeze a replica is under.
+func (r *Replica) mergeEpochValue() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.mergeEpoch
+}
+
+// unwindInheritedFreeze puts back in service a right-hand range frozen
+// for a merge into r by an attempt other than the caller's — one that
+// crashed, lost its leader, or ended with its proposal's fate unknown
+// (issue #266). Clearing such a freeze outright is unsafe: that
+// attempt's merge may still be in r's log, and if it applied after the
+// RHS had gone back to taking writes, the RHS would not be the same on
+// every replica at the point the merge absorbs it.
+//
+// So the freeze is fenced first. A merge applies only if r is still at
+// the generation it was built from (stageMerge), and is built under a
+// freeze only while r is at the generation the freeze names
+// (adminMerge). Moving r's generation on by one — a descriptor update
+// that changes nothing else — therefore rules out every merge under the
+// old freeze, on every replica, at one log position: those ordered
+// before the update have applied (and then the update itself is
+// refused, and there is no RHS left to unfreeze), those after it are
+// refused, and none can be built any more. When r has already moved on
+// since the freeze was made, that has happened by itself.
+//
+// Without cluster version v20 there is no such update to propose, and
+// the freeze is left for the merge's re-drive, as before.
+func (r *Replica) unwindInheritedFreeze(ctx context.Context, rhs *Replica, freezeEpoch int64) {
+	if !r.store.stickyBitsOK() {
+		return
+	}
+	fenced := false
+	for attempt := 0; attempt < maxDescriptorChangeAttempts && !fenced; attempt++ {
+		desc := r.Desc()
+		if !r.isLeader() || r.isFrozen() || !rhs.isFrozen() || rhs.mergedIntoRange() != r.rangeID || !rhs.Desc().StartKey.Equal(desc.EndKey) {
+			// Not ours to settle from here, or settled: the merge landed
+			// (this range now ends past the RHS's start), or someone else
+			// unwound it.
+			return
+		}
+		if freezeEpoch != 0 && freezeEpoch != int64(desc.Generation)+1 {
+			fenced = true // this range has moved on since the freeze
+			break
+		}
+		next := desc
+		next.Generation = desc.Generation + 1
+		_, kerr := r.proposeCmd(ctx, &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: r.rangeID}}, cmdTriggers{descriptor: &descriptorTrigger{Desc: next}})
+		if kerr != nil {
+			if kerr.DescriptorChanged != nil {
+				continue // something else moved the generation; look again
+			}
+			log.Warnf("%s: could not fence the abandoned merge of %s (%v); it stays frozen until the next pass", r.rangeID, rhs.rangeID, kerr)
+			return
+		}
+		if sender := r.store.getSender(); sender != nil {
+			if err := putMetaRecords(ctx, sender, r.store.cfg.Clock.Now(), r.store.orderedMetaUpdates(), next); err != nil {
+				log.Warnf("%s: generation moved to fence an abandoned merge but the meta update failed: %v", r.rangeID, err)
+			}
+		}
+		log.Infof("%s: generation moved to %d to fence the abandoned merge of %s", r.rangeID, next.Generation, rhs.rangeID)
+		fenced = true
+	}
+	if !fenced || !rhs.Desc().StartKey.Equal(r.Desc().EndKey) {
+		return
+	}
+	metrics.RangeMergesUnwound.Inc()
+	r.store.tryUnfreeze(ctx, rhs, freezeEpoch)
+}
+
+// tryUnfreeze abandons a stuck merge by clearing the RHS freeze made
+// under the given epoch (0: whichever freeze it is under). It needs RHS
+// leadership on this node; otherwise it is retried on a later pass.
+func (s *Store) tryUnfreeze(ctx context.Context, rhs *Replica, epoch int64) {
 	if !rhs.isLeader() {
 		log.Warnf("%s: frozen for a merge that was abandoned, and this node no longer leads it; left frozen for the leader's housekeeping", rhs.rangeID)
 		return
 	}
 	d := rhs.Desc()
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: d.RangeID, Timestamp: s.cfg.Clock.Now()}}
-	ba.Add(&kvpb.UnfreezeRequest{RequestHeader: kvpb.RequestHeader{Key: d.StartKey, EndKey: d.EndKey}})
+	ba.Add(&kvpb.UnfreezeRequest{RequestHeader: kvpb.RequestHeader{Key: d.StartKey, EndKey: d.EndKey}, MergeEpoch: epoch})
 	if _, kerr := rhs.Execute(ctx, ba); kerr != nil {
 		log.Warnf("%s: unfreezing abandoned merge: %v", d.RangeID, kerr)
-	} else {
+	} else if !rhs.isFrozen() {
 		log.Infof("%s: abandoned merge unwound; range serves again", d.RangeID)
 	}
+}
+
+// TestingUnwindMergeFreeze runs, for the left-hand range lhsID led here,
+// the unwinding of a freeze its right neighbor was left under — what a
+// merge pass does when it finds one it cannot finish. It reports whether
+// the neighbor serves afterwards.
+func (s *Store) TestingUnwindMergeFreeze(ctx context.Context, lhsID base.RangeID) bool {
+	lhs, ok := s.GetReplica(lhsID)
+	if !ok {
+		return false
+	}
+	rhs := s.replicaStartingAt(lhs.Desc().EndKey)
+	if rhs == nil {
+		return false
+	}
+	lhs.unwindInheritedFreeze(ctx, rhs, rhs.mergeEpochValue())
+	return !rhs.isFrozen()
 }
 
 // updateMetaRecords writes and deletes /meta addressing records in one
@@ -481,8 +628,10 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 	// fields named Left carry different generations.)
 	if r.Desc().Generation != trig.Left.Generation {
 		metrics.DescriptorChangeRefusals.WithLabelValues("merge").Inc()
-		return kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
+		e := kvpb.NewErrorf("%s: merge against generation %d but range is at %d; retried by housekeeping",
 			r.rangeID, trig.Left.Generation, r.Desc().Generation)
+		e.DescriptorChanged = &kvpb.DescriptorChangedError{RangeID: r.rangeID, BuiltFrom: trig.Left.Generation, Current: r.Desc().Generation}
+		return e
 	}
 	rhs, ok := r.store.GetReplica(trig.Right.RangeID)
 	if !ok {

@@ -8,15 +8,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
-	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 )
 
 // /api/schema — the schema browser behind the dashboard: every table
@@ -26,13 +27,19 @@ import (
 // namespace, so this is a table list rather than a database picker.
 //
 // The document is assembled node-locally from range 1's catalog and the
-// node's own replicas, cached for schemaCacheFor so a reload storm does
-// not turn into a catalog scan storm, and filtered per request: root and
-// admin-role members see everything; another user sees the tables it
-// holds a privilege on and no user list.
+// node's own replicas, when somebody asks for it: a request that finds
+// it older than schemaCacheFor builds it, concurrent requests share that
+// one build, and a node nobody is browsing builds nothing (issue #311 —
+// it used to be rebuilt on a timer on every node, because range labels,
+// placement and the table gauges were read off its by-products; each of
+// those now reads what it needs, see table_cache.go, placement.go and
+// table_gauges.go). It is filtered per request: root and admin-role
+// members see everything; another user sees the tables it holds a
+// privilege on and no user list.
 
 // schemaCacheFor bounds how often the catalog is re-scanned for the
-// browser and the table gauges.
+// browser: the console polls every few seconds while the page is open,
+// and a table created a moment ago shows within this.
 const schemaCacheFor = 5 * time.Second
 
 // schemaBuildTimeout bounds one catalog scan: a node cut off from range
@@ -66,6 +73,9 @@ type SchemaIndex struct {
 	// State is "" or "public" for a readable index, "write-only" while a
 	// CREATE INDEX backfill is in progress.
 	State string `json:"state,omitempty"`
+	// Method is the access method of an index that is not an ordinary
+	// (btree) one: "gin" for an inverted index.
+	Method string `json:"method,omitempty"`
 }
 
 // SchemaConstraint is one table constraint beyond the primary key and
@@ -162,20 +172,34 @@ type SchemaStatus struct {
 
 // schemaCache holds the last full (unfiltered) document.
 type schemaCache struct {
-	mu   sync.Mutex
-	at   time.Time
-	doc  *SchemaStatus
-	name map[uint64]string // table ID → name, for range labeling
-	// descs keeps the descriptors too, so range spans render with table,
-	// index and typed key values (rowenc.PrettyKey).
+	mu  sync.Mutex
+	at  time.Time
+	doc *SchemaStatus
+	// descs keeps the descriptors the document was built from, for the
+	// questions its shape cannot answer on its own (ownership, and so
+	// what a caller who is not an admin may see).
 	descs map[uint64]*catalog.TableDescriptor
-	// placement is the replica placement policy each table inherits from
-	// its database (issue #176), built by the same catalog scan. A table
-	// whose database carries no policy is absent, which is the same
-	// answer as the zero policy: the cluster default, any node.
-	placement map[uint64]base.PlacementPolicy
-	// refreshing marks a background rebuild in flight (see refreshSchema).
-	refreshing bool
+	// building is non-nil while a build is in flight and closed when its
+	// result is installed: the requests that arrive meanwhile wait for
+	// it instead of scanning the catalog again. started and finished
+	// number the builds, so a caller that must see the catalog as it is
+	// now (rebuildSchema) can tell a build begun after it asked from one
+	// that was already running.
+	building          chan struct{}
+	started, finished uint64
+	// builds counts catalog scans for the document (TestingSchemaBuilds).
+	builds atomic.Int64
+}
+
+// TestingSchemaBuilds is how many times this node has built the schema
+// document since it started.
+func (n *Node) TestingSchemaBuilds() int64 { return n.schema.builds.Load() }
+
+// TestingBuildSchemaDoc builds the schema document once under ctx, so a
+// test can attribute the build's KV requests to it; it returns the
+// number of tables in the document.
+func (n *Node) TestingBuildSchemaDoc(ctx context.Context) int {
+	return len(n.rebuildSchema(ctx).Tables)
 }
 
 func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
@@ -215,7 +239,7 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 			writeSchemaDoc(w, &doc)
 			return
 		}
-		descs := n.tableDescs()
+		descs := n.schemaDescs()
 		visible := make([]SchemaTable, 0, len(full.Tables))
 		for _, t := range full.Tables {
 			d := descs[t.ID]
@@ -227,6 +251,11 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 			// /api/security filters rather than gates, and the same
 			// applies here: the caller sees its own effective grants.
 			t.Privileges = ownGrants(set, d.Privileges)
+			if catalog.RowSecurityConfines(set, d) {
+				// The statistics count every tenant's rows; a role the
+				// table's policies confine is not told how many there are.
+				t.Stats = nil
+			}
 			visible = append(visible, t)
 		}
 		doc.Tables = visible
@@ -259,106 +288,103 @@ func ownGrants(set catalog.RoleSet, privs map[string][]string) map[string][]stri
 	return own
 }
 
-// tableDescs is the descriptor map the last catalog scan built, for the
-// questions the API shape cannot answer on its own (ownership, and so
-// visibility).
-func (n *Node) tableDescs() map[uint64]*catalog.TableDescriptor {
+// schemaDescs is the descriptor map the last build of the document
+// produced.
+func (n *Node) schemaDescs() map[uint64]*catalog.TableDescriptor {
 	n.schema.mu.Lock()
 	defer n.schema.mu.Unlock()
 	return n.schema.descs
 }
 
-// schemaDoc returns the cached full document, rebuilding it past
-// schemaCacheFor. The rebuild is bounded by schemaBuildTimeout; the
-// browser's own request waits for it, the other endpoints do not (see
-// refreshSchema).
+// viewerDescs is the descriptor of every table, no older than
+// schemaCacheFor when the catalog can be read: what decides which tables
+// and keys a caller who is not an admin is shown. It waits for a build
+// rather than answer from an old one, since a grant revoked an hour ago
+// must not show a table for one more poll; resolving such a caller's
+// roles already reads the catalog, so this adds no new way to wait.
+func (n *Node) viewerDescs(ctx context.Context) map[uint64]*catalog.TableDescriptor {
+	n.schemaDoc(ctx)
+	return n.schemaDescs()
+}
+
+// schemaDoc returns the full document, building it when the cached one
+// is older than schemaCacheFor. The build is bounded by
+// schemaBuildTimeout and shared by every request waiting for it.
 func (n *Node) schemaDoc(ctx context.Context) *SchemaStatus {
-	n.schema.mu.Lock()
-	if n.schema.doc != nil && time.Since(n.schema.at) < schemaCacheFor {
-		doc := n.schema.doc
-		n.schema.mu.Unlock()
-		return doc
-	}
-	n.schema.mu.Unlock()
-	return n.rebuildSchema(ctx)
+	return n.buildSchema(ctx, false)
 }
 
-// rebuildSchema scans the catalog and installs the result. Built without
-// the lock: the build reads this node's range views, which label
-// themselves through tableNameOf and the same lock. Two concurrent
-// rebuilds are a wasted scan, not a hazard. A build that could not read
-// the catalog keeps the previous name map, so range labels survive a
-// partition instead of blinking out.
+// rebuildSchema returns a document built from a catalog scan that began
+// after the call did, for the caller that has just been told of a table
+// the cached document does not list.
 func (n *Node) rebuildSchema(ctx context.Context) *SchemaStatus {
-	ctx, cancel := context.WithTimeout(ctx, schemaBuildTimeout)
-	defer cancel()
-	doc, names, descs, policies := n.buildSchemaDoc(ctx)
-	n.schema.mu.Lock()
-	n.schema.doc, n.schema.at = doc, time.Now()
-	if doc.Error == "" || n.schema.name == nil {
-		n.schema.name = names
-		n.schema.descs = descs
-		n.schema.placement = policies
-		// Lend the names to the key printer, so this process's log lines
-		// name tables too (every node of a cluster knows the same names).
-		keys.SetTableNamer(func(id uint64) (string, bool) {
-			n.schema.mu.Lock()
-			defer n.schema.mu.Unlock()
-			name, ok := n.schema.name[id]
-			return name, ok
-		})
-	}
-	n.schema.mu.Unlock()
-	return doc
+	return n.buildSchema(ctx, true)
 }
 
-// refreshSchema keeps the name map fresh for the endpoints that only
-// label ranges (/api/cluster, /status): past schemaCacheFor it starts one
-// background rebuild and returns at once. Those endpoints must answer
-// while the catalog is unreachable — a partitioned node's dashboard is
-// exactly when an operator looks — so they never wait on a catalog scan.
-func (n *Node) refreshSchema() {
-	n.schema.mu.Lock()
-	stale := n.schema.doc == nil || time.Since(n.schema.at) >= schemaCacheFor
-	if !stale || n.schema.refreshing {
-		n.schema.mu.Unlock()
-		return
-	}
-	n.schema.refreshing = true
-	n.schema.mu.Unlock()
-	if err := n.stopper.RunWorker(func(ctx context.Context) {
-		defer func() {
-			n.schema.mu.Lock()
-			n.schema.refreshing = false
-			n.schema.mu.Unlock()
-		}()
-		n.rebuildSchema(ctx)
-	}); err != nil {
-		n.schema.mu.Lock()
-		n.schema.refreshing = false
-		n.schema.mu.Unlock()
+func (n *Node) buildSchema(ctx context.Context, fresh bool) *SchemaStatus {
+	c := &n.schema
+	c.mu.Lock()
+	want := c.started + 1 // the first build to begin from here on
+	for {
+		if c.doc != nil && ((fresh && c.finished >= want) || (!fresh && time.Since(c.at) < schemaCacheFor)) {
+			doc := c.doc
+			c.mu.Unlock()
+			return doc
+		}
+		if building := c.building; building != nil {
+			c.mu.Unlock()
+			select {
+			case <-building:
+			case <-ctx.Done():
+				// The caller gave up waiting; the build goes on for the
+				// others. It gets the last document, if there is one.
+				if doc := n.cachedSchemaDoc(); doc != nil {
+					return doc
+				}
+				return &SchemaStatus{NodeID: int(n.ident.NodeID), Error: "catalog listing unavailable: " + ctx.Err().Error()}
+			}
+			c.mu.Lock()
+			continue
+		}
+		building := make(chan struct{})
+		c.building = building
+		c.started++
+		seq := c.started
+		c.mu.Unlock()
+
+		// Built without the lock, and detached from the caller's
+		// cancellation: the requests that joined this build must not lose
+		// it because the one that happened to start it hung up. A build
+		// that could not read the catalog keeps the previous descriptors,
+		// so what a caller may see does not blink out with a partition.
+		bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schemaBuildTimeout)
+		doc, descs := n.buildSchemaDoc(bctx)
+		cancel()
+
+		c.mu.Lock()
+		c.doc, c.at, c.finished = doc, time.Now(), seq
+		if doc.Error == "" || c.descs == nil {
+			c.descs = descs
+		}
+		c.building = nil
+		close(building)
 	}
 }
 
 // cachedSchemaDoc returns the last built document without rebuilding
-// (nil before the first build); pair with refreshSchema.
+// (nil before the first build).
 func (n *Node) cachedSchemaDoc() *SchemaStatus {
 	n.schema.mu.Lock()
 	defer n.schema.mu.Unlock()
 	return n.schema.doc
 }
 
-// tableNameOf labels a range with the table its start key belongs to
-// ("" for system and meta ranges, or before the first catalog scan).
 // prettyKey renders a key for the APIs and the dashboard: with the
 // table, index and typed values when the key belongs to a table this
-// node's schema cache knows, by shape otherwise.
+// node knows (tableDesc), by shape otherwise.
 func (n *Node) prettyKey(k keys.Key) string {
 	if id, ok := tableIDOfKey(k); ok {
-		n.schema.mu.Lock()
-		d := n.schema.descs[id]
-		n.schema.mu.Unlock()
-		if d != nil {
+		if d := n.tableDesc(id); d != nil {
 			return rowenc.PrettyKey(d, k)
 		}
 		// No descriptor: a dropped table, or a reserved one not created
@@ -375,28 +401,18 @@ func (n *Node) prettyKey(k keys.Key) string {
 	return keys.Pretty(k)
 }
 
-// tableNames is the current table ID → name map, rebuilt now so a table
-// created a moment ago is named too, for admin responses that print
-// spans (admin operations are rare; the catalog scan is cheap).
-func (n *Node) tableNames(ctx context.Context) map[uint64]string {
-	n.rebuildSchema(ctx)
-	n.schema.mu.Lock()
-	defer n.schema.mu.Unlock()
-	out := make(map[uint64]string, len(n.schema.name))
-	for id, name := range n.schema.name {
-		out[id] = name
-	}
-	return out
-}
-
+// tableNameOf labels a range with the table its start key belongs to
+// ("" for system and meta ranges, or a table this node has not read
+// yet).
 func (n *Node) tableNameOf(start keys.Key) string {
 	id, ok := tableIDOfKey(start)
 	if !ok {
 		return ""
 	}
-	n.schema.mu.Lock()
-	defer n.schema.mu.Unlock()
-	return n.schema.name[id]
+	if d := n.tableDesc(id); d != nil {
+		return d.Name
+	}
+	return ""
 }
 
 // tableIDOfKey decodes the table ID a user-data key belongs to.
@@ -415,7 +431,7 @@ func columnDefault(c catalog.Column) string {
 		return "NULL"
 	}
 	switch c.Default.Fam {
-	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Enum:
+	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Enum, types.Vector:
 		return "'" + strings.ReplaceAll(c.Default.Text(), "'", "''") + "'"
 	default:
 		return c.Default.Text()
@@ -447,15 +463,18 @@ func schemaConstraint(
 	return sc
 }
 
-func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]string, map[uint64]*catalog.TableDescriptor, map[uint64]base.PlacementPolicy) {
+// buildSchemaDoc scans the catalog once: every descriptor, the
+// databases, every table's statistics and the range list, a handful of
+// requests whatever the number of tables.
+func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]*catalog.TableDescriptor) {
+	n.schema.builds.Add(1)
 	doc := &SchemaStatus{NodeID: int(n.ident.NodeID)}
 	names := map[uint64]string{}
 	byID := map[uint64]*catalog.TableDescriptor{}
-	policies := map[uint64]base.PlacementPolicy{}
 
 	var descs []*catalog.TableDescriptor
+	var stats map[uint64]*catalog.TableStatistics
 	dbNames := map[uint64]string{0: catalog.DefaultDatabase}
-	dbPolicy := map[uint64]base.PlacementPolicy{}
 	err := n.db.RunTxn(ctx, "schema-api", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		descs, err = catalog.NewAccessor().List(ctx, txn)
@@ -468,15 +487,13 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 		for _, db := range dbs {
 			dbNames[db.ID] = db.Name
-			if !db.Placement.IsZero() {
-				dbPolicy[db.ID] = db.Placement.Clone()
-			}
 		}
-		return nil
+		stats, err = readAllTableStats(ctx, txn)
+		return err
 	})
 	if err != nil {
 		doc.Error = "catalog listing unavailable: " + err.Error()
-		return doc, names, byID, policies
+		return doc, byID
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].Name < descs[j].Name })
 
@@ -499,6 +516,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 	if rerr != nil {
 		doc.Error = "range listing unavailable: " + rerr.Error()
 	}
+	rangeIdx := newRangeIndex(ranges)
 	local := map[int64]RangeStatus{}
 	for _, rs := range n.rangeStatuses() {
 		local[rs.RangeID] = rs
@@ -515,9 +533,6 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			Comment: d.Comment,
 		}
 		byID[d.ID] = d
-		if p, ok := dbPolicy[d.DatabaseID]; ok {
-			policies[d.ID] = p
-		}
 		colName := map[catalog.ColumnID]string{}
 		for _, c := range d.Columns {
 			colName[c.ID] = c.Name
@@ -531,6 +546,9 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 		for _, idx := range d.Indexes {
 			si := SchemaIndex{Name: idx.Name, Unique: idx.Unique, State: idx.State}
+			if idx.IsInverted() || idx.IsVector() {
+				si.Method = vtable.IndexMethod(&idx)
+			}
 			for _, id := range idx.ColumnIDs {
 				si.Columns = append(si.Columns, colName[id])
 			}
@@ -543,21 +561,9 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 			doc.Tables = append(doc.Tables, t) // no rows, no ranges
 			continue
 		}
-		if raw, err := n.db.Get(ctx, keys.TableStatsKey(d.ID)); err == nil && raw != nil {
-			var st catalog.TableStatistics
-			if json.Unmarshal(raw, &st) == nil {
-				age := (now - st.CollectedAt) / int64(time.Second)
-				t.Stats = &SchemaStats{
-					RowCount: st.RowCount, CollectedAt: st.CollectedAt / int64(time.Millisecond),
-					AgeSeconds: age, Stale: time.Duration(now-st.CollectedAt) > statsStaleAfter,
-				}
-			}
-		}
+		t.Stats = schemaStats(stats[d.ID], now)
 		start, end := keys.TableDataSpan(d.ID)
-		for _, r := range ranges {
-			if r.StartKey.Compare(end) >= 0 || r.EndKey.Compare(start) <= 0 {
-				continue
-			}
+		rangeIdx.overlapping(start, end, func(r kvpb.RangeDescriptor) {
 			t.Ranges++
 			if rs, ok := local[int64(r.RangeID)]; ok {
 				t.LocalReplicas++
@@ -566,12 +572,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 					t.LeadersHere++
 				}
 			}
-		}
-		metrics.TableRanges.WithLabelValues(d.Name).Set(float64(t.Ranges))
-		if t.Stats != nil {
-			metrics.TableRows.WithLabelValues(d.Name).Set(float64(t.Stats.RowCount))
-			metrics.TableStatsAge.WithLabelValues(d.Name).Set(float64(t.Stats.AgeSeconds))
-		}
+		})
 		doc.Tables = append(doc.Tables, t)
 	}
 
@@ -597,5 +598,5 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]st
 		}
 	}
 	sort.Slice(doc.Users, func(i, j int) bool { return doc.Users[i].Name < doc.Users[j].Name })
-	return doc, names, byID, policies
+	return doc, byID
 }

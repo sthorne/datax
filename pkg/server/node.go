@@ -28,6 +28,7 @@ import (
 	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/storage/enc"
 	"github.com/sthorne/datax/pkg/util/events"
@@ -137,6 +138,11 @@ type Config struct {
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
+	// DescCacheSize bounds the gateway's descriptor cache, and so the
+	// leases it holds and renews (0 = catalog.DefaultDescCacheSize). A
+	// table resolved while the cache is full is read from the catalog by
+	// each statement instead (issue #311).
+	DescCacheSize int
 	// MergeSizeThreshold: a range and its right neighbor both below it (and
 	// colocated) merge automatically (0 = a quarter of SplitSizeThreshold;
 	// negative disables).
@@ -153,6 +159,18 @@ type Config struct {
 	// node's metrics into the datax_metrics system table (see
 	// metrics_recorder.go). 0 = 10s; negative disables recording.
 	MetricsRecordInterval time.Duration
+	// AuditFlushInterval paces the loop that writes this node's audit
+	// events into the datax_audit system table (see audit_table.go).
+	// 0 = 1s; negative leaves the table alone, and audit records are in
+	// the log only.
+	AuditFlushInterval time.Duration
+	// AuditHousekeepingInterval paces the audit table's retention and
+	// anchoring; 0 = 10m.
+	AuditHousekeepingInterval time.Duration
+	// AuditRetention, when positive, overrides the retention stored with
+	// the table (ALTER TABLE datax_audit SET (retention = ...), which
+	// accepts nothing under a day). Tests only.
+	AuditRetention time.Duration
 	// StatsRefreshInterval paces the background statistics sampler: each
 	// tick, the node leading range 1 re-collects statistics for at most
 	// ONE table whose stats are missing or older than StatsStaleness
@@ -162,6 +180,27 @@ type Config struct {
 	// StatsStaleness is the statistics age that triggers a background
 	// re-collection (0 = default 10m).
 	StatsStaleness time.Duration
+	// RowTTLInterval paces the row expiry job (rowttl.go): each tick,
+	// the node leading range 1 deletes the expired rows of every table
+	// with a row TTL (0 = default 30s; negative disables the job, and
+	// expired rows then stay). RowTTLBatchSize is how many rows one
+	// transaction deletes (0 = 100) and RowTTLBatchPause the wait between
+	// two batches on one table (0 = 20ms; negative = none), which
+	// together cap the rate at which the job writes.
+	RowTTLInterval   time.Duration
+	RowTTLBatchSize  int
+	RowTTLBatchPause time.Duration
+	// LargeObjectSweepInterval paces the large-object sweeper
+	// (largeobject.go): each tick, the node leading range 1 deletes the
+	// pages of unlinked objects and of uploads that never committed
+	// (0 = default 1m; negative disables it, and those pages then stay;
+	// the loop also creates the large-object tables, which with it
+	// disabled are created by the first session to store an object).
+	// LargeObjectUploadGrace is how long an upload may go without a sign
+	// of life before the sweeper takes it for abandoned — how long a
+	// client may leave an upload idle (0 = default 10m).
+	LargeObjectSweepInterval time.Duration
+	LargeObjectUploadGrace   time.Duration
 	// ReshardRetireFor is how long a completed re-shard's superseded
 	// layout stays on disk serving AS OF SYSTEM TIME below the swap
 	// before the janitor reclaims it (0 = the GC TTL, matching the
@@ -202,6 +241,16 @@ type Config struct {
 	// and a restart in between still opens the store (see
 	// enc.MatchStoreKey).
 	EncKeyPath string
+	// EncRoot is the alternative to EncKeyPath (issue #305): the root the
+	// store key is kept under — "file:<path>" or "exec:<command>". The
+	// key itself is made on the node and lives in the data directory only
+	// wrapped by the root. A comma-separated list names candidates: the
+	// one that wrapped the store's key is used, so the root a store is
+	// moving to can be staged beside the one it is under.
+	EncRoot string
+	// EncRootHealthInterval is how often a root that can be asked whether
+	// it works (a KMS root) is asked; 0 = the default, negative = never.
+	EncRootHealthInterval time.Duration
 	// AcceptEncryptionRollback lets a store whose switch to authenticated
 	// encryption has been rolled back — its key registry, or the whole
 	// store, restored from before the switch — start anyway (issue
@@ -216,6 +265,19 @@ type Config struct {
 
 	// Test hooks.
 	TestingKnobs kvserver.TestingKnobs
+	// RequireLockedKeys refuses to start an encrypted node whose key
+	// memory could not be locked and kept out of core dumps (issue
+	// #309); without it that is a warning.
+	RequireLockedKeys bool
+	// AllowCoreDumps records that the operator asked for the process to
+	// stay dumpable (the command, not the node, changes the process).
+	AllowCoreDumps bool
+	// OnSealed is called, with the RPC address, when the start stops to
+	// wait for shares of the root key (sealed.go): Start does not return
+	// until the node is unsealed, so this is how its caller learns it is
+	// waiting. StartContext, when set, abandons a start that is waiting.
+	OnSealed     func(addr string)
+	StartContext context.Context
 	// Engine injects the state engine (tests: in-memory); RaftEngine,
 	// with it, injects a raft engine so the store runs split. With
 	// Engine set the node never opens or migrates a store itself.
@@ -280,7 +342,10 @@ type Node struct {
 	// which reads it to publish SQL activity: an atomic pointer, not a
 	// plain field.
 	pgServer atomic.Pointer[pgwire.Server] // set when PGListen/PGListener is configured
-	httpAddr string                        // set when HTTPListen/HTTPListener is configured
+	// notify is the LISTEN / NOTIFY hub (notifyHub builds it on first use).
+	notifyOnce sync.Once
+	notify     *notify.Hub
+	httpAddr   string // set when HTTPListen/HTTPListener is configured
 
 	// encKey is the loaded store encryption key; non-nil means the store is
 	// encrypted and node-written artifacts (metadata backup) are sealed too.
@@ -291,6 +356,25 @@ type Node struct {
 	// the store first), consulted after an online rotation to tell the
 	// operator whether a restart would find the new key.
 	encKeyPaths []string
+	// encRoots are the roots EncRoot named and encRoot the one the store
+	// key is under (nil for a key-file or plaintext store). encRoot is
+	// guarded by encKeyMu: a rewrap can move the store to another.
+	encRoots []enc.Root
+	encRoot  enc.Root
+	// encBinding is the cluster and node the wrapped store key is bound
+	// to (zero until it is: enckms.go); encEntryKeyID is the key id its
+	// entry in the wrapped-key file records. Both under encKeyMu.
+	encBinding    enc.Binding
+	encEntryKeyID string
+	// rootHealth is what the last health check of the root found
+	// (enckms.go).
+	rootHealth rootHealthState
+	// peerUnseal is what this node remembers as the answering side of
+	// peer unseal (peerunseal.go).
+	peerUnseal peerUnsealState
+	// rpcListener is the RPC listener when a sealed start opened it
+	// early (sealed.go); nil otherwise.
+	rpcListener *handoffListener
 	// rotateMu serializes online store-key rotations end to end: registry
 	// reseal, encKey swap, and metadata-backup reseal (issue #66).
 	rotateMu sync.Mutex
@@ -328,6 +412,8 @@ type Node struct {
 	consoleVersion string
 	loginPage      []byte
 
+	// retention resolves a range to its table's GC window (retention.go).
+	retention *retentionProvider
 	// clusterVersion caches the last observed finalized cluster version
 	// (0 reads as v1). Seeded from the store-local mirror at startup and
 	// refreshed by the heartbeat loop from the replicated row.
@@ -348,6 +434,13 @@ type Node struct {
 	pinger *rpc.Pinger
 	// schema caches the schema browser's document (see schema_api.go).
 	schema schemaCache
+	// tableDescs holds the descriptors of the tables this node has been
+	// asked to name (table_cache.go); placement, each table's replica
+	// placement policy (placement.go); gauges, the last reading of the
+	// table gauges (table_gauges.go).
+	tableDescs tableDescCache
+	placement  placementCache
+	gauges     tableGaugeCache
 	// capacity caches the disk-fill forecasts (see capacity.go): they
 	// read a day of samples per node, which is not work to repeat on a
 	// console poll.
@@ -401,6 +494,9 @@ type Node struct {
 	// prefsReady is set once the datax_ui_prefs table is known to exist,
 	// so setting a preference does no DDL in the common case (issue #204).
 	prefsReady atomic.Bool
+	// audit is this node's writer for the datax_audit table (issue
+	// #293); nil when Config.AuditFlushInterval turns it off.
+	audit *auditTable
 	// metricsLastWarn rate-limits the recorder's write-failure warning
 	// (recorder goroutine only).
 	metricsLastWarn time.Time
@@ -430,6 +526,10 @@ func (n *Node) start() error {
 	if n.clock == nil {
 		n.clock = hlc.NewClock(nil, n.cfg.MaxOffset)
 	}
+	// First of all: a sealed start waits here for its shares before
+	// there is a store, and who gave them is exactly what the audit
+	// table is for. The events wait in memory until it can be written.
+	n.startAuditTable()
 
 	var err error
 	if paths := enc.SplitKeyPaths(n.cfg.EncKeyPath); len(paths) > 0 {
@@ -458,6 +558,14 @@ func (n *Node) start() error {
 		}
 		n.matchRaftEncKey(candidates)
 	}
+	if n.cfg.EncRoot != "" {
+		if err := n.loadRootedStoreKey(context.Background()); err != nil {
+			return err
+		}
+	}
+	if err := n.holdStoreKey(); err != nil {
+		return err
+	}
 	n.engine, n.raftEngine = n.cfg.Engine, n.cfg.RaftEngine
 	if n.engine == nil {
 		if err := n.openEngines(); err != nil {
@@ -476,6 +584,7 @@ func (n *Node) start() error {
 	if n.raftEngine != nil {
 		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
 	}
+	n.loadPeerUnsealSetting()
 	// Before anything asks the engines to move: what they opened with,
 	// held to the store's own record of its switch (issue #248).
 	if err := n.checkEncryptionMarker(); err != nil {
@@ -489,7 +598,12 @@ func (n *Node) start() error {
 	}
 
 	lis := n.cfg.Listener
-	if lis == nil {
+	if n.rpcListener != nil {
+		// A sealed start has been listening here since before the store
+		// opened; the node proper takes the listener over.
+		lis = n.rpcListener.final()
+		n.stopper.AddCloser(func() { _ = lis.Close() })
+	} else if lis == nil {
 		lis, err = net.Listen("tcp", n.cfg.Listen)
 		if err != nil {
 			return err
@@ -591,6 +705,10 @@ func (n *Node) start() error {
 	default:
 		return fmt.Errorf("store is uninitialized: start with --join or use 'datax init'")
 	}
+	// The node knows who it is: hold the wrapped store key to that.
+	if err := n.bindStoreKey(context.Background()); err != nil {
+		return err
+	}
 
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
@@ -599,6 +717,7 @@ func (n *Node) start() error {
 		defaultGCTTL = base.DefaultGCTTL
 	}
 	retention := &retentionProvider{node: n, defaultTTL: defaultGCTTL}
+	n.retention = retention
 	n.store = kvserver.NewStore(kvserver.StoreConfig{
 		NodeID:                  n.ident.NodeID,
 		Events:                  n.events,
@@ -650,6 +769,7 @@ func (n *Node) start() error {
 		return ids
 	})
 	n.store.SetSender(n.db)
+	n.db.SetPurger(n.PurgeSpan)
 
 	n.trans.SetLocalInfo(n.ident.NodeID, n.addr)
 	n.pinger = rpc.NewPinger(n.trans, n.ident.NodeID, func() []base.NodeID {
@@ -713,6 +833,9 @@ func (n *Node) start() error {
 		}
 	}()
 	n.stopper.AddCloser(grpcServer.Stop)
+	// What a sealed restart of this node will need before its store is
+	// open; the heartbeat keeps it in step with the registry after this.
+	n.writeSealIdentity()
 
 	if initialized {
 		// A restarted node may be back on a different address. Announce it
@@ -753,6 +876,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.heartbeatLoop); err != nil {
 		return err
 	}
+	// Lend table names to the key printer, so this process's log lines
+	// name tables too (every node of a cluster knows the same names).
+	keys.SetTableNamer(n.tableNameByID)
 	if err := n.stopper.RunWorker(n.upreplicationLoop); err != nil {
 		return err
 	}
@@ -777,7 +903,19 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.largeObjectSweepLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {
+		return err
+	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.auditLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.ensureDatabaseCatalog); err != nil {
@@ -785,6 +923,9 @@ func (n *Node) start() error {
 	}
 	n.maybeStartFilterRewrite()
 	if err := n.stopper.RunWorker(n.ensureRoleCatalog); err != nil {
+		return err
+	}
+	if err := n.startRootHealth(); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)

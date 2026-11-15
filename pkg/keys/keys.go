@@ -103,6 +103,14 @@ func StoreClusterVersionKey() Key {
 	return append(localUnreplicatedPrefix.Clone(), []byte("store-cluster-version")...)
 }
 
+// StorePeerUnsealKey holds this store's copy of the cluster's peer-unseal
+// setting (issue #307), so a node can answer a sealed peer while the
+// cluster has no quorum to read the setting from — which is exactly
+// when a cold start needs the answer.
+func StorePeerUnsealKey() Key {
+	return append(localUnreplicatedPrefix.Clone(), []byte("store-peer-unseal")...)
+}
+
 // StoreEncryptionMarkerKey holds the store's own record of its switch to
 // authenticated encryption (JSON; issue #248): written after each
 // transition the sealed key registry records, so a registry rolled back
@@ -277,6 +285,20 @@ func StoreEncryptionCutoverKey(storeID base.StoreID) Key {
 	return systemKey("enc-cutover", strconv.FormatInt(int64(storeID), 10))
 }
 
+// RestoreProgressKey holds the record of a table restore in flight (JSON;
+// issue #301): which node runs it and the table ids its rows are being
+// loaded under. The record is written before the first row and removed
+// in the transaction that makes the tables visible, so a record that
+// outlives its restore names rows nobody can reach, which a janitor
+// then removes.
+func RestoreProgressKey(opID string) Key { return systemKey("restore", opID) }
+
+// RestoreProgressSpan covers every table restore's record.
+func RestoreProgressSpan() (Key, Key) {
+	p := systemKey("restore")
+	return p, p.PrefixEnd()
+}
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")
@@ -294,6 +316,11 @@ func NodeRegistrySpan() (Key, Key) {
 // one value wins), keying the stand-in SCRAM salts for users that do not
 // exist (issue #137). Never shown to a client.
 func AuthSecretKey() Key { return systemKey("auth-secret") }
+
+// PeerUnsealSettingKey holds the cluster's peer-unseal setting: "off"
+// when running nodes must not hand the root key to a restarting peer
+// (issue #307). Absent means on.
+func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
 
 // NodeIDGenKey is the counter for allocating node IDs.
 func NodeIDGenKey() Key { return systemKey("idgen", "node") }
@@ -553,6 +580,25 @@ func TableDataSpan(tableID uint64) (Key, Key) {
 // /t/<tableID>/<indexID>/. Primary rows are index 1 (see pkg/sql/rowenc).
 func TableIndexPrefix(tableID, indexID uint64) Key {
 	return Key(encoding.EncodeUint64(TableDataPrefix(tableID), indexID))
+}
+
+// TableAuxIndexID is the index ID no index ever has (primary rows are
+// index 1 and secondary indexes count up from 2): the keys under it
+// belong to the table as a whole and stay put when its indexes are
+// renumbered.
+const TableAuxIndexID = 0
+
+// VectorCentroidPrefix is the prefix of the centres of one build of a
+// vector index (catalog.VectorIndex): /t/<tableID>/0/"ivf"/<build>/,
+// followed by the list number.
+func VectorCentroidPrefix(tableID uint64, build string) Key {
+	k := encoding.EncodeString(TableIndexPrefix(tableID, TableAuxIndexID), "ivf")
+	return Key(encoding.EncodeString(k, build))
+}
+
+// VectorCentroidKey is the key of one centre.
+func VectorCentroidKey(tableID uint64, build string, list int) Key {
+	return Key(encoding.EncodeUint64(VectorCentroidPrefix(tableID, build), uint64(list)))
 }
 
 // TableIndexSpan covers all entries of one index of a table.

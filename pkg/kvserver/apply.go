@@ -102,6 +102,29 @@ func (r *Replica) applyEntry(ctx context.Context, ent raftpb.Entry) error {
 				r.noteAppliedTerm(ent.Term)
 				return nil
 			}
+			// A range frozen for a merge takes no membership change either
+			// (issue #268). The proposer checks before proposing, but a
+			// Subsume can apply between that check and this entry, and a
+			// Subsume moves no generation, so the test above passes. Applied
+			// here, a removal would let a node drop its replica of this
+			// range while keeping its replica of the range it is merging
+			// into — and the merge's apply there finds no right-hand replica
+			// to subsume, which it treats as impossible. Frozen is part of
+			// the replicated state, written in log order, so every replica
+			// refuses at the same entry.
+			if r.isFrozen() {
+				log.Warnf("%s: replica change refused: range is frozen for a merge (the freeze applied after the change was proposed)", r.rangeID)
+				if err := r.persistAppliedIndex(ent.Index); err != nil {
+					return err
+				}
+				r.mu.Lock()
+				r.mu.confChangeRefusals++
+				r.mu.Unlock()
+				metrics.DescriptorChangeRefusals.WithLabelValues("replica-change").Inc()
+				r.setApplied(ent.Index)
+				r.noteAppliedTerm(ent.Term)
+				return nil
+			}
 			newDesc = &ccCtx.Desc
 		}
 		var state *raftpb.ConfState
@@ -203,6 +226,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 	size := r.mu.sizeBytes
 	frozen := r.mu.frozen
 	mergedInto := r.mu.mergedInto
+	mergeEpoch := r.mu.mergeEpoch
 	closedTS := r.mu.closedTS
 	r.mu.Unlock()
 	return putReplicaState(b, r.rangeID, replicaState{
@@ -213,6 +237,7 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 		SizeBytes:      size,
 		Frozen:         frozen,
 		MergedInto:     mergedInto,
+		MergeEpoch:     mergeEpoch,
 		ClosedTS:       closedTS,
 	})
 }
@@ -280,6 +305,14 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 			aerr = kvpb.NewError(err)
 		}
 	}
+	if aerr == nil && cmd.Descriptor != nil {
+		if err := r.stageDescriptorUpdate(b, cmd.Descriptor); err != nil {
+			log.Warnf("%s: descriptor update refused: %v", r.rangeID, err)
+			_ = b.Close()
+			b = eng.NewBatch()
+			aerr = kvpb.NewError(err)
+		}
+	}
 	if aerr == nil && cmd.Merge != nil {
 		if err := r.stageMerge(ctx, b, cmd.Merge); err != nil {
 			_ = b.Close()
@@ -303,6 +336,9 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 	r.setApplied(idx)
 	if aerr == nil && cmd.Split != nil {
 		r.finishSplit(cmd.Split)
+	}
+	if aerr == nil && cmd.Descriptor != nil {
+		r.finishDescriptorUpdate(cmd.Descriptor)
 	}
 	if aerr == nil && cmd.Merge != nil {
 		r.finishMerge(cmd.Merge)
@@ -536,14 +572,24 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			// same batch, so every future leader and restart honors it.
 			r.mu.Lock()
 			already := r.mu.frozen
+			if !already {
+				// The epoch is the freeze's, not the latest caller's: a
+				// re-drive that finds the range frozen is told whose
+				// freeze it is under.
+				r.mu.mergeEpoch = req.MergeEpoch
+			}
 			r.mu.frozen = true
 			r.mu.mergedInto = req.MergeInto
+			epoch := r.mu.mergeEpoch
 			r.mu.Unlock()
-			ru.Subsume = &kvpb.SubsumeResponse{AlreadyFrozen: already}
+			ru.Subsume = &kvpb.SubsumeResponse{AlreadyFrozen: already, MergeEpoch: epoch}
 		case *kvpb.UnfreezeRequest:
 			r.mu.Lock()
-			r.mu.frozen = false
-			r.mu.mergedInto = 0
+			if req.MergeEpoch == 0 || req.MergeEpoch == r.mu.mergeEpoch {
+				r.mu.frozen = false
+				r.mu.mergedInto = 0
+				r.mu.mergeEpoch = 0
+			}
 			r.mu.Unlock()
 			ru.Unfreeze = &kvpb.UnfreezeResponse{}
 		default:
@@ -580,11 +626,19 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
 		case *kvpb.GetRequest:
-			val, err := getter.Get(req.Key, ts, opts)
+			gopts := opts
+			var skipped []storage.Intent
+			if req.SkipLocked {
+				gopts.SkipLocked = &skipped
+			}
+			val, err := getter.Get(req.Key, ts, gopts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.Get = &kvpb.GetResponse{Value: val}
+			if len(skipped) > 0 {
+				ru.Get.Skipped = &skipped[0]
+			}
 		case *kvpb.ScanRequest:
 			scan := storage.MVCCScan
 			if req.Reverse {
@@ -592,19 +646,28 @@ func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvp
 			}
 			sopts := opts
 			sopts.TargetBytes = scanTargetBytes
+			var skipped []storage.Intent
+			if req.SkipLocked {
+				sopts.SkipLocked = &skipped
+			}
 			res, err := scan(eng, req.Key, req.EndKey, ts, req.MaxRows, sopts)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.Scan = scanResponse(res)
+			ru.Scan.Skipped = skipped
 		case *kvpb.ExportRequest:
-			res, err := storage.MVCCExport(eng, req.Key, req.EndKey, req.StartTS, ts, req.MaxRecords)
+			export := storage.MVCCExport
+			if req.AllRevisions {
+				export = storage.MVCCExportRevisions
+			}
+			res, err := export(eng, req.Key, req.EndKey, req.StartTS, ts, req.MaxRecords)
 			if err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			resp := &kvpb.ExportResponse{Resume: res.Resume}
 			for _, rec := range res.Records {
-				resp.Records = append(resp.Records, kvpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+				resp.Records = append(resp.Records, kvpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted, Timestamp: rec.Timestamp})
 			}
 			ru.Export = resp
 		case *kvpb.RefreshRequest:

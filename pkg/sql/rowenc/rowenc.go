@@ -20,7 +20,9 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
@@ -55,6 +57,13 @@ const (
 	// (self-delimiting for every scalar family).
 	tagArray byte = 14
 	tagEnum  byte = 15 // uvarint ordinal, uvarint length + label
+	// tagTsvector and tagTsquery: uvarint length + the value's canonical
+	// text, as JSONB is stored.
+	tagTsvector byte = 16
+	tagTsquery  byte = 17
+	// tagVector: uvarint byte length + the elements, four big-endian
+	// bytes of float32 each (the datum's own form).
+	tagVector byte = 18
 )
 
 // PrimaryKeyPrefix is the key prefix of a table's ORIGINAL primary rows
@@ -327,15 +336,21 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		case types.Float:
 			out = append(out, tagFloat)
 			out = binary.BigEndian.AppendUint64(out, math.Float64bits(d.F))
-		case types.String, types.Bytes, types.Decimal, types.Jsonb:
+		case types.String, types.Bytes, types.Decimal, types.Jsonb, types.Tsvector, types.Tsquery, types.Vector:
 			tag := tagString
 			switch col.Type {
+			case types.Tsvector:
+				tag = tagTsvector
+			case types.Tsquery:
+				tag = tagTsquery
 			case types.Bytes:
 				tag = tagBytes
 			case types.Decimal:
 				tag = tagDecimal
 			case types.Jsonb:
 				tag = tagJsonb
+			case types.Vector:
+				tag = tagVector
 			}
 			out = append(out, tag)
 			out = encoding.EncodeUvarint(out, uint64(len(d.S)))
@@ -480,7 +495,7 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if known && col.Type == types.Float {
 				out[colID] = types.NewFloat(v)
 			}
-		case tagString, tagBytes, tagDecimal, tagJsonb:
+		case tagString, tagBytes, tagDecimal, tagJsonb, tagTsvector, tagTsquery, tagVector:
 			var n uint64
 			var err error
 			rest, n, err = encoding.DecodeUvarint(rest)
@@ -497,6 +512,12 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 				want = types.Decimal
 			case tagJsonb:
 				want = types.Jsonb
+			case tagTsvector:
+				want = types.Tsvector
+			case tagTsquery:
+				want = types.Tsquery
+			case tagVector:
+				want = types.Vector
 			}
 			if known && col.Type == want {
 				out[colID] = types.Datum{Fam: want, S: v}
@@ -568,7 +589,8 @@ func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescript
 // non-empty: an empty MVCC read is indistinguishable from absence).
 var nonUniqueIndexValue = []byte{0}
 
-// EncodeIndexEntry builds the index KV pair for a full row. skip=true when
+// EncodeIndexEntry builds an ordinary index's KV pair for a full row
+// (IndexEntries serves both kinds of index). skip=true when
 // an indexed column is NULL: the row simply has no entry in that index
 // (SQL equality never matches NULL, so equality lookups stay correct;
 // unique indexes reject NULLs at the executor instead).
@@ -597,14 +619,9 @@ func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescrip
 	if err != nil {
 		return nil, nil, false, err
 	}
-	// Encoded PK column values (without any prefix).
-	var pkEnc keys.Key
-	for _, colID := range desc.PrimaryKey {
-		col, _ := desc.ColByID(colID)
-		pkEnc, err = appendDatum(pkEnc, col.Type, row[colID])
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("pk column %q: %w", col.Name, err)
-		}
+	pkEnc, err := encodePKSuffix(desc, row)
+	if err != nil {
+		return nil, nil, false, err
 	}
 	if idx.Unique {
 		return k, pkEnc, false, nil
@@ -612,8 +629,194 @@ func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescrip
 	return append(k, pkEnc...), nonUniqueIndexValue, false, nil
 }
 
+// IndexEntry is one KV pair of a secondary index.
+type IndexEntry struct {
+	Key   keys.Key
+	Value []byte
+}
+
+// IndexEntries returns every entry the row has in the index, at the
+// index's own ID: none or one for an ordinary index, one per element of
+// the indexed value for an inverted one. It is what the write path, the
+// backfill and the re-shard copy all encode with, so no caller needs to
+// know which kind of index it holds.
+func IndexEntries(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) ([]IndexEntry, error) {
+	return IndexEntriesAt(desc, idx, idx.ID, row)
+}
+
+// IndexEntriesAt is IndexEntries with the entries' index ID overridden
+// (see EncodeIndexEntryAt).
+func IndexEntriesAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) ([]IndexEntry, error) {
+	if idx.IsVector() {
+		return vectorEntries(desc, idx, entryID, row)
+	}
+	if !idx.IsInverted() {
+		key, val, skip, err := EncodeIndexEntryAt(desc, idx, entryID, row)
+		if err != nil || skip {
+			return nil, err
+		}
+		return []IndexEntry{{Key: key, Value: val}}, nil
+	}
+	elements, err := invertedElements(desc, idx, row)
+	if err != nil || len(elements) == 0 {
+		return nil, err
+	}
+	pkEnc, err := encodePKSuffix(desc, row)
+	if err != nil {
+		return nil, err
+	}
+	prefix := keys.TableIndexPrefix(desc.ID, entryID)
+	out := make([]IndexEntry, len(elements))
+	for i, el := range elements {
+		k := make(keys.Key, 0, len(prefix)+encoding.EncodedBytesLen(el)+len(pkEnc))
+		k = append(k, prefix...)
+		k = encoding.EncodeBytes(k, el)
+		out[i] = IndexEntry{Key: append(k, pkEnc...), Value: nonUniqueIndexValue}
+	}
+	return out, nil
+}
+
+// ErrCentroidsNotLoaded is returned for a vector index whose centres
+// this process has not read yet. The SQL layer loads them when it looks
+// the table up (they need a transaction to read, which this package
+// does not have), so reaching this is a path that skipped the lookup:
+// the write fails rather than file the row under a guess.
+type ErrCentroidsNotLoaded struct{ Index string }
+
+func (e *ErrCentroidsNotLoaded) Error() string {
+	return fmt.Sprintf("the centroids of vector index %q are not loaded", e.Index)
+}
+
+// vectorEntries returns the row's entry in a vector (IVF) index: keyed
+// by the list its vector is filed under and then the primary key, and
+// carrying the vector itself, so that a query ranks a list's rows from
+// the index alone and fetches only the few it returns. A NULL vector
+// has no entry. The list is a function of the vector and the build's
+// centres only, which is what lets an UPDATE or DELETE recompute the
+// key of the entry the INSERT wrote.
+func vectorEntries(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) ([]IndexEntry, error) {
+	if len(idx.ColumnIDs) != 1 {
+		return nil, fmt.Errorf("vector index %q must have exactly one column", idx.Name)
+	}
+	d, ok := row[idx.ColumnIDs[0]]
+	if !ok || d.Null {
+		return nil, nil
+	}
+	if d.Fam != types.Vector {
+		return nil, fmt.Errorf("vector index %q: column holds a %s value", idx.Name, d.Fam)
+	}
+	if d.VectorDims() != idx.Vector.Dims {
+		return nil, fmt.Errorf("vector index %q: expected %d dimensions, not %d", idx.Name, idx.Vector.Dims, d.VectorDims())
+	}
+	cents, ok := vector.Lookup(idx.Vector.Build)
+	if !ok {
+		return nil, &ErrCentroidsNotLoaded{Index: idx.Name}
+	}
+	pkEnc, err := encodePKSuffix(desc, row)
+	if err != nil {
+		return nil, err
+	}
+	k := VectorListPrefix(desc.ID, entryID, cents.Assign(d.VectorVal()))
+	return []IndexEntry{{Key: append(k, pkEnc...), Value: []byte(d.S)}}, nil
+}
+
+// VectorListPrefix is the key prefix of one list of a vector index;
+// the entries under it are the list's rows in primary-key order.
+func VectorListPrefix(tableID, indexID uint64, list int) keys.Key {
+	return keys.Key(encoding.EncodeUint64(keys.TableIndexPrefix(tableID, indexID), uint64(list)))
+}
+
+// VectorEntryPKSuffix returns the encoded primary key at the end of a
+// vector index entry's key.
+func VectorEntryPKSuffix(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key) ([]byte, error) {
+	at := len(keys.TableIndexPrefix(desc.ID, idx.ID)) + 8
+	if len(key) < at {
+		return nil, fmt.Errorf("index %q entry: short key", idx.Name)
+	}
+	return key[at:], nil
+}
+
+// invertedElements returns the sorted, distinct elements of the row's
+// value in an inverted index's column. A NULL value has none: no
+// predicate the index serves is true of NULL.
+func invertedElements(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) ([][]byte, error) {
+	kind, ok := inverted.Lookup(idx.Inverted)
+	if !ok {
+		return nil, fmt.Errorf("index %q: unknown inverted index kind %q", idx.Name, idx.Inverted)
+	}
+	if len(idx.ColumnIDs) != 1 {
+		return nil, fmt.Errorf("inverted index %q must have exactly one column", idx.Name)
+	}
+	d, ok := row[idx.ColumnIDs[0]]
+	if !ok || d.Null {
+		return nil, nil
+	}
+	return kind.Elements(d)
+}
+
+// encodePKSuffix encodes the row's primary key column values, without
+// any prefix: what follows the indexed part in a non-unique entry's key.
+func encodePKSuffix(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) (keys.Key, error) {
+	var pkEnc keys.Key
+	for _, colID := range desc.PrimaryKey {
+		col, _ := desc.ColByID(colID)
+		var err error
+		pkEnc, err = appendDatum(pkEnc, col.Type, row[colID])
+		if err != nil {
+			return nil, fmt.Errorf("pk column %q: %w", col.Name, err)
+		}
+	}
+	return pkEnc, nil
+}
+
+// InvertedElementSpan is the span of an inverted index holding the
+// entries of one element: one key per row whose value has the element,
+// in primary-key order.
+func InvertedElementSpan(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, element []byte) (start, end keys.Key) {
+	start = keys.Key(encoding.EncodeBytes(keys.TableIndexPrefix(desc.ID, idx.ID), element))
+	return start, start.PrefixEnd()
+}
+
+// InvertedPrefixSpan is the span holding the entries of every element
+// that starts with prefix. An element's key encoding is its bytes
+// (escaped) and then a terminator, so the elements sharing a prefix are
+// the keys sharing the prefix's encoding without its terminator.
+func InvertedPrefixSpan(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, prefix []byte) (start, end keys.Key) {
+	enc := encoding.EncodeBytes(keys.TableIndexPrefix(desc.ID, idx.ID), prefix)
+	start = keys.Key(enc[:len(enc)-2])
+	return start, start.PrefixEnd()
+}
+
+// InvertedEntryElement splits an inverted index entry's key into its
+// element and the encoded primary key that follows it.
+func InvertedEntryElement(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key) (element, pkSuffix []byte, err error) {
+	prefix := keys.TableIndexPrefix(desc.ID, idx.ID)
+	if !bytes.HasPrefix(key, prefix) {
+		return nil, nil, fmt.Errorf("key not in index %q", idx.Name)
+	}
+	pkSuffix, element, err = encoding.DecodeBytes(key[len(prefix):])
+	if err != nil {
+		return nil, nil, fmt.Errorf("index %q entry: %w", idx.Name, err)
+	}
+	return element, pkSuffix, nil
+}
+
 // IndexEntryPrimaryKey recovers the primary row key from an index entry.
 func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, key keys.Key, value []byte) (keys.Key, error) {
+	if idx.IsVector() {
+		pkSuffix, err := VectorEntryPKSuffix(desc, idx, key)
+		if err != nil {
+			return nil, err
+		}
+		return append(PrimaryKeyPrefixFor(desc), pkSuffix...), nil
+	}
+	if idx.IsInverted() {
+		_, pkSuffix, err := InvertedEntryElement(desc, idx, key)
+		if err != nil {
+			return nil, err
+		}
+		return append(PrimaryKeyPrefixFor(desc), pkSuffix...), nil
+	}
 	if idx.Unique {
 		return append(PrimaryKeyPrefixFor(desc), value...), nil
 	}

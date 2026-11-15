@@ -65,6 +65,14 @@ func (s *Store) RunLogTruncationOnce(ctx context.Context) {
 func (r *Replica) TruncatedIndex() uint64 { return r.rs.truncatedState().Index }
 
 func (r *Replica) maybeTruncateLog(ctx context.Context) error {
+	return r.truncateLog(ctx, raftLogTruncateFloor, raftLogTruncateMinPending)
+}
+
+// truncateLog proposes a truncation that keeps floor acknowledged entries
+// below the truncation point, when it would reclaim at least minPending.
+// Housekeeping keeps a floor and a threshold; a purge passes zero and
+// one, because the entries it wants gone are the ones the floor keeps.
+func (r *Replica) truncateLog(ctx context.Context, floor, minPending uint64) error {
 	st, ok := r.raftStatus()
 	if !ok || st.RaftState != raft.StateLeader || len(st.Progress) == 0 {
 		return nil
@@ -76,11 +84,11 @@ func (r *Replica) maybeTruncateLog(ctx context.Context) error {
 	if inFlight := r.minSnapshotInFlight(); inFlight != 0 && inFlight < target {
 		target = inFlight // keep the tail an in-flight snapshot's receiver needs
 	}
-	if target <= raftLogTruncateFloor {
+	if target <= floor {
 		return nil
 	}
-	target -= raftLogTruncateFloor
-	if cur := r.rs.truncatedState().Index; target < cur+raftLogTruncateMinPending {
+	target -= floor
+	if cur := r.rs.truncatedState().Index; target < cur+minPending {
 		return nil
 	}
 	term, err := r.rs.Term(target)

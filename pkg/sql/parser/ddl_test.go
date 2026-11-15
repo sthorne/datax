@@ -76,6 +76,20 @@ func TestParseDDLCompleteness(t *testing.T) {
 	if !ci.Unique || !ci.IfNotExists || ci.Name != "by_email" || ci.Table != "users" {
 		t.Fatalf("create index if not exists: %+v", ci)
 	}
+	// USING names the access method; an operator class may follow a
+	// column.
+	ci = parseOne(t, `CREATE INDEX docs_gin ON docs USING GIN (doc)`).(*CreateIndex)
+	if ci.Using != "gin" || len(ci.Columns) != 1 || ci.Columns[0] != "doc" || ci.OpClasses != nil || ci.Unique {
+		t.Fatalf("create index using gin: %+v", ci)
+	}
+	ci = parseOne(t, `CREATE INDEX IF NOT EXISTS docs_gin ON app.docs USING gin (doc jsonb_path_ops)`).(*CreateIndex)
+	if ci.Using != "gin" || ci.Table != "app.docs" || len(ci.OpClasses) != 1 || ci.OpClasses[0] != "jsonb_path_ops" {
+		t.Fatalf("create index with an operator class: %+v", ci)
+	}
+	ci = parseOne(t, `CREATE INDEX by_ab ON t USING btree (a, b)`).(*CreateIndex)
+	if ci.Using != "btree" || len(ci.Columns) != 2 || ci.OpClasses != nil {
+		t.Fatalf("create index using btree: %+v", ci)
+	}
 	cu := parseOne(t, `CREATE USER IF NOT EXISTS ann PASSWORD 'pw'`).(*CreateRole)
 	if cu.Name != "ann" || !cu.IfNotExists || cu.Alter || !cu.IsUser || cu.Password == nil || *cu.Password != "pw" {
 		t.Fatalf("create user if not exists: %+v", cu)
@@ -137,6 +151,107 @@ func TestParseSplitAt(t *testing.T) {
 	for _, bad := range []string{`ALTER TABLE t SPLIT VALUES (1)`, `ALTER TABLE t SPLIT AT (1)`, `ALTER TABLE t SPLIT AT VALUES 1`} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("%s: parsed", bad)
+		}
+	}
+}
+
+// TestParseSplitExpirationAndUnsplit: SPLIT AT ... WITH EXPIRATION e, and
+// the way back, UNSPLIT AT VALUES (...) and UNSPLIT ALL (issue #265).
+func TestParseSplitExpirationAndUnsplit(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10), (20) WITH EXPIRATION INTERVAL '1 hour'`).(*AlterTable)
+	if len(at.SplitAt) != 2 || at.SplitExpiration == nil || at.UnsplitAt != nil || at.UnsplitAll {
+		t.Fatalf("split at with expiration: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10) WITH EXPIRATION $1`).(*AlterTable); at.SplitExpiration == nil {
+		t.Fatalf("split at with a parameter for the expiration: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t SPLIT AT VALUES (10)`).(*AlterTable); at.SplitExpiration != nil {
+		t.Fatalf("split at without an expiration: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE IF EXISTS t UNSPLIT AT VALUES (10), (20, 'x')`).(*AlterTable)
+	if !at.IfExists || len(at.UnsplitAt) != 2 || len(at.UnsplitAt[1]) != 2 || at.SplitAt != nil || at.UnsplitAll {
+		t.Fatalf("unsplit at: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE t UNSPLIT ALL`).(*AlterTable); !at.UnsplitAll || at.UnsplitAt != nil || at.SplitAt != nil {
+		t.Fatalf("unsplit all: %+v", at)
+	}
+	for _, bad := range []string{
+		`ALTER TABLE t SPLIT AT VALUES (1) WITH EXPIRATION`,
+		`ALTER TABLE t SPLIT AT VALUES (1) WITH (expiration = 1)`,
+		`ALTER TABLE t UNSPLIT`,
+		`ALTER TABLE t UNSPLIT VALUES (1)`,
+		`ALTER TABLE t UNSPLIT AT (1)`,
+		`ALTER TABLE t UNSPLIT ALL VALUES (1)`,
+		`ALTER TABLE t UNSPLIT AT VALUES (1) WITH EXPIRATION '1 hour'`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%s: parsed", bad)
+		}
+	}
+}
+
+// TestParseResetAndPurge: ALTER TABLE ... RESET (name, ...) and ALTER
+// TABLE ... PURGE (issues #295, #298), and the option values a row expiry
+// takes, which are column names rather than literals.
+func TestParseResetAndPurge(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t RESET (gc_ttl, ttl)`).(*AlterTable)
+	if len(at.ResetOptions) != 2 || at.ResetOptions[0] != "gc_ttl" || at.ResetOptions[1] != "ttl" || at.Purge {
+		t.Fatalf("RESET: %+v", at)
+	}
+	if at := parseOne(t, `ALTER TABLE IF EXISTS db.t PURGE`).(*AlterTable); !at.Purge || !at.IfExists || at.Table != "db.t" {
+		t.Fatalf("PURGE: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t SET (ttl_column = created_at, ttl = '7 days', gc_ttl = '10m')`).(*AlterTable)
+	if at.SetOptions["ttl_column"] != "created_at" || at.SetOptions["ttl"] != "7 days" || at.SetOptions["gc_ttl"] != "10m" {
+		t.Fatalf("SET: %+v", at.SetOptions)
+	}
+	ct := parseOne(t, `CREATE TABLE t (a INT8 PRIMARY KEY, e TIMESTAMPTZ) WITH (ttl_expiration = e)`).(*CreateTable)
+	if ct.Options["ttl_expiration"] != "e" {
+		t.Fatalf("CREATE ... WITH: %+v", ct.Options)
+	}
+	for _, bad := range []string{`ALTER TABLE t RESET gc_ttl`, `ALTER TABLE t RESET ()`, `ALTER TABLE t RESET (gc_ttl = '1h')`, `ALTER TABLE t PURGE NOW`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s parsed", bad)
+		}
+	}
+}
+
+// TestParseTextSearch: the @@ operator, and the one expression CREATE
+// INDEX accepts as a key.
+func TestParseTextSearch(t *testing.T) {
+	sel := parseOne(t, `SELECT id FROM t WHERE v @@ to_tsquery('english', 'a & b') AND NOT (v @@ 'c')`).(*Select)
+	if len(sel.Where) != 2 || sel.Where[0].Column != "v" || sel.Where[0].Op != "@@" || sel.Where[0].Value.Func != "to_tsquery" || sel.Where[1].Op != "NOT @@" {
+		t.Fatalf("WHERE: %+v", sel.Where)
+	}
+	sel = parseOne(t, `SELECT id FROM t WHERE to_tsvector('english', body) @@ $1`).(*Select)
+	if c := sel.Where[0]; c.Op != "@@" || c.Expr == nil || c.Expr.Func != "to_tsvector" || len(c.Expr.Args) != 2 || c.Expr.Args[1].Column != "body" || c.Value.Param != 1 {
+		t.Fatalf("WHERE: %+v", sel.Where[0])
+	}
+	for src, want := range map[string]CreateIndex{
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body))`:             {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "english"},
+		`CREATE INDEX i ON t USING gin ((TO_TSVECTOR('simple'::regconfig, body)))`: {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "simple"},
+		`CREATE INDEX i ON t (lower('x', body))`:                                   {Name: "i", Table: "t", Columns: []string{"body"}, ExprFunc: "lower", ExprArg: "x"},
+		`CREATE INDEX i ON t USING GIN (v tsvector_ops)`:                           {Name: "i", Table: "t", Using: "gin", Columns: []string{"v"}, OpClasses: []string{"tsvector_ops"}},
+	} {
+		got := parseOne(t, src).(*CreateIndex)
+		if got.Name != want.Name || got.Table != want.Table || got.Using != want.Using || got.ExprFunc != want.ExprFunc || got.ExprArg != want.ExprArg ||
+			len(got.Columns) != 1 || got.Columns[0] != want.Columns[0] || len(got.OpClasses) != len(want.OpClasses) {
+			t.Errorf("%s: %+v", src, got)
+		}
+	}
+	for _, bad := range []string{
+		`CREATE INDEX i ON t USING GIN (to_tsvector(body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body), other)`,
+		`CREATE INDEX i ON t USING GIN (other, to_tsvector('english', body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', lower(body)))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body)`,
+		`CREATE INDEX i ON t USING GIN ((body))`,
+		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body) jsonb_ops)`,
+		`CREATE TABLE t (id INT8 PRIMARY KEY, v TSVECTOR[])`,
+		`CREATE TABLE t (id INT8 PRIMARY KEY, q TSQUERY ARRAY)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s parsed", bad)
 		}
 	}
 }

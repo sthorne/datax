@@ -19,8 +19,10 @@ syntax error or `0A000` feature not supported):
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
-| Column- and row-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin` |
-| Triggers, stored procedures, `LISTEN/NOTIFY` | — |
+| Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
+| Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, `row_security = off`, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
+| The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
+| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
 
 ## Things that exist but behave differently
 
@@ -29,6 +31,18 @@ syntax error or `0A000` feature not supported):
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
   one here.
+- **`FOR UPDATE SKIP LOCKED` and `NOWAIT`** work, with two differences
+  that follow from serializable isolation
+  ([details](sql.md#not-waiting-for-a-lock-skip-locked-and-nowait)).
+  `SKIP LOCKED` also passes over a row another transaction changed and
+  committed after this transaction's snapshot — PostgreSQL's
+  read-committed would lock the new version; here the row is skipped
+  rather than failing the statement with `40001` — and a transaction
+  block sees the table as of its snapshot, so rows inserted after
+  `BEGIN` do not appear. `NOWAIT` can fail with `55P03` on a locked row
+  the statement had to read but would have filtered out. `FOR SHARE`,
+  `FOR NO KEY UPDATE`, `FOR KEY SHARE` and `FOR UPDATE OF table` are
+  not supported.
 - **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
   half-even, `22003` on overflow, fixed-scale rendering), the integer
   widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
@@ -68,13 +82,145 @@ syntax error or `0A000` feature not supported):
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
 - **JSONB**: `->`/`->>` extraction (single-table queries and joins;
-  grouped SELECT lists refuse), containment `@>` (single-table only),
-  equality comparison, and `IS [NOT] NULL`. No indexing on
-  JSONB columns (`@>` always filters — no inverted indexes), no ordering
-  comparisons, no `<@`/`?`/`?|`/`?&`. `@>` is not accepted in `HAVING` or
-  after a computed left-hand side. One asymmetry to know: `@>` compares
+  grouped SELECT lists refuse), containment `@>` / `<@` and key
+  existence `?` / `?|` / `?&` (single-table only), equality comparison,
+  and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
+  `HAVING` or after a computed left-hand side.
+- **GIN indexes: JSONB and full-text search.** `CREATE INDEX ... USING GIN
+  (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
+  each value with its path (closer to PostgreSQL's `jsonb_path_ops` than
+  to `jsonb_ops`, but it serves the key operators too), so
+  `jsonb_path_ops` is accepted as a synonym of `jsonb_ops`, and
+  `pg_get_indexdef` reports the index without an operator class. Not
+  served, and evaluated as filters: `<@`, jsonpath (`@?`, `@@` do not
+  exist), containment under a `->` path, and a right-hand side that is
+  not a constant or a parameter. No GIN over arrays or
+  `pg_trgm`; no multi-column or `UNIQUE` GIN; no `fastupdate` or other
+  storage parameters. A document with more than 8,192 distinct indexed
+  values is refused (`54000`) on a table with a GIN index. There is no
+  bitmap scan: `EXPLAIN` reports an `inverted scan`, and
+  `enable_bitmapscan` is not a setting (`inverted_index_scan` is).
+- **Full-text search is a subset, and its parser and stemmer are
+  datax's own.** `tsvector`, `tsquery`, `@@`, `to_tsvector`,
+  `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`,
+  `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`,
+  `setweight`, `strip`, `numnode`, `tsvector_to_array`,
+  `get_current_ts_config`, `tsvector || tsvector`, weights, phrases and
+  prefixes work, and a GIN index serves `@@`
+  ([reference](sql.md#full-text-search)). Where it differs:
+  - *Configurations*: `english` and `simple` only. No `CREATE TEXT
+    SEARCH ...`, no dictionaries, thesauri or `unaccent`; `regconfig` is
+    not a type (`'english'::regconfig` is accepted and is text).
+  - *Tokens*: the parser is simpler than PostgreSQL's. A hyphenated word
+    is its parts only (PostgreSQL also emits the whole: `well-known`
+    here is `well`, `known`); a URL is its scheme, host and path words,
+    not PostgreSQL's `url` / `host` / `url_path` tokens; signed and
+    scientific numbers, XML tags and entities are not recognized
+    (`-3` is `3`, `1e5` is the word `1e5`); a version number such as
+    `1.2.3` is `1.2` and `3`. Positions therefore differ from
+    PostgreSQL's wherever these occur. Plain prose tokenizes the same.
+  - *Stemming*: the Snowball English (Porter2) algorithm as long
+    published, with PostgreSQL's 127 English stop words. PostgreSQL 17
+    and later ship a newer revision of the Snowball sources that stems
+    a handful of words differently. The implementation is checked
+    against the algorithm's published sample vocabulary and hand-derived
+    stems, not against a PostgreSQL server.
+  - *Indexes*: `USING GIN (tsvector_column)` and `USING GIN
+    (to_tsvector('config', text_column))` — the one expression an index
+    may be built on; the configuration must be written out, as
+    PostgreSQL requires. No expression indexes otherwise (not over a
+    concatenation of columns, not `setweight(...) || ...`), no generated
+    columns and no triggers to maintain a `tsvector` column: the
+    application writes it. No GiST (`USING GIST` is refused), no
+    `fastupdate`, no `gin_pending_list_limit`.
+  - *Planning*: a negated term is never looked up, so a query that is
+    only a negation (or an `OR` with one) scans; `tsquery @@ tsvector`
+    (the query on the left) is evaluated as a filter. `ORDER BY ts_rank
+    ... LIMIT n` ranks every matching row: there is no top-k shortcut
+    (PostgreSQL has none with GIN either; RUM indexes do).
+  - *Operators and functions not provided*: `text @@ tsquery` and `text
+    @@ text` (refused with `0A000` rather than guessed at: wrap the text
+    in `to_tsvector`), `tsquery && tsquery`, `||`, `!!`, `@>`, `<@`,
+    `tsquery_phrase`, `querytree`, `ts_rewrite`, `ts_delete`,
+    `ts_filter`, `ts_stat`, `ts_debug`, `ts_lexize`, `ts_parse`,
+    `array_to_tsvector`, `unnest(tsvector)`, `length(tsvector)` (it
+    returns the length of the text), `json(b)_to_tsvector`, and the `\dF`
+    commands' catalogs (`pg_ts_config` and friends). No ordering of
+    `tsvector` or `tsquery` values (`ORDER BY`, `<`), only equality; no
+    arrays of them.
+  - *Output*: `to_tsquery` does not rewrite a phrase over an `|` or `&`
+    into PostgreSQL's normal form (`'a' <-> ( 'b' | 'c' )` stays as
+    written where PostgreSQL prints `'a' <-> 'b' | 'a' <-> 'c'`; the two
+    match the same documents). `ts_rank` and `ts_rank_cd` follow
+    PostgreSQL's formulas and return `float8` rounded to single
+    precision. `ts_headline` chooses its fragment by a simpler rule
+    (the window with the most distinct query words), always returns one
+    fragment (`MaxFragments`, `ShortWord` and `FragmentDelimiter` are
+    accepted and ignored), and does not strip markup.
+  - *Limits*: a row in a full-text index may have at most 8,192 distinct
+    lexemes (`54000`); PostgreSQL's limits on lexeme length (2,046
+    bytes), positions (16,383) and positions per lexeme (256) apply.
+  One asymmetry to know: `@>` compares
   numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
   normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
+- **Vectors follow pgvector, built in, with one index method.**
+  `vector(n)`, the `<->`, `<=>` and `<#>` operators, `l2_distance`,
+  `cosine_distance`, `inner_product`, `l1_distance`, `vector_dims`,
+  `vector_norm`, `l2_normalize`, element-wise `+` and `-`, the text and
+  binary wire formats, and `CREATE INDEX ... USING ivfflat (col
+  vector_l2_ops | vector_cosine_ops | vector_ip_ops) WITH (lists = n)`
+  with `SET ivfflat.probes` behave as in pgvector
+  ([Vectors](sql.md#vectors)). What differs:
+  - *There is no extension.* `CREATE EXTENSION vector` is accepted and
+    does nothing (any other extension name is refused, `0A000`); `DROP
+    EXTENSION`, `pg_extension` and `vector_version()` do not exist. The
+    type's OID is fixed (16000) rather than assigned at install time;
+    `to_regtype('vector')` returns the OID as a number, and
+    `'vector'::regtype` does not resolve — look the OID up with
+    `to_regtype('vector')::oid` or in `pg_type`, as `pgvector-go` does.
+  - *No HNSW.* `USING hnsw` is refused (`0A000`) rather than built as
+    something else; `hnsw.ef_search` is not a setting. A graph index
+    suits a transactional, range-partitioned store poorly; `ivfflat` is
+    the index.
+  - *`ivfflat.probes` defaults to the square root of `lists`*, not to 1:
+    the default is a usable recall (about 0.98 on the test set) instead
+    of the fastest setting. `SET ivfflat.probes = 1` gives pgvector's
+    default. `ivfflat.iterative_scan` and `ivfflat.max_probes` do not
+    exist; a filtered query already considers every row of the probed
+    lists, nearest first, rather than only the nearest `k`.
+  - *The index serves one query shape*: `ORDER BY col <op> value LIMIT
+    k` over one table, ascending, the only sort key. Not through a
+    join, a `GROUP BY`, `DISTINCT`, `FOR UPDATE` or a distance in
+    `WHERE` alone; those run exactly. A filter that the primary key or
+    an ordinary index can serve takes that path, exactly, in preference
+    to the vector index.
+  - *The index is not used without `LIMIT`*, and there is no cost model
+    choosing between it and a scan: when the shape fits, it is used
+    (`SET vector_index_scan = off` forces the exact scan, as `SET
+    enable_indexscan = off` does in PostgreSQL).
+  - *No `REINDEX`*: rebuild by creating a second index and dropping the
+    first. `CREATE INDEX` is always online (there is no `CONCURRENTLY`
+    keyword to ask for it), and an index built on little or no data
+    gets fewer lists than asked for — one, on an empty table — instead
+    of pgvector's notice about low recall. `pg_indexes` shows the
+    number of lists actually built.
+  - *A vector cannot be a primary key or in a btree or unique index*
+    (pgvector allows btree). `=`, `<>`, `<`, `ORDER BY`, `GROUP BY` and
+    `DISTINCT` on a vector do work.
+  - *Not there*: `halfvec`, `sparsevec`, `bit` vectors and their
+    operators (`<+>` L1 as an operator, `<~>`, `<%>`), `vector *
+    vector`, `||`, `subvector`, `binary_quantize`, and the `avg` and
+    `sum` aggregates over vectors (`0A000`). Expression indexes (an
+    index over `(embedding::halfvec(3))`, or over a function of the
+    column) and partial indexes do not exist in datax for any index.
+    `vector[]` columns are refused.
+  - *Dimensions*: 16,000 for the type and 2,000 for an index, as in
+    pgvector. Elements are float4; a value outside float4's range is
+    refused, as are `NaN` and infinities.
+  - *NaN ordering*: the cosine distance to a zero vector is `NaN`,
+    which sorts after every number (as PostgreSQL orders `float8`); an
+    indexed scan can return such a row, last, where pgvector's cosine
+    index leaves zero vectors out.
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
   indexable `AND` condition alongside on large tables. `IN`, `EXISTS`
@@ -126,6 +272,22 @@ syntax error or `0A000` feature not supported):
   cheap historical/follower reads, including bounded staleness:
   `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
   the local replicas can serve within the bound.
+- **`LISTEN` / `NOTIFY`** behave as in PostgreSQL on one node and
+  reach listeners on every node, with these differences
+  ([reference](sql.md#notifications-listen-and-notify)): a notification
+  goes to the sessions listening when it commits and is kept nowhere,
+  and a listening session receives every one or is disconnected with a
+  FATAL error — because it let 16 MiB of notifications pile up unread
+  (`54000`), or because another node had to drop notifications it could
+  not get to this one (`57P01`) — so a client that is still connected
+  has missed nothing, with one exception: a node that crashes can take
+  with it the notifications of the transactions it committed in its
+  last instant. Notifications from one node arrive in that node's
+  commit order; notifications from different nodes are not ordered
+  against each other (PostgreSQL has one order for the whole server).
+  `pg_notify` is evaluated once per statement and its arguments cannot
+  name columns. There is no `pg_listening_channels()` or
+  `pg_notification_queue_usage()`.
 - **`SET x = y`** honors the variables datax has ([Session
   settings](sql.md#session-settings): the timeouts, `TimeZone`,
   `application_name`, `search_path`, the read-only and isolation
@@ -138,13 +300,80 @@ syntax error or `0A000` feature not supported):
   `pg_stat_activity` and `SHOW SESSIONS` list the serving node's
   sessions only.
 
+### Row-level security
+
+The rules are PostgreSQL's; these are the differences.
+
+| | PostgreSQL | datax |
+|---|---|---|
+| Who is exempt | superusers and `BYPASSRLS` roles always; the owner unless `FORCE` | `root` and `BYPASSRLS` roles always; the owner **and members of `admin`** unless `FORCE` (an admin is treated as an owner of every object) |
+| `TRUNCATE` | allowed with the `TRUNCATE` privilege, ignoring policies | refused (`42501`) to a role the table's policies apply to, whatever it was granted |
+| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user`, `session_user`, `current_setting`, `current_database`, `current_schema` and the clock. They are evaluated once per statement |
+| Predicate order | a leakproof-function analysis decides what may run before the policy | the policy is always evaluated first; no statement predicate sees a hidden row |
+| Views | owner's rights by default, `security_invoker` to change it | owner's rights only |
+| `SET row_security = off` | makes a filtered query an error instead (used by `pg_dump`) | not a setting; `42704` |
+| Historical reads | — | `AS OF SYSTEM TIME` reads are filtered by today's policies |
+| Statistics | `pg_stats` hidden; `pg_class.reltuples` visible | `SHOW STATS`, `reltuples`, `n_live_tup` and `EXPLAIN` estimates all withheld from a filtered role |
+| `psql \d t` | lists policies with their expressions | lists policies without the expressions; `pg_policies` and `SHOW CREATE TABLE` have them |
+| Custom settings | need a dot; any value; unknown until set | the same; `RESET` leaves the setting empty, and a transaction's rollback does not undo a plain `SET` or `set_config(..., false)` made inside it |
+| Constraint errors | reveal that a hidden row holds a unique value; foreign keys see the whole parent | the same, with no value of the hidden row in the message |
+
+### Large values
+
+A column value is limited by the row, and a row by what one replicated
+write can carry: a statement that writes more than 60 MiB to one range
+in one piece is refused with `54000` (PostgreSQL allows a 1 GB field).
+Well below that a large value is already expensive — it is written,
+replicated and read whole, with no out-of-line storage — so values of
+more than a few MiB belong in large objects.
+
+### Large objects
+
+The functions are PostgreSQL's and drivers use them unchanged; these
+are the differences ([reference](sql.md#large-objects)):
+
+- **A new object's content is not part of the transaction's write set.**
+  It is stored as it arrives and becomes visible, whole, when the
+  transaction that created the object commits — which is what lets an
+  upload be larger than any transaction. The visible behaviour is
+  PostgreSQL's (nothing before commit, everything after, nothing after a
+  rollback) with two exceptions: `ROLLBACK TO SAVEPOINT` cannot undo
+  such writes, so the transaction can then only roll back (`25P02` at
+  `COMMIT`); and an upload left idle for 10 minutes is abandoned
+  (`55000`).
+- The commit of an upload fails with `40001` if anything the
+  transaction read earlier — the catalog included — changed while the
+  upload ran (the transaction is moved forward at commit so that it
+  commits after its pages).
+- Writes to an object that existed before the transaction are fully
+  transactional and limited to 64 MiB per transaction (`54000`).
+  PostgreSQL has no such limit; replace a large object by writing a new
+  one.
+- Pages are 256 KiB rather than 2 kB, and objects up to 1 TiB rather
+  than 4 TiB.
+- An object is its owner's and the admins'. PostgreSQL's per-object
+  `SELECT` / `UPDATE` grants do not exist.
+- A reader that opens an object while another transaction is in the
+  middle of changing or unlinking it waits for that transaction, as
+  reads of any row a transaction has written do here; PostgreSQL would
+  read the old version without waiting.
+- Object ids are 32-bit as in PostgreSQL, but generated at random
+  (above 65,536) rather than from the OID counter.
+- `vacuumlo` is not needed for space — an unlinked object's pages are
+  removed by the cluster within about a minute and garbage-collected
+  after the GC window — but objects orphaned by deleting the row that
+  named them are still yours to unlink, exactly as in PostgreSQL.
+
 ## Errors you should know
 
 | SQLSTATE | Meaning | What to do |
 |---|---|---|
 | `40001` | serialization failure | retry the whole transaction |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
+| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
+| `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
+| `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |
 | `42601` "statement nests too deeply" | more than 1,000 nesting levels (parentheses, subqueries, derived tables, `CASE`) | flatten the statement; PostgreSQL bounds the same recursion by stack depth (issue #135) |
@@ -181,6 +410,12 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
+- **How many tables.** The `pg_catalog` views, `SHOW TABLES` and name
+  resolution cost in proportion to the current database, not to the
+  cluster; `information_schema.tables`, `.columns` and `.views` list
+  every database and read every table descriptor. See [Capacity
+  planning](operations.md#capacity-planning) for what was measured (up
+  to 5,000 tables) and what still grows with the table count.
 
 ## Client compatibility notes
 
@@ -197,5 +432,14 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   sort, aggregate or join are materialized at the first Execute and
   served in fetch-size chunks, under `statement_memory_limit` (`53200`
   beyond it).
+- Large objects work through pgx's `tx.LargeObjects()` and through
+  libpq's `lo_*` functions (the fast-path function call), which psql's
+  `\lo_import` / `\lo_export` / `\lo_list` / `\lo_unlink` use; both
+  are tested. The JDBC driver's `LargeObjectManager` and psycopg's
+  `lobject` use the same fast-path calls and are untested. Only the
+  large-object functions answer a fast-path call (`0A000` for any
+  other). Write and read with buffers of about 1 MiB. pgx's `LargeObject.Read` into a
+  buffer larger than half of `statement_memory_limit` is refused
+  (`53200`) — use `io.Copy` with a buffer, not `io.ReadAll`.
 - `sslmode=verify-full` works in secure mode with the datax CA
   ([Security](security.md)); `sslmode=disable` in insecure mode.

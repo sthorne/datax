@@ -81,10 +81,13 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   ([reference](docs/user/functions.md)) and aggregates, transactions,
   joins up to 8 tables,
   GROUP BY — including over joins, correlated subqueries to 4 levels,
-  UNION, `COPY FROM STDIN`, EXPLAIN, and ANALYZE / SHOW STATS feeding a
+  UNION, `COPY FROM STDIN`, `LISTEN` / `NOTIFY` across nodes, row-level security policies, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over
   ten column types including exact DECIMAL and JSONB with `->`/`->>`
-  extraction and `@>` containment, served over the Postgres wire protocol
+  extraction, `@>` containment and GIN indexes for it, full-text search
+  (`tsvector` / `tsquery`, `@@`, ranking, GIN-indexed), and pgvector-compatible
+  `vector(n)` columns with exact and approximate (`ivfflat`) nearest-neighbour
+  search, served over the Postgres wire protocol
   with TLS + SCRAM-SHA-256 authentication in secure mode; databases,
   the `pg_catalog` / `information_schema` views and the `SHOW` family,
   so `psql`'s `\d` commands and ORM introspection work as they do
@@ -100,8 +103,10 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   collection, raft log truncation, splitting and merging by size and
   load — plus dead-node repair, load rebalancing (count, bytes, and lease
   shedding), decommission, a paced replica consistency sweep, consistent
-  cluster backup/restore (full + incremental, `datax backup` /
-  `datax restore`), rolling upgrades with an explicit finalize
+  cluster backup/restore (full + incremental, optionally sealed under a
+  backup key, optionally keeping revision history for point-in-time
+  restore; restore of everything into an empty cluster or of chosen
+  tables into a running one, `datax backup` / `datax restore`), rolling upgrades with an explicit finalize
   (`datax debug upgrade`), the `datax debug` toolbox (split, merge,
   transfer-lease, rebalance, status, metadata, unsafe-recover,
   rotate-enc-key, reencrypt), `datax bench`, and a built-in
@@ -116,12 +121,18 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   member of `admin`). SQL authorization is PostgreSQL's role model:
   roles as groups with inheritance and `SET ROLE`, object ownership,
   grants on tables, sequences, databases and the schema (`ALL TABLES`,
-  default privileges, `GRANT OPTION`, `PUBLIC`), and the built-in
-  `admin`, `read_all`, `write_all` and `metrics` roles. Every HTTP
+  default privileges, `GRANT OPTION`, `PUBLIC`), the built-in
+  `admin`, `read_all`, `write_all` and `metrics` roles, and row-level
+  security (`CREATE POLICY`, `ENABLE` / `FORCE ROW LEVEL SECURITY`,
+  `BYPASSRLS`) for tables shared between tenants, with the policy
+  pushed into the scan. Every HTTP
   endpoint takes HTTP Basic credentials of a database user — Prometheus
   `basic_auth` with the `metrics` role — or a client certificate.
   Authentication failures, denied and executed admin ops, and role and
-  privilege DDL are audit-logged with their principal. Insecure mode
+  privilege DDL are audit-logged with their principal, and kept in the
+  cluster in `datax_audit`: a table SQL can read and no role can change,
+  each node's records hash-chained and verifiable from outside
+  (`datax debug audit verify`). Insecure mode
   stays open, like pgwire trust auth.
 
 **User documentation** — installing, deploying, securing, and operating a
@@ -255,12 +266,13 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Ranges | load statistics are leader-local samples: a lease transfer hands the measured rate to the new leader, but reservoir split-key samples start fresh (splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements); zone and lease preferences are parsed and stored but not acted on automatically |
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads are opt-in per statement — exact-timestamp `AS OF SYSTEM TIME` or bounded staleness `with_max_staleness('10s')` |
-| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing (`@>` always filters — no inverted indexes — and is single-table only) |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing beyond `@>` and key existence (`?`, `?|`, `?&`) through a GIN index: `<@`, extracted-value comparisons and containment under a path filter; `@>` is single-table only; row-level security policies with subqueries, `SECURITY INVOKER` views, and column-level privileges; full-text search beyond the `simple` and `english` configurations, a `tsvector` kept current by the database (no generated columns: index `to_tsvector('english', col)` or maintain the column), and ranked top-k without reading every match; for vectors, HNSW indexes (`ivfflat` is the index), `halfvec` / `sparsevec`, vector aggregates, a vector as a key, and an index that narrows by a filter column before it searches |
+| Large values | a row value is stored and replicated whole: keep it to a few MiB (a statement writing more than 60 MiB to one range in one piece is refused, `54000`). Larger things are [large objects](docs/user/sql.md#large-objects), streamed in 256 KiB pages up to 1 TiB; one transaction writes at most 64 MiB into objects that already existed, a new object's content cannot be rolled back to a savepoint, and there is no `BLOB` column type, `lo_import` / `lo_export`, or per-object grants |
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
-| Ops | a dedicated audit store (audit records ride the node's structured log); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
+| Ops | audit records signed or shipped off the cluster by the cluster itself (they are in the node's log and in the hash-chained `datax_audit` table; exporting the chain heads is the operator's job); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |
-| Backup | sealed/encrypted backup files (plaintext on disk, gated by `--allow-plaintext` on encrypted stores); restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
-| Encryption | key escrow / HSM integration (keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |
+| Backup | backup keys held by a KMS or an `--enc-root` root (a sealed backup, `--backup-key`, takes a key file); hiding a sealed backup's table count, table ids and file sizes; replacing a live table in one step (a table restore, `datax restore --table`, lands beside it under a new name) and resuming an interrupted table restore (it is cleaned up and run again); table restore of views, of enum columns into another database, and of tables caught mid-schema-change; point-in-time restore inside an interval backed up without `--revision-history`, or across a schema change in the interval (table definitions, roles and sequences are kept as of each backup's end, not versioned); holding garbage collection back for a backup chain (an incremental older than the GC TTL is refused) |
+| Encryption | a KMS or HSM spoken to directly (an `exec` root reaches one through its command line; keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |
 | Storage | debt-gate thresholds are first-cut constants (per-cause counters tell the compaction-debt gate and follower-health shedding apart; tune with production data) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |
 

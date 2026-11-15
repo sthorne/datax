@@ -1,0 +1,8 @@
+{
+  "workloads": [
+    {"name": "text-search-1m",        "args": ["text-search", "--preload", "1000000", "--groups", "20000", "--concurrency", "4", "--duration", "30s", "--seed", "1"]},
+    {"name": "text-search-1m-phrase", "args": ["text-search", "--text-query", "phrase", "--preload", "1000000", "--groups", "20000", "--concurrency", "4", "--duration", "30s", "--seed", "1"]},
+    {"name": "text-search-1m-prefix", "args": ["text-search", "--text-query", "prefix", "--preload", "1000000", "--groups", "20000", "--concurrency", "4", "--duration", "30s", "--seed", "1"]},
+    {"name": "text-search-1m-ranked", "args": ["text-search", "--text-query", "ranked", "--preload", "1000000", "--groups", "20000", "--concurrency", "4", "--duration", "30s", "--seed", "1"]}
+  ]
+}

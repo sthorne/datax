@@ -86,7 +86,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if err := os.Symlink(filepath.Join(elsewhere, "data.dxbk"), filepath.Join(dir, backupDataFile(7))); err != nil {
 		t.Fatal(err)
 	}
-	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file") {
+	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(7)), nil, func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file") {
 		t.Fatalf("a symlink at a data file's name: %v", err)
 	}
 	if err := os.Remove(filepath.Join(dir, backupManifestName)); err != nil {
@@ -113,7 +113,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, backupDataFile(8)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(8)), func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file (d---------)") {
+	if err := readBackupRecordsUnchecked(filepath.Join(dir, backupDataFile(8)), nil, func(kvpb.ExportRecord) error { return nil }); err == nil || !strings.Contains(err.Error(), "is not a regular file (d---------)") {
 		t.Fatalf("a directory at a data file's name: %v", err)
 	}
 	// The plain files themselves are read.
@@ -127,7 +127,7 @@ func TestBackupFilesMustBeRegular(t *testing.T) {
 	if _, err := readBackupManifest(plain); err != nil {
 		t.Fatalf("a plain manifest: %v", err)
 	}
-	if err := readBackupRecordsUnchecked(filepath.Join(plain, backupDataFile(7)), func(kvpb.ExportRecord) error { return nil }); err != nil {
+	if err := readBackupRecordsUnchecked(filepath.Join(plain, backupDataFile(7)), nil, func(kvpb.ExportRecord) error { return nil }); err != nil {
 		t.Fatalf("a plain data file: %v", err)
 	}
 }
@@ -252,10 +252,10 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 	}
 	own := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 1), Value: []byte("row")}
 	ownGone := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 2), Deleted: true}
-	if err := checkBackupRecords(write(own, ownGone), man); err != nil {
+	if err := checkBackupRecords(write(own, ownGone), nil, man); err != nil {
 		t.Fatalf("a file carrying the table's own keys, a tombstone among them, was refused: %v", err)
 	}
-	if err := checkBackupRecords(write(), man); err != nil {
+	if err := checkBackupRecords(write(), nil, man); err != nil {
 		t.Fatalf("an empty data file was refused: %v", err)
 	}
 	metaStart, _ := keys.MetaSpan()
@@ -276,7 +276,7 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 		// After the table's own records, so a refusal has to come from
 		// the record and not from a position.
 		dir := write(own, c.rec)
-		err := checkBackupRecords(dir, man)
+		err := checkBackupRecords(dir, nil, man)
 		if err == nil {
 			t.Fatalf("a data file carrying %s (%s) was accepted", c.what, keys.Key(c.rec.Key))
 		}
@@ -288,7 +288,7 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 		// were delivered (a reader that saw nothing would have refused
 		// at the wrong place).
 		var seen []string
-		err = readCheckedBackupRecords(filepath.Join(dir, table.File), table, func(rec kvpb.ExportRecord) error {
+		err = readCheckedBackupRecords(filepath.Join(dir, table.File), nil, table, func(rec kvpb.ExportRecord) error {
 			seen = append(seen, keys.Key(rec.Key).String())
 			return nil
 		})

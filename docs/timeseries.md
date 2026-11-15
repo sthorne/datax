@@ -44,6 +44,12 @@ primary key:
   edge splits also make "range fully inside the table" the common case
   for retention GC). The splits are best-effort and outlive an aborted
   enclosing transaction — harmless empty ranges the merger re-absorbs.
+  For that reason they are ordinary splits, not the sticky ones `ALTER
+  TABLE ... SPLIT AT` makes: a sticky boundary of a table that was never
+  created, or of a layout a re-shard has retired, could not be named by
+  any statement to release it. The table's edges are held by the
+  retention rule below; a bucket boundary is held, like any other, by
+  the data and traffic on either side of it.
 
 The planner plans against the **logical** primary key:
 
@@ -184,7 +190,13 @@ eventual wipe as unreachable garbage.
 
 - Retention expiry is best-effort in timing (one housekeeping tick,
   default 30s, plus the ~30s descriptor cache); on mixed ranges it is
-  row-granular but skips tables with secondary indexes.
+  row-granular but skips tables with secondary indexes. That is a
+  property of expiring beneath SQL, by key, and is why ordinary tables
+  expire rows another way: a row TTL (`WITH (ttl_expiration = col)`,
+  docs/sql.md "Table options") deletes through SQL, so indexes and
+  foreign keys follow. The two do not combine: a time-series table
+  refuses the `ttl` options, and a table with a retention refuses
+  `gc_ttl`, since the retention is its GC window.
 - Secondary indexes on sharded tables are unsharded (their own hot-tail
   characteristics apply).
 

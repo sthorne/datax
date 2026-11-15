@@ -152,12 +152,12 @@ func init() {
 			}
 			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(2), i64(TableOID(t)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
-				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(false), boolean(false), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(t.Comment)})
+				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(t.RowSecurity), boolean(t.ForceRowSecurity), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(t.Comment)})
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 			for _, idx := range t.Indexes {
-				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, idx.ID)), i64(0),
+				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(IndexMethodOID(&idx)), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment)})
 			}
@@ -276,7 +276,7 @@ func init() {
 				cat = "D"
 			case types.IntervalFam:
 				cat = "T"
-			case types.Bytes, types.Uuid, types.Jsonb:
+			case types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Vector:
 				cat = "U"
 			}
 			name := TypeName(f)
@@ -308,7 +308,14 @@ func init() {
 		// and the element row's typarray forward.
 		for i := range rows {
 			elem := rows[i][0].I
-			arr := ArrayTypeOID(elem)
+			arr, ok := arrayTypeOIDs[elem]
+			if !ok {
+				// Not an element type datax has arrays of (tsvector,
+				// tsquery, vector, enums): typarray stays 0. A row for one
+				// would take ArrayTypeOID's fallback, the text array's OID,
+				// and pg_type would hold two rows for 1009.
+				continue
+			}
 			rows[i][12] = i64(arr)
 			name := "_" + rows[i][1].S
 			rows = append(rows, Row{i64(arr), str(name), i64(OIDPgCatalog), i64(10), i64(-1), boolean(false), str("b"), str("A"),
@@ -343,10 +350,10 @@ func init() {
 		return rows, nil
 	})
 
-	// pg_am: btree, the only access method.
+	// pg_am: btree, gin (inverted indexes) and the heap.
 	pg("pg_am", []catalog.Column{col("oid", types.Int), col("amname", types.String), col("amhandler", types.String), col("amtype", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
-			return []Row{{i64(403), str("btree"), str("bthandler"), str("i")}, {i64(2), str("heap"), str("heap_tableam_handler"), str("t")}}, nil
+			return []Row{{i64(OIDBtree), str("btree"), str("bthandler"), str("i")}, {i64(OIDGin), str("gin"), str("ginhandler"), str("i")}, {i64(2), str("heap"), str("heap_tableam_handler"), str("t")}}, nil
 		})
 
 	// pg_collation: the default collation only (psql's \d consults it to
@@ -420,20 +427,15 @@ func init() {
 			case builtins.Volatile:
 				vol = "v"
 			}
-			rows = append(rows, Row{i64(int64(1<<28) + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
+			rows = append(rows, Row{i64(procOIDBase + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
 				i64(TypeOID(b.ResultFamily(b.Args))), i64(int64(len(b.Args))), str(strings.Join(argOIDs, " ")), null(), str(b.Name), str(vol), boolean(!b.NotStrict)})
 		}
 		return rows, nil
 	})
 
-	// Catalogs psql consults for features datax does not have: row-level
-	// security policies, extended statistics, logical-replication
-	// publications, and table inheritance. All empty.
-	pg("pg_policy", []catalog.Column{
-		col("oid", types.Int), col("polname", types.String), col("polrelid", types.Int), col("polcmd", types.String),
-		col("polpermissive", types.Bool), col("polroles", types.String), col("polqual", types.String), col("polwithcheck", types.String),
-		hidden("__expr"),
-	}, empty)
+	// Catalogs psql consults for features datax does not have: extended
+	// statistics, logical-replication publications, and table
+	// inheritance. All empty.
 	pg("pg_statistic_ext", []catalog.Column{
 		col("oid", types.Int), col("stxrelid", types.Int), col("stxname", types.String), col("stxnamespace", types.Int),
 		col("stxowner", types.Int), col("stxstattarget", types.Int), col("stxkeys", types.String), col("stxkind", types.String),
@@ -452,7 +454,21 @@ func init() {
 	pg("pg_ts_config", []catalog.Column{col("oid", types.Int), col("cfgname", types.String), col("cfgnamespace", types.Int), col("cfgowner", types.Int), col("cfgparser", types.Int)}, empty)
 	pg("pg_ts_parser", []catalog.Column{col("oid", types.Int), col("prsname", types.String), col("prsnamespace", types.Int), col("prsstart", types.Int), col("prstoken", types.Int), col("prsend", types.Int), col("prsheadline", types.Int), col("prslextype", types.Int)}, empty)
 	pg("pg_ts_template", []catalog.Column{col("oid", types.Int), col("tmplname", types.String), col("tmplnamespace", types.Int), col("tmplinit", types.Int), col("tmpllexize", types.Int)}, empty)
-	pg("pg_largeobject_metadata", []catalog.Column{col("oid", types.Int), col("lomowner", types.Int), col("lomacl", types.String)}, empty)
+	pg("pg_largeobject_metadata", []catalog.Column{col("oid", types.Int), col("lomowner", types.Int), col("lomacl", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.LargeObjects == nil {
+				return nil, nil
+			}
+			objs, err := env.LargeObjects()
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]Row, 0, len(objs))
+			for _, o := range objs {
+				rows = append(rows, Row{i64(o.OID), i64(RoleOID(catalog.OwnerOf(o.Owner))), null()})
+			}
+			return rows, nil
+		})
 	pg("pg_db_role_setting", []catalog.Column{col("setdatabase", types.Int), col("setrole", types.Int), col("setconfig", types.String)}, empty)
 	pg("pg_foreign_data_wrapper", []catalog.Column{col("oid", types.Int), col("fdwname", types.String), col("fdwowner", types.Int), col("fdwhandler", types.Int), col("fdwvalidator", types.Int), col("fdwacl", types.String), col("fdwoptions", types.String)}, empty)
 	pg("pg_foreign_server", []catalog.Column{col("oid", types.Int), col("srvname", types.String), col("srvowner", types.Int), col("srvfdw", types.Int), col("srvtype", types.String), col("srvversion", types.String), col("srvacl", types.String), col("srvoptions", types.String)}, empty)
@@ -617,8 +633,11 @@ func init() {
 				return nil, err
 			}
 			admin := set.IsAdmin()
+			// rolbypassrls is the unconditional exemption: root and the
+			// BYPASSRLS attribute. An admin is exempt like an owner —
+			// unless the table forces row security — so it does not count.
 			rows = append(rows, Row{i64(RoleOID(r.Name)), str(r.Name), boolean(admin), boolean(!r.NoInherit), boolean(admin), boolean(admin), boolean(r.Login), boolean(false),
-				i64(-1), str("********"), null(), boolean(admin), null()})
+				i64(-1), str("********"), null(), boolean(r.BypassRLS || r.Name == catalog.RootRole), null()})
 		}
 		return rows, nil
 	}
@@ -636,7 +655,7 @@ func init() {
 					return nil, err
 				}
 				admin := set.IsAdmin()
-				rows = append(rows, Row{str(r.Name), i64(RoleOID(r.Name)), boolean(admin), boolean(admin), boolean(false), boolean(admin), str("********"), null(), null()})
+				rows = append(rows, Row{str(r.Name), i64(RoleOID(r.Name)), boolean(admin), boolean(admin), boolean(false), boolean(r.BypassRLS || r.Name == catalog.RootRole), str("********"), null(), null()})
 			}
 			return rows, nil
 		})
@@ -688,8 +707,14 @@ func init() {
 					addr, port = addr[:i], i64(int64(p))
 				}
 			}
+			// Statement text carries literals: only an admin reads another
+			// role's (see QueryHidden).
+			query := si.Query
+			if !env.IsAdmin && si.User != env.SessionUser {
+				query = QueryHidden
+			}
 			rows = append(rows, Row{datid, str(si.Database), i64(int64(si.PID)), i64(10), str(si.User), str(si.Application), str(addr), null(), port,
-				ts(si.BackendStart), ts(si.XactStart), ts(si.QueryStart), null(), null(), null(), str(si.State), null(), null(), str(si.Query), str("client backend")})
+				ts(si.BackendStart), ts(si.XactStart), ts(si.QueryStart), null(), null(), null(), str(si.State), null(), null(), str(query), str("client backend")})
 		}
 		return rows, nil
 	})
@@ -699,7 +724,7 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, t := range env.currentTables() {
-				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), null(), boolean(len(t.Indexes) > 0), boolean(false), boolean(false), boolean(false)})
+				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), null(), boolean(len(t.Indexes) > 0), boolean(false), boolean(false), boolean(t.RowSecurity)})
 			}
 			return rows, nil
 		})
@@ -711,6 +736,58 @@ func init() {
 				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(pkIdx.Name), null(), str(IndexDef(t, pkIdx))})
 				for i := range t.Indexes {
 					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(t.Indexes[i].Name), null(), str(IndexDef(t, &t.Indexes[i]))})
+				}
+			}
+			return rows, nil
+		})
+
+	// pg_policy / pg_policies: the row-security policies of the current
+	// database's tables (issue #294). A policy's OID is derived from its
+	// table's and its position; polroles and roles render as text arrays
+	// ({0} / {public} for a policy that applies to every role). polqual
+	// and polwithcheck hold the expressions' text. psql's \d reads them
+	// through pg_get_expr, which rewrites to the one hidden column a
+	// catalog has for it; a policy has two expressions, so that column
+	// stays NULL here rather than show one of them as both — \d lists a
+	// table's policies without their expressions, and pg_policies has
+	// them.
+	pg("pg_policy", []catalog.Column{col("oid", types.Int), col("polname", types.String), col("polrelid", types.Int), col("polcmd", types.String),
+		col("polpermissive", types.Bool), col("polroles", types.String), col("polqual", types.String), col("polwithcheck", types.String), hidden("__expr")},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, t := range env.currentTables() {
+				for i := range t.Policies {
+					p := &t.Policies[i]
+					oids := []string{"0"}
+					if len(p.Roles) > 0 {
+						oids = oids[:0]
+						for _, r := range p.Roles {
+							oids = append(oids, strconv.FormatInt(RoleOID(r), 10))
+						}
+					}
+					rows = append(rows, Row{i64(TableOID(t)<<16 | int64(0x8000+i)), str(p.Name), i64(TableOID(t)), str(PolicyCmdChar(p.Command)),
+						boolean(!p.Restrictive), str("{" + strings.Join(oids, ",") + "}"), textOrNull(p.Using), textOrNull(p.Check)})
+				}
+			}
+			return rows, nil
+		})
+	pg("pg_policies", []catalog.Column{col("schemaname", types.String), col("tablename", types.String), col("policyname", types.String), col("permissive", types.String),
+		col("roles", types.String), col("cmd", types.String), col("qual", types.String), col("with_check", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			var rows []Row
+			for _, t := range env.currentTables() {
+				for i := range t.Policies {
+					p := &t.Policies[i]
+					kind := "PERMISSIVE"
+					if p.Restrictive {
+						kind = "RESTRICTIVE"
+					}
+					roles := []string{catalog.PublicRole}
+					if len(p.Roles) > 0 {
+						roles = p.Roles
+					}
+					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(p.Name), str(kind),
+						str("{" + strings.Join(roles, ",") + "}"), str(strings.ToUpper(p.Command)), textOrNull(p.Using), textOrNull(p.Check)})
 				}
 			}
 			return rows, nil

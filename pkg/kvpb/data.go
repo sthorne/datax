@@ -8,6 +8,8 @@ package kvpb
 
 import (
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/base"
@@ -34,6 +36,24 @@ type RangeDescriptor struct {
 	// Generation increments on every split or replica change; used to
 	// discard stale cached descriptors.
 	Generation int64 `json:"generation"`
+	// StickyUntil is the sticky bit: non-zero when the range's start
+	// boundary was set on purpose (ALTER TABLE ... SPLIT AT, datax debug
+	// split), as the wall-clock time in nanoseconds until which the merge
+	// queue leaves that boundary alone; StickyForever means no expiry.
+	// It describes the START boundary, so it stays with the left half of
+	// a later split and with the surviving (left) range of a merge, and
+	// the right half of an automatic split starts without it. Written
+	// only once the cluster has finalized v20 (version.V20).
+	StickyUntil int64 `json:"sticky_until,omitempty"`
+}
+
+// StickyForever is the StickyUntil of a manual split with no expiration.
+const StickyForever = math.MaxInt64
+
+// Sticky reports whether the range's start boundary is held against
+// merging at wall-clock time now (nanoseconds).
+func (d *RangeDescriptor) Sticky(now int64) bool {
+	return d.StickyUntil > now
 }
 
 // ContainsKey returns whether the range's span covers the (global) key.
@@ -52,7 +72,14 @@ func (d *RangeDescriptor) GetReplica(nodeID base.NodeID) (ReplicaDescriptor, boo
 }
 
 func (d *RangeDescriptor) String() string {
-	return fmt.Sprintf("%s [%s, %s) gen=%d replicas=%v", d.RangeID, d.StartKey, d.EndKey, d.Generation, d.Replicas)
+	sticky := ""
+	switch {
+	case d.StickyUntil == StickyForever:
+		sticky = " sticky"
+	case d.StickyUntil != 0:
+		sticky = " sticky-until=" + time.Unix(0, d.StickyUntil).UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf("%s [%s, %s) gen=%d replicas=%v%s", d.RangeID, d.StartKey, d.EndKey, d.Generation, d.Replicas, sticky)
 }
 
 // NodeDescriptor describes a node in the registry (range 1). The liveness

@@ -1125,8 +1125,9 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 	var natural []catalog.ColumnID
 	fanned := false
 	switch plan.kind {
-	case planFullScan, planPKPoint:
-		// Physical order — on a sharded table that leads with the hidden
+	case planFullScan, planPKPoint, planInvertedScan:
+		// Physical order (an inverted scan sorts the primary keys it
+		// found before fetching the rows) — on a sharded table that leads with the hidden
 		// shard column, which no ORDER BY names, so it stays unsatisfied.
 		natural = desc.PrimaryKey
 	case planPKScan:
@@ -1186,47 +1187,16 @@ func orderPlan(desc *catalog.TableDescriptor, plan accessPlan, order []parser.Or
 // sortRows sorts in place by the ORDER BY terms. NULL ordering follows
 // PostgreSQL's default: NULLS LAST ascending, NULLS FIRST descending.
 func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.OrderCol, params []types.Datum) error {
-	cols := make([]catalog.Column, len(order))
-	for i, oc := range order {
-		if oc.Expr != nil {
-			continue
-		}
-		if oc.Agg != nil {
-			return newErrf(CodeGrouping, "aggregate functions in ORDER BY require GROUP BY or an aggregated select list")
-		}
-		if oc.Position > 0 {
-			visible := desc.VisibleColumns()
-			if oc.Position > len(visible) {
-				return newErrf(CodeUndefinedColumn, "ORDER BY position %d is not in the select list", oc.Position)
-			}
-			cols[i] = visible[oc.Position-1]
-			continue
-		}
-		col, ok := desc.Col(oc.Column)
-		if !ok {
-			return newErrf(CodeUndefinedColumn, "column %q does not exist", oc.Column)
-		}
-		cols[i] = col
+	ok, err := newOrderKeyer(desc, order, params)
+	if err != nil {
+		return err
 	}
 	// Sort keys are materialized per row up front (computed expressions
 	// evaluate once), then the rows are permuted to match.
 	keys := make([][]types.Datum, len(rows))
 	for r := range rows {
-		keys[r] = make([]types.Datum, len(order))
-		for i, oc := range order {
-			if oc.Expr == nil {
-				d, ok := rows[r].row[cols[i].ID]
-				if !ok {
-					d = types.DNull
-				}
-				keys[r][i] = d
-				continue
-			}
-			d, err := evalExpr(*oc.Expr, desc, rows[r].row, params)
-			if err != nil {
-				return err
-			}
-			keys[r][i] = d
+		if keys[r], err = ok.key(rows[r].row); err != nil {
+			return err
 		}
 	}
 	perm := make([]int, len(rows))
@@ -1235,31 +1205,14 @@ func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.O
 	}
 	var sortErr error
 	sort.SliceStable(perm, func(a, b int) bool {
-		ka, kb := keys[perm[a]], keys[perm[b]]
-		for i, oc := range order {
-			da, db := ka[i], kb[i]
-			if da.Null || db.Null {
-				if da.Null == db.Null {
-					continue
-				}
-				return da.Null == nullsFirst(oc)
+		c, err := ok.compare(keys[perm[a]], keys[perm[b]])
+		if err != nil {
+			if sortErr == nil {
+				sortErr = err
 			}
-			c, err := da.Compare(db)
-			if err != nil {
-				if sortErr == nil {
-					sortErr = err
-				}
-				return false
-			}
-			if c == 0 {
-				continue
-			}
-			if oc.Desc {
-				return c > 0
-			}
-			return c < 0
+			return false
 		}
-		return false
+		return c < 0
 	})
 	if sortErr != nil {
 		return newErrf(CodeInternal, "ORDER BY: %v", sortErr)
@@ -1270,4 +1223,88 @@ func sortRows(desc *catalog.TableDescriptor, rows []fetchedRow, order []parser.O
 	}
 	copy(rows, sorted)
 	return nil
+}
+
+// orderKeyer computes and compares the ORDER BY keys of a table's rows:
+// what the in-memory sort and the top-k heap (topk.go) both order by.
+type orderKeyer struct {
+	desc   *catalog.TableDescriptor
+	order  []parser.OrderCol
+	cols   []catalog.Column // the column behind each plain term
+	params []types.Datum
+}
+
+func newOrderKeyer(desc *catalog.TableDescriptor, order []parser.OrderCol, params []types.Datum) (*orderKeyer, error) {
+	cols := make([]catalog.Column, len(order))
+	for i, oc := range order {
+		if oc.Expr != nil {
+			continue
+		}
+		if oc.Agg != nil {
+			return nil, newErrf(CodeGrouping, "aggregate functions in ORDER BY require GROUP BY or an aggregated select list")
+		}
+		if oc.Position > 0 {
+			visible := desc.VisibleColumns()
+			if oc.Position > len(visible) {
+				return nil, newErrf(CodeUndefinedColumn, "ORDER BY position %d is not in the select list", oc.Position)
+			}
+			cols[i] = visible[oc.Position-1]
+			continue
+		}
+		col, ok := desc.Col(oc.Column)
+		if !ok {
+			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", oc.Column)
+		}
+		cols[i] = col
+	}
+	return &orderKeyer{desc: desc, order: order, cols: cols, params: params}, nil
+}
+
+// key evaluates the row's sort key, one datum per ORDER BY term.
+func (k *orderKeyer) key(row map[catalog.ColumnID]types.Datum) ([]types.Datum, error) {
+	out := make([]types.Datum, len(k.order))
+	for i, oc := range k.order {
+		if oc.Expr == nil {
+			d, ok := row[k.cols[i].ID]
+			if !ok {
+				d = types.DNull
+			}
+			out[i] = d
+			continue
+		}
+		d, err := evalExpr(*oc.Expr, k.desc, row, k.params)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = d
+	}
+	return out, nil
+}
+
+// compare orders two sort keys: negative when ka sorts first.
+func (k *orderKeyer) compare(ka, kb []types.Datum) (int, error) {
+	for i, oc := range k.order {
+		da, db := ka[i], kb[i]
+		if da.Null || db.Null {
+			if da.Null == db.Null {
+				continue
+			}
+			if da.Null == nullsFirst(oc) {
+				return -1, nil
+			}
+			return 1, nil
+		}
+		c, err := da.Compare(db)
+		if err != nil {
+			return 0, err
+		}
+		if c == 0 {
+			continue
+		}
+		if oc.Desc {
+			return -c, nil
+		}
+		return c, nil
+	}
+	return 0, nil
 }

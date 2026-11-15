@@ -62,6 +62,10 @@ type ClusterRange struct {
 	EndKey     string `json:"end_key"`
 	Replicas   []int  `json:"replicas"`
 	Generation int64  `json:"generation"`
+	// StickyUntil is set when the range's start boundary was split
+	// manually and is held against merging: the wall-clock time in
+	// nanoseconds it is held until (kvpb.StickyForever for no expiry).
+	StickyUntil int64 `json:"sticky_until,omitempty"`
 	// Table names the table the range's start key belongs to ("" for
 	// system and meta ranges, or before the first catalog scan).
 	Table string `json:"table,omitempty"`
@@ -248,7 +252,6 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 // rendered as v may see them).
 func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer) ClusterStatus {
 	now := n.clock.Now().WallTime
-	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	forecasts := n.capacityForecasts()
 	if forecasts == nil {
 		forecasts = []Forecast{}
@@ -315,6 +318,7 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 				StartKey:         start,
 				EndKey:           end,
 				Generation:       d.Generation,
+				StickyUntil:      d.StickyUntil,
 				Table:            n.viewTable(v, d.StartKey),
 				StartKeyRedacted: startRedacted,
 				EndKeyRedacted:   endRedacted,

@@ -36,6 +36,9 @@ type replicaState struct {
 	// future leader and every restart honors the freeze.
 	Frozen     bool         `json:"frozen,omitempty"`
 	MergedInto base.RangeID `json:"merged_into,omitempty"`
+	// MergeEpoch is the epoch of the freeze (kvpb.SubsumeRequest): the
+	// generation, plus one, of the left-hand range it was made for.
+	MergeEpoch int64 `json:"merge_epoch,omitempty"`
 	// ClosedTS: no write at or below this timestamp will ever commit on
 	// this range. Replicated (raised by applied closed-timestamp commands;
 	// log order guarantees every earlier write applied first), so any

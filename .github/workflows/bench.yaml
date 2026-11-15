@@ -15,6 +15,16 @@ on:
 # night closes it (issue #244): a workload that errors — the routing
 # failures of #200 and then #263 hit three nights of seven — is otherwise
 # seen by nobody.
+#
+# What makes a night red is the exit status of the "run the workload set"
+# step, and that status covers the measured runs, not only their setup
+# (issue #267): bench/run.sh runs every workload against both targets and
+# then fails if any workload did not complete or counted more errors than
+# its tolerance (`datax bench run --max-errors`, default 0; serialization
+# retries are not errors). Its last lines name each failing workload with
+# its error count and most frequent error, and those are the lines the
+# standing issue quotes. The summary and the artifact are produced on a
+# red night too: its records are the ones somebody will want to read.
 permissions:
   contents: read
   issues: write
@@ -37,11 +47,17 @@ jobs:
         run: bench/run.sh 2>&1 | tee bench.out
         shell: bash -o pipefail -e {0}
       - name: summary
+        if: ${{ !cancelled() }}
         run: |
+          shopt -s nullglob
           for f in bench-results/nightly/*/*.json; do
-            printf '%s: ' "$f"; jq -r '"\(.ops_per_sec) ops/s p50 \(.p50_us)us p99 \(.p99_us)us errors \(.errors)"' "$f"
+            printf '%s: ' "$f"
+            jq -r '"\(.ops_per_sec) ops/s p50 \(.p50_us)us p99 \(.p99_us)us retries \(.retries) errors \(.errors)"
+              + ((.error_samples // {}) | to_entries | sort_by(-.value) | .[:1]
+                 | map(" (most frequent, \(.value) times: \(.key))") | join(""))' "$f"
           done
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: bench-${{ github.sha }}
           path: bench-results/nightly
