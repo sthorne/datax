@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -234,7 +233,7 @@ func (s *Session) checkTableOwnerNoTxn(ctx context.Context, name string) *Error 
 // tablePrivAllowed reports whether the actor may exercise priv on the
 // table or view.
 func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) (bool, error) {
-	if txn != nil && txn.Historical() && desc.Virtual == "" && !s.system && s.actor() != catalog.RootRole {
+	if txn != nil && txn.Historical() && txn != s.freshTxn && desc.Virtual == "" && !s.system && s.actor() != catalog.RootRole {
 		// root holds every privilege now as then (the sealed tables'
 		// rule is fixed), and asks nothing of today's state: a bounded
 		// staleness read it runs stays local under a partition.
@@ -337,28 +336,20 @@ type historicalPrivKey struct {
 // would not stop a role from reading the rows as they stood before it.
 // Privileges are therefore decided as row-security policies are
 // (historicalRowFilter): by the table's descriptor, the role
-// memberships and the schema's USAGE as they are now, read in a
-// transaction of their own; the rows are the timestamp's. The table is
-// found by ID, so one renamed since is checked under its grants today
+// memberships and the schema's USAGE as fresh as this node can know
+// them (freshCatalog); the rows are the timestamp's. The table is
+// found by ID, so one renamed since is checked under its grants
 // whichever name the statement used. One dropped since has no
-// privileges today: only root and admins may read what is left of it.
-//
-// Today's state is read from the leaseholders. If it cannot be read
-// within historicalPrivTimeout — a gateway cut off from them, serving a
-// bounded-staleness read locally — the statement fails rather than
-// fall back to the past's grants; root's reads ask nothing and are
-// unaffected.
+// privileges: only root and admins may read what is left of it.
 func (s *Session) historicalTablePrivAllowed(ctx context.Context, htxn *kvclient.Txn, hdesc *catalog.TableDescriptor, priv string) (bool, error) {
 	key := historicalPrivKey{txn: htxn, table: hdesc.ID, actor: s.actor(), priv: priv}
 	if ok, found := s.historicalPrivs[key]; found {
 		return ok, nil
 	}
 	var allowed bool
-	tctx, cancel := context.WithTimeout(ctx, historicalPrivTimeout)
-	defer cancel()
-	err := s.db.RunTxn(tctx, "asof-privileges", func(ctx context.Context, cur *kvclient.Txn) error {
+	err := s.freshCatalog(ctx, "asof-privileges", func(ctx context.Context, cur *kvclient.Txn) error {
 		allowed = false
-		desc, err := catalog.ReadTable(ctx, cur, hdesc.ID)
+		desc, err := s.freshTable(ctx, cur, hdesc)
 		if err != nil {
 			return err
 		}
@@ -372,9 +363,6 @@ func (s *Session) historicalTablePrivAllowed(ctx context.Context, htxn *kvclient
 	// The role sets resolved above belong to that transaction.
 	s.invalidateRoles()
 	if err != nil {
-		if ctx.Err() == nil && tctx.Err() != nil {
-			return false, newErrf(CodeInsufficientPriv, "cannot check today's privileges on table %q for a historical read: the catalog is unreachable from this node (%v)", hdesc.Name, err)
-		}
 		return false, err
 	}
 	if s.historicalPrivs == nil {
@@ -384,21 +372,58 @@ func (s *Session) historicalTablePrivAllowed(ctx context.Context, htxn *kvclient
 	return allowed, nil
 }
 
-// historicalPrivTimeout bounds the read of today's privileges a
-// historical read makes (historicalTablePrivAllowed, currentRoleSet).
-var historicalPrivTimeout = 5 * time.Second
+// freshCatalog runs fn against the freshest catalog state this node can
+// serve for a historical read's checks of privileges and policies —
+// "privileges are as fresh as the data the node can serve".
+//
+// An exact AS OF SYSTEM TIME read checks against today's state, read in
+// an ordinary transaction with the statement's context: it waits for
+// the leaseholders as any current read does. A bounded-staleness read
+// exists to be served by this node's own replicas when it is cut off,
+// so it checks against the state at the newest timestamp those
+// replicas can serve (the local closed timestamp, which bounded
+// staleness chose its own timestamp from, and never older than the
+// read): a REVOKE this node has not yet replicated is invisible to it,
+// the same staleness the data has, and one it has replicated stops the
+// read.
+func (s *Session) freshCatalog(ctx context.Context, name string, fn func(context.Context, *kvclient.Txn) error) error {
+	if !s.asofLocal {
+		return s.db.RunTxn(ctx, name, fn)
+	}
+	ts := s.asofTS
+	if lc := s.db.LocalClosedTimestamp(); ts.Less(lc) {
+		ts = lc
+	}
+	cur := s.db.NewHistoricalTxn(name, ts)
+	saved := s.freshTxn
+	s.freshTxn = cur
+	err := fn(ctx, cur)
+	s.freshTxn = saved
+	_ = cur.Commit(ctx) // read-only: releases nothing, marks finished
+	return err
+}
+
+// freshTable resolves, within a freshCatalog transaction, today's
+// descriptor of the table a historical read resolved as hdesc: the
+// gateway's leased copy when it holds a live lease on it under the same
+// name (no KV round trip, and as current as any statement here may
+// use), else the descriptor read by ID. nil when it has been dropped.
+func (s *Session) freshTable(ctx context.Context, cur *kvclient.Txn, hdesc *catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
+	if d := s.cat.Leased(hdesc.DatabaseID, hdesc.Name, hdesc.ID); d != nil {
+		return d, nil
+	}
+	return catalog.ReadTable(ctx, cur, hdesc.ID)
+}
 
 // currentRoleSet is roleSet, but for a historical transaction the
-// actor's roles as they are now rather than at its timestamp (root's
-// are fixed, and need no read).
+// actor's roles as fresh as freshCatalog reads them rather than at its
+// timestamp (root's are fixed, and need no read).
 func (s *Session) currentRoleSet(ctx context.Context, txn *kvclient.Txn) (catalog.RoleSet, error) {
-	if txn == nil || !txn.Historical() || s.actor() == catalog.RootRole {
+	if txn == nil || !txn.Historical() || txn == s.freshTxn || s.actor() == catalog.RootRole {
 		return s.roleSet(ctx, txn)
 	}
 	var set catalog.RoleSet
-	ctx, cancel := context.WithTimeout(ctx, historicalPrivTimeout)
-	defer cancel()
-	err := s.db.RunTxn(ctx, "asof-roles", func(ctx context.Context, cur *kvclient.Txn) error {
+	err := s.freshCatalog(ctx, "asof-roles", func(ctx context.Context, cur *kvclient.Txn) error {
 		var err error
 		set, err = catalog.LazyRoleGraph(ctx, cur).Effective(s.actor())
 		return err

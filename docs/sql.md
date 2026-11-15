@@ -1532,9 +1532,18 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   than secret. An `AS OF SYSTEM TIME` read resolves its
   descriptors and the role graph as of its timestamp; privileges are
   decided as of now instead (`historicalTablePrivAllowed`, the
-  counterpart of `historicalRowFilter`): the table is read by ID in a
-  fresh transaction and checked with today's roles and schema `USAGE`,
-  memoized per statement. A renamed table is checked under its grants
+  counterpart of `historicalRowFilter`), memoized per statement. Both
+  read "now" through `freshCatalog`: for an exact timestamp, an
+  ordinary transaction (it waits for the leaseholders as any current
+  read does); for a bounded-staleness read, a historical transaction at
+  the newest timestamp the node serves locally (`max(read timestamp,
+  LocalClosedTimestamp)`), so privileges and policies are as fresh as
+  the data and the read stays local under a partition. The table is the
+  gateway's leased descriptor when it holds a live lease on it under
+  the same name (`Accessor.Leased`, no KV read), else read by ID; the
+  role graph and schema `USAGE` are read in that transaction (there is
+  no gateway role cache). Checks inside that transaction are not
+  redirected again (`Session.freshTxn`). A renamed table is checked under its grants
   today; a dropped one, having none, is readable by admins only.
   `virtualEnv` under a historical transaction uses today's role set and
   withholds statistics and sequence counters from non-admins.

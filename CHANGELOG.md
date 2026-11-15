@@ -1030,9 +1030,16 @@ state or the internode protocol does, and an entry below says so.
   since answers to its grants under the new name; one dropped since is
   readable historically by admins only. Catalogs read `AS OF SYSTEM TIME`
   use today's roles and show statistics and sequence counters to admins
-  only. Today's grants are read from the cluster: a role other than
-  `root` running a bounded-staleness read on a node cut off from the
-  rest is refused after five seconds instead of being answered locally. (A statement prepared through the extended protocol still
+  only. "Now" is as fresh as the data the node can serve: an exact
+  timestamp checks the current grants and policies; a bounded-staleness
+  read checks the newest state the node's own replicas hold (the leased
+  descriptor, or the catalog at its closed timestamp), so a `REVOKE` the
+  node has replicated stops it, one not yet replicated is invisible to it
+  as unreplicated rows are, and under a partition it is still served
+  locally for every role. Row-security policies under a bounded-staleness
+  read are read the same way; before, their check needed the
+  leaseholders and could not finish on a partitioned node. (A statement
+  prepared through the extended protocol still
   resolves its tables by today's names when it is described, so a table
   renamed or dropped since is reachable only through the simple
   protocol, as before.)

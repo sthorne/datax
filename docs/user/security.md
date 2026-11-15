@@ -165,10 +165,19 @@ its identity, so one renamed since answers to its grants under the new
 name; one dropped since has no grants left, and only an admin may read
 what remains of it. Catalogs read as of a timestamp list that
 timestamp's schema under today's roles, and show statistics and sequence
-counters to admins only. Today's grants are read from the cluster, so a role other than
-`root` cannot run a bounded-staleness read on a node cut off from the
-rest: after five seconds it is refused (`42501`) rather than answered by
-the timestamp's grants.
+counters to admins only.
+
+"Now" is as fresh as the data the node can serve. An exact `AS OF
+SYSTEM TIME '...'` read checks the grants and policies in force now,
+reading them as any current statement would. A bounded-staleness read
+(`with_max_staleness`) exists to be answered by the node's own replicas
+when it is cut off from the rest, so it checks against the newest
+state those replicas hold (the gateway's leased copy of the table, or
+the catalog at the node's closed timestamp, never older than the read
+itself): a `REVOKE` the node has replicated stops the read, and one it
+has not yet replicated is invisible to it — the same staleness bound
+the rows themselves have. Under a partition such a read is still served
+locally, for every role.
 
 **The catalogs are every role's.** As in PostgreSQL, any role may read
 `pg_catalog` and `information_schema`, so `psql`'s `\d` and ORM

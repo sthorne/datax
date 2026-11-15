@@ -177,6 +177,15 @@ type Session struct {
 	// SYSTEM TIME read (historicalTablePrivAllowed); per statement, like
 	// historicalMemo.
 	historicalPrivs map[historicalPrivKey]bool
+	// asofLocal marks a bounded-staleness read in flight, and asofTS its
+	// timestamp: its checks of today's privileges and policies read the
+	// freshest state this node serves locally (freshCatalog).
+	asofLocal bool
+	asofTS    hlc.Timestamp
+	// freshTxn is the historical transaction freshCatalog is running a
+	// check in: one that stands for today, not for the past, so the
+	// checks inside it must not be redirected again.
+	freshTxn *kvclient.Txn
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -1031,8 +1040,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			}
 		}
 		s.streamTop = true
+		s.asofLocal, s.asofTS = sel.AsOfMaxStaleness != "", ts
 		res, serr := s.execSelect(ctx, txn, sel, params)
 		s.streamTop = false
+		s.asofLocal, s.asofTS = false, hlc.Timestamp{}
 		if serr != nil {
 			_ = txn.Rollback(ctx)
 			return nil, ToSQLError(serr)
