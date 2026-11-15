@@ -205,6 +205,9 @@ func sealedTableError(name string) *Error {
 	if catalog.IsLargeObjectTable(name) {
 		return newErrf(CodeInsufficientPriv, "table %q holds the cluster's large objects: it is written through the lo_* functions alone and cannot be changed through SQL by any role", name)
 	}
+	if catalog.IsUnreadableSystemTable(name) {
+		return keysTableError(name)
+	}
 	return newErrf(CodeInsufficientPriv, "table %q is the cluster's audit record: it is written by the nodes alone and cannot be changed through SQL by any role (ALTER TABLE %s SET (retention = ...) sets how long records are kept)", name, name)
 }
 
@@ -241,7 +244,9 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		// grant made for the purpose: the records name people and the
 		// addresses they came from, so the blanket read_all role does
 		// not reach it.
-		if priv != "SELECT" {
+		// The named keys (issue #310) are not even readable: a session is
+		// shown the virtual table of their metadata, which has the name.
+		if priv != "SELECT" || (catalog.IsUnreadableSystemTable(desc.Name) && desc.Virtual == "") {
 			return false, nil
 		}
 		if s.actor() == catalog.RootRole {
@@ -319,7 +324,7 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 		return err
 	}
 	if !ok {
-		if catalog.IsSealedSystemTable(desc.Name) && priv != "SELECT" {
+		if catalog.IsSealedSystemTable(desc.Name) && (priv != "SELECT" || (catalog.IsUnreadableSystemTable(desc.Name) && desc.Virtual == "")) {
 			return sealedTableError(desc.Name)
 		}
 		if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {

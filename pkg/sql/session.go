@@ -332,6 +332,13 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 			}
 		}
 	}
+	if catalog.IsUnreadableSystemTable(bare) && !s.system && !vtable.IsSchema(db) {
+		// The named keys (issue #310): no session but the node's own
+		// reads the table; every other is shown its metadata.
+		if d, ok := keysVirtualTable(); ok {
+			return d, nil
+		}
+	}
 	if vtable.IsSchema(db) {
 		if vt, ok := vtable.Lookup(name); ok {
 			return vt.Descriptor(), nil
@@ -458,6 +465,7 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	}
 	env.IsAdmin = set.IsAdmin()
 	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
+	env.Keys = func() ([]vtable.KeyInfo, error) { return s.listKeys(ctx, txn, set) }
 	// A table whose schema the session may not use is not listed, as
 	// the console does not list it (issue #259): both ask
 	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
