@@ -12,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/version"
@@ -191,6 +192,7 @@ func (s *Store) ClearRange(ctx context.Context, rangeID base.RangeID, start, end
 	if len(br.Responses) != 1 || br.Responses[0].ClearRange == nil || !br.Responses[0].ClearRange.Cleared {
 		return res, fmt.Errorf("%s changed before the clear applied; clear again", rangeID)
 	}
+	metrics.RangeClears.Inc()
 	res = ClearRangeResult{Desc: desc, Timestamp: ts, Keys: count.keys, Bytes: count.bytes, AppliedIndex: r.AppliedIndex()}
 	return res, nil
 }

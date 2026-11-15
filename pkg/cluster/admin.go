@@ -7,6 +7,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/storage/enc"
+	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
@@ -278,6 +279,9 @@ type AdminResponse struct {
 	Purge        *kvpb.PurgeReport        `json:"purge,omitempty"`
 	PurgeRange   *PurgeRangeAnswer        `json:"purge_range,omitempty"`
 	PurgeReplica *kvpb.PurgeReplicaReport `json:"purge_replica,omitempty"`
+	// ClearRange answers clear-range, a range clear's step on a range's
+	// leader (cluster version v22, issue #316).
+	ClearRange *ClearRangeAnswer `json:"clear_range,omitempty"`
 	// Status answers node-status: the serving node's /status document
 	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
 	// this package does not depend on the server package's types.
@@ -327,6 +331,18 @@ type BackupSummary struct {
 	// Notes are what a table restore left out or changed on the way in:
 	// foreign keys dropped, grants to roles the cluster does not have.
 	Notes []string `json:"notes,omitempty"`
+}
+
+// ClearRangeAnswer is a leader's answer to clear-range: the range as it
+// stands, the clear's time (the range's GC threshold after it), the
+// stored MVCC keys and bytes it removed, and the applied index a replica
+// must reach to hold it.
+type ClearRangeAnswer struct {
+	Desc         kvpb.RangeDescriptor `json:"desc"`
+	Timestamp    hlc.Timestamp        `json:"timestamp"`
+	Keys         int64                `json:"keys"`
+	Bytes        int64                `json:"bytes"`
+	AppliedIndex uint64               `json:"applied_index"`
 }
 
 // PurgeRangeAnswer is a leader's answer to purge-range: the range as it

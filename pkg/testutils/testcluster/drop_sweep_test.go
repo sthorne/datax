@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -163,7 +166,9 @@ func TestSweepReclaimsTablesDroppedBeforeTheirRecord(t *testing.T) {
 	if rows(oldID) != 3 {
 		t.Fatalf("the old table's rows went inside the window: %d", rows(oldID))
 	}
-	// Past it (the GC TTL plus the reclaim's slack): cleared.
+	// Past it (the GC TTL plus the reclaim's slack): cleared, by a range
+	// clear.
+	clears := testutil.ToFloat64(metrics.RangeClears)
 	deadline := time.Now().Add(30 * time.Second)
 	for n.RunDroppedTableReclaimOnce(ctx) == 0 {
 		if time.Now().After(deadline) {
@@ -173,6 +178,9 @@ func TestSweepReclaimsTablesDroppedBeforeTheirRecord(t *testing.T) {
 	}
 	if got := rows(oldID); got != 0 {
 		t.Fatalf("the old table has %d rows after the reclaim", got)
+	}
+	if testutil.ToFloat64(metrics.RangeClears) == clears {
+		t.Fatal("the old table was not reclaimed with a range clear")
 	}
 	if record(oldID) != nil {
 		t.Fatal("the old table's record outlived the reclaim")

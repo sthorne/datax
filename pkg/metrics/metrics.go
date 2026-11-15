@@ -208,6 +208,9 @@ var (
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
 	})
+	RangeClears = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_clears_total", Help: "Ranges of dropped tables emptied by a replicated range clear, counted on the leader that proposed it.",
+	})
 	PurgeVersionsRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_purge_versions_removed_total", Help: "MVCC versions deleted by purges this node coordinated (ALTER TABLE ... PURGE, datax debug purge).",
 	})

@@ -343,6 +343,13 @@ const (
 	// without records be running, so only then does "no record" mean
 	// "dropped before records"; the sweep's own record
 	// (keys.DroppedTableSweepKey) is a system key a v21 node never reads.
+	//
+	// V22 also introduces the replicated range clear (issue #316,
+	// kvpb.ClearRangeRequest, pkg/kvserver/clearrange.go) and the
+	// clear-range admin op that drives it: the dropped-table reclaim
+	// empties each range of a dropped table's span with one raft command
+	// instead of a tombstone per row. A v21 replica cannot apply the
+	// command, so below v22 the reclaim deletes row by row.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

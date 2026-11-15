@@ -78,6 +78,9 @@ var adminUnauditedOps = map[string]bool{
 	"purge-range":   true,
 	"purge-replica": true,
 	"purge-scrub":   true,
+	// A range clear's step on a range's leader, asked by the node running
+	// the dropped-table reclaim, which logs the clear (clear_span.go).
+	"clear-range": true,
 }
 
 // isAdminPrincipal reports whether an authenticated identity carries
@@ -534,6 +537,9 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 
 	case "purge-range", "purge-replica", "purge-scrub":
 		return n.servePurgeStep(ctx, req)
+
+	case "clear-range":
+		return n.serveClearRange(ctx, req)
 
 	case "merge":
 		if req.RangeID == 0 {

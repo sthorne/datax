@@ -6,10 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -68,7 +71,9 @@ func TestDropTableReclaimsRows(t *testing.T) {
 		t.Fatalf("no dropped-table record: %v", err)
 	}
 
-	// Past it (1s and the job's slack): the span is cleared.
+	// Past it (1s and the job's slack): the span is cleared, by a range
+	// clear (the cluster is at v22).
+	clears := testutil.ToFloat64(metrics.RangeClears)
 	deadline := time.Now().Add(30 * time.Second)
 	for n.RunDroppedTableReclaimOnce(ctx) == 0 {
 		if time.Now().After(deadline) {
@@ -79,11 +84,14 @@ func TestDropTableReclaimsRows(t *testing.T) {
 	if got := rows(); got != 0 {
 		t.Fatalf("%d rows left after the reclaim", got)
 	}
+	if testutil.ToFloat64(metrics.RangeClears) == clears {
+		t.Fatal("the reclaim did not use a range clear")
+	}
 	if raw, err := n.DB().Get(ctx, keys.DroppedTableKey(id)); err != nil || raw != nil {
 		t.Fatalf("the record outlived the reclaim: %q %v", raw, err)
 	}
-	if _, serr := trySQL(ctx, s, `SELECT count(*) FROM gone AS OF SYSTEM TIME '`+before+`'`); serr == nil {
-		t.Fatal("a read below the drop was answered after the rows were reclaimed")
+	if _, serr := trySQL(ctx, s, `SELECT count(*) FROM gone AS OF SYSTEM TIME '`+before+`'`); serr == nil || serr.Code != sql.CodeSnapshotTooOld {
+		t.Fatalf("a read below the drop after the rows were reclaimed: %v, want %s", serr, sql.CodeSnapshotTooOld)
 	}
 	// Nothing of the table is left in the files: no live key, version or
 	// tombstone on any replica.
