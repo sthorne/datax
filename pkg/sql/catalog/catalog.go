@@ -623,7 +623,26 @@ type TableDescriptor struct {
 	RowSecurity      bool     `json:"row_security,omitempty"`
 	ForceRowSecurity bool     `json:"force_row_security,omitempty"`
 	Policies         []Policy `json:"policies,omitempty"`
+	// EncryptionKey marks a sealed table (cluster version v22, issue
+	// #310): every row's value is sealed under a named key of kind table
+	// before it is written to KV (pkg/sql/rowseal). nil for an ordinary
+	// table, which is every table written before.
+	EncryptionKey *TableEncryptionKey `json:"encryption_key,omitempty"`
 }
+
+// TableEncryptionKey is a sealed table's key.
+type TableEncryptionKey struct {
+	// KeyID is the table's key in datax_keys (pkg/keystore).
+	KeyID int64 `json:"key_id"`
+	// SealID is the table id bound into every sealed value's associated
+	// data: the table's id when it was created. A table restore gives the
+	// table a new id and keeps SealID (and KeyID), so the rows it copies
+	// open as they were written.
+	SealID uint64 `json:"seal_id"`
+}
+
+// Sealed reports whether the table's row values are sealed.
+func (d *TableDescriptor) Sealed() bool { return d != nil && d.EncryptionKey != nil }
 
 // Policy commands: the statement kinds a row-security policy governs.
 const (
@@ -763,6 +782,10 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 			out.RetiredLayouts[i].IndexIDs = append([]uint64(nil), rl.IndexIDs...)
 		}
 	}
+	if d.EncryptionKey != nil {
+		ek := *d.EncryptionKey
+		out.EncryptionKey = &ek
+	}
 	if d.RowTTL != nil {
 		ttl := *d.RowTTL
 		out.RowTTL = &ttl
@@ -837,6 +860,23 @@ func (d *TableDescriptor) IsPKCol(id ColumnID) bool {
 	return false
 }
 
+// SetRowSealer gives the accessor the gateway's sealed-table boundary
+// (pkg/sql/rowseal), which every session over it seals and opens rows
+// through. The catalog only carries it.
+func (a *Accessor) SetRowSealer(v any) { a.rowSealer.Store(&v) }
+
+// RowSealer returns what SetRowSealer stored, or nil.
+func (a *Accessor) RowSealer() any {
+	if a == nil {
+		return nil
+	}
+	p, _ := a.rowSealer.Load().(*any)
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // ErrTableNotFound is returned (wrapped) for missing tables.
 type ErrTableNotFound struct{ Name string }
 
@@ -856,6 +896,10 @@ func (e *ErrTableExists) Error() string { return fmt.Sprintf("table %q already e
 type Accessor struct {
 	mu    sync.Mutex
 	cache map[string]*cachedDesc // keyed by cacheKey(dbID, name)
+	// rowSealer is the gateway's sealed-table boundary (a
+	// *rowseal.Boundary, issue #310), set by the server; nil on an
+	// accessor without a key store, where sealed tables are unreadable.
+	rowSealer atomic.Value
 	// dbs caches database name → ID (0 = the default database before
 	// the v6 migration); invalidated by database DDL on this gateway and
 	// re-read on a miss, so another gateway's CREATE DATABASE is seen on

@@ -158,6 +158,37 @@ func TestGoldenRowSecurityDescriptor(t *testing.T) {
 	}
 }
 
+// goldenTableDescriptorSealed is a sealed table (cluster version v22,
+// issue #310). The field is omitempty: a table that is not sealed encodes
+// as it did before.
+const goldenTableDescriptorSealed = `{"id":12,"name":"notes","columns":[{"id":1,"name":"id","type":1,"not_null":true},{"id":2,"name":"body","type":3}],"primary_key":[1],"encryption_key":{"key_id":4242,"seal_id":12}}`
+
+func TestGoldenSealedDescriptor(t *testing.T) {
+	var d TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorSealed), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Sealed() || d.EncryptionKey.KeyID != 4242 || d.EncryptionKey.SealID != 12 {
+		t.Fatalf("decoded %+v", d)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil || string(raw) != goldenTableDescriptorSealed {
+		t.Fatalf("encoding changed:\n got %s\nwant %s (%v)", raw, goldenTableDescriptorSealed, err)
+	}
+	c := d.Clone()
+	c.EncryptionKey.KeyID = 1
+	if d.EncryptionKey.KeyID != 4242 {
+		t.Fatal("Clone shares the encryption key")
+	}
+	var old TableDescriptor
+	if err := json.Unmarshal([]byte(goldenTableDescriptorV21), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Sealed() {
+		t.Fatalf("an older descriptor reads as sealed: %+v", old)
+	}
+}
+
 // TestGoldenRoleBypassRLS: the BYPASSRLS attribute is omitempty, so a
 // role without it encodes as before.
 func TestGoldenRoleBypassRLS(t *testing.T) {

@@ -353,6 +353,9 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	var rows int64
 	if res != nil {
 		rows = int64(len(res.Rows))
+		for _, msg := range res.Notices {
+			c.backend.Send(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000", Message: msg})
+		}
 	}
 	if serr == nil && emit != nil && res != nil {
 		rows, serr = emit(ctx, res)

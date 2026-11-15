@@ -123,7 +123,7 @@ func (s *Session) scanTopK(ctx context.Context, txn *kvclient.Txn, desc *catalog
 			return nil, err
 		}
 		for _, kv := range kvs {
-			row, err := decodeFullRow(desc, kv.Key, kv.Value)
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 			if err != nil {
 				return nil, err
 			}

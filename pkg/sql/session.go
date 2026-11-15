@@ -114,6 +114,9 @@ type Result struct {
 	Rows    [][]types.Datum
 	// Tag is the PostgreSQL command tag ("SELECT 3", "INSERT 0 2", ...).
 	Tag string
+	// Notices are messages for the client, sent as NOTICEs before the
+	// statement completes (a sealed table's plaintext columns, say).
+	Notices []string
 	// Stream, when set, delivers the rows on demand instead of Rows (a
 	// scan-shaped SELECT on a streaming session, see stream.go); the
 	// consumer pulls it with Next, closes it, and takes the tag from it.
@@ -889,6 +892,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			return s.execSetAuditRetention(ctx, at)
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
+			return nil, serr
+		}
+		if serr := refuseAlterSeal(at.SetOptions); serr != nil {
 			return nil, serr
 		}
 		// The options any table takes are set first, in one descriptor

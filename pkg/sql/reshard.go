@@ -420,7 +420,7 @@ func (s *Session) reshardChunk(ctx context.Context, table string, start, end key
 		}
 		var wb kvclient.WriteBatch
 		for _, kv := range kvs {
-			row, err := decodeFullRow(desc, kv.Key, kv.Value)
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 			if err != nil {
 				return err
 			}
@@ -428,8 +428,22 @@ func (s *Session) reshardChunk(ctx context.Context, table string, start, end key
 			if err != nil {
 				return err
 			}
-			// Value bytes carry only non-PK columns: verbatim copy.
-			wb.Put(newKey, kv.Value)
+			// Value bytes carry only non-PK columns: verbatim copy. A
+			// sealed value is bound to its key, so it is sealed again for
+			// the new one (time-series tables, the only ones re-sharded,
+			// cannot be sealed today; this keeps the copy right if they
+			// ever can).
+			value := kv.Value
+			if desc.Sealed() {
+				plain, err := s.rowSealer().OpenValue(ctx, desc, kv.Key, kv.Value)
+				if err != nil {
+					return err
+				}
+				if value, err = s.rowSealer().SealValue(ctx, desc, newKey, plain); err != nil {
+					return err
+				}
+			}
+			wb.Put(newKey, value)
 			// Rebuild every secondary index's entry at its shadow ID: the
 			// entry's primary-key suffix embeds the bucket, so it encodes
 			// from the shadow row. Idempotent against dual-writes for the

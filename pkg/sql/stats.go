@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
 
@@ -136,12 +138,26 @@ func statsHashDatum(d types.Datum) uint64 {
 
 // CollectTableStats sweeps the table's primary index at a frozen
 // timestamp and returns fresh statistics. Exported for the background
-// sampler in pkg/server; ANALYZE uses it too.
-func CollectTableStats(ctx context.Context, db *kvclient.DB, desc *catalog.TableDescriptor) (*catalog.TableStatistics, error) {
+// sampler in pkg/server; ANALYZE uses it too. A sealed table's rows are
+// opened through the gateway's boundary b; its sealed columns get no
+// statistics at all — a summary of their plaintext would outlive the
+// table's key — so only its row count and its primary-key and indexed
+// columns, which are plaintext anyway, are described.
+func CollectTableStats(ctx context.Context, db *kvclient.DB, b *rowseal.Boundary, desc *catalog.TableDescriptor) (*catalog.TableStatistics, error) {
 	boundary := db.Clock().Now()
 	cursor, end := rowenc.PrimarySpanFor(desc)
 
 	cols := desc.VisibleColumns()
+	if desc.Sealed() {
+		plain := rowseal.PlaintextColumns(desc)
+		kept := cols[:0:0]
+		for _, c := range cols {
+			if plain[c.ID] {
+				kept = append(kept, c)
+			}
+		}
+		cols = kept
+	}
 	sketches := make(map[catalog.ColumnID]*kmvSketch, len(cols))
 	nulls := make(map[catalog.ColumnID]int64, len(cols))
 	for _, c := range cols {
@@ -158,8 +174,12 @@ func CollectTableStats(ctx context.Context, db *kvclient.DB, desc *catalog.Table
 			break
 		}
 		for _, kv := range kvs {
-			row, derr := decodeFullRow(desc, kv.Key, kv.Value)
+			row, derr := decodeFullRow(ctx, b, desc, kv.Key, kv.Value)
 			if derr != nil {
+				var ku *rowseal.KeyUnavailableError
+				if errors.As(derr, &ku) {
+					return nil, derr // no key: nothing to describe, not an empty table
+				}
 				// A row we cannot decode (concurrent schema change edge)
 				// still counts; its column values are skipped.
 				rows++
@@ -230,7 +250,7 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 	}
 
 	for _, desc := range descs {
-		st, err := CollectTableStats(ctx, s.db, desc)
+		st, err := CollectTableStats(ctx, s.db, s.rowSealer(), desc)
 		if err != nil {
 			return nil, ToSQLError(err)
 		}

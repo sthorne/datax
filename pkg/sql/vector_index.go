@@ -196,7 +196,7 @@ func (s *Session) trainVectorIndex(ctx context.Context, t *parser.CreateIndex, s
 	rng := mrand.New(mrand.NewSource(int64(desc.ID)<<20 ^ int64(len(t.Name))))
 	sample := make([][]float32, 0, want)
 	vecOf := func(key keys.Key, value []byte) ([]float32, error) {
-		row, err := decodeFullRow(desc, key, value)
+		row, err := decodeFullRow(ctx, s.rowSealer(), desc, key, value)
 		if err != nil {
 			return nil, err
 		}
@@ -560,7 +560,7 @@ func (s *Session) executeVectorScan(ctx context.Context, txn *kvclient.Txn, desc
 				if raw == nil {
 					return false, newErrf(CodeInternal, "index %q entry points at a missing row", vp.idx.Name)
 				}
-				row, err := decodeFullRow(desc, pk, raw)
+				row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
 				if err != nil {
 					return false, err
 				}

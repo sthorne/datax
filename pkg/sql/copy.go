@@ -212,7 +212,7 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 				return ci.rowErr(r.ordinal, newErrf(CodeUniqueViolation,
 					"duplicate key value violates unique constraint on %q", desc.Name))
 			}
-			if err := insertRow(ctx, txn, desc, targets[i], r.vals, &wb, inserted, true, ps); err != nil {
+			if err := insertRow(ctx, ci.s.rowSealer(), txn, desc, targets[i], r.vals, &wb, inserted, true, ps); err != nil {
 				return ci.rowErr(r.ordinal, err)
 			}
 			if err := guard.checkInsert(ctx, txn, built[i], inserted); err != nil {
