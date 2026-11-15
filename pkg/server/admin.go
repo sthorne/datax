@@ -481,7 +481,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Purge: rep, TableNames: n.tableNames(ctx)}
+		return cluster.AdminResponse{Purge: rep, TableNames: n.tableNamesFor(ctx, kvpb.RangeDescriptor{StartKey: start, EndKey: end})}
 
 	case "purge-range", "purge-replica", "purge-scrub":
 		return n.servePurgeStep(ctx, req)
