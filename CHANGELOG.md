@@ -11,6 +11,27 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`LISTEN` / `NOTIFY`** (#297). `LISTEN channel`, `UNLISTEN channel | *`,
+  `NOTIFY channel [, 'payload']` and `pg_notify(channel, payload)`, delivered
+  to listening sessions on every node of the cluster and pushed to an idle
+  connection, so pgx's `WaitForNotification` and other drivers' listeners
+  work as they do against PostgreSQL. The semantics are PostgreSQL's: a
+  `NOTIFY` in a transaction is delivered if and when it commits (`ROLLBACK`
+  and `ROLLBACK TO SAVEPOINT` discard it), identical notifications in one
+  transaction collapse, `LISTEN` takes effect at commit, a session hears
+  itself, channels belong to a database, a payload is under 8000 bytes
+  (`22023`), and there are no privileges on channels. Nothing is stored: a
+  notification goes to the sessions listening when it commits, at most once.
+  A session that stays connected receives every one or is disconnected — with
+  FATAL `54000` if it let 16 MiB pile up unread, or `57P01` if another node
+  had to drop what it could not deliver to this one (it keeps 64 MiB per
+  unreachable node for up to five minutes, and delivers late otherwise). The
+  exception is a node that crashes between a commit and handing the
+  notification to its peers. Notifications from one node arrive in its commit
+  order; those from different nodes are not ordered against each other.
+  `pg_notify` runs once per statement and its arguments cannot name columns.
+  No cluster version change: a node on an older release is skipped by the
+  fan-out and cannot serve `LISTEN`.
 - **`SELECT ... FOR UPDATE SKIP LOCKED` and `NOWAIT`** (#296). `SKIP
   LOCKED` leaves out rows another transaction holds — or changed and
   committed since this transaction's snapshot — and locks the rest;
