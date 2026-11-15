@@ -194,6 +194,11 @@ type Config struct {
 	// StatsStaleness is the statistics age that triggers a background
 	// re-collection (0 = default 10m).
 	StatsStaleness time.Duration
+	// CatalogResumeEvery is how often the background jobs that follow
+	// the catalog (the retention provider, the re-shard janitor, the
+	// statistics sampler) write the record they resume from after a
+	// start (0 = each job's default: 1m, 10m, 10m). Tests only.
+	CatalogResumeEvery time.Duration
 	// RowTTLInterval paces the row expiry job (rowttl.go): each tick,
 	// the node leading range 1 deletes the expired rows of every table
 	// with a row TTL (0 = default 30s; negative disables the job, and

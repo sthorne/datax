@@ -224,6 +224,9 @@ type catalogFollower struct {
 }
 
 func newCatalogFollower(n *Node, spans []watchSpan, fresh func() followedState, store resumeStore, version uint64, every time.Duration) *catalogFollower {
+	if n.cfg.CatalogResumeEvery > 0 {
+		every = n.cfg.CatalogResumeEvery
+	}
 	return &catalogFollower{
 		w:     descWatcher{n: n, spans: spans},
 		state: fresh(), fresh: fresh,
