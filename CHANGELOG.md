@@ -11,6 +11,23 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **An audit table** (#293). Audit records are now also kept in the cluster,
+  in the `datax_audit` system table, once v21 is finalized: readable with SQL
+  by admins and by roles granted `SELECT` on it (not `read_all`), and not
+  changeable through SQL by any role, `root` included — only
+  `ALTER TABLE datax_audit SET (retention = ...)` (admins, at least a day;
+  default 90 days) is accepted. Each node's records form a hash chain;
+  `datax debug audit export | heads | verify` exports them as JSON lines and
+  verifies them outside the cluster, detecting removed, altered and reordered
+  records, and — against heads saved earlier — a chain rewritten underneath
+  SQL. Recording never delays or fails the audited action: events are
+  buffered in memory and written about once a second, a node without quorum
+  writes them when it can, and what a full buffer drops is counted
+  (`datax_audit_dropped_total`) and recorded as an `audit-gap`; the log lines
+  remain. Offline commands (which run with no cluster) stay log-only, and a
+  node that is killed loses what it had buffered. `/api/security` reports
+  each node's chain head. New flag `--audit-table=false`.
+  Cluster protocol version: v21.
 - **Roots in a key management service** (#308): `--enc-root` takes
   `vault:<address>/<mount>/<key>` (HashiCorp Vault Transit),
   `awskms:<key arn>`, `gcpkms:projects/…/cryptoKeys/<key>` and
