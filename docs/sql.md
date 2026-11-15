@@ -12,6 +12,7 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
     [WITH (gc_ttl = '10m')]                                         -- the table's own GC window (v21)
     [WITH (ttl_expiration = col | ttl_column = col, ttl = '7 days')] -- row expiry (v21); see Table options below
     [WITH (encryption_key = 'auto')]                                -- a sealed table (v22); see Sealed tables below
+    [WITH (encryption_key_by = 'col')]                              -- sealed per tenant (v22); see Per-tenant keys below
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
 ALTER TABLE [IF EXISTS] t SET (gc_ttl = ... | ttl_expiration = col | ttl_column = col | ttl = '...' | retention = '...')
 ALTER TABLE [IF EXISTS] t RESET (gc_ttl | ttl | ttl_column | ttl_expiration | retention [, ...])
@@ -359,9 +360,9 @@ under the key before it is written to KV and opened after it is read
 are **not** sealed.
 
 - **Refused** (`0A000`) before v22 is finalized, before the cluster key
-  is enabled (`datax debug cluster-key init`), for time-series tables,
-  and for `encryption_key_by` (per-tenant keys, not built yet). A value
-  other than `'auto'` is `22023`. `ALTER TABLE ... SET (encryption_key
+  is enabled (`datax debug cluster-key init`), and for time-series
+  tables. A value other than `'auto'` is `22023`, and so is giving both
+  `encryption_key` and `encryption_key_by`. `ALTER TABLE ... SET (encryption_key
   = ...)` is refused as not built yet (`0A000`): sealing an existing
   table rewrites its rows, which a later step does in the background.
   Create a new sealed table and copy the rows into it.
@@ -413,6 +414,72 @@ are **not** sealed.
   the cluster lacks it or has destroyed it (refused before anything is
   written when the backup does not hold it, holds it destroyed, or holds
   it under a cluster key this cluster has not imported).
+
+### Per-tenant keys (v22)
+
+`CREATE TABLE ... WITH (encryption_key_by = 'tenant_id')` seals a table
+**per tenant** (issue #310, step 4): each distinct value of the column —
+a tenant — has a key of its own, kind `tenant`, in `datax_keys`, made on
+the tenant's first write; no catalog object is made per tenant.
+Everything under *Sealed tables* above holds, with these differences.
+
+```sql
+CREATE TABLE items (tenant_id UUID, id UUID, title TEXT, details JSONB,
+  PRIMARY KEY (tenant_id, id)) WITH (encryption_key_by = 'tenant_id');
+SELECT datax_destroy_tenant_key('items', $1);   -- crypto-shred one tenant
+```
+
+- **The column** must be the leading primary-key column (`42P17`
+  otherwise), so a tenant's rows are one span of keys, and of an
+  integer, text, `bytea` or `uuid` type (`0A000` otherwise). Sharded
+  tables are refused (their hidden shard column leads the key). The
+  refusals of sealed tables apply.
+- **Keys.** The table gets one key of kind `table` at `CREATE TABLE`,
+  its *naming key*, which seals nothing: a tenant's key is named
+  `tenant/<seal id>/<hex HMAC-SHA256 under the naming key of the seal id
+  and the tenant column's key encoding>`, found through `datax_keys`'
+  unique index on names, and made in a transaction of its own just before
+  the tenant's first write (a write that then aborts leaves an unused
+  key, used by the tenant's next write). Concurrent first writes of one
+  tenant, from any gateways, converge on one key. Each sealed value
+  names its key: `0xD5`, the key's id (8 bytes), the version, a 12-byte
+  nonce, ciphertext and tag — 38 bytes per value.
+- **Gateways** cache tenants' key ids (up to 65,536) and keys' material
+  (up to 10,000 keys, `datax start --key-cache-keys`) least-recently-used, so a cached tenant costs no
+  KV work per row; a key is checked against `datax_keys` once per lease
+  per gateway. A read opens a value under the key it names, without
+  looking the tenant up.
+- **`datax_destroy_tenant_key(table text, tenant) → bigint`** destroys
+  one tenant's key: its record is tombstoned, renamed out of the way and
+  its history purged, and the call returns — with the destroyed key's
+  id — only after every gateway has stopped using it (the key lease,
+  10 seconds). It needs ownership of the table or the admin role
+  (`42501`), takes constants or parameters (`0A000` for a column), and
+  is refused inside a transaction block (`25001`). The tenant is given as
+  a value of the tenant column, or as text that converts to one
+  (`22P02` if it does not). Calling it again for a destroyed tenant
+  destroys and purges again and returns the same id; a tenant that never
+  wrote to the table — and so has no key — gets `NULL`. A table that is
+  not sealed per tenant is `42809`. An incomplete purge is `55000` after
+  the wait; calling again retries it. Each call is audited (`key-ddl`).
+- **After the destruction** a statement that reads a row of the tenant
+  still sealed under the key fails with `XXK01` naming the table and the
+  key, on every gateway; so does a `DELETE` of such a row, which reads
+  the row first (only `TRUNCATE` or `DROP TABLE` remove it). Delete the tenant's rows
+  (and purge) first: docs/encryption.md, "Erasing a tenant". The
+  tenant's next write makes a fresh key.
+- **`DROP TABLE`** destroys the naming key at once, after commit, and
+  every tenant key of the table in the background: a janitor on every
+  node, woken by the drop and run every five minutes, destroys the
+  tenant keys of tables that no longer exist a page at a time under one
+  purge, skipping keys younger than ten minutes. A table restored beside
+  its source shares its naming key and tenant keys; they go with the
+  last table that names them.
+- **Table restore** brings back the naming key, and every tenant key of
+  the table the backup holds and this cluster lacks or has destroyed,
+  500 to a transaction before the table is published. A tenant destroyed
+  before the backup was taken has no key in it, and its rows stay
+  unreadable after the restore.
 
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,

@@ -637,6 +637,26 @@ state or the internode protocol does, and an entry below says so.
   an existing table are later steps. `datax bench --sealed` runs a workload
   on a sealed table. Cluster protocol version v22. See docs/sql.md and
   docs/encryption.md, "Sealed tables".
+- **Per-tenant keys and crypto-shredding** (#310, step 4). `CREATE TABLE ...
+  WITH (encryption_key_by = 'tenant_id')`, the column leading the primary
+  key, seals each tenant's row values under a key of that tenant's own, made
+  on its first write (concurrent first writes of one tenant converge on one
+  key; tenants do not contend) — a million tenants are a million small rows
+  in `datax_keys`, not a million tables. `SELECT
+  datax_destroy_tenant_key('items', $tenant)` destroys one tenant's key and
+  purges its record, and returns once no gateway uses it (within 10
+  seconds); with the rows deleted and purged first, the tenant's data is
+  gone from the live cluster, and a row left behind fails with `XXK01`. The
+  function needs table ownership, runs outside a transaction block, is
+  audited, and is idempotent (`NULL` for a tenant that never wrote). A
+  tenant's next write gets a fresh key. `DROP TABLE` destroys every tenant
+  key in the background; a table restore brings them back in batches. The
+  gateway's key cache is bounded (10,000 keys, least recently used dropped;
+  `datax start --key-cache-keys`), its hit no longer takes a lock, and a
+  background refresh checks the keys in use in batches every half lease. `datax bench --sealed=tenant
+  --tenants N` runs `kv` per tenant, and every bench run with
+  `--server-url` reports KV batches per operation. See docs/sql.md and
+  docs/encryption.md, "Per-tenant keys".
 - **The console's table page shows row-level security** (#312): whether it
   is enabled and forced, and each policy — permissive or restrictive, the
   statements and roles it applies to, its `USING` and `WITH CHECK`
