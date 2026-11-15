@@ -315,6 +315,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.peekWord(1, "policy") {
 			return p.parseCreatePolicy()
 		}
+		if p.peekEncryptionKey(1) {
+			return p.parseCreateEncryptionKey()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
@@ -412,6 +415,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DROP":
 		if p.peekWord(1, "policy") {
 			return p.parseDropPolicy()
+		}
+		if p.peekEncryptionKey(1) {
+			return p.parseDropEncryptionKey()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseDropRole()
@@ -538,6 +544,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "ALTER":
 		if p.peekWord(1, "policy") {
 			return p.parseAlterPolicy()
+		}
+		if p.peekEncryptionKey(1) {
+			return p.parseAlterEncryptionKey()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseRoleStmt(true)
@@ -697,6 +706,14 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return a, nil
 	case "SHOW":
+		if p.peekWord(1, "cluster") && p.peekWord(2, "setting") {
+			p.i++
+			return p.parseClusterSetting(true)
+		}
+		if p.peekWord(1, "encryption") && p.peekWord(2, "keys") {
+			p.i += 3
+			return &ShowEncryptionKeys{}, p.expectEnd("SHOW ENCRYPTION KEYS")
+		}
 		p.i++
 		if p.consumeKeyword("TABLES") {
 			st := &ShowTables{}
@@ -844,6 +861,10 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &SetVar{Name: "show:" + strings.Join(words, "_")}, nil
 	case "SET":
+		if p.peekWord(1, "cluster") && p.peekWord(2, "setting") {
+			p.i++
+			return p.parseClusterSetting(false)
+		}
 		return p.parseSet()
 	case "reset": // not a reserved word; lexes as an identifier
 		p.i++

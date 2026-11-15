@@ -112,6 +112,10 @@ type auditEntry struct {
 	// many identical ones this entry stands for.
 	refusal bool
 	count   int64
+	// fold marks events that are folded like refusals — repeats within a
+	// flush become one record with a count — but are not subject to the
+	// refusal rate: the key service's uses, which it rate-limits itself.
+	fold bool
 }
 
 type auditAttr struct {
@@ -128,6 +132,19 @@ var auditRefusals = map[string]bool{
 	"sql-preauth-closed": true,
 	"admin-denied":       true,
 	"rpc-denied":         true,
+	// The key service's rate-limit refusals (issue #310): a role in a
+	// hot loop past its rate makes them as fast as it can call.
+	"key-use-throttled": true,
+}
+
+// auditFolded are the events folded within a flush without a rate: a
+// use of the key service (issue #310) is recorded every time — who,
+// which key and version, what, and the outcome — but an application
+// unwrapping in a loop would otherwise write a row per call. Repeats of
+// the same use within a flush (a second, by default) become one record
+// with a count; its time is the first one's.
+var auditFolded = map[string]bool{
+	"key-use": true,
 }
 
 // auditSecretKey reports whether an attribute's value must not be
@@ -146,7 +163,7 @@ func auditSecretKey(key string) bool {
 
 // newAuditEntry turns one log.Audit call into a table entry.
 func newAuditEntry(atMicros int64, event string, kv []any) auditEntry {
-	e := auditEntry{atMicros: atMicros, event: event, refusal: auditRefusals[event], count: 1}
+	e := auditEntry{atMicros: atMicros, event: event, refusal: auditRefusals[event], fold: auditFolded[event], count: 1}
 	var targetKey string
 	for i := 0; i+1 < len(kv); i += 2 {
 		key := fmt.Sprint(kv[i])
@@ -377,6 +394,16 @@ func (a *auditTable) enqueue(event string, kv []any) {
 
 // push adds e to the buffer; a.mu is held.
 func (a *auditTable) push(e auditEntry, now time.Time) {
+	if e.fold && !e.refusal {
+		key := e.foldKey()
+		if i, ok := a.folds[key]; ok {
+			a.queue[i].count += e.count
+			return
+		}
+		if len(a.queue) < auditBufferSize {
+			a.folds[key] = len(a.queue)
+		}
+	}
 	if e.refusal {
 		key := e.foldKey()
 		if i, ok := a.folds[key]; ok {

@@ -127,3 +127,35 @@ func TestAuditBuffer(t *testing.T) {
 		t.Fatalf("putBack kept the newest: %+v", last)
 	}
 }
+
+// TestAuditKeyUseFolds (issue #310): a use of the key service is
+// recorded every time but folded within a flush — a hot unwrap loop is
+// one record with a count, not a row per call — and is never subject to
+// the refusal rate; a different outcome or version is its own record.
+// Its rate-limit refusals are refusals.
+func TestAuditKeyUseFolds(t *testing.T) {
+	a := &auditTable{folds: map[string]int{}, refusalTokens: auditRefusalBurst}
+	now := time.Now()
+	use := func(version int64, outcome string) []any {
+		return []any{"principal", "app", "target", "billing", "role", "app", "op", "unwrap", "key_id", int64(7), "version", version, "outcome", outcome}
+	}
+	for i := 0; i < 5000; i++ {
+		a.push(newAuditEntry(1, "key-use", use(1, "ok")), now)
+	}
+	a.push(newAuditEntry(1, "key-use", use(2, "ok")), now)
+	a.push(newAuditEntry(1, "key-use", use(1, "failed")), now)
+	if len(a.queue) != 3 || a.queue[0].count != 5000 || a.suppressed != 0 || a.dropped != 0 {
+		t.Fatalf("fold: %d entries, first %+v, suppressed %d", len(a.queue), a.queue[0], a.suppressed)
+	}
+	if d := a.queue[0].detail(); d != `{"role":"app","op":"unwrap","key_id":7,"version":1,"count":5000}` || a.queue[0].target != "billing" {
+		t.Fatalf("detail: %s target %q", d, a.queue[0].target)
+	}
+	_, _, _ = a.take(auditBatchSize)
+	a.push(newAuditEntry(1, "key-use", use(1, "ok")), now)
+	if len(a.queue) != 1 || a.queue[0].count != 1 {
+		t.Fatalf("a fold outlived its flush: %+v", a.queue)
+	}
+	if e := newAuditEntry(1, "key-use-throttled", use(1, "throttled")); !e.refusal {
+		t.Fatal("a rate-limit refusal is not a refusal")
+	}
+}

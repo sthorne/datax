@@ -301,6 +301,12 @@ const (
 	// records complete (keys.ViewDependencyIndexKey), and until then the
 	// statements read every descriptor as before. The records are system
 	// keys a v21 node never reads.
+	//
+	// V22 also introduces the key service's statements and functions
+	// (CREATE / ALTER / DROP ENCRYPTION KEY, GRANT ... ON ENCRYPTION KEY,
+	// datax_key_wrap and the rest; pkg/sql/keyservice.go) and the owner
+	// and privileges columns of datax_keys, which a v21 node would not
+	// enforce: they are refused until finalize as well.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

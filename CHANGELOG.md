@@ -560,6 +560,36 @@ state or the internode protocol does, and an entry below says so.
   anywhere cannot drive an unbounded stream of distributed transactions.
   A console re-sending its own value never meets the bucket, because the
   suppression comes first.
+- **The key service** (#310, step 2; docs/design-key-service.md, "A. The key
+  service"). Applications keep named keys in datax and wrap and unwrap their
+  own data keys under them, as with a cloud KMS: `CREATE ENCRYPTION KEY k`
+  (admins; the creator owns it), `ALTER ENCRYPTION KEY k ROTATE | DISABLE |
+  ENABLE | OWNER TO role`, `DROP ENCRYPTION KEY [IF EXISTS] k` (destroys
+  every version and purges the key's record's history), `SHOW ENCRYPTION
+  KEYS`, and `GRANT | REVOKE WRAP | UNWRAP | USAGE ON ENCRYPTION KEY`.
+  `datax_key_wrap(name, data_key, context)` and `datax_key_unwrap(name,
+  wrapped, context)` return a blob and the data key; `datax_encrypt` and
+  `datax_decrypt` keep the key in datax for values up to 64 KiB. A blob
+  carries the key's id and version (unwrap needs no version, rotated keys
+  keep opening old blobs) and is AES-256-GCM bound to the key, version and
+  context; a wrong context, another key or a damaged blob all fail with one
+  error (`39000`). WRAP and UNWRAP are separate privileges and USAGE is
+  both; the owner holds both and an admin who does not own a key must be
+  granted them. A disabled key refuses every function. Every call is
+  audited in the audit table (role, key, version, operation, outcome; never
+  material or context; identical uses within a flush fold into one record
+  with a count) and rate-limited per role on each node by the new cluster
+  setting `key_service.rate_limit` (`SET CLUSTER SETTING`; default 100 a
+  second; refused with `53400`). Gateways cache key material under a
+  10-second lease that checks the key's generation, and `DROP`, `DISABLE`,
+  `REVOKE` and `OWNER TO` wait it out, so a key is out of use everywhere
+  when they return. The functions are refused on a connection that is
+  neither TLS nor loopback. `DROP ROLE` refuses a key's owner, `REASSIGN
+  OWNED` moves keys, `DROP OWNED` revokes grants on keys and refuses to
+  destroy owned keys. `datax_keys` gains `owner` and `privileges`. Needs
+  cluster version v22 and the cluster key enabled. See docs/sql.md,
+  "Encryption keys", docs/encryption.md, "The key service", and
+  docs/encryption-keys-for-applications.md.
 - **The cluster key and the `datax_keys` table** (#310, step 1 of the key
   service in docs/design-key-service.md). `datax debug cluster-key init`
   makes one 32-byte cluster key, hands it to every member over mutual TLS,
@@ -586,9 +616,8 @@ state or the internode protocol does, and an entry below says so.
   root included, and `SELECT * FROM datax_keys` shows admins the keys'
   metadata without the material. The Go API is `pkg/keystore` (create, get,
   list, unwrap, rotate, disable, enable, destroy with a purge of the row's
-  history, and a per-key generation for later caches); the SQL statements
-  are later steps. `/api/security` and the security view report the
-  cluster key and which nodes hold it. Cluster protocol version v22. See
+  history, and a per-key generation for later caches). `/api/security`
+  and the security view report the cluster key and which nodes hold it. Cluster protocol version v22. See
   docs/encryption.md, "Cluster key".
 - **The console's table page shows row-level security** (#312): whether it
   is enabled and forced, and each policy — permissive or restrictive, the

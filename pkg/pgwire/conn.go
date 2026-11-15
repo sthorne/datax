@@ -393,7 +393,28 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 		c.listener = opts.Notify.NewListener(c.wakePush, c.notifyEnd)
 		session.SetNotify(opts.Notify, c.listener)
 	}
+	session.SetKeyService(opts.KeyService)
+	session.SetTransport(false, isLoopbackAddr(nc.RemoteAddr()))
 	return c
+}
+
+// isLoopbackAddr reports whether a client connected from this machine:
+// a loopback address, or a Unix socket.
+func isLoopbackAddr(a net.Addr) bool {
+	switch v := a.(type) {
+	case *net.UnixAddr:
+		return true
+	case *net.TCPAddr:
+		return v.IP.IsLoopback()
+	case nil:
+		return false
+	}
+	host, _, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // errCancelServed ends a connection that carried a CancelRequest: it
@@ -606,6 +627,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				c.nc = tc
 				c.backend = pgproto3.NewBackend(tc, tc)
 				c.tlsDone = true
+				c.session.SetTransport(true, isLoopbackAddr(tc.RemoteAddr()))
 				continue
 			}
 			// Insecure mode: reply 'N', client continues in cleartext.

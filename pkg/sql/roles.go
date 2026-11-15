@@ -255,6 +255,13 @@ func (s *Session) ownedObjects(ctx context.Context, txn *kvclient.Txn, name stri
 			out = append(out, "owner of database "+db.Name)
 		}
 	}
+	keys, err := s.ownedKeys(ctx, txn, map[string]bool{name: true})
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range keys {
+		out = append(out, "owner of encryption key "+k)
+	}
 	return out, nil
 }
 
@@ -343,7 +350,12 @@ func (s *Session) revokeAllFrom(ctx context.Context, txn *kvclient.Txn, owned ma
 			revoked++
 		}
 	}
-	return revoked, nil
+	// And on the key service's keys (issue #310).
+	n, err := s.revokeKeysFrom(ctx, txn, owned)
+	if err != nil {
+		return 0, err
+	}
+	return revoked + n, nil
 }
 
 // execDropRole drops roles (admins only). A role that owns objects is
@@ -745,6 +757,11 @@ func (s *Session) execReassignOwned(ctx context.Context, txn *kvclient.Txn, t *p
 			moved++
 		}
 	}
+	n, err := s.reassignKeys(ctx, txn, owned, to)
+	if err != nil {
+		return nil, err
+	}
+	moved += n
 	log.Audit("ownership-ddl", "stmt", "REASSIGN OWNED", "from", strings.Join(from, ","), "to", to, "objects", moved, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "REASSIGN OWNED"}, nil
 }
@@ -752,7 +769,8 @@ func (s *Session) execReassignOwned(ctx context.Context, txn *kvclient.Txn, t *p
 // execDropOwned drops every table, view, sequence and type the roles own
 // (views first, then tables — CASCADE takes dependent views of other
 // owners too) and revokes every privilege granted to them. A database
-// the role owns is refused: ALTER DATABASE ... OWNER TO first.
+// or an encryption key the role owns is refused: ALTER DATABASE ...
+// OWNER TO, or DROP ENCRYPTION KEY, first.
 func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parser.DropOwned) (*Result, error) {
 	if err := s.requireV11("ownership changes"); err != nil {
 		return nil, err
@@ -783,6 +801,15 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 		if db.ID != 0 && owned[catalog.OwnerOf(db.Owner)] {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop objects owned by role %q because database %q is owned by it (ALTER DATABASE %s OWNER TO ... first)", catalog.OwnerOf(db.Owner), db.Name, db.Name)
 		}
+	}
+	// An encryption key is not dropped with its owner's other objects:
+	// dropping one destroys it, and everything wrapped under it with it.
+	// That is a DROP ENCRYPTION KEY of its own, or a REASSIGN OWNED.
+	if keys, err := s.ownedKeys(ctx, txn, owned); err != nil {
+		return nil, err
+	} else if len(keys) > 0 {
+		return nil, newErrf(CodeDependentObjectsExist, "cannot drop objects owned by %s because it owns encryption keys %s: dropping a key destroys everything wrapped under it, so it is never done by DROP OWNED (DROP ENCRYPTION KEY each one, or REASSIGN OWNED BY %s TO ..., first)",
+			strings.Join(roles, ", "), strings.Join(keys, ", "), strings.Join(roles, ", "))
 	}
 	dropped := 0
 	tables, err := s.cat.List(ctx, txn)

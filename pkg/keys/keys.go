@@ -358,6 +358,12 @@ func AuthSecretKey() Key { return systemKey("auth-secret") }
 // (issue #307). Absent means on.
 func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
 
+// ClusterSettingKey holds the value of the SQL cluster setting name (SET
+// CLUSTER SETTING; pkg/sql/clustersettings.go). Absent means its
+// default. The names have a dot (key_service.rate_limit), so they never
+// meet the settings above.
+func ClusterSettingKey(name string) Key { return systemKey("settings", name) }
+
 // ClusterKeyMarkerKey holds the cluster key's record (issue #310, JSON;
 // pkg/server/clusterkey.go): which cluster key is current, the versions
 // still accepted, imported keys, and for each a check value that tells a

@@ -20,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/keystore"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
@@ -164,6 +165,11 @@ type Config struct {
 	// 0 = 1s; negative leaves the table alone, and audit records are in
 	// the log only.
 	AuditFlushInterval time.Duration
+	// KeyCacheLease is how long a gateway trusts its cache of named keys'
+	// material before checking the key again (issue #310; 0: 10 s, the
+	// descriptor lease). DROP, DISABLE and REVOKE on an encryption key
+	// wait it out. Tests shorten it.
+	KeyCacheLease time.Duration
 	// AuditHousekeepingInterval paces the audit table's retention and
 	// anchoring; 0 = 10m.
 	AuditHousekeepingInterval time.Duration
@@ -388,6 +394,10 @@ type Node struct {
 	// clusterkey.go): the versions it holds, and its record as the
 	// answering side of hand-overs.
 	clusterKey clusterKeyState
+	// keyService is the key service (issue #310, step 2), made with the
+	// SQL server (keyServiceOnce).
+	keyServiceOnce sync.Once
+	keyService     *keystore.Service
 	// rpcListener is the RPC listener when a sealed start opened it
 	// early (sealed.go); nil otherwise.
 	rpcListener *handoffListener

@@ -71,6 +71,17 @@ const (
 	// CodeSnapshotTooOld is PostgreSQL's snapshot_too_old: a read whose
 	// timestamp lies below the history the cluster keeps.
 	CodeSnapshotTooOld = "72000"
+
+	// The key service (issue #310): a role past its rate limit
+	// (configuration_limit_exceeded: a configured limit, retry later); a
+	// blob that does not open (external_routine_invocation_exception, as
+	// pgcrypto's decrypt reports a wrong key or damaged data); a
+	// connection that may not carry key material
+	// (invalid_authorization_specification, as pg_hba refuses an
+	// unencrypted connection).
+	CodeConfigLimitExceeded  = "53400"
+	CodeExternalRoutine      = "39000"
+	CodeInvalidAuthorization = "28000"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.
