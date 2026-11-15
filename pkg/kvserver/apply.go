@@ -262,10 +262,17 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 	if aerr == nil {
 		// A GC command raises the replicated threshold atomically with its
 		// deletions (stageAppliedIndex persists it below).
+		// So does a range clear that applied, which also leaves the
+		// range's MVCC span empty: its size is then exactly zero.
 		var newThr hlc.Timestamp
-		for _, u := range cmd.Batch.Requests {
+		cleared := false
+		for i, u := range cmd.Batch.Requests {
 			if u.GC != nil {
 				newThr = newThr.Forward(u.GC.Threshold)
+			}
+			if u.ClearRange != nil && i < len(resp.Responses) && resp.Responses[i].ClearRange != nil && resp.Responses[i].ClearRange.Cleared {
+				newThr = newThr.Forward(u.ClearRange.Timestamp)
+				cleared = true
 			}
 		}
 		if !newThr.IsEmpty() {
@@ -294,6 +301,11 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 			if r.mu.sizeBytes < 0 {
 				r.mu.sizeBytes = 0
 			}
+			r.mu.Unlock()
+		}
+		if cleared {
+			r.mu.Lock()
+			r.mu.sizeBytes = 0
 			r.mu.Unlock()
 		}
 	}
@@ -554,6 +566,18 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				}
 			}
 			ru.GC = &kvpb.GCResponse{}
+		case *kvpb.ClearRangeRequest:
+			// A whole range's MVCC keys in one range deletion, evaluated
+			// by the leader (clearrange.go). Alone in its batch: the size
+			// it subtracts is the span's as the leader counted it.
+			if len(ba.Requests) != 1 {
+				return nil, kvpb.NewErrorf("a range clear must be the only request in its batch")
+			}
+			cleared, err := r.evalClearRange(b, req)
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			ru.ClearRange = &kvpb.ClearRangeResponse{Cleared: cleared}
 		case *kvpb.TruncateLogRequest:
 			// Applying this entry means everything at or below it — Index
 			// included — is applied here. With a WAL that is durable, so
