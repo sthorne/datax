@@ -371,7 +371,8 @@ func TestSplitAtIsSticky(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, d := range all {
-			if keys.Pretty(d.StartKey) == res.Rows[0][0].Text() {
+			id, _ := keys.TableIDOf(d.StartKey)
+			if keys.PrettyForTable(d.StartKey, id, "st") == res.Rows[0][0].Text() {
 				return &d
 			}
 		}
@@ -428,7 +429,10 @@ func TestStickySplitNeedsV20(t *testing.T) {
 	}
 	found := false
 	for _, d := range all {
-		if keys.Pretty(d.StartKey) == res.Rows[0][0].Text() {
+		// SPLIT AT names the table itself; the global namer can lag
+		// behind a table this new, so compare under the known name.
+		id, _ := keys.TableIDOf(d.StartKey)
+		if keys.PrettyForTable(d.StartKey, id, "old") == res.Rows[0][0].Text() {
 			found = true
 			if d.StickyUntil != 0 {
 				t.Fatalf("a sticky bit was written at v19: %v", d)
