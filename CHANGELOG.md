@@ -11,6 +11,25 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Vector columns and nearest-neighbour search** (#304): `vector(n)` columns
+  compatible with pgvector (float4 elements, up to 16,000 dimensions; text
+  `'[1,2,3]'` and pgvector's binary format; a fixed type OID found through
+  `to_regtype('vector')` or `pg_type`, so pgvector clients' type registration
+  works; `CREATE EXTENSION vector` is accepted and does nothing). Distance
+  operators `<->` (L2), `<=>` (cosine) and `<#>` (negative inner product),
+  `l2_distance`, `cosine_distance`, `inner_product`, `l1_distance`,
+  `vector_dims`, `vector_norm`, `l2_normalize`, element-wise `+`/`-`.
+  `ORDER BY embedding <-> $1 LIMIT k` is exact without an index. `CREATE
+  INDEX ... USING ivfflat (col vector_l2_ops | vector_cosine_ops |
+  vector_ip_ops) WITH (lists = n)` adds an approximate index, built online and
+  tuned with `SET ivfflat.probes` (default √lists; recall@10 0.98 on a
+  synthetic clustered test set — real embeddings were not measured).
+  `vector_index_scan = off` forces exact answers. The index's centres are
+  trained once and never move: after much change, build a new index and drop
+  the old. HNSW is refused (`0A000`) rather than mapped to IVF. Vectors cannot
+  be primary keys or in a btree index. New bench workloads `vector-knn` and
+  `vector-knn-exact` record recall and build time. Cluster protocol version
+  v21. See docs/user/sql.md, "Vectors".
 - **Full-text search** (#299): the `TSVECTOR` and `TSQUERY` types and the `@@`
   operator, with `to_tsvector`, `to_tsquery`, `plainto_tsquery`,
   `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`,
@@ -968,6 +987,12 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
+  first `n` (plus `OFFSET`) rows in a heap instead of sorting every row, so it
+  runs in bounded memory; `EXPLAIN` shows `top-k heap` (#304).
+- Floating-point comparison is a total order, as in PostgreSQL: `NaN` equals
+  `NaN` and sorts after every number. Before, a sort containing `NaN` had no
+  consistent order (#304).
 - A statement that writes more than 60 MiB to one range in a single piece (a
   huge row) is refused with `54000`. Before, a write of 64 MiB failed with
   `XX000` and left the range's leadership churning around an entry no follower
