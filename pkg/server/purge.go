@@ -230,51 +230,76 @@ func (n *Node) rangesTiling(ctx context.Context, start, end keys.Key) ([]kvpb.Ra
 // it run its step.
 func (n *Node) purgeRangeOnLeader(ctx context.Context, desc kvpb.RangeDescriptor, start, end keys.Key) (*cluster.PurgeRangeAnswer, error) {
 	req := cluster.AdminRequest{Op: "purge-range", RangeID: desc.RangeID, Key: start, EndKey: end}
+	resp, err := n.leaderCall(ctx, desc, req, func(resp cluster.AdminResponse) bool { return resp.PurgeRange != nil })
+	if err != nil {
+		return nil, err
+	}
+	return resp.PurgeRange, nil
+}
+
+// leaderCall asks the range's replicas in turn to run a leader's step (a
+// purge's collection, a range clear) until the leader answers with a
+// result (answered reports whether resp carries one).
+func (n *Node) leaderCall(ctx context.Context, desc kvpb.RangeDescriptor, req cluster.AdminRequest, answered func(cluster.AdminResponse) bool) (cluster.AdminResponse, error) {
 	var lastErr error
 	for round := 0; round < purgeLeaderRounds; round++ {
 		for _, replica := range desc.Replicas {
-			resp, err := n.purgeCall(ctx, replica.NodeID, req)
-			if err == nil && resp.PurgeRange != nil {
-				return resp.PurgeRange, nil
+			resp, err := n.purgeCallRaw(ctx, replica.NodeID, req)
+			if err != nil {
+				// The node is unreachable: a replica that is down is not
+				// the leader; ask the others.
+				lastErr = err
+				continue
 			}
-			if err == nil {
+			if resp.Error == "" && answered(resp) {
+				return resp, nil
+			}
+			err = errors.New(resp.Error)
+			if resp.Error == "" {
 				err = errors.New("no result in the answer")
 			}
 			if !strings.Contains(err.Error(), kvserver.ErrPurgeNotLeader.Error()) {
-				return nil, err
+				return cluster.AdminResponse{}, err
 			}
 			lastErr = err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return cluster.AdminResponse{}, ctx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	return nil, fmt.Errorf("no replica answered as leader: %w", lastErr)
+	return cluster.AdminResponse{}, fmt.Errorf("no replica answered as leader: %w", lastErr)
 }
 
 // purgeCall runs one purge step on a node: here directly, elsewhere over
 // the admin channel.
 func (n *Node) purgeCall(ctx context.Context, id base.NodeID, req cluster.AdminRequest) (cluster.AdminResponse, error) {
-	ctx, cancel := context.WithTimeout(ctx, purgeStepTimeout)
-	defer cancel()
-	var resp cluster.AdminResponse
-	if id == n.ident.NodeID {
-		resp = n.serveAdminOp(ctx, req)
-	} else {
-		addr, err := n.registry.Resolve(id)
-		if err != nil {
-			return resp, err
-		}
-		if err := n.trans.Call(ctx, addr, "admin", req, &resp); err != nil {
-			return resp, err
-		}
+	resp, err := n.purgeCallRaw(ctx, id, req)
+	if err != nil {
+		return resp, err
 	}
 	if resp.Error != "" {
 		return resp, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+// purgeCallRaw is purgeCall with the step's own error left in the answer:
+// the error it returns is the node's being out of reach.
+func (n *Node) purgeCallRaw(ctx context.Context, id base.NodeID, req cluster.AdminRequest) (cluster.AdminResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, purgeStepTimeout)
+	defer cancel()
+	var resp cluster.AdminResponse
+	if id == n.ident.NodeID {
+		return n.serveAdminOp(ctx, req), nil
+	}
+	addr, err := n.registry.Resolve(id)
+	if err != nil {
+		return resp, err
+	}
+	err = n.trans.Call(ctx, addr, "admin", req, &resp)
+	return resp, err
 }
 
 // servePurgeStep answers the three steps a purge asks of a node.

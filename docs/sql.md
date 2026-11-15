@@ -329,9 +329,12 @@ OF SYSTEM TIME` below the drop resolves the table as it was and reads
 them, which is why PostgreSQL-like systems with history delay the
 reclaim. After it, the job on the node leading range 1
 (`pkg/server/dropped_tables.go`, every minute; it reads the records,
-not the catalog) deletes every row in chunked transactions, resuming
-after the last key, marks the record, purges the span (above), and
-removes the record. Each step is idempotent and the record is
+not the catalog) clears the span, marks the record, purges the span
+(above), and removes the record. Once the cluster has finalized v22 the
+clear is one replicated range clear per range of the span — a raft
+command whatever the number of rows (issue #316; docs/transactions.md,
+"A dropped table's span"); below v22 it deletes every row in chunked
+transactions, resuming after the last key. Each step is idempotent and the record is
 replicated, so a pass cut short by a restart or a move of range 1 is
 taken up on the next one. A read below the drop after the reclaim is
 refused as below the GC threshold, never answered short. The emptied

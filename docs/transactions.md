@@ -449,9 +449,51 @@ pushee's anchor range:
 - Record PENDING and live:
   - pusher has **higher priority** → write ABORTED into the record (the pushee
     discovers this at its next heartbeat or EndTxn),
-  - otherwise re-push every 100 ms, for at most 10 s (`conflictBudget`,
-    `pkg/kvclient/txn.go`), then surface `40001` to the client. A wait
-    that can only end in a restart does not wait at all (see below).
+  - otherwise wait for the pushee to finish and push again, for at most
+    10 s (`conflictBudget`, `pkg/kvclient/txn.go`), then surface `40001`
+    to the client. A wait that can only end in a restart does not wait
+    at all (see below).
+
+How a waiter learns that the pushee finished (`pkg/kvclient/conflictwait.go`):
+
+- **Woken, when the pushee's coordinator is on the same node** — every
+  conflict on a one-node cluster, and any between two sessions on the
+  same gateway. Each node's client keeps a table of the transactions its
+  blocked operations are waiting on, registered before the push so a
+  finish landing between the push and the wait is not missed. A
+  coordinator that commits or aborts wakes the waiters on its
+  transaction once the record is final and its intents resolved (a
+  parallel commit, once its asynchronous finalization has run), and the
+  waiter's next attempt usually goes straight through. A pusher that
+  finds a record final, or aborts it (by priority or as a deadlock
+  victim), wakes the others on that node waiting on the same
+  transaction.
+- **Polled, otherwise** — the pushee runs on another gateway, or a wake
+  was missed. The waiter pushes again after a backoff: 5 ms, doubling to
+  100 ms, each wait drawn at random from the upper half of its interval
+  so waiters queued behind one holder do not push in step. Most holders
+  finish within milliseconds, which the first short waits catch; a long
+  wait costs a push every 75 ms or so, about the fixed 100 ms poll this
+  replaces. A wake ends the backoff early.
+
+Nothing about this is replicated or crosses the wire: the wake is a
+channel in the waiting node's own process, and the pushes are the same
+`PushTxn` requests as before, so mixed-version clusters behave as either
+version does. A wake is only a hint to push again now, never a verdict;
+the push still reads the record.
+
+Measured on the bank workload (one secure, encrypted on-disk node, 16
+workers, 1,000 accounts, seed 7, six alternating 30 s rounds each on a
+shared, busy machine): p99 went from 111 ms (103–117) — the poll — to
+45 ms (24–54; 24 ms in the two quiet rounds, where p50 and p95 matched
+the old poll's to within 0.2 ms). Pushes per committed transfer went
+from 0.036 to 0.040 and `40001`s per transfer stayed at 0.018. Committed
+transfers a second were within the machine's noise (median 1,148 vs
+1,076, ranges 870–1,377 and 821–1,476). hot-row, whose transactions hold
+a row for ~30 ms, pushes more (0.007 to 0.018 per transaction: the
+backoff's first short waits mostly end before the holder does), still a
+push per fifty transactions; kv 50 % reads does the same work per
+operation as before.
 
 Priorities are random at birth and bumped on retries, so starvation is
 unlikely. Genuine deadlocks are broken by **distributed detection over
@@ -462,10 +504,13 @@ chain with query-only pushes — reads of the records along the way. A walk
 that arrives back at the walker has found a cycle; every walker picks the
 same victim deterministically (lowest priority, transaction ID as
 tie-break) and force-aborts it — a self-chosen victim aborts its own
-record at once so its partners unblock on their next poll. Wait edges are
+record at once and wakes its partners on its node, so they unblock
+without waiting out a poll. Wait edges are
 advisory and may be stale, so a phantom cycle costs at worst one spurious
-retryable abort, never an anomaly. Constructed 2- and 3-cycles resolve in
-a few poll rounds (hundreds of milliseconds). With detection in place the
+retryable abort, never an anomaly. Every round of a wait — each wake or
+backoff — runs the walk again; constructed 2- and 3-cycles resolve in a
+few rounds, and since the rounds now start at a few milliseconds rather
+than 100, in 10–20 ms on one node (they took hundreds). With detection in place the
 conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
 waiters queueing behind a slow-but-live lock holder are no longer aborted
 by the clock.
@@ -657,11 +702,11 @@ deleted, whichever data key they were written under.
 
 `DROP TABLE` leaves the rows and a record of the drop
 (`catalog.DroppedTable`); once the table's history window has passed,
-the reclaim job (`pkg/server/dropped_tables.go`) deletes the rows and
-purges the span, as above (issue #313; docs/sql.md, "A dropped table's
-rows"). The purge's threshold of now is what refuses a late `AS OF
-SYSTEM TIME` read of the table; the merge queue keeps the emptied range
-apart from any neighbour whose own window has not yet passed that
+the reclaim job (`pkg/server/dropped_tables.go`) clears the span and
+purges it, as above (issues #313, #316; docs/sql.md, "A dropped table's
+rows"). The clear's and the purge's thresholds are what refuse a late
+`AS OF SYSTEM TIME` read of the table; the merge queue keeps the emptied
+range apart from any neighbour whose own window has not yet passed that
 threshold (`Store.mergeWouldHideHistory`), because a merged range
 adopts the higher of the two thresholds and would otherwise refuse
 reads the neighbour still promises. That rule covers every purged
@@ -669,42 +714,88 @@ range, not only a dropped table's: before it, a purged range merged
 into its neighbour — the system range among them — as soon as it was
 small enough.
 
-**Not done: a replicated range clear** (issue #316). The reclaim deletes
-a table row by row — a tombstone per row, through the log, in chunked
-transactions — and then purges the span. One command per range that
-clears the span outright would cost a log entry instead of one per row,
-and is what the reclaim would use. What it needs, and why it was left:
+**The range clear** (cluster version v22; `kvpb.ClearRangeRequest`,
+`pkg/kvserver/clearrange.go`, `server.Node.ClearSpan`). Before it the
+reclaim deleted a table row by row — a tombstone per row, through the
+log, in chunked transactions — and the purge then collected every
+version and tombstone, a thousand to a command. Now each range of the
+span is emptied by one command. The driver splits at the span's ends,
+as the purge does, and asks each range's leader (the `clear-range`
+admin op) to:
 
-- *A request and a gate.* A new `ClearRangeRequest` (an add-only proto
-  field), sent only once the cluster has finalized the version that
-  introduces it, since a replica that does not know it would refuse or
-  misapply the entry; below it the reclaim deletes row by row, as now.
-- *Evaluation on the leader*, under a write latch on the whole span:
-  refuse an intent in the span (resolve finished transactions first, as
-  the purge does), refuse a span that is not a whole table's, and raise
-  the range's GC threshold to the command's timestamp in the same
-  command, as the purge's collection does, so a read at or below it is
-  refused rather than answered from nothing. The reclaim already waits
-  out the table's window, so no admissible read is lost.
-- *MVCC statistics.* Stats move by deltas each command carries. A clear
-  must subtract exactly what the replicas hold, so the leader counts the
-  span at the applied index (every replica holds the same bytes there)
-  and the command carries the negated count — a read of the whole span,
-  but no write per row.
-- *Apply* is a range deletion (`storage.Batch.DeleteRange`, already used
-  for snapshots and replica removal) over the span's MVCC keys, plus the
-  stats delta and the threshold, identical on every replica; the
-  consistency checker's checksum then still agrees, and must be shown to
-  in a test that clears while it runs. There are no rangefeeds or
-  changefeeds to tell.
-- *What still has to happen after it:* a range tombstone hides the keys
-  but leaves their bytes in the files until compaction, and the values
-  in the log until truncation, so the purge (above) still runs.
+- *Check what it is clearing.* The span must be one table's whole data
+  span, and the table must have a dropped-table record and no
+  descriptor of any kind under its id. The job takes the span from the
+  record and has already checked the table descriptor; the leader reads
+  the catalog again, through the routed sender, under the latch below:
+  a restore that brings the id back removes the record before it writes
+  a row, and its rows wait on the latch, so either the record is gone
+  and the clear is refused, or the rows land after it, above its time.
+- *Evaluate under an exclusive latch on the whole range*, which drains
+  every write in flight (writes hold their latches until they apply,
+  L1) and keeps every new request out until the command has applied —
+  and only once an entry of the leader's own term has applied, so no
+  entry written under an earlier leader's latches is still on its way
+  to the state machine. An intent anywhere in the span refuses the clear
+  (the intents of finished transactions are resolved first, as the purge
+  does; the job runs again on its next pass if one is left).
+- *Pick the clear's time T*: at least the leader's clock, the newest
+  version in the span, every read the timestamp cache holds for the
+  range — which includes every closed-timestamp promise, on the log or
+  off it, since each bumps the cache under a shared latch this one
+  excludes — and the closed timestamp, and above the current threshold.
 
-It touches raft apply, the stats, the GC threshold and the consistency
-checker at once, for a job that runs in the background after a window
-of a day; the row-by-row path is slower but uses only commands every
-replica already applies, and was kept.
+Applying it is a range deletion of the span's MVCC keys
+(`storage.Batch.DeleteRange`, the tool snapshots and replica removal
+use) in the batch that also raises the GC threshold to T, sets the
+range's size to zero, and advances the applied index. So the command is
+a deletion of every key at T collected at once at a threshold of T:
+every read at or below T is refused from then on, writes too; every
+read above T sees nothing, and no read above T was served before it
+(the timestamp cache) nor any version above T deleted. A follower
+refuses a stale read at or below T once it has applied the command;
+before that its closed timestamp is below T, because a promise at or
+above T is made only after the latch is released, at a later index, so
+it sends the read to the leader.
+
+*Statistics.* The design note this replaced had the leader count the
+span and the command carry the negated count. Because a clear acts on a
+whole range, its span is empty afterwards and the range's size is
+exactly zero; the command sets it so, which needs no count the replicas
+would have to agree with and corrects whatever the approximate deltas
+had drifted. What must hold is that the command covers the whole range
+on every replica that applies it: a replica applies it only while its
+range still has the bounds and generation the leader evaluated at and
+is not frozen for a merge, and only while its threshold is below T —
+the command raises it to T, so a replayed or re-proposed entry finds it
+there and applies nothing. That is replicated state read at the
+command's log position, so every replica decides alike. The consistency
+checker now compares each replica's size and threshold at the probe's
+index as well as the data's checksum (a node that predates that answers
+without them and only the checksum is compared), and stays clean while
+clears run (`TestClearRangeReplicasAgree`). A snapshot taken after the
+clear streams no key of the span and carries the threshold and the zero
+size; one taken before carries the keys and an earlier index, and the
+command applies on top of it (`TestSnapshotAfterClearRange`,
+`TestClearRangeReplicaCaughtUpBySnapshot`). Transaction records are
+left to GC: a committed one is proof for intents elsewhere. There are no
+rangefeeds or changefeeds to tell.
+
+*The purge still runs after it.* A range tombstone hides the keys but
+leaves their bytes in the sstables until a compaction, and the values
+are in the raft log until it is truncated, and in the write-ahead log
+files until those roll. The purge's collection then finds nothing, and
+its compaction, truncation and log scrub are the parts that remove the
+bytes; a cheaper compaction alone would leave the log.
+
+*Below v22* a replica could run a binary that does not know the
+command, so the reclaim deletes row by row as before
+(`TestDropTableReclaimBelowV22DeletesRows`).
+
+On three nodes, a table of 100,000 rows: row by row the whole reclaim,
+purge included, wrote 939 raft entries with 43.9 MB of payload summed
+over the three stores and took 3.0 s; with the range clear, 24 entries,
+4.1 kB and 0.30 s (`TestDropTableReclaimMeasure`, opt-in).
 
 ## Invariants (asserted in tests)
 

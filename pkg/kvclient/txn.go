@@ -747,7 +747,7 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 		// uncertainty interval.
 		ba.Header.StaleRead = true
 	}
-	waited := time.Duration(0)
+	var cw conflictWait
 	refreshes := 0
 	for attempt := 1; ; attempt++ {
 		if err := t.checkDeadline(ba); err != nil {
@@ -756,7 +756,7 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 		}
 		br, kerr := t.db.Send(ctx, ba)
 		if kerr != nil && attempt%20 == 0 {
-			log.Debugf("txn %s: batch of %d still failing after %d attempts (%s waited on live conflicts): %v", t.mu.txn.ID, len(ba.Requests), attempt, waited, kerr)
+			log.Debugf("txn %s: batch of %d still failing after %d attempts (%s waited on live conflicts): %v", t.mu.txn.ID, len(ba.Requests), attempt, cw.waited(), kerr)
 		}
 		if kerr == nil {
 			t.publishWait(ctx, nil) // no longer blocked, if we were
@@ -772,49 +772,59 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 		}
 		switch {
 		case kerr.WriteIntent != nil:
+			// Watch for the owners finishing before pushing them, so a
+			// finish between the push and the wait still wakes us.
+			watch := t.db.waits.watch(kerr.WriteIntent.Intents)
 			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite && !opts.noWait)
 			if err != nil {
+				watch.release()
 				t.publishWait(ctx, nil)
 				return nil, err
 			}
 			if len(live) == 0 {
+				watch.release()
 				t.publishWait(ctx, nil)
 				continue
 			}
 			if opts.noWait {
+				watch.release()
 				return nil, &LockNotAvailableError{Intents: live}
 			}
 			if rerr := t.cannotOutwait(live); rerr != nil {
+				watch.release()
 				t.publishWait(ctx, nil)
 				return nil, rerr
 			}
 			pending := &live[0]
 			// We are blocked on a live transaction: publish the wait edge
 			// and walk the chain for a cycle before backing off.
-			if waited > 0 && waited%(2*time.Second) == 0 {
-				log.Debugf("txn %s: blocked %s on live transaction %s at %s", t.mu.txn.ID, waited, pending.Txn.ID, pending.Key)
+			if cw.dueLog() {
+				log.Debugf("txn %s: blocked %s on live transaction %s at %s", t.mu.txn.ID, cw.waited(), pending.Txn.ID, pending.Key)
 			}
 			t.publishWait(ctx, &pending.Txn)
 			if derr := t.detectDeadlock(ctx, pending); derr != nil {
+				watch.release()
 				return nil, derr // self chosen as deadlock victim
 			}
-			if lt := lockTimeoutFrom(ctx); lt > 0 && waited >= lt {
+			waited := cw.waited()
+			lt := lockTimeoutFrom(ctx)
+			if lt > 0 && waited >= lt {
+				watch.release()
 				t.publishWait(ctx, nil)
 				return nil, &LockTimeoutError{Waited: waited}
 			}
 			if waited >= conflictBudget {
+				watch.release()
 				t.publishWait(ctx, nil)
 				return nil, &RetryableError{Cause: kerr}
 			}
-			select {
-			case <-ctx.Done():
+			if err := watch.wait(ctx, pending.Txn.ID, cw.next(pending.Txn.ID, lt)); err != nil {
 				t.publishWait(ctx, nil)
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-				waited += 100 * time.Millisecond
+				return nil, err
 			}
 		case kerr.TxnAborted != nil:
 			t.markFinished()
+			t.wakeWaiters()
 			return nil, &RetryableError{Cause: kerr}
 		case kerr.Ambiguous != nil && !batchHasEndTxn(ba):
 			// The proposal's fate is unknown: leadership was interrupted
@@ -1076,6 +1086,7 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 			log.Debugf("txn %s: self-abort as deadlock victim: %v", self.ID, kerr)
 		}
 		t.markFinished()
+		t.db.waits.finished(self.ID)
 		e := kvpb.NewErrorf("deadlock detected: transaction %s chosen as victim", self.ID)
 		e.TxnAborted = &kvpb.TxnAbortedError{}
 		return &RetryableError{Cause: e}
@@ -1091,6 +1102,8 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 	})
 	if _, kerr := t.db.Send(ctx, ba); kerr != nil {
 		log.Debugf("txn %s: aborting deadlock victim %s: %v", self.ID, victim.id, kerr)
+	} else {
+		t.db.waits.finished(victim.id)
 	}
 	return nil
 }
@@ -1186,6 +1199,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				PushAbort:     pushAbort,
 				Now:           t.db.clock.Now(),
 			})
+			metrics.TxnPushes.Inc()
 			br, kerr := t.db.Send(ctx, ba)
 			if kerr != nil {
 				return nil, kerr
@@ -1195,6 +1209,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				// A parallel commit in flight: run status recovery, then let
 				// the next push observe the finalized record.
 				t.db.recoverStagedTxn(ctx, intent.Txn, push)
+				metrics.TxnPushes.Inc()
 				br, kerr = t.db.Send(ctx, ba)
 				if kerr != nil {
 					return nil, kerr
@@ -1219,6 +1234,13 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 	if len(rba.Requests) > 0 {
 		if _, kerr := t.db.Send(ctx, rba); kerr != nil {
 			return nil, kerr
+		}
+		// Others on this node blocked on a pushee found final here need
+		// not wait out their backoff to learn it.
+		for id, v := range verdicts {
+			if !v.live {
+				t.db.waits.finished(id)
+			}
 		}
 	}
 	return live, nil
@@ -1272,6 +1294,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 	t.markFinished()
 	metrics.TxnCommits.Inc()
 	t.resolveAll(enginepb.COMMITTED, br.Responses[0].EndTxn.CommitTimestamp)
+	t.wakeWaiters()
 	return nil
 }
 
@@ -1297,6 +1320,7 @@ func (t *Txn) abortFailedCommit(ctx context.Context) {
 	txn := t.mu.txn
 	t.mu.Unlock()
 	t.markFinished()
+	defer t.wakeWaiters()
 	if !anchored {
 		return
 	}
@@ -1374,6 +1398,7 @@ func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 	}
 	if err != nil {
 		t.markFinished()
+		t.wakeWaiters()
 		return true, err
 	}
 	et := br.Responses[len(br.Responses)-1].EndTxn
@@ -1392,6 +1417,7 @@ func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 		return true, nil
 	}
 	t.resolveAll(enginepb.COMMITTED, et.CommitTimestamp)
+	t.wakeWaiters()
 	return true, nil
 }
 
@@ -1401,7 +1427,7 @@ func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 // travel without its writes. sent=false (nothing applied) reports that
 // the range's bounds changed under us.
 func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (_ *kvpb.BatchResponse, sent bool, _ error) {
-	waited := time.Duration(0)
+	var cw conflictWait
 	refreshes := 0
 	for {
 		// The commit deadline holds on this path as on send's (issue
@@ -1429,27 +1455,30 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		}
 		switch {
 		case kerr.WriteIntent != nil:
+			watch := t.db.waits.watch(kerr.WriteIntent.Intents)
 			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, true)
 			if err != nil {
+				watch.release()
 				return nil, true, err
 			}
 			if len(live) == 0 {
+				watch.release()
 				continue
 			}
 			if rerr := t.cannotOutwait(live); rerr != nil {
+				watch.release()
 				return nil, true, rerr
 			}
 			if derr := t.detectDeadlock(ctx, &live[0]); derr != nil {
+				watch.release()
 				return nil, true, derr
 			}
-			if waited >= conflictBudget {
+			if cw.waited() >= conflictBudget {
+				watch.release()
 				return nil, true, &RetryableError{Cause: kerr}
 			}
-			select {
-			case <-ctx.Done():
-				return nil, true, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-				waited += 100 * time.Millisecond
+			if err := watch.wait(ctx, live[0].Txn.ID, cw.next(live[0].Txn.ID, 0)); err != nil {
+				return nil, true, err
 			}
 		case kerr.TxnAborted != nil:
 			return nil, true, &RetryableError{Cause: kerr}
@@ -1578,6 +1607,7 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		t.markFinished()
 		metrics.TxnCommits.Inc()
 		t.resolveAll(enginepb.COMMITTED, fbr.Responses[0].EndTxn.CommitTimestamp)
+		t.wakeWaiters()
 		return nil
 	}
 
@@ -1589,6 +1619,9 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 	metrics.TxnCommits.Inc()
 	metrics.ParallelCommits.Inc()
 	go func() {
+		// Waiters wake once the record is final and the intents resolved,
+		// or, if finalizing fails, to run status recovery themselves.
+		defer t.db.waits.finished(txn.ID)
 		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		fba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}}
@@ -1677,6 +1710,7 @@ func (t *Txn) Rollback(ctx context.Context) error {
 		log.Debugf("rollback of %s: %v", txn.ID, kerr)
 	}
 	t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+	t.db.waits.finished(txn.ID)
 	return nil
 }
 

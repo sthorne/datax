@@ -319,6 +319,10 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		out.Value = &rpcpb.RequestUnion_AdminSplit{AdminSplit: &rpcpb.AdminSplitRequest{Header: reqHeaderToProto(r.RequestHeader), StickyUntil: r.StickyUntil}}
 	case *AdminUnsplitRequest:
 		out.Value = &rpcpb.RequestUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitRequest{Header: reqHeaderToProto(r.RequestHeader)}}
+	case *ClearRangeRequest:
+		out.Value = &rpcpb.RequestUnion_ClearRange{ClearRange: &rpcpb.ClearRangeRequest{
+			Header: reqHeaderToProto(r.RequestHeader), Timestamp: tsToProto(r.Timestamp), Generation: r.Generation,
+		}}
 	case *AdminChangeReplicasRequest:
 		out.Value = &rpcpb.RequestUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasRequest{
 			Header: reqHeaderToProto(r.RequestHeader), AddNode: int64(r.AddNode), RemoveNode: int64(r.RemoveNode),
@@ -454,6 +458,11 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		u.AdminSplit = &AdminSplitRequest{RequestHeader: reqHeaderFromProto(v.AdminSplit.Header), StickyUntil: v.AdminSplit.StickyUntil}
 	case *rpcpb.RequestUnion_AdminUnsplit:
 		u.AdminUnsplit = &AdminUnsplitRequest{RequestHeader: reqHeaderFromProto(v.AdminUnsplit.Header)}
+	case *rpcpb.RequestUnion_ClearRange:
+		u.ClearRange = &ClearRangeRequest{
+			RequestHeader: reqHeaderFromProto(v.ClearRange.Header), Timestamp: tsFromProto(v.ClearRange.Timestamp),
+			Generation: v.ClearRange.Generation,
+		}
 	case *rpcpb.RequestUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasRequest{
 			RequestHeader: reqHeaderFromProto(v.AdminChangeReplicas.Header),
@@ -605,6 +614,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		}}
 	case u.AdminUnsplit != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminUnsplit{AdminUnsplit: &rpcpb.AdminUnsplitResponse{Desc: RangeDescriptorToProto(u.AdminUnsplit.Desc)}}
+	case u.ClearRange != nil:
+		out.Value = &rpcpb.ResponseUnion_ClearRange{ClearRange: &rpcpb.ClearRangeResponse{Cleared: u.ClearRange.Cleared}}
 	case u.AdminChangeReplicas != nil:
 		out.Value = &rpcpb.ResponseUnion_AdminChangeReplicas{AdminChangeReplicas: &rpcpb.AdminChangeReplicasResponse{Desc: RangeDescriptorToProto(u.AdminChangeReplicas.Desc)}}
 	case u.AdminTransferLease != nil:
@@ -700,6 +711,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		}
 	case *rpcpb.ResponseUnion_AdminUnsplit:
 		u.AdminUnsplit = &AdminUnsplitResponse{Desc: RangeDescriptorFromProto(v.AdminUnsplit.Desc)}
+	case *rpcpb.ResponseUnion_ClearRange:
+		u.ClearRange = &ClearRangeResponse{Cleared: v.ClearRange.Cleared}
 	case *rpcpb.ResponseUnion_AdminChangeReplicas:
 		u.AdminChangeReplicas = &AdminChangeReplicasResponse{Desc: RangeDescriptorFromProto(v.AdminChangeReplicas.Desc)}
 	case *rpcpb.ResponseUnion_AdminTransferLease:

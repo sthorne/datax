@@ -26,7 +26,11 @@ const reshardJanitorInterval = time.Minute
 // the range-1 leader acts (the cluster-singleton idiom the statistics
 // sampler uses).
 func (n *Node) reshardJanitorLoop(ctx context.Context) {
-	ticker := time.NewTicker(reshardJanitorInterval)
+	interval := n.cfg.ReshardJanitorInterval
+	if interval <= 0 {
+		interval = reshardJanitorInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -36,10 +40,34 @@ func (n *Node) reshardJanitorLoop(ctx context.Context) {
 		}
 		r1, ok := n.store.GetReplica(1)
 		if !ok || !r1.IsLeader() {
+			// What the janitor keeps belongs to the leader: should this
+			// node lead again, it resumes from the last leader's record.
+			n.reshardMu.Lock()
+			n.reshardFollow = nil
+			n.reshardMu.Unlock()
 			continue
 		}
 		n.RunReshardJanitorOnce(ctx)
 	}
+}
+
+// reshardResumeVersion is the format of the re-shard janitor's resume
+// record (keys.CatalogResumeKey("reshard")); bump it when what the
+// janitor keeps of a descriptor changes.
+const reshardResumeVersion = 1
+
+// reshardResumeEvery is how often the janitor writes its resume record:
+// the descriptors of the tables with a retired layout, usually none.
+const reshardResumeEvery = 10 * time.Minute
+
+func newReshardFollower(n *Node) *catalogFollower {
+	fresh := func() followedState {
+		s := &rawDescs{keep: func(d *catalog.TableDescriptor) bool { return len(d.RetiredLayouts) > 0 }}
+		s.reset()
+		return s
+	}
+	return newCatalogFollower("reshard", n, nil, fresh, clusterResume{n, keys.CatalogResumeKey("reshard")},
+		reshardResumeVersion, reshardResumeEvery)
 }
 
 // reshardKeepFor resolves the retired-layout keep window.
@@ -62,37 +90,23 @@ func (n *Node) reshardKeepFor() time.Duration {
 // It reads the descriptors written since its last pass (descWatcher;
 // issue #313) and keeps, between passes, only the retired layouts of the
 // tables that have any, so an idle pass reads nothing however many
-// tables the cluster has.
+// tables the cluster has. What it keeps, and the timestamp it is as of,
+// are persisted in the replicated keyspace (catalogFollower, #316): the
+// first pass of a node that starts or takes over range 1's leadership
+// reads what changed since the last leader's last record.
 func (n *Node) RunReshardJanitorOnce(ctx context.Context) {
 	n.reshardMu.Lock()
 	defer n.reshardMu.Unlock()
-	if n.reshardWatch == nil {
-		n.reshardWatch = &descWatcher{n: n}
+	if n.reshardFollow == nil {
+		n.reshardFollow = newReshardFollower(n)
 	}
-	full, recs, err := n.reshardWatch.next(ctx)
-	if err != nil {
+	if _, _, err := n.reshardFollow.pass(ctx); err != nil {
 		log.Debugf("reshard janitor: descriptors: %v", err)
 		return
 	}
-	if full || n.reshardRetired == nil {
-		n.reshardRetired = map[uint64][]byte{}
-	}
-	for _, rec := range recs {
-		id, ok := descIDOfKey(rec.Key)
-		if !ok {
-			continue
-		}
-		delete(n.reshardRetired, id)
-		if rec.Deleted {
-			continue
-		}
-		var d catalog.TableDescriptor
-		if json.Unmarshal(rec.Value, &d) == nil && d.ID != 0 && len(d.RetiredLayouts) > 0 {
-			n.reshardRetired[id] = rec.Value
-		}
-	}
-	descKVs := make([]kvpb.KeyValue, 0, len(n.reshardRetired))
-	for id, raw := range n.reshardRetired {
+	retired := n.reshardFollow.state.(*rawDescs).byID
+	descKVs := make([]kvpb.KeyValue, 0, len(retired))
+	for id, raw := range retired {
 		descKVs = append(descKVs, kvpb.KeyValue{Key: keys.TableDescKey(id), Value: raw})
 	}
 	// Paired only when there is something to reclaim: a janitor pass that

@@ -121,7 +121,9 @@ type StoreConfig struct {
 	// age. GC then collects such versions (survivors and tombstones
 	// included) WITHOUT ratcheting the range's GC threshold, so the
 	// range's other tenants keep their history. Keys with a live intent
-	// are never offered to the predicate.
+	// are never offered to the predicate. It is asked about ranges in
+	// expiry mode too, where it ages the versions a restore wrote by
+	// their rows' source commit times (issue #316).
 	RowExpiry func(start, end keys.Key) (func(key keys.Key, vts hlc.Timestamp) bool, bool)
 	// WaitForApplication, when set, blocks until the replica of rangeID
 	// on nodeID has applied index (or ctx ends). The merge driver uses it

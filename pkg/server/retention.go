@@ -19,8 +19,9 @@ import (
 // key span to the GC TTL implied by timeseries tables' retention options
 // and by the gc_ttl option any table may carry (issue #295).
 // The table set is refreshed from the descriptors at most every
-// retentionRefreshInterval — the first time by reading them all, after
-// that by reading what changed (descWatcher) — and served stale on errors — GC policy may
+// retentionRefreshInterval — the first time by reading them all, or
+// what changed since the state this node persisted (catalogFollower),
+// after that by reading what changed — and served stale on errors — GC policy may
 // lag a CREATE/DROP by one interval, which is harmless (retention is
 // best-effort aging, not a deadline).
 type retentionProvider struct {
@@ -30,9 +31,9 @@ type retentionProvider struct {
 	mu        sync.Mutex
 	fetchedAt time.Time
 	spans     []retentionSpan
-	// byID is spans by table id, kept up to date from watch.
-	byID  map[uint64]retentionSpan
-	watch *descWatcher
+	// follow keeps the descriptors of the tables with a window up to
+	// date, and where to resume after a start (catalogFollower).
+	follow *catalogFollower
 	// edgeSplitAt is when the edges of a table with a GC window were
 	// last asked for, by the table's first key (see splitEdges).
 	edgeSplitAt map[string]time.Time
@@ -53,6 +54,21 @@ type retentionSpan struct {
 	// see rowExpiry for the eligibility rules).
 	prefixes []keys.Key     // primary-index prefixes, every retained generation
 	pkFams   []types.Family // PK column families in physical order (last: the timestamp)
+	// restored is the table's RestoredRows: the versions a restore wrote,
+	// aged by when their rows were first written (issue #316).
+	restored []catalog.RestoredRowsBand
+}
+
+// writtenAt is when the version at vts was written, for retention: its
+// own timestamp, or for a version a restore wrote, the source's commit
+// time of the rows in its band.
+func (ts retentionSpan) writtenAt(vts hlc.Timestamp) int64 {
+	return catalog.RestoredWrittenAt(ts.restored, vts)
+}
+
+// restoredVersion says the version at vts is one a restore wrote.
+func (ts retentionSpan) restoredVersion(vts hlc.Timestamp) bool {
+	return len(ts.restored) > 0 && !ts.restored[len(ts.restored)-1].Through.Less(vts)
 }
 
 const retentionRefreshInterval = 30 * time.Second
@@ -147,47 +163,59 @@ func (p *retentionProvider) get() []retentionSpan {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// What changed since the last refresh, not every descriptor (issue
-	// #313): see descWatcher.
-	if p.watch == nil {
-		p.watch = &descWatcher{n: p.node}
+	// #313): see catalogFollower.
+	if p.follow == nil {
+		p.follow = newRetentionFollower(p.node)
 	}
-	full, recs, err := p.watch.next(ctx)
+	full, changed, err := p.follow.pass(ctx)
 	if err != nil {
 		log.Debugf("retention refresh: descriptors: %v", err)
 		return p.spans // stale-serve
 	}
-	if full || p.byID == nil {
-		p.byID = map[uint64]retentionSpan{}
-	}
-	changed := full
-	for _, rec := range recs {
-		id, ok := descIDOfKey(rec.Key)
-		if !ok {
-			continue
-		}
-		_, had := p.byID[id]
-		delete(p.byID, id)
-		if !rec.Deleted {
-			var d catalog.TableDescriptor
-			if json.Unmarshal(rec.Value, &d) == nil && d.ID != 0 {
-				if rs, ok := retentionSpanFor(&d); ok {
-					p.byID[id] = rs
-					had = true
-				}
-			}
-		}
-		changed = changed || had
-	}
-	if changed {
-		spans := make([]retentionSpan, 0, len(p.byID))
-		for _, rs := range p.byID {
-			spans = append(spans, rs)
-		}
-		sort.Slice(spans, func(i, j int) bool { return spans[i].start.Compare(spans[j].start) < 0 })
-		p.spans = spans
+	if full || changed {
+		p.spans = retentionSpansOf(p.follow.state.(*rawDescs))
 	}
 	p.fetchedAt = time.Now()
 	return p.spans
+}
+
+// retentionResumeVersion is the format of the retention provider's
+// resume record; bump it when what retentionSpanFor accepts changes, so
+// that a node resuming under the new rule reads every descriptor again.
+const retentionResumeVersion = 1
+
+// retentionResumeEvery is how often the provider writes its resume
+// record: on the node's own engine, a value of a few descriptors.
+const retentionResumeEvery = time.Minute
+
+func newRetentionFollower(n *Node) *catalogFollower {
+	fresh := func() followedState {
+		s := &rawDescs{keep: func(d *catalog.TableDescriptor) bool {
+			_, ok := retentionSpanFor(d)
+			return ok
+		}}
+		s.reset()
+		return s
+	}
+	return newCatalogFollower("retention", n, nil, fresh, localResume{n, keys.StoreCatalogResumeKey("retention")},
+		retentionResumeVersion, retentionResumeEvery)
+}
+
+// retentionSpansOf is the provider's windows for the descriptors it
+// keeps, by start key.
+func retentionSpansOf(s *rawDescs) []retentionSpan {
+	spans := make([]retentionSpan, 0, len(s.byID))
+	for _, raw := range s.byID {
+		var d catalog.TableDescriptor
+		if json.Unmarshal(raw, &d) != nil {
+			continue
+		}
+		if rs, ok := retentionSpanFor(&d); ok {
+			spans = append(spans, rs)
+		}
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start.Compare(spans[j].start) < 0 })
+	return spans
 }
 
 // retentionSpanFor is what the provider keeps for table d: its window, if
@@ -202,7 +230,7 @@ func retentionSpanFor(d *catalog.TableDescriptor) (retentionSpan, bool) {
 		}
 		return retentionSpan{}, false
 	}
-	rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true}
+	rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true, restored: d.RestoredRows}
 	// Row-level expiry eligibility: the timestamp must be decodable
 	// from the key alone (it always is — the last PK column), and the
 	// table must carry no secondary indexes (their entries hold no
@@ -244,6 +272,15 @@ func retentionSpanFor(d *catalog.TableDescriptor) (retentionSpan, bool) {
 // backfilled ancient row expires promptly. Keys that match no eligible
 // retention table (foreign tenants of the mixed range, secondary-index
 // entries) are never touched.
+//
+// A version a restore wrote is aged by when its row was first written at
+// the source rather than by its own timestamp (retentionSpan.writtenAt,
+// issue #316), on a mixed range and on one wholly inside the table
+// alike: expire-mode GC goes by the versions' own timestamps, so for a
+// range inside a table that has restored rows the predicate is what
+// expires them on the source's schedule rather than a period after the
+// restore. Every key of the table is held to it there, as expire mode
+// holds every key, index entries included.
 func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.Timestamp) bool, bool) {
 	spans := p.get()
 	var overlapping []retentionSpan
@@ -252,7 +289,13 @@ func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.T
 			continue
 		}
 		if ts.start.Compare(start) <= 0 && end.Compare(ts.end) <= 0 {
-			return nil, false // fully contained: expire-mode GC handles it
+			if len(ts.restored) == 0 {
+				return nil, false // fully contained: expire-mode GC handles it
+			}
+			cutoff := time.Now().UnixNano() - ts.ttl.Nanoseconds()
+			return func(_ keys.Key, vts hlc.Timestamp) bool {
+				return ts.restoredVersion(vts) && ts.writtenAt(vts) <= cutoff
+			}, true
 		}
 		if len(ts.prefixes) > 0 {
 			overlapping = append(overlapping, ts)
@@ -268,7 +311,7 @@ func (p *retentionProvider) rowExpiry(start, end keys.Key) (func(keys.Key, hlc.T
 				continue
 			}
 			cutoff := nowNanos - ts.ttl.Nanoseconds()
-			if vts.WallTime > cutoff {
+			if ts.writtenAt(vts) > cutoff {
 				return false // written too recently, whatever the row says
 			}
 			for _, prefix := range ts.prefixes {

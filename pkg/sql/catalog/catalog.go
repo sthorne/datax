@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -628,6 +629,43 @@ type TableDescriptor struct {
 	// before it is written to KV (pkg/sql/rowseal). nil for an ordinary
 	// table, which is every table written before.
 	EncryptionKey *TableEncryptionKey `json:"encryption_key,omitempty"`
+	// RestoredRows says when the rows a restore wrote into this
+	// time-series table were first written (cluster version v22, issue
+	// #316). A restore writes every row at its own time, and retention
+	// counts from a version's commit time; without this the restored rows
+	// would stay a retention period after the restore rather than after
+	// they were written at the source. The restore writes the rows in
+	// bands of commit time, oldest first, one band after another, and
+	// records each band here in that order: every version of the table at
+	// or below a band's Through and above the band before's was written
+	// by the restore, from source rows committed at or before its
+	// WrittenBy. Retention ages such a version by WrittenBy instead of its
+	// own timestamp (pkg/server/retention.go). Set only by a restore,
+	// which replaces whatever a backed-up descriptor carried: the
+	// timestamps are the restoring cluster's.
+	RestoredRows []RestoredRowsBand `json:"restored_rows,omitempty"`
+}
+
+// RestoredRowsBand is one band of RestoredRows.
+type RestoredRowsBand struct {
+	// Through is the restore's clock when the band's last write had
+	// committed.
+	Through hlc.Timestamp `json:"through"`
+	// WrittenBy is the latest source commit time (Unix nanoseconds) of
+	// the band's rows.
+	WrittenBy int64 `json:"written_by"`
+}
+
+// RestoredWrittenAt is when the version at vts was written, for a
+// table's retention: WrittenBy of the restore band (of bands, a table's
+// RestoredRows) that holds it, or vts itself for a version no restore
+// wrote.
+func RestoredWrittenAt(bands []RestoredRowsBand, vts hlc.Timestamp) int64 {
+	if len(bands) == 0 || bands[len(bands)-1].Through.Less(vts) {
+		return vts.WallTime
+	}
+	i := sort.Search(len(bands), func(i int) bool { return !bands[i].Through.Less(vts) })
+	return bands[i].WrittenBy
 }
 
 // TableEncryptionKey is a sealed table's key.
@@ -811,6 +849,7 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		ttl := *d.RowTTL
 		out.RowTTL = &ttl
 	}
+	out.RestoredRows = append([]RestoredRowsBand(nil), d.RestoredRows...)
 	if d.Policies != nil {
 		out.Policies = make([]Policy, len(d.Policies))
 		for i, p := range d.Policies {

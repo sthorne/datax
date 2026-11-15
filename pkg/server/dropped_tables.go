@@ -24,18 +24,28 @@ import (
 // read reaches them, and this job — on the node leading range 1, like
 // the re-shard janitor — clears the table's span:
 //
-//  1. Every row is deleted, in transactions of restoreChunk deletes,
-//     resuming after the last key deleted. Deleting is idempotent, so a
-//     pass cut short by a restart or a move of range 1's leadership is
-//     simply run again; the record then says the rows are gone.
-//  2. The deletions and the versions under them are collected at once
-//     by a purge of the span (collection at a window of zero, then
-//     compaction: docs/transactions.md, "Purge"), which leaves nothing
-//     of the table in the files. On a cluster below v21, which has no
-//     purge, ordinary GC collects them one window later.
+//  1. The span is cleared. On a cluster at v22, one replicated range
+//     clear per range of the span (ClearSpan, kvserver.Store.ClearRange:
+//     a range deletion of every version, with the range's GC threshold
+//     raised to the clear's time in the same command), whatever the
+//     number of rows. Below v22 — a replica could be on a binary that
+//     does not know the command — every row is deleted instead, in
+//     transactions of restoreChunk deletes, resuming after the last key
+//     deleted. Either is idempotent, so a pass cut short by a restart or
+//     a move of range 1's leadership is simply run again; the record
+//     then says the rows are gone.
+//  2. A purge of the span (collection at a window of zero, then
+//     compaction, log truncation and log scrub: docs/transactions.md,
+//     "Purge") leaves nothing of the table in the files: after a clear,
+//     the keys are still in their sstables under the range tombstone and
+//     their values in the raft log; after row-by-row deletion, the
+//     tombstones and the versions under them are collected too. On a
+//     cluster below v21, which has no purge, ordinary GC collects the
+//     deletions one window later.
 //  3. The record is removed.
 //
-// The purge raises the span's GC threshold to its own time. That refuses
+// The clear and the purge raise the span's GC threshold to their own
+// time. That refuses
 // only reads of the dropped table at times its history window no longer
 // covers anyway; the span is split from its neighbours first, and the
 // merge queue folds the empty ranges back into their neighbours once the
@@ -155,7 +165,14 @@ func (n *Node) reclaimDroppedTable(ctx context.Context, rec *catalog.DroppedTabl
 				return txn.Delete(ctx, keys.DroppedTableKey(rec.ID))
 			})
 		}
-		if err := n.wipeSpan(ctx, start, end); err != nil {
+		if n.ClusterVersion() >= version.V22 {
+			res, err := n.ClearSpan(ctx, start, end)
+			if err != nil {
+				return fmt.Errorf("clearing the span: %w", err)
+			}
+			log.Infof("dropped-table reclaim: table %s (id %d): cleared %d key(s), %d byte(s) over %d range(s) at %s",
+				rec.Label(), rec.ID, res.Keys, res.Bytes, res.Ranges, res.Timestamp)
+		} else if err := n.wipeSpan(ctx, start, end); err != nil {
 			return fmt.Errorf("deleting the rows: %w", err)
 		}
 		if err := n.updateDroppedTable(ctx, rec.ID, func(r *catalog.DroppedTable) { r.Cleared = true }); err != nil {

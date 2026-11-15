@@ -1408,8 +1408,53 @@ state or the internode protocol does, and an entry below says so.
   idle (1,000 tables: 3,042 → 94). New harness `TestMetricsRecorderScale`
   (`DATAX_CATALOG_SCALE`). A plain SQL query of `datax_metrics` sees the
   sparse rows; docs/user/operations.md says how to read them.
+- **The catalog-following jobs resume after a restart** (#316). The retention
+  provider behind GC, the re-shard janitor and the statistics sampler read
+  every descriptor (the sampler also every statistics record) on their first
+  pass after a node start, and the janitor and the sampler again on a node
+  that took over range 1's leadership. Each now persists its state with the
+  timestamp it is as of, in one value — the retention provider on the node's
+  own engine, the janitor and the sampler under `/system/catalog-resume/` so
+  that a new leader resumes too — and its first pass reads what changed since:
+  at 5,000 tables 5,002, 5,002 and 5,007 rows become 3, 2 and 7. A record
+  that is missing, of another format version, or older than the GC threshold
+  leaves a full read, as before. The sampler's record, about 45 KB at 5,000
+  tables, is written hourly; the others, a few hundred bytes, every minute
+  and every ten minutes. Each job still checks its state against a full read
+  about once a day (jittered); a difference is logged as a warning, counted in
+  the new `datax_catalog_follower_divergence_total{job}`, and replaced by the
+  full read's.
 
 ### Fixed
+- **A transaction blocked on another's lock noticed it was released up to
+  100 ms late.** It re-asked the lock holder's transaction record every
+  100 ms. Now the holder's coordinator wakes it as soon as the holder has
+  committed or aborted and released its rows, when both run on the same
+  node; otherwise it re-asks after 5 ms, doubling to 100 ms, with jitter so
+  waiters behind one holder do not ask in step. On the bank workload (one
+  node, 16 workers, 1,000 accounts) p99 latency fell from 111 ms to 45 ms
+  on a busy machine and to 24 ms on a quiet one, for about 10 % more pushes
+  per transfer; constructed deadlocks are broken in 10–20 ms instead of
+  hundreds. New metric `datax_txn_pushes_total`. Nothing replicated or on
+  the wire changed.
+- **A dropped table is reclaimed with one raft command per range** (#316).
+  The reclaim deleted a dropped table row by row and then collected every
+  version; once the cluster has finalized v22 it empties each range of the
+  table's span with a replicated range clear: the leader checks the span is
+  a dropped table's, refuses an intent, and picks a time above every version
+  and every read served; every replica deletes the span with one range
+  deletion and raises the range's GC threshold to that time in the same
+  command. The purge still follows, to take the bytes out of the files and
+  the logs. A table of 100,000 rows on three nodes: 939 raft entries and
+  43.9 MB of log payload in 3.0 s before, 24 entries, 4.1 kB and 0.30 s
+  now. The consistency checker also compares each replica's size and GC
+  threshold. New metrics `datax_range_clears_total` and
+  `datax_raft_entry_bytes_appended_total`. Cluster protocol version v22.
+
+### Fixed
+- Finding a range's leader for a purge gave up when a replica listed before
+  the leader was on a node that was down, though another replica could
+  answer; it now moves on to the next replica.
 - **A transaction whose commit failed kept its rows locked for up to five
   seconds** (#315). A `COMMIT` refused with a `40001` (its refresh failed,
   or its deadline had passed) stopped the transaction's heartbeat but left
@@ -1877,6 +1922,24 @@ state or the internode protocol does, and an entry below says so.
   destination and moved into place only when every table has been written; a
   failure removes them. Backup files are created 0600 and a directory the
   backup creates 0700 (they were 0644 and 0755), sealed or not.
+- **A restore brought back time-series rows that retention had expired, and
+  kept every restored row a retention period too long** (#316). Retention
+  expires rows by commit time and leaves no tombstone, so a full backup and
+  an incremental taken after rows expired restored them again; and a restore
+  writes every row at its own time, from which retention counted. A backup
+  now keeps each time-series row's commit time (its manifest has the magic
+  `DXBK3`, which older binaries refuse), and a restore of everything, a table
+  restore and a point-in-time restore leave out the rows committed at or
+  before the chain's end less the table's retention, then write the rest in
+  sixteen bands of commit time and record the bands in the descriptor
+  (`restored_rows`), so retention expires each restored row when the source
+  would have, at most a sixteenth of the retention late. A row backfilled
+  with an old timestamp is kept or dropped by its commit time, as the source
+  did. A time-series table's files are read once per band. A chain with a
+  backup from before has its time-series tables restored as before, and the
+  restore's summary says so. Backups record commit times, and restores
+  record bands, at cluster protocol version v22. See docs/user/operations.md,
+  "Time-series retention and backups".
 
 ## 0.57.0 — unreleased
 

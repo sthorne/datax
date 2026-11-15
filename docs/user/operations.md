@@ -506,6 +506,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
+| `datax_txn_pushes_total` vs `datax_txn_commits_total` | ratio climbing well above 1 | transactions are queueing behind each other's locks; each push is a blocked transaction asking the holder's record whether it has finished |
 | `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
@@ -580,7 +581,9 @@ stopped ticking and heartbeating; on a quiet cluster this approaches
 how many heartbeats each message carried),
 `datax_raft_entries_appended_total` / `datax_raft_entries_applied_total`
 (the log's write and apply rates; applied lagging appended for long is a
-store whose apply workers cannot keep up), `datax_raft_apply_seconds`
+store whose apply workers cannot keep up),
+`datax_raft_entry_bytes_appended_total` (the payload bytes of the entries
+written), `datax_raft_apply_seconds`
 (per-entry apply time — the single-range write ceiling is its inverse,
 see [Capacity planning](#capacity-planning)),
 `datax_raft_apply_backpressure_total` (raft passes deferred because a
@@ -708,7 +711,10 @@ Things to know before relying on it:
   from every file the database owns, not from the device beneath.
 
 `datax_purge_versions_removed_total` counts what purges on a node
-removed.
+removed. A dropped table's ranges are emptied by a range clear before
+their purge, once the cluster is at v22 (`datax_range_clears_total`
+counts them on the leaders that proposed them); the purge then has
+nothing to collect and removes the bytes from the files and logs.
 
 **A GC window per table.** Garbage collection normally waits out the
 node's window (25h). `ALTER TABLE t SET (gc_ttl = '10m')` gives one
@@ -857,26 +863,35 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   garbage-collection window"), because changes since it have been
   collected in part. Take a fresh full backup at least daily.
 - **Time-series retention and backups.** Retention expires rows beneath
-  SQL and leaves no tombstone, so an incremental taken after rows
-  expired has nothing to say about them: a restore of the full backup
-  and the incremental brings back the rows that expired in between
-  (with a revision-history incremental too). Every restored row is
-  written at the restore's time, and retention counts from a row's
-  write time, so restored rows — these and the rest — stay up to one
-  retention period after the restore rather than after they were first
-  written. To restore a time-series table as its retention would have
-  it, delete the old rows after the restore:
-  `DELETE FROM metrics WHERE at < now() - INTERVAL '7 days'` (the
-  retention, over the timestamp column). An incremental whose base the
-  retention has already passed is refused, like one older than the GC
-  window. (Issue #313; restore does not re-apply retention itself
-  because a backup holds no write times, and retention on a range of
-  its own goes by write time, not by the row's timestamp column. A
-  restore that dropped rows by their timestamp column instead would
-  also drop a row backfilled with an old timestamp shortly before the
-  backup, which the source still held; telling the expired rows apart
-  would take every incremental listing every live key of every
-  time-series table, a full export each time. Issue #316 left it so.)
+  SQL by commit time and leaves no tombstone, so an incremental taken
+  after rows expired has nothing to say about them. A backup therefore
+  keeps the commit time of every row of a time-series table, and a restore
+  applies the table's retention (as of the chain's last backup) as the
+  source did: a row whose commit time is at or before the chain's end less
+  the retention had expired there, and is not restored. It is the commit
+  time that decides, not the row's timestamp column: a row backfilled with
+  an old timestamp shortly before the backup was held by the source and is
+  restored, and a restore of a chain holds what the source held at the
+  chain's end once its retention had caught up (expiry at the source is
+  best-effort by a housekeeping tick or two). The rest are written in
+  sixteen bands of commit time, oldest first, and the table's descriptor
+  records when each band's rows were first written, so retention expires
+  a restored row when it would have expired at the source — at most a
+  sixteenth of the retention late, never early — rather than a retention
+  period after the restore. The same holds for a table restore and a
+  restore to a point in time (where the end is the moment restored to).
+  The summary says, per time-series table, how many rows were left out.
+  The cost is reads: a time-series table's data files are read once per
+  band. A backup keeps commit times, and a restore records the bands, only
+  at cluster version v22; before it (or for a chain with a backup taken
+  before it, which the summary names) the table is restored as it was:
+  expired rows may come back, and every restored row is kept a retention
+  period from the restore. To apply the retention then, delete the old
+  rows after the restore: `DELETE FROM metrics WHERE at < now() -
+  INTERVAL '7 days'` (the retention, over the timestamp column — which
+  also drops rows backfilled with old timestamps). An incremental whose
+  base the retention has already passed is refused, like one older than
+  the GC window. (Issues #313, #316.)
 - An incremental holds each changed key as it stood at the incremental's
   own timestamp. Taken with `--revision-history` it holds every version
   written since the base instead, and the chain restores to any moment

@@ -27,7 +27,37 @@ const (
 	// one-Put batch, a closed timestamp, a load handoff, a checksum
 	// trigger, and a split trigger. Old log entries must decode forever.
 	goldenRaftCommandProto = "010a05636d642d3112160a080a04086410011805120a12080a030a01611201761a200a0c08051201611a016d2803300d120c080612016d1a0171280330011a0208282a020832320b09000000000000044010633a040a02636b"
+
+	// goldenRaftCommandClearRange is a range clear's command (cluster
+	// version v22, issue #316): range 9, [a, q), at 200.3, generation 12.
+	goldenRaftCommandClearRange = "010a05636d642d3212210a090a0508c801100318091214c201110a060a0161120171120508c8011003180c"
 )
+
+func TestRaftCommandDecodesGoldenClearRange(t *testing.T) {
+	data, err := hex.DecodeString(goldenRaftCommandClearRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := decodeRaftCommand(data)
+	if err != nil {
+		t.Fatalf("golden range clear no longer decodes: %v", err)
+	}
+	ts := hlc.Timestamp{WallTime: 200, Logical: 3}
+	if cmd.ID != "cmd-2" || cmd.Batch.Header.RangeID != 9 || cmd.Batch.Header.Timestamp != ts || len(cmd.Batch.Requests) != 1 {
+		t.Fatalf("decoded %+v", cmd)
+	}
+	c := cmd.Batch.Requests[0].ClearRange
+	if c == nil || string(c.Key) != "a" || string(c.EndKey) != "q" || c.Timestamp != ts || c.Generation != 12 {
+		t.Fatalf("clear: %+v", c)
+	}
+	raw, err := encodeRaftCommand(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(raw) != goldenRaftCommandClearRange {
+		t.Fatalf("encoding changed:\n got %x\nwant %s", raw, goldenRaftCommandClearRange)
+	}
+}
 
 func TestGoldenReplicaState(t *testing.T) {
 	var st replicaState

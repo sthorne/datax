@@ -141,6 +141,9 @@ var (
 	RaftEntriesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_appended_total", Help: "Raft log entries written by this store (leader proposals and follower appends).",
 	})
+	RaftEntryBytesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entry_bytes_appended_total", Help: "Payload bytes of the raft log entries written by this store (leader proposals and follower appends).",
+	})
 	RaftEntriesApplied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_applied_total", Help: "Committed raft entries applied to the state machine.",
 	})
@@ -184,6 +187,9 @@ var (
 	ReadAttemptTimeouts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_read_attempt_timeouts_total", Help: "Read sub-batches whose attempt at a replica ran out its per-attempt deadline (a latch held by a slow write, a leader confirmation or apply that did not finish in time) and were sent again by the gateway instead of failing the statement (issue #269). Occasional under heavy load; a steady rate means reads are waiting seconds on some leader.",
 	})
+	TxnPushes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_txn_pushes_total", Help: "Pushes a transaction sent to the record of another transaction whose intent it ran into (one per conflicting transaction per attempt; deadlock-detection walks are not counted). The rate per commit is how often blocked transactions re-ask whether their conflict has ended.",
+	})
 	DeadlockAborts = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_deadlock_aborts_total", Help: "Transactions aborted as chosen victims of detected deadlock cycles.",
 	})
@@ -202,8 +208,15 @@ var (
 	StatsRefreshes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_stats_refreshes_total", Help: "Table statistics collections completed (ANALYZE and the background sampler).",
 	})
+	CatalogFollowerDivergence = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "datax_catalog_follower_divergence_total",
+		Help: "Times a background job that follows the catalog (retention, reshard, stats) found the state it kept from what changed, or resumed after a start, differing from a full read, which it then used (issue #316). Any is a bug.",
+	}, []string{"job"})
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
+	})
+	RangeClears = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_clears_total", Help: "Ranges of dropped tables emptied by a replicated range clear, counted on the leader that proposed it.",
 	})
 	PurgeVersionsRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_purge_versions_removed_total", Help: "MVCC versions deleted by purges this node coordinated (ALTER TABLE ... PURGE, datax debug purge).",
