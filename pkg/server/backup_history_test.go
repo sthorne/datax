@@ -235,29 +235,36 @@ func TestChainCutRefusals(t *testing.T) {
 // TestHistoryManifestMagic: a backup with revision history carries a
 // magic of its own, so a binary that knows only the first format refuses
 // it by the check it has always made, and a manifest whose magic and
-// marker disagree is refused by this one.
+// marker disagree is refused by this one. So does a backup whose
+// time-series tables' files carry commit times (issue #316).
 func TestHistoryManifestMagic(t *testing.T) {
 	if backupHistoryMagic == backupManifestMagic {
 		t.Fatal("a history backup must not carry the plain backup's magic: an older binary would read its files in the old framing")
 	}
 	base := backupManifest{ClusterID: "c", BaseTS: hts(1), EndTS: hts(2)}
 	for _, c := range []struct {
-		magic   string
-		history bool
-		want    string
+		magic       string
+		history     bool
+		commitTimes bool
+		want        string
 	}{
-		{backupManifestMagic, false, ""},
-		{backupHistoryMagic, true, ""},
-		{backupManifestMagic, true, "disagree"},
-		{backupHistoryMagic, false, "disagree"},
-		{"DXBK3", false, "not a datax backup"},
+		{backupManifestMagic, false, false, ""},
+		{backupHistoryMagic, true, false, ""},
+		{backupTimedMagic, false, true, ""},
+		{backupManifestMagic, true, false, "disagree"},
+		{backupHistoryMagic, false, false, "disagree"},
+		{backupManifestMagic, false, true, "disagree"},
+		{backupHistoryMagic, true, true, "disagree"},
+		{backupTimedMagic, true, false, "disagree"},
+		{"DXBK4", false, false, "not a datax backup"},
 	} {
 		man := base
 		man.Magic, man.RevisionHistory = c.magic, c.history
+		man.Tables = []backupTable{{ID: 100, Name: "m", File: backupDataFile(100), CommitTimes: c.commitTimes}}
 		raw, _ := json.Marshal(man)
 		_, err := parseBackupManifest("dir", raw)
 		if c.want == "" && err != nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
-			t.Errorf("magic %q, history %v: got %v, want %q", c.magic, c.history, err, c.want)
+			t.Errorf("magic %q, history %v, commit times %v: got %v, want %q", c.magic, c.history, c.commitTimes, err, c.want)
 		}
 	}
 	// History with no base is not a thing a backup writes.

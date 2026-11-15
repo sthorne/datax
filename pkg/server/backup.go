@@ -58,6 +58,14 @@ const (
 	// backup" and stops. A sealed backup keeps its envelope ("DXBKS1");
 	// the manifest inside carries this magic and is refused the same way.
 	backupHistoryMagic = "DXBK2"
+	// backupTimedMagic is the manifest magic of a backup without revision
+	// history whose time-series tables' data files frame each record
+	// with its commit time (backupTable.CommitTimes, issue #316), so that
+	// a restore can apply the tables' retention. A different magic for
+	// the reason backupHistoryMagic is one: a binary from before it would
+	// read the timestamps as records. A backup with no such table keeps
+	// backupManifestMagic, and older binaries read it as before.
+	backupTimedMagic   = "DXBK3"
 	backupManifestName = "BACKUP.json"
 	// backupExportChunk bounds one Export call's record count: memory on
 	// both sides and the JSON/proto envelope size.
@@ -200,6 +208,16 @@ type backupTable struct {
 	// newest version of each key — what the same backup without history
 	// would have held — so the two kinds compare.
 	Versions int64 `json:"versions,omitempty"`
+	// CommitTimes says the data file of a backup without revision history
+	// frames each record with the commit time of the version it holds, as
+	// a history file frames each version (issue #316). Backup records it
+	// for time-series tables at cluster version v22, so that a restore can
+	// drop the rows the table's retention had expired by the backup's
+	// time: retention expires rows by commit time and leaves no
+	// tombstone, so an incremental says nothing about them otherwise.
+	// Never set in a backup with revision history, whose files carry
+	// every version's time already.
+	CommitTimes bool `json:"commit_times,omitempty"`
 	// history says the data file frames each record with its timestamp;
 	// set from the manifest when it is read, never stored.
 	history bool
@@ -207,6 +225,10 @@ type backupTable struct {
 	// history file must lie in; set with history.
 	window [2]hlc.Timestamp
 }
+
+// timed says the table's data file frames each record with its
+// timestamp: a history file, or one with commit times.
+func (t backupTable) timed() bool { return t.history || t.CommitTimes }
 
 type backupManifest struct {
 	Magic     string        `json:"magic"`
@@ -601,6 +623,7 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 
 	// Descriptors, users, and admin markers: always the full set at endTS
 	// (tiny; makes every chain element self-describing for the schema).
+	commitTimesOK := n.db.ClusterVersion() >= version.V22
 	descStart, descEnd := keys.TableDescSpan()
 	var descs []backupTable
 	err = n.exportAll(ctx, descStart, descEnd, hlc.Timestamp{}, endTS, func(rec kvpb.ExportRecord) error {
@@ -618,7 +641,13 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		// console's preferences (datax_ui_prefs) are small and are not
 		// regenerable from anything — losing them across a restore
 		// silently resets every operator's display choices.
-		descs = append(descs, backupTable{ID: d.ID, Name: d.Name, Descriptor: append(json.RawMessage(nil), rec.Value...)})
+		bt := backupTable{ID: d.ID, Name: d.Name, Descriptor: append(json.RawMessage(nil), rec.Value...)}
+		// A time-series table's rows go with their commit times, so a
+		// restore can apply its retention (issue #316) — with or without
+		// one today, since one may be set before the next backup. Only at
+		// v22 does every replica answer an export with them.
+		bt.CommitTimes = d.Timeseries && !opts.RevisionHistory && commitTimesOK
+		descs = append(descs, bt)
 		return nil
 	})
 	if err != nil {
@@ -685,6 +714,13 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 					return nil
 				}
 				lastKey = keys.Key(rec.Key).Clone()
+			} else if bt.CommitTimes {
+				if rec.Timestamp.IsEmpty() {
+					return fmt.Errorf("a replica answered the export of %s without commit times (a node from before cluster version %s?)", keys.Key(rec.Key), version.V22)
+				}
+				if err := writeBackupRevision(w, rec); err != nil {
+					return err
+				}
 			} else if err := writeBackupRecord(w, rec); err != nil {
 				return err
 			}
@@ -714,6 +750,9 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 			return nil, fmt.Errorf("exporting table %s: %w", bt.Name, err)
 		}
 		bt.SHA256 = hex.EncodeToString(h.Sum(nil))
+		if bt.CommitTimes && man.Magic == backupManifestMagic {
+			man.Magic = backupTimedMagic
+		}
 		man.Tables = append(man.Tables, bt)
 		log.Infof("backup: table %s (id %d): %d records, %d live bytes", bt.Name, bt.ID, bt.Records, bt.Bytes)
 	}
@@ -825,17 +864,22 @@ func parseBackupManifest(dir string, raw []byte) (*backupManifest, error) {
 	if err := json.Unmarshal(raw, &man); err != nil {
 		return nil, err
 	}
+	timed := false
+	for _, t := range man.Tables {
+		timed = timed || t.CommitTimes
+	}
 	switch {
-	case man.Magic == backupManifestMagic && !man.RevisionHistory:
-	case man.Magic == backupHistoryMagic && man.RevisionHistory:
+	case man.Magic == backupManifestMagic && !man.RevisionHistory && !timed:
+	case man.Magic == backupTimedMagic && !man.RevisionHistory:
+	case man.Magic == backupHistoryMagic && man.RevisionHistory && !timed:
 		if man.BaseTS.IsEmpty() || !man.BaseTS.Less(man.EndTS) {
 			return nil, fmt.Errorf("%s: a backup with revision history holds the interval after a base backup, and this manifest names none (base %s, end %s)", dir, man.BaseTS, man.EndTS)
 		}
-	case man.Magic == backupManifestMagic || man.Magic == backupHistoryMagic:
-		// The magic is what an older binary goes by and the field what
+	case man.Magic == backupManifestMagic || man.Magic == backupHistoryMagic || man.Magic == backupTimedMagic:
+		// The magic is what an older binary goes by and the fields what
 		// this one reads the files by: a manifest where they disagree
 		// would be read one way here and another there.
-		return nil, fmt.Errorf("%s: the manifest's magic %q and its revision-history marker disagree", dir, man.Magic)
+		return nil, fmt.Errorf("%s: the manifest's magic %q and its revision-history or commit-time markers disagree", dir, man.Magic)
 	default:
 		return nil, fmt.Errorf("%s: not a datax backup (magic %q)", dir, man.Magic)
 	}
@@ -1188,6 +1232,23 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			return nil, err
 		}
 	}
+	// Time-series tables whose retention the restore applies (issue #316,
+	// restore_retention.go), by id.
+	expiry := map[uint64]*commitTimeExpiry{}
+	var expiryNotes []string
+	for _, t := range final.Tables {
+		var d catalog.TableDescriptor
+		if err := json.Unmarshal(t.Descriptor, &d); err != nil {
+			return nil, fmt.Errorf("table %s: corrupt descriptor in the backup: %w", t.Name, err)
+		}
+		e, note := n.planCommitTimeExpiry(chain, t.ID, &d, t.Name)
+		if e != nil {
+			expiry[t.ID] = e
+		}
+		if note != "" {
+			expiryNotes = append(expiryNotes, note)
+		}
+	}
 	n.metricsPaused.Store(true)
 	defer n.metricsPaused.Store(false)
 	restoresAudit := false
@@ -1218,7 +1279,13 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			}
 		}
 		for _, t := range final.Tables {
-			wb.Put(keys.TableDescKey(t.ID), []byte(t.Descriptor))
+			// Verbatim, less the source's restore bands (rewritten with
+			// this restore's once its rows are in).
+			raw, err := descriptorWithRestoredRows(t.Descriptor, nil)
+			if err != nil {
+				return fmt.Errorf("table %s: corrupt descriptor in the backup: %w", t.Name, err)
+			}
+			wb.Put(keys.TableDescKey(t.ID), []byte(raw))
 			var d catalog.TableDescriptor
 			if json.Unmarshal(t.Descriptor, &d) == nil && d.IsView() {
 				// The reverse records of a view's dependencies are not in
@@ -1301,6 +1368,9 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			if !live[t.ID] {
 				continue // dropped later in the chain
 			}
+			if expiry[t.ID] != nil {
+				continue // below, in bands of commit time
+			}
 			// The name is derived, not taken from the manifest (which
 			// readBackupManifest has already held to the same).
 			path := filepath.Join(srcs[i], backupDataFile(t.ID))
@@ -1346,11 +1416,38 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		}
 	}
 
+	// The time-series tables whose retention applies: their rows as the
+	// chain leaves them, less the expired ones, in bands of commit time,
+	// and the bands into the descriptor (restore_retention.go).
+	for _, t := range final.Tables {
+		e := expiry[t.ID]
+		if e == nil {
+			continue
+		}
+		bands, expired, err := n.loadByCommitTime(ctx, chain, t.ID, e, "restore-data", func(k keys.Key) keys.Key { return k })
+		if err != nil {
+			return nil, fmt.Errorf("restoring table %s: %w", t.Name, err)
+		}
+		if len(bands) > 0 {
+			raw, err := descriptorWithRestoredRows(t.Descriptor, bands)
+			if err != nil {
+				return nil, err
+			}
+			if err := n.db.RunTxn(ctx, "restore-bands", func(ctx context.Context, txn *kvclient.Txn) error {
+				return txn.Put(ctx, keys.TableDescKey(t.ID), raw)
+			}); err != nil {
+				return nil, err
+			}
+		}
+		expiryNotes = append(expiryNotes, expiryNote(t.Name, e, expired))
+	}
+
 	// Restored named keys are sealed under this cluster's key (issue #310).
 	keyNotes, err := n.rewrapRestoredKeys(ctx, chain)
 	if err != nil {
 		return nil, err
 	}
+	keyNotes = append(keyNotes, expiryNotes...)
 
 	// Verification: a fresh full export of every restored table, hashed the
 	// same way — the caller compares against the source's checksums.
