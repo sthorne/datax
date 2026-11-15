@@ -669,6 +669,43 @@ range, not only a dropped table's: before it, a purged range merged
 into its neighbour — the system range among them — as soon as it was
 small enough.
 
+**Not done: a replicated range clear** (issue #316). The reclaim deletes
+a table row by row — a tombstone per row, through the log, in chunked
+transactions — and then purges the span. One command per range that
+clears the span outright would cost a log entry instead of one per row,
+and is what the reclaim would use. What it needs, and why it was left:
+
+- *A request and a gate.* A new `ClearRangeRequest` (an add-only proto
+  field), sent only once the cluster has finalized the version that
+  introduces it, since a replica that does not know it would refuse or
+  misapply the entry; below it the reclaim deletes row by row, as now.
+- *Evaluation on the leader*, under a write latch on the whole span:
+  refuse an intent in the span (resolve finished transactions first, as
+  the purge does), refuse a span that is not a whole table's, and raise
+  the range's GC threshold to the command's timestamp in the same
+  command, as the purge's collection does, so a read at or below it is
+  refused rather than answered from nothing. The reclaim already waits
+  out the table's window, so no admissible read is lost.
+- *MVCC statistics.* Stats move by deltas each command carries. A clear
+  must subtract exactly what the replicas hold, so the leader counts the
+  span at the applied index (every replica holds the same bytes there)
+  and the command carries the negated count — a read of the whole span,
+  but no write per row.
+- *Apply* is a range deletion (`storage.Batch.DeleteRange`, already used
+  for snapshots and replica removal) over the span's MVCC keys, plus the
+  stats delta and the threshold, identical on every replica; the
+  consistency checker's checksum then still agrees, and must be shown to
+  in a test that clears while it runs. There are no rangefeeds or
+  changefeeds to tell.
+- *What still has to happen after it:* a range tombstone hides the keys
+  but leaves their bytes in the files until compaction, and the values
+  in the log until truncation, so the purge (above) still runs.
+
+It touches raft apply, the stats, the GC threshold and the consistency
+checker at once, for a job that runs in the background after a window
+of a day; the row-by-row path is slower but uses only commands every
+replica already applies, and was kept.
+
 ## Invariants (asserted in tests)
 
 1. An intent is never resolved except per its record's state.

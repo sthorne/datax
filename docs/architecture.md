@@ -189,6 +189,17 @@ statistics records) on every tick and reads 2 while collecting.
 `TestMetricsRecorderScale` measures the rows the recorder writes per
 tick.
 
+The first pass after a start (of the retention provider, the re-shard
+janitor and the statistics sampler) still reads every descriptor once,
+and so does the first pass of a node that has just taken range 1's
+leadership. Persisting the watcher's timestamp would not remove that
+read on its own: each job keeps state derived from every descriptor,
+which would have to be persisted beside the timestamp — per node for the
+provider, replicated for the two jobs that follow range 1's leader — in
+a format both sides of an upgrade agree on, and the full read is what
+corrects it when it is wrong. At 5,000 tables that read is about 5,000
+rows in 20–40 ms, once per start per job (issue #316 left it).
+
 ## Versioning and rolling upgrades
 
 Each binary has an integer protocol version with a supported window
