@@ -37,6 +37,11 @@ ALTER POLICY p ON t RENAME TO q  /  ALTER POLICY p ON t [TO role [, ...]] [USING
 DROP POLICY [IF EXISTS] p ON t [CASCADE | RESTRICT]
 CREATE | ALTER ROLE r ... [BYPASSRLS | NOBYPASSRLS]                                      -- exempt from every table's policies
 SET [LOCAL] class.name = value  /  RESET class.name  /  SHOW class.name                  -- custom session settings (app.tenant)
+CREATE ENCRYPTION KEY [IF NOT EXISTS] k  /  DROP ENCRYPTION KEY [IF EXISTS] k            -- the key service (v22); see Encryption keys below
+ALTER ENCRYPTION KEY k ROTATE | DISABLE | ENABLE | OWNER TO role
+GRANT | REVOKE WRAP | UNWRAP | USAGE | ALL ON ENCRYPTION KEY k [, ...] TO | FROM role [, ...]
+SHOW ENCRYPTION KEYS
+SET CLUSTER SETTING name = value | DEFAULT  /  SHOW CLUSTER SETTING name               -- key_service.rate_limit
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -690,6 +695,160 @@ sealed), and out-of-line storage of ordinary column values in the
 manner of TOAST — a different feature, which would make large `BYTEA`
 values cheaper to carry beside small columns but would still write and
 read each value whole.
+
+## Encryption keys (v22)
+
+`pkg/sql/keyservice.go` (statements, privileges), `pkg/keystore`
+(`service.go`: the functions, their rate limit and audit; `blob.go`: the
+blob format; `cache.go`: the gateway cache). The key service of issue
+#310, step 2 (docs/design-key-service.md, "A. The key service";
+written for application developers in
+docs/encryption-keys-for-applications.md): an application keeps named
+keys in datax and asks it to wrap and unwrap its own data keys under
+them. The keys are rows of `datax_keys` (docs/encryption.md, "Cluster
+key"), of kind `wrapping`; everything here needs cluster version v22
+finalized and the cluster key enabled (`datax debug cluster-key init`),
+and is refused before with `0A000` and `55000`.
+
+```
+CREATE ENCRYPTION KEY [IF NOT EXISTS] k          -- admins; the creator owns it
+ALTER ENCRYPTION KEY k ROTATE                    -- a new version for new wraps; old blobs still open
+ALTER ENCRYPTION KEY k DISABLE | ENABLE          -- every function refused / allowed again
+ALTER ENCRYPTION KEY k OWNER TO role
+DROP ENCRYPTION KEY [IF EXISTS] k                -- destroys every version; the name stays taken
+GRANT | REVOKE WRAP | UNWRAP | USAGE | ALL ON ENCRYPTION KEY k [, ...] TO | FROM role [, ...]
+SHOW ENCRYPTION KEYS
+
+datax_key_wrap(name text, data_key bytea, context bytea) → bytea     -- needs WRAP
+datax_key_unwrap(name text, wrapped bytea, context bytea) → bytea    -- needs UNWRAP; returns the data key
+datax_encrypt(name text, plaintext bytea, context bytea) → bytea     -- needs WRAP; at most 64 KiB
+datax_decrypt(name text, ciphertext bytea, context bytea) → bytea    -- needs UNWRAP
+```
+
+A key's name is an identifier in the statements (folded to lower case
+unless quoted) and the exact stored name in the functions. A dropped
+key keeps its row and its name, so the name cannot be reused (`42710`);
+dropping it again re-runs the purge of its record's history. The key
+statements write the `datax_keys` row in transactions of their own and
+are refused in a transaction block (`25001`).
+
+**Privileges.** `CREATE ENCRYPTION KEY` needs the admin role; the
+creating role owns the key. The owner and admins may `ALTER`, `DROP`
+and grant on it (no grant options). Using a key needs `WRAP`
+(`datax_key_wrap`, `datax_encrypt`) or `UNWRAP` (`datax_key_unwrap`,
+`datax_decrypt`); `USAGE` and `ALL` are both. The owner holds both. An
+admin who is not the owner holds neither until it grants them —
+usually to itself, in a statement the audit records — which keeps the
+roles that can recover data keys to the ones a key's grants name,
+rather than everyone with the admin role. A grant to `PUBLIC` is
+allowed. Ownership and grants are two columns of the key's row
+(`owner`, `privileges`: a JSON object of grantee → privileges), so they
+travel with `datax_keys` in backups and restores. `DROP ROLE` of a
+role that owns a key is refused (`2BP01`, "owner of encryption key
+k"); `REASSIGN OWNED` hands its keys on; `DROP OWNED` and `DROP ROLE`
+revoke the role's grants on keys. `DROP OWNED` of a role that owns a
+key is refused, as for a database it owns: dropping a key destroys
+everything wrapped under it, so it is never a side effect of removing
+a role — `DROP ENCRYPTION KEY` it, or `REASSIGN OWNED`, first.
+
+**The functions** are evaluated by the session once per call, before
+the statement's rows are read, as the large-object functions are: their
+arguments are constants or parameters, not columns (`0A000`, "read the
+value first and pass it as a parameter"). They are strict (a `NULL`
+argument gives `NULL`). Parameters type as `text, bytea, bytea`, so a
+driver sends a data key as bytea; pass data keys and values as
+parameters rather than literals, which would put them in the statement
+text that `pg_stat_activity` and the slow-statement list show.
+
+| Outcome | SQLSTATE |
+|---|---|
+| no key of that name | `42704` |
+| the role lacks the privilege | `42501` |
+| the key is disabled or destroyed | `55000` |
+| the blob does not open: the wrong key, the wrong context, a damaged or forged blob, the other kind of blob | `39000`, one message for all |
+| over the role's rate on this node | `53400` |
+| a value or context over 64 KiB | `54000` |
+| a connection neither TLS nor loopback | `28000` |
+| inside a transaction block (statements) | `25001` |
+
+A disabled key refuses unwrap and decrypt as well as wrap and encrypt,
+as a cloud KMS's disabled key refuses Decrypt: disabling is how an
+operator stops every use of a key at once without destroying it.
+
+**Blob format** (`pkg/keystore/blob.go`): one format byte (`0x01` a
+wrapped data key, `0x02` an encrypted value), the key's id (8 bytes)
+and version (4 bytes), a 12-byte random nonce, and the AES-256-GCM
+ciphertext and tag under that version's material — 41 bytes of
+overhead. The associated data is a fixed label, the format byte, the
+id, the version and the length-prefixed context. So unwrapping needs no
+version argument, a rotated key keeps opening blobs of its older
+versions, a blob opens only under the key whose id it carries (another
+key's name fails), only with its context, and only as its own kind (a
+wrapped key is not a value to `datax_decrypt`). Every way of not
+opening is the same error, so a caller probing contexts learns
+nothing from the message.
+
+**Transport.** The functions carry key material. The SQL server marks
+each session with whether its client is on TLS or on a loopback address
+or Unix socket (`Session.SetTransport`), and the functions are refused
+on a connection that is neither (`28000`). A secure cluster already
+refuses cleartext SQL, and the cluster key needs a secure cluster, so
+the rule bites only if that ever changes; the check is in the session
+so that it does not depend on it.
+
+**Gateway cache and leases** (`keystore.Cache`, shared with the
+sealing of tables in later steps). A gateway keeps unwrapped material
+per key and version in held memory and checks the key's row — its
+`generation`, which every change of state, version, owner or grants
+moves — at most a lease after its last check (10 s, the descriptor
+lease; `server.Config.KeyCacheLease`), dropping what it holds when the
+generation moved. The lease runs from when a check starts. So a change
+reaches every gateway within one lease, and the statements that take a
+use away — `DROP`, `DISABLE`, `REVOKE`, `OWNER TO`, and `DROP OWNED` /
+`REASSIGN OWNED` / `DROP ROLE` when they touch a key — wait out the
+lease after they commit before returning: once one returns, no gateway
+still uses what it removed. A refusal (no privilege, a disabled key) is
+checked against the row before it is given, so a `GRANT` or `ENABLE`
+made on another gateway takes effect at once. `ROTATE` does not wait:
+for up to a lease, other gateways still wrap under the previous
+version, which stays valid. A background sweep releases material no
+call has used for a lease.
+
+**Rate limit.** Each role has a token bucket on each node, a second's
+worth deep, refilled at the cluster setting `key_service.rate_limit`
+(operations a second; default 100; 0 is no limit; read by each gateway
+once a lease). A call past it is refused with `53400`
+(configuration_limit_exceeded): a configured limit was reached, and
+class 53 is what pools and drivers treat as "back off and retry", which
+is what the caller should do — and cache unwrapped data keys rather than
+unwrapping per read. 57P03 (cannot_connect_now) was the alternative and
+says the server is starting, which is false. The limit is per node, so
+the cluster-wide rate is at most the setting times the nodes a role
+reaches.
+
+`SET CLUSTER SETTING` is new with this step and knows only this
+setting; it is for admins, stored at `keys.ClusterSettingKey`, and
+audited (`cluster-setting`).
+
+**Audit.** Every call is recorded through `log.Audit` — the node's
+buffered path into the audit table — as `key-use` with the session user
+as principal, the key's name as target, and `role`, `op`, `key_id`,
+`version` and the outcome (`ok`, `denied`, `disabled`, `destroyed`,
+`failed` for a blob that did not open, `no-such-key`, `too-large`);
+never the data, the blob, the material or the context. The audit table
+folds repeats of the same record within one flush (a second) into one
+row with a `count`, so a hot loop is a row a second per distinct use,
+not a row per call; the log line is written for every call. A
+rate-limit refusal is `key-use-throttled`, one of the refusals the audit
+table records at a bounded rate and counts into `audit-gap` past it.
+The statements are recorded as `key-ddl`, `privilege-ddl` and
+`ownership-ddl`.
+
+**Catalog.** `SELECT * FROM datax_keys` (admins) shows each key's
+metadata, now with `owner` and `privileges`, and never material.
+`SHOW ENCRYPTION KEYS` lists name, state, version, owner, privileges
+and creation time: every key for an admin, the keys a role owns or
+holds a privilege on otherwise.
 
 ## Secondary indexes (v2)
 

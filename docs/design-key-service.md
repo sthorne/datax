@@ -1,13 +1,15 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed; step 1 built** (issue #310, the last piece of #292).
+Status: **agreed; steps 1 and 2 built** (issue #310, the last piece of #292).
 The issue asked for a written design to be agreed before any code. This
 is that design; the owner settled its five open decisions on
 2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
 of work — the cluster key, `datax_keys`, hand-over, export and import —
 is built (docs/encryption.md, "Cluster key"); the choices it made where
-this design was open are under *Choices made in step 1*. Nothing else
-described here exists yet.
+this design was open are under *Choices made in step 1*. Step 2, the
+key service (A below), is built too (docs/sql.md, "Encryption keys");
+its choices are under *Choices made in step 2*. Sealed tables (B) do
+not exist yet.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -332,3 +334,40 @@ Where the design above left a choice open, step 1 made these
   Import is refused before the target's own key is enabled; a
   whole-cluster restore refuses named keys it cannot open before applying
   anything, and rewraps them under the target's key after.
+
+## Choices made in step 2
+
+Where *A. The key service* left a choice open, step 2 made these
+(detail in docs/sql.md, "Encryption keys"):
+
+- **Who manages keys.** `CREATE ENCRYPTION KEY` needs the admin role;
+  the creator owns the key; the owner and admins alter, drop and grant
+  (no grant options), and `ALTER ENCRYPTION KEY ... OWNER TO` hands a
+  key on. Using a key needs `WRAP` or `UNWRAP`; the owner holds both,
+  an admin who is not the owner holds neither until granted. Owner and
+  grants are two new columns of the key's `datax_keys` row.
+- **Removing a role.** `DROP OWNED` refuses a role that owns a key
+  (dropping a key destroys what it wraps, so it is never a side effect);
+  `REASSIGN OWNED` moves keys; `DROP ROLE` refuses an owner and drops
+  the role's grants on keys.
+- **Disabled keys refuse unwrap and decrypt as well**, as a KMS's do.
+- **Blob format**: format byte, key id, version, nonce, AES-256-GCM;
+  41 bytes of overhead; the associated data binds the format, id,
+  version and context. One error (`39000`) for every blob that does not
+  open.
+- **Rate limit**: a token bucket per role per node, a second deep, at
+  the cluster setting `key_service.rate_limit` (default 100 a second; 0
+  none), introduced with `SET CLUSTER SETTING`; refused with `53400`.
+- **Audit volume**: each use is a `key-use` record through the buffered
+  audit path, and the audit table folds identical uses within a flush
+  into one row with a count; rate-limit refusals are refusals, recorded
+  at the audit table's bounded rate.
+- **Leases**: `DROP`, `DISABLE`, `REVOKE` and `OWNER TO` wait out the
+  gateway cache's lease (10 s) after committing; a refusal re-reads the
+  key first, so `GRANT` and `ENABLE` take effect at once; `ROTATE` does
+  not wait.
+- **The functions take constants or parameters**, evaluated once per
+  call like the large-object functions; a column argument is refused
+  with a pointer to pass the value as a parameter.
+- **The gateway cache is `keystore.Cache`**, meant to be shared with
+  sealed tables (step 3).

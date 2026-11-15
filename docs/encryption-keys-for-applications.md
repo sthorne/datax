@@ -1,12 +1,17 @@
 # Encryption keys for applications: what to expect
 
-**Status: agreed design, not built yet.** This guide describes how
-datax's per-tenant encryption and key service will behave, so that an
-application can shape its schema and its erasure process now. The
-design and its decisions are in
-[design-key-service.md](design-key-service.md) (issue #310). Statement
-names and syntax below are the planned ones and may still change in
-detail; the limits and guarantees will not.
+**Status: the key service is built; sealed tables are not yet.** The
+key service — named keys, `datax_key_wrap` / `datax_key_unwrap`,
+`datax_encrypt` / `datax_decrypt` and their privileges — works as
+described under [Using the key service](#using-the-key-service), on a
+cluster at version v22 with its cluster key enabled. Sealed tables
+(per-table and per-tenant keys, `datax_destroy_tenant_key`) are the
+agreed design, not built yet: this guide describes how they will
+behave so that an application can shape its schema and its erasure
+process now. The design and its decisions are in
+[design-key-service.md](design-key-service.md) (issue #310). The
+sealed-table statement names below are the planned ones and may still
+change in detail; the limits and guarantees will not.
 
 ## In one paragraph
 
@@ -213,6 +218,17 @@ SELECT datax_key_unwrap('documents', $wrapped, $context);
 ALTER ENCRYPTION KEY documents ROTATE;   -- new version; old blobs still unwrap
 ```
 
+The arguments are `text, bytea, bytea` and the result is `bytea`. Pass
+the data key, the blob and the context as **parameters** (`$1`, `$2`),
+not as literals in the statement text: statement text is shown to
+admins in `pg_stat_activity`. The functions take constants or
+parameters only, not columns: read a stored blob first, then pass it.
+
+Creating a key needs the admin role, and the creating role owns it;
+an admin can hand a key to your application's owning role with `ALTER
+ENCRYPTION KEY documents OWNER TO app_owner`. The owner (and admins)
+rotate, disable, drop and grant on it; the owner may also use it.
+
 - **Context.** Pass something that identifies what the key protects —
   the tenant id, or tenant id plus object id. A blob wrapped under one
   context will not unwrap under another, so one tenant's wrapped keys
@@ -230,10 +246,24 @@ ALTER ENCRYPTION KEY documents ROTATE;   -- new version; old blobs still unwrap
 - **Know what UNWRAP means.** A role allowed to unwrap under a key can
   recover every data key ever wrapped under it. Treat those credentials
   like the data itself.
+- **Admins are not readers by default.** An admin who does not own a
+  key can manage it but cannot wrap or unwrap under it until it is
+  granted the privilege — a grant the audit records.
 - **Every wrap and unwrap is audited** (who, key, version, operation,
   outcome; never the key material) in datax's audit table, and both are
-  **rate-limited per role**. Cache an unwrapped data key in memory for
+  **rate-limited per role** on each node (100 a second by default; an
+  operator changes it with `SET CLUSTER SETTING
+  key_service.rate_limit`). A call over the limit fails with SQLSTATE
+  `53400`: back off and retry. Cache an unwrapped data key in memory for
   as long as you work on its object rather than unwrapping it per read.
+- **Errors.** A blob that does not open — the wrong context, the wrong
+  key, or a damaged blob — fails with `39000` and the same message
+  whichever it is. A missing privilege is `42501`, an unknown key
+  `42704`.
+- **Disabling.** `ALTER ENCRYPTION KEY documents DISABLE` stops every
+  use of the key — wraps and unwraps both — on every node before the
+  statement returns (within about 10 seconds); `ENABLE` brings it
+  back. `REVOKE` takes effect the same way.
 - **Small values** (tokens, API secrets in a column) can instead use
   `datax_encrypt(key, plaintext, context)` / `datax_decrypt`, so the
   key never leaves datax. Values are capped at 64 KiB; use envelope
@@ -242,7 +272,8 @@ ALTER ENCRYPTION KEY documents ROTATE;   -- new version; old blobs still unwrap
   without TLS these functions only work from the same machine.
 - `DROP ENCRYPTION KEY documents` destroys every version: everything
   wrapped under it becomes unreadable, subject to the same backup
-  dependency as above.
+  dependency as above. The statement returns once no node uses the key
+  any more. The name stays taken; a new key needs a new name.
 
 ## What this does not protect against
 

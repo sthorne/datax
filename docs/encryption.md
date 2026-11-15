@@ -798,9 +798,9 @@ HSM protection levels), which the roots above use without knowing.
 The cluster key (#310) is the first piece of the key service designed in
 [design-key-service.md](design-key-service.md): one 32-byte key for the
 whole cluster, versioned, that wraps the **named keys** kept in the
-`datax_keys` system table. Nothing user-visible encrypts data with it
-yet — the key service's SQL and sealed tables are later steps — but the
-key, its distribution and its table are in place.
+`datax_keys` system table. The key service (below, *The key service*)
+keeps applications' named keys under it; sealed tables are a later
+step.
 
 ```
 root (per node)  wraps →  cluster key (one per cluster)  wraps →  named keys (datax_keys rows)
@@ -1005,6 +1005,60 @@ datax restore ...
   reach the cluster while the node it claims to be is not live (the same
   limit as peer unseal); and an export is exactly as safe as the root it
   is wrapped under.
+
+### The key service
+
+Step 2 of #310: applications keep named keys in `datax_keys` (kind
+`wrapping`) and ask datax to wrap and unwrap their own data keys under
+them, the way they would ask a cloud KMS — `CREATE ENCRYPTION KEY`,
+`datax_key_wrap` / `datax_key_unwrap`, `datax_encrypt` /
+`datax_decrypt`, `GRANT WRAP | UNWRAP | USAGE ON ENCRYPTION KEY`. The
+statements, functions, privileges and error codes are in
+[sql.md](sql.md), "Encryption keys"; what an application should expect
+is in [encryption-keys-for-applications.md](encryption-keys-for-applications.md).
+
+```
+cluster key  wraps →  named key "documents" (v1, v2, ...)  wraps →  the application's data keys (blobs it stores)
+```
+
+- **A blob** names the key's id and version and is sealed with
+  AES-256-GCM under that version's material, bound to the caller's
+  context. It is useless without the named key, which is useless
+  without the cluster key, which is useless without a node's root.
+- **Material leaves `datax_keys` only into a gateway's held memory**
+  (see *Keys in memory*), cached per key and version under a lease of
+  10 seconds that checks the key's generation. Disabling, destroying,
+  revoking or changing the owner of a key reaches every gateway within
+  that lease, and the statement waits it out before returning. Named
+  keys' material is never returned to a client; data keys are.
+- **Disabled keys refuse everything**, unwrap and decrypt included.
+- **Every use is audited** (who, which key and version, what, the
+  outcome; never material, data or context) and rate-limited per role
+  on each node (`SET CLUSTER SETTING key_service.rate_limit`).
+- **Transport.** The functions are refused on a connection that is
+  neither TLS nor loopback. (The cluster key needs a secure cluster,
+  whose SQL listener refuses cleartext, so in practice every remote
+  connection is TLS.)
+
+What it does not protect against, stated with the feature:
+
+- **A role holding `UNWRAP` (or `USAGE`) on a key can recover every
+  data key ever wrapped under it**, and so read whatever those data
+  keys encrypt, wherever it is stored. That is what `unwrap` is for
+  (decided in the design); treat such a role's credentials like the
+  data itself, and give writers `WRAP` alone. The same goes for
+  `datax_decrypt` and every value encrypted under the key.
+- An admin can grant itself `UNWRAP` on any key. It does not hold it
+  without that grant, and the grant is a recorded, visible statement,
+  but the admin role is in the trusted base.
+- A data key, once unwrapped, is the application's: datax cannot take
+  it back from an application's memory or from wherever it was copied.
+  Disabling or dropping a key stops further unwraps, not earlier ones.
+- `DROP ENCRYPTION KEY` destroys every version and purges the key's
+  record's history; backups taken before still hold the key (wrapped by
+  the cluster key) until they expire — the documented dependency of the
+  design, *Erasure*.
+- A compromised gateway, while it holds a key's material in its cache.
 
 ## Keys in memory
 
