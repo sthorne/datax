@@ -11,6 +11,24 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Full-text search** (#299): the `TSVECTOR` and `TSQUERY` types and the `@@`
+  operator, with `to_tsvector`, `to_tsquery`, `plainto_tsquery`,
+  `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`,
+  `ts_headline`, `setweight`, `strip`, `numnode`, `tsvector_to_array` and
+  `tsvector || tsvector`. Queries support and, or, not, phrases (`<->`,
+  `<N>`), prefixes (`word:*`) and weights. Two configurations: `simple`, and
+  `english` with a Snowball stemmer and stop words, chosen by
+  `default_text_search_config`. A GIN index on a `TSVECTOR` column, or on
+  `to_tsvector('english', text_column)`, makes `@@` an index lookup (`EXPLAIN`
+  shows an `inverted scan`); every row it finds is rechecked, so a phrase's
+  word order and a weight are verified against the real document. Ranking is
+  computed on the matching rows: `ORDER BY ts_rank(...) LIMIT k` reads every
+  match. The tokenizer and stemmer are datax's own and differ from
+  PostgreSQL's in places (hyphenated words, URLs, some numbers; the stemmer was
+  not checked against PostgreSQL's): see docs/user/postgres-differences.md.
+  Columns of the new types and full-text indexes need cluster protocol
+  version v21. The bench suite gains a `text-search` workload, and
+  `bench/workloads-large.json` runs it over a million documents.
 - **Large objects** (#303): values too big to be a row value — files,
   recordings, tens of megabytes to many gigabytes — are stored in 256 KiB
   pages and written and read as a stream through PostgreSQL's large-object
@@ -1100,6 +1118,15 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- **Online `CREATE INDEX` could keep entries for rows that changed while it
+  was waiting for every gateway to adopt the index** (found while building
+  #299). One gateway that had adopted the index wrote a row's entries,
+  another that had not yet changed or deleted the row, and the entries
+  stayed: queries through the index then reported "index entry points at a
+  missing row" or returned a row under a value it no longer held. The build
+  now empties the index after the wait and before its backfill, which
+  rewrites every row's entries. A build of a heavily written table does one
+  more pass over the new index.
 - A store on the balanced profile could sit at its L0 backpressure gate
   indefinitely after a long run of writes in key order: non-overlapping L0
   files never triggered a compaction below the gate's file count (#303).
