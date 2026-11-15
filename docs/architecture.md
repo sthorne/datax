@@ -151,8 +151,19 @@ cluster (issue #311):
   last (`server.descWatcher`), the read an incremental backup makes, and
   each keeps only what it needs (the tables with a GC window or a
   retention; those with a retired layout). An idle pass returns no rows.
+- **The statistics sampler** (issue #316) follows the descriptor and
+  statistics spans the same way, both as of one timestamp: an idle tick
+  returns no rows, and a tick that collects a table reads two (the
+  record it wrote last tick, the descriptor it collects).
 - **The dropped-table reclaim** reads the records of dropped tables
-  waiting to be reclaimed, not the catalog.
+  waiting to be reclaimed, not the catalog. The one-time sweep for
+  tables dropped before those records (issue #316) walks the ids that
+  hold rows once per cluster, a bounded number per pass.
+- **The metrics recorder's per-table and per-index series** (issue
+  #316) are written only when they change, plus a keyframe every 60
+  ticks, from v22; `/api/metrics` fills in the ticks between
+  (`server/metrics_sparse.go`). At 5,000 tables a tick wrote about
+  13,200 rows and writes about 370.
 
 What still reads every table descriptor: `catalog.Accessor.List`, used
 by `information_schema.tables`, `.columns` and `.views` (which list
@@ -162,15 +173,32 @@ granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`),
 `regclass` name resolution, a build of the schema document, and the
 table gauges (`table.rows`, `table.ranges`, `datax_table_*`), which the
 leader of range 1 reads once per recorder tick and any node reads when
-`/metrics` is scraped — a series per table costs a row per table.
-Backup, recovery and the statistics refresher (every minute, which also
-reads every statistics record) scan the descriptor span directly.
+`/metrics` is scraped — a series per table costs a row per table read,
+though from v22 only the changed ones are written. Backup and recovery
+scan the descriptor span directly, and the statistics sampler, the
+retention provider and the re-shard janitor read it whole on their
+first pass after a start.
 Sequences, types and roles are still listed whole by the catalog views.
 `TestCatalogScanScale` measures the passes above (rows read out of the
 descriptor span, one node): at 1,000 and 5,000 tables, DROP TABLE reads
 1,004 and 5,004 descriptor rows by the old check and 2 by the records;
 a retention refresh or a re-shard janitor pass reads about 1,000 and
-5,000 on its first pass and 0 on an idle one after (1 after a DROP).
+5,000 on its first pass and 0 on an idle one after (1 after a DROP); a
+statistics sampler tick read about 1,000 and 5,000 (descriptors and
+statistics records) on every tick and reads 2 while collecting.
+`TestMetricsRecorderScale` measures the rows the recorder writes per
+tick.
+
+The first pass after a start (of the retention provider, the re-shard
+janitor and the statistics sampler) still reads every descriptor once,
+and so does the first pass of a node that has just taken range 1's
+leadership. Persisting the watcher's timestamp would not remove that
+read on its own: each job keeps state derived from every descriptor,
+which would have to be persisted beside the timestamp — per node for the
+provider, replicated for the two jobs that follow range 1's leader — in
+a format both sides of an upgrade agree on, and the full read is what
+corrects it when it is wrong. At 5,000 tables that read is about 5,000
+rows in 20–40 ms, once per start per job (issue #316 left it).
 
 ## Versioning and rolling upgrades
 

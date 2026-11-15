@@ -344,8 +344,23 @@ gives its space back within a minute or two, and gives up `AS OF
 SYSTEM TIME` reads of it at the same rate. Views hold no rows and leave
 no record; nor do the cluster's own tables, whose ids are reserved. A
 restore of everything clears the rows and record of any dropped table
-whose id a restored table takes. Tables dropped before this change have
-no record and are not reclaimed.
+whose id a restored table takes.
+
+Tables dropped before this change have no record. Once the cluster has
+finalized v22 the node leading range 1 sweeps for them once
+(`pkg/server/dropped_sweep.go`, issue #316): an id up to the descriptor
+id generator's value when the sweep began, below the reserved range,
+that holds a live row and has no descriptor of any kind, no record and
+no table restore in flight naming it — all read in one transaction, so
+a table being created, whose descriptor and rows commit together, is
+seen whole or not at all — gets the record DROP TABLE would have
+written, dated when the sweep found it, with the node's GC TTL as its
+window (the drop's own time and the table's own `gc_ttl` are gone with
+the descriptor). The reclaim then clears it once that window has passed
+since the sweep saw it. The sweep keeps its progress
+(`keys.DroppedTableSweepKey`) in the transaction that writes each
+record, so it resumes where it stopped and records nothing twice, and
+marks itself done when it reaches the end.
 ### Sealed tables (v22)
 
 `CREATE TABLE ... WITH (encryption_key = 'auto')` makes a **sealed

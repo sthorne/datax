@@ -74,6 +74,18 @@ func (n *Node) droppedTableReclaimLoop(ctx context.Context) {
 		if !ok || !r1.IsLeader() {
 			continue
 		}
+		// The one-time sweep for tables dropped before the records
+		// (dropped_sweep.go) writes records for this job to act on.
+		for began := time.Now(); time.Since(began) < droppedSweepTickBudget && n.ClusterVersion() >= version.V22; {
+			done, err := n.droppedTableSweep(ctx)
+			if err != nil {
+				log.Debugf("dropped-table sweep: %v", err)
+				break
+			}
+			if done {
+				break
+			}
+		}
 		n.RunDroppedTableReclaimOnce(ctx)
 	}
 }
@@ -113,15 +125,15 @@ func (n *Node) RunDroppedTableReclaimOnce(ctx context.Context) int {
 			continue
 		}
 		opID := newOpID()
-		n.events.RecordStart("drop-reclaim", opID, "reclaiming dropped table %s (id %d)", rec.Name, rec.ID)
+		n.events.RecordStart("drop-reclaim", opID, "reclaiming dropped table %s (id %d)", rec.Label(), rec.ID)
 		if err := n.reclaimDroppedTable(ctx, rec); err != nil {
-			n.events.RecordEnd("drop-reclaim", opID, "failed", "reclaiming dropped table %s (id %d): %v", rec.Name, rec.ID, err)
-			log.Warnf("dropped-table reclaim: table %s (id %d): %v", rec.Name, rec.ID, err)
+			n.events.RecordEnd("drop-reclaim", opID, "failed", "reclaiming dropped table %s (id %d): %v", rec.Label(), rec.ID, err)
+			log.Warnf("dropped-table reclaim: table %s (id %d): %v", rec.Label(), rec.ID, err)
 			continue
 		}
-		n.events.RecordEnd("drop-reclaim", opID, "ok", "reclaimed dropped table %s (id %d)", rec.Name, rec.ID)
+		n.events.RecordEnd("drop-reclaim", opID, "ok", "reclaimed dropped table %s (id %d)", rec.Label(), rec.ID)
 		log.Infof("dropped-table reclaim: table %s (id %d) dropped at %s: span cleared",
-			rec.Name, rec.ID, time.Unix(0, rec.DroppedAt).UTC().Format(time.RFC3339))
+			rec.Label(), rec.ID, time.Unix(0, rec.DroppedAt).UTC().Format(time.RFC3339))
 		done++
 	}
 	return done
@@ -158,7 +170,7 @@ func (n *Node) reclaimDroppedTable(ctx context.Context, rec *catalog.DroppedTabl
 		if !rep.Complete {
 			// The collection is replicated: a replica that did not answer
 			// applies it when it does. The rows are deleted either way.
-			log.Infof("dropped-table reclaim: table %s (id %d): purge incomplete: %s", rec.Name, rec.ID, incompleteSuffix(rep))
+			log.Infof("dropped-table reclaim: table %s (id %d): purge incomplete: %s", rec.Label(), rec.ID, incompleteSuffix(rep))
 		}
 	}
 	return n.db.RunTxn(ctx, "drop-reclaim-record", func(ctx context.Context, txn *kvclient.Txn) error {
