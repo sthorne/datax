@@ -412,10 +412,12 @@ A running node hands the root key over only when all of these hold:
   runs under;
 - its node id is a member of the cluster and is not being
   decommissioned;
-- that node is **not live**: its last heartbeat is older than the
-  liveness grace (15 s by default), so a second copy of a running node
-  is handed nothing. A node restarted at once therefore waits out the
-  grace, asking every two seconds;
+- that node is **not live**: the last heartbeat the answering node
+  knows of is older than the liveness grace (15 s by default), so a
+  second copy of a running node is handed nothing. A node restarted at
+  once therefore waits, asking every two seconds — for the grace less
+  however stale the answering node's knowledge was, which is up to two
+  heartbeat periods (six seconds);
 - peer unseal is on.
 
 The key crosses inside the TLS connection sealed under a key agreed for

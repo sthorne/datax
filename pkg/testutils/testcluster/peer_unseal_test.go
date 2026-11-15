@@ -170,9 +170,12 @@ func TestPeerUnseal(t *testing.T) {
 		default:
 			t.Fatalf("n%d restarted without ever being sealed", i+1)
 		}
-		if waited := time.Since(stopped); waited < grace-3*time.Second {
-			// The peers' picture of the node's last heartbeat is up to
-			// one heartbeat old, so "the grace" is not exact from here.
+		// A peer judges "not live" by the last heartbeat it knows of, and
+		// what it knows is as old as the node's last heartbeat (every 3s)
+		// plus its own last read of the registry (every 3s). So the wait
+		// seen from here, measured from the stop, can be up to two such
+		// periods short of the grace; it cannot be nothing.
+		if waited := time.Since(stopped); waited < grace-7*time.Second {
 			t.Fatalf("n%d was handed the key %s after it stopped, while a node with its id could still have been running (grace %s)", i+1, waited, grace)
 		}
 		if kind, id := tc.Nodes[i].EncryptionRoot(); kind != "shares" || id != keyID {
@@ -272,9 +275,21 @@ func TestPeerUnseal(t *testing.T) {
 			t.Fatalf("cold start, n%d: %v", i+1, err)
 		}
 	}
-	// What n1 did is on its record.
-	doc := tc.Nodes[0].SecurityStores()
-	if len(doc) != 1 || doc[0].PeerUnseal == nil || !doc[0].PeerUnseal.Enabled || doc[0].PeerUnseal.Granted < 2 {
-		t.Fatalf("n1's record of the cold start: %+v", doc)
+	// What was done is on record: n1 handed the key over at least once,
+	// and two hand-overs happened in all — the third node may have asked
+	// the second, which by then held the key too.
+	granted := int64(0)
+	for i, n := range tc.Nodes {
+		doc := n.SecurityStores()
+		if len(doc) != 1 || doc[0].PeerUnseal == nil || !doc[0].PeerUnseal.Enabled {
+			t.Fatalf("n%d's record of the cold start: %+v", i+1, doc)
+		}
+		if i == 0 && doc[0].PeerUnseal.Granted < 1 {
+			t.Fatalf("n1, the only node unsealed by people, handed the key to nobody: %+v", *doc[0].PeerUnseal)
+		}
+		granted += doc[0].PeerUnseal.Granted
+	}
+	if granted < 2 {
+		t.Fatalf("%d hand-overs recorded for two nodes that started without shares", granted)
 	}
 }
