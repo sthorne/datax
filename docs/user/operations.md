@@ -506,6 +506,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_storage_disk_slow_total` | increasing | disk latency spikes |
 | `datax_txn_retries_total` vs `datax_txn_commits_total` | ratio ≫ a few % | heavy contention; look for missing `FOR UPDATE` or hot rows |
 | `datax_deadlock_aborts_total` | increasing | lock cycles between transactions |
+| `datax_txn_pushes_total` vs `datax_txn_commits_total` | ratio climbing well above 1 | transactions are queueing behind each other's locks; each push is a blocked transaction asking the holder's record whether it has finished |
 | `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |

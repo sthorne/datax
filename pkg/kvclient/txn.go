@@ -1186,6 +1186,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				PushAbort:     pushAbort,
 				Now:           t.db.clock.Now(),
 			})
+			metrics.TxnPushes.Inc()
 			br, kerr := t.db.Send(ctx, ba)
 			if kerr != nil {
 				return nil, kerr
@@ -1195,6 +1196,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 				// A parallel commit in flight: run status recovery, then let
 				// the next push observe the finalized record.
 				t.db.recoverStagedTxn(ctx, intent.Txn, push)
+				metrics.TxnPushes.Inc()
 				br, kerr = t.db.Send(ctx, ba)
 				if kerr != nil {
 					return nil, kerr
