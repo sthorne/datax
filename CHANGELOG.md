@@ -1293,6 +1293,10 @@ state or the internode protocol does, and an entry below says so.
   protocol version v22.
 
 ### Fixed
+- **`'1 ms'::interval` was a minute** and `'1 us'` was refused: interval
+  units were matched after a trailing "s" was taken off, so the
+  abbreviations `ms` and `us` read as `m` and `u`. Both now mean what
+  PostgreSQL means; plural units are unchanged.
 - **Online `CREATE INDEX` could keep entries for rows that changed while it
   was waiting for every gateway to adopt the index** (found while building
   #299). One gateway that had adopted the index wrote a row's entries,
