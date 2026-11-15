@@ -193,8 +193,22 @@ func (n *Node) metricsRecorderLoop(ctx context.Context) {
 
 // recordMetricsOnce writes one tick of samples (or skips it, counted).
 func (n *Node) recordMetricsOnce(ctx context.Context, interval time.Duration) {
+	at := n.clock.Now().WallTime
+	at -= at % interval.Nanoseconds()
+	n.recordMetricsAt(ctx, interval, at)
+}
+
+// RecordMetricsAt writes one recorder tick stamped at, which must be a
+// multiple of interval — for tests and measurements, which need ticks
+// faster than the clock gives them. It returns the rows written into
+// the metrics table (-1 when the tick wrote nothing: skipped or failed).
+func (n *Node) RecordMetricsAt(ctx context.Context, interval time.Duration, at time.Time) int {
+	return n.recordMetricsAt(ctx, interval, at.UnixNano()-at.UnixNano()%interval.Nanoseconds())
+}
+
+func (n *Node) recordMetricsAt(ctx context.Context, interval time.Duration, at int64) int {
 	if n.metricsPaused.Load() {
-		return
+		return -1
 	}
 	// One tick's budget: a multi-range INSERT under a re-shard or a busy
 	// store can outlast a short interval; ticks are sequential, so a slow
@@ -208,29 +222,35 @@ func (n *Node) recordMetricsOnce(ctx context.Context, interval time.Duration) {
 	}
 	wctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	if n.readClusterVersion(wctx) < version.V5 {
-		return // rule 4: nothing creates the table before finalize
+	ver := n.readClusterVersion(wctx)
+	if ver < version.V5 {
+		return -1 // rule 4: nothing creates the table before finalize
 	}
 	if !n.metricsReady.Load() {
 		if err := n.ensureMetricsTable(wctx); err != nil {
 			log.Debugf("metrics recorder: creating %s: %v", catalog.MetricsTableName, err)
-			return
+			return -1
 		}
 		n.metricsReady.Store(true)
 	}
 	if n.engine != nil {
 		if overloaded, _ := n.engine.Overloaded(); overloaded {
 			metrics.MetricsRecordSkipped.Inc()
-			return
+			return -1
 		}
 	}
 	r1, _ := n.store.GetReplica(1)
 	leader := r1 != nil && r1.IsLeader()
-	at := n.clock.Now().WallTime
-	at -= at % interval.Nanoseconds()
-	rows := n.sampleMetrics(leader)
+	rows, unknown := n.sampleMetrics(leader)
 	if len(rows) == 0 {
-		return
+		return -1
+	}
+	// From v22 the per-table and per-index series are written only when
+	// they change (metrics_sparse.go); a v21 node's /api/metrics would
+	// read the gaps as gaps.
+	commit := func() {}
+	if ver >= version.V22 {
+		rows, commit = n.metricsSparse.thin(rows, unknown, at, interval, int64(n.ident.NodeID), leader)
 	}
 	if err := n.writeMetricRows(wctx, catalog.MetricsTableName, at, rows); err != nil {
 		metrics.MetricsRecordErrors.Inc()
@@ -240,10 +260,13 @@ func (n *Node) recordMetricsOnce(ctx context.Context, interval time.Duration) {
 		}
 		if strings.Contains(err.Error(), "does not exist") {
 			n.metricsReady.Store(false) // dropped or restored away: recreate next tick
+			n.metricsSparse.reset()     // and write every series into the new one
 		}
-		return
+		return -1
 	}
+	commit()
 	n.recordShapesOnce(wctx, at)
+	return len(rows)
 }
 
 // ensureMetricsTable creates the table when it is missing.
@@ -277,6 +300,10 @@ type metricRow struct {
 	node  int64
 	name  string
 	value float64
+	// null writes a NULL value: the row that ends a sparse series.
+	null bool
+	// table is the table an index series belongs to (0 for others).
+	table uint64
 }
 
 // writeMetricRows inserts the tick's rows into table in one statement
@@ -296,7 +323,11 @@ func (n *Node) writeMetricRows(ctx context.Context, table string, at int64, rows
 		}
 		p := len(params)
 		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d)", p+1, p+2, p+3, p+4)
-		params = append(params, types.NewInt(r.node), types.NewString(r.name), types.NewTimestamp(at), types.NewFloat(r.value))
+		v := types.NewFloat(r.value)
+		if r.null {
+			v = types.DNull
+		}
+		params = append(params, types.NewInt(r.node), types.NewString(r.name), types.NewTimestamp(at), v)
 	}
 	stmts, err := parser.Parse(b.String())
 	if err != nil {
@@ -311,9 +342,10 @@ func (n *Node) writeMetricRows(ctx context.Context, table string, at int64, rows
 
 // sampleMetrics gathers this tick's rows: every per-node series for this
 // node and, when it leads range 1, the cluster-level series as node 0.
-func (n *Node) sampleMetrics(leader bool) []metricRow {
+// unknown are the tables whose index series could not be named this
+// tick (indexUsageRows).
+func (n *Node) sampleMetrics(leader bool) (rows []metricRow, unknown map[uint64]bool) {
 	self := int64(n.ident.NodeID)
-	var rows []metricRow
 	add := func(name string, v float64) { rows = append(rows, metricRow{node: self, name: name, value: v}) }
 
 	if n.sys != nil {
@@ -390,7 +422,14 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 	add("txn.retries", counterValue(metrics.TxnRetries))
 	add("kv.batch_p99_us", histogramQuantile(metrics.KVBatchLatency, 0.99)*1e6)
 	add("sql.rows_scanned", counterValue(metrics.SQLRowsScanned))
-	n.indexUsageRows(add)
+	n.indexUsageRows(func(name string, v float64, table uint64) {
+		rows = append(rows, metricRow{node: self, name: name, value: v, table: table})
+	}, func(table uint64) {
+		if unknown == nil {
+			unknown = map[uint64]bool{}
+		}
+		unknown[table] = true
+	})
 
 	if n.sqlServer() != nil {
 		if s := n.sqlServer().Activity().Summary(); s != nil {
@@ -422,7 +461,7 @@ func (n *Node) sampleMetrics(leader bool) []metricRow {
 			}
 		}
 	}
-	return rows
+	return rows, unknown
 }
 
 // histogramQuantile estimates a quantile from a cumulative Prometheus

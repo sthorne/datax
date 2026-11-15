@@ -1382,6 +1382,32 @@ state or the internode protocol does, and an entry below says so.
   span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
   measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
   protocol version v22.
+- **Tables dropped before dropped-table records are reclaimed** (#316). A table
+  dropped by a binary from before #313 left its rows under its id with
+  nothing naming them. Once the cluster has finalized v22, the node leading
+  range 1 sweeps once for ids that hold rows and have no descriptor, no
+  dropped-table record and no table restore in flight — never a reserved id,
+  never one issued after the sweep began — and records each as dropped when
+  it first sees it; the reclaim job clears it once the GC TTL has passed from
+  then. The sweep is resumable and records nothing twice. Cluster protocol
+  version v22.
+- **The statistics sampler reads only what changed** (#316). Its tick read every
+  descriptor and every statistics record to pick the stalest table; it now
+  reads both once and then only what was written since its last tick, as of
+  one timestamp: at 5,000 tables a tick read 5,000 rows and reads 2 while it
+  is collecting (the record it wrote last tick and the descriptor it
+  collects), none with nothing to collect.
+- **The metrics recorder writes the table and index series only when they
+  change** (#316). Every tick wrote a `table.ranges` (and `table.rows`) row per
+  table and an `index.scans` and `index.rows` row per index the node had
+  read; from cluster protocol version v22 those are written when the value
+  changes, once every 60 ticks regardless, and once with a NULL value when the
+  series ends, beside a `recorder.tick` row per tick. `/api/metrics` and the
+  dashboard fill in the unwritten ticks, so an idle table charts exactly as
+  before. At 5,000 tables a tick wrote about 13,200 rows and writes about 370
+  idle (1,000 tables: 3,042 → 94). New harness `TestMetricsRecorderScale`
+  (`DATAX_CATALOG_SCALE`). A plain SQL query of `datax_metrics` sees the
+  sparse rows; docs/user/operations.md says how to read them.
 
 ### Fixed
 - **A transaction whose commit failed kept its rows locked for up to five

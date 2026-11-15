@@ -241,9 +241,17 @@ func counterIncrease(pts []tsample) (inc float64, lastRise int64) {
 // (tableDesc), which reads the descriptors of the tables this node has
 // read through and no others; an index of a table it has not read yet
 // (just created) waits a tick.
-func (n *Node) indexUsageRows(add func(name string, v float64)) {
+//
+// A table the cache does not hold this tick (it holds tableDescCacheMax)
+// is passed to unknown: its series are not sampled this tick, but they
+// have not ended either (metrics_sparse.go).
+func (n *Node) indexUsageRows(add func(name string, v float64, table uint64), unknown func(table uint64)) {
 	for _, u := range sql.IndexUsageSnapshot() {
-		d := n.tableDesc(u.TableID)
+		d, known := n.tableDescKnown(u.TableID)
+		if !known {
+			unknown(u.TableID)
+			continue
+		}
 		if d == nil || catalog.IsSystemTable(d.Name) {
 			continue
 		}
@@ -261,7 +269,7 @@ func (n *Node) indexUsageRows(add func(name string, v float64)) {
 		if name == "" {
 			continue // an index dropped since, or a retired layout's
 		}
-		add(labelledSeries("index.scans", "index", indexUsageLabel(d.Name, name)), float64(u.Scans))
-		add(labelledSeries("index.rows", "index", indexUsageLabel(d.Name, name)), float64(u.Rows))
+		add(labelledSeries("index.scans", "index", indexUsageLabel(d.Name, name)), float64(u.Scans), u.TableID)
+		add(labelledSeries("index.rows", "index", indexUsageLabel(d.Name, name)), float64(u.Rows), u.TableID)
 	}
 }

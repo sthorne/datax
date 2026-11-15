@@ -345,6 +345,14 @@ type Node struct {
 	// reshardMu guards the re-shard janitor's view of the descriptors:
 	// the descriptors it has seen written, and of them the ones holding
 	// a retired layout (reshard_janitor.go).
+	// droppedSweepDone caches that the sweep for tables dropped before
+	// their records (dropped_sweep.go) has finished.
+	droppedSweepDone atomic.Bool
+	// metricsSparse is what the metrics recorder last wrote of each
+	// series it writes only on change.
+	metricsSparse metricsSparseState
+	// statsRefresh is the statistics sampler's view of the catalog.
+	statsRefresh   statsRefreshState
 	reshardMu      sync.Mutex
 	reshardWatch   *descWatcher
 	reshardRetired map[uint64][]byte

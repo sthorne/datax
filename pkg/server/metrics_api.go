@@ -75,7 +75,8 @@ type MetricsResult struct {
 
 // MetricResult is one series' points per node: [t_ms, value] pairs in
 // time order; buckets with no sample are absent (a restart shows as a
-// gap, not as a line to zero).
+// gap, not as a line to zero). A series written only on change
+// (metrics_sparse.go) reads as if it had been written every tick.
 type MetricResult struct {
 	Name  string `json:"name"`
 	Kind  string `json:"kind"`
@@ -290,6 +291,31 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string, admin bo
 	if interval <= 0 {
 		interval = defaultMetricsRecordInterval
 	}
+	// The sparse series (metrics_sparse.go) are filled in at the ticks a
+	// node's recorder marked, read once per node per request.
+	horizon := (metricsKeyframeTicks + 1) * interval.Nanoseconds()
+	marks := map[int64][]int64{}
+	tickMarks := func(id int64) ([]int64, error) {
+		if m, ok := marks[id]; ok {
+			return m, nil
+		}
+		stmt, err := queryFor(catalog.MetricsTableName)
+		if err != nil {
+			return nil, err
+		}
+		r, serr := sess.Execute(ctx, stmt, []types.Datum{types.NewInt(id), types.NewString(metricsTickSeries), types.NewTimestamp(int64(from)), types.NewTimestamp(int64(to))})
+		if serr != nil {
+			return nil, serr
+		}
+		m := make([]int64, 0, len(r.Rows))
+		for _, row := range r.Rows {
+			if len(row) == 2 && !row[0].Null {
+				m = append(m, row[0].I)
+			}
+		}
+		marks[id] = m
+		return m, nil
+	}
 	var texts map[string]string
 	for _, name := range names {
 		name = strings.TrimSpace(name)
@@ -318,8 +344,15 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string, admin bo
 		if def.Cluster {
 			targets = []int64{0}
 		}
+		sparse := sparseSeries(name) && table == catalog.MetricsTableName
 		for _, id := range targets {
-			params := []types.Datum{types.NewInt(id), types.NewString(name), types.NewTimestamp(int64(from)), types.NewTimestamp(int64(to))}
+			lo := int64(from)
+			if sparse {
+				// A sparse series' value at the window's first ticks may
+				// have been written up to a keyframe period before it.
+				lo -= horizon
+			}
+			params := []types.Datum{types.NewInt(id), types.NewString(name), types.NewTimestamp(lo), types.NewTimestamp(int64(to))}
 			r, serr := sess.Execute(ctx, stmt, params)
 			if serr != nil {
 				if strings.Contains(serr.Error(), "does not exist") {
@@ -330,12 +363,27 @@ func (n *Node) queryMetrics(ctx context.Context, q map[string][]string, admin bo
 				}
 				return nil, http.StatusInternalServerError, serr
 			}
-			pts := make([]tsample, 0, len(r.Rows))
-			for _, row := range r.Rows {
-				if len(row) != 2 || row[0].Null || row[1].Null {
-					continue
+			var pts []tsample
+			if sparse {
+				ticks, err := tickMarks(id)
+				if err != nil {
+					return nil, http.StatusInternalServerError, err
 				}
-				pts = append(pts, tsample{t: row[0].I, v: row[1].F})
+				rows := make([]sparseRow, 0, len(r.Rows))
+				for _, row := range r.Rows {
+					if len(row) == 2 && !row[0].Null {
+						rows = append(rows, sparseRow{t: row[0].I, v: row[1].F, null: row[1].Null})
+					}
+				}
+				pts = fillSparse(rows, ticks, int64(from), horizon)
+			} else {
+				pts = make([]tsample, 0, len(r.Rows))
+				for _, row := range r.Rows {
+					if len(row) != 2 || row[0].Null || row[1].Null {
+						continue
+					}
+					pts = append(pts, tsample{t: row[0].I, v: row[1].F})
+				}
 			}
 			out := downsample(pts, int64(from), int64(step), mr.Rate, 3*interval.Nanoseconds())
 			if len(out) > 0 {
@@ -361,15 +409,38 @@ func (n *Node) rawSeries(ctx context.Context, name string, node int64, from, to 
 	if err != nil {
 		return nil, err
 	}
+	lo := from.UnixNano()
+	sparse := sparseSeries(name)
+	if sparse {
+		// The value as of `from` of a series written only on change
+		// (metrics_sparse.go) may have been written up to a keyframe
+		// period before it: read back that far and keep the newest
+		// such row, as the sample a tick at the window's start held.
+		interval := n.metricsRecordInterval()
+		if interval <= 0 {
+			interval = defaultMetricsRecordInterval
+		}
+		lo -= (metricsKeyframeTicks + 1) * interval.Nanoseconds()
+	}
 	r, serr := sess.Execute(ctx, stmts[0], []types.Datum{
 		types.NewInt(node), types.NewString(name),
-		types.NewTimestamp(from.UnixNano()), types.NewTimestamp(to.UnixNano())})
+		types.NewTimestamp(lo), types.NewTimestamp(to.UnixNano())})
 	if serr != nil {
 		return nil, serr
 	}
 	pts := make([]tsample, 0, len(r.Rows))
 	for _, row := range r.Rows {
-		if len(row) != 2 || row[0].Null || row[1].Null {
+		if len(row) != 2 || row[0].Null {
+			continue
+		}
+		if sparse && row[0].I < from.UnixNano() {
+			pts = pts[:0]
+			if !row[1].Null {
+				pts = append(pts, tsample{t: from.UnixNano(), v: row[1].F})
+			}
+			continue
+		}
+		if row[1].Null {
 			continue
 		}
 		pts = append(pts, tsample{t: row[0].I, v: row[1].F})

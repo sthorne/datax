@@ -2,12 +2,14 @@ package testcluster
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
@@ -112,5 +114,102 @@ func TestBackgroundStatsSampler(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	if after := testutil.ToFloat64(metrics.StatsRefreshes); after != before {
 		t.Fatalf("sampler re-collected fresh stats (%v -> %v)", before, after)
+	}
+}
+
+// TestStatsSamplerReadsWhatChanged: the sampler follows the descriptor
+// and statistics spans through what changed since its last pass (#316)
+// rather than reading both in full every tick — an idle pass reads
+// nothing out of either — and still collects a table created since,
+// stops collecting one dropped since, and reaps an orphaned record that
+// appears after its first pass.
+func TestStatsSamplerReadsWhatChanged(t *testing.T) {
+	tc := StartWithOptions(t, 1, func(c *server.Config) {
+		c.StatsRefreshInterval = -1 // passes run by hand
+		c.StatsStaleness = time.Hour
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	n := tc.Nodes[0]
+	s := sql.NewSession(n.DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s)
+	for _, q := range []string{
+		`CREATE TABLE w1 (id INT8 PRIMARY KEY)`,
+		`CREATE TABLE w2 (id INT8 PRIMARY KEY)`,
+		`INSERT INTO w1 VALUES (1), (2), (3)`,
+	} {
+		execSQL(t, ctx, s, q)
+	}
+
+	var rows atomic.Int64
+	dlo, dhi := keys.TableDescSpan()
+	slo, shi := keys.TableStatsSpan()
+	in := func(k, lo, hi keys.Key) bool { return k.Compare(lo) >= 0 && k.Compare(hi) < 0 }
+	n.DB().TestingSetSendObserver(func(_ context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) {
+		for i, ru := range ba.Requests {
+			k := ru.GetInner().Header().Key
+			if !(in(k, dlo, dhi) || in(k, slo, shi)) || br == nil || i >= len(br.Responses) {
+				continue
+			}
+			switch r := br.Responses[i]; {
+			case r.Scan != nil:
+				rows.Add(int64(len(r.Scan.Rows)))
+			case r.Export != nil:
+				rows.Add(int64(len(r.Export.Records)))
+			case r.Get != nil && r.Get.Value != nil:
+				rows.Add(1)
+			}
+		}
+	})
+	defer n.DB().TestingSetSendObserver(nil)
+	pass := func() int64 {
+		rows.Store(0)
+		n.RunStatsRefreshOnce(ctx)
+		return rows.Load()
+	}
+	hasStats := func(table string) bool {
+		raw, err := n.DB().Get(ctx, keys.TableStatsKey(tableID(t, ctx, n, table)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw != nil
+	}
+
+	// One table per pass: w1, then w2; the pass after reads back w2's
+	// record and finds nothing to collect.
+	pass()
+	pass()
+	if !hasStats("w1") || !hasStats("w2") {
+		t.Fatalf("not collected: w1=%v w2=%v", hasStats("w1"), hasStats("w2"))
+	}
+	pass()
+	if got := pass(); got != 0 {
+		t.Fatalf("an idle pass read %d descriptor/statistics rows, want 0", got)
+	}
+
+	// A table created since is collected; an orphan planted since is
+	// reaped; a table dropped since is no longer a candidate.
+	execSQL(t, ctx, s, `CREATE TABLE w3 (id INT8 PRIMARY KEY)`)
+	orphan := keys.TableStatsKey(999999)
+	if err := n.DB().Put(ctx, orphan, []byte(`{"table_id":999999,"row_count":1,"collected_at":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	pass()
+	if !hasStats("w3") {
+		t.Fatal("a table created after the first pass was not collected")
+	}
+	if raw, err := n.DB().Get(ctx, orphan); err != nil || raw != nil {
+		t.Fatalf("orphan not reaped: %v %v", raw != nil, err)
+	}
+	w2 := tableID(t, ctx, n, "w2")
+	execSQL(t, ctx, s, `DROP TABLE w2`)
+	before := testutil.ToFloat64(metrics.StatsRefreshes)
+	pass()
+	pass()
+	if after := testutil.ToFloat64(metrics.StatsRefreshes); after != before {
+		t.Fatalf("collected %v tables after the drop, want none", after-before)
+	}
+	if raw, err := n.DB().Get(ctx, keys.TableStatsKey(w2)); err != nil || raw != nil {
+		t.Fatalf("the dropped table's statistics are still there: %v %v", raw != nil, err)
 	}
 }
