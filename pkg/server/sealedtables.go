@@ -50,6 +50,7 @@ func sealKeyError(err error) error {
 		{keystore.ErrDisabled, rowseal.ErrKeyDisabled},
 		{keystore.ErrNotFound, rowseal.ErrKeyNotFound},
 		{keystore.ErrNoVersion, rowseal.ErrKeyNoVersion},
+		{keystore.ErrVersionDestroyed, rowseal.ErrKeyVersionDestroyed},
 	} {
 		if errors.Is(err, m.from) {
 			return m.to
@@ -125,6 +126,48 @@ func (k sealedTableKeys) DestroyKey(ctx context.Context, id int64) error {
 		return fmt.Errorf("key %d is destroyed, but the purge of its record's history is incomplete: %s", id, strings.Join(rep.Incomplete, "; "))
 	}
 	return nil
+}
+
+// RotateKey implements rowseal.RotatingKeyStore.
+func (k sealedTableKeys) RotateKey(ctx context.Context, id int64) (int, error) {
+	ks, err := k.n.KeyStore()
+	if err != nil {
+		return 0, err
+	}
+	key, err := ks.Rotate(ctx, id)
+	sealKeys(k).Invalidate(id)
+	if err != nil {
+		return 0, sealKeyError(err)
+	}
+	return key.Version, nil
+}
+
+// DestroyKeyVersions implements rowseal.RotatingKeyStore.
+func (k sealedTableKeys) DestroyKeyVersions(ctx context.Context, id int64, below int) (int, error) {
+	ks, err := k.n.KeyStore()
+	if err != nil {
+		return 0, err
+	}
+	_, n, rep, err := ks.DestroyVersions(ctx, id, below)
+	sealKeys(k).Invalidate(id)
+	if err != nil {
+		return n, sealKeyError(err)
+	}
+	if rep != nil && !rep.Complete {
+		log.Warnf("key %d: %d older versions destroyed, but the purge of its record's history is incomplete: %s", id, n, strings.Join(rep.Incomplete, "; "))
+	}
+	return n, nil
+}
+
+// Lease implements rowseal.RotatingKeyStore: the key cache's lease.
+func (k sealedTableKeys) Lease() time.Duration {
+	if c := k.n.keyCache(); c != nil {
+		return c.Lease()
+	}
+	if k.n.cfg.KeyCacheLease > 0 {
+		return k.n.cfg.KeyCacheLease
+	}
+	return keystore.DefaultCacheLease
 }
 
 // tableKeyPrefix begins the name of every sealed table's key ("table/"
@@ -211,6 +254,15 @@ func (n *Node) SweepOrphanTableKeys(ctx context.Context) (int, error) {
 		}
 		if d.Sealed() {
 			named[d.EncryptionKey.KeyID] = true
+		}
+		if d.Sealed() && d.EncryptionKey.Sealing {
+			// A table being sealed without a seal job (its record lost in
+			// a whole-cluster restore) would accept plain values forever.
+			if err := n.db.RunTxn(ctx, "seal-job-backstop", func(ctx context.Context, txn *kvclient.Txn) error {
+				return putSealJobFor(ctx, txn, &d)
+			}); err != nil {
+				return 0, err
+			}
 		}
 	}
 	destroyed := 0
