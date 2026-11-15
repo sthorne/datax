@@ -784,6 +784,10 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			if opts.noWait {
 				return nil, &LockNotAvailableError{Intents: live}
 			}
+			if rerr := t.cannotOutwait(live); rerr != nil {
+				t.publishWait(ctx, nil)
+				return nil, rerr
+			}
 			pending := &live[0]
 			// We are blocked on a live transaction: publish the wait edge
 			// and walk the chain for a cycle before backing off.
@@ -1091,6 +1095,65 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 	return nil
 }
 
+// cannotOutwait returns a retryable error when waiting for the live
+// intents a batch ran into cannot end in this transaction committing,
+// and nil when it can (the caller then waits as usual).
+//
+// An intent above the read timestamp on a key the transaction has read
+// is such a wait (issue #315). If the intent's transaction commits, its
+// version lands above our read timestamp inside a span we read. We were
+// blocked on it either to write the key — the write then goes above that
+// version (WriteTooOld) — or to read it, the intent being inside our
+// uncertainty window — the read then finds the version uncertain. Either
+// way our timestamp must move past the version, and the refresh that
+// moves it re-reads the span, finds the version and fails. What the wait
+// could buy is the holder aborting, or, for a read, the holder being
+// pushed past our uncertainty limit before it commits (the read then
+// passes beneath its version); a pusher able to abort the holder has
+// already done so, since these intents survived the push. Both are rare,
+// and a restart is always safe: returning now gives them up for the wait
+// we would otherwise spend learning that the holder committed. On the
+// bank workload a transfer that met a newer transfer of an account it
+// had read waited a poll (100 ms) or more and then failed its read of
+// the account as uncertain, nearly every time.
+//
+// With the read set no longer tracked the same holds for any intent
+// above the read timestamp: every timestamp push then ends in a restart.
+func (t *Txn) cannotOutwait(live []storage.Intent) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	readTS := t.mu.txn.ReadTimestamp
+	for i := range live {
+		in := &live[i]
+		if !readTS.Less(in.Txn.WriteTimestamp) {
+			continue
+		}
+		if !t.mu.refreshUnusable && !readSpansCover(t.mu.readSpans, in.Key) {
+			continue
+		}
+		e := kvpb.NewErrorf("transaction %s must restart: transaction %s is writing key %s at %s, above the read timestamp %s at which it was read",
+			t.mu.txn.ID, in.Txn.ID, in.Key, in.Txn.WriteTimestamp, readTS)
+		e.TxnRetry = &kvpb.TxnRetryError{RetryTimestamp: in.Txn.WriteTimestamp}
+		metrics.TxnRetries.Inc()
+		return &RetryableError{Cause: e}
+	}
+	return nil
+}
+
+// readSpansCover reports whether key lies in one of spans.
+func readSpansCover(spans []readSpan, key keys.Key) bool {
+	for _, sp := range spans {
+		if len(sp.end) == 0 {
+			if sp.start.Equal(key) {
+				return true
+			}
+		} else if !key.Less(sp.start) && key.Less(sp.end) {
+			return true
+		}
+	}
+	return false
+}
+
 // pushIntents pushes the owners of conflicting intents and returns the
 // intents whose transactions are still live. None means every intent was
 // resolved (the pushees were finalized, expired, or aborted by priority)
@@ -1372,6 +1435,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 			}
 			if len(live) == 0 {
 				continue
+			}
+			if rerr := t.cannotOutwait(live); rerr != nil {
+				return nil, true, rerr
 			}
 			if derr := t.detectDeadlock(ctx, &live[0]); derr != nil {
 				return nil, true, derr

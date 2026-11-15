@@ -1348,6 +1348,13 @@ state or the internode protocol does, and an entry below says so.
   who met one of its rows waited for the record to expire. The failed
   commit now aborts the record and resolves its intents before it
   returns.
+- **A transaction waited for a lock it could not outwait** (#315). Blocked
+  on another transaction's uncommitted write to a row it had itself read —
+  on the bank workload, a transfer whose account a newer transfer was
+  changing — a transaction polled until the other committed and then
+  failed with `40001` (usually "read within uncertainty interval"), since
+  the committed change invalidated its read. It now fails at once, unless
+  its priority lets it abort the other transaction, which it still does.
 - **`'1 ms'::interval` was a minute** and `'1 us'` was refused: interval
   units were matched after a trailing "s" was taken off, so the
   abbreviations `ms` and `us` read as `m` and `u`. Both now mean what

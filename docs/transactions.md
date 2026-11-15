@@ -468,6 +468,30 @@ conflict-wait timeout is a generous backstop (10s, up from v1's 2s), so
 waiters queueing behind a slow-but-live lock holder are no longer aborted
 by the clock.
 
+A wait that cannot end in a commit is not waited (issue #315,
+`Txn.cannotOutwait`). A transaction blocked on a live intent **above
+its read timestamp on a key it has read** — a write to an account it
+read, or a second read of it that finds the intent inside the
+uncertainty window — can commit only if the holder aborts: once the
+holder commits, its version sits inside one of the waiter's read spans
+above its read timestamp, the waiter's write must go above it
+(WriteTooOld) or its read finds it uncertain, and the refresh that would
+move the waiter's timestamp past it re-reads that span and fails. (A
+read can also pass beneath the version if the holder is pushed past the
+reader's uncertainty limit before committing — rare, given the
+500 ms window.) So after a push that leaves such an intent live — a
+pusher with the priority to abort the holder has already done so — the
+operation returns a retryable error at once instead of polling until
+the holder's commit makes it fail anyway. The same holds for any intent
+above the read timestamp once the transaction has read too much for its
+read set to be tracked, since every timestamp move then restarts it. A
+restart is always safe; what the rule gives up is the rare wait whose
+holder would have aborted. Serializability is untouched, since the rule
+only ever makes a transaction restart, and so are priorities: a
+stronger writer still aborts the holder instead of restarting. On the bank workload these waits were most of the attempts
+that ended in a `40001`, each a 100 ms poll or more; they now end in
+the push's round trip.
+
 Reads below a committed value's timestamp never block (MVCC). A foreign
 intent strictly above both the read timestamp and the uncertainty limit is
 **read beneath**, not pushed: resolution only moves a write's timestamp
