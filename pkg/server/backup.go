@@ -1215,6 +1215,13 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		for _, t := range final.Tables {
 			wb.Put(keys.TableDescKey(t.ID), []byte(t.Descriptor))
 			var d catalog.TableDescriptor
+			if json.Unmarshal(t.Descriptor, &d) == nil && d.IsView() {
+				// The reverse records of a view's dependencies are not in
+				// a backup; they are written with the view (issue #313).
+				for _, dep := range d.ViewDepends {
+					wb.Put(keys.ViewDependencyKey(dep, d.ID), []byte{1})
+				}
+			}
 			if json.Unmarshal(t.Descriptor, &d) == nil && d.DatabaseID != 0 {
 				wb.Put(keys.TableNamespaceKey(d.DatabaseID, t.Name), []byte(fmt.Sprintf("%d", t.ID)))
 			} else {

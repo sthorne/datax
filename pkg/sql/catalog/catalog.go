@@ -1325,6 +1325,11 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	if err := recordDroppedTable(ctx, txn, d); err != nil {
 		return nil, err
 	}
+	if d.IsView() {
+		if err := DeleteViewDependencies(ctx, txn, d.ID, d.ViewDepends); err != nil {
+			return nil, err
+		}
+	}
 	a.Invalidate(name)
 	return d, nil
 }

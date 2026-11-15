@@ -181,6 +181,8 @@ func prettySystem(b *strings.Builder, rest []byte) {
 		shape = "s"
 	case "nsdb", "seqns":
 		shape = "us"
+	case "viewdep":
+		shape = "uu"
 	case "lease":
 		shape = "uU"
 	}

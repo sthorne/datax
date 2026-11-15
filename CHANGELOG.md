@@ -1180,6 +1180,18 @@ state or the internode protocol does, and an entry below says so.
   timestamp cannot succeed. The KV error carries a typed detail
   (`BelowGCThreshold`); one from a node that predates it is recognized by
   its message.
+- **Fewer reads of every table descriptor** (#313, following #311). `DROP`,
+  `ALTER ... RENAME` and `DROP COLUMN` find the views reading a relation from
+  records kept under it rather than by reading every descriptor: at 5,000
+  tables a `DROP TABLE` read 5,004 descriptor rows and reads 2. The records
+  are written with each view; they are trusted from cluster protocol version
+  v22, once the node leading range 1 has recorded every existing view, and
+  until then the old check runs. The retention provider behind GC and the
+  re-shard janitor read every descriptor on their first pass and then only
+  the descriptors changed since (an incremental export of the descriptor
+  span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
+  measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
+  protocol version v22.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it

@@ -492,7 +492,9 @@ the view's query executes once as the member and the statement reads
 the materialized rows through the ordinary access path, so a view works
 wherever a table does and a view over a view expands as the member
 executes. Views record the relations they read (`ViewDepends`) for the
-drop / rename refusals; DML and physical DDL on a view are refused.
+drop / rename refusals, and from v22 each relation records the views
+reading it (`keys.ViewDependencyKey`, issue #313), which is what the
+refusals read once complete; DML and physical DDL on a view are refused.
 
 `ALTER COLUMN TYPE` is the third online state machine: publish a
 hidden shadow column (`RetypeFrom` names the original; every

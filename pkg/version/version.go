@@ -278,8 +278,20 @@ const (
 	// before reads the same.
 	V21 Version = 21
 
+	// V22 also introduces the reverse record of view dependencies (issue
+	// #313, keys.ViewDependencyKey): under each relation, the views whose
+	// query reads it, written in the transactions that create, replace
+	// and drop a view, so DROP, RENAME and DROP COLUMN find a relation's
+	// views without reading every descriptor. A v21 node creates views
+	// without the records, so they are not trusted until finalize: at
+	// v22 the node leading range 1 records every view once and marks the
+	// records complete (keys.ViewDependencyIndexKey), and until then the
+	// statements read every descriptor as before. The records are system
+	// keys a v21 node never reads.
+	V22 Version = 22
+
 	// Current is the newest cluster version this binary can run.
-	Current = V21
+	Current = V22
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

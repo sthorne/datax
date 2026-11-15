@@ -8,6 +8,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -57,12 +58,42 @@ func (n *Node) reshardKeepFor() time.Duration {
 // guard starts refusing before any rows disappear), then the layout's
 // keyspaces are wiped. Errors are logged, never fatal — an unreclaimed
 // layout is just disk.
+//
+// It reads the descriptors written since its last pass (descWatcher;
+// issue #313) and keeps, between passes, only the retired layouts of the
+// tables that have any, so an idle pass reads nothing however many
+// tables the cluster has.
 func (n *Node) RunReshardJanitorOnce(ctx context.Context) {
-	lo, hi := keys.TableDescSpan()
-	descKVs, err := n.db.Scan(ctx, lo, hi, 0)
+	n.reshardMu.Lock()
+	defer n.reshardMu.Unlock()
+	if n.reshardWatch == nil {
+		n.reshardWatch = &descWatcher{n: n}
+	}
+	full, recs, err := n.reshardWatch.next(ctx)
 	if err != nil {
-		log.Debugf("reshard janitor: descriptor scan: %v", err)
+		log.Debugf("reshard janitor: descriptors: %v", err)
 		return
+	}
+	if full || n.reshardRetired == nil {
+		n.reshardRetired = map[uint64][]byte{}
+	}
+	for _, rec := range recs {
+		id, ok := descIDOfKey(rec.Key)
+		if !ok {
+			continue
+		}
+		delete(n.reshardRetired, id)
+		if rec.Deleted {
+			continue
+		}
+		var d catalog.TableDescriptor
+		if json.Unmarshal(rec.Value, &d) == nil && d.ID != 0 && len(d.RetiredLayouts) > 0 {
+			n.reshardRetired[id] = rec.Value
+		}
+	}
+	descKVs := make([]kvpb.KeyValue, 0, len(n.reshardRetired))
+	for id, raw := range n.reshardRetired {
+		descKVs = append(descKVs, kvpb.KeyValue{Key: keys.TableDescKey(id), Value: raw})
 	}
 	// Paired only when there is something to reclaim: a janitor pass that
 	// finds nothing is not an operation, and a timeline that fills with

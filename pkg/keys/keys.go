@@ -314,6 +314,27 @@ func DroppedTableSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// ViewDependencyKey records that view viewID's query reads relation
+// relID (issue #313): the reverse of TableDescriptor.ViewDepends, so the
+// views depending on a relation are a scan of ViewDependencySpan(relID)
+// rather than of every descriptor. The value is one byte, 1.
+func ViewDependencyKey(relID, viewID uint64) Key {
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(systemKey("viewdep"), relID), viewID))
+}
+
+// ViewDependencySpan covers the views recorded as reading relID.
+func ViewDependencySpan(relID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("viewdep"), relID))
+	return p, p.PrefixEnd()
+}
+
+// ViewDependencyIndexKey says the ViewDependencyKey records are complete:
+// written once every view of the cluster has its records, which is only
+// known once no binary that does not write them can be running (cluster
+// version v22). Until it exists, the views depending on a relation are
+// found by scanning every descriptor.
+func ViewDependencyIndexKey() Key { return systemKey("viewdep-ready") }
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")
