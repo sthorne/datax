@@ -22,7 +22,7 @@ CREATE INDEX [IF NOT EXISTS] i ON t USING gin (jsonb_col [jsonb_ops | jsonb_path
 CREATE INDEX [IF NOT EXISTS] i ON t USING ivfflat (vector_col [vector_l2_ops | vector_cosine_ops | vector_ip_ops]) [WITH (lists = n)]   -- see Vectors below
 CREATE EXTENSION [IF NOT EXISTS] vector  -- accepted, does nothing: the type is built in
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
-DROP TABLE t
+DROP TABLE t                             -- rows reclaimed once the table's GC window has passed (below)
 CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
 CREATE TABLE t [(names [, PRIMARY KEY (cols)])] AS SELECT ... [WITH [NO] DATA]   -- streamed through the COPY chunk path
 CREATE TABLE t (LIKE src [INCLUDING | EXCLUDING DEFAULTS | CONSTRAINTS | INDEXES | COMMENTS | ALL], ...)
@@ -308,6 +308,34 @@ succeeds either way, because the rows are the result.
 
 `SET`, `RESET` and `PURGE` run outside a transaction block (`25001`
 inside one) and need table ownership.
+
+**A dropped table's rows** (issue #313). `DROP TABLE` removes the
+descriptor and the name and leaves the rows, with a record beside them
+(`catalog.DroppedTable` at `keys.DroppedTableKey`, written in the same
+transaction): the drop's time and the table's history window — its
+`gc_ttl`, a time-series table's retention, or the node's GC TTL. Until
+that window has passed the rows are still reachable, and must be: `AS
+OF SYSTEM TIME` below the drop resolves the table as it was and reads
+them, which is why PostgreSQL-like systems with history delay the
+reclaim. After it, the job on the node leading range 1
+(`pkg/server/dropped_tables.go`, every minute; it reads the records,
+not the catalog) deletes every row in chunked transactions, resuming
+after the last key, marks the record, purges the span (above), and
+removes the record. Each step is idempotent and the record is
+replicated, so a pass cut short by a restart or a move of range 1 is
+taken up on the next one. A read below the drop after the reclaim is
+refused as below the GC threshold, never answered short. The emptied
+ranges merge into their neighbours once the neighbours' own window has
+passed the purge: the merge queue keeps apart two ranges whose GC
+thresholds are further apart than that, since the merged range adopts
+the higher one. A table with a short `gc_ttl` is reclaimed that much
+sooner after its drop: `ALTER TABLE t SET (gc_ttl = '1s'); DROP TABLE t`
+gives its space back within a minute or two, and gives up `AS OF
+SYSTEM TIME` reads of it at the same rate. Views hold no rows and leave
+no record; nor do the cluster's own tables, whose ids are reserved. A
+restore of everything clears the rows and record of any dropped table
+whose id a restored table takes. Tables dropped before this change have
+no record and are not reclaimed.
 
 v2 additions: `CREATE [UNIQUE] INDEX name ON t (cols)`,
 `EXPLAIN SELECT ...` (one-line access plan), `ORDER BY` (in-memory sort,

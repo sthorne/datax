@@ -1295,7 +1295,9 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 }
 
 // Drop removes a table's descriptor and namespace entry. Row data is left
-// behind (unreachable; space reclamation is a GC concern, out of scope).
+// behind, readable AS OF SYSTEM TIME below the drop, and a DroppedTable
+// record beside it, by which the reclaim job clears the table's span once
+// the table's history window has passed (issue #313).
 func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*TableDescriptor, error) {
 	return a.DropIn(ctx, txn, DefaultDatabase, name)
 }
@@ -1318,6 +1320,9 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 		return nil, err
 	}
 	if err := txn.Delete(ctx, keys.TableDescKey(d.ID)); err != nil {
+		return nil, err
+	}
+	if err := recordDroppedTable(ctx, txn, d); err != nil {
 		return nil, err
 	}
 	a.Invalidate(name)

@@ -1141,6 +1141,26 @@ state or the internode protocol does, and an entry below says so.
   choice for the tab and says plainly that it will not be kept. The table
   is included in backups: it is small, and unlike the metrics it cannot
   be regenerated from anything.
+- **`DROP TABLE` gives the table's space back** (#313). A dropped table's rows
+  used to stay on disk for good. They now stay for the table's history window
+  — its `gc_ttl`, a time-series table's retention, or the node's GC TTL (25h
+  by default) — so `AS OF SYSTEM TIME` below the drop keeps working, and then
+  a job on the node leading range 1 deletes them, purges the span and lets
+  its ranges merge away. The job is resumable: the drop leaves a record in
+  the system span, and a pass cut short by a restart is taken up again. A
+  short `gc_ttl` set before the drop makes the reclaim correspondingly
+  prompt. Tables dropped before this release are not reclaimed. The
+  operations view shows each reclaim as a `drop-reclaim`.
+- A restore of everything into a cluster that had dropped tables could mix
+  their leftover rows into a restored table carrying the same id (a fresh
+  cluster hands out the same first ids as any other); the restore now clears
+  such an id's rows first (#313).
+- The merge queue no longer merges two ranges whose GC thresholds are further
+  apart than the lower side's GC window. A purged range's threshold is the
+  purge's time, and a merged range adopts the higher threshold, so a purged
+  range merged into its neighbour — the system range included — made the
+  neighbour refuse `AS OF SYSTEM TIME` reads and incremental backups below
+  the purge (#313).
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it

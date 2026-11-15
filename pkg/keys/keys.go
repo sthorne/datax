@@ -299,6 +299,21 @@ func RestoreProgressSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// DroppedTableKey holds the record DROP TABLE leaves for a table whose
+// rows are still on disk (JSON; issue #313): when it was dropped and
+// how long its history is kept. The reclaim job (pkg/server,
+// dropped_tables.go) clears the table's span once that window has
+// passed and then removes the record.
+func DroppedTableKey(tableID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("dropped"), tableID))
+}
+
+// DroppedTableSpan covers every dropped table's record.
+func DroppedTableSpan() (Key, Key) {
+	p := systemKey("dropped")
+	return p, p.PrefixEnd()
+}
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")

@@ -1226,12 +1226,18 @@ func (n *Node) reclaimRestore(ctx context.Context, opID string) bool {
 }
 
 // wipeSpan deletes every key in [start, end) in transactions of
-// restoreChunk deletes.
+// restoreChunk deletes. Each transaction resumes after the last key the
+// one before it deleted, so a large span is walked once rather than
+// rescanned past its own tombstones from the start every time. The
+// callers' spans take no new writes (no descriptor names them), so
+// nothing appears behind the cursor.
 func (n *Node) wipeSpan(ctx context.Context, start, end keys.Key) error {
+	cur := start.Clone()
 	for {
 		var found int
-		err := n.db.RunTxn(ctx, "restore-table-wipe", func(ctx context.Context, txn *kvclient.Txn) error {
-			kvs, err := txn.Scan(ctx, start, end, restoreChunk)
+		var last keys.Key
+		err := n.db.RunTxn(ctx, "wipe-span", func(ctx context.Context, txn *kvclient.Txn) error {
+			kvs, err := txn.Scan(ctx, cur, end, restoreChunk)
 			if err != nil {
 				return err
 			}
@@ -1243,11 +1249,13 @@ func (n *Node) wipeSpan(ctx context.Context, start, end keys.Key) error {
 			if wb.Len() == 0 {
 				return nil
 			}
+			last = keys.Key(kvs[len(kvs)-1].Key).Clone()
 			return txn.RunBatch(ctx, &wb)
 		})
-		if err != nil || found == 0 {
+		if err != nil || found < restoreChunk {
 			return err
 		}
+		cur = last.Next()
 	}
 }
 

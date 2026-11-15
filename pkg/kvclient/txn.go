@@ -209,6 +209,14 @@ func (db *DB) NewHistoricalTxn(name string, ts hlc.Timestamp) *Txn {
 	return t
 }
 
+// ReadTimestamp is the timestamp the transaction currently reads at. A
+// transaction commits at or above it.
+func (t *Txn) ReadTimestamp() hlc.Timestamp {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mu.txn.ReadTimestamp
+}
+
 // Historical reports whether this is a read-only transaction pinned at a
 // fixed past timestamp (NewHistoricalTxn). Catalog lookups key off it:
 // a historical transaction reads the descriptor version current AT its

@@ -206,6 +206,11 @@ type Config struct {
 	// before the janitor reclaims it (0 = the GC TTL, matching the
 	// deepest admissible historical read).
 	ReshardRetireFor time.Duration
+	// DroppedTableReclaimInterval is how often the node leading range 1
+	// looks for dropped tables whose history window has passed and clears
+	// their spans (0 = default 1m; negative disables it, and a dropped
+	// table's rows then stay).
+	DroppedTableReclaimInterval time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -901,6 +906,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.reshardJanitorLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.droppedTableReclaimLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {

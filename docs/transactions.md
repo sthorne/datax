@@ -593,6 +593,22 @@ them (truncated on that range's own schedule); and the device beneath
 the file system. On an encrypted store the same files are rewritten and
 deleted, whichever data key they were written under.
 
+### A dropped table's span
+
+`DROP TABLE` leaves the rows and a record of the drop
+(`catalog.DroppedTable`); once the table's history window has passed,
+the reclaim job (`pkg/server/dropped_tables.go`) deletes the rows and
+purges the span, as above (issue #313; docs/sql.md, "A dropped table's
+rows"). The purge's threshold of now is what refuses a late `AS OF
+SYSTEM TIME` read of the table; the merge queue keeps the emptied range
+apart from any neighbour whose own window has not yet passed that
+threshold (`Store.mergeWouldHideHistory`), because a merged range
+adopts the higher of the two thresholds and would otherwise refuse
+reads the neighbour still promises. That rule covers every purged
+range, not only a dropped table's: before it, a purged range merged
+into its neighbour — the system range among them — as soon as it was
+small enough.
+
 ## Invariants (asserted in tests)
 
 1. An intent is never resolved except per its record's state.

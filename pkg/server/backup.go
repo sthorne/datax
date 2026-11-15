@@ -1137,6 +1137,16 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			return nil, fmt.Errorf("the target cluster already has tables; restore requires an empty cluster")
 		}
 	}
+	// A table this cluster dropped may still have its rows under an id a
+	// restored table carries (issue #313).
+	for _, t := range final.Tables {
+		if catalog.IsSystemTableID(t.ID) {
+			continue
+		}
+		if err := n.clearTableIDForRestore(ctx, t.ID); err != nil {
+			return nil, err
+		}
+	}
 	n.metricsPaused.Store(true)
 	defer n.metricsPaused.Store(false)
 	restoresAudit := false

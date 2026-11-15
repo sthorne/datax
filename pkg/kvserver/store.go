@@ -228,6 +228,11 @@ type Store struct {
 	// store; see Replica.heardSinceStart.
 	startedAt hlc.Timestamp
 
+	// gcTTL is the store-wide GC window the last GC pass collected at,
+	// in nanoseconds (zero before the first pass, and while GC is off);
+	// the merge queue reads it (mergeWouldHideHistory).
+	gcTTL atomic.Int64
+
 	mu struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica

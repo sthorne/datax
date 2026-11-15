@@ -100,7 +100,7 @@ func (n *Node) RunReshardJanitorOnce(ctx context.Context) {
 		err := n.db.RunTxn(ctx, "reshard-janitor", func(ctx context.Context, txn *kvclient.Txn) error {
 			raw, err := txn.Get(ctx, keys.TableDescKey(d.ID))
 			if err != nil || raw == nil {
-				return err // dropped table: its layouts are orphaned with the rest of its data
+				return err // dropped table: its layouts go with the rest of its span (dropped_tables.go)
 			}
 			var cur catalog.TableDescriptor
 			if err := json.Unmarshal(raw, &cur); err != nil {

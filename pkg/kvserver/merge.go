@@ -174,6 +174,9 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 				return true
 			}
 		}
+		if !redrive && s.mergeWouldHideHistory(lhs, rhs) {
+			return true
+		}
 		if !rhs.isLeader() {
 			// Pull the RHS's leadership to this node, then merge on a later
 			// pass. TransferLeadership is forwarded to the current leader.
@@ -191,6 +194,40 @@ func (s *Store) RunRangeMergeOnce(ctx context.Context) {
 		}
 		return true
 	})
+}
+
+// mergeWouldHideHistory reports whether merging the pair would refuse
+// reads one side still serves. The merged range adopts the higher of the
+// two GC thresholds (stageMerge), so the side with the lower one would
+// lose the history between the two. Ordinarily that history is already
+// past its window — both sides collect at the same window, a few
+// housekeeping ticks apart, and pairs with different windows are kept
+// apart above — but a purge sets a range's threshold to now: a purged
+// range, a dropped table's reclaimed span among them (issue #313), would
+// otherwise push its neighbour's threshold up to the purge as soon as it
+// was small enough to merge. The pair waits until the lower side's own
+// window has passed the higher threshold (the default window when the
+// store collects at none).
+func (s *Store) mergeWouldHideHistory(lhs, rhs *Replica) bool {
+	lt, rt := lhs.GCThreshold(), rhs.GCThreshold()
+	if lt.Equal(rt) {
+		return false
+	}
+	low, high := lhs, rt
+	if rt.Less(lt) {
+		low, high = rhs, lt
+	}
+	ttl := time.Duration(s.gcTTL.Load())
+	if s.cfg.RetentionOverride != nil {
+		desc := low.Desc()
+		if t, _, ok := s.cfg.RetentionOverride(desc.StartKey, desc.EndKey); ok {
+			ttl = t
+		}
+	}
+	if ttl <= 0 {
+		ttl = base.DefaultGCTTL
+	}
+	return s.cfg.Clock.Now().WallTime-ttl.Nanoseconds() < high.WallTime
 }
 
 // replicaStartingAt returns this store's replica whose range starts exactly
