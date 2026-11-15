@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -282,6 +283,7 @@ func TestCacheBound(t *testing.T) {
 	defer c.Close()
 	use := func(id int64) {
 		t.Helper()
+		clk.Add(time.Second) // recency is by the clock
 		if err := c.With(ctx, id, 0, func(m *Material) error {
 			if !bytes.Equal(m.Key, testMaterial(byte(id))) {
 				t.Fatalf("key %d: wrong material", id)
@@ -383,5 +385,116 @@ func TestTenantKeyNames(t *testing.T) {
 	}
 	if PrefixEnd("") != "" || PrefixEnd("\xff\xff") != "" || PrefixEnd("a\xff") != "b" {
 		t.Fatal("PrefixEnd edge cases")
+	}
+}
+
+// BenchmarkCacheHitParallel is a cached hit — a key whose lease is valid
+// and whose version is held — from every core at once, the way a busy
+// gateway's sealed-table reads and writes ask: AEAD (what the sealing of
+// rows uses) and With (what the key service uses), on one hot key and
+// spread over many keys of a bounded cache.
+func BenchmarkCacheHitParallel(b *testing.B) {
+	ctx := context.Background()
+	for _, bc := range []struct {
+		name string
+		keys int64
+		max  int
+	}{{"one-key", 1, 0}, {"1000-keys-bounded", 1000, 10000}} {
+		c := NewCache(&manySource{}, CacheConfig{Lease: time.Hour, MaxKeys: bc.max})
+		for id := int64(1); id <= bc.keys; id++ {
+			if _, _, err := c.AEAD(ctx, id, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.Run("AEAD/"+bc.name, func(b *testing.B) {
+			var n atomic.Int64
+			b.RunParallel(func(pb *testing.PB) {
+				id := n.Add(1)
+				for pb.Next() {
+					id = id%bc.keys + 1
+					if _, _, err := c.AEAD(ctx, id, 0); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
+		b.Run("With/"+bc.name, func(b *testing.B) {
+			var n atomic.Int64
+			b.RunParallel(func(pb *testing.PB) {
+				id := n.Add(1)
+				for pb.Next() {
+					id = id%bc.keys + 1
+					if err := c.With(ctx, id, 0, func(*Material) error { return nil }); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
+		c.Close()
+	}
+}
+
+// TestCacheHitRace (issue #310, step 4): hits on the lock-free path race
+// checks, rotations, Forget, sweeps and evictions without a caller ever
+// seeing released material, and a destroyed key is refused once the
+// lease after the change has run out.
+func TestCacheHitRace(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{key: Key{ID: 9, State: StateEnabled, Version: 1, Generation: 1}, material: map[int][]byte{1: testMaterial(1), 2: testMaterial(2)}}
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	c := NewCache(src, CacheConfig{Lease: 10 * time.Second, Now: clk.Now, MaxKeys: 2})
+	defer c.Close()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				err := c.With(ctx, 9, 0, func(m *Material) error {
+					if len(m.Key) != 32 || (m.Key[0] != 1 && m.Key[0] != 2) || m.Key[31] != m.Key[0] {
+						t.Errorf("material in use was released: %x", m.Key)
+					}
+					return nil
+				})
+				if err != nil && !errors.Is(err, ErrNotFound) {
+					t.Errorf("With: %v", err)
+				}
+				if a, _, err := c.AEAD(ctx, 9, 0); err == nil && a == nil {
+					t.Error("nil AEAD")
+				}
+				_, _ = c.Key(ctx, int64(100+w)) // churn the bound
+			}
+		}()
+	}
+	for i := 0; i < 300; i++ {
+		switch i % 5 {
+		case 0:
+			src.change(func(k *Key) { k.Version = 1 + i%2 })
+			clk.Add(10 * time.Second)
+		case 1:
+			c.Forget(9)
+		case 2:
+			c.Sweep()
+		case 3:
+			clk.Add(time.Second)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	src.change(func(k *Key) { k.State = StateDestroyed })
+	clk.Add(10 * time.Second)
+	if _, _, err := c.AEAD(ctx, 9, 0); !errors.Is(err, ErrDestroyed) {
+		t.Fatalf("AEAD of a destroyed key after the lease: %v", err)
+	}
+	if err := c.With(ctx, 9, 0, func(*Material) error { return nil }); !errors.Is(err, ErrDestroyed) {
+		t.Fatalf("With of a destroyed key after the lease: %v", err)
 	}
 }

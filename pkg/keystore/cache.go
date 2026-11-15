@@ -1,14 +1,15 @@
 package keystore
 
 import (
-	"container/list"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,21 +38,32 @@ import (
 // lease, so a key's material does not linger in memory after the key is
 // destroyed only because nothing asked for it again.
 //
-// A cache made with MaxKeys holds at most that many keys: the key used
-// least recently is dropped to make room for another (a gateway serving
+// A cache made with MaxKeys holds at most that many keys: the keys used
+// least recently are dropped to make room for others (a gateway serving
 // many tenants of a per-tenant sealed table, issue #310 step 4). A
 // dropped key is read again on its next use, as after its lease.
+//
+// The hit — a key checked within the lease whose version is held, which
+// is every row a busy gateway seals or opens — takes no mutex: the map of
+// entries is a sync.Map, each entry publishes what a hit needs as an
+// immutable snapshot behind an atomic pointer (the key's state, version
+// and generation, when its check began, the versions held), a version's
+// material is reference-counted atomically, and recency is an atomic
+// timestamp. Everything else — a check, an unwrap, a drop, an eviction —
+// runs under the entry's or the cache's mutex, as before, and publishes
+// a new snapshot.
 type Cache struct {
 	src     Source
 	lease   time.Duration
 	now     func() time.Time
 	maxKeys int
 
+	// keys maps a key id to its *cacheEntry; n counts them. Inserting
+	// and evicting hold mu, so the count and the eviction stay exact; a
+	// lookup holds nothing.
+	keys sync.Map
+	n    atomic.Int64
 	mu   sync.Mutex
-	keys map[int64]*cacheEntry
-	// lru orders the entries by last use, most recent at the front; its
-	// elements' values are the key ids. Kept only with maxKeys.
-	lru *list.List
 }
 
 // Source is what a Cache reads keys from; *Store is one.
@@ -84,19 +96,11 @@ func NewCache(src Source, cfg CacheConfig) *Cache {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	c := &Cache{src: src, lease: cfg.Lease, now: cfg.Now, maxKeys: cfg.MaxKeys, keys: map[int64]*cacheEntry{}}
-	if c.maxKeys > 0 {
-		c.lru = list.New()
-	}
-	return c
+	return &Cache{src: src, lease: cfg.Lease, now: cfg.Now, maxKeys: cfg.MaxKeys}
 }
 
 // Len is how many keys the cache holds.
-func (c *Cache) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.keys)
-}
+func (c *Cache) Len() int { return int(c.n.Load()) }
 
 // Lease is how long a change to a key can go unseen by this cache: what
 // a statement that changes a key waits out before it returns.
@@ -111,83 +115,189 @@ type cacheEntry struct {
 	key     Key
 	checked time.Time // when the check that confirmed key began; zero: never
 	held    map[int]*heldMaterial
-	// gone marks an entry Forget removed from the map: a caller that
-	// still has it starts over rather than put material where no sweep
-	// will find it.
+	// gone marks an entry removed from the map (Forget, an eviction): a
+	// caller that still has it starts over rather than put material where
+	// no sweep will find it.
 	gone bool
-	// elem is the entry's place in the cache's lru (nil without a bound);
-	// guarded by the cache's mu.
-	elem *list.Element
+
+	// snap is what a hit reads without a lock: published under mu by
+	// every change of the fields above, nil once the entry is gone.
+	snap atomic.Pointer[entrySnap]
+	// used is when the entry was last used (UnixNano), for eviction.
+	used atomic.Int64
 }
 
-// heldMaterial is one version's material and how many callers are using
-// it; dropped material is released when the last of them is done.
+// entrySnap is an immutable view of an entry for the hit path.
+type entrySnap struct {
+	state      State
+	version    int
+	generation int64
+	checked    int64 // UnixNano; 0: never
+	held       map[int]*heldMaterial
+}
+
+// publishLocked publishes the entry's current state for hits.
+func (e *cacheEntry) publishLocked() {
+	if e.gone {
+		e.snap.Store(nil)
+		return
+	}
+	s := &entrySnap{state: e.key.State, version: e.key.Version, generation: e.key.Generation, held: make(map[int]*heldMaterial, len(e.held))}
+	if !e.checked.IsZero() {
+		s.checked = e.checked.UnixNano()
+	}
+	for v, hm := range e.held {
+		s.held[v] = hm
+	}
+	e.snap.Store(s)
+}
+
+// heldMaterial is one version's material. refs counts the cache's own
+// hold (1, until the version is dropped) and each caller using it; the
+// material is released when it reaches zero, so a version dropped while
+// in use is released when its last caller is done.
 type heldMaterial struct {
-	m       *Material
-	refs    int
-	dropped bool
-	// aead is AES-256-GCM under m.Key, made on first use (AEAD).
+	m    *Material
+	refs atomic.Int64
+	// aead is AES-256-GCM under m.Key, made on first use (AEAD); ready is
+	// set once it is, after which a hit hands it out without a reference.
 	aeadOnce sync.Once
 	aead     cipher.AEAD
 	aeadErr  error
+	ready    atomic.Bool
+}
+
+func newHeld(m *Material) *heldMaterial {
+	hm := &heldMaterial{m: m}
+	hm.refs.Store(2) // the cache's hold and the caller's
+	return hm
+}
+
+// tryAcquire takes a reference unless the material is already released.
+func (hm *heldMaterial) tryAcquire() bool {
+	for {
+		r := hm.refs.Load()
+		if r <= 0 {
+			return false
+		}
+		if hm.refs.CompareAndSwap(r, r+1) {
+			return true
+		}
+	}
+}
+
+// unref gives back a reference, releasing the material with the last.
+func (hm *heldMaterial) unref() {
+	if hm.refs.Add(-1) == 0 {
+		hm.m.Release()
+	}
+}
+
+// makeAEAD makes the version's AEAD once.
+func (hm *heldMaterial) makeAEAD() {
+	hm.aeadOnce.Do(func() {
+		block, err := aes.NewCipher(hm.m.Key)
+		if err != nil {
+			hm.aeadErr = err
+			return
+		}
+		if hm.aead, hm.aeadErr = cipher.NewGCM(block); hm.aeadErr == nil {
+			hm.ready.Store(true)
+		}
+	})
 }
 
 func (e *cacheEntry) dropLocked() {
 	for v, hm := range e.held {
-		hm.dropped = true
-		if hm.refs == 0 {
-			hm.m.Release()
-		}
 		delete(e.held, v)
+		hm.unref() // the cache's hold
+	}
+	e.publishLocked()
+}
+
+// touch records a use of the entry, for eviction; only a bounded cache
+// needs it, and a timestamp already this recent is not written again.
+func (c *Cache) touch(e *cacheEntry, now int64) {
+	if c.maxKeys > 0 && now-e.used.Load() > int64(time.Millisecond) {
+		e.used.Store(now)
 	}
 }
 
+func (c *Cache) lookup(id int64) *cacheEntry {
+	if v, ok := c.keys.Load(id); ok {
+		return v.(*cacheEntry)
+	}
+	return nil
+}
+
 func (c *Cache) entry(id int64) *cacheEntry {
-	c.mu.Lock()
-	e := c.keys[id]
-	if e != nil {
-		if e.elem != nil {
-			c.lru.MoveToFront(e.elem)
-		}
-		c.mu.Unlock()
+	if e := c.lookup(id); e != nil {
+		c.touch(e, c.now().UnixNano())
 		return e
 	}
-	e = &cacheEntry{held: map[int]*heldMaterial{}}
-	c.keys[id] = e
+	c.mu.Lock()
+	if v, ok := c.keys.Load(id); ok {
+		c.mu.Unlock()
+		return v.(*cacheEntry)
+	}
+	e := &cacheEntry{held: map[int]*heldMaterial{}}
+	e.used.Store(c.now().UnixNano())
+	c.keys.Store(id, e)
 	var evict []*cacheEntry
-	if c.lru != nil {
-		e.elem = c.lru.PushFront(id)
-		for len(c.keys) > c.maxKeys {
-			last := c.lru.Back()
-			if last == nil || last == e.elem {
-				break
-			}
-			old := last.Value.(int64)
-			evict = append(evict, c.removeLocked(old))
-		}
+	if c.n.Add(1) > int64(c.maxKeys) && c.maxKeys > 0 {
+		evict = c.evictLocked(id)
 	}
 	c.mu.Unlock()
 	// Material still in use by a caller is released when that caller is
-	// done (heldMaterial.dropped), as after Forget.
+	// done, as after Forget.
 	for _, old := range evict {
 		old.drop()
 	}
 	return e
 }
 
-// removeLocked takes key id's entry out of the map and the lru; the
-// caller drops it (drop) once c.mu is released.
-func (c *Cache) removeLocked(id int64) *cacheEntry {
-	e := c.keys[id]
-	if e == nil {
+// evictLocked takes the least recently used entries out of the map, down
+// to nine tenths of the bound (so the scan it costs is paid once per
+// tenth of the bound's insertions), sparing keep; the caller drops them.
+func (c *Cache) evictLocked(keep int64) []*cacheEntry {
+	type aged struct {
+		id   int64
+		used int64
+	}
+	var all []aged
+	c.keys.Range(func(k, v any) bool {
+		if id := k.(int64); id != keep {
+			all = append(all, aged{id, v.(*cacheEntry).used.Load()})
+		}
+		return true
+	})
+	target := c.maxKeys - c.maxKeys/10
+	if target < 1 {
+		target = 1
+	}
+	over := int(c.n.Load()) - target
+	if over <= 0 {
 		return nil
 	}
-	delete(c.keys, id)
-	if e.elem != nil {
-		c.lru.Remove(e.elem)
-		e.elem = nil
+	sort.Slice(all, func(i, j int) bool { return all[i].used < all[j].used })
+	var out []*cacheEntry
+	for _, a := range all[:min(over, len(all))] {
+		if e := c.removeLocked(a.id); e != nil {
+			out = append(out, e)
+		}
 	}
-	return e
+	return out
+}
+
+// removeLocked takes key id's entry out of the map; the caller drops it
+// (drop) once c.mu is released.
+func (c *Cache) removeLocked(id int64) *cacheEntry {
+	v, ok := c.keys.LoadAndDelete(id)
+	if !ok {
+		return nil
+	}
+	c.n.Add(-1)
+	return v.(*cacheEntry)
 }
 
 // drop marks an entry removed and releases its unused material.
@@ -235,9 +345,13 @@ func (c *Cache) check(ctx context.Context, id int64, force bool) (*cacheEntry, K
 	}
 	e.mu.Lock()
 	if e.key.Generation != k.Generation || e.key.ID != k.ID {
-		e.dropLocked()
+		for v, hm := range e.held {
+			delete(e.held, v)
+			hm.unref()
+		}
 	}
 	e.key, e.checked = k, start
+	e.publishLocked()
 	e.mu.Unlock()
 	return e, k, nil
 }
@@ -258,11 +372,51 @@ func (c *Cache) Refresh(ctx context.Context, id int64) (Key, error) {
 	return k, err
 }
 
+// hit is the lock-free path: version (0: the current one) of key id, if
+// the entry's last check is within the lease, the key is enabled and the
+// version is held. With ref, it takes a reference on the material, which
+// the caller gives back (unref); without, the version's AEAD must be
+// made already, and nothing is held.
+func (c *Cache) hit(id int64, version int, ref bool) (*heldMaterial, bool) {
+	e := c.lookup(id)
+	if e == nil {
+		return nil, false
+	}
+	s := e.snap.Load()
+	if s == nil || s.checked == 0 || s.state != StateEnabled {
+		return nil, false
+	}
+	now := c.now().UnixNano()
+	if now-s.checked >= int64(c.lease) {
+		return nil, false
+	}
+	if version == 0 {
+		version = s.version
+	}
+	hm := s.held[version]
+	if hm == nil {
+		return nil, false
+	}
+	if ref {
+		if !hm.tryAcquire() {
+			return nil, false
+		}
+	} else if !hm.ready.Load() {
+		return nil, false
+	}
+	c.touch(e, now)
+	return hm, true
+}
+
 // With runs fn with version (0: the current one) of key id's material,
 // held for the duration of the call; fn must not keep m.Key past it. A
 // disabled or destroyed key is refused (ErrDisabled, ErrDestroyed) as of
 // the last check, which is within the lease.
 func (c *Cache) With(ctx context.Context, id int64, version int, fn func(m *Material) error) error {
+	if hm, ok := c.hit(id, version, true); ok {
+		defer hm.unref()
+		return fn(hm.m)
+	}
 	return c.withHeld(ctx, id, version, func(hm *heldMaterial) error { return fn(hm.m) })
 }
 
@@ -275,17 +429,13 @@ func (c *Cache) With(ctx context.Context, id int64, version int, fn func(m *Mate
 // again for the next one, so that a disabled or destroyed key stops
 // being used within the lease. Refusals are With's.
 func (c *Cache) AEAD(ctx context.Context, id int64, version int) (cipher.AEAD, int, error) {
+	if hm, ok := c.hit(id, version, false); ok {
+		return hm.aead, hm.m.Version, nil
+	}
 	var out cipher.AEAD
 	var ver int
 	err := c.withHeld(ctx, id, version, func(hm *heldMaterial) error {
-		hm.aeadOnce.Do(func() {
-			block, err := aes.NewCipher(hm.m.Key)
-			if err != nil {
-				hm.aeadErr = err
-				return
-			}
-			hm.aead, hm.aeadErr = cipher.NewGCM(block)
-		})
+		hm.makeAEAD()
 		out, ver = hm.aead, hm.m.Version
 		return hm.aeadErr
 	})
@@ -336,7 +486,7 @@ func (c *Cache) withHeld(ctx context.Context, id int64, version int, fn func(hm 
 			}
 			continue
 		}
-		defer c.release(e, hm)
+		defer hm.unref()
 		return fn(hm)
 	}
 }
@@ -349,8 +499,7 @@ func (c *Cache) acquire(ctx context.Context, e *cacheEntry, k Key, v int) (*held
 		e.mu.Unlock()
 		return nil, true, nil
 	}
-	if hm := e.held[v]; hm != nil {
-		hm.refs++
+	if hm := e.held[v]; hm != nil && hm.tryAcquire() {
 		e.mu.Unlock()
 		return hm, false, nil
 	}
@@ -368,23 +517,14 @@ func (c *Cache) acquire(ctx context.Context, e *cacheEntry, k Key, v int) (*held
 		m.Release()
 		return nil, true, nil
 	}
-	if hm := e.held[v]; hm != nil { // another caller unwrapped it first
+	if hm := e.held[v]; hm != nil && hm.tryAcquire() { // another caller unwrapped it first
 		m.Release()
-		hm.refs++
 		return hm, false, nil
 	}
-	hm := &heldMaterial{m: m, refs: 1}
+	hm := newHeld(m)
 	e.held[v] = hm
+	e.publishLocked()
 	return hm, false, nil
-}
-
-func (c *Cache) release(e *cacheEntry, hm *heldMaterial) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	hm.refs--
-	if hm.dropped && hm.refs == 0 {
-		hm.m.Release()
-	}
 }
 
 // Forget drops what the cache holds for key id: after this gateway
@@ -399,17 +539,17 @@ func (c *Cache) Forget(id int64) {
 // Sweep drops every key whose last check is older than the lease: their
 // material is released rather than kept until something asks again.
 func (c *Cache) Sweep() {
-	c.mu.Lock()
 	var stale []int64
 	now := c.now()
-	for id, e := range c.keys {
+	c.keys.Range(func(k, v any) bool {
+		e := v.(*cacheEntry)
 		e.mu.Lock()
 		if e.checked.IsZero() || now.Sub(e.checked) >= c.lease {
-			stale = append(stale, id)
+			stale = append(stale, k.(int64))
 		}
 		e.mu.Unlock()
-	}
-	c.mu.Unlock()
+		return true
+	})
 	for _, id := range stale {
 		c.Forget(id)
 	}
@@ -433,12 +573,11 @@ func (c *Cache) Run(ctx context.Context) {
 
 // Close releases everything the cache holds.
 func (c *Cache) Close() {
-	c.mu.Lock()
-	ids := make([]int64, 0, len(c.keys))
-	for id := range c.keys {
-		ids = append(ids, id)
-	}
-	c.mu.Unlock()
+	var ids []int64
+	c.keys.Range(func(k, _ any) bool {
+		ids = append(ids, k.(int64))
+		return true
+	})
 	for _, id := range ids {
 		c.Forget(id)
 	}
