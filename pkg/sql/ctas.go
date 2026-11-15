@@ -261,6 +261,12 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					if owned[idx.ID] || !idx.Public() {
 						continue
 					}
+					if idx.IsVector() {
+						// A vector index is its trained centres, which belong
+						// to the source table's data; the copy starts empty
+						// and is indexed once it has rows of its own.
+						continue
+					}
 					var names []string
 					for _, id := range idx.ColumnIDs {
 						names = append(names, byID[id])

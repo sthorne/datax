@@ -38,6 +38,11 @@ func (s *Session) requireV10(fam types.Family) error {
 	if (fam == types.IntervalFam || fam == types.Time || fam == types.Enum || fam.IsArray()) && s.db.ClusterVersion() < version.V10 {
 		return newErrf(CodeFeatureNotSupported, "%s columns need cluster version v10: finalize the upgrade with `datax debug upgrade` first", fam)
 	}
+	// VECTOR arrived with v21 (issue #304): the same reason, one version
+	// on.
+	if fam == types.Vector && s.db.ClusterVersion() < version.V21 {
+		return newErrf(CodeFeatureNotSupported, "%s columns need cluster version %s: finalize the upgrade with `datax debug upgrade` first", fam, version.V21)
+	}
 	return nil
 }
 

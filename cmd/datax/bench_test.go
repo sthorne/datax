@@ -46,6 +46,38 @@ func TestBenchHelpers(t *testing.T) {
 	}
 }
 
+// TestBenchVectors: the vector-knn workload's rows are a function of
+// the seed and the row number, cluster around the centre the row number
+// selects, and render as vector literals.
+func TestBenchVectors(t *testing.T) {
+	a, b := benchVectorAt(1, 42, 10, 8), benchVectorAt(1, 42, 10, 8)
+	if len(a) != 8 || benchVectorText(a) != benchVectorText(b) {
+		t.Fatalf("row 42 is not reproducible: %v, %v", a, b)
+	}
+	if benchVectorText(a) == benchVectorText(benchVectorAt(2, 42, 10, 8)) {
+		t.Fatal("another seed drew the same vector")
+	}
+	dist := func(x, y []float32) float64 {
+		var s float64
+		for i := range x {
+			s += float64(x[i]-y[i]) * float64(x[i]-y[i])
+		}
+		return s
+	}
+	// Rows j and j+10 share a centre (10 groups); row j+1 has another.
+	// In 64 dimensions the two squared distances are about 46 and 174.
+	for j := int64(0); j < 50; j++ {
+		row := benchVectorAt(1, j, 10, 64)
+		same, other := dist(row, benchVectorAt(1, j+10, 10, 64)), dist(row, benchVectorAt(1, j+1, 10, 64))
+		if same >= other {
+			t.Fatalf("row %d is nearer another centre's row (%.2f) than its own centre's (%.2f)", j, other, same)
+		}
+	}
+	if got := benchVectorText([]float32{1, -0.5, 3e10}); got != "[1,-0.5,3e+10]" {
+		t.Fatalf("benchVectorText: %s", got)
+	}
+}
+
 // captureStdout returns what fn printed to standard output.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()

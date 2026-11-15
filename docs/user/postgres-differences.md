@@ -163,6 +163,64 @@ syntax error or `0A000` feature not supported):
   One asymmetry to know: `@>` compares
   numbers **numerically** (`1` contains `1.0`), while jsonb `=` compares
   normalized text (`'{"a":1}' = '{"a":1.0}'` is false).
+- **Vectors follow pgvector, built in, with one index method.**
+  `vector(n)`, the `<->`, `<=>` and `<#>` operators, `l2_distance`,
+  `cosine_distance`, `inner_product`, `l1_distance`, `vector_dims`,
+  `vector_norm`, `l2_normalize`, element-wise `+` and `-`, the text and
+  binary wire formats, and `CREATE INDEX ... USING ivfflat (col
+  vector_l2_ops | vector_cosine_ops | vector_ip_ops) WITH (lists = n)`
+  with `SET ivfflat.probes` behave as in pgvector
+  ([Vectors](sql.md#vectors)). What differs:
+  - *There is no extension.* `CREATE EXTENSION vector` is accepted and
+    does nothing (any other extension name is refused, `0A000`); `DROP
+    EXTENSION`, `pg_extension` and `vector_version()` do not exist. The
+    type's OID is fixed (16000) rather than assigned at install time;
+    `to_regtype('vector')` returns the OID as a number, and
+    `'vector'::regtype` does not resolve — look the OID up with
+    `to_regtype('vector')::oid` or in `pg_type`, as `pgvector-go` does.
+  - *No HNSW.* `USING hnsw` is refused (`0A000`) rather than built as
+    something else; `hnsw.ef_search` is not a setting. A graph index
+    suits a transactional, range-partitioned store poorly; `ivfflat` is
+    the index.
+  - *`ivfflat.probes` defaults to the square root of `lists`*, not to 1:
+    the default is a usable recall (about 0.98 on the test set) instead
+    of the fastest setting. `SET ivfflat.probes = 1` gives pgvector's
+    default. `ivfflat.iterative_scan` and `ivfflat.max_probes` do not
+    exist; a filtered query already considers every row of the probed
+    lists, nearest first, rather than only the nearest `k`.
+  - *The index serves one query shape*: `ORDER BY col <op> value LIMIT
+    k` over one table, ascending, the only sort key. Not through a
+    join, a `GROUP BY`, `DISTINCT`, `FOR UPDATE` or a distance in
+    `WHERE` alone; those run exactly. A filter that the primary key or
+    an ordinary index can serve takes that path, exactly, in preference
+    to the vector index.
+  - *The index is not used without `LIMIT`*, and there is no cost model
+    choosing between it and a scan: when the shape fits, it is used
+    (`SET vector_index_scan = off` forces the exact scan, as `SET
+    enable_indexscan = off` does in PostgreSQL).
+  - *No `REINDEX`*: rebuild by creating a second index and dropping the
+    first. `CREATE INDEX` is always online (there is no `CONCURRENTLY`
+    keyword to ask for it), and an index built on little or no data
+    gets fewer lists than asked for — one, on an empty table — instead
+    of pgvector's notice about low recall. `pg_indexes` shows the
+    number of lists actually built.
+  - *A vector cannot be a primary key or in a btree or unique index*
+    (pgvector allows btree). `=`, `<>`, `<`, `ORDER BY`, `GROUP BY` and
+    `DISTINCT` on a vector do work.
+  - *Not there*: `halfvec`, `sparsevec`, `bit` vectors and their
+    operators (`<+>` L1 as an operator, `<~>`, `<%>`), `vector *
+    vector`, `||`, `subvector`, `binary_quantize`, and the `avg` and
+    `sum` aggregates over vectors (`0A000`). Expression indexes (an
+    index over `(embedding::halfvec(3))`, or over a function of the
+    column) and partial indexes do not exist in datax for any index.
+    `vector[]` columns are refused.
+  - *Dimensions*: 16,000 for the type and 2,000 for an index, as in
+    pgvector. Elements are float4; a value outside float4's range is
+    refused, as are `NaN` and infinities.
+  - *NaN ordering*: the cosine distance to a zero vector is `NaN`,
+    which sorts after every number (as PostgreSQL orders `float8`); an
+    indexed scan can return such a row, last, where pgvector's cosine
+    index leaves zero vectors out.
 - **`OR` is supported with full boolean grouping**, but `OR` conditions
   never become index bounds (they filter fetched rows) — keep an
   indexable `AND` condition alongside on large tables. `IN`, `EXISTS`

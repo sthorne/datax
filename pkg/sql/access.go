@@ -67,6 +67,12 @@ type accessPlan struct {
 	reverse  bool
 	mergeFan bool
 
+	// top, also stamped by execSelect, asks the fetch to return only
+	// the rows that sort first under the query's ORDER BY, up to its
+	// LIMIT: by a top-k scan of the plan's span, or through a vector
+	// index. See topk.go.
+	top *topKSpec
+
 	// inv (planInvertedScan) is what the WHERE clause says about the
 	// inverted index's column: the element lookups whose result contains
 	// every matching row. See inverted_scan.go.
@@ -506,6 +512,11 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		if idx.IsInverted() {
 			continue // no key order to bound; considered below
 		}
+		if idx.IsVector() {
+			// Keyed by list, not by value: it serves ORDER BY distance
+			// (pickVectorIndex), never a WHERE clause.
+			continue
+		}
 		if !idx.Unique {
 			// A non-unique index has no entry for rows with a NULL in ANY
 			// indexed column: it is a complete row source only when every
@@ -691,12 +702,18 @@ func reshardMirrorEntries(desc *catalog.TableDescriptor, i int, shadowRow map[ca
 // new one has. An ordinary index has at most one entry per row, so this
 // is "did the entry move"; an inverted index has one per element, and
 // an UPDATE that changes one field of a document touches only the
-// entries of that field.
+// entries of that field. An entry whose key stays but whose value
+// changes — a vector index's entry carries the row's vector, and a new
+// vector is often filed under the same list — is written again: it
+// counts as added, and the write replaces what is there.
 func entryDiff(old, new []rowenc.IndexEntry) (removed, added []rowenc.IndexEntry) {
 	i, j := 0, 0
 	for i < len(old) && j < len(new) {
 		switch c := bytes.Compare(old[i].Key, new[j].Key); {
 		case c == 0:
+			if !bytes.Equal(old[i].Value, new[j].Value) {
+				added = append(added, new[j])
+			}
 			i++
 			j++
 		case c < 0:
@@ -803,6 +820,15 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
+		if idx.IsVector() && len(idx.ColumnIDs) == 1 {
+			// Filing a vector compares it with every centre. An UPDATE
+			// that leaves the vector alone leaves its entry alone, and
+			// need not work out twice where that entry is.
+			o, n := oldRow[idx.ColumnIDs[0]], newRow[idx.ColumnIDs[0]]
+			if o.Null == n.Null && o.Fam == n.Fam && o.S == n.S {
+				continue
+			}
+		}
 		oldEntries, err := rowenc.IndexEntries(desc, idx, oldRow)
 		if err != nil {
 			return invertedEntryErr(idx, err)

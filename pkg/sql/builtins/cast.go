@@ -183,6 +183,23 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			}
 			return v, nil
 		}
+	case "vector":
+		// Text in the '[1,2,3]' form and numeric arrays become vectors;
+		// vector(n) also checks the dimension.
+		v := d
+		if d.Fam != types.Vector {
+			a, err := asVector(d)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			v = types.NewVector(a)
+		}
+		if len(mods) == 1 {
+			if n, err := strconv.Atoi(mods[0]); err == nil && n != v.VectorDims() {
+				return types.Datum{}, errf(CodeDataException, "expected %d dimensions, not %d", n, v.VectorDims())
+			}
+		}
+		return v, nil
 	case "regclass", "name", "oid", "regtype", "regnamespace", "regproc", "regprocedure", "regrole", "regoper", "regoperator",
 		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring",
 		"aclitem", "pg_node_tree", "pg_lsn", "unknown", "any", "anyelement", "anyarray", "record", "void":

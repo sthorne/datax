@@ -25,6 +25,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // Schemas the virtual tables live in.
@@ -316,6 +317,8 @@ func TypeOID(f types.Family) int64 {
 		return 1186
 	case types.Time:
 		return 1083
+	case types.Vector:
+		return vector.OID
 	}
 	return 25
 }
@@ -417,7 +420,7 @@ func typeNameOID(oid int64) string {
 	return "text"
 }
 
-var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery}
+var families = []types.Family{types.Bool, types.Bytes, types.Int, types.String, types.Float, types.Date, types.Timestamp, types.Uuid, types.Decimal, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery, types.Vector}
 
 // Families lists every type family, in pg_type order.
 func Families() []types.Family { return families }
@@ -456,6 +459,8 @@ func TypeName(f types.Family) string {
 		return "interval"
 	case types.Time:
 		return "time"
+	case types.Vector:
+		return "vector"
 	}
 	return "text"
 }
@@ -511,6 +516,11 @@ func FormatType(c *catalog.Column) string {
 			return fmt.Sprintf("numeric(%d,%d)", c.Precision, c.Scale)
 		}
 		return "numeric"
+	case types.Vector:
+		if c.MaxLen > 0 {
+			return fmt.Sprintf("vector(%d)", c.MaxLen)
+		}
+		return "vector"
 	}
 	return TypeName(c.Type)
 }
@@ -528,7 +538,7 @@ func ColumnTypeSQL(c *catalog.Column) string {
 		return ColumnTypeSQL(&elem) + "[]"
 	}
 	switch c.Type {
-	case types.Int, types.String, types.Timestamp, types.Time:
+	case types.Int, types.String, types.Timestamp, types.Time, types.Vector:
 		return c.TypeSQL()
 	case types.Decimal:
 		if c.Precision > 0 {
@@ -584,6 +594,11 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	if idx.Unique {
 		unique = "UNIQUE "
 	}
+	if v := idx.Vector; v != nil {
+		// As pgvector renders it: the operator class names the distance
+		// and lists is the storage parameter.
+		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", idx.Name, d.Name, v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
+	}
 	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "))
 }
 
@@ -596,6 +611,9 @@ const (
 // IndexMethod names an index's access method: btree, or the method of
 // its inverted kind (gin).
 func IndexMethod(idx *catalog.IndexDescriptor) string {
+	if idx.IsVector() {
+		return idx.Vector.Method
+	}
 	if kind, ok := inverted.Lookup(idx.Inverted); ok {
 		return kind.Method()
 	}
@@ -875,7 +893,7 @@ func renderDefault(d types.Datum) string {
 		return "NULL"
 	}
 	switch d.Fam {
-	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam:
+	case types.String, types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Decimal, types.Enum, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Vector:
 		return "'" + strings.ReplaceAll(d.Text(), "'", "''") + "'"
 	}
 	return d.Text()

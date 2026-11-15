@@ -352,8 +352,9 @@ func indexCovers(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 		return true
 	}
 	for i := range d.Indexes {
-		// An inverted index has no key order over its column's values.
-		if !d.Indexes[i].IsInverted() && prefix(d.Indexes[i].ColumnIDs) {
+		// An inverted index has no key order over its column's values,
+		// and neither has a vector index.
+		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && prefix(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
@@ -573,6 +574,11 @@ func (g *rowGuard) table(ctx context.Context, txn *kvclient.Txn, id uint64) (*ca
 	}
 	if d == nil {
 		return nil, newErrf(CodeInternal, "table %d referenced by a constraint of %q does not exist", id, g.desc.Name)
+	}
+	// A cascade writes this table's rows: its vector indexes need their
+	// centres, as after a lookup by name.
+	if err := g.s.loadVectorCentroids(ctx, d); err != nil {
+		return nil, err
 	}
 	g.parents[id] = d
 	return d, nil
@@ -1329,7 +1335,12 @@ func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, des
 
 // indexWipe is an index whose entries are reclaimed once the dropping
 // transaction has committed.
-type indexWipe struct{ tableID, indexID uint64 }
+type indexWipe struct {
+	tableID, indexID uint64
+	// vectorBuild names the centres of a dropped vector index, which
+	// live outside its entries (catalog.VectorIndex).
+	vectorBuild string
+}
 
 // runPendingWipes reclaims the entries of indexes dropped by committed
 // statements (best effort; the entries are unreachable either way).
@@ -1338,6 +1349,9 @@ func (s *Session) runPendingWipes(ctx context.Context) {
 	s.pendingWipes = nil
 	for _, w := range wipes {
 		s.wipeIndexEntries(ctx, w.tableID, w.indexID)
+		if w.vectorBuild != "" {
+			s.dropVectorCentroids(ctx, w.tableID, w.vectorBuild)
+		}
 	}
 }
 

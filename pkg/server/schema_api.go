@@ -431,7 +431,7 @@ func columnDefault(c catalog.Column) string {
 		return "NULL"
 	}
 	switch c.Default.Fam {
-	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Enum:
+	case types.String, types.Bytes, types.Timestamp, types.Date, types.Time, types.IntervalFam, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Enum, types.Vector:
 		return "'" + strings.ReplaceAll(c.Default.Text(), "'", "''") + "'"
 	default:
 		return c.Default.Text()
@@ -546,7 +546,7 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]*c
 		}
 		for _, idx := range d.Indexes {
 			si := SchemaIndex{Name: idx.Name, Unique: idx.Unique, State: idx.State}
-			if idx.IsInverted() {
+			if idx.IsInverted() || idx.IsVector() {
 				si.Method = vtable.IndexMethod(&idx)
 			}
 			for _, id := range idx.ColumnIDs {

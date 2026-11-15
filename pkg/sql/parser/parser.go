@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // maxJoinTables caps a SELECT's FROM+JOIN table count: the executor is a
@@ -325,6 +326,33 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
 			return p.parseCreateType()
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+			// CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s]
+			// [VERSION v] [CASCADE]: the trailing options say where and
+			// which, and there is nowhere and nothing to choose.
+			p.i += 2
+			ce := &CreateExtension{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("NOT"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+			}
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			ce.Name = strings.ToLower(name)
+			for !p.atStatementEnd() {
+				if t := p.peek(); t.kind != tkIdent && t.kind != tkKeyword && t.kind != tkString {
+					return nil, p.errf("unexpected %q in CREATE EXTENSION", t.text)
+				}
+				p.i++
+			}
+			return ce, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
 			return p.parseCreateView(false)
@@ -1330,6 +1358,16 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 				return spec, false, p.errf("%s(%s) precision must be between 0 and 6", strings.ToLower(upper), mods[0])
 			}
 			spec.TimePrecision = int32(n) + 1
+		case fam == types.Vector && len(mods) == 1:
+			// vector(n): the dimension every value must have, kept where
+			// a string's declared length is (MaxLen).
+			n, nerr := strconv.ParseInt(mods[0], 10, 32)
+			if nerr != nil || n < 1 || n > vector.MaxDims {
+				return spec, false, p.errf("dimensions for type vector must be between 1 and %d", vector.MaxDims)
+			}
+			spec.MaxLen = int32(n)
+		case fam == types.Vector:
+			return spec, false, p.errf("type vector takes one modifier, its dimension: vector(n)")
 		}
 	}
 	// TIME [WITHOUT TIME ZONE]; TIME WITH TIME ZONE is refused.
@@ -1395,6 +1433,9 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		}
 		if fam == types.Tsvector || fam == types.Tsquery {
 			return spec, false, p.errf("arrays of %s are not supported", fam)
+		}
+		if fam == types.Vector {
+			return spec, false, p.errf("arrays of vectors are not supported")
 		}
 		spec.Family = types.ArrayOf(fam)
 	}
@@ -2033,6 +2074,39 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
+	}
+	// WITH (name = value, ...): the access method's storage parameters
+	// (an IVF index's lists). The executor decides which it knows.
+	if p.consumeIdentWord("with") {
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		ci.With = map[string]string{}
+		for {
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("="); err != nil {
+				return nil, err
+			}
+			v := p.peek()
+			if v.kind != tkNumber && v.kind != tkString && v.kind != tkIdent {
+				return nil, p.errf("expected a value for index parameter %q, found %q", name, v.text)
+			}
+			p.i++
+			name = strings.ToLower(name)
+			if _, dup := ci.With[name]; dup {
+				return nil, p.errf("index parameter %q specified more than once", name)
+			}
+			ci.With[name] = v.text
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
 	}
 	return ci, nil
 }
@@ -4182,7 +4256,7 @@ func (p *parser) continuesValue() bool {
 	t := p.peek()
 	if t.kind == tkOp {
 		switch t.text {
-		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>":
+		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>", "<->", "<=>", "<#>":
 			return true
 		}
 	}
@@ -5224,7 +5298,31 @@ func (p *parser) parseValueOrColumnExpr() (Expr, error) {
 // the usual precedence (* / bind tighter than + -). A single binary op
 // keeps the flat historical Expr shape; further chaining nests the
 // accumulated expression through Left.
+//
+// The vector distance operators sit one level above: PostgreSQL gives
+// every operator it has no rule for the same precedence, looser than
+// + and - and tighter than the comparisons, so a <-> b + c is
+// a <-> (b + c) and a <-> b < 0.5 compares the distance.
 func (p *parser) parseAddExpr() (Expr, error) {
+	e, err := p.parseSumExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		op := p.peek()
+		if op.kind != tkOp || (op.text != "<->" && op.text != "<=>" && op.text != "<#>") {
+			return e, nil
+		}
+		p.i++
+		rhs, err := p.parseSumExpr()
+		if err != nil {
+			return e, err
+		}
+		e = foldBinOp(e, op.text, rhs)
+	}
+}
+
+func (p *parser) parseSumExpr() (Expr, error) {
 	e, err := p.parseMulExpr()
 	if err != nil {
 		return e, err
@@ -5305,7 +5403,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	// catalog splice, see pkg/sql/subquery.go).
 	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "set_config": 3, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
-	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
+	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1, "to_regtype": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
 	"pg_get_statisticsobjdef_columns": 1, "pg_relation_is_publishable": 1,
 	"pg_size_pretty": 1, "pg_table_size": 1, "pg_total_relation_size": 1, "pg_relation_size": -1, "pg_database_size": 1,

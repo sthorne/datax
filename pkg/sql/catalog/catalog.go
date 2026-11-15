@@ -47,6 +47,12 @@ type Column struct {
 	// MaxLen is a String column's VARCHAR(n) / CHAR(n) length in
 	// characters (0 = unbounded TEXT); a longer value is refused (22001)
 	// unless the excess is spaces.
+	//
+	// On a Vector column it is the declared dimension, vector(n), which
+	// every value must have (0 = any dimension; such a column cannot be
+	// indexed). A dimension is the same kind of thing as a length — the
+	// one number the type takes — and keeping it here carries it through
+	// every place a declared type is copied.
 	MaxLen int32 `json:"max_len,omitempty"`
 	// Char marks CHAR(n): values are stored with trailing spaces trimmed
 	// and render blank-padded to MaxLen.
@@ -115,7 +121,7 @@ func (e *ValueError) Error() string { return e.Msg }
 // write path must apply (DECIMAL(p,s), an integer width, a character
 // length, CHAR padding, TIMESTAMP without time zone or TIMESTAMP(p)).
 func (c *Column) HasTypmod() bool {
-	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum
+	return c.Precision > 0 || c.Width == 2 || c.Width == 4 || c.MaxLen > 0 || c.Char || c.NoTZ || c.TimePrecision > 0 || c.Type.IsArray() || c.Type == types.Enum || c.Type == types.Vector
 }
 
 // EnumValue converts a label (or an enum datum of the type) to the
@@ -253,6 +259,18 @@ func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 			d.I = types.RoundTimestamp(d.I, p)
 		}
 		return d, nil
+	case types.Vector:
+		if d.Fam != types.Vector {
+			v, err := d.Coerce(types.Vector)
+			if err != nil {
+				return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("column %q: %v", c.Name, err)}
+			}
+			d = v
+		}
+		if c.MaxLen > 0 && d.VectorDims() != int(c.MaxLen) {
+			return d, &ValueError{Code: "22000", Msg: fmt.Sprintf("column %q: expected %d dimensions, not %d", c.Name, c.MaxLen, d.VectorDims())}
+		}
+		return d, nil
 	}
 	return d, nil
 }
@@ -318,6 +336,11 @@ func (c *Column) TypeSQL() string {
 			return fmt.Sprintf("DECIMAL(%d,%d)", c.Precision, c.Scale)
 		}
 		return "DECIMAL"
+	case types.Vector:
+		if c.MaxLen > 0 {
+			return fmt.Sprintf("VECTOR(%d)", c.MaxLen)
+		}
+		return "VECTOR"
 	}
 	return c.Type.String()
 }
@@ -344,6 +367,8 @@ func (c *Column) Typmod() int32 {
 		if p, ok := c.FracDigits(); ok {
 			return p
 		}
+	case types.Vector:
+		return c.MaxLen // pgvector's typmod is the dimension itself
 	}
 	return 0
 }
@@ -371,10 +396,55 @@ type IndexDescriptor struct {
 	// Cluster version v21: a node that does not know the field would
 	// maintain the index as an ordinary one.
 	Inverted string `json:"inverted,omitempty"`
+	// Vector marks an approximate nearest-neighbour index over a VECTOR
+	// column (issue #304; see VectorIndex). Like an inverted index it
+	// has one column and is never unique. Cluster version v21: a node
+	// that does not know the field would key the entries by the column's
+	// value, which has no key encoding. The value is never changed once
+	// the index is published, so clones of a descriptor share it.
+	Vector *VectorIndex `json:"vector,omitempty"`
+}
+
+// VectorIndex describes an IVF ("inverted file") index: the vectors of
+// a sample of the table are clustered into Lists centres when the index
+// is built, every row's vector is filed under the centre nearest to it,
+// and a query reads only the lists whose centres are nearest the query
+// vector. Entries live at
+//
+//	/t/<tableID>/<indexID>/<list>/<primary key>  →  the row's vector
+//
+// so each list is one contiguous key span, and the centres at
+//
+//	/t/<tableID>/0/"ivf"/<Build>/<list>          →  the centre
+//
+// (keys.VectorCentroidPrefix): under the table, so that a backup, a
+// table restore and DROP TABLE carry or remove them with the rows, but
+// outside every index ID, so that TRUNCATE and a re-shard — which move
+// the indexes to fresh IDs — leave them where they are.
+type VectorIndex struct {
+	// Method is the access method as declared: "ivfflat".
+	Method string `json:"method"`
+	// Metric is the distance the index serves: "l2" (<->), "cosine"
+	// (<=>) or "ip" (<#>).
+	Metric string `json:"metric"`
+	// Lists is the number of centres actually trained — at most the
+	// number asked for (fewer when the table had fewer distinct vectors).
+	Lists int `json:"lists"`
+	// Dims is the column's dimension when the index was built.
+	Dims int `json:"dims"`
+	// Build names the training run whose centres the entries are filed
+	// by: a random identifier, new for every CREATE INDEX. The centres
+	// of a build never change (a delete finds a row's entry by
+	// recomputing its list), so anything derived from them may be cached
+	// under this name forever.
+	Build string `json:"build"`
 }
 
 // IsInverted reports whether the index is an inverted one.
 func (idx *IndexDescriptor) IsInverted() bool { return idx.Inverted != "" }
+
+// IsVector reports whether the index is a vector (IVF) index.
+func (idx *IndexDescriptor) IsVector() bool { return idx.Vector != nil }
 
 // Constraint kinds.
 const (

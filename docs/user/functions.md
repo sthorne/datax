@@ -2,7 +2,7 @@
 
 <!-- Generated from pkg/sql/builtins by `go generate ./pkg/sql/builtins`; do not edit by hand. -->
 
-Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`) and casts are described in [the SQL reference](sql.md#reading).
+Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`, the vector distances `<->`, `<=>`, `<#>`) and casts are described in [the SQL reference](sql.md#reading).
 
 ## Conditionals
 
@@ -113,6 +113,16 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `ts_rank_cd(any, any, [any], [any]) → float8` — ts_rank_cd([weights,] tsvector, tsquery [, normalization]): cover density ranking — a score from the shortest stretches of the document that satisfy the query, higher the fewer other words they hold. Arguments as ts_rank; normalization 4 also divides by the mean harmonic distance between the stretches. Needs positions: a stripped vector scores as if every word stood at one place. *immutable*
 - `tsvector_to_array(tsvector) → text[]` — tsvector_to_array(tsvector): the vector's lexemes, sorted, as a text array. *immutable*
 - `websearch_to_tsquery(text, [text]) → tsquery` — websearch_to_tsquery([config,] text): a tsquery from search-box syntax — words are required, "quoted text" is a phrase, or separates alternatives and -word excludes; never raises a syntax error. *stable*
+
+## Vectors
+
+- `cosine_distance(vector, vector) → float8` — One minus the cosine of the angle between two vectors (the `<=>` operator); NaN when either is the zero vector. *immutable*
+- `inner_product(vector, vector) → float8` — Inner (dot) product of two vectors; the `<#>` operator is its negation, so that smaller is nearer. *immutable*
+- `l1_distance(vector, vector) → float8` — Taxicab distance between two vectors: the sum of the absolute element differences. *immutable*
+- `l2_distance(vector, vector) → float8` — Euclidean distance between two vectors of the same dimension (the `<->` operator). *immutable*
+- `l2_normalize(vector) → vector` — The vector scaled to unit length (the zero vector stays zero). *immutable*
+- `vector_dims(vector) → int8` — The number of elements of a vector. *immutable*
+- `vector_norm(vector) → float8` — The Euclidean length of a vector. *immutable*
 
 ## Session and system
 

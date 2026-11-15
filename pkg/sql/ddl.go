@@ -91,6 +91,10 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, newErrf(CodeObjectInUse, "index %q is still being built", idx.Name)
 	}
 	indexID, indexName := idx.ID, idx.Name
+	wipe := indexWipe{tableID: desc.ID, indexID: indexID}
+	if idx.IsVector() {
+		wipe.vectorBuild = idx.Vector.Build
+	}
 	kept := desc.Indexes[:0]
 	for _, ix := range desc.Indexes {
 		if ix.ID != indexID {
@@ -102,7 +106,7 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, err
 	}
 	s.noteDDL(desc.Name)
-	s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
+	s.pendingWipes = append(s.pendingWipes, wipe)
 	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP INDEX"}, nil
 }

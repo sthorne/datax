@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sthorne/datax/pkg/sql/tsearch"
+	"github.com/sthorne/datax/pkg/sql/vector"
 	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
@@ -37,6 +38,7 @@ const (
 	Enum               // a user-defined enum: the label's ordinal (in I) and the label (in S)
 	Tsvector           // TSVECTOR: the canonical text of a text-search vector (in S)
 	Tsquery            // TSQUERY: the canonical text of a text-search query (in S)
+	Vector             // VECTOR: float32 elements, four big-endian bytes each (in S); see vector.go
 )
 
 // The Family values above are ON-DISK FORMAT (JSON-serialized in table
@@ -77,6 +79,8 @@ func (f Family) String() string {
 		return "TSVECTOR"
 	case Tsquery:
 		return "TSQUERY"
+	case Vector:
+		return "VECTOR"
 	}
 	return "UNKNOWN"
 }
@@ -105,7 +109,7 @@ func ParseType(name string) (Family, error) {
 		if err != nil {
 			return Unknown, err
 		}
-		if elem.IsArray() {
+		if elem.IsArray() || elem == Vector {
 			return Unknown, fmt.Errorf("unsupported type %q", name)
 		}
 		return ArrayOf(elem), nil
@@ -139,6 +143,8 @@ func ParseType(name string) (Family, error) {
 		return Tsvector, nil
 	case "TSQUERY":
 		return Tsquery, nil
+	case "VECTOR":
+		return Vector, nil
 	}
 	return Unknown, fmt.Errorf("unsupported type %q", name)
 }
@@ -375,7 +381,7 @@ func ParseJSONB(s string) (Datum, error) {
 // IsIndexable reports whether the family has an order-preserving key
 // encoding (usable in primary keys and indexes).
 func IsIndexable(f Family) bool {
-	return f != Jsonb && f != Tsvector && f != Tsquery && f != Unknown && !f.IsArray()
+	return f != Jsonb && f != Tsvector && f != Tsquery && f != Vector && f != Unknown && !f.IsArray()
 }
 
 // DecimalVal parses the canonical form back out of a Decimal datum.
@@ -407,6 +413,13 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 			return d.coerceArray(target)
 		case d.Fam == String:
 			return ParseArray(d.S, target.Elem())
+		case d.Fam == Vector && target.Elem() == Float:
+			v := d.VectorVal()
+			elems := make([]Datum, len(v))
+			for i, x := range v {
+				elems[i] = NewFloat(float64(x))
+			}
+			return NewArray(Float, elems), nil
 		}
 		return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 	}
@@ -486,6 +499,10 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		return ParseTsvector(d.S)
 	case d.Fam == String && target == Tsquery:
 		return ParseTsquery(d.S)
+	case d.Fam == String && target == Vector:
+		return ParseVector(d.S)
+	case d.Fam.IsArray() && target == Vector:
+		return VectorFromArray(d)
 	case d.Fam == String && target == IntervalFam:
 		iv, err := ParseInterval(d.S)
 		if err != nil {
@@ -561,6 +578,19 @@ func (d Datum) Compare(o Datum) (int, error) {
 		}
 		return compareArrays(d, o)
 	}
+	if (d.Fam == Vector && o.Fam == String) || (d.Fam == String && o.Fam == Vector) {
+		// A vector against a text literal: the literal is read as a
+		// vector (embedding = '[1,2,3]').
+		var err error
+		if d.Fam == String {
+			d, err = d.Coerce(Vector)
+		} else {
+			o, err = o.Coerce(Vector)
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
 	if (d.Fam == Enum && o.Fam == String) || (d.Fam == String && o.Fam == Enum) {
 		// An enum against text: by label (equality is exact; an order
 		// between the two is the labels' text order).
@@ -596,6 +626,8 @@ func (d Datum) Compare(o Datum) (int, error) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("%s values have no order", d.Fam)
+	case Vector:
+		return vector.Compare(vector.Decode(d.S), vector.Decode(o.S)), nil
 	}
 	return 0, fmt.Errorf("cannot compare %s values", d.Fam)
 }
@@ -627,12 +659,25 @@ func cmpInt(a, b int64) int {
 	return 0
 }
 
+// cmpFloat orders floats as PostgreSQL does: NaN equals NaN and sorts
+// after every other value. Without that rule NaN would compare equal to
+// everything, and a sort over a column holding one — the cosine
+// distance to a zero vector is NaN — would have no consistent order.
 func cmpFloat(a, b float64) int {
 	switch {
 	case a < b:
 		return -1
 	case a > b:
 		return 1
+	case a == b:
+		return 0
+	}
+	an, bn := math.IsNaN(a), math.IsNaN(b)
+	switch {
+	case an && !bn:
+		return 1
+	case bn && !an:
+		return -1
 	}
 	return 0
 }
@@ -725,6 +770,8 @@ func (d Datum) Text() string {
 		return FormatClock(d.I)
 	case Enum:
 		return d.S
+	case Vector:
+		return vector.Format(vector.Decode(d.S))
 	}
 	return ""
 }

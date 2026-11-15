@@ -10,6 +10,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // The tables. Column sets follow PostgreSQL 16's, trimmed to what psql,
@@ -276,7 +277,7 @@ func init() {
 				cat = "D"
 			case types.IntervalFam:
 				cat = "T"
-			case types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery:
+			case types.Bytes, types.Uuid, types.Jsonb, types.Tsvector, types.Tsquery, types.Vector:
 				cat = "U"
 			}
 			name := TypeName(f)
@@ -308,6 +309,11 @@ func init() {
 		// and the element row's typarray forward.
 		for i := range rows {
 			elem := rows[i][0].I
+			if elem == vector.OID {
+				// vector[] is not a type datax has (typarray stays 0): a
+				// row for it would take the text array's OID.
+				continue
+			}
 			arr := ArrayTypeOID(elem)
 			rows[i][12] = i64(arr)
 			name := "_" + rows[i][1].S

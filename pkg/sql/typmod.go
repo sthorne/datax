@@ -102,6 +102,10 @@ func pureWidening(old, new catalog.Column) bool {
 		return new.TimePrecision == 0 || (old.TimePrecision > 0 && new.TimePrecision >= old.TimePrecision)
 	case types.Decimal:
 		return old.Precision == new.Precision && old.Scale == new.Scale
+	case types.Vector:
+		// Dropping the declared dimension keeps every value valid;
+		// declaring or changing one does not.
+		return new.MaxLen == 0 || old.MaxLen == new.MaxLen
 	}
 	return true
 }

@@ -78,7 +78,7 @@ func retypeAllowed(from, to types.Family) bool {
 		return to == types.IntervalFam
 	case types.String:
 		switch to {
-		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery:
+		case types.Int, types.Float, types.Decimal, types.Bool, types.Timestamp, types.Date, types.Bytes, types.Uuid, types.Jsonb, types.IntervalFam, types.Time, types.Tsvector, types.Tsquery, types.Vector:
 			return true
 		}
 	}

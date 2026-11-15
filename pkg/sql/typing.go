@@ -79,6 +79,8 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 // arithFamily is the result family of l op r.
 func arithFamily(op string, l, r types.Family) types.Family {
 	switch op {
+	case "<->", "<=>", "<#>":
+		return types.Float // a distance between two vectors
 	case "||":
 		if l == types.Tsvector || r == types.Tsvector {
 			return types.Tsvector
@@ -109,6 +111,8 @@ func arithFamily(op string, l, r types.Family) types.Family {
 	}
 	ln, rn := numeric(l), numeric(r)
 	switch {
+	case l == types.Vector || r == types.Vector:
+		return types.Vector // element-wise + and -
 	case l == types.Timestamp && (r == types.Timestamp || r == types.Date) && op == "-",
 		l == types.Date && r == types.Timestamp && op == "-":
 		return types.IntervalFam
@@ -150,7 +154,7 @@ func sessionFuncFamily(name string) types.Family {
 		return types.Timestamp
 	case "current_date":
 		return types.Date
-	case "nextval", "currval", "lastval", "setval", "unique_rowid", "pg_backend_pid":
+	case "nextval", "currval", "lastval", "setval", "unique_rowid", "pg_backend_pid", "to_regtype":
 		return types.Int
 	case "gen_random_uuid", "uuid_generate_v4":
 		return types.Uuid

@@ -93,6 +93,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterTable(ctx, txn, t)
 	case *parser.DropIndex:
 		return s.execDropIndex(ctx, txn, t)
+	case *parser.CreateExtension:
+		// pgvector's type, operators and index method are built in, so
+		// the statement that would install them has nothing to do; any
+		// other extension is something datax does not have.
+		if t.Name != "vector" {
+			return nil, newErrf(CodeFeatureNotSupported, "extension %q is not available (datax has no extensions; \"vector\" is accepted because its type and operators are built in)", t.Name)
+		}
+		return &Result{Tag: "CREATE EXTENSION"}, nil
 	case *parser.CreateView:
 		return s.execCreateView(ctx, txn, t)
 	case *parser.CommentOn:
@@ -1672,6 +1680,12 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		// filter (its "primary key" is the hidden ordinal).
 		return s.fetchVirtual(ctx, txn, desc, where, params, limit)
 	}
+	if top := plan.top; top != nil {
+		if top.vec != nil {
+			return s.executeVectorScan(ctx, txn, desc, top.vec, where, params, top.keep)
+		}
+		return s.scanTopK(ctx, txn, desc, plan, where, top.order, params, top.keep)
+	}
 	switch plan.kind {
 	case planPKPoint:
 		key, err := rowenc.EncodePK(desc, plan.pkVals)
@@ -2306,7 +2320,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 	}
 	needSort := false
-	order := resolveOrderAliases(t)
+	order := foldDistanceConstants(desc, resolveOrderAliases(t), params)
 	if len(order) > 0 {
 		dec := orderPlan(desc, plan, order, s.db.ReverseScansOK())
 		needSort = !dec.satisfied
@@ -2323,6 +2337,16 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		return s.newScanStream(txn, desc, plan, t, proj, t.Where, params, fetchLimit)
 	}
 	var rows []fetchedRow
+	if topKEligible(desc, plan, t, needSort, corr) {
+		// ORDER BY ... LIMIT over a scan: only the rows that can still
+		// make the limit are kept (topk.go) — read out of a vector index
+		// when the order is a distance one serves, else out of the scan
+		// itself. It is a directive on the plan, like the scan direction,
+		// so the fetch below goes through executePlan as every fetch
+		// does; the rows it returns then take the ordinary sort, over at
+		// most the limit's worth of them.
+		plan.top = &topKSpec{order: order, keep: keepCount(t), vec: s.pickVectorIndex(desc, plan, order, params)}
+	}
 	if t.ForUpdate && t.LockWait == parser.LockWaitSkipLocked {
 		rows, err = s.fetchSkipLocked(ctx, txn, desc, plan, t, params, fetchLimit, corr, needSort, order)
 		if err != nil {
@@ -3058,8 +3082,21 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	}
 	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
 	dec := orderPlan(desc, plan, sel.OrderBy, s.db.ReverseScansOK())
+	// The top-k paths, decided as execSelect decides them.
+	topK := !grouped && topKEligible(desc, plan, sel, len(sel.OrderBy) > 0 && !dec.satisfied, corr)
+	viaVector := false
+	if topK {
+		if vp := s.pickVectorIndex(desc, plan, resolveOrderAliases(sel), params); vp != nil {
+			text = vp.String() + strings.TrimPrefix(text, plan.String())
+			viaVector = true
+		}
+	}
 	if len(sel.OrderBy) > 0 && !grouped {
 		switch {
+		case viaVector:
+			text += fmt.Sprintf("; top-k: the nearest %d candidates that pass the filter kept, in index distance order", keepCount(sel))
+		case topK:
+			text += fmt.Sprintf("; top-k heap: the first %d rows in order kept while scanning, no full sort", keepCount(sel))
 		case dec.satisfied && dec.mergeFan:
 			text += "; order satisfied by K-way merge across shard buckets"
 			if dec.reverse {

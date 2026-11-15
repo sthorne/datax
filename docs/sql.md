@@ -19,6 +19,8 @@ ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN]
     | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t [USING btree] (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
 CREATE INDEX [IF NOT EXISTS] i ON t USING gin (jsonb_col [jsonb_ops | jsonb_path_ops])
+CREATE INDEX [IF NOT EXISTS] i ON t USING ivfflat (vector_col [vector_l2_ops | vector_cosine_ops | vector_ip_ops]) [WITH (lists = n)]   -- see Vectors below
+CREATE EXTENSION [IF NOT EXISTS] vector  -- accepted, does nothing: the type is built in
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]   -- a layout swap: new index IDs, the old layout retired
 DROP TABLE t
 CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...  /  DROP VIEW [IF EXISTS] v [, ...] [CASCADE]  /  SHOW VIEWS
@@ -76,7 +78,10 @@ SHOW STATS FOR t
   rowenc tag 15, keys as ordinal then label, so nothing on a read path
   looks the type up),
   `BYTES` (alias BYTEA; `\x` hex text format), `UUID`, `DECIMAL` (aliases
-  NUMERIC, DEC), `JSONB` (alias JSON), and arrays of every scalar
+  NUMERIC, DEC), `JSONB` (alias JSON), `VECTOR` (pgvector's `vector(n)`:
+  float32 elements, four big-endian bytes each in `Datum.S`, the
+  dimension in `Column.MaxLen`; rowenc tag 18; no key encoding — see
+  Vectors below), and arrays of every scalar
   family but JSONB (`types.ArrayOf(elem)`, a composite Family value
   `Array | elem<<8` so one value names `INT8[]` wherever a family flows;
   elements in `Datum.A`; rowenc tag 14 encodes each element with its
@@ -1020,6 +1025,183 @@ PostgreSQL's richer token types; generated columns, which would make the
 weighted title-and-body vector maintainable by the database; `query @@
 vector` and negation-aware planning; ranked top-k.
 
+## Vectors (v21)
+
+Issue #304: pgvector's surface — `vector(n)`, the distance operators
+`<->` (L2), `<=>` (cosine) and `<#>` (negative inner product), `ORDER BY
+embedding <-> $1 LIMIT k` — in two steps: exact search, then an
+approximate index.
+
+**The type.** `types.Vector` is a family like any other: a datum holds
+its elements in `Datum.S` as big-endian float32, which is at once the
+stored form (rowenc tag 18, length-prefixed), the payload of pgvector's
+binary wire form (`int16` dimension, `int16` zero, the elements) and
+what an index entry carries, so a value is never rebuilt on its way
+through. `pkg/sql/vector` has the arithmetic and knows nothing of
+datums: parse and format (shortest float32 text), the three distances
+accumulated in float64, k-means. `vector(n)`'s dimension is the column's
+`MaxLen` — the one number the type takes, kept where a string's length
+is so that every place a declared type is copied (CTAS, LIKE, ALTER
+COLUMN TYPE, the result column) carries it without a new field — and
+`Column.Conform` refuses a value of another dimension (`22000`). `NaN`
+and infinities are refused at parse and at binary decode. The type has
+no order-preserving key encoding (`types.IsIndexable` is false: a
+6 KiB key per row would be the result), so it is not a primary key or an
+ordinary index column; `Datum.Compare` orders vectors element by
+element for `=`, `ORDER BY` and grouping. Float comparison was made a
+total order while here (`NaN` equal to itself and after every number, as
+PostgreSQL has it): the cosine distance to a zero vector is `NaN`, and a
+sort over distances containing one had no consistent order.
+
+**The OID.** pgvector is an extension, so its type's OID differs per
+database and clients look it up by name. Here it is a constant
+(`vector.OID`, 16000: in the range PostgreSQL leaves to initdb-time
+objects, below the first user OID, so it meets no built-in and no
+enum), answered by `to_regtype('vector')` and `pg_type`. `CREATE
+EXTENSION vector` parses and does nothing; any other name is `0A000`. A
+`$n` that is an operand of a distance operator, or that the client
+declared with the vector OID, is typed as a vector in
+`ParameterDescription`, which is what makes a registered client send
+it in binary. (`parser.CountParams` did not look at `ORDER BY`
+expressions; a statement whose only parameter was in one described no
+parameters.)
+
+**Operators.** The lexer takes `<->`, `<=>` and `<#>` as three-character
+tokens (none is a prefix of anything valid: after `<-`, `<=` or `<#`, a
+`>` could only begin an operand). They parse one level above `+` and
+`-` (`parseAddExpr` → `parseSumExpr`), PostgreSQL's precedence for
+"any other operator", as ordinary `BinOp` nodes, and evaluate through
+`builtins.VectorOp` with a vector, a text literal or a numeric array on
+either side.
+
+**Exact search: the top-k scan** (`pkg/sql/topk.go`). `ORDER BY <expr>
+LIMIT k` over a scan the access path does not deliver in order used to
+fetch every matching row, sort, and cut. Now, when nothing between the
+fetch and the sort needs the whole set (no DISTINCT, correlated filter
+or `FOR UPDATE`) and the plan is one span of a real table's primary
+index, the scan reads the span in pages of 512 keys and keeps a heap of
+the `k` (limit + offset) best rows, worst on top; a row that does not
+beat the worst is dropped where it stands, and a row that leaves the
+heap gives back its charge against `statement_memory_limit`. Memory is
+`k` rows and a page whatever the table. Ties keep scan order — equal
+keys are ordered by the sequence the scan produced them in — so the
+result is the stable sort's, row for row; the `k` survivors then go
+through `sortRows` as before. `sortRows` and the heap share one key
+evaluator (`orderKeyer`). The constant operand of a distance term is
+read as a vector once per statement (`foldDistanceConstants`) and the
+per-row distance is computed over the two stored forms without
+decoding either (`vector.Metric.StoredDistance`): about 3 µs a row at
+64 dimensions, most of it the scan and the row decode. This path is for
+any ORDER BY ... LIMIT, not only distances. `EXPLAIN`: `...; top-k
+heap: the first 10 rows in order kept while scanning, no full sort`.
+
+**The index: IVF** (`pkg/sql/vector_index.go`, `catalog.VectorIndex`).
+`CREATE INDEX ... USING ivfflat (col vector_l2_ops | vector_cosine_ops |
+vector_ip_ops) WITH (lists = n)`. An "ordered key → rows" index cannot
+hold nearness, and of the two families of approximate index the
+clustering one maps onto an ordered, range-partitioned store and the
+graph one does not:
+
+- IVF: the vectors are clustered around `lists` centres; a row's entry
+  is `/t/<table>/<index>/<list>/<pk> → vector`. A list is one contiguous
+  key span, so a probe is one scan, lists split, merge and move as
+  ranges like any data, and maintaining a row's entry is one key in the
+  row's own transaction, a function of that row alone.
+- HNSW: a query is hundreds of dependent point reads across ranges, and
+  an insert rewrites the neighbour lists of *other* rows — writes to
+  keys the inserting transaction did not otherwise touch, so unrelated
+  inserts conflict under serializable isolation, and every one is a
+  multi-range transaction. `USING hnsw` is refused by name.
+
+*Centres.* `trainVectorIndex` runs before anything is published: it
+reads the table at one timestamp without a transaction, keeps a
+reservoir sample (50 rows per list, at least 2,000; only sampled rows
+are decoded), runs k-means++ and at most 12 rounds of Lloyd's algorithm
+(`vector.Train`; spherical — unit centres, direction only — for the
+cosine and inner-product classes, which also file and probe by inner
+product with the centre), and commits the centres at
+`/t/<table>/0/"ivf"/<build>/<list>` (`keys.VectorCentroidPrefix`),
+where `<build>` is a random identifier new for every CREATE INDEX. Only
+then does the descriptor gain the index (`IndexDescriptor.Vector`:
+method, metric, lists actually trained, dimension, build), in the
+write-only state, and the ordinary online backfill runs. So no writer
+ever sees the index without its final centres. Fewer distinct sample
+vectors than `lists` train fewer lists; an empty table trains one, at
+the origin — an exact index no faster than a scan.
+
+*Why the centres never move.* An UPDATE or DELETE finds a row's entry
+by recomputing its key from the old row (`rowenc.IndexEntries`, the one
+encoder the write path, the backfill and the re-shard copy share): the
+list is `Centroids.Assign(vector)`, a pure function. A centre that
+moved would strand every entry filed before it did. The cost is drift:
+rows unlike the training sample are filed under centres that fit them
+badly and recall at a given `probes` falls. The remedy is a rebuild
+(a second index, then drop the first — a new build, new centres); there
+is no REINDEX and no incremental retraining.
+
+*Why under index 0.* TRUNCATE and a re-shard move every index to a
+fresh ID and retire the old span; centres under the index's own ID
+would be wiped with it. Index ID 0 is never an index (the primary is 1),
+so keys under it belong to the table: they survive renumbering, and a
+backup, a table restore (which re-keys the whole table prefix; the
+`vector` field is on its allow-list) and DROP TABLE carry or remove
+them with the rows. DROP INDEX deletes them after its commit, with the
+entries.
+
+*How the encoder gets them.* `rowenc` has no transaction to read with.
+The centres of each build are kept in a process-wide registry keyed by
+build ID (`vector.Lookup`) — immutable, so never stale, and a build ID
+is random, so two clusters in one test process do not collide.
+`Session.lookup` (and the cascade's lookup by ID) loads the centres of a
+table's vector indexes into it, outside the caller's transaction, before
+the descriptor is used; an index whose centres cannot be read whole is
+left unloaded and writes to its table fail by name
+(`rowenc.ErrCentroidsNotLoaded`) rather than file a row under a guess.
+Entries are dropped from the registry on DROP INDEX on that node and
+otherwise live as long as the process.
+
+*Maintenance.* One entry per row with a non-NULL vector, written,
+moved or removed in the row's transaction like any index entry.
+`entryDiff` now also rewrites an entry whose key is unchanged but whose
+value differs: a new vector filed under the same list.
+
+*Reading* (`pickVectorIndex`, `executeVectorScan`). The shape is one
+ascending distance term as the only sort key, a LIMIT, the top-k
+conditions above, an access plan that would otherwise be a full scan,
+and a public index on the column for the term's metric. The scan ranks
+the centres, reads the lists of the nearest `ivfflat.probes` (default
+`⌈√lists⌉`; pgvector's default of 1 is a poor recall to hand out
+unasked), computes each entry's true distance from the vector in the
+entry, sorts the candidates (NaN last, ties by primary key, as the
+exact scan breaks them), and fetches rows nearest first through
+`fetchPrimaryRows` → `decodeFullRow` → `matchesWhere` — the ordinary
+row path — until `k` have passed the full WHERE clause. The filter is
+therefore applied to every candidate of the probed lists in distance
+order, not to a pre-cut top `k`. A WHERE clause the primary key or an
+ordinary index can serve keeps that plan and the exact top-k over what
+it selects: correct, and usually cheaper than probing for a selective
+filter. There is no cost model between the two and no index prefix
+column (`WHERE tenant = $1` inside the index); both are left for later.
+`SET vector_index_scan = off` forces the exact path. Rows with a NULL
+vector have no entry, so the index never returns them.
+
+*Recall.* Approximate means: every row returned is real, with its true
+distance, in true order, and rows of unprobed lists are missing.
+`TestVectorIndexRecall` (20,000 × 32 dimensions in 400 Gaussian
+clusters, 100 lists, 3 nodes, k = 10) measures 0.83 at 1 probe, 0.92 at
+3, 0.98 at the default 10, 0.999 at 20 and exactly 1 at 100; the
+`vector-knn` bench workload records recall, latency and build time
+(bench/README.md).
+
+**Version gate.** A v20 node meets rowenc tag 18 as a corrupt row and
+would drop `IndexDescriptor.Vector`; VECTOR columns and `USING ivfflat`
+are refused until v21 is finalized.
+
+Left for later: a prefix column for filtered search, a cost model
+against the scan, quantized entries (the entry holds the full vector:
+storage doubles per index), retraining in place, `halfvec` /
+`sparsevec`, vector aggregates, parallel probes across lists.
+
 ## Execution
 
 The executor ranks access paths:
@@ -1036,7 +1218,9 @@ The executor ranks access paths:
 
 An inverted index that the WHERE clause constrains is considered between
 steps 2 and 4: taken unless step 3 pinned a key column by equality (see
-Inverted indexes above).
+Inverted indexes above). A vector index is not an access path for a
+WHERE clause at all: it is chosen after this ranking, from the ORDER BY,
+when the ranking ended at step 4 (see Vectors above).
 
 With table statistics present (ANALYZE or the background sampler),
 step 3 ranks competing scans by **estimated cost** instead of the
@@ -1058,7 +1242,9 @@ complete WHERE clause against every fetched row regardless of path, so
 plan bounds only ever narrow the scan. `LIMIT` is pushed into the KV scan
 exactly when the residual is empty (every scanned row is a result row)
 and any ORDER BY is already satisfied by the access path; scanned-row
-counts are observable via `datax_sql_rows_scanned_total`.
+counts are observable via `datax_sql_rows_scanned_total`. An ORDER BY
+the path does not satisfy, with a LIMIT, keeps a heap of the limit's
+rows while scanning instead of sorting them all (see Vectors above).
 
 **Panic barrier.** The statement path is a panic barrier (#136): a
 panic anywhere below `Session.Execute` — in the planner, the executor,

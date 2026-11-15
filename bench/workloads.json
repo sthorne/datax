@@ -15,6 +15,8 @@
     {"name": "jsonb-contain-filter", "args": ["jsonb-contain", "--jsonb-index", "none", "--preload", "50000", "--groups", "1000", "--payload-bytes", "64", "--concurrency", "2", "--duration", "20s", "--seed", "1"]},
     {"name": "text-search",          "args": ["text-search", "--preload", "50000", "--groups", "1000", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
     {"name": "text-search-filter",   "args": ["text-search", "--text-index", "none", "--preload", "50000", "--groups", "1000", "--concurrency", "2", "--duration", "20s", "--seed", "1"]},
+    {"name": "vector-knn",       "args": ["vector-knn", "--preload", "50000", "--dims", "64", "--groups", "1000", "--lists", "200", "--concurrency", "8", "--duration", "20s", "--seed", "1"]},
+    {"name": "vector-knn-exact", "args": ["vector-knn", "--vector-index", "none", "--preload", "50000", "--dims", "64", "--groups", "1000", "--concurrency", "2", "--duration", "20s", "--seed", "1"]},
     {"name": "scan",             "args": ["scan", "--preload", "20000", "--payload-bytes", "256", "--concurrency", "4", "--duration", "20s", "--seed", "1"]},
     {"name": "scan-200k",        "args": ["scan", "--preload", "200000", "--payload-bytes", "256", "--concurrency", "2", "--duration", "30s", "--seed", "1"]},
     {"name": "kv-50-50-1000-ranges",      "args": ["kv", "--read-pct", "50", "--preload", "10000", "--presplit", "1000", "--concurrency", "16", "--duration", "20s", "--seed", "1"]},

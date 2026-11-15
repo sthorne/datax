@@ -1217,6 +1217,12 @@ Rules of the road:
   AS` are refused with `0A000`), and neither kind of full-text GIN index
   can be created: a node on the older binary cannot decode such a row.
   The functions and the `@@` operator store nothing and work at once.
+- **v21 also adds `VECTOR` columns and their `ivfflat` index.** Until
+  it is finalized a `vector` column (`CREATE TABLE`, `ADD COLUMN`,
+  `ALTER COLUMN TYPE`) and `CREATE INDEX ... USING ivfflat` are refused
+  (`0A000`): a node on the older binary cannot read a row holding a
+  vector, and would maintain the index as an ordinary one. The distance
+  operators and functions work on values at either version.
 
 ## Decommissioning a node
 
@@ -1325,6 +1331,7 @@ datax bench index-join --preload 20000 --groups 1000   # secondary-index fan-out
 datax bench scan --preload 20000                        # large result sets through pgwire
 datax bench jsonb-contain --preload 50000 [--jsonb-index none]   # JSONB containment: through a GIN index, or as a filter
 datax bench text-search --preload 1000000 --groups 20000 [--text-query word|phrase|prefix|ranked] [--text-index none]   # full-text search: through a GIN index, or as a filter
+datax bench vector-knn --preload 50000 --dims 64 [--vector-index none] [--lists 200] [--probes 5]   # nearest neighbours: through an ivfflat index (with its recall and build time), or exactly
 ```
 
 `ingest` writes batches of keys (random for LSM stress); `timeseries`

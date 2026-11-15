@@ -24,6 +24,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vector"
 )
 
 // PostgreSQL type OIDs for datax's SQL types.
@@ -47,6 +48,7 @@ const (
 	oidTsquery     = 3615
 	oidTime        = 1083
 	oidInterval    = 1186
+	oidVector      = vector.OID
 )
 
 // pgEpochOffsetMicros converts between the Unix epoch and PostgreSQL's
@@ -143,6 +145,8 @@ func typeOID(f types.Family) uint32 {
 		return oidInterval
 	case types.Time:
 		return oidTime
+	case types.Vector:
+		return oidVector
 	case types.Enum:
 		return oidText // a value without its type describes as text
 	default:
@@ -947,6 +951,8 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	case types.Time:
 		// Binary time: microseconds since midnight.
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000))
+	case types.Vector:
+		return vector.EncodeBinary(d.S)
 	default:
 		return []byte(d.Text()) // an enum's binary form is its label
 	}
@@ -1128,6 +1134,12 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
 		}
 		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
+	case types.Vector:
+		stored, err := vector.DecodeBinary(raw)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		return types.Datum{Fam: types.Vector, S: stored}, nil
 	default:
 		return types.NewString(string(raw)), nil // text: binary == raw bytes
 	}
@@ -1169,6 +1181,13 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 		if serr != nil {
 			c.extError(serr)
 			return
+		}
+		// A parameter the client declared a vector is one, wherever it
+		// stands in the statement: its binary form is not text.
+		for i, oid := range m.ParameterOIDs {
+			if oid == oidVector && i < len(fams) && fams[i] == types.Unknown {
+				fams[i] = types.Vector
+			}
 		}
 		p.paramFams = fams
 	default:

@@ -358,6 +358,13 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 			memo.m[name] = d
 		}
 	}
+	if err == nil && d != nil {
+		// Whatever the statement goes on to do with the table, the row
+		// encoder can file its rows in the table's vector indexes.
+		if verr := s.loadVectorCentroids(ctx, d); verr != nil {
+			return nil, verr
+		}
+	}
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -1270,6 +1277,11 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 	if d, ok, err := builtins.DateArith(l, op, r); ok {
 		return d, builtinErr(err)
 	}
+	if l.Fam == types.Vector || r.Fam == types.Vector || builtins.IsVectorOp(op) {
+		if d, ok, err := builtins.VectorOp(l, op, r); ok {
+			return d, builtinErr(err)
+		}
+	}
 	switch op {
 	case "||":
 		if l.Fam == types.Tsvector || r.Fam == types.Tsvector {
@@ -1414,6 +1426,22 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		return types.NewString(`"` + strings.ReplaceAll(args[0].Text(), `"`, `""`) + `"`), nil
 	case "pg_typeof":
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
+	case "to_regtype":
+		// The type's OID when the name is a type's, NULL when it is not:
+		// how a client finds the vector type, whose OID no client knows
+		// in advance (to_regtype('vector')::oid).
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		name := strings.ToLower(strings.TrimSpace(args[0].Text()))
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		fam, err := types.ParseType(name)
+		if err != nil {
+			return types.DNull, nil
+		}
+		return types.NewInt(vtable.TypeOID(fam)), nil
 	case "format_type":
 		if args[0].Null {
 			return types.DNull, nil

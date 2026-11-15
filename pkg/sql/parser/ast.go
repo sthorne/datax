@@ -339,6 +339,17 @@ type CreateIndex struct {
 	// executor decides which functions it can index by.
 	ExprFunc string
 	ExprArg  string
+	// With holds the WITH (name = value) storage parameters, names
+	// lower-cased (USING ivfflat ... WITH (lists = 100)).
+	With map[string]string
+}
+
+// CreateExtension is CREATE EXTENSION [IF NOT EXISTS] name. There are
+// no extensions to install; the statement exists so that a schema
+// written for PostgreSQL with pgvector ("CREATE EXTENSION vector")
+// loads, and the executor refuses any other name.
+type CreateExtension struct {
+	Name string
 }
 
 // DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on
@@ -984,6 +995,7 @@ func (*AlterSequence) stmt()          {}
 func (*ShowSequences) stmt()          {}
 func (*ShowFunctions) stmt()          {}
 func (*CreateIndex) stmt()            {}
+func (*CreateExtension) stmt()        {}
 func (*DropIndex) stmt()              {}
 func (*CreateView) stmt()             {}
 func (*CommentOn) stmt()              {}

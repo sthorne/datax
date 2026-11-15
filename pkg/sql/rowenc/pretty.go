@@ -61,6 +61,17 @@ func PrettyKey(desc *catalog.TableDescriptor, k keys.Key) string {
 		}
 		rest = tail
 		fams = pkFamilies(desc)
+	case idx != nil && idx.IsVector():
+		// A vector entry: the list it is filed under, then the primary
+		// key.
+		b.WriteString("/" + idx.Name)
+		tail, list, err := encoding.DecodeUint64(rest)
+		if err != nil {
+			return b.String() + keys.PrettyDatums(rest)
+		}
+		fmt.Fprintf(&b, "/list %d", list)
+		rest = tail
+		fams = pkFamilies(desc)
 	case idx != nil:
 		b.WriteString("/" + idx.Name)
 		for _, id := range idx.ColumnIDs {

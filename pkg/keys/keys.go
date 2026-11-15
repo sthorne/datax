@@ -582,6 +582,25 @@ func TableIndexPrefix(tableID, indexID uint64) Key {
 	return Key(encoding.EncodeUint64(TableDataPrefix(tableID), indexID))
 }
 
+// TableAuxIndexID is the index ID no index ever has (primary rows are
+// index 1 and secondary indexes count up from 2): the keys under it
+// belong to the table as a whole and stay put when its indexes are
+// renumbered.
+const TableAuxIndexID = 0
+
+// VectorCentroidPrefix is the prefix of the centres of one build of a
+// vector index (catalog.VectorIndex): /t/<tableID>/0/"ivf"/<build>/,
+// followed by the list number.
+func VectorCentroidPrefix(tableID uint64, build string) Key {
+	k := encoding.EncodeString(TableIndexPrefix(tableID, TableAuxIndexID), "ivf")
+	return Key(encoding.EncodeString(k, build))
+}
+
+// VectorCentroidKey is the key of one centre.
+func VectorCentroidKey(tableID uint64, build string, list int) Key {
+	return Key(encoding.EncodeUint64(VectorCentroidPrefix(tableID, build), uint64(list)))
+}
+
 // TableIndexSpan covers all entries of one index of a table.
 func TableIndexSpan(tableID, indexID uint64) (Key, Key) {
 	p := TableIndexPrefix(tableID, indexID)

@@ -265,6 +265,43 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		for _, se := range t.Exprs {
 			fromCalls(se.Expr)
 		}
+		// A parameter that is an operand of a vector distance is a
+		// vector (ORDER BY embedding <-> $1), wherever the distance is
+		// written: a client that knows the type then sends it in binary.
+		var fromDistances func(e parser.Expr)
+		fromDistances = func(e parser.Expr) {
+			if builtins.IsVectorOp(e.BinOp) && e.Right != nil {
+				for _, operand := range []int{e.Param, e.Right.Param} {
+					if operand > 0 && fams[operand-1] == types.Unknown {
+						fams[operand-1] = types.Vector
+					}
+				}
+			}
+			for _, sub := range []*parser.Expr{e.Left, e.Right} {
+				if sub != nil {
+					fromDistances(*sub)
+				}
+			}
+			for _, a := range e.Args {
+				fromDistances(a)
+			}
+		}
+		for m := t; m != nil; m = m.Union {
+			for _, se := range m.Exprs {
+				fromDistances(se.Expr)
+			}
+			for _, oc := range m.OrderBy {
+				if oc.Expr != nil {
+					fromDistances(*oc.Expr)
+				}
+			}
+			for _, cmp := range m.Where {
+				if cmp.Expr != nil {
+					fromDistances(*cmp.Expr)
+				}
+				fromDistances(cmp.Value)
+			}
+		}
 		// Every set-operation member types its own WHERE; a derived table
 		// types as a statement of its own.
 		if hasDerivedJoin(t) {

@@ -56,7 +56,7 @@ func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDesc
 		return nil, nil
 	case "gin":
 	default:
-		return nil, newErrf(CodeFeatureNotSupported, "access method %q is not supported (btree and gin are)", t.Using)
+		return nil, newErrf(CodeFeatureNotSupported, "access method %q is not supported (btree, gin and ivfflat are)", t.Using)
 	}
 	if s.db.ClusterVersion() < version.V21 {
 		return nil, newErrf(CodeFeatureNotSupported, "CREATE INDEX ... USING GIN needs cluster version %s (finalize the upgrade first)", version.V21)
@@ -140,10 +140,25 @@ const backfillChunkSize = 64
 // execCreateIndexOnline runs the state machine. The session has already
 // rejected explicit-transaction contexts.
 func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateIndex) (*Result, *Error) {
+	// A vector index trains its centres before anything is published
+	// (see vector_index.go): vec is then the index's description, its
+	// centres already committed. nil for every other kind of index, and
+	// when the name is taken and there was nothing to train for.
+	vspec, err := s.vectorSpecFor(t)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	var vec *catalog.VectorIndex
+	var vecTableID uint64
+	if vspec != nil {
+		if vec, vecTableID, err = s.trainVectorIndex(ctx, t, vspec); err != nil {
+			return nil, ToSQLError(err)
+		}
+	}
 	// Step 1: publish write-only.
 	var indexID uint64
 	exists := false
-	err := s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
+	err = s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		exists = false
 		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
@@ -169,9 +184,21 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			}
 			return newErrf(CodeDuplicateObject, "index %q already exists", t.Name)
 		}
-		kind, err := s.invertedKindFor(t, desc)
-		if err != nil {
-			return err
+		var kind inverted.Kind
+		if vspec == nil {
+			if kind, err = s.invertedKindFor(t, desc); err != nil {
+				return err
+			}
+		} else {
+			// The column may have changed since the centres were trained
+			// on it.
+			col, err := vectorIndexColumn(desc, t.Columns[0])
+			if err != nil {
+				return err
+			}
+			if vec == nil || desc.ID != vecTableID || int(col.MaxLen) != vec.Dims {
+				return newErrf(CodeObjectInUse, "table %q changed while index %q was being prepared; run CREATE INDEX again", t.Table, t.Name)
+			}
 		}
 		var colIDs []catalog.ColumnID
 		seenCol := map[catalog.ColumnID]bool{}
@@ -180,7 +207,10 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			if !ok {
 				return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 			}
-			if kind == nil && !types.IsIndexable(col.Type) {
+			if kind == nil && vspec == nil && !types.IsIndexable(col.Type) {
+				if col.Type == types.Vector {
+					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it for nearest-neighbour search with USING ivfflat", name, col.Type)
+				}
 				if col.Type == types.Jsonb || col.Type == types.Tsvector {
 					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
 				}
@@ -205,11 +235,16 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		if kind != nil {
 			idx.Inverted = kind.Name()
 		}
+		idx.Vector = vec
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
 		indexID = idx.ID
 		return s.cat.Update(ctx, txn, desc)
 	})
+	if vec != nil && (err != nil || exists) {
+		// The centres were trained for an index that is not to be.
+		s.dropVectorCentroids(ctx, vecTableID, vec.Build)
+	}
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
@@ -265,6 +300,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		_ = s.cat.FinishDDLIn(ctx, s.database, t.Table)
 		if tableID != 0 {
 			s.wipeIndexEntries(ctx, tableID, indexID)
+			if vec != nil {
+				s.dropVectorCentroids(ctx, tableID, vec.Build)
+			}
 		}
 		return nil, ToSQLError(backfillErr)
 	}

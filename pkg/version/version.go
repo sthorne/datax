@@ -263,6 +263,19 @@ const (
 	// tables as ordinary ones, whose owner may delete rows, which here are
 	// pages of somebody's object. Nothing creates the tables and the
 	// functions are refused until finalize (rule 4).
+	//
+	// V21 also introduces the VECTOR column type and its index (issue #304,
+	// pkg/sql/vector). A column of the new type family has a row-value
+	// tag of its own, which a v20 node meets as a corrupt row; and an
+	// index descriptor may describe a vector index
+	// (catalog.IndexDescriptor.Vector), whose entries are keyed by the
+	// list a row's vector is filed under and whose centres live beside
+	// the table's indexes (keys.VectorCentroidPrefix). A v20 node drops
+	// the field and would maintain the index as an ordinary one over a
+	// type it cannot key. A VECTOR column and CREATE INDEX ... USING
+	// ivfflat are therefore refused until finalize (rule 4). The field is
+	// omitempty and the family is appended, so every descriptor written
+	// before reads the same.
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

@@ -81,8 +81,11 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   filters over every row; `CREATE INDEX ... USING GIN (j)` makes `@>`
   and the three key operators index lookups — see
   [JSONB indexes](#jsonb-indexes).
-- Every type except JSONB, TSVECTOR and TSQUERY can appear in primary
-  keys and ordinary indexes.
+- `VECTOR(n)` (pgvector's `vector`) holds `n` float4 elements, for
+  embeddings: `'[0.1, 2, -3.5]'`. See [Vectors](#vectors) for the
+  distance operators, nearest-neighbour queries and the index.
+- Every type except JSONB, TSVECTOR, TSQUERY and VECTOR can appear in
+  primary keys and ordinary indexes.
 
 ## DDL
 
@@ -99,6 +102,7 @@ DROP TABLE [IF EXISTS] t;
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
+CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
 DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
@@ -857,7 +861,10 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   delivers the order — ascending along the key, descending via a
   reverse scan, and on sharded timeseries tables either direction via a
   K-way merge of the per-bucket scans (`ORDER BY ts DESC LIMIT n`
-  dashboards stop early instead of scanning everything).
+  dashboards stop early instead of scanning everything). A sort with a
+  `LIMIT` over a single table's scan keeps only the limit's rows while
+  it reads (`top-k heap` in `EXPLAIN`): every matching row is still
+  read, but memory is the limit's rows, not the table's.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when
@@ -1097,6 +1104,162 @@ so full backups and restores carry them, encryption at rest covers
 them, and their pages spread over ranges like any table's rows. Cluster
 version v21.
 
+## Vectors
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;     -- accepted and does nothing: the type is built in
+CREATE TABLE items (id INT8 PRIMARY KEY, tenant INT8, embedding vector(3));
+INSERT INTO items VALUES (1, 7, '[1, 2, 3]'), (2, 7, ARRAY[4, 6, 3]);
+
+SELECT id FROM items ORDER BY embedding <-> '[3, 1, 2]' LIMIT 5;        -- the 5 nearest, Euclidean
+SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 5;                 -- cosine distance
+SELECT id FROM items ORDER BY embedding <#> $1 LIMIT 5;                 -- largest inner product
+SELECT id, embedding <-> $1 AS d FROM items WHERE tenant = 7 ORDER BY d LIMIT 5;
+```
+
+This follows [pgvector](https://github.com/pgvector/pgvector), so its
+clients and ORM integrations work; what differs is listed under
+[PostgreSQL differences](postgres-differences.md).
+
+**The type.** `vector(n)` holds exactly `n` elements, each a float4
+(about seven significant digits); `vector` without `(n)` takes any
+dimension, but only a column with a declared dimension can be indexed.
+A value is written `'[1, 2.5, -3e2]'`, or converted from a numeric
+array. Up to 16,000 dimensions; every element must be a finite number
+(`NaN` and `Infinity` are refused, `22P02`), and a value of the wrong
+dimension for its column is refused (`22000`). A 1,536-dimension vector
+takes about 6 KiB in its row. Vectors compare for equality and order
+element by element (`=`, `<>`, `<`, `ORDER BY v`, `GROUP BY v`,
+`DISTINCT`), but a vector cannot be a primary key or part of an ordinary
+or unique index. `ALTER TABLE ... ALTER COLUMN ... TYPE vector(n)`
+converts a text column whose values are vectors.
+
+**Operators and functions.**
+
+| | |
+|---|---|
+| `a <-> b` | Euclidean (L2) distance; `l2_distance(a, b)` |
+| `a <=> b` | cosine distance, `1 − cos(a, b)`, from 0 (same direction) to 2 (opposite); `NaN` when either is the zero vector, and `NaN` sorts after every number; `cosine_distance(a, b)` |
+| `a <#> b` | **negative** inner product, so that ascending order is nearest first; `inner_product(a, b)` is the product itself |
+| `a + b`, `a - b` | element-wise |
+| `vector_dims(a)`, `vector_norm(a)`, `l2_normalize(a)`, `l1_distance(a, b)` | [functions reference](functions.md#vectors) |
+
+Either operand may be a column, a `'[...]'` literal, a parameter or a
+numeric array. The two operands must have the same dimension (`22000`).
+A distance with a NULL operand is NULL, and sorts last. The distance
+operators bind more loosely than `+` and `-` and more tightly than
+comparisons, as in PostgreSQL: `embedding <-> $1 < 0.5` compares the
+distance.
+
+**Casts.** `'[1,2,3]'::vector`, `::vector(3)` (checks the dimension),
+`ARRAY[1,2,3]::vector`, `v::text`, `v::float8[]`.
+
+**Clients.** In text, a vector is its `'[...]'` form: send a string,
+read a string. For binary, a client registers the type by OID, and
+looks the OID up by name first, because in PostgreSQL an extension's
+type has no fixed one: `SELECT to_regtype('vector')::oid` and `SELECT
+oid FROM pg_type WHERE typname = 'vector'` both answer (16000, the same
+on every node and in every database). With pgx, `pgvector-go`'s
+`pgxvec.RegisterTypes(ctx, conn)` does exactly that, after which
+`pgvector.NewVector(...)` values are sent and scanned in pgvector's
+binary format. A parameter that is an operand of a distance operator or
+is assigned to a vector column is described as a vector.
+
+**Exact search.** Without an index, `ORDER BY <distance> LIMIT k`
+returns exactly the `k` nearest rows. The table (or the part of it the
+`WHERE` clause selects through a key or an index) is scanned once and
+only the best `k` rows seen so far are kept, so memory is `k` rows
+however large the table; `EXPLAIN` says so:
+
+```
+full table scan; top-k heap: the first 5 rows in order kept while scanning, no full sort
+```
+
+(The same holds for any `ORDER BY ... LIMIT` the access path cannot
+deliver in order, not only distances.) Time is linear in the rows
+scanned — about 3 µs a row for 64 dimensions on one core — which is
+fine for tens of thousands of rows per query and is what the index is
+for beyond that. Ties are returned in primary-key order.
+
+**Approximate search: the ivfflat index.**
+
+```sql
+CREATE INDEX items_embedding ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
+--                                                   vector_cosine_ops for <=>, vector_ip_ops for <#>
+SET ivfflat.probes = 10;      -- per session; SET LOCAL per transaction; RESET for the default
+```
+
+The index groups the table's vectors into `lists` clusters when it is
+built. A query reads only the `ivfflat.probes` clusters whose centres
+are nearest the query vector, ranks the rows in them by their true
+distance, and returns the nearest `k`. `EXPLAIN` shows it:
+
+```
+vector scan of index "items_embedding" (ivfflat, <->: the nearest 10 of 100 lists probed, approximate) + primary key join, rows rechecked; top-k: ...
+```
+
+- **Results are approximate.** Every row returned is a real row with
+  its true distance, in true distance order — but a row nearer than
+  some of those returned may be missing, if it sits in a cluster that
+  was not read. *Recall* is the share of the true `k` nearest that come
+  back. It rises with `ivfflat.probes` and reaches 1 (exact) when
+  `probes` equals `lists`; the cost rises with it, in proportion.
+- **`ivfflat.probes`** defaults to the square root of the index's
+  `lists` (`auto`: 10 for 100 lists). Measured on 50,000 clustered
+  64-dimension vectors, `lists = 200`, `k = 10`, one node:
+
+  | `ivfflat.probes` | recall@10 | median latency |
+  |---|---|---|
+  | 1 | 0.85 | 0.9 ms |
+  | 5 | 0.96 | 3 ms |
+  | 15 (`auto`) | 0.99 | 10 ms |
+  | 40 | 1.00 | 29 ms |
+  | no index (exact) | 1 | 164 ms |
+
+  Your data decides these numbers: vectors with little cluster
+  structure need more probes for the same recall. Measure on your own
+  with `datax bench vector-knn`, or by comparing a query's result with
+  the same query under `SET vector_index_scan = off`, which answers it
+  exactly.
+- **`lists`** (1 to 32,768, default 100): about `rows / 1000` is the
+  usual starting point, and at least 10 × `lists` rows in the table when
+  the index is built. More lists make each probe cheaper and need more
+  probes for the same recall.
+- **Build the index after loading data.** The clusters are found from
+  a sample of the rows present when `CREATE INDEX` runs, and never
+  move afterwards. An index built on an empty table has one cluster
+  holding everything: correct, and no faster than a scan. The same
+  happens gradually when the data changes character after the build
+  (or after `TRUNCATE`, which keeps the clusters): the index stays
+  correct, recall at a given `probes` falls. Rebuild it — create a
+  second index, then drop the first; there is no `REINDEX`.
+- **One operator class per index, and the query must use its operator**:
+  an index built with `vector_cosine_ops` serves `ORDER BY v <=> ...`
+  only. Create one per distance you query by.
+- **The query shape it serves**: `ORDER BY column <op> value LIMIT k`
+  (optionally `OFFSET`), ascending, as the only sort key, the value a
+  literal, a parameter or a scalar subquery. Without a `LIMIT`, with a
+  second sort key, in a join, a grouped query or with `DISTINCT` or `FOR
+  UPDATE`, the query runs exactly, without the index.
+- **Filters.** A `WHERE` clause is applied to the candidates nearest
+  first until `k` rows pass, so a filter never costs answers within the
+  clusters read. A selective filter may still leave fewer than `k` rows
+  in them: raise `ivfflat.probes`. When the filter can use the primary
+  key or an ordinary index (`WHERE tenant = 7` with an index on
+  `tenant`), the planner uses that instead and the answer is exact over
+  the rows it selects.
+- **NULL vectors** are not in the index: an indexed query does not
+  return them, while the exact scan returns them last.
+- **Writes** cost one extra KV write per index, holding a copy of the
+  vector, in the row's own transaction: an indexed table stores each
+  vector twice per index. The index is built online, under concurrent
+  writes, like any other.
+- **Limits**: one column, at most 2,000 dimensions, not `UNIQUE`.
+  `USING hnsw` is refused (`0A000`); use `ivfflat`.
+- `vector_index_scan = off` makes every nearest-neighbour query exact
+  for the session, whatever indexes exist.
+- Needs cluster version v21, as does the type itself.
+
 ## Transactions and retries
 
 ```sql
@@ -1328,6 +1491,8 @@ invalid value `22023`:
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
 | `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
 | `default_text_search_config` | `english` (default), `simple`; `pg_catalog.` may qualify either | the configuration `to_tsvector`, `to_tsquery` and their relatives use when a call names none; reported schema-qualified (`pg_catalog.english`), as PostgreSQL does |
+| `ivfflat.probes` | `auto` (default: the square root of the index's lists) or 1 to 32768 | how many clusters of an ivfflat index a nearest-neighbour query reads: more is higher recall and slower ([Vectors](#vectors)) |
+| `vector_index_scan` | `on` (default), `off` | `off` answers every nearest-neighbour query exactly, by scanning, whatever vector index exists |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 **Custom settings.** A name with a prefix and a dot (`app.tenant`,

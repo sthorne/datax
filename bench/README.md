@@ -53,6 +53,7 @@ duration, so two runs draw the same keys:
 | `scan`, `scan-200k` | large result sets (20,000 and 200,000 rows of 256 bytes per query) streamed through pgwire; the records carry the time to the first row (`first_row_p50_us`, `first_row_p99_us`) |
 | `jsonb-contain`, `jsonb-contain-filter` | JSONB containment (`doc @> '{"tenant": n}'`, 50 of 50,000 documents per query) through a GIN index and as a filter over every document (#300) |
 | `text-search`, `text-search-filter` | full-text search (`to_tsvector('english', body) @@ to_tsquery('english', 'topic<n>')`, 50 of 50,000 short documents per query) through a GIN index on the expression and as a filter that reduces every document to lexemes for every query (#299) |
+| `vector-knn`, `vector-knn-exact` | the 10 nearest of 50,000 vectors of 64 dimensions (`ORDER BY v <-> q LIMIT 10`) through an `ivfflat` index of 200 lists and by the exact top-k scan (#304); the records carry the index build time and recall@10 (`vector.build_sec`, `vector.recall`) |
 | `kv-50-50-1000-ranges`, `ingest-random-1000-ranges` | the same mixes over a table pre-split into 1,000 ranges (`--presplit`): the store's raft scheduler and group commit under many groups |
 
 `--presplit N` carves a table of the run's own (`bench_kv_r1000`, ...)
@@ -74,6 +75,25 @@ and is skipped when the table already holds the rows):
 ```sh
 bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s
 bin/datax bench jsonb-contain --preload 1000000 --groups 20000 --concurrency 4 --duration 60s --jsonb-index none
+```
+
+The `vector-knn` pair loads vectors drawn around `--groups` Gaussian
+centres from the seed (so it needs no download and two runs see the
+same table), builds the index after the load, and before the measured
+phase answers 100 queries both through the index and exactly, recording
+recall@10 beside the build time. It is a synthetic set, not one of the
+public ANN benchmarks: clustered data flatters a clustering index, and
+recall on real embeddings should be measured on them. `--probes` sets
+`ivfflat.probes` (default: the server's, the square root of `--lists`),
+`--dims` the dimension, `--vector-index none` the exact scan. Recorded
+on one node, 4 cores, 50,000 × 64, `--lists 200`, one worker: recall
+0.85 / 0.96 / 0.99 / 1.00 at 1 / 5 / 15 (default) / 40 probes with a
+median of 0.9 / 3 / 10 / 29 ms, against 164 ms for the exact scan; the
+index built in 3.9 s.
+
+```sh
+bin/datax bench vector-knn --preload 50000 --dims 64 --groups 1000 --lists 200 --probes 5 --concurrency 1 --duration 20s
+bin/datax bench vector-knn --preload 50000 --dims 64 --groups 1000 --vector-index none --concurrency 1 --duration 20s
 ```
 
 ## The large set

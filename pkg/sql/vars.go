@@ -55,13 +55,22 @@ type sessionVars struct {
 	// changed in place, on every SET: sessionVars is copied by value to
 	// save a transaction's SET LOCAL, and the copy must keep the old one.
 	custom map[string]string
+	// ivfProbes is ivfflat.probes: how many lists of a vector index a
+	// query reads (0 = the square root of the index's lists, the default).
+	ivfProbes int
+	// noVectorScan is vector_index_scan = off: nearest-neighbour queries
+	// are answered exactly, by scanning, whatever index exists.
+	noVectorScan bool
 }
 
 // isCustomVar reports whether name is a custom setting's: PostgreSQL's
-// rule, a name with a class prefix (class.name).
+// rule, a name with a class prefix (class.name) — unless the name is a
+// setting datax defines itself under such a prefix (ivfflat.probes, as
+// pgvector names it), which is typed and checked like any other, as an
+// extension's settings are in PostgreSQL once it is loaded.
 func isCustomVar(name string) bool {
 	i := strings.IndexByte(name, '.')
-	return i > 0 && i < len(name)-1
+	return i > 0 && i < len(name)-1 && canonicalVar(name) == ""
 }
 
 // setCustomVar sets a custom setting on vars.
@@ -91,6 +100,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"idle_in_transaction_session_timeout", "integer", "ms"},
 	{"integer_datetimes", "bool", ""},
 	{"inverted_index_scan", "enum", ""},
+	{"ivfflat.probes", "integer", ""},
 	{"lock_timeout", "integer", "ms"},
 	{"role", "string", ""},
 	{"search_path", "string", ""},
@@ -102,6 +112,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"TimeZone", "string", ""},
 	{"transaction_isolation", "string", ""},
 	{"transaction_read_only", "bool", ""},
+	{"vector_index_scan", "bool", ""},
 }
 
 // canonicalVar resolves a SET / SHOW name (case-insensitively, with the
@@ -155,6 +166,13 @@ func (s *Session) varValue(name string) string {
 		return "on"
 	case "inverted_index_scan":
 		return v.invertedScan.String()
+	case "ivfflat.probes":
+		if v.ivfProbes == 0 {
+			return "auto"
+		}
+		return strconv.Itoa(v.ivfProbes)
+	case "vector_index_scan":
+		return onOff(!v.noVectorScan)
 	case "lock_timeout":
 		return strconv.FormatInt(v.lockTimeout.Milliseconds(), 10)
 	case "search_path":
@@ -398,6 +416,24 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			default:
 				return invalid("must be auto, on or off, not %q", value)
 			}
+		}
+	case "ivfflat.probes":
+		vars.ivfProbes = 0
+		if !reset && !strings.EqualFold(unquote(value), "auto") {
+			n, err := strconv.Atoi(unquote(value))
+			if err != nil || n < 1 || n > maxVectorLists {
+				return invalid("must be auto or an integer between 1 and %d, not %q", maxVectorLists, value)
+			}
+			vars.ivfProbes = n
+		}
+	case "vector_index_scan":
+		vars.noVectorScan = false
+		if !reset {
+			b, err := parseOnOff(value)
+			if err != nil {
+				return invalid("%v", err)
+			}
+			vars.noVectorScan = !b
 		}
 	case "foreign_key_cascade_limit":
 		vars.cascadeLimit, vars.cascadeLimitIsSet = 0, false

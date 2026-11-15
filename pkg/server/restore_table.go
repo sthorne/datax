@@ -130,7 +130,11 @@ var (
 		"sequence_id", "fill_default", "hidden", "comment", "retype_from")
 	// An inverted index's entries are keyed under the table prefix like
 	// any index's, so they are re-keyed with the rest.
-	restoreIndexFields      = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted")
+	// So are a vector index's, and so are its centres, which sit under
+	// the table prefix beside the indexes (keys.VectorCentroidPrefix): the
+	// field names them by a build identifier, not by the table's id, and
+	// carries over as it is.
+	restoreIndexFields      = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
 	restoreConstraintFields = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
 		"on_update", "index_id", "auto_index", "validated")
 )
