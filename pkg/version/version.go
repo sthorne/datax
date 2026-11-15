@@ -289,7 +289,10 @@ const (
 	// ordinary table whose owner may read or delete its rows. So
 	// `datax debug cluster-key init` is refused, nothing creates the
 	// table, and no node writes the record or its holder report until
-	// finalize (rule 4).
+	// finalize (rule 4). V22 also introduces sealed tables (issue #310,
+	// step 3; pkg/sql/rowseal): the descriptor field encryption_key,
+	// omitempty, and row values a v21 node could not decode, so CREATE
+	// TABLE ... WITH (encryption_key) is refused until finalize too.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

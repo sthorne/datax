@@ -1,13 +1,15 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed; step 1 built** (issue #310, the last piece of #292).
-The issue asked for a written design to be agreed before any code. This
-is that design; the owner settled its five open decisions on
+Status: **agreed; steps 1 and 3 built** (issue #310, the last piece of
+#292). The issue asked for a written design to be agreed before any
+code. This is that design; the owner settled its five open decisions on
 2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
 of work — the cluster key, `datax_keys`, hand-over, export and import —
 is built (docs/encryption.md, "Cluster key"); the choices it made where
-this design was open are under *Choices made in step 1*. Nothing else
-described here exists yet.
+this design was open are under *Choices made in step 1*. Step 3, sealed
+whole tables, is built (docs/encryption.md, "Sealed tables"), with its
+choices under *Choices made in step 3*. Nothing else described here
+exists yet.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -332,3 +334,35 @@ Where the design above left a choice open, step 1 made these
   Import is refused before the target's own key is enabled; a
   whole-cluster restore refuses named keys it cannot open before applying
   anything, and rewraps them under the target's key after.
+
+## Choices made in step 3
+
+- **Associated data names the seal id, not the table id.** The seal id
+  is the table's id when it was created and is kept by a table restore,
+  which gives the table a new id and copies its sealed rows as they are
+  (a restore that re-sealed every row would need the key at load time
+  and could not compare the loaded rows with the backup's checksum).
+  The row key bound is the KV key after the table prefix. A table
+  restored beside its source shares its key.
+- **The key is created in the `CREATE TABLE`'s transaction**
+  (`keystore.Store.CreateIn`), so a key exists exactly when its table
+  does; a janitor destroys a table key no descriptor names.
+- **`DROP TABLE` destroys the key at the drop**, after commit, not when
+  the data is reclaimed: the drop of a sealed table is its erasure, `AS
+  OF SYSTEM TIME` reads included. A table restore of a table whose key
+  was destroyed brings the key back from the backup — the documented
+  dependency.
+- **`XXK01`** for a key that gives nothing (class `XX`, subclass in the
+  implementation-defined range), **`XX001`** for a value that does not
+  authenticate.
+- **The key cache** is `pkg/keystore/keycache`, beneath `pkg/keystore`
+  because the SQL layer uses it and `pkg/keystore` imports the SQL
+  layer. The statement that destroys a key invalidates its own gateway's
+  cache at once; other gateways stop within one lease.
+- **No `STORING` columns exist** in datax's indexes: a secondary index
+  entry's value is the bare primary-key suffix or a presence byte, which
+  is plaintext in the key anyway, so index values are not sealed. An
+  `ivfflat` entry keeps the row's vector, an indexed column.
+- **A sealed table reads only sealed values**; the acceptance of plain
+  values the design describes for sealing an existing table comes with
+  that step.

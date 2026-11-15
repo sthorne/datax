@@ -203,6 +203,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	vectorIndex := fs.String("vector-index", "ivfflat", "vector-knn workload: ivfflat (an approximate index serves the query) or none (every query scans the table and keeps the nearest); the table name embeds this, so A/B runs don't collide")
 	lists := fs.Int("lists", 100, "vector-knn workload: lists of the ivfflat index")
 	probes := fs.Int("probes", 0, "vector-knn workload: lists each query reads (0 = the server's default, the square root of --lists)")
+	sealed := fs.Bool("sealed", false, "kv, bank, hot-row, ingest, scan: make the workload's table a sealed table, WITH (encryption_key = 'auto'), whose row values are encrypted under a key of its own (needs the cluster key; the table name embeds this, so A/B runs don't collide)")
 	presplit := fs.Int("presplit", 0, "carve the workload's table into this many ranges before the run (ALTER TABLE ... SPLIT AT; sharded timeseries tables are carved by --shards)")
 	seed := fs.Int64("seed", 1, "random seed (0 = from the clock); a fixed seed makes runs comparable")
 	maxErrors := fs.Int64("max-errors", 0, benchMaxErrorsDoc)
@@ -304,6 +305,18 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if *presplit > 1 {
 		rsuffix = fmt.Sprintf("_r%d", *presplit)
 	}
+	// withSealed closes the CREATE TABLE of a workload that can be run
+	// on a sealed table.
+	withSealed := ""
+	if *sealed {
+		switch workload {
+		case "kv", "bank", "hot-row", "ingest", "ingest-copy", "scan":
+		default:
+			return nil, fmt.Errorf("--sealed applies to kv, bank, hot-row, ingest, ingest-copy and scan")
+		}
+		rsuffix += "_sealed"
+		withSealed = " WITH (encryption_key = 'auto')"
+	}
 	ingestTable += rsuffix
 	kvTable, bankTable, ijTable, scanTable := "bench_kv"+rsuffix, "bench_bank"+rsuffix, "bench_ij"+rsuffix, "bench_scan"+rsuffix
 	hotTable := "bench_hot" + rsuffix
@@ -390,7 +403,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	}
 	switch workload {
 	case "kv":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+kvTable+" (k INT8 PRIMARY KEY, v TEXT)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(kvTable, int64(*preload), false); err != nil {
@@ -400,9 +413,9 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			return nil, err
 		}
 	case "ingest", "ingest-copy":
-		ddl := "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k INT8 PRIMARY KEY, pad TEXT)"
+		ddl := "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k INT8 PRIMARY KEY, pad TEXT)" + withSealed
 		if *keys == "uuid" {
-			ddl = "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k TEXT PRIMARY KEY, pad TEXT)"
+			ddl = "CREATE TABLE IF NOT EXISTS " + ingestTable + " (k TEXT PRIMARY KEY, pad TEXT)" + withSealed
 		}
 		if _, err := setup.Exec(ctx, ddl); err != nil {
 			return nil, err
@@ -433,7 +446,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 			}
 		}
 	case "bank":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+bankTable+" (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+bankTable+" (id INT8 PRIMARY KEY, balance INT8)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(bankTable, int64(*preload), false); err != nil {
@@ -445,7 +458,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	case "hot-row":
 		// One row updated --updates times inside one transaction: the
 		// depth of an intent's rewrite chain (issue #162).
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+hotTable+" (id INT8 PRIMARY KEY, n INT8)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+hotTable+" (id INT8 PRIMARY KEY, n INT8)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(hotTable, int64(*preload), false); err != nil {
@@ -577,7 +590,7 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 		}
 		fmt.Printf("  plan:      %s\n  recall@%d: %.3f over %d queries\n", res.Vector.Plan, res.Vector.K, res.Vector.Recall, res.Vector.RecallQueries)
 	case "scan":
-		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
+		if _, err := setup.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+scanTable+" (k INT8 PRIMARY KEY, pad TEXT)"+withSealed); err != nil {
 			return nil, err
 		}
 		if err := split(scanTable, int64(*preload), false); err != nil {

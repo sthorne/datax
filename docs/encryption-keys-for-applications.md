@@ -1,12 +1,17 @@
 # Encryption keys for applications: what to expect
 
-**Status: agreed design, not built yet.** This guide describes how
+**Status: agreed design, partly built.** This guide describes how
 datax's per-tenant encryption and key service will behave, so that an
 application can shape its schema and its erasure process now. The
 design and its decisions are in
-[design-key-service.md](design-key-service.md) (issue #310). Statement
-names and syntax below are the planned ones and may still change in
-detail; the limits and guarantees will not.
+[design-key-service.md](design-key-service.md) (issue #310). **Sealed
+whole tables are built** (`WITH (encryption_key = 'auto')`, cluster
+version v22; docs/sql.md and docs/encryption.md, "Sealed tables"):
+dropping such a table destroys its key. **Per-tenant keys
+(`encryption_key_by`, `datax_destroy_tenant_key`) and the key service
+are not built yet**; their statement names and syntax below are the
+planned ones and may still change in detail; the limits and guarantees
+will not.
 
 ## In one paragraph
 

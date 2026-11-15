@@ -278,3 +278,26 @@ func TestPlaintextColumns(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 }
+
+// BenchmarkBoundary is the boundary's cost per row value: a seal and an
+// open of a 64-byte value through a cache-like key source.
+func BenchmarkBoundary(b *testing.B) {
+	t := &testing.T{}
+	fk := &fakeKeys{keys: map[int64]map[int]cipher.AEAD{11: {1: newAEAD(t)}}, cur: map[int64]int{11: 1}}
+	bd := New(fk, nil, nil)
+	d := &catalog.TableDescriptor{ID: 51, Name: "t", Columns: []catalog.Column{{ID: 1, Name: "id", Type: types.Int}},
+		PrimaryKey: []catalog.ColumnID{1}, EncryptionKey: &catalog.TableEncryptionKey{KeyID: 11, SealID: 51}}
+	k, _ := rowenc.EncodePK(d, []types.Datum{types.NewInt(1)})
+	plain := bytes.Repeat([]byte{1}, 64)
+	ctx := context.Background()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		s, err := bd.SealValue(ctx, d, k, plain)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := bd.OpenValue(ctx, d, k, s); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

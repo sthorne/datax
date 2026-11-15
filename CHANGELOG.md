@@ -590,6 +590,24 @@ state or the internode protocol does, and an entry below says so.
   are later steps. `/api/security` and the security view report the
   cluster key and which nodes hold it. Cluster protocol version v22. See
   docs/encryption.md, "Cluster key".
+- **Sealed tables, one key per table** (#310, step 3). `CREATE TABLE ...
+  WITH (encryption_key = 'auto')` gives the table a key of its own in
+  `datax_keys`, and every row value is encrypted under it (AES-256-GCM, the
+  table, key, key version and row bound in) in the SQL layer before it
+  reaches KV; replicas, snapshots, backups and the consistency checker see
+  ciphertext. **Primary-key and indexed columns are not sealed**: `CREATE
+  TABLE` and `CREATE INDEX` say which columns stay plaintext in a `NOTICE`.
+  Queries, constraints and every index kind work as before; sealed columns
+  get no statistics. `DROP TABLE` destroys the key, so the table's rows are
+  unreadable at once, `AS OF SYSTEM TIME` included. A row whose key is
+  destroyed, disabled or unavailable fails the statement with `XXK01` naming
+  the table, within 10 seconds of the change on every gateway (the key
+  cache's lease). A table restore shares the source table's key, or brings
+  it back from the backup. Refused for time-series tables and before the
+  cluster key is enabled; per-tenant keys (`encryption_key_by`) and sealing
+  an existing table are later steps. `datax bench --sealed` runs a workload
+  on a sealed table. Cluster protocol version v22. See docs/sql.md and
+  docs/encryption.md, "Sealed tables".
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
