@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -62,14 +64,14 @@ func (w *descWatcher) watched() []watchSpan {
 	return []watchSpan{{lo, hi}}
 }
 
-// next returns the descriptors written since the last pass, or, with
-// full true, every descriptor: the job then rebuilds its state from them
-// rather than updating it. A removed descriptor comes as a record with
+// nextAt returns the descriptors written since the last pass up to now,
+// a timestamp from the node's clock, or, with full true, every
+// descriptor as of now: the job then rebuilds its state from them rather
+// than updating it. A removed descriptor comes as a record with
 // Deleted set. On an error the job keeps its state, and the next pass
 // reads the same interval again.
-func (w *descWatcher) next(ctx context.Context) (full bool, recs []kvpb.ExportRecord, err error) {
+func (w *descWatcher) nextAt(ctx context.Context, now hlc.Timestamp) (full bool, recs []kvpb.ExportRecord, err error) {
 	spans := w.watched()
-	now := w.n.clock.Now()
 	if !w.since.IsEmpty() {
 		var err error
 		for _, sp := range spans {
@@ -202,8 +204,18 @@ func (r clusterResume) save(ctx context.Context, raw []byte) error {
 // state, or what a job keeps of a descriptor, bumps the version), it
 // does not decode, its timestamp is too far ahead of this node's clock,
 // or the interval since it has fallen below the spans' GC threshold
-// (descWatcher.next).
+// (descWatcher.nextAt).
+//
+// However it was resumed, the state is checked against a full read at
+// least every fullEvery (a day by default, jittered so that followers
+// do not read together): a pass reads what changed and everything, as
+// of one timestamp, and if the two disagree it says so at warning
+// level, counts it (datax_catalog_follower_divergence_total) and keeps
+// the full read's. A bug that leaves a state wrong, which a restart's
+// full read used to correct, is corrected within a day, and seen.
 type catalogFollower struct {
+	// name is the job's: in logs, the metric, and its record's key.
+	name  string
 	w     descWatcher
 	state followedState
 	// fresh makes an empty state of the job's kind: what a full read
@@ -215,24 +227,45 @@ type catalogFollower struct {
 	store   resumeStore
 	version uint64
 	every   time.Duration
+	// fullEvery is how often the state is checked against a full read
+	// (jittered per follower); 0 never.
+	fullEvery time.Duration
 
-	tried   bool      // the resume record has been looked for
-	savedAt time.Time // when the record was last written
+	tried bool // the resume record has been looked for
+	// unreported: the state was resumed and no pass has told the job.
+	unreported bool
+	savedAt    time.Time // when the record was last written
+	// fullAt is when the state was last built or checked by a full read,
+	// on this node or, carried in the resume record, another.
+	fullAt time.Time
 	// resumed is whether the state came from a resume record and has not
-	// been rebuilt by a full read since.
+	// been rebuilt, or checked, by a full read since.
 	resumed bool
 }
 
-func newCatalogFollower(n *Node, spans []watchSpan, fresh func() followedState, store resumeStore, version uint64, every time.Duration) *catalogFollower {
+func newCatalogFollower(name string, n *Node, spans []watchSpan, fresh func() followedState, store resumeStore, version uint64, every time.Duration) *catalogFollower {
 	if n.cfg.CatalogResumeEvery > 0 {
 		every = n.cfg.CatalogResumeEvery
 	}
+	fullEvery := n.cfg.CatalogFullReadEvery
+	switch {
+	case fullEvery == 0:
+		fullEvery = defaultCatalogFullReadEvery
+		fullEvery += rand.N(fullEvery / 4)
+	case fullEvery < 0:
+		fullEvery = 0
+	}
 	return &catalogFollower{
+		name:  name,
 		w:     descWatcher{n: n, spans: spans},
 		state: fresh(), fresh: fresh,
-		store: store, version: version, every: every,
+		store: store, version: version, every: every, fullEvery: fullEvery,
 	}
 }
+
+// defaultCatalogFullReadEvery is how often, before jitter of up to a
+// quarter more, a follower checks its state against a full read.
+const defaultCatalogFullReadEvery = 24 * time.Hour
 
 // pass brings the state up to the present: on the first call from the
 // resume record if there is a usable one, then from what changed since
@@ -241,15 +274,22 @@ func newCatalogFollower(n *Node, spans []watchSpan, fresh func() followedState, 
 func (f *catalogFollower) pass(ctx context.Context) (full, changed bool, err error) {
 	if !f.tried {
 		f.tried = true
-		f.resume(ctx)
+		// A resumed state is new to the job, whatever the pass finds.
+		f.unreported = f.resume(ctx)
 	}
-	full, recs, err := f.w.next(ctx)
+	// Due a check against a full read: this pass reads both as of one
+	// timestamp.
+	verify := f.fullEvery > 0 && !f.w.since.IsEmpty() && time.Since(f.fullAt) >= f.fullEvery
+	now := f.w.n.clock.Now()
+	full, recs, err := f.w.nextAt(ctx, now)
 	if err != nil {
 		return false, false, err
 	}
+	changed, f.unreported = f.unreported, false
 	if full {
 		f.state.reset()
 		f.resumed = false
+		f.fullAt = time.Now()
 		changed = true
 	}
 	for _, rec := range recs {
@@ -257,8 +297,23 @@ func (f *catalogFollower) pass(ctx context.Context) (full, changed bool, err err
 			changed = true
 		}
 	}
+	if verify && !full {
+		if want, err := f.fullStateAt(ctx, now); err != nil {
+			log.Debugf("catalog follower %s: full read: %v", f.name, err) // the next pass tries again
+		} else {
+			if !bytes.Equal(f.state.encode(), want.encode()) {
+				log.Warnf("catalog follower %s: the state kept since the last full read differs from a full read as of %s; using the full read's",
+					f.name, now)
+				metrics.CatalogFollowerDivergence.WithLabelValues(f.name).Inc()
+				f.state = want
+				changed = true
+			}
+			f.resumed = false
+			f.fullAt = time.Now()
+		}
+	}
 	if f.store != nil && (f.savedAt.IsZero() || time.Since(f.savedAt) >= f.every) {
-		if err := f.store.save(ctx, encodeResume(f.version, f.w.since, f.state.encode())); err != nil {
+		if err := f.store.save(ctx, encodeResume(f.version, f.w.since, f.fullAt, f.state.encode())); err != nil {
 			log.Debugf("catalog follower: saving where to resume: %v", err)
 		} else {
 			f.savedAt = time.Now()
@@ -268,36 +323,37 @@ func (f *catalogFollower) pass(ctx context.Context) (full, changed bool, err err
 }
 
 // resume loads the resume record into the state and the watcher's
-// timestamp, if it is usable; otherwise it leaves both empty, for a full
-// read.
-func (f *catalogFollower) resume(ctx context.Context) {
+// timestamp, if it is usable, and says so; otherwise it leaves both
+// empty, for a full read.
+func (f *catalogFollower) resume(ctx context.Context) bool {
 	if f.store == nil {
-		return
+		return false
 	}
 	raw, err := f.store.load(ctx)
 	if err != nil || raw == nil {
 		if err != nil {
 			log.Debugf("catalog follower: reading where to resume: %v", err)
 		}
-		return
+		return false
 	}
-	v, since, payload, ok := decodeResume(raw)
+	v, since, fullAt, payload, ok := decodeResume(raw)
 	if !ok || v != f.version || since.IsEmpty() {
-		return
+		return false
 	}
 	// The record may come from a node whose clock ran ahead of this
 	// one's: reads from it must be at later timestamps. One further ahead
 	// than the clock offset allows is not trusted.
 	if err := f.w.n.clock.Update(since); err != nil {
 		log.Debugf("catalog follower: not resuming: %v", err)
-		return
+		return false
 	}
 	st := f.fresh()
 	if err := st.decode(payload); err != nil {
 		log.Debugf("catalog follower: not resuming: %v", err)
-		return
+		return false
 	}
-	f.state, f.w.since, f.resumed = st, since, true
+	f.state, f.w.since, f.fullAt, f.resumed = st, since, fullAt, true
+	return true
 }
 
 // fullStateAt is the state a full read of the followed spans as of ts
@@ -334,23 +390,26 @@ func (f *catalogFollower) check(ctx context.Context) error {
 }
 
 // encodeResume is a resume record: the format version, the timestamp,
-// then the state.
-func encodeResume(version uint64, since hlc.Timestamp, state []byte) []byte {
+// when the state was last built or checked by a full read (wall
+// nanoseconds), then the state.
+func encodeResume(version uint64, since hlc.Timestamp, fullAt time.Time, state []byte) []byte {
 	b := binary.AppendUvarint(nil, version)
 	b = binary.AppendVarint(b, since.WallTime)
 	b = binary.AppendVarint(b, int64(since.Logical))
+	b = binary.AppendVarint(b, fullAt.UnixNano())
 	return append(b, state...)
 }
 
-func decodeResume(raw []byte) (version uint64, since hlc.Timestamp, state []byte, ok bool) {
+func decodeResume(raw []byte) (version uint64, since hlc.Timestamp, fullAt time.Time, state []byte, ok bool) {
 	r := byteReader{b: raw}
 	version = r.uvarint()
 	since.WallTime = r.varint()
 	since.Logical = int32(r.varint())
+	fullAt = time.Unix(0, r.varint())
 	if r.bad {
-		return 0, hlc.Timestamp{}, nil, false
+		return 0, hlc.Timestamp{}, time.Time{}, nil, false
 	}
-	return version, since, r.b, true
+	return version, since, fullAt, r.b, true
 }
 
 // byteReader reads varints off a byte slice; bad is set, and every read
@@ -477,20 +536,12 @@ func sortedIDs[V any](m map[uint64]V) []uint64 {
 // GC), "reshard" (the re-shard janitor) or "stats" (the statistics
 // sampler) — without acting on it, and compares it with what a full
 // read at the same timestamp derives (issue #316). resumed reports
-// whether the job's state was loaded from its resume record, rather
-// than built by a full read, since the job's first pass on this node.
+// whether the job's state was loaded from its resume record and has not
+// been rebuilt or checked by a full read since.
 func (n *Node) TestingCheckCatalogFollower(ctx context.Context, job string) (resumed bool, err error) {
-	var mu *sync.Mutex
-	var f **catalogFollower
-	switch job {
-	case "retention":
-		mu, f = &n.retention.mu, &n.retention.follow
-	case "reshard":
-		mu, f = &n.reshardMu, &n.reshardFollow
-	case "stats":
-		mu, f = &n.statsRefresh.mu, &n.statsRefresh.follow
-	default:
-		return false, fmt.Errorf("no job %q", job)
+	mu, f, err := n.catalogFollower(job)
+	if err != nil {
+		return false, err
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -504,4 +555,34 @@ func (n *Node) TestingCheckCatalogFollower(ctx context.Context, job string) (res
 		return (*f).resumed, fmt.Errorf("%s: %w", job, err)
 	}
 	return (*f).resumed, nil
+}
+
+// TestingCatalogFollowerKept reports, reading nothing, whether the job
+// keeps a state on this node (it has run here, and its loop has not
+// dropped it since), and whether that state was resumed from a record
+// (see TestingCheckCatalogFollower).
+func (n *Node) TestingCatalogFollowerKept(job string) (kept, resumed bool) {
+	mu, f, err := n.catalogFollower(job)
+	if err != nil {
+		return false, false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if *f == nil {
+		return false, false
+	}
+	return true, (*f).resumed
+}
+
+// catalogFollower is the job's follower and the mutex that guards it.
+func (n *Node) catalogFollower(job string) (*sync.Mutex, **catalogFollower, error) {
+	switch job {
+	case "retention":
+		return &n.retention.mu, &n.retention.follow, nil
+	case "reshard":
+		return &n.reshardMu, &n.reshardFollow, nil
+	case "stats":
+		return &n.statsRefresh.mu, &n.statsRefresh.follow, nil
+	}
+	return nil, nil, fmt.Errorf("no job %q", job)
 }

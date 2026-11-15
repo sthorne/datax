@@ -182,7 +182,7 @@ func newRetentionFollower(n *Node) *catalogFollower {
 		s.reset()
 		return s
 	}
-	return newCatalogFollower(n, nil, fresh, localResume{n, keys.StoreCatalogResumeKey("retention")},
+	return newCatalogFollower("retention", n, nil, fresh, localResume{n, keys.StoreCatalogResumeKey("retention")},
 		retentionResumeVersion, retentionResumeEvery)
 }
 

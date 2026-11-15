@@ -26,7 +26,11 @@ const reshardJanitorInterval = time.Minute
 // the range-1 leader acts (the cluster-singleton idiom the statistics
 // sampler uses).
 func (n *Node) reshardJanitorLoop(ctx context.Context) {
-	ticker := time.NewTicker(reshardJanitorInterval)
+	interval := n.cfg.ReshardJanitorInterval
+	if interval <= 0 {
+		interval = reshardJanitorInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -62,7 +66,7 @@ func newReshardFollower(n *Node) *catalogFollower {
 		s.reset()
 		return s
 	}
-	return newCatalogFollower(n, nil, fresh, clusterResume{n, keys.CatalogResumeKey("reshard")},
+	return newCatalogFollower("reshard", n, nil, fresh, clusterResume{n, keys.CatalogResumeKey("reshard")},
 		reshardResumeVersion, reshardResumeEvery)
 }
 

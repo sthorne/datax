@@ -199,6 +199,13 @@ type Config struct {
 	// statistics sampler) write the record they resume from after a
 	// start (0 = each job's default: 1m, 10m, 1h). Tests only.
 	CatalogResumeEvery time.Duration
+	// CatalogFullReadEvery is how often those jobs check the state they
+	// keep against a full read (0 = a day, plus up to a quarter of jitter;
+	// negative never). Tests only.
+	CatalogFullReadEvery time.Duration
+	// ReshardJanitorInterval paces the re-shard janitor (0 = 1m). Tests
+	// only.
+	ReshardJanitorInterval time.Duration
 	// RowTTLInterval paces the row expiry job (rowttl.go): each tick,
 	// the node leading range 1 deletes the expired rows of every table
 	// with a row TTL (0 = default 30s; negative disables the job, and

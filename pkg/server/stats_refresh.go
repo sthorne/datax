@@ -114,7 +114,7 @@ func newStatsFollower(n *Node) *catalogFollower {
 		s.reset()
 		return s
 	}
-	return newCatalogFollower(n, []watchSpan{{dlo, dhi}, {slo, shi}}, fresh,
+	return newCatalogFollower("stats", n, []watchSpan{{dlo, dhi}, {slo, shi}}, fresh,
 		clusterResume{n, keys.CatalogResumeKey("stats")}, statsResumeVersion, statsResumeEvery)
 }
 

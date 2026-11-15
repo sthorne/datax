@@ -105,7 +105,7 @@ func TestCatalogFollowerResumeRecord(t *testing.T) {
 	st := fresh().(*statsState)
 	st.tables[42] = true
 	since := clock.Now()
-	good := encodeResume(3, since, st.encode())
+	good := encodeResume(3, since, time.Now(), st.encode())
 
 	for _, tc := range []struct {
 		name   string
@@ -113,13 +113,13 @@ func TestCatalogFollowerResumeRecord(t *testing.T) {
 		resume bool
 	}{
 		{"same version", good, true},
-		{"other version", encodeResume(4, since, st.encode()), false},
-		{"no timestamp", encodeResume(3, hlc.Timestamp{}, st.encode()), false},
+		{"other version", encodeResume(4, since, time.Now(), st.encode()), false},
+		{"no timestamp", encodeResume(3, hlc.Timestamp{}, time.Now(), st.encode()), false},
 		{"truncated", good[:len(good)-1], false},
 		{"garbage", []byte{0xff}, false},
-		{"ahead of the clock", encodeResume(3, since.AddNanos(time.Hour.Nanoseconds()), st.encode()), false},
+		{"ahead of the clock", encodeResume(3, since.AddNanos(time.Hour.Nanoseconds()), time.Now(), st.encode()), false},
 	} {
-		f := newCatalogFollower(n, nil, fresh, &memResume{raw: tc.raw}, 3, time.Minute)
+		f := newCatalogFollower("stats", n, nil, fresh, &memResume{raw: tc.raw}, 3, time.Minute)
 		f.resume(ctx)
 		if f.resumed != tc.resume {
 			t.Fatalf("%s: resumed %v, want %v", tc.name, f.resumed, tc.resume)
