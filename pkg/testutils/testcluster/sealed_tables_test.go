@@ -249,9 +249,9 @@ func TestSealedTables(t *testing.T) {
 		wantSQLErr(t, ctx, conn, `CREATE TABLE ts (s INT8, at TIMESTAMPTZ, v FLOAT8, PRIMARY KEY (s, at)) WITH (timeseries = true, encryption_key = 'auto')`,
 			"0A000", "time-series tables cannot be sealed")
 		wantSQLErr(t, ctx, conn, `CREATE TABLE bad (id INT8 PRIMARY KEY) WITH (encryption_key = 'mine')`, "22023", "'auto'")
-		wantSQLErr(t, ctx, conn, `ALTER TABLE notes SET (encryption_key = 'auto')`, "0A000", "not built yet")
+		wantSQLErr(t, ctx, conn, `ALTER TABLE notes SET (encryption_key = 'auto')`, "55000", "sealed already")
 		sealExec(t, ctx, conn, `CREATE TABLE plain (id INT8 PRIMARY KEY, body TEXT)`)
-		wantSQLErr(t, ctx, conn, `ALTER TABLE plain SET (encryption_key = 'auto')`, "0A000", "not built yet")
+		wantSQLErr(t, ctx, conn, `ALTER TABLE notes RESET (encryption_key)`, "0A000", "unsealing")
 	})
 
 	t.Run("crud", func(t *testing.T) {
@@ -443,6 +443,14 @@ func TestSealedTablesNeedV22(t *testing.T) {
 	conn := sealedConn(t, ctx, c, 0, nil)
 	wantSQLErr(t, ctx, conn, `CREATE TABLE notes (id INT8 PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto')`, "0A000", "need cluster version v22")
 	wantSQLErr(t, ctx, conn, `CREATE TABLE items (t UUID, id INT8, body TEXT, PRIMARY KEY (t, id)) WITH (encryption_key_by = 't')`, "0A000", "need cluster version v22")
+	// Sealing an existing table, rotating, and the functions of step 5.
+	sealExec(t, ctx, conn, `CREATE TABLE plain (t INT8, id INT8, body TEXT, PRIMARY KEY (t, id))`)
+	wantSQLErr(t, ctx, conn, `ALTER TABLE plain SET (encryption_key = 'auto')`, "0A000", "need cluster version v22")
+	wantSQLErr(t, ctx, conn, `ALTER TABLE plain SET (encryption_key_by = 't')`, "0A000", "need cluster version v22")
+	wantSQLErr(t, ctx, conn, `ALTER TABLE plain ROTATE ENCRYPTION KEY`, "0A000", "needs cluster version v22")
+	for _, fn := range []string{`datax_rotate_tenant_key('plain', 1)`, `datax_destroy_old_key_versions('plain')`, `datax_remove_tenant_rows('plain', 1)`} {
+		wantSQLErr(t, ctx, conn, `SELECT `+fn, "0A000", "needs cluster version v22")
+	}
 }
 
 // exportClusterKey exports src's cluster key the way the CLI does,
