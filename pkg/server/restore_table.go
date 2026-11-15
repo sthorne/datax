@@ -84,6 +84,11 @@ type restoreProgress struct {
 	// enough to have been given up on cannot publish over rows that are
 	// being taken away.
 	Reclaiming bool `json:"reclaiming,omitempty"`
+	// SealIDs are the seal ids of the per-tenant sealed tables being
+	// restored, whose tenant keys the restore brings back before it
+	// publishes: the tenant key janitor leaves them alone while the
+	// record exists (tenantkeys.go).
+	SealIDs []uint64 `json:"seal_ids,omitempty"`
 }
 
 const (
@@ -139,8 +144,12 @@ var (
 	// the table prefix beside the indexes (keys.VectorCentroidPrefix): the
 	// field names them by a build identifier, not by the table's id, and
 	// carries over as it is.
-	restoreIndexFields      = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
-	restoreConstraintFields = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
+	// A sealed table's key: the naming key and seal id carry over (see
+	// "encryption_key" above), and a per-tenant table's tenant column is
+	// a column id.
+	restoreEncryptionKeyFields = fieldSet("key_id", "seal_id", "tenant_column")
+	restoreIndexFields         = fieldSet("id", "name", "unique", "column_ids", "comment", "state", "inverted", "vector")
+	restoreConstraintFields    = fieldSet("id", "name", "kind", "columns", "expr", "ref_table", "ref_columns", "on_delete",
 		"on_update", "index_id", "auto_index", "validated")
 )
 
@@ -169,6 +178,15 @@ func checkRestorableFields(name string, raw json.RawMessage) error {
 	}
 	if err := unknown("the descriptor field", top, restoreTableFields); err != nil {
 		return err
+	}
+	if raw := top["encryption_key"]; len(raw) > 0 && string(raw) != "null" {
+		var ek map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &ek); err != nil {
+			return fmt.Errorf("table %s: corrupt descriptor in the backup: %w", name, err)
+		}
+		if err := unknown("the encryption key field", ek, restoreEncryptionKeyFields); err != nil {
+			return err
+		}
 	}
 	for _, part := range []struct {
 		field, what string
@@ -836,7 +854,7 @@ func (n *Node) runTableRestore(ctx context.Context, opID string, opts RestoreOpt
 	key := activeRestoreKey{n, opID}
 	activeRestores.Store(key, struct{}{})
 	defer activeRestores.Delete(key)
-	progress := restoreProgress{OpID: opID, NodeID: n.ident.NodeID}
+	progress := restoreProgress{OpID: opID, NodeID: n.ident.NodeID, SealIDs: plan.sealed.tenantSealIDs()}
 	if err := n.db.RunTxn(ctx, "restore-table-begin", func(ctx context.Context, txn *kvclient.Txn) error {
 		top, err := txn.Increment(ctx, keys.DescIDGenKey(), int64(len(plan.tables)))
 		if err != nil {
@@ -1037,6 +1055,13 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 		return nil, err
 	}
 	var notes []string
+	// The tenant keys of per-tenant tables, possibly many, come back in
+	// batches of their own before the publish (restore_sealed.go); the
+	// progress record names their seal ids, so the tenant key janitor
+	// leaves them alone until the restore publishes or is reclaimed.
+	if err := n.reinstateTenantKeys(ctx, plan.sealed); err != nil {
+		return nil, err
+	}
 	err = n.db.RunTxn(ctx, "restore-table-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		notes = notes[:0]
 		rec, err := readRestoreProgress(ctx, txn, opID)
