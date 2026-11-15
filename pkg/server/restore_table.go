@@ -223,6 +223,10 @@ type restorePlan struct {
 	// allocated when the restore publishes.
 	newDB *catalog.DatabaseDescriptor
 	notes []string
+	// types are the backup's enum type descriptors by id (empty for a
+	// backup from before types were backed up: the columns' own copies
+	// of the labels are what a missing type is made from).
+	types map[uint64]catalog.TypeDescriptor
 }
 
 // planTableRestore works out, from the chain's last manifest, which
@@ -271,7 +275,18 @@ func planTableRestore(final *backupManifest, opts RestoreOptions) (*restorePlan,
 		seqs = append(seqs, d)
 	}
 
-	plan := &restorePlan{}
+	plan := &restorePlan{types: map[uint64]catalog.TypeDescriptor{}}
+	typeDescStart, typeDescEnd := keys.TypeDescSpan()
+	for _, kv := range final.Types {
+		if !inAnySpan(keys.Key(kv.Key), [][2]keys.Key{{typeDescStart, typeDescEnd}}) {
+			continue // a name entry
+		}
+		var d catalog.TypeDescriptor
+		if err := json.Unmarshal(kv.Value, &d); err != nil {
+			return nil, fmt.Errorf("corrupt type descriptor in the backup: %w", err)
+		}
+		plan.types[d.ID] = d
+	}
 	add := func(t backupTable, intoDB, intoName string) error {
 		if err := checkRestorableFields(t.Name, t.Descriptor); err != nil {
 			return err
@@ -519,6 +534,18 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 	return d, notes
 }
 
+func sameLabels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func containsString(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
@@ -546,10 +573,18 @@ func restoredSequenceName(p *tableRestorePlan, s restoreSequence) string {
 type restoreTargets struct {
 	dbIDs map[string]uint64
 	roles map[string]bool
+	// types is where each enum type the restored columns are of goes:
+	// the id of the same type, same labels, already in the target
+	// database, or zero for a type the restore creates there.
+	types map[restoreTypeKey]uint64
 }
 
+// restoreTypeKey is an enum type of a table restore: the database it is
+// restored into and its name there.
+type restoreTypeKey struct{ db, name string }
+
 func (n *Node) readRestoreTargets(ctx context.Context, txn *kvclient.Txn, plan *restorePlan) (*restoreTargets, error) {
-	tg := &restoreTargets{dbIDs: map[string]uint64{}, roles: map[string]bool{}}
+	tg := &restoreTargets{dbIDs: map[string]uint64{}, roles: map[string]bool{}, types: map[restoreTypeKey]uint64{}}
 	if plan.newDB != nil {
 		if raw, err := txn.Get(ctx, keys.DatabaseNamespaceKey(plan.newDB.Name)); err != nil {
 			return nil, err
@@ -597,26 +632,64 @@ func (n *Node) readRestoreTargets(ctx context.Context, txn *kvclient.Txn, plan *
 			}
 		}
 	}
+	restored := map[restoreTypeKey]bool{} // the names the restored tables and sequences take
 	for _, p := range plan.tables {
-		// An enum column stores a label's position in its type. The type
-		// is not part of a backup's table, so the column is restorable
-		// only where the same type, with the same labels in the same
-		// order, already is.
+		restored[restoreTypeKey{p.intoDB, p.intoName}] = true
+		for _, s := range p.seqs {
+			restored[restoreTypeKey{p.intoDB, restoredSequenceName(p, s)}] = true
+		}
+	}
+	labelsOf := map[restoreTypeKey][]string{}
+	for _, p := range plan.tables {
+		// An enum column stores a label's position in its type, so it is
+		// restored only onto a type with the same labels in the same
+		// order: the one of that name in the target database, or, where
+		// the database has no type of that name, the type the restore
+		// creates there from the backup (issue #313).
 		for _, c := range p.srcDesc.Columns {
 			if c.EnumType == 0 {
 				continue
 			}
-			td, err := catalog.ReadType(ctx, txn, c.EnumType)
-			var nf *catalog.ErrTypeNotFound
-			if errors.As(err, &nf) {
-				td, err = nil, nil
+			tk := restoreTypeKey{p.intoDB, c.EnumName}
+			if prev, seen := labelsOf[tk]; seen {
+				if !sameLabels(prev, c.EnumLabels) {
+					return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and another table of this restore has a type of that name with other labels", p.from(), c.Name, c.EnumName)
+				}
+				continue
 			}
+			labelsOf[tk] = c.EnumLabels
+			if plan.newDB != nil {
+				tg.types[tk] = 0 // the database is new: the type is made in it
+				continue
+			}
+			dbID := tg.dbIDs[p.intoDB]
+			raw, err := txn.Get(ctx, keys.TypeNamespaceKey(dbID, c.EnumName))
 			if err != nil {
 				return nil, err
 			}
-			if td == nil || plan.newDB != nil || td.DatabaseID != tg.dbIDs[p.intoDB] || td.Name != c.EnumName || strings.Join(td.Labels, "\x00") != strings.Join(c.EnumLabels, "\x00") {
-				return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and a table is restored with its enum columns only into the database that still has that very type, labels unchanged; restore the whole backup into an empty cluster and copy the rows from there", p.from(), c.Name, c.EnumName)
+			if raw == nil {
+				for _, k := range []keys.Key{keys.TableNamespaceKey(dbID, c.EnumName), keys.SequenceNamespaceKey(dbID, c.EnumName)} {
+					if other, err := txn.Get(ctx, k); err != nil {
+						return nil, err
+					} else if other != nil {
+						return nil, fmt.Errorf("table %s: column %q is of the enum type %q, which %s does not have, and the restore cannot create it there because a table or sequence has that name", p.from(), c.Name, c.EnumName, p.intoDB)
+					}
+				}
+				if restored[tk] {
+					return nil, fmt.Errorf("table %s: column %q is of the enum type %q, and the restore would give that name to a table or sequence too", p.from(), c.Name, c.EnumName)
+				}
+				tg.types[tk] = 0
+				continue
 			}
+			td, err := catalog.LookupType(ctx, txn, dbID, c.EnumName)
+			if err != nil {
+				return nil, err
+			}
+			if !sameLabels(td.Labels, c.EnumLabels) {
+				return nil, fmt.Errorf("table %s: column %q is of the enum type %q with the labels (%s), and %s has a type of that name with the labels (%s): a value is stored as its label's position, so the column cannot be restored onto it. Restore into another database (--into), or restore the whole backup into an empty cluster and copy the rows from there",
+					p.from(), c.Name, c.EnumName, strings.Join(c.EnumLabels, ", "), p.intoDB, strings.Join(td.Labels, ", "))
+			}
+			tg.types[tk] = td.ID
 		}
 		check := []string{catalog.OwnerOf(p.srcDesc.Owner)}
 		for g := range p.srcDesc.Privileges {
@@ -1023,6 +1096,31 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 				tg.dbIDs[p.intoDB] = nd.ID
 			}
 		}
+		// The enum types the restored columns need and the target lacks,
+		// made from the backup: its labels are the columns' own copies,
+		// which are what the rows were written against; the owner is the
+		// backup's when that role exists here.
+		for _, p := range plan.tables {
+			for _, c := range p.srcDesc.Columns {
+				tk := restoreTypeKey{p.intoDB, c.EnumName}
+				if c.EnumType == 0 || tg.types[tk] != 0 {
+					continue
+				}
+				td := &catalog.TypeDescriptor{Name: c.EnumName, DatabaseID: tg.dbIDs[p.intoDB], Labels: append([]string(nil), c.EnumLabels...)}
+				if src, ok := plan.types[c.EnumType]; ok && src.Owner != "" && src.Owner != catalog.RootRole {
+					if rd, err := catalog.LookupRole(ctx, txn, src.Owner); err != nil {
+						return err
+					} else if rd != nil {
+						td.Owner = src.Owner
+					}
+				}
+				if err := catalog.CreateType(ctx, txn, td); err != nil {
+					return err
+				}
+				tg.types[tk] = td.ID
+				notes = append(notes, fmt.Sprintf("enum type %s.%s created for %s", p.intoDB, c.EnumName, p.into()))
+			}
+		}
 		ids := map[uint64]uint64{}
 		for _, p := range plan.tables {
 			ids[p.src.ID] = p.newID
@@ -1059,6 +1157,11 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 			}
 			d, dnotes := restoredDescriptor(p, dbID, ids, seqIDs, seqNames, roles)
 			notes = append(notes, dnotes...)
+			for i := range d.Columns {
+				if c := &d.Columns[i]; c.EnumType != 0 {
+					c.EnumType = tg.types[restoreTypeKey{p.intoDB, c.EnumName}]
+				}
+			}
 			raw, err := json.Marshal(d)
 			if err != nil {
 				return err

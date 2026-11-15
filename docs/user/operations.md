@@ -824,7 +824,7 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   file's name is refused without being followed, so a directory prepared
   by someone else cannot point the node at a path of their choosing.
   The system records a backup carries (users, roles, databases,
-  sequences) are written back only to the key spans backup collected
+  sequences, enum types) are written back only to the key spans backup collected
   them from; a manifest carrying any other key — the cluster's
   authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
@@ -920,7 +920,13 @@ datax restore --addr 10.0.1.1:26257 --src /backups/2026-08-31,/backups/2026-08-3
 
 Table IDs are preserved, so secondary indexes and timeseries shard layouts
 restore as-is with no backfill; the descriptor ID generator is bumped past
-every restored ID. Users, admin-role markers, and per-table grants come
+every restored ID. Enum types come back with their ids, so the restored
+columns are still of them. A backup taken before 0.59.0 holds no enum
+types: restoring everything from one brings back the enum columns
+(their labels travel with the column) but not the `CREATE TYPE`. A
+table restore (`--table`, `--database`) from such a backup makes the
+type from the column's labels, so that is the way to bring an enum
+column back from one with its type. Users, admin-role markers, and per-table grants come
 from the backup — after a restore, **credentials are the source cluster's**.
 The restore summary re-exports every table and prints fresh checksums:
 compare them against the backup's to verify the restore byte-for-byte.
@@ -970,7 +976,10 @@ for any restore. Needs cluster version v21.
   continuing from the backup's counter; its grants and owner, for the
   roles this cluster has — grants to roles it lacks are left out and
   listed in the summary, and a table whose owner is missing is owned by
-  `root`. Statistics are not in a backup; the table is sampled like any
+  `root`. An enum column's type: the type of that name in the target
+  database when its labels are the same, in the same order; created
+  there from the backup when the database has none (the summary says
+  so). Statistics are not in a backup; the table is sampled like any
   new one.
 - **Foreign keys.** A foreign key to a table restored in the same run
   follows it: restore `orders` and `customers` together and the copy of
@@ -982,9 +991,9 @@ for any restore. Needs cluster version v21.
   original keep referencing the original.
 - **What is refused,** each with the reason: a view (restore its tables
   and recreate it; a database restore skips views and prints their
-  definitions); a table with an enum column, unless it goes back into
-  the database that still has that same type with the same labels; a
-  table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
+  definitions); a table with an enum column whose target database has
+  a type of that name with other labels (a value is stored as its
+  label's position); a table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
   TYPE` when backed up; the cluster's own tables; and a table whose
   descriptor carries a feature this version's table restore does not
   know. For all of these, restore the whole backup into an empty

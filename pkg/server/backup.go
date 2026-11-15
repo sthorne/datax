@@ -228,6 +228,12 @@ type backupManifest struct {
 	Databases []backupKV `json:"databases,omitempty"`
 	// Sequences are the sequence descriptors, names and counters (v7).
 	Sequences []backupKV `json:"sequences,omitempty"`
+	// Types are the user-defined (enum) type descriptors and their names
+	// (v10). A column of an enum type carries a copy of its labels, but
+	// the type itself is a catalog object of its own: without it a
+	// restored cluster would have the columns and no CREATE TYPE behind
+	// them (issue #313). A manifest from before the field has none.
+	Types []backupKV `json:"types,omitempty"`
 	// RevisionHistory says the data files hold every version written in
 	// (BaseTS, EndTS], newest first within a key, each with its timestamp.
 	// True exactly when Magic is backupHistoryMagic.
@@ -599,7 +605,8 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		return out, err
 	}
 	// The raw groups — users, admins, roles, databases (descriptors and
-	// names), sequences (descriptors, names, counters) — each from the
+	// names), sequences (descriptors, names, counters), types
+	// (descriptors and names) — each from the
 	// spans manifestKeyGroups lists for it, which are the spans restore
 	// holds the group to (issue #256): one list for both sides.
 	for _, g := range manifestKeyGroups {
@@ -856,10 +863,14 @@ var manifestKeyGroups = []manifestKeyGroup{
 		func() [][2]keys.Key {
 			return [][2]keys.Key{spanOf(keys.SequenceDescSpan()), spanOf(keys.AllSequenceNamespaceSpan()), spanOf(keys.SequenceValueSpan())}
 		}},
+	{"types", func(m *backupManifest) *[]backupKV { return &m.Types },
+		func() [][2]keys.Key {
+			return [][2]keys.Key{spanOf(keys.TypeDescSpan()), spanOf(keys.AllTypeNamespaceSpan())}
+		}},
 }
 
 // checkManifestKeys holds a manifest's raw key/value groups — users,
-// admins, roles, databases, sequences — to the key spans backup collects
+// admins, roles, databases, sequences, types — to the key spans backup collects
 // each from. Restore writes those keys back verbatim, so a crafted
 // manifest could otherwise have it write any key in the cluster, as the
 // node, inside restore's own transaction: the authentication secret
@@ -1145,6 +1156,13 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		for _, kv := range final.Sequences {
 			wb.Put(keys.Key(kv.Key), kv.Value)
 			if id, ok := catalog.SequenceIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
+				maxID = id
+			}
+		}
+		// Types keep their ids, which the restored columns name.
+		for _, kv := range final.Types {
+			wb.Put(keys.Key(kv.Key), kv.Value)
+			if id, ok := catalog.TypeIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
 				maxID = id
 			}
 		}

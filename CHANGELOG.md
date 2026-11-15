@@ -1554,6 +1554,19 @@ state or the internode protocol does, and an entry below says so.
   one, no shared family clearing the floors in both — so every pair
   involving it is at least 15 apart, and a test computes the distances
   rather than trusting the numbers.
+- **Backups did not hold enum types** (#313). A backup carried the tables
+  whose columns are of an enum type, with the labels copied into each column,
+  but not the `CREATE TYPE` itself: a restore of everything brought the
+  columns back with no type behind them (`ALTER TYPE` and `'x'::mood` then
+  failed with "type does not exist"). Backups now carry type descriptors and
+  their names (manifest field `types`, held to the type key spans like the
+  other system records) and a restore of everything brings them back under
+  their ids, moving the id generator past them. A table restore no longer
+  refuses a table with an enum column whose type the target database lacks:
+  it creates the type there from the column's labels (which also works from a
+  backup taken before this change) and says so in the summary. Onto a type of
+  that name with the same labels it maps the column to it, as before; onto
+  one with other labels it is refused, naming both label lists.
 
 ## 0.57.0 — unreleased
 

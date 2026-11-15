@@ -8,6 +8,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
 // TypeDescriptor is a user-defined type: an enum with its labels in
@@ -145,4 +146,18 @@ func EnumTypeID(oid int64) (uint64, bool) {
 		return 0, false
 	}
 	return uint64(oid - 16384), true
+}
+
+// TypeIDOfKey extracts the type id from a type descriptor key
+// (keys.TypeDescKey); ok is false for any other key.
+func TypeIDOfKey(k keys.Key) (uint64, bool) {
+	lo, _ := keys.TypeDescSpan()
+	if len(k) <= len(lo) || string(k[:len(lo)]) != string(lo) {
+		return 0, false
+	}
+	_, id, err := encoding.DecodeUint64(k[len(lo):])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
