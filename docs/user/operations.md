@@ -816,7 +816,13 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   filesystem makes them portable).
 - A backup directory holds a `BACKUP.json` manifest plus one data file per
   table; the manifest is written last, so its presence marks the backup
-  complete. The summary prints per-table record counts and SHA-256
+  complete. The data files are written into a hidden
+  `.backup-in-progress-*` directory inside the destination and moved
+  beside the manifest only once every table is written: a backup that
+  fails removes what it wrote and leaves the destination as it found it,
+  and one whose node dies mid-way leaves only that directory (delete it).
+  The directory backup creates is mode 0700 and every file 0600, sealed
+  or not; a destination that already exists keeps its mode. The summary prints per-table record counts and SHA-256
   checksums over the live data. Restore reads only the names a backup
   writes, derived from each table's id, and only a regular file at one
   of them: a manifest naming any other file is refused before anything

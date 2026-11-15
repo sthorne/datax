@@ -1594,6 +1594,12 @@ state or the internode protocol does, and an entry below says so.
   its manifest — count, checksum and key order — in the pass made before
   anything is written, as a table restore already did; a mismatch is refused
   with the target left empty.
+- A backup that failed part way left the data files of the tables it had
+  already written in its destination, with no manifest (#313). The files are
+  now written into a hidden `.backup-in-progress-*` directory inside the
+  destination and moved into place only when every table has been written; a
+  failure removes them. Backup files are created 0600 and a directory the
+  backup creates 0700 (they were 0644 and 0755), sealed or not.
 
 ## 0.57.0 — unreleased
 

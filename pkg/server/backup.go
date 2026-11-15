@@ -546,12 +546,36 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		}
 		baseTS = base.EndTS
 	}
-	if err := os.MkdirAll(dest, 0o755); err != nil {
+	// The directory and its files are the node's user's alone: a
+	// plaintext backup holds every row, and a sealed one still shows the
+	// tables' ids and sizes (issue #313). A directory that already
+	// exists keeps its mode.
+	if err := os.MkdirAll(dest, 0o700); err != nil {
 		return nil, err
 	}
 	if _, err := os.Stat(filepath.Join(dest, backupManifestName)); err == nil {
 		return nil, fmt.Errorf("%s already holds a backup", dest)
 	}
+	// The data files are written into a directory of their own inside
+	// dest and moved beside the manifest only once every table has been
+	// exported, so a backup that fails part way — and is cleaned up here
+	// — leaves nothing in dest, and one whose node dies leaves only that
+	// directory, whose name says what it is: never data files that could
+	// be taken for part of a backup (issue #313). The manifest is still
+	// written last, and is what marks a backup complete.
+	staging, err := os.MkdirTemp(dest, ".backup-in-progress-")
+	if err != nil {
+		return nil, err
+	}
+	var moved []string
+	defer func() {
+		if err != nil {
+			for _, name := range moved {
+				_ = os.Remove(filepath.Join(dest, name))
+			}
+		}
+		_ = os.RemoveAll(staging)
+	}()
 
 	// A sealed backup gets a data key of its own: the backup key wraps
 	// only that, so it seals 32 bytes per backup however large the data.
@@ -630,7 +654,7 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 	// span — every index, raw, so restore needs no backfill.
 	for _, bt := range descs {
 		bt.File = backupDataFile(bt.ID)
-		f, err := os.Create(filepath.Join(dest, bt.File))
+		f, err := os.OpenFile(filepath.Join(staging, bt.File), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return nil, err
 		}
@@ -694,7 +718,6 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		log.Infof("backup: table %s (id %d): %d records, %d live bytes", bt.Name, bt.ID, bt.Records, bt.Bytes)
 	}
 
-	n.events.RecordEnd("backup", opID, "ok", "backup written to %s: %d tables", dest, len(descs))
 	// Manifest last, atomically: its presence marks the backup complete.
 	raw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -705,13 +728,20 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 			return nil, err
 		}
 	}
-	tmp := filepath.Join(dest, backupManifestName+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	tmp := filepath.Join(staging, backupManifestName)
+	if err = os.WriteFile(tmp, raw, 0o600); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp, filepath.Join(dest, backupManifestName)); err != nil {
+	for _, bt := range man.Tables {
+		if err = os.Rename(filepath.Join(staging, bt.File), filepath.Join(dest, bt.File)); err != nil {
+			return nil, fmt.Errorf("moving %s into %s: %w", bt.File, dest, err)
+		}
+		moved = append(moved, bt.File)
+	}
+	if err = os.Rename(tmp, filepath.Join(dest, backupManifestName)); err != nil {
 		return nil, err
 	}
+	n.events.RecordEnd("backup", opID, "ok", "backup written to %s: %d tables", dest, len(descs))
 	sum := backupSummary(dest, &man)
 	sum.Sealed = dataKey != nil
 	return sum, nil
