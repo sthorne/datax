@@ -1331,6 +1331,9 @@ type indexWipe struct {
 	// table), destroyed instead of any entries being wiped (sealed.go).
 	destroyKey int64
 	table      string
+	// tenantSeal, when set, is the seal id of a dropped per-tenant table,
+	// whose tenants' keys are destroyed in the background.
+	tenantSeal uint64
 }
 
 // runPendingWipes reclaims the entries of indexes dropped by committed

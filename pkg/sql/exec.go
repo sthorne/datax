@@ -271,7 +271,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
 	}
-	sealed, err := s.checkSealOptions(ctx, desc, t.Options)
+	sealed, tenantCol, err := s.checkSealOptions(ctx, desc, t.Options, pkNames)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		ttlIndexed = len(desc.Indexes) != before
 	}
 	if sealed {
-		if err := s.sealNewTable(ctx, txn, desc); err != nil {
+		if err := s.sealNewTable(ctx, txn, desc, tenantCol); err != nil {
 			return nil, err
 		}
 	}
