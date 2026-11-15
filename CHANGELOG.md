@@ -909,6 +909,25 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- **The catalog's costs follow what is used, not every table in the
+  cluster** (#311). Listing one database's tables (`SHOW TABLES`, `DROP
+  DATABASE`, `GRANT ... ON ALL TABLES`, the `pg_catalog` views) reads that
+  database's names and descriptors instead of scanning every descriptor:
+  102 rows at 1,000 tables and at 5,000, where it was 1,005 and 5,005.
+  The console's schema document is built when requested, cached for five
+  seconds and shared by concurrent requests, rather than rebuilt on a
+  timer on every node; a build is seven KV requests whatever the table
+  count. Range labels, placement, index-usage names and the table gauges
+  no longer depend on it. A gateway's descriptor cache holds at most
+  1,024 descriptors (`DescCacheSize`) and gives up the lease of a table
+  unused for three lease periods, so a schema change on an idle table
+  waits for nothing; a table resolved while the cache is full is read
+  from the catalog by each statement. `datax_table_rows`,
+  `datax_table_ranges` and `datax_table_stats_age_seconds` are now read
+  when `/metrics` is scraped. `information_schema.tables`, `.columns`
+  and `.views`, role DDL and the per-table gauges still read every
+  descriptor. Measured at 1,000 and 5,000 tables, not beyond. No cluster
+  version change.
 - A restarted node serves no follower reads from a range until that range's
   closed timestamp has passed the node's start time (a few seconds on a
   healthy cluster; not at all while the range has no leader). Before, it
@@ -1036,6 +1055,10 @@ state or the internode protocol does, and an entry below says so.
   be regenerated from anything.
 
 ### Fixed
+- A gateway renewing its lease on a table that had been renamed could
+  delete the lease it already held on the same table under its new name,
+  leaving a cached descriptor no schema change waited for until the next
+  renewal (#311).
 - **A write in flight across a planned lease transfer is answered with
   its outcome** (#271). When the balancer shed a lease, writes proposed
   just before the hand-over were told at once "leadership lost with
