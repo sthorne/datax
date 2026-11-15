@@ -288,6 +288,17 @@ func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 	}
 	defer func(start time.Time) { metrics.KVBatchLatency.Observe(time.Since(start).Seconds()) }(time.Now())
 
+	if ba.Header.CreateTxnRecord && ba.Header.Txn != nil {
+		// A record is born with the heartbeat this batch carries. The
+		// transaction's own copy still says when it began, and a
+		// transaction that makes its first write more than
+		// kvserver.TxnExpiration after it began — a block that read for a
+		// while, or streamed a large object, before writing — would have
+		// a record that reads as expired until its first heartbeat a
+		// second later, for any pusher that came by to abort.
+		ba.Header.Txn.LastHeartbeat = ba.Header.Txn.LastHeartbeat.Forward(db.clock.Now())
+	}
+
 	// Transactional batches of point requests spanning several ranges fan
 	// out concurrently — one range's consensus round no longer waits for
 	// another's. Everything else (non-transactional batches, whose
@@ -1085,10 +1096,38 @@ func overloadBackoff(n int) time.Duration {
 	return d/2 + time.Duration(rand.Int64N(int64(d)))
 }
 
+// MaxWriteBatchBytes bounds the keys and values one write batch may
+// carry to one range. The batch becomes one Raft entry, and an entry is
+// sent to a follower in one message: one that does not fit under
+// rpc.MaxMessageBytes is appended to the leader's log and can never
+// leave it — the client's statement fails with "leadership lost with
+// proposal in flight", and the range's leadership churns around an
+// entry nobody can replicate (issue #303 measured it with a 64 MiB
+// value). Refusing the batch on the gateway costs the statement and
+// nothing else. The margin below the message limit is for what travels
+// with the payload: the transaction, the entry's framing.
+const MaxWriteBatchBytes = rpc.MaxMessageBytes - 4<<20
+
+// writeBatchBytes is the payload a batch would put into a Raft entry.
+func writeBatchBytes(ba *kvpb.BatchRequest) int64 {
+	var n int64
+	for i := range ba.Requests {
+		if p := ba.Requests[i].Put; p != nil {
+			n += int64(len(p.Key) + len(p.Value))
+		}
+	}
+	return n
+}
+
 // sendToRange tries the range's replicas — leader hint first, local replica
 // next — retrying around NotLeader and transport errors until ctx expires.
 func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.RangeDescriptor) (*kvpb.BatchResponse, *kvpb.Error) {
 	ba.Header.RangeID = desc.RangeID
+	if n := writeBatchBytes(ba); n > MaxWriteBatchBytes {
+		e := kvpb.NewErrorf("a write of %d bytes to r%d is larger than a single replicated write can be (%d bytes)", n, desc.RangeID, int64(MaxWriteBatchBytes))
+		e.TooLarge = &kvpb.WriteTooLargeError{Bytes: n, Limit: MaxWriteBatchBytes}
+		return nil, e
+	}
 	// Follower-read fallback accounting: a stale read the gateway cannot
 	// serve from its own replica goes to the leader instead. Counted at
 	// most once per sub-batch — either the gateway holds no replica of

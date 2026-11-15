@@ -101,13 +101,14 @@ func startCluster(t testing.TB, numNodes int, localities []string, opt func(*ser
 			t.Fatal(err)
 		}
 		cfg := server.Config{
-			MetricsRecordInterval: -1,               // off by default: tests own their range set; the metrics tests opt in
-			AuditFlushInterval:    -1,               // likewise: the audit table tests opt in
-			TruncationFlushAfter:  time.Millisecond, // a test's housekeeping call truncates at once
-			Listener:              listeners[i],
-			PGListener:            pglis,
-			Locality:              locality(t, localities, i),
-			UpreplicationInterval: time.Second,
+			MetricsRecordInterval:    -1,               // off by default: tests own their range set; the metrics tests opt in
+			AuditFlushInterval:       -1,               // likewise: the audit table tests opt in
+			LargeObjectSweepInterval: -1,               // and the large-object tables: the large-object tests make them
+			TruncationFlushAfter:     time.Millisecond, // a test's housekeeping call truncates at once
+			Listener:                 listeners[i],
+			PGListener:               pglis,
+			Locality:                 locality(t, localities, i),
+			UpreplicationInterval:    time.Second,
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID,
 				NodeID:    nodeIDs[i],
@@ -182,13 +183,14 @@ func StartWithEngineOptions(t testing.TB, numNodes int, storageOpts storage.Opti
 	})
 	for i := 0; i < numNodes; i++ {
 		cfg := server.Config{
-			MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-			AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-			TruncationFlushAfter:  time.Millisecond,
-			Listener:              listeners[i],
-			Engine:                engines[i],
-			RaftEngine:            raftEngines[i],
-			GCInterval:            -1, // no background housekeeping
+			MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+			AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+			LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+			TruncationFlushAfter:     time.Millisecond,
+			Listener:                 listeners[i],
+			Engine:                   engines[i],
+			RaftEngine:               raftEngines[i],
+			GCInterval:               -1, // no background housekeeping
 			StaticBootstrap: &server.StaticBootstrap{
 				ClusterID: clusterID, NodeID: nodeIDs[i], Range1: range1, Nodes: nodeDescs,
 			},
@@ -237,14 +239,15 @@ func (tc *TestCluster) AddNode(localityStr string) *server.Node {
 		tc.T.Fatal(err)
 	}
 	n, err := server.Start(server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		TruncationFlushAfter:  time.Millisecond,
-		Listener:              lis,
-		PGListener:            pglis,
-		Join:                  tc.Nodes[0].Addr(),
-		Locality:              loc,
-		UpreplicationInterval: time.Second,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		TruncationFlushAfter:     time.Millisecond,
+		Listener:                 lis,
+		PGListener:               pglis,
+		Join:                     tc.Nodes[0].Addr(),
+		Locality:                 loc,
+		UpreplicationInterval:    time.Second,
 	})
 	if err != nil {
 		tc.T.Fatalf("joining node: %v", err)
@@ -263,12 +266,13 @@ func (tc *TestCluster) AddNodeErr(opts ...func(*server.Config)) (*server.Node, e
 		tc.T.Fatal(err)
 	}
 	cfg := server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		TruncationFlushAfter:  time.Millisecond,
-		Listener:              lis,
-		Join:                  tc.Nodes[0].Addr(),
-		UpreplicationInterval: time.Second,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		TruncationFlushAfter:     time.Millisecond,
+		Listener:                 lis,
+		Join:                     tc.Nodes[0].Addr(),
+		UpreplicationInterval:    time.Second,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -295,12 +299,13 @@ func (tc *TestCluster) RestartNodeErr(i int, eng *storage.Engine, opts ...func(*
 		tc.T.Fatalf("re-listening on %s: %v", tc.addrs[i], err)
 	}
 	cfg := server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		Listener:              lis,
-		Engine:                eng,
-		RaftEngine:            tc.raftEngineFor(i, eng),
-		GCInterval:            -1,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		Listener:                 lis,
+		Engine:                   eng,
+		RaftEngine:               tc.raftEngineFor(i, eng),
+		GCInterval:               -1,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -354,13 +359,14 @@ func tryStartDiskNode(t testing.TB, dir string, bootstrap bool, join string, opt
 	t.Helper()
 	lis := listenerForDir(t, dir)
 	cfg := server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		TruncationFlushAfter:  time.Millisecond,
-		Dir:                   dir,
-		Listener:              lis,
-		BootstrapSelf:         bootstrap,
-		Join:                  join,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		TruncationFlushAfter:     time.Millisecond,
+		Dir:                      dir,
+		Listener:                 lis,
+		BootstrapSelf:            bootstrap,
+		Join:                     join,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -428,12 +434,13 @@ func (tc *TestCluster) RestartNode(i int, eng *storage.Engine, opts ...func(*ser
 		tc.T.Fatalf("re-listening on %s: %v", tc.addrs[i], err)
 	}
 	cfg := server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		Listener:              lis,
-		Engine:                eng,
-		RaftEngine:            tc.raftEngineFor(i, eng),
-		GCInterval:            -1,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		Listener:                 lis,
+		Engine:                   eng,
+		RaftEngine:               tc.raftEngineFor(i, eng),
+		GCInterval:               -1,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -474,13 +481,14 @@ func (tc *TestCluster) RestartNodeNewPort(i int, eng *storage.Engine, join strin
 		_ = l.Close()
 	}
 	cfg := server.Config{
-		MetricsRecordInterval: -1, // off by default: tests own their range set; the metrics tests opt in
-		AuditFlushInterval:    -1, // likewise: the audit table tests opt in
-		Listener:              lis,
-		Engine:                eng,
-		RaftEngine:            tc.raftEngineFor(i, eng),
-		Join:                  join,
-		GCInterval:            -1,
+		MetricsRecordInterval:    -1, // off by default: tests own their range set; the metrics tests opt in
+		AuditFlushInterval:       -1, // likewise: the audit table tests opt in
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
+		Listener:                 lis,
+		Engine:                   eng,
+		RaftEngine:               tc.raftEngineFor(i, eng),
+		Join:                     join,
+		GCInterval:               -1,
 	}
 	for _, opt := range opts {
 		opt(&cfg)

@@ -46,7 +46,8 @@ func startGCNodeCfg(t *testing.T, opts ...func(*server.Config)) (*server.Node, *
 		GCTTL:    -1, // disable the background loop
 		// These tests count keys and ranges by hand; the audit table
 		// arriving (and its range splitting off) mid-test is not theirs.
-		AuditFlushInterval: -1,
+		AuditFlushInterval:       -1,
+		LargeObjectSweepInterval: -1, // and the large-object tables: the large-object tests make them
 		StaticBootstrap: &server.StaticBootstrap{
 			ClusterID: uuid.New(),
 			NodeID:    1,

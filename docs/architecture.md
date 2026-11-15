@@ -29,6 +29,15 @@ Raft group. The layout (see `pkg/keys`):
 | `/system/seqdesc/<seqID>`, `/system/seqns/<dbID>/<name>`, `/system/seq/<seqID>` | sequences (v7): descriptors, names per database, and each sequence's counter, advanced by non-transactional increments of one `CACHE` block at a time | range 1 |
 | `/t/<tableID>/<pk...>` | user table rows | user ranges |
 
+A row is one key and one value: every non-key column of the row is in
+that value (`docs/sql.md`, "Row encoding"), written, replicated and read
+as a unit. Nothing is stored out of line, so a row is as large as its
+largest column value, and the practical ceiling on a value is what one
+Raft proposal and one internode message can carry (see "Large objects"
+in `docs/sql.md`). Values meant to be larger than that are large
+objects: pages of 256 KiB, each an ordinary row of a system table under
+`/t/<1<<40 + 5>/...`.
+
 Range 1 initially spans the whole keyspace; splits carve off new ranges.
 Because all replicas of all ranges on a node share one Pebble store, and range
 membership of a key is purely logical (descriptor bounds), **splitting a range
@@ -215,6 +224,12 @@ transactional path, under table ids nothing names until one transaction
 publishes the descriptors; a replicated progress record
 (`/system/restore/<op>`, also **v21**) lets any node remove the rows of
 a restore whose node died (see `pkg/server/restore_table.go`).
+
+Large objects (**v21**) are three system tables at reserved ids and the
+`lo_*` functions over them; nothing below SQL is new. The gate exists
+for the tables: a v20 node knows nothing of the reservation, would
+treat them as ordinary tables their owner may write, and could delete
+pages out from under an object.
 
 ## Modules
 

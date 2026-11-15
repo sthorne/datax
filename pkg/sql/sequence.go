@@ -469,6 +469,14 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 			args[i] = d
 		}
 		var d types.Datum
+		if largeObjectFuncs[e.Func] {
+			v, err := s.evalLargeObjectFunc(ctx, txn, e.Func, args)
+			if err != nil {
+				return e, err
+			}
+			out.Func, out.Args, out.Lit = "", nil, &v
+			return out, nil
+		}
 		switch e.Func {
 		case "nextval", "currval":
 			if len(args) != 1 {

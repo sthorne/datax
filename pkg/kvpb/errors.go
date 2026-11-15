@@ -28,12 +28,22 @@ type Error struct {
 	// StorageOverloaded accompanies TxnRetry when the leader's engine shed
 	// the write under backpressure: retry, but with backoff.
 	StorageOverloaded *StorageOverloadedError `json:"storage_overloaded,omitempty"`
+	// TooLarge: the gateway refused to send a write batch that no
+	// replica could have replicated (kvclient.MaxWriteBatchBytes). It is
+	// raised and read on the gateway and never crosses the wire.
+	TooLarge *WriteTooLargeError `json:"-"`
 	// DescriptorChanged: a split, merge or descriptor update was refused
 	// at apply because the range changed after the change was built.
 	DescriptorChanged *DescriptorChangedError `json:"descriptor_changed,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
+
+// WriteTooLargeError: a write batch for one range is larger than one
+// replicated write may be. Bytes is its size and Limit the bound.
+type WriteTooLargeError struct {
+	Bytes, Limit int64
+}
 
 // NotLeaderError: the replica is not the Raft leader; retry at LeaderHint's
 // replica if known.

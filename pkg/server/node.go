@@ -190,6 +190,17 @@ type Config struct {
 	RowTTLInterval   time.Duration
 	RowTTLBatchSize  int
 	RowTTLBatchPause time.Duration
+	// LargeObjectSweepInterval paces the large-object sweeper
+	// (largeobject.go): each tick, the node leading range 1 deletes the
+	// pages of unlinked objects and of uploads that never committed
+	// (0 = default 1m; negative disables it, and those pages then stay;
+	// the loop also creates the large-object tables, which with it
+	// disabled are created by the first session to store an object).
+	// LargeObjectUploadGrace is how long an upload may go without a sign
+	// of life before the sweeper takes it for abandoned — how long a
+	// client may leave an upload idle (0 = default 10m).
+	LargeObjectSweepInterval time.Duration
+	LargeObjectUploadGrace   time.Duration
 	// ReshardRetireFor is how long a completed re-shard's superseded
 	// layout stays on disk serving AS OF SYSTEM TIME below the swap
 	// before the janitor reclaims it (0 = the GC TTL, matching the
@@ -893,6 +904,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.largeObjectSweepLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {

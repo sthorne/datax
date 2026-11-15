@@ -503,6 +503,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
 | `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally. Like `datax_table_rows` and `datax_table_ranges` it is read from the catalog when `/metrics` is scraped (at most every 5 s; a scrape waits up to 2 s for the reading, then serves the previous one), so every node reports the same current value and a node nobody scrapes reads nothing for it |
 | `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard). `SET idle_in_transaction_session_timeout` (per session, or in the application's connection setup) ends such a connection and releases its intents; `SELECT pg_cancel_backend(pid)` / `pg_terminate_backend(pid)` with the pid from `pg_stat_activity` does it by hand, and `SET lock_timeout` bounds how long the blocked writers wait ([Session settings](sql.md#session-settings)) |
+| `datax_largeobject_pages_reclaimed_total` flat while `SELECT count(*) FROM datax_largeobject_pending` stays above zero | for more than a few minutes | the large-object sweeper is not reclaiming: unlinked objects and failed uploads are keeping their disk (see [Large objects](#large-objects)) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
 | `datax_replica_gc_removed_total` | increasing | the housekeeping pass found replicas that `/meta` says are members of nothing — preseeds whose membership change never landed — and removed them with their data; expected after a refused replica change, otherwise worth a look at the log for which ranges |
 | `datax_raft_nonmember_messages_dropped_total` | increasing steadily | a replica id the range has moved past keeps sending — a removed replica that has not noticed, or a leftover replica GC has not yet collected (60 s grace) |
@@ -731,6 +732,54 @@ one.
   and leave old versions for garbage collection like any delete.
 - If range 1's leadership moves mid-pass, two nodes may delete for a
   moment; the second finds the rows gone.
+
+### Large objects
+
+[Large objects](sql.md#large-objects) are rows of three system tables
+— `datax_largeobject` (the pages, 256 KiB each),
+`datax_largeobject_metadata` (one row per object) and
+`datax_largeobject_pending` (contents waiting to be removed) — created
+by the nodes a few seconds after the cluster reaches v21. What that
+means for running a cluster:
+
+- **Ranges.** Pages are keyed by content and page number, so one object
+  is a contiguous run of keys and a busy cluster's uploads interleave by
+  content, not by time. The page table splits by size like any table; a
+  range boundary may fall inside an object and nothing notices. A range
+  of pages holds about 250 of them at the default range size, and no
+  page is ever too big to split around — which a single multi-megabyte
+  row value is.
+- **Disk.** An object takes its size times the replication factor, plus
+  the Raft log's copy until the log is truncated (briefly about twice
+  that during an upload). Overwritten pages and the pages of unlinked
+  objects stay as old versions until the page table's GC window passes;
+  `ALTER TABLE` is refused on these tables, so that window is the
+  node's (25h by default).
+- **The sweeper.** One job for the cluster, on the node leading range 1,
+  runs every minute and deletes the pages of contents that no object
+  stands for: unlinked objects, uploads that rolled back or lost their
+  connection (marked on the way out, so reclaimed on the next pass), and
+  uploads that have shown no sign of life for 10 minutes (a gateway that
+  died mid-upload). `datax_largeobject_contents_reclaimed_total` and
+  `datax_largeobject_pages_reclaimed_total` count its work, and a pass
+  that reclaimed something logs one line. A non-empty
+  `datax_largeobject_pending` that does not drain means the sweeper is
+  not running (no range-1 leader) or cannot write.
+- **Load.** An upload is a stream of 256 KiB replicated writes, about
+  20 MiB/s per upload on modest disks; it holds no locks while it runs
+  and does not delay backups. Several at once are a bulk load like any
+  other and meet the same [backpressure](#backpressure).
+  `datax_largeobject_bytes_written_total` and `..._read_total` are the
+  traffic, per gateway.
+- **Backups.** A full or incremental backup carries the three tables;
+  a full restore brings the objects back, and the restored cluster's
+  sweeper finishes whatever removals were pending at the backup's time.
+  An object whose upload had not committed at the backup's time is not
+  in the backup. `datax restore --table` restores user tables only: it
+  does not bring back the large objects a restored table's rows refer
+  to (restore everything into a scratch cluster and copy them out).
+- **Memory.** Gateways need nothing extra: a transfer holds a page or a
+  read's worth at a time.
 
 Keys print as paths everywhere — logs, `datax debug`, the dashboard and
 its API: `/Min` and `/Max` bound the keyspace, `/meta/...` are the range
@@ -1192,6 +1241,24 @@ datax debug unsafe-recover --dir /var/lib/datax --yes    # [--range N]
 This can lose recently committed writes on the dead replicas — hence
 "unsafe". `datax debug metadata --dir ...` inspects a store's metadata
 (works on encrypted stores with `--enc-key`).
+
+- **v21 also adds large objects.** Until it is finalized the `lo_*`
+  functions are refused (`0A000`) and nothing creates their tables: a
+  node on the older binary knows nothing of the reservation and would
+  let the tables' owner delete pages out from under an object.
+- **This release changes three behaviours without a version gate**, all
+  found by measuring large values and all safe in a mixed cluster. A
+  gateway refuses a write batch of more than 60 MiB for one range
+  (`54000` to the SQL client) instead of sending it: such a batch could
+  not be replicated, failed with `XX000`, and left the range's
+  leadership churning around the entry. A
+  store on the balanced profile now starts an L0 compaction at 200
+  files rather than 500: files that do not overlap (a stream of writes
+  in key order) used to pile up to the 400-file backpressure gate and
+  stay there, shedding writes for good. And a transaction's record is
+  created with a current heartbeat: a transaction that made its first
+  write more than five seconds after `BEGIN` could be aborted by any
+  other transaction that met its row in the following second.
 
 ## Backpressure
 

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -64,6 +65,10 @@ type Env struct {
 	// SequenceValue reads a sequence's last value (called reports whether
 	// nextval has run); nil when the caller cannot read counters.
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
+	// LargeObjects lists the large objects the session may open (every
+	// one for an admin, its own otherwise); nil when the caller cannot
+	// read them. A function, because most catalog queries never ask.
+	LargeObjects func() ([]LargeObjectInfo, error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	// Roles holds every role (catalog.ListRoles: root first, then by
@@ -78,6 +83,28 @@ type Env struct {
 	SessionUser string // the authenticated user (session_user)
 	Database    string // the session's current database
 	IsAdmin     bool
+}
+
+// procOIDBase is where pg_proc's OIDs start: a builtin's OID is the
+// base plus its position in builtins.All().
+const procOIDBase = int64(1 << 28)
+
+// ProcName resolves a pg_proc OID back to the function it was listed
+// for (the fast-path protocol names a function by the OID a client read
+// from pg_proc).
+func ProcName(oid int64) (string, bool) {
+	all := builtins.All()
+	if i := oid - procOIDBase; i >= 0 && i < int64(len(all)) {
+		return all[i].Name, true
+	}
+	return "", false
+}
+
+// LargeObjectInfo is one large object as pg_largeobject_metadata lists
+// it.
+type LargeObjectInfo struct {
+	OID   int64
+	Owner string
 }
 
 // RoleOID is a role's stable catalog OID (pg_roles.oid, pg_auth_members,

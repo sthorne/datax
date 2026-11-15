@@ -24,6 +24,25 @@ var (
 	TxnRetries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_retries_total", Help: "Retryable transaction errors surfaced to clients (40001s).",
 	})
+	// Large objects (issue #303; pkg/sql/largeobject.go).
+	LargeObjectsCreated = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobjects_created_total", Help: "Large objects created (lo_create, lo_from_bytea), whether or not their transaction went on to commit.",
+	})
+	LargeObjectsUnlinked = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobjects_unlinked_total", Help: "Large objects unlinked (lo_unlink).",
+	})
+	LargeObjectBytesWritten = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_bytes_written_total", Help: "Bytes written to large-object pages by this gateway.",
+	})
+	LargeObjectBytesRead = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_bytes_read_total", Help: "Bytes read from large objects through this gateway.",
+	})
+	LargeObjectContentsReclaimed = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_contents_reclaimed_total", Help: "Large-object contents the sweeper reclaimed: unlinked objects and uploads that never committed.",
+	})
+	LargeObjectPagesReclaimed = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_largeobject_pages_reclaimed_total", Help: "Large-object pages the sweeper deleted.",
+	})
 	TxnAmbiguousResends = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_txn_ambiguous_resends_total", Help: "Transactional batches re-sent because a leadership change left their proposal's fate unknown.",
 	})

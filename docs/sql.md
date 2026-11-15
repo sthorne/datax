@@ -563,6 +563,124 @@ paths).
   lazy `DROP COLUMN` and nullable `ADD COLUMN` free. Binary encode is
   ~3× faster than the JSON encoding it replaced (see rowenc benchmarks).
 
+A row value has no out-of-line part: a large column value makes a
+large KV value, and the limits on that are not SQL's. Measured on three
+nodes (issue #303): a 32 MiB `BYTEA` INSERT takes about a second and
+grows the process by over a gigabyte (the value is copied at each of
+parse, datum, row encoding, batch, Raft entry, apply — on three nodes);
+an `UPDATE` of another column of that row rewrites the whole value and
+costs the same; reading only its length reads all of it.
+`statement_memory_limit` does not come into it — it bounds what a
+statement collects, not what it is handed.
+
+The hard limit is the Raft entry. A write batch for one range becomes
+one entry, and an entry that reaches `rpc.MaxMessageBytes` (64 MiB) is
+appended to the leader's log and can never be sent to a follower: the
+client got `XX000` ("leadership lost with proposal in flight") and the
+range stalled while leadership churned around the entry. The gateway
+now refuses such a batch before sending it
+(`kvclient.MaxWriteBatchBytes`, 60 MiB of keys and values to one
+range), and SQL reports `54000` with the advice to use a large object.
+
+## Large objects (v21)
+
+`pkg/sql/largeobject.go`. PostgreSQL's large-object functions over
+three system tables (reserved ids `1<<40 + 5..7`, sealed like the audit
+table: only a node's own session writes them):
+
+```
+datax_largeobject_metadata (loid PK, cid, owner, created_at)   -- an object exists iff its row does
+datax_largeobject          (cid, pageno, data; PK (cid, pageno)) -- 256 KiB pages of a content
+datax_largeobject_pending  (cid PK, loid, kind, node, at)      -- contents nobody may be standing for
+```
+
+**Pages.** An object's bytes are rows of at most
+`LargeObjectPageSize` (256 KiB); the object's size is where its last
+page ends; an absent page, or a short page before the last, reads as
+zeros. Pages are written and read at the KV level with the table's own
+row encoding (`rowenc`), so the tables are ordinary to everything
+below: ranges split between pages, snapshots, the consistency checker,
+MVCC garbage collection, backup and encryption at rest need nothing.
+A descriptor (`lo_open`) holds a position and one page, so a stream of
+small `lowrite` calls costs one KV write per page, not per call.
+
+**Content ids.** Pages are keyed by a content id (`cid`, a
+`unique_rowid`), not by the object id, because an object id may be
+chosen by the client and reused while the pages of the object that had
+it before are still waiting to be deleted.
+
+**The two write paths.** Writes to an object that was already committed
+go through the session's transaction (`txn.Put` of the page rows): they
+are isolated and atomic like any row write, a writer locks the object's
+metadata row so that an unlink waits for it, and they are capped at
+64 MiB per transaction because they are intents. A new object created
+in a transaction block is different: its pages are written *outside*
+the transaction, as non-transactional puts, while the block is open.
+Nobody can see them, because the metadata row that would lead to them
+is not written until `COMMIT`. This is the issue's "many transactions
+with a commit record": the commit record is the metadata row.
+
+**Orphans and the sweeper.** Before the first page of an upload, the
+gateway writes a pending row (kind `upload`) outside the transaction.
+At `COMMIT` the session's transaction reads that row under a lock,
+deletes it and writes the metadata row — one atomic step — so the
+pending row survives exactly when the object does not. A rollback or a
+closed session rewrites the row as kind `unlink` on its way out;
+`lo_unlink` of a committed object deletes the metadata row and writes a
+pending row of kind `unlink` in its transaction. The sweeper
+(`SweepLargeObjects`, driven by the range-1 leader every minute)
+deletes the pages of every `unlink` row and then the row. For an upload
+whose gateway died there is nobody to mark the row, so a live upload
+refreshes its row's timestamp every 15 seconds of activity and the
+sweeper claims an `upload` row older than the grace period (10 minutes)
+by rewriting it as `unlink` in a transaction. The heartbeat, the commit
+and the claim all read the row before changing it, so they are
+serialized on it: an upload either commits with all its pages, or
+learns (`55000`) that it was reclaimed.
+
+An earlier shape kept the uploading transaction's intents on the
+metadata and pending rows for the whole upload, which needs no
+heartbeat. It was dropped because every scan of those tables — a
+backup's export in particular — waits for a live transaction's intent,
+so a ten-minute upload would have held up backups for ten minutes.
+
+**Visibility.** A transaction that can see the metadata row must see
+every page. Pages carry the timestamps at which they were written,
+which are later than the uploading transaction's; so before writing the
+metadata row the transaction is moved forward to the present
+(`Txn.AdvanceTo`, the read-refresh a timestamp conflict uses), and
+commits above every page. A backup taken at any timestamp therefore
+holds an object whole or not at all.
+
+The move can fail: it is a read refresh, so if anything the transaction
+read has changed since, the commit is `40001` and the upload is lost
+(its pages go to the sweeper). A transaction that only uploads has read
+one thing, the absence of the metadata row. libpq reads the catalog in
+the transaction (its lookup of the functions' OIDs in `pg_proc`), which
+is why the nodes create the tables ahead of use rather than on first
+use — creating them is a catalog write — and why DDL during a libpq
+upload fails that upload.
+
+**Fast path.** libpq's large-object API calls the functions through the
+protocol's function-call message rather than SQL. `pkg/pgwire/fastpath.go`
+serves that message for the large-object functions only, by running
+`SELECT fn($1, ...)` with the decoded arguments, and encodes the result
+at the width PostgreSQL declares (four bytes for descriptors, counts and
+object ids, eight for the 64-bit positions).
+
+**Savepoints.** Non-transactional page writes cannot be undone, so
+`ROLLBACK TO SAVEPOINT` in a transaction that has created an object
+marks the transaction as unable to commit.
+
+Not built: a `BLOB` column type that owns its object (the lifecycle
+would need a reference from row to object and a sweep of dropped rows;
+the issue asked for one interface to be picked), streaming through
+`COPY`, compression (the values this is for are already compressed or
+sealed), and out-of-line storage of ordinary column values in the
+manner of TOAST — a different feature, which would make large `BYTEA`
+values cheaper to carry beside small columns but would still write and
+read each value whole.
+
 ## Secondary indexes (v2)
 
 `CREATE [UNIQUE] INDEX name ON table (cols)` adds an index with its own

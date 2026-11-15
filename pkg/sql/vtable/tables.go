@@ -420,7 +420,7 @@ func init() {
 			case builtins.Volatile:
 				vol = "v"
 			}
-			rows = append(rows, Row{i64(int64(1<<28) + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
+			rows = append(rows, Row{i64(procOIDBase + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
 				i64(TypeOID(b.ResultFamily(b.Args))), i64(int64(len(b.Args))), str(strings.Join(argOIDs, " ")), null(), str(b.Name), str(vol), boolean(!b.NotStrict)})
 		}
 		return rows, nil
@@ -447,7 +447,21 @@ func init() {
 	pg("pg_ts_config", []catalog.Column{col("oid", types.Int), col("cfgname", types.String), col("cfgnamespace", types.Int), col("cfgowner", types.Int), col("cfgparser", types.Int)}, empty)
 	pg("pg_ts_parser", []catalog.Column{col("oid", types.Int), col("prsname", types.String), col("prsnamespace", types.Int), col("prsstart", types.Int), col("prstoken", types.Int), col("prsend", types.Int), col("prsheadline", types.Int), col("prslextype", types.Int)}, empty)
 	pg("pg_ts_template", []catalog.Column{col("oid", types.Int), col("tmplname", types.String), col("tmplnamespace", types.Int), col("tmplinit", types.Int), col("tmpllexize", types.Int)}, empty)
-	pg("pg_largeobject_metadata", []catalog.Column{col("oid", types.Int), col("lomowner", types.Int), col("lomacl", types.String)}, empty)
+	pg("pg_largeobject_metadata", []catalog.Column{col("oid", types.Int), col("lomowner", types.Int), col("lomacl", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.LargeObjects == nil {
+				return nil, nil
+			}
+			objs, err := env.LargeObjects()
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]Row, 0, len(objs))
+			for _, o := range objs {
+				rows = append(rows, Row{i64(o.OID), i64(RoleOID(catalog.OwnerOf(o.Owner))), null()})
+			}
+			return rows, nil
+		})
 	pg("pg_db_role_setting", []catalog.Column{col("setdatabase", types.Int), col("setrole", types.Int), col("setconfig", types.String)}, empty)
 	pg("pg_foreign_data_wrapper", []catalog.Column{col("oid", types.Int), col("fdwname", types.String), col("fdwowner", types.Int), col("fdwhandler", types.Int), col("fdwvalidator", types.Int), col("fdwacl", types.String), col("fdwoptions", types.String)}, empty)
 	pg("pg_foreign_server", []catalog.Column{col("oid", types.Int), col("srvname", types.String), col("srvowner", types.Int), col("srvfdw", types.Int), col("srvtype", types.String), col("srvversion", types.String), col("srvacl", types.String), col("srvoptions", types.String)}, empty)

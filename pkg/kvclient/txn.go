@@ -909,6 +909,28 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	return true
 }
 
+// AdvanceTo moves the transaction forward so that it commits at or above
+// ts, by the same proof a timestamp conflict takes: every span it has
+// read saw no foreign write up to ts. A transaction whose commit must
+// not precede writes made outside it uses this — a large object's pages
+// are written outside the transaction that creates the object, and the
+// row that makes the object visible must not carry a timestamp below
+// theirs (pkg/sql/largeobject.go). When the proof fails the transaction
+// cannot commit and the error is retryable.
+func (t *Txn) AdvanceTo(ctx context.Context, ts hlc.Timestamp) error {
+	if t.historical {
+		return fmt.Errorf("cannot advance a read-only historical transaction")
+	}
+	if err := t.flushDeferred(ctx); err != nil {
+		return err
+	}
+	if !t.maybeRefresh(ctx, ts) {
+		metrics.TxnRetries.Inc()
+		return &RetryableError{Cause: &kvpb.Error{Message: fmt.Sprintf("transaction could not be moved forward to %s: something it read has changed since (or it has read too much to tell)", ts)}}
+	}
+	return nil
+}
+
 // publishWait records the transaction this one is blocked on (nil = no
 // longer blocked) and publishes the edge on the transaction record with an
 // immediate heartbeat, so pushers walking wait chains see it without

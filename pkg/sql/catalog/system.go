@@ -21,6 +21,13 @@ package catalog
 //   - datax_audit (issue #293) is the audit table: every node's chain of
 //     audit records. Unlike the others it is sealed — see
 //     IsSealedSystemTable.
+//   - datax_largeobject, datax_largeobject_metadata and
+//     datax_largeobject_pending (issue #303) hold large objects: the
+//     pages of each object's content, the object ids that name a
+//     content, and the contents awaiting reclamation. They are sealed
+//     too: a page deleted through SQL would be a hole in somebody's
+//     file, and the pages are read through the lo_* functions, which
+//     check the object's owner.
 
 // MetricsTableName is the reserved name of the metrics table.
 const MetricsTableName = "datax_metrics"
@@ -61,6 +68,19 @@ const (
 	AuditTableID   uint64 = 1<<40 + 4
 )
 
+// The large-object tables' reserved names and fixed descriptor IDs, the
+// next above AuditTableID (issue #303; pkg/sql/largeobject.go has the
+// layout).
+const (
+	LargeObjectTableName         = "datax_largeobject"
+	LargeObjectMetadataTableName = "datax_largeobject_metadata"
+	LargeObjectPendingTableName  = "datax_largeobject_pending"
+
+	LargeObjectTableID         uint64 = 1<<40 + 5
+	LargeObjectMetadataTableID uint64 = 1<<40 + 6
+	LargeObjectPendingTableID  uint64 = 1<<40 + 7
+)
+
 // systemTableIDs is every reserved name and the ID it is created at.
 // Adding an entry here is the whole registration: the DDL path assigns
 // the ID from it, and the privilege, rename, drop and backup rules read
@@ -71,6 +91,10 @@ var systemTableIDs = map[string]uint64{
 	ShapesMetricsTableName:   ShapesMetricsTableID,
 	StatementShapesTableName: StatementShapesTableID,
 	AuditTableName:           AuditTableID,
+
+	LargeObjectTableName:         LargeObjectTableID,
+	LargeObjectMetadataTableName: LargeObjectMetadataTableID,
+	LargeObjectPendingTableName:  LargeObjectPendingTableID,
 }
 
 // SystemTableName is the reserved name whose table is created at id, or
@@ -120,7 +144,16 @@ func IsSystemTableID(id uint64) bool {
 // not its shape, not its ownership — whatever role asks, root and
 // admins included. The other system tables are the cluster's but an
 // admin may still tidy them; an audit trail an admin can edit is not
-// one, so the audit table is held apart (issue #293).
+// one, so the audit table is held apart (issue #293). The large-object
+// tables are held apart for a plainer reason: their rows are pages of
+// objects that only the lo_* functions know how to keep whole
+// (issue #303).
 func IsSealedSystemTable(name string) bool {
-	return name == AuditTableName
+	return name == AuditTableName || IsLargeObjectTable(name)
+}
+
+// IsLargeObjectTable reports whether name is one of the tables large
+// objects are stored in.
+func IsLargeObjectTable(name string) bool {
+	return name == LargeObjectTableName || name == LargeObjectMetadataTableName || name == LargeObjectPendingTableName
 }

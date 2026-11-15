@@ -457,7 +457,7 @@ func (c *conn) run(ctx context.Context) error {
 			return err
 		}
 		switch msg.(type) {
-		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.Terminate:
+		case *pgproto3.Query, *pgproto3.Sync, *pgproto3.Terminate, *pgproto3.FunctionCall:
 			boundary = true
 		default:
 			boundary = false
@@ -471,6 +471,17 @@ func (c *conn) run(ctx context.Context) error {
 			c.handleSimpleQuery(ctx, m.String)
 			if c.session.State() != sql.StateOpen {
 				c.reapPortals() // a simple-query COMMIT/ROLLBACK ends them
+			}
+			c.sendReady()
+			if err := c.backend.Flush(); err != nil {
+				return err
+			}
+
+		case *pgproto3.FunctionCall:
+			c.skipToSync = false
+			c.handleFunctionCall(ctx, m)
+			if c.session.State() != sql.StateOpen {
+				c.reapPortals()
 			}
 			c.sendReady()
 			if err := c.backend.Flush(); err != nil {

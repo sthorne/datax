@@ -241,6 +241,16 @@ const (
 	// descriptor back without them. ENABLE and FORCE ROW LEVEL SECURITY,
 	// CREATE and ALTER POLICY and the BYPASSRLS role attribute are
 	// therefore refused until finalize (rule 4).
+	//
+	// V21 also introduces large objects (issue #303, pkg/sql/largeobject.go):
+	// three more system tables (pkg/sql/catalog.LargeObjectTableName and
+	// its two companions) holding objects cut into pages, behind
+	// PostgreSQL's lo_* functions. Nothing below SQL changes — a page is
+	// an ordinary row — so the gate is the one every system table has: a
+	// v20 node knows nothing of the reservations and would treat the
+	// tables as ordinary ones, whose owner may delete rows, which here are
+	// pages of somebody's object. Nothing creates the tables and the
+	// functions are refused until finalize (rule 4).
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

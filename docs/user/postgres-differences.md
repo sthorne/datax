@@ -21,6 +21,7 @@ syntax error or `0A000` feature not supported):
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
 | Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, `row_security = off`, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
+| The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
 | Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
 
 ## Things that exist but behave differently
@@ -199,6 +200,52 @@ The rules are PostgreSQL's; these are the differences.
 | Custom settings | need a dot; any value; unknown until set | the same; `RESET` leaves the setting empty, and a transaction's rollback does not undo a plain `SET` or `set_config(..., false)` made inside it |
 | Constraint errors | reveal that a hidden row holds a unique value; foreign keys see the whole parent | the same, with no value of the hidden row in the message |
 
+### Large values
+
+A column value is limited by the row, and a row by what one replicated
+write can carry: a statement that writes more than 60 MiB to one range
+in one piece is refused with `54000` (PostgreSQL allows a 1 GB field).
+Well below that a large value is already expensive — it is written,
+replicated and read whole, with no out-of-line storage — so values of
+more than a few MiB belong in large objects.
+
+### Large objects
+
+The functions are PostgreSQL's and drivers use them unchanged; these
+are the differences ([reference](sql.md#large-objects)):
+
+- **A new object's content is not part of the transaction's write set.**
+  It is stored as it arrives and becomes visible, whole, when the
+  transaction that created the object commits — which is what lets an
+  upload be larger than any transaction. The visible behaviour is
+  PostgreSQL's (nothing before commit, everything after, nothing after a
+  rollback) with two exceptions: `ROLLBACK TO SAVEPOINT` cannot undo
+  such writes, so the transaction can then only roll back (`25P02` at
+  `COMMIT`); and an upload left idle for 10 minutes is abandoned
+  (`55000`).
+- The commit of an upload fails with `40001` if anything the
+  transaction read earlier — the catalog included — changed while the
+  upload ran (the transaction is moved forward at commit so that it
+  commits after its pages).
+- Writes to an object that existed before the transaction are fully
+  transactional and limited to 64 MiB per transaction (`54000`).
+  PostgreSQL has no such limit; replace a large object by writing a new
+  one.
+- Pages are 256 KiB rather than 2 kB, and objects up to 1 TiB rather
+  than 4 TiB.
+- An object is its owner's and the admins'. PostgreSQL's per-object
+  `SELECT` / `UPDATE` grants do not exist.
+- A reader that opens an object while another transaction is in the
+  middle of changing or unlinking it waits for that transaction, as
+  reads of any row a transaction has written do here; PostgreSQL would
+  read the old version without waiting.
+- Object ids are 32-bit as in PostgreSQL, but generated at random
+  (above 65,536) rather than from the OID counter.
+- `vacuumlo` is not needed for space — an unlinked object's pages are
+  removed by the cluster within about a minute and garbage-collected
+  after the GC window — but objects orphaned by deleting the row that
+  named them are still yours to unlink, exactly as in PostgreSQL.
+
 ## Errors you should know
 
 | SQLSTATE | Meaning | What to do |
@@ -207,6 +254,8 @@ The rules are PostgreSQL's; these are the differences.
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
 | `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
+| `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
+| `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
 | `0A000` | feature not supported | you've left the subset — check this page |
 | `42601` | syntax error | likewise, usually |
 | `42601` "statement nests too deeply" | more than 1,000 nesting levels (parentheses, subqueries, derived tables, `CASE`) | flatten the statement; PostgreSQL bounds the same recursion by stack depth (issue #135) |
@@ -265,5 +314,14 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   sort, aggregate or join are materialized at the first Execute and
   served in fetch-size chunks, under `statement_memory_limit` (`53200`
   beyond it).
+- Large objects work through pgx's `tx.LargeObjects()` and through
+  libpq's `lo_*` functions (the fast-path function call), which psql's
+  `\lo_import` / `\lo_export` / `\lo_list` / `\lo_unlink` use; both
+  are tested. The JDBC driver's `LargeObjectManager` and psycopg's
+  `lobject` use the same fast-path calls and are untested. Only the
+  large-object functions answer a fast-path call (`0A000` for any
+  other). Write and read with buffers of about 1 MiB. pgx's `LargeObject.Read` into a
+  buffer larger than half of `statement_memory_limit` is refused
+  (`53200`) — use `io.Copy` with a buffer, not `io.ReadAll`.
 - `sslmode=verify-full` works in secure mode with the datax CA
   ([Security](security.md)); `sslmode=disable` in insecure mode.

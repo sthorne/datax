@@ -230,6 +230,10 @@ type Session struct {
 	// members, subqueries) materialize as they must.
 	streamTop bool
 
+	// lo is the session's large-object state: the descriptors open in
+	// its transaction (largeobject.go), made on first use.
+	lo *loState
+
 	// notify is the session's LISTEN / NOTIFY state (listen.go).
 	notify notifyState
 
@@ -446,6 +450,7 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		return nil, err
 	}
 	env.IsAdmin = set.IsAdmin()
+	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
 	// A table whose schema the session may not use is not listed, as
 	// the console does not list it (issue #259): both ask
 	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
@@ -586,6 +591,7 @@ func (s *Session) statementTime() int64 {
 func (s *Session) Close(ctx context.Context) {
 	if s.txn != nil {
 		_ = s.txn.Rollback(ctx)
+		s.loEndTxn(ctx, false)
 		s.txn = nil
 	}
 	s.discardNotify()
@@ -670,7 +676,14 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if s.state != StateOpen {
 			return &Result{Tag: "COMMIT"}, nil // PG: warning, not error
 		}
+		// Large-object pages still buffered are written first; if they
+		// cannot be, there is nothing to commit.
+		if lerr := s.loBeforeCommit(ctx); lerr != nil {
+			s.rollback(ctx)
+			return nil, ToSQLError(lerr)
+		}
 		err := s.txn.Commit(ctx)
+		s.loEndTxn(ctx, err == nil)
 		s.txn = nil
 		s.state = StateIdle
 		s.endTxnVars()
@@ -857,7 +870,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (...) cannot run inside a transaction block")
 		}
-		if _, bare := catalog.SplitTableName(at.Table); catalog.IsSealedSystemTable(bare) && !s.system {
+		if _, bare := catalog.SplitTableName(at.Table); bare == catalog.AuditTableName && !s.system {
 			return s.execSetAuditRetention(ctx, at)
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
@@ -1102,6 +1115,7 @@ func (s *Session) noteDDL(name string) {
 func (s *Session) rollback(ctx context.Context) {
 	if s.txn != nil {
 		_ = s.txn.Rollback(ctx)
+		s.loEndTxn(ctx, false)
 		s.txn = nil
 	}
 	s.endTxnVars()
@@ -2287,6 +2301,7 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 		return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 	}
 	s.notifyRollbackToSavepoint(name)
+	s.loRollbackToSavepoint()
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
 }

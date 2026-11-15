@@ -117,6 +117,22 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*
 
+## Large objects
+
+- `lo_close(int8) → int8` — Closes a large-object descriptor (the end of the transaction closes those left open). *volatile*
+- `lo_creat(int8) → int8` — Creates an empty large object with a free id (the argument is ignored, as in PostgreSQL) and returns the id. *volatile*
+- `lo_create(int8) → int8` — Creates an empty large object with the given id (0 picks a free one) and returns the id. Created inside a transaction block, the object can then be written as a stream of any length. *volatile*
+- `lo_from_bytea(int8, bytes) → int8` — Creates a large object holding the given bytes (id 0 picks a free one) and returns its id. *volatile*
+- `lo_get(int8, [int8], [int8]) → bytes` — The object's bytes, or the given number of them from an offset, as one value (bounded by statement_memory_limit; read large objects with loread). *volatile*
+- `lo_lseek64(int8, int8, int8) → int8` (also `lo_lseek`) — Moves the descriptor's position to an offset from the start (whence 0), the current position (1) or the end (2) and returns it. *volatile*
+- `lo_open(int8, int8) → int8` — Opens a large object and returns a descriptor valid until the transaction ends; mode 131072 (INV_WRITE) allows writing, 262144 (INV_READ) is read-only. *volatile*
+- `lo_put(int8, int8, bytes) → text` — Writes the bytes into the object at an offset. *volatile*
+- `lo_tell64(int8) → int8` (also `lo_tell`) — The descriptor's position. *volatile*
+- `lo_truncate64(int8, int8) → int8` (also `lo_truncate`) — Cuts the large object to the given length, or extends it with zeros. *volatile*
+- `lo_unlink(int8) → int8` — Removes a large object; its storage is reclaimed in the background. *volatile*
+- `loread(int8, int8) → bytes` — Reads up to the given number of bytes at the descriptor's position and advances it; fewer bytes mean the end of the object. *volatile*
+- `lowrite(int8, bytes) → int8` — Writes the bytes at the descriptor's position, advances it, and returns the number written. *volatile*
+
 ## Arrays
 
 - `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*

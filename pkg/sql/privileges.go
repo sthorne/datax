@@ -202,6 +202,9 @@ func (s *Session) checkTableOwner(ctx context.Context, txn *kvclient.Txn, desc *
 // sealedTableError is the refusal every attempt to change a sealed
 // system table gets, whoever makes it.
 func sealedTableError(name string) *Error {
+	if catalog.IsLargeObjectTable(name) {
+		return newErrf(CodeInsufficientPriv, "table %q holds the cluster's large objects: it is written through the lo_* functions alone and cannot be changed through SQL by any role", name)
+	}
 	return newErrf(CodeInsufficientPriv, "table %q is the cluster's audit record: it is written by the nodes alone and cannot be changed through SQL by any role (ALTER TABLE %s SET (retention = ...) sets how long records are kept)", name, name)
 }
 

@@ -147,6 +147,18 @@ func (p Profile) apply(opts *pebble.Options) softGate {
 		// Balanced: the flush and compaction shape at Pebble's defaults; no
 		// memtable criterion (tiny default memtables make byte thresholds
 		// twitchy).
+		//
+		// One Pebble default is not kept: the number of L0 files at which
+		// an L0 compaction starts on the count alone (500). Files that do
+		// not overlap — what a stream of writes in key order leaves, a
+		// large object's pages or a Raft log — form a single sublevel
+		// however many there are, so the sublevel score never asks for a
+		// compaction, and with the file gate below at 400 the count that
+		// would have asked for one was never reached: the store shed
+		// every write from 400 files on and nothing drained them (issue
+		// #303 found it at 450 MiB of one object). The threshold has to
+		// sit well under the gate.
+		opts.L0CompactionFileThreshold = 200
 		return softGate{l0Sublevels: 10, l0Files: 400,
 			debtHigh: 2 << 30, debtLow: 1 << 30}
 	}

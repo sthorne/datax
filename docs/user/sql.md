@@ -25,7 +25,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
 | `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
 | `DATE` | | |
-| `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals |
+| `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |
 | `UUID` | | |
 | `JSONB` | `JSON` | normalized on write: sorted keys, compact |
 
@@ -852,6 +852,126 @@ the failing row and the committed count), and COPY cannot run inside
 `BEGIN`. Only the `FORMAT text|csv|binary` option is supported; `COPY TO`
 is not.
 
+## Large objects
+
+A column value — `BYTEA`, `TEXT`, `JSONB` — is written, replicated and
+read in one piece, and a statement holds it in memory several times
+over. That is the right shape up to a few megabytes. Past that it costs
+memory out of proportion (a 32 MiB value takes over a gigabyte across
+the cluster to insert), and a statement that writes more than 60 MiB to
+one range in one piece is refused with `54000`: it could not be
+replicated (see [Limits](#large-object-limits)). Files, recordings and other
+things of tens of megabytes to many gigabytes go in a **large object**
+instead: a value stored in pages and written and read as a stream, so
+that no node ever holds more than a little of it.
+
+The interface is PostgreSQL's large objects, which drivers already
+speak: the functions are callable from SQL
+([functions reference](functions.md#large-objects)), which is how pgx's
+`tx.LargeObjects()` uses them, and through the protocol's fast-path
+function call, which is how libpq's `lo_*` API does — and with it
+psql's `\lo_import`, `\lo_export`, `\lo_list` and `\lo_unlink`.
+
+```sql
+BEGIN;
+SELECT lo_create(0);                  -- → 3141592653: a new, empty object
+SELECT lo_open(3141592653, 131072);   -- → 0: a descriptor, opened for writing (INV_WRITE)
+SELECT lowrite(0, $1);                -- any number of times, any sizes
+SELECT lo_close(0);
+INSERT INTO documents (id, body) VALUES (7, 3141592653);   -- keep the id where you will find it
+COMMIT;                               -- the object exists from here
+
+BEGIN;
+SELECT lo_open(3141592653, 262144);   -- INV_READ
+SELECT loread(0, 1048576);            -- until it returns fewer bytes than asked for
+COMMIT;
+
+SELECT lo_unlink(3141592653);         -- remove it
+```
+
+```go
+tx, _ := conn.Begin(ctx)
+los := tx.LargeObjects()
+oid, _ := los.Create(ctx, 0)
+obj, _ := los.Open(ctx, oid, pgx.LargeObjectModeWrite)
+io.CopyBuffer(obj, file, make([]byte, 1<<20))   // streams: memory stays flat
+tx.Commit(ctx)
+```
+
+What to know:
+
+- **A large upload is a new object written in one transaction block.**
+  `lo_create` inside `BEGIN` makes an object nobody else can see yet;
+  what is written to it before `COMMIT` is stored as it arrives, outside
+  the transaction, so the upload can be of any size and holds no lock
+  while it runs. `COMMIT` makes the whole object appear at once.
+  `ROLLBACK`, an error, or a lost connection leaves no object, and the
+  pages already stored are removed in the background.
+- **Let the upload's transaction be about the upload.** At `COMMIT` the
+  transaction is moved forward to the present, past the pages it
+  stored, and like any transaction that has to move it fails with
+  `40001` if something it read has changed meanwhile. Rows it read
+  earlier in the block count, and so does the catalog: libpq looks the
+  functions up in `pg_proc` inside the transaction, once per
+  connection, so an upload on a fresh libpq connection (every psql
+  `\lo_import` is one) fails at its commit if a table or role was
+  created or altered while it ran. Repeat it.
+- **Changes to an object that already exists are ordinary transactional
+  writes** — isolated, rolled back with their transaction, visible at
+  its commit — and for that reason bounded: one transaction may write at
+  most 64 MiB into existing objects (`54000` beyond). The same holds for
+  the one-statement forms outside a block (`lo_from_bytea`, `lo_put`).
+  To replace a large object, write a new one and unlink the old in the
+  same transaction.
+- **Read in pieces.** `loread` returns up to the length asked for; what
+  one call returns counts against `statement_memory_limit` (twice: it is
+  assembled from pages), so with the default 64 MiB limit ask for no
+  more than about 30 MiB a call — 1 MiB is a good size. `lo_get(oid)`
+  returns a whole object as one value and is for small ones.
+- **Descriptors live until the transaction ends**, as in PostgreSQL;
+  outside a transaction block a descriptor is gone when its statement
+  returns, so `lo_open` is only useful inside `BEGIN`.
+- **Nothing ties an object to the rows that mention its id**, as in
+  PostgreSQL: deleting the row does not unlink the object. Unlink it in
+  the same transaction that deletes or repoints the row.
+- **The functions run once per statement, on constant arguments**
+  (literals and parameters), like `nextval`: `SELECT lo_unlink(body)
+  FROM documents` is refused. Select the ids, then unlink each.
+- An object belongs to the role that created it; the owner and admins
+  may read, write and unlink it. There are no per-object grants.
+- `lo_lseek64` / `lo_tell64` position a descriptor; writing past the end
+  leaves a hole that reads as zeros and takes no space;
+  `lo_truncate64` cuts or extends.
+- An upload that goes quiet — no large-object call in its transaction —
+  for more than 10 minutes is taken for abandoned: its pages are
+  removed, and if the client does come back its next call or its
+  `COMMIT` fails with `55000`. Start the upload again.
+- `ROLLBACK TO SAVEPOINT` closes the transaction's descriptors and
+  undoes its changes to existing objects. It cannot undo what was
+  streamed into a new object, so a transaction that created one and then
+  rolls back to a savepoint can no longer commit (`25P02`); roll it back.
+
+### Large object limits
+
+| | |
+|---|---|
+| Object size | up to 1 TiB (`54000` beyond). Tested to 1 GiB |
+| Page size | 256 KiB, fixed. A 1 GiB object is 4,096 rows of `datax_largeobject` |
+| Written by one transaction into existing objects | 64 MiB |
+| Returned by one `loread` or `lo_get` | half of `statement_memory_limit` (about 30 MiB by default) |
+| Upload idle time | 10 minutes |
+| A single column value, for comparison | a statement may write at most 60 MiB to one range in one piece — a row with its index entries, or the rows of one `INSERT` that land in one range — and is refused with `54000` beyond; keep row values to a few MiB |
+
+Throughput on a three-node cluster on one machine is about 20 MiB/s
+written (each page is a replicated write of its own) and over 100 MiB/s
+read; the process's memory grows by tens of megabytes whatever the
+object's size.
+
+Large objects are stored in three [reserved tables](#reserved-tables),
+so full backups and restores carry them, encryption at rest covers
+them, and their pages spread over ranges like any table's rows. Cluster
+version v21.
+
 ## Transactions and retries
 
 ```sql
@@ -1420,6 +1540,14 @@ read it, and no role — `root` and admins included — can `INSERT`,
 reference it from a foreign key. The one statement it accepts is
 `ALTER TABLE datax_audit SET (retention = '<period>')`, from an admin,
 with a period of at least a day.
+
+`datax_largeobject`, `datax_largeobject_metadata` and
+`datax_largeobject_pending` hold [large objects](#large-objects): the
+pages, the objects, and the contents waiting to be removed. They are
+written through the `lo_*` functions alone — no role can change them
+with SQL — and read by admins and by roles granted `SELECT` on them
+(which shows every object's bytes, whoever owns it).
+`pg_largeobject_metadata` lists the objects.
 
 ## Views
 
