@@ -102,6 +102,7 @@ CREATE USER analyst PASSWORD 'trustno1' IN ROLE app_readers;  -- = CREATE ROLE .
 CREATE ROLE etl WITH LOGIN PASSWORD '...' NOINHERIT;      -- privileges only via SET ROLE
 ALTER ROLE analyst PASSWORD 'rotated';                    -- a role may change its own password
 ALTER ROLE etl NOLOGIN;                                   -- lock out; LOGIN reopens
+ALTER ROLE auditor BYPASSRLS;                             -- exempt from row-level security; NOBYPASSRLS undoes it
 DROP ROLE analyst;                                        -- refused (2BP01) while it owns objects
 
 GRANT app_readers TO analyst;                             -- membership
@@ -157,6 +158,132 @@ grants, `SET ROLE`) are refused with `0A000`.
 Note the syntax: `CREATE USER name PASSWORD '...'` — `WITH` is optional.
 In insecure (trust) mode the session user is whatever the client
 claims, but grants still name existing roles: create them first.
+
+## Row-level security
+
+Table privileges decide *whether* a role may read or write a table.
+Row-level security decides *which rows*: a table shared by many tenants
+can be read and changed by one role without that role ever seeing
+another tenant's rows, enforced by the database rather than by every
+query the application writes. The statements and rules are
+PostgreSQL's ([SQL reference](sql.md#row-level-security)); it needs
+cluster version v21.
+
+### A multi-tenant recipe
+
+One table, the tenant's id leading the primary key so each tenant's
+rows are one contiguous span; one role the application connects as; the
+tenant chosen per connection (or per transaction) with a setting.
+
+```sql
+-- As the owner (the role that runs migrations):
+CREATE TABLE invoices (
+    tenant_id UUID,
+    id        INT8,
+    amount    DECIMAL(12,2),
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE ROLE app LOGIN PASSWORD '...';
+GRANT SELECT, INSERT, UPDATE, DELETE ON invoices TO app;   -- not TRUNCATE, not ALL
+
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON invoices
+    USING (tenant_id = current_setting('app.tenant')::uuid);
+
+-- As app, once the request's tenant is known:
+SET app.tenant = '8b1f...';                       -- or, from a pool, per transaction:
+BEGIN; SELECT set_config('app.tenant', $1, true); ... COMMIT;
+
+SELECT * FROM invoices;                            -- this tenant's invoices
+INSERT INTO invoices VALUES ('8b1f...', 7, 12.50); -- fine
+INSERT INTO invoices VALUES ('ffff...', 7, 12.50); -- 42501: new row violates row-level security policy
+UPDATE invoices SET amount = 0;                    -- this tenant's rows only
+```
+
+Things to get right:
+
+- **The application must not connect as the owner.** The owner and
+  admins are exempt. Use a separate role for migrations and for the
+  application; `ALTER TABLE ... FORCE ROW LEVEL SECURITY` if the owner
+  must be filtered as well.
+- **A session that has not named a tenant gets an error**, not every
+  row: `current_setting('app.tenant')` is `42704` until set. Write
+  `current_setting('app.tenant', true)` to get no rows instead.
+- **Whoever can run SQL on the connection can change the setting.** A
+  policy keyed on `app.tenant` protects against application bugs — a
+  forgotten `WHERE tenant_id = ...`, a mixed-up join — not against a
+  client that issues its own `SET`. If tenants (or anything acting for
+  them) hold database credentials, give each a role and key the policy
+  on `current_user`, which a session cannot choose:
+
+  ```sql
+  CREATE POLICY own_tenant ON invoices USING (tenant_name = current_user);
+  ```
+
+- **A pooled connection keeps its setting.** Set it at the start of
+  every request, or use `set_config(..., true)` / `SET LOCAL` inside a
+  transaction so it ends with it.
+- **Views run as their owner.** A view owned by the table's owner shows
+  every tenant's rows to whoever may read the view. Have the
+  application's role (or another role the policies apply to) own views
+  over protected tables.
+- **Unique indexes span tenants.** A unique index that does not start
+  with the tenant column makes one tenant's value collide with
+  another's, and the unique-violation error says so. Lead unique
+  indexes with the tenant column.
+- **Reporting accounts**: `ALTER ROLE auditor BYPASSRLS` (admins only)
+  exempts a role from every policy; it still needs the table grants.
+
+### What it protects, and what it does not
+
+It does: every statement a filtered role runs — reads through any index,
+joins, subqueries, aggregates, writes, `ON CONFLICT`, `COPY`,
+`RETURNING`, locking reads, prepared statements, historical (`AS OF
+SYSTEM TIME`) reads — sees and changes only permitted rows; a write is
+refused the same way whether or not the forbidden row exists; table
+statistics and the console's range boundaries and row counts are
+withheld from a filtered role; `TRUNCATE` is refused to it; and another
+role's statement text in `SHOW SESSIONS` / `pg_stat_activity` is hidden
+from non-admins.
+
+It does not:
+
+- **It is not encryption.** Rows of every tenant sit in the same ranges
+  and files. Anyone with access to the data directory, a backup, or the
+  internode RPC sees them all; so does `datax debug`. Use
+  [encryption at rest](../encryption.md) and protect backups for that.
+- **The owner, admins, `root` and `BYPASSRLS` roles see everything.**
+  `FORCE` filters the owner and admins, but either can turn it off
+  again: it guards against mistakes, not against a hostile owner. The
+  node's own work — row expiry, statistics, backup and restore, the
+  audit and metrics recorders — always sees every row.
+- **Constraints see the whole table.** A unique violation (`23505`)
+  tells a role that some row it cannot see holds that value, and a
+  foreign key can reference, or be refused for the lack of, a parent row
+  it cannot see. PostgreSQL behaves the same. The messages name the
+  constraint (and, for a foreign key, the key the statement itself
+  supplied), never a value from the hidden row. Cascades (`ON DELETE
+  CASCADE`, `SET NULL`) act on child rows whether or not the role could
+  see them.
+- **Timing is not hidden.** How long a statement takes can depend on
+  rows it does not return — a unique check, a lock held by another
+  tenant's transaction, an index shared across tenants. `SKIP LOCKED`
+  and `NOWAIT` behave differently when a row is locked, including one
+  the role cannot see if the scan reaches it.
+- **Estimates are withheld, counts of the role's own rows are not.**
+  `EXPLAIN` omits row estimates for a filtered role; `EXPLAIN ANALYZE`
+  reports the rows the statement itself read.
+- **`DO NOTHING` is quiet.** `INSERT ... ON CONFLICT DO NOTHING` skips a
+  row that collides with one the role cannot see, without an error —
+  which is itself a way to learn the key exists, as in PostgreSQL.
+- **The console lags by a few seconds.** It reuses its copy of the
+  schema briefly, so a table whose row security was just enabled may
+  show a filtered role its range boundaries for that long.
+- **Policies are evaluated with today's definitions.** A historical
+  read does not bring back an older, laxer policy.
+
+Policy changes and `BYPASSRLS` grants are audit-logged (`policy-ddl`,
+`role-ddl`) with their principal.
 
 ## HTTP endpoints in secure mode
 
@@ -446,6 +573,7 @@ does not record either; and anything from before v21 was finalized.
 
 ## What secure mode does not do
 
-- No column- or row-level SQL privileges — grants are per table (or
-  sequence, database, schema).
+- No column-level SQL privileges — grants are per table (or sequence,
+  database, schema). Rows are restricted with
+  [row-level security](#row-level-security).
 - No certificate revocation — rotate the CA to invalidate issued certs.

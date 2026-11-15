@@ -228,6 +228,9 @@ func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc 
 		}
 		c.Expr = text
 	}
+	if err := renamePolicyColumn(desc, r.From, r.To); err != nil {
+		return nil, err
+	}
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
@@ -366,6 +369,18 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 		}
 		if err := s.checkTablePriv(ctx, txn, shared, "TRUNCATE"); err != nil {
 			return nil, err
+		}
+		// TRUNCATE removes every row without reading one, so no policy
+		// can filter it. PostgreSQL lets a role with the TRUNCATE
+		// privilege do that past the table's row security; here the
+		// privilege is also what a DELETE grant from before v11 carries,
+		// and a role confined to its own rows must not be able to remove
+		// everyone's by either route. It is refused; the owner (unless
+		// forced) and exempt roles truncate as before.
+		if confined, err := s.rowSecurityActive(ctx, txn, shared); err != nil {
+			return nil, err
+		} else if confined {
+			return nil, newErrf(CodeInsufficientPriv, "permission denied for table %q: row-level security applies to %q, and TRUNCATE would remove rows its policies do not show it", shared.Name, s.actor())
 		}
 		desc := shared.Clone()
 		if desc.Reshard != nil {

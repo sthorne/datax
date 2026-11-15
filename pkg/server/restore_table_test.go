@@ -8,6 +8,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 // planManifest is a manifest of two databases: shop (id 10) with orders
@@ -205,5 +206,53 @@ func TestTableRestoreRefusesFieldsItDoesNotKnow(t *testing.T) {
 	_, err := planTableRestore(&m, RestoreOptions{Tables: []RestoreTable{{Name: "shop.orders"}}, DropForeignKeys: true})
 	if err == nil || !strings.Contains(err.Error(), `the index field "predicate"`) {
 		t.Errorf("got %v, want a refusal naming the index field", err)
+	}
+}
+
+// TestRestoredDescriptorKeepsRowSecurity (issue #294): a restored table
+// comes back as protected as it was. Row security stays enabled and
+// forced; a policy's roles are cut to the ones this cluster has, and a
+// policy left with none is dropped rather than kept with an empty list
+// (which would mean every role) — so a role sees no more of the
+// restored table than of the original, and possibly less.
+func TestRestoredDescriptorKeepsRowSecurity(t *testing.T) {
+	src := &catalog.TableDescriptor{
+		ID: 60, Name: "docs", DatabaseID: 10, Owner: "root",
+		Columns:     []catalog.Column{{ID: 1, Name: "tenant", Type: types.String, NotNull: true}},
+		PrimaryKey:  []catalog.ColumnID{1},
+		RowSecurity: true, ForceRowSecurity: true,
+		Policies: []catalog.Policy{
+			{Name: "everyone", Command: catalog.PolicySelect, Using: "tenant = current_user"},
+			{Name: "mixed", Command: catalog.PolicyAll, Roles: []string{"bob", "gone"}, Using: "true"},
+			{Name: "orphan", Command: catalog.PolicyAll, Roles: []string{"gone"}, Using: "true"},
+			{Name: "narrow", Restrictive: true, Command: catalog.PolicySelect, Roles: []string{"bob"}, Using: "tenant != 'x'"},
+		},
+	}
+	p := &tableRestorePlan{srcDesc: src, srcDB: "shop", intoDB: "shop", intoName: "docs_r", newID: 160}
+	roles := func(name string) bool { return name == "bob" || name == "root" }
+	d, notes := restoredDescriptor(p, 10, map[uint64]uint64{60: 160}, nil, nil, roles)
+	if !d.RowSecurity || !d.ForceRowSecurity {
+		t.Fatalf("row security lost: %+v", d)
+	}
+	var names []string
+	for _, pol := range d.Policies {
+		names = append(names, pol.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"everyone", "mixed", "narrow"}) {
+		t.Fatalf("policies restored: %v", names)
+	}
+	if mixed, _ := d.Policy("mixed"); !reflect.DeepEqual(mixed.Roles, []string{"bob"}) {
+		t.Fatalf("mixed restored for %v", mixed.Roles)
+	}
+	if every, _ := d.Policy("everyone"); every.Roles != nil || every.Using != "tenant = current_user" {
+		t.Fatalf("a PUBLIC policy changed: %+v", every)
+	}
+	joined := strings.Join(notes, "\n")
+	if !strings.Contains(joined, `policy "orphan" not restored`) || !strings.Contains(joined, `policy "mixed" restored for the roles that exist here (bob)`) {
+		t.Fatalf("notes: %q", notes)
+	}
+	// The plan's source is untouched (a retried transaction rebuilds from it).
+	if len(src.Policies) != 4 || len(src.Policies[1].Roles) != 2 {
+		t.Fatalf("building the descriptor changed the source: %+v", src.Policies)
 	}
 }

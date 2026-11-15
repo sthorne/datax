@@ -726,6 +726,9 @@ type AlterTable struct {
 	// stop holding; UnsplitAll is UNSPLIT ALL, every one in the table.
 	UnsplitAt  [][]Expr
 	UnsplitAll bool
+	// RowSecurity is ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL
+	// SECURITY: "enable", "disable", "force" or "no force".
+	RowSecurity string
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
@@ -765,8 +768,8 @@ type Delete struct {
 
 // CreateRole is CREATE ROLE / CREATE USER / ALTER ROLE / ALTER USER
 // (issue #98). CREATE USER is CREATE ROLE ... LOGIN; the options are
-// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT and
-// IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
+// LOGIN | NOLOGIN, PASSWORD 'pw' | PASSWORD NULL, INHERIT | NOINHERIT,
+// BYPASSRLS | NOBYPASSRLS and IN ROLE r [, ...]. A nil option was not spelled (ALTER leaves it
 // alone; CREATE applies the default).
 type CreateRole struct {
 	Name string
@@ -780,6 +783,9 @@ type CreateRole struct {
 	// Password: nil = not spelled; "" = PASSWORD NULL (no password).
 	Password *string
 	Inherit  *bool
+	// BypassRLS is BYPASSRLS / NOBYPASSRLS: whether the role is exempt
+	// from row-security policies.
+	BypassRLS *bool
 	// InRoles are the roles the new role is made a member of (IN ROLE).
 	InRoles []string
 }

@@ -621,6 +621,12 @@ func statementSubject(s Statement) string {
 		}
 	case *CopyFrom:
 		return t.Table
+	case *CreatePolicy:
+		return t.Table
+	case *AlterPolicy:
+		return t.Table
+	case *DropPolicy:
+		return t.Table
 	}
 	return ""
 }

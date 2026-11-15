@@ -28,6 +28,13 @@ ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE type       -- online rewrite: sha
 ALTER TABLE [IF EXISTS] t SPLIT AT VALUES (k, ...) [, (k, ...)]... [WITH EXPIRATION expr]   -- manual (sticky) range boundaries; expr: timestamp | interval
 ALTER TABLE [IF EXISTS] t UNSPLIT AT VALUES (k, ...) [, (k, ...)]... | UNSPLIT ALL          -- release them to the merge queue
 COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text' | NULL
+ALTER TABLE [IF EXISTS] t ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY         -- row-level security (v21); see below
+CREATE POLICY p ON t [AS PERMISSIVE | RESTRICTIVE] [FOR ALL | SELECT | INSERT | UPDATE | DELETE]
+    [TO role [, ...] | PUBLIC] [USING (expr)] [WITH CHECK (expr)]
+ALTER POLICY p ON t RENAME TO q  /  ALTER POLICY p ON t [TO role [, ...]] [USING (expr)] [WITH CHECK (expr)]
+DROP POLICY [IF EXISTS] p ON t [CASCADE | RESTRICT]
+CREATE | ALTER ROLE r ... [BYPASSRLS | NOBYPASSRLS]                                      -- exempt from every table's policies
+SET [LOCAL] class.name = value  /  RESET class.name  /  SHOW class.name                  -- custom session settings (app.tenant)
 INSERT INTO t [(cols)] VALUES (v, ...), (v, ...) | SELECT ...
 COPY t [(cols)] FROM STDIN [WITH (FORMAT text|csv|binary)]   -- see Wire protocol below
 [WITH [RECURSIVE] name [(cols)] AS (query), ...]   -- on SELECT, INSERT, UPDATE, DELETE
@@ -159,6 +166,90 @@ SHOW STATS FOR t
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
   format).
+
+### Row-level security (v21)
+
+A table with row security enabled (`TableDescriptor.RowSecurity`,
+issue #294) carries its policies in the descriptor
+(`TableDescriptor.Policies`: name, permissive or restrictive, command,
+roles, and the `USING` and `WITH CHECK` expressions as SQL text). The
+implementation is `pkg/sql/rls.go`.
+
+**Who is filtered.** `Session.rowSecurityActive` decides per statement
+and table: never the node's own sessions or `root`; never a role with
+the `BYPASSRLS` attribute (the role's own — it is not inherited); the
+owner and members of `admin` only when the table says `FORCE`; everyone
+else always. The actor is the one privileges are checked as, so inside
+a view's query it is the view's owner.
+
+**Where it is applied.** As WHERE conjuncts, when the statement is
+planned. Every read of a table's rows passes one filter — `matchesWhere`
+over the conjunct list the fetch was given (`executePlan`, the streaming
+iterator, the inverted scan; there is no index-only read path) — so the
+policy's conjuncts are put at the head of that list:
+
+- `fetchRows`, which every join side, aggregate input, index lookup and
+  subquery reads through, adds the `SELECT` policies itself. That is
+  what applies a policy per table reference.
+- the single-table `SELECT` path adds them to the statement's WHERE
+  before the access path is chosen (and the `UPDATE` policies too for
+  `FOR UPDATE`), so the stream, the `SKIP LOCKED` loop and `EXPLAIN`
+  see the same list.
+- `UPDATE` and `DELETE` add their own command's policies, and the
+  `SELECT` policies when the statement reads the table (a WHERE clause,
+  `RETURNING`, a `SET` computed from a column), then read through
+  `fetchRowsRaw`.
+- the foreign-key checks and cascades call `fetchRowsRaw` with no
+  policy: referential integrity is checked against the whole table.
+
+Being ordinary conjuncts, they bound the scan: a policy on the leading
+primary-key column is a range scan of that prefix, a policy on an
+indexed column an index scan (`EXPLAIN` shows the bound and `; row-level
+security policy applied`). They go first so the statement's own
+predicates never run against a row the policy hides — an error raised
+by one would say something about that row.
+
+The permissive policies that govern the command for the actor's roles
+are OR-ed (one alone is inlined, so its conjuncts can bound the scan),
+each restrictive one AND-ed; none applicable is the constant `FALSE`.
+Expressions are parsed and bound afresh by every statement:
+`current_user`, `current_setting()` and the clock are spliced to
+literals as a WHERE clause's are (`resolveWhereSubs`), memoized for the
+statement (`Session.policyMemo`).
+
+**Writes.** `rowCheck` holds the bound `WITH CHECK` side (`USING` when
+a policy gives none). `INSERT`, `COPY` and the insert half of `ON
+CONFLICT` check every proposed row before the table is probed for its
+key, so a refusal does not depend on whether a row exists. `UPDATE`
+checks each new row. `ON CONFLICT DO UPDATE` also requires the existing
+row to pass the `UPDATE` and `SELECT` policies, and fails rather than
+skips when it does not. A refused row is `42501`, `new row violates
+row-level security policy for table "t"`. `TRUNCATE` reads no row and
+is refused to a role the policies confine.
+
+**Plan cache.** A statement row security applies to plans in full every
+time: the single-table `SELECT` runs on a copy of the statement, and
+`UPDATE` / `DELETE` pass no cache key. The cache is keyed by statement
+and database, which cannot tell two roles or two values of a setting
+apart; a role the policy does not apply to keeps its cached plans.
+
+**Historical reads.** `AS OF SYSTEM TIME` resolves the descriptor — and
+so the policies — as of its timestamp. `historicalRowFilter` therefore
+reads today's descriptor and roles in a transaction of its own and
+filters the historical rows by today's policies; it fails closed.
+
+**Elsewhere.** Statistics (row and distinct counts) are withheld from a
+confined role in `SHOW STATS`, `pg_class.reltuples`,
+`pg_stat_user_tables`, `/api/schema` and `EXPLAIN`'s estimates. The
+console decodes no range boundary of such a table for it
+(`catalog.CanReadTable`). `DROP COLUMN` refuses a column a policy
+reads, `RENAME COLUMN` rewrites the policies, `DROP ROLE` refuses a
+role a policy names, and a table restore keeps row security and cuts
+each policy's roles to the ones the cluster has.
+
+**Custom settings.** `sessionVars.custom` holds two-part names
+(`app.tenant`); `SET`, `SET LOCAL`, `RESET`, `SHOW`, `current_setting`
+and `set_config` work on them. One is unknown (`42704`) until first set.
 
 ### Table options: GC window, row expiry, purge
 
@@ -886,6 +977,8 @@ refresh, so an entry is used only while the lookups it skips return the
 same pointers — a schema change, `ANALYZE`, a dropped table or a
 recreated one all miss. A data statement also resolves each table name
 once per execution (the view check and the plan share the lookup).
+A statement that row-level security applies to never enters the cache
+(see Row-level security above).
 `EXPLAIN` appends `(cached plan)` when the plan it shows is the cached
 one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
 `_evictions_total`, and the hit rate on the console's node page.

@@ -699,7 +699,7 @@ func (g *rowGuard) checkForeignKeys(ctx context.Context, txn *kvclient.Txn, oldR
 			return newErrf(CodeForeignKeyViolation, "%s %q violates foreign key constraint %q: key %s is not present in table %q",
 				what, g.desc.Name, fk.Name, keyText(g.desc, fk.Columns, row), parent.Name)
 		}
-		rows, _, err := g.s.fetchRows(ctx, txn, parent, equalityConds(parent, fk.RefColumns, vals), nil, 1)
+		rows, _, err := g.s.fetchRowsRaw(ctx, txn, parent, equalityConds(parent, fk.RefColumns, vals), nil, 1, nil)
 		if err != nil {
 			return err
 		}
@@ -802,7 +802,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 		if action != catalog.FKRestrict && action != "" {
 			limit = int64(g.st.budget) + 1
 		}
-		rows, _, err := g.s.fetchRows(ctx, txn, child, equalityConds(child, fk.Columns, vals), nil, limit)
+		rows, _, err := g.s.fetchRowsRaw(ctx, txn, child, equalityConds(child, fk.Columns, vals), nil, limit, nil)
 		if err != nil {
 			return err
 		}

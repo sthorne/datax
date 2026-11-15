@@ -448,6 +448,14 @@ func ddlTableName(stmt parser.Statement) string {
 		if t.Kind == "table" || t.Kind == "view" {
 			return t.Name
 		}
+	case *parser.CreatePolicy:
+		// A policy rides the descriptor: once the statement returns,
+		// every gateway filters by it.
+		return t.Table
+	case *parser.AlterPolicy:
+		return t.Table
+	case *parser.DropPolicy:
+		return t.Table
 	}
 	return ""
 }

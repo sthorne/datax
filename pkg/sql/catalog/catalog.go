@@ -543,6 +543,54 @@ type TableDescriptor struct {
 	// RowTTL, when set, expires the table's rows (v21): a background
 	// job deletes each row once its expiry time has passed.
 	RowTTL *RowTTL `json:"row_ttl,omitempty"`
+	// RowSecurity marks a table with row-level security enabled (cluster
+	// version v21, issue #294): a role that is not exempt reads and
+	// writes only the rows its policies allow, and none when no policy
+	// applies to it. ForceRowSecurity applies the policies to the
+	// table's owner (and to admins) as well. Policies are the table's
+	// policies in creation order; they stay in the descriptor while row
+	// security is disabled and take effect again when it is re-enabled.
+	RowSecurity      bool     `json:"row_security,omitempty"`
+	ForceRowSecurity bool     `json:"force_row_security,omitempty"`
+	Policies         []Policy `json:"policies,omitempty"`
+}
+
+// Policy commands: the statement kinds a row-security policy governs.
+const (
+	PolicyAll    = "all"
+	PolicySelect = "select"
+	PolicyInsert = "insert"
+	PolicyUpdate = "update"
+	PolicyDelete = "delete"
+)
+
+// Policy is one row-security policy of a table (CREATE POLICY). A
+// permissive policy admits a row; a restrictive one narrows what the
+// permissive policies admit. Using filters the rows a statement reads
+// or targets; Check must hold for every row it writes (when empty,
+// Using stands in for it, as in PostgreSQL).
+type Policy struct {
+	Name        string `json:"name"`
+	Restrictive bool   `json:"restrictive,omitempty"`
+	// Command is PolicyAll or one of the four statement kinds.
+	Command string `json:"command"`
+	// Roles are the roles the policy applies to; empty means PUBLIC
+	// (every role).
+	Roles []string `json:"roles,omitempty"`
+	// Using and Check are the expressions as SQL text, parsed and bound
+	// to the session by every statement that applies them.
+	Using string `json:"using,omitempty"`
+	Check string `json:"check,omitempty"`
+}
+
+// Policy returns the named policy.
+func (d *TableDescriptor) Policy(name string) (*Policy, bool) {
+	for i := range d.Policies {
+		if d.Policies[i].Name == name {
+			return &d.Policies[i], true
+		}
+	}
+	return nil, false
 }
 
 // RowTTL is a table's row expiry: a row expires at the value of its
@@ -648,6 +696,13 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	if d.RowTTL != nil {
 		ttl := *d.RowTTL
 		out.RowTTL = &ttl
+	}
+	if d.Policies != nil {
+		out.Policies = make([]Policy, len(d.Policies))
+		for i, p := range d.Policies {
+			out.Policies[i] = p
+			out.Policies[i].Roles = append([]string(nil), p.Roles...)
+		}
 	}
 	return &out
 }

@@ -162,6 +162,16 @@ type Session struct {
 	// (privileges.go).
 	roleCache    map[string]catalog.RoleSet
 	roleCacheTxn *kvclient.Txn
+	// bypassCache holds, per actor, whether the role carries BYPASSRLS,
+	// resolved in bypassCacheTxn (rls.go).
+	bypassCache    map[string]bool
+	bypassCacheTxn *kvclient.Txn
+	// policyMemo holds the row-security conjuncts bound so far by the
+	// statement being executed (rls.go). It never outlives a statement:
+	// the next one may run as another role or under another value of a
+	// setting a policy reads, and must bind afresh.
+	policyMemo     map[policyKey][]parser.Comparison
+	historicalMemo map[policyKey]historicalFilter
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -472,6 +482,14 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 			continue
 		}
 		env.Tables = append(env.Tables, d)
+		// Statistics count every row of a table. A role its row-security
+		// policies confine sees none: reltuples and n_live_tup read as
+		// "not analyzed" rather than as the size of everyone's data.
+		if confined, err := s.rowSecurityActive(ctx, txn, d); err != nil {
+			return nil, err
+		} else if confined {
+			continue
+		}
 		if st, _ := s.cat.Stats(ctx, d.ID); st != nil {
 			env.Stats[d.ID] = st
 		}
@@ -579,6 +597,7 @@ func (s *Session) Close(ctx context.Context) {
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
 	s.memUsed = 0
+	s.policyMemo, s.historicalMemo = nil, nil
 	s.invalidateRoles()
 	var deadline time.Time
 	if d := s.vars.statementTimeout; d > 0 {

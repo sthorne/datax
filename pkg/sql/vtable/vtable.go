@@ -92,6 +92,10 @@ func RoleOID(name string) int64 {
 	return int64(h.Sum32()&0x3fffffff) | 0x40000000
 }
 
+// QueryHidden stands in for the statement text of another role's
+// session when the reader is not an admin (PostgreSQL's wording).
+const QueryHidden = "<insufficient privilege>"
+
 // SessionInfo is one session of this node as SHOW SESSIONS and
 // pg_stat_activity report it.
 type SessionInfo struct {
@@ -749,6 +753,60 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		fmt.Fprintf(&b, " WITH (%s)", strings.Join(opts, ", "))
 	}
 	return b.String()
+}
+
+// PolicyCmdChar is pg_policy.polcmd for a policy command: r, a, w, d,
+// or * for ALL.
+func PolicyCmdChar(cmd string) string {
+	switch cmd {
+	case catalog.PolicySelect:
+		return "r"
+	case catalog.PolicyInsert:
+		return "a"
+	case catalog.PolicyUpdate:
+		return "w"
+	case catalog.PolicyDelete:
+		return "d"
+	}
+	return "*"
+}
+
+// PolicyDef renders a policy as the CREATE POLICY statement that makes it.
+func PolicyDef(d *catalog.TableDescriptor, p *catalog.Policy) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE POLICY %s ON %s", p.Name, d.Name)
+	if p.Restrictive {
+		b.WriteString(" AS RESTRICTIVE")
+	}
+	if p.Command != catalog.PolicyAll {
+		fmt.Fprintf(&b, " FOR %s", strings.ToUpper(p.Command))
+	}
+	if len(p.Roles) > 0 {
+		fmt.Fprintf(&b, " TO %s", strings.Join(p.Roles, ", "))
+	}
+	if p.Using != "" {
+		fmt.Fprintf(&b, " USING (%s)", p.Using)
+	}
+	if p.Check != "" {
+		fmt.Fprintf(&b, " WITH CHECK (%s)", p.Check)
+	}
+	return b.String()
+}
+
+// RowSecurityDefs renders the statements that reproduce a table's row
+// security after its CREATE TABLE: ENABLE / FORCE and each policy.
+func RowSecurityDefs(d *catalog.TableDescriptor) []string {
+	var out []string
+	if d.RowSecurity {
+		out = append(out, fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", d.Name))
+	}
+	if d.ForceRowSecurity {
+		out = append(out, fmt.Sprintf("ALTER TABLE %s FORCE ROW LEVEL SECURITY", d.Name))
+	}
+	for i := range d.Policies {
+		out = append(out, PolicyDef(d, &d.Policies[i]))
+	}
+	return out
 }
 
 // ColumnDefault renders a column's default as the catalogs show it:

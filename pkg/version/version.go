@@ -231,6 +231,16 @@ const (
 	// node died: a v20 node knows nothing of the record and would leave
 	// them, so restoring a table into a running cluster is refused until
 	// finalize too (rule 4).
+	//
+	// V21 also introduces row-level security (issue #294): a table
+	// descriptor may carry RowSecurity, ForceRowSecurity and Policies, and
+	// a role descriptor BypassRLS. The fields are omitempty, so every
+	// descriptor written before reads the same; but a v20 gateway drops
+	// the fields it does not know and would serve every row of a
+	// protected table to a role its policies confine, and would write the
+	// descriptor back without them. ENABLE and FORCE ROW LEVEL SECURITY,
+	// CREATE and ALTER POLICY and the BYPASSRLS role attribute are
+	// therefore refused until finalize (rule 4).
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

@@ -264,11 +264,17 @@ func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parse
 		{Name: "distinct_count", Type: types.Int},
 		{Name: "null_count", Type: types.Int},
 	}}
+	// A role confined by the table's row-security policies is shown no
+	// statistics: row, distinct and null counts describe every row.
+	confined, err := s.rowSecurityActive(ctx, txn, desc)
+	if err != nil {
+		return nil, err
+	}
 	raw, err := txn.Get(ctx, keys.TableStatsKey(desc.ID))
 	if err != nil {
 		return nil, err
 	}
-	if raw != nil {
+	if raw != nil && !confined {
 		var st catalog.TableStatistics
 		if jerr := json.Unmarshal(raw, &st); jerr == nil {
 			for _, c := range st.Columns {

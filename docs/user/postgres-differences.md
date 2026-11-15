@@ -19,7 +19,8 @@ syntax error or `0A000` feature not supported):
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
-| Column- and row-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin` |
+| Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
+| Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, `row_security = off`, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
 | Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
 
 ## Things that exist but behave differently
@@ -179,6 +180,24 @@ syntax error or `0A000` feature not supported):
   so `psql` and drivers use their PostgreSQL-14 query flavors.
   `pg_stat_activity` and `SHOW SESSIONS` list the serving node's
   sessions only.
+
+### Row-level security
+
+The rules are PostgreSQL's; these are the differences.
+
+| | PostgreSQL | datax |
+|---|---|---|
+| Who is exempt | superusers and `BYPASSRLS` roles always; the owner unless `FORCE` | `root` and `BYPASSRLS` roles always; the owner **and members of `admin`** unless `FORCE` (an admin is treated as an owner of every object) |
+| `TRUNCATE` | allowed with the `TRUNCATE` privilege, ignoring policies | refused (`42501`) to a role the table's policies apply to, whatever it was granted |
+| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user`, `session_user`, `current_setting`, `current_database`, `current_schema` and the clock. They are evaluated once per statement |
+| Predicate order | a leakproof-function analysis decides what may run before the policy | the policy is always evaluated first; no statement predicate sees a hidden row |
+| Views | owner's rights by default, `security_invoker` to change it | owner's rights only |
+| `SET row_security = off` | makes a filtered query an error instead (used by `pg_dump`) | not a setting; `42704` |
+| Historical reads | — | `AS OF SYSTEM TIME` reads are filtered by today's policies |
+| Statistics | `pg_stats` hidden; `pg_class.reltuples` visible | `SHOW STATS`, `reltuples`, `n_live_tup` and `EXPLAIN` estimates all withheld from a filtered role |
+| `psql \d t` | lists policies with their expressions | lists policies without the expressions; `pg_policies` and `SHOW CREATE TABLE` have them |
+| Custom settings | need a dot; any value; unknown until set | the same; `RESET` leaves the setting empty, and a transaction's rollback does not undo a plain `SET` or `set_config(..., false)` made inside it |
+| Constraint errors | reveal that a hidden row holds a unique value; foreign keys see the whole parent | the same, with no value of the hidden row in the message |
 
 ## Errors you should know
 

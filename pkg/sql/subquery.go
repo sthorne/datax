@@ -131,6 +131,37 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			return e, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", nameArg.Text())
 		}
 		out.Func, out.Args, out.Lit = "", nil, &d
+	case "set_config":
+		// set_config(name, value, is_local): SET as a function, so the
+		// value can be bound as a parameter — what a connection pool does
+		// to name the tenant a request runs for. Returns the value.
+		if len(e.Args) != 3 {
+			return e, newErrf(CodeSyntaxError, "set_config() takes a name, a value and is_local")
+		}
+		var vals [3]types.Datum
+		for i := range vals {
+			d, err := evalExpr(e.Args[i], nil, nil, params)
+			if err != nil {
+				return e, err
+			}
+			vals[i] = d
+		}
+		if vals[0].Null {
+			return e, newErrf(CodeInvalidParameterValue, "set_config: the setting's name is NULL")
+		}
+		value := ""
+		if !vals[1].Null {
+			value = vals[1].Text()
+		}
+		local, cerr := vals[2].Coerce(types.Bool)
+		if cerr != nil {
+			return e, newErrf(CodeInvalidTextRepresentation, "set_config: is_local: %v", cerr)
+		}
+		if _, serr := s.execSetVar(ctx, &parser.SetVar{Name: vals[0].Text(), Value: value, Local: !local.Null && local.B}); serr != nil {
+			return e, serr
+		}
+		d := types.NewString(value)
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_sleep":
 		// pg_sleep(seconds): waits, honoring cancellation and the
 		// statement timeout.
@@ -955,7 +986,7 @@ var splicedFuncs = map[string]bool{
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
 	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
-	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "pg_get_triggerdef": true,
+	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,

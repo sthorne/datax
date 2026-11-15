@@ -464,6 +464,82 @@ constraint.
 Constraints need **cluster version v8** (`0A000` until `datax debug
 upgrade` finalizes it): a v7 node would write rows unchecked.
 
+### Row-level security
+
+```sql
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;      -- from now on: only what a policy allows
+CREATE POLICY tenant_isolation ON docs
+    USING (tenant_id = current_setting('app.tenant')::uuid);
+CREATE POLICY own_rows ON notes FOR UPDATE TO editors
+    USING (author = current_user) WITH CHECK (author = current_user);
+CREATE POLICY not_archived ON docs AS RESTRICTIVE FOR SELECT USING (NOT archived);
+ALTER POLICY own_rows ON notes TO editors, admins USING (author = current_user OR shared);
+ALTER POLICY own_rows ON notes RENAME TO authors;
+DROP POLICY [IF EXISTS] not_archived ON docs;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;       -- the owner and admins are filtered too
+ALTER TABLE docs NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE docs DISABLE ROW LEVEL SECURITY;     -- policies kept, not applied
+ALTER ROLE auditor BYPASSRLS;                    -- admins only: exempt from every policy
+```
+
+With row security enabled, a role reads and changes only the rows the
+table's policies allow it, on top of the table privileges it still
+needs. The rules are PostgreSQL's:
+
+- **Default deny.** Enabled with no policy that applies to the role, it
+  sees no rows and can write none.
+- **`USING`** filters the rows a statement reads or targets; **`WITH
+  CHECK`** must be true for every row it writes (when omitted, `USING`
+  stands in). A row that fails the check is `42501`: `new row violates
+  row-level security policy for table "docs"`. An expression that is
+  NULL counts as false in both.
+- **`FOR`** names the statement kind a policy governs (`ALL` by
+  default). `SELECT ... FOR UPDATE` needs the `UPDATE` policies as well
+  as the `SELECT` ones; an `UPDATE` or `DELETE` with a `WHERE` clause or
+  `RETURNING` needs the `SELECT` policies as well as its own.
+- **Permissive** policies (the default) are OR-ed together;
+  **restrictive** ones are AND-ed on top. Restrictive policies alone
+  admit nothing.
+- **`TO`** limits a policy to roles — held directly or through
+  membership; without it, or with `PUBLIC`, it applies to everyone.
+- **Exempt**: the table's owner and members of `admin`, unless the table
+  is `FORCE`d; `root` and roles with `BYPASSRLS`, always.
+
+A policy expression may use the row's columns (unqualified), constants,
+the ordinary functions and operators, and `current_user`,
+`session_user`, `current_setting(...)`, `current_database()` and
+`now()`. Subqueries are not supported in a policy.
+
+The policy is applied like a `WHERE` condition written first, so it
+uses indexes: with the tenant column leading the primary key, a
+tenant's queries scan that tenant's rows only. `EXPLAIN` shows it:
+
+```
+> EXPLAIN SELECT * FROM docs WHERE id = 7;
+point lookup on primary key; row-level security policy applied
+> EXPLAIN SELECT * FROM docs;
+range scan of primary key (tenant_id = 11111111-1111-1111-1111-111111111111); row-level security policy applied
+```
+
+It covers every statement kind — joins and subqueries (each table
+reference is filtered), aggregates, `INSERT ... SELECT`, `INSERT ... ON
+CONFLICT` (the proposed row and, for `DO UPDATE`, the existing one),
+`UPSERT`, `COPY FROM`, `RETURNING`, locking reads with `SKIP LOCKED` or
+`NOWAIT`, prepared statements, and `AS OF SYSTEM TIME` reads, which are
+filtered by the policies in force now rather than at the read's
+timestamp. `TRUNCATE` is refused to a role the policies apply to.
+Foreign-key checks and cascades look at the whole table regardless, as
+in PostgreSQL. The [security guide](security.md#row-level-security) has
+a multi-tenant recipe and the limits of what this protects.
+
+Policy DDL takes the table's owner (or an admin), and takes effect on
+every node by the time the statement returns. `SHOW CREATE TABLE`,
+`pg_policies`, `pg_policy`, `pg_class.relrowsecurity` /
+`relforcerowsecurity`, `pg_tables.rowsecurity` and
+`pg_roles.rolbypassrls` describe it. A column a policy reads cannot be
+dropped (`2BP01`); renaming it updates the policy. A role a policy
+names cannot be dropped until the policy stops naming it.
+
 ## Reading
 
 ```sql
@@ -539,7 +615,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
-  `current_user`, `current_schema()`, `current_setting(name)`,
+  `current_user`, `current_schema()`, `current_setting(name)`, `set_config`,
   `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`,
   `pg_get_expr`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`,
   ...) as well as the sequence and id functions `nextval`, `currval`,
@@ -981,6 +1057,9 @@ SET TRANSACTION READ ONLY;                    -- this block refuses writes (2500
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;
+SET app.tenant = 'acme';                      -- a custom setting: any class.name
+SELECT set_config('app.tenant', $1, false);   -- the same, with the value as a parameter
+SELECT current_setting('app.tenant');         -- 42704 if never set; current_setting(name, true) gives NULL
 ```
 
 `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
@@ -1004,6 +1083,18 @@ invalid value `22023`:
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
 | `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
+
+**Custom settings.** A name with a prefix and a dot (`app.tenant`,
+`myapp.user_id`) is a setting of your own: `SET`, `SET LOCAL`, `RESET`
+and `SHOW` take it, it holds any text, and `current_setting('app.tenant')`
+reads it — which is how a [row-level security](#row-level-security)
+policy learns which tenant a connection is working for.
+`set_config(name, value, is_local)` sets one from an expression or a
+parameter (`is_local` true is `SET LOCAL`). A custom setting does not
+exist until it is first set: reading it before is `42704`, or NULL with
+`current_setting(name, true)`. `RESET` leaves it set and empty. It
+belongs to the session, so a pooled connection must set it again (or
+`SET LOCAL` it per transaction) for each request.
 
 `SET LOCAL` and `SET TRANSACTION` apply to the current block and end
 with it (outside a block they do nothing, as in PostgreSQL). A changed
@@ -1300,9 +1391,10 @@ The PostgreSQL catalogs are there too, as read-only virtual tables over
 the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
 `pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
-`pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`
+`pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`,
+`pg_policy`, `pg_policies`
 (and empty stand-ins for the catalogs of features datax lacks —
-policies, publications, extensions, functions, triggers, ...), plus
+publications, extensions, functions, triggers, ...), plus
 `information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and
 `role_table_grants`. OIDs are stable across the cluster (a table's is its

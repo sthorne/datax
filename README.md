@@ -81,7 +81,7 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   ([reference](docs/user/functions.md)) and aggregates, transactions,
   joins up to 8 tables,
   GROUP BY — including over joins, correlated subqueries to 4 levels,
-  UNION, `COPY FROM STDIN`, `LISTEN` / `NOTIFY` across nodes, EXPLAIN, and ANALYZE / SHOW STATS feeding a
+  UNION, `COPY FROM STDIN`, `LISTEN` / `NOTIFY` across nodes, row-level security policies, EXPLAIN, and ANALYZE / SHOW STATS feeding a
   cost-based planner — a background sampler keeps statistics fresh) over
   ten column types including exact DECIMAL and JSONB with `->`/`->>`
   extraction, `@>` containment and GIN indexes for it, served over the Postgres wire protocol
@@ -118,8 +118,11 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   member of `admin`). SQL authorization is PostgreSQL's role model:
   roles as groups with inheritance and `SET ROLE`, object ownership,
   grants on tables, sequences, databases and the schema (`ALL TABLES`,
-  default privileges, `GRANT OPTION`, `PUBLIC`), and the built-in
-  `admin`, `read_all`, `write_all` and `metrics` roles. Every HTTP
+  default privileges, `GRANT OPTION`, `PUBLIC`), the built-in
+  `admin`, `read_all`, `write_all` and `metrics` roles, and row-level
+  security (`CREATE POLICY`, `ENABLE` / `FORCE ROW LEVEL SECURITY`,
+  `BYPASSRLS`) for tables shared between tenants, with the policy
+  pushed into the scan. Every HTTP
   endpoint takes HTTP Basic credentials of a database user — Prometheus
   `basic_auth` with the `metrics` role — or a client certificate.
   Authentication failures, denied and executed admin ops, and role and
@@ -260,7 +263,7 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Ranges | load statistics are leader-local samples: a lease transfer hands the measured rate to the new leader, but reservoir split-key samples start fresh (splits and merges are otherwise automatic by size and load, or manual via `datax debug split`/`merge`) |
 | Placement | cross-node QPS accounting beyond heartbeat aggregates (lease shedding and byte-weighted moves act on ~3s-stale top-8 advertisements); zone and lease preferences are parsed and stored but not acted on automatically |
 | Reads | current-time reads are leader-only (lease-based ReadIndex); follower reads are opt-in per statement — exact-timestamp `AS OF SYSTEM TIME` or bounded staleness `with_max_staleness('10s')` |
-| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing beyond `@>` and key existence (`?`, `?|`, `?&`) through a GIN index: `<@`, extracted-value comparisons and containment under a path filter; `@>` is single-table only |
+| SQL | correlated subqueries past 4 nesting levels or over join/derived shapes; joins beyond 8 tables (INNER joins cost-reorder when statistics exist, LEFT joins keep syntactic order); typmods beyond `DECIMAL(p,s)`, the integer widths, `VARCHAR(n)` / `CHAR(n)` and the `TIMESTAMP` / `TIME` precisions (others are parsed and ignored); `TIME WITH TIME ZONE`; multidimensional arrays, array slices, indexes on array columns, `JSONB[]`; enum `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, arrays of enums; JSONB indexing beyond `@>` and key existence (`?`, `?|`, `?&`) through a GIN index: `<@`, extracted-value comparisons and containment under a path filter; `@>` is single-table only; row-level security policies with subqueries, `SECURITY INVOKER` views, and column-level privileges |
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
 | Ops | audit records signed or shipped off the cluster by the cluster itself (they are in the node's log and in the hash-chained `datax_audit` table; exporting the chain heads is the operator's job); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |

@@ -118,7 +118,13 @@ var (
 		"primary_index", "reshard", "resharded_at", "retired_layouts",
 		// A GC window is a number and a row expiry names a column by id:
 		// neither refers to the table's id, so both carry over as they are.
-		"gc_ttl_seconds", "row_ttl")
+		"gc_ttl_seconds", "row_ttl",
+		// Row security names columns by name and roles by name, never
+		// the table's id: the flags and the policies carry over, the
+		// policies' roles cut to the ones this cluster has
+		// (restoredDescriptor), so the restored copy is no less
+		// protected than the table it was taken from.
+		"row_security", "force_row_security", "policies")
 	restoreColumnFields = fieldSet("id", "name", "type", "precision", "scale", "width", "max_len", "char", "no_tz",
 		"enum_type", "enum_name", "enum_labels", "time_precision", "not_null", "default", "default_expr", "identity",
 		"sequence_id", "fill_default", "hidden", "comment", "retype_from")
@@ -474,6 +480,37 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 			}
 		}
 	}
+	// Row security comes back as it was: enabled, forced, and with its
+	// policies. A policy's TO list is cut to the roles this cluster has,
+	// for the reason grants are; a policy left naming no role is dropped
+	// rather than kept with an empty list, which would mean every role.
+	// Either way the table stays protected — with fewer policies a role
+	// sees less, never more.
+	if len(d.Policies) > 0 {
+		kept := d.Policies[:0:0]
+		for _, pol := range d.Policies {
+			if len(pol.Roles) == 0 {
+				kept = append(kept, pol)
+				continue
+			}
+			var have []string
+			for _, r := range pol.Roles {
+				if r == catalog.PublicRole || roles(r) {
+					have = append(have, r)
+				}
+			}
+			if len(have) == 0 {
+				notes = append(notes, fmt.Sprintf("%s: policy %q not restored (none of its roles exists here)", p.into(), pol.Name))
+				continue
+			}
+			if len(have) < len(pol.Roles) {
+				notes = append(notes, fmt.Sprintf("%s: policy %q restored for the roles that exist here (%s)", p.into(), pol.Name, strings.Join(have, ", ")))
+			}
+			pol.Roles = have
+			kept = append(kept, pol)
+		}
+		d.Policies = kept
+	}
 	sort.Strings(notes)
 	return d, notes
 }
@@ -583,6 +620,9 @@ func (n *Node) readRestoreTargets(ctx context.Context, txn *kvclient.Txn, plan *
 		}
 		for g := range p.srcDesc.GrantOptions {
 			check = append(check, g)
+		}
+		for i := range p.srcDesc.Policies {
+			check = append(check, p.srcDesc.Policies[i].Roles...)
 		}
 		for _, name := range check {
 			if _, seen := tg.roles[name]; seen || name == catalog.PublicRole {

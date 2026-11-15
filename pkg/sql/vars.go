@@ -44,6 +44,29 @@ type sessionVars struct {
 	// must (on) or must not (off) read an inverted index that can serve
 	// a statement. For comparing the two paths; auto is right otherwise.
 	invertedScan invertedMode
+	// custom holds the custom settings (issue #294): two-part names an
+	// application defines for itself (app.tenant), which a row-security
+	// policy reads with current_setting(). The map is replaced, never
+	// changed in place, on every SET: sessionVars is copied by value to
+	// save a transaction's SET LOCAL, and the copy must keep the old one.
+	custom map[string]string
+}
+
+// isCustomVar reports whether name is a custom setting's: PostgreSQL's
+// rule, a name with a class prefix (class.name).
+func isCustomVar(name string) bool {
+	i := strings.IndexByte(name, '.')
+	return i > 0 && i < len(name)-1
+}
+
+// setCustomVar sets a custom setting on vars.
+func setCustomVar(vars *sessionVars, name, value string) {
+	next := make(map[string]string, len(vars.custom)+1)
+	for k, v := range vars.custom {
+		next[k] = v
+	}
+	next[name] = value
+	vars.custom = next
 }
 
 func defaultVars() sessionVars {
@@ -163,6 +186,13 @@ func (s *Session) settings() [][2]string {
 
 // setting resolves a SHOW name to the setting's canonical name and value.
 func (s *Session) setting(name string) (string, string, bool) {
+	if isCustomVar(name) {
+		// A custom setting exists once it has been set; before that it is
+		// unrecognized (current_setting's missing_ok turns that into NULL).
+		lname := strings.ToLower(strings.TrimSpace(name))
+		v, ok := s.vars.custom[lname]
+		return lname, v, ok
+	}
 	c := canonicalVar(name)
 	if c == "" {
 		return "", "", false
@@ -474,6 +504,26 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 			return &Result{Tag: tag}, nil
 		}
 	}
+	if isCustomVar(t.Name) {
+		// A custom setting takes any text; RESET leaves it set and empty,
+		// as PostgreSQL does. SET LOCAL lasts until the block ends.
+		if t.Local && s.state != StateOpen {
+			return &Result{Tag: tag}, nil
+		}
+		if t.Local && s.localVars == nil {
+			saved := s.vars
+			s.localVars = &saved
+		}
+		value := t.Value
+		if t.Reset {
+			value = ""
+		}
+		setCustomVar(&s.vars, strings.ToLower(t.Name), value)
+		// set_config() arrives here mid-statement: whatever the statement
+		// reads next binds its policies to the new value.
+		s.policyMemo = nil
+		return &Result{Tag: tag}, nil
+	}
 	name := canonicalVar(t.Name)
 	if name == "" {
 		return nil, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", t.Name)
@@ -553,7 +603,8 @@ func writeKind(stmt parser.Statement) string {
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateType, *parser.AlterType, *parser.DropType,
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
 		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
-		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze:
+		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze,
+		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy:
 		return "DDL"
 	}
 	return ""
@@ -563,8 +614,11 @@ func writeKind(stmt parser.Statement) string {
 // pg_stat_activity report it.
 type SessionInfo = vtable.SessionInfo
 
-// sessionRows renders the sessions the hook reports.
-func (s *Session) sessionRows() [][]types.Datum {
+// sessionRows renders the sessions the hook reports. A statement's text
+// carries its literals — another tenant's keys, on a table shared under
+// row security — so a role that is not an admin reads the text of its
+// own sessions only, as in PostgreSQL.
+func (s *Session) sessionRows(admin bool) [][]types.Datum {
 	if s.SessionsHook == nil {
 		return nil
 	}
@@ -576,8 +630,12 @@ func (s *Session) sessionRows() [][]types.Datum {
 			}
 			return types.NewTimestamp(t.UnixNano())
 		}
+		query := si.Query
+		if !admin && si.User != s.sessionUser {
+			query = vtable.QueryHidden
+		}
 		rows = append(rows, []types.Datum{types.NewInt(int64(si.PID)), types.NewString(si.User), types.NewString(si.Database), types.NewString(si.Application),
-			types.NewString(si.ClientAddr), types.NewString(si.State), types.NewString(si.Query), ts(si.BackendStart), ts(si.QueryStart), ts(si.XactStart)})
+			types.NewString(si.ClientAddr), types.NewString(si.State), types.NewString(query), ts(si.BackendStart), ts(si.QueryStart), ts(si.XactStart)})
 	}
 	return rows
 }

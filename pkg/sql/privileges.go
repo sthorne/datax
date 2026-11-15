@@ -118,6 +118,8 @@ func (s *Session) roleSet(ctx context.Context, txn *kvclient.Txn) (catalog.RoleS
 func (s *Session) invalidateRoles() {
 	s.roleCache = nil
 	s.roleCacheTxn = nil
+	s.bypassCache = nil
+	s.bypassCacheTxn = nil
 }
 
 // requiresAdmin reports whether a statement is restricted to the admin

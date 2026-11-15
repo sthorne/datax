@@ -61,6 +61,7 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 		return nil, newErrf(CodeInFailedTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
+	s.policyMemo = nil // a statement of its own, though not run by Execute
 	var target []catalog.Column
 	err := s.db.RunTxn(ctx, "copy-begin", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, err := s.lookup(ctx, txn, cf.Table)
@@ -167,6 +168,12 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// Row security: each chunk binds the INSERT policies afresh, like
+		// the descriptor, and every row must pass their WITH CHECK.
+		rowSec, err := ci.s.rowCheckFor(ctx, txn, desc, true, false, false)
+		if err != nil {
+			return err
+		}
 		targets := make([][]catalog.Column, len(rows))
 		built := make([]map[catalog.ColumnID]types.Datum, len(rows))
 		pkKeys := make([]keys.Key, len(rows))
@@ -198,6 +205,9 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 		var wb kvclient.WriteBatch
 		inserted := map[string]bool{}
 		for i, r := range rows {
+			if err := rowSec.checkInsert(built[i]); err != nil {
+				return ci.rowErr(r.ordinal, err)
+			}
 			if ps.vals[string(pkKeys[i])] != nil {
 				return ci.rowErr(r.ordinal, newErrf(CodeUniqueViolation,
 					"duplicate key value violates unique constraint on %q", desc.Name))

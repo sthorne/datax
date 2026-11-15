@@ -115,6 +115,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execDropOwned(ctx, txn, t)
 	case *parser.AlterDefaultPrivileges:
 		return s.execAlterDefaultPrivileges(ctx, txn, t)
+	case *parser.CreatePolicy:
+		return s.execCreatePolicy(ctx, txn, t)
+	case *parser.AlterPolicy:
+		return s.execAlterPolicy(ctx, txn, t)
+	case *parser.DropPolicy:
+		return s.execDropPolicy(ctx, txn, t)
 	case *parser.DropTable:
 		return s.execDropTable(ctx, txn, t)
 	case *parser.Insert:
@@ -1004,6 +1010,22 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	if err != nil {
 		return nil, err
 	}
+	// Row security: every proposed row must pass the INSERT policies'
+	// WITH CHECK, whether it ends up inserted or — through ON CONFLICT DO
+	// UPDATE — only names the row to update; that path checks the UPDATE
+	// policies too. With RETURNING, or a DO UPDATE (which reads the
+	// existing row), a written row must also be one the role may see.
+	doUpdate := conflict != nil && !conflict.oc.DoNothing
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, true, doUpdate, t.Returning != nil || doUpdate)
+	if err != nil {
+		return nil, err
+	}
+	var conflictVisible []parser.Comparison
+	if rowSec != nil && doUpdate {
+		if conflictVisible, _, err = s.rowFilter(ctx, txn, desc, catalog.PolicyUpdate, catalog.PolicySelect); err != nil {
+			return nil, err
+		}
+	}
 	count := 0
 	var wb kvclient.WriteBatch
 	inserted := map[string]bool{} // duplicates within this statement
@@ -1072,6 +1094,12 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 	for _, b := range built {
 		rowTarget, rowVals := b.target, b.vals
 		var row map[catalog.ColumnID]types.Datum
+		// The policy check comes before any probe of the table: a row the
+		// role may not write is refused as such, whether or not a row
+		// with its key exists.
+		if err := rowSec.checkInsert(b.row); err != nil {
+			return nil, err
+		}
 		if conflict == nil {
 			if row, err = insertRowReturning(ctx, txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
 				return nil, err
@@ -1080,7 +1108,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 				return nil, err
 			}
 		} else {
-			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps)
+			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps, rowSec, conflictVisible)
 			if err != nil {
 				return nil, err
 			}
@@ -1215,7 +1243,7 @@ func insertRowReturning(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 // It reports whether a row was written (inserted or updated) and that
 // row. A conflict on a unique key other than the arbiter is the usual
 // unique violation, as in PostgreSQL.
-func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard, ps *probeSet) (bool, map[catalog.ColumnID]types.Datum, error) {
+func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, plan *conflictPlan, params []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, guard *rowGuard, ps *probeSet, rowSec *rowCheck, conflictVisible []parser.Comparison) (bool, map[catalog.ColumnID]types.Datum, error) {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return false, nil, err
@@ -1296,6 +1324,20 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	if plan.oc.DoNothing {
 		return false, nil, nil
 	}
+	// DO UPDATE under row security: the existing row must be one the
+	// role's UPDATE and SELECT policies admit. It is an error rather than
+	// a skipped row, as in PostgreSQL — the statement asked to change a
+	// row it may not touch — and it is checked before SET or WHERE can
+	// compute anything from that row.
+	if rowSec != nil {
+		ok, err := matchesWhere(conflictVisible, desc, oldRow, nil)
+		if err != nil {
+			return false, nil, err
+		}
+		if !ok {
+			return false, nil, rowSecurityError(desc)
+		}
+	}
 	// DO UPDATE: SET and WHERE see the existing row by its columns and
 	// the proposed one as excluded.*.
 	env := conflictEnv{desc: desc, table: desc.Name, old: oldRow, excluded: row}
@@ -1326,6 +1368,9 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			return false, nil, err
 		}
 		newRow[col.ID] = d
+	}
+	if err := rowSec.checkUpdate(newRow); err != nil {
+		return false, nil, err
 	}
 	if err := guard.checkUpdate(ctx, txn, oldRow, newRow, wb); err != nil {
 		return false, nil, err
@@ -1571,13 +1616,27 @@ type fetchedRow struct {
 	row map[catalog.ColumnID]types.Datum
 }
 
+// fetchRows reads the rows of desc that match where, as a query would:
+// when row security applies to the actor, only the rows its SELECT
+// policies admit (rls.go). Every read made on behalf of a query — a
+// join's sides, an aggregate's input, an index lookup — comes through
+// here, which is what applies the policy to each table reference.
 func (s *Session) fetchRows(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, accessPlan, error) {
-	return s.fetchRowsFor(ctx, txn, desc, where, params, limit, nil)
+	where, _, err := s.securedWhere(ctx, txn, desc, where, catalog.PolicySelect)
+	if err != nil {
+		return nil, accessPlan{}, err
+	}
+	return s.fetchRowsRaw(ctx, txn, desc, where, params, limit, nil)
 }
 
-// fetchRowsFor is fetchRows for a statement whose plan may be cached
-// (stmt: the UPDATE or DELETE as prepared; nil plans in full).
-func (s *Session) fetchRowsFor(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64, stmt parser.Statement) ([]fetchedRow, accessPlan, error) {
+// fetchRowsRaw reads the rows of desc that match where and nothing else:
+// no row-security policy is added. Its callers either have put the
+// policy in where themselves (UPDATE and DELETE, whose filter is their
+// own command's) or must not apply one (the foreign-key checks and
+// cascades, which see the whole of the other table). stmt is the
+// statement whose plan may be cached (the UPDATE or DELETE as prepared);
+// nil plans in full.
+func (s *Session) fetchRowsRaw(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum, limit int64, stmt parser.Statement) ([]fetchedRow, accessPlan, error) {
 	st, _ := s.cat.Stats(ctx, desc.ID)
 	var pe *planEntry
 	if stmt != nil {
@@ -2188,6 +2247,23 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Distinct && t.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with DISTINCT")
 	}
+	// Row security: the policy's conjuncts lead the WHERE clause, so the
+	// access path is chosen with them and every row read below — by key,
+	// through an index, streamed, or passed over by SKIP LOCKED — is
+	// filtered by them. A locking read must pass the UPDATE policies as
+	// well. The filtered statement is a copy, which also keeps it out of
+	// the plan cache (keyed on the statement as prepared).
+	rlsCmds := []string{catalog.PolicySelect}
+	if t.ForUpdate {
+		rlsCmds = append(rlsCmds, catalog.PolicyUpdate)
+	}
+	if where, secured, serr := s.securedWhere(ctx, txn, desc, t.Where, rlsCmds...); serr != nil {
+		return nil, serr
+	} else if secured {
+		c := *t
+		c.Where = where
+		t = &c
+	}
 	st, _ := s.cat.Stats(ctx, desc.ID)
 	var pe *planEntry
 	if t == orig {
@@ -2407,7 +2483,24 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if t == orig {
 		planKeyStmt = t
 	}
-	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
+	// Row security: the UPDATE policies' USING filters the target rows,
+	// and — when the statement had to read the table to find or compute
+	// them — so does the SELECT policies'. The new version of each row
+	// must pass WITH CHECK below. A statement so filtered plans in full:
+	// the plan cache cannot tell roles or settings apart.
+	reads := updateReadsTable(t, corr)
+	cmds := []string{catalog.PolicyUpdate}
+	if reads {
+		cmds = append(cmds, catalog.PolicySelect)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, t.Where, cmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		planKeyStmt = nil
+	}
+	rows, _, err := s.fetchRowsRaw(ctx, txn, desc, where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2426,6 +2519,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		rows = kept
 	}
 	ret, err := s.returningProjection(desc, t.Table, t.Returning)
+	if err != nil {
+		return nil, err
+	}
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, reads)
 	if err != nil {
 		return nil, err
 	}
@@ -2496,6 +2593,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	}
 	for i, fr := range rows {
 		oldRow := oldRows[i]
+		if err := rowSec.checkUpdate(fr.row); err != nil {
+			return nil, err
+		}
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
@@ -2568,7 +2668,21 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if t == orig {
 		planKeyStmt = t
 	}
-	rows, _, err := s.fetchRowsFor(ctx, txn, desc, t.Where, params, 0, planKeyStmt)
+	// Row security: the DELETE policies' USING filters the target rows,
+	// with the SELECT policies' when the statement reads the table (a
+	// WHERE clause or RETURNING).
+	cmds := []string{catalog.PolicyDelete}
+	if len(t.Where) > 0 || len(corr) > 0 || t.Returning != nil {
+		cmds = append(cmds, catalog.PolicySelect)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, t.Where, cmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		planKeyStmt = nil
+	}
+	rows, _, err := s.fetchRowsRaw(ctx, txn, desc, where, params, 0, planKeyStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -2677,6 +2791,10 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		desc.NextColumnID = max + 1
 	}
 	switch {
+	case t.RowSecurity != "":
+		if err := s.applyRowSecurity(desc, t.RowSecurity); err != nil {
+			return nil, err
+		}
 	case t.AddConstraint != nil || t.ValidateConstraint != "" || t.SetNotNull != "":
 		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 	case t.DropConstraint != "":
@@ -2776,6 +2894,9 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 			return nil, err
 		} else if len(uses) > 0 {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by constraint %s (drop the constraint first)", t.DropCol, strings.Join(uses, ", "))
+		}
+		if uses := policyColumnUses(desc, col.Name); len(uses) > 0 {
+			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by policy %s (drop the policy first)", t.DropCol, strings.Join(uses, ", "))
 		}
 		for _, idx := range desc.Indexes {
 			for _, id := range idx.ColumnIDs {
@@ -2888,16 +3009,34 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 			Tag:     "EXPLAIN",
 		}, nil
 	}
+	// Row security shows in the plan as it runs: the policy's conjuncts
+	// bound the scan. The row estimate is left out for a role the policy
+	// confines — it is drawn from statistics over every tenant's rows.
+	rlsCmds := []string{catalog.PolicySelect}
+	if sel.ForUpdate {
+		rlsCmds = append(rlsCmds, catalog.PolicyUpdate)
+	}
+	where, secured, err := s.securedWhere(ctx, txn, desc, sel.Where, rlsCmds...)
+	if err != nil {
+		return nil, err
+	}
+	if secured {
+		c := *sel
+		c.Where = where
+		sel = &c
+	}
 	st, _ := s.cat.Stats(ctx, desc.ID)
 	plan, err := pickPlanMode(desc, st, sel.Where, params, s.vars.invertedScan)
 	if err != nil {
 		return nil, err
 	}
 	text := plan.String()
-	if plan.estRows > 0 {
+	if plan.estRows > 0 && !secured {
 		text += fmt.Sprintf(" [~%.0f rows]", plan.estRows)
 	}
-	if e := s.plans.peek(sel, s.database); e != nil && e.desc == desc && e.stats == st {
+	if secured {
+		text += "; row-level security policy applied"
+	} else if e := s.plans.peek(sel, s.database); e != nil && e.desc == desc && e.stats == st {
 		text += " (cached plan)"
 	} else if sel == t.Stmt {
 		// EXPLAIN plans exactly as execution would: the next execution of
@@ -3289,7 +3428,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			return d
 		}
-		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(vtable.CreateTableDefWith(desc, byID))})
+		def := vtable.CreateTableDefWith(desc, byID)
+		if rls := vtable.RowSecurityDefs(desc); len(rls) > 0 {
+			def += ";\n" + strings.Join(rls, ";\n")
+		}
+		res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(def)})
 	case "users", "roles":
 		// SHOW USERS: the login roles; SHOW ROLES: every role, the built-in
 		// ones included.
@@ -3365,7 +3508,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		for i := 7; i < 10; i++ {
 			res.Columns[i].Type = types.Timestamp
 		}
-		res.Rows = s.sessionRows()
+		admin, err := s.isAdmin(ctx, txn)
+		if err != nil {
+			return nil, err
+		}
+		res.Rows = s.sessionRows(admin)
 	default:
 		return nil, newErrf(CodeInternal, "unknown SHOW form %q", t.Kind)
 	}

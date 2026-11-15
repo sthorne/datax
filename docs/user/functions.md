@@ -103,6 +103,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `current_database() → text` — The session's database. *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
+- `current_setting(text, [bool]) → text` — The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Evaluated once per statement. *stable*
 - `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
@@ -111,6 +112,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `now() → timestamptz` (also `current_timestamp`, `localtimestamp`, `statement_timestamp`, `transaction_timestamp`) — The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()). *stable*
 - `pg_notify(text, text) → text` — Sends a notification to the sessions listening on the channel (NOTIFY with a computed channel or payload); delivered when the transaction commits. Evaluated once per statement: its arguments cannot name columns. *volatile*
 - `session_user() → text` — The authenticated session user (unchanged by SET ROLE). *stable*
+- `set_config(text, text, bool) → text` — Sets a session setting, as SET does (SET LOCAL when is_local is true), and returns the value: SET with a value that can be a parameter. Evaluated once per statement: its arguments cannot name columns. *volatile*
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*

@@ -251,6 +251,11 @@ func (n *Node) serveSchemaAPI(w http.ResponseWriter, req *http.Request) {
 			// /api/security filters rather than gates, and the same
 			// applies here: the caller sees its own effective grants.
 			t.Privileges = ownGrants(set, d.Privileges)
+			if catalog.RowSecurityConfines(set, d) {
+				// The statistics count every tenant's rows; a role the
+				// table's policies confine is not told how many there are.
+				t.Stats = nil
+			}
 			visible = append(visible, t)
 		}
 		doc.Tables = visible

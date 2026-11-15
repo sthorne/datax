@@ -311,6 +311,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	}
 	switch t.text {
 	case "CREATE":
+		if p.peekWord(1, "policy") {
+			return p.parseCreatePolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
@@ -379,6 +382,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return &Explain{Stmt: inner, Analyze: analyze}, nil
 	case "DROP":
+		if p.peekWord(1, "policy") {
+			return p.parseDropPolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseDropRole()
 		}
@@ -502,6 +508,9 @@ func (p *parser) parseStatement() (Statement, error) {
 	case "DELETE":
 		return p.parseDelete()
 	case "ALTER":
+		if p.peekWord(1, "policy") {
+			return p.parseAlterPolicy()
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
 			return p.parseRoleStmt(true)
 		}
@@ -786,6 +795,14 @@ func (p *parser) parseStatement() (Statement, error) {
 		// SHOW <variable>: multi-word names join with "_" (SHOW TIME ZONE,
 		// SHOW TRANSACTION ISOLATION LEVEL); the session resolves them.
 		var words []string
+		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "." {
+			// SHOW class.name: a custom setting.
+			name, err := p.parseVarName()
+			if err != nil {
+				return nil, err
+			}
+			return &SetVar{Name: "show:" + name}, nil
+		}
 		for !p.atStatementEnd() {
 			t := p.peek()
 			if t.kind != tkIdent && t.kind != tkKeyword {
@@ -813,7 +830,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			sv.Name = "TimeZone"
 			return sv, nil
 		}
-		name, err := p.expectIdent()
+		name, err := p.parseVarName()
 		if err != nil {
 			return nil, err
 		}
@@ -828,6 +845,25 @@ func (p *parser) parseStatement() (Statement, error) {
 		return &Use{Name: name}, nil
 	}
 	return nil, p.errf("unsupported statement %q", t.text)
+}
+
+// parseVarName parses a setting's name: an identifier, or a custom
+// setting's class.name (PostgreSQL's two-part names: app.tenant), whose
+// parts may be words this grammar otherwise reserves.
+func (p *parser) parseVarName() (string, error) {
+	name, err := p.expectIdent()
+	if err != nil {
+		return "", err
+	}
+	for p.consumeOp(".") {
+		t := p.peek()
+		if t.kind != tkIdent && t.kind != tkKeyword {
+			return "", p.errf("expected a name after %q., found %q", name, t.text)
+		}
+		p.i++
+		name += "." + strings.ToLower(t.text)
+	}
+	return name, nil
 }
 
 func (p *parser) atStatementEnd() bool {
@@ -1642,7 +1678,7 @@ func (p *parser) parseSet() (Statement, error) {
 			return sv, nil
 		}
 	default:
-		name, err := p.expectIdent()
+		name, err := p.parseVarName()
 		if err != nil {
 			return nil, err
 		}
@@ -3362,6 +3398,11 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		return nil, err
 	}
 	at.Table = name
+	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
+		return nil, err
+	} else if at.RowSecurity != "" {
+		return at, nil
+	}
 	switch {
 	case p.consumeIdentWord("owner"):
 		return p.parseOwnerTo("table", name)
@@ -5198,7 +5239,7 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
-	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
+	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "set_config": 3, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1,
 	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
