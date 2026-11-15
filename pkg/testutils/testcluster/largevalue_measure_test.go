@@ -228,11 +228,17 @@ func startDiskCluster(t *testing.T, ctx context.Context, n int, opts ...func(*se
 // cluster and the client, which is more than the gateway — grows by
 // much less than the object while it happens.
 //
-// DATAX_LARGE_OBJECT_MIB sets the size (default 64; 1024 is the issue's
+// DATAX_LARGE_OBJECT_MIB sets the size (default 64, or 16 under the race
+// detector; 1024 is the issue's
 // 1 GiB, which wants about 8 GiB of free disk on three nodes) and
 // DATAX_LARGE_OBJECT_NODES the cluster size (default 3).
 func TestLargeObjectStream(t *testing.T) {
 	sizeMiB, nodes := 64, 3
+	if raceEnabled {
+		// The bound below is about memory that does not grow with the
+		// object; 16 MiB still streams 64 pages through every node.
+		sizeMiB = 16
+	}
 	if v := os.Getenv("DATAX_LARGE_OBJECT_MIB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {

@@ -296,7 +296,16 @@ func resolve(t *testing.T, ctx context.Context, db *kvclient.DB, cat *catalog.Ac
 // when there is none).
 func gatewayLease(t *testing.T, ctx context.Context, db *kvclient.DB, cat *catalog.Accessor, descID uint64) (version uint64, expiration int64, ok bool) {
 	t.Helper()
-	raw, err := db.Get(ctx, keys.DescLeaseKey(descID, cat.TestingGatewayID()))
+	// Read in a transaction: the gateway renews, releases and evicts its
+	// lease records while the test looks, and a bare read that meets one
+	// of those writes in flight reports the intent instead of waiting it
+	// out.
+	var raw []byte
+	err := db.RunTxn(ctx, "test-gateway-lease", func(ctx context.Context, txn *kvclient.Txn) error {
+		v, err := txn.Get(ctx, keys.DescLeaseKey(descID, cat.TestingGatewayID()))
+		raw = v
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

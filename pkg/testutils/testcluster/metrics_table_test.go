@@ -223,13 +223,15 @@ func TestMetricsTable(t *testing.T) {
 				got = &sd.Tables[i]
 			}
 		}
-		if got == nil {
-			t.Fatal("datax_metrics missing from /api/schema")
-		}
-		if got.RetentionSeconds == 2*86400 && got.Shards == 8 {
+		// A document built before the table was created can still be
+		// the one served: absent is "not yet", like a stale retention.
+		if got != nil && got.RetentionSeconds == 2*86400 && got.Shards == 8 {
 			break
 		}
 		if time.Now().After(deadline) {
+			if got == nil {
+				t.Fatal("datax_metrics missing from /api/schema")
+			}
 			t.Fatalf("retention/shards after ALTER: %+v", *got)
 		}
 		time.Sleep(300 * time.Millisecond)

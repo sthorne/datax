@@ -835,7 +835,7 @@ func exactKNN(t testing.TB, ctx context.Context, s *sql.Session, table, op strin
 // default setting reaches 0.95.
 func TestVectorIndexRecall(t *testing.T) {
 	n := 20000
-	if testing.Short() {
+	if testing.Short() || raceEnabled {
 		n = 4000
 	}
 	const dims, lists, k = 32, 100, 10
