@@ -89,6 +89,14 @@ type ExportRequest struct {
 	RequestHeader
 	StartTS    hlc.Timestamp `json:"start_ts,omitempty"`
 	MaxRecords int64         `json:"max_records,omitempty"`
+	// AllRevisions asks for every version in the window rather than the
+	// newest, each record carrying its timestamp (a backup with revision
+	// history, issue #302). A key's versions are never split across
+	// responses, so a response may exceed MaxRecords by the versions of
+	// its last key. A replica that predates the field ignores it and
+	// answers with the newest versions only, so it is sent only once the
+	// cluster has finalized v21 (version.V21).
+	AllRevisions bool `json:"all_revisions,omitempty"`
 }
 
 // EndTxnRequest commits or aborts the transaction: the atomic flip of the
@@ -502,6 +510,9 @@ type ExportRecord struct {
 	Key     keys.Key `json:"key"`
 	Value   []byte   `json:"value,omitempty"`
 	Deleted bool     `json:"deleted,omitempty"`
+	// Timestamp is the version's timestamp; set only in answer to an
+	// AllRevisions export.
+	Timestamp hlc.Timestamp `json:"ts,omitzero"`
 }
 
 type ExportResponse struct {

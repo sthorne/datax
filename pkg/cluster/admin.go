@@ -44,6 +44,27 @@ type AdminRequest struct {
 	// IncludeMetrics backs up the datax_metrics system table too (bulky
 	// and regenerable, so excluded by default).
 	IncludeMetrics bool `json:"include_metrics,omitempty"`
+	// What "backup-history" and "restore-select" add to backup and
+	// restore (issues #301, #302). They travel under op names of their
+	// own because a node from before them would read "backup" or
+	// "restore", ignore the fields it does not know, and do the old thing
+	// — a plain incremental, or a restore of everything to the chain's
+	// end — and report success.
+	//
+	// AsOf is the moment to restore to, as BackupSummary.EndTS writes
+	// one; empty means the end of the chain. Tables names the tables to
+	// restore ("db.table", or "table" in the default database) and Into,
+	// parallel to it, the names to restore them under (an empty entry
+	// keeps the name). Database restores every table of one database into
+	// a new database, IntoDatabase its name there (empty keeps the name).
+	// DropForeignKeys restores a table without its foreign keys to tables
+	// that are not being restored with it, rather than refusing.
+	AsOf            string   `json:"as_of,omitempty"`
+	Tables          []string `json:"tables,omitempty"`
+	Into            []string `json:"into,omitempty"`
+	Database        string   `json:"database,omitempty"`
+	IntoDatabase    string   `json:"into_database,omitempty"`
+	DropForeignKeys bool     `json:"drop_foreign_keys,omitempty"`
 	// CheckID identifies a consistency probe for collect-checksum.
 	CheckID string `json:"check_id,omitempty"`
 	// Index is the applied index wait-applied blocks for (with RangeID).
@@ -191,6 +212,13 @@ type BackupTableSummary struct {
 	// in key order — comparable between a backup and a fresh export of the
 	// restored cluster.
 	SHA256 string `json:"sha256"`
+	// Versions is the number of versions the table's data file holds, in
+	// a backup with revision history.
+	Versions int64 `json:"versions,omitempty"`
+	// From is the table's name and id in the backup, where a restore
+	// brought it back under another (a table restore).
+	From   string `json:"from,omitempty"`
+	FromID uint64 `json:"from_id,omitempty"`
 }
 
 // BackupSummary is the admin RPC's report for a backup or restore.
@@ -203,6 +231,18 @@ type BackupSummary struct {
 	Sealed bool                 `json:"sealed,omitempty"`
 	Tables []BackupTableSummary `json:"tables,omitempty"`
 	Users  int                  `json:"users,omitempty"`
+	// EndTS and BaseTS are the backup's timestamps as restore's --as-of
+	// takes them: Unix nanoseconds, with ",<logical>" appended when the
+	// logical part is not zero. For a restore, EndTS is the moment the
+	// restored data is as of.
+	EndTS  string `json:"end_ts,omitempty"`
+	BaseTS string `json:"base_ts,omitempty"`
+	// RevisionHistory: the backup holds every version written since its
+	// base, so a chain through it restores to any moment in between.
+	RevisionHistory bool `json:"revision_history,omitempty"`
+	// Notes are what a table restore left out or changed on the way in:
+	// foreign keys dropped, grants to roles the cluster does not have.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // PurgeRangeAnswer is a leader's answer to purge-range: the range as it

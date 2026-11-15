@@ -285,6 +285,20 @@ func StoreEncryptionCutoverKey(storeID base.StoreID) Key {
 	return systemKey("enc-cutover", strconv.FormatInt(int64(storeID), 10))
 }
 
+// RestoreProgressKey holds the record of a table restore in flight (JSON;
+// issue #301): which node runs it and the table ids its rows are being
+// loaded under. The record is written before the first row and removed
+// in the transaction that makes the tables visible, so a record that
+// outlives its restore names rows nobody can reach, which a janitor
+// then removes.
+func RestoreProgressKey(opID string) Key { return systemKey("restore", opID) }
+
+// RestoreProgressSpan covers every table restore's record.
+func RestoreProgressSpan() (Key, Key) {
+	p := systemKey("restore")
+	return p, p.PrefixEnd()
+}
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")

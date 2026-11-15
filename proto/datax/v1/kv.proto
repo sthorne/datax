@@ -191,12 +191,14 @@ message ExportRequest {
   RequestHeader header = 1;
   Hlc start_ts = 2; // export keys changed in (start_ts, batch timestamp]
   int64 max_records = 3;
+  bool all_revisions = 4; // every version in the window, not the newest (v21)
 }
 
 message ExportRecord {
   bytes key = 1;
   bytes value = 2;
   bool deleted = 3; // tombstone: the key was deleted in the window
+  Hlc ts = 4; // the version's timestamp; all_revisions exports only
 }
 
 message ExportResponse {

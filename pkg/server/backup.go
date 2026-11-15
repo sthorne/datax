@@ -1,12 +1,10 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/cluster"
@@ -28,6 +27,7 @@ import (
 	"github.com/sthorne/datax/pkg/util/encoding"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Backup and restore (issue #45). A backup is a directory the serving node
@@ -36,6 +36,11 @@ import (
 // applies a chain of such directories (one full, then incrementals) into
 // an EMPTY cluster, preserving table IDs so index data restores raw.
 //
+// Two things build on that: an incremental may keep every version of its
+// interval, so a chain restores to a moment inside it (backup_history.go,
+// issue #302), and a restore may bring back chosen tables into a cluster
+// that is in use, under new table IDs (restore_table.go, issue #301).
+//
 // The manifest deliberately re-snapshots descriptors and users on every
 // backup (they are tiny), so any chain element could reconstruct the
 // schema; restore uses the LAST element's metadata — tables dropped
@@ -43,7 +48,17 @@ import (
 
 const (
 	backupManifestMagic = "DXBK1"
-	backupManifestName  = "BACKUP.json"
+	// backupHistoryMagic is the manifest magic of a backup with revision
+	// history (issue #302), whose data files frame every record with its
+	// timestamp. It is a different magic, and not a field beside the old
+	// one, because of who reads it: a binary from before the format reads
+	// a manifest's magic and nothing it does not know, so under the old
+	// magic it would read the timestamps as the next record's length and
+	// restore whatever came of it. Under this one it says "not a datax
+	// backup" and stops. A sealed backup keeps its envelope ("DXBKS1");
+	// the manifest inside carries this magic and is refused the same way.
+	backupHistoryMagic = "DXBK2"
+	backupManifestName = "BACKUP.json"
 	// backupExportChunk bounds one Export call's record count: memory on
 	// both sides and the JSON/proto envelope size.
 	backupExportChunk = 4096
@@ -145,6 +160,10 @@ type BackupOptions struct {
 	AllowPlaintext bool
 	// IncludeMetrics backs up the cluster's own metrics tables too.
 	IncludeMetrics bool
+	// RevisionHistory makes an incremental keep every version written
+	// since its base, with timestamps, so the chain restores to any
+	// moment of the interval and not only to its end (issue #302).
+	RevisionHistory bool
 }
 
 // backupDataFile is the name of table id's data file inside its backup
@@ -176,6 +195,17 @@ type backupTable struct {
 	// SHA256 covers the LIVE (non-tombstone) records' key/value bytes in
 	// key order — comparable to a fresh full export of a restored table.
 	SHA256 string `json:"sha256"`
+	// Versions is how many versions the data file holds, in a backup with
+	// revision history. Records, Bytes and SHA256 there describe the
+	// newest version of each key — what the same backup without history
+	// would have held — so the two kinds compare.
+	Versions int64 `json:"versions,omitempty"`
+	// history says the data file frames each record with its timestamp;
+	// set from the manifest when it is read, never stored.
+	history bool
+	// window is the manifest's (BaseTS, EndTS], which every version of a
+	// history file must lie in; set with history.
+	window [2]hlc.Timestamp
 }
 
 type backupManifest struct {
@@ -198,6 +228,10 @@ type backupManifest struct {
 	Databases []backupKV `json:"databases,omitempty"`
 	// Sequences are the sequence descriptors, names and counters (v7).
 	Sequences []backupKV `json:"sequences,omitempty"`
+	// RevisionHistory says the data files hold every version written in
+	// (BaseTS, EndTS], newest first within a key, each with its timestamp.
+	// True exactly when Magic is backupHistoryMagic.
+	RevisionHistory bool `json:"revision_history,omitempty"`
 }
 
 // exportAll streams every export record in [start, end) for the window
@@ -205,9 +239,20 @@ type backupManifest struct {
 // live conflicting transaction is waited out with backoff — a backup
 // prefers lateness to inconsistency.
 func (n *Node) exportAll(ctx context.Context, start, end keys.Key, startTS, endTS hlc.Timestamp, fn func(kvpb.ExportRecord) error) error {
+	return n.exportSpan(ctx, start, end, startTS, endTS, false, fn)
+}
+
+// exportSpan is exportAll, or with revisions set the same walk over every
+// version in the window: newest first within a key, each record carrying
+// its timestamp.
+func (n *Node) exportSpan(ctx context.Context, start, end keys.Key, startTS, endTS hlc.Timestamp, revisions bool, fn func(kvpb.ExportRecord) error) error {
+	export := n.db.ExportSpan
+	if revisions {
+		export = n.db.ExportSpanRevisions
+	}
 	cur := start.Clone()
 	for {
-		resp, err := n.db.ExportSpan(ctx, cur, end, startTS, endTS, backupExportChunk)
+		resp, err := export(ctx, cur, end, startTS, endTS, backupExportChunk)
 		if err != nil {
 			var kerr *kvpb.Error
 			if errors.As(err, &kerr) && kerr.WriteIntent != nil {
@@ -254,7 +299,6 @@ func writeBackupRecord(w io.Writer, rec kvpb.ExportRecord) error {
 	return err
 }
 
-// readBackupRecords streams a data file's records through fn.
 // readBackupFile reads one file of a backup directory — the manifest, or
 // a table's data file — and only if it is the plain file backup wrote.
 // The names are derived (backupDataFile), so a manifest can no longer
@@ -370,12 +414,7 @@ func checkBackupRecords(dir string, dataKey []byte, man *backupManifest) error {
 // reader beneath is named for what it lacks, so a call site that reaches
 // past this one reads as what it is.
 func readCheckedBackupRecords(path string, dataKey []byte, t backupTable, fn func(kvpb.ExportRecord) error) error {
-	return readBackupRecordsUnchecked(path, dataKey, func(rec kvpb.ExportRecord) error {
-		if err := checkBackupRecord(path, t, rec); err != nil {
-			return err
-		}
-		return fn(rec)
-	})
+	return readTableRecords(path, dataKey, t, hlc.Timestamp{}, false, fn)
 }
 
 // checkBackupRecord refuses a record of table t's data file whose key
@@ -392,74 +431,18 @@ func checkBackupRecord(path string, t backupTable, rec kvpb.ExportRecord) error 
 // holding one record (and, for a sealed file, one chunk) in memory at a
 // time. dataKey is the backup's data key for a sealed backup and nil for a
 // plaintext one; a sealed file's records reach fn only from chunks that
-// authenticated.
+// authenticated. The file is read in the framing of a backup without
+// revision history.
 func readBackupRecordsUnchecked(path string, dataKey []byte, fn func(kvpb.ExportRecord) error) error {
-	f, err := openBackupFile(path)
+	rd, err := openBackupRecords(path, dataKey, false)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	var src io.Reader = f
-	if dataKey != nil {
-		// The name bound into the file is the one it is being read under.
-		if src, err = enc.NewStreamReader(f, dataKey, filepath.Base(path)); err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-	}
-	r := bufio.NewReaderSize(src, 64<<10)
-	// field reads n bytes. It grows with what arrives rather than
-	// allocating n up front: n is whatever a damaged plaintext file says.
-	field := func(n uint64, what string) ([]byte, error) {
-		var buf bytes.Buffer
-		if _, err := io.CopyN(&buf, r, int64(n)); err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("%s: truncated record %s", path, what)
-			}
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		return buf.Bytes(), nil
-	}
-	length := func(first bool) (uint64, bool, error) {
-		n, err := binary.ReadUvarint(r)
-		switch {
-		case err == nil:
-			return n, false, nil
-		case err == io.EOF && first:
-			return 0, true, nil
-		}
-		// A length cut short or malformed, or — from a sealed file — a
-		// chunk that did not authenticate, which the error then says.
-		return 0, false, fmt.Errorf("%s: corrupt record framing: %w", path, err)
-	}
+	defer rd.Close()
 	for {
-		klen, end, err := length(true)
-		if err != nil {
+		rec, ok, err := rd.next()
+		if err != nil || !ok {
 			return err
-		}
-		if end {
-			return nil
-		}
-		key, err := field(klen, "key")
-		if err != nil {
-			return err
-		}
-		vlen, _, err := length(false)
-		if err != nil {
-			return err
-		}
-		val, err := field(vlen, "value")
-		if err != nil {
-			return err
-		}
-		deleted, err := r.ReadByte()
-		if err == io.EOF {
-			return fmt.Errorf("%s: truncated record value", path)
-		} else if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		rec := kvpb.ExportRecord{Key: keys.Key(key), Deleted: deleted == 1}
-		if !rec.Deleted {
-			rec.Value = val
 		}
 		if err := fn(rec); err != nil {
 			return err
@@ -494,6 +477,18 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 	// something about the result that one of them contradicts.
 	if opts.Key != nil && opts.AllowPlaintext {
 		return nil, fmt.Errorf("--backup-key seals the backup and --allow-plaintext asks for an unsealed one; pass one of them")
+	}
+	if opts.RevisionHistory {
+		// A full backup is the floor of what a chain restores to: the
+		// history below it is whatever garbage collection has left, which
+		// no timestamp can be promised from. History lives in the
+		// incrementals, each holding exactly its own interval.
+		if basePath == "" {
+			return nil, fmt.Errorf("--revision-history keeps the versions written since a base backup; a full backup has no base (take the full backup without it, and the incrementals after it with it)")
+		}
+		if !n.db.RevisionExportsOK() {
+			return nil, fmt.Errorf("a backup with revision history needs cluster version %s (finalize the upgrade first)", version.V21)
+		}
 	}
 	if (n.cfg.EncKeyPath != "" || n.cfg.EncRoot != "") && opts.Key == nil && !opts.AllowPlaintext {
 		return nil, fmt.Errorf("the store is encrypted and a backup without a key is written in plaintext; pass --backup-key to seal it, or --allow-plaintext to proceed unsealed")
@@ -563,6 +558,9 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		EndTS:     endTS,
 		BaseTS:    baseTS,
 		CreatedAt: time.Now().UTC(),
+	}
+	if opts.RevisionHistory {
+		man.Magic, man.RevisionHistory = backupHistoryMagic, true
 	}
 
 	// Descriptors, users, and admin markers: always the full set at endTS
@@ -637,8 +635,20 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		}
 		h := sha256.New()
 		start, end := keys.TableDataSpan(bt.ID)
-		err = n.exportAll(ctx, start, end, baseTS, endTS, func(rec kvpb.ExportRecord) error {
-			if err := writeBackupRecord(w, rec); err != nil {
+		var lastKey keys.Key
+		err = n.exportSpan(ctx, start, end, baseTS, endTS, opts.RevisionHistory, func(rec kvpb.ExportRecord) error {
+			if opts.RevisionHistory {
+				if err := writeBackupRevision(w, rec); err != nil {
+					return err
+				}
+				bt.Versions++
+				// Counted and hashed once per key, at its newest version,
+				// which is the first the export hands over.
+				if lastKey != nil && lastKey.Equal(rec.Key) {
+					return nil
+				}
+				lastKey = keys.Key(rec.Key).Clone()
+			} else if err := writeBackupRecord(w, rec); err != nil {
 				return err
 			}
 			bt.Records++
@@ -657,6 +667,13 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 			err = cerr
 		}
 		if err != nil {
+			if !baseTS.IsEmpty() && strings.Contains(err.Error(), "below the GC threshold") {
+				// The replica's refusal, in the operator's terms: part of
+				// (base, now] has been collected, so neither the deletions
+				// nor the versions in it can be told from this cluster any
+				// more. Nothing short of a new full backup restarts the chain.
+				return nil, fmt.Errorf("exporting table %s: the base backup is older than the garbage-collection window, so changes since it have been collected in part and an incremental cannot hold them; take a full backup, and take incrementals more often than the GC TTL: %w", bt.Name, err)
+			}
 			return nil, fmt.Errorf("exporting table %s: %w", bt.Name, err)
 		}
 		bt.SHA256 = hex.EncodeToString(h.Sum(nil))
@@ -765,8 +782,23 @@ func parseBackupManifest(dir string, raw []byte) (*backupManifest, error) {
 	if err := json.Unmarshal(raw, &man); err != nil {
 		return nil, err
 	}
-	if man.Magic != backupManifestMagic {
+	switch {
+	case man.Magic == backupManifestMagic && !man.RevisionHistory:
+	case man.Magic == backupHistoryMagic && man.RevisionHistory:
+		if man.BaseTS.IsEmpty() || !man.BaseTS.Less(man.EndTS) {
+			return nil, fmt.Errorf("%s: a backup with revision history holds the interval after a base backup, and this manifest names none (base %s, end %s)", dir, man.BaseTS, man.EndTS)
+		}
+	case man.Magic == backupManifestMagic || man.Magic == backupHistoryMagic:
+		// The magic is what an older binary goes by and the field what
+		// this one reads the files by: a manifest where they disagree
+		// would be read one way here and another there.
+		return nil, fmt.Errorf("%s: the manifest's magic %q and its revision-history marker disagree", dir, man.Magic)
+	default:
 		return nil, fmt.Errorf("%s: not a datax backup (magic %q)", dir, man.Magic)
+	}
+	for i := range man.Tables {
+		man.Tables[i].history = man.RevisionHistory
+		man.Tables[i].window = [2]hlc.Timestamp{man.BaseTS, man.EndTS}
 	}
 	// A backup names its own files, and nothing else: refused here, before
 	// any data file is opened, so neither door — restore, or the base of
@@ -866,10 +898,16 @@ func backupSummary(path string, man *backupManifest) *cluster.BackupSummary {
 		EndTSNanos:  man.EndTS.WallTime,
 		Incremental: !man.BaseTS.IsEmpty(),
 		Users:       len(man.Users) + len(man.Roles),
+
+		EndTS:           formatBackupTS(man.EndTS),
+		RevisionHistory: man.RevisionHistory,
+	}
+	if !man.BaseTS.IsEmpty() {
+		sum.BaseTS = formatBackupTS(man.BaseTS)
 	}
 	for _, t := range man.Tables {
 		sum.Tables = append(sum.Tables, cluster.BackupTableSummary{
-			ID: t.ID, Name: t.Name, Records: t.Records, Bytes: t.Bytes, SHA256: t.SHA256,
+			ID: t.ID, Name: t.Name, Records: t.Records, Bytes: t.Bytes, SHA256: t.SHA256, Versions: t.Versions,
 		})
 	}
 	return sum
@@ -912,13 +950,69 @@ func restoreKeys(srcs []string, backupKeys [][]byte) ([][]byte, error) {
 	return out, nil
 }
 
-// RunRestoreWith applies a backup chain (full first, then incrementals in
-// order) into this — empty — cluster, then re-exports each table and
-// reports fresh checksums for verification against the source.
-// backupKeys opens the chain's sealed backups (restoreKeys). Every
-// manifest is opened and every data file read to its end — which for a
-// sealed one authenticates all of it — before anything is applied.
-func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][]byte) (_ *cluster.BackupSummary, err error) {
+// RestoreOptions is what a restore is asked for.
+type RestoreOptions struct {
+	// Srcs is the chain, full backup first, as directories on this node's
+	// filesystem; Keys opens its sealed backups (restoreKeys).
+	Srcs []string
+	Keys [][]byte
+	// AsOf is the moment to restore to; zero is the end of the chain.
+	AsOf hlc.Timestamp
+	// Tables, or Database, makes this a restore of those tables into a
+	// cluster that is in use (restore_table.go); with neither it is a
+	// restore of everything into an empty one.
+	Tables       []RestoreTable
+	Database     string
+	IntoDatabase string
+	// DropForeignKeys restores a table without its foreign keys to tables
+	// outside the restore, where the default is to refuse it.
+	DropForeignKeys bool
+	// TestingAbandonAfterLoad makes a table restore return once its rows
+	// are loaded, without publishing or cleaning up — where a node that
+	// died would have left it. Tests only.
+	TestingAbandonAfterLoad bool
+}
+
+// RestoreTable names one table of a table restore: Name as it is in the
+// backup ("db.table", or "table" in the default database) and Into the
+// name to restore it under (empty keeps Name).
+type RestoreTable struct {
+	Name, Into string
+}
+
+// restoreChain is a chain opened for a restore: the backups it will read,
+// already cut to the moment asked for.
+type restoreChain struct {
+	srcs     []string
+	mans     []*backupManifest
+	dataKeys [][]byte
+	// cutoff, when set, is a moment inside the last backup's interval:
+	// that backup's history is read to it and no further.
+	cutoff hlc.Timestamp
+}
+
+func (c *restoreChain) final() *backupManifest { return c.mans[len(c.mans)-1] }
+
+// asOf is the moment the restored data is as of.
+func (c *restoreChain) asOf() hlc.Timestamp {
+	if !c.cutoff.IsEmpty() {
+		return c.cutoff
+	}
+	return c.final().EndTS
+}
+
+// cutoffFor is the cutoff to read backup i's data files with.
+func (c *restoreChain) cutoffFor(i int) hlc.Timestamp {
+	if i == len(c.mans)-1 {
+		return c.cutoff
+	}
+	return hlc.Timestamp{}
+}
+
+// openRestoreChain opens every manifest of a chain, holds the chain to
+// its shape — a full backup, then incrementals each on the one before —
+// and cuts it to asOf. No data file is read here.
+func openRestoreChain(srcs []string, backupKeys [][]byte, asOf hlc.Timestamp) (*restoreChain, error) {
 	if len(srcs) == 0 {
 		return nil, fmt.Errorf("restore requires at least one backup directory")
 	}
@@ -926,28 +1020,13 @@ func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][
 	if err != nil {
 		return nil, err
 	}
-	opID := newOpID()
-	n.events.RecordStart("restore", opID, "restore from %d backup(s) started", len(srcs))
-	defer func() {
-		if err != nil {
-			n.events.RecordEnd("restore", opID, "failed", "restore failed: %v", err)
-		}
-	}()
-	mans := make([]*backupManifest, len(srcs))
-	dataKeys := make([][]byte, len(srcs))
+	c := &restoreChain{srcs: srcs, mans: make([]*backupManifest, len(srcs)), dataKeys: make([][]byte, len(srcs))}
 	for i, src := range srcs {
-		man, dataKey, err := openBackupManifest(src, srcKeys[i])
-		if err != nil {
+		if c.mans[i], c.dataKeys[i], err = openBackupManifest(src, srcKeys[i]); err != nil {
 			return nil, err
 		}
-		if err := checkBackupFiles(src, man); err != nil {
-			return nil, err
-		}
-		if err := checkBackupRecords(src, dataKey, man); err != nil {
-			return nil, err
-		}
-		mans[i], dataKeys[i] = man, dataKey
 	}
+	mans := c.mans
 	if !mans[0].BaseTS.IsEmpty() {
 		return nil, fmt.Errorf("%s is an incremental backup; the chain must start with a full one", srcs[0])
 	}
@@ -960,7 +1039,75 @@ func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][
 				srcs[i], mans[i].BaseTS, srcs[i-1], mans[i-1].EndTS)
 		}
 	}
-	final := mans[len(mans)-1]
+	n, cutoff, err := chainCut(srcs, mans, asOf)
+	if err != nil {
+		return nil, err
+	}
+	c.srcs, c.mans, c.dataKeys, c.cutoff = c.srcs[:n], c.mans[:n], c.dataKeys[:n], cutoff
+	return c, nil
+}
+
+// RunRestoreWith applies a backup chain (full first, then incrementals in
+// order) into this — empty — cluster, then re-exports each table and
+// reports fresh checksums for verification against the source.
+// backupKeys opens the chain's sealed backups (restoreKeys). Every
+// manifest is opened and every data file read to its end — which for a
+// sealed one authenticates all of it — before anything is applied.
+func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][]byte) (*cluster.BackupSummary, error) {
+	return n.RunRestoreOpts(ctx, RestoreOptions{Srcs: srcs, Keys: backupKeys})
+}
+
+// RunRestoreOpts runs a restore: of the whole chain into this — empty —
+// cluster, or, when opts names tables or a database, of those into this
+// cluster as it runs. Either reads the chain to opts.AsOf.
+func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *cluster.BackupSummary, err error) {
+	srcs := opts.Srcs
+	opID := newOpID()
+	what := fmt.Sprintf("restore from %d backup(s)", len(srcs))
+	if len(opts.Tables) > 0 || opts.Database != "" {
+		what = fmt.Sprintf("table restore from %d backup(s)", len(srcs))
+	}
+	n.events.RecordStart("restore", opID, "%s started", what)
+	defer func() {
+		if err != nil {
+			n.events.RecordEnd("restore", opID, "failed", "%s failed: %v", what, err)
+		}
+	}()
+	chain, err := openRestoreChain(srcs, opts.Keys, opts.AsOf)
+	if err != nil {
+		return nil, err
+	}
+	if len(opts.Tables) > 0 || opts.Database != "" {
+		sum, err := n.runTableRestore(ctx, opID, opts, chain)
+		if err != nil {
+			return nil, err
+		}
+		n.events.RecordEnd("restore", opID, "ok", "restored %d table(s) from %d backup(s), as of %s", len(sum.Tables), len(chain.srcs), sum.EndTS)
+		return sum, nil
+	}
+	if opts.DropForeignKeys || opts.IntoDatabase != "" {
+		return nil, fmt.Errorf("--drop-foreign-keys and --into belong to a restore of tables (--table, --database); a restore of everything brings every table back as it was")
+	}
+	srcs = chain.srcs
+	mans, dataKeys := chain.mans, chain.dataKeys
+	for i, src := range srcs {
+		if err := checkBackupFiles(src, mans[i]); err != nil {
+			return nil, err
+		}
+		if err := checkBackupRecords(src, dataKeys[i], mans[i]); err != nil {
+			return nil, err
+		}
+	}
+	final := chain.final()
+	if !chain.cutoff.IsEmpty() {
+		// The cut falls inside the last backup's interval, whose manifest
+		// describes the schema at the interval's end.
+		for _, t := range final.Tables {
+			if err := tableStableAcross(mans[len(mans)-2], final, t, chain.cutoff); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	// The target must hold no user tables: restored data keys bake in the
 	// backed-up table IDs, which an existing catalog could collide with.
@@ -1096,7 +1243,9 @@ func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][
 			// Held to the table's span again at the write (issue
 			// #255): the pass above read the file once already, and
 			// a file rewritten since is refused rather than applied.
-			err := readCheckedBackupRecords(path, dataKeys[i], t, func(rec kvpb.ExportRecord) error {
+			// readTableRecords is readCheckedBackupRecords with the cut
+			// a point-in-time restore reads the last backup to.
+			err := readTableRecords(path, dataKeys[i], t, chain.cutoffFor(i), false, func(rec kvpb.ExportRecord) error {
 				if rec.Deleted {
 					wb.Delete(keys.Key(rec.Key))
 				} else {
@@ -1119,7 +1268,7 @@ func (n *Node) RunRestoreWith(ctx context.Context, srcs []string, backupKeys [][
 
 	// Verification: a fresh full export of every restored table, hashed the
 	// same way — the caller compares against the source's checksums.
-	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users) + len(final.Roles)}
+	sum := &cluster.BackupSummary{ClusterID: final.ClusterID, Users: len(final.Users) + len(final.Roles), EndTS: formatBackupTS(chain.asOf())}
 	verifyTS := n.clock.Now()
 	for _, t := range final.Tables {
 		h := sha256.New()

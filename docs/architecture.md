@@ -149,6 +149,28 @@ and the purge are refused until finalize
 ([transactions.md](transactions.md), "A window per table" and "Purge";
 [sql.md](sql.md), "Table options").
 
+Exports are the read a backup is made of (`ExportRequest`, evaluated by
+`storage.MVCCExport` as a consistent read at the backup's timestamp):
+for each key that changed in a window `(start, end]`, its newest version
+at `end`, tombstones included. With `AllRevisions` (**v21**) the same
+walk returns every version in the window, newest first within a key,
+each with its timestamp — what a backup with revision history stores and
+a point-in-time restore replays up to a chosen moment. A key's versions
+are never split across responses. The window is whole only while garbage
+collection has not passed its start, so a replica refuses an export
+whose start timestamp is below its GC threshold; that refusal, already
+there for incrementals (a collected tombstone is a missed deletion), is
+what keeps a history backup from being written with versions missing.
+The flag is gated like the others: a v20 replica would ignore it and
+answer with the newest versions only, which a backup would record as
+the whole history.
+
+A table restore into a running cluster writes through the ordinary
+transactional path, under table ids nothing names until one transaction
+publishes the descriptors; a replicated progress record
+(`/system/restore/<op>`, also **v21**) lets any node remove the rows of
+a restore whose node died (see `pkg/server/restore_table.go`).
+
 ## Modules
 
 - `pkg/base` — shared ID types (NodeID, StoreID, RangeID) and configuration.

@@ -880,6 +880,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.rowTTLLoop); err != nil {
 		return err
 	}
+	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {
+		return err
+	}
 	if err := n.stopper.RunWorker(n.metricsRecorderLoop); err != nil {
 		return err
 	}

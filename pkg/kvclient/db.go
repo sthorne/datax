@@ -908,7 +908,7 @@ func (db *DB) sendExport(ctx context.Context, header kvpb.BatchHeader, req *kvpb
 		if desc.EndKey.Less(end) {
 			end = desc.EndKey
 		}
-		sub := &kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, StartTS: req.StartTS, MaxRecords: remaining}
+		sub := &kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: cur, EndKey: end}, StartTS: req.StartTS, MaxRecords: remaining, AllRevisions: req.AllRevisions}
 		br, regroup, kerr := db.sendPartial(ctx, &header, []kvpb.RequestUnion{{Export: sub}}, desc)
 		if regroup {
 			if regroups++; regroups > maxRoutingRetries {
@@ -1362,6 +1362,35 @@ func (db *DB) PushAndResolveIntents(ctx context.Context, intents []storage.Inten
 func (db *DB) ExportSpan(ctx context.Context, start, end keys.Key, startTS, ts hlc.Timestamp, max int64) (*kvpb.ExportResponse, error) {
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: ts}}
 	ba.Add(&kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, StartTS: startTS, MaxRecords: max})
+	br, kerr := db.Send(ctx, ba)
+	if kerr != nil {
+		return nil, kerr
+	}
+	return br.Responses[0].Export, nil
+}
+
+// RevisionExportsOK reports whether exports of every revision may be sent
+// (cluster version v21): an older replica ignores the flag and answers
+// with the newest versions only, which a backup would then record as the
+// whole history.
+func (db *DB) RevisionExportsOK() bool {
+	return db.ClusterVersion() >= version.V21
+}
+
+// ExportSpanRevisions is ExportSpan keeping the history: every version of
+// every key in (startTS, ts], newest first within a key, each with its
+// timestamp. startTS must be set — the history below it is not asked for
+// — and a range whose GC threshold has passed it refuses, since versions
+// in the window may already be gone.
+func (db *DB) ExportSpanRevisions(ctx context.Context, start, end keys.Key, startTS, ts hlc.Timestamp, max int64) (*kvpb.ExportResponse, error) {
+	if !db.RevisionExportsOK() {
+		return nil, fmt.Errorf("exports with revision history need cluster version %s (finalize the upgrade first)", version.V21)
+	}
+	if startTS.IsEmpty() {
+		return nil, fmt.Errorf("an export with revision history needs a start timestamp")
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: ts}}
+	ba.Add(&kvpb.ExportRequest{RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end}, StartTS: startTS, MaxRecords: max, AllRevisions: true})
 	br, kerr := db.Send(ctx, ba)
 	if kerr != nil {
 		return nil, kerr

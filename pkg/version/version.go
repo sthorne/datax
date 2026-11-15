@@ -219,6 +219,18 @@ const (
 	// maintain and read the index as an ordinary one over a column type
 	// it cannot key. CREATE INDEX ... USING GIN is therefore refused
 	// until finalize (rule 4).
+	//
+	// V21 also introduces two things backups and restores rely on (issues
+	// #301, #302). Exports of every revision
+	// (kvpb.ExportRequest.AllRevisions): a v20 replica does not read the
+	// flag and answers with the newest version of each key, which a
+	// backup would then record as the whole history of its window, so a
+	// backup with revision history is refused until finalize. And the
+	// progress record of a table restore (keys.RestoreProgressKey), which
+	// every node's janitor reads to reclaim the rows of a restore whose
+	// node died: a v20 node knows nothing of the record and would leave
+	// them, so restoring a table into a running cluster is refused until
+	// finalize too (rule 4).
 	V21 Version = 21
 
 	// Current is the newest cluster version this binary can run.

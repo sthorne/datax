@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -144,5 +146,91 @@ func TestBackupKeyFlags(t *testing.T) {
 	res := backupTestSQL(t, dst, `SELECT v FROM cli_orders ORDER BY id`)
 	if len(res.Rows) != 2 || res.Rows[0][0].S != "first-capybara" || res.Rows[1][0].S != "second-capybara" {
 		t.Fatalf("restored rows: %+v", res.Rows)
+	}
+}
+
+// TestRestoreSelectionFlags (issues #301, #302): `datax backup
+// --revision-history` and `datax restore --table / --into / --as-of`
+// end to end against a running node — a table brought back beside the
+// live one as it stood before a bad UPDATE — and the refusals the flags
+// produce on their own.
+func TestRestoreSelectionFlags(t *testing.T) {
+	n := startBackupTestNode(t)
+	backupTestSQL(t, n, `CREATE TABLE cli_prices (id INT8 PRIMARY KEY, cents INT8)`)
+	backupTestSQL(t, n, `INSERT INTO cli_prices VALUES (1, 100), (2, 250)`)
+	work := t.TempDir()
+	full, inc := filepath.Join(work, "full"), filepath.Join(work, "inc")
+	args := func(a ...string) []string { return append([]string{"--addr", n.Addr()}, a...) }
+
+	if err := runBackupCmd(args("--dest", full, "--revision-history")); err == nil || !strings.Contains(err.Error(), "a full backup has no base") {
+		t.Fatalf("a full backup with --revision-history: %v", err)
+	}
+	if _, err := os.Stat(full); err == nil {
+		t.Fatal("a refused backup command reached the node")
+	}
+	if err := runBackupCmd(args("--dest", full)); err != nil {
+		t.Fatal(err)
+	}
+	backupTestSQL(t, n, `UPDATE cli_prices SET cents = 300 WHERE id = 2`)
+	time.Sleep(2 * time.Millisecond)
+	before := strconv.FormatInt(n.Clock().Now().WallTime, 10)
+	time.Sleep(2 * time.Millisecond)
+	backupTestSQL(t, n, `UPDATE cli_prices SET cents = 0`) // the bad UPDATE
+	if err := runBackupCmd(args("--dest", inc, "--base", full, "--revision-history")); err != nil {
+		t.Fatalf("incremental with revision history: %v", err)
+	}
+
+	rargs := func(a ...string) []string { return args(append([]string{"--src", full + "," + inc}, a...)...) }
+	for _, c := range []struct {
+		what string
+		args []string
+		want string
+	}{
+		{"--table and --database", rargs("--table", "cli_prices", "--database", "datax"), "two restores"},
+		{"--into without a table", rargs("--into", "x"), "belong to a restore of tables"},
+		{"--drop-foreign-keys without a table", rargs("--drop-foreign-keys"), "belong to a restore of tables"},
+		{"two names for one table", rargs("--table", "cli_prices", "--into", "a,b"), "names 2 tables for the 1 in --table"},
+		{"a time that is not one", rargs("--table", "cli_prices", "--into", "x", "--as-of", "last tuesday"), "cannot interpret"},
+		{"a time before the chain", rargs("--table", "cli_prices", "--into", "x", "--as-of", "1000"), "is earlier than the full backup"},
+		{"a table the backup lacks", rargs("--table", "nope"), "the backup has no table datax.nope"},
+		{"the live table's own name", rargs("--table", "cli_prices"), "already exists"},
+		{"everything, into a cluster in use", rargs("--as-of", before), "restore requires an empty cluster"},
+	} {
+		if err := runRestoreCmd(c.args); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("restore with %s: %v", c.what, err)
+		}
+	}
+	if err := runRestoreCmd(rargs("--table", "cli_prices", "--into", "cli_prices_before", "--as-of", before)); err != nil {
+		t.Fatalf("table restore to a moment: %v", err)
+	}
+	res := backupTestSQL(t, n, `SELECT cents FROM cli_prices_before ORDER BY id`)
+	if len(res.Rows) != 2 || res.Rows[0][0].I != 100 || res.Rows[1][0].I != 300 {
+		t.Fatalf("the table before the bad UPDATE: %+v", res.Rows)
+	}
+	// Copying the rows back is SQL.
+	backupTestSQL(t, n, `BEGIN; DELETE FROM cli_prices WHERE id IN (SELECT id FROM cli_prices_before); INSERT INTO cli_prices SELECT * FROM cli_prices_before; COMMIT`)
+	res = backupTestSQL(t, n, `SELECT cents FROM cli_prices ORDER BY id`)
+	if len(res.Rows) != 2 || res.Rows[0][0].I != 100 || res.Rows[1][0].I != 300 {
+		t.Fatalf("the live table after copying back: %+v", res.Rows)
+	}
+
+	// What the flags send: a request under an op name of its own exactly
+	// when a node from before them would do something else with it.
+	for _, c := range []struct {
+		asOf, tables, database, into string
+		wantOp                       string
+	}{
+		{"", "", "", "", "restore"},
+		{"12", "", "", "", "restore-select"},
+		{"", "a,b", "", "", "restore-select"},
+		{"", "", "d", "e", "restore-select"},
+	} {
+		req := cluster.AdminRequest{Op: "restore"}
+		if err := restoreSelection(&req, c.asOf, c.tables, c.database, c.into, false); err != nil || req.Op != c.wantOp {
+			t.Fatalf("%+v: op %q, err %v", c, req.Op, err)
+		}
+		if c.database != "" && (req.Database != "d" || req.IntoDatabase != "e" || len(req.Into) != 0) {
+			t.Fatalf("database restore request: %+v", req)
+		}
 	}
 }

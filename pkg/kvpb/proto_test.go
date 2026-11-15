@@ -79,6 +79,8 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	ba.Add(&PushTxnRequest{RequestHeader: h("q"), PusherTxn: testTxn(), PusheeTxn: testTxn().TxnMeta, PushAbort: true, Now: mkts(61)})
 	ba.Add(&ResolveIntentRequest{RequestHeader: h("r"), TxnID: uuid.New(), Status: enginepb.COMMITTED, CommitTS: mkts(62)})
 	ba.Add(&RefreshRequest{RequestHeader: hr("c", "d"), FromTS: mkts(40)})
+	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5})
+	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5, AllRevisions: true})
 	ba.Add(&GCRequest{RequestHeader: hr("a", "z"), Threshold: mkts(10),
 		Versions:      []GCVersion{{Key: keys.Key("k"), TS: mkts(5), Bytes: 33}},
 		TxnRecordKeys: []keys.Key{keys.Key("t")}})
@@ -123,6 +125,8 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{PushTxn: &PushTxnResponse{Status: enginepb.COMMITTED, CommitTS: mkts(72)}},
 		{ResolveIntent: &ResolveIntentResponse{}},
 		{Refresh: &RefreshResponse{}},
+		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v")}, {Key: keys.Key("d"), Deleted: true}}, Resume: keys.Key("r")}},
+		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v"), Timestamp: mkts(33)}, {Key: keys.Key("k"), Deleted: true, Timestamp: mkts(31)}}}},
 		{GC: &GCResponse{}},
 		{TruncateLog: &TruncateLogResponse{}},
 		{AdminSplit: &AdminSplitResponse{Left: testDesc(), Right: testDesc()}},

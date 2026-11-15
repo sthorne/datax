@@ -164,6 +164,22 @@ func (n *Node) serveAdmin(ctx context.Context, req cluster.AdminRequest) cluster
 	if req.Version != 0 {
 		kv = append(kv, "version", int64(req.Version))
 	}
+	// What a restore was asked to bring back, and to when.
+	if req.AsOf != "" {
+		kv = append(kv, "as_of", req.AsOf)
+	}
+	if len(req.Tables) != 0 {
+		kv = append(kv, "tables", strings.Join(req.Tables, ","))
+	}
+	if len(req.Into) != 0 {
+		kv = append(kv, "into", strings.Join(req.Into, ","))
+	}
+	if req.Database != "" {
+		kv = append(kv, "database", req.Database, "into_database", req.IntoDatabase)
+	}
+	if req.DropForeignKeys {
+		kv = append(kv, "drop_foreign_keys", true)
+	}
 	// That a backup key came with the request is worth a record; the key
 	// is not, and no field of it is listed here.
 	if requestCarriesBackupKey(req) {
@@ -269,6 +285,57 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 			Dest: req.Path, BasePath: req.BasePath, Key: req.BackupKey, BaseKey: req.BaseBackupKey,
 			AllowPlaintext: req.AllowPlaintext, IncludeMetrics: req.IncludeMetrics,
 		})
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
+	case "backup-history":
+		// "backup" with revision history: an op of its own, so a node
+		// from before it refuses rather than write a plain incremental.
+		if req.Path == "" {
+			return cluster.AdminResponse{Error: "backup requires a destination path"}
+		}
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		sum, err := n.RunBackupWith(ctx, BackupOptions{
+			Dest: req.Path, BasePath: req.BasePath, Key: req.BackupKey, BaseKey: req.BaseBackupKey,
+			AllowPlaintext: req.AllowPlaintext, IncludeMetrics: req.IncludeMetrics, RevisionHistory: true,
+		})
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Backup: sum}
+
+	case "restore-select":
+		// "restore" of chosen tables, or to a chosen moment; an op of its
+		// own for the same reason.
+		if err := n.backupKeyAccepted(ctx, req); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		opts := RestoreOptions{
+			Srcs: req.Paths, Keys: req.BackupKeys, Database: req.Database, IntoDatabase: req.IntoDatabase,
+			DropForeignKeys: req.DropForeignKeys,
+		}
+		if req.AsOf != "" {
+			ts, err := ParseBackupTS(req.AsOf)
+			if err != nil {
+				return cluster.AdminResponse{Error: "--as-of: " + err.Error()}
+			}
+			opts.AsOf = ts
+		}
+		if len(req.Into) != 0 && len(req.Into) != len(req.Tables) {
+			return cluster.AdminResponse{Error: "restore: one --into per --table, in the same order"}
+		}
+		for i, name := range req.Tables {
+			rt := RestoreTable{Name: name}
+			if len(req.Into) != 0 {
+				rt.Into = req.Into[i]
+			}
+			opts.Tables = append(opts.Tables, rt)
+		}
+		sum, err := n.RunRestoreOpts(ctx, opts)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

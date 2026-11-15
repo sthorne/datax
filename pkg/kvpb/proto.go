@@ -256,7 +256,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *ScanRequest:
 		out.Value = &rpcpb.RequestUnion_Scan{Scan: &rpcpb.ScanRequest{Header: reqHeaderToProto(r.RequestHeader), MaxRows: r.MaxRows, ForUpdate: r.ForUpdate, Reverse: r.Reverse, SkipLocked: r.SkipLocked}}
 	case *ExportRequest:
-		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords}}
+		out.Value = &rpcpb.RequestUnion_Export{Export: &rpcpb.ExportRequest{Header: reqHeaderToProto(r.RequestHeader), StartTs: tsToProto(r.StartTS), MaxRecords: r.MaxRecords, AllRevisions: r.AllRevisions}}
 	case *EndTxnRequest:
 		pb := &rpcpb.EndTxnRequest{Header: reqHeaderToProto(r.RequestHeader), Commit: r.Commit, All: r.All}
 		for _, k := range r.IntentKeys {
@@ -367,7 +367,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Scan:
 		u.Scan = &ScanRequest{RequestHeader: reqHeaderFromProto(v.Scan.Header), MaxRows: v.Scan.MaxRows, ForUpdate: v.Scan.ForUpdate, Reverse: v.Scan.Reverse, SkipLocked: v.Scan.SkipLocked}
 	case *rpcpb.RequestUnion_Export:
-		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords}
+		u.Export = &ExportRequest{RequestHeader: reqHeaderFromProto(v.Export.Header), StartTS: tsFromProto(v.Export.StartTs), MaxRecords: v.Export.MaxRecords, AllRevisions: v.Export.AllRevisions}
 	case *rpcpb.RequestUnion_EndTxn:
 		r := &EndTxnRequest{RequestHeader: reqHeaderFromProto(v.EndTxn.Header), Commit: v.EndTxn.Commit, All: v.EndTxn.All}
 		for _, k := range v.EndTxn.IntentKeys {
@@ -571,7 +571,7 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 	case u.Export != nil:
 		pb := &rpcpb.ExportResponse{Resume: u.Export.Resume}
 		for _, rec := range u.Export.Records {
-			pb.Records = append(pb.Records, &rpcpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+			pb.Records = append(pb.Records, &rpcpb.ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted, Ts: tsToProto(rec.Timestamp)})
 		}
 		out.Value = &rpcpb.ResponseUnion_Export{Export: pb}
 	case u.EndTxn != nil:
@@ -661,7 +661,7 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 	case *rpcpb.ResponseUnion_Export:
 		r := &ExportResponse{Resume: v.Export.Resume}
 		for _, rec := range v.Export.Records {
-			r.Records = append(r.Records, ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted})
+			r.Records = append(r.Records, ExportRecord{Key: rec.Key, Value: rec.Value, Deleted: rec.Deleted, Timestamp: tsFromProto(rec.Ts)})
 		}
 		u.Export = r
 	case *rpcpb.ResponseUnion_EndTxn:

@@ -101,7 +101,9 @@ works out of the box — `psql`, [pgx](https://github.com/jackc/pgx), or
   load — plus dead-node repair, load rebalancing (count, bytes, and lease
   shedding), decommission, a paced replica consistency sweep, consistent
   cluster backup/restore (full + incremental, optionally sealed under a
-  backup key, `datax backup` / `datax restore`), rolling upgrades with an explicit finalize
+  backup key, optionally keeping revision history for point-in-time
+  restore; restore of everything into an empty cluster or of chosen
+  tables into a running one, `datax backup` / `datax restore`), rolling upgrades with an explicit finalize
   (`datax debug upgrade`), the `datax debug` toolbox (split, merge,
   transfer-lease, rebalance, status, metadata, unsafe-recover,
   rotate-enc-key, reencrypt), `datax bench`, and a built-in
@@ -262,7 +264,7 @@ These are the boundaries, chosen deliberately rather than left unfinished:
 | Wire | `COPY TO` and COPY options beyond `FORMAT`; cursor-style streaming of results that sort, aggregate or join (scan-shaped `SELECT`s stream; the rest materializes under `statement_memory_limit`) |
 | Ops | audit records signed or shipped off the cluster by the cluster itself (they are in the node's log and in the hash-chained `datax_audit` table; exporting the chain heads is the operator's job); password auth on the RPC port (admin RPCs authenticate by client certificate only) |
 | Upgrades | skipping versions (adjacent-version rolls only); auto-finalize (the version bump is a deliberate `datax debug upgrade` — before it, binaries roll back freely; after it, never) |
-| Backup | backup keys held by a KMS or an `--enc-root` root (a sealed backup, `--backup-key`, takes a key file); hiding a sealed backup's table count, table ids and file sizes; restore into a non-empty cluster or of a single table; point-in-time restore between chain elements (a chain restores to its last backup's timestamp) |
+| Backup | backup keys held by a KMS or an `--enc-root` root (a sealed backup, `--backup-key`, takes a key file); hiding a sealed backup's table count, table ids and file sizes; replacing a live table in one step (a table restore, `datax restore --table`, lands beside it under a new name) and resuming an interrupted table restore (it is cleaned up and run again); table restore of views, of enum columns into another database, and of tables caught mid-schema-change; point-in-time restore inside an interval backed up without `--revision-history`, or across a schema change in the interval (table definitions, roles and sequences are kept as of each backup's end, not versioned); holding garbage collection back for a backup chain (an incremental older than the GC TTL is refused) |
 | Encryption | a KMS or HSM spoken to directly (an `exec` root reaches one through its command line; keys live in process memory); the node never rewrites the operator's key file — stage a new key with `--enc-key old.key,new.key` before rotating online; a stale sstable spanning a single user key waits for natural compaction churn |
 | Storage | debt-gate thresholds are first-cut constants (per-cause counters tell the compaction-debt gate and follower-health shedding apart; tune with production data) |
 | Time series | row-level retention on mixed ranges skips tables with secondary indexes (their entries carry no timestamp); expiry timing is best-effort (one housekeeping tick + the ~30s descriptor cache) |

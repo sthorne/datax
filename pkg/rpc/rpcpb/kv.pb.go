@@ -1410,6 +1410,7 @@ type ExportRequest struct {
 	Header        *RequestHeader         `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
 	StartTs       *Hlc                   `protobuf:"bytes,2,opt,name=start_ts,json=startTs,proto3" json:"start_ts,omitempty"` // export keys changed in (start_ts, batch timestamp]
 	MaxRecords    int64                  `protobuf:"varint,3,opt,name=max_records,json=maxRecords,proto3" json:"max_records,omitempty"`
+	AllRevisions  bool                   `protobuf:"varint,4,opt,name=all_revisions,json=allRevisions,proto3" json:"all_revisions,omitempty"` // every version in the window, not the newest (v21)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1465,11 +1466,19 @@ func (x *ExportRequest) GetMaxRecords() int64 {
 	return 0
 }
 
+func (x *ExportRequest) GetAllRevisions() bool {
+	if x != nil {
+		return x.AllRevisions
+	}
+	return false
+}
+
 type ExportRecord struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
 	Deleted       bool                   `protobuf:"varint,3,opt,name=deleted,proto3" json:"deleted,omitempty"` // tombstone: the key was deleted in the window
+	Ts            *Hlc                   `protobuf:"bytes,4,opt,name=ts,proto3" json:"ts,omitempty"`            // the version's timestamp; all_revisions exports only
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1523,6 +1532,13 @@ func (x *ExportRecord) GetDeleted() bool {
 		return x.Deleted
 	}
 	return false
+}
+
+func (x *ExportRecord) GetTs() *Hlc {
+	if x != nil {
+		return x.Ts
+	}
+	return nil
 }
 
 type ExportResponse struct {
@@ -5588,16 +5604,18 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\bsequence\x18\x03 \x01(\x05R\bsequence\"i\n" +
 	"\x0eRefreshRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12&\n" +
-	"\afrom_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\x06fromTs\"\x8b\x01\n" +
+	"\afrom_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\x06fromTs\"\xb0\x01\n" +
 	"\rExportRequest\x12/\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.datax.v1.RequestHeaderR\x06header\x12(\n" +
 	"\bstart_ts\x18\x02 \x01(\v2\r.datax.v1.HlcR\astartTs\x12\x1f\n" +
 	"\vmax_records\x18\x03 \x01(\x03R\n" +
-	"maxRecords\"P\n" +
+	"maxRecords\x12#\n" +
+	"\rall_revisions\x18\x04 \x01(\bR\fallRevisions\"o\n" +
 	"\fExportRecord\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x18\n" +
-	"\adeleted\x18\x03 \x01(\bR\adeleted\"Z\n" +
+	"\adeleted\x18\x03 \x01(\bR\adeleted\x12\x1d\n" +
+	"\x02ts\x18\x04 \x01(\v2\r.datax.v1.HlcR\x02ts\"Z\n" +
 	"\x0eExportResponse\x120\n" +
 	"\arecords\x18\x01 \x03(\v2\x16.datax.v1.ExportRecordR\arecords\x12\x16\n" +
 	"\x06resume\x18\x02 \x01(\fR\x06resume\"[\n" +
@@ -5981,126 +5999,127 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	82,  // 26: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
 	8,   // 27: datax.v1.ExportRequest.header:type_name -> datax.v1.RequestHeader
 	82,  // 28: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
-	21,  // 29: datax.v1.ExportResponse.records:type_name -> datax.v1.ExportRecord
-	82,  // 30: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
-	8,   // 31: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 32: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
-	23,  // 33: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
-	8,   // 34: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 35: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 36: datax.v1.AdminUnsplitRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 37: datax.v1.AdminChangeReplicasRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 38: datax.v1.AdminTransferLeaseRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 39: datax.v1.AdminMergeRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 40: datax.v1.SubsumeRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 41: datax.v1.UnfreezeRequest.header:type_name -> datax.v1.RequestHeader
-	8,   // 42: datax.v1.UpdateMetaRequest.header:type_name -> datax.v1.RequestHeader
-	9,   // 43: datax.v1.RequestUnion.get:type_name -> datax.v1.GetRequest
-	10,  // 44: datax.v1.RequestUnion.put:type_name -> datax.v1.PutRequest
-	11,  // 45: datax.v1.RequestUnion.delete:type_name -> datax.v1.DeleteRequest
-	12,  // 46: datax.v1.RequestUnion.increment:type_name -> datax.v1.IncrementRequest
-	13,  // 47: datax.v1.RequestUnion.scan:type_name -> datax.v1.ScanRequest
-	14,  // 48: datax.v1.RequestUnion.end_txn:type_name -> datax.v1.EndTxnRequest
-	15,  // 49: datax.v1.RequestUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnRequest
-	16,  // 50: datax.v1.RequestUnion.push_txn:type_name -> datax.v1.PushTxnRequest
-	17,  // 51: datax.v1.RequestUnion.resolve_intent:type_name -> datax.v1.ResolveIntentRequest
-	19,  // 52: datax.v1.RequestUnion.refresh:type_name -> datax.v1.RefreshRequest
-	18,  // 53: datax.v1.RequestUnion.rollback_intent:type_name -> datax.v1.RollbackIntentRequest
-	45,  // 54: datax.v1.RequestUnion.recover_txn:type_name -> datax.v1.RecoverTxnRequest
-	24,  // 55: datax.v1.RequestUnion.gc:type_name -> datax.v1.GcRequest
-	25,  // 56: datax.v1.RequestUnion.truncate_log:type_name -> datax.v1.TruncateLogRequest
-	26,  // 57: datax.v1.RequestUnion.admin_split:type_name -> datax.v1.AdminSplitRequest
-	28,  // 58: datax.v1.RequestUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasRequest
-	29,  // 59: datax.v1.RequestUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseRequest
-	30,  // 60: datax.v1.RequestUnion.admin_merge:type_name -> datax.v1.AdminMergeRequest
-	31,  // 61: datax.v1.RequestUnion.subsume:type_name -> datax.v1.SubsumeRequest
-	32,  // 62: datax.v1.RequestUnion.unfreeze:type_name -> datax.v1.UnfreezeRequest
-	20,  // 63: datax.v1.RequestUnion.export:type_name -> datax.v1.ExportRequest
-	33,  // 64: datax.v1.RequestUnion.update_meta:type_name -> datax.v1.UpdateMetaRequest
-	27,  // 65: datax.v1.RequestUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitRequest
-	82,  // 66: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
-	3,   // 67: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
-	35,  // 68: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
-	34,  // 69: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
-	7,   // 70: datax.v1.GetResponse.skipped:type_name -> datax.v1.Intent
-	6,   // 71: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
-	7,   // 72: datax.v1.ScanResponse.skipped:type_name -> datax.v1.Intent
-	82,  // 73: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
-	82,  // 74: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
-	8,   // 75: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
-	5,   // 76: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
-	5,   // 77: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
-	5,   // 78: datax.v1.AdminUnsplitResponse.desc:type_name -> datax.v1.RangeDescriptor
-	5,   // 79: datax.v1.AdminChangeReplicasResponse.desc:type_name -> datax.v1.RangeDescriptor
-	5,   // 80: datax.v1.AdminTransferLeaseResponse.desc:type_name -> datax.v1.RangeDescriptor
-	5,   // 81: datax.v1.AdminMergeResponse.desc:type_name -> datax.v1.RangeDescriptor
-	37,  // 82: datax.v1.ResponseUnion.get:type_name -> datax.v1.GetResponse
-	38,  // 83: datax.v1.ResponseUnion.put:type_name -> datax.v1.PutResponse
-	39,  // 84: datax.v1.ResponseUnion.delete:type_name -> datax.v1.DeleteResponse
-	40,  // 85: datax.v1.ResponseUnion.increment:type_name -> datax.v1.IncrementResponse
-	41,  // 86: datax.v1.ResponseUnion.scan:type_name -> datax.v1.ScanResponse
-	42,  // 87: datax.v1.ResponseUnion.end_txn:type_name -> datax.v1.EndTxnResponse
-	43,  // 88: datax.v1.ResponseUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnResponse
-	44,  // 89: datax.v1.ResponseUnion.push_txn:type_name -> datax.v1.PushTxnResponse
-	47,  // 90: datax.v1.ResponseUnion.resolve_intent:type_name -> datax.v1.ResolveIntentResponse
-	48,  // 91: datax.v1.ResponseUnion.refresh:type_name -> datax.v1.RefreshResponse
-	49,  // 92: datax.v1.ResponseUnion.rollback_intent:type_name -> datax.v1.RollbackIntentResponse
-	46,  // 93: datax.v1.ResponseUnion.recover_txn:type_name -> datax.v1.RecoverTxnResponse
-	50,  // 94: datax.v1.ResponseUnion.gc:type_name -> datax.v1.GcResponse
-	51,  // 95: datax.v1.ResponseUnion.truncate_log:type_name -> datax.v1.TruncateLogResponse
-	52,  // 96: datax.v1.ResponseUnion.admin_split:type_name -> datax.v1.AdminSplitResponse
-	54,  // 97: datax.v1.ResponseUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasResponse
-	55,  // 98: datax.v1.ResponseUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseResponse
-	56,  // 99: datax.v1.ResponseUnion.admin_merge:type_name -> datax.v1.AdminMergeResponse
-	57,  // 100: datax.v1.ResponseUnion.subsume:type_name -> datax.v1.SubsumeResponse
-	58,  // 101: datax.v1.ResponseUnion.unfreeze:type_name -> datax.v1.UnfreezeResponse
-	22,  // 102: datax.v1.ResponseUnion.export:type_name -> datax.v1.ExportResponse
-	59,  // 103: datax.v1.ResponseUnion.update_meta:type_name -> datax.v1.UpdateMetaResponse
-	53,  // 104: datax.v1.ResponseUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitResponse
-	3,   // 105: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
-	82,  // 106: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
-	60,  // 107: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
-	5,   // 108: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
-	7,   // 109: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
-	82,  // 110: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
-	82,  // 111: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
-	82,  // 112: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
-	82,  // 113: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
-	82,  // 114: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
-	62,  // 115: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
-	63,  // 116: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
-	64,  // 117: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
-	66,  // 118: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
-	67,  // 119: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
-	68,  // 120: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
-	69,  // 121: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
-	70,  // 122: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
-	71,  // 123: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
-	72,  // 124: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
-	73,  // 125: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
-	65,  // 126: datax.v1.Error.descriptor_changed:type_name -> datax.v1.DescriptorChangedError
-	61,  // 127: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
-	74,  // 128: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
-	36,  // 129: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
-	80,  // 130: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
-	81,  // 131: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
-	82,  // 132: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
-	78,  // 133: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
-	79,  // 134: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
-	77,  // 135: datax.v1.RaftCommand.descriptor_update:type_name -> datax.v1.DescriptorUpdateTrigger
-	5,   // 136: datax.v1.DescriptorUpdateTrigger.desc:type_name -> datax.v1.RangeDescriptor
-	5,   // 137: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
-	5,   // 138: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
-	82,  // 139: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
-	5,   // 140: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
-	5,   // 141: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
-	5,   // 142: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
-	82,  // 143: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
-	144, // [144:144] is the sub-list for method output_type
-	144, // [144:144] is the sub-list for method input_type
-	144, // [144:144] is the sub-list for extension type_name
-	144, // [144:144] is the sub-list for extension extendee
-	0,   // [0:144] is the sub-list for field type_name
+	82,  // 29: datax.v1.ExportRecord.ts:type_name -> datax.v1.Hlc
+	21,  // 30: datax.v1.ExportResponse.records:type_name -> datax.v1.ExportRecord
+	82,  // 31: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
+	8,   // 32: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
+	82,  // 33: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
+	23,  // 34: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
+	8,   // 35: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 36: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 37: datax.v1.AdminUnsplitRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 38: datax.v1.AdminChangeReplicasRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 39: datax.v1.AdminTransferLeaseRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 40: datax.v1.AdminMergeRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 41: datax.v1.SubsumeRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 42: datax.v1.UnfreezeRequest.header:type_name -> datax.v1.RequestHeader
+	8,   // 43: datax.v1.UpdateMetaRequest.header:type_name -> datax.v1.RequestHeader
+	9,   // 44: datax.v1.RequestUnion.get:type_name -> datax.v1.GetRequest
+	10,  // 45: datax.v1.RequestUnion.put:type_name -> datax.v1.PutRequest
+	11,  // 46: datax.v1.RequestUnion.delete:type_name -> datax.v1.DeleteRequest
+	12,  // 47: datax.v1.RequestUnion.increment:type_name -> datax.v1.IncrementRequest
+	13,  // 48: datax.v1.RequestUnion.scan:type_name -> datax.v1.ScanRequest
+	14,  // 49: datax.v1.RequestUnion.end_txn:type_name -> datax.v1.EndTxnRequest
+	15,  // 50: datax.v1.RequestUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnRequest
+	16,  // 51: datax.v1.RequestUnion.push_txn:type_name -> datax.v1.PushTxnRequest
+	17,  // 52: datax.v1.RequestUnion.resolve_intent:type_name -> datax.v1.ResolveIntentRequest
+	19,  // 53: datax.v1.RequestUnion.refresh:type_name -> datax.v1.RefreshRequest
+	18,  // 54: datax.v1.RequestUnion.rollback_intent:type_name -> datax.v1.RollbackIntentRequest
+	45,  // 55: datax.v1.RequestUnion.recover_txn:type_name -> datax.v1.RecoverTxnRequest
+	24,  // 56: datax.v1.RequestUnion.gc:type_name -> datax.v1.GcRequest
+	25,  // 57: datax.v1.RequestUnion.truncate_log:type_name -> datax.v1.TruncateLogRequest
+	26,  // 58: datax.v1.RequestUnion.admin_split:type_name -> datax.v1.AdminSplitRequest
+	28,  // 59: datax.v1.RequestUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasRequest
+	29,  // 60: datax.v1.RequestUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseRequest
+	30,  // 61: datax.v1.RequestUnion.admin_merge:type_name -> datax.v1.AdminMergeRequest
+	31,  // 62: datax.v1.RequestUnion.subsume:type_name -> datax.v1.SubsumeRequest
+	32,  // 63: datax.v1.RequestUnion.unfreeze:type_name -> datax.v1.UnfreezeRequest
+	20,  // 64: datax.v1.RequestUnion.export:type_name -> datax.v1.ExportRequest
+	33,  // 65: datax.v1.RequestUnion.update_meta:type_name -> datax.v1.UpdateMetaRequest
+	27,  // 66: datax.v1.RequestUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitRequest
+	82,  // 67: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
+	3,   // 68: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
+	35,  // 69: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
+	34,  // 70: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
+	7,   // 71: datax.v1.GetResponse.skipped:type_name -> datax.v1.Intent
+	6,   // 72: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
+	7,   // 73: datax.v1.ScanResponse.skipped:type_name -> datax.v1.Intent
+	82,  // 74: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
+	82,  // 75: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
+	8,   // 76: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
+	5,   // 77: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
+	5,   // 78: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
+	5,   // 79: datax.v1.AdminUnsplitResponse.desc:type_name -> datax.v1.RangeDescriptor
+	5,   // 80: datax.v1.AdminChangeReplicasResponse.desc:type_name -> datax.v1.RangeDescriptor
+	5,   // 81: datax.v1.AdminTransferLeaseResponse.desc:type_name -> datax.v1.RangeDescriptor
+	5,   // 82: datax.v1.AdminMergeResponse.desc:type_name -> datax.v1.RangeDescriptor
+	37,  // 83: datax.v1.ResponseUnion.get:type_name -> datax.v1.GetResponse
+	38,  // 84: datax.v1.ResponseUnion.put:type_name -> datax.v1.PutResponse
+	39,  // 85: datax.v1.ResponseUnion.delete:type_name -> datax.v1.DeleteResponse
+	40,  // 86: datax.v1.ResponseUnion.increment:type_name -> datax.v1.IncrementResponse
+	41,  // 87: datax.v1.ResponseUnion.scan:type_name -> datax.v1.ScanResponse
+	42,  // 88: datax.v1.ResponseUnion.end_txn:type_name -> datax.v1.EndTxnResponse
+	43,  // 89: datax.v1.ResponseUnion.heartbeat_txn:type_name -> datax.v1.HeartbeatTxnResponse
+	44,  // 90: datax.v1.ResponseUnion.push_txn:type_name -> datax.v1.PushTxnResponse
+	47,  // 91: datax.v1.ResponseUnion.resolve_intent:type_name -> datax.v1.ResolveIntentResponse
+	48,  // 92: datax.v1.ResponseUnion.refresh:type_name -> datax.v1.RefreshResponse
+	49,  // 93: datax.v1.ResponseUnion.rollback_intent:type_name -> datax.v1.RollbackIntentResponse
+	46,  // 94: datax.v1.ResponseUnion.recover_txn:type_name -> datax.v1.RecoverTxnResponse
+	50,  // 95: datax.v1.ResponseUnion.gc:type_name -> datax.v1.GcResponse
+	51,  // 96: datax.v1.ResponseUnion.truncate_log:type_name -> datax.v1.TruncateLogResponse
+	52,  // 97: datax.v1.ResponseUnion.admin_split:type_name -> datax.v1.AdminSplitResponse
+	54,  // 98: datax.v1.ResponseUnion.admin_change_replicas:type_name -> datax.v1.AdminChangeReplicasResponse
+	55,  // 99: datax.v1.ResponseUnion.admin_transfer_lease:type_name -> datax.v1.AdminTransferLeaseResponse
+	56,  // 100: datax.v1.ResponseUnion.admin_merge:type_name -> datax.v1.AdminMergeResponse
+	57,  // 101: datax.v1.ResponseUnion.subsume:type_name -> datax.v1.SubsumeResponse
+	58,  // 102: datax.v1.ResponseUnion.unfreeze:type_name -> datax.v1.UnfreezeResponse
+	22,  // 103: datax.v1.ResponseUnion.export:type_name -> datax.v1.ExportResponse
+	59,  // 104: datax.v1.ResponseUnion.update_meta:type_name -> datax.v1.UpdateMetaResponse
+	53,  // 105: datax.v1.ResponseUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitResponse
+	3,   // 106: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
+	82,  // 107: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
+	60,  // 108: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
+	5,   // 109: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
+	7,   // 110: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
+	82,  // 111: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
+	82,  // 112: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
+	82,  // 113: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
+	82,  // 114: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
+	82,  // 115: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
+	62,  // 116: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
+	63,  // 117: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
+	64,  // 118: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
+	66,  // 119: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
+	67,  // 120: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
+	68,  // 121: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
+	69,  // 122: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
+	70,  // 123: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
+	71,  // 124: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
+	72,  // 125: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
+	73,  // 126: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
+	65,  // 127: datax.v1.Error.descriptor_changed:type_name -> datax.v1.DescriptorChangedError
+	61,  // 128: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
+	74,  // 129: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
+	36,  // 130: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
+	80,  // 131: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
+	81,  // 132: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
+	82,  // 133: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
+	78,  // 134: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
+	79,  // 135: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
+	77,  // 136: datax.v1.RaftCommand.descriptor_update:type_name -> datax.v1.DescriptorUpdateTrigger
+	5,   // 137: datax.v1.DescriptorUpdateTrigger.desc:type_name -> datax.v1.RangeDescriptor
+	5,   // 138: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
+	5,   // 139: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
+	82,  // 140: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
+	5,   // 141: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
+	5,   // 142: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
+	5,   // 143: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
+	82,  // 144: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
+	145, // [145:145] is the sub-list for method output_type
+	145, // [145:145] is the sub-list for method input_type
+	145, // [145:145] is the sub-list for extension type_name
+	145, // [145:145] is the sub-list for extension extendee
+	0,   // [0:145] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_kv_proto_init() }

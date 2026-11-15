@@ -776,9 +776,14 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   them from; a manifest carrying any other key — the cluster's
   authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
-  included — and must chain within the MVCC GC window (25h by default): an
-  older base is refused with "incremental base too old". Take a fresh full
-  backup at least daily.
+  included — and must chain within the MVCC GC window (25h by default): a
+  base older than that is refused ("the base backup is older than the
+  garbage-collection window"), because changes since it have been
+  collected in part. Take a fresh full backup at least daily.
+- An incremental holds each changed key as it stood at the incremental's
+  own timestamp. Taken with `--revision-history` it holds every version
+  written since the base instead, and the chain restores to any moment
+  in between (see [Restoring to a point in time](#restoring-to-a-point-in-time)).
 - Without a key, backup files are written in plaintext. On an encrypted
   store the command refuses to do that silently: pass `--backup-key` to
   seal the backup (below), or `--allow-plaintext` to write an unsealed
@@ -852,6 +857,8 @@ datax restore --addr 10.0.1.1:26257 --src /backups/full,/backups/inc1 \
 - `--enc-root` roots (a KMS command, operator shares) do not hold backup
   keys yet: a backup key is always a key file.
 
+### Restoring everything
+
 `datax restore` applies a chain (full first, then incrementals in order)
 into an **empty** cluster — it refuses if any table exists:
 
@@ -868,6 +875,194 @@ compare them against the backup's to verify the restore byte-for-byte.
 
 MVCC history is not preserved (rows are rewritten at restore time), so
 `AS OF SYSTEM TIME` cannot see below the restore.
+
+### Restoring a table into a running cluster
+
+`--table` brings named tables back from a chain into a cluster that is
+serving traffic, beside what is there. Nothing else is touched: no other
+table, no user or role, no setting.
+
+```sh
+# one table, under a new name, to compare and copy rows from
+datax restore --addr 10.0.0.1:26257 --src /backups/full,/backups/inc1 \
+              --table shop.orders --into orders_restored
+
+# several at once (names pair up in order; an empty --into entry keeps the name)
+datax restore --addr 10.0.0.1:26257 --src /backups/full,/backups/inc1 \
+              --table shop.orders,shop.customers --into orders_r,customers_r
+
+# every table of a database, as a new database
+datax restore --addr 10.0.0.1:26257 --src /backups/full --database shop --into shop_restored
+```
+
+A table is named `db.table` (or `table`, in the default database
+`datax`). `--into` takes `table` to stay in the same database or
+`db.table` to land in another, which must exist. `--backup-key` works as
+for any restore. Needs cluster version v21.
+
+- **It never overwrites.** A name that exists is refused. To replace a
+  live table with its restored copy, restore under another name, check
+  it, then `DROP TABLE orders; ALTER TABLE orders_restored RENAME TO
+  orders`. There is no flag that does the swap for you. A database is
+  always restored as a new one: `--database shop` without `--into` is
+  for a database that is gone.
+- **A new table id.** The restored table takes a fresh id and its rows
+  are re-keyed to it; index ids are kept, so secondary indexes come
+  back as stored, with no backfill. The summary prints the new id, the
+  table it came from, and a checksum computed over the restored rows
+  *under the keys the backup knows them by* — the same checksum a full
+  backup of the source taken at that moment prints for the table.
+- **What comes with a table.** Its columns, indexes, constraints,
+  comment, timeseries options and retention; the sequences its `SERIAL`
+  and identity columns own, as new sequences named for the new table,
+  continuing from the backup's counter; its grants and owner, for the
+  roles this cluster has — grants to roles it lacks are left out and
+  listed in the summary, and a table whose owner is missing is owned by
+  `root`. Statistics are not in a backup; the table is sampled like any
+  new one.
+- **Foreign keys.** A foreign key to a table restored in the same run
+  follows it: restore `orders` and `customers` together and the copy of
+  `orders` references the copy of `customers`. A foreign key to a table
+  that is *not* being restored is **refused** — the restored rows would
+  be checked against a table that has moved on since the backup. Pass
+  `--drop-foreign-keys` to restore the table without those constraints
+  (the summary lists each one dropped). Tables that referenced the
+  original keep referencing the original.
+- **What is refused,** each with the reason: a view (restore its tables
+  and recreate it; a database restore skips views and prints their
+  definitions); a table with an enum column, unless it goes back into
+  the database that still has that same type with the same labels; a
+  table that was mid-re-shard, mid-`CREATE INDEX` or mid-`ALTER COLUMN
+  TYPE` when backed up; the cluster's own tables; and a table whose
+  descriptor carries a feature this version's table restore does not
+  know. For all of these, restore the whole backup into an empty
+  cluster and copy the rows from there.
+- **Checked before anything is written.** The chain, the names, the
+  foreign keys, and every data file the restore needs: each is read to
+  its end first — which authenticates a sealed file — and held to its
+  manifest's record count and checksum, to its table's key span, and to
+  key order. A refusal leaves nothing behind, not even a table id.
+- **Appears all at once, or not at all.** Rows are loaded under the new
+  id in ordinary transactions of 1024 writes — replicated, encrypted
+  and versioned like any write, and unreachable by any statement,
+  because no table has that id yet. They are then read back and their
+  checksum compared with the backup's. One transaction publishes
+  everything: descriptors, names, sequences, the database. Before it
+  commits the tables do not exist; after it they are complete.
+- **If it is interrupted.** A restore that fails removes what it loaded.
+  If the node running it dies, the rows stay invisible and a janitor
+  removes them: the node itself shortly after it restarts, or any other
+  node five minutes after the restore's last sign of life. Either way
+  the operations view shows a `restore-reclaim`. A restore is not
+  resumed: run it again.
+- **Cost.** The data files are read twice (checked, then loaded) and the
+  loaded rows once more. The load is ordinary write
+  traffic on new ranges and competes with other writes like any bulk
+  insert. Placement policy applies to the new table once it is
+  published; a database restore brings the database's policy with it.
+- A timeseries table with a retention keeps it: rows already past it
+  are restored and then expire as they would have.
+
+### Restoring to a point in time
+
+A chain restores to the end of any backup in it. Incrementals taken with
+`--revision-history` also keep every version written since their base,
+and `--as-of` then reaches any moment of that interval:
+
+```sh
+datax backup  --addr 10.0.0.1:26257 --dest /backups/sun-full
+datax backup  --addr 10.0.0.1:26257 --dest /backups/mon-06 --base /backups/sun-full --revision-history
+datax backup  --addr 10.0.0.1:26257 --dest /backups/mon-12 --base /backups/mon-06   --revision-history
+
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --as-of 2026-11-16T09:41:00Z --table shop.orders --into orders_0941
+```
+
+- `--as-of` takes an RFC 3339 time or Unix nanoseconds — the same
+  timestamp `AS OF SYSTEM TIME` takes, so a moment you checked with a
+  query is the moment you restore to. Backup and restore summaries
+  print their timestamps in the nanosecond form (`as of: ...`), with
+  `,<n>` appended in the rare case the clock's logical counter was not
+  zero; pass that back verbatim to restore to exactly a backup's end.
+- It works with `--table` / `--database` (into a running cluster) and
+  without (everything, into an empty one).
+- **The restored data is the committed data at that moment.** A
+  transaction's writes all carry its commit timestamp, so a restore
+  shows every transaction whole or not at all, across however many
+  ranges it wrote.
+- **What is refused,** with the times the chain does restore to: a
+  moment before the full backup, after the last backup, or inside an
+  interval whose incremental was taken without `--revision-history`.
+  `--revision-history` on a full backup is refused too: a full backup
+  is the floor of the window.
+- **History costs space in proportion to the write rate**: a history
+  incremental holds one record per version, where a plain one holds one
+  per changed key. The summary prints both (`records`, `versions`).
+- **History must still exist to be backed up.** Versions older than the
+  GC TTL (25h by default) are collected. An incremental whose base is
+  older than that is refused rather than written with a hole in it — so
+  take history incrementals more often than the GC TTL, and leave
+  margin: nothing holds collection back for a chain that falls behind.
+  If one is refused, the chain ends at its last backup and a new full
+  backup starts the next. Rows a timeseries table's retention has
+  expired are gone from history like any other collected version.
+- **The schema is not versioned.** A backup holds each table's
+  definition, and the cluster's roles and sequences, as of the backup's
+  end. A restore to a moment *inside* an interval therefore refuses a
+  table that was created or altered in that interval (grants and
+  comments do not count) — restore it to either end of the interval
+  instead — and a table dropped in the interval is restorable up to the
+  last backup that still has it. For a restore of everything, one such
+  table refuses the restore; use `--table` for the others. Roles,
+  grants and sequence counters come from the interval's end.
+- Needs cluster version v21 to take; a sealed chain restores to a moment
+  exactly like a plaintext one. A binary from before v21 refuses a
+  history backup ("not a datax backup") rather than misreading it.
+
+**Worked example: a dropped table.** `shop.orders` was dropped at about
+14:20; the last backup before that is `/backups/mon-12`.
+
+```sh
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --table shop.orders --drop-foreign-keys
+```
+
+The name is free, so the table comes back under it, as of 12:00, with
+its indexes, its `SERIAL` sequence and its grants. `--drop-foreign-keys`
+is there because `orders` referenced `customers`, which is live and is
+not being restored; put the constraint back once you have looked at the
+rows (`ALTER TABLE orders ADD CONSTRAINT ... FOREIGN KEY ...`). Rows
+written between 12:00 and the drop are in no backup: a table dropped
+inside an interval is restorable to the interval's start, not into it.
+
+**Worked example: a bad UPDATE.** At 09:42 an `UPDATE orders SET status =
+'cancelled'` ran without its `WHERE`. The 12:00 incremental was taken
+with history, so:
+
+```sh
+# 1. find the moment: the last time the data was right
+datax sql -e "SELECT count(*) FROM shop.orders AS OF SYSTEM TIME '2026-11-16T09:41:00Z' WHERE status = 'cancelled'"
+
+# 2. bring the table back as of then, beside the live one
+datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/backups/mon-12 \
+              --as-of 2026-11-16T09:41:00Z --table shop.orders --into orders_0941 --drop-foreign-keys
+```
+
+```sql
+-- 3. compare, then put back what the UPDATE destroyed
+SELECT count(*) FROM orders_0941 WHERE status <> 'cancelled';
+BEGIN;
+DELETE FROM orders WHERE id IN (SELECT id FROM orders_0941);
+INSERT INTO orders SELECT * FROM orders_0941;
+COMMIT;
+DROP TABLE orders_0941;
+```
+
+Orders created after 09:41 are not in `orders_0941` and are left as they
+are. While step 1 still works — the mistake is younger than the GC TTL —
+the cluster has the history itself and can be queried `AS OF SYSTEM
+TIME` directly; the backup is for when it no longer does, and for
+having the old rows as a table to join against.
 
 ## Stopping a node
 
@@ -944,6 +1139,9 @@ Rules of the road:
   writes them to `datax_audit` (see [Security → Audit
   table](security.md#audit-table)). Records from before finalize are not
   copied in.
+- **v21 also gates two backup features**: `datax backup --revision-history`
+  and `datax restore --table` / `--database` are refused until it is
+  finalized. Plain backups and restores work as before on either side.
 - **v20 makes manual splits sticky.** Until it is finalized `ALTER TABLE
   ... SPLIT AT` and `datax debug split` split as before and housekeeping
   may merge the ranges back; boundaries made before finalize are not
