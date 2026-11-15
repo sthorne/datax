@@ -172,6 +172,11 @@ type Session struct {
 	// setting a policy reads, and must bind afresh.
 	policyMemo     map[policyKey][]parser.Comparison
 	historicalMemo map[policyKey]historicalFilter
+	// historicalPrivs holds the statement's answers to "may the actor
+	// exercise this privilege on this table today", asked by an AS OF
+	// SYSTEM TIME read (historicalTablePrivAllowed); per statement, like
+	// historicalMemo.
+	historicalPrivs map[historicalPrivKey]bool
 	// database is the session's current database (the startup parameter,
 	// USE, or SET database); unqualified table names resolve in it.
 	database string
@@ -456,14 +461,24 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	if env.Types, err = catalog.ListTypes(ctx, txn, 0); err != nil {
 		return nil, err
 	}
-	set, err := s.roleSet(ctx, txn)
+	set, err := s.currentRoleSet(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
+	// A historical read lists the schema as of its timestamp but under
+	// today's roles (issue #312). What is today's — statistics, a
+	// sequence's counter — it shows to an admin only: deciding by the
+	// past's grants would undo a revoke, and today's grant on a table
+	// the timestamp's schema names is not worth a read per table.
+	historical := txn != nil && txn.Historical()
 	env.SequenceValue = func(sd *catalog.SequenceDescriptor) (int64, bool, error) {
 		// PostgreSQL's pg_sequences shows last_value only to a role that
 		// may read the sequence.
-		if ok, err := s.sequencePrivAllowed(ctx, txn, sd, "SELECT"); err != nil || !ok {
+		if historical {
+			if !set.IsAdmin() {
+				return 0, false, nil
+			}
+		} else if ok, err := s.sequencePrivAllowed(ctx, txn, sd, "SELECT"); err != nil || !ok {
 			return 0, false, err
 		}
 		return s.sequenceValue(ctx, sd)
@@ -514,7 +529,7 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		// the rows sees none, and neither does one its row-security
 		// policies confine. reltuples and n_live_tup read as "not
 		// analyzed" rather than as the size of data it cannot read.
-		if !catalog.CanSelectTable(set, d) || denied[d.DatabaseID] {
+		if !catalog.CanSelectTable(set, d) || denied[d.DatabaseID] || (historical && !set.IsAdmin()) {
 			continue
 		}
 		if confined, err := s.rowSecurityActive(ctx, txn, d); err != nil {
@@ -630,7 +645,7 @@ func (s *Session) Close(ctx context.Context) {
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	s.stmtNow = 0
 	s.memUsed = 0
-	s.policyMemo, s.historicalMemo = nil, nil
+	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
 	s.invalidateRoles()
 	var deadline time.Time
 	if d := s.vars.statementTimeout; d > 0 {

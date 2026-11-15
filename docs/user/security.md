@@ -151,6 +151,21 @@ Its grants and memberships go with it. Grants take effect cluster-wide
 by the time the statement returns; a membership change is seen by the
 next statement everywhere.
 
+**Historical reads answer to today's privileges.** A `SELECT ... AS OF
+SYSTEM TIME` reads the rows as they stood at the timestamp, but whether
+the role may read a table is decided by the table's grants and the
+role's memberships as they are now, as its row-security policies are: a
+`REVOKE` stops reads at every earlier timestamp too, and a grant made
+since opens them. The table is found as of the timestamp and checked by
+its identity, so one renamed since answers to its grants under the new
+name; one dropped since has no grants left, and only an admin may read
+what remains of it. Catalogs read as of a timestamp list that
+timestamp's schema under today's roles, and show statistics and sequence
+counters to admins only. Today's grants are read from the cluster, so a role other than
+`root` cannot run a bounded-staleness read on a node cut off from the
+rest: after five seconds it is refused (`42501`) rather than answered by
+the timestamp's grants.
+
 **The catalogs are every role's.** As in PostgreSQL, any role may read
 `pg_catalog` and `information_schema`, so `psql`'s `\d` and ORM
 introspection work for an ordinary role. What they list follows
@@ -306,7 +321,8 @@ It does not:
   schema briefly, so a table whose row security was just enabled may
   show a filtered role its range boundaries for that long.
 - **Policies are evaluated with today's definitions.** A historical
-  read does not bring back an older, laxer policy.
+  read does not bring back an older, laxer policy — nor older, laxer
+  privileges (see below).
 
 Policy changes and `BYPASSRLS` grants are audit-logged (`policy-ddl`,
 `role-ddl`) with their principal.

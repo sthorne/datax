@@ -1527,7 +1527,15 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   named in the refusal only to a role holding some privilege on it
   (`mayKnowTable`); `pg_constraint` lists every foreign key to every
   role, as PostgreSQL's does, so this keeps errors consistent rather
-  than secret.
+  than secret. An `AS OF SYSTEM TIME` read resolves its
+  descriptors and the role graph as of its timestamp; privileges are
+  decided as of now instead (`historicalTablePrivAllowed`, the
+  counterpart of `historicalRowFilter`): the table is read by ID in a
+  fresh transaction and checked with today's roles and schema `USAGE`,
+  memoized per statement. A renamed table is checked under its grants
+  today; a dropped one, having none, is readable by admins only.
+  `virtualEnv` under a historical transaction uses today's role set and
+  withholds statistics and sequence counters from non-admins.
   Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
   version string), `client_encoding=UTF8`, `DateStyle=ISO`,
   `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;

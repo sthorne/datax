@@ -1016,6 +1016,21 @@ state or the internode protocol does, and an entry below says so.
   referencing table gets the message as before. The privilege checks on
   the tables the statement names already came first; `pg_constraint`
   lists foreign keys to every role, as in PostgreSQL.
+- **`AS OF SYSTEM TIME` answers to today's privileges** (#312). A
+  historical read checked a table's privileges, and the reader's role
+  memberships, as of its timestamp, so a `REVOKE` did not stop a role
+  from reading the table as it stood before. Privileges are now decided
+  as row-security policies already were: by the table's grants and the
+  role's memberships now, the rows being the timestamp's. A table renamed
+  since answers to its grants under the new name; one dropped since is
+  readable historically by admins only. Catalogs read `AS OF SYSTEM TIME`
+  use today's roles and show statistics and sequence counters to admins
+  only. Today's grants are read from the cluster: a role other than
+  `root` running a bounded-staleness read on a node cut off from the
+  rest is refused after five seconds instead of being answered locally. (A statement prepared through the extended protocol still
+  resolves its tables by today's names when it is described, so a table
+  renamed or dropped since is reachable only through the simple
+  protocol, as before.)
 
 ### Changed
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the

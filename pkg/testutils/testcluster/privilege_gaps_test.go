@@ -2,9 +2,12 @@ package testcluster
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sthorne/datax/pkg/server"
 )
@@ -184,5 +187,70 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsRefused(t, ctx, alice, "42501", `TRUNCATE fk_parent CASCADE`)
 		rlsExec(t, ctx, root, `GRANT TRUNCATE ON fk_hidden_child TO alice`)
 		rlsExec(t, ctx, alice, `TRUNCATE fk_parent CASCADE`)
+	})
+
+	t.Run("AS OF SYSTEM TIME answers to today's privileges", func(t *testing.T) {
+		mark := func() int64 {
+			time.Sleep(20 * time.Millisecond)
+			ts := tc.Nodes[0].Clock().Now().WallTime
+			time.Sleep(20 * time.Millisecond)
+			return ts
+		}
+		asOf := func(table string, ts int64) string {
+			return fmt.Sprintf(`SELECT count(*) FROM %s AS OF SYSTEM TIME '%d'`, table, ts)
+		}
+		// A direct grant, revoked.
+		rlsExec(t, ctx, root, `CREATE TABLE hist (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `INSERT INTO hist VALUES (1), (2)`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON hist TO alice`)
+		rlsWant(t, ctx, alice, []string{"2"}, `SELECT count(*) FROM hist`)
+		granted := mark()
+		rlsWant(t, ctx, alice, []string{"2"}, asOf("hist", granted))
+		rlsExec(t, ctx, root, `REVOKE SELECT ON hist FROM alice`)
+		rlsRefused(t, ctx, alice, "42501", `SELECT count(*) FROM hist`)
+		rlsRefused(t, ctx, alice, "42501", asOf("hist", granted))
+		// A joined table answers the same way.
+		rlsRefused(t, ctx, alice, "42501", fmt.Sprintf(`SELECT count(*) FROM open_t JOIN hist ON open_t.id = hist.id AS OF SYSTEM TIME '%d'`, granted))
+		// A grant made since applies to the past too: privileges are
+		// today's, the rows are the timestamp's.
+		before := mark()
+		rlsExec(t, ctx, root, `INSERT INTO hist VALUES (3)`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON hist TO alice`)
+		rlsWant(t, ctx, alice, []string{"2"}, asOf("hist", before))
+
+		// Membership in a role holding the grant, revoked.
+		rlsExec(t, ctx, root, `CREATE ROLE hist_readers`)
+		rlsExec(t, ctx, root, `CREATE TABLE hist2 (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON hist2 TO hist_readers`)
+		rlsExec(t, ctx, root, `GRANT hist_readers TO alice`)
+		rlsWant(t, ctx, alice, []string{"0"}, `SELECT count(*) FROM hist2`)
+		member := mark()
+		rlsExec(t, ctx, root, `REVOKE hist_readers FROM alice`)
+		rlsRefused(t, ctx, alice, "42501", asOf("hist2", member))
+
+		// A table renamed since is reached by its old name at the
+		// timestamp and checked against its privileges today. (The
+		// simple protocol: the extended protocol describes a statement
+		// against today's names, where the old one no longer resolves.)
+		simple := pgx.QueryExecModeSimpleProtocol
+		rlsExec(t, ctx, root, `CREATE TABLE hist_old (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `INSERT INTO hist_old VALUES (1)`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON hist_old TO alice`)
+		named := mark()
+		rlsExec(t, ctx, root, `ALTER TABLE hist_old RENAME TO hist_new`)
+		rlsWant(t, ctx, alice, []string{"1"}, asOf("hist_old", named), simple)
+		rlsExec(t, ctx, root, `REVOKE SELECT ON hist_new FROM alice`)
+		rlsRefused(t, ctx, alice, "42501", asOf("hist_old", named), simple)
+
+		// A table dropped since has no privileges today: only an admin
+		// reads what is left of it.
+		rlsExec(t, ctx, root, `CREATE TABLE hist_gone (id INT8 PRIMARY KEY)`)
+		rlsExec(t, ctx, root, `INSERT INTO hist_gone VALUES (1)`)
+		rlsExec(t, ctx, root, `GRANT SELECT ON hist_gone TO alice`)
+		rlsWant(t, ctx, alice, []string{"1"}, `SELECT count(*) FROM hist_gone`)
+		alive := mark()
+		rlsWant(t, ctx, alice, []string{"1"}, asOf("hist_gone", alive), simple)
+		rlsExec(t, ctx, root, `DROP TABLE hist_gone`)
+		rlsRefused(t, ctx, alice, "42501", asOf("hist_gone", alive), simple)
 	})
 }
