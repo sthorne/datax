@@ -116,9 +116,11 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 		}
 		// Row-level retention: a range that only partially overlaps
 		// retention tables keeps the conservative TTL, but individual
-		// rows past their table's retention still expire.
+		// rows past their table's retention still expire; and on a
+		// retention range, the versions a restore wrote expire by when
+		// their rows were first written (issue #316).
 		var rowExpired func(keys.Key, hlc.Timestamp) bool
-		if !expire && s.cfg.RowExpiry != nil {
+		if s.cfg.RowExpiry != nil {
 			desc := r.Desc()
 			if pred, ok := s.cfg.RowExpiry(desc.StartKey, desc.EndKey); ok {
 				rowExpired = pred

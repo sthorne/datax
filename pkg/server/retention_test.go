@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -131,6 +132,81 @@ func TestRowExpiryPredicate(t *testing.T) {
 	// No overlap: no predicate.
 	if _, ok := p.rowExpiry(keys.Key("\x03"), keys.Key("\x03z")); ok {
 		t.Fatal("predicate offered for a non-overlapping range")
+	}
+}
+
+// TestRowExpiryAgesRestoredVersions (issue #316): a version a restore
+// wrote is aged by its band's source commit time, on a range wholly
+// inside the table (where expire-mode GC alone would age it by the
+// restore's own timestamp) and on a mixed one; a version written after
+// the restore goes by its own timestamp, and nothing is offered for a
+// contained range of a table no restore wrote.
+func TestRowExpiryAgesRestoredVersions(t *testing.T) {
+	tsLo, tsHi := keys.TableDataSpan(10)
+	now := time.Now().UnixNano()
+	restoredAt := hlc.Timestamp{WallTime: now - time.Minute.Nanoseconds()}
+	p := &retentionProvider{defaultTTL: 24 * time.Hour}
+	p.spans = []retentionSpan{{
+		start: tsLo, end: tsHi, ttl: time.Hour, expire: true,
+		prefixes: []keys.Key{keys.TableIndexPrefix(10, 1)},
+		pkFams:   []types.Family{types.Int, types.Timestamp},
+		// Two bands: rows first written 2h ago (past the 1h retention),
+		// then rows written 10 minutes ago.
+		restored: []catalog.RestoredRowsBand{
+			{Through: restoredAt, WrittenBy: now - 2*time.Hour.Nanoseconds()},
+			{Through: restoredAt.Next(), WrittenBy: now - 10*time.Minute.Nanoseconds()},
+		},
+	}}
+	p.fetchedAt = time.Now()
+	pkKey := func(id, atNanos int64) keys.Key {
+		k, err := rowenc.AppendKeyDatum(keys.TableIndexPrefix(10, 1), types.Int, types.NewInt(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err = rowenc.AppendKeyDatum(k, types.Timestamp, types.NewTimestamp(atNanos))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	oldRow := pkKey(1, now-3*time.Hour.Nanoseconds())
+	firstBand := hlc.Timestamp{WallTime: restoredAt.WallTime - 1}
+	secondBand, after := restoredAt.Next(), restoredAt.Next().Next()
+
+	pred, ok := p.rowExpiry(tsLo, tsHi)
+	if !ok {
+		t.Fatal("no predicate for a contained range of a table with restored rows")
+	}
+	if !pred(oldRow, firstBand) {
+		t.Fatal("a restored version first written past the retention was kept")
+	}
+	if pred(oldRow, secondBand) {
+		t.Fatal("a restored version first written inside the retention was expired")
+	}
+	if pred(oldRow, after) {
+		t.Fatal("a version written after the restore was aged by a band")
+	}
+
+	// A mixed range: the band's time stands in for the write age, and
+	// the row's own timestamp still has to be past the retention.
+	p.spans[0].expire = false
+	pred, ok = p.rowExpiry(keys.Key("\x03"), tsHi)
+	if !ok {
+		t.Fatal("no predicate for a straddling range")
+	}
+	if !pred(oldRow, firstBand) {
+		t.Fatal("mixed range: a restored version first written past the retention was kept")
+	}
+	if pred(pkKey(1, now), firstBand) {
+		t.Fatal("mixed range: a restored row whose timestamp is inside the retention was expired")
+	}
+	if pred(oldRow, secondBand) {
+		t.Fatal("mixed range: a restored version first written inside the retention was expired")
+	}
+
+	p.spans[0].restored = nil
+	if _, ok := p.rowExpiry(tsLo, tsHi); ok {
+		t.Fatal("predicate offered for a contained range of a table no restore wrote")
 	}
 }
 
