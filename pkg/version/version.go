@@ -318,6 +318,16 @@ const (
 	// kind tenant in datax_keys, and a sealed form naming its key; CREATE
 	// TABLE ... WITH (encryption_key_by) and datax_destroy_tenant_key are
 	// refused until finalize as well.
+	//
+	// V22 also introduces sealing an existing table and online key
+	// rotation (issue #310, step 5): the descriptor field
+	// encryption_key.sealing, omitempty; the seal job's records
+	// (keys.SealJobKey), system keys a v21 node never reads; and
+	// ALTER TABLE ... SET (encryption_key | encryption_key_by) on a table
+	// with rows, ALTER TABLE ... ROTATE ENCRYPTION KEY,
+	// datax_rotate_tenant_key, datax_destroy_old_key_versions and
+	// datax_remove_tenant_rows, all refused until finalize, and the job
+	// does not run before it.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

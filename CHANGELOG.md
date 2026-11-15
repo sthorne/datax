@@ -657,6 +657,30 @@ state or the internode protocol does, and an entry below says so.
   --tenants N` runs `kv` per tenant, and every bench run with
   `--server-url` reports KV batches per operation. See docs/sql.md and
   docs/encryption.md, "Per-tenant keys".
+- **Sealing an existing table and online key rotation** (#310, step 5).
+  `ALTER TABLE t SET (encryption_key = 'auto')` and `SET (encryption_key_by
+  = 'col')` seal a table that already holds rows: new writes are sealed as
+  soon as the statement returns, reads accept plain and sealed rows while a
+  background job seals the existing ones, and once it is done a plain value
+  is corruption again. The rows' plaintext versions stay in history until GC
+  — the `NOTICE` says so, and `ALTER TABLE ... PURGE` after the job removes
+  them. `ALTER TABLE t ROTATE ENCRYPTION KEY [KEEP OLD VERSIONS]` and
+  `datax_rotate_tenant_key(table, tenant [, keep_old])` give a table's or a
+  tenant's key a new version for new writes, and the job rewrites the rows
+  under older versions and then destroys them;
+  `datax_destroy_old_key_versions` destroys them early (rows and history
+  still under them become unreadable). The job runs on the node leading
+  range 1 in batches of 100 rows, each an ordinary transaction that also
+  records its progress, so it resumes after restarts and leadership
+  changes; one per table; `datax_encryption_jobs` shows it. Unsealing (`RESET
+  (encryption_key)`) is refused. `datax_remove_tenant_rows(table, tenant)`
+  removes a tenant's rows left behind after its key was destroyed, with
+  their index entries, without the key (a table referenced by foreign keys
+  is refused). Key names beginning `table/`, `tenant/` or `destroyed/` are
+  reserved, and `SHOW ENCRYPTION KEYS`, `DROP OWNED`, `REASSIGN OWNED` and
+  `DROP ROLE` read only the key service's keys: 4 entries instead of 10,019
+  with 10,000 tenant keys. See docs/sql.md and docs/encryption.md, "Sealing
+  an existing table and rotating keys".
 - **The console's table page shows row-level security** (#312): whether it
   is enabled and forced, and each policy — permissive or restrictive, the
   statements and roles it applies to, its `USING` and `WITH CHECK`
