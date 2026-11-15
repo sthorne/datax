@@ -785,9 +785,6 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if at.IfExists && !s.tableExists(ctx, at.Table) {
 			return &Result{Tag: "ALTER TABLE"}, nil
 		}
-		if _, bare := catalog.SplitTableName(at.Table); catalog.IsSealedSystemTable(bare) && !s.system {
-			return s.execSetAuditRetention(ctx, at)
-		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
 		}
@@ -799,6 +796,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	if at, ok := stmt.(*parser.AlterTable); ok && at.SetOptions != nil {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... SET (...) cannot run inside a transaction block")
+		}
+		if _, bare := catalog.SplitTableName(at.Table); catalog.IsSealedSystemTable(bare) && !s.system {
+			return s.execSetAuditRetention(ctx, at)
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr

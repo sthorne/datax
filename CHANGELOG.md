@@ -11,6 +11,41 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **A GC window per table** (#295). `CREATE TABLE … WITH (gc_ttl = '10m')` and
+  `ALTER TABLE … SET / RESET (gc_ttl)` give one table its own GC window,
+  shorter or longer than the node's 25h. It governs the ranges that hold only
+  that table (the statement splits the table's edges, and housekeeping asks
+  again if a range still straddles one); a range shared with other data keeps
+  the longest window of what it holds, so no other table's history changes.
+  A short window shortens `AS OF SYSTEM TIME`, follower reads, long
+  transactions and the age an incremental backup's base may have, for that
+  table: older reads fail with an error. Not per database. Cluster protocol
+  version v21.
+- **Purge** (#295). `ALTER TABLE t PURGE` and `datax debug purge` (a table or
+  a key range) collect deleted and superseded versions now instead of a GC
+  window later, truncate the raft log, compact the span on every replica,
+  retire the write-ahead logs written before it, and return what each replica
+  then holds, counted from the storage engine's keys. The result — complete
+  only when every replica answered with no superseded version, tombstone or
+  intent — is written whole to the audit log; an incomplete purge says which
+  replica and why, and can be run again. Readers older than the purge are
+  refused on that span, never answered short. A replica that was down applies
+  the purge when it rejoins and serves no follower read until it has heard
+  from its range's leader again; one that is partitioned but still running is
+  not covered until it reconnects. Backups taken earlier still hold the data.
+  Cluster protocol version v21.
+- **Row expiry on ordinary tables** (#298). `WITH (ttl_expiration = col)`, or
+  `WITH (ttl_column = col, ttl = '7 days')`, on any table that is not a
+  time-series one; `ALTER TABLE … SET / RESET` on a table with data. One
+  background job for the cluster deletes expired rows in batches with ordinary
+  `DELETE`s, so secondary indexes, `ON DELETE CASCADE` and restricting foreign
+  keys behave as for any delete (a row still referenced is skipped, counted and
+  retried). An expired row is visible until the job deletes it, normally
+  within 30 seconds. The option creates an index on the column if none leads
+  with it. `ttl` without a column is refused: a lifetime is counted from a
+  timestamp column you name. Metrics `datax_row_ttl_rows_deleted_total`,
+  `datax_row_ttl_rows_blocked_total`, `datax_row_ttl_lag_seconds`; passes
+  appear in the operations view. Cluster protocol version v21.
 - **An audit table** (#293). Audit records are now also kept in the cluster,
   in the `datax_audit` system table, once v21 is finalized: readable with SQL
   by admins and by roles granted `SELECT` on it (not `read_all`), and not
@@ -822,6 +857,11 @@ state or the internode protocol does, and an entry below says so.
   combined PR, where #213 met #226's copy controls).
 
 ### Changed
+- A restarted node serves no follower reads from a range until that range's
+  closed timestamp has passed the node's start time (a few seconds on a
+  healthy cluster; not at all while the range has no leader). Before, it
+  served from the closed timestamp it had persisted, which could predate a
+  purge it had missed (#295).
 - **The console, tidied** (#278, #279, #280, #281). A pass over what a
   person reads and reaches for, none of it new capability.
   - *The event timeline.* A split or merge names its keys the way the
