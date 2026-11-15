@@ -4888,6 +4888,60 @@ func (*StorageOverloadedError) Descriptor() ([]byte, []int) {
 	return file_datax_v1_kv_proto_rawDescGZIP(), []int{73}
 }
 
+// BelowGCThresholdError: the batch reads (or writes) at or below the
+// range's GC threshold, whose history may have been collected.
+type BelowGCThresholdError struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     *Hlc                   `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Threshold     *Hlc                   `protobuf:"bytes,2,opt,name=threshold,proto3" json:"threshold,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BelowGCThresholdError) Reset() {
+	*x = BelowGCThresholdError{}
+	mi := &file_datax_v1_kv_proto_msgTypes[74]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BelowGCThresholdError) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BelowGCThresholdError) ProtoMessage() {}
+
+func (x *BelowGCThresholdError) ProtoReflect() protoreflect.Message {
+	mi := &file_datax_v1_kv_proto_msgTypes[74]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BelowGCThresholdError.ProtoReflect.Descriptor instead.
+func (*BelowGCThresholdError) Descriptor() ([]byte, []int) {
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{74}
+}
+
+func (x *BelowGCThresholdError) GetTimestamp() *Hlc {
+	if x != nil {
+		return x.Timestamp
+	}
+	return nil
+}
+
+func (x *BelowGCThresholdError) GetThreshold() *Hlc {
+	if x != nil {
+		return x.Threshold
+	}
+	return nil
+}
+
 type Error struct {
 	state             protoimpl.MessageState  `protogen:"open.v1"`
 	Message           string                  `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
@@ -4903,13 +4957,14 @@ type Error struct {
 	Ambiguous         *AmbiguousResultError   `protobuf:"bytes,11,opt,name=ambiguous,proto3" json:"ambiguous,omitempty"`
 	StorageOverloaded *StorageOverloadedError `protobuf:"bytes,12,opt,name=storage_overloaded,json=storageOverloaded,proto3" json:"storage_overloaded,omitempty"`
 	DescriptorChanged *DescriptorChangedError `protobuf:"bytes,13,opt,name=descriptor_changed,json=descriptorChanged,proto3" json:"descriptor_changed,omitempty"`
+	BelowGcThreshold  *BelowGCThresholdError  `protobuf:"bytes,14,opt,name=below_gc_threshold,json=belowGcThreshold,proto3" json:"below_gc_threshold,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Error) Reset() {
 	*x = Error{}
-	mi := &file_datax_v1_kv_proto_msgTypes[74]
+	mi := &file_datax_v1_kv_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4921,7 +4976,7 @@ func (x *Error) String() string {
 func (*Error) ProtoMessage() {}
 
 func (x *Error) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[74]
+	mi := &file_datax_v1_kv_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4934,7 +4989,7 @@ func (x *Error) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Error.ProtoReflect.Descriptor instead.
 func (*Error) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{74}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *Error) GetMessage() string {
@@ -5028,6 +5083,13 @@ func (x *Error) GetDescriptorChanged() *DescriptorChangedError {
 	return nil
 }
 
+func (x *Error) GetBelowGcThreshold() *BelowGCThresholdError {
+	if x != nil {
+		return x.BelowGcThreshold
+	}
+	return nil
+}
+
 // BatchEnvelope is the Batch RPC's response body: outcome or wire error.
 type BatchEnvelope struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -5039,7 +5101,7 @@ type BatchEnvelope struct {
 
 func (x *BatchEnvelope) Reset() {
 	*x = BatchEnvelope{}
-	mi := &file_datax_v1_kv_proto_msgTypes[75]
+	mi := &file_datax_v1_kv_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5051,7 +5113,7 @@ func (x *BatchEnvelope) String() string {
 func (*BatchEnvelope) ProtoMessage() {}
 
 func (x *BatchEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[75]
+	mi := &file_datax_v1_kv_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5064,7 +5126,7 @@ func (x *BatchEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchEnvelope.ProtoReflect.Descriptor instead.
 func (*BatchEnvelope) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{75}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *BatchEnvelope) GetResponse() *BatchResponse {
@@ -5112,7 +5174,7 @@ type RaftCommand struct {
 
 func (x *RaftCommand) Reset() {
 	*x = RaftCommand{}
-	mi := &file_datax_v1_kv_proto_msgTypes[76]
+	mi := &file_datax_v1_kv_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5124,7 +5186,7 @@ func (x *RaftCommand) String() string {
 func (*RaftCommand) ProtoMessage() {}
 
 func (x *RaftCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[76]
+	mi := &file_datax_v1_kv_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5137,7 +5199,7 @@ func (x *RaftCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftCommand.ProtoReflect.Descriptor instead.
 func (*RaftCommand) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{76}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *RaftCommand) GetId() string {
@@ -5205,7 +5267,7 @@ type DescriptorUpdateTrigger struct {
 
 func (x *DescriptorUpdateTrigger) Reset() {
 	*x = DescriptorUpdateTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[77]
+	mi := &file_datax_v1_kv_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5217,7 +5279,7 @@ func (x *DescriptorUpdateTrigger) String() string {
 func (*DescriptorUpdateTrigger) ProtoMessage() {}
 
 func (x *DescriptorUpdateTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[77]
+	mi := &file_datax_v1_kv_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5230,7 +5292,7 @@ func (x *DescriptorUpdateTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescriptorUpdateTrigger.ProtoReflect.Descriptor instead.
 func (*DescriptorUpdateTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{77}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *DescriptorUpdateTrigger) GetDesc() *RangeDescriptor {
@@ -5250,7 +5312,7 @@ type LoadHandoff struct {
 
 func (x *LoadHandoff) Reset() {
 	*x = LoadHandoff{}
-	mi := &file_datax_v1_kv_proto_msgTypes[78]
+	mi := &file_datax_v1_kv_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5262,7 +5324,7 @@ func (x *LoadHandoff) String() string {
 func (*LoadHandoff) ProtoMessage() {}
 
 func (x *LoadHandoff) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[78]
+	mi := &file_datax_v1_kv_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5275,7 +5337,7 @@ func (x *LoadHandoff) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadHandoff.ProtoReflect.Descriptor instead.
 func (*LoadHandoff) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{78}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *LoadHandoff) GetQps() float64 {
@@ -5301,7 +5363,7 @@ type ChecksumTrigger struct {
 
 func (x *ChecksumTrigger) Reset() {
 	*x = ChecksumTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[79]
+	mi := &file_datax_v1_kv_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5313,7 +5375,7 @@ func (x *ChecksumTrigger) String() string {
 func (*ChecksumTrigger) ProtoMessage() {}
 
 func (x *ChecksumTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[79]
+	mi := &file_datax_v1_kv_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5326,7 +5388,7 @@ func (x *ChecksumTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChecksumTrigger.ProtoReflect.Descriptor instead.
 func (*ChecksumTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{79}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *ChecksumTrigger) GetId() string {
@@ -5350,7 +5412,7 @@ type SplitTrigger struct {
 
 func (x *SplitTrigger) Reset() {
 	*x = SplitTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[80]
+	mi := &file_datax_v1_kv_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5362,7 +5424,7 @@ func (x *SplitTrigger) String() string {
 func (*SplitTrigger) ProtoMessage() {}
 
 func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[80]
+	mi := &file_datax_v1_kv_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5375,7 +5437,7 @@ func (x *SplitTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitTrigger.ProtoReflect.Descriptor instead.
 func (*SplitTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{80}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *SplitTrigger) GetLeft() *RangeDescriptor {
@@ -5413,7 +5475,7 @@ type MergeTrigger struct {
 
 func (x *MergeTrigger) Reset() {
 	*x = MergeTrigger{}
-	mi := &file_datax_v1_kv_proto_msgTypes[81]
+	mi := &file_datax_v1_kv_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5425,7 +5487,7 @@ func (x *MergeTrigger) String() string {
 func (*MergeTrigger) ProtoMessage() {}
 
 func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
-	mi := &file_datax_v1_kv_proto_msgTypes[81]
+	mi := &file_datax_v1_kv_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5438,7 +5500,7 @@ func (x *MergeTrigger) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MergeTrigger.ProtoReflect.Descriptor instead.
 func (*MergeTrigger) Descriptor() ([]byte, []int) {
-	return file_datax_v1_kv_proto_rawDescGZIP(), []int{81}
+	return file_datax_v1_kv_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *MergeTrigger) GetLeft() *RangeDescriptor {
@@ -5822,7 +5884,10 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x0fretry_timestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\x0eretryTimestamp\"\x12\n" +
 	"\x10TxnNotFoundError\"\x16\n" +
 	"\x14AmbiguousResultError\"\x18\n" +
-	"\x16StorageOverloadedError\"\xbe\x06\n" +
+	"\x16StorageOverloadedError\"q\n" +
+	"\x15BelowGCThresholdError\x12+\n" +
+	"\ttimestamp\x18\x01 \x01(\v2\r.datax.v1.HlcR\ttimestamp\x12+\n" +
+	"\tthreshold\x18\x02 \x01(\v2\r.datax.v1.HlcR\tthreshold\"\x8d\a\n" +
 	"\x05Error\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x127\n" +
 	"\n" +
@@ -5839,7 +5904,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	" \x01(\v2\x1a.datax.v1.TxnNotFoundErrorR\vtxnNotFound\x12<\n" +
 	"\tambiguous\x18\v \x01(\v2\x1e.datax.v1.AmbiguousResultErrorR\tambiguous\x12O\n" +
 	"\x12storage_overloaded\x18\f \x01(\v2 .datax.v1.StorageOverloadedErrorR\x11storageOverloaded\x12O\n" +
-	"\x12descriptor_changed\x18\r \x01(\v2 .datax.v1.DescriptorChangedErrorR\x11descriptorChanged\"k\n" +
+	"\x12descriptor_changed\x18\r \x01(\v2 .datax.v1.DescriptorChangedErrorR\x11descriptorChanged\x12M\n" +
+	"\x12below_gc_threshold\x18\x0e \x01(\v2\x1f.datax.v1.BelowGCThresholdErrorR\x10belowGcThreshold\"k\n" +
 	"\rBatchEnvelope\x123\n" +
 	"\bresponse\x18\x01 \x01(\v2\x17.datax.v1.BatchResponseR\bresponse\x12%\n" +
 	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\x94\x03\n" +
@@ -5883,7 +5949,7 @@ func file_datax_v1_kv_proto_rawDescGZIP() []byte {
 	return file_datax_v1_kv_proto_rawDescData
 }
 
-var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 82)
+var file_datax_v1_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 83)
 var file_datax_v1_kv_proto_goTypes = []any{
 	(*TxnMeta)(nil),                     // 0: datax.v1.TxnMeta
 	(*IntentValue)(nil),                 // 1: datax.v1.IntentValue
@@ -5959,25 +6025,26 @@ var file_datax_v1_kv_proto_goTypes = []any{
 	(*TxnNotFoundError)(nil),            // 71: datax.v1.TxnNotFoundError
 	(*AmbiguousResultError)(nil),        // 72: datax.v1.AmbiguousResultError
 	(*StorageOverloadedError)(nil),      // 73: datax.v1.StorageOverloadedError
-	(*Error)(nil),                       // 74: datax.v1.Error
-	(*BatchEnvelope)(nil),               // 75: datax.v1.BatchEnvelope
-	(*RaftCommand)(nil),                 // 76: datax.v1.RaftCommand
-	(*DescriptorUpdateTrigger)(nil),     // 77: datax.v1.DescriptorUpdateTrigger
-	(*LoadHandoff)(nil),                 // 78: datax.v1.LoadHandoff
-	(*ChecksumTrigger)(nil),             // 79: datax.v1.ChecksumTrigger
-	(*SplitTrigger)(nil),                // 80: datax.v1.SplitTrigger
-	(*MergeTrigger)(nil),                // 81: datax.v1.MergeTrigger
-	(*Hlc)(nil),                         // 82: datax.v1.Hlc
+	(*BelowGCThresholdError)(nil),       // 74: datax.v1.BelowGCThresholdError
+	(*Error)(nil),                       // 75: datax.v1.Error
+	(*BatchEnvelope)(nil),               // 76: datax.v1.BatchEnvelope
+	(*RaftCommand)(nil),                 // 77: datax.v1.RaftCommand
+	(*DescriptorUpdateTrigger)(nil),     // 78: datax.v1.DescriptorUpdateTrigger
+	(*LoadHandoff)(nil),                 // 79: datax.v1.LoadHandoff
+	(*ChecksumTrigger)(nil),             // 80: datax.v1.ChecksumTrigger
+	(*SplitTrigger)(nil),                // 81: datax.v1.SplitTrigger
+	(*MergeTrigger)(nil),                // 82: datax.v1.MergeTrigger
+	(*Hlc)(nil),                         // 83: datax.v1.Hlc
 }
 var file_datax_v1_kv_proto_depIdxs = []int32{
-	82,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
-	82,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
+	83,  // 0: datax.v1.TxnMeta.write_timestamp:type_name -> datax.v1.Hlc
+	83,  // 1: datax.v1.TxnMeta.min_timestamp:type_name -> datax.v1.Hlc
 	0,   // 2: datax.v1.MVCCMetadata.txn:type_name -> datax.v1.TxnMeta
-	82,  // 3: datax.v1.MVCCMetadata.timestamp:type_name -> datax.v1.Hlc
+	83,  // 3: datax.v1.MVCCMetadata.timestamp:type_name -> datax.v1.Hlc
 	1,   // 4: datax.v1.MVCCMetadata.history:type_name -> datax.v1.IntentValue
 	0,   // 5: datax.v1.Transaction.meta:type_name -> datax.v1.TxnMeta
-	82,  // 6: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
-	82,  // 7: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
+	83,  // 6: datax.v1.Transaction.read_timestamp:type_name -> datax.v1.Hlc
+	83,  // 7: datax.v1.Transaction.last_heartbeat:type_name -> datax.v1.Hlc
 	4,   // 8: datax.v1.RangeDescriptor.replicas:type_name -> datax.v1.ReplicaDescriptor
 	0,   // 9: datax.v1.Intent.txn:type_name -> datax.v1.TxnMeta
 	8,   // 10: datax.v1.GetRequest.header:type_name -> datax.v1.RequestHeader
@@ -5987,23 +6054,23 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	8,   // 14: datax.v1.ScanRequest.header:type_name -> datax.v1.RequestHeader
 	8,   // 15: datax.v1.EndTxnRequest.header:type_name -> datax.v1.RequestHeader
 	8,   // 16: datax.v1.HeartbeatTxnRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 17: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
+	83,  // 17: datax.v1.HeartbeatTxnRequest.now:type_name -> datax.v1.Hlc
 	8,   // 18: datax.v1.PushTxnRequest.header:type_name -> datax.v1.RequestHeader
 	3,   // 19: datax.v1.PushTxnRequest.pusher_txn:type_name -> datax.v1.Transaction
 	0,   // 20: datax.v1.PushTxnRequest.pushee_txn:type_name -> datax.v1.TxnMeta
-	82,  // 21: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
+	83,  // 21: datax.v1.PushTxnRequest.now:type_name -> datax.v1.Hlc
 	8,   // 22: datax.v1.ResolveIntentRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 23: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
+	83,  // 23: datax.v1.ResolveIntentRequest.commit_ts:type_name -> datax.v1.Hlc
 	8,   // 24: datax.v1.RollbackIntentRequest.header:type_name -> datax.v1.RequestHeader
 	8,   // 25: datax.v1.RefreshRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 26: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
+	83,  // 26: datax.v1.RefreshRequest.from_ts:type_name -> datax.v1.Hlc
 	8,   // 27: datax.v1.ExportRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 28: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
-	82,  // 29: datax.v1.ExportRecord.ts:type_name -> datax.v1.Hlc
+	83,  // 28: datax.v1.ExportRequest.start_ts:type_name -> datax.v1.Hlc
+	83,  // 29: datax.v1.ExportRecord.ts:type_name -> datax.v1.Hlc
 	21,  // 30: datax.v1.ExportResponse.records:type_name -> datax.v1.ExportRecord
-	82,  // 31: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
+	83,  // 31: datax.v1.GcVersion.ts:type_name -> datax.v1.Hlc
 	8,   // 32: datax.v1.GcRequest.header:type_name -> datax.v1.RequestHeader
-	82,  // 33: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
+	83,  // 33: datax.v1.GcRequest.threshold:type_name -> datax.v1.Hlc
 	23,  // 34: datax.v1.GcRequest.versions:type_name -> datax.v1.GcVersion
 	8,   // 35: datax.v1.TruncateLogRequest.header:type_name -> datax.v1.RequestHeader
 	8,   // 36: datax.v1.AdminSplitRequest.header:type_name -> datax.v1.RequestHeader
@@ -6037,15 +6104,15 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	20,  // 64: datax.v1.RequestUnion.export:type_name -> datax.v1.ExportRequest
 	33,  // 65: datax.v1.RequestUnion.update_meta:type_name -> datax.v1.UpdateMetaRequest
 	27,  // 66: datax.v1.RequestUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitRequest
-	82,  // 67: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
+	83,  // 67: datax.v1.BatchHeader.timestamp:type_name -> datax.v1.Hlc
 	3,   // 68: datax.v1.BatchHeader.txn:type_name -> datax.v1.Transaction
 	35,  // 69: datax.v1.BatchRequest.header:type_name -> datax.v1.BatchHeader
 	34,  // 70: datax.v1.BatchRequest.requests:type_name -> datax.v1.RequestUnion
 	7,   // 71: datax.v1.GetResponse.skipped:type_name -> datax.v1.Intent
 	6,   // 72: datax.v1.ScanResponse.rows:type_name -> datax.v1.KeyValue
 	7,   // 73: datax.v1.ScanResponse.skipped:type_name -> datax.v1.Intent
-	82,  // 74: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
-	82,  // 75: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
+	83,  // 74: datax.v1.EndTxnResponse.commit_timestamp:type_name -> datax.v1.Hlc
+	83,  // 75: datax.v1.PushTxnResponse.commit_ts:type_name -> datax.v1.Hlc
 	8,   // 76: datax.v1.RecoverTxnRequest.header:type_name -> datax.v1.RequestHeader
 	5,   // 77: datax.v1.AdminSplitResponse.left:type_name -> datax.v1.RangeDescriptor
 	5,   // 78: datax.v1.AdminSplitResponse.right:type_name -> datax.v1.RangeDescriptor
@@ -6077,49 +6144,52 @@ var file_datax_v1_kv_proto_depIdxs = []int32{
 	59,  // 104: datax.v1.ResponseUnion.update_meta:type_name -> datax.v1.UpdateMetaResponse
 	53,  // 105: datax.v1.ResponseUnion.admin_unsplit:type_name -> datax.v1.AdminUnsplitResponse
 	3,   // 106: datax.v1.BatchResponse.txn:type_name -> datax.v1.Transaction
-	82,  // 107: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
+	83,  // 107: datax.v1.BatchResponse.timestamp:type_name -> datax.v1.Hlc
 	60,  // 108: datax.v1.BatchResponse.responses:type_name -> datax.v1.ResponseUnion
 	5,   // 109: datax.v1.RangeKeyMismatchError.actual_descriptors:type_name -> datax.v1.RangeDescriptor
 	7,   // 110: datax.v1.WriteIntentError.intents:type_name -> datax.v1.Intent
-	82,  // 111: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
-	82,  // 112: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
-	82,  // 113: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
-	82,  // 114: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
-	82,  // 115: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
-	62,  // 116: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
-	63,  // 117: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
-	64,  // 118: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
-	66,  // 119: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
-	67,  // 120: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
-	68,  // 121: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
-	69,  // 122: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
-	70,  // 123: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
-	71,  // 124: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
-	72,  // 125: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
-	73,  // 126: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
-	65,  // 127: datax.v1.Error.descriptor_changed:type_name -> datax.v1.DescriptorChangedError
-	61,  // 128: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
-	74,  // 129: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
-	36,  // 130: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
-	80,  // 131: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
-	81,  // 132: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
-	82,  // 133: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
-	78,  // 134: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
-	79,  // 135: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
-	77,  // 136: datax.v1.RaftCommand.descriptor_update:type_name -> datax.v1.DescriptorUpdateTrigger
-	5,   // 137: datax.v1.DescriptorUpdateTrigger.desc:type_name -> datax.v1.RangeDescriptor
-	5,   // 138: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
-	5,   // 139: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
-	82,  // 140: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
-	5,   // 141: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
-	5,   // 142: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
-	5,   // 143: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
-	82,  // 144: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
-	145, // [145:145] is the sub-list for method output_type
-	145, // [145:145] is the sub-list for method input_type
-	145, // [145:145] is the sub-list for extension type_name
-	145, // [145:145] is the sub-list for extension extendee
-	0,   // [0:145] is the sub-list for field type_name
+	83,  // 111: datax.v1.WriteTooOldError.timestamp:type_name -> datax.v1.Hlc
+	83,  // 112: datax.v1.WriteTooOldError.actual_timestamp:type_name -> datax.v1.Hlc
+	83,  // 113: datax.v1.UncertaintyError.read_timestamp:type_name -> datax.v1.Hlc
+	83,  // 114: datax.v1.UncertaintyError.existing_timestamp:type_name -> datax.v1.Hlc
+	83,  // 115: datax.v1.TxnRetryError.retry_timestamp:type_name -> datax.v1.Hlc
+	83,  // 116: datax.v1.BelowGCThresholdError.timestamp:type_name -> datax.v1.Hlc
+	83,  // 117: datax.v1.BelowGCThresholdError.threshold:type_name -> datax.v1.Hlc
+	62,  // 118: datax.v1.Error.not_leader:type_name -> datax.v1.NotLeaderError
+	63,  // 119: datax.v1.Error.range_not_found:type_name -> datax.v1.RangeNotFoundError
+	64,  // 120: datax.v1.Error.range_key_mismatch:type_name -> datax.v1.RangeKeyMismatchError
+	66,  // 121: datax.v1.Error.write_intent:type_name -> datax.v1.WriteIntentError
+	67,  // 122: datax.v1.Error.write_too_old:type_name -> datax.v1.WriteTooOldError
+	68,  // 123: datax.v1.Error.uncertainty:type_name -> datax.v1.UncertaintyError
+	69,  // 124: datax.v1.Error.txn_aborted:type_name -> datax.v1.TxnAbortedError
+	70,  // 125: datax.v1.Error.txn_retry:type_name -> datax.v1.TxnRetryError
+	71,  // 126: datax.v1.Error.txn_not_found:type_name -> datax.v1.TxnNotFoundError
+	72,  // 127: datax.v1.Error.ambiguous:type_name -> datax.v1.AmbiguousResultError
+	73,  // 128: datax.v1.Error.storage_overloaded:type_name -> datax.v1.StorageOverloadedError
+	65,  // 129: datax.v1.Error.descriptor_changed:type_name -> datax.v1.DescriptorChangedError
+	74,  // 130: datax.v1.Error.below_gc_threshold:type_name -> datax.v1.BelowGCThresholdError
+	61,  // 131: datax.v1.BatchEnvelope.response:type_name -> datax.v1.BatchResponse
+	75,  // 132: datax.v1.BatchEnvelope.error:type_name -> datax.v1.Error
+	36,  // 133: datax.v1.RaftCommand.batch:type_name -> datax.v1.BatchRequest
+	81,  // 134: datax.v1.RaftCommand.split:type_name -> datax.v1.SplitTrigger
+	82,  // 135: datax.v1.RaftCommand.merge:type_name -> datax.v1.MergeTrigger
+	83,  // 136: datax.v1.RaftCommand.closed_ts:type_name -> datax.v1.Hlc
+	79,  // 137: datax.v1.RaftCommand.load_handoff:type_name -> datax.v1.LoadHandoff
+	80,  // 138: datax.v1.RaftCommand.checksum:type_name -> datax.v1.ChecksumTrigger
+	78,  // 139: datax.v1.RaftCommand.descriptor_update:type_name -> datax.v1.DescriptorUpdateTrigger
+	5,   // 140: datax.v1.DescriptorUpdateTrigger.desc:type_name -> datax.v1.RangeDescriptor
+	5,   // 141: datax.v1.SplitTrigger.left:type_name -> datax.v1.RangeDescriptor
+	5,   // 142: datax.v1.SplitTrigger.right:type_name -> datax.v1.RangeDescriptor
+	83,  // 143: datax.v1.SplitTrigger.closed_ts:type_name -> datax.v1.Hlc
+	5,   // 144: datax.v1.MergeTrigger.left:type_name -> datax.v1.RangeDescriptor
+	5,   // 145: datax.v1.MergeTrigger.right:type_name -> datax.v1.RangeDescriptor
+	5,   // 146: datax.v1.MergeTrigger.merged:type_name -> datax.v1.RangeDescriptor
+	83,  // 147: datax.v1.MergeTrigger.right_gc_threshold:type_name -> datax.v1.Hlc
+	148, // [148:148] is the sub-list for method output_type
+	148, // [148:148] is the sub-list for method input_type
+	148, // [148:148] is the sub-list for extension type_name
+	148, // [148:148] is the sub-list for extension extendee
+	0,   // [0:148] is the sub-list for field type_name
 }
 
 func init() { file_datax_v1_kv_proto_init() }
@@ -6184,7 +6254,7 @@ func file_datax_v1_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datax_v1_kv_proto_rawDesc), len(file_datax_v1_kv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   82,
+			NumMessages:   83,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

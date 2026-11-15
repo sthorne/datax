@@ -491,10 +491,18 @@ resolution only touches keys the enumeration skipped.
 
 Correctness rules enforced around the threshold:
 
-- **Reads at or below the threshold are rejected**, non-retryably — the
-  versions they would need may be gone. Live transactions never trip this
-  (TTL ≫ transaction lifetime, and refresh/uncertainty only move `readTS`
-  forward).
+- **Reads at or below the threshold are rejected** — the versions they
+  would need may be gone — with a typed detail
+  (`kvpb.BelowGCThresholdError`; a peer that predates it is recognized
+  by the message). What follows depends on who chose the timestamp
+  (issue #313). A transaction the cluster timestamped restarts at a new
+  one (`kvclient.RetryableError`; SQLSTATE `40001`), which succeeds: it
+  tripped because it outlived a short `gc_ttl` or began before a purge.
+  A historical transaction's timestamp is the client's, so the refusal
+  stands (SQLSTATE `72000`, PostgreSQL's `snapshot_too_old`): no retry
+  at that timestamp can succeed. With the default 25h window live
+  transactions never trip it (TTL ≫ transaction lifetime, and
+  refresh/uncertainty only move `readTS` forward).
 - **Resurrection guard**: `createTxnRecord` rejects any transaction whose
   `MinTimestamp` is at or below the threshold, so a zombie coordinator
   cannot recreate a reclaimed record as PENDING after having possibly been
@@ -592,6 +600,22 @@ flight; the log of a range the rows were written to before a split moved
 them (truncated on that range's own schedule); and the device beneath
 the file system. On an encrypted store the same files are rewritten and
 deleted, whichever data key they were written under.
+
+### A dropped table's span
+
+`DROP TABLE` leaves the rows and a record of the drop
+(`catalog.DroppedTable`); once the table's history window has passed,
+the reclaim job (`pkg/server/dropped_tables.go`) deletes the rows and
+purges the span, as above (issue #313; docs/sql.md, "A dropped table's
+rows"). The purge's threshold of now is what refuses a late `AS OF
+SYSTEM TIME` read of the table; the merge queue keeps the emptied range
+apart from any neighbour whose own window has not yet passed that
+threshold (`Store.mergeWouldHideHistory`), because a merged range
+adopts the higher of the two thresholds and would otherwise refuse
+reads the neighbour still promises. That rule covers every purged
+range, not only a dropped table's: before it, a purged range merged
+into its neighbour — the system range among them — as soon as it was
+small enough.
 
 ## Invariants (asserted in tests)
 

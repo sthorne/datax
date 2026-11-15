@@ -42,13 +42,7 @@ func runBackupCmd(args []string) error {
 		return fmt.Errorf("--revision-history keeps the versions written since a base backup; a full backup has no base (take the full backup without it, and the incrementals after it with it)")
 	}
 	req := cluster.AdminRequest{
-		Op: "backup", Path: *dest, BasePath: *basePath, AllowPlaintext: *allowPlaintext, IncludeMetrics: *includeMetrics,
-	}
-	if *revisionHistory {
-		// An op of its own: a node from before revision history would
-		// take "backup", ignore a flag it does not know, and write an
-		// incremental without the history.
-		req.Op = "backup-history"
+		Path: *dest, BasePath: *basePath, AllowPlaintext: *allowPlaintext, IncludeMetrics: *includeMetrics,
 	}
 	var err error
 	if *backupKey != "" {
@@ -61,12 +55,57 @@ func runBackupCmd(args []string) error {
 			return fmt.Errorf("--base-key: %w", err)
 		}
 	}
+	req.Op = backupOp(req, *revisionHistory)
 	resp, err := adminCall(*addr, *certsDir, *certUser, *timeout, req)
 	if err != nil {
 		return err
 	}
 	printBackupSummary("backup", resp.Backup)
 	return nil
+}
+
+// backupOp names the admin op a backup request travels under. A request
+// that asks for something an older node would not know to do travels
+// under an op of its own, because the older node would read "backup",
+// ignore the fields it does not know, do the old thing and report
+// success:
+//
+//   - with revision history, "backup-history": the older node would
+//     write an incremental without the history;
+//   - sealed, "backup-sealed" (issue #313): a node from before sealed
+//     backups would ignore backup_key and write the backup in plaintext.
+//
+// Under the new name such a node refuses the op instead. A base key
+// alone needs no name of its own: a node that does not know it cannot
+// read the sealed base and refuses anyway. "backup-history" is newer
+// than sealing, so it carries a key as it is.
+func backupOp(req cluster.AdminRequest, revisionHistory bool) string {
+	switch {
+	case revisionHistory:
+		return "backup-history"
+	case len(req.BackupKey) != 0:
+		return "backup-sealed"
+	default:
+		return "backup"
+	}
+}
+
+// restoreOp is backupOp for a restore: a restore of everything given
+// keys travels as "restore-sealed" (issue #313). A node from before
+// sealed backups would ignore the keys — and with them the refusal of a
+// plaintext directory put where a sealed backup was named — and restore
+// whatever plaintext backup it found. "restore-select" is newer than
+// sealing and carries keys as it is.
+func restoreOp(req cluster.AdminRequest) string {
+	if req.Op != "restore" {
+		return req.Op
+	}
+	for _, k := range req.BackupKeys {
+		if len(k) != 0 {
+			return "restore-sealed"
+		}
+	}
+	return "restore"
 }
 
 // runRestoreCmd is `datax restore`: ask a node to apply a backup chain
@@ -101,6 +140,7 @@ func runRestoreCmd(args []string) error {
 	if req.BackupKeys, err = loadRestoreKeys(*backupKey, len(req.Paths)); err != nil {
 		return err
 	}
+	req.Op = restoreOp(req)
 	resp, err := adminCall(*addr, *certsDir, *certUser, *timeout, req)
 	if err != nil {
 		return err

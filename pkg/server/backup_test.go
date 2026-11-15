@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -252,10 +254,13 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 	}
 	own := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 1), Value: []byte("row")}
 	ownGone := kvpb.ExportRecord{Key: keys.TableIndexPrefix(tableID, 2), Deleted: true}
-	if err := checkBackupRecords(write(own, ownGone), nil, man); err != nil {
+	described := func(recs ...kvpb.ExportRecord) *backupManifest {
+		return &backupManifest{Tables: []backupTable{describeBackupTable(table, recs...)}}
+	}
+	if err := checkBackupRecords(write(own, ownGone), nil, described(own, ownGone)); err != nil {
 		t.Fatalf("a file carrying the table's own keys, a tombstone among them, was refused: %v", err)
 	}
-	if err := checkBackupRecords(write(), nil, man); err != nil {
+	if err := checkBackupRecords(write(), nil, described()); err != nil {
 		t.Fatalf("an empty data file was refused: %v", err)
 	}
 	metaStart, _ := keys.MetaSpan()
@@ -299,4 +304,19 @@ func TestBackupDataFilesStayInTheirTableSpan(t *testing.T) {
 			t.Fatalf("readCheckedBackupRecords delivered %v before refusing %s", seen, c.what)
 		}
 	}
+}
+
+// describeBackupTable is t with the record count and checksum a backup
+// writing recs (without revision history) puts in its manifest.
+func describeBackupTable(t backupTable, recs ...kvpb.ExportRecord) backupTable {
+	h := sha256.New()
+	t.Records = 0
+	for _, rec := range recs {
+		t.Records++
+		if !rec.Deleted {
+			hashLiveRecord(h, rec)
+		}
+	}
+	t.SHA256 = hex.EncodeToString(h.Sum(nil))
+	return t
 }

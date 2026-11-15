@@ -423,7 +423,7 @@ func (r *Replica) executeStaleRead(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, 
 	}
 	ts := readTimestamp(ba)
 	if thr := r.GCThreshold(); !thr.IsEmpty() && ts.LessEq(thr) {
-		return nil, kvpb.NewErrorf("%s: batch timestamp %s is below the GC threshold %s", r.rangeID, ts, thr)
+		return nil, kvpb.NewBelowGCThresholdError(r.rangeID, ts, thr)
 	}
 	if closed := r.ClosedTimestamp(); closed.Less(ts) || !r.heardSinceStart() {
 		// Not provably closed here (yet), or closed only by a promise

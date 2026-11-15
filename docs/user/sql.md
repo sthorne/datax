@@ -97,7 +97,7 @@ CREATE TABLE t (
   PRIMARY KEY (a)                -- or: a INT8 PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS t (...);
-DROP TABLE [IF EXISTS] t;
+DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,8 +18,9 @@ import (
 // retentionProvider backs kvserver's RetentionOverride: it maps a range's
 // key span to the GC TTL implied by timeseries tables' retention options
 // and by the gc_ttl option any table may carry (issue #295).
-// The table set is refreshed from the descriptors (a KV scan) at most every
-// retentionRefreshInterval, and served stale on scan errors — GC policy may
+// The table set is refreshed from the descriptors at most every
+// retentionRefreshInterval — the first time by reading them all, after
+// that by reading what changed (descWatcher) — and served stale on errors — GC policy may
 // lag a CREATE/DROP by one interval, which is harmless (retention is
 // best-effort aging, not a deadline).
 type retentionProvider struct {
@@ -28,6 +30,9 @@ type retentionProvider struct {
 	mu        sync.Mutex
 	fetchedAt time.Time
 	spans     []retentionSpan
+	// byID is spans by table id, kept up to date from watch.
+	byID  map[uint64]retentionSpan
+	watch *descWatcher
 	// edgeSplitAt is when the edges of a table with a GC window were
 	// last asked for, by the table's first key (see splitEdges).
 	edgeSplitAt map[string]time.Time
@@ -141,61 +146,93 @@ func (p *retentionProvider) get() []retentionSpan {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	lo, hi := keys.TableDescSpan()
-	rows, err := p.node.db.Scan(ctx, lo, hi, 0)
+	// What changed since the last refresh, not every descriptor (issue
+	// #313): see descWatcher.
+	if p.watch == nil {
+		p.watch = &descWatcher{n: p.node}
+	}
+	full, recs, err := p.watch.next(ctx)
 	if err != nil {
-		log.Debugf("retention refresh: descriptor scan: %v", err)
+		log.Debugf("retention refresh: descriptors: %v", err)
 		return p.spans // stale-serve
 	}
-	var spans []retentionSpan
-	for _, kv := range rows {
-		var d catalog.TableDescriptor
-		if json.Unmarshal(kv.Value, &d) != nil || d.ID == 0 {
-			continue
-		}
-		start, end := keys.TableDataSpan(d.ID)
-		if !d.Timeseries || d.RetentionSeconds <= 0 {
-			// The DDL refuses a gc_ttl beside a retention, so the two
-			// never compete for one table.
-			if d.GCTTLSeconds > 0 {
-				spans = append(spans, retentionSpan{start: start, end: end, ttl: time.Duration(d.GCTTLSeconds) * time.Second})
-			}
-			continue
-		}
-		rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true}
-		// Row-level expiry eligibility: the timestamp must be decodable
-		// from the key alone (it always is — the last PK column), and the
-		// table must carry no secondary indexes (their entries hold no
-		// timestamp; expiring rows but not entries would leave dangling
-		// entries that index reads treat as corruption). Every retained
-		// primary generation — live, mid-reshard shadow, retired — decodes
-		// with the same column families, so all of them are eligible.
-		if len(d.Indexes) == 0 && len(d.PrimaryKey) > 0 {
-			fams := make([]types.Family, 0, len(d.PrimaryKey))
-			okFams := true
-			for _, colID := range d.PrimaryKey {
-				col, ok := d.ColByID(colID)
-				if !ok {
-					okFams = false
-					break
-				}
-				fams = append(fams, col.Type)
-			}
-			if okFams && fams[len(fams)-1] == types.Timestamp {
-				rs.pkFams = fams
-				rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.LivePrimaryIndex()))
-				if d.Reshard != nil {
-					rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.Reshard.NewIndexID))
-				}
-				for _, rl := range d.RetiredLayouts {
-					rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, rl.PrimaryIndexID))
-				}
-			}
-		}
-		spans = append(spans, rs)
+	if full || p.byID == nil {
+		p.byID = map[uint64]retentionSpan{}
 	}
-	p.spans, p.fetchedAt = spans, time.Now()
+	changed := full
+	for _, rec := range recs {
+		id, ok := descIDOfKey(rec.Key)
+		if !ok {
+			continue
+		}
+		_, had := p.byID[id]
+		delete(p.byID, id)
+		if !rec.Deleted {
+			var d catalog.TableDescriptor
+			if json.Unmarshal(rec.Value, &d) == nil && d.ID != 0 {
+				if rs, ok := retentionSpanFor(&d); ok {
+					p.byID[id] = rs
+					had = true
+				}
+			}
+		}
+		changed = changed || had
+	}
+	if changed {
+		spans := make([]retentionSpan, 0, len(p.byID))
+		for _, rs := range p.byID {
+			spans = append(spans, rs)
+		}
+		sort.Slice(spans, func(i, j int) bool { return spans[i].start.Compare(spans[j].start) < 0 })
+		p.spans = spans
+	}
+	p.fetchedAt = time.Now()
 	return p.spans
+}
+
+// retentionSpanFor is what the provider keeps for table d: its window, if
+// it has one of its own.
+func retentionSpanFor(d *catalog.TableDescriptor) (retentionSpan, bool) {
+	start, end := keys.TableDataSpan(d.ID)
+	if !d.Timeseries || d.RetentionSeconds <= 0 {
+		// The DDL refuses a gc_ttl beside a retention, so the two
+		// never compete for one table.
+		if d.GCTTLSeconds > 0 {
+			return retentionSpan{start: start, end: end, ttl: time.Duration(d.GCTTLSeconds) * time.Second}, true
+		}
+		return retentionSpan{}, false
+	}
+	rs := retentionSpan{start: start, end: end, ttl: time.Duration(d.RetentionSeconds) * time.Second, expire: true}
+	// Row-level expiry eligibility: the timestamp must be decodable
+	// from the key alone (it always is — the last PK column), and the
+	// table must carry no secondary indexes (their entries hold no
+	// timestamp; expiring rows but not entries would leave dangling
+	// entries that index reads treat as corruption). Every retained
+	// primary generation — live, mid-reshard shadow, retired — decodes
+	// with the same column families, so all of them are eligible.
+	if len(d.Indexes) == 0 && len(d.PrimaryKey) > 0 {
+		fams := make([]types.Family, 0, len(d.PrimaryKey))
+		okFams := true
+		for _, colID := range d.PrimaryKey {
+			col, ok := d.ColByID(colID)
+			if !ok {
+				okFams = false
+				break
+			}
+			fams = append(fams, col.Type)
+		}
+		if okFams && fams[len(fams)-1] == types.Timestamp {
+			rs.pkFams = fams
+			rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.LivePrimaryIndex()))
+			if d.Reshard != nil {
+				rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, d.Reshard.NewIndexID))
+			}
+			for _, rl := range d.RetiredLayouts {
+				rs.prefixes = append(rs.prefixes, keys.TableIndexPrefix(d.ID, rl.PrimaryIndexID))
+			}
+		}
+	}
+	return rs, true
 }
 
 // rowExpiry implements kvserver.StoreConfig.RowExpiry: row-level
@@ -254,4 +291,10 @@ func (n *Node) TestingRefreshRetention() {
 	n.retention.mu.Lock()
 	n.retention.fetchedAt = time.Time{}
 	n.retention.mu.Unlock()
+}
+
+// TestingRetentionSpans makes the provider answer as GC would, and
+// returns how many tables carry a window: what a refresh found.
+func (n *Node) TestingRetentionSpans() int {
+	return len(n.retention.get())
 }

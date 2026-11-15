@@ -1240,6 +1240,57 @@ state or the internode protocol does, and an entry below says so.
   grant is refused (`42501`) and needs `GRANT TRUNCATE ON t TO role`
   (`SHOW GRANTS` lists who holds `DELETE` without it). `ALL` and the
   `write_all` role include `TRUNCATE` as before.
+- **`DROP TABLE` gives the table's space back** (#313). A dropped table's rows
+  used to stay on disk for good. They now stay for the table's history window
+  — its `gc_ttl`, a time-series table's retention, or the node's GC TTL (25h
+  by default) — so `AS OF SYSTEM TIME` below the drop keeps working, and then
+  a job on the node leading range 1 deletes them, purges the span and lets
+  its ranges merge away. The job is resumable: the drop leaves a record in
+  the system span, and a pass cut short by a restart is taken up again. A
+  short `gc_ttl` set before the drop makes the reclaim correspondingly
+  prompt. Tables dropped before this release are not reclaimed. The
+  operations view shows each reclaim as a `drop-reclaim`.
+- A restore of everything into a cluster that had dropped tables could mix
+  their leftover rows into a restored table carrying the same id (a fresh
+  cluster hands out the same first ids as any other); the restore now clears
+  such an id's rows first (#313).
+- The merge queue no longer merges two ranges whose GC thresholds are further
+  apart than the lower side's GC window. A purged range's threshold is the
+  purge's time, and a merged range adopts the higher threshold, so a purged
+  range merged into its neighbour — the system range included — made the
+  neighbour refuse `AS OF SYSTEM TIME` reads and incremental backups below
+  the purge (#313).
+- `datax backup --backup-key` asks the node for the admin op `backup-sealed`,
+  and `datax restore --backup-key` (without `--table`, `--database` or
+  `--as-of`) for `restore-sealed`, instead of `backup` and `restore` with
+  extra fields (#313). A node from before sealed backups — one not yet
+  upgraded in a rolling upgrade — ignored the key under the old names and
+  wrote the backup in plaintext; it refuses the new ones. Nodes still accept
+  `backup` and `restore` with keys from older commands. A command from this
+  release pointed at a node from before it fails with an unknown op: run it
+  against an upgraded node.
+- A read below a range's GC threshold now reaches the client with a SQLSTATE
+  that says what to do, instead of `XX000` (#313). A transaction the cluster
+  timestamped — one that ran longer than a table's `gc_ttl`, or began before
+  a `PURGE` of what it reads — is restarted like any other conflict: inside
+  the cluster's own transactions automatically, and over SQL as `40001`,
+  which succeeds when retried. `AS OF SYSTEM TIME` below the kept history
+  fails with `72000` (PostgreSQL's `snapshot_too_old`): retrying the same
+  timestamp cannot succeed. The KV error carries a typed detail
+  (`BelowGCThreshold`); one from a node that predates it is recognized by
+  its message.
+- **Fewer reads of every table descriptor** (#313, following #311). `DROP`,
+  `ALTER ... RENAME` and `DROP COLUMN` find the views reading a relation from
+  records kept under it rather than by reading every descriptor: at 5,000
+  tables a `DROP TABLE` read 5,004 descriptor rows and reads 2. The records
+  are written with each view; they are trusted from cluster protocol version
+  v22, once the node leading range 1 has recorded every existing view, and
+  until then the old check runs. The retention provider behind GC and the
+  re-shard janitor read every descriptor on their first pass and then only
+  the descriptors changed since (an incremental export of the descriptor
+  span): an idle pass at 5,000 tables read 5,000 rows and reads none. New
+  measurement harness `TestCatalogScanScale` (`DATAX_CATALOG_SCALE`). Cluster
+  protocol version v22.
 
 ### Fixed
 - **Online `CREATE INDEX` could keep entries for rows that changed while it
@@ -1660,6 +1711,32 @@ state or the internode protocol does, and an entry below says so.
   policy's `TO` list, and a policy that named only it is dropped (an
   empty list would mean every role). Each such drop is audit-logged as
   `policy-ddl`.
+- **Backups did not hold enum types** (#313). A backup carried the tables
+  whose columns are of an enum type, with the labels copied into each column,
+  but not the `CREATE TYPE` itself: a restore of everything brought the
+  columns back with no type behind them (`ALTER TYPE` and `'x'::mood` then
+  failed with "type does not exist"). Backups now carry type descriptors and
+  their names (manifest field `types`, held to the type key spans like the
+  other system records) and a restore of everything brings them back under
+  their ids, moving the id generator past them. A table restore no longer
+  refuses a table with an enum column whose type the target database lacks:
+  it creates the type there from the column's labels (which also works from a
+  backup taken before this change) and says so in the summary. Onto a type of
+  that name with the same labels it maps the column to it, as before; onto
+  one with other labels it is refused, naming both label lists.
+- A restore of everything from a plaintext backup did not hold the data files
+  to the manifest's record counts and checksums: it reported them afterwards
+  and enforced nothing, so a data file swapped for another backup's file of
+  the same table restored silently (#313). Every file is now checked against
+  its manifest — count, checksum and key order — in the pass made before
+  anything is written, as a table restore already did; a mismatch is refused
+  with the target left empty.
+- A backup that failed part way left the data files of the tables it had
+  already written in its destination, with no manifest (#313). The files are
+  now written into a hidden `.backup-in-progress-*` directory inside the
+  destination and moved into place only when every table has been written; a
+  failure removes them. Backup files are created 0600 and a directory the
+  backup creates 0700 (they were 0644 and 0755), sealed or not.
 
 ## 0.57.0 — unreleased
 

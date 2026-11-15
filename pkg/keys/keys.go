@@ -299,6 +299,42 @@ func RestoreProgressSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// DroppedTableKey holds the record DROP TABLE leaves for a table whose
+// rows are still on disk (JSON; issue #313): when it was dropped and
+// how long its history is kept. The reclaim job (pkg/server,
+// dropped_tables.go) clears the table's span once that window has
+// passed and then removes the record.
+func DroppedTableKey(tableID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("dropped"), tableID))
+}
+
+// DroppedTableSpan covers every dropped table's record.
+func DroppedTableSpan() (Key, Key) {
+	p := systemKey("dropped")
+	return p, p.PrefixEnd()
+}
+
+// ViewDependencyKey records that view viewID's query reads relation
+// relID (issue #313): the reverse of TableDescriptor.ViewDepends, so the
+// views depending on a relation are a scan of ViewDependencySpan(relID)
+// rather than of every descriptor. The value is one byte, 1.
+func ViewDependencyKey(relID, viewID uint64) Key {
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(systemKey("viewdep"), relID), viewID))
+}
+
+// ViewDependencySpan covers the views recorded as reading relID.
+func ViewDependencySpan(relID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("viewdep"), relID))
+	return p, p.PrefixEnd()
+}
+
+// ViewDependencyIndexKey says the ViewDependencyKey records are complete:
+// written once every view of the cluster has its records, which is only
+// known once no binary that does not write them can be running (cluster
+// version v22). Until it exists, the views depending on a relation are
+// found by scanning every descriptor.
+func ViewDependencyIndexKey() Key { return systemKey("viewdep-ready") }
+
 // NodeRegistryKey holds a node's registration (address, locality, liveness).
 func NodeRegistryKey(nodeID base.NodeID) Key {
 	k := systemKey("nodes")
