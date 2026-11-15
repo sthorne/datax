@@ -255,7 +255,9 @@ confined role in `SHOW STATS`, `pg_class.reltuples`,
 console decodes no range boundary of such a table for it
 (`catalog.CanReadTable`). `DROP COLUMN` refuses a column a policy
 reads, `RENAME COLUMN` rewrites the policies, `DROP ROLE` refuses a
-role a policy names, and a table restore keeps row security and cuts
+role a policy names, `DROP OWNED BY` takes the role out of every
+policy's list and drops a policy it leaves empty (an empty list would
+mean PUBLIC; `stripPolicyRoles`, as PostgreSQL's DROP OWNED), and a table restore keeps row security and cuts
 each policy's roles to the ones the cluster has.
 
 **Custom settings.** `sessionVars.custom` holds two-part names

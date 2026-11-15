@@ -1611,6 +1611,13 @@ state or the internode protocol does, and an entry below says so.
   one, no shared family clearing the floors in both — so every pair
   involving it is at least 15 apart, and a test computes the distances
   rather than trusting the numbers.
+- **`DROP OWNED BY r` takes `r` out of row-security policies** (#312). It
+  left the policies naming the role alone, so the `DROP ROLE` that
+  follows it was still refused (`2BP01`) until each policy was altered or
+  dropped by hand. As in PostgreSQL, the role is now removed from every
+  policy's `TO` list, and a policy that named only it is dropped (an
+  empty list would mean every role). Each such drop is audit-logged as
+  `policy-ddl`.
 
 ## 0.57.0 — unreleased
 

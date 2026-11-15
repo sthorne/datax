@@ -144,9 +144,13 @@ take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
 the sequence — a `SERIAL` column's sequence follows `INSERT` on the
 table; `EXPLAIN` takes `SELECT` on every table the statement reads, as
 running it would, and `SHOW STATS FOR t` takes `SELECT` on `t`;
-`CREATE DATABASE`, role management and `ANALYZE` take the admin role. A view's query runs with its **owner's** privileges (PostgreSQL's
+`CREATE DATABASE`, role management and `ANALYZE` take the admin role.
+A view's query runs with its **owner's** privileges (PostgreSQL's
 rule): a reader needs `SELECT` on the view only. `DROP ROLE` refuses a
-role that owns objects (`2BP01`); `REASSIGN OWNED` or `DROP OWNED` first.
+role that owns objects or that a row-security policy names (`2BP01`);
+`REASSIGN OWNED` or `DROP OWNED` first. `DROP OWNED` also takes the role
+out of every policy's `TO` list, dropping a policy that named it alone,
+as PostgreSQL does.
 Its grants and memberships go with it. Grants take effect cluster-wide
 by the time the statement returns; a membership change is seen by the
 next statement everywhere.

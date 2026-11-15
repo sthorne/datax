@@ -253,4 +253,21 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsExec(t, ctx, root, `DROP TABLE hist_gone`)
 		rlsRefused(t, ctx, alice, "42501", asOf("hist_gone", alive), simple)
 	})
+
+	t.Run("DROP OWNED BY takes the role out of policies", func(t *testing.T) {
+		rlsExec(t, ctx, root, `CREATE USER pol_user PASSWORD 'pol-pw-12'`)
+		rlsExec(t, ctx, root, `CREATE ROLE pol_other`)
+		rlsExec(t, ctx, root, `CREATE TABLE pol_t (id INT8 PRIMARY KEY, owner_name TEXT)`)
+		rlsExec(t, ctx, root, `ALTER TABLE pol_t ENABLE ROW LEVEL SECURITY`)
+		rlsExec(t, ctx, root, `CREATE POLICY only_hers ON pol_t TO pol_user USING (owner_name = current_user)`)
+		rlsExec(t, ctx, root, `CREATE POLICY shared ON pol_t TO pol_user, pol_other USING (true)`)
+		rlsExec(t, ctx, root, `CREATE POLICY everyone ON pol_t USING (false)`)
+		rlsRefused(t, ctx, root, "2BP01", `DROP ROLE pol_user`)
+		rlsExec(t, ctx, root, `DROP OWNED BY pol_user`)
+		// The policy that named only her is gone; the shared one names
+		// the other role alone; the PUBLIC one is untouched.
+		rlsWant(t, ctx, root, []string{"everyone|{public}", "shared|{pol_other}"},
+			`SELECT policyname, roles FROM pg_policies WHERE tablename = 'pol_t' ORDER BY policyname`)
+		rlsExec(t, ctx, root, `DROP ROLE pol_user`)
+	})
 }

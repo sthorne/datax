@@ -835,6 +835,11 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 		}
 		dropped++
 	}
+	// Take the roles out of the policies that name them, as
+	// PostgreSQL's DROP OWNED does: a policy naming only them goes.
+	if err := s.stripPolicyRoles(ctx, txn, owned); err != nil {
+		return nil, err
+	}
 	// Revoke what the roles were granted.
 	revoked, err := s.revokeAllFrom(ctx, txn, owned)
 	if err != nil {
@@ -842,6 +847,51 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 	}
 	log.Audit("ownership-ddl", "stmt", "DROP OWNED", "roles", strings.Join(roles, ","), "dropped", dropped, "revoked", revoked, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP OWNED"}, nil
+}
+
+// stripPolicyRoles removes roles from every row-security policy's TO
+// list (issue #312). A policy whose list would be left empty is
+// dropped rather than left to apply to PUBLIC, which is what an empty
+// list means; PostgreSQL's DROP OWNED does the same.
+func (s *Session) stripPolicyRoles(ctx context.Context, txn *kvclient.Txn, roles map[string]bool) error {
+	names, err := s.databaseNames(ctx, txn)
+	if err != nil {
+		return err
+	}
+	tables, err := s.cat.List(ctx, txn)
+	if err != nil {
+		return err
+	}
+	for _, d := range tables {
+		changed := false
+		var kept []catalog.Policy
+		for _, p := range d.Policies {
+			var rs []string
+			for _, r := range p.Roles {
+				if roles[r] {
+					changed = true
+					continue
+				}
+				rs = append(rs, r)
+			}
+			if len(p.Roles) > 0 && len(rs) == 0 {
+				log.Audit("policy-ddl", "stmt", "DROP POLICY", "target", p.Name+" ON "+d.Name, "reason", "DROP OWNED", "principal", s.sessionUser, "role", s.user)
+				continue
+			}
+			p.Roles = rs
+			kept = append(kept, p)
+		}
+		if !changed {
+			continue
+		}
+		c := d.Clone()
+		c.Policies = kept
+		if err := s.cat.Update(ctx, txn, c); err != nil {
+			return err
+		}
+		s.extraDDL = append(s.extraDDL, drainName(names, d))
+	}
+	return nil
 }
 
 // drainName names a table for the post-commit lease drain: db.name, or
