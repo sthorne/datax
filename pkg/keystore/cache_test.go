@@ -246,3 +246,142 @@ func TestCacheAEAD(t *testing.T) {
 		t.Fatalf("destroyed: %v", err)
 	}
 }
+
+// manySource is a Source over many keys, id i's material being i's byte
+// repeated, counting reads.
+type manySource struct {
+	mu    sync.Mutex
+	gets  int
+	state map[int64]State
+}
+
+func (m *manySource) GetByID(_ context.Context, id int64) (Key, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gets++
+	st := StateEnabled
+	if s, ok := m.state[id]; ok {
+		st = s
+	}
+	return Key{ID: id, State: st, Version: 1, Generation: 1}, nil
+}
+
+func (m *manySource) Unwrap(_ context.Context, id int64, version int) (*Material, error) {
+	return &Material{ID: id, Version: 1, Generation: 1, Key: testMaterial(byte(id))}, nil
+}
+
+// TestCacheBound (issue #310, step 4): a cache made with MaxKeys holds no
+// more keys than that, dropping the least recently used; a key in use is
+// not read again while it stays among the most recent; material a caller
+// holds while its key is dropped stays usable for that call.
+func TestCacheBound(t *testing.T) {
+	ctx := context.Background()
+	src := &manySource{}
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	c := NewCache(src, CacheConfig{Lease: time.Hour, Now: clk.Now, MaxKeys: 4})
+	defer c.Close()
+	use := func(id int64) {
+		t.Helper()
+		if err := c.With(ctx, id, 0, func(m *Material) error {
+			if !bytes.Equal(m.Key, testMaterial(byte(id))) {
+				t.Fatalf("key %d: wrong material", id)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id := int64(1); id <= 100; id++ {
+		use(id)
+		use(1) // kept hot: never the least recently used
+		if n := c.Len(); n > 4 {
+			t.Fatalf("after key %d the cache holds %d keys", id, n)
+		}
+	}
+	if src.gets != 100 {
+		t.Fatalf("%d reads for 100 keys, one of them used throughout (want 100)", src.gets)
+	}
+	// Material held across an eviction.
+	err := c.With(ctx, 500, 0, func(m *Material) error {
+		for id := int64(600); id < 610; id++ {
+			use(id)
+		}
+		if !bytes.Equal(m.Key, testMaterial(byte(500%256))) {
+			t.Fatal("held material changed under its caller")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unbounded by default.
+	u := NewCache(src, CacheConfig{Lease: time.Hour, Now: clk.Now})
+	defer u.Close()
+	for id := int64(1); id <= 50; id++ {
+		if _, err := u.Key(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if u.Len() != 50 {
+		t.Fatalf("an unbounded cache holds %d of 50 keys", u.Len())
+	}
+}
+
+// TestCacheMAC (issue #310, step 4): MAC is deterministic for one key,
+// label and input, differs across keys, labels and inputs, and refuses a
+// destroyed key.
+func TestCacheMAC(t *testing.T) {
+	ctx := context.Background()
+	src := &manySource{state: map[int64]State{3: StateDestroyed}}
+	c := NewCache(src, CacheConfig{})
+	defer c.Close()
+	mac := func(id int64, label, data string) string {
+		t.Helper()
+		m, err := c.MAC(ctx, id, 1, label, []byte(data))
+		if err != nil || len(m) != 32 {
+			t.Fatalf("MAC: %x %v", m, err)
+		}
+		return string(m)
+	}
+	a := mac(1, "l", "x")
+	if a != mac(1, "l", "x") {
+		t.Fatal("not deterministic")
+	}
+	for _, other := range []string{mac(2, "l", "x"), mac(1, "m", "x"), mac(1, "l", "y"), mac(1, "lx", "")} {
+		if other == a {
+			t.Fatal("two inputs share a MAC")
+		}
+	}
+	if _, err := c.MAC(ctx, 3, 1, "l", nil); !errors.Is(err, ErrDestroyed) {
+		t.Fatalf("destroyed: %v", err)
+	}
+}
+
+// TestTenantKeyNames (issue #310, step 4): a destroyed tenant key's name
+// leaves the namespace of live tenant keys, and PrefixEnd bounds a scan
+// of one prefix.
+func TestTenantKeyNames(t *testing.T) {
+	n := TenantKeyPrefix + "12/ab"
+	d := DestroyedName(n, 77)
+	if d != "destroyed/tenant/12/ab/77" {
+		t.Fatalf("destroyed name %q", d)
+	}
+	p := TenantKeyPrefix + "12/"
+	end := PrefixEnd(p)
+	if end != TenantKeyPrefix+"120" {
+		t.Fatalf("end of %q: %q", p, end)
+	}
+	for _, in := range []string{n, p, p + "\xff"} {
+		if !(in >= p && in < end) {
+			t.Fatalf("%q is outside [%q, %q)", in, p, end)
+		}
+	}
+	for _, out := range []string{TenantKeyPrefix + "120/x", TenantKeyPrefix + "1/x", d} {
+		if out >= p && out < end {
+			t.Fatalf("%q is inside [%q, %q)", out, p, end)
+		}
+	}
+	if PrefixEnd("") != "" || PrefixEnd("\xff\xff") != "" || PrefixEnd("a\xff") != "b" {
+		t.Fatal("PrefixEnd edge cases")
+	}
+}

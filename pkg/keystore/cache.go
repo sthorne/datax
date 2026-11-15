@@ -1,9 +1,12 @@
 package keystore
 
 import (
+	"container/list"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"time"
@@ -33,13 +36,22 @@ import (
 // and run Run in the background to drop material nobody has used for a
 // lease, so a key's material does not linger in memory after the key is
 // destroyed only because nothing asked for it again.
+//
+// A cache made with MaxKeys holds at most that many keys: the key used
+// least recently is dropped to make room for another (a gateway serving
+// many tenants of a per-tenant sealed table, issue #310 step 4). A
+// dropped key is read again on its next use, as after its lease.
 type Cache struct {
-	src   Source
-	lease time.Duration
-	now   func() time.Time
+	src     Source
+	lease   time.Duration
+	now     func() time.Time
+	maxKeys int
 
 	mu   sync.Mutex
 	keys map[int64]*cacheEntry
+	// lru orders the entries by last use, most recent at the front; its
+	// elements' values are the key ids. Kept only with maxKeys.
+	lru *list.List
 }
 
 // Source is what a Cache reads keys from; *Store is one.
@@ -59,6 +71,9 @@ type CacheConfig struct {
 	Lease time.Duration
 	// Now is the clock (nil: time.Now).
 	Now func() time.Time
+	// MaxKeys bounds how many keys the cache holds at once, dropping the
+	// least recently used beyond it (0: no bound).
+	MaxKeys int
 }
 
 // NewCache returns a cache over src.
@@ -69,7 +84,18 @@ func NewCache(src Source, cfg CacheConfig) *Cache {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Cache{src: src, lease: cfg.Lease, now: cfg.Now, keys: map[int64]*cacheEntry{}}
+	c := &Cache{src: src, lease: cfg.Lease, now: cfg.Now, maxKeys: cfg.MaxKeys, keys: map[int64]*cacheEntry{}}
+	if c.maxKeys > 0 {
+		c.lru = list.New()
+	}
+	return c
+}
+
+// Len is how many keys the cache holds.
+func (c *Cache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.keys)
 }
 
 // Lease is how long a change to a key can go unseen by this cache: what
@@ -89,6 +115,9 @@ type cacheEntry struct {
 	// still has it starts over rather than put material where no sweep
 	// will find it.
 	gone bool
+	// elem is the entry's place in the cache's lru (nil without a bound);
+	// guarded by the cache's mu.
+	elem *list.Element
 }
 
 // heldMaterial is one version's material and how many callers are using
@@ -115,13 +144,61 @@ func (e *cacheEntry) dropLocked() {
 
 func (c *Cache) entry(id int64) *cacheEntry {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	e := c.keys[id]
-	if e == nil {
-		e = &cacheEntry{held: map[int]*heldMaterial{}}
-		c.keys[id] = e
+	if e != nil {
+		if e.elem != nil {
+			c.lru.MoveToFront(e.elem)
+		}
+		c.mu.Unlock()
+		return e
+	}
+	e = &cacheEntry{held: map[int]*heldMaterial{}}
+	c.keys[id] = e
+	var evict []*cacheEntry
+	if c.lru != nil {
+		e.elem = c.lru.PushFront(id)
+		for len(c.keys) > c.maxKeys {
+			last := c.lru.Back()
+			if last == nil || last == e.elem {
+				break
+			}
+			old := last.Value.(int64)
+			evict = append(evict, c.removeLocked(old))
+		}
+	}
+	c.mu.Unlock()
+	// Material still in use by a caller is released when that caller is
+	// done (heldMaterial.dropped), as after Forget.
+	for _, old := range evict {
+		old.drop()
 	}
 	return e
+}
+
+// removeLocked takes key id's entry out of the map and the lru; the
+// caller drops it (drop) once c.mu is released.
+func (c *Cache) removeLocked(id int64) *cacheEntry {
+	e := c.keys[id]
+	if e == nil {
+		return nil
+	}
+	delete(c.keys, id)
+	if e.elem != nil {
+		c.lru.Remove(e.elem)
+		e.elem = nil
+	}
+	return e
+}
+
+// drop marks an entry removed and releases its unused material.
+func (e *cacheEntry) drop() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.gone = true
+	e.dropLocked()
+	e.mu.Unlock()
 }
 
 // check returns key id's metadata as confirmed within the lease, reading
@@ -215,6 +292,24 @@ func (c *Cache) AEAD(ctx context.Context, id int64, version int) (cipher.AEAD, i
 	return out, ver, err
 }
 
+// MAC returns HMAC-SHA256 under version (0: the current one) of key id
+// of label, a zero byte, and data: a keyed, deterministic digest for a
+// caller that names things by a key without handling its material (the
+// names of a per-tenant table's tenant keys, which its table key keys).
+// The label separates uses of one key. Refusals are With's.
+func (c *Cache) MAC(ctx context.Context, id int64, version int, label string, data []byte) ([]byte, error) {
+	var out []byte
+	err := c.With(ctx, id, version, func(m *Material) error {
+		h := hmac.New(sha256.New, m.Key)
+		h.Write([]byte(label))
+		h.Write([]byte{0})
+		h.Write(data)
+		out = h.Sum(nil)
+		return nil
+	})
+	return out, err
+}
+
 func (c *Cache) withHeld(ctx context.Context, id int64, version int, fn func(hm *heldMaterial) error) error {
 	for attempt := 0; ; attempt++ {
 		e, k, err := c.check(ctx, id, attempt > 0)
@@ -296,15 +391,9 @@ func (c *Cache) release(e *cacheEntry, hm *heldMaterial) {
 // changed the key itself, so its next use reads the row.
 func (c *Cache) Forget(id int64) {
 	c.mu.Lock()
-	e := c.keys[id]
-	delete(c.keys, id)
+	e := c.removeLocked(id)
 	c.mu.Unlock()
-	if e != nil {
-		e.mu.Lock()
-		e.gone = true
-		e.dropLocked()
-		e.mu.Unlock()
-	}
+	e.drop()
 }
 
 // Sweep drops every key whose last check is older than the lease: their

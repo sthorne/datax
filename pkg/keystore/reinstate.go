@@ -32,7 +32,8 @@ var ErrReinstateDestroyed = errors.New("the key was already destroyed when the b
 //     it for a state it knew. A destroyed key coming back is the
 //     documented dependency on backup retention, not a bypass of it: the
 //     backup held the key all along. If another key has taken the name
-//     here, the restored key is renamed. The result is true.
+//     here (a tenant's fresh key, after its old one was destroyed), the
+//     restored key is renamed. The result is true.
 //
 // The cluster key the backup's record is under must be one this node
 // holds (its own, or one imported from the source).
@@ -60,9 +61,11 @@ func (s *Store) Reinstate(ctx context.Context, txn *kvclient.Txn, backupDesc *ca
 			return Key{}, false, err
 		}
 	}
-	// The name: the key's own, unless another key holds it here.
+	// The name: the key's own, unless another key holds it here (a
+	// tenant key destroyed here was renamed, and its tenant may have a
+	// fresh key under the name since).
 	name := br.Name
-	if live == nil {
+	if live == nil || live.Name != name {
 		probe := &row{Key: Key{ID: br.ID, Name: name}}
 		ie, err := probe.indexEntry(d)
 		if err != nil {
@@ -118,6 +121,14 @@ func (s *Store) Reinstate(ctx context.Context, txn *kvclient.Txn, backupDesc *ca
 	wb.Put(pk, val)
 	if live == nil || live.Name != name {
 		wb.Put(ie.Key, ie.Value)
+	}
+	if live != nil && live.Name != name {
+		old := &row{Key: Key{ID: live.ID, Name: live.Name}}
+		oe, err := old.indexEntry(d)
+		if err != nil {
+			return Key{}, false, err
+		}
+		wb.Delete(oe.Key)
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return Key{}, false, err

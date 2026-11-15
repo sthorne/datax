@@ -59,7 +59,16 @@ type ServiceConfig struct {
 	Rate func(ctx context.Context) (int, error)
 	// Now is the clock (nil: time.Now).
 	Now func() time.Time
+	// MaxKeys bounds the cache (0: DefaultCacheMaxKeys; negative: no
+	// bound).
+	MaxKeys int
 }
+
+// DefaultCacheMaxKeys is how many keys a gateway's cache holds at most by
+// default: enough for the tenants a gateway is busy with at once, small
+// enough that a scan across a million tenants does not hold a million
+// keys (each is 32 bytes of held memory and a little bookkeeping).
+const DefaultCacheMaxKeys = 10000
 
 // NewService returns the key service over cfg.Store.
 func NewService(cfg ServiceConfig) *Service {
@@ -69,9 +78,15 @@ func NewService(cfg ServiceConfig) *Service {
 	if cfg.Rate == nil {
 		cfg.Rate = func(context.Context) (int, error) { return sql.DefaultKeyServiceRate, nil }
 	}
+	switch {
+	case cfg.MaxKeys == 0:
+		cfg.MaxKeys = DefaultCacheMaxKeys
+	case cfg.MaxKeys < 0:
+		cfg.MaxKeys = 0
+	}
 	return &Service{
 		store:   cfg.Store,
-		cache:   NewCache(cfg.Store, CacheConfig{Lease: cfg.Lease, Now: cfg.Now}),
+		cache:   NewCache(cfg.Store, CacheConfig{Lease: cfg.Lease, Now: cfg.Now, MaxKeys: cfg.MaxKeys}),
 		now:     cfg.Now,
 		rate:    cfg.Rate,
 		buckets: map[string]*bucket{},
