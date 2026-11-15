@@ -329,26 +329,38 @@ func TestListenNotify(t *testing.T) {
 		mustExec(t, ctx, remote, `LISTEN seq`)
 		mustExec(t, ctx, local, `LISTEN seq`)
 		const commits, perTxn = 1500, 300
+		// The notifier is driven from its own goroutine, and a pgx
+		// connection is not safe to share: the goroutine is cancelled and
+		// waited for before the connections' own cleanups close them. Cleanups
+		// run last-registered first, so this one runs ahead of those, also
+		// when a listener's check stops the subtest early.
+		wctx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		t.Cleanup(func() {
+			stop()
+			<-done
+		})
 		go func() {
+			defer close(done)
 			for i := 0; i < commits; i++ {
-				if _, err := notifier.Exec(ctx, `SELECT pg_notify('seq', $1)`, fmt.Sprint(i)); err != nil {
+				if _, err := notifier.Exec(wctx, `SELECT pg_notify('seq', $1)`, fmt.Sprint(i)); err != nil {
 					t.Errorf("notify %d: %v", i, err)
 					return
 				}
 			}
 			// One transaction's notifications keep their order as well.
-			tx, err := notifier.Begin(ctx)
+			tx, err := notifier.Begin(wctx)
 			if err != nil {
 				t.Error(err)
 				return
 			}
 			for i := 0; i < perTxn; i++ {
-				if _, err := tx.Exec(ctx, `SELECT pg_notify('seq', $1)`, fmt.Sprintf("t%d", i)); err != nil {
+				if _, err := tx.Exec(wctx, `SELECT pg_notify('seq', $1)`, fmt.Sprintf("t%d", i)); err != nil {
 					t.Errorf("notify t%d: %v", i, err)
 					return
 				}
 			}
-			if err := tx.Commit(ctx); err != nil {
+			if err := tx.Commit(wctx); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -515,9 +527,17 @@ func TestListenNotify(t *testing.T) {
 		mustExec(t, ctx, slow, `BEGIN`)
 		payload := strings.Repeat("z", 7900)
 		const n = 2400 // well past the 16 MiB a session may have waiting
+		// Joined before the connections close, as in "many in order".
+		wctx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		t.Cleanup(func() {
+			stop()
+			<-done
+		})
 		go func() {
+			defer close(done)
 			for i := 0; i < n; i++ {
-				if _, err := notifier.Exec(ctx, `SELECT pg_notify('flood', $1)`, fmt.Sprintf("%d %s", i, payload)); err != nil {
+				if _, err := notifier.Exec(wctx, `SELECT pg_notify('flood', $1)`, fmt.Sprintf("%d %s", i, payload)); err != nil {
 					t.Errorf("notify %d: %v", i, err)
 					return
 				}
