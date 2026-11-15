@@ -124,7 +124,12 @@ var (
 		// policies' roles cut to the ones this cluster has
 		// (restoredDescriptor), so the restored copy is no less
 		// protected than the table it was taken from.
-		"row_security", "force_row_security", "policies")
+		"row_security", "force_row_security", "policies",
+		// A sealed table's key is named by its id in datax_keys and its
+		// rows by the seal id, neither of which is the table's own id:
+		// both carry over, and the key is shared or brought back
+		// (restore_sealed.go).
+		"encryption_key")
 	restoreColumnFields = fieldSet("id", "name", "type", "precision", "scale", "width", "max_len", "char", "no_tz",
 		"enum_type", "enum_name", "enum_labels", "time_precision", "not_null", "default", "default_expr", "identity",
 		"sequence_id", "fill_default", "hidden", "comment", "retype_from")
@@ -223,6 +228,9 @@ type restorePlan struct {
 	// allocated when the restore publishes.
 	newDB *catalog.DatabaseDescriptor
 	notes []string
+	// sealed is what the restore of the plan's sealed tables needs (nil
+	// without one; restore_sealed.go).
+	sealed *sealedRestore
 }
 
 // planTableRestore works out, from the chain's last manifest, which
@@ -723,6 +731,9 @@ func (n *Node) runTableRestore(ctx context.Context, opID string, opts RestoreOpt
 	}); err != nil {
 		return nil, err
 	}
+	if plan.sealed, err = n.planSealedRestore(ctx, chain, plan); err != nil {
+		return nil, err
+	}
 
 	// Every data file the restore will read, read to its end before
 	// anything is written: held to its table's span and its order, and
@@ -1027,6 +1038,11 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 		for _, p := range plan.tables {
 			ids[p.src.ID] = p.newID
 		}
+		knotes, err := n.reinstateSealedKeys(ctx, txn, plan.sealed)
+		if err != nil {
+			return err
+		}
+		notes = append(notes, knotes...)
 		roles := func(name string) bool { return tg.roles[name] }
 		for _, p := range plan.tables {
 			dbID := tg.dbIDs[p.intoDB]
