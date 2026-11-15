@@ -134,6 +134,43 @@ file and sends no key over the network
 (`datax debug rotate-enc-key --addr ...`). See
 [encryption](../encryption.md#roots-where-the-store-key-lives).
 
+A root can also be a key management service spoken to directly — no
+helper command, and datax's own timeouts, retries, health check and
+audit:
+
+```sh
+--enc-root 'vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token'
+--enc-root 'awskms:arn:aws:kms:eu-west-1:111122223333:key/1234abcd-…'
+--enc-root 'gcpkms:projects/acme/locations/europe-west1/keyRings/datax/cryptoKeys/store-root'
+--enc-root 'azurekv:datax-prod/store-root'
+```
+
+Options follow the key as `?name=value&name=value`; credentials are
+never among them — they are a file an option names (a Vault token file,
+a service-account key file), or the environment, or the instance's own
+identity. What to know before choosing one:
+
+- **A node cannot start while its KMS is unreachable** (it gives up
+  after about 45 seconds and says which service and why). A running
+  node is unaffected. Do not put the KMS behind the database.
+- Each node checks its KMS every minute and exports
+  `datax_enc_root_healthy`; alert on 0 — that node is serving and would
+  not survive a restart. The console's security view and
+  `/api/security` say the same.
+- Grant each node encrypt and decrypt on the one key and nothing else;
+  the minimum policy for each service is in
+  [encryption](../encryption.md#a-root-in-a-key-management-service).
+- Each wrapped store key is bound to its cluster and node, so one
+  node's is refused as another's. Give each node its own credential
+  where you can: that, not the binding, is what keeps a compromised
+  node from asking the KMS for a neighbour's key.
+- After the service rotates its key, run
+  `datax debug enc-root rewrap --addr <node>` on each node; the
+  console says when there is a newer version to move to.
+- These roots are tested against fakes of each service's API and have
+  not been run against the services themselves: prove the root on a
+  scratch node first. For an HSM (PKCS#11), use `exec:<command>`.
+
 To keep the root key off every machine, split it among people:
 `datax debug enc-root split --shares 2/3` makes a root key, prints
 three shares of which any two rebuild it, and keeps nothing. Nodes

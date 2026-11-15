@@ -193,7 +193,7 @@ function eventRow(e) {
 // records, and that sequence is what the timeline is for. Folding is for
 // churn — lease moves, rebalances, splits — where the count is the news.
 const FOLD_MIN = 4, FOLD_GAP_MS = 60000;
-const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation", "peer-unseal"]);
+const NEVER_FOLD = new Set(["health", "consistency-failure", "security", "auth-failure", "key-rotation", "peer-unseal", "enc-root"]);
 const openFolds = new Set();
 function foldEvents(evs) {
   const out = [];
@@ -402,6 +402,19 @@ function renderSecurityDoc() {
       const keyHome = !st.encrypted ? ""
         : st.root ? ` <span class="muted">· store key under a ${esc(st.root.kind)} root${st.root.key_id ? ` (${esc(st.root.key_id)})` : ""}</span>`
           : ` <span class="muted">· store key from a key file</span>`;
+      // A root that is a service (issue #308) is asked now and then
+      // whether it still works. Said only when it does not, or when the
+      // service has a newer version of its key than the store key is
+      // wrapped under: the node runs either way, and what is at stake is
+      // its next restart, which is what the words say.
+      const rt = st.root;
+      const rootHealth = !st.encrypted || !rt ? ""
+        : (rt.healthy === false
+          ? ` <span class="muted">· ${warn("draining", "root not usable")} — this node could not restart now${rt.health_error ? ": " + esc(rt.health_error) : ""}${rt.last_healthy_at ? ` (last usable ${esc(rt.last_healthy_at)})` : ""}</span>`
+          : "")
+          + (rt.latest_key_id
+            ? ` <span class="muted">· the root's key has a newer version (${esc(rt.latest_key_id)}); rewrap to move to it</span>`
+            : "");
       // How the keys are held while the node runs (issue #309): said
       // only when short of the ordinary case, with the reason the node
       // gave, since "locked" on every row would be noise.
@@ -416,7 +429,7 @@ function renderSecurityDoc() {
       return {
         key: "n" + st.node_id, html: `<tr data-key="n${st.node_id}">
         <td data-label="store">n${st.node_id}</td>
-        <td data-label="state">${state}${keyHome}${keyMem}${peerUnseal}</td>
+        <td data-label="state">${state}${keyHome}${rootHealth}${keyMem}${peerUnseal}</td>
         <td class="num" data-label="re-encryption">${progress}</td>
       </tr>` };
     })

@@ -61,7 +61,7 @@ func (n *Node) loadRootedStoreKey(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("making the store key: %w", err)
 		}
-		n.encKey, n.encRoots, n.encRoot = key, roots, roots[0]
+		n.encKey, n.encRoots, n.encRoot, n.encEntryKeyID = key, roots, roots[0], roots[0].KeyID()
 		log.Infof("store key made and wrapped by the %s root (%s)", roots[0].Kind(), rootKeyID(roots[0]))
 		log.Audit("store-key-wrap", "root", roots[0].Kind(), "key_id", roots[0].KeyID(), "reason", "new store")
 		return nil
@@ -81,6 +81,7 @@ func (n *Node) loadRootedStoreKey(ctx context.Context) error {
 		return fmt.Errorf("selecting the store key: %w", err)
 	}
 	n.encKey, n.encRoots, n.encRoot = candidates[idx], roots, got[idx].Root
+	n.encBinding, n.encEntryKeyID = got[idx].Binding, got[idx].KeyID
 	log.Audit("store-key-unwrap", "root", n.encRoot.Kind(), "key_id", n.encRoot.KeyID())
 	// A split store's second registry is sealed under the same key. A
 	// rotation interrupted between the two leaves it under the other
@@ -183,11 +184,21 @@ func (n *Node) serveRotateRootedStoreKey(ctx context.Context, req cluster.AdminR
 	n.encKeyMu.Lock()
 	current := append([]byte(nil), n.encKey...)
 	root := n.encRoot
+	bound := !n.encBinding.IsZero()
 	n.encKeyMu.Unlock()
-	next, err := enc.RotateWrappedStoreKey(ctx, vfs.Default, n.cfg.Dir, root, current, n.resealStoreKeyLive)
+	defer enc.Zero(current)
+	// The new key's entry is bound as the old one's was: a rotation does
+	// not change what a store's key is tied to, and so does not write an
+	// entry an older release could not read where there was none.
+	wctx := ctx
+	if _, takes := root.(enc.ContextRoot); bound || takes {
+		wctx = enc.WithBinding(ctx, n.storeKeyBinding())
+	}
+	next, err := enc.RotateWrappedStoreKey(wctx, vfs.Default, n.cfg.Dir, root, current, n.resealStoreKeyLive)
 	if err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
 	}
+	n.noteWrapped(root, enc.BindingFrom(wctx))
 	n.adoptStoreKey(ctx, next)
 	msg := fmt.Sprintf("store key rotated online under the %s root (%s); registry and metadata backup sealed under the new key", root.Kind(), rootKeyID(root))
 	log.Infof("%s", msg)
@@ -225,12 +236,20 @@ func (n *Node) serveRewrapStoreKey(ctx context.Context, req cluster.AdminRequest
 		}
 		to = roots[req.Root-1]
 	}
-	if err := enc.RewrapStoreKey(ctx, vfs.Default, n.cfg.Dir, to, key); err != nil {
+	defer enc.Zero(key)
+	// A rewrap binds the key to this node, whatever the root: it is the
+	// operator's own act, and the one that puts an unbound key right.
+	binding := n.storeKeyBinding()
+	if err := enc.RewrapStoreKey(enc.WithBinding(ctx, binding), vfs.Default, n.cfg.Dir, to, key); err != nil {
 		return cluster.AdminResponse{Error: err.Error()}
 	}
 	n.encKeyMu.Lock()
 	n.encRoot = to
 	n.encKeyMu.Unlock()
+	n.noteWrapped(to, binding)
+	if _, ok := to.(enc.HealthChecker); ok {
+		n.rootHealth.usedJustNow(to.KeyID())
+	}
 	msg := fmt.Sprintf("store key rewrapped under the %s root (%s)", to.Kind(), rootKeyID(to))
 	if to != from {
 		msg = fmt.Sprintf("store key moved from the %s root (%s) to the %s root (%s); a restart needs --enc-root to name the new root", from.Kind(), rootKeyID(from), to.Kind(), rootKeyID(to))
@@ -247,18 +266,6 @@ func (n *Node) EncryptionRoot() (kind, keyID string) {
 		return r.Kind, r.KeyID
 	}
 	return "", ""
-}
-
-// securityRoot is what /api/security says of the root a store's key is
-// under.
-func (n *Node) securityRoot() *SecurityRoot {
-	n.encKeyMu.Lock()
-	r := n.encRoot
-	n.encKeyMu.Unlock()
-	if r == nil {
-		return nil
-	}
-	return &SecurityRoot{Kind: r.Kind(), KeyID: r.KeyID()}
 }
 
 // ResealMetadataBackup moves a stopped store's sealed metadata backup

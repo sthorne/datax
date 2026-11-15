@@ -165,7 +165,8 @@ func runDebugRotateEncKey(args []string) error {
 		if err := enc.PruneWrappedKeys(vfs.Default, *dir, got[idx].Index); err != nil {
 			return err
 		}
-		if _, err := enc.RotateWrappedStoreKey(ctx, vfs.Default, *dir, got[idx].Root, cands[idx], func(o, n []byte) error {
+		// The new key's entry is bound as the old one's was.
+		if _, err := enc.RotateWrappedStoreKey(enc.WithBinding(ctx, got[idx].Binding), vfs.Default, *dir, got[idx].Root, cands[idx], func(o, n []byte) error {
 			if err := enc.RotateStoreKey(vfs.Default, *dir, o, n); err != nil {
 				return err
 			}

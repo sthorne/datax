@@ -133,3 +133,62 @@ func TestDebugEncRootOffline(t *testing.T) {
 		t.Fatal("unwrapping with no root was accepted")
 	}
 }
+
+// The offline tools cannot open a store to learn whose it is, so they
+// keep the binding its wrapped key has (issue #308): a key bound to its
+// node is still bound to it after an offline rotation and an offline
+// move to another root.
+func TestDebugEncRootOfflineKeepsTheBinding(t *testing.T) {
+	keyDir, dir := t.TempDir(), t.TempDir()
+	spec := func(name string, fill byte) string {
+		p := filepath.Join(keyDir, name)
+		if err := os.WriteFile(p, bytes.Repeat([]byte{fill}, enc.KeyLen), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return "file:" + p
+	}
+	rootA, rootB := spec("a.key", 2), spec("b.key", 3)
+	node := enc.Binding{ClusterID: "6f1c2a0e-8a53-4c60-9d0c-0c8f8f1d3b11", NodeID: 4}
+	roots, err := enc.ParseRoots(rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := enc.WithBinding(context.Background(), node)
+	key, err := enc.InitWrappedStoreKey(ctx, vfs.Default, dir, roots[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := storage.Open(dir, storage.Options{EncryptionKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bound := func(when string) {
+		t.Helper()
+		entries, err := enc.ReadWrappedKeys(vfs.Default, dir)
+		if err != nil || len(entries) != 1 || entries[0].Binding == nil || *entries[0].Binding != node {
+			t.Fatalf("%s: the wrapped key is not bound to %s: %v %+v", when, node, err, entries)
+		}
+	}
+	bound("as made")
+	if err := runDebugRotateEncKey([]string{"--dir", dir, "--enc-root", rootA}); err != nil {
+		t.Fatalf("offline rotation: %v", err)
+	}
+	bound("after an offline rotation")
+	if err := runDebugEncRoot([]string{"rewrap", "--dir", dir, "--enc-root", rootA + "," + rootB, "--to-root", "2"}); err != nil {
+		t.Fatalf("offline move to another root: %v", err)
+	}
+	bound("after an offline move to another root")
+	// And the key is refused to a caller that says it is another node.
+	other := node
+	other.NodeID = 5
+	rootsB, err := enc.ParseRoots(rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := enc.UnwrapStoreKeys(enc.WithBinding(context.Background(), other), vfs.Default, dir, rootsB); err == nil || !strings.Contains(err.Error(), "another node's") {
+		t.Fatalf("a bound key opened as another node: %v", err)
+	}
+}

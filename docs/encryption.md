@@ -228,7 +228,7 @@ datax init  --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
 datax start --dir data1 --enc-root exec:/usr/local/bin/datax-wrap ...
 ```
 
-Two roots exist today:
+The two simplest roots:
 
 - **`file:<path>`** — a 32-byte wrapping key in a file (raw or hex, as a
   key file is). This moves the problem one step: the wrapping key is a
@@ -274,6 +274,10 @@ What the node does with a root, and refuses:
   root's kind, its key id and the wrapped bytes.
 - A node that cannot reach its root cannot start. A running node is
   unaffected: it unwrapped its key at start.
+- A wrapped store key can be bound to the cluster and node it was
+  wrapped for, and is then refused as any other node's. The KMS roots
+  bind it themselves; for the others a rewrap does (see *A root in a
+  key management service*).
 - `--enc-key` and `--enc-root` together are refused. A root does not
   take over a store it did not make: one opened with a key file is
   refused with a pointer to `datax debug enc-root adopt`, and a
@@ -289,9 +293,10 @@ What a root does and does not give depends on the root. A `file` root
 on the same disk as the data protects nothing a key file would not. An
 `exec` root is as strong as what its command talks to. Neither changes
 the fact that the store key is in the node's memory while it runs.
-A root key split among operators is the next section. Roots handed
-between running nodes, or held in a KMS spoken to directly, are planned
-(#307, #308).
+A root key split among operators is the next section, the handing of
+it between running nodes the one after, and a root that is a key
+management service spoken to directly — Vault, AWS KMS, Google Cloud
+KMS, Azure Key Vault — the one after that.
 
 ### A root key held as shares
 
@@ -449,6 +454,343 @@ What peer unseal keeps and gives up:
   design — for one node; the others take the key from it.
 - A node that has never been a member (a new node joining) has no id
   to be vouched for and is unsealed with shares.
+
+### A root in a key management service
+
+Four roots are a key management service spoken to directly (#308).
+Wrapping and unwrapping the store key are calls to the service; the
+service's key never reaches datax, and what the data directory holds is
+the service's ciphertext of the store key.
+
+| root | spec |
+|---|---|
+| HashiCorp Vault, Transit engine | `vault:<address>/<mount>/<key>` |
+| AWS KMS | `awskms:<key arn>` |
+| Google Cloud KMS | `gcpkms:projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>` |
+| Azure Key Vault | `azurekv:<vault>/<key>[/<version>]` |
+
+```sh
+datax start --dir data1 --enc-root 'vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token' ...
+```
+
+They are written against each service's REST API with Go's standard
+library; datax links no cloud SDK. **They are tested against fakes of
+each API (`pkg/storage/enc/kmstest`), and have not been run against the
+real services.** Try a root against your service — a node started on an
+empty directory wraps a key, unwraps it and compares, and refuses to
+start if any of that fails — before relying on it. The `exec` root
+reaches the same services through their own command-line tools, and
+remains the choice where you would rather trust the vendor's client.
+
+**Options** ride on the spec the way a URL's query does, because
+`--enc-root` separates several roots with commas:
+
+```
+<kind>:<key>?name=value&name=value
+```
+
+A value that needs a comma, `&` or `?` writes it percent-encoded
+(`%2C`, `%26`, `%3F`). An option nobody recognises is an error. **No
+option carries a secret.** A credential is a file an option names, or
+comes from where the service's own tools look — the environment, the
+instance's identity — so a spec can be put in a unit file, logged and
+shown. Every KMS root takes:
+
+| option | meaning | default |
+|---|---|---|
+| `timeout` | how long one request may take | `10s` |
+| `retries` | how many times a request that failed transiently is tried again | `3` |
+| `ca` | PEM file of the certificate authorities to trust, in place of the system's | — |
+
+Requests go through the proxy the environment names (`HTTPS_PROXY`,
+`NO_PROXY`), except those to an instance's metadata service. Plain
+HTTP is accepted only to the machine itself (a local agent): every
+request carries a credential. Redirects are not followed.
+
+**What a node does when the service does not answer.** Each request has
+the timeout above. A failure that may pass — no connection, no answer
+in time, HTTP 429, any 5xx, and AWS's throttling errors — is tried
+again, `retries` times, after a pause that doubles from 200 ms (with
+jitter, capped at 5 s). A refusal — any other 4xx: denied, no such key,
+a ciphertext the key did not make — is not tried again; the one
+exception is a 401 from Google or Azure, where the cached token is
+dropped and the call made again with a fresh one. Then:
+
+- **A node cannot start while its KMS is unreachable**, and says which
+  service, which key and why, in the service's own words:
+
+  ```
+  unwrapping the store key: the vault root could not unwrap the store key: Vault Transit key transit/datax at
+  https://vault.example:8200: decrypt failed after 4 attempts: could not reach vault.example:8200: dial tcp
+  10.0.0.9:8200: connect: connection refused
+  ```
+
+  With the defaults a start gives up after at most about 45 seconds.
+- **A running node is unaffected.** It unwrapped its key at start and
+  holds it; it does not ask again until a rotation or a rewrap.
+
+**Credentials are yours to place**, and datax keeps them nowhere: not
+in the cluster, not in the data directory. No token, secret, signature
+or signed assertion appears in a log line, an error, an event or
+`/api/security`; a root strikes whatever it has sent from any message
+it produces, including a service's own error text.
+
+**Binding to the cluster and node.** A KMS is reachable by every node
+holding a credential for it, so a wrapped store key copied from one
+node's directory would unwrap for another as readily. Each wrapped key
+is therefore bound to its cluster id and node id, in three places:
+
+1. *In the call to the service*, as its encryption context or
+   associated data (below, per service). The service refuses to unwrap
+   under any other, records it in its audit log, and — AWS — lets a key
+   policy condition on it.
+2. *Inside what the service encrypts*: datax wraps a digest of the
+   binding together with the key, and checks it after every unwrap. This
+   holds for a service that has no notion of associated data (RSA
+   wrapping in Azure Key Vault) and for one that would answer for a
+   context it was not asked about.
+3. *In the wrapped-key file*, under the entry's tag, for every root
+   including `file`, `exec` and `shares`.
+
+What this does and does not give, honestly:
+
+- A store key is first wrapped **before its node has an id**: the id is
+  in the store, and the store cannot open without the key. That first
+  wrap is bound to nothing. A node on a KMS root binds its key at the
+  same start, the moment it has bootstrapped or joined (one more wrap
+  and unwrap); if the service fails just then, the node runs with an
+  unbound key, says so (a warning, and `"bound": false` in
+  `/api/security`), and a rewrap binds it. A key policy that *requires*
+  the context therefore refuses a new node's first start: grant the
+  unconditioned call for commissioning, or condition only once the
+  nodes are bound.
+- An unbound entry is accepted, from any node. It has to be: that is
+  what a store from before bindings, and a new node, has.
+- At a restart the node does not yet know who it is, so it presents the
+  binding its own wrapped-key file records, and compares that with the
+  store's identity once the store is open — refusing to run on a
+  mismatch. The binding is not a secret. What stops a holder of node
+  B's credential from unwrapping node A's key by presenting A's context
+  is the service's policy, where the service can condition on it; where
+  it cannot (Vault without per-node tokens, Google, Azure), the binding
+  catches a wrapped key *misplaced* and is recorded in the audit log,
+  and it is separate credentials per node that keep one node from
+  another's key.
+- For `file`, `exec` and `shares` the binding is checked by datax
+  alone, and is written only when you rewrap
+  (`datax debug enc-root rewrap`): an entry with a binding is refused
+  as altered by releases before 0.58, and datax does not make a store
+  unreadable to the release you might roll back to without being asked.
+  The offline tools keep whatever binding an entry has.
+
+**Health.** A running node does not need its root, so one that has
+become unreachable would otherwise be found at the next restart. Every
+minute a node on a KMS root has the service wrap and unwrap a
+throwaway 32-byte value — never the store key — which is exactly what
+a restart needs to work and requires no permission beyond the two a
+node already has. The outcome is:
+
+- in `/api/security`, per store: `root.healthy`, `root.health_error`
+  (the service's reason), `root.health_checked_at`,
+  `root.last_healthy_at`;
+- in the console's security view, said only when the root is not
+  usable;
+- a warning in the health document (`enc-root-unreachable`), and an
+  event when the root goes and when it returns;
+- the gauges `datax_enc_root_healthy` (1 or 0) and
+  `datax_enc_root_last_healthy_timestamp_seconds`. Alert on the first:
+  a node at 0 is serving, and would not come back from a restart.
+
+A check costs two requests to the service a minute per node, which the
+service bills and logs.
+
+**The service's own key rotation.** The key id a node reports carries
+the service's key version where the service names one
+(`transit/datax@v3`). After the service rotates its key, everything
+already wrapped still unwraps; the health check notices the new version
+(`root.latest_key_id`, and a line in the console), and a rewrap moves
+the node's store key onto it, after which the old version can be
+retired in the service:
+
+```sh
+datax debug enc-root rewrap --addr 10.0.0.1:26257 --certs-dir certs   # per node
+datax debug enc-root status --dir data1                                # stopped node: root, key id, binding
+```
+
+AWS KMS rotates a key's material behind one key id and names no
+version, so there is nothing to see move: a rewrap re-encrypts under
+the current material, and the key id stays the ARN.
+
+#### HashiCorp Vault (Transit)
+
+```
+vault:https://vault.example:8200/transit/datax?token_file=/run/vault/token
+```
+
+The address is the scheme and host; the last path element is the key
+and what lies between is the mount. (A Vault served under a path prefix
+is not supported.) Calls: `POST /v1/<mount>/encrypt/<key>` and
+`/decrypt/<key>`. Redirects are not followed, so name the active node,
+a load balancer, or a cluster whose standbys forward requests (Vault's
+default) — a standby that answers with a redirect is a refusal.
+
+| option | environment | meaning |
+|---|---|---|
+| `token_file` | `VAULT_TOKEN_FILE` | file holding the token; **read on every call**, so a token Vault Agent renews is picked up |
+| — | `VAULT_TOKEN`, then `~/.vault-token` | the token, when no file is named |
+| `namespace` | `VAULT_NAMESPACE` | Vault Enterprise namespace |
+| `ca` | `VAULT_CACERT` | CA that signed Vault's certificate |
+| `derived` | — | `true` for a key created with `derived=true` |
+
+The binding is sent as `associated_data`, which Vault authenticates for
+its AEAD key types (`aes256-gcm96`, `chacha20-poly1305`); with
+`derived=true` it is sent as the key-derivation `context` instead,
+which a derived key requires. A Vault too old to know
+`associated_data` ignores it, and the binding then rests on the digest
+inside the ciphertext. The key version is the `v<N>` of Vault's
+ciphertext. Minimum policy:
+
+```hcl
+path "transit/encrypt/datax" { capabilities = ["update"] }
+path "transit/decrypt/datax" { capabilities = ["update"] }
+```
+
+Nothing else: not `transit/keys/*` (the node never reads, creates or
+rotates the key) and not `rewrap`.
+
+#### AWS KMS
+
+```
+awskms:arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab
+```
+
+The region is the ARN's. A symmetric key (`SYMMETRIC_DEFAULT`). Calls:
+`Encrypt` and `Decrypt` (the JSON protocol), signed with Signature
+Version 4; `Decrypt` names the key, so a ciphertext made under some
+other key the credential can use is refused. Credentials are looked for
+in this order:
+
+1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (and
+   `AWS_SESSION_TOKEN`);
+2. `AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN` — the role is
+   assumed through STS (EKS service accounts);
+3. the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`, or
+   `~/.aws/credentials`), profile `AWS_PROFILE` or `default`;
+4. the container credentials endpoint
+   (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`: ECS, EKS
+   Pod Identity);
+5. the instance's role, from the instance metadata service — version 2
+   only; version 1 is never fallen back to.
+
+Temporary credentials are cached until two minutes before they expire.
+Not supported: SSO, `credential_process`, and roles assumed through a
+profile in `~/.aws/config`; use the `exec` root, or run something that
+writes the shared credentials file.
+
+| option | environment | meaning |
+|---|---|---|
+| `profile` | `AWS_PROFILE` | profile of the shared credentials file |
+| `credentials_file` | `AWS_SHARED_CREDENTIALS_FILE` | the shared credentials file |
+| `endpoint` | — | the KMS endpoint (a VPC or FIPS endpoint) |
+| `sts_endpoint` | — | the STS endpoint, for web identity |
+| `imds` | `AWS_EC2_METADATA_SERVICE_ENDPOINT` | the instance metadata endpoint |
+| `ca` | `AWS_CA_BUNDLE` | CA bundle |
+
+The binding is the encryption context
+`{"datax-cluster": "<cluster id>", "datax-node": "<node id>"}`, which
+appears in CloudTrail with every call. Minimum policy for a node's
+role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["kms:Encrypt", "kms:Decrypt"],
+    "Resource": "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  }]
+}
+```
+
+To hold a role to one cluster, add
+`"Condition": {"StringEquals": {"kms:EncryptionContext:datax-cluster": "<cluster id>"}}`
+(and `datax-node` for one role per node) — after the nodes have
+started once, for the reason given under *Binding* above.
+
+#### Google Cloud KMS
+
+```
+gcpkms:projects/acme/locations/europe-west1/keyRings/datax/cryptoKeys/store-root
+```
+
+The key's resource name, without a version; a symmetric
+(`ENCRYPT_DECRYPT`) key. Calls: `cryptoKeys.encrypt` and
+`cryptoKeys.decrypt`. The access token comes from a service-account
+key file when one is named — a JWT signed with the account's key
+(RS256) is exchanged at the file's `token_uri` — and otherwise from
+the metadata server, as the instance's or the pod's service account
+(Workload Identity on GKE). Tokens are cached until two minutes before
+they expire. Not supported: workload identity federation
+(`external_account` files), user credentials and impersonation.
+
+| option | environment | meaning |
+|---|---|---|
+| `credentials` | `GOOGLE_APPLICATION_CREDENTIALS` | a service-account key file |
+| `endpoint` | — | the KMS endpoint |
+| `metadata` | `GCE_METADATA_HOST` | the metadata server |
+
+The binding is the request's `additionalAuthenticatedData`. The key
+version is the one `encrypt` reports (`…/cryptoKeys/store-root@3`).
+Minimum IAM, on the key and nothing wider:
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` — that is,
+`cloudkms.cryptoKeyVersions.useToEncrypt` and
+`cloudkms.cryptoKeyVersions.useToDecrypt`.
+
+#### Azure Key Vault
+
+```
+azurekv:datax-prod/store-root
+azurekv:datax-prod/store-root/0123456789abcdef0123456789abcdef
+```
+
+The vault by name (`https://<name>.vault.azure.net`) or, for another
+cloud, by full host name; an **RSA** key (2048 bits or more). With a
+version in the spec the root wraps under that version always; without,
+under the key's current one. Calls: `wrapKey` and `unwrapKey` with
+`RSA-OAEP-256`; an unwrap names the version that wrapped, which the
+wrapped key records. The access token comes from the client-secret
+variables when all three are set (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+`AZURE_CLIENT_SECRET`) and otherwise from the instance's managed
+identity. Not supported: workload identity federation, certificate
+credentials, and Managed HSM (its token audience differs).
+
+| option | environment | meaning |
+|---|---|---|
+| `client_id` | `AZURE_CLIENT_ID` | the user-assigned managed identity to use |
+| `endpoint` | — | the vault's URL, in place of the one its name gives |
+| `login` | `AZURE_AUTHORITY_HOST` | the token authority |
+| `imds` | — | the instance metadata endpoint |
+
+**RSA wrapping has no associated data**: Key Vault is told nothing of
+the binding, cannot enforce it and gives a policy nothing to condition
+on. The binding rests on the digest inside what is wrapped, which datax
+checks after every unwrap, and on the wrapped-key file's tag. That
+catches a wrapped key moved between nodes; it does not stop a holder of
+any credential for the key from unwrapping any node's blob with their
+own tool. Minimum access, on the key: the data actions
+`Microsoft.KeyVault/vaults/keys/wrap/action` and
+`…/unwrap/action` (the built-in role *Key Vault Crypto Service
+Encryption User* is those two and reading the key's metadata), or, with
+access policies, the key permissions `wrapKey` and `unwrapKey`.
+
+#### HSMs and PKCS#11
+
+datax does not speak PKCS#11: it would need cgo and a vendor's
+library in the process, and the project builds without either. An HSM
+is reached through the `exec` root — a small command around the
+vendor's tool or `pkcs11-tool` — or through a KMS that fronts it
+(Vault's seal or managed keys, AWS CloudHSM custom key stores, Cloud
+HSM protection levels), which the roots above use without knowing.
 
 ## Keys in memory
 
@@ -730,8 +1072,18 @@ WAL recycling for the same reason. Recorded runs live in issue #27.
   The held copies are locked and out of core dumps; a cipher's expanded
   key, and a key on its way through a stack, are on the ordinary heap,
   and anyone who can read the process's memory can read all of it.
-- An HSM or KMS is reachable through an `exec` root's command, not
-  spoken to directly (#308).
+- **The KMS roots have been tested against fakes of each service's
+  API, not against the services.** Their request signing is held to
+  AWS's published examples and their behaviour to what each API
+  documents; the first start against a real service is the test that
+  counts, and it fails closed.
+- **A wrapped store key's binding to its node is enforced by the
+  service only where the service's policy can condition on it** (AWS
+  KMS encryption context). Elsewhere it catches a misplaced key and is
+  audited; Azure Key Vault's RSA wrapping carries none at the service
+  at all. A new node's first wrap is unbound until the node has an id.
+- An HSM is reachable through an `exec` root's command or a KMS that
+  fronts it; PKCS#11 is not spoken directly.
 - Re-encryption covers live sstables; a stale file spanning a single
   user key waits for natural compaction churn.
 - The node never rewrites the operator's key file: after an online

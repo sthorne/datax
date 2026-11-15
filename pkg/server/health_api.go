@@ -563,6 +563,15 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			Summary: "this node cannot read the cluster's authentication secret, so it is refusing SQL password logins; certificate authentication is unaffected"})
 	}
 
+	// The root this node's store key is under (issue #308). The node
+	// runs without it; what is at risk is the next restart, which is why
+	// this is a warning and why it is worth one.
+	doc.Checks++
+	if r := n.securityRoot(); r != nil && r.Healthy != nil && !*r.Healthy {
+		add(Problem{Severity: SeverityWarning, Check: "enc-root-unreachable", Node: int(n.ident.NodeID), Section: "nodes",
+			Summary: fmt.Sprintf("the %s root this node's store key is kept under is not usable, so the node could not restart: %s", r.Kind, r.HealthError)})
+	}
+
 	// Statistics: tables with stale or missing statistics (info).
 	doc.Checks++
 	// From the cached schema document, refreshed in the background: the

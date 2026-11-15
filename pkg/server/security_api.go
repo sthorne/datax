@@ -88,11 +88,33 @@ type SecurityPeerUnseal struct {
 	Refused int64 `json:"refused"`
 }
 
-// SecurityRoot names the root a store key is wrapped by. Neither field
-// is secret: the kind, and the name the root gives its key.
+// SecurityRoot names the root a store key is wrapped by, and says what
+// is known of it. Nothing here is secret: the kind, the name the root
+// gives its key, and the root's own words when it fails.
 type SecurityRoot struct {
-	Kind  string `json:"kind"`
+	Kind string `json:"kind"`
+	// KeyID is the root's key, with the service's key version where the
+	// service names one: the version the store key is wrapped under.
 	KeyID string `json:"key_id,omitempty"`
+	// Bound: the wrapped store key is tied to this cluster and node
+	// (issue #308). False for a store from before bindings, and for a
+	// root that does not take the binding until the key is rewrapped.
+	Bound bool `json:"bound"`
+	// Healthy is the outcome of the latest check that the root is
+	// reachable and can use its key; absent for a root that cannot be
+	// checked (file, exec, shares). A root that is not healthy does not
+	// affect the running node: it is the next restart that would fail.
+	Healthy *bool `json:"healthy,omitempty"`
+	// HealthError is the root's reason, when it is not healthy.
+	HealthError string `json:"health_error,omitempty"`
+	// HealthCheckedAt and LastHealthyAt are when the root was last
+	// asked, and last answered (RFC 3339).
+	HealthCheckedAt string `json:"health_checked_at,omitempty"`
+	LastHealthyAt   string `json:"last_healthy_at,omitempty"`
+	// LatestKeyID is set when the service has a newer version of the
+	// key than the one the store key is wrapped under: a rewrap
+	// (`datax debug enc-root rewrap`) moves the store key to it.
+	LatestKeyID string `json:"latest_key_id,omitempty"`
 }
 
 // AuthenticatedEncryption is a store's position in the switch to the

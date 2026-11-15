@@ -221,6 +221,9 @@ func (n *Node) startHTTP() error {
 			return 0
 		}))
 		nodeReg.MustRegister(&writtenCollector{vec: written, node: n})
+		if n.cfg.EncRoot != "" {
+			nodeReg.MustRegister(&rootHealthCollector{node: n})
+		}
 		if eng.Encrypted() {
 			nodeReg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "datax_reencryption_remaining_bytes", Help: "Live sstable bytes still encrypted under retired data keys (0 = every live sstable rides the active key).",

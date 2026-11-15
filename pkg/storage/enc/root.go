@@ -42,11 +42,11 @@ import (
 // the problem one step and is for tests and for migrating; "exec" hands
 // the wrapping to a command the operator names, which is the bridge to
 // anything with a command line — a TPM, a cloud KMS's CLI, an HSM
-// vendor's tool. The roots that make this more than a bridge (a root key
-// split among operators, one handed between peers, a KMS spoken to
-// directly) are the issues that follow this one.
+// vendor's tool. The roots that make this more than a bridge are in
+// their own files: a root key split among operators (shares.go), handed
+// between peers (peer.go), and a KMS spoken to directly (kms.go).
 type Root interface {
-	// Kind names the sort of root: "file", "exec".
+	// Kind names the sort of root: "file", "exec", "shares", "vault".
 	Kind() string
 	// KeyID identifies the key the root wraps under, for the audit record
 	// and to tell which of several roots wrapped an entry. It is not
@@ -89,11 +89,17 @@ type WrappedEntry struct {
 	KeyID string `json:"key_id,omitempty"`
 	// Wrapped is the root's output, opaque here.
 	Wrapped []byte `json:"wrapped"`
-	// MAC authenticates the three fields above under a key derived from
-	// the store key they wrap, so the file cannot be edited — a key id
-	// changed, one entry's blob put under another's label — without the
-	// store key. The root authenticates Wrapped itself; this covers the
-	// rest, and the case of a root that authenticates nothing.
+	// Binding is the cluster and node the key was wrapped for (binding.go,
+	// issue #308); nil for an entry made before its node had an identity,
+	// or by a release that did not bind. A release before bindings reads
+	// an entry without one and refuses an entry with one as altered.
+	Binding *Binding `json:"binding,omitempty"`
+	// MAC authenticates the fields above under a key derived from the
+	// store key they wrap, so the file cannot be edited — a key id
+	// changed, one entry's blob put under another's label, a binding
+	// swapped — without the store key. The root authenticates Wrapped
+	// itself; this covers the rest, and the case of a root that
+	// authenticates nothing.
 	MAC []byte `json:"mac"`
 }
 
@@ -186,12 +192,18 @@ func writeFileAtomic(base vfs.FS, dir, name string, content []byte) error {
 // The MAC key is derived, not the store key itself: the store key seals
 // the registry with AES-GCM, and one key is not used for two things.
 func entryMAC(storeKey []byte, e *WrappedEntry) ([]byte, error) {
-	macKey, err := hkdf.Key(sha256.New, storeKey, nil, "datax wrapped store key mac v1", KeyLen)
+	// An entry with a binding is tagged under a label of its own, so the
+	// binding can be neither removed from an entry nor added to one.
+	label, fields := "datax wrapped store key mac v1", [][]byte{[]byte(e.Root), []byte(e.KeyID), e.Wrapped}
+	if e.Binding != nil {
+		label, fields = "datax wrapped store key mac v2", append(fields, e.Binding.AAD())
+	}
+	macKey, err := hkdf.Key(sha256.New, storeKey, nil, label, KeyLen)
 	if err != nil {
 		return nil, err
 	}
 	m := hmac.New(sha256.New, macKey)
-	for _, field := range [][]byte{[]byte(e.Root), []byte(e.KeyID), e.Wrapped} {
+	for _, field := range fields {
 		var n [8]byte
 		binary.BigEndian.PutUint64(n[:], uint64(len(field)))
 		m.Write(n[:])
@@ -201,11 +213,14 @@ func entryMAC(storeKey []byte, e *WrappedEntry) ([]byte, error) {
 }
 
 // WrapStoreKey wraps storeKey under root and returns the entry to store.
+// The entry is bound to the cluster and node ctx names (WithBinding),
+// and to none when it names none.
 func WrapStoreKey(ctx context.Context, root Root, storeKey []byte) (WrappedEntry, error) {
 	if len(storeKey) != KeyLen {
 		return WrappedEntry{}, fmt.Errorf("store key must be %d bytes, got %d", KeyLen, len(storeKey))
 	}
-	wrapped, err := root.Wrap(ctx, storeKey)
+	binding := BindingFrom(ctx)
+	wrapped, err := wrapWith(ctx, root, storeKey, binding)
 	if err != nil {
 		return WrappedEntry{}, fmt.Errorf("the %s root could not wrap the store key: %w", root.Kind(), err)
 	}
@@ -221,14 +236,19 @@ func WrapStoreKey(ctx context.Context, root Root, storeKey []byte) (WrappedEntry
 	// What the root wrapped must be what it gives back, before anything
 	// is sealed under this key: a root that cannot unwrap its own output
 	// is found now, not at the next start.
-	back, err := root.Unwrap(ctx, wrapped)
+	back, err := unwrapWith(ctx, root, wrapped, binding)
 	if err != nil {
 		return WrappedEntry{}, fmt.Errorf("the %s root could not unwrap what it had just wrapped: %w", root.Kind(), err)
 	}
-	if !bytes.Equal(back, storeKey) {
+	same := bytes.Equal(back, storeKey)
+	Zero(back)
+	if !same {
 		return WrappedEntry{}, fmt.Errorf("the %s root unwrapped its own output to a different key", root.Kind())
 	}
 	e := WrappedEntry{Root: root.Kind(), KeyID: root.KeyID(), Wrapped: wrapped}
+	if !binding.IsZero() {
+		e.Binding = &binding
+	}
 	if e.MAC, err = entryMAC(storeKey, &e); err != nil {
 		return WrappedEntry{}, err
 	}
@@ -241,6 +261,15 @@ func rootFor(roots []Root, e *WrappedEntry) Root {
 	for _, r := range roots {
 		if r.Kind() != e.Root {
 			continue
+		}
+		// A root whose key id carries the service's key version is asked
+		// whether the entry's is its key at any version: the entry was
+		// wrapped before the rotation the root has since seen.
+		if o, ok := r.(keyOwner); ok && e.KeyID != "" {
+			if !o.OwnsKeyID(e.KeyID) {
+				continue
+			}
+			return r
 		}
 		if id := r.KeyID(); id != "" && e.KeyID != "" && id != e.KeyID {
 			continue
@@ -260,7 +289,19 @@ func unwrapEntry(ctx context.Context, roots []Root, e *WrappedEntry) ([]byte, Ro
 	if len(e.Wrapped) == 0 || len(e.Wrapped) > maxWrappedLen {
 		return nil, nil, fmt.Errorf("corrupt %s: a wrapped key of %d bytes", WrappedKeyName, len(e.Wrapped))
 	}
-	key, err := r.Unwrap(ctx, e.Wrapped)
+	// The entry says what it was wrapped for, and that is what the root
+	// is asked to unwrap under. A caller that knows who it is refuses an
+	// entry wrapped for someone else before the root is asked at all; an
+	// entry bound to nothing is accepted from anyone, which is what lets
+	// a store from before bindings, or a node on its first start, open.
+	var binding Binding
+	if e.Binding != nil {
+		binding = *e.Binding
+	}
+	if want := BindingFrom(ctx); !want.IsZero() && e.Binding != nil && binding != want {
+		return nil, nil, fmt.Errorf("the store key in %s was wrapped for %s, not for %s: it is another node's", WrappedKeyName, binding, want)
+	}
+	key, err := unwrapWith(ctx, r, e.Wrapped, binding)
 	if err != nil {
 		return nil, nil, fmt.Errorf("the %s root could not unwrap the store key: %w", r.Kind(), err)
 	}
@@ -283,6 +324,10 @@ type Unwrapped struct {
 	Root Root
 	// Index is the entry's position in the file (0 is the newest).
 	Index int
+	// Binding is what the entry was wrapped for; zero when unbound.
+	Binding Binding
+	// KeyID is the entry's own record of the key that wrapped it.
+	KeyID string
 }
 
 // UnwrapStoreKeys recovers every store key in dir's wrapped-key file that
@@ -311,7 +356,11 @@ func UnwrapStoreKeys(ctx context.Context, base vfs.FS, dir string, roots []Root)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Unwrapped{Key: key, Root: r, Index: i})
+		u := Unwrapped{Key: key, Root: r, Index: i, KeyID: entries[i].KeyID}
+		if entries[i].Binding != nil {
+			u.Binding = *entries[i].Binding
+		}
+		out = append(out, u)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%w: it was wrapped by %s", ErrNoRootForEntry, describeEntries(entries))
@@ -453,8 +502,10 @@ func RemoveWrappedKeys(base vfs.FS, dir string) error {
 // ---- Parsing ----
 
 // ParseRoot builds a root from its spec: "file:<path>",
-// "exec:<command> [args...]", or "shares" (shares.go), which is made
-// sealed.
+// "exec:<command> [args...]", "shares" (shares.go), which is made
+// sealed, or a key management service spoken to directly (kms.go):
+// "vault:", "awskms:", "gcpkms:", "azurekv:". Building a KMS root makes
+// no call: whether the service answers is found when it is first asked.
 func ParseRoot(spec string) (Root, error) {
 	if strings.TrimSpace(spec) == "shares" {
 		// Nothing to configure: the shares say what they are shares of.
@@ -463,22 +514,31 @@ func ParseRoot(spec string) (Root, error) {
 	kind, rest, ok := strings.Cut(strings.TrimSpace(spec), ":")
 	rest = strings.TrimSpace(rest)
 	if !ok || rest == "" {
-		return nil, fmt.Errorf("root %q: want file:<path>, exec:<command> or shares", spec)
+		return nil, fmt.Errorf("root %q: want file:<path>, exec:<command>, shares, or a key management service (vault:, awskms:, gcpkms:, azurekv:)", spec)
 	}
 	switch kind {
 	case "file":
 		return newFileRoot(rest)
 	case "exec":
 		return newExecRoot(rest, DefaultRootTimeout)
+	case "vault":
+		return newVaultRoot(rest)
+	case "awskms":
+		return newAWSKMSRoot(rest)
+	case "gcpkms":
+		return newGCPKMSRoot(rest)
+	case "azurekv":
+		return newAzureKVRoot(rest)
 	}
-	return nil, fmt.Errorf("root %q: unknown kind %q (want file, exec or shares)", spec, kind)
+	return nil, fmt.Errorf("root %q: unknown kind %q (want file, exec, shares, vault, awskms, gcpkms or azurekv)", spec, kind)
 }
 
 // ParseRoots builds the roots of an --enc-root value: one spec, or
 // several separated by commas. Several are candidates — the one that
 // wrapped the store's key is used, which is what lets an operator stage
 // the root a store is moving to beside the one it is under. A spec
-// cannot itself contain a comma.
+// cannot itself contain a comma; a KMS root's options are written so
+// that they need none (kms.go).
 func ParseRoots(value string) ([]Root, error) {
 	var out []Root
 	for _, spec := range strings.Split(value, ",") {

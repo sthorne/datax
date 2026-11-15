@@ -32,7 +32,7 @@ func runDebugEncRoot(args []string) error {
 	dir := fs.String("dir", "", "data directory of the STOPPED node")
 	addr := fs.String("addr", "", "rewrap: RPC address of the RUNNING node")
 	keyPath := fs.String("enc-key", "", "adopt: the store's current key file (a comma-separated list is tried in order)")
-	rootSpec := fs.String("enc-root", "", "the root: file:<path>, exec:<command> or shares; for an offline rewrap, a comma-separated list of the root the store is under and the one it moves to")
+	rootSpec := fs.String("enc-root", "", "the root: file:<path>, exec:<command>, shares, or a KMS (vault:, awskms:, gcpkms:, azurekv:; see docs/encryption.md); for an offline rewrap, a comma-separated list of the root the store is under and the one it moves to")
 	toRoot := fs.Int("to-root", 0, "rewrap: wrap under this root instead of the one in use — its position (from 1) in the node's --enc-root list (online) or in --enc-root here (offline)")
 	split := fs.String("shares", "", "split, resplit: <threshold>/<total>, for example 2/3")
 	outDir := fs.String("out-dir", "", "split, resplit: write each share to its own file in this directory instead of printing them")
@@ -129,7 +129,11 @@ func runDebugEncRoot(args []string) error {
 				if id == "" {
 					id = "(none)"
 				}
-				fmt.Printf("store key wrapped by a %s root, key id %s\n", e.Root, id)
+				bound := "not bound to a node"
+				if e.Binding != nil {
+					bound = "bound to " + e.Binding.String()
+				}
+				fmt.Printf("store key wrapped by a %s root, key id %s, %s\n", e.Root, id, bound)
 				if i == 0 && len(entries) > 1 {
 					fmt.Println("a store-key rotation did not finish; the next start settles it. Also held:")
 				}
@@ -202,7 +206,11 @@ func runDebugEncRoot(args []string) error {
 			}
 			to = roots[*toRoot-1]
 		}
-		if err := enc.RewrapStoreKey(ctx, vfs.Default, *dir, to, cur.Key); err != nil {
+		// Offline the tool cannot open the store to learn whose it is, so
+		// it keeps the binding the key has: a key bound to its node stays
+		// bound, and an unbound one is bound by the node at its next
+		// start (a KMS root) or by an online rewrap.
+		if err := enc.RewrapStoreKey(enc.WithBinding(ctx, cur.Binding), vfs.Default, *dir, to, cur.Key); err != nil {
 			return err
 		}
 		audit("rewrap", to)

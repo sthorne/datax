@@ -210,6 +210,9 @@ type Config struct {
 	// one that wrapped the store's key is used, so the root a store is
 	// moving to can be staged beside the one it is under.
 	EncRoot string
+	// EncRootHealthInterval is how often a root that can be asked whether
+	// it works (a KMS root) is asked; 0 = the default, negative = never.
+	EncRootHealthInterval time.Duration
 	// AcceptEncryptionRollback lets a store whose switch to authenticated
 	// encryption has been rolled back — its key registry, or the whole
 	// store, restored from before the switch — start anyway (issue
@@ -320,6 +323,14 @@ type Node struct {
 	// guarded by encKeyMu: a rewrap can move the store to another.
 	encRoots []enc.Root
 	encRoot  enc.Root
+	// encBinding is the cluster and node the wrapped store key is bound
+	// to (zero until it is: enckms.go); encEntryKeyID is the key id its
+	// entry in the wrapped-key file records. Both under encKeyMu.
+	encBinding    enc.Binding
+	encEntryKeyID string
+	// rootHealth is what the last health check of the root found
+	// (enckms.go).
+	rootHealth rootHealthState
 	// peerUnseal is what this node remembers as the answering side of
 	// peer unseal (peerunseal.go).
 	peerUnseal peerUnsealState
@@ -640,6 +651,10 @@ func (n *Node) start() error {
 	default:
 		return fmt.Errorf("store is uninitialized: start with --join or use 'datax init'")
 	}
+	// The node knows who it is: hold the wrapped store key to that.
+	if err := n.bindStoreKey(context.Background()); err != nil {
+		return err
+	}
 
 	// Serve RPC before starting replicas so peers can reach us as soon as
 	// raft groups spin up.
@@ -837,6 +852,9 @@ func (n *Node) start() error {
 	}
 	n.maybeStartFilterRewrite()
 	if err := n.stopper.RunWorker(n.ensureRoleCatalog); err != nil {
+		return err
+	}
+	if err := n.startRootHealth(); err != nil {
 		return err
 	}
 	log.Infof("node %s serving internode RPC at %s", n.ident.NodeID, n.addr)
