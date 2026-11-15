@@ -1408,6 +1408,19 @@ state or the internode protocol does, and an entry below says so.
   idle (1,000 tables: 3,042 → 94). New harness `TestMetricsRecorderScale`
   (`DATAX_CATALOG_SCALE`). A plain SQL query of `datax_metrics` sees the
   sparse rows; docs/user/operations.md says how to read them.
+- **The catalog-following jobs resume after a restart** (#316). The retention
+  provider behind GC, the re-shard janitor and the statistics sampler read
+  every descriptor (the sampler also every statistics record) on their first
+  pass after a node start, and the janitor and the sampler again on a node
+  that took over range 1's leadership. Each now persists its state with the
+  timestamp it is as of, in one value — the retention provider on the node's
+  own engine, the janitor and the sampler under `/system/catalog-resume/` so
+  that a new leader resumes too — and its first pass reads what changed since:
+  at 5,000 tables 5,002, 5,002 and 5,007 rows become 3, 2 and 7. A record
+  that is missing, of another format version, or older than the GC threshold
+  leaves a full read, as before. The sampler's record, about 45 KB at 5,000
+  tables, is written hourly; the others, a few hundred bytes, every minute
+  and every ten minutes.
 
 ### Fixed
 - **A transaction whose commit failed kept its rows locked for up to five

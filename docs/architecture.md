@@ -175,9 +175,9 @@ table gauges (`table.rows`, `table.ranges`, `datax_table_*`), which the
 leader of range 1 reads once per recorder tick and any node reads when
 `/metrics` is scraped — a series per table costs a row per table read,
 though from v22 only the changed ones are written. Backup and recovery
-scan the descriptor span directly, and the statistics sampler, the
-retention provider and the re-shard janitor read it whole on their
-first pass after a start.
+scan the descriptor span directly. The statistics sampler, the
+retention provider and the re-shard janitor read it whole only when
+they cannot resume (below).
 Sequences, types and roles are still listed whole by the catalog views.
 `TestCatalogScanScale` measures the passes above (rows read out of the
 descriptor span, one node): at 1,000 and 5,000 tables, DROP TABLE reads
@@ -185,20 +185,59 @@ descriptor span, one node): at 1,000 and 5,000 tables, DROP TABLE reads
 a retention refresh or a re-shard janitor pass reads about 1,000 and
 5,000 on its first pass and 0 on an idle one after (1 after a DROP); a
 statistics sampler tick read about 1,000 and 5,000 (descriptors and
-statistics records) on every tick and reads 2 while collecting.
-`TestMetricsRecorderScale` measures the rows the recorder writes per
-tick.
+statistics records) on every tick and reads 2 while collecting. After
+a restart, their first passes read 2 to 7 rows at either size, what
+changed (below). `TestMetricsRecorderScale` measures the rows the recorder
+writes per tick.
 
-The first pass after a start (of the retention provider, the re-shard
-janitor and the statistics sampler) still reads every descriptor once,
-and so does the first pass of a node that has just taken range 1's
-leadership. Persisting the watcher's timestamp would not remove that
-read on its own: each job keeps state derived from every descriptor,
-which would have to be persisted beside the timestamp — per node for the
-provider, replicated for the two jobs that follow range 1's leader — in
-a format both sides of an upgrade agree on, and the full read is what
-corrects it when it is wrong. At 5,000 tables that read is about 5,000
-rows in 20–40 ms, once per start per job (issue #316 left it).
+**Resuming after a start** (issue #316). Each of the three jobs keeps
+its state beside its watcher (`server.catalogFollower`) and persists a
+resume record: a format version, the watcher's timestamp, and the state
+as of that timestamp, in one value. The retention provider, which every
+node runs for its own GC, keeps the record on the node's engine
+(`keys.StoreCatalogResumeKey`); the janitor and the sampler, which run
+on range 1's leader, keep theirs in the replicated keyspace
+(`keys.CatalogResumeKey`), so a node that takes over the leadership
+resumes from the last leader's record, and a node that loses it drops
+its state. The first pass after a start loads the record and reads what
+changed since its timestamp, as any later pass does.
+
+- *What is persisted.* The retention provider and the janitor keep only
+  a few descriptors (the tables with a GC window or a retention; those
+  with a retired layout) and persist them raw, so the binary that
+  resumes derives its windows and layouts itself. The sampler persists
+  its table set and collection times compactly (about 45 KB at 5,000
+  tables).
+- *Why the result equals a full read.* A record's state is what a full
+  read at its timestamp derives: it is written straight after a pass
+  applied the changes up to that timestamp, before the job acts on it.
+  The export after it covers (timestamp, now], and no write commits at
+  or below a timestamp the spans were read at. Persisting state and
+  timestamp as one value means a crash leaves either the new record or
+  the one before, and each starts from a state and the timestamp it is
+  as of, so changes are read twice at worst and never skipped. Any
+  record is a valid starting point, so two nodes that both think they
+  lead range 1 for a moment can both write one. A node's clock is moved
+  past a record's timestamp before it reads from it, and a record too
+  far ahead of the clock is not used.
+- *When the job reads everything instead.* When the record is missing or
+  does not decode, when its format version is not the job's (an upgrade
+  that changes the state, or what a job keeps of a descriptor, bumps the
+  version), or when GC has passed its timestamp (the export is refused
+  below the GC threshold). These are the same full reads as before
+  records existed.
+- *Cost.* A record is written after a pass at most every minute (the
+  retention provider: a few hundred bytes on the node's engine), ten
+  minutes (the janitor: usually an empty list) or hour (the sampler,
+  whose state changes every tick while it collects). So the first pass
+  after a start reads what changed in that long plus the time the node
+  was down. At 5,000 tables the sampler writes about 1 MB a day. In
+  exchange, each start or leadership move skips reading 5,000
+  descriptors (1 MB at their smallest) and as many statistics records.
+
+`TestCatalogScanScale` measures the first passes after a restart, and
+`TestCatalogFollowersResumeAfterRestart` and
+`TestCatalogFollowersFallBack` check that the states equal a full read.
 
 ## Versioning and rolling upgrades
 
