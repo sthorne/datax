@@ -28,6 +28,11 @@ package catalog
 //     too: a page deleted through SQL would be a hole in somebody's
 //     file, and the pages are read through the lo_* functions, which
 //     check the object's owner.
+//   - datax_keys (issue #310) holds the named keys of the key service,
+//     each wrapped by the cluster key. It is sealed, and more: no SQL
+//     session but the node's own may read it at all (IsUnreadableSystemTable);
+//     sessions are shown its metadata through a virtual table of the same
+//     name that has no column for the key material.
 
 // MetricsTableName is the reserved name of the metrics table.
 const MetricsTableName = "datax_metrics"
@@ -81,6 +86,14 @@ const (
 	LargeObjectPendingTableID  uint64 = 1<<40 + 7
 )
 
+// KeysTableName is the reserved name of the named-keys table and
+// KeysTableID its fixed descriptor ID, the next above
+// LargeObjectPendingTableID (issue #310; pkg/keystore has the layout).
+const (
+	KeysTableName        = "datax_keys"
+	KeysTableID   uint64 = 1<<40 + 8
+)
+
 // systemTableIDs is every reserved name and the ID it is created at.
 // Adding an entry here is the whole registration: the DDL path assigns
 // the ID from it, and the privilege, rename, drop and backup rules read
@@ -95,6 +108,8 @@ var systemTableIDs = map[string]uint64{
 	LargeObjectTableName:         LargeObjectTableID,
 	LargeObjectMetadataTableName: LargeObjectMetadataTableID,
 	LargeObjectPendingTableName:  LargeObjectPendingTableID,
+
+	KeysTableName: KeysTableID,
 }
 
 // SystemTableName is the reserved name whose table is created at id, or
@@ -149,7 +164,17 @@ func IsSystemTableID(id uint64) bool {
 // objects that only the lo_* functions know how to keep whole
 // (issue #303).
 func IsSealedSystemTable(name string) bool {
-	return name == AuditTableName || IsLargeObjectTable(name)
+	return name == AuditTableName || IsLargeObjectTable(name) || name == KeysTableName
+}
+
+// IsUnreadableSystemTable reports whether name is a system table no SQL
+// session but the node's own may read, whatever role asks: the named
+// keys (issue #310). Its rows hold key material wrapped by the cluster
+// key; a session asking for the table by name is given a virtual table
+// of its metadata instead (pkg/sql/keystable.go), and anything that
+// reaches the real descriptor some other way is refused.
+func IsUnreadableSystemTable(name string) bool {
+	return name == KeysTableName
 }
 
 // IsLargeObjectTable reports whether name is one of the tables large

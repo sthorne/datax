@@ -42,6 +42,8 @@ var adminReadOnlyOps = map[string]bool{
 	"wait-applied":     true,
 	"reencrypt-status": true,
 	"seal-status":      true,
+	// What the cluster key is and who holds it (issue #310): no secret.
+	"cluster-key-status": true,
 }
 
 // adminUnauditedOps skip the audit log: the read-only ops (collect-checksum
@@ -59,8 +61,14 @@ var adminUnauditedOps = map[string]bool{
 	// peer-unseal writes its own record, with the node asked about and
 	// the reason for a refusal.
 	"peer-unseal": true,
-	"node-status": true,
-	"node-detail": true,
+	// The cluster key's node-to-node steps write their own records, as
+	// peer-unseal does (issue #310).
+	"cluster-key-status":   true,
+	"cluster-key-handover": true,
+	"cluster-key-offer":    true,
+	"cluster-key-install":  true,
+	"node-status":          true,
+	"node-detail":          true,
 	// notify is one node handing another its committed notifications: a
 	// record per batch would be a record per NOTIFY.
 	"notify": true,
@@ -393,6 +401,33 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 
 	case "peer-unseal-setting":
 		return n.servePeerUnsealSetting(ctx, req)
+
+	case "cluster-key-status":
+		return n.clusterKeyStatusResponse(ctx)
+
+	case "cluster-key-init":
+		return n.serveClusterKeyInit(ctx)
+
+	case "cluster-key-rotate":
+		return n.serveClusterKeyRotate(ctx)
+
+	case "cluster-key-sync":
+		return n.serveClusterKeySync(ctx)
+
+	case "cluster-key-export":
+		return n.serveClusterKeyExport(ctx, req)
+
+	case "cluster-key-import":
+		return n.serveClusterKeyImport(ctx, req)
+
+	case "cluster-key-handover":
+		return n.serveClusterKeyHandover(ctx, req)
+
+	case "cluster-key-offer":
+		return n.serveClusterKeyOffer(ctx, req)
+
+	case "cluster-key-install":
+		return n.serveClusterKeyInstall(ctx, req)
 
 	case "reencrypt":
 		return n.serveReencrypt(req)

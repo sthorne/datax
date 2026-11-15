@@ -560,6 +560,36 @@ state or the internode protocol does, and an entry below says so.
   anywhere cannot drive an unbounded stream of distributed transactions.
   A console re-sending its own value never meets the bucket, because the
   suppression comes first.
+- **The cluster key and the `datax_keys` table** (#310, step 1 of the key
+  service in docs/design-key-service.md). `datax debug cluster-key init`
+  makes one 32-byte cluster key, hands it to every member over mutual TLS,
+  and records it (id, version and a check value, never the key) once every
+  member has kept its own copy, wrapped by its root, beside its wrapped
+  store key (`CLUSTER-KEY`); it is refused unless the cluster is at v22,
+  secure, and every member not being decommissioned is live and runs under
+  `--enc-root` (a key-file node is named, with the pointer to `datax debug
+  enc-root adopt`). An enabling that cannot reach every node is finished,
+  with the same key, by running it again. A node that joins later or loses
+  its copy is handed the key by a running peer under peer unseal's checks
+  (node certificate, member, not being decommissioned, and a live asker
+  only from the host it is registered at); every hand-over is audited and
+  counted (`datax_cluster_key_handovers_total`). `rotate` hands out a new
+  version, rewraps every named key and destroys the old version, resumably;
+  `sync` hands the key to live nodes that lack it; `export --to-root` writes
+  the cluster's keys to a file wrapped under a root the operator names, and
+  `import --from-root` gives them to another cluster, whose whole-cluster
+  restore of the first one's backups then rewraps the restored keys under
+  its own key (a restore of named keys this cluster cannot open is refused
+  before anything is applied). Named keys live in the new system table
+  `datax_keys`, each version sealed under the cluster key with its id, name,
+  version and kind as associated data; no SQL session may read the table,
+  root included, and `SELECT * FROM datax_keys` shows admins the keys'
+  metadata without the material. The Go API is `pkg/keystore` (create, get,
+  list, unwrap, rotate, disable, enable, destroy with a purge of the row's
+  history, and a per-key generation for later caches); the SQL statements
+  are later steps. `/api/security` and the security view report the
+  cluster key and which nodes hold it. Cluster protocol version v22. See
+  docs/encryption.md, "Cluster key".
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server

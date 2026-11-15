@@ -1,10 +1,13 @@
 # Design proposal: a key service, and per-table and per-user data keys
 
-Status: **agreed, not built** (issue #310, the last piece of #292).
+Status: **agreed; step 1 built** (issue #310, the last piece of #292).
 The issue asked for a written design to be agreed before any code. This
 is that design; the owner settled its five open decisions on
-2026-11-15, recorded under *Decisions* at the end. Nothing described
-here exists yet.
+2026-11-15, recorded under *Decisions* at the end. Step 1 of the order
+of work — the cluster key, `datax_keys`, hand-over, export and import —
+is built (docs/encryption.md, "Cluster key"); the choices it made where
+this design was open are under *Choices made in step 1*. Nothing else
+described here exists yet.
 
 What an application should expect from this design — what is
 encrypted, what is not, how to shape a schema for it, and how erasure
@@ -288,3 +291,44 @@ Settled by the owner on 2026-11-15.
    enabling the feature on a cluster with any key-file node is refused
    with that pointer.
 5. **Time-series tables are out of scope** for the first version.
+
+## Choices made in step 1
+
+Where the design above left a choice open, step 1 made these
+(operator-facing detail in docs/encryption.md, "Cluster key"):
+
+- **Enabling is explicit and all-or-nothing.** `datax debug cluster-key
+  init` needs v22, a secure cluster, and every member not being
+  decommissioned live and under `--enc-root`. One node makes the key and
+  pushes it to every member (each keeps its own root-wrapped copy before
+  acknowledging); the key is recorded — id, version and a check value
+  HMAC-SHA256(key, constant ‖ id ‖ version) — only after every
+  acknowledgement, and named keys only after that. A retry finishes the
+  same key from any node that holds it.
+- **Hand-over and the liveness rule.** A node that lacks the key asks
+  while it runs, so peer unseal's "not live" rule cannot apply as it
+  stands. The rule kept is its reason — a second copy of a running node
+  is handed nothing — by answering a live asker only from the host the
+  cluster has it registered at; any other asker waits out the liveness
+  grace, as under peer unseal.
+- **Hand-over is not governed by the peer-unseal setting.** That setting
+  is about a root key that opens a disk; the cluster key opens none, and
+  a node without it cannot serve sealed tables. An operator can push the
+  key to a refused node with `datax debug cluster-key sync`.
+- **`datax_keys` is one row per key**, every version in one column (each
+  version sealed separately, the associated data being the key's id,
+  name, version and kind), with a unique index on the name; all of a
+  key's versions are under one cluster key version, so a rotation of the
+  cluster key rewraps a row at a time. Destroyed keys keep their row and
+  name. The table is a real (sealed) system table, so backups, restores
+  and purges handle it as any table, but no SQL session may read it: a
+  session naming it gets a virtual table of the same name with the
+  metadata only, for admins.
+- **The Go API is `pkg/keystore`**, with a per-key `generation` that
+  every state change bumps, for the gateway caches of steps 3 and 4.
+- **Export and import keep the operator's root on the operator's
+  machine.** The CLI receives the keys sealed for its own exchange and
+  wraps them under `--to-root` itself; no request names a root to a node.
+  Import is refused before the target's own key is enabled; a
+  whole-cluster restore refuses named keys it cannot open before applying
+  anything, and rewraps them under the target's key after.

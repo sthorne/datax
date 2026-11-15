@@ -556,6 +556,9 @@ func CanSeeTable(set RoleSet, d *TableDescriptor) bool {
 // range boundary is whichever row the split fell on — as likely
 // another tenant's as its own. Such a role is shown none of them.
 func CanReadTable(set RoleSet, d *TableDescriptor) bool {
+	if IsUnreadableSystemTable(d.Name) {
+		return false
+	}
 	if IsSealedSystemTable(d.Name) {
 		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
 	}

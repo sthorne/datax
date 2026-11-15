@@ -80,6 +80,15 @@ type SecurityStore struct {
 	PeerUnseal *SecurityPeerUnseal `json:"peer_unseal,omitempty"`
 }
 
+// SecurityClusterKey is the cluster key as /api/security reports it.
+type SecurityClusterKey struct {
+	cluster.ClusterKeyStatus
+	// HandoversGranted and HandoversRefused are this node's answers to
+	// peers that asked it for the key, since it started.
+	HandoversGranted int64 `json:"handovers_granted"`
+	HandoversRefused int64 `json:"handovers_refused"`
+}
+
 // SecurityPeerUnseal is a node's record as the answering side of peer
 // unseal, since it started.
 type SecurityPeerUnseal struct {
@@ -180,6 +189,11 @@ type SecurityStatus struct {
 	// authenticated user, like the counters above: a hash and some
 	// counts name nobody.
 	Audit SecurityAudit `json:"audit"`
+	// ClusterKey is the cluster key (issue #310): whether it is enabled,
+	// its id and version, and per node whether it holds it. Open to any
+	// authenticated user: ids, versions and node numbers name nobody and
+	// open nothing.
+	ClusterKey *SecurityClusterKey `json:"cluster_key,omitempty"`
 	// Error notes a partial document; what is present is still valid.
 	Error string `json:"error,omitempty"`
 }
@@ -209,6 +223,12 @@ func (n *Node) securityDoc(req *http.Request) SecurityStatus {
 	doc.ThrottledVerifyRate = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyRate))
 	doc.ThrottledVerifyFull = counterValue(metrics.AuthThrottled.WithLabelValues(throttleVerifyFull))
 	doc.Audit = n.AuditStatus()
+	if st, err := n.ClusterKeyStatus(req.Context()); err == nil {
+		doc.ClusterKey = &SecurityClusterKey{ClusterKeyStatus: *st,
+			HandoversGranted: n.clusterKey.granted.Load(), HandoversRefused: n.clusterKey.refused.Load()}
+	} else {
+		doc.Error = "the cluster key's state is unavailable: " + err.Error()
+	}
 	doc.AuthThrottled = doc.ThrottledRateLimit + doc.ThrottledVerifyRate + doc.ThrottledVerifyFull
 
 	// Certificates. The loaded material is operational and open; the

@@ -434,8 +434,20 @@ function renderSecurityDoc() {
       </tr>` };
     })
     : [{ key: "none", html: `<tr data-key="none"><td colspan="3" class="muted">no store reported</td></tr>` }]);
+  // The cluster key (issue #310) is the cluster's, not a store's: one
+  // line under the stores, from the replicated record and each node's
+  // own report of what it holds.
+  const ck = d && d.cluster_key;
+  const ckText = !ck ? "" : !ck.enabled
+    ? " · cluster key: not enabled" + (ck.pending ? ` (${ck.pending})` : "")
+    : ` · cluster key ${ck.id} v${ck.version} enabled`
+      + ((ck.previous || []).length ? `; a rotation is still leaving v${ck.previous.join(", v")}` : "")
+      + ((ck.imported || []).length ? `; ${ck.imported.length} imported` : "")
+      + "; " + (ck.nodes || []).filter(nd => !nd.decommissioning).map(nd => `n${nd.node_id} ${nd.holds_current ? "holds it" : "does not hold it"}`).join(", ")
+      + (ck.handovers_granted || ck.handovers_refused ? ` (this node: ${ck.handovers_granted} hand-over(s) granted, ${ck.handovers_refused} refused)` : "")
+      + (ck.pending ? `; in progress: ${ck.pending}` : "");
   document.getElementById("sec-stores-note").textContent = !d ? "" :
-    `n${d.node_id}'s own store — each node's is on its own page, because asking every node would be a fan-out this view does not make`;
+    `n${d.node_id}'s own store — each node's is on its own page, because asking every node would be a fan-out this view does not make` + ckText;
 
   const roles = d ? (d.roles || []) : [];
   renderKeyed(document.getElementById("users"), roles.length

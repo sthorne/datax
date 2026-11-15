@@ -6,6 +6,7 @@ import (
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/notify"
+	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
 // AdminRequest is the JSON body of admin RPCs (datax debug ...).
@@ -104,6 +105,79 @@ type AdminRequest struct {
 	// Notify (notify) is a run of committed NOTIFYs from another node,
 	// for this node's listening sessions (issue #297).
 	Notify *notify.Batch `json:"notify,omitempty"`
+	// ClusterKey carries the arguments of the cluster-key-* ops (issue
+	// #310).
+	ClusterKey *ClusterKeyRequest `json:"cluster_key,omitempty"`
+}
+
+// ClusterKeyRequest is what the cluster-key-* ops carry (issue #310;
+// pkg/server/clusterkey.go).
+type ClusterKeyRequest struct {
+	// ClusterID and NodeID say who asks (cluster-key-handover) or whom
+	// an offer is for (cluster-key-offer).
+	ClusterID string      `json:"cluster_id,omitempty"`
+	NodeID    base.NodeID `json:"node_id,omitempty"`
+	// Exchange is the asker's public half of a key exchange
+	// (cluster-key-handover, cluster-key-export).
+	Exchange []byte `json:"exchange,omitempty"`
+	// Nonce names the offer an install answers; Giver and Sealed are the
+	// giver's public half and the keys sealed for that offer.
+	Nonce  string `json:"nonce,omitempty"`
+	Giver  []byte `json:"giver,omitempty"`
+	Sealed []byte `json:"sealed,omitempty"`
+	// Keys (cluster-key-import) are another cluster's keys, unwrapped by
+	// the CLI from an export: key material in transit, accepted over
+	// mutual TLS only, never logged, audited or echoed.
+	Keys []enc.TransportKey `json:"keys,omitempty"`
+}
+
+// ClusterKeyAnswer is what the cluster-key-* ops answer.
+type ClusterKeyAnswer struct {
+	Status *ClusterKeyStatus `json:"status,omitempty"`
+	// Exchange and Nonce answer an offer; Exchange and Sealed a
+	// handover or an export.
+	Exchange []byte `json:"exchange,omitempty"`
+	Nonce    string `json:"nonce,omitempty"`
+	Sealed   []byte `json:"sealed,omitempty"`
+	// Notes say what an op did, for the operator.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// ClusterKeyStatus is the cluster key as the cluster records it, and who
+// holds it. Nothing in it is secret.
+type ClusterKeyStatus struct {
+	ClusterID string `json:"cluster_id"`
+	Enabled   bool   `json:"enabled"`
+	// ID and Version name the current cluster key.
+	ID      string `json:"id,omitempty"`
+	Version int    `json:"version,omitempty"`
+	// Previous are versions a rotation has not finished leaving.
+	Previous []int `json:"previous,omitempty"`
+	// Imported are other clusters' keys held for their backups, as
+	// id/vN.
+	Imported []string `json:"imported,omitempty"`
+	// Pending describes an enabling, rotation or import that began and
+	// has not finished: running the same command again finishes it.
+	Pending string `json:"pending,omitempty"`
+	// Nodes is every member and what it reports.
+	Nodes []ClusterKeyNode `json:"nodes,omitempty"`
+}
+
+// ClusterKeyNode is one member as the cluster key sees it.
+type ClusterKeyNode struct {
+	NodeID          base.NodeID `json:"node_id"`
+	Live            bool        `json:"live"`
+	Decommissioning bool        `json:"decommissioning,omitempty"`
+	// Reported: the node has written its holder record (it does once the
+	// cluster is at v22).
+	Reported bool `json:"reported"`
+	// Root is the kind of root its store key is under ("" for a key file
+	// or a plaintext store).
+	Root string `json:"root,omitempty"`
+	// Holds lists the cluster keys it holds, as id/vN; HoldsCurrent says
+	// whether the current one is among them.
+	Holds        []string `json:"holds,omitempty"`
+	HoldsCurrent bool     `json:"holds_current"`
 }
 
 // PeerUnsealRequest is what a sealed node sends a running peer: who it
@@ -200,6 +274,8 @@ type AdminResponse struct {
 	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
 	// this package does not depend on the server package's types.
 	Status json.RawMessage `json:"status,omitempty"`
+	// ClusterKey answers the cluster-key-* ops (issue #310).
+	ClusterKey *ClusterKeyAnswer `json:"cluster_key,omitempty"`
 }
 
 // BackupTableSummary reports one table of a backup or restore.

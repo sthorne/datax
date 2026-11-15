@@ -70,6 +70,10 @@ type Env struct {
 	// one for an admin, its own otherwise); nil when the caller cannot
 	// read them. A function, because most catalog queries never ask.
 	LargeObjects func() ([]LargeObjectInfo, error)
+	// Keys lists the named keys of the key service (issue #310) as the
+	// datax_keys virtual table shows them: metadata only, for admins;
+	// nil when the caller cannot read them.
+	Keys func() ([]KeyInfo, error)
 	// Stats maps table ID → statistics (nil when uncollected).
 	Stats map[uint64]*catalog.TableStatistics
 	// Roles holds every role (catalog.ListRoles: root first, then by
@@ -99,6 +103,22 @@ func ProcName(oid int64) (string, bool) {
 		return all[i].Name, true
 	}
 	return "", false
+}
+
+// KeyInfo is one named key as the datax_keys virtual table lists it:
+// everything but the key material, which no SQL session can read.
+type KeyInfo struct {
+	ID           int64
+	Name         string
+	Kind         string
+	Version      int64
+	Versions     int64
+	State        string
+	Generation   int64
+	ClusterKey   string
+	Created      int64 // Unix nanoseconds
+	Rotated      int64 // Unix nanoseconds; 0 = never
+	ExternalRoot string
 }
 
 // LargeObjectInfo is one large object as pg_largeobject_metadata lists

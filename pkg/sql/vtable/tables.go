@@ -469,6 +469,32 @@ func init() {
 			}
 			return rows, nil
 		})
+	// datax_keys (issue #310): the named keys' metadata. The table of the
+	// same name that holds them is readable by no session; a session that
+	// names it is given this instead, which has no column for the key
+	// material. Admins see every key, anyone else none.
+	pg("datax_keys", []catalog.Column{col("id", types.Int), col("name", types.String), col("kind", types.String),
+		col("version", types.Int), col("versions", types.Int), col("state", types.String), col("generation", types.Int),
+		col("cluster_key", types.String), col("created", types.Timestamp), col("rotated", types.Timestamp), col("external_root", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			if env.Keys == nil || !env.IsAdmin {
+				return nil, nil
+			}
+			keys, err := env.Keys()
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]Row, 0, len(keys))
+			for _, k := range keys {
+				rotated := null()
+				if k.Rotated != 0 {
+					rotated = types.NewTimestamp(k.Rotated)
+				}
+				rows = append(rows, Row{i64(k.ID), str(k.Name), str(k.Kind), i64(k.Version), i64(k.Versions), str(k.State),
+					i64(k.Generation), textOrNull(k.ClusterKey), types.NewTimestamp(k.Created), rotated, textOrNull(k.ExternalRoot)})
+			}
+			return rows, nil
+		})
 	pg("pg_db_role_setting", []catalog.Column{col("setdatabase", types.Int), col("setrole", types.Int), col("setconfig", types.String)}, empty)
 	pg("pg_foreign_data_wrapper", []catalog.Column{col("oid", types.Int), col("fdwname", types.String), col("fdwowner", types.Int), col("fdwhandler", types.Int), col("fdwvalidator", types.Int), col("fdwacl", types.String), col("fdwoptions", types.String)}, empty)
 	pg("pg_foreign_server", []catalog.Column{col("oid", types.Int), col("srvname", types.String), col("srvowner", types.Int), col("srvfdw", types.Int), col("srvtype", types.String), col("srvversion", types.String), col("srvacl", types.String), col("srvoptions", types.String)}, empty)
