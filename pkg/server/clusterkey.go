@@ -193,6 +193,10 @@ type clusterKeyState struct {
 
 	// pushFilter, set by tests, fails a push to a node before it is sent.
 	pushFilter atomic.Pointer[func(to base.NodeID) error]
+	// stopBeforeRewrap, set by tests, ends a rotation once the new
+	// version is recorded, before any named key is rewrapped: the state
+	// a rotation interrupted there leaves.
+	stopBeforeRewrap atomic.Bool
 
 	// opMu serializes init, rotate, import and sync on this node.
 	opMu    sync.Mutex
@@ -1030,6 +1034,12 @@ func (n *Node) pushClusterKeys(ctx context.Context, nd kvpb.NodeDescriptor, ks [
 	return nil
 }
 
+// StopClusterKeyRotationBeforeRewrapForTesting makes a rotation on this
+// node stop once its new version is recorded, before the rewrap.
+func (n *Node) StopClusterKeyRotationBeforeRewrapForTesting(stop bool) {
+	n.clusterKey.stopBeforeRewrap.Store(stop)
+}
+
 // SetClusterKeyPushFilterForTesting makes a push from this node to a
 // node fail when fn returns an error for it; nil clears it.
 func (n *Node) SetClusterKeyPushFilterForTesting(fn func(to base.NodeID) error) {
@@ -1359,6 +1369,9 @@ func (n *Node) serveClusterKeyRotate(ctx context.Context) cluster.AdminResponse 
 		n.events.Record("cluster-key", "cluster key rotated to %s", next)
 	} else {
 		notes = append(notes, fmt.Sprintf("finishing an unfinished rotation to %s", m.current().ClusterKeyRef))
+	}
+	if st.stopBeforeRewrap.Load() {
+		return clusterKeyError("cluster key rotate: stopped before the rewrap (testing); run it again to finish")
 	}
 	// Rewrap and retire.
 	done, rewrapped, err := n.retirePreviousClusterKeys(ctx)
