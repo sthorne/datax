@@ -1267,6 +1267,9 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		gh := ba.Header
 		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
 		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)
+		if obs := t.db.sendObserver.Load(); obs != nil {
+			(*obs)(ctx, ba, br) // this path bypasses DB.Send
+		}
 		if regroup {
 			return nil, false, nil
 		}

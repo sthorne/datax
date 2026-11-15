@@ -252,7 +252,6 @@ func (n *Node) clusterDoc(req *http.Request) ClusterStatus {
 // rendered as v may see them).
 func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer) ClusterStatus {
 	now := n.clock.Now().WallTime
-	n.refreshSchema() // keep the table-name map fresh for range labels, without waiting on it
 	forecasts := n.capacityForecasts()
 	if forecasts == nil {
 		forecasts = []Forecast{}

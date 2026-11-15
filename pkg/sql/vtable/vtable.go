@@ -47,8 +47,16 @@ const (
 // and the session's identity.
 type Env struct {
 	Databases []*catalog.DatabaseDescriptor
-	// Tables holds every table the session may see, in every database.
+	// Tables holds the tables the session may see: those of its current
+	// database, or of every database for a table that lists them all
+	// (Table.AllDatabases). A generator that ranges over Tables directly
+	// rather than through currentTables must be one of the latter.
 	Tables []*catalog.TableDescriptor
+	// ReadTable resolves a table that Tables does not hold — the
+	// referenced table of a foreign key into another database — as the
+	// session may see it (nil when it may not, or there is none). Nil
+	// when Tables already holds every database's.
+	ReadTable func(id uint64) *catalog.TableDescriptor
 	// Sequences holds every sequence, in every database.
 	Sequences []*catalog.SequenceDescriptor
 	// Types holds every user-defined type (enum), in every database.
@@ -109,6 +117,21 @@ type Table struct {
 	Columns []catalog.Column
 	Rows    func(ctx context.Context, env *Env) ([]Row, error)
 }
+
+// allDatabaseTables are the virtual tables that list the tables of
+// every database rather than the session's current one.
+var allDatabaseTables = map[string]bool{
+	InformationSchema + ".tables":  true,
+	InformationSchema + ".views":   true,
+	InformationSchema + ".columns": true,
+}
+
+// AllDatabases reports whether the table's rows describe the tables of
+// every database. Every other virtual table renders the current
+// database's, so its Env is built from that database alone and reading
+// it costs the same however many tables the rest of the cluster holds
+// (issue #311).
+func (t *Table) AllDatabases() bool { return allDatabaseTables[t.Schema+"."+t.Name] }
 
 // Descriptor renders the table as a catalog descriptor the planner and
 // executor understand: a table with a primary key on a hidden ordinal
@@ -615,6 +638,9 @@ func (env *Env) tableByID(id uint64) *catalog.TableDescriptor {
 		if t.ID == id {
 			return t
 		}
+	}
+	if env.ReadTable != nil {
+		return env.ReadTable(id)
 	}
 	return nil
 }

@@ -247,12 +247,12 @@ func (n *Node) startHTTP() error {
 	if n.tlsCfgs != nil {
 		nodeReg.MustRegister(newCertExpiryCollector(n))
 	}
+	nodeReg.MustRegister(newTableGaugeCollector(n))
 	gatherers := prometheus.Gatherers{metrics.Registry, nodeReg}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", n.requireMetrics(promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
 	mux.HandleFunc("/status", func(w http.ResponseWriter, req *http.Request) {
-		n.refreshSchema() // range labels, without waiting on the catalog
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")

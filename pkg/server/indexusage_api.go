@@ -237,16 +237,13 @@ func counterIncrease(pts []tsample) (inc float64, lastRise int64) {
 // indexUsageRows is the recorder's sample of this node's index counters
 // (issue #208): one index.scans and one index.rows row per index the
 // node has read through, labelled table.index, with the primary under
-// "primary". Resolved through the schema cache, so an index of a table
-// the cache does not know yet (just created) waits a tick.
+// "primary". Names are resolved through the node's table cache
+// (tableDesc), which reads the descriptors of the tables this node has
+// read through and no others; an index of a table it has not read yet
+// (just created) waits a tick.
 func (n *Node) indexUsageRows(add func(name string, v float64)) {
-	// Every node resolves names through its own cache; the leader's is
-	// refreshed by the table gauges, the others' only by what asks, so
-	// ask (a background rebuild past the cache's age, never a wait).
-	n.refreshSchema()
-	descs := n.tableDescs()
 	for _, u := range sql.IndexUsageSnapshot() {
-		d := descs[u.TableID]
+		d := n.tableDesc(u.TableID)
 		if d == nil || catalog.IsSystemTable(d.Name) {
 			continue
 		}

@@ -269,7 +269,10 @@ serves, on that address:
   finalized v5 it is a 503.
 - **`/api/schema`** — JSON: the schema browser's document. In secure mode
   root and admins see every table and the user list; another user sees
-  the tables it holds a grant on. Rebuilt at most every 5 s per node.
+  the tables it holds a grant on. Built when requested and cached for
+  5 s per node, with concurrent requests sharing one build: a table
+  created while the page is open shows within that, and a node whose
+  console nobody has open does not read the catalog for it.
 
 In secure mode an unauthenticated browser gets a sign-in page, and the
 console's user menu shows who you are, how you got in, which roles you
@@ -498,7 +501,7 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_clock_offset_seconds{peer}` | \|offset\| > half of `--max-offset` (0.25 s by default) | a node's clock is drifting; past the tolerance the node refuses the peer's timestamps and exits — fix NTP now (the node also logs a warning at this point) |
 | `datax_peer_reachable{peer}` | 0 | this node's pings to the peer fail: a partition, a firewall, or the peer is down (its heartbeat will say which) |
 | `datax_rpc_rtt_seconds{peer}` | p99 rising | the link to that peer is degrading; every raft round trip to it pays this |
-| `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally |
+| `datax_table_stats_age_seconds{table}` | > 1h on a table that changes | statistics are not refreshing (the sampler needs the table to be readable and the node to lead); the planner is estimating structurally. Like `datax_table_rows` and `datax_table_ranges` it is read from the catalog when `/metrics` is scraped (at most every 5 s; a scrape waits up to 2 s for the reading, then serves the previous one), so every node reports the same current value and a node nobody scrapes reads nothing for it |
 | `datax_sql_connections{state="idle_in_txn"}` | > 0 for minutes | a client is holding a transaction open and idle; its write intents block every other writer to those keys (see the oldest-idle-txn age on the dashboard). `SET idle_in_transaction_session_timeout` (per session, or in the application's connection setup) ends such a connection and releases its intents; `SELECT pg_cancel_backend(pid)` / `pg_terminate_backend(pid)` with the pid from `pg_stat_activity` does it by hand, and `SET lock_timeout` bounds how long the blocked writers wait ([Session settings](sql.md#session-settings)) |
 | `datax_sql_serialization_failures_total` vs `datax_sql_statements_total` | ratio ≫ a few % | contention on hot rows; the client-side view of `datax_txn_retries_total` |
 | `datax_replica_gc_removed_total` | increasing | the housekeeping pass found replicas that `/meta` says are members of nothing — preseeds whose membership change never landed — and removed them with their data; expected after a refused replica change, otherwise worth a look at the log for which ranges |
@@ -1313,6 +1316,30 @@ Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
 - **Secondary indexes multiply write cost**: each row insert writes every
   index too, and each **unique** index adds a read-before-write check.
   Unique-index-heavy tables ingest at point-read speed, not write speed.
+- **Many tables cost the catalog little; many ranges cost what ranges
+  cost.** Listing one database's tables and resolving one table read
+  the same number of keys with 1,000 tables in the cluster as with
+  5,000 (measured on an in-process three-node cluster, fifty tables to
+  a database: 53 point reads and one scan to list a database, 4 point
+  reads to resolve a table cold). A gateway caches at most 1,024
+  descriptors and gives up the lease of any it has not used for 30 s,
+  so one that touched every table once is back to no lease traffic half
+  a minute later; a workload that keeps more than 1,024 tables hot on
+  one gateway pays two point reads per statement for the overflow. The
+  schema page costs one build per five seconds while somebody has it
+  open — 51 ms and 1 MB of descriptors at 5,000 tables — and it, the
+  catalog-wide `information_schema` views, the per-table gauges and a
+  few background passes (statistics refresh, retention, backup) are
+  what still read every descriptor. Small tables do not get a range
+  each: ranges split by size, and 5,000 one-row tables shared nine
+  ranges in that test, at roughly 4–16 KiB of heap per table per node
+  (the lower figure after this change; it includes storage engine and
+  raft state and is an observation, not a guarantee). A table does
+  occupy at least one range of its own when it is a timeseries table or
+  its database carries a placement policy, and a range is a raft group
+  on three nodes; tens of thousands of such tables are a range-count
+  question (see the range and raft numbers above), not a catalog one.
+  Beyond 5,000 tables is untested.
 - **Reads scale with replicas** for historical (`AS OF SYSTEM TIME`)
   queries, which any replica can serve; current reads go to leaseholders,
   which the load balancer spreads by QPS.

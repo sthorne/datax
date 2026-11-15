@@ -127,6 +127,22 @@ type DB struct {
 		sync.Mutex
 		last map[uuid.UUID]time.Time
 	}
+	// sendObserver, when set, is shown every routed batch and its
+	// response (TestingSetSendObserver).
+	sendObserver atomic.Pointer[func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse)]
+}
+
+// TestingSetSendObserver installs (or, with nil, removes) a function
+// shown every batch this DB routes, with its response (nil on error):
+// how a test counts the KV requests and rows an operation costs, which a
+// shared machine's wall clock cannot say. The observer runs on the
+// sender's goroutine and must not send.
+func (db *DB) TestingSetSendObserver(f func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse)) {
+	if f == nil {
+		db.sendObserver.Store(nil)
+		return
+	}
+	db.sendObserver.Store(&f)
 }
 
 // SetNodeLister wires the cluster-node enumeration used as routing fallback.
@@ -259,6 +275,14 @@ func replicaNodeIDs(desc kvpb.RangeDescriptor) []base.NodeID {
 // Note that a non-transactional batch that crosses ranges is NOT atomic —
 // atomicity across ranges is the transaction layer's job.
 func (db *DB) Send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	br, kerr := db.send(ctx, ba)
+	if obs := db.sendObserver.Load(); obs != nil {
+		(*obs)(ctx, ba, br)
+	}
+	return br, kerr
+}
+
+func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, kvpb.NewErrorf("empty batch")
 	}

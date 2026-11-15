@@ -399,10 +399,25 @@ func sequenceRelation(sd *catalog.SequenceDescriptor) *catalog.TableDescriptor {
 	}
 }
 
+// envTables is which tables a virtual environment gathers.
+type envTables int
+
+const (
+	// envNoTables: the reader wants roles or settings only.
+	envNoTables envTables = iota
+	// envCurrentTables: the session's current database, which is all
+	// that pg_catalog and most of information_schema describe.
+	envCurrentTables
+	// envAllTables: every database's, for the few views that list them
+	// all (vtable.Table.AllDatabases). This one reads the whole catalog.
+	envAllTables
+)
+
 // virtualEnv gathers what the virtual tables render: every database,
-// the tables the session may see (all of them for admins; for others,
-// the tables they hold a privilege on), statistics, users and admins.
-func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.Env, error) {
+// the tables the session may see within scope (all of them for admins;
+// for others, the tables they hold a privilege on), statistics, users
+// and admins.
+func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables) (*vtable.Env, error) {
 	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
@@ -421,15 +436,37 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn) (*vtable.En
 		return nil, err
 	}
 	env.IsAdmin = set.IsAdmin()
-	all, err := s.cat.List(ctx, txn)
-	if err != nil {
-		return nil, err
-	}
 	// A table whose schema the session may not use is not listed, as
 	// the console does not list it (issue #259): both ask
 	// catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema answer
 	// the listing question the same way (issue #197).
 	denied := catalog.SchemaUsageDenied(dbs, set)
+	var all []*catalog.TableDescriptor
+	switch scope {
+	case envAllTables:
+		if all, err = s.cat.List(ctx, txn); err != nil {
+			return nil, err
+		}
+	case envCurrentTables:
+		for _, db := range dbs {
+			if db.Name != s.database {
+				continue
+			}
+			if all, err = s.cat.ListIn(ctx, txn, db); err != nil {
+				return nil, err
+			}
+		}
+		// A foreign key may reference a table of another database; it is
+		// resolved by ID when a row needs it, under the same visibility
+		// rule as the listing.
+		env.ReadTable = func(id uint64) *catalog.TableDescriptor {
+			d, err := catalog.ReadTable(ctx, txn, id)
+			if err != nil || d == nil || !canSeeTable(set, d) || denied[d.DatabaseID] {
+				return nil
+			}
+			return d
+		}
+	}
 	for _, d := range all {
 		if !canSeeTable(set, d) || denied[d.DatabaseID] {
 			continue
@@ -480,7 +517,11 @@ func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *cat
 	if !ok {
 		return nil, newErrf(CodeInternal, "virtual table %q vanished", desc.Virtual)
 	}
-	env, err := s.virtualEnv(ctx, txn)
+	scope := envCurrentTables
+	if vt.AllDatabases() {
+		scope = envAllTables
+	}
+	env, err := s.virtualEnv(ctx, txn, scope)
 	if err != nil {
 		return nil, err
 	}

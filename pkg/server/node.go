@@ -138,6 +138,11 @@ type Config struct {
 	// DescLeaseTTL is the gateway descriptor-lease lifetime (0 = default
 	// 10s; negative disables leasing, restoring pre-lease cache semantics).
 	DescLeaseTTL time.Duration
+	// DescCacheSize bounds the gateway's descriptor cache, and so the
+	// leases it holds and renews (0 = catalog.DefaultDescCacheSize). A
+	// table resolved while the cache is full is read from the catalog by
+	// each statement instead (issue #311).
+	DescCacheSize int
 	// MergeSizeThreshold: a range and its right neighbor both below it (and
 	// colocated) merge automatically (0 = a quarter of SplitSizeThreshold;
 	// negative disables).
@@ -418,6 +423,13 @@ type Node struct {
 	pinger *rpc.Pinger
 	// schema caches the schema browser's document (see schema_api.go).
 	schema schemaCache
+	// tableDescs holds the descriptors of the tables this node has been
+	// asked to name (table_cache.go); placement, each table's replica
+	// placement policy (placement.go); gauges, the last reading of the
+	// table gauges (table_gauges.go).
+	tableDescs tableDescCache
+	placement  placementCache
+	gauges     tableGaugeCache
 	// capacity caches the disk-fill forecasts (see capacity.go): they
 	// read a day of samples per node, which is not work to repeat on a
 	// console poll.
@@ -853,6 +865,9 @@ func (n *Node) start() error {
 	if err := n.stopper.RunWorker(n.heartbeatLoop); err != nil {
 		return err
 	}
+	// Lend table names to the key printer, so this process's log lines
+	// name tables too (every node of a cluster knows the same names).
+	keys.SetTableNamer(n.tableNameByID)
 	if err := n.stopper.RunWorker(n.upreplicationLoop); err != nil {
 		return err
 	}

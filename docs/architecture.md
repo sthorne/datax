@@ -101,6 +101,51 @@ These are the load-bearing rules; tests assert them.
    still equals its read timestamp; anything that bumps the write timestamp
    forces a retry (see [transactions.md](transactions.md)).
 
+## The catalog, and what its costs follow
+
+The catalog lives in range 1, and most of what reads it is meant to cost
+in proportion to what is asked for, not to the number of tables in the
+cluster (issue #311):
+
+- **Resolving a table** is four point reads cold (the database's name
+  and descriptor, the table's name, its descriptor) and none from a
+  gateway's cache.
+- **Listing a database's tables** (`catalog.Accessor.ListIn`: `SHOW
+  TABLES`, `DROP DATABASE`, `GRANT ... ON ALL TABLES`, `ANALYZE`, the
+  `pg_catalog` views) scans that database's names under
+  `/system/nsdb/<dbID>/` — plus the flat pre-v6 namespace for the
+  default database — and reads those descriptors in batched point
+  reads.
+- **Descriptor leases** follow the tables a gateway is using: an entry
+  unused for three lease TTLs is evicted and its lease deleted, and the
+  cache holds at most 1,024 descriptors (see
+  [sql.md](sql.md), "versions and leases").
+- **The console's schema document** is built when `/api/schema` (or a
+  page that needs it) is requested, cached for five seconds, and shared
+  by concurrent requests. No node builds it on a timer.
+- **Names for range labels, rendered keys, log lines and index-usage
+  series** come from a per-node cache of descriptors read by ID, holding
+  only the tables that node has been asked about.
+- **Placement** is a per-node map refreshed every few seconds from the
+  database descriptors and, for databases that carry a policy, the names
+  keyed under them; a cluster with no policy reads only the database
+  descriptors.
+
+What still reads every table descriptor: `catalog.Accessor.List`, used
+by `information_schema.tables`, `.columns` and `.views` (which list
+every database), role DDL that must find everything a role owns or is
+granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`), the dependent-view
+check on `DROP` and `ALTER`, `ALTER TYPE ... ADD VALUE` and `DROP TYPE`,
+`regclass` name resolution, a build of the schema document, and the
+table gauges (`table.rows`, `table.ranges`, `datax_table_*`), which the
+leader of range 1 reads once per recorder tick and any node reads when
+`/metrics` is scraped — a series per table costs a row per table.
+Backup, recovery and three background passes scan the descriptor span
+directly and are unchanged: the statistics refresher (every minute),
+the retention provider behind GC (every 30 s while GC asks) and the
+re-shard janitor (every minute). Sequences, types and roles are still
+listed whole by the catalog views.
+
 ## Versioning and rolling upgrades
 
 Each binary has an integer protocol version with a supported window

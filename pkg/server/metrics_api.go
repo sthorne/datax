@@ -148,7 +148,9 @@ func (n *Node) metricsCatalog(ctx context.Context, v keyViewer) MetricsCatalog {
 	}
 	sort.Ints(doc.Nodes)
 	sort.Strings(doc.Labels["peer"])
-	if sd := n.cachedSchemaDoc(); sd != nil {
+	// The table and index label values come from the schema document,
+	// built for this request if nobody has asked for it lately.
+	if sd := n.schemaDoc(ctx); sd != nil {
 		for _, t := range sd.Tables {
 			// A table the caller may not see is not named here either,
 			// nor its indexes: the label values are the listing question

@@ -224,6 +224,12 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
+- **How many tables.** The `pg_catalog` views, `SHOW TABLES` and name
+  resolution cost in proportion to the current database, not to the
+  cluster; `information_schema.tables`, `.columns` and `.views` list
+  every database and read every table descriptor. See [Capacity
+  planning](operations.md#capacity-planning) for what was measured (up
+  to 5,000 tables) and what still grows with the table count.
 
 ## Client compatibility notes
 

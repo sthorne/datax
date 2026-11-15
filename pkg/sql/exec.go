@@ -3293,7 +3293,7 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 	case "users", "roles":
 		// SHOW USERS: the login roles; SHOW ROLES: every role, the built-in
 		// ones included.
-		env, err := s.virtualEnv(ctx, txn)
+		env, err := s.virtualEnv(ctx, txn, envNoTables)
 		if err != nil {
 			return nil, err
 		}

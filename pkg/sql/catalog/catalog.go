@@ -746,6 +746,14 @@ type Accessor struct {
 	ttl     time.Duration
 	// renewalPaused makes the renewal loop skip its ticks (tests only).
 	renewalPaused atomic.Bool
+	// maxEntries bounds the cache of a leasing accessor and idleAfter is
+	// how long an entry may go unused before its lease is given up; zero
+	// means the defaults (lease.go, "Eviction"). acquiring counts the
+	// lookups that have reserved a slot and are taking the lease for it,
+	// so that concurrent first uses cannot overshoot the bound.
+	maxEntries int
+	idleAfter  time.Duration
+	acquiring  int
 
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
@@ -771,6 +779,18 @@ type cachedDesc struct {
 	priorExpiration     int64
 	handedOut           bool
 	handedOutExpiration int64
+	// lastUsed is the wall time a statement last resolved the table
+	// through this cache key; a renewal carries it over unchanged, so an
+	// entry nobody uses grows old however often its lease is renewed.
+	lastUsed int64
+}
+
+// outstanding reports whether a statement that was handed this entry, or
+// one of the entries it replaced, may still commit under the deadline it
+// took: the three expirations a drain waits for on this gateway. Such an
+// entry is never evicted, because the cache is where they are remembered.
+func (c *cachedDesc) outstanding(nowWall int64) bool {
+	return (c.handedOut && c.expiration > nowWall) || c.handedOutExpiration > nowWall || c.priorExpiration > nowWall
 }
 
 func NewAccessor() *Accessor {
@@ -808,13 +828,15 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	}
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
-	if c, ok := a.cache[key]; ok && (c.expiration == 0 || a.nowWallLocked() < c.expiration) {
+	now := a.nowWallLocked()
+	if c, ok := a.cache[key]; ok && (c.expiration == 0 || now < c.expiration) {
 		// This statement plans against a descriptor it did not read in
 		// its own transaction, so its only bound is the deadline below.
 		// Mark the entry: until it expires, a drain that sees this
 		// gateway adopt a newer version must still wait for this
 		// statement (issue #185).
 		c.handedOut = true
+		c.lastUsed = now
 		desc := c.desc
 		exp := c.expiration
 		a.mu.Unlock()
@@ -826,28 +848,45 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	if err != nil {
 		return nil, err
 	}
-	entry := &cachedDesc{desc: d}
-	if a.leasing {
-		// The lease is taken in its own transaction, with the descriptor
-		// it covers read there (acquireLease): the cache holds what the
-		// lease record claims. This statement keeps d, the version its
-		// own transaction read — if that is older than the leased one,
-		// its read of the descriptor conflicts with the schema change
-		// at commit, as any stale read does.
-		ld, info, err := a.acquireLease(ctx, dbID, name, key)
-		if err != nil || ld == nil {
-			// Without a lease the cache may not be trusted beyond this
-			// statement; return the descriptor uncached. d was read
-			// inside txn, so a schema change committing after that read
-			// fails the transaction's refresh — the deadline is what the
-			// CACHED path needs, and this path did not take one.
-			return d, nil
-		}
-		entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
+	entry := &cachedDesc{desc: d, lastUsed: now}
+	if !a.leasing {
+		a.mu.Lock()
+		a.cache[key] = entry
+		a.mu.Unlock()
+		return d, nil
 	}
-	a.mu.Lock()
-	a.cache[key] = entry
-	a.mu.Unlock()
+	// A full cache takes no new entry and no new lease: the statement
+	// keeps d, which it read inside its own transaction, exactly as it
+	// does when the lease cannot be taken (below). The renewal loop makes
+	// room by giving up the leases nobody is using.
+	reserved, ok := a.reserveSlot(key)
+	if !ok {
+		return d, nil
+	}
+	// The lease is taken in its own transaction, with the descriptor
+	// it covers read there (acquireLease): the cache holds what the
+	// lease record claims. This statement keeps d, the version its
+	// own transaction read — if that is older than the leased one,
+	// its read of the descriptor conflicts with the schema change
+	// at commit, as any stale read does.
+	ld, info, err := a.acquireLease(ctx, dbID, name, key)
+	if err != nil || ld == nil {
+		// Without a lease the cache may not be trusted beyond this
+		// statement; return the descriptor uncached. d was read
+		// inside txn, so a schema change committing after that read
+		// fails the transaction's refresh — the deadline is what the
+		// CACHED path needs, and this path did not take one.
+		a.releaseSlot(reserved)
+		return d, nil
+	}
+	entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration, lastUsed: now}
+	if !a.install(key, entry, reserved) {
+		// The entry this lookup meant to replace went away while the
+		// lease was being taken, and the cache filled meanwhile. Nothing
+		// was handed out under the lease, so it is given back.
+		a.releaseLease(ctx, ld.ID, info.expiration)
+		return d, nil
+	}
 	pinDeadline(txn, entry.expiration)
 	return d, nil
 }
@@ -1160,7 +1199,9 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	return d, nil
 }
 
-// List returns all table descriptors.
+// List returns all table descriptors, of every database, by scanning
+// the whole descriptor span: its cost is the size of the cluster's
+// catalog. A caller that wants one database's tables asks ListIn.
 func (a *Accessor) List(ctx context.Context, txn *kvclient.Txn) ([]*TableDescriptor, error) {
 	start, end := keys.TableDescSpan()
 	rows, err := txn.Scan(ctx, start, end, 0)

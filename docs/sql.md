@@ -429,6 +429,29 @@ schema. The cost is that a schema change waits out the superseded entry —
 up to one TTL — whenever a gateway served that descriptor from cache
 within the last renewal interval.
 
+A gateway does not hold a lease for ever (issue #311). An entry no
+statement has resolved a table through for three TTLs is dropped from
+the cache, and its lease record is deleted rather than renewed. By then
+every deadline taken under the entry has passed, so the record protects
+nothing; with it gone, a schema change on a table the gateway has
+stopped using waits for nothing from that gateway, where a record left
+to lapse would have held it up for the rest of a TTL. The delete is
+conditional on the record still being the evicted entry's: a statement
+that resolves the table again in the meantime takes a new lease, and the
+late delete leaves it alone. Using the table again is an ordinary first
+use — the descriptor is read, and the lease taken, in one transaction.
+
+The cache is bounded too: 1,024 descriptors by default (`DescCacheSize`
+in the server config), which is also the most leases a gateway renews —
+about three hundred lease writes a second at the default TTL when the
+cache is full. A table resolved while it is full is neither cached nor
+leased. Each statement then plans against the descriptor its own
+transaction read, which costs two point reads and needs no deadline (a
+schema change that commits after the read fails the transaction's
+refresh), until idle entries make room. An entry in use is never pushed
+out to admit another: it is the gateway's record of the deadlines a
+drain must still wait for.
+
 A statement whose descriptor came from the uncached path holds no
 deadline and needs none: it read the descriptor inside its own
 transaction, so a schema change committing after that read fails the

@@ -574,15 +574,13 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 
 	// Statistics: tables with stale or missing statistics (info).
 	doc.Checks++
-	// From the cached schema document, refreshed in the background: the
-	// panel must answer while the catalog is unreachable.
-	n.refreshSchema()
+	// From the last reading of the table gauges, refreshed in the
+	// background: the panel must answer while the catalog is unreachable.
+	n.refreshTableGauges()
 	stale := 0
-	if schema := n.cachedSchemaDoc(); schema != nil {
-		for _, t := range schema.Tables {
-			if t.Stats != nil && t.Stats.Stale && t.Stats.RowCount > 1000 {
-				stale++
-			}
+	for _, g := range n.cachedTableGauges() {
+		if g.Stats != nil && g.Stats.Stale && g.Stats.RowCount > 1000 {
+			stale++
 		}
 	}
 	if stale > 0 {

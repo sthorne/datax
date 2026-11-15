@@ -136,6 +136,7 @@ func (n *Node) catalogAccessor() (*catalog.Accessor, error) {
 	n.catOnce.Do(func() {
 		cat := catalog.NewAccessor()
 		cat.EnableStats(n.db)
+		cat.SetCacheLimits(n.cfg.DescCacheSize, 0)
 		if n.cfg.DescLeaseTTL >= 0 {
 			if err := cat.StartLeasing(n.db, n.clock, n.stopper, n.cfg.DescLeaseTTL); err != nil {
 				n.catErr = err

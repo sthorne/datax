@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -298,19 +299,109 @@ func (a *Accessor) DropDatabase(ctx context.Context, txn *kvclient.Txn, d *Datab
 
 // ListIn returns the table descriptors of one database (ID 0 = the
 // default database's pre-migration tables, which also belong to the
-// default database once it has an ID).
+// default database once it has an ID), in ID order.
+//
+// It reads the database's own names and then exactly the descriptors
+// they point at, so its cost follows the size of the database and not of
+// the cluster (issue #311): since the v6 catalog a table's name is keyed
+// under its database, and a table that predates it is named in the flat
+// namespace, which only the default database reads. A descriptor is
+// always written and removed together with its name entry, in one
+// transaction, so the names of a database are its tables; a descriptor
+// with no name entry at all, which only a damaged catalog could hold, is
+// the one thing a scan of every descriptor (List) would have returned
+// and this does not.
 func (a *Accessor) ListIn(ctx context.Context, txn *kvclient.Txn, db *DatabaseDescriptor) ([]*TableDescriptor, error) {
-	all, err := a.List(ctx, txn)
+	ids, err := tableIDsIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}
-	out := all[:0]
-	for _, d := range all {
+	descs, err := readTables(ctx, txn, ids)
+	if err != nil {
+		return nil, err
+	}
+	// The descriptor has the last word on which database it belongs to,
+	// as it had when this was a filter over every descriptor.
+	out := descs[:0]
+	for _, d := range descs {
 		if d.DatabaseID == db.ID || (d.DatabaseID == 0 && db.Name == DefaultDatabase) {
 			out = append(out, d)
 		}
 	}
 	return out, nil
+}
+
+// tableIDsIn is the IDs a database's name entries point at, ascending.
+func tableIDsIn(ctx context.Context, txn *kvclient.Txn, db *DatabaseDescriptor) ([]uint64, error) {
+	var ids []uint64
+	seen := map[uint64]bool{}
+	scan := func(lo, hi keys.Key) error {
+		rows, err := txn.Scan(ctx, lo, hi, 0)
+		if err != nil {
+			return err
+		}
+		for _, kv := range rows {
+			id, err := strconv.ParseUint(string(kv.Value), 10, 64)
+			if err != nil || seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+		return nil
+	}
+	if db.ID != 0 {
+		if err := scan(keys.TableNamespaceSpan(db.ID)); err != nil {
+			return nil, err
+		}
+	}
+	if db.ID == 0 || db.Name == DefaultDatabase {
+		if err := scan(keys.NamespaceSpan()); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+// readTablesBatch is how many descriptors one batch of point reads asks
+// for: a database of any size is read in round trips of bounded size.
+const readTablesBatch = 512
+
+// readTables reads the descriptors with the given IDs in batches of
+// point reads, in the order given; an ID with no descriptor, or one that
+// does not decode, is left out.
+func readTables(ctx context.Context, txn *kvclient.Txn, ids []uint64) ([]*TableDescriptor, error) {
+	out := make([]*TableDescriptor, 0, len(ids))
+	for len(ids) > 0 {
+		n := min(len(ids), readTablesBatch)
+		ks := make([]keys.Key, n)
+		for i, id := range ids[:n] {
+			ks[i] = keys.TableDescKey(id)
+		}
+		vals, err := txn.GetBatch(ctx, ks)
+		if err != nil {
+			return nil, err
+		}
+		for _, raw := range vals {
+			if raw == nil {
+				continue
+			}
+			var d TableDescriptor
+			if err := json.Unmarshal(raw, &d); err != nil {
+				continue
+			}
+			out = append(out, &d)
+		}
+		ids = ids[n:]
+	}
+	return out, nil
+}
+
+// ReadTables reads table descriptors by ID in batched point reads,
+// uncached; an ID with no descriptor is left out of the result.
+func ReadTables(ctx context.Context, txn *kvclient.Txn, ids []uint64) ([]*TableDescriptor, error) {
+	return readTables(ctx, txn, ids)
 }
 
 // MigrateNamespace is the v6 catalog migration, idempotent and run in

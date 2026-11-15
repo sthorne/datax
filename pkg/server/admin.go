@@ -233,7 +233,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		resp := cluster.AdminResponse{Right: &sr.Right, TableNames: n.tableNames(ctx)}
+		resp := cluster.AdminResponse{Right: &sr.Right, TableNames: n.tableNamesFor(ctx, sr.Left, sr.Right)}
 		if sr.Left.RangeID != 0 {
 			resp.Left = &sr.Left
 		}
@@ -247,14 +247,14 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Ranges: []kvpb.RangeDescriptor{ur.Desc}, TableNames: n.tableNames(ctx)}
+		return cluster.AdminResponse{Ranges: []kvpb.RangeDescriptor{ur.Desc}, TableNames: n.tableNamesFor(ctx, ur.Desc)}
 
 	case "ranges":
 		descs, err := n.listRanges(ctx)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}
-		return cluster.AdminResponse{Ranges: descs, TableNames: n.tableNames(ctx)}
+		return cluster.AdminResponse{Ranges: descs, TableNames: n.tableNamesFor(ctx, descs...)}
 
 	case "nodes":
 		return cluster.AdminResponse{
