@@ -449,7 +449,9 @@ pushee's anchor range:
 - Record PENDING and live:
   - pusher has **higher priority** → write ABORTED into the record (the pushee
     discovers this at its next heartbeat or EndTxn),
-  - otherwise poll with backoff up to ~2s, then surface `40001` to the client.
+  - otherwise re-push every 100 ms, for at most 10 s (`conflictBudget`,
+    `pkg/kvclient/txn.go`), then surface `40001` to the client. A wait
+    that can only end in a restart does not wait at all (see below).
 
 Priorities are random at birth and bumped on retries, so starvation is
 unlikely. Genuine deadlocks are broken by **distributed detection over
