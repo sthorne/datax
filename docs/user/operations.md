@@ -581,7 +581,9 @@ stopped ticking and heartbeating; on a quiet cluster this approaches
 how many heartbeats each message carried),
 `datax_raft_entries_appended_total` / `datax_raft_entries_applied_total`
 (the log's write and apply rates; applied lagging appended for long is a
-store whose apply workers cannot keep up), `datax_raft_apply_seconds`
+store whose apply workers cannot keep up),
+`datax_raft_entry_bytes_appended_total` (the payload bytes of the entries
+written), `datax_raft_apply_seconds`
 (per-entry apply time — the single-range write ceiling is its inverse,
 see [Capacity planning](#capacity-planning)),
 `datax_raft_apply_backpressure_total` (raft passes deferred because a
@@ -709,7 +711,10 @@ Things to know before relying on it:
   from every file the database owns, not from the device beneath.
 
 `datax_purge_versions_removed_total` counts what purges on a node
-removed.
+removed. A dropped table's ranges are emptied by a range clear before
+their purge, once the cluster is at v22 (`datax_range_clears_total`
+counts them on the leaders that proposed them); the purge then has
+nothing to collect and removes the bytes from the files and logs.
 
 **A GC window per table.** Garbage collection normally waits out the
 node's window (25h). `ALTER TABLE t SET (gc_ttl = '10m')` gives one

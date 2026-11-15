@@ -355,6 +355,13 @@ const (
 	// would age them by the restore's time, a period late, so the restore
 	// records no bands until finalize. Dropping the rows retention had
 	// already expired needs neither and is done at any version.
+	//
+	// V22 also introduces the replicated range clear (issue #316,
+	// kvpb.ClearRangeRequest, pkg/kvserver/clearrange.go) and the
+	// clear-range admin op that drives it: the dropped-table reclaim
+	// empties each range of a dropped table's span with one raft command
+	// instead of a tombstone per row. A v21 replica cannot apply the
+	// command, so below v22 the reclaim deletes row by row.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

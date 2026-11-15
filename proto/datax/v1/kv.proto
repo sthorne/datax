@@ -219,6 +219,20 @@ message GcRequest {
   repeated bytes txn_record_keys = 4;
 }
 
+// ClearRangeRequest removes every MVCC key in [header.key, header.end_key)
+// — one whole range, a dropped table's (cluster version v22, issue #316).
+// The range's leader built it under an exclusive latch on the range: no
+// intent in the span, no version above timestamp, no read served above
+// it. Applying it is a range deletion of the span, with the range's GC
+// threshold raised to timestamp and its size set to zero; a replica whose
+// range is no longer at generation with these bounds, or whose threshold
+// is already at or past timestamp, applies nothing.
+message ClearRangeRequest {
+  RequestHeader header = 1;
+  Hlc timestamp = 2;
+  int64 generation = 3;
+}
+
 message TruncateLogRequest {
   RequestHeader header = 1;
   uint64 index = 2;
@@ -306,6 +320,7 @@ message RequestUnion {
     ExportRequest export = 21;
     UpdateMetaRequest update_meta = 22;
     AdminUnsplitRequest admin_unsplit = 23;
+    ClearRangeRequest clear_range = 24;
   }
 }
 
@@ -391,6 +406,10 @@ message GcResponse {}
 
 message TruncateLogResponse {}
 
+message ClearRangeResponse {
+  bool cleared = 1; // false: the command found it had already applied, or the range had changed
+}
+
 message AdminSplitResponse {
   RangeDescriptor left = 1;
   RangeDescriptor right = 2;
@@ -450,6 +469,7 @@ message ResponseUnion {
     ExportResponse export = 21;
     UpdateMetaResponse update_meta = 22;
     AdminUnsplitResponse admin_unsplit = 23;
+    ClearRangeResponse clear_range = 24;
   }
 }
 

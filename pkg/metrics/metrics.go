@@ -141,6 +141,9 @@ var (
 	RaftEntriesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_appended_total", Help: "Raft log entries written by this store (leader proposals and follower appends).",
 	})
+	RaftEntryBytesAppended = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_entry_bytes_appended_total", Help: "Payload bytes of the raft log entries written by this store (leader proposals and follower appends).",
+	})
 	RaftEntriesApplied = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_entries_applied_total", Help: "Committed raft entries applied to the state machine.",
 	})
@@ -211,6 +214,9 @@ var (
 	}, []string{"job"})
 	RetentionRowsExpired = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_retention_rows_expired_total", Help: "MVCC versions expired by row-level retention on mixed ranges (keyed on the row's timestamp column).",
+	})
+	RangeClears = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_clears_total", Help: "Ranges of dropped tables emptied by a replicated range clear, counted on the leader that proposed it.",
 	})
 	PurgeVersionsRemoved = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_purge_versions_removed_total", Help: "MVCC versions deleted by purges this node coordinated (ALTER TABLE ... PURGE, datax debug purge).",

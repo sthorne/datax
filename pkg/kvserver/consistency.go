@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +20,10 @@ import (
 // checksum trigger through the raft log; every replica that applies it
 // checksums the range's replicated state — the MVCC data span plus the
 // range-local addressed keys (transaction records) — over an engine
-// snapshot taken atomically at that applied index. Because replicas apply
+// snapshot taken atomically at that applied index, and notes the range's
+// replicated statistics at the same index (its size and GC threshold,
+// which every replica moves by the same deltas: a range clear's included,
+// issue #316). The collector compares both. Because replicas apply
 // the same log prefix to the same state machine (GC included: it
 // replicates the exact versions to delete), the state at a given applied
 // index is byte-identical by construction; any divergence is corruption
@@ -35,8 +39,15 @@ const checksumKeep = 4
 
 type checksumResult struct {
 	sum   []byte
+	stats string // replicated statistics at index (checksumStats)
 	index uint64 // applied index the checksum was computed at
 	at    time.Time
+}
+
+// checksumStats renders the range's replicated statistics for comparison
+// across replicas.
+func checksumStats(size int64, gcThreshold hlc.Timestamp) string {
+	return fmt.Sprintf("size=%d gc_threshold=%s", size, gcThreshold)
 }
 
 // startChecksum captures an engine snapshot at the current applied state
@@ -45,6 +56,9 @@ type checksumResult struct {
 func (r *Replica) startChecksum(id string, idx uint64) {
 	snap := r.store.cfg.Engine.NewSnapshot()
 	desc := r.Desc()
+	r.mu.Lock()
+	stats := checksumStats(r.mu.sizeBytes, r.mu.gcThreshold)
+	r.mu.Unlock()
 	go func() {
 		defer func() { _ = snap.Close() }()
 		sum, err := checksumRangeState(snap, desc)
@@ -56,7 +70,7 @@ func (r *Replica) startChecksum(id string, idx uint64) {
 		if r.mu.checksums == nil {
 			r.mu.checksums = map[string]checksumResult{}
 		}
-		r.mu.checksums[id] = checksumResult{sum: sum, index: idx, at: time.Now()}
+		r.mu.checksums[id] = checksumResult{sum: sum, stats: stats, index: idx, at: time.Now()}
 		if len(r.mu.checksums) > checksumKeep {
 			oldestID, oldest := "", time.Time{}
 			for cid, res := range r.mu.checksums {
@@ -118,7 +132,9 @@ type ConsistencyProbe struct {
 	CheckID  string
 	Desc     kvpb.RangeDescriptor
 	LocalSum []byte
-	Index    uint64
+	// LocalStats is the leader's replicated statistics at Index.
+	LocalStats string
+	Index      uint64
 	// PassStart marks the probe that begins a fresh pass over the ranges
 	// this store leads, and Ranges is how many that is. The sweep is
 	// paced — one range per tick, forever — so the unit with a real
@@ -198,19 +214,21 @@ func (s *Store) ProposeChecksumOn(ctx context.Context, rangeID base.RangeID) (*C
 		return nil, kvpb.NewErrorf("%s: local checksum %s did not complete", r.rangeID, id)
 	}
 	metrics.ConsistencyChecks.Inc()
-	return &ConsistencyProbe{RangeID: r.rangeID, CheckID: id, Desc: r.Desc(), LocalSum: res.sum, Index: res.index}, nil
+	return &ConsistencyProbe{RangeID: r.rangeID, CheckID: id, Desc: r.Desc(), LocalSum: res.sum, LocalStats: res.stats, Index: res.index}, nil
 }
 
 // LookupChecksum serves a collector's query for this store's result of a
-// probe, waiting for the trigger to apply and compute if necessary.
-func (s *Store) LookupChecksum(ctx context.Context, rangeID base.RangeID, checkID string) ([]byte, uint64, bool) {
+// probe — the checksum, the replicated statistics and the applied index
+// they were taken at — waiting for the trigger to apply and compute if
+// necessary.
+func (s *Store) LookupChecksum(ctx context.Context, rangeID base.RangeID, checkID string) ([]byte, string, uint64, bool) {
 	r, ok := s.GetReplica(rangeID)
 	if !ok {
-		return nil, 0, false
+		return nil, "", 0, false
 	}
 	res, ok := r.waitChecksum(ctx, checkID)
 	if !ok {
-		return nil, 0, false
+		return nil, "", 0, false
 	}
-	return res.sum, res.index, true
+	return res.sum, res.stats, res.index, true
 }

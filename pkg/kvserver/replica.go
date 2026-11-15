@@ -724,6 +724,13 @@ func (r *Replica) stageReady(b *storage.Batch, rd raft.Ready) error {
 		}
 	}
 	metrics.RaftEntriesAppended.Add(float64(len(rd.Entries)))
+	if len(rd.Entries) > 0 {
+		var n int
+		for i := range rd.Entries {
+			n += len(rd.Entries[i].Data)
+		}
+		metrics.RaftEntryBytesAppended.Add(float64(n))
+	}
 	return r.rs.append(b, rd.Entries)
 }
 
@@ -1293,6 +1300,14 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	}
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
+	}
+	for _, u := range ba.Requests {
+		if u.ClearRange != nil {
+			// Its checks and its timestamp are the leader's evaluation
+			// (Store.ClearRange); a batch that carries one is never
+			// proposed as it came.
+			return nil, kvpb.NewErrorf("%s: a range clear is proposed by the range's leader, not sent", r.rangeID)
+		}
 	}
 	spans, mode, serr := latchSpans(ba)
 	if serr != nil {
