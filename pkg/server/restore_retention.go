@@ -191,6 +191,62 @@ func expiryNote(name string, e *commitTimeExpiry, expired int64) string {
 	return fmt.Sprintf("table %s: %d row(s) committed at or before %s, which the table's retention had expired by the chain's end, left out; %s", name, expired, describeBackupTS(e.horizon), how)
 }
 
+// recordRestoredRows puts the bands a restore of everything wrote table
+// t's rows in into its descriptor, as an ordinary descriptor change: the
+// descriptor is read and rewritten in one transaction, so a change that
+// commits in between makes this one retry on what it wrote rather than be
+// written over (and the bands go onto whatever it left); the version is
+// bumped; and the change is drained like a schema change's, so that once
+// it returns no gateway still holds the copy without the bands, which a
+// statement planned against it could otherwise write back. The descriptor
+// was written verbatim from the backup at the start of the restore, and
+// SQL may have leased it since.
+//
+// The rewrite edits the descriptor's JSON rather than decoding it into
+// catalog.TableDescriptor, like the write before it: a restore of
+// everything keeps a descriptor byte for byte, fields this binary does
+// not know included, and only restored_rows and version change here.
+func (n *Node) recordRestoredRows(ctx context.Context, t backupTable, bands []catalog.RestoredRowsBand) error {
+	var d catalog.TableDescriptor
+	err := n.db.RunTxn(ctx, "restore-bands", func(ctx context.Context, txn *kvclient.Txn) error {
+		raw, err := txn.Get(ctx, keys.TableDescKey(t.ID))
+		if err != nil {
+			return err
+		}
+		if raw == nil {
+			return fmt.Errorf("its descriptor is gone")
+		}
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return err
+		}
+		out, err := descriptorWithRestoredRows(raw, bands)
+		if err != nil {
+			return err
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(out, &top); err != nil {
+			return err
+		}
+		d.Version++
+		if top["version"], err = json.Marshal(d.Version); err != nil {
+			return err
+		}
+		if out, err = json.Marshal(top); err != nil {
+			return err
+		}
+		return txn.Put(ctx, keys.TableDescKey(t.ID), out)
+	})
+	if err != nil {
+		return err
+	}
+	cat, err := n.catalogAccessor()
+	if err != nil || cat == nil {
+		return err
+	}
+	cat.Invalidate(d.Name)
+	return cat.FinishDDLByID(ctx, d.DatabaseID, d.Name)
+}
+
 // descriptorWithRestoredRows is a backed-up descriptor as a restore of
 // everything writes it: verbatim, but for its RestoredRows, which are the
 // bands this restore wrote (none, when it wrote the table's rows in one

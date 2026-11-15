@@ -3,6 +3,7 @@ package testcluster
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/cluster"
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -115,7 +117,9 @@ func TestRetentionRowsStayExpiredAcrossAnIncrementalChain(t *testing.T) {
 // restore — a row backfilled with an old timestamp included, which goes
 // by its commit time like every other. The backup is sealed (#291): the
 // commit times are inside its authenticated files, and a damaged file is
-// refused before anything is restored.
+// refused before anything is restored. The restore records the bands as
+// an ordinary descriptor change (the version moves on), a schema change
+// after it keeps them, and so does a restart of the node.
 func TestRetentionRestoredRowsExpireOnTheSourceSchedule(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -123,7 +127,7 @@ func TestRetentionRestoredRowsExpireOnTheSourceSchedule(t *testing.T) {
 	n := tc.Nodes[0]
 	s := sql.NewSession(n.DB(), catalog.NewAccessor())
 	waitForDatabases(t, ctx, s)
-	tc2 := Start(t, 1)
+	tc2, engs := StartWithEngines(t, 1)
 	n2 := tc2.Nodes[0]
 	s2 := sql.NewSession(n2.DB(), catalog.NewAccessor())
 	waitForDatabases(t, ctx, s2)
@@ -132,10 +136,10 @@ func TestRetentionRestoredRowsExpireOnTheSourceSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	execSQL(t, ctx, s, `CREATE TABLE m (series TEXT, at TIMESTAMPTZ, v FLOAT8, PRIMARY KEY (series, at)) WITH (timeseries = true, retention = '5s')`)
+	execSQL(t, ctx, s, `CREATE TABLE m (series TEXT, at TIMESTAMPTZ, v FLOAT8, PRIMARY KEY (series, at)) WITH (timeseries = true, retention = '8s')`)
 	execSQL(t, ctx, s, `INSERT INTO m VALUES ('early', now(), 1)`)
 	early := time.Now()
-	time.Sleep(3 * time.Second)
+	time.Sleep(4 * time.Second)
 	execSQL(t, ctx, s, `INSERT INTO m VALUES ('late', now(), 2), ('backfill', now() - INTERVAL '1 day', 3)`)
 	dir := t.TempDir()
 	bsum, err := n.RunBackupWith(ctx, server.BackupOptions{Dest: dir, Key: key})
@@ -183,15 +187,64 @@ func TestRetentionRestoredRowsExpireOnTheSourceSchedule(t *testing.T) {
 	requireNote(t, sum, "expire on the source's schedule")
 	requireSameRows(t, "restored", rowsText(t, ctx, s2, `SELECT series, v FROM m`), []string{"backfill|3", "early|1", "late|2"})
 
+	srcID := tableID(t, ctx, n, "m")
+	srcDesc := readDescriptor(t, ctx, n, srcID)
+	id := tableID(t, ctx, n2, "m")
+	restored := readDescriptor(t, ctx, n2, id)
+	if len(restored.RestoredRows) == 0 || restored.Version != srcDesc.Version+1 {
+		t.Fatalf("restored descriptor: version %d (the backup's %d), bands %+v; want the bands as a change of its own", restored.Version, srcDesc.Version, restored.RestoredRows)
+	}
+	// Schema changes after the restore keep the bands.
+	execSQL(t, ctx, s2, `ALTER TABLE m SET (retention = '8s')`)
+	execSQL(t, ctx, s2, `COMMENT ON TABLE m IS 'restored'`)
+	altered := readDescriptor(t, ctx, n2, id)
+	if altered.Version <= restored.Version || altered.Comment != "restored" || !sameBands(altered.RestoredRows, restored.RestoredRows) {
+		t.Fatalf("after ALTER and COMMENT: version %d (was %d), comment %q, bands %+v (were %+v)", altered.Version, restored.Version, altered.Comment, altered.RestoredRows, restored.RestoredRows)
+	}
+	// And a restart.
+	tc2.StopNode(0)
+	n2 = tc2.RestartNode(0, engs[0])
+	s2 = sql.NewSession(n2.DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s2)
+	if d := readDescriptor(t, ctx, n2, id); !sameBands(d.RestoredRows, restored.RestoredRows) {
+		t.Fatalf("after a restart: bands %+v, were %+v", d.RestoredRows, restored.RestoredRows)
+	}
+
 	// Past the early row's retention, inside the others': the restored
 	// early row goes on the source's schedule; restored at its own time
-	// it would stay five seconds after the restore.
-	if wait := time.Until(early.Add(5*time.Second + 300*time.Millisecond)); wait > 0 {
+	// it would stay eight seconds after the restore.
+	if wait := time.Until(early.Add(8*time.Second + 300*time.Millisecond)); wait > 0 {
 		time.Sleep(wait)
 	}
 	n2.TestingRefreshRetention()
 	n2.Store().RunGCOnce(ctx, 24*time.Hour)
 	requireSameRows(t, "after the early row's retention", rowsText(t, ctx, s2, `SELECT series, v FROM m`), []string{"backfill|3", "late|2"})
+}
+
+// readDescriptor reads table id's descriptor as stored.
+func readDescriptor(t *testing.T, ctx context.Context, n *server.Node, id uint64) catalog.TableDescriptor {
+	t.Helper()
+	raw, err := n.DB().Get(ctx, keys.TableDescKey(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d catalog.TableDescriptor
+	if err := json.Unmarshal(raw, &d); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func sameBands(a, b []catalog.RestoredRowsBand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestRetentionOldFormatBackupRestoresAsBefore (issue #316): a backup

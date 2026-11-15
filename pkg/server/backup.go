@@ -1429,14 +1429,8 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			return nil, fmt.Errorf("restoring table %s: %w", t.Name, err)
 		}
 		if len(bands) > 0 {
-			raw, err := descriptorWithRestoredRows(t.Descriptor, bands)
-			if err != nil {
-				return nil, err
-			}
-			if err := n.db.RunTxn(ctx, "restore-bands", func(ctx context.Context, txn *kvclient.Txn) error {
-				return txn.Put(ctx, keys.TableDescKey(t.ID), raw)
-			}); err != nil {
-				return nil, err
+			if err := n.recordRestoredRows(ctx, t, bands); err != nil {
+				return nil, fmt.Errorf("restoring table %s: recording when its rows were written: %w", t.Name, err)
 			}
 		}
 		expiryNotes = append(expiryNotes, expiryNote(t.Name, e, expired))
