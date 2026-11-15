@@ -492,6 +492,17 @@ stronger writer still aborts the holder instead of restarting. On the bank workl
 that ended in a `40001`, each a 100 ms poll or more; they now end in
 the push's round trip.
 
+Measured together with the failed-commit fix above (one secure,
+encrypted on-disk node, 16 workers, 1,000 accounts, seed 7, four
+alternating 30 s rounds each): committed transfers went from a median
+of 238 a second (209–252) to 974 (832–1,271). An attempt that ended in a
+`40001` ran 3.1 s on average before and 0.02 s after, and those attempts
+went from about 70 % of the workers' time to under 3 %. There are a few
+more of them (0.018 per committed transfer against 0.016), since a
+waiter whose holder would have aborted now restarts too. kv 50 % reads
+and hot-row did the same KV work per operation as before and stayed
+within their run-to-run noise.
+
 Reads below a committed value's timestamp never block (MVCC). A foreign
 intent strictly above both the read timestamp and the uncertainty limit is
 **read beneath**, not pushed: resolution only moves a write's timestamp
