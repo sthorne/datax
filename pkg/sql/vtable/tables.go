@@ -641,6 +641,9 @@ func init() {
 		col("condeferrable", types.Bool), col("condeferred", types.Bool), col("convalidated", types.Bool), col("conrelid", types.Int),
 		col("contypid", types.Int), col("conindid", types.Int), col("confrelid", types.Int), col("conkey", types.String), col("confkey", types.String), col("conbin", types.String),
 		col("conparentid", types.Int), col("confupdtype", types.String), col("confdeltype", types.String), col("confmatchtype", types.String),
+		// Inheritance: datax has none, so every constraint is local, inherited
+		// by nothing and from nothing. psql's \d+ reads these.
+		col("conislocal", types.Bool), col("coninhcount", types.Int), col("connoinherit", types.Bool),
 		hidden("__condef"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
@@ -655,14 +658,14 @@ func init() {
 		}
 		for _, t := range env.currentTables() {
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
-				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), str(PrimaryKeyDef(t))})
+				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t))})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				if !idx.Unique {
 					continue
 				}
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), str("u"), boolean(false), boolean(false), boolean(true),
-					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), str(UniqueDef(t, idx))})
+					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(UniqueDef(t, idx))})
 			}
 			for i := range t.Constraints {
 				c := &t.Constraints[i]
@@ -670,7 +673,7 @@ func init() {
 				switch c.Kind {
 				case catalog.ConstraintCheck:
 					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("c"), boolean(false), boolean(false), boolean(c.Validated),
-						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), str(def)})
+						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(def)})
 				case catalog.ConstraintForeign:
 					ref := t
 					if c.RefTable != t.ID {
@@ -681,7 +684,7 @@ func init() {
 						confkey = str(intArray(attnums(ref, c.RefColumns)))
 					}
 					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("f"), boolean(false), boolean(false), boolean(c.Validated),
-						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), str(def)})
+						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), boolean(true), i64(0), boolean(false), str(def)})
 				}
 			}
 		}
