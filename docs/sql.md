@@ -725,7 +725,11 @@ Table descriptors are JSON documents stored in system keys (range 1):
   `ALTER TABLE ... ADD CONSTRAINT` is a multi-transaction statement of
   the `CREATE INDEX` shape: publish (unvalidated), drain lease
   adoption, backfill the index, sweep the existing rows in chunks as of
-  a boundary, mark validated.
+  a boundary, mark validated. `ADD CONSTRAINT IF NOT EXISTS name` (a
+  datax extension, issue #322) checks, in the publish transaction,
+  whether the table has a constraint of that name (`<table>_pkey` or one
+  in `Constraints`) and if so commits nothing and returns a NOTICE; the
+  definitions are not compared.
 
 `TRUNCATE` reuses the re-shard's layout swap: the descriptor moves the
 primary rows and every secondary index to fresh index IDs in one write

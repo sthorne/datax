@@ -3611,6 +3611,16 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
+			// IF NOT EXISTS: a datax extension (PostgreSQL has none here).
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("NOT"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				at.AddConstraintIfNotExists = true
+			}
 			n, err := p.expectIdent()
 			if err != nil {
 				return nil, err

@@ -63,6 +63,17 @@ func (s *Session) requireNullsNotDistinct() error {
 	return nil
 }
 
+// hasConstraintNamed reports whether the table has a constraint called
+// name: its primary key's, or one of its CHECK, UNIQUE and FOREIGN KEY
+// constraints. (An index made by CREATE UNIQUE INDEX is not one.)
+func hasConstraintNamed(desc *catalog.TableDescriptor, name string) bool {
+	if name == desc.Name+"_pkey" {
+		return true
+	}
+	_, ok := desc.Constraint(name)
+	return ok
+}
+
 // constraintName picks a constraint's name: the given one (refused when
 // taken), else PostgreSQL's <table>_<col>_<suffix>, numbered when taken.
 func constraintName(desc *catalog.TableDescriptor, given string, cols []string, suffix string) (string, error) {
@@ -1003,13 +1014,19 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	cd := t.AddConstraint
 	var cID, indexID uint64
 	var parentName string
+	exists := false
 	err := s.db.RunTxn(ctx, "add-constraint-publish", func(ctx context.Context, txn *kvclient.Txn) error {
+		exists = false
 		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
 		if err := mustBeReal(shared); err != nil {
 			return err
+		}
+		if t.AddConstraintIfNotExists && hasConstraintNamed(shared, cd.Name) {
+			exists = true
+			return nil
 		}
 		desc := shared.Clone()
 		if desc.Reshard != nil {
@@ -1035,6 +1052,9 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	})
 	if err != nil {
 		return nil, ToSQLError(err)
+	}
+	if exists {
+		return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("constraint %q for relation %q already exists, skipping", cd.Name, t.Table)}}, nil
 	}
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)

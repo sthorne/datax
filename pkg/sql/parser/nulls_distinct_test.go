@@ -40,3 +40,24 @@ func TestParseUniqueNullsDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAddConstraintIfNotExists (issue #322): the datax extension
+// ADD CONSTRAINT IF NOT EXISTS name.
+func TestParseAddConstraintIfNotExists(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS k CHECK (a > 0)`).(*AlterTable)
+	if !at.AddConstraintIfNotExists || at.AddConstraint == nil || at.AddConstraint.Name != "k" || at.AddConstraint.Kind != "check" {
+		t.Fatalf("%+v %+v", at, at.AddConstraint)
+	}
+	at = parseOne(t, `ALTER TABLE t ADD CONSTRAINT k UNIQUE (a)`).(*AlterTable)
+	if at.AddConstraintIfNotExists {
+		t.Fatalf("%+v", at)
+	}
+	for _, bad := range []string{
+		`ALTER TABLE t ADD CONSTRAINT IF EXISTS k CHECK (a > 0)`,
+		`ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS CHECK (a > 0)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%q parsed", bad)
+		}
+	}
+}

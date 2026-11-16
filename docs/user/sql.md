@@ -531,6 +531,7 @@ ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100);            -- val
 ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100) NOT VALID;  -- new writes only, for now
 ALTER TABLE orders VALIDATE CONSTRAINT qty_small;
 ALTER TABLE orders ADD UNIQUE (code);                                     -- an online unique index build
+ALTER TABLE orders ADD CONSTRAINT IF NOT EXISTS qty_small CHECK (qty < 100); -- datax: a no-op (NOTICE) if the name exists
 ALTER TABLE orders ADD FOREIGN KEY (cust) REFERENCES customers;
 ALTER TABLE orders DROP CONSTRAINT [IF EXISTS] qty_small;
 ALTER TABLE orders RENAME CONSTRAINT qty_small TO qty_bounded;
@@ -539,6 +540,12 @@ ALTER TABLE orders ALTER COLUMN region DROP NOT NULL;
 DROP TABLE customers CASCADE;                    -- also drops the foreign keys that reference it
 SET foreign_key_cascade_limit = 50000;           -- per statement; default 10000
 ```
+
+`ADD CONSTRAINT IF NOT EXISTS name` is a datax extension (PostgreSQL has
+none): when the table has a constraint called `name` it does nothing but
+send a NOTICE, without comparing the definitions — a constraint of that
+name that says something else stays as it is. The name of an index made
+by `CREATE UNIQUE INDEX` is not a constraint's and is still refused.
 
 Names default to PostgreSQL's (`orders_qty_check`, `orders_code_key`,
 `orders_cust_fkey`, numbered when taken); `\d`, `pg_constraint`,

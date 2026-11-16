@@ -384,6 +384,22 @@ are the differences ([reference](sql.md#large-objects)):
   after the GC window — but objects orphaned by deleting the row that
   named them are still yours to unlink, exactly as in PostgreSQL.
 
+## Things datax accepts that PostgreSQL does not
+
+- **`ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS name ...`**: when the
+  table already has a constraint called `name` (its `<table>_pkey`, or a
+  `CHECK`, `UNIQUE` or `FOREIGN KEY` constraint), the statement does
+  nothing and says so in a NOTICE (`constraint "name" for relation "t"
+  already exists, skipping`); otherwise it adds the constraint as `ADD
+  CONSTRAINT` would. Only the name is compared, never the definition: a
+  constraint of that name that checks something else is left as it is.
+  An index made by `CREATE UNIQUE INDEX` is not a constraint, so its name
+  is still refused (`42710`). PostgreSQL has `IF NOT EXISTS` on `ADD
+  COLUMN` and `CREATE INDEX` (both supported here) but not on `ADD
+  CONSTRAINT`; migration tools that want an idempotent constraint can
+  use it, at the price of a schema PostgreSQL will not load.
+- `UPSERT INTO` (CockroachDB syntax), above.
+
 ## Errors you should know
 
 | SQLSTATE | Meaning | What to do |

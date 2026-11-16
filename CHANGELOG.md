@@ -11,6 +11,12 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
+  extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
+  INDEX`, both supported, but not here): when the table already has a
+  constraint of that name the statement does nothing and sends the NOTICE
+  `constraint "name" for relation "t" already exists, skipping`. Only the
+  name is compared, never the definition.
 - **`UPDATE` may change primary-key columns** (#322). A row whose key
   changes moves: its old row and index entries are deleted and the new
   version written at the new key, with its entries, in the statement's

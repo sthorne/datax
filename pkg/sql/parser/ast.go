@@ -740,10 +740,14 @@ type AlterTable struct {
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.
-	AddConstraint          *ConstraintDef
-	DropConstraint         string
-	DropConstraintIfExists bool
-	ValidateConstraint     string
+	AddConstraint *ConstraintDef
+	// AddConstraintIfNotExists is ADD CONSTRAINT IF NOT EXISTS name ...,
+	// a datax extension: nothing happens (with a NOTICE) when the table
+	// has a constraint of that name, whatever its definition.
+	AddConstraintIfNotExists bool
+	DropConstraint           string
+	DropConstraintIfExists   bool
+	ValidateConstraint       string
 	// SetNotNull / DropNotNull are ALTER [COLUMN] c SET NOT NULL / DROP
 	// NOT NULL (the column name).
 	SetNotNull  string
