@@ -2792,6 +2792,19 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, err
 		}
 		for {
+			if t := p.peek(); t.kind == tkNumber {
+				// GROUP BY n: the column select item n reads.
+				name, err := p.groupByPosition(sel.Exprs, t.text)
+				if err != nil {
+					return nil, err
+				}
+				p.i++
+				sel.GroupBy = append(sel.GroupBy, name)
+				if !p.consumeOp(",") {
+					break
+				}
+				continue
+			}
 			// Possibly qualified: GROUP BY c.name over a join.
 			ref, err := p.parseColumnRef()
 			if err != nil {
@@ -3002,15 +3015,25 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 		var oc OrderCol
 		if t := p.peek(); t.kind == tkNumber {
 			n, err := strconv.Atoi(t.text)
-			if err != nil || n < 1 || (exprsKnown && n > len(exprs)) {
+			star := firstStar(exprs)
+			if err != nil || n < 1 || (exprsKnown && star < 0 && n > len(exprs)) {
 				return nil, p.errf("ORDER BY position %s is not in the select list", t.text)
 			}
 			p.i++
-			if exprsKnown {
-				oc = OrderCol{Column: outputName(exprs[n-1])}
-			} else {
+			switch {
+			case !exprsKnown:
 				oc = OrderCol{Position: n}
+			case star < 0 || n <= star:
+				// The items up to the first * are positions as written.
+				oc = orderByItem(exprs, n-1)
+			case len(exprs) == 1:
+				// SELECT * alone: the position of the relation's
+				// columns, which the executor knows.
+				oc = OrderCol{Position: n}
+			default:
+				return nil, p.errf("ORDER BY position %s is at or after a * among other select items; name the column instead", t.text)
 			}
+			oc.Ordinal = n
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
 		} else if ok {
@@ -3048,6 +3071,79 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 			return out, nil
 		}
 	}
+}
+
+// groupByPosition resolves GROUP BY n to the column select item n
+// reads, by the item and never by its output name (an alias may name
+// another column). Grouping takes columns, so an item that is an
+// expression is refused (a syntax error, as GROUP BY of the expression
+// written out is), and so is an aggregate.
+func (p *parser) groupByPosition(exprs []SelectExpr, text string) (string, error) {
+	n, err := strconv.Atoi(text)
+	if star := firstStar(exprs); err != nil || n < 1 || n > len(exprs) || (star >= 0 && n > star) {
+		return "", p.errf("GROUP BY position %s is not in the select list", text)
+	}
+	se := exprs[n-1]
+	switch {
+	case se.Agg != "" || se.Window != nil:
+		return "", p.errf("GROUP BY position %d is an aggregate; aggregate functions are not allowed in GROUP BY", n)
+	case !isPlainColumn(se.Expr):
+		return "", p.errf("GROUP BY position %d is an expression; GROUP BY takes columns (group by the column and compute the expression in the select list)", n)
+	}
+	return se.Expr.Column, nil
+}
+
+// firstStar is the index of a select list's first * (bare or
+// qualified), -1 when it has none.
+func firstStar(exprs []SelectExpr) int {
+	for i, se := range exprs {
+		if se.Star {
+			return i
+		}
+	}
+	return -1
+}
+
+// orderByItem is ORDER BY i+1 for select item exprs[i]: the item
+// itself, never its output name, which may be generated ("?column?",
+// shared by every unnamed expression) or name an input column as well
+// (SELECT id AS b, b ...). A plain column sorts by that column, an
+// aggregate by the aggregate, an expression by the expression; a window
+// function, which is computed after the sort keys are, by its output
+// name. A column that another item's alias also names is written as an
+// expression, which reads the input column: a bare name would resolve
+// to the alias.
+func orderByItem(exprs []SelectExpr, i int) OrderCol {
+	se := exprs[i]
+	switch {
+	case se.Window != nil:
+		return OrderCol{Column: outputName(se)}
+	case se.Agg != "":
+		c := se
+		c.Alias = ""
+		return OrderCol{Agg: &c}
+	case isPlainColumn(se.Expr) && !aliasedElsewhere(exprs, i, se.Expr.Column):
+		return OrderCol{Column: se.Expr.Column}
+	default:
+		e := se.Expr
+		return OrderCol{Expr: &e}
+	}
+}
+
+// aliasedElsewhere reports whether an item other than exprs[i] has an
+// alias that the column reference col (possibly qualified) would
+// resolve to.
+func aliasedElsewhere(exprs []SelectExpr, i int, col string) bool {
+	bare := col
+	if j := strings.LastIndexByte(bare, '.'); j >= 0 {
+		bare = bare[j+1:]
+	}
+	for k, se := range exprs {
+		if k != i && se.Alias != "" && strings.EqualFold(se.Alias, bare) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseCount parses the count of a LIMIT / OFFSET / FETCH clause: a
@@ -3111,7 +3207,7 @@ func (p *parser) parseSetOps(sel *Select) error {
 		if err != nil {
 			return err
 		}
-		sel.OrderBy, tail.OrderBy = tail.OrderBy, nil
+		sel.OrderBy, tail.OrderBy = byOutputPosition(tail.OrderBy), nil
 		sel.Limit, tail.Limit = tail.Limit, -1
 		sel.Offset, tail.Offset = tail.Offset, 0
 		sel.LimitParam, tail.LimitParam = tail.LimitParam, 0
@@ -3124,6 +3220,18 @@ func (p *parser) parseSetOps(sel *Select) error {
 		// The tail's own list continues from it; nothing more to parse
 		// here unless it stopped at a parenthesized member's boundary.
 	}
+}
+
+// byOutputPosition rewrites the positions of an ORDER BY written after
+// a set operation's last member, which were resolved against that
+// member's select list, back to positions of the operation's result.
+func byOutputPosition(order []OrderCol) []OrderCol {
+	for i, oc := range order {
+		if oc.Ordinal > 0 {
+			order[i] = OrderCol{Position: oc.Ordinal, Ordinal: oc.Ordinal, Desc: oc.Desc, Nulls: oc.Nulls}
+		}
+	}
+	return order
 }
 
 // parseSetMember parses one member of a set operation: SELECT ...,
@@ -3157,6 +3265,10 @@ func (p *parser) parseSetMember() (*Select, error) {
 		head := stmt.(*Select)
 		if err := p.parseOrderLimit(head, true); err != nil {
 			return nil, err
+		}
+		if head.Union != nil {
+			// The rows of a VALUES list are a set operation's members.
+			head.OrderBy = byOutputPosition(head.OrderBy)
 		}
 		if err := p.parseSetOps(head); err != nil {
 			return nil, err

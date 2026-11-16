@@ -35,7 +35,7 @@ func TestParseQueryShapes(t *testing.T) {
 
 	// A flat member list; the operator sits on the link to the next
 	// member; ORDER BY / LIMIT / OFFSET after the last member move to
-	// the head, and a position is rewritten to the last member's name.
+	// the head, and a position stays a position of the result.
 	sel = parseOne(t, `SELECT a FROM t UNION SELECT b FROM u INTERSECT ALL SELECT c FROM v EXCEPT SELECT d FROM w ORDER BY 1 LIMIT 3 OFFSET 1`).(*Select)
 	var ops []string
 	for m := sel; m != nil; m = m.Union {
@@ -47,7 +47,7 @@ func TestParseQueryShapes(t *testing.T) {
 	if strings.Join(ops, ",") != "UNION,INTERSECT,EXCEPT," || !sel.Union.UnionAll || sel.UnionAll {
 		t.Fatalf("set ops: %v all=%v/%v", ops, sel.UnionAll, sel.Union.UnionAll)
 	}
-	if len(sel.OrderBy) != 1 || sel.OrderBy[0].Column != "d" || sel.Limit != 3 || sel.Offset != 1 {
+	if len(sel.OrderBy) != 1 || sel.OrderBy[0].Position != 1 || sel.Limit != 3 || sel.Offset != 1 {
 		t.Fatalf("head ordering: %+v %d %d", sel.OrderBy, sel.Limit, sel.Offset)
 	}
 	// Parenthesized members keep their own ORDER BY / LIMIT as derived
@@ -61,8 +61,8 @@ func TestParseQueryShapes(t *testing.T) {
 	}
 	sel = parseOne(t, `VALUES (1), (2) UNION SELECT 3 ORDER BY 1 DESC`).(*Select)
 	// The rows chain UNION ALL; the link from the last row to SELECT 3 is
-	// the written UNION; the position names the last member's output.
-	if sel.Union == nil || !sel.UnionAll || sel.Union.SetOp != "UNION" || sel.Union.UnionAll || sel.Union.Union == nil || sel.OrderBy[0].Column != "?column?" {
+	// the written UNION; the position is the result's first column.
+	if sel.Union == nil || !sel.UnionAll || sel.Union.SetOp != "UNION" || sel.Union.UnionAll || sel.Union.Union == nil || sel.OrderBy[0].Position != 1 {
 		t.Fatalf("values head: %+v", sel)
 	}
 	sel = parseOne(t, `SELECT 1 EXCEPT ALL SELECT 2`).(*Select)
@@ -72,8 +72,21 @@ func TestParseQueryShapes(t *testing.T) {
 
 	sel = parseOne(t, `SELECT g, count(*) AS n FROM t GROUP BY g ORDER BY count(*) DESC, max(x), 2`).(*Select)
 	if len(sel.OrderBy) != 3 || sel.OrderBy[0].Agg == nil || sel.OrderBy[0].Agg.Agg != "COUNT" || !sel.OrderBy[0].Desc ||
-		sel.OrderBy[1].Agg == nil || sel.OrderBy[1].Agg.AggCol != "x" || sel.OrderBy[2].Column != "n" {
+		sel.OrderBy[1].Agg == nil || sel.OrderBy[1].Agg.AggCol != "x" ||
+		sel.OrderBy[2].Agg == nil || sel.OrderBy[2].Agg.Agg != "COUNT" || sel.OrderBy[2].Ordinal != 2 {
 		t.Fatalf("aggregates in ORDER BY: %+v", sel.OrderBy)
+	}
+
+	// A position names the select item, never its output name (#322).
+	sel = parseOne(t, `SELECT a || 'q', id AS b, b, * FROM t GROUP BY 3 ORDER BY 1, 2, 3`).(*Select)
+	if ob := sel.OrderBy; len(ob) != 3 || ob[0].Expr == nil || ob[0].Expr.BinOp != "||" || ob[0].Column != "" ||
+		ob[1].Column != "id" || ob[2].Expr == nil || ob[2].Expr.Column != "b" || ob[2].Ordinal != 3 || len(sel.GroupBy) != 1 || sel.GroupBy[0] != "b" {
+		t.Fatalf("positions: %+v group %v", sel.OrderBy, sel.GroupBy)
+	}
+	for _, q := range []string{`SELECT a FROM t ORDER BY 2`, `SELECT a, * FROM t ORDER BY 2`, `SELECT lower(a) FROM t GROUP BY 1`, `SELECT count(*) FROM t GROUP BY 1`} {
+		if _, err := Parse(q); err == nil {
+			t.Fatalf("%s parsed", q)
+		}
 	}
 
 	sel = parseOne(t, `SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.aid FULL JOIN c USING (id, k) NATURAL LEFT JOIN d`).(*Select)

@@ -2052,6 +2052,22 @@ state or the internode protocol does, and an entry below says so.
   cluster's. What a role sees is otherwise unchanged (#312). Reading
   `information_schema.tables`, `columns` and `views` no longer reads every
   table descriptor in the cluster.
+- **`DROP OWNED BY r` and `DROP ROLE r` hung when `r` held default
+  privileges** (`ALTER DEFAULT PRIVILEGES ... TO r` or `FOR ROLE r`), over
+  pgwire, until the client gave up (#322). Removing the default privileges
+  writes the database's descriptor in the statement's transaction, and the
+  key service then looked up its table in a transaction of its own, which
+  waited on that write. The key service's work inside a statement now reads
+  its table in the statement's transaction.
+- **`ORDER BY n` resolved select item n by its output name** (#322): over an
+  unnamed expression it failed with `42703` (`column "?column?" does not
+  exist`, as in `SELECT table_schema || '.' || table_name FROM
+  information_schema.tables ORDER BY 1`), and over a column that another
+  item's alias also named (`SELECT id AS b, b ... ORDER BY 1`) it sorted by
+  the other column. A position now names the item itself — its column,
+  aggregate or expression — and after a set operation the result's column
+  n, whatever the last member calls it. `SELECT * ... ORDER BY n` works.
+  `GROUP BY n` is accepted for a select item that is a column.
 
 ## 0.57.0 — unreleased
 

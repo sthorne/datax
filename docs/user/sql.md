@@ -737,7 +737,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
-  [GROUP BY cols] [HAVING ...]
+  [GROUP BY col | position, ...] [HAVING ...]
   [WINDOW name AS (...), ...]
   [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
   [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
@@ -927,6 +927,14 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   `LIMIT` over a single table's scan keeps only the limit's rows while
   it reads (`top-k heap` in `EXPLAIN`): every matching row is still
   read, but memory is the limit's rows, not the table's.
+  `ORDER BY n` sorts by select item n itself — its column, aggregate or
+  expression — never by what its output name would resolve to, so an
+  unnamed expression (`ORDER BY 1` over `a || b`) and a column another
+  item's alias also names sort as written; after a set operation it is
+  the result's column n. A position at or after a `*` is accepted only
+  when the `*` is the whole select list. `GROUP BY n` groups by the
+  column select item n reads; a position that is an expression or an
+  aggregate is refused (`42601`), as grouping takes columns.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when
