@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1696,6 +1697,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		noteIndexRows(desc, desc.LivePrimaryIndex(), len(rows))
 		return rows, err
 
+	case planPKPoints:
+		return s.fetchPKPoints(ctx, txn, desc, plan, where, params, limit)
+
 	case planUniquePoint:
 		key, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
@@ -1903,6 +1907,71 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 
 	start, end := rowenc.PrimarySpanFor(desc)
 	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+}
+
+// fetchPKPoints runs a planPKPoints plan: the rows at its primary keys,
+// looked up in key order (descending for a reverse plan) in pages of
+// primaryFetchPage, filtered by the WHERE clause, up to limit. A key
+// with no row — or, under SKIP LOCKED, a row another transaction holds
+// — yields nothing. Once the limit is met the keys after the last row
+// kept leave the read set, as the tail of a limited scan does.
+func (s *Session) fetchPKPoints(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if len(plan.pkPoints) == 0 {
+		return nil, nil
+	}
+	pks := make([]keys.Key, 0, len(plan.pkPoints))
+	for _, vals := range plan.pkPoints {
+		key, err := rowenc.EncodePK(desc, vals)
+		if err != nil {
+			return nil, err
+		}
+		pks = append(pks, key)
+	}
+	slices.SortFunc(pks, func(a, b keys.Key) int {
+		if plan.reverse {
+			return bytes.Compare(b, a)
+		}
+		return bytes.Compare(a, b)
+	})
+	pks = slices.CompactFunc(pks, func(a, b keys.Key) bool { return a.Equal(b) })
+	noteIndexScan(desc, desc.LivePrimaryIndex())
+	mark := txn.ReadMark()
+	var out []fetchedRow
+	err := fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+		for i, raw := range raws {
+			if raw == nil {
+				continue // no such row, or one passed over as locked
+			}
+			pk := pks[first+i]
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+			if err != nil {
+				return false, err
+			}
+			match, err := matchesWhere(where, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if !match {
+				continue
+			}
+			if err := s.chargeRow(row); err != nil {
+				return false, err
+			}
+			out = append(out, fetchedRow{key: pk, row: row})
+			if limit > 0 && int64(len(out)) == limit {
+				txn.ForgetReads(mark, pks[first+i+1:first+len(raws)])
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	metrics.SQLRowsScanned.Add(float64(len(out)))
+	s.AddScanned(int64(len(out)))
+	noteIndexRows(desc, desc.LivePrimaryIndex(), len(out))
+	return out, nil
 }
 
 // spanScan runs one KV scan in the plan's direction.

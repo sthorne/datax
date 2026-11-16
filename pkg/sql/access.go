@@ -36,6 +36,10 @@ type accessPlan struct {
 	idxVals []types.Datum // pinned leading key column values (scans and unique points)
 	eqCols  []string      // names of the pinned columns, for EXPLAIN
 
+	// pkPoints (planPKPoints): the primary keys to look up, one datum
+	// per PK column each; none when the WHERE clause cannot be true.
+	pkPoints [][]types.Datum
+
 	// Range constraint on the key column immediately after the pinned
 	// prefix: WHERE a = 1 AND b > 5 AND b <= 9 pins a and bounds b.
 	lo, hi   *colBound
@@ -90,7 +94,106 @@ const (
 	// planInvertedScan reads row references out of an inverted index,
 	// fetches the rows and rechecks each against the WHERE clause.
 	planInvertedScan
+	// planPKPoints looks up a list of primary keys — a key column pinned
+	// by IN (...), the others by = — or none at all when the WHERE
+	// clause cannot be true (issue #322).
+	planPKPoints
 )
+
+// maxPKInPoints caps the IN list that plans as point lookups; a longer
+// one plans as any other filter.
+const maxPKInPoints = 4096
+
+// pkInPoints returns the primary keys a WHERE clause confines its rows
+// to when every primary-key column but one is pinned by = and that one
+// by IN with a list of constants (a spliced IN subquery among them):
+// one key per distinct non-NULL value, none when every value is NULL.
+// Such a statement then reads only those rows. Planned as a scan with a
+// filter it read every row of the table, and a plain read waits for
+// another transaction's lock on any of them: UPDATE ... WHERE id IN
+// (SELECT ... FOR UPDATE SKIP LOCKED) waited for the very rows its
+// subquery had skipped (issue #322).
+func pkInPoints(desc *catalog.TableDescriptor, where []parser.Comparison, params []types.Datum) ([][]types.Datum, bool, error) {
+	eqs := make([]parser.Comparison, 0, len(where)+1)
+	for _, cmp := range where {
+		if cmp.Op == "=" {
+			eqs = append(eqs, cmp)
+		}
+	}
+	for _, cmp := range where {
+		if cmp.Op != "IN" || cmp.Column == "" || len(cmp.Path) > 0 || cmp.Expr != nil || cmp.Sub != nil || len(cmp.Values) > maxPKInPoints {
+			continue
+		}
+		col, ok := desc.Col(cmp.Column)
+		if !ok || !desc.IsPKCol(col.ID) || col.Hidden {
+			continue
+		}
+		var points [][]types.Datum
+		usable := true
+		for _, v := range cmp.Values {
+			d, err := evalExpr(v, nil, nil, params)
+			if err != nil {
+				usable = false // row-dependent: not a list of points
+				break
+			}
+			if d.Null {
+				continue // matches nothing
+			}
+			lit := d
+			vals, ok, err := pkPointValues(desc, append(eqs, parser.Comparison{Column: cmp.Column, Op: "=", Value: parser.Expr{Lit: &lit}}), params)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				usable = false // other key columns unpinned, or an un-coercible value
+				break
+			}
+			points = append(points, vals) // duplicates are dropped by key at execution
+		}
+		if usable {
+			return points, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// neverTrue reports whether a WHERE clause is false for every row on
+// its face: a conjunct FALSE (a spliced EXISTS that found nothing), a
+// column compared with a NULL constant (a scalar subquery that returned
+// no row), or IN over a list holding only NULLs or nothing (an IN
+// subquery that returned no row). Such a statement reads nothing — as a
+// scan with a filter it read every row, and waited for any another
+// transaction held locked.
+func neverTrue(where []parser.Comparison, params []types.Datum) bool {
+	for _, cmp := range where {
+		switch cmp.Op {
+		case "FALSE":
+			return true
+		case "=", "<", "<=", ">", ">=":
+			if cmp.Column == "" {
+				continue
+			}
+			if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil && d.Null {
+				return true
+			}
+		case "IN":
+			if cmp.Column == "" || cmp.Sub != nil {
+				continue
+			}
+			allNull := true
+			for _, v := range cmp.Values {
+				if d, err := evalExpr(v, nil, nil, params); err != nil || !d.Null {
+					allNull = false
+					break
+				}
+			}
+			if allNull {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // hasBounds reports whether the plan carries a range constraint.
 func (p accessPlan) hasBounds() bool { return p.lo != nil || p.hi != nil }
@@ -137,6 +240,11 @@ func (p accessPlan) String() string {
 	switch p.kind {
 	case planPKPoint:
 		return "point lookup on primary key"
+	case planPKPoints:
+		if len(p.pkPoints) == 0 {
+			return "no rows read (the WHERE clause cannot be true)"
+		}
+		return fmt.Sprintf("point lookups on primary key (%d keys)", len(p.pkPoints))
 	case planUniquePoint:
 		return fmt.Sprintf("point lookup via unique index %q", p.idx.Name)
 	case planPKScan:
@@ -350,6 +458,9 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		}
 		conjs[i] = pc
 	}
+	if neverTrue(where, params) {
+		return accessPlan{kind: planPKPoints}, nil
+	}
 
 	// nullSafe: rows where col is NULL provably cannot match the WHERE
 	// clause (or cannot exist). Secondary-index entries are skipped when ANY
@@ -397,6 +508,14 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		if len(vals) == len(idx.ColumnIDs) {
 			return accessPlan{kind: planUniquePoint, idx: idx, idxVals: vals}, nil
 		}
+	}
+
+	// A primary key pinned but for one column, which IN (...) holds to a
+	// list of values → a point lookup per value.
+	if points, ok, err := pkInPoints(desc, where, params); err != nil {
+		return accessPlan{}, err
+	} else if ok {
+		return accessPlan{kind: planPKPoints, pkPoints: points}, nil
 	}
 
 	// buildCandidate constrains the given key column order: an equality

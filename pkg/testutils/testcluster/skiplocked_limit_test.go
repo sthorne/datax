@@ -239,3 +239,84 @@ func TestSkipLockedIndexJoinRowsStayOutOfTheReadSet(t *testing.T) {
 		t.Fatalf("B's commit (a 40001 here means a skipped row's index entry was in its read set): %v", err)
 	}
 }
+
+// TestSkipLockedSubqueryOfAWrite (issue #322 item 16): SKIP LOCKED in a
+// subquery of an UPDATE, a DELETE, an INSERT ... SELECT or a CTE holds
+// for that subquery's scan, and the write then acts on the row the
+// subquery returned — job 2 — without waiting for the holder of job 3.
+func TestSkipLockedSubqueryOfAWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	_, _, _, b := claimQueue(t, ctx)
+	pick := `SELECT id FROM jobs WHERE ` + claimWhere + ` ORDER BY visible_at LIMIT 1 FOR UPDATE SKIP LOCKED`
+	// The states of jobs 1 and 2, read by point lookups: a plain read
+	// of job 3 would wait for A's lock.
+	states := func(sctx context.Context, tx pgx.Tx) (string, error) {
+		var got []string
+		for _, id := range []int64{1, 2} {
+			var state string
+			err := tx.QueryRow(sctx, `SELECT state FROM jobs WHERE id = $1`, id).Scan(&state)
+			if err == pgx.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+			got = append(got, fmt.Sprintf("%d:%s", id, state))
+		}
+		return fmt.Sprint(got), nil
+	}
+	for _, w := range []struct{ stmt, tag, want string }{
+		{`UPDATE jobs SET state = 'claimed' WHERE id = (` + pick + `)`, "UPDATE 1", "[1:pending 2:claimed]"},
+		{`UPDATE jobs SET state = 'claimed' WHERE id IN (` + pick + `)`, "UPDATE 1", "[1:pending 2:claimed]"},
+		{`DELETE FROM jobs WHERE id IN (` + pick + `)`, "DELETE 1", "[1:pending]"},
+		{`DELETE FROM jobs WHERE id = (` + pick + `)`, "DELETE 1", "[1:pending]"},
+		{`WITH c AS (` + pick + `) UPDATE jobs SET state = 'claimed' WHERE id IN (SELECT id FROM c)`, "UPDATE 1", "[1:pending 2:claimed]"},
+		{`WITH c AS (` + pick + `) DELETE FROM jobs WHERE id IN (SELECT id FROM c)`, "DELETE 1", "[1:pending]"},
+		{`INSERT INTO claims ` + pick, "INSERT 0 1", "[1:pending 2:pending]"},
+		// A subquery that skips every row it finds returns nothing, and
+		// the write then reads nothing either: it does not scan the table
+		// and wait for the row that was skipped.
+		{`UPDATE jobs SET state = 'claimed' WHERE id = (SELECT id FROM jobs WHERE id = 3 FOR UPDATE SKIP LOCKED)`, "UPDATE 0", "[1:pending 2:pending]"},
+		{`UPDATE jobs SET state = 'claimed' WHERE id IN (SELECT id FROM jobs WHERE id = 3 FOR UPDATE SKIP LOCKED)`, "UPDATE 0", "[1:pending 2:pending]"},
+		{`DELETE FROM jobs WHERE id = (SELECT id FROM jobs WHERE id = 3 FOR UPDATE SKIP LOCKED) AND state = 'pending'`, "DELETE 0", "[1:pending 2:pending]"},
+		{`UPDATE jobs SET state = 'claimed' WHERE state = 'pending' AND EXISTS (SELECT 1 FROM jobs WHERE id = 3 FOR UPDATE SKIP LOCKED)`, "UPDATE 0", "[1:pending 2:pending]"},
+	} {
+		promptly(t, ctx, b, w.stmt, time.Second, func(sctx context.Context, tx pgx.Tx) error {
+			tag, err := tx.Exec(sctx, w.stmt)
+			if err != nil {
+				return err
+			}
+			if tag.String() != w.tag {
+				return fmt.Errorf("tag %q, want %q", tag.String(), w.tag)
+			}
+			if got, err := states(sctx, tx); err != nil || got != w.want {
+				return fmt.Errorf("jobs then %s, %v; want %s", got, err, w.want)
+			}
+			if strings.HasPrefix(w.stmt, "INSERT") {
+				if ids, err := queryIDs(sctx, tx, `SELECT id FROM claims`); err != nil || fmt.Sprint(ids) != "[2]" {
+					return fmt.Errorf("claims %v, %v; want [2]", ids, err)
+				}
+			}
+			return nil
+		})
+	}
+	// The claim's lock on job 2 is held to the end of the transaction:
+	// a second claim in it takes job 1, and the subquery's NOWAIT fails.
+	promptly(t, ctx, b, "two claims", time.Second, func(sctx context.Context, tx pgx.Tx) error {
+		for _, want := range []string{"[2]", "[1]"} {
+			ids, err := queryIDs(sctx, tx, `UPDATE jobs SET state = 'claimed' WHERE id = (`+pick+`) RETURNING id`)
+			if err != nil || fmt.Sprint(ids) != want {
+				return fmt.Errorf("claimed %v, %v; want %s", ids, err, want)
+			}
+		}
+		return nil
+	})
+	nowait := `UPDATE jobs SET state = 'claimed' WHERE id = (SELECT id FROM jobs WHERE ` + claimWhere + ` ORDER BY visible_at LIMIT 1 FOR UPDATE NOWAIT)`
+	promptly(t, ctx, b, nowait, time.Second, func(sctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(sctx, nowait); pgErrCode(err) != sql.CodeLockNotAvailable {
+			return fmt.Errorf("got %v, want SQLSTATE %s", err, sql.CodeLockNotAvailable)
+		}
+		return nil
+	})
+}

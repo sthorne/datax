@@ -402,3 +402,61 @@ func TestSpanBounds(t *testing.T) {
 		t.Fatalf("span = [%s, %s)", start, end)
 	}
 }
+
+// A primary key pinned by = but for one column held by IN (...) to
+// constants plans as point lookups (issue #322); one IN value that is
+// NULL is dropped, and a clause that cannot be true plans as reading
+// nothing.
+func TestPickPlanPKInListAndNeverTrue(t *testing.T) {
+	desc := testDesc()
+	lit := func(v int64) parser.Expr {
+		d := types.NewInt(v)
+		return parser.Expr{Lit: &d}
+	}
+	n := types.DNull
+	null := parser.Expr{Lit: &n}
+	in := func(col string, vals ...parser.Expr) parser.Comparison {
+		return parser.Comparison{Column: col, Op: "IN", Values: vals}
+	}
+
+	plan := mustPlan(t, desc, []parser.Comparison{cmpInt("a", "=", 1), in("b", lit(3), null, lit(2), lit(3))})
+	if plan.kind != planPKPoints || len(plan.pkPoints) != 3 {
+		t.Fatalf("plan = %+v, want three point lookups", plan)
+	}
+	for i, want := range []int64{3, 2, 3} { // duplicates go at execution
+		if p := plan.pkPoints[i]; len(p) != 2 || p[0].I != 1 || p[1].I != want {
+			t.Fatalf("point %d = %+v", i, p)
+		}
+	}
+	if got, want := plan.String(), "point lookups on primary key (3 keys)"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+	// The other key column unpinned: no points.
+	if plan := mustPlan(t, desc, []parser.Comparison{in("b", lit(3))}); plan.kind == planPKPoints {
+		t.Fatalf("plan = %+v, want no point lookups with a unpinned", plan)
+	}
+	// IN on a column outside the key: no points.
+	if plan := mustPlan(t, desc, []parser.Comparison{cmpInt("a", "=", 1), in("c", lit(3))}); plan.kind == planPKPoints {
+		t.Fatalf("plan = %+v, want no point lookups for a non-key IN", plan)
+	}
+
+	for _, where := range [][]parser.Comparison{
+		{{Column: "c", Op: "=", Value: null}},
+		{cmpInt("a", ">", 1), {Column: "d", Op: "<", Value: null}},
+		{in("a", null, null)},
+		{in("c")},
+		{cmpInt("c", "=", 1), {Op: "FALSE"}},
+	} {
+		plan := mustPlan(t, desc, where)
+		if plan.kind != planPKPoints || len(plan.pkPoints) != 0 {
+			t.Fatalf("%+v: plan = %+v, want nothing read", where, plan)
+		}
+		if got, want := plan.String(), "no rows read (the WHERE clause cannot be true)"; got != want {
+			t.Fatalf("String() = %q, want %q", got, want)
+		}
+	}
+	// A clause that may be true reads as before.
+	if plan := mustPlan(t, desc, []parser.Comparison{{Column: "c", Op: "IS NULL"}, in("c", null, lit(1))}); plan.kind == planPKPoints {
+		t.Fatalf("plan = %+v", plan)
+	}
+}
