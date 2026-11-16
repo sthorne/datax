@@ -532,9 +532,15 @@ type OrderCol struct {
 	// descending).
 	Nulls string
 	// Position is a 1-based output position, kept when the select list
-	// is not known at parse time (ORDER BY after a parenthesized query);
-	// otherwise positions are rewritten to output names.
+	// is not known at parse time (ORDER BY after a parenthesized query,
+	// a set operation, or a select list with a *); otherwise a position
+	// is rewritten to the select item it names (the column, aggregate or
+	// expression, never its output name).
 	Position int
+	// Ordinal is the position as written (ORDER BY 2), 0 for any other
+	// term; it survives the rewrite so that the ORDER BY of a set
+	// operation can be taken back to positions of the result.
+	Ordinal int
 	// Agg is an aggregate call (ORDER BY count(*) DESC) in a grouped
 	// query: sorted by, and computed when no select item is the same.
 	Agg *SelectExpr

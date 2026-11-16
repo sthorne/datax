@@ -271,7 +271,10 @@ syntax error or `0A000` feature not supported):
   inside a transaction block.
 - **`ORDER BY`** takes output names, positions and expressions, but an
   expression sort never uses an index; NULLs order last ASC / first DESC
-  (PostgreSQL default). Under `GROUP BY` and `UNION`, output names only.
+  (PostgreSQL default). Under `GROUP BY` and `UNION`, output names and
+  positions only. A position after a `*` that is not the whole select
+  list is refused; `GROUP BY` takes columns and positions of columns,
+  not expressions.
 - **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
   precision on the wire, nanosecond internally.
 - **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
