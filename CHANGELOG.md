@@ -1467,6 +1467,13 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **40001 errors say "restart transaction:" once.** A retryable error's
+  own text already starts with that prefix, and the conversion to a SQL
+  error added it again. Every 40001 from a transaction restart read
+  "restart transaction: restart transaction: ...", for example a large
+  object's `loread` failing with `TransactionAbortedError`. The prefix
+  is now added only when missing, and a wrapped error has it moved to
+  the front.
 - **After an online store-key rotation, the metadata backup is always
   under the new key.** Each heartbeat rewrites the backup, and a
   rotation reseals it right after swapping the key. A heartbeat's write
