@@ -170,6 +170,8 @@ type likeIndex struct {
 	cols   []string
 	// inverted is the source index's inverted kind ("" = ordinary).
 	inverted string
+	// nullsNotDistinct copies UNIQUE NULLS NOT DISTINCT.
+	nullsNotDistinct bool
 }
 
 // expandLike replaces each LIKE clause of a CREATE TABLE with the source
@@ -252,7 +254,11 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 						for _, id := range c.Columns {
 							names = append(names, byID[id])
 						}
-						out.Constraints = append(out.Constraints, parser.ConstraintDef{Kind: "unique", Columns: names})
+						nnd := false
+						if idx, ok := src.IndexByID(c.IndexID); ok {
+							nnd = idx.NullsNotDistinct
+						}
+						out.Constraints = append(out.Constraints, parser.ConstraintDef{Kind: "unique", Columns: names, NullsNotDistinct: nnd})
 					}
 				}
 			}
@@ -271,7 +277,7 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					for _, id := range idx.ColumnIDs {
 						names = append(names, byID[id])
 					}
-					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted})
+					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted, nullsNotDistinct: idx.NullsNotDistinct})
 				}
 			}
 		}
@@ -300,7 +306,7 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 		if desc.NextIndexID < 2 {
 			desc.NextIndexID = 2
 		}
-		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted})
+		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted, NullsNotDistinct: li.nullsNotDistinct})
 		desc.NextIndexID++
 	}
 	return nil

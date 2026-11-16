@@ -347,7 +347,7 @@ func init() {
 	// pg_class rows; indkey lists column attnums separated by spaces.
 	pg("pg_index", []catalog.Column{
 		col("indexrelid", types.Int), col("indrelid", types.Int), col("indnatts", types.Int), col("indnkeyatts", types.Int),
-		col("indisunique", types.Bool), col("indisprimary", types.Bool), col("indisexclusion", types.Bool), col("indimmediate", types.Bool),
+		col("indisunique", types.Bool), col("indnullsnotdistinct", types.Bool), col("indisprimary", types.Bool), col("indisexclusion", types.Bool), col("indimmediate", types.Bool),
 		col("indisclustered", types.Bool), col("indisvalid", types.Bool), col("indisready", types.Bool), col("indislive", types.Bool),
 		col("indisreplident", types.Bool), col("indkey", types.String), col("indpred", types.String),
 		hidden("__indexdef"), hidden("__expr"),
@@ -356,12 +356,12 @@ func init() {
 		for _, t := range env.currentTables() {
 			pk := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
 			rows = append(rows, Row{i64(IndexOID(t, 1)), i64(TableOID(t)), i64(int64(len(visiblePK(t)))), i64(int64(len(visiblePK(t)))),
-				boolean(true), boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(true), boolean(true),
+				boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(true), boolean(true),
 				boolean(false), str(attnums(t, visiblePK(t))), null(), str(IndexDef(t, pk)), null()})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(TableOID(t)), i64(int64(len(idx.ColumnIDs))), i64(int64(len(idx.ColumnIDs))),
-					boolean(idx.Unique), boolean(false), boolean(false), boolean(true), boolean(false), boolean(idx.Public()), boolean(true), boolean(true),
+					boolean(idx.Unique), boolean(idx.NullsNotDistinct), boolean(false), boolean(false), boolean(true), boolean(false), boolean(idx.Public()), boolean(true), boolean(true),
 					boolean(false), str(attnums(t, idx.ColumnIDs)), null(), str(IndexDef(t, idx)), null()})
 			}
 		}

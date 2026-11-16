@@ -166,6 +166,10 @@ type ConstraintDef struct {
 	// NotValid is ALTER TABLE ... ADD CONSTRAINT ... NOT VALID: existing
 	// rows are not checked.
 	NotValid bool
+	// NullsNotDistinct is UNIQUE NULLS NOT DISTINCT (PostgreSQL 15): NULLs
+	// in the unique columns conflict with each other. NULLS DISTINCT, the
+	// default, may be written too.
+	NullsNotDistinct bool
 }
 
 type CreateTable struct {
@@ -342,6 +346,11 @@ type CreateIndex struct {
 	// With holds the WITH (name = value) storage parameters, names
 	// lower-cased (USING ivfflat ... WITH (lists = 100)).
 	With map[string]string
+	// NullsNotDistinct is CREATE UNIQUE INDEX ... NULLS NOT DISTINCT
+	// (PostgreSQL 15); NullsClause says a NULLS [NOT] DISTINCT clause was
+	// written at all (only a unique index takes one).
+	NullsNotDistinct bool
+	NullsClause      bool
 }
 
 // CreateExtension is CREATE EXTENSION [IF NOT EXISTS] name. There are
@@ -737,10 +746,14 @@ type AlterTable struct {
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.
-	AddConstraint          *ConstraintDef
-	DropConstraint         string
-	DropConstraintIfExists bool
-	ValidateConstraint     string
+	AddConstraint *ConstraintDef
+	// AddConstraintIfNotExists is ADD CONSTRAINT IF NOT EXISTS name ...,
+	// a datax extension: nothing happens (with a NOTICE) when the table
+	// has a constraint of that name, whatever its definition.
+	AddConstraintIfNotExists bool
+	DropConstraint           string
+	DropConstraintIfExists   bool
+	ValidateConstraint       string
 	// SetNotNull / DropNotNull are ALTER [COLUMN] c SET NOT NULL / DROP
 	// NOT NULL (the column name).
 	SetNotNull  string

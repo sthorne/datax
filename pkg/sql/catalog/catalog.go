@@ -404,6 +404,16 @@ type IndexDescriptor struct {
 	// value, which has no key encoding. The value is never changed once
 	// the index is published, so clones of a descriptor share it.
 	Vector *VectorIndex `json:"vector,omitempty"`
+	// NullsNotDistinct marks a unique index declared NULLS NOT DISTINCT
+	// (PostgreSQL 15): two rows whose indexed values are equal or both
+	// NULL column by column conflict. Without it (NULLS DISTINCT, the
+	// default) a row with a NULL in any indexed column has no entry and
+	// conflicts with nothing. Such an index keys every column with a tag
+	// byte first — rowenc.IndexKeyNullTag for NULL, IndexKeyValueTag
+	// before a value — so a NULL has a key of its own. The field is
+	// omitempty and set only at creation. Cluster version v22: a node
+	// that does not know the field would key the entries untagged.
+	NullsNotDistinct bool `json:"nulls_not_distinct,omitempty"`
 }
 
 // VectorIndex describes an IVF ("inverted file") index: the vectors of
@@ -1338,6 +1348,20 @@ func ReadTable(ctx context.Context, txn *kvclient.Txn, id uint64) (*TableDescrip
 // Create writes a new table descriptor within txn. The caller has validated
 // the definition.
 func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+	// The database is read in this transaction, not taken from the
+	// gateway's cache of names, so that a DROP DATABASE committing
+	// alongside either sees the new table or makes this transaction
+	// fail: otherwise the table could be created under a database that
+	// no longer exists, where nothing would ever find or drop it.
+	if d.DatabaseID != 0 && !IsSystemTableID(d.ID) {
+		db, err := ReadDatabase(ctx, txn, d.DatabaseID)
+		if err != nil {
+			return err
+		}
+		if db == nil {
+			return &ErrDatabaseNotFound{Name: fmt.Sprintf("#%d", d.DatabaseID)}
+		}
+	}
 	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.Name, a.isDefaultID(d.DatabaseID))
 	if err != nil {
 		return err
@@ -1442,23 +1466,31 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 	if err != nil {
 		return nil, err
 	}
+	var wb kvclient.WriteBatch
+	if err := a.DropDescriptor(txn, d, &wb); err != nil {
+		return nil, err
+	}
+	return d, txn.RunBatch(ctx, &wb)
+}
+
+// DropDescriptor buffers in wb the drop of a table whose descriptor the
+// transaction has read: DropIn without reading the name and the
+// descriptor again, for DROP DATABASE, which has just read them all
+// (ListIn) and writes the drops of all its tables in one batch.
+func (a *Accessor) DropDescriptor(txn *kvclient.Txn, d *TableDescriptor, wb *kvclient.WriteBatch) error {
 	// The name entry is wherever the descriptor says it is.
-	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, name)); err != nil {
-		return nil, err
-	}
-	if err := txn.Delete(ctx, keys.TableDescKey(d.ID)); err != nil {
-		return nil, err
-	}
-	if err := recordDroppedTable(ctx, txn, d); err != nil {
-		return nil, err
+	wb.Delete(namespaceKey(d.DatabaseID, d.Name))
+	wb.Delete(keys.TableDescKey(d.ID))
+	if err := recordDroppedTable(txn, d, wb); err != nil {
+		return err
 	}
 	if d.IsView() {
-		if err := DeleteViewDependencies(ctx, txn, d.ID, d.ViewDepends); err != nil {
-			return nil, err
+		for _, dep := range d.ViewDepends {
+			wb.Delete(keys.ViewDependencyKey(dep, d.ID))
 		}
 	}
-	a.Invalidate(name)
-	return d, nil
+	a.Invalidate(d.Name)
+	return nil
 }
 
 // List returns all table descriptors, of every database, by scanning

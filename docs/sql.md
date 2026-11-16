@@ -56,7 +56,7 @@ SELECT [DISTINCT] * | col, ... | aggregates | func() OVER ([PARTITION BY ...] [O
     [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
     [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE [SKIP LOCKED | NOWAIT]]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
-UPDATE t SET col = value, ... [WHERE conjunction]
+UPDATE t SET col = value, ... [WHERE conjunction]   -- primary-key columns too (see below)
 DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
@@ -735,7 +735,11 @@ Table descriptors are JSON documents stored in system keys (range 1):
   `ALTER TABLE ... ADD CONSTRAINT` is a multi-transaction statement of
   the `CREATE INDEX` shape: publish (unvalidated), drain lease
   adoption, backfill the index, sweep the existing rows in chunks as of
-  a boundary, mark validated.
+  a boundary, mark validated. `ADD CONSTRAINT IF NOT EXISTS name` (a
+  datax extension, issue #322) checks, in the publish transaction,
+  whether the table has a constraint of that name (`<table>_pkey` or one
+  in `Constraints`) and if so commits nothing and returns a NOTICE; the
+  definitions are not compared.
 
 `TRUNCATE` reuses the re-shard's layout swap: the descriptor moves the
 primary rows and every secondary index to fresh index IDs in one write
@@ -1161,8 +1165,22 @@ key space (`/t/<tableID>/<indexID>/`):
   (SQL equality never matches NULL, so equality lookups stay correct; such
   rows are found by full scans).
 - **Unique**: key = indexed columns only, value = the encoded primary key.
-  NULLs in unique-indexed columns are **rejected** (a deliberate divergence
-  from PostgreSQL's multiple-NULLs-allowed behavior).
+  As in PostgreSQL (NULLS DISTINCT, the default), a row with NULL in any
+  indexed column has **no entry**, like a non-unique index, and so
+  conflicts with no other row: a unique index takes any number of NULLs.
+  Before cluster version v22 is finalized NULLs are refused instead
+  (`23502`), as every earlier binary refuses them — a v21 planner takes a
+  unique index for a complete row source.
+- **Unique, `NULLS NOT DISTINCT`** (PostgreSQL 15; on `CREATE UNIQUE
+  INDEX ... (cols) NULLS NOT DISTINCT`, `UNIQUE NULLS NOT DISTINCT` on a
+  column, and `UNIQUE NULLS NOT DISTINCT (cols)` as a table constraint or
+  in `ADD CONSTRAINT`; cluster version v22): every row has an entry, and
+  two rows whose indexed values are equal or both NULL column by column
+  conflict, `ON CONFLICT` included. Each key column is preceded by a tag
+  byte — `0x00` for NULL, `0x01` before a value — so a NULL has a key no
+  value can have (`IndexDescriptor.NullsNotDistinct`). `NULLS DISTINCT`
+  may be written too and is the default. `pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show the clause.
 
 Maintenance happens inside the writing transaction — index entries ride the
 same write batch as the row, so they commit or roll back atomically, and
@@ -1181,9 +1199,9 @@ explicit transaction block — code 25001):
    union is complete. The backfill transaction deliberately touches only
    row and index data — the descriptor flip to **public** is a separate
    small transaction, so a stream of concurrent writes cannot starve the
-   backfill's commit. Unique violations (including a NULL in a
-   unique-indexed column) abort the build and remove the write-only index
-   again.
+   backfill's commit. Unique violations abort the build and remove the
+   write-only index again; a row with a NULL in an indexed column is
+   skipped, as its writer would skip it (before v22: a violation too).
 3. Drain once more, so every gateway plans with the public index.
 
 The backfill is **bounded and snapshot-planned**: a planning sweep reads
@@ -1224,6 +1242,48 @@ every kind of index (`TestCreateIndexDiscardsEntriesWrittenDuringItsDrain`).
 
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.
+
+## Updating primary-key columns
+
+`UPDATE` may set primary-key columns (issue #322; `pkg/sql/update_pk.go`).
+A row whose key changes **moves**: in the statement's transaction its
+old row (and a re-shard's shadow copy) and every index entry are
+deleted, and the new version is written at the new key with its
+entries. A hash-sharded table files it under the new key's bucket. A
+sealed table's value is sealed afresh for the new key — the key is in
+its associated data — and on a table sealed per tenant, a new tenant
+column value seals it under the new tenant's key (made on its first
+write, as for an insert). Foreign keys see an ordinary change of the
+referenced columns: `ON UPDATE CASCADE` re-keys the children, `SET
+NULL` nulls them, `RESTRICT` / `NO ACTION` refuse (`23503`, checked per
+row). Where a table's foreign key references the table itself, a
+statement that changes both a referenced row and a row its cascade
+rewrites is refused (`0A000`, `cascadeOverlap`): the cascade rewrote
+that row from the version the statement read, and the statement would
+then write its own version over it. PostgreSQL runs the cascade after
+the statement, on the rows as it left them; here the rows are changed
+in separate statements. Row security checks the new row against
+`WITH CHECK` before any probe of the new key; `RETURNING` shows the new
+row. The hidden key columns (`rowid`, the shard bucket) cannot be set.
+
+**Uniqueness is checked for the statement as a whole**, for the primary
+key and every unique index, in every `UPDATE` (`checkUpdateKeys`): a new
+key conflicts when two of the statement's rows take it, or when a row
+the statement does not move out of it holds it now (`23505`). So `UPDATE
+t SET id = id + 1` succeeds over keys 1, 2, 3, as does a swap. This is
+the SQL standard's rule and PostgreSQL's for a `DEFERRABLE` constraint;
+PostgreSQL checks a non-deferrable key row by row, in the order it
+visits the rows, and so refuses `id = id + 1` over 1, 2, 3 (but not `id =
+id - 1`). Datax accepts what PostgreSQL accepts and some statements it
+refuses; none that leaves the table with a duplicate. Because a row may
+take a key another row of the statement gives up, the statement's own
+row and index writes go through `updateWrites`, which writes each key
+once (the new version wins over the old one's delete).
+
+`ON CONFLICT DO UPDATE` still may not change a primary-key column
+(`0A000`): its arbiter reads see the table as it was before the
+statement, so a key one proposed row's update gave up would still look
+taken to the next row of the same `INSERT`. Use `UPDATE`.
 
 ## Inverted indexes (v21)
 
@@ -1811,11 +1871,14 @@ by a K-way merge of the per-bucket scans (see docs/timeseries.md); the
 per-bucket scans carry the pushed limit, so `ORDER BY ts DESC LIMIT n`
 reads at most `buckets × n` rows.
 
-A non-unique index has no entry for rows with NULL in any indexed column,
-so the planner only uses one when the schema (`NOT NULL`) or the WHERE
-clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
-match — and `col IS NULL` therefore always reads the primary rows. Unique
-indexes reject NULLs at write time and are always complete.
+An index — unique or not — has no entry for rows with NULL in any
+indexed column, so the planner only scans one when the schema (`NOT
+NULL`) or the WHERE clause (equality/range/`IS NOT NULL` conjuncts)
+proves those rows cannot match — and `col IS NULL` therefore always
+reads the primary rows. A unique-index point lookup pins every column to
+a value, so it is unaffected. (A `NULLS NOT DISTINCT` index does hold
+its NULLs, but is planned by the same rule; its scans start past the
+NULL entries.)
 
 Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops.
 Without statistics they execute **in syntactic order** — the FROM/JOIN

@@ -615,15 +615,44 @@ func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescript
 			return nil, fmt.Errorf("index %q references unknown column %d", idx.Name, idx.ColumnIDs[i])
 		}
 		if d.Null {
-			return nil, fmt.Errorf("cannot encode NULL in an index key")
+			if !TaggedIndexKey(idx) {
+				return nil, fmt.Errorf("cannot encode NULL in an index key")
+			}
+			k = append(k, IndexKeyNullTag)
+			continue
 		}
 		var err error
-		k, err = appendDatum(k, col.Type, d)
+		k, err = AppendIndexKeyDatum(k, idx, col.Type, d)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)
 		}
 	}
 	return k, nil
+}
+
+// The tags of a NULLS NOT DISTINCT unique index's key columns: each
+// column's encoding is preceded by one of them, so that a NULL has a key
+// of its own that no value's encoding can equal, and NULLs sort first.
+const (
+	IndexKeyNullTag  byte = 0x00
+	IndexKeyValueTag byte = 0x01
+)
+
+// TaggedIndexKey reports whether the index keys every column with a tag
+// byte first (a unique index declared NULLS NOT DISTINCT).
+func TaggedIndexKey(idx *catalog.IndexDescriptor) bool {
+	return idx != nil && idx.Unique && idx.NullsNotDistinct
+}
+
+// AppendIndexKeyDatum appends one non-NULL key column of the index, as
+// the index's entries encode it: AppendKeyDatum, after the value tag
+// when the index tags its columns. A scan bound on an index column is
+// built with it.
+func AppendIndexKeyDatum(k keys.Key, idx *catalog.IndexDescriptor, fam types.Family, d types.Datum) (keys.Key, error) {
+	if TaggedIndexKey(idx) {
+		k = append(k, IndexKeyValueTag)
+	}
+	return appendDatum(k, fam, d)
 }
 
 // nonUniqueIndexValue marks a non-unique index entry present (values must be
@@ -633,8 +662,11 @@ var nonUniqueIndexValue = []byte{0}
 // EncodeIndexEntry builds an ordinary index's KV pair for a full row
 // (IndexEntries serves both kinds of index). skip=true when
 // an indexed column is NULL: the row simply has no entry in that index
-// (SQL equality never matches NULL, so equality lookups stay correct;
-// unique indexes reject NULLs at the executor instead).
+// (SQL equality never matches NULL, so equality lookups stay correct).
+// For a unique index that is PostgreSQL's NULLS DISTINCT: a row with a
+// NULL conflicts with no other row. A unique index declared NULLS NOT
+// DISTINCT is the exception: it keys a NULL like a value (see
+// TaggedIndexKey), so every row has an entry.
 func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
 	return EncodeIndexEntryAt(desc, idx, idx.ID, row)
 }
@@ -647,9 +679,13 @@ func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescripto
 // yields the new-layout entry.
 func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
 	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
+	tagged := TaggedIndexKey(idx)
 	for _, colID := range idx.ColumnIDs {
 		d, ok := row[colID]
-		if !ok || d.Null {
+		if !ok {
+			d = types.DNull
+		}
+		if d.Null && !tagged {
 			return nil, nil, true, nil
 		}
 		vals = append(vals, d)

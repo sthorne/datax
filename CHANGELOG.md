@@ -11,6 +11,29 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
+  extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
+  INDEX`, both supported, but not here): when the table already has a
+  constraint of that name the statement does nothing and sends the NOTICE
+  `constraint "name" for relation "t" already exists, skipping`. Only the
+  name is compared, never the definition.
+- **`UPDATE` may change primary-key columns** (#322). A row whose key
+  changes moves: its old row and index entries are deleted and the new
+  version written at the new key, with its entries, in the statement's
+  transaction; a hash-sharded table files it under the new bucket; a sealed
+  table seals it afresh for the new key, and a per-tenant table under the
+  new tenant's key when the tenant column changes. Foreign keys apply their
+  `ON UPDATE` actions, row security checks `WITH CHECK` on the new row, and
+  `RETURNING` shows it. Unique keys — the primary key and unique indexes —
+  are now checked for the statement as a whole in every `UPDATE`, so
+  `UPDATE t SET id = id + 1` and swaps succeed (PostgreSQL, checking a
+  non-deferrable key row by row, refuses the first); before, a unique index
+  refused `SET u = u - 1` over consecutive values. Where a foreign key
+  references its own table with `ON UPDATE CASCADE` or `SET NULL`, a
+  statement that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`) rather than losing one of the two changes,
+  as it could before. `ON CONFLICT DO UPDATE` still cannot change the key.
+  Before, any update of a key column was refused with `0A000`.
 - **Vector columns and nearest-neighbour search** (#304): `vector(n)` columns
   compatible with pgvector (float4 elements, up to 16,000 dimensions; text
   `'[1,2,3]'` and pgvector's binary format; a fixed type OID found through
@@ -1166,6 +1189,24 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **A unique index takes NULLs, as in PostgreSQL** (#322). A row with a NULL
+  in any column of a unique index has no entry in it and conflicts with no
+  other row (NULLS DISTINCT, PostgreSQL's default), on every path: `INSERT`,
+  `COPY`, `UPDATE` to and from NULL, `ON CONFLICT (col)` (a NULL inserts),
+  the backfill of `CREATE UNIQUE INDEX` and `ADD CONSTRAINT ... UNIQUE` over
+  existing NULLs, and foreign keys referencing a unique column. Before, such
+  a row was refused with `23502`. The planner no longer takes a unique index
+  for a complete row source: like a non-unique one it scans it only where a
+  NULL cannot match (`WHERE col = 'x'` is still a point lookup; `WHERE col
+  IS NULL` reads the table). `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15) is
+  supported on a column, as a table constraint and on `CREATE UNIQUE INDEX
+  ... NULLS NOT DISTINCT`: its index keys each column behind a tag byte so a
+  NULL has a key of its own (`pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show it). Both need cluster
+  version v22: before it is finalized a unique index refuses NULLs as
+  before and `NULLS NOT DISTINCT` is refused, since a v21 planner reads a
+  unique index as holding every row and a v21 node does not know the tag.
+  Existing unique indexes hold no NULLs and need no change.
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
   first `n` (plus `OFFSET`) rows in a heap instead of sorting every row, so it
   runs in bounded memory; `EXPLAIN` shows `top-k heap` (#304).
@@ -1458,6 +1499,20 @@ state or the internode protocol does, and an entry below says so.
 - **`EXPLAIN` of a parameterized statement** (#322) describes and binds
   the statement's parameters; `EXPLAIN ANALYZE` runs with the bound values;
   and a `SELECT` without `FROM` is explained instead of refused.
+- **`DROP DATABASE ... CASCADE` of a large database failed with `40001`
+  after about a minute** (#322), "write timestamp diverged from read
+  timestamp", with no other load. It reads every table's name and
+  descriptor; past 512 read spans a transaction gave up its read set, so
+  once a drop's commit outlived the closed-timestamp lag (3 s) and was
+  pushed above it, the transaction could not refresh and restarted, every
+  attempt alike, 21 times. A transaction now condenses its read spans past
+  512 into at most 64 covering ones and goes on refreshing; and `DROP
+  DATABASE` no longer reads each table a second time and writes its drops
+  in one batch instead of a round trip per key. A drop that loses to
+  concurrent DDL in the same database still fails with `40001` as a
+  whole. `CREATE TABLE` (and view, sequence) now reads its database in its
+  own transaction: one racing `DROP DATABASE` could commit a table under
+  the dropped database, where nothing would ever find or drop it.
 - **A transaction blocked on another's lock noticed it was released up to
   100 ms late.** It re-asked the lock holder's transaction record every
   100 ms. Now the holder's coordinator wakes it as soon as the holder has

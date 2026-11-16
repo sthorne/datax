@@ -531,6 +531,7 @@ ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100);            -- val
 ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100) NOT VALID;  -- new writes only, for now
 ALTER TABLE orders VALIDATE CONSTRAINT qty_small;
 ALTER TABLE orders ADD UNIQUE (code);                                     -- an online unique index build
+ALTER TABLE orders ADD CONSTRAINT IF NOT EXISTS qty_small CHECK (qty < 100); -- datax: a no-op (NOTICE) if the name exists
 ALTER TABLE orders ADD FOREIGN KEY (cust) REFERENCES customers;
 ALTER TABLE orders DROP CONSTRAINT [IF EXISTS] qty_small;
 ALTER TABLE orders RENAME CONSTRAINT qty_small TO qty_bounded;
@@ -539,6 +540,12 @@ ALTER TABLE orders ALTER COLUMN region DROP NOT NULL;
 DROP TABLE customers CASCADE;                    -- also drops the foreign keys that reference it
 SET foreign_key_cascade_limit = 50000;           -- per statement; default 10000
 ```
+
+`ADD CONSTRAINT IF NOT EXISTS name` is a datax extension (PostgreSQL has
+none): when the table has a constraint called `name` it does nothing but
+send a NOTICE, without comparing the definitions — a constraint of that
+name that says something else stays as it is. The name of an index made
+by `CREATE UNIQUE INDEX` is not a constraint's and is still refused.
 
 Names default to PostgreSQL's (`orders_qty_check`, `orders_code_key`,
 `orders_cust_fkey`, numbered when taken); `\d`, `pg_constraint`,
@@ -556,7 +563,15 @@ a cascade rewrites.
 name (`23505` on a duplicate); `ON CONFLICT ON CONSTRAINT name` and
 `ON CONFLICT (cols)` resolve through them. Adding one to a table with
 rows is the online index build: it cannot run inside a transaction
-block, and duplicates fail it with nothing left behind.
+block, and duplicates fail it with nothing left behind. As in
+PostgreSQL, NULLs are distinct: a row with a NULL in any of the unique
+columns conflicts with no other row, so a unique column takes any
+number of NULLs (and `ON CONFLICT (col)` with a NULL inserts). `UNIQUE
+NULLS NOT DISTINCT` (PostgreSQL 15) makes NULLs equal for the
+constraint: on a column, as a table constraint `UNIQUE NULLS NOT
+DISTINCT (a, b)`, or on an index `CREATE UNIQUE INDEX ... (cols) NULLS
+NOT DISTINCT`. Both need cluster version v22; before it a unique index
+refuses NULLs (`23502`).
 
 **FOREIGN KEY**s reference the parent's primary key or a unique
 constraint / index (`42P10` otherwise), column types must match, and
@@ -1008,6 +1023,7 @@ DELETE FROM t WHERE a = 1;
 
 INSERT INTO t (a, b) VALUES (3, 'q') RETURNING a, b;            -- any expression over the written row, or *
 UPDATE t SET c = c + 1 WHERE a = 1 RETURNING *;
+UPDATE t SET a = a + 100 WHERE a < 10;              -- the primary key too: the rows move
 DELETE FROM t WHERE a = 1 RETURNING a;
 
 INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT DO NOTHING;    -- any unique key; the tag counts inserted rows
@@ -1025,7 +1041,19 @@ unique index — by columns or by constraint name (`<table>_pkey`, the
 index name) — else SQLSTATE `42P10`; a conflict on some other unique key
 is still the usual `23505`. `ON CONFLICT DO NOTHING` without a target
 accepts a conflict on any unique key. `DO UPDATE` cannot change primary
-key columns, and the same key twice in one statement is `21000`. The
+key columns (an `UPDATE` can), and the same key twice in one statement is `21000`.
+
+An `UPDATE` may change primary-key columns: the row moves to its new key
+with its index entries, foreign keys referencing it apply their `ON
+UPDATE` action, and a sealed table seals it for its new key (and tenant).
+Unique keys — the primary key and unique indexes — are checked for the
+statement as a whole, so `UPDATE t SET id = id + 1` and swaps work
+whatever order the rows are visited in; PostgreSQL checks a
+non-deferrable key row by row and refuses the first of these. When a
+foreign key references its own table with `ON UPDATE CASCADE` or `SET
+NULL`, a statement that changes both a referenced row and a row the
+cascade then rewrites is refused (`0A000`): change them in separate
+statements. The
 whole statement is one transaction: the read of the existing row and the
 write are serializable, so two sessions upserting the same key never lose
 an update — one of them restarts with `40001` and retries.
@@ -2013,6 +2041,10 @@ unqualified table name resolves in the session's current database;
 VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
 database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
+`DROP DATABASE ... CASCADE` is one transaction, however many tables it
+drops: it retries itself like any single statement, and if it still
+loses to DDL running in the same database it fails with `40001` having
+dropped nothing.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
 bob`. `CREATE` lets a non-admin create tables there (admins and the

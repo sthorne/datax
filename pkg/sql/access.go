@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // colBound is one end of a range constraint on a key column.
@@ -636,12 +637,12 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			// (pickVectorIndex), never a WHERE clause.
 			continue
 		}
-		if !idx.Unique {
-			// A non-unique index has no entry for rows with a NULL in ANY
-			// indexed column: it is a complete row source only when every
-			// indexed column is null-safe under this WHERE clause. (Unique
-			// indexes reject NULLs at write time, so they are always
-			// complete.)
+		{
+			// An index has no entry for rows with a NULL in ANY indexed
+			// column — a unique one included, since NULLs are distinct
+			// (and one declared NULLS NOT DISTINCT is held to the same
+			// rule for simplicity): it is a complete row source only when
+			// every indexed column is null-safe under this WHERE clause.
 			complete := true
 			for _, colID := range idx.ColumnIDs {
 				col, _ := desc.ColByID(colID)
@@ -738,11 +739,18 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 
 // spanBounds builds the KV scan span for a constrained scan: the pinned
 // prefix (already encoded into prefix by the caller), narrowed by the
-// range bounds on the next key column of family fam.
+// range bounds on the next key column of family fam. On an index that
+// keys NULLs (NULLS NOT DISTINCT) the span starts after the next
+// column's NULL entries even without a lower bound: the planner only
+// scans an index where a NULL cannot match, and a NULL entry inside the
+// span would use up a pushed-down limit.
 func (p accessPlan) spanBounds(prefix keys.Key, fam types.Family) (start, end keys.Key, err error) {
 	start = prefix.Clone()
+	if p.lo == nil && rowenc.TaggedIndexKey(p.idx) && len(p.idxVals) < len(p.idx.ColumnIDs) {
+		start = append(start, rowenc.IndexKeyValueTag)
+	}
 	if p.lo != nil {
-		start, err = rowenc.AppendKeyDatum(start, fam, p.lo.val)
+		start, err = rowenc.AppendIndexKeyDatum(start, p.idx, fam, p.lo.val)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -754,7 +762,7 @@ func (p accessPlan) spanBounds(prefix keys.Key, fam types.Family) (start, end ke
 	}
 	end = prefix.Clone()
 	if p.hi != nil {
-		end, err = rowenc.AppendKeyDatum(end, fam, p.hi.val)
+		end, err = rowenc.AppendIndexKeyDatum(end, p.idx, fam, p.hi.val)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -848,11 +856,42 @@ func entryDiff(old, new []rowenc.IndexEntry) (removed, added []rowenc.IndexEntry
 	return removed, added
 }
 
+// uniqueNullsDistinct reports whether a unique index takes rows with a
+// NULL in an indexed column (PostgreSQL's NULLS DISTINCT: such a row has
+// no entry and conflicts with nothing). Before cluster version v22 they
+// are refused, as every earlier binary refuses them: a v21 planner takes
+// a unique index for a complete row source and would miss such rows.
+func uniqueNullsDistinct(txn *kvclient.Txn) bool {
+	return txn == nil || txn.ClusterVersion() >= version.V22
+}
+
+// nullInUniqueIndex is the error for a NULL a unique index cannot take
+// yet (uniqueNullsDistinct).
+func nullInUniqueIndex(idx *catalog.IndexDescriptor) error {
+	return newErrf(CodeNotNullViolation, "null value in column of unique index %q (NULLs in a unique index need cluster version %s: finalize the upgrade first)", idx.Name, version.V22)
+}
+
+// batchWriter is where a statement buffers its writes: the statement's
+// kvclient.WriteBatch, or an UPDATE's updateWrites, which writes each
+// key once.
+type batchWriter interface {
+	Put(key keys.Key, value []byte)
+	Delete(key keys.Key)
+}
+
+// sameEntryKey reports whether a unique index's old entries (none or
+// one) have key k.
+func sameEntryKey(old []rowenc.IndexEntry, k keys.Key) bool {
+	return len(old) == 1 && bytes.Equal(old[0].Key, k)
+}
+
 // addIndexEntries buffers the row's entries in every secondary index.
 // Unique conflicts are detected through the transaction (a racing insert's
 // intent makes the conflict visible); seen catches duplicates within one
-// statement whose writes are still buffered.
-func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool, ps *probeSet) error {
+// statement whose writes are still buffered. A nil seen says the caller
+// has checked the row's unique keys itself (an UPDATE that moves rows
+// checks the statement's keys together, checkUpdateKeys).
+func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb batchWriter, seen map[string]bool, ps *probeSet) error {
 	shadowRow, serr := reshardShadowRow(desc, row)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -864,12 +903,12 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			return invertedEntryErr(idx, err)
 		}
 		if len(entries) == 0 {
-			if idx.Unique {
-				return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
+			if idx.Unique && !uniqueNullsDistinct(txn) {
+				return nullInUniqueIndex(idx)
 			}
 			continue
 		}
-		if idx.Unique {
+		if idx.Unique && seen != nil {
 			key := entries[0].Key
 			if seen[string(key)] {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
@@ -896,7 +935,7 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 }
 
 // dropIndexEntries buffers deletion of the row's entries in every index.
-func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch) error {
+func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb batchWriter) error {
 	shadowRow, serr := reshardShadowRow(desc, row)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -925,10 +964,12 @@ func dropIndexEntries(desc *catalog.TableDescriptor, row map[catalog.ColumnID]ty
 }
 
 // updateIndexEntries buffers, for every index, the deletion of the
-// entries only oldRow has and the write of the entries only newRow has
-// (the primary key is immutable under UPDATE, so only indexed-column
-// changes move entries).
-func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb *kvclient.WriteBatch, seen map[string]bool, ps *probeSet) error {
+// entries only oldRow has and the write of the entries only newRow has.
+// An entry moves when its indexed columns change, or when the primary
+// key does (a non-unique entry's key ends in it, a unique entry's value
+// is it). A nil seen: the caller checked the unique keys (see
+// addIndexEntries).
+func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum, wb batchWriter, seen map[string]bool, ps *probeSet) error {
 	shadowOld, serr := reshardShadowRow(desc, oldRow)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -944,7 +985,7 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 			// that leaves the vector alone leaves its entry alone, and
 			// need not work out twice where that entry is.
 			o, n := oldRow[idx.ColumnIDs[0]], newRow[idx.ColumnIDs[0]]
-			if o.Null == n.Null && o.Fam == n.Fam && o.S == n.S {
+			if o.Null == n.Null && o.Fam == n.Fam && o.S == n.S && !pkChanged(desc, oldRow, newRow) {
 				continue
 			}
 		}
@@ -956,20 +997,23 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 		if err != nil {
 			return invertedEntryErr(idx, err)
 		}
-		if len(newEntries) == 0 && idx.Unique {
-			return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
+		if len(newEntries) == 0 && idx.Unique && !uniqueNullsDistinct(txn) {
+			return nullInUniqueIndex(idx)
 		}
 		removed, added := entryDiff(oldEntries, newEntries)
 		if len(removed) == 0 && len(added) == 0 {
 			// Entries unchanged. The shadow entries are unchanged too:
-			// the indexed columns and the (immutable-under-UPDATE)
-			// primary key are what both layouts' keys encode.
+			// the indexed columns and the primary key (which every entry
+			// carries, in its key or its value) are what both layouts'
+			// keys encode.
 			continue
 		}
 		for _, e := range removed {
 			wb.Delete(e.Key)
 		}
-		if idx.Unique && len(added) > 0 {
+		// A unique entry whose key stays and whose value changes (the
+		// row's primary key moved) is the row's own: nothing to check.
+		if idx.Unique && len(added) > 0 && seen != nil && !sameEntryKey(oldEntries, added[0].Key) {
 			newKey := added[0].Key
 			if seen[string(newKey)] {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
@@ -1044,6 +1088,17 @@ func appendMovedUniqueIndexKeys(ks []keys.Key, desc *catalog.TableDescriptor, ol
 		ks = append(ks, newKey)
 	}
 	return ks
+}
+
+// pkChanged reports whether a row's primary-key columns differ between
+// two versions of it.
+func pkChanged(desc *catalog.TableDescriptor, oldRow, newRow map[catalog.ColumnID]types.Datum) bool {
+	for _, id := range desc.PrimaryKey {
+		if datumChanged(rowVal(oldRow, id), rowVal(newRow, id)) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyRow(row map[catalog.ColumnID]types.Datum) map[catalog.ColumnID]types.Datum {

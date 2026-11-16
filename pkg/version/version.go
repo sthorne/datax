@@ -375,6 +375,17 @@ const (
 	// which goes on until its coordinator learns of the abort (from its
 	// heartbeat, after which the coordinator refuses every request
 	// itself, or from its commit).
+	//
+	// V22 also lets a unique index take NULLs (issue #322): a row with a
+	// NULL in an indexed column has no entry and conflicts with nothing,
+	// as in PostgreSQL. A v21 planner takes a unique index for a complete
+	// row source and would miss such rows, and a v21 node refuses to
+	// update them, so until finalize a unique index refuses NULLs as
+	// before. And it introduces UNIQUE NULLS NOT DISTINCT: the index
+	// descriptor field nulls_not_distinct, omitempty, whose index keys
+	// every column behind a tag byte (rowenc.TaggedIndexKey) that a v21
+	// node would not write; the DDL that declares one is refused until
+	// finalize.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

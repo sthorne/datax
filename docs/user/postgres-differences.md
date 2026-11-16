@@ -263,8 +263,16 @@ syntax error or `0A000` feature not supported):
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
-  change a primary-key column, and there is no `ON CONFLICT ... DO
-  UPDATE` over exclusion constraints (there are none). `UPSERT INTO`
+  change a primary-key column (a plain `UPDATE` can), and there is no `ON
+  CONFLICT ... DO UPDATE` over exclusion constraints (there are none).
+- **Unique keys are checked at the end of an `UPDATE`**, as the SQL
+  standard (and PostgreSQL for a `DEFERRABLE` constraint) has it:
+  `UPDATE t SET id = id + 1` succeeds where PostgreSQL, checking a
+  non-deferrable key row by row, fails with `23505`. Where a foreign
+  key references its own table with `ON UPDATE CASCADE` or `SET NULL`,
+  an `UPDATE` that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`); PostgreSQL cascades after the
+  statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
@@ -380,6 +388,22 @@ are the differences ([reference](sql.md#large-objects)):
   removed by the cluster within about a minute and garbage-collected
   after the GC window — but objects orphaned by deleting the row that
   named them are still yours to unlink, exactly as in PostgreSQL.
+
+## Things datax accepts that PostgreSQL does not
+
+- **`ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS name ...`**: when the
+  table already has a constraint called `name` (its `<table>_pkey`, or a
+  `CHECK`, `UNIQUE` or `FOREIGN KEY` constraint), the statement does
+  nothing and says so in a NOTICE (`constraint "name" for relation "t"
+  already exists, skipping`); otherwise it adds the constraint as `ADD
+  CONSTRAINT` would. Only the name is compared, never the definition: a
+  constraint of that name that checks something else is left as it is.
+  An index made by `CREATE UNIQUE INDEX` is not a constraint, so its name
+  is still refused (`42710`). PostgreSQL has `IF NOT EXISTS` on `ADD
+  COLUMN` and `CREATE INDEX` (both supported here) but not on `ADD
+  CONSTRAINT`; migration tools that want an idempotent constraint can
+  use it, at the price of a schema PostgreSQL will not load.
+- `UPSERT INTO` (CockroachDB syntax), above.
 
 ## Errors you should know
 

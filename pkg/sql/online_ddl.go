@@ -232,6 +232,15 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		idx := catalog.IndexDescriptor{
 			ID: desc.NextIndexID, Name: t.Name, Unique: t.Unique,
 			ColumnIDs: colIDs, State: catalog.IndexStateWriteOnly,
+			// NULLS NOT DISTINCT means something only to a unique index;
+			// on another it is accepted and has no effect, as in
+			// PostgreSQL.
+			NullsNotDistinct: t.Unique && t.NullsNotDistinct,
+		}
+		if idx.NullsNotDistinct {
+			if err := s.requireNullsNotDistinct(); err != nil {
+				return err
+			}
 		}
 		if kind != nil {
 			idx.Inverted = kind.Name()
@@ -466,8 +475,11 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 				return invertedEntryErr(idx, err)
 			}
 			if len(entries) == 0 {
-				if idx.Unique {
-					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column", idx.Name)
+				// NULLS DISTINCT: a row with a NULL has no entry and
+				// duplicates nothing (refused before v22, as the write
+				// path refuses it).
+				if idx.Unique && !uniqueNullsDistinct(txn) {
+					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column (NULLs in a unique index need cluster version %s: finalize the upgrade first)", idx.Name, version.V22)
 				}
 				continue
 			}
