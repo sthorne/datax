@@ -175,13 +175,15 @@ func TestForUpdateLimitWaitsPastIndexJoin(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
+		// The result is sent once B is done with its connection, which
+		// the test's cleanup closes.
 		tx, err := b.Begin(ctx)
 		if err != nil {
 			done <- result{err: err}
 			return
 		}
-		defer func() { _ = tx.Rollback(ctx) }()
 		ids, err := queryIDs(ctx, tx, `SELECT id FROM jobs WHERE `+claimWhere+` ORDER BY visible_at LIMIT 1 FOR UPDATE`)
+		_ = tx.Rollback(ctx)
 		done <- result{ids, err}
 	}()
 	select {
