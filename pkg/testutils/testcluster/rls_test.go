@@ -833,12 +833,19 @@ func TestRowSecurityPlansAndTime(t *testing.T) {
 		// After SET ROLE to the tenant role the same prepared statement
 		// must be filtered, and unfiltered again after RESET ROLE.
 		const q = `SELECT n FROM docs WHERE tenant_id = $1 AND id = $2`
+		// A cached plan is valid while the table's descriptor and
+		// statistics are the ones it was planned against, so a background
+		// statistics refresh (the UPDATEs above invite one) or a lease
+		// renewal can cost a hit. Run until two hits, within a bound.
 		h0, _ := planCacheCounts()
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 10; i++ {
 			rlsWant(t, ctx, owner, []string{"600"}, q, rlsTenantB, int64(6))
+			if h1, _ := planCacheCounts(); h1-h0 >= 2 {
+				break
+			}
 		}
 		if h1, _ := planCacheCounts(); h1-h0 < 2 {
-			t.Fatalf("the owner's statement did not use the plan cache (%v hits): the test proves nothing", h1-h0)
+			t.Fatalf("the owner's statement did not use the plan cache (%v hits in 10 runs): the test proves nothing", h1-h0)
 		}
 		rlsTenant(t, ctx, owner, rlsTenantA)
 		rlsExec(t, ctx, owner, `SET ROLE app`)
