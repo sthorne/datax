@@ -584,19 +584,25 @@ func TestSealJobs(t *testing.T) {
 		if raceEnabled {
 			tenants = 2000
 		}
+		// 25 to a transaction: eight of them at once contend on the keys
+		// table's ranges, and a restart of a short one loses little. With
+		// 100 to a transaction, after the subtests above, making them
+		// under the race detector took minutes of restarts, long enough
+		// for a purge of the keys' history to refuse one past its retries.
+		const per = 25
 		start := time.Now()
-		db := c.tc.Nodes[alive].DB()
+		db := c.node(t, alive).DB()
 		var wg sync.WaitGroup
-		errs := make(chan error, tenants/100)
+		errs := make(chan error, tenants/per)
 		sem := make(chan struct{}, 8)
-		for at := 0; at < tenants; at += 100 {
+		for at := 0; at < tenants; at += per {
 			wg.Add(1)
 			go func(at int) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				errs <- db.RunTxn(ctx, "test-tenant-keys", func(ctx context.Context, txn *kvclient.Txn) error {
-					for i := at; i < at+100; i++ {
+					for i := at; i < at+per; i++ {
 						name := rowseal.TenantKeyName(999999, []byte(hex.EncodeToString([]byte(strconv.Itoa(i)))))
 						if _, err := ks.CreateIn(ctx, txn, keystore.KindTenant, name); err != nil {
 							return err
