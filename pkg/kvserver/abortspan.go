@@ -237,8 +237,11 @@ func (r *Replica) checkAbortSpan(rd getter, ba *kvpb.BatchRequest) *kvpb.Error {
 	return e
 }
 
-// abortSpanOK reports whether abort-span entries may be written or
-// collected (cluster version v22): a v21 replica does not know them.
+// abortSpanOK reports whether the leader may propose a GC of the abort
+// span (cluster version v22): a v21 replica would drop the cutoff. The
+// entries themselves are only written by resolutions whose senders check
+// the same version (kvclient), and never gated at apply, where the
+// replicas must decide alike whatever version each has heard of.
 func (s *Store) abortSpanOK() bool {
 	if s.cfg.ClusterVersion == nil {
 		return true
