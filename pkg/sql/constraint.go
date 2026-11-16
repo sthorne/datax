@@ -922,7 +922,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 }
 
 // deleteRow buffers the deletion of a fetched row and its index entries.
-func deleteRow(d *catalog.TableDescriptor, fr fetchedRow, wb *kvclient.WriteBatch) error {
+func deleteRow(d *catalog.TableDescriptor, fr fetchedRow, wb batchWriter) error {
 	wb.Delete(fr.key)
 	if d.Reshard != nil {
 		shadow, err := reshardShadowKey(d, fr.row)

@@ -263,8 +263,16 @@ syntax error or `0A000` feature not supported):
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
-  change a primary-key column, and there is no `ON CONFLICT ... DO
-  UPDATE` over exclusion constraints (there are none). `UPSERT INTO`
+  change a primary-key column (a plain `UPDATE` can), and there is no `ON
+  CONFLICT ... DO UPDATE` over exclusion constraints (there are none).
+- **Unique keys are checked at the end of an `UPDATE`**, as the SQL
+  standard (and PostgreSQL for a `DEFERRABLE` constraint) has it:
+  `UPDATE t SET id = id + 1` succeeds where PostgreSQL, checking a
+  non-deferrable key row by row, fails with `23505`. Where a foreign
+  key references its own table with `ON UPDATE CASCADE` or `SET NULL`,
+  an `UPDATE` that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`); PostgreSQL cascades after the
+  statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run

@@ -11,6 +11,23 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`UPDATE` may change primary-key columns** (#322). A row whose key
+  changes moves: its old row and index entries are deleted and the new
+  version written at the new key, with its entries, in the statement's
+  transaction; a hash-sharded table files it under the new bucket; a sealed
+  table seals it afresh for the new key, and a per-tenant table under the
+  new tenant's key when the tenant column changes. Foreign keys apply their
+  `ON UPDATE` actions, row security checks `WITH CHECK` on the new row, and
+  `RETURNING` shows it. Unique keys — the primary key and unique indexes —
+  are now checked for the statement as a whole in every `UPDATE`, so
+  `UPDATE t SET id = id + 1` and swaps succeed (PostgreSQL, checking a
+  non-deferrable key row by row, refuses the first); before, a unique index
+  refused `SET u = u - 1` over consecutive values. Where a foreign key
+  references its own table with `ON UPDATE CASCADE` or `SET NULL`, a
+  statement that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`) rather than losing one of the two changes,
+  as it could before. `ON CONFLICT DO UPDATE` still cannot change the key.
+  Before, any update of a key column was refused with `0A000`.
 - **Vector columns and nearest-neighbour search** (#304): `vector(n)` columns
   compatible with pgvector (float4 elements, up to 16,000 dimensions; text
   `'[1,2,3]'` and pgvector's binary format; a fixed type OID found through

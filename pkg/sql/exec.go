@@ -2064,7 +2064,7 @@ func (s *Session) cachePlan(stmt parser.Statement, desc *catalog.TableDescriptor
 // re-shard's shadow key when there is one, each sealed for its own key
 // when the table is sealed (pkg/sql/rowseal). Every write of a row value
 // goes through here.
-func putRowValue(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, wb *kvclient.WriteBatch, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
+func putRowValue(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, wb batchWriter, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
 	value, err := rowenc.EncodeValue(desc, row)
 	if err != nil {
 		return err
@@ -2566,15 +2566,20 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
 		return nil, err
 	}
+	pkSet := false // the statement sets a primary-key column: rows may move
 	for _, set := range t.Set {
 		col, ok := desc.Col(set.Column)
 		if !ok {
 			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", set.Column)
 		}
 		if desc.IsPKCol(col.ID) {
-			return nil, newErrf(CodeFeatureNotSupported, "updating primary key column %q is not supported", set.Column)
+			if col.Hidden {
+				return nil, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", set.Column)
+			}
+			pkSet = true
 		}
 	}
+
 	var planKeyStmt parser.Statement
 	if t == orig {
 		planKeyStmt = t
@@ -2624,7 +2629,6 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	}
 	res := &Result{}
 	var wb kvclient.WriteBatch
-	seen := map[string]bool{}
 	defaults, err := s.prepareDefaults(ctx, txn, desc, params)
 	if err != nil {
 		return nil, err
@@ -2673,10 +2677,35 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			fr.row[col.ID] = d
 		}
 	}
+	// The rows' keys after the update: a row whose primary key changes
+	// moves (update_pk.go).
+	oldKeys := make([]keys.Key, len(rows))
+	newKeys := make([]keys.Key, len(rows))
+	newRows := make([]map[catalog.ColumnID]types.Datum, len(rows))
+	for i, fr := range rows {
+		oldKeys[i], newKeys[i], newRows[i] = fr.key, fr.key, fr.row
+		if !pkSet {
+			continue
+		}
+		for _, id := range desc.PrimaryKey {
+			if col, _ := desc.ColByID(id); rowVal(fr.row, id).Null {
+				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+			}
+		}
+		if _, err := withShardBucket(desc, fr.row); err != nil {
+			return nil, newErrf(CodeInternal, "shard bucket: %v", err)
+		}
+		if newKeys[i], err = pkKey(desc, fr.row); err != nil {
+			return nil, err
+		}
+	}
 	var ps *probeSet
 	if len(rows) > 1 {
 		var probeKeys []keys.Key
 		for i, fr := range rows {
+			if !newKeys[i].Equal(oldKeys[i]) {
+				probeKeys = append(probeKeys, newKeys[i])
+			}
 			probeKeys = appendMovedUniqueIndexKeys(probeKeys, desc, oldRows[i], fr.row)
 			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, oldRows[i], fr.row)
 		}
@@ -2687,20 +2716,45 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			guard.setProbe(ps)
 		}
 	}
-	for i, fr := range rows {
-		oldRow := oldRows[i]
+	// The policy check comes before any probe of the table: a row the
+	// role may not write is refused as such, whether or not its new key
+	// is taken.
+	for _, fr := range rows {
 		if err := rowSec.checkUpdate(fr.row); err != nil {
 			return nil, err
 		}
+	}
+	// The statement's unique keys are checked together, so a row may
+	// take a key another row of the statement gives up.
+	if err := checkUpdateKeys(ctx, txn, desc, oldRows, newRows, oldKeys, newKeys, ps); err != nil {
+		return nil, err
+	}
+	writes := newUpdateWrites()
+	for i, fr := range rows {
+		oldRow := oldRows[i]
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
-		// PK updates are unsupported, so a re-shard's shadow key is stable.
-		if err := putRowValue(ctx, s.rowSealer(), desc, &wb, fr.key, fr.row); err != nil {
-			return nil, err
-		}
-		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen, ps); err != nil {
-			return nil, err
+		if newKeys[i].Equal(fr.key) {
+			if err := putRowValue(ctx, s.rowSealer(), desc, writes, fr.key, fr.row); err != nil {
+				return nil, err
+			}
+			if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, writes, nil, ps); err != nil {
+				return nil, err
+			}
+		} else {
+			// The row moves: its old version and entries go (a re-shard's
+			// shadow copy too), the new one is written at its new key —
+			// sealed for that key on a sealed table.
+			if err := deleteRow(desc, fetchedRow{key: fr.key, row: oldRow}, writes); err != nil {
+				return nil, err
+			}
+			if err := putRowValue(ctx, s.rowSealer(), desc, writes, newKeys[i], fr.row); err != nil {
+				return nil, err
+			}
+			if err := addIndexEntries(ctx, txn, desc, fr.row, writes, nil, ps); err != nil {
+				return nil, err
+			}
 		}
 		if ret != nil {
 			out, err := ret.project(desc, fr.row, params)
@@ -2710,6 +2764,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			res.Rows = append(res.Rows, out)
 		}
 	}
+	if err := guard.cascadeOverlap(desc, oldKeys, newKeys); err != nil {
+		return nil, err
+	}
+	writes.flush(&wb)
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}

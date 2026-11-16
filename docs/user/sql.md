@@ -1005,6 +1005,7 @@ DELETE FROM t WHERE a = 1;
 
 INSERT INTO t (a, b) VALUES (3, 'q') RETURNING a, b;            -- any expression over the written row, or *
 UPDATE t SET c = c + 1 WHERE a = 1 RETURNING *;
+UPDATE t SET a = a + 100 WHERE a < 10;              -- the primary key too: the rows move
 DELETE FROM t WHERE a = 1 RETURNING a;
 
 INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT DO NOTHING;    -- any unique key; the tag counts inserted rows
@@ -1022,7 +1023,19 @@ unique index — by columns or by constraint name (`<table>_pkey`, the
 index name) — else SQLSTATE `42P10`; a conflict on some other unique key
 is still the usual `23505`. `ON CONFLICT DO NOTHING` without a target
 accepts a conflict on any unique key. `DO UPDATE` cannot change primary
-key columns, and the same key twice in one statement is `21000`. The
+key columns (an `UPDATE` can), and the same key twice in one statement is `21000`.
+
+An `UPDATE` may change primary-key columns: the row moves to its new key
+with its index entries, foreign keys referencing it apply their `ON
+UPDATE` action, and a sealed table seals it for its new key (and tenant).
+Unique keys — the primary key and unique indexes — are checked for the
+statement as a whole, so `UPDATE t SET id = id + 1` and swaps work
+whatever order the rows are visited in; PostgreSQL checks a
+non-deferrable key row by row and refuses the first of these. When a
+foreign key references its own table with `ON UPDATE CASCADE` or `SET
+NULL`, a statement that changes both a referenced row and a row the
+cascade then rewrites is refused (`0A000`): change them in separate
+statements. The
 whole statement is one transaction: the read of the existing row and the
 write are serializable, so two sessions upserting the same key never lose
 an update — one of them restarts with `40001` and retries.

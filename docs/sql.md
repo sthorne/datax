@@ -56,7 +56,7 @@ SELECT [DISTINCT] * | col, ... | aggregates | func() OVER ([PARTITION BY ...] [O
     [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
     [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE [SKIP LOCKED | NOWAIT]]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
-UPDATE t SET col = value, ... [WHERE conjunction]
+UPDATE t SET col = value, ... [WHERE conjunction]   -- primary-key columns too (see below)
 DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
@@ -1228,6 +1228,48 @@ every kind of index (`TestCreateIndexDiscardsEntriesWrittenDuringItsDrain`).
 
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.
+
+## Updating primary-key columns
+
+`UPDATE` may set primary-key columns (issue #322; `pkg/sql/update_pk.go`).
+A row whose key changes **moves**: in the statement's transaction its
+old row (and a re-shard's shadow copy) and every index entry are
+deleted, and the new version is written at the new key with its
+entries. A hash-sharded table files it under the new key's bucket. A
+sealed table's value is sealed afresh for the new key — the key is in
+its associated data — and on a table sealed per tenant, a new tenant
+column value seals it under the new tenant's key (made on its first
+write, as for an insert). Foreign keys see an ordinary change of the
+referenced columns: `ON UPDATE CASCADE` re-keys the children, `SET
+NULL` nulls them, `RESTRICT` / `NO ACTION` refuse (`23503`, checked per
+row). Where a table's foreign key references the table itself, a
+statement that changes both a referenced row and a row its cascade
+rewrites is refused (`0A000`, `cascadeOverlap`): the cascade rewrote
+that row from the version the statement read, and the statement would
+then write its own version over it. PostgreSQL runs the cascade after
+the statement, on the rows as it left them; here the rows are changed
+in separate statements. Row security checks the new row against
+`WITH CHECK` before any probe of the new key; `RETURNING` shows the new
+row. The hidden key columns (`rowid`, the shard bucket) cannot be set.
+
+**Uniqueness is checked for the statement as a whole**, for the primary
+key and every unique index, in every `UPDATE` (`checkUpdateKeys`): a new
+key conflicts when two of the statement's rows take it, or when a row
+the statement does not move out of it holds it now (`23505`). So `UPDATE
+t SET id = id + 1` succeeds over keys 1, 2, 3, as does a swap. This is
+the SQL standard's rule and PostgreSQL's for a `DEFERRABLE` constraint;
+PostgreSQL checks a non-deferrable key row by row, in the order it
+visits the rows, and so refuses `id = id + 1` over 1, 2, 3 (but not `id =
+id - 1`). Datax accepts what PostgreSQL accepts and some statements it
+refuses; none that leaves the table with a duplicate. Because a row may
+take a key another row of the statement gives up, the statement's own
+row and index writes go through `updateWrites`, which writes each key
+once (the new version wins over the old one's delete).
+
+`ON CONFLICT DO UPDATE` still may not change a primary-key column
+(`0A000`): its arbiter reads see the table as it was before the
+statement, so a key one proposed row's update gave up would still look
+taken to the next row of the same `INSERT`. Use `UPDATE`.
 
 ## Inverted indexes (v21)
 
