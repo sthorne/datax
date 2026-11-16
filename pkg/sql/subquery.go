@@ -93,7 +93,18 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		d := types.NewString(s.textSearchConfig())
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "now", "current_timestamp", "localtimestamp", "statement_timestamp", "transaction_timestamp":
-		d := types.NewTimestamp(s.statementTime())
+		d := types.NewTimestamp(roundClock(s.statementTime(), e.Args))
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "current_time", "localtime":
+		// The time of day of the statement's start, in the session's
+		// time zone.
+		loc := s.TimeZone()
+		if loc == nil {
+			loc = time.UTC
+		}
+		at := time.Unix(0, roundClock(s.statementTime(), e.Args)).In(loc)
+		midnight := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, loc)
+		d := types.NewTime(int64(at.Sub(midnight)))
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "current_date":
 		d := types.NewDate(s.statementTime() / (86400 * 1e9))
@@ -457,6 +468,21 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 	return out, nil
 }
 
+// roundClock rounds a clock reading (nanoseconds) to the fractional-
+// seconds precision of current_timestamp(p) and its kin, when args
+// carries one (the parser admits only a non-negative integer literal;
+// above 6, microseconds, it changes nothing).
+func roundClock(nanos int64, args []parser.Expr) int64 {
+	if len(args) != 1 || args[0].Lit == nil || args[0].Lit.I >= 6 {
+		return nanos
+	}
+	unit := int64(1000)
+	for p := args[0].Lit.I; p < 6; p++ {
+		unit *= 10
+	}
+	return (nanos + unit/2) / unit * unit
+}
+
 // exprHasSub reports whether an expression needs the pre-execution
 // resolve pass: a scalar subquery or a now() call anywhere inside it.
 func exprHasSub(e parser.Expr) bool {
@@ -748,11 +774,46 @@ func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *p
 		}
 		out.Set[i].Value = v
 	}
+	ret, err := s.resolveReturning(ctx, txn, t.Returning, params)
+	if err != nil {
+		return nil, err
+	}
+	if ret != nil {
+		if out == t {
+			c := *t
+			out = &c
+		}
+		out.Returning = ret
+	}
+	return out, nil
+}
+
+// resolveReturning splices the once-per-statement calls of a RETURNING
+// list (now(), current_timestamp, current_user, ...) as the SET and
+// VALUES positions have them spliced, returning nil when nothing
+// changed. An item holding a subquery is left for returningProjection
+// to refuse; per-row volatile calls are left in place.
+func (s *Session) resolveReturning(ctx context.Context, txn *kvclient.Txn, exprs []parser.SelectExpr, params []types.Datum) ([]parser.SelectExpr, error) {
+	var out []parser.SelectExpr
+	for i, se := range exprs {
+		if se.Star || !exprHasSub(se.Expr) || exprHasSubquery(se.Expr) {
+			continue
+		}
+		v, err := s.resolveValueExprOpts(ctx, txn, se.Expr, params, true)
+		if err != nil {
+			return nil, err
+		}
+		if out == nil {
+			out = append([]parser.SelectExpr(nil), exprs...)
+		}
+		out[i].Expr = v
+	}
 	return out, nil
 }
 
 // resolveDeleteSubs evaluates subqueries in a DELETE's WHERE clause.
 func (s *Session) resolveDeleteSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Delete, params []types.Datum) (*parser.Delete, error) {
+	out := t
 	where, err := s.resolveWhereSubs(ctx, txn, t.Where, params)
 	if err != nil {
 		return nil, err
@@ -760,9 +821,20 @@ func (s *Session) resolveDeleteSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	if len(where) > 0 && &where[0] != &t.Where[0] {
 		c := *t
 		c.Where = where
-		return &c, nil
+		out = &c
 	}
-	return t, nil
+	ret, err := s.resolveReturning(ctx, txn, t.Returning, params)
+	if err != nil {
+		return nil, err
+	}
+	if ret != nil {
+		if out == t {
+			c := *t
+			out = &c
+		}
+		out.Returning = ret
+	}
+	return out, nil
 }
 
 // resolveInsertSubs evaluates scalar subqueries in INSERT values.
@@ -788,6 +860,54 @@ func (s *Session) resolveInsertSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			}
 			out.Rows[ri][ci] = v
 		}
+	}
+	clone := func() *parser.Insert {
+		if out == t {
+			c := *t
+			out = &c
+		}
+		return out
+	}
+	if oc := t.OnConflict; oc != nil {
+		// ON CONFLICT ... DO UPDATE SET v = now() WHERE t.at < now():
+		// spliced as an UPDATE's SET and WHERE are.
+		var noc *parser.OnConflict
+		for i, set := range oc.Set {
+			if !exprHasSub(set.Value) {
+				continue
+			}
+			v, err := s.resolveValueExpr(ctx, txn, set.Value, params)
+			if err != nil {
+				return nil, err
+			}
+			if noc == nil {
+				c := *oc
+				c.Set = append([]parser.SetClause(nil), oc.Set...)
+				noc = &c
+			}
+			noc.Set[i].Value = v
+		}
+		where, err := s.resolveWhereSubs(ctx, txn, oc.Where, params)
+		if err != nil {
+			return nil, err
+		}
+		if len(where) > 0 && &where[0] != &oc.Where[0] {
+			if noc == nil {
+				c := *oc
+				noc = &c
+			}
+			noc.Where = where
+		}
+		if noc != nil {
+			clone().OnConflict = noc
+		}
+	}
+	ret, err := s.resolveReturning(ctx, txn, t.Returning, params)
+	if err != nil {
+		return nil, err
+	}
+	if ret != nil {
+		clone().Returning = ret
 	}
 	return out, nil
 }
@@ -997,6 +1117,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 // depend on the session, the clock, or the catalog rather than the row.
 var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
+	"current_time": true, "localtime": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
 	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,

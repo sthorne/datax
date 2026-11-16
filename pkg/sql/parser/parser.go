@@ -5434,6 +5434,7 @@ func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
 // session before execution; the rest evaluate per row).
 var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"now": 0, "current_database": 0, "current_schema": 0, "current_timestamp": 0, "localtimestamp": 0, "current_date": 0,
+	"current_time": 0, "localtime": 0,
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
@@ -5450,7 +5451,12 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 }
 
 // bareFuncs are called without parentheses (SQL keywords in PostgreSQL).
-var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true, "current_timestamp": true, "current_date": true, "localtimestamp": true}
+var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true,
+	"current_timestamp": true, "current_date": true, "localtimestamp": true, "current_time": true, "localtime": true}
+
+// precisionFuncs are the SQL-standard clock keywords that also take a
+// fractional-seconds precision: current_timestamp(3), localtime(0).
+var precisionFuncs = map[string]bool{"current_timestamp": true, "localtimestamp": true, "current_time": true, "localtime": true}
 
 // parsePrimaryExpr parses one operand: a parenthesized expression, a
 // builtin call, a possibly-qualified column reference (with an optional
@@ -5642,6 +5648,16 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			case registered:
 				if !bi.ArityOK(len(e.Args)) {
 					return e, p.errf("%s() takes %s argument(s), got %d", t.text, bi.ArityText(), len(e.Args))
+				}
+			case precisionFuncs[t.text] && len(e.Args) <= 1:
+				if len(e.Args) == 1 {
+					a := e.Args[0]
+					if a.Lit == nil || a.Lit.Fam != types.Int || a.BinOp != "" {
+						return e, p.errf("%s() takes an integer constant precision", t.text)
+					}
+					if a.Lit.I < 0 {
+						return e, p.errf("%s(%d) precision must not be negative", strings.ToUpper(t.text), a.Lit.I)
+					}
 				}
 			case arity == -1 && len(e.Args) == 0:
 				return e, p.errf("%s() requires at least one argument", t.text)

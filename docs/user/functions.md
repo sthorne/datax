@@ -130,6 +130,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
 - `current_setting(text, [bool]) → text` — The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Evaluated once per statement. *stable*
+- `current_time() → time` (also `localtime`) — The time of day of the statement's start time, in the session's time zone. current_time, current_timestamp, localtime and localtimestamp are written without parentheses, as in PostgreSQL, and take an optional fractional-seconds precision: current_timestamp(3). *stable*
 - `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
