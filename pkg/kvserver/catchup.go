@@ -145,6 +145,10 @@ func (s *Store) installSnapshot(r *Replica, h snapshotHeader, next func() ([]Sna
 	if err := b.DeleteRange(loL, hiL); err != nil {
 		return fail(err)
 	}
+	abortPre := keys.AbortSpanPrefix(r.rangeID)
+	if err := b.DeleteRange(abortPre, abortPre.PrefixEnd()); err != nil {
+		return fail(err)
+	}
 	if !s.splitEngines() {
 		// The log lives on this engine: reset it in the same batch. A
 		// split store resets it on the raft engine after the state has

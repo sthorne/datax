@@ -147,8 +147,37 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 // version of a row the predicate ages out — above the threshold included
 // — without changing how the threshold ratchets.
 func (r *Replica) runGC(ctx context.Context, threshold hlc.Timestamp, expire bool, rowExpired func(keys.Key, hlc.Timestamp) bool) error {
+	if r.store.abortSpanOK() {
+		cutoff := r.store.cfg.Clock.Now().AddNanos(-AbortSpanTTL.Nanoseconds())
+		if _, err := r.collectAbortSpan(ctx, cutoff); err != nil {
+			log.Warnf("%s: abort-span gc at %s: %v", r.rangeID, cutoff, err)
+		}
+	}
 	_, err := r.collectGarbage(ctx, threshold, expire, rowExpired)
 	return err
+}
+
+// collectAbortSpan removes the range's abort-span entries written at or
+// below cutoff (issue #320) with a replicated GC command of their own,
+// one that moves no threshold, and reports how many there were.
+func (r *Replica) collectAbortSpan(ctx context.Context, cutoff hlc.Timestamp) (int, error) {
+	_, old, err := countAbortSpan(r.store.cfg.Engine, r.rangeID, cutoff)
+	if err != nil || old == 0 {
+		return 0, err
+	}
+	desc := r.Desc()
+	ba := &kvpb.BatchRequest{
+		Header: kvpb.BatchHeader{RangeID: r.rangeID, Timestamp: r.store.cfg.Clock.Now()},
+		Requests: []kvpb.RequestUnion{{GC: &kvpb.GCRequest{
+			RequestHeader:   kvpb.RequestHeader{Key: desc.StartKey, EndKey: desc.EndKey},
+			AbortSpanCutoff: cutoff,
+		}}},
+	}
+	if _, kerr := r.Execute(ctx, ba); kerr != nil {
+		return 0, kerr
+	}
+	log.Debugf("%s: gc removed %d abort-span entries written at or below %s", r.rangeID, old, cutoff)
+	return old, nil
 }
 
 // collectGarbage is runGC reporting how many versions it deleted (a

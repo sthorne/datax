@@ -735,6 +735,12 @@ wait:
 	if err := PutRangeDescriptor(b, trig.Merged); err != nil {
 		return err
 	}
+	// The RHS's abort span (issue #320) moves to the merged range before
+	// its local keys go: the RHS is frozen at the subsume, so its entries
+	// here are the same on every replica.
+	if err := copyAbortSpan(b, trig.Right.RangeID, r.rangeID); err != nil {
+		return err
+	}
 	pre := keys.RangeUnreplicatedPrefix(trig.Right.RangeID)
 	if err := b.DeleteRange(pre, pre.PrefixEnd()); err != nil {
 		return err

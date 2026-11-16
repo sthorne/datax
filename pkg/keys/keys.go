@@ -200,6 +200,24 @@ func RangeUnreplicatedPrefix(rangeID base.RangeID) Key {
 // Raft messages.
 func RangeTombstoneKey(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "tomb") }
 
+// AbortSpanKey holds the range's abort-span entry for a transaction
+// (issue #320, cluster version v22): written when a pusher resolves away
+// an intent of the transaction after aborting it, so the transaction's
+// next request on the range fails instead of reading past its own
+// removed write. Unlike its neighbours under this prefix it is
+// replicated state: written by an applied command on every replica,
+// streamed with snapshots, copied to both halves of a split and carried
+// into the left-hand range by a merge (see pkg/kvserver/abortspan.go).
+// It lives here rather than in the addressed keyspace because it belongs
+// to the range as a whole, not to a key: every request of the
+// transaction on the range checks one key, whatever it reads.
+func AbortSpanKey(rangeID base.RangeID, txnID uuid.UUID) Key {
+	return append(AbortSpanPrefix(rangeID), txnID[:]...)
+}
+
+// AbortSpanPrefix is the prefix of every abort-span entry of a range.
+func AbortSpanPrefix(rangeID base.RangeID) Key { return makeRangeLocalKey(rangeID, "abrt") }
+
 // ---------------------------------------------------------------------------
 // Range-local addressed keys (replicated, routed by embedded global key).
 
