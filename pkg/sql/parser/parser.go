@@ -85,7 +85,7 @@ func (p *parser) errf(format string, args ...any) error {
 }
 
 // tableFuncs are the set-returning functions accepted in FROM.
-var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true}
+var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true, "pg_available_extensions": true}
 
 // parseFuncTable parses a FROM-clause table function call, if present.
 func (p *parser) parseFuncTable() (*Expr, bool, error) {

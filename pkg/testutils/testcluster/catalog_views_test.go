@@ -475,6 +475,19 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	if _, serr := trySQL(ctx, root, `SELECT t.name FROM t CROSS JOIN unnest(ARRAY[t.id]) AS k(x)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
 		t.Fatalf("LATERAL table function: %v", serr)
 	}
+	if r := execSQL(t, ctx, root, `SELECT * FROM pg_available_extensions()`); len(r.Rows) != 0 || len(r.Columns) != 3 || r.Columns[0].Name != "name" || r.Columns[2].Name != "comment" {
+		t.Fatalf("pg_available_extensions(): %+v %+v", r.Columns, r.Rows)
+	}
+	if r := execSQL(t, ctx, root, `SELECT name, installed_version FROM pg_available_extensions`); len(r.Rows) != 0 {
+		t.Fatalf("pg_available_extensions: %+v", r.Rows)
+	}
+	if _, serr := trySQL(ctx, root, `SELECT * FROM pg_available_extensions() AS ae(a, b, c, d)`); serr == nil || serr.Code != sql.CodeInvalidColumnReference {
+		t.Fatalf("too many column aliases: %v", serr)
+	}
+	// psql 18's \dx: every installed extension beside its default version.
+	if r := execSQL(t, ctx, root, `SELECT e.extname, ae.default_version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname ORDER BY 1`); len(r.Rows) != 0 || len(r.Columns) != 2 || r.Columns[1].Name != "default_version" {
+		t.Fatalf("\\dx's join: %+v %+v", r.Columns, r.Rows)
+	}
 	eq("CAST", names(execSQL(t, ctx, root, `SELECT CAST(qty AS text) FROM t WHERE id = 1`)), "5")
 	eq("subquery as predicate", names(execSQL(t, ctx, root, `SELECT name FROM t WHERE (SELECT count(*) FROM u WHERE u.tid = t.id) = 2 OR (SELECT true)`)), "Alice", "bob", "carol")
 	if _, serr := trySQL(ctx, root, `SELECT nosuchfn(1)`); serr == nil || serr.Code != sql.CodeUndefinedFunction {

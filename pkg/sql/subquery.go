@@ -996,6 +996,8 @@ func tableFuncColumns(e parser.Expr, alias string, rename []string) ([]ResultCol
 		cols = []ResultColumn{{Name: alias, Type: funcTableElem(e)}}
 	case "pg_partition_ancestors":
 		cols = []ResultColumn{{Name: alias, Type: types.Int}}
+	case "pg_available_extensions":
+		cols = []ResultColumn{{Name: "name", Type: types.String}, {Name: "default_version", Type: types.String}, {Name: "comment", Type: types.String}}
 	default:
 		return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
 	}
@@ -1078,6 +1080,13 @@ func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parse
 			return nil, nil, newErrf(CodeFeatureNotSupported, "pg_partition_ancestors takes a relation OID or name")
 		}
 		rows = append(rows, []types.Datum{*e.Lit})
+	case "pg_available_extensions":
+		// datax packages no installable extension: CREATE EXTENSION
+		// vector is accepted only because its type is built in, and
+		// pg_extension lists nothing.
+		if len(fe.Args) != 0 {
+			return nil, nil, newErrf(CodeUndefinedFunction, "pg_available_extensions takes no arguments")
+		}
 	}
 	return cols, rows, nil
 }
