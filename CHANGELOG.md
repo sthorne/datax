@@ -1426,6 +1426,38 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Parameters are counted and typed wherever they stand** (#322). A
+  parameter used only inside a subquery (`WHERE sid IN (SELECT sid FROM s
+  WHERE g = $1)`), or only under `EXPLAIN` (`EXPLAIN SELECT $1::text`), was
+  not counted, so a prepared statement refused its argument ("expected 0
+  arguments"); and a parameter compared with a qualified column of a join
+  inside `OR` (`g.at < $1 OR (g.at = $1 AND ...)`) was described as text,
+  so a client sent a timestamp as text and it failed to parse. One walker
+  (`parser.Walker`) now visits every expression position — subqueries of
+  every kind, WITH members, set members, `JOIN ... ON`, `HAVING`, `ORDER
+  BY`, windows, `LIMIT` / `OFFSET`, `VALUES`, `SET`, `ON CONFLICT`,
+  `RETURNING`, `EXPLAIN` — for counting and for typing. A parameter takes
+  the type of the column it is compared with or assigned to, resolved per
+  query level (aliases, join sides, derived tables, WITH members,
+  correlated references), or the type it is cast to (`$1::int8`); one
+  parameter has one type, and two columns fixing different ones are
+  `42P08`, as in PostgreSQL. `LIMIT '5'` (a client interpolating a
+  parameter) parses.
+- **A single table's alias works in every query shape** (#322). `SELECT
+  count(*) FROM gr AS g WHERE g.at < $1` failed with `column "g.at" does not
+  exist`: the alias was removed only on the plain (ungrouped, unwindowed)
+  path. It is now removed for grouped, windowed and explained queries too,
+  including aggregate arguments, `HAVING` and window clauses.
+- **`now()` and the clock keywords in `RETURNING`** (#322). `UPDATE ...
+  RETURNING now()` (and in `INSERT`, `DELETE`, `UPSERT`, `ON CONFLICT DO
+  UPDATE SET` / `WHERE`) failed with `now() was not resolved before
+  execution`; `RETURNING current_timestamp` with `unknown function`. They
+  are now the statement's start time there as everywhere. `current_time`
+  and `localtime` are new, and `current_timestamp`, `localtimestamp`,
+  `current_time` and `localtime` take a precision (`current_timestamp(3)`).
+- **`EXPLAIN` of a parameterized statement** (#322) describes and binds
+  the statement's parameters; `EXPLAIN ANALYZE` runs with the bound values;
+  and a `SELECT` without `FROM` is explained instead of refused.
 - **A transaction blocked on another's lock noticed it was released up to
   100 ms late.** It re-asked the lock holder's transaction record every
   100 ms. Now the holder's coordinator wakes it as soon as the holder has

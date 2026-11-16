@@ -794,8 +794,11 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   `quote_literal`), math (`abs`,
   `ceil`, `floor`, `round`, `trunc`, `mod`, `div`, `power`, `sqrt`,
   `cbrt`, `exp`, `ln`, `log`, `sign`, `pi`, `random`, the
-  trigonometric functions, ...), date and time (`now()`,
-  `current_timestamp`, `current_date`, `date_trunc`, `date_part` /
+  trigonometric functions, ...), date and time (`now()`, the SQL
+  keywords `current_timestamp`, `current_date`, `current_time`,
+  `localtimestamp` and `localtime` — no parentheses, an optional
+  precision as in `current_timestamp(3)`, the statement's start time
+  wherever an expression goes, `RETURNING` included — `date_trunc`, `date_part` /
   `extract(field FROM x)`, `to_char`, `to_timestamp`, `to_date`,
   `make_date`, `make_timestamp`, `make_time`, `make_interval`, `age`,
   `extract` over intervals and times, `justify_hours`, `justify_days`,
@@ -933,7 +936,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access
 path — or run it with `EXPLAIN ANALYZE SELECT ...`, which executes the
-statement and reports the plan line followed by every stage with its
+statement (with the bound values, when it has parameters) and reports the plan line followed by every stage with its
 actual rows and time (each scan and its path, each join level, the
 group / window / set-operation and sort stages), then the output row
 count and the total time:
@@ -1821,9 +1824,23 @@ query. A replica with zeros in `garbage_versions`, `tombstones` and
 ## Parameters
 
 `$1, $2, ...` work through the extended protocol in text and binary
-formats — every driver's normal parameterized-query path. Parameter types
-are inferred from column context; when a driver asks, unknown parameters
-describe as text.
+formats — every driver's normal parameterized-query path. A parameter
+counts wherever it is written: the select list, `WHERE`, `JOIN ... ON`,
+`HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`, `CASE`, any subquery (`IN`,
+`EXISTS`, scalar, derived or joined), a `WITH` member, `VALUES`, `SET`,
+`ON CONFLICT`, `RETURNING`, and the statement under `EXPLAIN [ANALYZE]`.
+
+Its type, which the server reports when a driver describes the statement
+(and which decides how the driver encodes the value), is inferred as in
+PostgreSQL: a parameter compared with a column — bare, qualified by its
+table or alias, or by a join side (`g.at < $1`), inside `OR`, in a
+subquery — or assigned to one (`SET`, `VALUES`, `INSERT ... SELECT $1`)
+takes the column's type; `$1::int8` takes the cast's; `LIMIT` and
+`OFFSET` take `int8`. A parameter used more than once has one type; two
+columns that fix different ones (`WHERE a.at = $1 OR b.name = $1`) are
+an error, `42P08`, as in PostgreSQL. Columns of different numeric widths
+(or a date and a timestamp) agree on the first. A parameter nothing
+types describes as text.
 
 ## EXPLAIN-driven checklist
 

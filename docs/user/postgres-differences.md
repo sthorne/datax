@@ -273,9 +273,11 @@ syntax error or `0A000` feature not supported):
   expression sort never uses an index; NULLs order last ASC / first DESC
   (PostgreSQL default). Under `GROUP BY` and `UNION`, output names only.
 - **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
-  precision on the wire, nanosecond internally.
-- **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
-  `EXPLAIN ANALYZE`.
+  precision on the wire, nanosecond internally. `current_time` is a
+  `time` (PostgreSQL's is `timetz`), and `localtimestamp` a
+  `timestamptz` like `current_timestamp`.
+- **`EXPLAIN`** returns one plain-text line, not a plan tree (`EXPLAIN
+  ANALYZE` adds a line per stage), and explains `SELECT` only.
 - **`ANALYZE`** exists but is admin-only (PostgreSQL allows table
   owners), takes no column list or options, and stores row counts +
   distinct estimates only — no histograms, no `pg_statistic`. `SHOW
